@@ -71,6 +71,8 @@ pub const ReadSegment = struct {
             cursor += columnBlockSize(self.file_bytes, cursor);
         }
 
+        const flags = format.ColumnBlockFlags.fromByte(self.file_bytes[cursor + 1]);
+
         // Try cache for the decompressed bytes.
         if (c) |cc| {
             const key = storage_cache.Key{
@@ -79,7 +81,7 @@ pub const ReadSegment = struct {
                 .column_idx = @intCast(column_idx),
             };
             if (cc.get(key)) |raw| {
-                return decodeRawColumn(allocator, col_type, raw, rg.row_count);
+                return decodeRawColumn(allocator, col_type, raw, rg.row_count, flags);
             }
             // Miss: decompress fresh + cache.
             const raw = try getDecompressedBytes(allocator, self.file_bytes, cursor);
@@ -87,11 +89,11 @@ pub const ReadSegment = struct {
             try cc.put(key, raw);
             // After put(), cache OWNS raw — re-fetch a borrowed slice to decode from.
             const cached_raw = cc.get(key) orelse raw;
-            return decodeRawColumn(allocator, col_type, cached_raw, rg.row_count);
+            return decodeRawColumn(allocator, col_type, cached_raw, rg.row_count, flags);
         }
 
         // No cache: original path.
-        return decodeBlock(allocator, self.file_bytes, cursor, col_type, rg.row_count);
+        return decodeBlock(allocator, self.file_bytes, cursor, col_type, rg.row_count, flags);
     }
 };
 
@@ -188,12 +190,13 @@ fn decodeBlock(
     offset: usize,
     col_type: Type,
     row_count: u32,
+    flags: format.ColumnBlockFlags,
 ) !OwnedColumn {
     var owned_raw: ?[]u8 = null;
     defer if (owned_raw) |r| allocator.free(r);
 
     const raw = try readBlockRaw(allocator, bytes, offset, &owned_raw);
-    return decodeRawColumn(allocator, col_type, raw, row_count);
+    return decodeRawColumn(allocator, col_type, raw, row_count, flags);
 }
 
 /// Reads the block at `offset`, returns its decompressed bytes. If the block
@@ -250,39 +253,54 @@ fn decodeRawColumn(
     col_type: Type,
     raw: []const u8,
     row_count: u32,
+    flags: format.ColumnBlockFlags,
 ) !OwnedColumn {
+    // If has_nulls, the first `bitmapBytes(row_count)` bytes of `raw` are the
+    // validity bitmap. Copy them out so OwnedColumn owns its bitmap, then
+    // decode the rest as values.
+    var nulls: ?[]u8 = null;
+    errdefer if (nulls) |n| allocator.free(n);
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        const bm_copy = try allocator.alloc(u8, bm_len);
+        @memcpy(bm_copy, raw[0..bm_len]);
+        nulls = bm_copy;
+        values = raw[bm_len..];
+    }
+
     switch (col_type) {
         .int => {
             const data = try allocator.alloc(i32, row_count);
             errdefer allocator.free(data);
             var i: usize = 0;
             while (i < row_count) : (i += 1) {
-                data[i] = format.readI32(raw[i * 4 .. i * 4 + 4]);
+                data[i] = format.readI32(values[i * 4 .. i * 4 + 4]);
             }
-            return .{ .int = data };
+            return .{ .data = .{ .int = data }, .nulls = nulls };
         },
         .bigint => {
             const data = try allocator.alloc(i64, row_count);
             errdefer allocator.free(data);
             var i: usize = 0;
             while (i < row_count) : (i += 1) {
-                data[i] = format.readI64(raw[i * 8 .. i * 8 + 8]);
+                data[i] = format.readI64(values[i * 8 .. i * 8 + 8]);
             }
-            return .{ .bigint = data };
+            return .{ .data = .{ .bigint = data }, .nulls = nulls };
         },
         .boolean => {
             const data = try allocator.alloc(u8, row_count);
             errdefer allocator.free(data);
-            @memcpy(data, raw[0..row_count]);
-            return .{ .boolean = data };
+            @memcpy(data, values[0..row_count]);
+            return .{ .data = .{ .boolean = data }, .nulls = nulls };
         },
         .varchar => {
-            const owned = try decodeStringRaw(allocator, raw, row_count);
-            return .{ .varchar = owned };
+            const owned = try decodeStringRaw(allocator, values, row_count);
+            return .{ .data = .{ .varchar = owned }, .nulls = nulls };
         },
         .string => {
-            const owned = try decodeStringRaw(allocator, raw, row_count);
-            return .{ .string = owned };
+            const owned = try decodeStringRaw(allocator, values, row_count);
+            return .{ .data = .{ .string = owned }, .nulls = nulls };
         },
     }
 }

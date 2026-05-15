@@ -29,10 +29,11 @@
 const std = @import("std");
 
 pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
-/// v3: each column block is prefixed by a small header recording compression
-/// kind (none vs flate) + compressed/uncompressed sizes. v2 segments aren't
-/// readable by v3 code.
-pub const segment_version: u16 = 3;
+/// v4: column-block header carries a flags byte (currently `has_nulls`). When
+/// `has_nulls` is set the (decompressed) payload begins with `bitmapBytes(rg.row_count)`
+/// bytes of validity bitmap (1=valid, 0=null) before the value bytes.
+/// v3 segments aren't readable by v4 code.
+pub const segment_version: u16 = 4;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -40,16 +41,31 @@ pub const Compression = enum(u8) {
     flate = 1,
 };
 
-/// Header preceding each column block in v3 segments. Always emitted, even
+/// Per-column-block flags (u8). Bit 0 = has_nulls (decompressed payload is
+/// prefixed by a validity bitmap). Remaining bits reserved.
+pub const ColumnBlockFlags = packed struct(u8) {
+    has_nulls: bool = false,
+    _reserved: u7 = 0,
+
+    pub fn toByte(self: ColumnBlockFlags) u8 {
+        return @bitCast(self);
+    }
+    pub fn fromByte(b: u8) ColumnBlockFlags {
+        return @bitCast(b);
+    }
+};
+
+/// Header preceding each column block in v4 segments. Always emitted, even
 /// for `Compression.none`, so the reader can skip blocks of any kind.
 pub const ColumnBlockHeader = struct {
     compression: Compression,
+    flags: ColumnBlockFlags,
     uncompressed_size: u32,
     compressed_size: u32,
 };
 
-/// Size of the in-file column-block header: u8 + u32 + u32 + 3 padding bytes
-/// for 4-byte alignment.
+/// Size of the in-file column-block header:
+///   u8 compression + u8 flags + 2 reserved + u32 uncompressed_size + u32 compressed_size.
 pub const column_block_header_size: usize = 12;
 pub const header_size: usize = 32;
 pub const row_group_header_size: usize = 8;

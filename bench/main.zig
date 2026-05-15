@@ -138,7 +138,7 @@ fn benchScan(allocator: Allocator, io: Io, n_rows: usize) !void {
     defer q.deinit();
     while (try q.next()) |batch| {
         scanned += batch.row_count;
-        const ids = batch.values[0].bigint;
+        const ids = batch.values[0].data.bigint;
         for (ids) |v| checksum +%= v;
     }
     const elapsed = elapsedNs(io, t0);
@@ -174,7 +174,7 @@ fn benchScanFilterNonOrderKey(allocator: Allocator, io: Io, n_rows: usize) !void
     defer q.deinit();
     while (try q.next()) |batch| {
         matched += batch.row_count;
-        const ids = batch.values[0].bigint;
+        const ids = batch.values[0].data.bigint;
         for (ids) |v| checksum +%= v;
     }
     const elapsed = elapsedNs(io, t0);
@@ -211,7 +211,7 @@ fn benchScanFilterOrderKeyNarrow(allocator: Allocator, io: Io, n_rows: usize) !v
     defer q.deinit();
     while (try q.next()) |batch| {
         matched += batch.row_count;
-        const ids = batch.values[0].bigint;
+        const ids = batch.values[0].data.bigint;
         for (ids) |v| checksum +%= v;
     }
     const elapsed = elapsedNs(io, t0);
@@ -248,7 +248,7 @@ fn benchScanFilterOrderKeyMid(allocator: Allocator, io: Io, n_rows: usize) !void
     defer q.deinit();
     while (try q.next()) |batch| {
         matched += batch.row_count;
-        const ids = batch.values[0].bigint;
+        const ids = batch.values[0].data.bigint;
         for (ids) |v| checksum +%= v;
     }
     const elapsed = elapsedNs(io, t0);
@@ -316,7 +316,7 @@ fn benchScanColdVsWarm(allocator: Allocator, io: Io, n_rows: usize) !void {
         var checksum: i64 = 0;
         var q = try thindb.scan(allocator, t);
         defer q.deinit();
-        while (try q.next()) |b| for (b.values[0].bigint) |v| {
+        while (try q.next()) |b| for (b.values[0].data.bigint) |v| {
             checksum +%= v;
         };
         std.mem.doNotOptimizeAway(&checksum);
@@ -329,7 +329,7 @@ fn benchScanColdVsWarm(allocator: Allocator, io: Io, n_rows: usize) !void {
         var checksum: i64 = 0;
         var q = try thindb.scan(allocator, t);
         defer q.deinit();
-        while (try q.next()) |b| for (b.values[0].bigint) |v| {
+        while (try q.next()) |b| for (b.values[0].data.bigint) |v| {
             checksum +%= v;
         };
         std.mem.doNotOptimizeAway(&checksum);
@@ -364,7 +364,7 @@ fn benchAggregateGlobal(allocator: Allocator, io: Io, n_rows: usize) !void {
     });
     defer q.deinit();
     const b = (try q.next()).?;
-    const checksum = b.values[0].bigint[0] + b.values[1].bigint[0] + b.values[2].int[0] + b.values[3].int[0];
+    const checksum = b.values[0].data.bigint[0] + b.values[1].data.bigint[0] + b.values[2].data.int[0] + b.values[3].data.int[0];
     std.mem.doNotOptimizeAway(&checksum);
     const elapsed = elapsedNs(io, t0);
 
@@ -396,7 +396,7 @@ fn benchGroupByTag(allocator: Allocator, io: Io, n_rows: usize) !void {
     var checksum: i64 = 0;
     while (try q.next()) |b| {
         n_groups += b.row_count;
-        for (b.values[1].bigint) |v| checksum +%= v;
+        for (b.values[1].data.bigint) |v| checksum +%= v;
     }
     std.mem.doNotOptimizeAway(&checksum);
     const elapsed = elapsedNs(io, t0);

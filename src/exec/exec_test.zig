@@ -42,8 +42,8 @@ test "scan reads inserted rows from memtable" {
 
     const b = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 3), b.row_count);
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, b.values[0].bigint);
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30 }, b.values[1].int);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, b.values[0].data.bigint);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30 }, b.values[1].data.int);
 
     try std.testing.expect((try q.next()) == null);
 }
@@ -87,7 +87,7 @@ test "scan reads across flushed segments then memtable" {
     var collected: std.ArrayList(i64) = .empty;
     defer collected.deinit(allocator);
     while (try q.next()) |b| {
-        try collected.appendSlice(allocator, b.values[0].bigint);
+        try collected.appendSlice(allocator, b.values[0].data.bigint);
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4, 5, 6 }, collected.items);
 }
@@ -121,7 +121,7 @@ test "filter on bigint column" {
     var collected: std.ArrayList(i64) = .empty;
     defer collected.deinit(allocator);
     while (try q.next()) |b| {
-        try collected.appendSlice(allocator, b.values[0].bigint);
+        try collected.appendSlice(allocator, b.values[0].data.bigint);
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4 }, collected.items);
 }
@@ -158,8 +158,8 @@ test "project narrows column set" {
     try std.testing.expectEqual(@as(usize, 2), b.schema.len);
     try std.testing.expectEqualStrings("id", b.schema[0].name);
     try std.testing.expectEqualStrings("tag", b.schema[1].name);
-    try std.testing.expectEqualStrings("a", b.values[1].string.rowBytes(0));
-    try std.testing.expectEqualStrings("b", b.values[1].string.rowBytes(1));
+    try std.testing.expectEqualStrings("a", b.values[1].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("b", b.values[1].data.string.rowBytes(1));
 }
 
 test "limit cuts off after N rows" {
@@ -191,7 +191,7 @@ test "limit cuts off after N rows" {
     var collected: std.ArrayList(i64) = .empty;
     defer collected.deinit(allocator);
     while (try q.next()) |b| {
-        try collected.appendSlice(allocator, b.values[0].bigint);
+        try collected.appendSlice(allocator, b.values[0].data.bigint);
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4, 5 }, collected.items);
 }
@@ -233,10 +233,10 @@ test "aggregate: ungrouped COUNT + SUM + MIN + MAX" {
     try std.testing.expectEqual(@as(usize, 1), b.row_count);
     try std.testing.expectEqual(@as(usize, 4), b.schema.len);
     try std.testing.expectEqualStrings("n", b.schema[0].name);
-    try std.testing.expectEqual(@as(i64, 4), b.values[0].bigint[0]); // count
-    try std.testing.expectEqual(@as(i64, 100), b.values[1].bigint[0]); // sum
-    try std.testing.expectEqual(@as(i32, 10), b.values[2].int[0]); // min
-    try std.testing.expectEqual(@as(i32, 40), b.values[3].int[0]); // max
+    try std.testing.expectEqual(@as(i64, 4), b.values[0].data.bigint[0]); // count
+    try std.testing.expectEqual(@as(i64, 100), b.values[1].data.bigint[0]); // sum
+    try std.testing.expectEqual(@as(i32, 10), b.values[2].data.int[0]); // min
+    try std.testing.expectEqual(@as(i32, 40), b.values[3].data.int[0]); // max
     try std.testing.expect((try q.next()) == null);
 }
 
@@ -284,9 +284,9 @@ test "aggregate: groupBy with COUNT and SUM" {
     var got_sum_for: std.AutoHashMap(i64, i64) = .init(allocator);
     defer got_sum_for.deinit();
     for (0..b.row_count) |i| {
-        const u = b.values[0].bigint[i];
-        const n = b.values[1].bigint[i];
-        const s = b.values[2].bigint[i];
+        const u = b.values[0].data.bigint[i];
+        const n = b.values[1].data.bigint[i];
+        const s = b.values[2].data.bigint[i];
         try got_n_for.put(u, n);
         try got_sum_for.put(u, s);
     }
@@ -337,9 +337,9 @@ test "aggregate: groupBy with string column" {
     var seen_pending_n: i64 = -1;
     var seen_pending_s: i64 = -1;
     for (0..b.row_count) |i| {
-        const s = b.values[0].string.rowBytes(i);
-        const n = b.values[1].bigint[i];
-        const sum = b.values[2].bigint[i];
+        const s = b.values[0].data.string.rowBytes(i);
+        const n = b.values[1].data.bigint[i];
+        const sum = b.values[2].data.bigint[i];
         if (std.mem.eql(u8, s, "paid")) {
             seen_paid_n = n;
             seen_paid_s = sum;
@@ -382,8 +382,8 @@ test "aggregate: empty input emits zeroed counters" {
 
     const b = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 1), b.row_count);
-    try std.testing.expectEqual(@as(i64, 0), b.values[0].bigint[0]);
-    try std.testing.expectEqual(@as(i64, 0), b.values[1].bigint[0]);
+    try std.testing.expectEqual(@as(i64, 0), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 0), b.values[1].data.bigint[0]);
 }
 
 test "filter with AND" {
@@ -420,7 +420,7 @@ test "filter with AND" {
 
     var ids: std.ArrayList(i64) = .empty;
     defer ids.deinit(allocator);
-    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].bigint);
+    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].data.bigint);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4 }, ids.items);
 }
 
@@ -457,7 +457,7 @@ test "filter with OR" {
 
     var ids: std.ArrayList(i64) = .empty;
     defer ids.deinit(allocator);
-    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].bigint);
+    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].data.bigint);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 3 }, ids.items);
 }
 
@@ -491,7 +491,7 @@ test "filter with NOT" {
 
     var ids: std.ArrayList(i64) = .empty;
     defer ids.deinit(allocator);
-    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].bigint);
+    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].data.bigint);
     try std.testing.expectEqualSlices(i64, &[_]i64{3}, ids.items);
 }
 
@@ -534,7 +534,7 @@ test "filter with nested AND inside OR" {
 
     var ids: std.ArrayList(i64) = .empty;
     defer ids.deinit(allocator);
-    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].bigint);
+    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].data.bigint);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4 }, ids.items);
 }
 
@@ -568,7 +568,7 @@ test "sort: orderBy single bigint column ASC" {
 
     var qtys: std.ArrayList(i32) = .empty;
     defer qtys.deinit(allocator);
-    while (try q.next()) |b| try qtys.appendSlice(allocator, b.values[1].int);
+    while (try q.next()) |b| try qtys.appendSlice(allocator, b.values[1].data.int);
     try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30, 40 }, qtys.items);
 }
 
@@ -602,7 +602,7 @@ test "sort: orderBy DESC" {
 
     var qtys: std.ArrayList(i32) = .empty;
     defer qtys.deinit(allocator);
-    while (try q.next()) |b| try qtys.appendSlice(allocator, b.values[1].int);
+    while (try q.next()) |b| try qtys.appendSlice(allocator, b.values[1].data.int);
     try std.testing.expectEqualSlices(i32, &[_]i32{ 40, 30, 20, 10 }, qtys.items);
 }
 
@@ -644,8 +644,8 @@ test "sort: multi-column with mixed direction" {
     var tss: std.ArrayList(i64) = .empty;
     defer tss.deinit(allocator);
     while (try q.next()) |b| {
-        try users.appendSlice(allocator, b.values[0].bigint);
-        try tss.appendSlice(allocator, b.values[1].bigint);
+        try users.appendSlice(allocator, b.values[0].data.bigint);
+        try tss.appendSlice(allocator, b.values[1].data.bigint);
     }
     // Expected: (1,200), (1,100), (2,75), (2,50)
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 1, 2, 2 }, users.items);
@@ -711,8 +711,8 @@ test "sort: groupBy then orderBy (composed)" {
     var users: std.ArrayList(i64) = .empty;
     defer users.deinit(allocator);
     while (try q.next()) |b| {
-        try users.appendSlice(allocator, b.values[0].bigint);
-        try totals.appendSlice(allocator, b.values[1].bigint);
+        try users.appendSlice(allocator, b.values[0].data.bigint);
+        try totals.appendSlice(allocator, b.values[1].data.bigint);
     }
     // Expected (sorted by total DESC):
     //   user=10 → 5+7=12
@@ -764,9 +764,9 @@ test "pipe composes a chain" {
     var collected_tags: std.ArrayList(u8) = .empty;
     defer collected_tags.deinit(allocator);
     while (try q.next()) |b| {
-        try collected_ids.appendSlice(allocator, b.values[0].bigint);
+        try collected_ids.appendSlice(allocator, b.values[0].data.bigint);
         for (0..b.row_count) |i| {
-            try collected_tags.appendSlice(allocator, b.values[1].string.rowBytes(i));
+            try collected_tags.appendSlice(allocator, b.values[1].data.string.rowBytes(i));
         }
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3, 4 }, collected_ids.items);

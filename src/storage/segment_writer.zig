@@ -35,7 +35,7 @@ pub fn writeSegment(
     const row_count: usize = if (columns.len == 0) 0 else columns[0].rowCount();
     for (columns, schema.columns) |view, schema_col| {
         if (view.rowCount() != row_count) return format.Error.UnevenColumns;
-        if (std.meta.activeTag(view) != std.meta.activeTag(schema_col.type)) {
+        if (std.meta.activeTag(view.data) != std.meta.activeTag(schema_col.type)) {
             return format.Error.SchemaMismatch;
         }
     }
@@ -67,8 +67,8 @@ pub fn writeSegment(
         try appendU32(allocator, &buf, @intCast(rows_in_group));
         try appendU32(allocator, &buf, 0); // padding
 
-        for (columns) |view| {
-            try writeColumnBlock(allocator, &buf, view, row_offset, row_offset + rows_in_group);
+        for (columns, schema.columns) |view, schema_col| {
+            try writeColumnBlock(allocator, &buf, view, schema_col.nullable, row_offset, row_offset + rows_in_group);
         }
 
         const rg_length: u32 = @intCast(buf.items.len - rg_file_offset);
@@ -132,11 +132,20 @@ fn writeColumnBlock(
     allocator: Allocator,
     buf: *std.ArrayList(u8),
     view: ColumnView,
+    nullable: bool,
     row_start: usize,
     row_end: usize,
 ) !void {
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
+
+    // Validity bitmap prefix. We emit it whenever the column is declared
+    // nullable, even if no rows are actually null in this block — the reader
+    // shape stays uniform per-column across row groups.
+    const has_nulls = nullable;
+    if (has_nulls) {
+        try writeValidityBitmap(allocator, &scratch, view, row_start, row_end);
+    }
     try writeRawColumnBlock(allocator, &scratch, view, row_start, row_end);
 
     const raw_size: u32 = @intCast(scratch.items.len);
@@ -152,10 +161,13 @@ fn writeColumnBlock(
     else
         raw_size;
 
-    // Header: kind (u8) + 3-byte padding + uncompressed_size (u32) + compressed_size (u32)
+    const flags = format.ColumnBlockFlags{ .has_nulls = has_nulls };
+
+    // Header: kind (u8) + flags (u8) + 2 reserved + uncompressed_size (u32) + compressed_size (u32)
     try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + payload_size);
     buf.appendAssumeCapacity(@intFromEnum(kind));
-    buf.appendSliceAssumeCapacity(&[_]u8{ 0, 0, 0 });
+    buf.appendAssumeCapacity(flags.toByte());
+    buf.appendSliceAssumeCapacity(&[_]u8{ 0, 0 });
     var b4: [4]u8 = undefined;
     format.writeU32(&b4, raw_size);
     buf.appendSliceAssumeCapacity(&b4);
@@ -169,6 +181,27 @@ fn writeColumnBlock(
     }
 }
 
+fn writeValidityBitmap(
+    allocator: Allocator,
+    buf: *std.ArrayList(u8),
+    view: ColumnView,
+    row_start: usize,
+    row_end: usize,
+) !void {
+    const n = row_end - row_start;
+    const byte_len = column.bitmapBytes(n);
+    try buf.ensureUnusedCapacity(allocator, byte_len);
+
+    // Emit zero-initialized bitmap, then flip valid bits on.
+    const start = buf.items.len;
+    buf.appendNTimesAssumeCapacity(0, byte_len);
+    const slice = buf.items[start .. start + byte_len];
+    for (0..n) |i| {
+        const valid = column.isValidBit(view.nulls, row_start + i);
+        if (valid) column.setValidBit(slice, i, true);
+    }
+}
+
 fn writeRawColumnBlock(
     allocator: Allocator,
     buf: *std.ArrayList(u8),
@@ -176,7 +209,7 @@ fn writeRawColumnBlock(
     row_start: usize,
     row_end: usize,
 ) !void {
-    switch (view) {
+    switch (view.data) {
         .int => |data| {
             const slice = data[row_start..row_end];
             try buf.ensureUnusedCapacity(allocator, slice.len * 4);
@@ -204,7 +237,7 @@ fn writeRawColumnBlock(
 }
 
 fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats {
-    return switch (view) {
+    return switch (view.data) {
         .int => |data| blk: {
             const slice = data[row_start..row_end];
             var lo: i32 = std.math.maxInt(i32);

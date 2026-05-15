@@ -88,7 +88,7 @@ test "Table insert + flush writes a segment, manifest reflects it" {
         for (seg.info.row_groups, 0..) |_, rg_idx| {
             var c = try seg.decodeColumn(allocator, schema, rg_idx, 0);
             defer c.deinit(allocator);
-            try ids.appendSlice(allocator, c.bigint);
+            try ids.appendSlice(allocator, c.data.bigint);
         }
         try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4, 5 }, ids.items);
     }
@@ -134,11 +134,11 @@ test "Flush writes segment sorted by order key" {
 
     var col = try seg.decodeColumn(allocator, schema, 0, 0);
     defer col.deinit(allocator);
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 5, 7, 9 }, col.bigint);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 5, 7, 9 }, col.data.bigint);
 
     var tag_col = try seg.decodeColumn(allocator, schema, 0, 1);
     defer tag_col.deinit(allocator);
-    const sv = tag_col.string;
+    const sv = tag_col.data.string;
     try std.testing.expectEqualStrings("a", sv.view().rowBytes(0));
     try std.testing.expectEqualStrings("b", sv.view().rowBytes(1));
     try std.testing.expectEqualStrings("e", sv.view().rowBytes(2));
@@ -187,8 +187,8 @@ test "Flush sorts by composite order key (lexicographic)" {
     defer ts_col.deinit(allocator);
 
     // Expected order: (1,100,c), (1,200,a), (2,50,d), (2,100,b)
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 1, 2, 2 }, u_col.bigint);
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 200, 50, 100 }, ts_col.bigint);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 1, 2, 2 }, u_col.data.bigint);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 200, 50, 100 }, ts_col.data.bigint);
 }
 
 test "Table reopen with different schema returns mismatch" {
@@ -305,7 +305,7 @@ test "delete tombstones matching rows in flushed segments" {
     var collected: std.ArrayList(i64) = .empty;
     defer collected.deinit(allocator);
     while (try q.next()) |b| {
-        try collected.appendSlice(allocator, b.values[0].bigint);
+        try collected.appendSlice(allocator, b.values[0].data.bigint);
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 4 }, collected.items);
 }
@@ -352,9 +352,9 @@ test "upsert works with compound (bigint, bigint) order key" {
     var vals: std.ArrayList(i32) = .empty;
     defer vals.deinit(allocator);
     while (try q.next()) |b| {
-        try users.appendSlice(allocator, b.values[0].bigint);
-        try tss.appendSlice(allocator, b.values[1].bigint);
-        try vals.appendSlice(allocator, b.values[2].int);
+        try users.appendSlice(allocator, b.values[0].data.bigint);
+        try tss.appendSlice(allocator, b.values[1].data.bigint);
+        try vals.appendSlice(allocator, b.values[2].data.int);
     }
     // Segment after upsert: (1,200,20), (2,100,30). Memtable: (1,100,999).
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 1 }, users.items);
@@ -399,10 +399,10 @@ test "upsert works with single STRING order key" {
     var codes: std.ArrayList(u8) = .empty;
     defer codes.deinit(allocator);
     while (try q.next()) |b| {
-        try qtys.appendSlice(allocator, b.values[1].int);
+        try qtys.appendSlice(allocator, b.values[1].data.int);
         for (0..b.row_count) |i| {
             try codes.append(allocator, '|');
-            try codes.appendSlice(allocator, b.values[0].string.rowBytes(i));
+            try codes.appendSlice(allocator, b.values[0].data.string.rowBytes(i));
         }
     }
     // Segment after upsert: alpha=1, gamma=3 (sorted lex). Memtable: beta=999.
@@ -446,7 +446,7 @@ test "upsert works with mixed (string, bigint) compound key" {
     var payloads: std.ArrayList(i32) = .empty;
     defer payloads.deinit(allocator);
     while (try q.next()) |b| {
-        try payloads.appendSlice(allocator, b.values[2].int);
+        try payloads.appendSlice(allocator, b.values[2].data.int);
     }
     // Segment kept (acme,2,20) + (globex,1,30); upserted (acme,1) is now 111 in memtable.
     try std.testing.expectEqualSlices(i32, &[_]i32{ 20, 30, 111 }, payloads.items);
@@ -503,7 +503,7 @@ test "compact merges segments and absorbs tombstones" {
     var ids: std.ArrayList(i64) = .empty;
     defer ids.deinit(allocator);
     while (try q.next()) |b| {
-        try ids.appendSlice(allocator, b.values[0].bigint);
+        try ids.appendSlice(allocator, b.values[0].data.bigint);
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 4, 5, 6 }, ids.items);
 }
@@ -631,8 +631,8 @@ test "upsert: re-inserting the same key tombstones the old row" {
     var vals: std.ArrayList(i32) = .empty;
     defer vals.deinit(allocator);
     while (try q.next()) |b| {
-        try ids.appendSlice(allocator, b.values[0].bigint);
-        try vals.appendSlice(allocator, b.values[1].int);
+        try ids.appendSlice(allocator, b.values[0].data.bigint);
+        try vals.appendSlice(allocator, b.values[1].data.int);
     }
     // Expected: id=2 from segment (untouched), id=1 and id=3 from memtable.
     // Order: scan returns segment (id=2 only — id=1 and id=3 are tombstoned)
@@ -671,8 +671,8 @@ test "upsert: duplicate keys within a single insert keep the last one" {
     var q = try thindb_scan(allocator, t);
     defer q.deinit();
     const b = (try q.next()).?;
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, b.values[0].bigint);
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 30, 50 }, b.values[1].int);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, b.values[0].data.bigint);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 30, 50 }, b.values[1].data.int);
 }
 
 test "delete removes matching rows from memtable" {
@@ -713,7 +713,7 @@ test "delete removes matching rows from memtable" {
     var q = try thindb_scan(allocator, t);
     defer q.deinit();
     const b = (try q.next()).?;
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, b.values[0].bigint);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, b.values[0].data.bigint);
 }
 
 test "openTable on missing table returns FileNotFound" {

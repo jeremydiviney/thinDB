@@ -12,6 +12,7 @@ const TypeTag = types.TypeTag;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
+const ValueView = storage.column.ValueView;
 const StringView = storage.StringView;
 
 pub const Error = error{
@@ -59,14 +60,74 @@ pub const StringStore = struct {
     }
 };
 
-pub const ColumnStore = union(TypeTag) {
+pub const ColumnStore = struct {
+    data: DataStore,
+    /// Validity bitmap (1 = valid, 0 = null). Present iff the column is
+    /// nullable. Grown alongside the data so `data.rowCount()` rows always
+    /// have a bit available.
+    nulls: ?std.ArrayList(u8) = null,
+
+    pub fn init(allocator: Allocator, t: Type, nullable: bool) Allocator.Error!ColumnStore {
+        return .{
+            .data = try DataStore.init(allocator, t),
+            .nulls = if (nullable) std.ArrayList(u8).empty else null,
+        };
+    }
+
+    pub fn deinit(self: *ColumnStore, allocator: Allocator) void {
+        self.data.deinit(allocator);
+        if (self.nulls) |*n| n.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn rowCount(self: ColumnStore) usize {
+        return self.data.rowCount();
+    }
+
+    pub fn view(self: ColumnStore) ColumnView {
+        return .{
+            .data = self.data.view(),
+            .nulls = if (self.nulls) |n| n.items else null,
+        };
+    }
+
+    pub fn clear(self: *ColumnStore) void {
+        self.data.clear();
+        if (self.nulls) |*n| n.clearRetainingCapacity();
+    }
+
+    /// Append a single validity bit for the row at index `row` (= current row
+    /// count BEFORE this call's data append). Grows the bitmap byte by byte
+    /// as needed. No-op on non-nullable columns.
+    pub fn appendValidBit(self: *ColumnStore, allocator: Allocator, row: usize, valid: bool) !void {
+        const nulls = self.nullsPtr() orelse return;
+        const byte_idx = row >> 3;
+        if (byte_idx >= nulls.items.len) {
+            const need = byte_idx + 1 - nulls.items.len;
+            try nulls.appendNTimes(allocator, 0, need);
+        }
+        const bit: u3 = @intCast(row & 7);
+        if (valid) {
+            nulls.items[byte_idx] |= (@as(u8, 1) << bit);
+        } else {
+            nulls.items[byte_idx] &= ~(@as(u8, 1) << bit);
+        }
+    }
+
+    fn nullsPtr(self: *ColumnStore) ?*std.ArrayList(u8) {
+        if (self.nulls) |_| return &self.nulls.?;
+        return null;
+    }
+};
+
+pub const DataStore = union(TypeTag) {
     int: std.ArrayList(i32),
     bigint: std.ArrayList(i64),
     boolean: std.ArrayList(u8),
     varchar: StringStore,
     string: StringStore,
 
-    pub fn init(allocator: Allocator, t: Type) Allocator.Error!ColumnStore {
+    pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return switch (t) {
             .int => .{ .int = .empty },
             .bigint => .{ .bigint = .empty },
@@ -76,7 +137,7 @@ pub const ColumnStore = union(TypeTag) {
         };
     }
 
-    pub fn deinit(self: *ColumnStore, allocator: Allocator) void {
+    pub fn deinit(self: *DataStore, allocator: Allocator) void {
         switch (self.*) {
             .int => |*list| list.deinit(allocator),
             .bigint => |*list| list.deinit(allocator),
@@ -87,7 +148,7 @@ pub const ColumnStore = union(TypeTag) {
         self.* = undefined;
     }
 
-    pub fn rowCount(self: ColumnStore) usize {
+    pub fn rowCount(self: DataStore) usize {
         return switch (self) {
             .int => |l| l.items.len,
             .bigint => |l| l.items.len,
@@ -97,7 +158,7 @@ pub const ColumnStore = union(TypeTag) {
         };
     }
 
-    pub fn view(self: ColumnStore) ColumnView {
+    pub fn view(self: DataStore) ValueView {
         return switch (self) {
             .int => |l| .{ .int = l.items },
             .bigint => |l| .{ .bigint = l.items },
@@ -107,13 +168,26 @@ pub const ColumnStore = union(TypeTag) {
         };
     }
 
-    pub fn clear(self: *ColumnStore) void {
+    pub fn clear(self: *DataStore) void {
         switch (self.*) {
             .int => |*l| l.clearRetainingCapacity(),
             .bigint => |*l| l.clearRetainingCapacity(),
             .boolean => |*l| l.clearRetainingCapacity(),
             .varchar => |*s| s.clear(),
             .string => |*s| s.clear(),
+        }
+    }
+
+    /// Append a placeholder/null value (zero for ints, false for bool,
+    /// empty for strings). Used when the row's actual value is NULL — the
+    /// data slot still has to be filled to keep row indices aligned.
+    pub fn appendNullPlaceholder(self: *DataStore, allocator: Allocator) !void {
+        switch (self.*) {
+            .int => |*l| try l.append(allocator, 0),
+            .bigint => |*l| try l.append(allocator, 0),
+            .boolean => |*l| try l.append(allocator, 0),
+            .varchar => |*s| try s.appendValue(allocator, ""),
+            .string => |*s| try s.appendValue(allocator, ""),
         }
     }
 };
@@ -133,7 +207,7 @@ pub const Memtable = struct {
             for (columns[0..initialized]) |*c| c.deinit(allocator);
         }
         for (schema.columns, 0..) |c, i| {
-            columns[i] = try ColumnStore.init(allocator, c.type);
+            columns[i] = try ColumnStore.init(allocator, c.type, c.nullable);
             initialized += 1;
         }
 
@@ -156,13 +230,14 @@ pub const Memtable = struct {
     pub fn byteSize(self: Memtable) usize {
         var total: usize = 0;
         for (self.columns) |col| {
-            total += switch (col) {
+            total += switch (col.data) {
                 .int => |l| l.items.len * @sizeOf(i32),
                 .bigint => |l| l.items.len * @sizeOf(i64),
                 .boolean => |l| l.items.len,
                 .varchar => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
                 .string => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
             };
+            if (col.nulls) |n| total += n.items.len;
         }
         return total;
     }
@@ -188,7 +263,7 @@ pub const Memtable = struct {
         var inited: usize = 0;
         errdefer for (new_columns[0..inited]) |*c| c.deinit(self.allocator);
         for (self.schema.columns, 0..) |sch_col, ci| {
-            new_columns[ci] = try ColumnStore.init(self.allocator, sch_col.type);
+            new_columns[ci] = try ColumnStore.init(self.allocator, sch_col.type, sch_col.nullable);
             inited += 1;
         }
 
@@ -306,7 +381,12 @@ pub const Memtable = struct {
         // Validate fields against schema.
         inline for (fields) |field| {
             const col_idx = self.schema.columnIndex(field.name) orelse return Error.ColumnNotFound;
-            if (!self.schema.columns[col_idx].type.matchesZigType(field.type)) {
+            const sch_col = self.schema.columns[col_idx];
+            const InnerT = comptime innerType(field.type);
+            if (comptime isOptionalType(field.type)) {
+                if (!sch_col.nullable) return Error.TypeMismatch;
+            }
+            if (!sch_col.type.matchesZigType(InnerT)) {
                 return Error.TypeMismatch;
             }
         }
@@ -322,9 +402,29 @@ pub const Memtable = struct {
         // Append.
         inline for (fields) |field| {
             const col_idx = self.schema.columnIndex(field.name).?;
-            try self.appendValue(col_idx, field.type, @field(row, field.name));
+            const value = @field(row, field.name);
+            if (comptime isOptionalType(field.type)) {
+                if (value) |v| {
+                    try self.appendValue(col_idx, @TypeOf(v), v);
+                } else {
+                    try self.appendNullToColumn(col_idx);
+                }
+            } else {
+                try self.appendValue(col_idx, field.type, value);
+            }
         }
         self.row_count += 1;
+    }
+
+    fn isOptionalType(comptime T: type) bool {
+        return @typeInfo(T) == .optional;
+    }
+
+    fn innerType(comptime T: type) type {
+        return switch (@typeInfo(T)) {
+            .optional => |o| o.child,
+            else => T,
+        };
     }
 
     pub fn appendValue(self: *Memtable, col_idx: usize, comptime V: type, value: V) !void {
@@ -343,36 +443,50 @@ pub const Memtable = struct {
 
     fn appendInt32Like(self: *Memtable, col_idx: usize, comptime V: type, value: V) !void {
         const col = &self.columns[col_idx];
-        switch (col.*) {
+        switch (col.data) {
             .int => |*list| try list.append(self.allocator, @as(i32, value)),
             .bigint => |*list| try list.append(self.allocator, @as(i64, value)),
             else => return Error.TypeMismatch,
         }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendInt64(self: *Memtable, col_idx: usize, value: i64) !void {
         const col = &self.columns[col_idx];
-        switch (col.*) {
+        switch (col.data) {
             .bigint => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendBoolean(self: *Memtable, col_idx: usize, value: bool) !void {
         const col = &self.columns[col_idx];
-        switch (col.*) {
+        switch (col.data) {
             .boolean => |*list| try list.append(self.allocator, @intFromBool(value)),
             else => return Error.TypeMismatch,
         }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendString(self: *Memtable, col_idx: usize, value: []const u8) !void {
         const col = &self.columns[col_idx];
-        switch (col.*) {
+        switch (col.data) {
             .varchar => |*ss| try ss.appendValue(self.allocator, value),
             .string => |*ss| try ss.appendValue(self.allocator, value),
             else => return Error.TypeMismatch,
         }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+    }
+
+    /// Append a NULL slot. The schema column at `col_idx` must be nullable.
+    /// Writes a placeholder into `data` (zero / empty) and clears the
+    /// validity bit.
+    pub fn appendNullToColumn(self: *Memtable, col_idx: usize) !void {
+        const col = &self.columns[col_idx];
+        if (col.nulls == null) return Error.TypeMismatch;
+        try col.data.appendNullPlaceholder(self.allocator);
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, false);
     }
 };
 
@@ -382,82 +496,100 @@ pub fn compareInColumnPub(col: ColumnStore, a: u32, b: u32) std.math.Order {
     return compareInColumn(col, a, b);
 }
 
-/// Append every row of `view` to `out`. Types must match.
+/// Append every row of `view` (including its validity bits if `view.nulls`
+/// is non-null) to `out`. Types must match.
 pub fn appendAllColumn(
     allocator: Allocator,
     view: ColumnView,
     out: *ColumnStore,
 ) !void {
-    switch (view) {
-        .int => |s| switch (out.*) {
+    const dst_start = out.data.rowCount();
+    switch (view.data) {
+        .int => |s| switch (out.data) {
             .int => |*list| try list.appendSlice(allocator, s),
             else => unreachable,
         },
-        .bigint => |s| switch (out.*) {
+        .bigint => |s| switch (out.data) {
             .bigint => |*list| try list.appendSlice(allocator, s),
             else => unreachable,
         },
-        .boolean => |s| switch (out.*) {
+        .boolean => |s| switch (out.data) {
             .boolean => |*list| try list.appendSlice(allocator, s),
             else => unreachable,
         },
-        .varchar => |sv| switch (out.*) {
+        .varchar => |sv| switch (out.data) {
             .varchar => |*ss| {
                 for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
             },
             else => unreachable,
         },
-        .string => |sv| switch (out.*) {
+        .string => |sv| switch (out.data) {
             .string => |*ss| {
                 for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
             },
             else => unreachable,
         },
     }
+    // Carry validity bits across.
+    if (out.nulls != null) {
+        const n = view.data.rowCount();
+        for (0..n) |i| {
+            const valid = storage.column.isValidBit(view.nulls, i);
+            try out.appendValidBit(allocator, dst_start + i, valid);
+        }
+    }
 }
 
 /// Append rows from `view` to `out`, picking by the given indices into `view`.
-/// Used by Sort to materialize batches in permutation order.
+/// Used by Sort to materialize batches in permutation order. Validity bits
+/// are carried across via `view.nulls`.
 pub fn appendByIndices(
     allocator: Allocator,
     view: ColumnView,
     indices: []const u32,
     out: *ColumnStore,
 ) !void {
-    switch (view) {
-        .int => |s| switch (out.*) {
+    const dst_start = out.data.rowCount();
+    switch (view.data) {
+        .int => |s| switch (out.data) {
             .int => |*list| {
                 try list.ensureUnusedCapacity(allocator, indices.len);
                 for (indices) |idx| list.appendAssumeCapacity(s[idx]);
             },
             else => unreachable,
         },
-        .bigint => |s| switch (out.*) {
+        .bigint => |s| switch (out.data) {
             .bigint => |*list| {
                 try list.ensureUnusedCapacity(allocator, indices.len);
                 for (indices) |idx| list.appendAssumeCapacity(s[idx]);
             },
             else => unreachable,
         },
-        .boolean => |s| switch (out.*) {
+        .boolean => |s| switch (out.data) {
             .boolean => |*list| {
                 try list.ensureUnusedCapacity(allocator, indices.len);
                 for (indices) |idx| list.appendAssumeCapacity(s[idx]);
             },
             else => unreachable,
         },
-        .varchar => |sv| switch (out.*) {
+        .varchar => |sv| switch (out.data) {
             .varchar => |*ss| {
                 for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
             },
             else => unreachable,
         },
-        .string => |sv| switch (out.*) {
+        .string => |sv| switch (out.data) {
             .string => |*ss| {
                 for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
             },
             else => unreachable,
         },
+    }
+    if (out.nulls != null) {
+        for (indices, 0..) |src_idx, j| {
+            const valid = storage.column.isValidBit(view.nulls, src_idx);
+            try out.appendValidBit(allocator, dst_start + j, valid);
+        }
     }
 }
 
@@ -467,37 +599,47 @@ pub fn appendMaskedColumn(
     mask: []const bool,
     out: *ColumnStore,
 ) !void {
-    switch (view) {
-        .int => |s| switch (out.*) {
+    const dst_start = out.data.rowCount();
+    switch (view.data) {
+        .int => |s| switch (out.data) {
             .int => |*list| for (s, mask) |v, m| {
                 if (m) try list.append(allocator, v);
             },
             else => unreachable,
         },
-        .bigint => |s| switch (out.*) {
+        .bigint => |s| switch (out.data) {
             .bigint => |*list| for (s, mask) |v, m| {
                 if (m) try list.append(allocator, v);
             },
             else => unreachable,
         },
-        .boolean => |s| switch (out.*) {
+        .boolean => |s| switch (out.data) {
             .boolean => |*list| for (s, mask) |v, m| {
                 if (m) try list.append(allocator, v);
             },
             else => unreachable,
         },
-        .varchar => |sv| switch (out.*) {
+        .varchar => |sv| switch (out.data) {
             .varchar => |*ss| for (mask, 0..) |m, row| {
                 if (m) try ss.appendValue(allocator, sv.rowBytes(row));
             },
             else => unreachable,
         },
-        .string => |sv| switch (out.*) {
+        .string => |sv| switch (out.data) {
             .string => |*ss| for (mask, 0..) |m, row| {
                 if (m) try ss.appendValue(allocator, sv.rowBytes(row));
             },
             else => unreachable,
         },
+    }
+    if (out.nulls != null) {
+        var j: usize = 0;
+        for (mask, 0..) |m, src_row| {
+            if (!m) continue;
+            const valid = storage.column.isValidBit(view.nulls, src_row);
+            try out.appendValidBit(allocator, dst_start + j, valid);
+            j += 1;
+        }
     }
 }
 
@@ -522,42 +664,59 @@ fn applyPermutation(
     src: ColumnStore,
     perm: []const u32,
 ) !ColumnStore {
-    return switch (src) {
+    const dst_data: DataStore = switch (src.data) {
         .int => |l| blk: {
             var dst: std.ArrayList(i32) = try .initCapacity(allocator, perm.len);
             errdefer dst.deinit(allocator);
             for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk ColumnStore{ .int = dst };
+            break :blk DataStore{ .int = dst };
         },
         .bigint => |l| blk: {
             var dst: std.ArrayList(i64) = try .initCapacity(allocator, perm.len);
             errdefer dst.deinit(allocator);
             for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk ColumnStore{ .bigint = dst };
+            break :blk DataStore{ .bigint = dst };
         },
         .boolean => |l| blk: {
             var dst: std.ArrayList(u8) = try .initCapacity(allocator, perm.len);
             errdefer dst.deinit(allocator);
             for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk ColumnStore{ .boolean = dst };
+            break :blk DataStore{ .boolean = dst };
         },
         .varchar => |s| blk: {
             var dst = try StringStore.init(allocator);
             errdefer dst.deinit(allocator);
             for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
-            break :blk ColumnStore{ .varchar = dst };
+            break :blk DataStore{ .varchar = dst };
         },
         .string => |s| blk: {
             var dst = try StringStore.init(allocator);
             errdefer dst.deinit(allocator);
             for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
-            break :blk ColumnStore{ .string = dst };
+            break :blk DataStore{ .string = dst };
         },
     };
+
+    var nulls: ?std.ArrayList(u8) = null;
+    if (src.nulls) |src_bits| {
+        var b: std.ArrayList(u8) = try .initCapacity(allocator, storage.column.bitmapBytes(perm.len));
+        errdefer b.deinit(allocator);
+        try b.appendNTimes(allocator, 0, storage.column.bitmapBytes(perm.len));
+        for (perm, 0..) |src_row, dst_row| {
+            if (storage.column.isValidBit(src_bits.items, src_row)) {
+                const byte_idx = dst_row >> 3;
+                const bit: u3 = @intCast(dst_row & 7);
+                b.items[byte_idx] |= (@as(u8, 1) << bit);
+            }
+        }
+        nulls = b;
+    }
+
+    return .{ .data = dst_data, .nulls = nulls };
 }
 
 fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
-    return switch (col) {
+    return switch (col.data) {
         .int => |l| std.math.order(l.items[a], l.items[b]),
         .bigint => |l| std.math.order(l.items[a], l.items[b]),
         .boolean => |l| std.math.order(l.items[a], l.items[b]),
@@ -612,12 +771,12 @@ test "memtable insertRows accumulates and exposes ColumnViews" {
     const v = try mt.views(allocator);
     defer allocator.free(v);
 
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, v[0].bigint);
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30 }, v[1].int);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1 }, v[2].boolean);
-    try std.testing.expectEqualStrings("alpha", v[3].string.rowBytes(0));
-    try std.testing.expectEqualStrings("beta", v[3].string.rowBytes(1));
-    try std.testing.expectEqualStrings("", v[3].string.rowBytes(2));
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, v[0].data.bigint);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30 }, v[1].data.int);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1 }, v[2].data.boolean);
+    try std.testing.expectEqualStrings("alpha", v[3].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("beta", v[3].data.string.rowBytes(1));
+    try std.testing.expectEqualStrings("", v[3].data.string.rowBytes(2));
 }
 
 test "memtable insertRows rejects missing column" {
@@ -676,5 +835,5 @@ test "memtable clear resets row count but preserves capacity" {
 
     try mt.insertRows(&.{.{ .id = @as(i64, 3), .tag = "ccc" }});
     try std.testing.expectEqual(@as(u64, 1), mt.row_count);
-    try std.testing.expectEqualStrings("ccc", mt.columns[1].view().string.rowBytes(0));
+    try std.testing.expectEqualStrings("ccc", mt.columns[1].view().data.string.rowBytes(0));
 }

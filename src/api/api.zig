@@ -696,7 +696,7 @@ fn appendColumnValueBytes(
     view: storage.ColumnView,
     row: u32,
 ) !void {
-    switch (view) {
+    switch (view.data) {
         .int => |s| try storage.format.appendI32(aa, buf, s[row]),
         .bigint => |s| try storage.format.appendI64(aa, buf, s[row]),
         .boolean => |s| try buf.append(aa, s[row]),
@@ -714,7 +714,7 @@ fn appendColumnValueBytes(
 }
 
 fn evalRow(view: storage.ColumnView, row: u32, pred: exec.Predicate) bool {
-    return switch (view) {
+    return switch (view.data) {
         .int => |s| cmpVal(i32, s[row], pred.val.int, pred.op),
         .bigint => |s| cmpVal(i64, s[row], pred.val.bigint, pred.op),
         .boolean => |s| cmpVal(u8, s[row], @intFromBool(pred.val.boolean), pred.op),
@@ -795,6 +795,7 @@ pub fn schemaFingerprint(schema: Schema) u64 {
         hasher.update(c.name);
         const tag: u8 = @intFromEnum(@as(TypeTag, c.type));
         hasher.update(&[_]u8{tag});
+        hasher.update(&[_]u8{@intFromBool(c.nullable)});
         switch (c.type) {
             .varchar => |n| {
                 var b: [4]u8 = undefined;

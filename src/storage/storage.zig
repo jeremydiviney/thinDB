@@ -69,11 +69,11 @@ test "round-trip a single row group with all v0.1 types" {
     const note_offsets = [_]u32{ 0, 5, 11, 11, 17, 22 };
 
     const columns = [_]ColumnView{
-        .{ .bigint = &ids },
-        .{ .int = &qtys },
-        .{ .boolean = &actives },
-        .{ .varchar = .{ .offsets = &tag_offsets, .bytes = tag_bytes } },
-        .{ .string = .{ .offsets = &note_offsets, .bytes = note_bytes } },
+        .{ .data = .{ .bigint = &ids } },
+        .{ .data = .{ .int = &qtys } },
+        .{ .data = .{ .boolean = &actives } },
+        .{ .data = .{ .varchar = .{ .offsets = &tag_offsets, .bytes = tag_bytes } } },
+        .{ .data = .{ .string = .{ .offsets = &note_offsets, .bytes = note_bytes } } },
     };
 
     var info = try writeSegment(
@@ -103,19 +103,19 @@ test "round-trip a single row group with all v0.1 types" {
 
     var col0 = try seg.decodeColumn(allocator, schema, 0, 0);
     defer col0.deinit(allocator);
-    try std.testing.expectEqualSlices(i64, &ids, col0.bigint);
+    try std.testing.expectEqualSlices(i64, &ids, col0.data.bigint);
 
     var col1 = try seg.decodeColumn(allocator, schema, 0, 1);
     defer col1.deinit(allocator);
-    try std.testing.expectEqualSlices(i32, &qtys, col1.int);
+    try std.testing.expectEqualSlices(i32, &qtys, col1.data.int);
 
     var col2 = try seg.decodeColumn(allocator, schema, 0, 2);
     defer col2.deinit(allocator);
-    try std.testing.expectEqualSlices(u8, &actives, col2.boolean);
+    try std.testing.expectEqualSlices(u8, &actives, col2.data.boolean);
 
     var col3 = try seg.decodeColumn(allocator, schema, 0, 3);
     defer col3.deinit(allocator);
-    const tag_view = col3.view().varchar;
+    const tag_view = col3.view().data.varchar;
     try std.testing.expectEqualStrings("AAA", tag_view.rowBytes(0));
     try std.testing.expectEqualStrings("BB", tag_view.rowBytes(1));
     try std.testing.expectEqualStrings("C", tag_view.rowBytes(2));
@@ -124,7 +124,7 @@ test "round-trip a single row group with all v0.1 types" {
 
     var col4 = try seg.decodeColumn(allocator, schema, 0, 4);
     defer col4.deinit(allocator);
-    const note_view = col4.view().string;
+    const note_view = col4.view().data.string;
     try std.testing.expectEqualStrings("first", note_view.rowBytes(0));
     try std.testing.expectEqualStrings("second", note_view.rowBytes(1));
     try std.testing.expectEqualStrings("", note_view.rowBytes(2));
@@ -153,8 +153,8 @@ test "round-trip with multiple row groups" {
     const qtys = [_]i32{ 10, 20, 30, 40, 50, 60, 70 };
 
     const columns = [_]ColumnView{
-        .{ .bigint = &ids },
-        .{ .int = &qtys },
+        .{ .data = .{ .bigint = &ids } },
+        .{ .data = .{ .int = &qtys } },
     };
 
     var info = try writeSegment(allocator, io, tmp.dir, "multi.dat", schema, 1, 0, 3, &columns);
@@ -174,7 +174,7 @@ test "round-trip with multiple row groups" {
     for (seg.info.row_groups, 0..) |_, rg_idx| {
         var col = try seg.decodeColumn(allocator, schema, rg_idx, 0);
         defer col.deinit(allocator);
-        try collected.appendSlice(allocator, col.bigint);
+        try collected.appendSlice(allocator, col.data.bigint);
     }
     try std.testing.expectEqualSlices(i64, &ids, collected.items);
 }

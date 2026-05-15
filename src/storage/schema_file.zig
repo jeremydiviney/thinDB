@@ -1,6 +1,6 @@
 //! Per-table schema persistence (<table>/schema.bin).
 //!
-//! Format (v1, binary, little-endian):
+//! Format (v2, binary, little-endian):
 //!
 //!   "tDBC" (4)
 //!   version u16
@@ -9,7 +9,8 @@
 //!   For each column:
 //!     name_len u32, name bytes
 //!     type_tag u8
-//!     type_extra u32   (varchar N or 0)
+//!     nullable u8     (added v2; 0 = NOT NULL, 1 = nullable)
+//!     type_extra u32  (varchar N or 0)
 //!   order_key_count u32
 //!   For each order_key name:
 //!     name_len u32, name bytes
@@ -29,7 +30,7 @@ const Schema = types.Schema;
 const format = @import("format.zig");
 
 pub const schema_magic: [4]u8 = .{ 't', 'D', 'B', 'C' };
-pub const schema_version: u16 = 1;
+pub const schema_version: u16 = 2;
 pub const schema_filename = "schema.bin";
 
 pub const Error = error{
@@ -75,6 +76,7 @@ pub const SchemaOwner = struct {
             columns[i] = .{
                 .name = try aa.dupe(u8, c.name),
                 .type = c.type,
+                .nullable = c.nullable,
             };
         }
 
@@ -106,6 +108,7 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: Schema, scratch: Allocator) !voi
         try buf.appendSlice(scratch, c.name);
         const tag: u8 = @intFromEnum(@as(TypeTag, c.type));
         try buf.append(scratch, tag);
+        try buf.append(scratch, @intFromBool(c.nullable));
         const extra: u32 = switch (c.type) {
             .varchar => |n| n,
             else => 0,
@@ -154,11 +157,13 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         const name = try aa.dupe(u8, bytes[cursor .. cursor + name_len]);
         cursor += name_len;
 
-        if (cursor + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
+        if (cursor + 1 + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
         const tag_byte = bytes[cursor];
         cursor += 1;
         if (tag_byte < 1 or tag_byte > 5) return Error.SchemaCorrupt;
         const tag: TypeTag = @enumFromInt(tag_byte);
+        const nullable = bytes[cursor] != 0;
+        cursor += 1;
         const extra = format.readU32(bytes[cursor .. cursor + 4]);
         cursor += 4;
 
@@ -169,7 +174,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .varchar => .{ .varchar = extra },
             .string => .string,
         };
-        columns[i] = .{ .name = name, .type = t };
+        columns[i] = .{ .name = name, .type = t, .nullable = nullable };
     }
 
     if (cursor + 4 > bytes.len) return Error.SchemaCorrupt;
@@ -212,6 +217,7 @@ pub fn schemasEqual(a: Schema, b: Schema) bool {
     for (a.columns, b.columns) |ac, bc| {
         if (!std.mem.eql(u8, ac.name, bc.name)) return false;
         if (std.meta.activeTag(ac.type) != std.meta.activeTag(bc.type)) return false;
+        if (ac.nullable != bc.nullable) return false;
         switch (ac.type) {
             .varchar => |n| if (n != bc.type.varchar) return false,
             else => {},

@@ -107,6 +107,10 @@ pub const Value = union(ValueTag) {
 pub const Column = struct {
     name: []const u8,
     type: Type,
+    /// True if NULL values are permitted in this column. When true, segment
+    /// blocks and memtable buffers carry a validity bitmap alongside the
+    /// data. Default `false` (NOT NULL) matches the original v0.1 contract.
+    nullable: bool = false,
 };
 
 pub const SchemaError = error{

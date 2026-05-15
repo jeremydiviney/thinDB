@@ -276,7 +276,7 @@ pub const Scan = struct {
         var inited: usize = 0;
         errdefer for (arr[0..inited]) |*c| c.deinit(self.allocator);
         for (self.table.schema.columns, 0..) |col, i| {
-            arr[i] = try ColumnStore.init(self.allocator, col.type);
+            arr[i] = try ColumnStore.init(self.allocator, col.type, col.nullable);
             inited += 1;
         }
         self.filtered = arr;
@@ -480,12 +480,16 @@ pub const Predicate = struct {
 
 /// Boolean expression over Predicates.
 ///
-///   - `.leaf` — a single column-op-value comparison
-///   - `.@"and"` — all children must match
-///   - `.@"or"`  — at least one child must match
-///   - `.not`    — child must NOT match (single-element slice for ergonomics)
+///   - `.leaf`       — a single column-op-value comparison
+///   - `.is_null`    — column value is NULL
+///   - `.is_not_null`— column value is non-NULL
+///   - `.@"and"`     — all children must match
+///   - `.@"or"`      — at least one child must match
+///   - `.not`        — child must NOT match
 pub const PredicateExpr = union(enum) {
     leaf: Predicate,
+    is_null: []const u8,
+    is_not_null: []const u8,
     @"and": []const PredicateExpr,
     @"or": []const PredicateExpr,
     not: *const PredicateExpr,
@@ -494,6 +498,14 @@ pub const PredicateExpr = union(enum) {
 /// Build a leaf predicate expression. Shorthand for `.{ .leaf = ... }`.
 pub fn leafExpr(col: []const u8, op: PredicateOp, val: Value) PredicateExpr {
     return .{ .leaf = .{ .col = col, .op = op, .val = val } };
+}
+
+pub fn isNullExpr(col: []const u8) PredicateExpr {
+    return .{ .is_null = col };
+}
+
+pub fn isNotNullExpr(col: []const u8) PredicateExpr {
+    return .{ .is_not_null = col };
 }
 
 pub const Filter = struct {
@@ -519,7 +531,7 @@ pub const Filter = struct {
         var inited: usize = 0;
         errdefer for (filtered[0..inited]) |*c| c.deinit(allocator);
         for (schema, 0..) |col, i| {
-            filtered[i] = try ColumnStore.init(allocator, col.type);
+            filtered[i] = try ColumnStore.init(allocator, col.type, col.nullable);
             inited += 1;
         }
 
@@ -598,6 +610,26 @@ pub const Filter = struct {
                 };
                 try evaluateMaskWithPred(batch.values[col_idx], p, batch.row_count, out);
             },
+            .is_null => |col_name| {
+                const col_idx = blk: {
+                    for (self.schema, 0..) |c, i| {
+                        if (std.mem.eql(u8, c.name, col_name)) break :blk i;
+                    }
+                    return Error.ColumnNotFound;
+                };
+                const view = batch.values[col_idx];
+                for (0..batch.row_count) |i| out[i] = !view.isValid(i);
+            },
+            .is_not_null => |col_name| {
+                const col_idx = blk: {
+                    for (self.schema, 0..) |c, i| {
+                        if (std.mem.eql(u8, c.name, col_name)) break :blk i;
+                    }
+                    return Error.ColumnNotFound;
+                };
+                const view = batch.values[col_idx];
+                for (0..batch.row_count) |i| out[i] = view.isValid(i);
+            },
             .@"and" => |children| {
                 if (children.len == 0) {
                     @memset(out, true);
@@ -654,6 +686,12 @@ fn validateExpr(expr: PredicateExpr, schema: []const Column) !void {
                 return Error.UnsupportedOperatorForType;
             }
         },
+        .is_null, .is_not_null => |col_name| {
+            for (schema) |c| {
+                if (std.mem.eql(u8, c.name, col_name)) return;
+            }
+            return Error.ColumnNotFound;
+        },
         .@"and" => |children| {
             for (children) |c| try validateExpr(c, schema);
         },
@@ -684,7 +722,7 @@ fn pushExprDown(upstream: *Query, expr: PredicateExpr) !void {
 
 fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bool) !void {
     const op = p.op;
-    switch (view) {
+    switch (view.data) {
         .int => |s| {
             const want = p.val.int;
             for (s[0..n], 0..) |v, i| mask[i] = cmp(i32, v, want, op);
@@ -711,6 +749,12 @@ fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bool) 
                 mask[i] = if (op == .eq) eq else !eq;
             }
         },
+    }
+    // Two-valued logic: a NULL value never matches a comparison.
+    if (view.nulls != null) {
+        for (0..n) |i| {
+            if (!view.isValid(i)) mask[i] = false;
+        }
     }
 }
 
@@ -865,12 +909,10 @@ pub const Limit = struct {
     }
 
     fn truncateView(view: ColumnView, n: usize) ColumnView {
-        return switch (view) {
+        const new_data: storage.column.ValueView = switch (view.data) {
             .int => |s| .{ .int = s[0..n] },
             .bigint => |s| .{ .bigint = s[0..n] },
             .boolean => |s| .{ .boolean = s[0..n] },
-            // For strings, truncating to n rows means keeping offsets[0..n+1]
-            // and bytes[0..offsets[n]].
             .varchar => |sv| .{ .varchar = .{
                 .offsets = sv.offsets[0 .. n + 1],
                 .bytes = sv.bytes[0..sv.offsets[n]],
@@ -880,6 +922,7 @@ pub const Limit = struct {
                 .bytes = sv.bytes[0..sv.offsets[n]],
             } },
         };
+        return .{ .data = new_data, .nulls = if (view.nulls) |b| b[0..storage.column.bitmapBytes(n)] else null };
     }
 };
 
@@ -936,7 +979,7 @@ pub const Sort = struct {
         var inited: usize = 0;
         errdefer for (accumulated[0..inited]) |*c| c.deinit(allocator);
         for (schema, 0..) |col, i| {
-            accumulated[i] = try ColumnStore.init(allocator, col.type);
+            accumulated[i] = try ColumnStore.init(allocator, col.type, col.nullable);
             inited += 1;
         }
 
@@ -945,7 +988,7 @@ pub const Sort = struct {
         var oinited: usize = 0;
         errdefer for (output_columns[0..oinited]) |*c| c.deinit(allocator);
         for (schema, 0..) |col, i| {
-            output_columns[i] = try ColumnStore.init(allocator, col.type);
+            output_columns[i] = try ColumnStore.init(allocator, col.type, col.nullable);
             oinited += 1;
         }
 
@@ -1160,7 +1203,7 @@ pub const Aggregate = struct {
         var inited: usize = 0;
         errdefer for (output_columns[0..inited]) |*c| c.deinit(allocator);
         for (output_schema, 0..) |col, i| {
-            output_columns[i] = try ColumnStore.init(allocator, col.type);
+            output_columns[i] = try ColumnStore.init(allocator, col.type, col.nullable);
             inited += 1;
         }
 
@@ -1333,18 +1376,35 @@ fn updateState(
 ) !void {
     switch (func) {
         .count => {
-            s.count += @as(u64, row_end - row_start);
+            // COUNT(*) counts every row. COUNT(col) skips NULLs.
+            if (col_idx) |idx| {
+                const view = batch.values[idx];
+                if (view.nulls == null) {
+                    s.count += @as(u64, row_end - row_start);
+                } else {
+                    var r: u32 = row_start;
+                    while (r < row_end) : (r += 1) {
+                        if (view.isValid(r)) s.count += 1;
+                    }
+                }
+            } else {
+                s.count += @as(u64, row_end - row_start);
+            }
         },
         .sum => {
             const idx = col_idx.?;
-            switch (batch.values[idx]) {
-                .int => |s_int| for (s_int[row_start..row_end]) |v| {
+            const view = batch.values[idx];
+            switch (view.data) {
+                .int => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .bigint => |s_b| for (s_b[row_start..row_end]) |v| {
+                .bigint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .boolean => |s_b| for (s_b[row_start..row_end]) |v| {
+                .boolean => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
                 else => unreachable,
@@ -1352,15 +1412,19 @@ fn updateState(
         },
         .min => {
             const idx = col_idx.?;
-            switch (batch.values[idx]) {
-                .int => |s_int| for (s_int[row_start..row_end]) |v| {
+            const view = batch.values[idx];
+            switch (view.data) {
+                .int => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
                     const iv: i64 = v;
                     if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
                 },
-                .bigint => |s_b| for (s_b[row_start..row_end]) |v| {
+                .bigint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
                     if (s.min_int == null or v < s.min_int.?) s.min_int = v;
                 },
-                .boolean => |s_b| for (s_b[row_start..row_end]) |v| {
+                .boolean => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
                     const iv: i64 = v;
                     if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
                 },
@@ -1369,15 +1433,19 @@ fn updateState(
         },
         .max => {
             const idx = col_idx.?;
-            switch (batch.values[idx]) {
-                .int => |s_int| for (s_int[row_start..row_end]) |v| {
+            const view = batch.values[idx];
+            switch (view.data) {
+                .int => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
                     const iv: i64 = v;
                     if (s.max_int == null or iv > s.max_int.?) s.max_int = iv;
                 },
-                .bigint => |s_b| for (s_b[row_start..row_end]) |v| {
+                .bigint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
                     if (s.max_int == null or v > s.max_int.?) s.max_int = v;
                 },
-                .boolean => |s_b| for (s_b[row_start..row_end]) |v| {
+                .boolean => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
                     const iv: i64 = v;
                     if (s.max_int == null or iv > s.max_int.?) s.max_int = iv;
                 },
@@ -1397,21 +1465,21 @@ fn appendAccToColumn(
     switch (func) {
         .count => {
             // BIGINT output
-            try col.bigint.append(allocator, @intCast(state.count));
+            try col.data.bigint.append(allocator, @intCast(state.count));
         },
         .sum => {
             // BIGINT output; check i128 → i64 overflow.
             if (state.sum_int > std.math.maxInt(i64) or state.sum_int < std.math.minInt(i64)) {
                 return Error.ArithmeticOverflow;
             }
-            try col.bigint.append(allocator, @intCast(state.sum_int));
+            try col.data.bigint.append(allocator, @intCast(state.sum_int));
         },
         .min, .max => {
             const v: i64 = if (func == .min) (state.min_int orelse 0) else (state.max_int orelse 0);
             switch (out_type) {
-                .int => try col.int.append(allocator, @intCast(v)),
-                .bigint => try col.bigint.append(allocator, v),
-                .boolean => try col.boolean.append(allocator, @intCast(v)),
+                .int => try col.data.int.append(allocator, @intCast(v)),
+                .bigint => try col.data.bigint.append(allocator, v),
+                .boolean => try col.data.boolean.append(allocator, @intCast(v)),
                 else => unreachable,
             }
         },
@@ -1433,7 +1501,7 @@ fn compoundGroupKey(
     var buf: std.ArrayList(u8) = .empty;
     for (group_col_indices) |ci| {
         const view = batch.values[ci];
-        switch (view) {
+        switch (view.data) {
             .int => |s| try storage.format.appendI32(aa, &buf, s[row]),
             .bigint => |s| try storage.format.appendI64(aa, &buf, s[row]),
             .boolean => |s| try buf.append(aa, s[row]),
@@ -1468,15 +1536,15 @@ fn appendGroupKey(
             .int => {
                 const v = storage.format.readI32(key_bytes[cursor .. cursor + 4]);
                 cursor += 4;
-                try out_cols[i].int.append(allocator, v);
+                try out_cols[i].data.int.append(allocator, v);
             },
             .bigint => {
                 const v = storage.format.readI64(key_bytes[cursor .. cursor + 8]);
                 cursor += 8;
-                try out_cols[i].bigint.append(allocator, v);
+                try out_cols[i].data.bigint.append(allocator, v);
             },
             .boolean => {
-                try out_cols[i].boolean.append(allocator, key_bytes[cursor]);
+                try out_cols[i].data.boolean.append(allocator, key_bytes[cursor]);
                 cursor += 1;
             },
             .varchar, .string => {
@@ -1484,7 +1552,7 @@ fn appendGroupKey(
                 cursor += 4;
                 const bytes = key_bytes[cursor .. cursor + len];
                 cursor += len;
-                const ss: *engine.StringStore = switch (out_cols[i]) {
+                const ss: *engine.StringStore = switch (out_cols[i].data) {
                     .varchar => |*x| x,
                     .string => |*x| x,
                     else => unreachable,
