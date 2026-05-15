@@ -720,6 +720,8 @@ fn appendColumnValueBytes(
             storage.format.writeF64(&b, s[row]);
             try buf.appendSlice(aa, &b);
         },
+        .date => |s| try storage.format.appendI32(aa, buf, s[row]),
+        .datetime => |s| try storage.format.appendI64(aa, buf, s[row]),
     }
 }
 
@@ -732,6 +734,8 @@ fn evalRow(view: storage.ColumnView, row: u32, pred: exec.Predicate) bool {
         .string => |sv| cmpStr(sv.rowBytes(row), pred.val.text, pred.op),
         .float => |s| cmpVal(f32, s[row], pred.val.float, pred.op),
         .double => |s| cmpVal(f64, s[row], pred.val.double, pred.op),
+        .date => |s| cmpVal(i32, s[row], pred.val.date, pred.op),
+        .datetime => |s| cmpVal(i64, s[row], pred.val.datetime, pred.op),
     };
 }
 

@@ -757,6 +757,14 @@ fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bool) 
             const want = p.val.double;
             for (s[0..n], 0..) |v, i| mask[i] = cmp(f64, v, want, op);
         },
+        .date => |s| {
+            const want = p.val.date;
+            for (s[0..n], 0..) |v, i| mask[i] = cmp(i32, v, want, op);
+        },
+        .datetime => |s| {
+            const want = p.val.datetime;
+            for (s[0..n], 0..) |v, i| mask[i] = cmp(i64, v, want, op);
+        },
     }
     // Two-valued logic: a NULL value never matches a comparison.
     if (view.nulls != null) {
@@ -931,6 +939,8 @@ pub const Limit = struct {
             } },
             .float => |s| .{ .float = s[0..n] },
             .double => |s| .{ .double = s[0..n] },
+            .date => |s| .{ .date = s[0..n] },
+            .datetime => |s| .{ .datetime = s[0..n] },
         };
         return .{ .data = new_data, .nulls = if (view.nulls) |b| b[0..storage.column.bitmapBytes(n)] else null };
     }
@@ -1399,7 +1409,7 @@ fn validateAggFn(func: AggFunc, in: ?Type) !void {
         },
         .min, .max => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!(t == .int or t == .bigint or t == .boolean or t == .float or t == .double)) {
+            if (!(t == .int or t == .bigint or t == .boolean or t == .float or t == .double or t == .date or t == .datetime)) {
                 return Error.AggregateUnsupportedType;
             }
         },
@@ -1462,12 +1472,12 @@ fn updateState(
             const idx = col_idx.?;
             const view = batch.values[idx];
             switch (view.data) {
-                .int => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
+                .int, .date => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     const iv: i64 = v;
                     if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
                 },
-                .bigint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                .bigint, .datetime => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     if (s.min_int == null or v < s.min_int.?) s.min_int = v;
                 },
@@ -1492,12 +1502,12 @@ fn updateState(
             const idx = col_idx.?;
             const view = batch.values[idx];
             switch (view.data) {
-                .int => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
+                .int, .date => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     const iv: i64 = v;
                     if (s.max_int == null or iv > s.max_int.?) s.max_int = iv;
                 },
-                .bigint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                .bigint, .datetime => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     if (s.max_int == null or v > s.max_int.?) s.max_int = v;
                 },
@@ -1582,6 +1592,8 @@ fn appendAccToColumn(
                     .int => try col.data.int.append(allocator, @intCast(v)),
                     .bigint => try col.data.bigint.append(allocator, v),
                     .boolean => try col.data.boolean.append(allocator, @intCast(v)),
+                    .date => try col.data.date.append(allocator, @intCast(v)),
+                    .datetime => try col.data.datetime.append(allocator, v),
                     else => unreachable,
                 }
             },
@@ -1645,6 +1657,8 @@ fn compoundGroupKey(
                 storage.format.writeF64(&b, s[row]);
                 try buf.appendSlice(aa, &b);
             },
+            .date => |s| try storage.format.appendI32(aa, &buf, s[row]),
+            .datetime => |s| try storage.format.appendI64(aa, &buf, s[row]),
         }
     }
     return buf.toOwnedSlice(aa);
@@ -1699,6 +1713,16 @@ fn appendGroupKey(
                 cursor += 8;
                 try out_cols[i].data.double.append(allocator, v);
             },
+            .date => {
+                const v = storage.format.readI32(key_bytes[cursor .. cursor + 4]);
+                cursor += 4;
+                try out_cols[i].data.date.append(allocator, v);
+            },
+            .datetime => {
+                const v = storage.format.readI64(key_bytes[cursor .. cursor + 8]);
+                cursor += 8;
+                try out_cols[i].data.datetime.append(allocator, v);
+            },
         }
     }
 }
@@ -1718,6 +1742,8 @@ pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value)
         .int => |x| x,
         .bigint => |x| x,
         .boolean => |x| @intFromBool(x),
+        .date => |x| x,
+        .datetime => |x| x,
         .text, .float, .double => return true, // no stats on strings/floats yet
     };
     return switch (op) {

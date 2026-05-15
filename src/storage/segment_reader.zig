@@ -320,6 +320,24 @@ fn decodeRawColumn(
             }
             return .{ .data = .{ .double = data }, .nulls = nulls };
         },
+        .date => {
+            const data = try allocator.alloc(i32, row_count);
+            errdefer allocator.free(data);
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) {
+                data[i] = format.readI32(values[i * 4 .. i * 4 + 4]);
+            }
+            return .{ .data = .{ .date = data }, .nulls = nulls };
+        },
+        .datetime => {
+            const data = try allocator.alloc(i64, row_count);
+            errdefer allocator.free(data);
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) {
+                data[i] = format.readI64(values[i * 8 .. i * 8 + 8]);
+            }
+            return .{ .data = .{ .datetime = data }, .nulls = nulls };
+        },
     }
 }
 

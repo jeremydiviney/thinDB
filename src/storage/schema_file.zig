@@ -160,7 +160,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         if (cursor + 1 + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
         const tag_byte = bytes[cursor];
         cursor += 1;
-        if (tag_byte < 1 or tag_byte > 7) return Error.SchemaCorrupt;
+        if (tag_byte < 1 or tag_byte > 9) return Error.SchemaCorrupt;
         const tag: TypeTag = @enumFromInt(tag_byte);
         const nullable = bytes[cursor] != 0;
         cursor += 1;
@@ -175,6 +175,8 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .string => .string,
             .float => .float,
             .double => .double,
+            .date => .date,
+            .datetime => .datetime,
         };
         columns[i] = .{ .name = name, .type = t, .nullable = nullable };
     }

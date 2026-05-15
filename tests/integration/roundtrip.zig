@@ -500,6 +500,86 @@ test "avg: int, float, with nulls and grouping" {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DATE / DATETIME columns
+// ---------------------------------------------------------------------------
+
+test "date/datetime: insert, flush, reread, comparison filter, MIN/MAX" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "d", .type = .date },
+            .{ .name = "ts", .type = .datetime },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 4 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+        defer db.close();
+        const t = try db.table("events", schema, opts);
+        // 19500 ≈ 2023-05-14, 19503 ≈ 2023-05-17, etc. Microseconds: 1e6 = 1 second.
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .d = thindb.types.Date.fromDays(19500), .ts = thindb.types.DateTime.fromMicros(1_000_000_000) },
+            .{ .id = @as(i64, 2), .d = thindb.types.Date.fromDays(19501), .ts = thindb.types.DateTime.fromMicros(2_000_000_000) },
+            .{ .id = @as(i64, 3), .d = thindb.types.Date.fromDays(19503), .ts = thindb.types.DateTime.fromMicros(3_000_000_000) },
+            .{ .id = @as(i64, 4), .d = thindb.types.Date.fromDays(19495), .ts = thindb.types.DateTime.fromMicros(500_000_000) },
+        });
+        try t.flush();
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("events", schema, opts);
+
+    // Reread.
+    {
+        var q = try thindb.scan(allocator, t);
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 4), b.row_count);
+        try std.testing.expectEqualSlices(i32, &[_]i32{ 19500, 19501, 19503, 19495 }, b.values[1].data.date);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 1_000_000_000, 2_000_000_000, 3_000_000_000, 500_000_000 }, b.values[2].data.datetime);
+    }
+
+    // Filter on date.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.filter(thindb.leafExpr("d", .gte, .{ .date = 19500 }));
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids.items);
+    }
+
+    // MIN/MAX over date + datetime; output types preserve input width.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.aggregate(&.{
+            .{ .func = .min, .col = "d", .as = "min_d" },
+            .{ .func = .max, .col = "d", .as = "max_d" },
+            .{ .func = .min, .col = "ts", .as = "min_ts" },
+            .{ .func = .max, .col = "ts", .as = "max_ts" },
+        });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(i32, 19495), b.values[0].data.date[0]);
+        try std.testing.expectEqual(@as(i32, 19503), b.values[1].data.date[0]);
+        try std.testing.expectEqual(@as(i64, 500_000_000), b.values[2].data.datetime[0]);
+        try std.testing.expectEqual(@as(i64, 3_000_000_000), b.values[3].data.datetime[0]);
+    }
+}
+
 test "nullable: rejects ?T into a non-nullable column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

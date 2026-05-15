@@ -128,6 +128,8 @@ pub const DataStore = union(TypeTag) {
     string: StringStore,
     float: std.ArrayList(f32),
     double: std.ArrayList(f64),
+    date: std.ArrayList(i32),
+    datetime: std.ArrayList(i64),
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return switch (t) {
@@ -138,6 +140,8 @@ pub const DataStore = union(TypeTag) {
             .string => .{ .string = try StringStore.init(allocator) },
             .float => .{ .float = .empty },
             .double => .{ .double = .empty },
+            .date => .{ .date = .empty },
+            .datetime => .{ .datetime = .empty },
         };
     }
 
@@ -150,6 +154,8 @@ pub const DataStore = union(TypeTag) {
             .string => |*ss| ss.deinit(allocator),
             .float => |*list| list.deinit(allocator),
             .double => |*list| list.deinit(allocator),
+            .date => |*list| list.deinit(allocator),
+            .datetime => |*list| list.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -163,6 +169,8 @@ pub const DataStore = union(TypeTag) {
             .string => |s| s.rowCount(),
             .float => |l| l.items.len,
             .double => |l| l.items.len,
+            .date => |l| l.items.len,
+            .datetime => |l| l.items.len,
         };
     }
 
@@ -175,6 +183,8 @@ pub const DataStore = union(TypeTag) {
             .string => |s| .{ .string = s.view() },
             .float => |l| .{ .float = l.items },
             .double => |l| .{ .double = l.items },
+            .date => |l| .{ .date = l.items },
+            .datetime => |l| .{ .datetime = l.items },
         };
     }
 
@@ -187,6 +197,8 @@ pub const DataStore = union(TypeTag) {
             .string => |*s| s.clear(),
             .float => |*l| l.clearRetainingCapacity(),
             .double => |*l| l.clearRetainingCapacity(),
+            .date => |*l| l.clearRetainingCapacity(),
+            .datetime => |*l| l.clearRetainingCapacity(),
         }
     }
 
@@ -202,6 +214,8 @@ pub const DataStore = union(TypeTag) {
             .string => |*s| try s.appendValue(allocator, ""),
             .float => |*l| try l.append(allocator, 0.0),
             .double => |*l| try l.append(allocator, 0.0),
+            .date => |*l| try l.append(allocator, 0),
+            .datetime => |*l| try l.append(allocator, 0),
         }
     }
 };
@@ -252,6 +266,8 @@ pub const Memtable = struct {
                 .string => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
                 .float => |l| l.items.len * @sizeOf(f32),
                 .double => |l| l.items.len * @sizeOf(f64),
+                .date => |l| l.items.len * @sizeOf(i32),
+                .datetime => |l| l.items.len * @sizeOf(i64),
             };
             if (col.nulls) |n| total += n.items.len;
         }
@@ -444,7 +460,11 @@ pub const Memtable = struct {
     }
 
     pub fn appendValue(self: *Memtable, col_idx: usize, comptime V: type, value: V) !void {
-        if (comptime V == i32 or V == comptime_int) {
+        if (comptime V == types.Date) {
+            try self.appendDate(col_idx, value.days());
+        } else if (comptime V == types.DateTime) {
+            try self.appendDateTime(col_idx, value.micros());
+        } else if (comptime V == i32 or V == comptime_int) {
             try self.appendInt32Like(col_idx, V, value);
         } else if (comptime V == i64) {
             try self.appendInt64(col_idx, value);
@@ -459,6 +479,24 @@ pub const Memtable = struct {
         } else {
             @compileError("memtable.appendValue: unsupported value type " ++ @typeName(V));
         }
+    }
+
+    fn appendDate(self: *Memtable, col_idx: usize, days: i32) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .date => |*list| try list.append(self.allocator, days),
+            else => return Error.TypeMismatch,
+        }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+    }
+
+    fn appendDateTime(self: *Memtable, col_idx: usize, micros: i64) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .datetime => |*list| try list.append(self.allocator, micros),
+            else => return Error.TypeMismatch,
+        }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendFloat32Like(self: *Memtable, col_idx: usize, comptime V: type, value: V) !void {
@@ -485,6 +523,8 @@ pub const Memtable = struct {
         switch (col.data) {
             .int => |*list| try list.append(self.allocator, @as(i32, value)),
             .bigint => |*list| try list.append(self.allocator, @as(i64, value)),
+            .date => |*list| try list.append(self.allocator, @as(i32, value)),
+            .datetime => |*list| try list.append(self.allocator, @as(i64, value)),
             else => return Error.TypeMismatch,
         }
         try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -494,6 +534,7 @@ pub const Memtable = struct {
         const col = &self.columns[col_idx];
         switch (col.data) {
             .bigint => |*list| try list.append(self.allocator, value),
+            .datetime => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
         try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -576,6 +617,14 @@ pub fn appendAllColumn(
             .double => |*list| try list.appendSlice(allocator, s),
             else => unreachable,
         },
+        .date => |s| switch (out.data) {
+            .date => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
+        .datetime => |s| switch (out.data) {
+            .datetime => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
     }
     // Carry validity bits across.
     if (out.nulls != null) {
@@ -645,6 +694,20 @@ pub fn appendByIndices(
             },
             else => unreachable,
         },
+        .date => |s| switch (out.data) {
+            .date => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
+        .datetime => |s| switch (out.data) {
+            .datetime => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
     }
     if (out.nulls != null) {
         for (indices, 0..) |src_idx, j| {
@@ -700,6 +763,18 @@ pub fn appendMaskedColumn(
         },
         .double => |s| switch (out.data) {
             .double => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
+            },
+            else => unreachable,
+        },
+        .date => |s| switch (out.data) {
+            .date => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
+            },
+            else => unreachable,
+        },
+        .datetime => |s| switch (out.data) {
+            .datetime => |*list| for (s, mask) |v, m| {
                 if (m) try list.append(allocator, v);
             },
             else => unreachable,
@@ -780,6 +855,18 @@ fn applyPermutation(
             for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
             break :blk DataStore{ .double = dst };
         },
+        .date => |l| blk: {
+            var dst: std.ArrayList(i32) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .date = dst };
+        },
+        .datetime => |l| blk: {
+            var dst: std.ArrayList(i64) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .datetime = dst };
+        },
     };
 
     var nulls: ?std.ArrayList(u8) = null;
@@ -809,6 +896,8 @@ fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
         .string => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
         .float => |l| std.math.order(l.items[a], l.items[b]),
         .double => |l| std.math.order(l.items[a], l.items[b]),
+        .date => |l| std.math.order(l.items[a], l.items[b]),
+        .datetime => |l| std.math.order(l.items[a], l.items[b]),
     };
 }
 

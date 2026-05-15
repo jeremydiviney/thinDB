@@ -251,6 +251,24 @@ fn writeRawColumnBlock(
                 buf.appendSliceAssumeCapacity(&b);
             }
         },
+        .date => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 4);
+            for (slice) |v| {
+                var b: [4]u8 = undefined;
+                format.writeI32(&b, v);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
+        .datetime => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 8);
+            for (slice) |v| {
+                var b: [8]u8 = undefined;
+                format.writeI64(&b, v);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
     }
 }
 
@@ -280,6 +298,26 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
             const slice = data[row_start..row_end];
             var lo: u8 = 1;
             var hi: u8 = 0;
+            for (slice) |v| {
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            break :blk .{ .min = lo, .max = hi };
+        },
+        .date => |data| blk: {
+            const slice = data[row_start..row_end];
+            var lo: i32 = std.math.maxInt(i32);
+            var hi: i32 = std.math.minInt(i32);
+            for (slice) |v| {
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
+        },
+        .datetime => |data| blk: {
+            const slice = data[row_start..row_end];
+            var lo: i64 = std.math.maxInt(i64);
+            var hi: i64 = std.math.minInt(i64);
             for (slice) |v| {
                 if (v < lo) lo = v;
                 if (v > hi) hi = v;

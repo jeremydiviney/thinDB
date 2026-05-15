@@ -11,6 +11,11 @@ pub const TypeTag = enum(u8) {
     string = 5,
     float = 6,
     double = 7,
+    /// Days since 1970-01-01 (UTC), stored as i32.
+    date = 8,
+    /// Microseconds since 1970-01-01T00:00:00 UTC (timezone-naive),
+    /// stored as i64.
+    datetime = 9,
 };
 
 pub const Type = union(TypeTag) {
@@ -21,6 +26,8 @@ pub const Type = union(TypeTag) {
     string,
     float,
     double,
+    date,
+    datetime,
 
     pub fn fixedSize(self: Type) ?usize {
         return switch (self) {
@@ -29,6 +36,8 @@ pub const Type = union(TypeTag) {
             .boolean => @sizeOf(u8),
             .float => @sizeOf(f32),
             .double => @sizeOf(f64),
+            .date => @sizeOf(i32),
+            .datetime => @sizeOf(i64),
             .varchar, .string => null,
         };
     }
@@ -47,6 +56,13 @@ pub const Type = union(TypeTag) {
         };
     }
 
+    pub fn isTemporal(self: Type) bool {
+        return switch (self) {
+            .date, .datetime => true,
+            else => false,
+        };
+    }
+
     pub fn matchesZigType(self: Type, comptime T: type) bool {
         return switch (self) {
             .int => T == i32 or T == comptime_int,
@@ -54,8 +70,34 @@ pub const Type = union(TypeTag) {
             .boolean => T == bool,
             .float => T == f32 or T == comptime_float,
             .double => T == f64 or T == comptime_float,
+            .date => T == Date or T == i32 or T == comptime_int,
+            .datetime => T == DateTime or T == i64 or T == comptime_int,
             .varchar, .string => isStringLikeType(T),
         };
+    }
+};
+
+/// Logical wrapper around a stored `i32` of days since the epoch. Provided
+/// so insertion can be unambiguous (`@as(Date, ...)`) without colliding
+/// with INT columns. `.value` accesses the raw days count.
+pub const Date = enum(i32) {
+    _,
+    pub fn fromDays(d: i32) Date {
+        return @enumFromInt(d);
+    }
+    pub fn days(self: Date) i32 {
+        return @intFromEnum(self);
+    }
+};
+
+/// Logical wrapper around a stored `i64` of microseconds since the epoch.
+pub const DateTime = enum(i64) {
+    _,
+    pub fn fromMicros(us: i64) DateTime {
+        return @enumFromInt(us);
+    }
+    pub fn micros(self: DateTime) i64 {
+        return @intFromEnum(self);
     }
 };
 
@@ -89,6 +131,8 @@ pub const ValueTag = enum(u8) {
     text = 4, // covers both VARCHAR and STRING
     float = 5,
     double = 6,
+    date = 7,
+    datetime = 8,
 
     pub fn fromType(t: Type) ValueTag {
         return switch (t) {
@@ -98,6 +142,8 @@ pub const ValueTag = enum(u8) {
             .varchar, .string => .text,
             .float => .float,
             .double => .double,
+            .date => .date,
+            .datetime => .datetime,
         };
     }
 };
@@ -109,6 +155,8 @@ pub const Value = union(ValueTag) {
     text: []const u8,
     float: f32,
     double: f64,
+    date: i32,
+    datetime: i64,
 
     pub fn compare(self: Value, other: Value) std.math.Order {
         std.debug.assert(std.meta.activeTag(self) == std.meta.activeTag(other));
@@ -118,6 +166,8 @@ pub const Value = union(ValueTag) {
             .boolean => |a| std.math.order(@as(u8, @intFromBool(a)), @as(u8, @intFromBool(other.boolean))),
             .float => |a| std.math.order(a, other.float),
             .double => |a| std.math.order(a, other.double),
+            .date => |a| std.math.order(a, other.date),
+            .datetime => |a| std.math.order(a, other.datetime),
             .text => |a| switch (std.mem.order(u8, a, other.text)) {
                 .lt => .lt,
                 .gt => .gt,

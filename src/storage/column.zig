@@ -51,6 +51,8 @@ pub const ValueView = union(TypeTag) {
     string: StringView,
     float: []const f32,
     double: []const f64,
+    date: []const i32,
+    datetime: []const i64,
 
     pub fn rowCount(self: ValueView) usize {
         return switch (self) {
@@ -61,6 +63,8 @@ pub const ValueView = union(TypeTag) {
             .string => |s| s.rowCount(),
             .float => |s| s.len,
             .double => |s| s.len,
+            .date => |s| s.len,
+            .datetime => |s| s.len,
         };
     }
 };
@@ -132,6 +136,8 @@ pub const OwnedData = union(TypeTag) {
     string: OwnedStringColumn,
     float: []f32,
     double: []f64,
+    date: []i32,
+    datetime: []i64,
 
     pub fn rowCount(self: OwnedData) usize {
         return switch (self) {
@@ -142,6 +148,8 @@ pub const OwnedData = union(TypeTag) {
             .string => |s| s.offsets.len - 1,
             .float => |s| s.len,
             .double => |s| s.len,
+            .date => |s| s.len,
+            .datetime => |s| s.len,
         };
     }
 
@@ -154,6 +162,8 @@ pub const OwnedData = union(TypeTag) {
             .string => |s| .{ .string = s.view() },
             .float => |s| .{ .float = s },
             .double => |s| .{ .double = s },
+            .date => |s| .{ .date = s },
+            .datetime => |s| .{ .datetime = s },
         };
     }
 
@@ -166,6 +176,8 @@ pub const OwnedData = union(TypeTag) {
             .string => |*s| s.deinit(allocator),
             .float => |s| allocator.free(s),
             .double => |s| allocator.free(s),
+            .date => |s| allocator.free(s),
+            .datetime => |s| allocator.free(s),
         }
         self.* = undefined;
     }
