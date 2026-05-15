@@ -45,6 +45,7 @@ pub const Config = struct {
 
     /// LRU cache budget for decompressed column blocks. 0 disables caching.
     cache_size_bytes: usize = 256 * 1024 * 1024,
+
 };
 
 pub const TableOptions = struct {
@@ -67,6 +68,10 @@ pub const Database = struct {
     data_dir: Io.Dir,
     config: Config,
     tables: std.StringHashMap(*Table),
+
+    /// Guards `tables` map iteration from a background flusher caller.
+    /// Held briefly to snapshot table pointers.
+    tables_mutex: Io.Mutex = .init,
 
     /// Open a database rooted at `data_dir`. Caller retains ownership of
     /// `data_dir` and must keep it open for the lifetime of the returned
@@ -99,6 +104,28 @@ pub const Database = struct {
         allocator.destroy(self);
     }
 
+    /// One sweep of the background flush check: takes a brief snapshot of
+    /// open tables and calls `tryBackgroundFlush` on each. Designed to be
+    /// driven by an external loop (an OS thread, a task on an `Io`, or a
+    /// test harness). Safe to call concurrently with `insert` / `flush`
+    /// because each `tryBackgroundFlush` non-blockingly `tryLock`s the
+    /// table.
+    pub fn backgroundFlushSweep(self: *Database) !void {
+        self.tables_mutex.lockUncancelable(self.io);
+        const count = self.tables.count();
+        const ptrs = self.allocator.alloc(*Table, count) catch |err| {
+            self.tables_mutex.unlock(self.io);
+            return err;
+        };
+        defer self.allocator.free(ptrs);
+        var i: usize = 0;
+        var it = self.tables.valueIterator();
+        while (it.next()) |p| : (i += 1) ptrs[i] = p.*;
+        self.tables_mutex.unlock(self.io);
+
+        for (ptrs) |t| t.tryBackgroundFlush() catch {};
+    }
+
     /// Create-or-open a table with the given schema. If the table already
     /// exists on disk, its persisted schema must match the one passed here.
     pub fn table(
@@ -109,11 +136,15 @@ pub const Database = struct {
     ) !*Table {
         try schema.validate();
 
-        if (self.tables.get(name)) |existing| {
-            if (schemaFingerprint(schema) != existing.schema_fingerprint) {
-                return Error.SchemaMismatch;
+        {
+            self.tables_mutex.lockUncancelable(self.io);
+            defer self.tables_mutex.unlock(self.io);
+            if (self.tables.get(name)) |existing| {
+                if (schemaFingerprint(schema) != existing.schema_fingerprint) {
+                    return Error.SchemaMismatch;
+                }
+                return existing;
             }
-            return existing;
         }
 
         const t = try Table.open(
@@ -127,6 +158,8 @@ pub const Database = struct {
         );
         errdefer t.close();
 
+        self.tables_mutex.lockUncancelable(self.io);
+        defer self.tables_mutex.unlock(self.io);
         try self.tables.put(t.name, t);
         return t;
     }
@@ -138,7 +171,11 @@ pub const Database = struct {
         name: []const u8,
         options: OpenOptions,
     ) !*Table {
-        if (self.tables.get(name)) |existing| return existing;
+        {
+            self.tables_mutex.lockUncancelable(self.io);
+            defer self.tables_mutex.unlock(self.io);
+            if (self.tables.get(name)) |existing| return existing;
+        }
 
         const t = try Table.open(
             self.allocator,
@@ -151,6 +188,8 @@ pub const Database = struct {
         );
         errdefer t.close();
 
+        self.tables_mutex.lockUncancelable(self.io);
+        defer self.tables_mutex.unlock(self.io);
         try self.tables.put(t.name, t);
         return t;
     }
@@ -184,6 +223,12 @@ pub const Table = struct {
 
     manifest: storage.Manifest,
     memtable: engine.Memtable,
+
+    /// Serializes writers vs. the background flusher. Public mutating
+    /// entry points (`insert`, `delete`, `flush`, `compact`) lock this
+    /// before touching the memtable / manifest. Internal `*Locked` helpers
+    /// assume it's already held.
+    mutex: Io.Mutex = .init,
 
     fn open(
         allocator: Allocator,
@@ -275,6 +320,9 @@ pub const Table = struct {
     /// causes the old row to be tombstoned. The new row becomes the visible
     /// value. (StarRocks "last writer wins" semantics.)
     pub fn insert(self: *Table, rows: anytype) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         const was_empty = self.memtable.isEmpty();
         try self.memtable.insertRows(rows);
         if (was_empty and !self.memtable.isEmpty()) {
@@ -283,13 +331,19 @@ pub const Table = struct {
         if (self.schema.unique) {
             try applyUpsertResolution(self);
         }
-        try self.maybeAutoFlush();
+        try self.maybeAutoFlushLocked();
     }
 
     /// Flush the memtable to a new segment on disk and update the manifest
     /// atomically. Rows are written sorted by the table's order key. No-op
     /// if the memtable is empty.
     pub fn flush(self: *Table) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.flushLocked();
+    }
+
+    fn flushLocked(self: *Table) !void {
         if (self.memtable.isEmpty()) {
             self.first_write_ts = null;
             return;
@@ -325,14 +379,14 @@ pub const Table = struct {
     }
 
     /// Called from `insert`/`delete` after mutation. Flushes the memtable if
-    /// any auto-flush trigger is satisfied.
-    fn maybeAutoFlush(self: *Table) !void {
+    /// any auto-flush trigger is satisfied. Caller holds `self.mutex`.
+    fn maybeAutoFlushLocked(self: *Table) !void {
         if (self.memtable.isEmpty()) return;
         const rows = self.memtable.row_count;
         const bytes = self.memtable.byteSize();
 
         if (rows >= self.auto_flush_rows or bytes >= self.auto_flush_bytes) {
-            try self.flush();
+            try self.flushLocked();
             return;
         }
 
@@ -345,10 +399,19 @@ pub const Table = struct {
                     rows >= self.auto_flush_min_rows and
                     bytes >= self.auto_flush_min_bytes)
                 {
-                    try self.flush();
+                    try self.flushLocked();
                 }
             }
         }
+    }
+
+    /// Used by the Database-level background flusher thread. Tries to
+    /// acquire the table's mutex non-blockingly; on success, runs the
+    /// time-based auto-flush check. No-op on lock contention.
+    pub fn tryBackgroundFlush(self: *Table) !void {
+        if (!self.mutex.tryLock()) return;
+        defer self.mutex.unlock(self.io);
+        try self.maybeAutoFlushLocked();
     }
 
     pub fn segmentCount(self: Table) usize {
@@ -363,12 +426,16 @@ pub const Table = struct {
     /// emits tombstones for matches in segments, and rebuilds the memtable
     /// without them. Returns the number of rows deleted.
     pub fn delete(self: *Table, pred: exec.Predicate) !usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return execDelete(self, pred);
     }
 
     /// Merge all segments into a single new segment. Drops tombstoned rows.
     /// No-op if there's at most one segment.
     pub fn compact(self: *Table) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.manifest.segments.items.len <= 1) return;
         try execCompact(self);
     }
