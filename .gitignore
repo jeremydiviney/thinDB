@@ -1,0 +1,19 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Bench scratch directories — recreated each run
+.bench-data/
+
+# Local IDE / editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Personal Claude/agent caches (in case anything lands inside the repo)
+.claude/
