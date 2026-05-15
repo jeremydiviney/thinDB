@@ -1111,7 +1111,7 @@ pub const Sort = struct {
 // Aggregate / GROUP BY
 // ---------------------------------------------------------------------------
 
-pub const AggFunc = enum { count, sum, min, max };
+pub const AggFunc = enum { count, sum, min, max, avg };
 
 pub const AggSpec = struct {
     func: AggFunc,
@@ -1132,6 +1132,12 @@ const AccState = union(enum) {
     max_int: ?i64,
     min_float: ?f64,
     max_float: ?f64,
+    avg: AvgAcc,
+};
+
+const AvgAcc = struct {
+    sum: f64,
+    count: u64,
 };
 
 pub const Aggregate = struct {
@@ -1366,6 +1372,7 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
             .{ .max_float = null }
         else
             .{ .max_int = null },
+        .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
     };
 }
 
@@ -1377,13 +1384,14 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
             break :blk if (t.isFloat()) .double else .bigint;
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
+        .avg => .double,
     };
 }
 
 fn validateAggFn(func: AggFunc, in: ?Type) !void {
     switch (func) {
         .count => return,
-        .sum => {
+        .sum, .avg => {
             const t = in orelse return Error.AggregateColumnRequired;
             if (!(t == .int or t == .bigint or t == .boolean or t == .float or t == .double)) {
                 return Error.AggregateUnsupportedType;
@@ -1510,6 +1518,38 @@ fn updateState(
                 else => unreachable,
             }
         },
+        .avg => {
+            const idx = col_idx.?;
+            const view = batch.values[idx];
+            switch (view.data) {
+                .int => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.avg.sum += @as(f64, @floatFromInt(v));
+                    s.avg.count += 1;
+                },
+                .bigint => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.avg.sum += @as(f64, @floatFromInt(v));
+                    s.avg.count += 1;
+                },
+                .boolean => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.avg.sum += @as(f64, @floatFromInt(v));
+                    s.avg.count += 1;
+                },
+                .float => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.avg.sum += v;
+                    s.avg.count += 1;
+                },
+                .double => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.avg.sum += v;
+                    s.avg.count += 1;
+                },
+                else => unreachable,
+            }
+        },
     }
 }
 
@@ -1554,6 +1594,14 @@ fn appendAccToColumn(
                 }
             },
             else => unreachable,
+        },
+        .avg => {
+            const a = state.avg;
+            // AVG over an empty set is defined as 0.0 here (we don't yet
+            // surface aggregate-result NULLs). When `count` is 0 we'd be
+            // dividing by zero — guard explicitly.
+            const v: f64 = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count));
+            try col.data.double.append(allocator, v);
         },
     }
 }

@@ -429,6 +429,77 @@ test "float: nullable column with SUM skipping NULLs" {
     try std.testing.expectEqual(@as(f64, 4.0), b.values[1].data.double[0]);
 }
 
+test "avg: int, float, with nulls and grouping" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "grp", .type = .int },
+            .{ .name = "v", .type = .int, .nullable = true },
+            .{ .name = "f", .type = .double, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 8 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 8 });
+    defer db.close();
+    const t = try db.table("agg", schema, opts);
+
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .grp = @as(i32, 1), .v = @as(?i32, 10), .f = @as(?f64, 1.5) },
+        .{ .id = @as(i64, 2), .grp = @as(i32, 1), .v = @as(?i32, null), .f = @as(?f64, 2.5) },
+        .{ .id = @as(i64, 3), .grp = @as(i32, 1), .v = @as(?i32, 30), .f = @as(?f64, null) },
+        .{ .id = @as(i64, 4), .grp = @as(i32, 2), .v = @as(?i32, 100), .f = @as(?f64, 10.0) },
+        .{ .id = @as(i64, 5), .grp = @as(i32, 2), .v = @as(?i32, 200), .f = @as(?f64, 20.0) },
+    });
+    try t.flush();
+
+    // Global AVG (skips NULLs): AVG(v) = (10+30+100+200)/4 = 85
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.aggregate(&.{
+            .{ .func = .avg, .col = "v", .as = "avg_v" },
+            .{ .func = .avg, .col = "f", .as = "avg_f" },
+        });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(f64, 85.0), b.values[0].data.double[0]);
+        try std.testing.expectEqual(@as(f64, (1.5 + 2.5 + 10.0 + 20.0) / 4.0), b.values[1].data.double[0]);
+    }
+
+    // Grouped AVG.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.groupBy(&.{"grp"}, &.{
+            .{ .func = .avg, .col = "v", .as = "avg_v" },
+        });
+        defer q.deinit();
+
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 2), b.row_count);
+
+        // Order of groups is hashmap-defined; gather into (grp → avg) map.
+        var found1: ?f64 = null;
+        var found2: ?f64 = null;
+        for (0..b.row_count) |i| {
+            switch (b.values[0].data.int[i]) {
+                1 => found1 = b.values[1].data.double[i],
+                2 => found2 = b.values[1].data.double[i],
+                else => unreachable,
+            }
+        }
+        try std.testing.expectEqual(@as(f64, 20.0), found1.?); // (10+30)/2
+        try std.testing.expectEqual(@as(f64, 150.0), found2.?); // (100+200)/2
+    }
+}
+
 test "nullable: rejects ?T into a non-nullable column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
