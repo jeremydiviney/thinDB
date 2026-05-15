@@ -302,6 +302,133 @@ test "nullable: SUM, MIN, MAX, COUNT(col) skip NULL rows" {
     try std.testing.expect((try q.next()) == null);
 }
 
+// ---------------------------------------------------------------------------
+// FLOAT / DOUBLE columns
+// ---------------------------------------------------------------------------
+
+const float_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "price", .type = .float },
+        .{ .name = "ratio", .type = .double },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+
+const float_order_key = [_][]const u8{"id"};
+const float_opts = thindb.TableOptions{
+    .order_key = &float_order_key,
+    .unique = true,
+    .row_group_size = 4,
+};
+
+test "float/double: insert, flush, reread, comparison filter, aggregate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+        defer db.close();
+        const t = try db.table("prices", float_schema, float_opts);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .price = @as(f32, 1.5), .ratio = @as(f64, 0.25) },
+            .{ .id = @as(i64, 2), .price = @as(f32, 2.5), .ratio = @as(f64, 0.5) },
+            .{ .id = @as(i64, 3), .price = @as(f32, 10.0), .ratio = @as(f64, 0.75) },
+            .{ .id = @as(i64, 4), .price = @as(f32, -3.25), .ratio = @as(f64, 1.0) },
+        });
+        try t.flush();
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("prices", float_schema, float_opts);
+
+    // Reread + roundtrip values.
+    {
+        var q = try thindb.scan(allocator, t);
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 4), b.row_count);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 1.5, 2.5, 10.0, -3.25 }, b.values[1].data.float);
+        try std.testing.expectEqualSlices(f64, &[_]f64{ 0.25, 0.5, 0.75, 1.0 }, b.values[2].data.double);
+    }
+
+    // Comparison filter on float.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.filter(thindb.leafExpr("price", .gte, .{ .float = 2.0 }));
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, ids.items);
+    }
+
+    // SUM/MIN/MAX over float and double.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.aggregate(&.{
+            .{ .func = .sum, .col = "price", .as = "sum_price" },
+            .{ .func = .min, .col = "price", .as = "min_price" },
+            .{ .func = .max, .col = "price", .as = "max_price" },
+            .{ .func = .sum, .col = "ratio", .as = "sum_ratio" },
+            .{ .func = .min, .col = "ratio", .as = "min_ratio" },
+            .{ .func = .max, .col = "ratio", .as = "max_ratio" },
+        });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 1), b.row_count);
+        try std.testing.expectEqual(@as(f64, 1.5 + 2.5 + 10.0 - 3.25), b.values[0].data.double[0]);
+        try std.testing.expectEqual(@as(f32, -3.25), b.values[1].data.float[0]);
+        try std.testing.expectEqual(@as(f32, 10.0), b.values[2].data.float[0]);
+        try std.testing.expectEqual(@as(f64, 2.5), b.values[3].data.double[0]);
+        try std.testing.expectEqual(@as(f64, 0.25), b.values[4].data.double[0]);
+        try std.testing.expectEqual(@as(f64, 1.0), b.values[5].data.double[0]);
+    }
+}
+
+test "float: nullable column with SUM skipping NULLs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "x", .type = .float, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 4 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("nf", schema, opts);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .x = @as(?f32, 1.5) },
+        .{ .id = @as(i64, 2), .x = @as(?f32, null) },
+        .{ .id = @as(i64, 3), .x = @as(?f32, 2.5) },
+    });
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.aggregate(&.{
+        .{ .func = .count, .col = "x", .as = "n" },
+        .{ .func = .sum, .col = "x", .as = "s" },
+    });
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 2), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(f64, 4.0), b.values[1].data.double[0]);
+}
+
 test "nullable: rejects ?T into a non-nullable column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

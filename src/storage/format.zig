@@ -131,6 +131,12 @@ pub fn writeI32(buf: []u8, v: i32) void {
 pub fn writeI64(buf: []u8, v: i64) void {
     std.mem.writeInt(i64, buf[0..8], v, .little);
 }
+pub fn writeF32(buf: []u8, v: f32) void {
+    std.mem.writeInt(u32, buf[0..4], @bitCast(v), .little);
+}
+pub fn writeF64(buf: []u8, v: f64) void {
+    std.mem.writeInt(u64, buf[0..8], @bitCast(v), .little);
+}
 
 pub fn readU16(buf: []const u8) u16 {
     return std.mem.readInt(u16, buf[0..2], .little);
@@ -146,6 +152,12 @@ pub fn readI32(buf: []const u8) i32 {
 }
 pub fn readI64(buf: []const u8) i64 {
     return std.mem.readInt(i64, buf[0..8], .little);
+}
+pub fn readF32(buf: []const u8) f32 {
+    return @bitCast(std.mem.readInt(u32, buf[0..4], .little));
+}
+pub fn readF64(buf: []const u8) f64 {
+    return @bitCast(std.mem.readInt(u64, buf[0..8], .little));
 }
 
 // ---------- ArrayList(u8) append helpers ----------

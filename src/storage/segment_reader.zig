@@ -302,6 +302,24 @@ fn decodeRawColumn(
             const owned = try decodeStringRaw(allocator, values, row_count);
             return .{ .data = .{ .string = owned }, .nulls = nulls };
         },
+        .float => {
+            const data = try allocator.alloc(f32, row_count);
+            errdefer allocator.free(data);
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) {
+                data[i] = format.readF32(values[i * 4 .. i * 4 + 4]);
+            }
+            return .{ .data = .{ .float = data }, .nulls = nulls };
+        },
+        .double => {
+            const data = try allocator.alloc(f64, row_count);
+            errdefer allocator.free(data);
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) {
+                data[i] = format.readF64(values[i * 8 .. i * 8 + 8]);
+            }
+            return .{ .data = .{ .double = data }, .nulls = nulls };
+        },
     }
 }
 

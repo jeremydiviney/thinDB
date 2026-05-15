@@ -9,6 +9,8 @@ pub const TypeTag = enum(u8) {
     boolean = 3,
     varchar = 4,
     string = 5,
+    float = 6,
+    double = 7,
 };
 
 pub const Type = union(TypeTag) {
@@ -17,12 +19,16 @@ pub const Type = union(TypeTag) {
     boolean,
     varchar: u32, // declared max length (not enforced in v0.1)
     string,
+    float,
+    double,
 
     pub fn fixedSize(self: Type) ?usize {
         return switch (self) {
             .int => @sizeOf(i32),
             .bigint => @sizeOf(i64),
             .boolean => @sizeOf(u8),
+            .float => @sizeOf(f32),
+            .double => @sizeOf(f64),
             .varchar, .string => null,
         };
     }
@@ -34,11 +40,20 @@ pub const Type = union(TypeTag) {
         };
     }
 
+    pub fn isFloat(self: Type) bool {
+        return switch (self) {
+            .float, .double => true,
+            else => false,
+        };
+    }
+
     pub fn matchesZigType(self: Type, comptime T: type) bool {
         return switch (self) {
             .int => T == i32 or T == comptime_int,
             .bigint => T == i64 or T == comptime_int,
             .boolean => T == bool,
+            .float => T == f32 or T == comptime_float,
+            .double => T == f64 or T == comptime_float,
             .varchar, .string => isStringLikeType(T),
         };
     }
@@ -72,6 +87,8 @@ pub const ValueTag = enum(u8) {
     bigint = 2,
     boolean = 3,
     text = 4, // covers both VARCHAR and STRING
+    float = 5,
+    double = 6,
 
     pub fn fromType(t: Type) ValueTag {
         return switch (t) {
@@ -79,6 +96,8 @@ pub const ValueTag = enum(u8) {
             .bigint => .bigint,
             .boolean => .boolean,
             .varchar, .string => .text,
+            .float => .float,
+            .double => .double,
         };
     }
 };
@@ -88,6 +107,8 @@ pub const Value = union(ValueTag) {
     bigint: i64,
     boolean: bool,
     text: []const u8,
+    float: f32,
+    double: f64,
 
     pub fn compare(self: Value, other: Value) std.math.Order {
         std.debug.assert(std.meta.activeTag(self) == std.meta.activeTag(other));
@@ -95,6 +116,8 @@ pub const Value = union(ValueTag) {
             .int => |a| std.math.order(a, other.int),
             .bigint => |a| std.math.order(a, other.bigint),
             .boolean => |a| std.math.order(@as(u8, @intFromBool(a)), @as(u8, @intFromBool(other.boolean))),
+            .float => |a| std.math.order(a, other.float),
+            .double => |a| std.math.order(a, other.double),
             .text => |a| switch (std.mem.order(u8, a, other.text)) {
                 .lt => .lt,
                 .gt => .gt,

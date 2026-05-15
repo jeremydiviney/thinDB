@@ -749,6 +749,14 @@ fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bool) 
                 mask[i] = if (op == .eq) eq else !eq;
             }
         },
+        .float => |s| {
+            const want = p.val.float;
+            for (s[0..n], 0..) |v, i| mask[i] = cmp(f32, v, want, op);
+        },
+        .double => |s| {
+            const want = p.val.double;
+            for (s[0..n], 0..) |v, i| mask[i] = cmp(f64, v, want, op);
+        },
     }
     // Two-valued logic: a NULL value never matches a comparison.
     if (view.nulls != null) {
@@ -921,6 +929,8 @@ pub const Limit = struct {
                 .offsets = sv.offsets[0 .. n + 1],
                 .bytes = sv.bytes[0..sv.offsets[n]],
             } },
+            .float => |s| .{ .float = s[0..n] },
+            .double => |s| .{ .double = s[0..n] },
         };
         return .{ .data = new_data, .nulls = if (view.nulls) |b| b[0..storage.column.bitmapBytes(n)] else null };
     }
@@ -1111,14 +1121,17 @@ pub const AggSpec = struct {
     as: []const u8,
 };
 
-/// Per-aggregate accumulator state. All integer types accumulate into i64
-/// (MIN/MAX) or i128 (SUM); the final value is cast back to the declared
-/// output column type.
+/// Per-aggregate accumulator state. Integer types accumulate into i64
+/// (MIN/MAX) or i128 (SUM); float/double types accumulate into f64. The
+/// final value is cast back to the declared output column type.
 const AccState = union(enum) {
     count: u64,
     sum_int: i128,
+    sum_float: f64,
     min_int: ?i64,
     max_int: ?i64,
+    min_float: ?f64,
+    max_float: ?f64,
 };
 
 pub const Aggregate = struct {
@@ -1213,7 +1226,10 @@ pub const Aggregate = struct {
         // Single-state buffer (used iff no group-by columns).
         const single_state = try allocator.alloc(AccState, aggs.len);
         errdefer allocator.free(single_state);
-        for (aggs, single_state) |a, *s| s.* = initialState(a.func);
+        for (aggs, agg_col_indices, single_state) |a, idx, *s| {
+            const in_t: ?Type = if (idx) |i| up_schema[i].type else null;
+            s.* = initialState(a.func, in_t);
+        }
 
         const self = try allocator.create(Aggregate);
         errdefer allocator.destroy(self);
@@ -1297,7 +1313,11 @@ pub const Aggregate = struct {
             const gop = try self.groups.getOrPut(aa, key_bytes);
             if (!gop.found_existing) {
                 const state = try aa.alloc(AccState, self.aggs.len);
-                for (self.aggs, state) |a, *s| s.* = initialState(a.func);
+                const up_schema = self.upstream.outputSchema();
+                for (self.aggs, self.agg_col_indices, state) |a, maybe_idx, *s| {
+                    const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
+                    s.* = initialState(a.func, in_t);
+                }
                 gop.value_ptr.* = state;
             }
             const state = gop.value_ptr.*;
@@ -1331,19 +1351,31 @@ pub const Aggregate = struct {
     }
 };
 
-fn initialState(func: AggFunc) AccState {
+fn initialState(func: AggFunc, in: ?Type) AccState {
     return switch (func) {
         .count => .{ .count = 0 },
-        .sum => .{ .sum_int = 0 },
-        .min => .{ .min_int = null },
-        .max => .{ .max_int = null },
+        .sum => if (in != null and in.?.isFloat())
+            .{ .sum_float = 0.0 }
+        else
+            .{ .sum_int = 0 },
+        .min => if (in != null and in.?.isFloat())
+            .{ .min_float = null }
+        else
+            .{ .min_int = null },
+        .max => if (in != null and in.?.isFloat())
+            .{ .max_float = null }
+        else
+            .{ .max_int = null },
     };
 }
 
 fn aggOutputType(func: AggFunc, in: ?Type) !Type {
     return switch (func) {
         .count => .bigint,
-        .sum => .bigint,
+        .sum => blk: {
+            const t = in orelse return Error.AggregateColumnRequired;
+            break :blk if (t.isFloat()) .double else .bigint;
+        },
         .min, .max => in orelse return Error.AggregateNoSpecs,
     };
 }
@@ -1353,13 +1385,13 @@ fn validateAggFn(func: AggFunc, in: ?Type) !void {
         .count => return,
         .sum => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!(t == .int or t == .bigint or t == .boolean)) {
+            if (!(t == .int or t == .bigint or t == .boolean or t == .float or t == .double)) {
                 return Error.AggregateUnsupportedType;
             }
         },
         .min, .max => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!(t == .int or t == .bigint or t == .boolean)) {
+            if (!(t == .int or t == .bigint or t == .boolean or t == .float or t == .double)) {
                 return Error.AggregateUnsupportedType;
             }
         },
@@ -1407,6 +1439,14 @@ fn updateState(
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
+                .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.sum_float += v;
+                },
+                .double => |s_d| for (s_d[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.sum_float += v;
+                },
                 else => unreachable,
             }
         },
@@ -1427,6 +1467,15 @@ fn updateState(
                     if (!view.isValid(r)) continue;
                     const iv: i64 = v;
                     if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
+                },
+                .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    const fv: f64 = v;
+                    if (s.min_float == null or fv < s.min_float.?) s.min_float = fv;
+                },
+                .double => |s_d| for (s_d[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    if (s.min_float == null or v < s.min_float.?) s.min_float = v;
                 },
                 else => unreachable,
             }
@@ -1449,6 +1498,15 @@ fn updateState(
                     const iv: i64 = v;
                     if (s.max_int == null or iv > s.max_int.?) s.max_int = iv;
                 },
+                .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    const fv: f64 = v;
+                    if (s.max_float == null or fv > s.max_float.?) s.max_float = fv;
+                },
+                .double => |s_d| for (s_d[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    if (s.max_float == null or v > s.max_float.?) s.max_float = v;
+                },
                 else => unreachable,
             }
         },
@@ -1467,21 +1525,35 @@ fn appendAccToColumn(
             // BIGINT output
             try col.data.bigint.append(allocator, @intCast(state.count));
         },
-        .sum => {
-            // BIGINT output; check i128 → i64 overflow.
-            if (state.sum_int > std.math.maxInt(i64) or state.sum_int < std.math.minInt(i64)) {
-                return Error.ArithmeticOverflow;
-            }
-            try col.data.bigint.append(allocator, @intCast(state.sum_int));
+        .sum => switch (state) {
+            .sum_int => |total| {
+                if (total > std.math.maxInt(i64) or total < std.math.minInt(i64)) {
+                    return Error.ArithmeticOverflow;
+                }
+                try col.data.bigint.append(allocator, @intCast(total));
+            },
+            .sum_float => |total| try col.data.double.append(allocator, total),
+            else => unreachable,
         },
-        .min, .max => {
-            const v: i64 = if (func == .min) (state.min_int orelse 0) else (state.max_int orelse 0);
-            switch (out_type) {
-                .int => try col.data.int.append(allocator, @intCast(v)),
-                .bigint => try col.data.bigint.append(allocator, v),
-                .boolean => try col.data.boolean.append(allocator, @intCast(v)),
-                else => unreachable,
-            }
+        .min, .max => switch (state) {
+            .min_int, .max_int => {
+                const v: i64 = if (func == .min) (state.min_int orelse 0) else (state.max_int orelse 0);
+                switch (out_type) {
+                    .int => try col.data.int.append(allocator, @intCast(v)),
+                    .bigint => try col.data.bigint.append(allocator, v),
+                    .boolean => try col.data.boolean.append(allocator, @intCast(v)),
+                    else => unreachable,
+                }
+            },
+            .min_float, .max_float => {
+                const v: f64 = if (func == .min) (state.min_float orelse 0.0) else (state.max_float orelse 0.0);
+                switch (out_type) {
+                    .float => try col.data.float.append(allocator, @floatCast(v)),
+                    .double => try col.data.double.append(allocator, v),
+                    else => unreachable,
+                }
+            },
+            else => unreachable,
         },
     }
 }
@@ -1514,6 +1586,16 @@ fn compoundGroupKey(
                 const bytes = sv.rowBytes(row);
                 try storage.format.appendU32(aa, &buf, @intCast(bytes.len));
                 try buf.appendSlice(aa, bytes);
+            },
+            .float => |s| {
+                var b: [4]u8 = undefined;
+                storage.format.writeF32(&b, s[row]);
+                try buf.appendSlice(aa, &b);
+            },
+            .double => |s| {
+                var b: [8]u8 = undefined;
+                storage.format.writeF64(&b, s[row]);
+                try buf.appendSlice(aa, &b);
             },
         }
     }
@@ -1559,6 +1641,16 @@ fn appendGroupKey(
                 };
                 try ss.appendValue(allocator, bytes);
             },
+            .float => {
+                const v = storage.format.readF32(key_bytes[cursor .. cursor + 4]);
+                cursor += 4;
+                try out_cols[i].data.float.append(allocator, v);
+            },
+            .double => {
+                const v = storage.format.readF64(key_bytes[cursor .. cursor + 8]);
+                cursor += 8;
+                try out_cols[i].data.double.append(allocator, v);
+            },
         }
     }
 }
@@ -1578,7 +1670,7 @@ pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value)
         .int => |x| x,
         .bigint => |x| x,
         .boolean => |x| @intFromBool(x),
-        .text => return true, // no stats on strings
+        .text, .float, .double => return true, // no stats on strings/floats yet
     };
     return switch (op) {
         .eq => wanted >= s.min and wanted <= s.max,

@@ -710,6 +710,16 @@ fn appendColumnValueBytes(
             try storage.format.appendU32(aa, buf, @intCast(bytes.len));
             try buf.appendSlice(aa, bytes);
         },
+        .float => |s| {
+            var b: [4]u8 = undefined;
+            storage.format.writeF32(&b, s[row]);
+            try buf.appendSlice(aa, &b);
+        },
+        .double => |s| {
+            var b: [8]u8 = undefined;
+            storage.format.writeF64(&b, s[row]);
+            try buf.appendSlice(aa, &b);
+        },
     }
 }
 
@@ -720,6 +730,8 @@ fn evalRow(view: storage.ColumnView, row: u32, pred: exec.Predicate) bool {
         .boolean => |s| cmpVal(u8, s[row], @intFromBool(pred.val.boolean), pred.op),
         .varchar => |sv| cmpStr(sv.rowBytes(row), pred.val.text, pred.op),
         .string => |sv| cmpStr(sv.rowBytes(row), pred.val.text, pred.op),
+        .float => |s| cmpVal(f32, s[row], pred.val.float, pred.op),
+        .double => |s| cmpVal(f64, s[row], pred.val.double, pred.op),
     };
 }
 

@@ -233,6 +233,24 @@ fn writeRawColumnBlock(
         },
         .varchar => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
         .string => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
+        .float => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 4);
+            for (slice) |v| {
+                var b: [4]u8 = undefined;
+                format.writeF32(&b, v);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
+        .double => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 8);
+            for (slice) |v| {
+                var b: [8]u8 = undefined;
+                format.writeF64(&b, v);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
     }
 }
 
@@ -268,8 +286,8 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
             }
             break :blk .{ .min = lo, .max = hi };
         },
-        // Strings carry no stats in v0.2.
-        .varchar, .string => .{ .min = 0, .max = 0 },
+        // Strings + floats carry no stats today (NaN ordering punted).
+        .varchar, .string, .float, .double => .{ .min = 0, .max = 0 },
     };
 }
 

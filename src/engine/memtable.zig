@@ -126,6 +126,8 @@ pub const DataStore = union(TypeTag) {
     boolean: std.ArrayList(u8),
     varchar: StringStore,
     string: StringStore,
+    float: std.ArrayList(f32),
+    double: std.ArrayList(f64),
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return switch (t) {
@@ -134,6 +136,8 @@ pub const DataStore = union(TypeTag) {
             .boolean => .{ .boolean = .empty },
             .varchar => .{ .varchar = try StringStore.init(allocator) },
             .string => .{ .string = try StringStore.init(allocator) },
+            .float => .{ .float = .empty },
+            .double => .{ .double = .empty },
         };
     }
 
@@ -144,6 +148,8 @@ pub const DataStore = union(TypeTag) {
             .boolean => |*list| list.deinit(allocator),
             .varchar => |*ss| ss.deinit(allocator),
             .string => |*ss| ss.deinit(allocator),
+            .float => |*list| list.deinit(allocator),
+            .double => |*list| list.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -155,6 +161,8 @@ pub const DataStore = union(TypeTag) {
             .boolean => |l| l.items.len,
             .varchar => |s| s.rowCount(),
             .string => |s| s.rowCount(),
+            .float => |l| l.items.len,
+            .double => |l| l.items.len,
         };
     }
 
@@ -165,6 +173,8 @@ pub const DataStore = union(TypeTag) {
             .boolean => |l| .{ .boolean = l.items },
             .varchar => |s| .{ .varchar = s.view() },
             .string => |s| .{ .string = s.view() },
+            .float => |l| .{ .float = l.items },
+            .double => |l| .{ .double = l.items },
         };
     }
 
@@ -175,6 +185,8 @@ pub const DataStore = union(TypeTag) {
             .boolean => |*l| l.clearRetainingCapacity(),
             .varchar => |*s| s.clear(),
             .string => |*s| s.clear(),
+            .float => |*l| l.clearRetainingCapacity(),
+            .double => |*l| l.clearRetainingCapacity(),
         }
     }
 
@@ -188,6 +200,8 @@ pub const DataStore = union(TypeTag) {
             .boolean => |*l| try l.append(allocator, 0),
             .varchar => |*s| try s.appendValue(allocator, ""),
             .string => |*s| try s.appendValue(allocator, ""),
+            .float => |*l| try l.append(allocator, 0.0),
+            .double => |*l| try l.append(allocator, 0.0),
         }
     }
 };
@@ -236,6 +250,8 @@ pub const Memtable = struct {
                 .boolean => |l| l.items.len,
                 .varchar => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
                 .string => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
+                .float => |l| l.items.len * @sizeOf(f32),
+                .double => |l| l.items.len * @sizeOf(f64),
             };
             if (col.nulls) |n| total += n.items.len;
         }
@@ -434,11 +450,34 @@ pub const Memtable = struct {
             try self.appendInt64(col_idx, value);
         } else if (comptime V == bool) {
             try self.appendBoolean(col_idx, value);
+        } else if (comptime V == f32 or V == comptime_float) {
+            try self.appendFloat32Like(col_idx, V, value);
+        } else if (comptime V == f64) {
+            try self.appendFloat64(col_idx, value);
         } else if (comptime types.isStringLikeType(V)) {
             try self.appendString(col_idx, asConstSlice(value));
         } else {
             @compileError("memtable.appendValue: unsupported value type " ++ @typeName(V));
         }
+    }
+
+    fn appendFloat32Like(self: *Memtable, col_idx: usize, comptime V: type, value: V) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .float => |*list| try list.append(self.allocator, @as(f32, value)),
+            .double => |*list| try list.append(self.allocator, @as(f64, value)),
+            else => return Error.TypeMismatch,
+        }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+    }
+
+    fn appendFloat64(self: *Memtable, col_idx: usize, value: f64) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .double => |*list| try list.append(self.allocator, value),
+            else => return Error.TypeMismatch,
+        }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendInt32Like(self: *Memtable, col_idx: usize, comptime V: type, value: V) !void {
@@ -529,6 +568,14 @@ pub fn appendAllColumn(
             },
             else => unreachable,
         },
+        .float => |s| switch (out.data) {
+            .float => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
+        .double => |s| switch (out.data) {
+            .double => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
     }
     // Carry validity bits across.
     if (out.nulls != null) {
@@ -584,6 +631,20 @@ pub fn appendByIndices(
             },
             else => unreachable,
         },
+        .float => |s| switch (out.data) {
+            .float => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
+        .double => |s| switch (out.data) {
+            .double => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
     }
     if (out.nulls != null) {
         for (indices, 0..) |src_idx, j| {
@@ -628,6 +689,18 @@ pub fn appendMaskedColumn(
         .string => |sv| switch (out.data) {
             .string => |*ss| for (mask, 0..) |m, row| {
                 if (m) try ss.appendValue(allocator, sv.rowBytes(row));
+            },
+            else => unreachable,
+        },
+        .float => |s| switch (out.data) {
+            .float => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
+            },
+            else => unreachable,
+        },
+        .double => |s| switch (out.data) {
+            .double => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
             },
             else => unreachable,
         },
@@ -695,6 +768,18 @@ fn applyPermutation(
             for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
             break :blk DataStore{ .string = dst };
         },
+        .float => |l| blk: {
+            var dst: std.ArrayList(f32) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .float = dst };
+        },
+        .double => |l| blk: {
+            var dst: std.ArrayList(f64) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .double = dst };
+        },
     };
 
     var nulls: ?std.ArrayList(u8) = null;
@@ -722,6 +807,8 @@ fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
         .boolean => |l| std.math.order(l.items[a], l.items[b]),
         .varchar => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
         .string => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
+        .float => |l| std.math.order(l.items[a], l.items[b]),
+        .double => |l| std.math.order(l.items[a], l.items[b]),
     };
 }
 

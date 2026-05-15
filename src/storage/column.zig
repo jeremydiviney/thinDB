@@ -49,6 +49,8 @@ pub const ValueView = union(TypeTag) {
     boolean: []const u8,
     varchar: StringView,
     string: StringView,
+    float: []const f32,
+    double: []const f64,
 
     pub fn rowCount(self: ValueView) usize {
         return switch (self) {
@@ -57,6 +59,8 @@ pub const ValueView = union(TypeTag) {
             .boolean => |s| s.len,
             .varchar => |s| s.rowCount(),
             .string => |s| s.rowCount(),
+            .float => |s| s.len,
+            .double => |s| s.len,
         };
     }
 };
@@ -126,6 +130,8 @@ pub const OwnedData = union(TypeTag) {
     boolean: []u8,
     varchar: OwnedStringColumn,
     string: OwnedStringColumn,
+    float: []f32,
+    double: []f64,
 
     pub fn rowCount(self: OwnedData) usize {
         return switch (self) {
@@ -134,6 +140,8 @@ pub const OwnedData = union(TypeTag) {
             .boolean => |s| s.len,
             .varchar => |s| s.offsets.len - 1,
             .string => |s| s.offsets.len - 1,
+            .float => |s| s.len,
+            .double => |s| s.len,
         };
     }
 
@@ -144,6 +152,8 @@ pub const OwnedData = union(TypeTag) {
             .boolean => |s| .{ .boolean = s },
             .varchar => |s| .{ .varchar = s.view() },
             .string => |s| .{ .string = s.view() },
+            .float => |s| .{ .float = s },
+            .double => |s| .{ .double = s },
         };
     }
 
@@ -154,6 +164,8 @@ pub const OwnedData = union(TypeTag) {
             .boolean => |s| allocator.free(s),
             .varchar => |*s| s.deinit(allocator),
             .string => |*s| s.deinit(allocator),
+            .float => |s| allocator.free(s),
+            .double => |s| allocator.free(s),
         }
         self.* = undefined;
     }
