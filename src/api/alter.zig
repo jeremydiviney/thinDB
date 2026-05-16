@@ -178,8 +178,12 @@ fn valueTagMatchesType(v: Value, t: Type) bool {
     };
 }
 
-/// Shadow-rewrite the table. Holds `table.mutex` for the duration.
+/// Shadow-rewrite the table. Holds `ddl_lock` exclusive AND `table.mutex`
+/// for the duration — blocks readers (waiting on in-flight scans),
+/// writers (via the existing mutex), and any other DDL.
 pub fn execAlter(db: *Database, t: *Table, ops: []const AlterOp) !void {
+    t.ddl_lock.lockUncancelable(t.io);
+    defer t.ddl_lock.unlock(t.io);
     t.mutex.lockUncancelable(t.io);
     defer t.mutex.unlock(t.io);
 

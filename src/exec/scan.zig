@@ -86,6 +86,13 @@ pub const Scan = struct {
         const self = try allocator.create(Scan);
         errdefer allocator.destroy(self);
 
+        // Take the table's ddl_lock SHARED for the scan's entire lifetime.
+        // This blocks DDL (drop/alter/rename) from running while we have
+        // segment files and a pinned memtable in-flight. DDL waits at its
+        // exclusive lock acquisition until we deinit and release.
+        table.ddl_lock.lockSharedUncancelable(table.io);
+        errdefer table.ddl_lock.unlockShared(table.io);
+
         // Capture (segment_count, memtable_snap, memtable_row_count) atomically
         // under the table mutex so we see a consistent (segments, memtable)
         // pair. Pin the memtable via `acquire` so a subsequent flush/delete
@@ -145,6 +152,9 @@ pub const Scan = struct {
         // the memtable was retired (a flush/delete swapped it out), it's
         // freed here.
         self.memtable_snap.release();
+        // Release our shared ddl_lock — any DDL waiter on the exclusive
+        // lock can now proceed once all shared holders have released.
+        self.table.ddl_lock.unlockShared(self.table.io);
         const allocator = self.allocator;
         allocator.destroy(self);
     }

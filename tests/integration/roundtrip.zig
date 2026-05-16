@@ -2379,6 +2379,51 @@ test "alterTable: rejects dropping a column in the order key" {
     }));
 }
 
+test "ddl_lock: dropTable waits for an in-flight scan to release before proceeding" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("orders", schema_v1, opts_v1);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+    });
+    try t.flush();
+
+    // Start a scan and hold its shared ddl_lock by NOT yet calling deinit.
+    var q = try thindb.scan(allocator, t);
+
+    // Spawn a thread that calls dropTable — should block until we deinit q.
+    var drop_completed: std.atomic.Value(bool) = .init(false);
+    const Ctx = struct {
+        db: *thindb.Database,
+        completed: *std.atomic.Value(bool),
+        fn run(self: @This()) void {
+            self.db.dropTable("orders") catch {};
+            self.completed.store(true, .release);
+        }
+    };
+    const thr = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .db = db, .completed = &drop_completed }});
+
+    // Yield a couple of times to let the drop thread run far enough to
+    // attempt the exclusive lock acquisition and BLOCK.
+    var i: usize = 0;
+    while (i < 100) : (i += 1) std.Thread.yield() catch {};
+
+    // Drop must NOT have completed — the scan still holds shared ddl_lock.
+    try std.testing.expect(!drop_completed.load(.acquire));
+
+    // Releasing the scan lets drop proceed.
+    q.deinit();
+    thr.join();
+    try std.testing.expect(drop_completed.load(.acquire));
+}
+
 test "alterTable: rejects duplicate column name on add" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -179,26 +179,55 @@ pub const Database = struct {
         allocator.destroy(self);
     }
 
-    /// One sweep of the background flush check: takes a brief snapshot of
-    /// open tables and calls `tryBackgroundFlush` on each. Designed to be
-    /// driven by an external loop (an OS thread, a task on an `Io`, or a
-    /// test harness). Safe to call concurrently with `insert` / `flush`
-    /// because each `tryBackgroundFlush` non-blockingly `tryLock`s the
-    /// table.
+    /// One sweep of the background flush check. Looks up each known table
+    /// by name under `tables_mutex` and atomically grabs its `ddl_lock`
+    /// shared before releasing the map lock — this prevents a concurrent
+    /// `dropTable` from freeing the Table while we still hold a pointer
+    /// to it. Then calls `tryBackgroundFlush` (non-blocking on the per-
+    /// table write mutex).
     pub fn backgroundFlushSweep(self: *Database) !void {
-        self.tables_mutex.lockUncancelable(self.io);
-        const count = self.tables.count();
-        const ptrs = self.allocator.alloc(*Table, count) catch |err| {
-            self.tables_mutex.unlock(self.io);
-            return err;
-        };
-        defer self.allocator.free(ptrs);
-        var i: usize = 0;
-        var it = self.tables.valueIterator();
-        while (it.next()) |p| : (i += 1) ptrs[i] = p.*;
-        self.tables_mutex.unlock(self.io);
+        const names = try self.snapshotTableNames();
+        defer self.freeTableNames(names);
 
-        for (ptrs) |t| t.tryBackgroundFlush() catch {};
+        for (names) |name| {
+            if (self.acquireTableShared(name)) |t| {
+                defer t.ddl_lock.unlockShared(t.io);
+                t.tryBackgroundFlush() catch {};
+            }
+        }
+    }
+
+    /// Snapshot the current set of table names. Names are duplicated so
+    /// they survive a concurrent drop. Caller frees with `freeTableNames`.
+    fn snapshotTableNames(self: *Database) ![][]u8 {
+        self.tables_mutex.lockUncancelable(self.io);
+        defer self.tables_mutex.unlock(self.io);
+
+        const out = try self.allocator.alloc([]u8, self.tables.count());
+        errdefer self.allocator.free(out);
+        var i: usize = 0;
+        errdefer for (out[0..i]) |s| self.allocator.free(s);
+        var it = self.tables.keyIterator();
+        while (it.next()) |k| : (i += 1) {
+            out[i] = try self.allocator.dupe(u8, k.*);
+        }
+        return out;
+    }
+
+    fn freeTableNames(self: *Database, names: [][]u8) void {
+        for (names) |s| self.allocator.free(s);
+        self.allocator.free(names);
+    }
+
+    /// Re-resolve `name` under `tables_mutex` AND grab its `ddl_lock`
+    /// shared atomically. Returns `null` if the table has been dropped
+    /// since the snapshot. Caller MUST `t.ddl_lock.unlockShared` when done.
+    fn acquireTableShared(self: *Database, name: []const u8) ?*Table {
+        self.tables_mutex.lockUncancelable(self.io);
+        defer self.tables_mutex.unlock(self.io);
+        const t = self.tables.get(name) orelse return null;
+        t.ddl_lock.lockSharedUncancelable(t.io);
+        return t;
     }
 
     /// Blocking loop that drives `backgroundFlushSweep` at `poll_ms`
@@ -233,26 +262,22 @@ pub const Database = struct {
         }
     }
 
-    /// One sweep of the background compaction check. Snapshots open tables
-    /// under `tables_mutex`, then calls `tryBackgroundCompact` on each.
-    /// Compaction runs only when a table's segment count meets the
-    /// configured threshold AND the table mutex is uncontended.
+    /// One sweep of the background compaction check. Same coordination
+    /// pattern as `backgroundFlushSweep`: name-snapshot + atomic shared
+    /// lock acquisition so a concurrent drop can't free the Table out
+    /// from under us.
     pub fn backgroundCompactSweep(self: *Database) !void {
-        self.tables_mutex.lockUncancelable(self.io);
-        const count = self.tables.count();
-        const ptrs = self.allocator.alloc(*Table, count) catch |err| {
-            self.tables_mutex.unlock(self.io);
-            return err;
-        };
-        defer self.allocator.free(ptrs);
-        var i: usize = 0;
-        var it = self.tables.valueIterator();
-        while (it.next()) |p| : (i += 1) ptrs[i] = p.*;
-        self.tables_mutex.unlock(self.io);
+        const names = try self.snapshotTableNames();
+        defer self.freeTableNames(names);
 
         const min_segs = self.config.compact_min_segments;
         const tomb_thresh = self.config.compact_tombstone_threshold;
-        for (ptrs) |t| t.tryBackgroundCompact(min_segs, tomb_thresh) catch {};
+        for (names) |name| {
+            if (self.acquireTableShared(name)) |t| {
+                defer t.ddl_lock.unlockShared(t.io);
+                t.tryBackgroundCompact(min_segs, tomb_thresh) catch {};
+            }
+        }
     }
 
     /// Blocking loop that drives `backgroundCompactSweep` at `poll_ms`
@@ -341,23 +366,26 @@ pub const Database = struct {
         return t;
     }
 
-    /// Drop a table by name. Closes the table (releasing its memtable
-    /// reference — refcounted, so any active scan keeps its pinned snapshot
-    /// alive), removes it from the in-memory map, and deletes the table's
-    /// directory tree from disk. Errors with `TableNotFound` if no table by
-    /// that name exists either in memory or on disk.
+    /// Drop a table by name. Removes it from the in-memory map, waits for
+    /// any in-flight scans to finish (via the table's exclusive ddl_lock),
+    /// then closes and deletes the directory tree from disk. Errors with
+    /// `TableNotFound` if no table by that name exists in memory or on disk.
     ///
-    /// CALLER RESPONSIBILITY: ensure no active `Query` references this
-    /// table. Holding a `*Table` pointer past `dropTable` is a use-after-
-    /// free. (Memtable snapshots survive correctly because they're
-    /// refcounted; the Table struct itself is destroyed.)
+    /// After this returns, any caller-held `*Table` pointer is dangling.
     pub fn dropTable(self: *Database, name: []const u8) !void {
         self.tables_mutex.lockUncancelable(self.io);
         const maybe_existing = self.tables.fetchRemove(name);
         self.tables_mutex.unlock(self.io);
 
         if (maybe_existing) |entry| {
-            entry.value.close();
+            const t = entry.value;
+            // Wait for any active scans on this table to finish. Once we
+            // hold the exclusive lock, no further shared lock acquisitions
+            // can succeed — and the table is no longer in the map, so new
+            // scans wouldn't even find it.
+            t.ddl_lock.lockUncancelable(t.io);
+            // Don't unlock — we're destroying the holder of the lock.
+            t.close();
         } else {
             // Not in memory — verify it exists on disk before claiming success.
             var probe = self.data_dir.openDir(self.io, name, .{}) catch |err| switch (err) {
@@ -397,9 +425,8 @@ pub const Database = struct {
     /// if `new_name` is already taken. The existing `*Table` pointer
     /// remains valid — any caller holding it continues to work.
     ///
-    /// CALLER RESPONSIBILITY: ensure no active `Query` references this
-    /// table. We close + reopen the table's directory handles around the
-    /// rename (Windows refuses to rename a directory with an open handle).
+    /// Acquires the table's ddl_lock exclusive — blocks until any in-flight
+    /// scans finish, and blocks new scans for the duration of the rename.
     pub fn renameTable(self: *Database, old_name: []const u8, new_name: []const u8) !void {
         self.tables_mutex.lockUncancelable(self.io);
         defer self.tables_mutex.unlock(self.io);
@@ -417,12 +444,15 @@ pub const Database = struct {
 
         const t = self.tables.get(old_name) orelse return Error.TableNotFound;
 
-        // Pause writers on this table and close its directory handles so
-        // Windows will let us rename. The handles point to the same inode
-        // after rename, but we have to reopen via the new path.
+        // Block readers (waits for in-flight scans) and writers.
+        t.ddl_lock.lockUncancelable(t.io);
+        defer t.ddl_lock.unlock(t.io);
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
 
+        // Close the dir handles so Windows will let us rename. The handles
+        // point to the same inode after rename, but we have to reopen via
+        // the new path.
         t.segments_dir.close(t.io);
         t.table_dir.close(t.io);
 
@@ -488,6 +518,16 @@ pub const Table = struct {
     /// before touching the memtable / manifest. Internal `*Locked` helpers
     /// assume it's already held.
     mutex: Io.Mutex = .init,
+
+    /// Reader/DDL coordination. Scans hold this SHARED for their entire
+    /// lifetime (acquire on create, release on deinit). DDL operations
+    /// (drop / alter / rename) hold it EXCLUSIVE. Background flushers and
+    /// compactors briefly hold it shared while they have a `*Table` pointer.
+    ///
+    /// Semantic: DDL waits for in-flight scans to finish, then runs while
+    /// no new scans can start. Standard SQL-DB behavior (cf. PostgreSQL
+    /// AccessExclusiveLock, MySQL MDL).
+    ddl_lock: Io.RwLock = .init,
 
     fn open(
         allocator: Allocator,
