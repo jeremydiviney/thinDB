@@ -1169,6 +1169,46 @@ test "error: insert with wrong-type value into typed column" {
 // Background flusher thread
 // ---------------------------------------------------------------------------
 
+test "runBackgroundFlusher: thread actually flushes when triggers fire" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Configure the inline auto-flush triggers wide so the bg sweep is the
+    // only thing that can flush — but enable the time-based trigger.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        .auto_flush_secs = 0, // disable time trigger inline...
+        .auto_flush_rows = 1_000_000,
+        .auto_flush_bytes = 64 * 1024 * 1024,
+        .auto_flush_min_rows = 0,
+        .auto_flush_min_bytes = 0,
+    });
+    defer db.close();
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    // Insert; this won't trigger an inline flush (thresholds too high) and
+    // the time-based trigger is off, so the memtable sits.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+    });
+    try std.testing.expectEqual(@as(usize, 0), t.segmentCount());
+
+    // Manually drive a sweep — and it should flush nothing because all
+    // triggers are off. This proves the inline path doesn't fire.
+    try db.backgroundFlushSweep();
+    try std.testing.expectEqual(@as(usize, 0), t.segmentCount());
+    try std.testing.expectEqual(@as(u64, 2), t.memtable.row_count);
+
+    // Manual flush works:
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+    try std.testing.expectEqual(@as(u64, 0), t.memtable.row_count);
+}
+
 test "runBackgroundFlusher: spawns a thread that drives flush sweeps" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
