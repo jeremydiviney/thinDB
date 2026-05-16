@@ -2117,3 +2117,119 @@ test "nullable: rejects ?T into a non-nullable column" {
         .{ .id = @as(i64, 1), .qty = @as(?i32, null), .active = true, .tag = "x" },
     }));
 }
+
+// ---------------------------------------------------------------------------
+// dropTable / renameTable
+// ---------------------------------------------------------------------------
+
+test "dropTable: removes the directory and forgets the table" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.table("orders", schema_v1, opts_v1);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        });
+        try t.flush();
+
+        try db.dropTable("orders");
+
+        // Dropping again is an error.
+        try std.testing.expectError(thindb.Error.TableNotFound, db.dropTable("orders"));
+    }
+
+    // After reopen, second drop attempt confirms the on-disk directory is gone.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try std.testing.expectError(thindb.Error.TableNotFound, db.dropTable("orders"));
+}
+
+test "dropTable: works on a table that exists only on disk (not yet opened)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Session 1: create + flush + close.
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.table("orders", schema_v1, opts_v1);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        });
+        try t.flush();
+    }
+
+    // Session 2: drop without opening first.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try db.dropTable("orders");
+    // Dropping again confirms it's gone.
+    try std.testing.expectError(thindb.Error.TableNotFound, db.dropTable("orders"));
+}
+
+test "renameTable: changes the on-disk directory and the in-memory key" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.table("orders", schema_v1, opts_v1);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "alpha" },
+            .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "beta" },
+        });
+        try t.flush();
+
+        try db.renameTable("orders", "orders_v2");
+
+        // Existing pointer still works; same data, new name.
+        try std.testing.expectEqualStrings("orders_v2", t.name);
+
+        // Old name returns TableNotFound on drop.
+        try std.testing.expectError(thindb.Error.TableNotFound, db.dropTable("orders"));
+    }
+
+    // After reopen, the new name has the rows; the old name's directory
+    // is gone (confirmed by a drop attempt returning TableNotFound).
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try std.testing.expectError(thindb.Error.TableNotFound, db.dropTable("orders"));
+
+    const t = try db.openTable("orders_v2", .{});
+
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var seen: usize = 0;
+    while (try q.next()) |batch| seen += batch.row_count;
+    try std.testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "renameTable: rejects collision with existing name" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    _ = try db.table("orders", schema_v1, opts_v1);
+    _ = try db.table("invoices", schema_v1, opts_v1);
+
+    try std.testing.expectError(thindb.Error.TableAlreadyExists, db.renameTable("orders", "invoices"));
+}

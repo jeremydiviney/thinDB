@@ -23,6 +23,11 @@ pub const Error = error{
     SchemaMismatch,
     UnsupportedUniqueKeyType,
     UpsertRequiresUniqueKey,
+    TableNotFound,
+    TableAlreadyExists,
+    ColumnNotFound,
+    ColumnAlreadyExists,
+    UnsupportedAlterOp,
 };
 
 pub const SyncMode = enum { none, per_flush };
@@ -301,6 +306,89 @@ pub const Database = struct {
         defer self.tables_mutex.unlock(self.io);
         try self.tables.put(t.name, t);
         return t;
+    }
+
+    /// Drop a table by name. Closes the table (releasing its memtable
+    /// reference — refcounted, so any active scan keeps its pinned snapshot
+    /// alive), removes it from the in-memory map, and deletes the table's
+    /// directory tree from disk. Errors with `TableNotFound` if no table by
+    /// that name exists either in memory or on disk.
+    ///
+    /// CALLER RESPONSIBILITY: ensure no active `Query` references this
+    /// table. Holding a `*Table` pointer past `dropTable` is a use-after-
+    /// free. (Memtable snapshots survive correctly because they're
+    /// refcounted; the Table struct itself is destroyed.)
+    pub fn dropTable(self: *Database, name: []const u8) !void {
+        self.tables_mutex.lockUncancelable(self.io);
+        const maybe_existing = self.tables.fetchRemove(name);
+        self.tables_mutex.unlock(self.io);
+
+        if (maybe_existing) |entry| {
+            entry.value.close();
+        } else {
+            // Not in memory — verify it exists on disk before claiming success.
+            var probe = self.data_dir.openDir(self.io, name, .{}) catch |err| switch (err) {
+                error.FileNotFound => return Error.TableNotFound,
+                else => return err,
+            };
+            probe.close(self.io);
+        }
+
+        // deleteTree silently treats a missing path as success — no need to
+        // special-case FileNotFound here.
+        try self.data_dir.deleteTree(self.io, name);
+    }
+
+    /// Rename a table. Renames the on-disk directory, updates the in-memory
+    /// map key, and updates the Table's internal name string. Errors with
+    /// `TableNotFound` if `old_name` isn't present, or `TableAlreadyExists`
+    /// if `new_name` is already taken. The existing `*Table` pointer
+    /// remains valid — any caller holding it continues to work.
+    ///
+    /// CALLER RESPONSIBILITY: ensure no active `Query` references this
+    /// table. We close + reopen the table's directory handles around the
+    /// rename (Windows refuses to rename a directory with an open handle).
+    pub fn renameTable(self: *Database, old_name: []const u8, new_name: []const u8) !void {
+        self.tables_mutex.lockUncancelable(self.io);
+        defer self.tables_mutex.unlock(self.io);
+
+        if (self.tables.get(new_name) != null) return Error.TableAlreadyExists;
+        // Detect collision with an on-disk-only directory under the new name.
+        if (self.data_dir.openDir(self.io, new_name, .{})) |probe_| {
+            var probe = probe_;
+            probe.close(self.io);
+            return Error.TableAlreadyExists;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        const t = self.tables.get(old_name) orelse return Error.TableNotFound;
+
+        // Pause writers on this table and close its directory handles so
+        // Windows will let us rename. The handles point to the same inode
+        // after rename, but we have to reopen via the new path.
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+
+        t.segments_dir.close(t.io);
+        t.table_dir.close(t.io);
+
+        try self.data_dir.rename(old_name, self.data_dir, new_name, self.io);
+
+        t.table_dir = try self.data_dir.openDir(self.io, new_name, .{});
+        t.segments_dir = try t.table_dir.openDir(t.io, "segments", .{});
+
+        // Update the Table's name string. The hashmap stores the new name
+        // as its key (which is t.name).
+        const new_owned = try self.allocator.dupe(u8, new_name);
+        const old_owned = t.name;
+        t.name = new_owned;
+
+        _ = self.tables.remove(old_name);
+        try self.tables.put(t.name, t);
+
+        self.allocator.free(old_owned);
     }
 };
 

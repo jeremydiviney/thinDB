@@ -24,6 +24,7 @@ pub const Config = api.Config;
 pub const SyncMode = api.SyncMode;
 pub const TableOptions = api.TableOptions;
 pub const OpenOptions = api.OpenOptions;
+pub const Error = api.Error;
 pub const Query = exec.Query;
 pub const Batch = exec.Batch;
 pub const Predicate = exec.Predicate;
