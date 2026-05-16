@@ -8,12 +8,20 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const Type = types.Type;
 const Schema = types.Schema;
-const TypeTag = types.TypeTag;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
-const ValueView = storage.column.ValueView;
-const StringView = storage.StringView;
+
+const store = @import("store.zig");
+pub const StringStore = store.StringStore;
+pub const ColumnStore = store.ColumnStore;
+pub const DataStore = store.DataStore;
+
+const transform = @import("transform.zig");
+pub const appendAllColumn = transform.appendAllColumn;
+pub const appendByIndices = transform.appendByIndices;
+pub const appendMaskedColumn = transform.appendMaskedColumn;
+pub const compareInColumn = transform.compareInColumn;
 
 pub const Error = error{
     ColumnNotFound,
@@ -21,230 +29,19 @@ pub const Error = error{
     MissingColumn,
 };
 
-/// Variable-width string column buffer. `offsets` is invariant length
-/// `row_count + 1` with `offsets[0] == 0` and `offsets[row_count]` = total bytes.
-pub const StringStore = struct {
-    offsets: std.ArrayList(u32),
-    bytes: std.ArrayList(u8),
+/// Owns the buffers produced by `Memtable.buildSortedSnapshot`. `views`
+/// borrows from `columns`.
+pub const SortedSnapshot = struct {
+    allocator: Allocator,
+    columns: []ColumnStore,
+    views: []ColumnView,
+    row_count: u64,
 
-    pub fn init(allocator: Allocator) Allocator.Error!StringStore {
-        var offsets: std.ArrayList(u32) = .empty;
-        errdefer offsets.deinit(allocator);
-        try offsets.append(allocator, 0);
-        return .{ .offsets = offsets, .bytes = .empty };
-    }
-
-    pub fn deinit(self: *StringStore, allocator: Allocator) void {
-        self.offsets.deinit(allocator);
-        self.bytes.deinit(allocator);
+    pub fn deinit(self: *SortedSnapshot) void {
+        for (self.columns) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.columns);
+        self.allocator.free(self.views);
         self.* = undefined;
-    }
-
-    pub fn appendValue(self: *StringStore, allocator: Allocator, slice: []const u8) !void {
-        try self.bytes.appendSlice(allocator, slice);
-        try self.offsets.append(allocator, @intCast(self.bytes.items.len));
-    }
-
-    pub fn rowCount(self: StringStore) usize {
-        return self.offsets.items.len - 1;
-    }
-
-    pub fn view(self: StringStore) StringView {
-        return .{ .offsets = self.offsets.items, .bytes = self.bytes.items };
-    }
-
-    pub fn clear(self: *StringStore) void {
-        self.offsets.clearRetainingCapacity();
-        self.bytes.clearRetainingCapacity();
-        self.offsets.appendAssumeCapacity(0);
-    }
-};
-
-pub const ColumnStore = struct {
-    data: DataStore,
-    /// Validity bitmap (1 = valid, 0 = null). Present iff the column is
-    /// nullable. Grown alongside the data so `data.rowCount()` rows always
-    /// have a bit available.
-    nulls: ?std.ArrayList(u8) = null,
-
-    pub fn init(allocator: Allocator, t: Type, nullable: bool) Allocator.Error!ColumnStore {
-        return .{
-            .data = try DataStore.init(allocator, t),
-            .nulls = if (nullable) std.ArrayList(u8).empty else null,
-        };
-    }
-
-    pub fn deinit(self: *ColumnStore, allocator: Allocator) void {
-        self.data.deinit(allocator);
-        if (self.nulls) |*n| n.deinit(allocator);
-        self.* = undefined;
-    }
-
-    pub fn rowCount(self: ColumnStore) usize {
-        return self.data.rowCount();
-    }
-
-    pub fn view(self: ColumnStore) ColumnView {
-        return .{
-            .data = self.data.view(),
-            .nulls = if (self.nulls) |n| n.items else null,
-        };
-    }
-
-    pub fn clear(self: *ColumnStore) void {
-        self.data.clear();
-        if (self.nulls) |*n| n.clearRetainingCapacity();
-    }
-
-    /// Append a single validity bit for the row at index `row` (= current row
-    /// count BEFORE this call's data append). Grows the bitmap byte by byte
-    /// as needed. No-op on non-nullable columns.
-    pub fn appendValidBit(self: *ColumnStore, allocator: Allocator, row: usize, valid: bool) !void {
-        const nulls = self.nullsPtr() orelse return;
-        const byte_idx = row >> 3;
-        if (byte_idx >= nulls.items.len) {
-            const need = byte_idx + 1 - nulls.items.len;
-            try nulls.appendNTimes(allocator, 0, need);
-        }
-        const bit: u3 = @intCast(row & 7);
-        if (valid) {
-            nulls.items[byte_idx] |= (@as(u8, 1) << bit);
-        } else {
-            nulls.items[byte_idx] &= ~(@as(u8, 1) << bit);
-        }
-    }
-
-    fn nullsPtr(self: *ColumnStore) ?*std.ArrayList(u8) {
-        if (self.nulls) |_| return &self.nulls.?;
-        return null;
-    }
-};
-
-pub const DataStore = union(TypeTag) {
-    int: std.ArrayList(i32),
-    bigint: std.ArrayList(i64),
-    boolean: std.ArrayList(u8),
-    varchar: StringStore,
-    string: StringStore,
-    float: std.ArrayList(f32),
-    double: std.ArrayList(f64),
-    date: std.ArrayList(i32),
-    datetime: std.ArrayList(i64),
-    tinyint: std.ArrayList(i8),
-    smallint: std.ArrayList(i16),
-    largeint: std.ArrayList(i128),
-    char: StringStore,
-
-    pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
-        return switch (t) {
-            .int => .{ .int = .empty },
-            .bigint => .{ .bigint = .empty },
-            .boolean => .{ .boolean = .empty },
-            .varchar => .{ .varchar = try StringStore.init(allocator) },
-            .string => .{ .string = try StringStore.init(allocator) },
-            .float => .{ .float = .empty },
-            .double => .{ .double = .empty },
-            .date => .{ .date = .empty },
-            .datetime => .{ .datetime = .empty },
-            .tinyint => .{ .tinyint = .empty },
-            .smallint => .{ .smallint = .empty },
-            .largeint => .{ .largeint = .empty },
-            .char => .{ .char = try StringStore.init(allocator) },
-        };
-    }
-
-    pub fn deinit(self: *DataStore, allocator: Allocator) void {
-        switch (self.*) {
-            .int => |*list| list.deinit(allocator),
-            .bigint => |*list| list.deinit(allocator),
-            .boolean => |*list| list.deinit(allocator),
-            .varchar => |*ss| ss.deinit(allocator),
-            .string => |*ss| ss.deinit(allocator),
-            .float => |*list| list.deinit(allocator),
-            .double => |*list| list.deinit(allocator),
-            .date => |*list| list.deinit(allocator),
-            .datetime => |*list| list.deinit(allocator),
-            .tinyint => |*list| list.deinit(allocator),
-            .smallint => |*list| list.deinit(allocator),
-            .largeint => |*list| list.deinit(allocator),
-            .char => |*ss| ss.deinit(allocator),
-        }
-        self.* = undefined;
-    }
-
-    pub fn rowCount(self: DataStore) usize {
-        return switch (self) {
-            .int => |l| l.items.len,
-            .bigint => |l| l.items.len,
-            .boolean => |l| l.items.len,
-            .varchar => |s| s.rowCount(),
-            .string => |s| s.rowCount(),
-            .float => |l| l.items.len,
-            .double => |l| l.items.len,
-            .date => |l| l.items.len,
-            .datetime => |l| l.items.len,
-            .tinyint => |l| l.items.len,
-            .smallint => |l| l.items.len,
-            .largeint => |l| l.items.len,
-            .char => |s| s.rowCount(),
-        };
-    }
-
-    pub fn view(self: DataStore) ValueView {
-        return switch (self) {
-            .int => |l| .{ .int = l.items },
-            .bigint => |l| .{ .bigint = l.items },
-            .boolean => |l| .{ .boolean = l.items },
-            .varchar => |s| .{ .varchar = s.view() },
-            .string => |s| .{ .string = s.view() },
-            .float => |l| .{ .float = l.items },
-            .double => |l| .{ .double = l.items },
-            .date => |l| .{ .date = l.items },
-            .datetime => |l| .{ .datetime = l.items },
-            .tinyint => |l| .{ .tinyint = l.items },
-            .smallint => |l| .{ .smallint = l.items },
-            .largeint => |l| .{ .largeint = l.items },
-            .char => |s| .{ .char = s.view() },
-        };
-    }
-
-    pub fn clear(self: *DataStore) void {
-        switch (self.*) {
-            .int => |*l| l.clearRetainingCapacity(),
-            .bigint => |*l| l.clearRetainingCapacity(),
-            .boolean => |*l| l.clearRetainingCapacity(),
-            .varchar => |*s| s.clear(),
-            .string => |*s| s.clear(),
-            .float => |*l| l.clearRetainingCapacity(),
-            .double => |*l| l.clearRetainingCapacity(),
-            .date => |*l| l.clearRetainingCapacity(),
-            .datetime => |*l| l.clearRetainingCapacity(),
-            .tinyint => |*l| l.clearRetainingCapacity(),
-            .smallint => |*l| l.clearRetainingCapacity(),
-            .largeint => |*l| l.clearRetainingCapacity(),
-            .char => |*s| s.clear(),
-        }
-    }
-
-    /// Append a placeholder/null value (zero for ints, false for bool,
-    /// empty for strings). Used when the row's actual value is NULL — the
-    /// data slot still has to be filled to keep row indices aligned.
-    pub fn appendNullPlaceholder(self: *DataStore, allocator: Allocator) !void {
-        switch (self.*) {
-            .int => |*l| try l.append(allocator, 0),
-            .bigint => |*l| try l.append(allocator, 0),
-            .boolean => |*l| try l.append(allocator, 0),
-            .varchar => |*s| try s.appendValue(allocator, ""),
-            .string => |*s| try s.appendValue(allocator, ""),
-            .float => |*l| try l.append(allocator, 0.0),
-            .double => |*l| try l.append(allocator, 0.0),
-            .date => |*l| try l.append(allocator, 0),
-            .datetime => |*l| try l.append(allocator, 0),
-            .tinyint => |*l| try l.append(allocator, 0),
-            .smallint => |*l| try l.append(allocator, 0),
-            .largeint => |*l| try l.append(allocator, 0),
-            .char => |*s| try s.appendValue(allocator, ""),
-        }
     }
 };
 
@@ -332,7 +129,7 @@ pub const Memtable = struct {
         }
 
         for (self.columns, 0..) |src, ci| {
-            try appendMaskedColumn(self.allocator, src.view(), keep, &new_columns[ci]);
+            try transform.appendMaskedColumn(self.allocator, src.view(), keep, &new_columns[ci]);
         }
 
         for (self.columns) |*c| c.deinit(self.allocator);
@@ -369,7 +166,7 @@ pub const Memtable = struct {
 
             pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
                 for (ctx.keys) |ci| {
-                    const ord = compareInColumn(ctx.mt.columns[ci], a, b);
+                    const ord = transform.compareInColumn(ctx.mt.columns[ci], a, b);
                     if (ord == .lt) return true;
                     if (ord == .gt) return false;
                 }
@@ -385,7 +182,7 @@ pub const Memtable = struct {
         errdefer for (sorted_columns[0..inited]) |*c| c.deinit(allocator);
 
         for (self.columns, 0..) |src, ci| {
-            sorted_columns[ci] = try applyPermutation(allocator, src, perm);
+            sorted_columns[ci] = try transform.applyPermutation(allocator, src, perm);
             inited += 1;
         }
 
@@ -400,6 +197,7 @@ pub const Memtable = struct {
             .row_count = self.row_count,
         };
     }
+
     /// Append a slice/array/tuple of row structs. Each row must have one field
     /// per schema column. Field types are validated against schema column types
     /// via `Type.matchesZigType`.
@@ -658,434 +456,6 @@ pub const Memtable = struct {
     }
 };
 
-/// Compare row `a` vs row `b` within a single column. Lexicographic order
-/// for strings, numeric order for everything else. Used by sort kernels.
-pub fn compareInColumnPub(col: ColumnStore, a: u32, b: u32) std.math.Order {
-    return compareInColumn(col, a, b);
-}
-
-/// Append every row of `view` (including its validity bits if `view.nulls`
-/// is non-null) to `out`. Types must match.
-pub fn appendAllColumn(
-    allocator: Allocator,
-    view: ColumnView,
-    out: *ColumnStore,
-) !void {
-    const dst_start = out.data.rowCount();
-    switch (view.data) {
-        .int => |s| switch (out.data) {
-            .int => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .bigint => |s| switch (out.data) {
-            .bigint => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .boolean => |s| switch (out.data) {
-            .boolean => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .varchar => |sv| switch (out.data) {
-            .varchar => |*ss| {
-                for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
-            },
-            else => unreachable,
-        },
-        .string => |sv| switch (out.data) {
-            .string => |*ss| {
-                for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
-            },
-            else => unreachable,
-        },
-        .float => |s| switch (out.data) {
-            .float => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .double => |s| switch (out.data) {
-            .double => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .date => |s| switch (out.data) {
-            .date => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .datetime => |s| switch (out.data) {
-            .datetime => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .tinyint => |s| switch (out.data) {
-            .tinyint => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .smallint => |s| switch (out.data) {
-            .smallint => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .largeint => |s| switch (out.data) {
-            .largeint => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .char => |sv| switch (out.data) {
-            .char => |*ss| {
-                for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
-            },
-            else => unreachable,
-        },
-    }
-    // Carry validity bits across.
-    if (out.nulls != null) {
-        const n = view.data.rowCount();
-        for (0..n) |i| {
-            const valid = storage.column.isValidBit(view.nulls, i);
-            try out.appendValidBit(allocator, dst_start + i, valid);
-        }
-    }
-}
-
-/// Append rows from `view` to `out`, picking by the given indices into `view`.
-/// Used by Sort to materialize batches in permutation order. Validity bits
-/// are carried across via `view.nulls`.
-pub fn appendByIndices(
-    allocator: Allocator,
-    view: ColumnView,
-    indices: []const u32,
-    out: *ColumnStore,
-) !void {
-    const dst_start = out.data.rowCount();
-    switch (view.data) {
-        .int => |s| switch (out.data) {
-            .int => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .bigint => |s| switch (out.data) {
-            .bigint => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .boolean => |s| switch (out.data) {
-            .boolean => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .varchar => |sv| switch (out.data) {
-            .varchar => |*ss| {
-                for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
-            },
-            else => unreachable,
-        },
-        .string => |sv| switch (out.data) {
-            .string => |*ss| {
-                for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
-            },
-            else => unreachable,
-        },
-        .float => |s| switch (out.data) {
-            .float => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .double => |s| switch (out.data) {
-            .double => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .date => |s| switch (out.data) {
-            .date => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .datetime => |s| switch (out.data) {
-            .datetime => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .tinyint => |s| switch (out.data) {
-            .tinyint => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .smallint => |s| switch (out.data) {
-            .smallint => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .largeint => |s| switch (out.data) {
-            .largeint => |*list| {
-                try list.ensureUnusedCapacity(allocator, indices.len);
-                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
-            },
-            else => unreachable,
-        },
-        .char => |sv| switch (out.data) {
-            .char => |*ss| {
-                for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
-            },
-            else => unreachable,
-        },
-    }
-    if (out.nulls != null) {
-        for (indices, 0..) |src_idx, j| {
-            const valid = storage.column.isValidBit(view.nulls, src_idx);
-            try out.appendValidBit(allocator, dst_start + j, valid);
-        }
-    }
-}
-
-pub fn appendMaskedColumn(
-    allocator: Allocator,
-    view: ColumnView,
-    mask: []const bool,
-    out: *ColumnStore,
-) !void {
-    const dst_start = out.data.rowCount();
-    switch (view.data) {
-        .int => |s| switch (out.data) {
-            .int => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .bigint => |s| switch (out.data) {
-            .bigint => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .boolean => |s| switch (out.data) {
-            .boolean => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .varchar => |sv| switch (out.data) {
-            .varchar => |*ss| for (mask, 0..) |m, row| {
-                if (m) try ss.appendValue(allocator, sv.rowBytes(row));
-            },
-            else => unreachable,
-        },
-        .string => |sv| switch (out.data) {
-            .string => |*ss| for (mask, 0..) |m, row| {
-                if (m) try ss.appendValue(allocator, sv.rowBytes(row));
-            },
-            else => unreachable,
-        },
-        .float => |s| switch (out.data) {
-            .float => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .double => |s| switch (out.data) {
-            .double => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .date => |s| switch (out.data) {
-            .date => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .datetime => |s| switch (out.data) {
-            .datetime => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .tinyint => |s| switch (out.data) {
-            .tinyint => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .smallint => |s| switch (out.data) {
-            .smallint => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .largeint => |s| switch (out.data) {
-            .largeint => |*list| for (s, mask) |v, m| {
-                if (m) try list.append(allocator, v);
-            },
-            else => unreachable,
-        },
-        .char => |sv| switch (out.data) {
-            .char => |*ss| for (mask, 0..) |m, row| {
-                if (m) try ss.appendValue(allocator, sv.rowBytes(row));
-            },
-            else => unreachable,
-        },
-    }
-    if (out.nulls != null) {
-        var j: usize = 0;
-        for (mask, 0..) |m, src_row| {
-            if (!m) continue;
-            const valid = storage.column.isValidBit(view.nulls, src_row);
-            try out.appendValidBit(allocator, dst_start + j, valid);
-            j += 1;
-        }
-    }
-}
-
-/// Owns the buffers produced by `Memtable.buildSortedSnapshot`. `views`
-/// borrows from `columns`.
-pub const SortedSnapshot = struct {
-    allocator: Allocator,
-    columns: []ColumnStore,
-    views: []ColumnView,
-    row_count: u64,
-
-    pub fn deinit(self: *SortedSnapshot) void {
-        for (self.columns) |*c| c.deinit(self.allocator);
-        self.allocator.free(self.columns);
-        self.allocator.free(self.views);
-        self.* = undefined;
-    }
-};
-
-fn applyPermutation(
-    allocator: Allocator,
-    src: ColumnStore,
-    perm: []const u32,
-) !ColumnStore {
-    const dst_data: DataStore = switch (src.data) {
-        .int => |l| blk: {
-            var dst: std.ArrayList(i32) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .int = dst };
-        },
-        .bigint => |l| blk: {
-            var dst: std.ArrayList(i64) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .bigint = dst };
-        },
-        .boolean => |l| blk: {
-            var dst: std.ArrayList(u8) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .boolean = dst };
-        },
-        .varchar => |s| blk: {
-            var dst = try StringStore.init(allocator);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
-            break :blk DataStore{ .varchar = dst };
-        },
-        .string => |s| blk: {
-            var dst = try StringStore.init(allocator);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
-            break :blk DataStore{ .string = dst };
-        },
-        .float => |l| blk: {
-            var dst: std.ArrayList(f32) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .float = dst };
-        },
-        .double => |l| blk: {
-            var dst: std.ArrayList(f64) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .double = dst };
-        },
-        .date => |l| blk: {
-            var dst: std.ArrayList(i32) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .date = dst };
-        },
-        .datetime => |l| blk: {
-            var dst: std.ArrayList(i64) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .datetime = dst };
-        },
-        .tinyint => |l| blk: {
-            var dst: std.ArrayList(i8) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .tinyint = dst };
-        },
-        .smallint => |l| blk: {
-            var dst: std.ArrayList(i16) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .smallint = dst };
-        },
-        .largeint => |l| blk: {
-            var dst: std.ArrayList(i128) = try .initCapacity(allocator, perm.len);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
-            break :blk DataStore{ .largeint = dst };
-        },
-        .char => |s| blk: {
-            var dst = try StringStore.init(allocator);
-            errdefer dst.deinit(allocator);
-            for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
-            break :blk DataStore{ .char = dst };
-        },
-    };
-
-    var nulls: ?std.ArrayList(u8) = null;
-    if (src.nulls) |src_bits| {
-        var b: std.ArrayList(u8) = try .initCapacity(allocator, storage.column.bitmapBytes(perm.len));
-        errdefer b.deinit(allocator);
-        try b.appendNTimes(allocator, 0, storage.column.bitmapBytes(perm.len));
-        for (perm, 0..) |src_row, dst_row| {
-            if (storage.column.isValidBit(src_bits.items, src_row)) {
-                const byte_idx = dst_row >> 3;
-                const bit: u3 = @intCast(dst_row & 7);
-                b.items[byte_idx] |= (@as(u8, 1) << bit);
-            }
-        }
-        nulls = b;
-    }
-
-    return .{ .data = dst_data, .nulls = nulls };
-}
-
-fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
-    return switch (col.data) {
-        .int => |l| std.math.order(l.items[a], l.items[b]),
-        .bigint => |l| std.math.order(l.items[a], l.items[b]),
-        .boolean => |l| std.math.order(l.items[a], l.items[b]),
-        .varchar => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
-        .string => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
-        .char => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
-        .tinyint => |l| std.math.order(l.items[a], l.items[b]),
-        .smallint => |l| std.math.order(l.items[a], l.items[b]),
-        .largeint => |l| std.math.order(l.items[a], l.items[b]),
-        .float => |l| std.math.order(l.items[a], l.items[b]),
-        .double => |l| std.math.order(l.items[a], l.items[b]),
-        .date => |l| std.math.order(l.items[a], l.items[b]),
-        .datetime => |l| std.math.order(l.items[a], l.items[b]),
-    };
-}
-
 fn asConstSlice(v: anytype) []const u8 {
     const V = @TypeOf(v);
     if (V == []const u8) return v;
@@ -1197,4 +567,9 @@ test "memtable clear resets row count but preserves capacity" {
     try mt.insertRows(&.{.{ .id = @as(i64, 3), .tag = "ccc" }});
     try std.testing.expectEqual(@as(u64, 1), mt.row_count);
     try std.testing.expectEqualStrings("ccc", mt.columns[1].view().data.string.rowBytes(0));
+}
+
+test {
+    _ = store;
+    _ = transform;
 }
