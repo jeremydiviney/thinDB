@@ -1032,6 +1032,140 @@ test "chain: scan across memtable + segments threads through filter+aggregate" {
 }
 
 // ---------------------------------------------------------------------------
+// Error paths — type mismatches and unsupported operations
+// ---------------------------------------------------------------------------
+
+test "error: filter predicate type mismatch on each new type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "small", .type = .smallint },
+            .{ .name = "big", .type = .largeint },
+            .{ .name = "code", .type = .{ .char = 4 } },
+            .{ .name = "amt", .type = thindb.decimal(10, 2) },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = false };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, opts);
+
+    // Filter SMALLINT column with an INT literal — type mismatch.
+    var base = try thindb.scan(allocator, t);
+    var q = base.filter(thindb.leafExpr("small", .eq, .{ .int = 1 }));
+    try std.testing.expectError(error.PredicateTypeMismatch, q);
+    base.deinit();
+
+    // LARGEINT column with a BIGINT literal — type mismatch.
+    base = try thindb.scan(allocator, t);
+    q = base.filter(thindb.leafExpr("big", .eq, .{ .bigint = 1 }));
+    try std.testing.expectError(error.PredicateTypeMismatch, q);
+    base.deinit();
+
+    // DECIMAL column with a BIGINT literal — type mismatch.
+    base = try thindb.scan(allocator, t);
+    q = base.filter(thindb.leafExpr("amt", .eq, .{ .bigint = 100 }));
+    try std.testing.expectError(error.PredicateTypeMismatch, q);
+    base.deinit();
+
+    // CHAR column with .lt (only eq/neq allowed on string-shaped types).
+    base = try thindb.scan(allocator, t);
+    q = base.filter(thindb.leafExpr("code", .lt, .{ .text = "AAAA" }));
+    try std.testing.expectError(error.UnsupportedOperatorForType, q);
+    base.deinit();
+}
+
+test "error: filter on unknown column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    var base = try thindb.scan(allocator, t);
+    const q = base.filter(thindb.leafExpr("nonexistent", .eq, .{ .int = 1 }));
+    try std.testing.expectError(error.ColumnNotFound, q);
+    base.deinit();
+}
+
+test "error: SUM/MIN/MAX reject string and unsupported types" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "x" },
+    });
+
+    // SUM on a STRING column is unsupported.
+    var base = try thindb.scan(allocator, t);
+    const q = base.aggregate(&.{.{ .func = .sum, .col = "tag", .as = "s" }});
+    try std.testing.expectError(error.AggregateUnsupportedType, q);
+    base.deinit();
+}
+
+test "error: aggregate with no specs returns error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    var base = try thindb.scan(allocator, t);
+    const q = base.aggregate(&.{});
+    try std.testing.expectError(error.AggregateNoSpecs, q);
+    base.deinit();
+}
+
+test "error: insert with wrong-type value into typed column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .{ .char = 8 } },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = false };
+    const t = try db.table("t", schema, opts);
+
+    // CHAR column expects a string-like value; passing i32 errors.
+    try std.testing.expectError(
+        error.TypeMismatch,
+        t.insert(&.{.{ .id = @as(i64, 1), .v = @as(i32, 5) }}),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Background flusher thread
 // ---------------------------------------------------------------------------
 
