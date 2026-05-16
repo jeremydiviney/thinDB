@@ -50,13 +50,60 @@ pub fn execCompact(t: *Table) !void {
     try mergeSegments(t, all_ids);
 }
 
-/// Pick the smallest-tier run of `tier_target_count` adjacent (by
-/// segment_id) segments at the same tier and merge them. No-op if no run
-/// qualifies. Background compactor entry point.
-pub fn execTieredCompact(t: *Table) !void {
+/// Background compactor entry point. Picks one compaction group and
+/// merges it. First check is tombstone pressure: any segment with
+/// `tombs / row_count >= tomb_threshold` is compacted (with adjacent
+/// same-tier neighbors if there are any). If no tombstone-pressured
+/// segment, fall back to the count-based tier picker. No-op if no
+/// group qualifies.
+///
+/// Pass `tomb_threshold > 1.0` to disable the tombstone trigger.
+pub fn execTieredCompact(t: *Table, tomb_threshold: f32) !void {
+    // 1. Tombstone pressure first.
+    if (tomb_threshold <= 1.0) {
+        const tomb_pick = try pickTombstonePressuredGroup(t, tomb_threshold);
+        if (tomb_pick) |ids| {
+            defer t.allocator.free(ids);
+            try mergeSegments(t, ids);
+            return;
+        }
+    }
+    // 2. Tier-based count trigger.
     const seg_ids = try pickCompactionGroup(t.allocator, t.manifest.segments.items) orelse return;
     defer t.allocator.free(seg_ids);
     try mergeSegments(t, seg_ids);
+}
+
+/// Find the first segment whose tombstone fraction exceeds `threshold`
+/// and return it together with adjacent same-tier neighbors (up to
+/// `tier_target_count` total). If no neighbors share the tier, returns
+/// just the single segment (a "rewrite to drop tombs" compaction).
+/// Caller owns the returned slice.
+fn pickTombstonePressuredGroup(t: *Table, threshold: f32) !?[]u64 {
+    for (t.manifest.segments.items, 0..) |entry, i| {
+        if (entry.row_count == 0) continue;
+        const tombs = try storage.tombstone.read(t.allocator, t.io, t.segments_dir, entry.segment_id);
+        defer if (tombs) |arr| t.allocator.free(arr);
+        if (tombs == null) continue;
+        const ratio = @as(f32, @floatFromInt(tombs.?.len)) / @as(f32, @floatFromInt(entry.row_count));
+        if (ratio < threshold) continue;
+
+        // Found a heavily-tombstoned segment. Grow to a run of adjacent
+        // same-tier neighbors so the merged output stays on tier.
+        const tier = segmentTier(entry.row_count);
+        var lo: usize = i;
+        var hi: usize = i + 1;
+        while (lo > 0 and segmentTier(t.manifest.segments.items[lo - 1].row_count) == tier and (hi - lo) < tier_target_count) {
+            lo -= 1;
+        }
+        while (hi < t.manifest.segments.items.len and segmentTier(t.manifest.segments.items[hi].row_count) == tier and (hi - lo) < tier_target_count) {
+            hi += 1;
+        }
+        const out = try t.allocator.alloc(u64, hi - lo);
+        for (out, 0..) |*id, j| id.* = t.manifest.segments.items[lo + j].segment_id;
+        return out;
+    }
+    return null;
 }
 
 /// Walk the manifest looking for `tier_target_count` adjacent-by-position

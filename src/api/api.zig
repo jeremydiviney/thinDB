@@ -48,6 +48,12 @@ pub const Config = struct {
     /// conservative tier-1 cutoff per DESIGN.md §7.1.
     compact_min_segments: u32 = 8,
 
+    /// Tombstone-pressure trigger. When any segment's tombstone fraction
+    /// (tombs / row_count) crosses this threshold, the next compaction
+    /// sweep picks it (regardless of tier count) so the dead rows get
+    /// reclaimed. Default 0.30. Set to a value > 1.0 to disable.
+    compact_tombstone_threshold: f32 = 0.30,
+
 };
 
 pub const TableOptions = struct {
@@ -177,8 +183,9 @@ pub const Database = struct {
         while (it.next()) |p| : (i += 1) ptrs[i] = p.*;
         self.tables_mutex.unlock(self.io);
 
-        const threshold = self.config.compact_min_segments;
-        for (ptrs) |t| t.tryBackgroundCompact(threshold) catch {};
+        const min_segs = self.config.compact_min_segments;
+        const tomb_thresh = self.config.compact_tombstone_threshold;
+        for (ptrs) |t| t.tryBackgroundCompact(min_segs, tomb_thresh) catch {};
     }
 
     /// Blocking loop that drives `backgroundCompactSweep` at `poll_ms`
@@ -488,16 +495,18 @@ pub const Table = struct {
     }
 
     /// Background-compactor entry point. Tries to acquire the mutex
-    /// non-blockingly; on success, runs one tiered compaction step iff
-    /// the segment count is at least `min_segments`. No-op on lock
-    /// contention, when below the threshold, or when no tier has enough
-    /// adjacent segments to merge.
-    pub fn tryBackgroundCompact(self: *Table, min_segments: u32) !void {
-        if (min_segments == 0) return;
+    /// non-blockingly; on success, runs one compaction step. Considers
+    /// both the tombstone-pressure trigger and (when at least
+    /// `min_segments` are live) the count-based tier trigger. No-op on
+    /// lock contention, no qualifying segment, or both gates disabled.
+    pub fn tryBackgroundCompact(self: *Table, min_segments: u32, tomb_threshold: f32) !void {
         if (!self.mutex.tryLock()) return;
         defer self.mutex.unlock(self.io);
-        if (self.manifest.segments.items.len < min_segments) return;
-        try @import("compact.zig").execTieredCompact(self);
+        // Cheap optimization: skip the work if neither trigger can fire.
+        const enough_for_tier = (min_segments != 0 and self.manifest.segments.items.len >= min_segments);
+        const tomb_enabled = (tomb_threshold <= 1.0);
+        if (!enough_for_tier and !tomb_enabled) return;
+        try @import("compact.zig").execTieredCompact(self, tomb_threshold);
     }
 
     pub fn segmentCount(self: Table) usize {

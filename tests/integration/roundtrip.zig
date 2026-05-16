@@ -931,6 +931,63 @@ test "backgroundCompactSweep: tiered merge when 4 same-tier segments accumulate"
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 }
 
+test "compactor: tombstone-pressure trigger reclaims a heavily-deleted segment" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        // Set tier threshold high so it doesn't fire; we want the tomb trigger.
+        .compact_min_segments = 100,
+        .compact_tombstone_threshold = 0.30,
+        .auto_flush_secs = 0,
+        .auto_flush_rows = 1_000_000,
+        .auto_flush_bytes = 64 * 1024 * 1024,
+    });
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    // Flush one segment with 10 rows.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = true, .tag = "c" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 40), .active = true, .tag = "d" },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 50), .active = true, .tag = "e" },
+        .{ .id = @as(i64, 6), .qty = @as(i32, 60), .active = true, .tag = "f" },
+        .{ .id = @as(i64, 7), .qty = @as(i32, 70), .active = true, .tag = "g" },
+        .{ .id = @as(i64, 8), .qty = @as(i32, 80), .active = true, .tag = "h" },
+        .{ .id = @as(i64, 9), .qty = @as(i32, 90), .active = true, .tag = "i" },
+        .{ .id = @as(i64, 10), .qty = @as(i32, 100), .active = true, .tag = "j" },
+    });
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+    // Delete 5 of the 10 rows (50% tombstone fraction, well above 30%).
+    _ = try t.delete(.{ .col = "qty", .op = .lte, .val = .{ .int = 50 } });
+
+    // Tomb file now exists for the only segment.
+    // Sweep should pick it (single-segment compact: rewrite without tombs).
+    try db.backgroundCompactSweep();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+    // After compaction the surviving rows should be the 5 with qty > 50.
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 6, 7, 8, 9, 10 }, ids.items);
+
+    // Sweep again: no tombstones left, no tier trigger. No-op.
+    try db.backgroundCompactSweep();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+}
+
 test "execTieredCompact: no-op when no tier has enough segments" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
