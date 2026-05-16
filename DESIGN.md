@@ -394,12 +394,40 @@ Compaction holds the writer queue (no concurrent inserts/deletes/flushes during 
 
 ## 8. Concurrency
 
-- **One writer thread** per `Database`. Processes a serial queue of `Insert`, `Delete`, `Flush`, `Compact`, `Alter` commands. No locking between commands — they're serialized by the queue.
+- **Per-table mutex** serializes memtable + WAL mutations. Multiple writer threads may call `insert`/`upsert`/`delete`/`flush` concurrently; they line up at the mutex one record at a time. Each `Table` has its own mutex, so writes to different tables run in parallel.
 - **Many reader threads.** Reads acquire a manifest snapshot at query start; no locks held during execution.
 - **Manifest update is atomic** via `rename`. Readers always see either the pre- or post-state, never partial.
 - **No reader-writer blocking.** A long-running query does not delay writes; a long write does not delay reads.
 
 The atomic-rename semantics of `manifest` are load-bearing. On Windows, `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` provides the same atomicity for same-volume renames.
+
+### 8.1 WAL group commit
+
+When `sync_mode = .per_flush` AND `wal_enabled = true`, each `insert`/`delete` is durable on return. The naive implementation — fsync the WAL inside the table mutex — would serialize every writer through one fsync. Instead, we use leader-follower group commit:
+
+1. Under the table mutex: mutate memtable, append WAL bytes, capture the cumulative `write_offset`. Release the table mutex.
+2. Outside the table mutex: call `WalWriter.awaitDurable(target_offset)`.
+3. In `awaitDurable`: if another fsync is in-flight (`in_progress == true`), park on a condition variable. Otherwise become leader.
+4. **Adaptive coalescing pause** (key to amortization):
+   - Leader spins for `coalesce_probe_ns` (20 µs) regardless of contention. Single-writer cost: ~20 µs added latency.
+   - If `waiters` grew during the probe, the leader restarts the dwell clock and keeps spinning, up to `coalesce_max_ns` (200 µs total).
+   - Otherwise fsync immediately.
+5. Snap `write_offset`, call `file.sync()`, then broadcast. Followers wake; those whose target is now covered return immediately; others retry as the next leader.
+
+The probe is unconditional because the "is anyone arriving" signal only appears *during* a pause — checking before the leader pauses would always see `waiters == 1` (just the leader itself, which has just incremented the counter on entry to `awaitDurable`).
+
+Bench numbers (8 OS threads, `sync_mode=.per_flush`, tight insert loop, Windows / NVMe):
+
+| Threads | Wall clock | fsyncs | inserts/fsync |
+|--------:|----------:|-------:|--------------:|
+| 1 | 67 ms | 250 | 1.0 |
+| 2 | 77 ms | 256 | 1.95 |
+| 4 | 87 ms | 270 | 3.70 |
+| 8 | 127 ms | 370 | 5.41 |
+
+Throughput scales sub-linearly with thread count (each fsync is now amortized over multiple writers), single-writer pays ~3% latency overhead vs. the no-pause baseline.
+
+Truncate (called at end of flush) coordinates with `awaitDurable`: it drains the current leader, then bumps `synced_offset` to the pre-truncate `write_offset` so any pending waiters from before the truncate become no-ops (their data is now in a segment, not the WAL).
 
 ---
 
@@ -651,7 +679,7 @@ Target Zig version: 0.16.
 | Non-Zig client libraries (JS/TS, Python, Go, …) | v2 | Each client library builds the operator-tree IR locally and sends it over the wire protocol. |
 | Joins, subqueries, CTEs, window functions | v2 | New operators (`Join`, `Apply`, `Window`). The pipeline framework supports them without redesign. |
 | Transactions | post-v2 if at all | Multi-statement atomicity would require coordinating manifest updates across commands. Not currently planned. |
-| Crash durability of in-memory writes | v2 | Add WAL with group commit. Manifest already supports crash recovery for flushed data. |
+| ~~Crash durability of in-memory writes~~ | ✅ done in v0.8 | WAL with leader-follower group commit (§8.1); `wal_enabled = true` + `sync_mode = .per_flush`. |
 | Upserts | v2 | Explicit `.upsert()` method that fuses delete+insert against the order key. |
 | `TIMESTAMPTZ` | v2 | Add as a new type; existing `DATETIME` columns unaffected. |
 | Schema evolution via in-place changes (order-key changes, column reorder) | v3+ if at all | The v1 copy-and-swap covers most needs. |

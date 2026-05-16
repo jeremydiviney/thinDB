@@ -1700,6 +1700,165 @@ test "wal: works with nullable columns and a unique-key table" {
     try std.testing.expect(seen[0] and seen[1] and seen[2]);
 }
 
+test "wal: concurrent writers preserve all rows + group-commit fsync amortizes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .wal_enabled = true,
+        .sync_mode = .per_flush,
+        // Keep everything in the memtable so the test exercises the WAL path
+        // for every insert (no auto-flush truncation).
+        .auto_flush_rows = 10_000_000,
+        .auto_flush_bytes = 1 << 30,
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    // Non-unique schema so we don't trigger applyUpsertResolution between
+    // threads (each thread inserts a disjoint id range; unique resolution
+    // would still be a no-op, but it adds CPU work we don't need).
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .row_group_size = 1024 };
+    const t = try db.table("orders", schema, opts);
+
+    const num_threads = 4;
+    const per_thread = 100;
+
+    var error_count: std.atomic.Value(usize) = .init(0);
+
+    const Ctx = struct {
+        t: *thindb.Table,
+        base: i64,
+        n: usize,
+        ec: *std.atomic.Value(usize),
+
+        fn run(self: @This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.t.insert(&.{.{
+                    .id = self.base + @as(i64, @intCast(i)),
+                    .qty = @as(i32, 1),
+                }}) catch {
+                    _ = self.ec.fetchAdd(1, .release);
+                    return;
+                };
+            }
+        }
+    };
+
+    var threads: [num_threads]std.Thread = undefined;
+    for (&threads, 0..) |*thr, ti| {
+        const ctx = Ctx{
+            .t = t,
+            .base = @as(i64, @intCast(ti)) * 1_000_000,
+            .n = per_thread,
+            .ec = &error_count,
+        };
+        thr.* = try std.Thread.spawn(.{}, Ctx.run, .{ctx});
+    }
+    for (&threads) |*thr| thr.join();
+
+    try std.testing.expectEqual(@as(usize, 0), error_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, num_threads * per_thread), t.memtable.row_count);
+
+    // Group-commit upper bound: at most one fsync per insert. The actual
+    // amortization ratio depends on scheduling and is exercised in the bench;
+    // here we just assert correctness (counter is sane).
+    if (t.wal) |*w| {
+        try std.testing.expect(w.fsync_count <= num_threads * per_thread);
+    }
+}
+
+test "wal: concurrent writers survive close + reopen" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .row_group_size = 1024 };
+
+    const num_threads = 4;
+    const per_thread = 80;
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+            .wal_enabled = true,
+            .sync_mode = .per_flush,
+            .auto_flush_rows = 10_000_000,
+            .auto_flush_bytes = 1 << 30,
+            .auto_flush_secs = 0,
+        });
+        defer db.close();
+        const t = try db.table("orders", schema, opts);
+
+        var error_count: std.atomic.Value(usize) = .init(0);
+        const Ctx = struct {
+            t: *thindb.Table,
+            base: i64,
+            n: usize,
+            ec: *std.atomic.Value(usize),
+            fn run(self: @This()) void {
+                var i: usize = 0;
+                while (i < self.n) : (i += 1) {
+                    self.t.insert(&.{.{
+                        .id = self.base + @as(i64, @intCast(i)),
+                        .qty = @as(i32, 1),
+                    }}) catch {
+                        _ = self.ec.fetchAdd(1, .release);
+                        return;
+                    };
+                }
+            }
+        };
+
+        var threads: [num_threads]std.Thread = undefined;
+        for (&threads, 0..) |*thr, ti| {
+            const ctx = Ctx{
+                .t = t,
+                .base = @as(i64, @intCast(ti)) * 1_000_000,
+                .n = per_thread,
+                .ec = &error_count,
+            };
+            thr.* = try std.Thread.spawn(.{}, Ctx.run, .{ctx});
+        }
+        for (&threads) |*thr| thr.join();
+
+        try std.testing.expectEqual(@as(usize, 0), error_count.load(.acquire));
+        // Intentionally do NOT flush — exercise the WAL replay path on reopen.
+    }
+
+    // Reopen: WAL replay should reconstruct every row from every thread.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .wal_enabled = true,
+        .sync_mode = .per_flush,
+    });
+    defer db.close();
+    const t = try db.table("orders", schema, opts);
+    try std.testing.expectEqual(@as(u64, num_threads * per_thread), t.memtable.row_count);
+}
+
 // ---------------------------------------------------------------------------
 // Durability — sync_mode round-trip and toggle
 // ---------------------------------------------------------------------------

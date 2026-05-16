@@ -463,8 +463,12 @@ pub const Table = struct {
     /// value. (StarRocks "last writer wins" semantics.)
     pub fn insert(self: *Table, rows: anytype) !void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.insertLocked(rows);
+        var wal_target: ?u64 = null;
+        {
+            defer self.mutex.unlock(self.io);
+            wal_target = try self.insertLocked(rows);
+        }
+        try self.awaitWalDurable(wal_target);
     }
 
     /// Explicit upsert. Identical to `insert` on a unique-key table —
@@ -476,21 +480,28 @@ pub const Table = struct {
     pub fn upsert(self: *Table, rows: anytype) !void {
         if (!self.schema.unique) return Error.UpsertRequiresUniqueKey;
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.insertLocked(rows);
+        var wal_target: ?u64 = null;
+        {
+            defer self.mutex.unlock(self.io);
+            wal_target = try self.insertLocked(rows);
+        }
+        try self.awaitWalDurable(wal_target);
     }
 
-    fn insertLocked(self: *Table, rows: anytype) !void {
+    /// Mutates the memtable + appends bytes to the WAL (no fsync). The
+    /// returned offset is the cumulative WAL write_offset after our append,
+    /// passed to `awaitDurable` once the Table mutex is released so a
+    /// concurrent batch of writers can amortize a single fsync syscall.
+    /// Returns null when no WAL is configured.
+    fn insertLocked(self: *Table, rows: anytype) !?u64 {
         const was_empty = self.memtable.isEmpty();
         const before_count: usize = @intCast(self.memtable.row_count);
         try self.memtable.insertRows(rows);
         const after_count: usize = @intCast(self.memtable.row_count);
 
-        // Log the just-appended rows to the WAL before doing anything that
-        // could mutate them (upsert resolution, auto-flush). One fsync
-        // covers the whole batch.
+        var wal_target: ?u64 = null;
         if (self.wal) |*w| {
-            try w.appendInsert(&self.memtable, before_count, after_count);
+            wal_target = try w.appendInsert(&self.memtable, before_count, after_count);
         }
 
         if (was_empty and !self.memtable.isEmpty()) {
@@ -500,6 +511,18 @@ pub const Table = struct {
             try @import("upsert.zig").applyUpsertResolution(self);
         }
         try self.maybeAutoFlushLocked();
+        return wal_target;
+    }
+
+    /// Called outside the Table mutex (after releasing it) to wait for the
+    /// WAL through `target` to be durably fsynced. No-op when WAL disabled,
+    /// sync_mode is `.none`, or when an in-call flush already truncated past
+    /// the target (in which case `WalWriter.truncate` has bumped synced past
+    /// our offset and `awaitDurable` returns immediately).
+    fn awaitWalDurable(self: *Table, target: ?u64) !void {
+        if (!self.syncEnabled()) return;
+        const o = target orelse return;
+        if (self.wal) |*w| try w.awaitDurable(self.io, o);
     }
 
     /// Flush the memtable to a new segment on disk and update the manifest
@@ -547,8 +570,11 @@ pub const Table = struct {
         // WAL: the records preceding this flush are now redundant. Append a
         // flush marker so a crash mid-truncate is still recoverable, then
         // truncate. Order is intentional — marker first, truncate second.
+        // Truncate is self-syncing AND bumps `synced_offset` past every
+        // append before the truncate, so any pending `awaitDurable` from
+        // the same call chain becomes a no-op.
         if (self.wal) |*w| {
-            try w.appendFlushMarker(seg_id);
+            _ = try w.appendFlushMarker(seg_id);
             try w.truncate(self.schema_fingerprint);
         }
 
@@ -626,10 +652,18 @@ pub const Table = struct {
     /// without them. Returns the number of rows deleted.
     pub fn delete(self: *Table, pred: exec.Predicate) !usize {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        // Log first; the delete primitive is idempotent on replay.
-        if (self.wal) |*w| try w.appendDelete(pred);
-        return @import("delete.zig").execDelete(self, pred);
+        var wal_target: ?u64 = null;
+        var deleted: usize = 0;
+        {
+            defer self.mutex.unlock(self.io);
+            // Log first; the delete primitive is idempotent on replay.
+            if (self.wal) |*w| {
+                wal_target = try w.appendDelete(pred);
+            }
+            deleted = try @import("delete.zig").execDelete(self, pred);
+        }
+        try self.awaitWalDurable(wal_target);
+        return deleted;
     }
 
     /// Merge all segments into a single new segment. Drops tombstoned rows.
