@@ -400,21 +400,50 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
         },
     );
 
-    // Implied write-only time = compress+write − compress-only (approx, since
-    // segment writer slices compression by row group rather than one shot).
-    const implied_write_ns = if (compress_and_write_ns > compress_only_ns)
-        compress_and_write_ns - compress_only_ns
-    else
-        0;
-    const write_seconds = @as(f64, @floatFromInt(implied_write_ns)) / 1e9;
-    const write_mb_per_s = if (write_seconds > 0)
-        (@as(f64, @floatFromInt(compressed.len)) / 1_048_576.0) / write_seconds
-    else
-        0;
+    // ---- Isolated disk-write measurement ----
+    // Read the segment we already wrote back into memory, then re-write it to
+    // a fresh file and time only the writeFile call. This measures the syscall
+    // path with no compression interleaved.
+    const seg_bytes = try dir.readFileAlloc(io, file_name, allocator, .unlimited);
+    defer allocator.free(seg_bytes);
+
+    // One-shot write of the actual segment-sized buffer.
+    const t_write_seg = Io.Clock.awake.now(io);
+    try dir.writeFile(io, .{ .sub_path = "write_only_seg.dat", .data = seg_bytes });
+    const write_seg_ns = elapsedNs(io, t_write_seg);
+    const seg_mb = @as(f64, @floatFromInt(seg_bytes.len)) / 1_048_576.0;
+    const seg_mb_per_s = seg_mb / (@as(f64, @floatFromInt(write_seg_ns)) / 1e9);
     std.debug.print(
-        "  disk write (implied: compr+wr − compr-only)  {d:.1}ms  {d:.1} MB/s (compressed bytes)\n",
-        .{ @as(f64, @floatFromInt(implied_write_ns)) / 1e6, write_mb_per_s },
+        "  disk write (isolated, segment-sized)         {d:.2}MB  {d:.2}ms  {d:.1} MB/s\n",
+        .{ seg_mb, @as(f64, @floatFromInt(write_seg_ns)) / 1e6, seg_mb_per_s },
     );
+
+    // Larger one-shot writes to expose actual disk bandwidth, free of syscall
+    // overhead. Use the segment bytes as filler, repeated.
+    const sizes = [_]usize{ 16 * 1024 * 1024, 64 * 1024 * 1024, 256 * 1024 * 1024 };
+    inline for (sizes) |target_size| {
+        const big = try allocator.alloc(u8, target_size);
+        defer allocator.free(big);
+        // Fill so the FS / OS can't just zero-page-trick the write.
+        var off: usize = 0;
+        while (off + seg_bytes.len <= big.len) : (off += seg_bytes.len) {
+            @memcpy(big[off..][0..seg_bytes.len], seg_bytes);
+        }
+        if (off < big.len) @memset(big[off..], 0xab);
+
+        var name_buf2: [32]u8 = undefined;
+        const big_name = try std.fmt.bufPrint(&name_buf2, "write_only_{d}.dat", .{target_size});
+
+        const t_big = Io.Clock.awake.now(io);
+        try dir.writeFile(io, .{ .sub_path = big_name, .data = big });
+        const big_ns = elapsedNs(io, t_big);
+        const big_mb = @as(f64, @floatFromInt(big.len)) / 1_048_576.0;
+        const big_mb_per_s = big_mb / (@as(f64, @floatFromInt(big_ns)) / 1e9);
+        std.debug.print(
+            "  disk write (isolated, {d:>3}MB)                {d:.2}MB  {d:.2}ms  {d:.1} MB/s\n",
+            .{ target_size / (1024 * 1024), big_mb, @as(f64, @floatFromInt(big_ns)) / 1e6, big_mb_per_s },
+        );
+    }
 }
 
 fn benchSustainedInsert(allocator: Allocator, io: Io, n_rows: usize) !void {
