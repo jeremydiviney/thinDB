@@ -880,6 +880,45 @@ test "runBackgroundFlusher: spawns a thread that drives flush sweeps" {
     try std.testing.expectEqual(@as(usize, 0), t.segmentCount());
 }
 
+test "backgroundCompactSweep: compacts when threshold met" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        .compact_min_segments = 3, // small threshold for the test
+        .auto_flush_secs = 0,
+        .auto_flush_rows = 1_000_000,
+        .auto_flush_bytes = 64 * 1024 * 1024,
+    });
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    // Manually flush three small segments.
+    try t.insert(&.{.{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" }});
+    try t.flush();
+    try t.insert(&.{.{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" }});
+    try t.flush();
+    try t.insert(&.{.{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = true, .tag = "c" }});
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 3), t.segmentCount());
+
+    // Sweep should collapse them into one segment.
+    try db.backgroundCompactSweep();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+    // Below-threshold table is left alone.
+    try t.insert(&.{.{ .id = @as(i64, 4), .qty = @as(i32, 40), .active = true, .tag = "d" }});
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 2), t.segmentCount());
+    try db.backgroundCompactSweep();
+    try std.testing.expectEqual(@as(usize, 2), t.segmentCount());
+}
+
 test "nullable: rejects ?T into a non-nullable column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -42,6 +42,12 @@ pub const Config = struct {
     /// LRU cache budget for decompressed column blocks. 0 disables caching.
     cache_size_bytes: usize = 256 * 1024 * 1024,
 
+    /// Background-compactor threshold. When a table has at least this many
+    /// live segments and the background compactor sweep runs, it triggers
+    /// a compaction. 0 disables the count-based trigger. Default 8 — a
+    /// conservative tier-1 cutoff per DESIGN.md §7.1.
+    compact_min_segments: u32 = 8,
+
 };
 
 pub const TableOptions = struct {
@@ -151,6 +157,45 @@ pub const Database = struct {
             Io.sleep(sleeper_io, duration, .awake) catch return;
             if (should_stop.load(.acquire)) return;
             self.backgroundFlushSweep() catch {};
+        }
+    }
+
+    /// One sweep of the background compaction check. Snapshots open tables
+    /// under `tables_mutex`, then calls `tryBackgroundCompact` on each.
+    /// Compaction runs only when a table's segment count meets the
+    /// configured threshold AND the table mutex is uncontended.
+    pub fn backgroundCompactSweep(self: *Database) !void {
+        self.tables_mutex.lockUncancelable(self.io);
+        const count = self.tables.count();
+        const ptrs = self.allocator.alloc(*Table, count) catch |err| {
+            self.tables_mutex.unlock(self.io);
+            return err;
+        };
+        defer self.allocator.free(ptrs);
+        var i: usize = 0;
+        var it = self.tables.valueIterator();
+        while (it.next()) |p| : (i += 1) ptrs[i] = p.*;
+        self.tables_mutex.unlock(self.io);
+
+        const threshold = self.config.compact_min_segments;
+        for (ptrs) |t| t.tryBackgroundCompact(threshold) catch {};
+    }
+
+    /// Blocking loop that drives `backgroundCompactSweep` at `poll_ms`
+    /// intervals until `should_stop` flips to true. Spawn from the
+    /// application alongside (or instead of) `runBackgroundFlusher`.
+    /// Same `sleeper_io` semantics as the flusher.
+    pub fn runBackgroundCompactor(
+        self: *Database,
+        sleeper_io: Io,
+        poll_ms: u32,
+        should_stop: *std.atomic.Value(bool),
+    ) void {
+        const duration: Io.Duration = .fromMilliseconds(@intCast(poll_ms));
+        while (!should_stop.load(.acquire)) {
+            Io.sleep(sleeper_io, duration, .awake) catch return;
+            if (should_stop.load(.acquire)) return;
+            self.backgroundCompactSweep() catch {};
         }
     }
 
@@ -440,6 +485,18 @@ pub const Table = struct {
         if (!self.mutex.tryLock()) return;
         defer self.mutex.unlock(self.io);
         try self.maybeAutoFlushLocked();
+    }
+
+    /// Background-compactor entry point. Tries to acquire the mutex
+    /// non-blockingly; on success, runs `execCompact` iff the segment
+    /// count is at least `min_segments`. No-op on lock contention or
+    /// when below the threshold.
+    pub fn tryBackgroundCompact(self: *Table, min_segments: u32) !void {
+        if (min_segments == 0) return;
+        if (!self.mutex.tryLock()) return;
+        defer self.mutex.unlock(self.io);
+        if (self.manifest.segments.items.len < min_segments) return;
+        try @import("compact.zig").execCompact(self);
     }
 
     pub fn segmentCount(self: Table) usize {
