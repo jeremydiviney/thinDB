@@ -828,6 +828,209 @@ test "decimal: insert, flush, reread, filter, SUM/MIN/MAX over both backings" {
     }
 }
 
+test "decimal: backing transitions at p=18 (i64) and p=19 (i128)" {
+    // p=18 should pick the i64 backing; p=19 should pick i128.
+    const t_small = thindb.decimal(18, 4);
+    const t_big = thindb.decimal(19, 4);
+    try std.testing.expect(std.meta.activeTag(t_small) == .decimal64);
+    try std.testing.expect(std.meta.activeTag(t_big) == .decimal128);
+    try std.testing.expectEqual(@as(u8, 18), t_small.decimal64.p);
+    try std.testing.expectEqual(@as(u8, 19), t_big.decimal128.p);
+    try std.testing.expectEqual(@as(u8, 4), t_small.decimal64.s);
+    try std.testing.expectEqual(@as(u8, 4), t_big.decimal128.s);
+}
+
+test "decimal: p=38 holds the maximum i128 range" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            // Max precision, scale=0 (pure i128 integer-shaped storage).
+            .{ .name = "v", .type = thindb.decimal(38, 0) },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("big", schema, opts);
+
+    // i128 max is ~1.7e38. Pick values near the top end and the bottom.
+    const max_i128: i128 = std.math.maxInt(i128);
+    const min_i128: i128 = std.math.minInt(i128);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .v = max_i128 },
+        .{ .id = @as(i64, 2), .v = min_i128 },
+        .{ .id = @as(i64, 3), .v = @as(i128, 0) },
+    });
+    try t.flush();
+
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqualSlices(i128, &[_]i128{ max_i128, min_i128, 0 }, b.values[1].data.decimal128);
+}
+
+test "decimal: scale == precision (all fractional digits)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // DECIMAL(5, 5) — values in [-0.99999, 0.99999], i64 backing.
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "frac", .type = thindb.decimal(5, 5) },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("f", schema, opts);
+
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .frac = @as(i64, 99999) }, // 0.99999
+        .{ .id = @as(i64, 2), .frac = @as(i64, -99999) },
+        .{ .id = @as(i64, 3), .frac = @as(i64, 0) },
+    });
+    try t.flush();
+
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 99999, -99999, 0 }, b.values[1].data.decimal64);
+}
+
+// ---------------------------------------------------------------------------
+// Combinator chains — typical multi-operator query shapes
+// ---------------------------------------------------------------------------
+
+test "chain: filter -> project -> orderBy -> limit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 30), .active = true, .tag = "c" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 50), .active = false, .tag = "e" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 20), .active = true, .tag = "b" },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 40), .active = true, .tag = "d" },
+    });
+    try t.flush();
+
+    // active = true, then project (id, qty), then order by qty DESC, then limit 2.
+    var base = try thindb.scan(allocator, t);
+    var filtered = try base.filter(thindb.leafExpr("active", .eq, .{ .boolean = true }));
+    var projected = try filtered.project(&.{ "id", "qty" });
+    var sorted = try projected.orderBy(&.{.{ .col = "qty", .desc = true }});
+    var q = try sorted.limit(2);
+    defer q.deinit();
+
+    var got_ids: std.ArrayList(i64) = .empty;
+    defer got_ids.deinit(allocator);
+    var got_qty: std.ArrayList(i32) = .empty;
+    defer got_qty.deinit(allocator);
+    while (try q.next()) |batch| {
+        try got_ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try got_qty.appendSlice(allocator, batch.values[1].data.int);
+    }
+    // Top 2 active qty: id=5/qty=40, id=1/qty=30.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 1 }, got_ids.items);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 40, 30 }, got_qty.items);
+}
+
+test "chain: filter -> groupBy -> orderBy" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 100), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 200), .active = true, .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 50), .active = false, .tag = "a" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 75), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 300), .active = true, .tag = "b" },
+    });
+    try t.flush();
+
+    // active=true, group by tag, sum qty, order by sum DESC.
+    var base = try thindb.scan(allocator, t);
+    var filtered = try base.filter(thindb.leafExpr("active", .eq, .{ .boolean = true }));
+    var grouped = try filtered.groupBy(&.{"tag"}, &.{
+        .{ .func = .sum, .col = "qty", .as = "total" },
+    });
+    var q = try grouped.orderBy(&.{.{ .col = "total", .desc = true }});
+    defer q.deinit();
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), b.row_count);
+    // tag=b has 200+300=500, tag=a (active only) has 100+75=175.
+    try std.testing.expectEqualStrings("b", b.values[0].data.string.rowBytes(0));
+    try std.testing.expectEqual(@as(i64, 500), b.values[1].data.bigint[0]);
+    try std.testing.expectEqualStrings("a", b.values[0].data.string.rowBytes(1));
+    try std.testing.expectEqual(@as(i64, 175), b.values[1].data.bigint[1]);
+}
+
+test "chain: scan across memtable + segments threads through filter+aggregate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    // Three flushed segments + memtable rows.
+    try t.insert(&.{.{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" }});
+    try t.flush();
+    try t.insert(&.{.{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" }});
+    try t.flush();
+    try t.insert(&.{.{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = false, .tag = "c" }});
+    try t.flush();
+    try t.insert(&.{
+        .{ .id = @as(i64, 4), .qty = @as(i32, 40), .active = true, .tag = "d" },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 50), .active = false, .tag = "e" },
+    });
+
+    var base = try thindb.scan(allocator, t);
+    var filtered = try base.filter(thindb.leafExpr("active", .eq, .{ .boolean = true }));
+    var q = try filtered.aggregate(&.{
+        .{ .func = .count, .col = null, .as = "n" },
+        .{ .func = .sum, .col = "qty", .as = "total_qty" },
+    });
+    defer q.deinit();
+
+    const b = (try q.next()).?;
+    // active=true: ids 1, 2, 4. sum = 10+20+40 = 70. count = 3.
+    try std.testing.expectEqual(@as(i64, 3), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 70), b.values[1].data.bigint[0]);
+}
+
 // ---------------------------------------------------------------------------
 // Background flusher thread
 // ---------------------------------------------------------------------------
