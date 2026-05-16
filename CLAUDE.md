@@ -179,7 +179,7 @@ Default to inline for files under ~300 lines, companion above. Both are picked u
 
 ### Always end tests + benches with a manual `t.flush()` if you care about persistence
 
-There is no background flush *thread* yet — only the locking infrastructure (`Table.mutex`, `Database.backgroundFlushSweep`) is in place. Auto-flush still only fires inline on `insert`/`delete`, or whenever an external caller invokes `Database.backgroundFlushSweep()`. If a test/bench ends without an explicit `t.flush()`, any data in the memtable below the auto-flush thresholds is silently lost when the process exits.
+The library provides `Database.runBackgroundFlusher(io, poll_ms, &stop)` — a blocking loop the application can `std.Thread.spawn` to drive periodic flush sweeps. Without spawning that thread (or calling `Database.backgroundFlushSweep()` from the main thread), auto-flush only fires inline on `insert`/`delete`. Tests do NOT spawn the flusher by default. If a test/bench ends without an explicit `t.flush()` and below the auto-flush thresholds, the in-memory rows are silently lost on process exit.
 
 Tests that *test* memtable-only behavior (no flush, no segments) are fine — but those should use small row counts that stay below the thresholds, or explicitly raise the thresholds in their `Config`. Tests that need data on disk must call `t.flush()` explicitly before reading.
 

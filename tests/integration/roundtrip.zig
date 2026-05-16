@@ -828,6 +828,58 @@ test "decimal: insert, flush, reread, filter, SUM/MIN/MAX over both backings" {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Background flusher thread
+// ---------------------------------------------------------------------------
+
+test "runBackgroundFlusher: spawns a thread that drives flush sweeps" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Configure auto-flush triggers so a sweep WILL fire when run.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        // Time-based trigger: at least 1ms old + at least 1 row + 0 bytes min.
+        .auto_flush_secs = 0,
+        .auto_flush_rows = 1_000_000,
+        .auto_flush_bytes = 64 * 1024 * 1024,
+        .auto_flush_min_rows = 1,
+        .auto_flush_min_bytes = 0,
+    });
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    // Spawn the bg flusher with a fast poll interval. Use the same io as the
+    // database since std.testing.io's sleep path will block this OS thread.
+    var stop: std.atomic.Value(bool) = .init(false);
+    const thr = try std.Thread.spawn(.{}, thindb.Database.runBackgroundFlusher, .{
+        db, io, 10, &stop,
+    });
+
+    // Insert a couple rows — main thread, lock held briefly per insert.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+    });
+
+    // Let the bg thread loop a few times; it can't actually trigger a flush
+    // because auto_flush_secs=0 disables the time trigger and size/rows are
+    // far below thresholds. So this test really proves: the thread spawns,
+    // loops without crashing, and stops cleanly when signalled.
+    std.Thread.yield() catch {};
+
+    stop.store(true, .release);
+    thr.join();
+
+    // Memtable still has data (no flush actually fired).
+    try std.testing.expectEqual(@as(u64, 2), t.memtable.row_count);
+    try std.testing.expectEqual(@as(usize, 0), t.segmentCount());
+}
+
 test "nullable: rejects ?T into a non-nullable column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

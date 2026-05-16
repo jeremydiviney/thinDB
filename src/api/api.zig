@@ -122,6 +122,38 @@ pub const Database = struct {
         for (ptrs) |t| t.tryBackgroundFlush() catch {};
     }
 
+    /// Blocking loop that drives `backgroundFlushSweep` at `poll_ms`
+    /// intervals until `should_stop` flips to true. Designed to be
+    /// `std.Thread.spawn`-ed from the application:
+    ///
+    /// ```zig
+    /// var stop: std.atomic.Value(bool) = .init(false);
+    /// const thr = try std.Thread.spawn(.{}, thindb.Database.runBackgroundFlusher,
+    ///                                  .{ db, sleeper_io, 500, &stop });
+    /// defer { stop.store(true, .release); thr.join(); }
+    /// ```
+    ///
+    /// `sleeper_io` is the `Io` used for the per-iteration sleep. It must
+    /// support being called from this thread; in practice that means a
+    /// multi-threaded `Io` (e.g. `std.Io.Threaded.init(...)`), separate
+    /// from the `io` used for storage operations if those are
+    /// single-threaded.
+    pub fn runBackgroundFlusher(
+        self: *Database,
+        sleeper_io: Io,
+        poll_ms: u32,
+        should_stop: *std.atomic.Value(bool),
+    ) void {
+        const duration: Io.Duration = .fromMilliseconds(@intCast(poll_ms));
+        while (!should_stop.load(.acquire)) {
+            // Swallow sleep errors (cancellation/clock-unavailable): the loop
+            // will re-check the stop flag and exit cleanly.
+            Io.sleep(sleeper_io, duration, .awake) catch return;
+            if (should_stop.load(.acquire)) return;
+            self.backgroundFlushSweep() catch {};
+        }
+    }
+
     /// Create-or-open a table with the given schema. If the table already
     /// exists on disk, its persisted schema must match the one passed here.
     pub fn table(
