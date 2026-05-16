@@ -300,6 +300,24 @@ fn writeRawColumnBlock(
             }
         },
         .char => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
+        .decimal64 => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 8);
+            for (slice) |v| {
+                var b: [8]u8 = undefined;
+                format.writeI64(&b, v);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
+        .decimal128 => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 16);
+            for (slice) |v| {
+                var b: [16]u8 = undefined;
+                std.mem.writeInt(i128, &b, v, .little);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
     }
 }
 
@@ -376,8 +394,18 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
             break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
         },
         // i128 doesn't fit in the i64 stats slot — skip stats. Filter
-        // pushdown on LARGEINT columns will scan all row groups.
-        .largeint => .{ .min = 0, .max = 0 },
+        // pushdown on LARGEINT / DECIMAL(p>18) columns will scan all row groups.
+        .largeint, .decimal128 => .{ .min = 0, .max = 0 },
+        .decimal64 => |data| blk: {
+            const slice = data[row_start..row_end];
+            var lo: i64 = std.math.maxInt(i64);
+            var hi: i64 = std.math.minInt(i64);
+            for (slice) |v| {
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            break :blk .{ .min = lo, .max = hi };
+        },
         // Strings + floats + char carry no stats today.
         .varchar, .string, .char, .float, .double => .{ .min = 0, .max = 0 },
     };

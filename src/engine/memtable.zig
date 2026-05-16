@@ -97,6 +97,8 @@ pub const Memtable = struct {
                 .smallint => |l| l.items.len * @sizeOf(i16),
                 .largeint => |l| l.items.len * @sizeOf(i128),
                 .char => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
+                .decimal64 => |l| l.items.len * @sizeOf(i64),
+                .decimal128 => |l| l.items.len * @sizeOf(i128),
             };
             if (col.nulls) |n| total += n.items.len;
         }
@@ -331,6 +333,8 @@ pub const Memtable = struct {
             .largeint => |*list| try list.append(self.allocator, @as(i128, value)),
             .date => |*list| try list.append(self.allocator, @as(i32, value)),
             .datetime => |*list| try list.append(self.allocator, @as(i64, value)),
+            .decimal64 => |*list| try list.append(self.allocator, @as(i64, value)),
+            .decimal128 => |*list| try list.append(self.allocator, @as(i128, value)),
             else => return Error.TypeMismatch,
         }
         try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -372,6 +376,7 @@ pub const Memtable = struct {
         const col = &self.columns[col_idx];
         switch (col.data) {
             .largeint => |*list| try list.append(self.allocator, value),
+            .decimal128 => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
         try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -420,6 +425,8 @@ pub const Memtable = struct {
             .bigint => |*list| try list.append(self.allocator, value),
             .datetime => |*list| try list.append(self.allocator, value),
             .largeint => |*list| try list.append(self.allocator, @as(i128, value)),
+            .decimal64 => |*list| try list.append(self.allocator, value),
+            .decimal128 => |*list| try list.append(self.allocator, @as(i128, value)),
             else => return Error.TypeMismatch,
         }
         try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);

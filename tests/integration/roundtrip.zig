@@ -726,6 +726,108 @@ test "tinyint/smallint/largeint/char: insert, flush, reread, filter, MIN/MAX" {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DECIMAL columns
+// ---------------------------------------------------------------------------
+
+test "decimal: insert, flush, reread, filter, SUM/MIN/MAX over both backings" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            // DECIMAL(10, 2) — i64 backing. Values are raw mantissa
+            // (e.g. 12345 stored = 123.45 logical).
+            .{ .name = "price", .type = thindb.decimal(10, 2) },
+            // DECIMAL(30, 6) — i128 backing.
+            .{ .name = "big", .type = thindb.decimal(30, 6) },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 4 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+        defer db.close();
+        const t = try db.table("prices", schema, opts);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .price = @as(i64, 12345), .big = @as(i128, 1_000_000_000_000_000_000_000) },
+            .{ .id = @as(i64, 2), .price = @as(i64, 99999), .big = @as(i128, 2_000_000_000_000_000_000_000) },
+            .{ .id = @as(i64, 3), .price = @as(i64, 50000), .big = @as(i128, -3_000_000_000_000_000_000_000) },
+            .{ .id = @as(i64, 4), .price = @as(i64, 1), .big = @as(i128, 0) },
+        });
+        try t.flush();
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("prices", schema, opts);
+
+    // Roundtrip reread.
+    {
+        var q = try thindb.scan(allocator, t);
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 4), b.row_count);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 12345, 99999, 50000, 1 }, b.values[1].data.decimal64);
+        try std.testing.expectEqualSlices(i128, &[_]i128{
+            1_000_000_000_000_000_000_000,
+            2_000_000_000_000_000_000_000,
+            -3_000_000_000_000_000_000_000,
+            0,
+        }, b.values[2].data.decimal128);
+    }
+
+    // Filter on DECIMAL64.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.filter(thindb.leafExpr("price", .gte, .{ .decimal64 = 50000 }));
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, ids.items);
+    }
+
+    // Filter on DECIMAL128 (values exceed i64 range).
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.filter(thindb.leafExpr("big", .gt, .{ .decimal128 = 0 }));
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, ids.items);
+    }
+
+    // SUM(decimal64) → DECIMAL128(38, 2). MIN/MAX preserve input.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.aggregate(&.{
+            .{ .func = .sum, .col = "price", .as = "sum_price" },
+            .{ .func = .min, .col = "price", .as = "min_price" },
+            .{ .func = .max, .col = "price", .as = "max_price" },
+            .{ .func = .sum, .col = "big", .as = "sum_big" },
+            .{ .func = .min, .col = "big", .as = "min_big" },
+            .{ .func = .max, .col = "big", .as = "max_big" },
+        });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(i128, 12345 + 99999 + 50000 + 1), b.values[0].data.decimal128[0]);
+        try std.testing.expectEqual(@as(i64, 1), b.values[1].data.decimal64[0]);
+        try std.testing.expectEqual(@as(i64, 99999), b.values[2].data.decimal64[0]);
+        try std.testing.expectEqual(@as(i128, 0), b.values[3].data.decimal128[0]);
+        try std.testing.expectEqual(@as(i128, -3_000_000_000_000_000_000_000), b.values[4].data.decimal128[0]);
+        try std.testing.expectEqual(@as(i128, 2_000_000_000_000_000_000_000), b.values[5].data.decimal128[0]);
+    }
+}
+
 test "nullable: rejects ?T into a non-nullable column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

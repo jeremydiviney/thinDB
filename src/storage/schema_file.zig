@@ -112,6 +112,8 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: Schema, scratch: Allocator) !voi
         const extra: u32 = switch (c.type) {
             .varchar => |n| n,
             .char => |n| n,
+            .decimal64 => |spec| (@as(u32, spec.p) << 8) | @as(u32, spec.s),
+            .decimal128 => |spec| (@as(u32, spec.p) << 8) | @as(u32, spec.s),
             else => 0,
         };
         try appendU32(scratch, &buf, extra);
@@ -161,7 +163,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         if (cursor + 1 + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
         const tag_byte = bytes[cursor];
         cursor += 1;
-        if (tag_byte < 1 or tag_byte > 13) return Error.SchemaCorrupt;
+        if (tag_byte < 1 or tag_byte > 15) return Error.SchemaCorrupt;
         const tag: TypeTag = @enumFromInt(tag_byte);
         const nullable = bytes[cursor] != 0;
         cursor += 1;
@@ -182,6 +184,9 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .smallint => .smallint,
             .largeint => .largeint,
             .char => .{ .char = extra },
+            // Decimal extra: high byte = precision, low byte = scale.
+            .decimal64 => .{ .decimal64 = .{ .p = @intCast((extra >> 8) & 0xff), .s = @intCast(extra & 0xff) } },
+            .decimal128 => .{ .decimal128 = .{ .p = @intCast((extra >> 8) & 0xff), .s = @intCast(extra & 0xff) } },
         };
         columns[i] = .{ .name = name, .type = t, .nullable = nullable };
     }
@@ -230,6 +235,8 @@ pub fn schemasEqual(a: Schema, b: Schema) bool {
         switch (ac.type) {
             .varchar => |n| if (n != bc.type.varchar) return false,
             .char => |n| if (n != bc.type.char) return false,
+            .decimal64 => |spec| if (spec.p != bc.type.decimal64.p or spec.s != bc.type.decimal64.s) return false,
+            .decimal128 => |spec| if (spec.p != bc.type.decimal128.p or spec.s != bc.type.decimal128.s) return false,
             else => {},
         }
     }

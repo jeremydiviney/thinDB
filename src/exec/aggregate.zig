@@ -275,16 +275,17 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
         .sum => if (in != null and in.?.isFloat())
             .{ .sum_float = 0.0 }
         else
+            // i128 accumulator covers BIGINT, LARGEINT, DECIMAL64, DECIMAL128.
             .{ .sum_int = 0 },
         .min => if (in != null and in.?.isFloat())
             .{ .min_float = null }
-        else if (in != null and in.? == .largeint)
+        else if (in != null and (in.? == .largeint or in.? == .decimal128))
             .{ .min_large = null }
         else
             .{ .min_int = null },
         .max => if (in != null and in.?.isFloat())
             .{ .max_float = null }
-        else if (in != null and in.? == .largeint)
+        else if (in != null and (in.? == .largeint or in.? == .decimal128))
             .{ .max_large = null }
         else
             .{ .max_int = null },
@@ -297,7 +298,11 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         .count => .bigint,
         .sum => blk: {
             const t = in orelse return Error.AggregateColumnRequired;
-            break :blk if (t.isFloat()) .double else if (t == .largeint) .largeint else .bigint;
+            // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s).
+            if (t.decimalSpec()) |spec| break :blk .{ .decimal128 = .{ .p = 38, .s = spec.s } };
+            if (t.isFloat()) break :blk .double;
+            if (t == .largeint) break :blk .largeint;
+            break :blk .bigint;
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
         .avg => .double,
@@ -309,13 +314,13 @@ fn validateAggFn(func: AggFunc, in: ?Type) !void {
         .count => return,
         .sum, .avg => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!(t.isInteger() or t == .boolean or t == .float or t == .double)) {
+            if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double)) {
                 return Error.AggregateUnsupportedType;
             }
         },
         .min, .max => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!(t.isInteger() or t == .boolean or t == .float or t == .double or t == .date or t == .datetime)) {
+            if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double or t == .date or t == .datetime)) {
                 return Error.AggregateUnsupportedType;
             }
         },
@@ -375,6 +380,14 @@ fn updateState(
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
+                .decimal64 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.sum_int += v;
+                },
+                .decimal128 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.sum_int += v;
+                },
                 .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_float += v;
@@ -415,6 +428,14 @@ fn updateState(
                     if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
                 },
                 .largeint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    if (s.min_large == null or v < s.min_large.?) s.min_large = v;
+                },
+                .decimal64 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    if (s.min_int == null or v < s.min_int.?) s.min_int = v;
+                },
+                .decimal128 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     if (s.min_large == null or v < s.min_large.?) s.min_large = v;
                 },
@@ -462,6 +483,14 @@ fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.max_large == null or v > s.max_large.?) s.max_large = v;
                 },
+                .decimal64 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    if (s.max_int == null or v > s.max_int.?) s.max_int = v;
+                },
+                .decimal128 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    if (s.max_large == null or v > s.max_large.?) s.max_large = v;
+                },
                 .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     const fv: f64 = v;
@@ -478,10 +507,15 @@ fn updateState(
             const idx = col_idx.?;
             const view = batch.values[idx];
             switch (view.data) {
-                .int, .bigint, .boolean, .tinyint, .smallint => {
+                .int, .bigint, .boolean, .tinyint, .smallint, .decimal64 => {
                     avgUpdateInt(s, view, row_start, row_end);
                 },
                 .largeint => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.avg.sum += @as(f64, @floatFromInt(v));
+                    s.avg.count += 1;
+                },
+                .decimal128 => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.avg.sum += @as(f64, @floatFromInt(v));
                     s.avg.count += 1;
@@ -504,7 +538,7 @@ fn updateState(
 
 fn avgUpdateInt(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) void {
     switch (view.data) {
-        inline .int, .bigint, .boolean, .tinyint, .smallint => |slice| {
+        inline .int, .bigint, .boolean, .tinyint, .smallint, .decimal64 => |slice| {
             for (slice[row_start..row_end], row_start..) |v, r| {
                 if (!view.isValid(r)) continue;
                 s.avg.sum += @as(f64, @floatFromInt(v));
@@ -529,6 +563,10 @@ fn appendAccToColumn(
         .sum => switch (state) {
             .sum_int => |total| switch (out_type) {
                 .largeint => try col.data.largeint.append(allocator, total),
+                // DESIGN.md §3.4: SUM(DECIMAL) -> DECIMAL128(38, s). i128
+                // overflow is impossible here because total is already i128;
+                // any further widening would only occur in row-level arithmetic.
+                .decimal128 => try col.data.decimal128.append(allocator, total),
                 else => {
                     if (total > std.math.maxInt(i64) or total < std.math.minInt(i64)) {
                         return Error.ArithmeticOverflow;
@@ -550,6 +588,7 @@ fn appendAccToColumn(
                     .datetime => try col.data.datetime.append(allocator, v),
                     .tinyint => try col.data.tinyint.append(allocator, @intCast(v)),
                     .smallint => try col.data.smallint.append(allocator, @intCast(v)),
+                    .decimal64 => try col.data.decimal64.append(allocator, v),
                     else => unreachable,
                 }
             },
@@ -557,6 +596,7 @@ fn appendAccToColumn(
                 const v: i128 = if (func == .min) (state.min_large orelse 0) else (state.max_large orelse 0);
                 switch (out_type) {
                     .largeint => try col.data.largeint.append(allocator, v),
+                    .decimal128 => try col.data.decimal128.append(allocator, v),
                     else => unreachable,
                 }
             },
@@ -632,6 +672,12 @@ fn compoundGroupKey(
                 const bytes = sv.rowBytes(row);
                 try storage.format.appendU32(aa, &buf, @intCast(bytes.len));
                 try buf.appendSlice(aa, bytes);
+            },
+            .decimal64 => |s| try storage.format.appendI64(aa, &buf, s[row]),
+            .decimal128 => |s| {
+                var b: [16]u8 = undefined;
+                std.mem.writeInt(i128, &b, s[row], .little);
+                try buf.appendSlice(aa, &b);
             },
         }
     }
@@ -712,6 +758,16 @@ fn appendGroupKey(
                 const v = std.mem.readInt(i128, key_bytes[cursor..][0..16], .little);
                 cursor += 16;
                 try out_cols[i].data.largeint.append(allocator, v);
+            },
+            .decimal64 => {
+                const v = storage.format.readI64(key_bytes[cursor .. cursor + 8]);
+                cursor += 8;
+                try out_cols[i].data.decimal64.append(allocator, v);
+            },
+            .decimal128 => {
+                const v = std.mem.readInt(i128, key_bytes[cursor..][0..16], .little);
+                cursor += 16;
+                try out_cols[i].data.decimal128.append(allocator, v);
             },
         }
     }

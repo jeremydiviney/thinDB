@@ -127,6 +127,8 @@ pub const DataStore = union(TypeTag) {
     smallint: std.ArrayList(i16),
     largeint: std.ArrayList(i128),
     char: StringStore,
+    decimal64: std.ArrayList(i64),
+    decimal128: std.ArrayList(i128),
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return switch (t) {
@@ -143,6 +145,8 @@ pub const DataStore = union(TypeTag) {
             .smallint => .{ .smallint = .empty },
             .largeint => .{ .largeint = .empty },
             .char => .{ .char = try StringStore.init(allocator) },
+            .decimal64 => .{ .decimal64 = .empty },
+            .decimal128 => .{ .decimal128 = .empty },
         };
     }
 
@@ -161,6 +165,8 @@ pub const DataStore = union(TypeTag) {
             .smallint => |*list| list.deinit(allocator),
             .largeint => |*list| list.deinit(allocator),
             .char => |*ss| ss.deinit(allocator),
+            .decimal64 => |*list| list.deinit(allocator),
+            .decimal128 => |*list| list.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -180,6 +186,8 @@ pub const DataStore = union(TypeTag) {
             .smallint => |l| l.items.len,
             .largeint => |l| l.items.len,
             .char => |s| s.rowCount(),
+            .decimal64 => |l| l.items.len,
+            .decimal128 => |l| l.items.len,
         };
     }
 
@@ -198,6 +206,8 @@ pub const DataStore = union(TypeTag) {
             .smallint => |l| .{ .smallint = l.items },
             .largeint => |l| .{ .largeint = l.items },
             .char => |s| .{ .char = s.view() },
+            .decimal64 => |l| .{ .decimal64 = l.items },
+            .decimal128 => |l| .{ .decimal128 = l.items },
         };
     }
 
@@ -216,6 +226,8 @@ pub const DataStore = union(TypeTag) {
             .smallint => |*l| l.clearRetainingCapacity(),
             .largeint => |*l| l.clearRetainingCapacity(),
             .char => |*s| s.clear(),
+            .decimal64 => |*l| l.clearRetainingCapacity(),
+            .decimal128 => |*l| l.clearRetainingCapacity(),
         }
     }
 
@@ -237,6 +249,8 @@ pub const DataStore = union(TypeTag) {
             .smallint => |*l| try l.append(allocator, 0),
             .largeint => |*l| try l.append(allocator, 0),
             .char => |*s| try s.appendValue(allocator, ""),
+            .decimal64 => |*l| try l.append(allocator, 0),
+            .decimal128 => |*l| try l.append(allocator, 0),
         }
     }
 };

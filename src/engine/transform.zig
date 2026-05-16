@@ -30,6 +30,8 @@ pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
         .double => |l| std.math.order(l.items[a], l.items[b]),
         .date => |l| std.math.order(l.items[a], l.items[b]),
         .datetime => |l| std.math.order(l.items[a], l.items[b]),
+        .decimal64 => |l| std.math.order(l.items[a], l.items[b]),
+        .decimal128 => |l| std.math.order(l.items[a], l.items[b]),
     };
 }
 
@@ -98,6 +100,14 @@ pub fn appendAllColumn(
             .char => |*ss| {
                 for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
             },
+            else => unreachable,
+        },
+        .decimal64 => |s| switch (out.data) {
+            .decimal64 => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
+        .decimal128 => |s| switch (out.data) {
+            .decimal128 => |*list| try list.appendSlice(allocator, s),
             else => unreachable,
         },
     }
@@ -209,6 +219,20 @@ pub fn appendByIndices(
             },
             else => unreachable,
         },
+        .decimal64 => |s| switch (out.data) {
+            .decimal64 => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
+        .decimal128 => |s| switch (out.data) {
+            .decimal128 => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
     }
     if (out.nulls != null) {
         for (indices, 0..) |src_idx, j| {
@@ -301,6 +325,18 @@ pub fn appendMaskedColumn(
         .char => |sv| switch (out.data) {
             .char => |*ss| for (mask, 0..) |m, row| {
                 if (m) try ss.appendValue(allocator, sv.rowBytes(row));
+            },
+            else => unreachable,
+        },
+        .decimal64 => |s| switch (out.data) {
+            .decimal64 => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
+            },
+            else => unreachable,
+        },
+        .decimal128 => |s| switch (out.data) {
+            .decimal128 => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
             },
             else => unreachable,
         },
@@ -401,6 +437,18 @@ pub fn applyPermutation(
             errdefer dst.deinit(allocator);
             for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
             break :blk DataStore{ .char = dst };
+        },
+        .decimal64 => |l| blk: {
+            var dst: std.ArrayList(i64) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .decimal64 = dst };
+        },
+        .decimal128 => |l| blk: {
+            var dst: std.ArrayList(i128) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .decimal128 = dst };
         },
     };
 

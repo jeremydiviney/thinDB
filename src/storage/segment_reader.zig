@@ -364,6 +364,23 @@ fn decodeRawColumn(
             const owned = try decodeStringRaw(allocator, values, row_count);
             return .{ .data = .{ .char = owned }, .nulls = nulls };
         },
+        .decimal64 => {
+            const data = try allocator.alloc(i64, row_count);
+            errdefer allocator.free(data);
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) {
+                data[i] = format.readI64(values[i * 8 .. i * 8 + 8]);
+            }
+            return .{ .data = .{ .decimal64 = data }, .nulls = nulls };
+        },
+        .decimal128 => {
+            const data = try allocator.alloc(i128, row_count);
+            errdefer allocator.free(data);
+            for (data, 0..) |*slot, i| {
+                slot.* = std.mem.readInt(i128, values[i * 16 ..][0..16], .little);
+            }
+            return .{ .data = .{ .decimal128 = data }, .nulls = nulls };
+        },
     }
 }
 

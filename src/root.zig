@@ -10,6 +10,8 @@ pub const Type = types.Type;
 pub const Value = types.Value;
 pub const Column = types.Column;
 pub const Schema = types.Schema;
+pub const decimal = types.decimal;
+pub const DecimalSpec = types.DecimalSpec;
 
 pub const storage = @import("storage/storage.zig");
 pub const engine = @import("engine/engine.zig");

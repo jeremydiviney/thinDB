@@ -174,6 +174,8 @@ pub const Limit = struct {
                 .offsets = sv.offsets[0 .. n + 1],
                 .bytes = sv.bytes[0..sv.offsets[n]],
             } },
+            .decimal64 => |s| .{ .decimal64 = s[0..n] },
+            .decimal128 => |s| .{ .decimal128 = s[0..n] },
         };
         return .{ .data = new_data, .nulls = if (view.nulls) |b| b[0..storage.column.bitmapBytes(n)] else null };
     }

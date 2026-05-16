@@ -20,7 +20,32 @@ pub const TypeTag = enum(u8) {
     smallint = 11,
     largeint = 12,
     char = 13,
+    /// Fixed-point decimal with i64 backing (precision <= 18).
+    decimal64 = 14,
+    /// Fixed-point decimal with i128 backing (19 <= precision <= 38).
+    decimal128 = 15,
 };
+
+/// Precision/scale carried by both decimal type variants.
+pub const DecimalSpec = struct {
+    /// Total number of significant digits. Range [1, 38].
+    p: u8,
+    /// Digits after the decimal point. Range [0, p].
+    s: u8,
+};
+
+/// Build a `Type` for a DECIMAL(p, s). Picks the smallest backing that
+/// holds `p` digits.
+pub fn decimal(comptime p: u8, comptime s: u8) Type {
+    comptime {
+        if (p == 0 or p > 38) @compileError("DECIMAL precision must be in 1..=38");
+        if (s > p) @compileError("DECIMAL scale must be <= precision");
+    }
+    return if (p <= 18)
+        .{ .decimal64 = .{ .p = p, .s = s } }
+    else
+        .{ .decimal128 = .{ .p = p, .s = s } };
+}
 
 pub const Type = union(TypeTag) {
     int,
@@ -38,6 +63,8 @@ pub const Type = union(TypeTag) {
     /// CHAR(N) — declared max length N, storage identical to VARCHAR.
     /// Per DuckDB convention: no blank-padding, N is metadata only.
     char: u32,
+    decimal64: DecimalSpec,
+    decimal128: DecimalSpec,
 
     pub fn fixedSize(self: Type) ?usize {
         return switch (self) {
@@ -51,6 +78,8 @@ pub const Type = union(TypeTag) {
             .tinyint => @sizeOf(i8),
             .smallint => @sizeOf(i16),
             .largeint => @sizeOf(i128),
+            .decimal64 => @sizeOf(i64),
+            .decimal128 => @sizeOf(i128),
             .varchar, .string, .char => null,
         };
     }
@@ -83,6 +112,22 @@ pub const Type = union(TypeTag) {
         };
     }
 
+    pub fn isDecimal(self: Type) bool {
+        return switch (self) {
+            .decimal64, .decimal128 => true,
+            else => false,
+        };
+    }
+
+    /// Returns the (p, s) of a decimal column, or null if not a decimal.
+    pub fn decimalSpec(self: Type) ?DecimalSpec {
+        return switch (self) {
+            .decimal64 => |spec| spec,
+            .decimal128 => |spec| spec,
+            else => null,
+        };
+    }
+
     pub fn matchesZigType(self: Type, comptime T: type) bool {
         return switch (self) {
             .int => T == i32 or T == comptime_int,
@@ -95,6 +140,8 @@ pub const Type = union(TypeTag) {
             .tinyint => T == i8 or T == comptime_int,
             .smallint => T == i16 or T == comptime_int,
             .largeint => T == i128 or T == comptime_int,
+            .decimal64 => T == i64 or T == comptime_int,
+            .decimal128 => T == i128 or T == comptime_int,
             .varchar, .string, .char => isStringLikeType(T),
         };
     }
@@ -159,6 +206,8 @@ pub const ValueTag = enum(u8) {
     tinyint = 9,
     smallint = 10,
     largeint = 11,
+    decimal64 = 12,
+    decimal128 = 13,
 
     pub fn fromType(t: Type) ValueTag {
         return switch (t) {
@@ -173,6 +222,8 @@ pub const ValueTag = enum(u8) {
             .tinyint => .tinyint,
             .smallint => .smallint,
             .largeint => .largeint,
+            .decimal64 => .decimal64,
+            .decimal128 => .decimal128,
         };
     }
 };
@@ -189,6 +240,8 @@ pub const Value = union(ValueTag) {
     tinyint: i8,
     smallint: i16,
     largeint: i128,
+    decimal64: i64,
+    decimal128: i128,
 
     pub fn compare(self: Value, other: Value) std.math.Order {
         std.debug.assert(std.meta.activeTag(self) == std.meta.activeTag(other));
@@ -203,6 +256,8 @@ pub const Value = union(ValueTag) {
             .tinyint => |a| std.math.order(a, other.tinyint),
             .smallint => |a| std.math.order(a, other.smallint),
             .largeint => |a| std.math.order(a, other.largeint),
+            .decimal64 => |a| std.math.order(a, other.decimal64),
+            .decimal128 => |a| std.math.order(a, other.decimal128),
             .text => |a| switch (std.mem.order(u8, a, other.text)) {
                 .lt => .lt,
                 .gt => .gt,

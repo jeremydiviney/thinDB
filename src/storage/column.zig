@@ -57,6 +57,8 @@ pub const ValueView = union(TypeTag) {
     smallint: []const i16,
     largeint: []const i128,
     char: StringView,
+    decimal64: []const i64,
+    decimal128: []const i128,
 
     pub fn rowCount(self: ValueView) usize {
         return switch (self) {
@@ -73,6 +75,8 @@ pub const ValueView = union(TypeTag) {
             .smallint => |s| s.len,
             .largeint => |s| s.len,
             .char => |s| s.rowCount(),
+            .decimal64 => |s| s.len,
+            .decimal128 => |s| s.len,
         };
     }
 };
@@ -150,6 +154,8 @@ pub const OwnedData = union(TypeTag) {
     smallint: []i16,
     largeint: []i128,
     char: OwnedStringColumn,
+    decimal64: []i64,
+    decimal128: []i128,
 
     pub fn rowCount(self: OwnedData) usize {
         return switch (self) {
@@ -166,6 +172,8 @@ pub const OwnedData = union(TypeTag) {
             .smallint => |s| s.len,
             .largeint => |s| s.len,
             .char => |s| s.offsets.len - 1,
+            .decimal64 => |s| s.len,
+            .decimal128 => |s| s.len,
         };
     }
 
@@ -184,6 +192,8 @@ pub const OwnedData = union(TypeTag) {
             .smallint => |s| .{ .smallint = s },
             .largeint => |s| .{ .largeint = s },
             .char => |s| .{ .char = s.view() },
+            .decimal64 => |s| .{ .decimal64 = s },
+            .decimal128 => |s| .{ .decimal128 = s },
         };
     }
 
@@ -202,6 +212,8 @@ pub const OwnedData = union(TypeTag) {
             .smallint => |s| allocator.free(s),
             .largeint => |s| allocator.free(s),
             .char => |*s| s.deinit(allocator),
+            .decimal64 => |s| allocator.free(s),
+            .decimal128 => |s| allocator.free(s),
         }
         self.* = undefined;
     }
