@@ -69,6 +69,20 @@ pub const Config = struct {
     /// theoretical hole closed by future WAL support.
     sync_mode: SyncMode = .none,
 
+    /// Enable the write-ahead log. When true, every insert and delete is
+    /// appended to a single per-table WAL file and fsynced BEFORE the
+    /// operation returns success. On reopen, the WAL is replayed to
+    /// reconstruct any memtable contents that were lost on shutdown.
+    ///
+    /// This gives "INSERT returned OK = durable" semantics without
+    /// per-insert segment flushes. Pairs naturally with `sync_mode =
+    /// .per_flush` (segments + manifest also durable).
+    ///
+    /// Cost: one fsync per insert() / delete() call. Many small calls →
+    /// many fsyncs. Application code should batch inserts where possible
+    /// — a single insert(big_batch) is one fsync regardless of row count.
+    wal_enabled: bool = false,
+
 };
 
 pub const TableOptions = struct {
@@ -322,6 +336,9 @@ pub const Table = struct {
     manifest: storage.Manifest,
     memtable: engine.Memtable,
 
+    /// WAL writer when `Config.wal_enabled = true`. `null` otherwise.
+    wal: ?engine.wal.WalWriter,
+
     /// Serializes writers vs. the background flusher. Public mutating
     /// entry points (`insert`, `delete`, `flush`, `compact`) lock this
     /// before touching the memtable / manifest. Internal `*Locked` helpers
@@ -360,6 +377,15 @@ pub const Table = struct {
         var memtable = try engine.Memtable.init(allocator, schema);
         errdefer memtable.deinit();
 
+        // If a WAL exists on disk, replay it into the memtable BEFORE
+        // we open the WAL writer for new appends. If wal_enabled is
+        // false but a WAL file is present from a previous run, we still
+        // replay it so no acked writes are silently dropped.
+        _ = engine.wal.replay(allocator, io, table_dir, fp, &memtable) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
 
@@ -392,13 +418,30 @@ pub const Table = struct {
             .segments_dir = segments_dir,
             .manifest = manifest,
             .memtable = memtable,
+            .wal = null,
         };
+
+        // If we replayed WAL records into a unique-key table's memtable,
+        // re-run upsert resolution so any same-key dupes get tombstoned
+        // (intra-memtable + against existing segments). Without this,
+        // unique-key tables wouldn't behave the same after a crash as
+        // they did before.
+        if (schema.unique and self.memtable.row_count > 0) {
+            try @import("upsert.zig").applyUpsertResolution(self);
+        }
+
+        if (cfg.wal_enabled) {
+            // Replay already happened above (from the on-disk file). Now
+            // truncate-and-recreate so subsequent writes go through a fresh log.
+            self.wal = try engine.wal.WalWriter.create(allocator, io, table_dir, fp);
+        }
         return self;
     }
 
     fn close(self: *Table) void {
         const allocator = self.allocator;
         const io = self.io;
+        if (self.wal) |*w| w.deinit();
         self.cache.deinit();
         self.memtable.deinit();
         self.manifest.deinit();
@@ -439,7 +482,17 @@ pub const Table = struct {
 
     fn insertLocked(self: *Table, rows: anytype) !void {
         const was_empty = self.memtable.isEmpty();
+        const before_count: usize = @intCast(self.memtable.row_count);
         try self.memtable.insertRows(rows);
+        const after_count: usize = @intCast(self.memtable.row_count);
+
+        // Log the just-appended rows to the WAL before doing anything that
+        // could mutate them (upsert resolution, auto-flush). One fsync
+        // covers the whole batch.
+        if (self.wal) |*w| {
+            try w.appendInsert(&self.memtable, before_count, after_count);
+        }
+
         if (was_empty and !self.memtable.isEmpty()) {
             self.first_write_ts = Io.Clock.awake.now(self.io);
         }
@@ -490,6 +543,14 @@ pub const Table = struct {
 
         try self.manifest.appendSegment(.{ .segment_id = seg_id, .row_count = row_count });
         try storage.writeManifest(self.io, self.table_dir, self.manifest, sync);
+
+        // WAL: the records preceding this flush are now redundant. Append a
+        // flush marker so a crash mid-truncate is still recoverable, then
+        // truncate. Order is intentional — marker first, truncate second.
+        if (self.wal) |*w| {
+            try w.appendFlushMarker(seg_id);
+            try w.truncate(self.schema_fingerprint);
+        }
 
         self.memtable.clear();
         self.first_write_ts = null;
@@ -566,6 +627,8 @@ pub const Table = struct {
     pub fn delete(self: *Table, pred: exec.Predicate) !usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        // Log first; the delete primitive is idempotent on replay.
+        if (self.wal) |*w| try w.appendDelete(pred);
         return @import("delete.zig").execDelete(self, pred);
     }
 

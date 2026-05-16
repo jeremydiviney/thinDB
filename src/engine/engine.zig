@@ -9,9 +9,11 @@ pub const StringStore = memtable.StringStore;
 
 pub const store = @import("store.zig");
 pub const transform = @import("transform.zig");
+pub const wal = @import("wal.zig");
 
 test {
     _ = memtable;
     _ = store;
     _ = transform;
+    _ = wal;
 }
