@@ -789,6 +789,22 @@ fn appendColumnValueBytes(
         },
         .date => |s| try storage.format.appendI32(aa, buf, s[row]),
         .datetime => |s| try storage.format.appendI64(aa, buf, s[row]),
+        .tinyint => |s| try buf.append(aa, @bitCast(s[row])),
+        .smallint => |s| {
+            var b: [2]u8 = undefined;
+            std.mem.writeInt(i16, &b, s[row], .little);
+            try buf.appendSlice(aa, &b);
+        },
+        .largeint => |s| {
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(i128, &b, s[row], .little);
+            try buf.appendSlice(aa, &b);
+        },
+        .char => |sv| {
+            const bytes = sv.rowBytes(row);
+            try storage.format.appendU32(aa, buf, @intCast(bytes.len));
+            try buf.appendSlice(aa, bytes);
+        },
     }
 }
 
@@ -803,6 +819,10 @@ fn evalRow(view: storage.ColumnView, row: u32, pred: exec.Predicate) bool {
         .double => |s| cmpVal(f64, s[row], pred.val.double, pred.op),
         .date => |s| cmpVal(i32, s[row], pred.val.date, pred.op),
         .datetime => |s| cmpVal(i64, s[row], pred.val.datetime, pred.op),
+        .tinyint => |s| cmpVal(i8, s[row], pred.val.tinyint, pred.op),
+        .smallint => |s| cmpVal(i16, s[row], pred.val.smallint, pred.op),
+        .largeint => |s| cmpVal(i128, s[row], pred.val.largeint, pred.op),
+        .char => |sv| cmpStr(sv.rowBytes(row), pred.val.text, pred.op),
     };
 }
 
@@ -880,7 +900,7 @@ pub fn schemaFingerprint(schema: Schema) u64 {
         hasher.update(&[_]u8{tag});
         hasher.update(&[_]u8{@intFromBool(c.nullable)});
         switch (c.type) {
-            .varchar => |n| {
+            .varchar, .char => |n| {
                 var b: [4]u8 = undefined;
                 std.mem.writeInt(u32, &b, n, .little);
                 hasher.update(&b);

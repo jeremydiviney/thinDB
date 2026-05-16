@@ -53,6 +53,10 @@ pub const ValueView = union(TypeTag) {
     double: []const f64,
     date: []const i32,
     datetime: []const i64,
+    tinyint: []const i8,
+    smallint: []const i16,
+    largeint: []const i128,
+    char: StringView,
 
     pub fn rowCount(self: ValueView) usize {
         return switch (self) {
@@ -65,6 +69,10 @@ pub const ValueView = union(TypeTag) {
             .double => |s| s.len,
             .date => |s| s.len,
             .datetime => |s| s.len,
+            .tinyint => |s| s.len,
+            .smallint => |s| s.len,
+            .largeint => |s| s.len,
+            .char => |s| s.rowCount(),
         };
     }
 };
@@ -138,6 +146,10 @@ pub const OwnedData = union(TypeTag) {
     double: []f64,
     date: []i32,
     datetime: []i64,
+    tinyint: []i8,
+    smallint: []i16,
+    largeint: []i128,
+    char: OwnedStringColumn,
 
     pub fn rowCount(self: OwnedData) usize {
         return switch (self) {
@@ -150,6 +162,10 @@ pub const OwnedData = union(TypeTag) {
             .double => |s| s.len,
             .date => |s| s.len,
             .datetime => |s| s.len,
+            .tinyint => |s| s.len,
+            .smallint => |s| s.len,
+            .largeint => |s| s.len,
+            .char => |s| s.offsets.len - 1,
         };
     }
 
@@ -164,6 +180,10 @@ pub const OwnedData = union(TypeTag) {
             .double => |s| .{ .double = s },
             .date => |s| .{ .date = s },
             .datetime => |s| .{ .datetime = s },
+            .tinyint => |s| .{ .tinyint = s },
+            .smallint => |s| .{ .smallint = s },
+            .largeint => |s| .{ .largeint = s },
+            .char => |s| .{ .char = s.view() },
         };
     }
 
@@ -178,6 +198,10 @@ pub const OwnedData = union(TypeTag) {
             .double => |s| allocator.free(s),
             .date => |s| allocator.free(s),
             .datetime => |s| allocator.free(s),
+            .tinyint => |s| allocator.free(s),
+            .smallint => |s| allocator.free(s),
+            .largeint => |s| allocator.free(s),
+            .char => |*s| s.deinit(allocator),
         }
         self.* = undefined;
     }

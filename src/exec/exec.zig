@@ -765,6 +765,25 @@ fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bool) 
             const want = p.val.datetime;
             for (s[0..n], 0..) |v, i| mask[i] = cmp(i64, v, want, op);
         },
+        .tinyint => |s| {
+            const want = p.val.tinyint;
+            for (s[0..n], 0..) |v, i| mask[i] = cmp(i8, v, want, op);
+        },
+        .smallint => |s| {
+            const want = p.val.smallint;
+            for (s[0..n], 0..) |v, i| mask[i] = cmp(i16, v, want, op);
+        },
+        .largeint => |s| {
+            const want = p.val.largeint;
+            for (s[0..n], 0..) |v, i| mask[i] = cmp(i128, v, want, op);
+        },
+        .char => |sv| {
+            if (op != .eq and op != .neq) return Error.UnsupportedOperatorForType;
+            for (0..n) |i| {
+                const eq = std.mem.eql(u8, sv.rowBytes(i), p.val.text);
+                mask[i] = if (op == .eq) eq else !eq;
+            }
+        },
     }
     // Two-valued logic: a NULL value never matches a comparison.
     if (view.nulls != null) {
@@ -941,6 +960,13 @@ pub const Limit = struct {
             .double => |s| .{ .double = s[0..n] },
             .date => |s| .{ .date = s[0..n] },
             .datetime => |s| .{ .datetime = s[0..n] },
+            .tinyint => |s| .{ .tinyint = s[0..n] },
+            .smallint => |s| .{ .smallint = s[0..n] },
+            .largeint => |s| .{ .largeint = s[0..n] },
+            .char => |sv| .{ .char = .{
+                .offsets = sv.offsets[0 .. n + 1],
+                .bytes = sv.bytes[0..sv.offsets[n]],
+            } },
         };
         return .{ .data = new_data, .nulls = if (view.nulls) |b| b[0..storage.column.bitmapBytes(n)] else null };
     }
@@ -1142,6 +1168,9 @@ const AccState = union(enum) {
     max_int: ?i64,
     min_float: ?f64,
     max_float: ?f64,
+    /// Separate i128 min/max variants for LARGEINT inputs (don't fit in i64).
+    min_large: ?i128,
+    max_large: ?i128,
     avg: AvgAcc,
 };
 
@@ -1376,10 +1405,14 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
             .{ .sum_int = 0 },
         .min => if (in != null and in.?.isFloat())
             .{ .min_float = null }
+        else if (in != null and in.? == .largeint)
+            .{ .min_large = null }
         else
             .{ .min_int = null },
         .max => if (in != null and in.?.isFloat())
             .{ .max_float = null }
+        else if (in != null and in.? == .largeint)
+            .{ .max_large = null }
         else
             .{ .max_int = null },
         .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
@@ -1391,7 +1424,7 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         .count => .bigint,
         .sum => blk: {
             const t = in orelse return Error.AggregateColumnRequired;
-            break :blk if (t.isFloat()) .double else .bigint;
+            break :blk if (t.isFloat()) .double else if (t == .largeint) .largeint else .bigint;
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
         .avg => .double,
@@ -1403,13 +1436,13 @@ fn validateAggFn(func: AggFunc, in: ?Type) !void {
         .count => return,
         .sum, .avg => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!(t == .int or t == .bigint or t == .boolean or t == .float or t == .double)) {
+            if (!(t.isInteger() or t == .boolean or t == .float or t == .double)) {
                 return Error.AggregateUnsupportedType;
             }
         },
         .min, .max => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!(t == .int or t == .bigint or t == .boolean or t == .float or t == .double or t == .date or t == .datetime)) {
+            if (!(t.isInteger() or t == .boolean or t == .float or t == .double or t == .date or t == .datetime)) {
                 return Error.AggregateUnsupportedType;
             }
         },
@@ -1457,6 +1490,18 @@ fn updateState(
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
+                .tinyint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.sum_int += v;
+                },
+                .smallint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.sum_int += v;
+                },
+                .largeint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.sum_int += v;
+                },
                 .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_float += v;
@@ -1485,6 +1530,20 @@ fn updateState(
                     if (!view.isValid(r)) continue;
                     const iv: i64 = v;
                     if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
+                },
+                .tinyint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    const iv: i64 = v;
+                    if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
+                },
+                .smallint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    const iv: i64 = v;
+                    if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
+                },
+                .largeint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    if (s.min_large == null or v < s.min_large.?) s.min_large = v;
                 },
                 .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
@@ -1516,6 +1575,20 @@ fn updateState(
                     const iv: i64 = v;
                     if (s.max_int == null or iv > s.max_int.?) s.max_int = iv;
                 },
+                .tinyint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    const iv: i64 = v;
+                    if (s.max_int == null or iv > s.max_int.?) s.max_int = iv;
+                },
+                .smallint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    const iv: i64 = v;
+                    if (s.max_int == null or iv > s.max_int.?) s.max_int = iv;
+                },
+                .largeint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    if (s.max_large == null or v > s.max_large.?) s.max_large = v;
+                },
                 .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     const fv: f64 = v;
@@ -1532,17 +1605,10 @@ fn updateState(
             const idx = col_idx.?;
             const view = batch.values[idx];
             switch (view.data) {
-                .int => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
-                    if (!view.isValid(r)) continue;
-                    s.avg.sum += @as(f64, @floatFromInt(v));
-                    s.avg.count += 1;
+                .int, .bigint, .boolean, .tinyint, .smallint => {
+                    avgUpdateInt(s, view, row_start, row_end);
                 },
-                .bigint => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
-                    if (!view.isValid(r)) continue;
-                    s.avg.sum += @as(f64, @floatFromInt(v));
-                    s.avg.count += 1;
-                },
-                .boolean => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
+                .largeint => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.avg.sum += @as(f64, @floatFromInt(v));
                     s.avg.count += 1;
@@ -1563,6 +1629,19 @@ fn updateState(
     }
 }
 
+fn avgUpdateInt(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) void {
+    switch (view.data) {
+        inline .int, .bigint, .boolean, .tinyint, .smallint => |slice| {
+            for (slice[row_start..row_end], row_start..) |v, r| {
+                if (!view.isValid(r)) continue;
+                s.avg.sum += @as(f64, @floatFromInt(v));
+                s.avg.count += 1;
+            }
+        },
+        else => unreachable,
+    }
+}
+
 fn appendAccToColumn(
     allocator: Allocator,
     func: AggFunc,
@@ -1576,11 +1655,14 @@ fn appendAccToColumn(
             try col.data.bigint.append(allocator, @intCast(state.count));
         },
         .sum => switch (state) {
-            .sum_int => |total| {
-                if (total > std.math.maxInt(i64) or total < std.math.minInt(i64)) {
-                    return Error.ArithmeticOverflow;
-                }
-                try col.data.bigint.append(allocator, @intCast(total));
+            .sum_int => |total| switch (out_type) {
+                .largeint => try col.data.largeint.append(allocator, total),
+                else => {
+                    if (total > std.math.maxInt(i64) or total < std.math.minInt(i64)) {
+                        return Error.ArithmeticOverflow;
+                    }
+                    try col.data.bigint.append(allocator, @intCast(total));
+                },
             },
             .sum_float => |total| try col.data.double.append(allocator, total),
             else => unreachable,
@@ -1594,6 +1676,15 @@ fn appendAccToColumn(
                     .boolean => try col.data.boolean.append(allocator, @intCast(v)),
                     .date => try col.data.date.append(allocator, @intCast(v)),
                     .datetime => try col.data.datetime.append(allocator, v),
+                    .tinyint => try col.data.tinyint.append(allocator, @intCast(v)),
+                    .smallint => try col.data.smallint.append(allocator, @intCast(v)),
+                    else => unreachable,
+                }
+            },
+            .min_large, .max_large => {
+                const v: i128 = if (func == .min) (state.min_large orelse 0) else (state.max_large orelse 0);
+                switch (out_type) {
+                    .largeint => try col.data.largeint.append(allocator, v),
                     else => unreachable,
                 }
             },
@@ -1659,6 +1750,22 @@ fn compoundGroupKey(
             },
             .date => |s| try storage.format.appendI32(aa, &buf, s[row]),
             .datetime => |s| try storage.format.appendI64(aa, &buf, s[row]),
+            .tinyint => |s| try buf.append(aa, @bitCast(s[row])),
+            .smallint => |s| {
+                var b: [2]u8 = undefined;
+                std.mem.writeInt(i16, &b, s[row], .little);
+                try buf.appendSlice(aa, &b);
+            },
+            .largeint => |s| {
+                var b: [16]u8 = undefined;
+                std.mem.writeInt(i128, &b, s[row], .little);
+                try buf.appendSlice(aa, &b);
+            },
+            .char => |sv| {
+                const bytes = sv.rowBytes(row);
+                try storage.format.appendU32(aa, &buf, @intCast(bytes.len));
+                try buf.appendSlice(aa, bytes);
+            },
         }
     }
     return buf.toOwnedSlice(aa);
@@ -1691,7 +1798,7 @@ fn appendGroupKey(
                 try out_cols[i].data.boolean.append(allocator, key_bytes[cursor]);
                 cursor += 1;
             },
-            .varchar, .string => {
+            .varchar, .string, .char => {
                 const len = storage.format.readU32(key_bytes[cursor .. cursor + 4]);
                 cursor += 4;
                 const bytes = key_bytes[cursor .. cursor + len];
@@ -1699,6 +1806,7 @@ fn appendGroupKey(
                 const ss: *engine.StringStore = switch (out_cols[i].data) {
                     .varchar => |*x| x,
                     .string => |*x| x,
+                    .char => |*x| x,
                     else => unreachable,
                 };
                 try ss.appendValue(allocator, bytes);
@@ -1723,6 +1831,21 @@ fn appendGroupKey(
                 cursor += 8;
                 try out_cols[i].data.datetime.append(allocator, v);
             },
+            .tinyint => {
+                const v: i8 = @bitCast(key_bytes[cursor]);
+                cursor += 1;
+                try out_cols[i].data.tinyint.append(allocator, v);
+            },
+            .smallint => {
+                const v = std.mem.readInt(i16, key_bytes[cursor..][0..2], .little);
+                cursor += 2;
+                try out_cols[i].data.smallint.append(allocator, v);
+            },
+            .largeint => {
+                const v = std.mem.readInt(i128, key_bytes[cursor..][0..16], .little);
+                cursor += 16;
+                try out_cols[i].data.largeint.append(allocator, v);
+            },
         }
     }
 }
@@ -1744,7 +1867,10 @@ pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value)
         .boolean => |x| @intFromBool(x),
         .date => |x| x,
         .datetime => |x| x,
-        .text, .float, .double => return true, // no stats on strings/floats yet
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        // No stats on strings/floats/largeint — can't fit i128 in the i64 stats slot.
+        .text, .float, .double, .largeint => return true,
     };
     return switch (op) {
         .eq => wanted >= s.min and wanted <= s.max,

@@ -16,6 +16,10 @@ pub const TypeTag = enum(u8) {
     /// Microseconds since 1970-01-01T00:00:00 UTC (timezone-naive),
     /// stored as i64.
     datetime = 9,
+    tinyint = 10,
+    smallint = 11,
+    largeint = 12,
+    char = 13,
 };
 
 pub const Type = union(TypeTag) {
@@ -28,6 +32,12 @@ pub const Type = union(TypeTag) {
     double,
     date,
     datetime,
+    tinyint,
+    smallint,
+    largeint,
+    /// CHAR(N) — declared max length N, storage identical to VARCHAR.
+    /// Per DuckDB convention: no blank-padding, N is metadata only.
+    char: u32,
 
     pub fn fixedSize(self: Type) ?usize {
         return switch (self) {
@@ -38,13 +48,16 @@ pub const Type = union(TypeTag) {
             .double => @sizeOf(f64),
             .date => @sizeOf(i32),
             .datetime => @sizeOf(i64),
-            .varchar, .string => null,
+            .tinyint => @sizeOf(i8),
+            .smallint => @sizeOf(i16),
+            .largeint => @sizeOf(i128),
+            .varchar, .string, .char => null,
         };
     }
 
     pub fn isString(self: Type) bool {
         return switch (self) {
-            .varchar, .string => true,
+            .varchar, .string, .char => true,
             else => false,
         };
     }
@@ -63,6 +76,13 @@ pub const Type = union(TypeTag) {
         };
     }
 
+    pub fn isInteger(self: Type) bool {
+        return switch (self) {
+            .tinyint, .smallint, .int, .bigint, .largeint => true,
+            else => false,
+        };
+    }
+
     pub fn matchesZigType(self: Type, comptime T: type) bool {
         return switch (self) {
             .int => T == i32 or T == comptime_int,
@@ -72,7 +92,10 @@ pub const Type = union(TypeTag) {
             .double => T == f64 or T == comptime_float,
             .date => T == Date or T == i32 or T == comptime_int,
             .datetime => T == DateTime or T == i64 or T == comptime_int,
-            .varchar, .string => isStringLikeType(T),
+            .tinyint => T == i8 or T == comptime_int,
+            .smallint => T == i16 or T == comptime_int,
+            .largeint => T == i128 or T == comptime_int,
+            .varchar, .string, .char => isStringLikeType(T),
         };
     }
 };
@@ -128,22 +151,28 @@ pub const ValueTag = enum(u8) {
     int = 1,
     bigint = 2,
     boolean = 3,
-    text = 4, // covers both VARCHAR and STRING
+    text = 4, // covers VARCHAR, STRING, and CHAR
     float = 5,
     double = 6,
     date = 7,
     datetime = 8,
+    tinyint = 9,
+    smallint = 10,
+    largeint = 11,
 
     pub fn fromType(t: Type) ValueTag {
         return switch (t) {
             .int => .int,
             .bigint => .bigint,
             .boolean => .boolean,
-            .varchar, .string => .text,
+            .varchar, .string, .char => .text,
             .float => .float,
             .double => .double,
             .date => .date,
             .datetime => .datetime,
+            .tinyint => .tinyint,
+            .smallint => .smallint,
+            .largeint => .largeint,
         };
     }
 };
@@ -157,6 +186,9 @@ pub const Value = union(ValueTag) {
     double: f64,
     date: i32,
     datetime: i64,
+    tinyint: i8,
+    smallint: i16,
+    largeint: i128,
 
     pub fn compare(self: Value, other: Value) std.math.Order {
         std.debug.assert(std.meta.activeTag(self) == std.meta.activeTag(other));
@@ -168,6 +200,9 @@ pub const Value = union(ValueTag) {
             .double => |a| std.math.order(a, other.double),
             .date => |a| std.math.order(a, other.date),
             .datetime => |a| std.math.order(a, other.datetime),
+            .tinyint => |a| std.math.order(a, other.tinyint),
+            .smallint => |a| std.math.order(a, other.smallint),
+            .largeint => |a| std.math.order(a, other.largeint),
             .text => |a| switch (std.mem.order(u8, a, other.text)) {
                 .lt => .lt,
                 .gt => .gt,

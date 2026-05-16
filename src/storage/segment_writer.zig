@@ -276,6 +276,30 @@ fn writeRawColumnBlock(
                 buf.appendSliceAssumeCapacity(&b);
             }
         },
+        .tinyint => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len);
+            for (slice) |v| buf.appendAssumeCapacity(@bitCast(v));
+        },
+        .smallint => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 2);
+            for (slice) |v| {
+                var b: [2]u8 = undefined;
+                std.mem.writeInt(i16, &b, v, .little);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
+        .largeint => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 16);
+            for (slice) |v| {
+                var b: [16]u8 = undefined;
+                std.mem.writeInt(i128, &b, v, .little);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
+        .char => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
     }
 }
 
@@ -331,8 +355,31 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
             }
             break :blk .{ .min = lo, .max = hi };
         },
-        // Strings + floats carry no stats today (NaN ordering punted).
-        .varchar, .string, .float, .double => .{ .min = 0, .max = 0 },
+        .tinyint => |data| blk: {
+            const slice = data[row_start..row_end];
+            var lo: i8 = std.math.maxInt(i8);
+            var hi: i8 = std.math.minInt(i8);
+            for (slice) |v| {
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
+        },
+        .smallint => |data| blk: {
+            const slice = data[row_start..row_end];
+            var lo: i16 = std.math.maxInt(i16);
+            var hi: i16 = std.math.minInt(i16);
+            for (slice) |v| {
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
+        },
+        // i128 doesn't fit in the i64 stats slot — skip stats. Filter
+        // pushdown on LARGEINT columns will scan all row groups.
+        .largeint => .{ .min = 0, .max = 0 },
+        // Strings + floats + char carry no stats today.
+        .varchar, .string, .char, .float, .double => .{ .min = 0, .max = 0 },
     };
 }
 

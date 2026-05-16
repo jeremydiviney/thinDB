@@ -338,6 +338,32 @@ fn decodeRawColumn(
             }
             return .{ .data = .{ .datetime = data }, .nulls = nulls };
         },
+        .tinyint => {
+            const data = try allocator.alloc(i8, row_count);
+            errdefer allocator.free(data);
+            for (data, 0..) |*slot, i| slot.* = @bitCast(values[i]);
+            return .{ .data = .{ .tinyint = data }, .nulls = nulls };
+        },
+        .smallint => {
+            const data = try allocator.alloc(i16, row_count);
+            errdefer allocator.free(data);
+            for (data, 0..) |*slot, i| {
+                slot.* = std.mem.readInt(i16, values[i * 2 ..][0..2], .little);
+            }
+            return .{ .data = .{ .smallint = data }, .nulls = nulls };
+        },
+        .largeint => {
+            const data = try allocator.alloc(i128, row_count);
+            errdefer allocator.free(data);
+            for (data, 0..) |*slot, i| {
+                slot.* = std.mem.readInt(i128, values[i * 16 ..][0..16], .little);
+            }
+            return .{ .data = .{ .largeint = data }, .nulls = nulls };
+        },
+        .char => {
+            const owned = try decodeStringRaw(allocator, values, row_count);
+            return .{ .data = .{ .char = owned }, .nulls = nulls };
+        },
     }
 }
 

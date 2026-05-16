@@ -620,6 +620,112 @@ test "backgroundFlushSweep: fires time-based auto-flush when threshold met" {
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 }
 
+// ---------------------------------------------------------------------------
+// New integer widths + CHAR(N)
+// ---------------------------------------------------------------------------
+
+test "tinyint/smallint/largeint/char: insert, flush, reread, filter, MIN/MAX" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "tiny", .type = .tinyint },
+            .{ .name = "small", .type = .smallint },
+            .{ .name = "huge", .type = .largeint },
+            .{ .name = "code", .type = .{ .char = 4 } },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 4 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+        defer db.close();
+        const t = try db.table("widths", schema, opts);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .tiny = @as(i8, -10), .small = @as(i16, 100), .huge = @as(i128, 1_000_000_000_000_000_000), .code = "AAAA" },
+            .{ .id = @as(i64, 2), .tiny = @as(i8, 0), .small = @as(i16, -32_000), .huge = @as(i128, -1_000_000_000_000_000_000), .code = "BBBB" },
+            .{ .id = @as(i64, 3), .tiny = @as(i8, 127), .small = @as(i16, 32_000), .huge = @as(i128, 0), .code = "CCCC" },
+            .{ .id = @as(i64, 4), .tiny = @as(i8, -128), .small = @as(i16, 0), .huge = @as(i128, 999_999_999_999_999_999_999), .code = "DDDD" },
+        });
+        try t.flush();
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("widths", schema, opts);
+
+    // Reread roundtrip.
+    {
+        var q = try thindb.scan(allocator, t);
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 4), b.row_count);
+        try std.testing.expectEqualSlices(i8, &[_]i8{ -10, 0, 127, -128 }, b.values[1].data.tinyint);
+        try std.testing.expectEqualSlices(i16, &[_]i16{ 100, -32_000, 32_000, 0 }, b.values[2].data.smallint);
+        try std.testing.expectEqualSlices(i128, &[_]i128{ 1_000_000_000_000_000_000, -1_000_000_000_000_000_000, 0, 999_999_999_999_999_999_999 }, b.values[3].data.largeint);
+        try std.testing.expectEqualStrings("AAAA", b.values[4].data.char.rowBytes(0));
+        try std.testing.expectEqualStrings("DDDD", b.values[4].data.char.rowBytes(3));
+    }
+
+    // Filter on TINYINT.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.filter(thindb.leafExpr("tiny", .gte, .{ .tinyint = 0 }));
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, ids.items);
+    }
+
+    // Filter on LARGEINT (values exceed i64 range).
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.filter(thindb.leafExpr("huge", .gt, .{ .largeint = 100_000_000_000_000_000_000 }));
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try std.testing.expectEqualSlices(i64, &[_]i64{4}, ids.items);
+    }
+
+    // Filter on CHAR equality.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.filter(thindb.leafExpr("code", .eq, .{ .text = "BBBB" }));
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try std.testing.expectEqualSlices(i64, &[_]i64{2}, ids.items);
+    }
+
+    // MIN/MAX preserve narrow int widths.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.aggregate(&.{
+            .{ .func = .min, .col = "tiny", .as = "min_tiny" },
+            .{ .func = .max, .col = "tiny", .as = "max_tiny" },
+            .{ .func = .min, .col = "small", .as = "min_small" },
+            .{ .func = .max, .col = "small", .as = "max_small" },
+        });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(i8, -128), b.values[0].data.tinyint[0]);
+        try std.testing.expectEqual(@as(i8, 127), b.values[1].data.tinyint[0]);
+        try std.testing.expectEqual(@as(i16, -32_000), b.values[2].data.smallint[0]);
+        try std.testing.expectEqual(@as(i16, 32_000), b.values[3].data.smallint[0]);
+    }
+}
+
 test "nullable: rejects ?T into a non-nullable column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

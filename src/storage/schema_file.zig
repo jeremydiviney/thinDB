@@ -111,6 +111,7 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: Schema, scratch: Allocator) !voi
         try buf.append(scratch, @intFromBool(c.nullable));
         const extra: u32 = switch (c.type) {
             .varchar => |n| n,
+            .char => |n| n,
             else => 0,
         };
         try appendU32(scratch, &buf, extra);
@@ -160,7 +161,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         if (cursor + 1 + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
         const tag_byte = bytes[cursor];
         cursor += 1;
-        if (tag_byte < 1 or tag_byte > 9) return Error.SchemaCorrupt;
+        if (tag_byte < 1 or tag_byte > 13) return Error.SchemaCorrupt;
         const tag: TypeTag = @enumFromInt(tag_byte);
         const nullable = bytes[cursor] != 0;
         cursor += 1;
@@ -177,6 +178,10 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .double => .double,
             .date => .date,
             .datetime => .datetime,
+            .tinyint => .tinyint,
+            .smallint => .smallint,
+            .largeint => .largeint,
+            .char => .{ .char = extra },
         };
         columns[i] = .{ .name = name, .type = t, .nullable = nullable };
     }
@@ -224,6 +229,7 @@ pub fn schemasEqual(a: Schema, b: Schema) bool {
         if (ac.nullable != bc.nullable) return false;
         switch (ac.type) {
             .varchar => |n| if (n != bc.type.varchar) return false,
+            .char => |n| if (n != bc.type.char) return false,
             else => {},
         }
     }

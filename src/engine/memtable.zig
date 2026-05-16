@@ -130,6 +130,10 @@ pub const DataStore = union(TypeTag) {
     double: std.ArrayList(f64),
     date: std.ArrayList(i32),
     datetime: std.ArrayList(i64),
+    tinyint: std.ArrayList(i8),
+    smallint: std.ArrayList(i16),
+    largeint: std.ArrayList(i128),
+    char: StringStore,
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return switch (t) {
@@ -142,6 +146,10 @@ pub const DataStore = union(TypeTag) {
             .double => .{ .double = .empty },
             .date => .{ .date = .empty },
             .datetime => .{ .datetime = .empty },
+            .tinyint => .{ .tinyint = .empty },
+            .smallint => .{ .smallint = .empty },
+            .largeint => .{ .largeint = .empty },
+            .char => .{ .char = try StringStore.init(allocator) },
         };
     }
 
@@ -156,6 +164,10 @@ pub const DataStore = union(TypeTag) {
             .double => |*list| list.deinit(allocator),
             .date => |*list| list.deinit(allocator),
             .datetime => |*list| list.deinit(allocator),
+            .tinyint => |*list| list.deinit(allocator),
+            .smallint => |*list| list.deinit(allocator),
+            .largeint => |*list| list.deinit(allocator),
+            .char => |*ss| ss.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -171,6 +183,10 @@ pub const DataStore = union(TypeTag) {
             .double => |l| l.items.len,
             .date => |l| l.items.len,
             .datetime => |l| l.items.len,
+            .tinyint => |l| l.items.len,
+            .smallint => |l| l.items.len,
+            .largeint => |l| l.items.len,
+            .char => |s| s.rowCount(),
         };
     }
 
@@ -185,6 +201,10 @@ pub const DataStore = union(TypeTag) {
             .double => |l| .{ .double = l.items },
             .date => |l| .{ .date = l.items },
             .datetime => |l| .{ .datetime = l.items },
+            .tinyint => |l| .{ .tinyint = l.items },
+            .smallint => |l| .{ .smallint = l.items },
+            .largeint => |l| .{ .largeint = l.items },
+            .char => |s| .{ .char = s.view() },
         };
     }
 
@@ -199,6 +219,10 @@ pub const DataStore = union(TypeTag) {
             .double => |*l| l.clearRetainingCapacity(),
             .date => |*l| l.clearRetainingCapacity(),
             .datetime => |*l| l.clearRetainingCapacity(),
+            .tinyint => |*l| l.clearRetainingCapacity(),
+            .smallint => |*l| l.clearRetainingCapacity(),
+            .largeint => |*l| l.clearRetainingCapacity(),
+            .char => |*s| s.clear(),
         }
     }
 
@@ -216,6 +240,10 @@ pub const DataStore = union(TypeTag) {
             .double => |*l| try l.append(allocator, 0.0),
             .date => |*l| try l.append(allocator, 0),
             .datetime => |*l| try l.append(allocator, 0),
+            .tinyint => |*l| try l.append(allocator, 0),
+            .smallint => |*l| try l.append(allocator, 0),
+            .largeint => |*l| try l.append(allocator, 0),
+            .char => |*s| try s.appendValue(allocator, ""),
         }
     }
 };
@@ -268,6 +296,10 @@ pub const Memtable = struct {
                 .double => |l| l.items.len * @sizeOf(f64),
                 .date => |l| l.items.len * @sizeOf(i32),
                 .datetime => |l| l.items.len * @sizeOf(i64),
+                .tinyint => |l| l.items.len,
+                .smallint => |l| l.items.len * @sizeOf(i16),
+                .largeint => |l| l.items.len * @sizeOf(i128),
+                .char => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
             };
             if (col.nulls) |n| total += n.items.len;
         }
@@ -464,10 +496,18 @@ pub const Memtable = struct {
             try self.appendDate(col_idx, value.days());
         } else if (comptime V == types.DateTime) {
             try self.appendDateTime(col_idx, value.micros());
-        } else if (comptime V == i32 or V == comptime_int) {
-            try self.appendInt32Like(col_idx, V, value);
+        } else if (comptime V == comptime_int) {
+            try self.appendComptimeInt(col_idx, value);
+        } else if (comptime V == i8) {
+            try self.appendInt8(col_idx, value);
+        } else if (comptime V == i16) {
+            try self.appendInt16(col_idx, value);
+        } else if (comptime V == i32) {
+            try self.appendInt32(col_idx, value);
         } else if (comptime V == i64) {
             try self.appendInt64(col_idx, value);
+        } else if (comptime V == i128) {
+            try self.appendInt128(col_idx, value);
         } else if (comptime V == bool) {
             try self.appendBoolean(col_idx, value);
         } else if (comptime V == f32 or V == comptime_float) {
@@ -479,6 +519,64 @@ pub const Memtable = struct {
         } else {
             @compileError("memtable.appendValue: unsupported value type " ++ @typeName(V));
         }
+    }
+
+    /// `comptime_int` literals can flow into any integer-shaped column;
+    /// the comptime cast verifies the literal fits.
+    fn appendComptimeInt(self: *Memtable, col_idx: usize, comptime value: comptime_int) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .tinyint => |*list| try list.append(self.allocator, @as(i8, value)),
+            .smallint => |*list| try list.append(self.allocator, @as(i16, value)),
+            .int => |*list| try list.append(self.allocator, @as(i32, value)),
+            .bigint => |*list| try list.append(self.allocator, @as(i64, value)),
+            .largeint => |*list| try list.append(self.allocator, @as(i128, value)),
+            .date => |*list| try list.append(self.allocator, @as(i32, value)),
+            .datetime => |*list| try list.append(self.allocator, @as(i64, value)),
+            else => return Error.TypeMismatch,
+        }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+    }
+
+    /// Runtime i32 may only flow into columns where it fits without narrowing.
+    fn appendInt32(self: *Memtable, col_idx: usize, value: i32) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .int => |*list| try list.append(self.allocator, value),
+            .bigint => |*list| try list.append(self.allocator, value),
+            .largeint => |*list| try list.append(self.allocator, value),
+            .date => |*list| try list.append(self.allocator, value),
+            .datetime => |*list| try list.append(self.allocator, value),
+            else => return Error.TypeMismatch,
+        }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+    }
+
+    fn appendInt8(self: *Memtable, col_idx: usize, value: i8) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .tinyint => |*list| try list.append(self.allocator, value),
+            else => return Error.TypeMismatch,
+        }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+    }
+
+    fn appendInt16(self: *Memtable, col_idx: usize, value: i16) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .smallint => |*list| try list.append(self.allocator, value),
+            else => return Error.TypeMismatch,
+        }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+    }
+
+    fn appendInt128(self: *Memtable, col_idx: usize, value: i128) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .largeint => |*list| try list.append(self.allocator, value),
+            else => return Error.TypeMismatch,
+        }
+        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendDate(self: *Memtable, col_idx: usize, days: i32) !void {
@@ -518,23 +616,12 @@ pub const Memtable = struct {
         try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
-    fn appendInt32Like(self: *Memtable, col_idx: usize, comptime V: type, value: V) !void {
-        const col = &self.columns[col_idx];
-        switch (col.data) {
-            .int => |*list| try list.append(self.allocator, @as(i32, value)),
-            .bigint => |*list| try list.append(self.allocator, @as(i64, value)),
-            .date => |*list| try list.append(self.allocator, @as(i32, value)),
-            .datetime => |*list| try list.append(self.allocator, @as(i64, value)),
-            else => return Error.TypeMismatch,
-        }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
-    }
-
     fn appendInt64(self: *Memtable, col_idx: usize, value: i64) !void {
         const col = &self.columns[col_idx];
         switch (col.data) {
             .bigint => |*list| try list.append(self.allocator, value),
             .datetime => |*list| try list.append(self.allocator, value),
+            .largeint => |*list| try list.append(self.allocator, @as(i128, value)),
             else => return Error.TypeMismatch,
         }
         try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -554,6 +641,7 @@ pub const Memtable = struct {
         switch (col.data) {
             .varchar => |*ss| try ss.appendValue(self.allocator, value),
             .string => |*ss| try ss.appendValue(self.allocator, value),
+            .char => |*ss| try ss.appendValue(self.allocator, value),
             else => return Error.TypeMismatch,
         }
         try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -623,6 +711,24 @@ pub fn appendAllColumn(
         },
         .datetime => |s| switch (out.data) {
             .datetime => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
+        .tinyint => |s| switch (out.data) {
+            .tinyint => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
+        .smallint => |s| switch (out.data) {
+            .smallint => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
+        .largeint => |s| switch (out.data) {
+            .largeint => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
+        .char => |sv| switch (out.data) {
+            .char => |*ss| {
+                for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
+            },
             else => unreachable,
         },
     }
@@ -708,6 +814,33 @@ pub fn appendByIndices(
             },
             else => unreachable,
         },
+        .tinyint => |s| switch (out.data) {
+            .tinyint => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
+        .smallint => |s| switch (out.data) {
+            .smallint => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
+        .largeint => |s| switch (out.data) {
+            .largeint => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
+        .char => |sv| switch (out.data) {
+            .char => |*ss| {
+                for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
+            },
+            else => unreachable,
+        },
     }
     if (out.nulls != null) {
         for (indices, 0..) |src_idx, j| {
@@ -776,6 +909,30 @@ pub fn appendMaskedColumn(
         .datetime => |s| switch (out.data) {
             .datetime => |*list| for (s, mask) |v, m| {
                 if (m) try list.append(allocator, v);
+            },
+            else => unreachable,
+        },
+        .tinyint => |s| switch (out.data) {
+            .tinyint => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
+            },
+            else => unreachable,
+        },
+        .smallint => |s| switch (out.data) {
+            .smallint => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
+            },
+            else => unreachable,
+        },
+        .largeint => |s| switch (out.data) {
+            .largeint => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
+            },
+            else => unreachable,
+        },
+        .char => |sv| switch (out.data) {
+            .char => |*ss| for (mask, 0..) |m, row| {
+                if (m) try ss.appendValue(allocator, sv.rowBytes(row));
             },
             else => unreachable,
         },
@@ -867,6 +1024,30 @@ fn applyPermutation(
             for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
             break :blk DataStore{ .datetime = dst };
         },
+        .tinyint => |l| blk: {
+            var dst: std.ArrayList(i8) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .tinyint = dst };
+        },
+        .smallint => |l| blk: {
+            var dst: std.ArrayList(i16) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .smallint = dst };
+        },
+        .largeint => |l| blk: {
+            var dst: std.ArrayList(i128) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .largeint = dst };
+        },
+        .char => |s| blk: {
+            var dst = try StringStore.init(allocator);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
+            break :blk DataStore{ .char = dst };
+        },
     };
 
     var nulls: ?std.ArrayList(u8) = null;
@@ -894,6 +1075,10 @@ fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
         .boolean => |l| std.math.order(l.items[a], l.items[b]),
         .varchar => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
         .string => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
+        .char => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
+        .tinyint => |l| std.math.order(l.items[a], l.items[b]),
+        .smallint => |l| std.math.order(l.items[a], l.items[b]),
+        .largeint => |l| std.math.order(l.items[a], l.items[b]),
         .float => |l| std.math.order(l.items[a], l.items[b]),
         .double => |l| std.math.order(l.items[a], l.items[b]),
         .date => |l| std.math.order(l.items[a], l.items[b]),
