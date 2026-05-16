@@ -35,6 +35,23 @@ pub const readManifest = manifest.readManifest;
 pub const writeSegment = segment_writer.writeSegment;
 pub const readSegment = segment_reader.readSegment;
 
+/// Write `data` to `dir/sub_path`. When `sync_after_write` is true, also
+/// `fsync` the resulting file before closing — guarantees the bytes are on
+/// physical media (not just OS page cache) by the time we return. Used for
+/// segments, tombstones, and the manifest's write-tmp step.
+pub fn writeFileSynced(
+    io: Io,
+    dir: Io.Dir,
+    sub_path: []const u8,
+    data: []const u8,
+    sync_after_write: bool,
+) !void {
+    var file = try dir.createFile(io, sub_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, data);
+    if (sync_after_write) try file.sync(io);
+}
+
 // ---------------------------------------------------------------------------
 // Round-trip test — write some columns out, read them back, verify.
 // ---------------------------------------------------------------------------
@@ -86,6 +103,7 @@ test "round-trip a single row group with all v0.1 types" {
         0xCAFEBABE_DEADBEEF, // fingerprint
         16, // row_group_size — small to force one row group of 5
         &columns,
+        false, // sync not needed for round-trip test
     );
     defer info.deinit(allocator);
 
@@ -157,7 +175,7 @@ test "round-trip with multiple row groups" {
         .{ .data = .{ .int = &qtys } },
     };
 
-    var info = try writeSegment(allocator, io, tmp.dir, "multi.dat", schema, 1, 0, 3, &columns);
+    var info = try writeSegment(allocator, io, tmp.dir, "multi.dat", schema, 1, 0, 3, &columns, false);
     defer info.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 3), info.row_groups.len);

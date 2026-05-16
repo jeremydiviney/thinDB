@@ -62,6 +62,7 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
                 t.segments_dir,
                 entry.segment_id,
                 deleted.items,
+                t.syncEnabled(),
             );
             total += deleted.items.len;
         }

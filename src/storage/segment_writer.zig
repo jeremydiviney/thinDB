@@ -28,6 +28,7 @@ pub fn writeSegment(
     schema_fingerprint: u64,
     row_group_size: usize,
     columns: []const ColumnView,
+    sync_on_close: bool,
 ) !SegmentInfo {
     if (columns.len != schema.columns.len) return format.Error.SchemaMismatch;
     if (row_group_size == 0) return format.Error.InvalidRowGroupSize;
@@ -111,7 +112,7 @@ pub fn writeSegment(
     try buf.appendSlice(allocator, &format.segment_magic);
 
     // ---- Flush to disk ----
-    try dir.writeFile(io, .{ .sub_path = file_name, .data = buf.items });
+    try @import("storage.zig").writeFileSynced(io, dir, file_name, buf.items, sync_on_close);
 
     return SegmentInfo{
         .segment_id = segment_id,

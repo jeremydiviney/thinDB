@@ -78,7 +78,7 @@ pub const Manifest = struct {
     }
 };
 
-pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest) !void {
+pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(m.allocator);
 
@@ -95,7 +95,10 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest) !void {
 
     try buf.appendSlice(m.allocator, &manifest_magic);
 
-    try dir.writeFile(io, .{ .sub_path = manifest_tmp_filename, .data = buf.items });
+    // write-tmp + (optional fsync) + atomic rename. Parent-directory fsync
+    // is skipped — NTFS rename is durable via the journal; ext4 has a small
+    // known hole closed by future WAL work.
+    try @import("storage.zig").writeFileSynced(io, dir, manifest_tmp_filename, buf.items, sync);
     try Io.Dir.rename(dir, manifest_tmp_filename, dir, manifest_filename, io);
 }
 
@@ -176,7 +179,7 @@ test "manifest round-trips with entries" {
     try written.appendSegment(.{ .segment_id = 2, .row_count = 250 });
     try written.appendSegment(.{ .segment_id = 5, .row_count = 73 });
 
-    try writeManifest(io, tmp.dir, written);
+    try writeManifest(io, tmp.dir, written, false);
 
     var read = try readManifest(allocator, io, tmp.dir, 0xABCDEF);
     defer read.deinit();
@@ -215,7 +218,7 @@ test "manifest fingerprint mismatch errors" {
 
     var written = Manifest.empty(allocator, 0xAAAA);
     defer written.deinit();
-    try writeManifest(io, tmp.dir, written);
+    try writeManifest(io, tmp.dir, written, false);
 
     try std.testing.expectError(Error.SchemaFingerprintMismatch, readManifest(allocator, io, tmp.dir, 0xBBBB));
 }
@@ -231,14 +234,14 @@ test "manifest atomic rename replaces existing manifest" {
     var v1 = Manifest.empty(allocator, 1);
     defer v1.deinit();
     try v1.appendSegment(.{ .segment_id = 1, .row_count = 10 });
-    try writeManifest(io, tmp.dir, v1);
+    try writeManifest(io, tmp.dir, v1, false);
 
     // Second write replaces it
     var v2 = Manifest.empty(allocator, 1);
     defer v2.deinit();
     try v2.appendSegment(.{ .segment_id = 1, .row_count = 10 });
     try v2.appendSegment(.{ .segment_id = 2, .row_count = 20 });
-    try writeManifest(io, tmp.dir, v2);
+    try writeManifest(io, tmp.dir, v2, false);
 
     var read = try readManifest(allocator, io, tmp.dir, 1);
     defer read.deinit();

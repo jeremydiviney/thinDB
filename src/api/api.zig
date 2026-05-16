@@ -25,6 +25,8 @@ pub const Error = error{
     UpsertRequiresUniqueKey,
 };
 
+pub const SyncMode = enum { none, per_flush };
+
 pub const Config = struct {
     /// Default rows per row-group in flushed segments.
     row_group_size: usize = 65_536,
@@ -54,6 +56,18 @@ pub const Config = struct {
     /// sweep picks it (regardless of tier count) so the dead rows get
     /// reclaimed. Default 0.30. Set to a value > 1.0 to disable.
     compact_tombstone_threshold: f32 = 0.30,
+
+    /// Durability mode. `.none` (default) returns from flush/delete as
+    /// soon as bytes are in the OS page cache — fast but lossy on power
+    /// loss. `.per_flush` fsyncs each segment + tombstone file after
+    /// writing, and routes the manifest update through an atomic
+    /// write-tmp-then-rename with an fsync on the temp. Adds ~3-15 ms
+    /// per flush on consumer NVMe; reads are unaffected.
+    ///
+    /// Note: v0.7 fsync does NOT fsync the parent directory. NTFS handles
+    /// rename durability via its journal; on Linux ext4 there is a small
+    /// theoretical hole closed by future WAL support.
+    sync_mode: SyncMode = .none,
 
 };
 
@@ -295,6 +309,9 @@ pub const Table = struct {
     auto_flush_secs: u32,
     auto_flush_min_rows: u64,
     auto_flush_min_bytes: usize,
+
+    /// Durability mode (copied from Database.Config at open time).
+    sync_mode: SyncMode,
     /// Timestamp at which the current (post-flush) memtable received its
     /// first row. Reset to `null` after every flush. Drives the time trigger.
     first_write_ts: ?Io.Timestamp = null,
@@ -370,6 +387,7 @@ pub const Table = struct {
             .auto_flush_secs = cfg.auto_flush_secs,
             .auto_flush_min_rows = cfg.auto_flush_min_rows,
             .auto_flush_min_bytes = cfg.auto_flush_min_bytes,
+            .sync_mode = cfg.sync_mode,
             .table_dir = table_dir,
             .segments_dir = segments_dir,
             .manifest = manifest,
@@ -455,6 +473,7 @@ pub const Table = struct {
         var snapshot = try self.memtable.buildSortedSnapshot(self.allocator, self.order_key_indices);
         defer snapshot.deinit();
 
+        const sync = self.syncEnabled();
         var info = try storage.writeSegment(
             self.allocator,
             self.io,
@@ -465,11 +484,12 @@ pub const Table = struct {
             self.schema_fingerprint,
             self.row_group_size,
             snapshot.views,
+            sync,
         );
         defer info.deinit(self.allocator);
 
         try self.manifest.appendSegment(.{ .segment_id = seg_id, .row_count = row_count });
-        try storage.writeManifest(self.io, self.table_dir, self.manifest);
+        try storage.writeManifest(self.io, self.table_dir, self.manifest, sync);
 
         self.memtable.clear();
         self.first_write_ts = null;
@@ -528,6 +548,12 @@ pub const Table = struct {
 
     pub fn segmentCount(self: Table) usize {
         return self.manifest.segments.items.len;
+    }
+
+    /// True iff this table is configured for durable writes (Config.sync_mode).
+    /// Storage primitives that fsync take this as a parameter.
+    pub fn syncEnabled(self: Table) bool {
+        return self.sync_mode != .none;
     }
 
     pub fn segmentFileName(buf: []u8, seg_id: u64) ![]u8 {

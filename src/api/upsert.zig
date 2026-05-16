@@ -96,6 +96,7 @@ pub fn applyUpsertResolution(t: *Table) !void {
                 t.segments_dir,
                 entry.segment_id,
                 deleted.items,
+                t.syncEnabled(),
             );
         }
     }

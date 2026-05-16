@@ -81,6 +81,7 @@ pub fn write(
     seg_id: u64,
     offsets: []const u32,
     scratch: Allocator,
+    sync: bool,
 ) !void {
     var name_buf: [32]u8 = undefined;
     const file_name = try fileNameFor(&name_buf, seg_id);
@@ -95,7 +96,7 @@ pub fn write(
     for (offsets) |off| try appendU32(scratch, &buf, off);
     try buf.appendSlice(scratch, &tombstone_magic);
 
-    try segments_dir.writeFile(io, .{ .sub_path = file_name, .data = buf.items });
+    try @import("storage.zig").writeFileSynced(io, segments_dir, file_name, buf.items, sync);
 }
 
 /// Read existing tombstones (if any), merge in `new_offsets`, dedupe, sort,
@@ -107,6 +108,7 @@ pub fn merge(
     segments_dir: Io.Dir,
     seg_id: u64,
     new_offsets: []const u32,
+    sync: bool,
 ) !void {
     var combined: std.ArrayList(u32) = .empty;
     defer combined.deinit(allocator);
@@ -129,7 +131,7 @@ pub fn merge(
     }
     combined.items.len = write_idx;
 
-    try write(io, segments_dir, seg_id, combined.items, allocator);
+    try write(io, segments_dir, seg_id, combined.items, allocator, sync);
 }
 
 const appendU16 = format.appendU16;
@@ -143,7 +145,7 @@ test "round-trip tombstone offsets" {
     defer tmp.cleanup();
 
     const offsets = [_]u32{ 3, 17, 42, 1024 };
-    try write(io, tmp.dir, 7, &offsets, allocator);
+    try write(io, tmp.dir, 7, &offsets, allocator, false);
 
     const got = (try read(allocator, io, tmp.dir, 7)).?;
     defer allocator.free(got);
@@ -168,8 +170,8 @@ test "merge sorts and dedupes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try merge(allocator, io, tmp.dir, 1, &[_]u32{ 5, 10, 3 });
-    try merge(allocator, io, tmp.dir, 1, &[_]u32{ 10, 7, 5 });
+    try merge(allocator, io, tmp.dir, 1, &[_]u32{ 5, 10, 3 }, false);
+    try merge(allocator, io, tmp.dir, 1, &[_]u32{ 10, 7, 5 }, false);
 
     const got = (try read(allocator, io, tmp.dir, 1)).?;
     defer allocator.free(got);

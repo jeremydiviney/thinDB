@@ -21,6 +21,7 @@ pub const exec = @import("exec/exec.zig");
 pub const Database = api.Database;
 pub const Table = api.Table;
 pub const Config = api.Config;
+pub const SyncMode = api.SyncMode;
 pub const TableOptions = api.TableOptions;
 pub const OpenOptions = api.OpenOptions;
 pub const Query = exec.Query;

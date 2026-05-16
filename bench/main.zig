@@ -70,6 +70,10 @@ pub fn main() !void {
     try benchTombstonePressureCompact(allocator, io);
     try benchTierFillUp(allocator, io);
 
+    std.debug.print("\nDurability (sync_mode)\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    try benchDurabilityCost(allocator, io);
+
     std.debug.print("--------------------------------------------------------------------------------\n\n", .{});
 }
 
@@ -339,6 +343,7 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
         t.schema_fingerprint,
         65_536,
         snapshot.views,
+        false, // no fsync — measuring compress+write throughput, not durability
     );
     defer info.deinit(allocator);
     const compress_and_write_ns = elapsedNs(io, t_write_start);
@@ -827,6 +832,108 @@ fn benchTierFillUp(allocator: Allocator, io: Io) !void {
                 },
             );
         }
+    }
+}
+
+/// Compare ingest throughput under sync_mode .none vs .per_flush.
+/// Same workload run twice — fsync overhead per flush is what we're isolating.
+fn benchDurabilityCost(allocator: Allocator, io: Io) !void {
+    const total_rows: usize = 1_000_000;
+
+    // -------- .none: no fsync, fast path --------
+    {
+        var dir = try freshDir(io, ".bench-data/dur_none");
+        defer dir.close(io);
+        var db = try thindb.Database.open(allocator, io, dir, .{
+            .sync_mode = .none,
+            .auto_flush_secs = 0,
+        });
+        defer db.close();
+        const t = try db.table("t", schema, options);
+        const rows = try buildRows(allocator, total_rows);
+        defer allocator.free(rows);
+
+        const t0 = Io.Clock.awake.now(io);
+        try t.insert(rows);
+        try t.flush();
+        const elapsed = elapsedNs(io, t0);
+        try report("insert + flush  (sync=.none)    ", total_rows, elapsed, null);
+    }
+
+    // -------- .per_flush: one fsync on segment, one on manifest --------
+    {
+        var dir = try freshDir(io, ".bench-data/dur_per_flush");
+        defer dir.close(io);
+        var db = try thindb.Database.open(allocator, io, dir, .{
+            .sync_mode = .per_flush,
+            .auto_flush_secs = 0,
+        });
+        defer db.close();
+        const t = try db.table("t", schema, options);
+        const rows = try buildRows(allocator, total_rows);
+        defer allocator.free(rows);
+
+        const t0 = Io.Clock.awake.now(io);
+        try t.insert(rows);
+        try t.flush();
+        const elapsed = elapsedNs(io, t0);
+        try report("insert + flush  (sync=.per_flush)", total_rows, elapsed, null);
+    }
+
+    // -------- sustained ingest, .none --------
+    {
+        const batches: usize = 100;
+        const batch_size: usize = 1_000;
+        var dir = try freshDir(io, ".bench-data/dur_sus_none");
+        defer dir.close(io);
+        var db = try thindb.Database.open(allocator, io, dir, .{
+            .sync_mode = .none,
+            .auto_flush_secs = 0,
+            .auto_flush_rows = std.math.maxInt(u64),
+            .auto_flush_bytes = std.math.maxInt(usize),
+        });
+        defer db.close();
+        const t = try db.table("t", schema, options);
+        const batch = try buildRows(allocator, batch_size);
+        defer allocator.free(batch);
+
+        const t0 = Io.Clock.awake.now(io);
+        var done: usize = 0;
+        while (done < batches * batch_size) : (done += batch_size) {
+            for (batch, 0..) |*r, i| r.id = @intCast(done + i);
+            try t.insert(batch);
+            try t.flush();
+        }
+        const elapsed = elapsedNs(io, t0);
+        try report("sustained 100 flushes (sync=.none)    ", batches * batch_size, elapsed, null);
+    }
+
+    // -------- sustained ingest, .per_flush --------
+    {
+        const batches: usize = 100;
+        const batch_size: usize = 1_000;
+        var dir = try freshDir(io, ".bench-data/dur_sus_per_flush");
+        defer dir.close(io);
+        var db = try thindb.Database.open(allocator, io, dir, .{
+            .sync_mode = .per_flush,
+            .auto_flush_secs = 0,
+            .auto_flush_rows = std.math.maxInt(u64),
+            .auto_flush_bytes = std.math.maxInt(usize),
+        });
+        defer db.close();
+        const t = try db.table("t", schema, options);
+        const batch = try buildRows(allocator, batch_size);
+        defer allocator.free(batch);
+
+        const t0 = Io.Clock.awake.now(io);
+        var done: usize = 0;
+        while (done < batches * batch_size) : (done += batch_size) {
+            for (batch, 0..) |*r, i| r.id = @intCast(done + i);
+            try t.insert(batch);
+            try t.flush();
+        }
+        const elapsed = elapsedNs(io, t0);
+        try report("sustained 100 flushes (sync=.per_flush)", batches * batch_size, elapsed, null);
     }
 }
 

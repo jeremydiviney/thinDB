@@ -230,11 +230,13 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
         if (!is_input) keep.appendAssumeCapacity(entry);
     }
 
+    const sync = t.syncEnabled();
+
     if (work.row_count == 0) {
         // Everything was tombstoned. Just drop the inputs from the manifest.
         t.manifest.segments.clearRetainingCapacity();
         try t.manifest.segments.appendSlice(t.allocator, keep.items);
-        try storage.writeManifest(t.io, t.table_dir, t.manifest);
+        try storage.writeManifest(t.io, t.table_dir, t.manifest, sync);
         for (seg_ids) |id| try t.deleteSegmentFiles(id);
         return;
     }
@@ -257,6 +259,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
         t.schema_fingerprint,
         t.row_group_size,
         snapshot.views,
+        sync,
     );
     defer info.deinit(t.allocator);
 
@@ -268,7 +271,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
 
     t.manifest.segments.clearRetainingCapacity();
     try t.manifest.segments.appendSlice(t.allocator, keep.items);
-    try storage.writeManifest(t.io, t.table_dir, t.manifest);
+    try storage.writeManifest(t.io, t.table_dir, t.manifest, sync);
 
     for (seg_ids) |id| try t.deleteSegmentFiles(id);
 }
