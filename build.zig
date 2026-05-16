@@ -4,12 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ---- zstd C library (allyourcodebase/zstd via build.zig.zon) ----
+    const zstd_dep = b.dependency("zstd", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ---- thinDB library module ----
     const thindb_mod = b.addModule("thindb", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    thindb_mod.linkLibrary(zstd_dep.artifact("zstd"));
 
     // ---- Library artifact (so we have something to `zig build`) ----
     const lib = b.addLibrary(.{

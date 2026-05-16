@@ -1,6 +1,10 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
+# Local Zig package cache (populated by build.zig.zon deps).
+zig-pkg/
+# Throwaway clone we used while debugging the zstd Windows-symlink issue.
+vendor/zstd-upstream/
 
 # Bench scratch directories — recreated each run
 .bench-data/

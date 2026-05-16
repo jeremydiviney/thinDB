@@ -29,16 +29,15 @@
 const std = @import("std");
 
 pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
-/// v4: column-block header carries a flags byte (currently `has_nulls`). When
-/// `has_nulls` is set the (decompressed) payload begins with `bitmapBytes(rg.row_count)`
-/// bytes of validity bitmap (1=valid, 0=null) before the value bytes.
-/// v3 segments aren't readable by v4 code.
-pub const segment_version: u16 = 4;
+/// v5: column blocks use zstd (level 3) instead of flate for compression.
+/// On-disk format is otherwise identical to v4; v4 segments aren't readable by
+/// v5 code because the per-block compression bytes have a different meaning.
+pub const segment_version: u16 = 5;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
     none = 0,
-    flate = 1,
+    zstd = 1,
 };
 
 /// Per-column-block flags (u8). Bit 0 = has_nulls (decompressed payload is

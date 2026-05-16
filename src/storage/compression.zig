@@ -1,53 +1,59 @@
-//! In-memory DEFLATE compress/decompress, used by the segment writer/reader
-//! for column block compression.
-//!
-//! We use the raw DEFLATE container (no zlib/gzip header) to save a few bytes
-//! per block. zstd isn't available in stdlib 0.16 for compression yet, so
-//! flate is the pragmatic choice with no external deps.
+//! In-memory zstd compress/decompress, used by the segment writer/reader for
+//! column-block compression. Calls into the vendored libzstd C library via
+//! `@cImport`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Io = std.Io;
-const flate = std.compress.flate;
 
-/// Default DEFLATE compression level. Level 6 is the GZIP/zlib default —
-/// a good speed/ratio balance.
-pub const default_level: flate.Compress.Options = flate.Compress.Options.default;
+const c = @cImport({
+    @cInclude("zstd.h");
+});
+
+/// Default zstd compression level. 3 is the upstream default — Pareto-optimal
+/// speed/ratio for analytics-shaped data. Range is 1 (fastest) to 22.
+pub const default_level: c_int = 3;
+
+pub const Error = error{
+    ZstdEncodeFailed,
+    ZstdDecodeFailed,
+    OutOfMemory,
+};
 
 /// Compress `input` into a freshly-allocated byte slice. Caller owns the
 /// returned slice and must `allocator.free` it.
 pub fn compress(allocator: Allocator, input: []const u8) ![]u8 {
-    // Allocating writer needs a non-empty buffer for flate.Compress.init
-    // (which asserts `output.buffer.len > 8`). Seed with a small capacity;
-    // it grows as needed.
-    var out: Io.Writer.Allocating = try .initCapacity(allocator, @max(64, input.len / 4 + 64));
-    defer out.deinit();
+    const bound = c.ZSTD_compressBound(input.len);
+    const dst = try allocator.alloc(u8, bound);
+    errdefer allocator.free(dst);
 
-    // flate.Compress also needs a working buffer at least `flate.max_window_len`
-    // bytes (its lookahead/hash table is built on top of this).
-    var lookahead: [flate.max_window_len]u8 = undefined;
-    var comp = try flate.Compress.init(&out.writer, &lookahead, .raw, default_level);
-    try comp.writer.writeAll(input);
-    try comp.finish();
+    const written = c.ZSTD_compress(
+        dst.ptr,
+        dst.len,
+        input.ptr,
+        input.len,
+        default_level,
+    );
+    if (c.ZSTD_isError(written) != 0) return Error.ZstdEncodeFailed;
 
-    // Move the bytes out of the Allocating writer.
-    var list = out.toArrayList();
-    return list.toOwnedSlice(allocator);
+    return allocator.realloc(dst, written) catch dst[0..written];
 }
 
-/// Decompress `input` (raw DEFLATE) and return a freshly-allocated slice of
-/// exactly `uncompressed_size` bytes. Caller owns the returned slice.
+/// Decompress `input` and return a freshly-allocated slice of exactly
+/// `uncompressed_size` bytes. Caller owns the returned slice.
 pub fn decompress(allocator: Allocator, input: []const u8, uncompressed_size: usize) ![]u8 {
-    var in_reader = Io.Reader.fixed(input);
+    const dst = try allocator.alloc(u8, uncompressed_size);
+    errdefer allocator.free(dst);
 
-    var window: [flate.max_window_len]u8 = undefined;
-    var dec = flate.Decompress.init(&in_reader, .raw, &window);
+    const written = c.ZSTD_decompress(
+        dst.ptr,
+        dst.len,
+        input.ptr,
+        input.len,
+    );
+    if (c.ZSTD_isError(written) != 0) return Error.ZstdDecodeFailed;
+    if (written != uncompressed_size) return Error.ZstdDecodeFailed;
 
-    const out = try allocator.alloc(u8, uncompressed_size);
-    errdefer allocator.free(out);
-
-    try dec.reader.readSliceAll(out);
-    return out;
+    return dst;
 }
 
 // ---------- tests --------------------------------------------------------

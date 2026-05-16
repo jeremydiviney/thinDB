@@ -210,7 +210,7 @@ fn readBlockRaw(
     owned_raw: *?[]u8,
 ) ![]const u8 {
     const kind_byte = bytes[offset];
-    if (kind_byte > @intFromEnum(format.Compression.flate)) return format.Error.UnknownCompression;
+    if (kind_byte > @intFromEnum(format.Compression.zstd)) return format.Error.UnknownCompression;
     const kind: format.Compression = @enumFromInt(kind_byte);
     const uncompressed_size = format.readU32(bytes[offset + 4 .. offset + 8]);
     const compressed_size = format.readU32(bytes[offset + 8 .. offset + 12]);
@@ -219,7 +219,7 @@ fn readBlockRaw(
 
     switch (kind) {
         .none => return payload,
-        .flate => {
+        .zstd => {
             const r = try compression_mod.decompress(allocator, payload, uncompressed_size);
             owned_raw.* = r;
             return r;
@@ -235,7 +235,7 @@ fn getDecompressedBytes(
     offset: usize,
 ) ![]u8 {
     const kind_byte = bytes[offset];
-    if (kind_byte > @intFromEnum(format.Compression.flate)) return format.Error.UnknownCompression;
+    if (kind_byte > @intFromEnum(format.Compression.zstd)) return format.Error.UnknownCompression;
     const kind: format.Compression = @enumFromInt(kind_byte);
     const uncompressed_size = format.readU32(bytes[offset + 4 .. offset + 8]);
     const compressed_size = format.readU32(bytes[offset + 8 .. offset + 12]);
@@ -244,7 +244,7 @@ fn getDecompressedBytes(
 
     switch (kind) {
         .none => return allocator.dupe(u8, payload),
-        .flate => return compression_mod.decompress(allocator, payload, uncompressed_size),
+        .zstd => return compression_mod.decompress(allocator, payload, uncompressed_size),
     }
 }
 

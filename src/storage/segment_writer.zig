@@ -155,7 +155,7 @@ fn writeColumnBlock(
     defer allocator.free(compressed);
 
     const use_compressed = compressed.len < scratch.items.len;
-    const kind: format.Compression = if (use_compressed) .flate else .none;
+    const kind: format.Compression = if (use_compressed) .zstd else .none;
     const payload_size: u32 = if (use_compressed)
         @intCast(compressed.len)
     else

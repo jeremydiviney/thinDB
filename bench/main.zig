@@ -390,7 +390,7 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
     const compress_seconds = @as(f64, @floatFromInt(compress_only_ns)) / 1e9;
     const compress_mb_per_s = (@as(f64, @floatFromInt(raw_bytes)) / 1_048_576.0) / compress_seconds;
     std.debug.print(
-        "  flate compress (level 6, one shot)  {d:.1}MB → {d:.1}MB  {d:.1}ms  {d:.1} MB/s (input)  ratio={d:.2}\n",
+        "  zstd compress (level 3, one shot)   {d:.1}MB → {d:.1}MB  {d:.1}ms  {d:.1} MB/s (input)  ratio={d:.2}\n",
         .{
             @as(f64, @floatFromInt(raw_bytes)) / 1_048_576.0,
             @as(f64, @floatFromInt(compressed.len)) / 1_048_576.0,
