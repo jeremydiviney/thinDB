@@ -69,6 +69,10 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
     }
 
     // ---- Memtable ----
+    // Snapshot-isolated path: build a NEW memtable with the surviving rows,
+    // atomically swap the table's pointer, retire the old. Concurrent scans
+    // that captured the old memtable continue to see the pre-delete state
+    // until they finish; the old memtable's columns are never mutated again.
     if (t.memtable.row_count > 0) {
         const n: usize = @intCast(t.memtable.row_count);
         const keep = try t.allocator.alloc(bool, n);
@@ -76,8 +80,13 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
         const view = t.memtable.columns[col_idx].view();
         for (0..n) |i| keep[i] = !comparison.evalRow(view, @intCast(i), pred);
 
-        const kept = try t.memtable.retainRows(keep);
-        total += n - kept;
+        if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
+            const old_mt = t.memtable;
+            t.memtable = new_mt;
+            old_mt.retire();
+            old_mt.release();
+            total += n - new_mt.row_count;
+        }
     }
 
     return total;

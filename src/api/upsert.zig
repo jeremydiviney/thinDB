@@ -41,7 +41,15 @@ pub fn applyUpsertResolution(t: *Table) !void {
         gop.value_ptr.* = @intCast(i);
     }
 
-    _ = try t.memtable.retainRows(keep);
+    // Snapshot-isolated retire-replace if any rows were dropped. Scans that
+    // pinned the pre-resolution memtable keep seeing those rows; new scans
+    // see the deduped state.
+    if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
+        const old_mt = t.memtable;
+        t.memtable = new_mt;
+        old_mt.retire();
+        old_mt.release();
+    }
 
     // ---- 2. Build a set of surviving keys to probe segments with. --------
     const surviving_n: usize = @intCast(t.memtable.row_count);

@@ -51,7 +51,50 @@ pub const Memtable = struct {
     columns: []ColumnStore,
     row_count: u64 = 0,
 
+    /// Reference count for snapshot-isolated reads. Starts at 1 (the Table's
+    /// own reference). Each scan that captures this memtable calls `acquire`
+    /// to bump it; `release` drops the count and frees the memtable when
+    /// the count reaches 0 AND it has been retired.
+    refcount: std.atomic.Value(u32) = .init(1),
+    /// Set to true by `retire()` once a flush/delete has installed a fresh
+    /// memtable as the table's active one. A retired memtable is read-only
+    /// from then on — readers iterating it remain safe because we never
+    /// mutate columns after retirement.
+    retired: std.atomic.Value(bool) = .init(false),
+
+    /// Heap-allocate a Memtable with refcount = 1. Use this for any Memtable
+    /// owned by a Table (the value-returning `init` is kept for unit tests
+    /// that own the struct on the stack).
+    pub fn create(allocator: Allocator, schema: Schema) !*Memtable {
+        return createCapacity(allocator, schema, 0, 0);
+    }
+
+    /// Like `create` but pre-reserves per-column buffer capacity. Used by
+    /// Table to size memtables to ~`auto_flush_rows` so concurrent inserts
+    /// never trigger an ArrayList realloc — which would invalidate the slice
+    /// pointers a snapshot-pinned scan is iterating.
+    pub fn createCapacity(
+        allocator: Allocator,
+        schema: Schema,
+        rows_cap: usize,
+        bytes_cap: usize,
+    ) !*Memtable {
+        const self = try allocator.create(Memtable);
+        errdefer allocator.destroy(self);
+        self.* = try initCapacity(allocator, schema, rows_cap, bytes_cap);
+        return self;
+    }
+
     pub fn init(allocator: Allocator, schema: Schema) !Memtable {
+        return initCapacity(allocator, schema, 0, 0);
+    }
+
+    pub fn initCapacity(
+        allocator: Allocator,
+        schema: Schema,
+        rows_cap: usize,
+        bytes_cap: usize,
+    ) !Memtable {
         var columns = try allocator.alloc(ColumnStore, schema.columns.len);
         errdefer allocator.free(columns);
 
@@ -60,7 +103,7 @@ pub const Memtable = struct {
             for (columns[0..initialized]) |*c| c.deinit(allocator);
         }
         for (schema.columns, 0..) |c, i| {
-            columns[i] = try ColumnStore.init(allocator, c.type, c.nullable);
+            columns[i] = try ColumnStore.initCapacity(allocator, c.type, c.nullable, rows_cap, bytes_cap);
             initialized += 1;
         }
 
@@ -71,6 +114,31 @@ pub const Memtable = struct {
         for (self.columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.columns);
         self.* = undefined;
+    }
+
+    /// Snapshot pin: increments refcount so this memtable's column buffers
+    /// stay alive even after a flush/delete swaps it out as the table's
+    /// active memtable. Pair with `release`.
+    pub fn acquire(self: *Memtable) void {
+        _ = self.refcount.fetchAdd(1, .monotonic);
+    }
+
+    /// Release a snapshot pin. If this drops the refcount to 0 AND the
+    /// memtable has been retired, frees the heap allocation.
+    pub fn release(self: *Memtable) void {
+        const prev = self.refcount.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            // We held the last reference. Safe to free.
+            const allocator = self.allocator;
+            self.deinit();
+            allocator.destroy(self);
+        }
+    }
+
+    /// Mark this memtable as retired (no longer the table's active one).
+    /// Caller must still call `release` to drop the table's own reference.
+    pub fn retire(self: *Memtable) void {
+        self.retired.store(true, .release);
     }
 
     pub fn isEmpty(self: Memtable) bool {
@@ -113,6 +181,10 @@ pub const Memtable = struct {
     /// Replace the memtable's column buffers, keeping only rows where
     /// `keep[i] == true`. Returns the number of rows kept. If all rows are
     /// kept, returns without rebuilding.
+    ///
+    /// NOTE: in-place mutation — unsafe to call when other threads may be
+    /// reading this memtable. Callers that need snapshot isolation should
+    /// use `cloneWithRetainedRows` and swap the pointer instead.
     pub fn retainRows(self: *Memtable, keep: []const bool) !usize {
         std.debug.assert(keep.len == @as(usize, @intCast(self.row_count)));
         var kept: usize = 0;
@@ -139,6 +211,29 @@ pub const Memtable = struct {
         self.columns = new_columns;
         self.row_count = kept;
         return kept;
+    }
+
+    /// Build a fresh heap-allocated Memtable containing only the rows from
+    /// `self` where `keep[i] == true`. Returns null if `keep` is all-true
+    /// (caller should skip the swap). Used by the snapshot-isolated delete
+    /// path: instead of mutating in place, we build a new memtable and the
+    /// caller atomically swaps the table's pointer + retires the old.
+    pub fn cloneWithRetainedRows(self: *const Memtable, allocator: Allocator, keep: []const bool) !?*Memtable {
+        std.debug.assert(keep.len == @as(usize, @intCast(self.row_count)));
+        var kept: usize = 0;
+        for (keep) |m| if (m) {
+            kept += 1;
+        };
+        if (kept == keep.len) return null;
+
+        const new = try Memtable.create(allocator, self.schema);
+        errdefer new.release();
+
+        for (self.columns, 0..) |src, ci| {
+            try transform.appendMaskedColumn(allocator, src.view(), keep, &new.columns[ci]);
+        }
+        new.row_count = kept;
+        return new;
     }
 
     pub fn views(self: Memtable, allocator: Allocator) ![]ColumnView {

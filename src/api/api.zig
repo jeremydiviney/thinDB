@@ -334,7 +334,11 @@ pub const Table = struct {
     segments_dir: Io.Dir,
 
     manifest: storage.Manifest,
-    memtable: engine.Memtable,
+    /// Active memtable. Heap-allocated + refcounted so concurrent scans
+    /// can pin a snapshot of it: flush/delete swap this pointer to a fresh
+    /// memtable and retire the old, but the old stays alive while readers
+    /// hold a reference (see `Memtable.acquire` / `release`).
+    memtable: *engine.Memtable,
 
     /// WAL writer when `Config.wal_enabled = true`. `null` otherwise.
     wal: ?engine.wal.WalWriter,
@@ -374,14 +378,14 @@ pub const Table = struct {
         var manifest = try storage.readManifest(allocator, io, table_dir, fp);
         errdefer manifest.deinit();
 
-        var memtable = try engine.Memtable.init(allocator, schema);
-        errdefer memtable.deinit();
+        const memtable = try engine.Memtable.create(allocator, schema);
+        errdefer memtable.release();
 
         // If a WAL exists on disk, replay it into the memtable BEFORE
         // we open the WAL writer for new appends. If wal_enabled is
         // false but a WAL file is present from a previous run, we still
         // replay it so no acked writes are silently dropped.
-        _ = engine.wal.replay(allocator, io, table_dir, fp, &memtable) catch |err| switch (err) {
+        _ = engine.wal.replay(allocator, io, table_dir, fp, memtable) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
@@ -443,7 +447,9 @@ pub const Table = struct {
         const io = self.io;
         if (self.wal) |*w| w.deinit();
         self.cache.deinit();
-        self.memtable.deinit();
+        // Drop the Table's reference. If scans pinned a snapshot, the
+        // memtable stays alive until the last reader releases it.
+        self.memtable.release();
         self.manifest.deinit();
         self.segments_dir.close(io);
         self.table_dir.close(io);
@@ -501,7 +507,7 @@ pub const Table = struct {
 
         var wal_target: ?u64 = null;
         if (self.wal) |*w| {
-            wal_target = try w.appendInsert(&self.memtable, before_count, after_count);
+            wal_target = try w.appendInsert(self.memtable, before_count, after_count);
         }
 
         if (was_empty and !self.memtable.isEmpty()) {
@@ -549,6 +555,12 @@ pub const Table = struct {
         var snapshot = try self.memtable.buildSortedSnapshot(self.allocator, self.order_key_indices);
         defer snapshot.deinit();
 
+        // Allocate the replacement memtable up front. If any of the segment /
+        // manifest / WAL work below fails, errdefer frees the new one and we
+        // leave the current memtable intact.
+        const new_mt = try engine.Memtable.create(self.allocator, self.schema);
+        errdefer new_mt.release();
+
         const sync = self.syncEnabled();
         var info = try storage.writeSegment(
             self.allocator,
@@ -578,7 +590,15 @@ pub const Table = struct {
             try w.truncate(self.schema_fingerprint);
         }
 
-        self.memtable.clear();
+        // Retire-replace: swap the active memtable for the fresh one. The
+        // old memtable's columns are not mutated again; any scan that pinned
+        // it via `acquire` continues to read it safely until its `release`
+        // drops the refcount to zero and frees it.
+        const old_mt = self.memtable;
+        self.memtable = new_mt;
+        old_mt.retire();
+        old_mt.release();
+
         self.first_write_ts = null;
     }
 

@@ -37,6 +37,15 @@ pub const Scan = struct {
 
     segment_count: usize,
 
+    /// Pinned snapshot of the memtable at scan-create time. The scan holds
+    /// an `acquire`d reference so flush/delete/upsert can swap the table's
+    /// active memtable without invalidating this scan's view. Released in
+    /// `deinit`. Iteration uses `memtable_row_count` to bound the scan to
+    /// rows that existed at capture time — appends after capture are
+    /// invisible to this scan.
+    memtable_snap: *engine.Memtable,
+    memtable_row_count: u64,
+
     phase: Phase = .segments,
     cur_seg_idx: usize = 0,
     cur_rg_idx: usize = 0,
@@ -77,11 +86,43 @@ pub const Scan = struct {
         const self = try allocator.create(Scan);
         errdefer allocator.destroy(self);
 
+        // Capture (segment_count, memtable_snap, memtable_row_count) atomically
+        // under the table mutex so we see a consistent (segments, memtable)
+        // pair. Pin the memtable via `acquire` so a subsequent flush/delete
+        // swap doesn't invalidate our pointer.
+        //
+        // We additionally FORCE a retire-replace when the captured memtable
+        // has rows: install a fresh empty memtable as the table's active
+        // one, hand the old (now frozen) memtable to this scan. Writers'
+        // subsequent appends go to the fresh memtable and cannot trigger an
+        // ArrayList realloc on the buffers this scan is iterating — closing
+        // the last concurrent-write hazard. An empty captured memtable
+        // already has nothing for the scan to iterate (row_count == 0), so
+        // we skip the swap in that case.
+        table.mutex.lockUncancelable(table.io);
+        const segment_count = table.manifest.segments.items.len;
+        var memtable_snap = table.memtable;
+        memtable_snap.acquire();
+        const memtable_row_count = memtable_snap.row_count;
+        if (memtable_row_count > 0) {
+            const fresh = engine.Memtable.create(allocator, table.schema) catch |err| {
+                memtable_snap.release();
+                table.mutex.unlock(table.io);
+                return err;
+            };
+            table.memtable = fresh;
+            memtable_snap.retire();
+            memtable_snap.release(); // drop the table's prior reference
+        }
+        table.mutex.unlock(table.io);
+
         self.* = .{
             .allocator = allocator,
             .io = table.io,
             .table = table,
-            .segment_count = table.manifest.segments.items.len,
+            .segment_count = segment_count,
+            .memtable_snap = memtable_snap,
+            .memtable_row_count = memtable_row_count,
             .decoded = decoded,
             .views = views,
             .prunes = .empty,
@@ -100,6 +141,10 @@ pub const Scan = struct {
         }
         self.allocator.free(self.decoded);
         self.allocator.free(self.views);
+        // Drop our pinned memtable reference. If we held the last one and
+        // the memtable was retired (a flush/delete swapped it out), it's
+        // freed here.
+        self.memtable_snap.release();
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -239,18 +284,20 @@ pub const Scan = struct {
             };
         }
 
-        // Memtable phase
+        // Memtable phase — read from the pinned snapshot, not the table's
+        // live memtable. Bounded by `memtable_row_count` captured at scan
+        // create time; rows appended after that are invisible to this scan.
         if (self.phase == .memtable) {
             self.phase = .done;
-            if (self.table.memtable.row_count == 0) return null;
+            if (self.memtable_row_count == 0) return null;
 
-            for (self.table.memtable.columns, 0..) |c, i| {
+            for (self.memtable_snap.columns, 0..) |c, i| {
                 self.views[i] = c.view();
             }
             return Batch{
                 .schema = self.table.schema.columns,
                 .values = self.views,
-                .row_count = @intCast(self.table.memtable.row_count),
+                .row_count = @intCast(self.memtable_row_count),
             };
         }
 

@@ -21,10 +21,22 @@ pub const StringStore = struct {
     bytes: std.ArrayList(u8),
 
     pub fn init(allocator: Allocator) Allocator.Error!StringStore {
+        return initCapacity(allocator, 0, 0);
+    }
+
+    /// Initialize with pre-reserved capacity. Required for snapshot isolation:
+    /// once a reader pins a slice into `offsets`/`bytes`, an `append` that
+    /// triggers realloc would invalidate the reader's pointer. By reserving
+    /// enough capacity up-front, appends never realloc.
+    pub fn initCapacity(allocator: Allocator, rows_cap: usize, bytes_cap: usize) Allocator.Error!StringStore {
         var offsets: std.ArrayList(u32) = .empty;
         errdefer offsets.deinit(allocator);
+        try offsets.ensureTotalCapacity(allocator, rows_cap + 1);
         try offsets.append(allocator, 0);
-        return .{ .offsets = offsets, .bytes = .empty };
+        var bytes: std.ArrayList(u8) = .empty;
+        errdefer bytes.deinit(allocator);
+        try bytes.ensureTotalCapacity(allocator, bytes_cap);
+        return .{ .offsets = offsets, .bytes = bytes };
     }
 
     pub fn deinit(self: *StringStore, allocator: Allocator) void {
@@ -61,9 +73,26 @@ pub const ColumnStore = struct {
     nulls: ?std.ArrayList(u8) = null,
 
     pub fn init(allocator: Allocator, t: Type, nullable: bool) Allocator.Error!ColumnStore {
+        return initCapacity(allocator, t, nullable, 0, 0);
+    }
+
+    pub fn initCapacity(
+        allocator: Allocator,
+        t: Type,
+        nullable: bool,
+        rows_cap: usize,
+        bytes_cap: usize,
+    ) Allocator.Error!ColumnStore {
+        var nulls_opt: ?std.ArrayList(u8) = if (nullable) blk: {
+            var nb: std.ArrayList(u8) = .empty;
+            errdefer nb.deinit(allocator);
+            try nb.ensureTotalCapacity(allocator, (rows_cap + 7) >> 3);
+            break :blk nb;
+        } else null;
+        errdefer if (nulls_opt) |*n| n.deinit(allocator);
         return .{
-            .data = try DataStore.init(allocator, t),
-            .nulls = if (nullable) std.ArrayList(u8).empty else null,
+            .data = try DataStore.initCapacity(allocator, t, rows_cap, bytes_cap),
+            .nulls = nulls_opt,
         };
     }
 
@@ -131,23 +160,38 @@ pub const DataStore = union(TypeTag) {
     decimal128: std.ArrayList(i128),
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
+        return initCapacity(allocator, t, 0, 0);
+    }
+
+    pub fn initCapacity(
+        allocator: Allocator,
+        t: Type,
+        rows_cap: usize,
+        bytes_cap: usize,
+    ) Allocator.Error!DataStore {
         return switch (t) {
-            .int => .{ .int = .empty },
-            .bigint => .{ .bigint = .empty },
-            .boolean => .{ .boolean = .empty },
-            .varchar => .{ .varchar = try StringStore.init(allocator) },
-            .string => .{ .string = try StringStore.init(allocator) },
-            .float => .{ .float = .empty },
-            .double => .{ .double = .empty },
-            .date => .{ .date = .empty },
-            .datetime => .{ .datetime = .empty },
-            .tinyint => .{ .tinyint = .empty },
-            .smallint => .{ .smallint = .empty },
-            .largeint => .{ .largeint = .empty },
-            .char => .{ .char = try StringStore.init(allocator) },
-            .decimal64 => .{ .decimal64 = .empty },
-            .decimal128 => .{ .decimal128 = .empty },
+            .int => .{ .int = try ensuredCapList(i32, allocator, rows_cap) },
+            .bigint => .{ .bigint = try ensuredCapList(i64, allocator, rows_cap) },
+            .boolean => .{ .boolean = try ensuredCapList(u8, allocator, rows_cap) },
+            .varchar => .{ .varchar = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
+            .string => .{ .string = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
+            .float => .{ .float = try ensuredCapList(f32, allocator, rows_cap) },
+            .double => .{ .double = try ensuredCapList(f64, allocator, rows_cap) },
+            .date => .{ .date = try ensuredCapList(i32, allocator, rows_cap) },
+            .datetime => .{ .datetime = try ensuredCapList(i64, allocator, rows_cap) },
+            .tinyint => .{ .tinyint = try ensuredCapList(i8, allocator, rows_cap) },
+            .smallint => .{ .smallint = try ensuredCapList(i16, allocator, rows_cap) },
+            .largeint => .{ .largeint = try ensuredCapList(i128, allocator, rows_cap) },
+            .char => .{ .char = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
+            .decimal64 => .{ .decimal64 = try ensuredCapList(i64, allocator, rows_cap) },
+            .decimal128 => .{ .decimal128 = try ensuredCapList(i128, allocator, rows_cap) },
         };
+    }
+
+    fn ensuredCapList(comptime T: type, allocator: Allocator, cap: usize) !std.ArrayList(T) {
+        var list: std.ArrayList(T) = .empty;
+        if (cap > 0) try list.ensureTotalCapacity(allocator, cap);
+        return list;
     }
 
     pub fn deinit(self: *DataStore, allocator: Allocator) void {

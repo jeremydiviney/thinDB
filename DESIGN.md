@@ -397,9 +397,27 @@ Compaction holds the writer queue (no concurrent inserts/deletes/flushes during 
 - **Per-table mutex** serializes memtable + WAL mutations. Multiple writer threads may call `insert`/`upsert`/`delete`/`flush` concurrently; they line up at the mutex one record at a time. Each `Table` has its own mutex, so writes to different tables run in parallel.
 - **Many reader threads.** Reads acquire a manifest snapshot at query start; no locks held during execution.
 - **Manifest update is atomic** via `rename`. Readers always see either the pre- or post-state, never partial.
-- **No reader-writer blocking.** A long-running query does not delay writes; a long write does not delay reads.
+- **Memtable snapshot isolation.** Scans pin a refcounted snapshot of the memtable at start; concurrent writers see a fresh memtable. Long readers and active writers never block each other.
 
 The atomic-rename semantics of `manifest` are load-bearing. On Windows, `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` provides the same atomicity for same-volume renames.
+
+### 8.0 Memtable snapshot isolation
+
+The memtable is heap-allocated and reference-counted:
+
+- The `Table` holds one reference. A scan that captures the memtable holds another via `Memtable.acquire`.
+- `flush`, `delete`, `upsert` (when they would mutate existing rows) all do **retire-replace**: allocate a new empty memtable, atomically swap the table's `memtable` pointer, mark the old one retired, release the table's reference. The old memtable's columns are never mutated again, so any reader iterating it is safe.
+- When a reader releases its reference and refcount drops to zero, the retired memtable's buffers are freed.
+
+The remaining hazard is a writer extending the **active** memtable while a reader is iterating it — an `ArrayList` append that triggers realloc would invalidate the reader's pointer. We close this with a small twist: `scan()` captures the memtable under the table mutex, and **if the captured memtable has rows, it forces a retire-replace right there**. The scan's snapshot becomes a frozen, retired memtable that no writer will ever touch again. The active memtable becomes empty; writers append to it without ever endangering this scan. Single overhead: one empty `Memtable.create` per scan against a non-empty memtable.
+
+This is structurally similar to MVCC by full-snapshot — each long reader pins one retired memtable in memory until it finishes. Memory bound:
+
+```
+(1 active + N retired) × auto_flush_bytes
+```
+
+where N is the number of concurrent long readers. Bounded by workload, freed automatically when readers complete.
 
 ### 8.1 WAL group commit
 
