@@ -22,6 +22,7 @@ const exec = @import("../exec/exec.zig");
 pub const Error = error{
     SchemaMismatch,
     UnsupportedUniqueKeyType,
+    UpsertRequiresUniqueKey,
 };
 
 pub const Config = struct {
@@ -402,7 +403,23 @@ pub const Table = struct {
     pub fn insert(self: *Table, rows: anytype) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        try self.insertLocked(rows);
+    }
 
+    /// Explicit upsert. Identical to `insert` on a unique-key table —
+    /// new rows overwrite any existing row sharing the same order key
+    /// (older copies are tombstoned). On a non-unique table this is
+    /// nonsensical and errors with `UpsertRequiresUniqueKey`. Use this
+    /// when you want the call site to be explicit that overwrite is
+    /// the intent.
+    pub fn upsert(self: *Table, rows: anytype) !void {
+        if (!self.schema.unique) return Error.UpsertRequiresUniqueKey;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.insertLocked(rows);
+    }
+
+    fn insertLocked(self: *Table, rows: anytype) !void {
         const was_empty = self.memtable.isEmpty();
         try self.memtable.insertRows(rows);
         if (was_empty and !self.memtable.isEmpty()) {

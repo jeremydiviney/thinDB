@@ -1018,6 +1018,111 @@ test "execTieredCompact: no-op when no tier has enough segments" {
     try std.testing.expectEqual(@as(usize, 3), t.segmentCount());
 }
 
+// ---------------------------------------------------------------------------
+// Upserts
+// ---------------------------------------------------------------------------
+
+test "upsert: overwrites existing rows on unique-key tables" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    // Initial inserts.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "alpha" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "beta" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = true, .tag = "gamma" },
+    });
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+    // Upsert: id=2 already exists, id=4 is new.
+    try t.upsert(&.{
+        .{ .id = @as(i64, 2), .qty = @as(i32, 999), .active = true, .tag = "BETA_NEW" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 40), .active = true, .tag = "delta" },
+    });
+    try t.flush();
+
+    // Scan should see the overwritten value for id=2 and the new id=4.
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+
+    var got_ids: std.ArrayList(i64) = .empty;
+    defer got_ids.deinit(allocator);
+    var got_qty: std.ArrayList(i32) = .empty;
+    defer got_qty.deinit(allocator);
+    var got_tag: std.ArrayList(u8) = .empty;
+    defer got_tag.deinit(allocator);
+
+    while (try q.next()) |batch| {
+        try got_ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try got_qty.appendSlice(allocator, batch.values[1].data.int);
+        for (0..batch.row_count) |i| {
+            try got_tag.append(allocator, '|');
+            try got_tag.appendSlice(allocator, batch.values[3].data.string.rowBytes(i));
+        }
+    }
+
+    // Order across segment + memtable isn't guaranteed, so check the set.
+    // Expected: id=1 unchanged, id=2 overwritten (qty=999, tag=BETA_NEW),
+    // id=3 unchanged, id=4 new.
+    try std.testing.expectEqual(@as(usize, 4), got_ids.items.len);
+
+    var seen_2: bool = false;
+    var seen_4: bool = false;
+    for (got_ids.items, 0..) |id, i| {
+        switch (id) {
+            1 => try std.testing.expectEqual(@as(i32, 10), got_qty.items[i]),
+            2 => {
+                seen_2 = true;
+                try std.testing.expectEqual(@as(i32, 999), got_qty.items[i]);
+            },
+            3 => try std.testing.expectEqual(@as(i32, 30), got_qty.items[i]),
+            4 => {
+                seen_4 = true;
+                try std.testing.expectEqual(@as(i32, 40), got_qty.items[i]);
+            },
+            else => unreachable,
+        }
+    }
+    try std.testing.expect(seen_2);
+    try std.testing.expect(seen_4);
+}
+
+test "upsert: errors on non-unique tables" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false, // <-- not unique
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = false };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const t = try db.table("dup", schema, opts);
+    try std.testing.expectError(
+        error.UpsertRequiresUniqueKey,
+        t.upsert(&.{.{ .id = @as(i64, 1), .v = @as(i32, 10) }}),
+    );
+}
+
 test "nullable: rejects ?T into a non-nullable column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
