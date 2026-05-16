@@ -53,6 +53,7 @@ pub fn main() !void {
 
     try benchInsertMemtable(allocator, io, n_rows);
     try benchInsertAndFlush(allocator, io, n_rows);
+    try benchFlushPhases(allocator, io, n_rows);
     try benchSustainedInsert(allocator, io, n_rows);
     try benchScan(allocator, io, n_rows);
     try benchScanColdVsWarm(allocator, io, n_rows);
@@ -263,6 +264,159 @@ fn benchScanFilterOrderKeyMid(allocator: Allocator, io: Io, n_rows: usize) !void
 /// Many small batches in a tight loop, exercising the auto-flush trigger.
 /// Demonstrates the "sustained ingest" pattern where data lands in segments
 /// continuously rather than via one giant batch.
+/// Break out the cost of `flush()` into its three logical phases:
+///   1. sort the memtable into order-key order
+///   2. flate-compress the columnar payload
+///   3. write the resulting bytes to disk + update the manifest
+/// Used to identify the single-core upper bound on flush throughput.
+fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
+    var dir = try freshDir(io, ".bench-data/flush_phases");
+    defer dir.close(io);
+
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+    const t = try db.table("t", schema, options);
+
+    const rows = try buildRows(allocator, n_rows);
+    defer allocator.free(rows);
+    try t.insert(rows);
+
+    // ---- Phase 1: sort (buildSortedSnapshot) ----
+    const t_sort_start = Io.Clock.awake.now(io);
+    var snapshot = try t.memtable.buildSortedSnapshot(allocator, t.order_key_indices);
+    defer snapshot.deinit();
+    const sort_ns = elapsedNs(io, t_sort_start);
+
+    // ---- Compute the uncompressed payload size ----
+    var raw_bytes: u64 = 0;
+    for (snapshot.views) |v| {
+        raw_bytes += switch (v.data) {
+            .int => |s| s.len * 4,
+            .bigint => |s| s.len * 8,
+            .boolean => |s| s.len,
+            .varchar => |sv| sv.offsets.len * 4 + sv.bytes.len,
+            .string => |sv| sv.offsets.len * 4 + sv.bytes.len,
+            .float => |s| s.len * 4,
+            .double => |s| s.len * 8,
+            .date => |s| s.len * 4,
+            .datetime => |s| s.len * 8,
+        };
+    }
+
+    // ---- Phase 2: serialize + compress (by writing the segment to memory) ----
+    // We can't easily isolate compression from disk write without changing the
+    // writer, so do the segment write twice: once to a scratch dir (this is
+    // the compress + write combo), once to /dev/null-equivalent by writing
+    // then deleting. The difference is dominated by disk I/O.
+    var name_buf: [32]u8 = undefined;
+    const file_name = try std.fmt.bufPrint(&name_buf, "phases.dat", .{});
+
+    const t_write_start = Io.Clock.awake.now(io);
+    var info = try thindb.storage.writeSegment(
+        allocator,
+        io,
+        dir,
+        file_name,
+        schema,
+        999_999,
+        t.schema_fingerprint,
+        65_536,
+        snapshot.views,
+    );
+    defer info.deinit(allocator);
+    const compress_and_write_ns = elapsedNs(io, t_write_start);
+
+    // ---- Report ----
+    const total_ns = sort_ns + compress_and_write_ns;
+    const seconds = @as(f64, @floatFromInt(total_ns)) / 1e9;
+    const mb_per_s = (@as(f64, @floatFromInt(raw_bytes)) / 1_048_576.0) / seconds;
+    std.debug.print(
+        "  flush phases                        {d} rows  raw={d:.1}MB  sort={d:.1}ms  compress+write={d:.1}ms  total={d:.1}ms  {d:.1} MB/s (raw)\n",
+        .{
+            n_rows,
+            @as(f64, @floatFromInt(raw_bytes)) / 1_048_576.0,
+            @as(f64, @floatFromInt(sort_ns)) / 1e6,
+            @as(f64, @floatFromInt(compress_and_write_ns)) / 1e6,
+            @as(f64, @floatFromInt(total_ns)) / 1e6,
+            mb_per_s,
+        },
+    );
+
+    // Now time JUST a flate compress of the equivalent raw byte stream so we
+    // can subtract the disk-write part. Build a single flat buffer of all
+    // column blocks concatenated (matching what writeSegment internally feeds
+    // to compression_mod.compress, minus the per-block boundaries).
+    const concat = try allocator.alloc(u8, raw_bytes);
+    defer allocator.free(concat);
+    var cur: usize = 0;
+    for (snapshot.views) |v| {
+        switch (v.data) {
+            .int => |s| {
+                for (s) |x| {
+                    std.mem.writeInt(i32, concat[cur..][0..4], x, .little);
+                    cur += 4;
+                }
+            },
+            .bigint => |s| {
+                for (s) |x| {
+                    std.mem.writeInt(i64, concat[cur..][0..8], x, .little);
+                    cur += 8;
+                }
+            },
+            .boolean => |s| {
+                @memcpy(concat[cur..][0..s.len], s);
+                cur += s.len;
+            },
+            .varchar, .string => |sv| {
+                const off_bytes = sv.offsets.len * 4;
+                @memcpy(concat[cur..][0..off_bytes], std.mem.sliceAsBytes(sv.offsets));
+                cur += off_bytes;
+                @memcpy(concat[cur..][0..sv.bytes.len], sv.bytes);
+                cur += sv.bytes.len;
+            },
+            else => {},
+        }
+    }
+
+    const t_comp_start = Io.Clock.awake.now(io);
+    const compressed = try thindb.storage.compression.compress(allocator, concat);
+    defer allocator.free(compressed);
+    const compress_only_ns = elapsedNs(io, t_comp_start);
+
+    const compress_seconds = @as(f64, @floatFromInt(compress_only_ns)) / 1e9;
+    const compress_mb_per_s = (@as(f64, @floatFromInt(raw_bytes)) / 1_048_576.0) / compress_seconds;
+    std.debug.print(
+        "  flate compress (level 6, one shot)  {d:.1}MB → {d:.1}MB  {d:.1}ms  {d:.1} MB/s (input)  ratio={d:.2}\n",
+        .{
+            @as(f64, @floatFromInt(raw_bytes)) / 1_048_576.0,
+            @as(f64, @floatFromInt(compressed.len)) / 1_048_576.0,
+            @as(f64, @floatFromInt(compress_only_ns)) / 1e6,
+            compress_mb_per_s,
+            @as(f64, @floatFromInt(raw_bytes)) / @as(f64, @floatFromInt(compressed.len)),
+        },
+    );
+
+    // Implied write-only time = compress+write − compress-only (approx, since
+    // segment writer slices compression by row group rather than one shot).
+    const implied_write_ns = if (compress_and_write_ns > compress_only_ns)
+        compress_and_write_ns - compress_only_ns
+    else
+        0;
+    const write_seconds = @as(f64, @floatFromInt(implied_write_ns)) / 1e9;
+    const write_mb_per_s = if (write_seconds > 0)
+        (@as(f64, @floatFromInt(compressed.len)) / 1_048_576.0) / write_seconds
+    else
+        0;
+    std.debug.print(
+        "  disk write (implied: compr+wr − compr-only)  {d:.1}ms  {d:.1} MB/s (compressed bytes)\n",
+        .{ @as(f64, @floatFromInt(implied_write_ns)) / 1e6, write_mb_per_s },
+    );
+}
+
 fn benchSustainedInsert(allocator: Allocator, io: Io, n_rows: usize) !void {
     var dir = try freshDir(io, ".bench-data/sustained_insert");
     defer dir.close(io);

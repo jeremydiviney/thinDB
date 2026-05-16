@@ -1107,7 +1107,7 @@ pub const Sort = struct {
             }
         };
 
-        std.sort.heap(u32, self.perm, Ctx{
+        std.sort.pdq(u32, self.perm, Ctx{
             .accumulated = self.accumulated,
             .indices = self.sort_col_indices,
             .desc = self.sort_desc,

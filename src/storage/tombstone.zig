@@ -117,7 +117,7 @@ pub fn merge(
     }
     try combined.appendSlice(allocator, new_offsets);
 
-    std.sort.heap(u32, combined.items, {}, std.sort.asc(u32));
+    std.sort.pdq(u32, combined.items, {}, std.sort.asc(u32));
 
     // dedupe in place
     var write_idx: usize = 0;

@@ -345,7 +345,7 @@ pub const Memtable = struct {
             }
         };
 
-        std.sort.heap(u32, perm, Ctx{ .mt = &self, .keys = order_key_indices }, Ctx.lessThan);
+        std.sort.pdq(u32, perm, Ctx{ .mt = &self, .keys = order_key_indices }, Ctx.lessThan);
 
         const sorted_columns = try allocator.alloc(ColumnStore, self.columns.len);
         errdefer allocator.free(sorted_columns);
