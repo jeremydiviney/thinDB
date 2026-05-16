@@ -19,23 +19,53 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Compress `input` into a freshly-allocated byte slice. Caller owns the
-/// returned slice and must `allocator.free` it.
+/// Reusable zstd compression context. A CCtx allocates ~1-2 MB of internal
+/// hash tables, FSE/Huffman state, and staging buffers; reusing one across
+/// many small compress calls (e.g. one per column block in a flush) avoids
+/// paying that setup cost on every call.
+///
+/// Not thread-safe — give each thread its own Compressor.
+pub const Compressor = struct {
+    cctx: *c.ZSTD_CCtx,
+
+    pub fn init() !Compressor {
+        const cctx = c.ZSTD_createCCtx() orelse return Error.OutOfMemory;
+        return .{ .cctx = cctx };
+    }
+
+    pub fn deinit(self: *Compressor) void {
+        _ = c.ZSTD_freeCCtx(self.cctx);
+        self.* = undefined;
+    }
+
+    /// Compress `input` into a freshly-allocated byte slice using this
+    /// context's persistent state. Caller owns the returned slice.
+    pub fn compress(self: *Compressor, allocator: Allocator, input: []const u8) ![]u8 {
+        const bound = c.ZSTD_compressBound(input.len);
+        const dst = try allocator.alloc(u8, bound);
+        errdefer allocator.free(dst);
+
+        const written = c.ZSTD_compressCCtx(
+            self.cctx,
+            dst.ptr,
+            dst.len,
+            input.ptr,
+            input.len,
+            default_level,
+        );
+        if (c.ZSTD_isError(written) != 0) return Error.ZstdEncodeFailed;
+
+        return allocator.realloc(dst, written) catch dst[0..written];
+    }
+};
+
+/// One-shot compress: convenience wrapper around `Compressor.compress` that
+/// creates a fresh CCtx for a single call. Use `Compressor` directly in hot
+/// paths that compress many blocks back-to-back.
 pub fn compress(allocator: Allocator, input: []const u8) ![]u8 {
-    const bound = c.ZSTD_compressBound(input.len);
-    const dst = try allocator.alloc(u8, bound);
-    errdefer allocator.free(dst);
-
-    const written = c.ZSTD_compress(
-        dst.ptr,
-        dst.len,
-        input.ptr,
-        input.len,
-        default_level,
-    );
-    if (c.ZSTD_isError(written) != 0) return Error.ZstdEncodeFailed;
-
-    return allocator.realloc(dst, written) catch dst[0..written];
+    var ctx = try Compressor.init();
+    defer ctx.deinit();
+    return ctx.compress(allocator, input);
 }
 
 /// Decompress `input` and return a freshly-allocated slice of exactly

@@ -43,6 +43,11 @@ pub fn writeSegment(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
+    // One zstd context, reused for every column block in this segment. Avoids
+    // ~200 µs of CCtx setup/teardown per call (typically 64+ calls per flush).
+    var compressor = try compression_mod.Compressor.init();
+    defer compressor.deinit();
+
     // ---- Header ----
     try buf.appendSlice(allocator, &format.segment_magic);
     try appendU16(allocator, &buf, format.segment_version);
@@ -68,7 +73,7 @@ pub fn writeSegment(
         try appendU32(allocator, &buf, 0); // padding
 
         for (columns, schema.columns) |view, schema_col| {
-            try writeColumnBlock(allocator, &buf, view, schema_col.nullable, row_offset, row_offset + rows_in_group);
+            try writeColumnBlock(allocator, &compressor, &buf, view, schema_col.nullable, row_offset, row_offset + rows_in_group);
         }
 
         const rg_length: u32 = @intCast(buf.items.len - rg_file_offset);
@@ -126,10 +131,12 @@ const appendU64 = format.appendU64;
 const appendI32 = format.appendI32;
 const appendI64 = format.appendI64;
 
-/// Build the raw (uncompressed) column-block payload, then try flate-compress
-/// it. Keep whichever is smaller. Prepend the on-disk header.
+/// Build the raw (uncompressed) column-block payload, then try zstd-compress
+/// it via the shared `Compressor`. Keep whichever is smaller. Prepend the
+/// on-disk header.
 fn writeColumnBlock(
     allocator: Allocator,
+    compressor: *compression_mod.Compressor,
     buf: *std.ArrayList(u8),
     view: ColumnView,
     nullable: bool,
@@ -151,7 +158,7 @@ fn writeColumnBlock(
     const raw_size: u32 = @intCast(scratch.items.len);
 
     // Try compressing. If the result is smaller, use it; otherwise keep raw.
-    const compressed = try compression_mod.compress(allocator, scratch.items);
+    const compressed = try compressor.compress(allocator, scratch.items);
     defer allocator.free(compressed);
 
     const use_compressed = compressed.len < scratch.items.len;
