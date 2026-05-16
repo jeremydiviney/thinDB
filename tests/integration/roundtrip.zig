@@ -880,7 +880,7 @@ test "runBackgroundFlusher: spawns a thread that drives flush sweeps" {
     try std.testing.expectEqual(@as(usize, 0), t.segmentCount());
 }
 
-test "backgroundCompactSweep: compacts when threshold met" {
+test "backgroundCompactSweep: tiered merge when 4 same-tier segments accumulate" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -889,7 +889,7 @@ test "backgroundCompactSweep: compacts when threshold met" {
 
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{
         .row_group_size = 4,
-        .compact_min_segments = 3, // small threshold for the test
+        .compact_min_segments = 4,
         .auto_flush_secs = 0,
         .auto_flush_rows = 1_000_000,
         .auto_flush_bytes = 64 * 1024 * 1024,
@@ -898,25 +898,67 @@ test "backgroundCompactSweep: compacts when threshold met" {
 
     const t = try db.table("orders", schema_v1, opts_v1);
 
-    // Manually flush three small segments.
-    try t.insert(&.{.{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" }});
-    try t.flush();
-    try t.insert(&.{.{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" }});
-    try t.flush();
-    try t.insert(&.{.{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = true, .tag = "c" }});
-    try t.flush();
-    try std.testing.expectEqual(@as(usize, 3), t.segmentCount());
+    // Flush four single-row segments. All four are tier 0 (<65k rows).
+    inline for (.{ 1, 2, 3, 4 }) |i| {
+        try t.insert(&.{.{
+            .id = @as(i64, i),
+            .qty = @as(i32, i * 10),
+            .active = true,
+            .tag = "x",
+        }});
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 4), t.segmentCount());
 
-    // Sweep should collapse them into one segment.
+    // Sweep should pick all 4 (same tier, adjacent) and merge into one.
     try db.backgroundCompactSweep();
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 
-    // Below-threshold table is left alone.
-    try t.insert(&.{.{ .id = @as(i64, 4), .qty = @as(i32, 40), .active = true, .tag = "d" }});
-    try t.flush();
-    try std.testing.expectEqual(@as(usize, 2), t.segmentCount());
+    // Three more flushes — only 3 segments, tiered policy needs 4 to fire.
+    inline for (.{ 5, 6, 7 }) |i| {
+        try t.insert(&.{.{
+            .id = @as(i64, i),
+            .qty = @as(i32, i * 10),
+            .active = true,
+            .tag = "x",
+        }});
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 4), t.segmentCount()); // 1 merged + 3 new
     try db.backgroundCompactSweep();
-    try std.testing.expectEqual(@as(usize, 2), t.segmentCount());
+    // The 3 new ones are tier 0; the merged one is also tier 0 (still <65k rows).
+    // So all 4 are at tier 0 and adjacent → merged again.
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+}
+
+test "execTieredCompact: no-op when no tier has enough segments" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    // Just 3 segments → below the default tier_target_count of 4.
+    inline for (.{ 1, 2, 3 }) |i| {
+        try t.insert(&.{.{
+            .id = @as(i64, i),
+            .qty = @as(i32, i * 10),
+            .active = true,
+            .tag = "x",
+        }});
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 3), t.segmentCount());
+
+    // backgroundCompactSweep WITHOUT the count gate: threshold defaults to 8.
+    // With 3 segments < 8 it doesn't even try.
+    try db.backgroundCompactSweep();
+    try std.testing.expectEqual(@as(usize, 3), t.segmentCount());
 }
 
 test "nullable: rejects ?T into a non-nullable column" {

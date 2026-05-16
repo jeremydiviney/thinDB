@@ -488,15 +488,16 @@ pub const Table = struct {
     }
 
     /// Background-compactor entry point. Tries to acquire the mutex
-    /// non-blockingly; on success, runs `execCompact` iff the segment
-    /// count is at least `min_segments`. No-op on lock contention or
-    /// when below the threshold.
+    /// non-blockingly; on success, runs one tiered compaction step iff
+    /// the segment count is at least `min_segments`. No-op on lock
+    /// contention, when below the threshold, or when no tier has enough
+    /// adjacent segments to merge.
     pub fn tryBackgroundCompact(self: *Table, min_segments: u32) !void {
         if (min_segments == 0) return;
         if (!self.mutex.tryLock()) return;
         defer self.mutex.unlock(self.io);
         if (self.manifest.segments.items.len < min_segments) return;
-        try @import("compact.zig").execCompact(self);
+        try @import("compact.zig").execTieredCompact(self);
     }
 
     pub fn segmentCount(self: Table) usize {
