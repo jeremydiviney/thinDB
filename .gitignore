@@ -21,3 +21,6 @@ Thumbs.db
 
 # Personal Claude/agent caches (in case anything lands inside the repo)
 .claude/
+
+# Scratch files from one-time refactor passes
+*.body
