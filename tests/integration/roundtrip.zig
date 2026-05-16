@@ -2233,3 +2233,164 @@ test "renameTable: rejects collision with existing name" {
 
     try std.testing.expectError(thindb.Error.TableAlreadyExists, db.renameTable("orders", "invoices"));
 }
+
+// ---------------------------------------------------------------------------
+// alterTable
+// ---------------------------------------------------------------------------
+
+test "alterTable: rename column preserves data" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.table("orders", schema_v1, opts_v1);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+            .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+        });
+        try t.flush();
+
+        try db.alterTable("orders", &.{
+            .{ .rename = .{ .from = "qty", .to = "quantity" } },
+        });
+
+        // The table's schema reflects the new name.
+        try std.testing.expect(t.schema.columnIndex("quantity") != null);
+        try std.testing.expect(t.schema.columnIndex("qty") == null);
+    }
+
+    // Reopen: the new schema is on disk; data preserved.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const new_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "quantity", .type = .int },
+            .{ .name = "active", .type = .boolean },
+            .{ .name = "tag", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const t = try db.table("orders", new_schema, opts_v1);
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var rows: usize = 0;
+    while (try q.next()) |batch| rows += batch.row_count;
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "alterTable: drop column removes it; data for other columns intact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("orders", schema_v1, opts_v1);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = true, .tag = "c" },
+    });
+    try t.flush();
+
+    try db.alterTable("orders", &.{
+        .{ .drop = "active" },
+    });
+
+    try std.testing.expect(t.schema.columnIndex("active") == null);
+    try std.testing.expectEqual(@as(usize, 3), t.schema.columns.len);
+
+    // Scan the post-alter table — should still have 3 rows, no "active" column.
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var seen: usize = 0;
+    while (try q.next()) |batch| {
+        seen += batch.row_count;
+        try std.testing.expectEqual(@as(usize, 3), batch.schema.len);
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "alterTable: add column fills existing rows with default" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("orders", schema_v1, opts_v1);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+    });
+    try t.flush();
+
+    try db.alterTable("orders", &.{
+        .{ .add = .{
+            .name = "priority",
+            .type = .int,
+            .default = .{ .int = 7 },
+        } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 5), t.schema.columns.len);
+    try std.testing.expect(t.schema.columnIndex("priority") != null);
+
+    // Scan: the new column should be present with the default value
+    // populated for the existing 2 rows.
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var saw: usize = 0;
+    while (try q.next()) |batch| {
+        try std.testing.expectEqual(@as(usize, 5), batch.schema.len);
+        const priority_idx = t.schema.columnIndex("priority").?;
+        const priority_col = batch.values[priority_idx];
+        for (priority_col.data.int) |v| try std.testing.expectEqual(@as(i32, 7), v);
+        saw += batch.row_count;
+    }
+    try std.testing.expectEqual(@as(usize, 2), saw);
+}
+
+test "alterTable: rejects dropping a column in the order key" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try db.table("orders", schema_v1, opts_v1);
+
+    try std.testing.expectError(thindb.Error.UnsupportedAlterOp, db.alterTable("orders", &.{
+        .{ .drop = "id" }, // "id" is in opts_v1.order_key
+    }));
+}
+
+test "alterTable: rejects duplicate column name on add" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try db.table("orders", schema_v1, opts_v1);
+
+    try std.testing.expectError(thindb.Error.ColumnAlreadyExists, db.alterTable("orders", &.{
+        .{ .add = .{ .name = "qty", .type = .int, .default = .{ .int = 0 } } },
+    }));
+}

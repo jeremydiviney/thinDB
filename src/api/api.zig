@@ -32,6 +32,39 @@ pub const Error = error{
 
 pub const SyncMode = enum { none, per_flush };
 
+/// One schema-change operation. `alterTable` takes a slice of these and
+/// applies them in order to derive the new schema, then rewrites every
+/// segment under that schema.
+///
+/// Not supported in v1: `change_type` (per-value conversion is a separate
+/// piece of work). Use drop+add as a workaround if you need it.
+pub const AlterOp = union(enum) {
+    /// Append a new column. Existing rows get `default` as their value.
+    /// `default`'s active tag must match `type` (e.g., type=.int requires
+    /// `.int = N`); nullable columns may pass anything (the default is
+    /// only used as the placeholder bytes — the validity bit is set true
+    /// either way for existing rows).
+    add: AddColumn,
+    /// Remove a column by name. Errors if the column is part of the order
+    /// key (would change row identity).
+    drop: []const u8,
+    /// Rename a column. Existing data unchanged; only the schema name
+    /// changes. Errors if `to` is already a column name.
+    rename: RenameColumn,
+
+    pub const AddColumn = struct {
+        name: []const u8,
+        type: types.Type,
+        nullable: bool = false,
+        default: types.Value,
+    };
+
+    pub const RenameColumn = struct {
+        from: []const u8,
+        to: []const u8,
+    };
+};
+
 pub const Config = struct {
     /// Default rows per row-group in flushed segments.
     row_group_size: usize = 65_536,
@@ -339,6 +372,25 @@ pub const Database = struct {
         try self.data_dir.deleteTree(self.io, name);
     }
 
+    /// Apply schema operations (`.add`, `.drop`, `.rename` columns) to a
+    /// table. Implemented as orchestrated copy-and-swap (DESIGN.md §9.2):
+    /// flush memtable → write a shadow directory with rewritten segments
+    /// → atomic directory rename → re-init Table in place.
+    ///
+    /// CALLER RESPONSIBILITY: no active `Query` references during alter.
+    /// Active scans hold a memtable snapshot of the pre-alter schema and
+    /// will see inconsistent state if they try to advance past it.
+    pub fn alterTable(self: *Database, name: []const u8, ops: []const AlterOp) !void {
+        self.tables_mutex.lockUncancelable(self.io);
+        const t = self.tables.get(name) orelse {
+            self.tables_mutex.unlock(self.io);
+            return Error.TableNotFound;
+        };
+        self.tables_mutex.unlock(self.io);
+
+        try @import("alter.zig").execAlter(self, t, ops);
+    }
+
     /// Rename a table. Renames the on-disk directory, updates the in-memory
     /// map key, and updates the Table's internal name string. Errors with
     /// `TableNotFound` if `old_name` isn't present, or `TableAlreadyExists`
@@ -628,7 +680,7 @@ pub const Table = struct {
         try self.flushLocked();
     }
 
-    fn flushLocked(self: *Table) !void {
+    pub fn flushLocked(self: *Table) !void {
         if (self.memtable.isEmpty()) {
             self.first_write_ts = null;
             return;
