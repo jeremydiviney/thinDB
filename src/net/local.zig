@@ -100,6 +100,16 @@ pub const Connection = struct {
     /// is always supported on the read side regardless of this flag.
     compress_writes: bool = false,
 
+    /// Optional shared-secret token sent on every outgoing TCP
+    /// connection as a `req_auth` frame *before* the real request.
+    /// Caller-owned slice; must outlive the Connection. Null = no
+    /// auth (server with a token configured will reject).
+    ///
+    /// Note: the token rides as plaintext over the wire. This is
+    /// "weak" auth — useful for "only the right deployment can
+    /// connect", not a substitute for TLS on hostile networks.
+    auth_token: ?[]const u8 = null,
+
     pub const Transport = union(enum) {
         /// In-process — server runs in this process. The Connection
         /// owns the Database.
@@ -307,6 +317,18 @@ pub const Connection = struct {
         }
     }
 
+    /// If an auth_token is configured, write a `req_auth` frame to
+    /// `w` (NOT yet flushed — callers send the real request right
+    /// after so the two frames pipeline in one round-trip). No-op
+    /// when auth_token is null.
+    fn maybeSendAuth(self: *Connection, w: *std.Io.Writer) !void {
+        const token = self.auth_token orelse return;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try wire.appendLenString(self.allocator, &payload, token);
+        try wire.writeFrameToIo(w, .req_auth, payload.items);
+    }
+
     /// One-shot admin TCP round-trip. Opens a fresh stream, sends one
     /// request frame, reads the first response frame, returns its
     /// payload (caller-owned, freed by caller). Errors out on
@@ -325,6 +347,7 @@ pub const Connection = struct {
         var reader = stream.reader(self.io, &read_buf);
         var writer = stream.writer(self.io, &write_buf);
 
+        try self.maybeSendAuth(&writer.interface);
         if (self.compress_writes) {
             try wire.writeFrameToIoMaybeCompressed(self.allocator, &writer.interface, msg_type, payload);
         } else {
@@ -630,8 +653,14 @@ pub const ClientQuery = struct {
                     .frame_payload = .empty,
                 };
 
-                // Write the request frame.
-                try wire.writeFrameToIo(&tcp.writer.interface, .req_query, encoded.items);
+                // Pipeline auth (if configured) before the real
+                // request — one round-trip total.
+                try self.conn.maybeSendAuth(&tcp.writer.interface);
+                if (self.conn.compress_writes) {
+                    try wire.writeFrameToIoMaybeCompressed(self.allocator, &tcp.writer.interface, .req_query, encoded.items);
+                } else {
+                    try wire.writeFrameToIo(&tcp.writer.interface, .req_query, encoded.items);
+                }
                 try tcp.writer.interface.flush();
 
                 // We can drop the encoded IR now — the server has its own copy.

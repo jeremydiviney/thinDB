@@ -73,6 +73,10 @@ pub const MsgType = enum(u8) {
     req_alter_table = 0x07,
     req_flush = 0x08,
     req_compact = 0x09,
+    /// Optional pre-flight frame carrying a shared-secret auth token.
+    /// Payload: `[token_len u32][token bytes]`. Sent BEFORE the real
+    /// request on the same connection (pipelined — no extra round-trip).
+    req_auth = 0x0A,
     // Response types (server → client)
     resp_ok = 0x80,
     resp_error = 0x81,
@@ -155,7 +159,8 @@ pub fn codeFromError(err: anyerror) WireErrorCode {
         error.SchemaMismatch => .schema_mismatch,
         error.TypeMismatch => .type_mismatch,
         error.UnsupportedOp, error.UnsupportedAlterOp => .unsupported_op,
-        error.WireCorrupt, error.WireTooSmall, error.WireUnknownMsgType, error.WireUnknownType => .bad_request,
+        error.AuthFailed => .auth_failed,
+        error.BadRequest, error.WireCorrupt, error.WireTooSmall, error.WireUnknownMsgType, error.WireUnknownType => .bad_request,
         else => .unknown_error,
     };
 }

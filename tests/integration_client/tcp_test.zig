@@ -444,6 +444,80 @@ test "tcp: alterTable add column populates default + appears in scan output" {
     if (sctx.err) |e| return e;
 }
 
+// Auth: server requires a shared-secret token. Client must present a
+// matching token in a `req_auth` frame pipelined before the real
+// request, or the server replies `auth_failed` and closes.
+test "tcp: auth accepts matching token, rejects missing + wrong token" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 11;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+    server.auth_token = "s3cret-token-do-not-reuse";
+
+    _ = try server.db.table("t", schema_v1, opts_v1);
+
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    // 3 attempts: no token (reject), wrong token (reject), right token (accept).
+    var sctx: ServerCtx = .{ .server = server, .n = 3 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    // Attempt 1: no auth_token on the client → server rejects.
+    {
+        var conn = try thindb.connect(allocator, io, listen_addr);
+        defer conn.close();
+        var q = try conn.scan("t");
+        defer q.deinit();
+        try std.testing.expectError(thindb.net.Error.AuthFailed, q.next());
+    }
+
+    // Attempt 2: wrong token → AuthFailed.
+    {
+        var conn = try thindb.connect(allocator, io, listen_addr);
+        defer conn.close();
+        conn.auth_token = "wrong";
+        var q = try conn.scan("t");
+        defer q.deinit();
+        try std.testing.expectError(thindb.net.Error.AuthFailed, q.next());
+    }
+
+    // Attempt 3: correct token → scan works (empty table, no rows).
+    {
+        var conn = try thindb.connect(allocator, io, listen_addr);
+        defer conn.close();
+        conn.auth_token = "s3cret-token-do-not-reuse";
+        var q = try conn.scan("t");
+        defer q.deinit();
+        var total: usize = 0;
+        while (try q.next()) |b| total += b.row_count;
+        try std.testing.expectEqual(@as(usize, 0), total);
+    }
+
+    if (sctx.err) |e| return e;
+}
+
 // Compression: flip the opt-in flag on both ends and verify a big
 // scan still round-trips correctly. The wire frames cross the
 // threshold and get zstd-compressed; readFramePayload decompresses

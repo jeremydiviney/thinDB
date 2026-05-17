@@ -48,6 +48,15 @@ pub const Server = struct {
     /// requests is always supported regardless of this flag.
     compress_writes: bool = false,
 
+    /// Optional shared-secret token required of every client. When
+    /// null, the server accepts unauthenticated connections (the
+    /// default — convenient for local dev). When set, the very first
+    /// frame on each connection MUST be a `req_auth` whose payload
+    /// matches this token bytes-for-bytes, or the server replies
+    /// `resp_error(auth_failed)` and closes. Caller-owned slice;
+    /// must outlive the Server.
+    auth_token: ?[]const u8 = null,
+
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
         self.db.close();
@@ -61,7 +70,7 @@ pub const Server = struct {
     pub fn acceptOne(self: *Server) !void {
         const stream = try self.listener.accept(self.io);
         defer stream.close(self.io);
-        try handleConnection(self.allocator, self.io, self.db, stream, self.compress_writes);
+        try handleConnection(self.allocator, self.io, self.db, stream, self.compress_writes, self.auth_token);
     }
 
     /// Long-running accept loop. Breaks when `should_stop` flips to true
@@ -115,16 +124,45 @@ fn handleConnection(
     db: *Database,
     stream: std.Io.net.Stream,
     compress_writes: bool,
+    auth_token: ?[]const u8,
 ) !void {
     var read_buf: [8 * 1024]u8 = undefined;
     var write_buf: [8 * 1024]u8 = undefined;
     var reader = stream.reader(io, &read_buf);
     var writer = stream.writer(io, &write_buf);
 
-    // Read one frame — the request. readFramePayload handles
-    // decompression transparently if the client compressed.
-    const frame = try wire.readFramePayload(allocator, &reader.interface);
+    // Read one frame. If it's req_auth, validate and read the next
+    // frame as the real request. Otherwise treat it as the request
+    // (and reject if the server requires auth).
+    var frame = try wire.readFramePayload(allocator, &reader.interface);
     defer allocator.free(frame.payload);
+
+    if (frame.msg_type == .req_auth) {
+        // Token format: [len u32][bytes]. Use readLenString to parse.
+        var cursor: usize = 0;
+        const presented = wire.readLenString(frame.payload, &cursor) catch {
+            try sendError(allocator, &writer.interface, error.BadRequest);
+            try writer.interface.flush();
+            return;
+        };
+        if (auth_token) |required| {
+            if (!std.mem.eql(u8, presented, required)) {
+                try sendError(allocator, &writer.interface, error.AuthFailed);
+                try writer.interface.flush();
+                return;
+            }
+        }
+        // Auth OK (or server has no token configured and just ignores
+        // the presented one). Read the next frame as the real request.
+        allocator.free(frame.payload);
+        frame = try wire.readFramePayload(allocator, &reader.interface);
+    } else if (auth_token != null) {
+        // Server requires auth but client didn't send req_auth first.
+        try sendError(allocator, &writer.interface, error.AuthFailed);
+        try writer.interface.flush();
+        return;
+    }
+
     const payload = frame.payload;
 
     // Dispatch on request type. Read-path streams batches via
