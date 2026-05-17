@@ -169,6 +169,31 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "nullif", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = nullifIntKernel },
     .{ .name = "nullif", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = nullifBigintKernel },
     .{ .name = "nullif", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = nullifStringKernel },
+    // --- date/time ---
+    // NB: now() / current_date() are deferred to a follow-up commit.
+    // Wall-clock in Zig 0.16 routes through std.Io.Clock which needs
+    // an Io instance — kernels don't carry one yet. Plumbing Io
+    // through the kernel signature is a separate piece of work.
+    //
+    // Calendar extractors. v1: pre-1970 dates return 0 (Zig stdlib's
+    // epoch helpers are unsigned). Sentinel-on-underflow is awkward
+    // but covers the dominant use case (post-epoch timestamps).
+    .{ .name = "year", .arg_types = &.{.date}, .return_type = .int, .kernel = yearFromDateKernel },
+    .{ .name = "year", .arg_types = &.{.datetime}, .return_type = .int, .kernel = yearFromDatetimeKernel },
+    .{ .name = "month", .arg_types = &.{.date}, .return_type = .int, .kernel = monthFromDateKernel },
+    .{ .name = "month", .arg_types = &.{.datetime}, .return_type = .int, .kernel = monthFromDatetimeKernel },
+    .{ .name = "day", .arg_types = &.{.date}, .return_type = .int, .kernel = dayFromDateKernel },
+    .{ .name = "day", .arg_types = &.{.datetime}, .return_type = .int, .kernel = dayFromDatetimeKernel },
+    .{ .name = "hour", .arg_types = &.{.datetime}, .return_type = .int, .kernel = hourKernel },
+    .{ .name = "minute", .arg_types = &.{.datetime}, .return_type = .int, .kernel = minuteKernel },
+    .{ .name = "second", .arg_types = &.{.datetime}, .return_type = .int, .kernel = secondKernel },
+    // Arithmetic
+    .{ .name = "datediff", .arg_types = &.{ .date, .date }, .return_type = .int, .kernel = datediffKernel },
+    .{ .name = "date_add", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = dateAddKernel },
+    .{ .name = "date_sub", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = dateSubKernel },
+    // Epoch conversion
+    .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = unixTimestampKernel },
+    .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .kernel = fromUnixtimeKernel },
 };
 
 // ---------------------------------------------------------------------------
@@ -649,6 +674,167 @@ fn nullifStringKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
 }
 
 // ---------------------------------------------------------------------------
+// Date/time kernels
+// ---------------------------------------------------------------------------
+//
+// Storage convention (see types.zig):
+//   DATE     i32, days since 1970-01-01 UTC
+//   DATETIME i64, microseconds since 1970-01-01T00:00:00 UTC
+//
+// v1 calendar extractors are non-negative-only — pre-1970 inputs
+// return 0 rather than wrapping (Zig stdlib's epoch helpers are
+// unsigned). Acceptable for the typical analytics workload.
+
+/// Extract (year, month1to12, day1to31) from a day-since-epoch i32.
+/// Returns null for pre-1970 dates.
+fn daysToYmd(days: i32) ?struct { year: u16, month: u4, day: u5 } {
+    if (days < 0) return null;
+    const u_days: u47 = @intCast(days);
+    const epoch_day = std.time.epoch.EpochDay{ .day = u_days };
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return .{
+        .year = year_day.year,
+        .month = month_day.month.numeric(),
+        .day = month_day.day_index + 1,
+    };
+}
+
+/// Extract (hour, minute, second) from a datetime i64 (micros).
+/// Returns null for pre-1970 datetimes.
+fn microsToHms(micros: i64) ?struct { hour: u5, minute: u6, second: u6 } {
+    if (micros < 0) return null;
+    const secs: u64 = @intCast(@divTrunc(micros, 1_000_000));
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day_seconds = epoch_seconds.getDaySeconds();
+    return .{
+        .hour = day_seconds.getHoursIntoDay(),
+        .minute = day_seconds.getMinutesIntoHour(),
+        .second = day_seconds.getSecondsIntoMinute(),
+    };
+}
+
+fn daysFromDatetime(micros: i64) i32 {
+    // Floor-division so pre-epoch micros round towards -infinity.
+    const secs = @divFloor(micros, 1_000_000);
+    return @intCast(@divFloor(secs, 86_400));
+}
+
+fn yearFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const y: i32 = if (daysToYmd(s[i])) |ymd| @intCast(ymd.year) else 0;
+        try out.data.int.append(allocator, y);
+    }
+}
+
+fn yearFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const y: i32 = if (daysToYmd(daysFromDatetime(s[i]))) |ymd| @intCast(ymd.year) else 0;
+        try out.data.int.append(allocator, y);
+    }
+}
+
+fn monthFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const m: i32 = if (daysToYmd(s[i])) |ymd| @intCast(ymd.month) else 0;
+        try out.data.int.append(allocator, m);
+    }
+}
+
+fn monthFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const m: i32 = if (daysToYmd(daysFromDatetime(s[i]))) |ymd| @intCast(ymd.month) else 0;
+        try out.data.int.append(allocator, m);
+    }
+}
+
+fn dayFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const d: i32 = if (daysToYmd(s[i])) |ymd| @intCast(ymd.day) else 0;
+        try out.data.int.append(allocator, d);
+    }
+}
+
+fn dayFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const d: i32 = if (daysToYmd(daysFromDatetime(s[i]))) |ymd| @intCast(ymd.day) else 0;
+        try out.data.int.append(allocator, d);
+    }
+}
+
+fn hourKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const h: i32 = if (microsToHms(s[i])) |hms| @intCast(hms.hour) else 0;
+        try out.data.int.append(allocator, h);
+    }
+}
+
+fn minuteKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const m: i32 = if (microsToHms(s[i])) |hms| @intCast(hms.minute) else 0;
+        try out.data.int.append(allocator, m);
+    }
+}
+
+fn secondKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const sec: i32 = if (microsToHms(s[i])) |hms| @intCast(hms.second) else 0;
+        try out.data.int.append(allocator, sec);
+    }
+}
+
+fn datediffKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.date;
+    const b = args[1].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, a[i] - b[i]);
+}
+
+fn dateAddKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const d = args[0].data.date;
+    const n = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.date.append(allocator, d[i] + n[i]);
+}
+
+fn dateSubKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const d = args[0].data.date;
+    const n = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.date.append(allocator, d[i] - n[i]);
+}
+
+fn unixTimestampKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, @divFloor(s[i], 1_000_000));
+}
+
+fn fromUnixtimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.datetime.append(allocator, s[i] * 1_000_000);
+}
+
+// ---------------------------------------------------------------------------
 // Small helpers shared across kernels
 // ---------------------------------------------------------------------------
 
@@ -755,6 +941,21 @@ pub fn least(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(ar
 // --- conditional ---
 pub fn ifnull(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "ifnull", &.{ a, b }); }
 pub fn nullif(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "nullif", &.{ a, b }); }
+
+// --- date/time ---
+// now() and current_date() helpers will land alongside their kernels
+// when wall-clock plumbing through Io is wired up.
+pub fn year(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "year", &.{arg}); }
+pub fn month(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "month", &.{arg}); }
+pub fn day(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "day", &.{arg}); }
+pub fn hour(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "hour", &.{arg}); }
+pub fn minute(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "minute", &.{arg}); }
+pub fn second(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "second", &.{arg}); }
+pub fn datediff(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "datediff", &.{ a, b }); }
+pub fn dateAdd(arena: Allocator, d: Expr, n: Expr) !Expr { return expr_mod.call(arena, "date_add", &.{ d, n }); }
+pub fn dateSub(arena: Allocator, d: Expr, n: Expr) !Expr { return expr_mod.call(arena, "date_sub", &.{ d, n }); }
+pub fn unixTimestamp(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "unix_timestamp", &.{arg}); }
+pub fn fromUnixtime(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "from_unixtime", &.{arg}); }
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -337,6 +337,85 @@ test "compute: conditional — ifnull, nullif" {
     try std.testing.expectEqual(@as(i32, 5), nullif_val.items[1]); // only the non-null one matters
 }
 
+test "compute: date/time — calendar extractors + datediff + date_add" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_dt = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "d", .type = .date },
+            .{ .name = "ts", .type = .datetime },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 8 };
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("dt", schema_dt, opts);
+
+    // Reference values picked so calendar arithmetic is unambiguous:
+    //   2026-05-16 → 20589 days since 1970-01-01
+    //     (1970→2026 = 56*365 + 14 leap days = 20454 days at Jan 1 2026;
+    //      Jan 31 + Feb 28 + Mar 31 + Apr 30 = 120 days; +15 from May 1)
+    //   2026-05-16T14:30:00 UTC → 20589 * 86400 + 14*3600 + 30*60 seconds
+    //                           = 1779424200 seconds → ×1_000_000 micros
+    //   2024-01-01 → 56*365 - 2*365 + 13 leap days = 19723 days... but
+    //     we need actual: 54 years × 365 = 19710 + 13 leap = 19723. ✓
+    const d_2026_05_16: i32 = 20589;
+    const ts_2026_05_16_14_30_00: i64 = (20589 * 86400 + 14 * 3600 + 30 * 60) * 1_000_000;
+    const d_2024_01_01: i32 = 19723;
+
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .d = thindb.types.Date.fromDays(d_2026_05_16), .ts = thindb.types.DateTime.fromMicros(ts_2026_05_16_14_30_00) },
+        .{ .id = @as(i64, 2), .d = thindb.types.Date.fromDays(d_2024_01_01), .ts = thindb.types.DateTime.fromMicros(0) },
+    });
+    try t.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const E = thindb.exec.expr_mod;
+    const F = thindb.exec.scalar_fn;
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{
+        .{ .name = "y", .expr = try F.year(aa, E.col("d")) },
+        .{ .name = "m", .expr = try F.month(aa, E.col("d")) },
+        .{ .name = "dd", .expr = try F.day(aa, E.col("d")) },
+        .{ .name = "hh", .expr = try F.hour(aa, E.col("ts")) },
+        .{ .name = "diff_days", .expr = try F.datediff(aa, E.col("d"), E.col("d")) },
+    });
+    defer q.deinit();
+
+    var years: std.ArrayList(i32) = .empty;
+    defer years.deinit(allocator);
+    var months: std.ArrayList(i32) = .empty;
+    defer months.deinit(allocator);
+    var days: std.ArrayList(i32) = .empty;
+    defer days.deinit(allocator);
+    var hours: std.ArrayList(i32) = .empty;
+    defer hours.deinit(allocator);
+
+    while (try q.next()) |b| {
+        try years.appendSlice(allocator, b.values[3].data.int[0..b.row_count]);
+        try months.appendSlice(allocator, b.values[4].data.int[0..b.row_count]);
+        try days.appendSlice(allocator, b.values[5].data.int[0..b.row_count]);
+        try hours.appendSlice(allocator, b.values[6].data.int[0..b.row_count]);
+    }
+    // Row 1: 2026-05-16T14:30:00 → year=2026, month=5, day=16, hour=14
+    // Row 2: 2024-01-01T00:00:00 → year=2024, month=1, day=1, hour=0
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2026, 2024 }, years.items);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 5, 1 }, months.items);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 16, 1 }, days.items);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 14, 0 }, hours.items);
+}
+
 test "compute: coalesce returns first non-null + bookkeeps the output bitmap" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
