@@ -102,7 +102,7 @@ pub const Table = struct {
         var segments_dir = try table_dir.createDirPathOpen(io, "segments", .{});
         errdefer segments_dir.close(io);
 
-        var manifest = try storage.readManifest(allocator, io, table_dir, fp);
+        var manifest = try storage.readManifest(allocator, io, table_dir, fp, @intCast(schema.columns.len));
         errdefer manifest.deinit();
 
         const memtable = try engine.Memtable.create(allocator, schema);
@@ -337,7 +337,7 @@ pub const Table = struct {
         );
         defer info.deinit(self.allocator);
 
-        try self.manifest.appendSegment(self.entryFor(info));
+        try self.manifest.appendSegment(try self.entryFor(info));
         try storage.writeManifest(self.io, self.table_dir, self.manifest, sync);
 
         // WAL: the records preceding this flush are now redundant. Append a
@@ -418,17 +418,16 @@ pub const Table = struct {
         return self.manifest.segments.items.len;
     }
 
-    /// Build a `ManifestEntry` for a freshly-written segment, populating
-    /// the v2 fields (byte_size, row_group_count, leading_key_stats)
-    /// from `info` under this table's schema. Used by flush + compact +
-    /// alter when appending or rewriting manifest entries.
-    pub fn entryFor(self: Table, info: storage.format.SegmentInfo) storage.manifest.ManifestEntry {
+    /// Build a `ManifestEntry` for a freshly-written segment under this
+    /// table's schema. Populates byte_size, row_group_count,
+    /// leading_key_stats, and the new v4 per-column_stats. Caller
+    /// (Manifest) owns the allocated `column_stats` slice via
+    /// `Manifest.deinit`.
+    pub fn entryFor(self: Table, info: storage.format.SegmentInfo) !storage.manifest.ManifestEntry {
         const lk_idx: ?usize = if (self.order_key_indices.len > 0) self.order_key_indices[0] else null;
-        const lk_has_stats = if (lk_idx) |idx|
-            storage.format.typeHasStats(self.schema.columns[idx].type)
-        else
-            false;
-        return storage.manifest.entryFromSegmentInfo(info, lk_idx, lk_has_stats);
+        const has_stats = try buildColumnHasStats(self.allocator, self.schema);
+        defer self.allocator.free(has_stats);
+        return storage.manifest.entryFromSegmentInfo(self.allocator, info, lk_idx, has_stats);
     }
 
     /// True iff this table is configured for durable writes (Config.sync_mode).
@@ -523,6 +522,14 @@ fn validateUniqueKey(schema: Schema) !void {
         _ = idx;
         // All v0.3 column types are supported in compound keys.
     }
+}
+
+/// Build a per-column "has_stats" bitvec under the given schema.
+/// Caller owns the returned slice.
+pub fn buildColumnHasStats(allocator: Allocator, schema: Schema) ![]bool {
+    const out = try allocator.alloc(bool, schema.columns.len);
+    for (schema.columns, 0..) |c, i| out[i] = storage.format.typeHasStats(c.type);
+    return out;
 }
 
 /// Stable hash of a schema's column names, types, order key, and unique flag.

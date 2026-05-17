@@ -928,6 +928,64 @@ test "scan: segment-level pruning skips segments excluded by leading-key predica
     try std.testing.expectEqual(@as(u32, 1), scan_op.segments_opened);
 }
 
+test "scan: segment-level pruning works for non-leading-column predicates" {
+    // The order key is `id` (bigint), but the predicate filters on
+    // `qty` (a separate int column). Manifest v4 stores per-column
+    // stats so segments where `qty` ranges don't overlap the predicate
+    // value get skipped — without opening their .dat files.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    // seg0 covers qty 1..2, seg1 qty 100..200, seg2 qty 1000..2000.
+    // Disjoint qty ranges → predicate `qty = 150` matches seg1 only.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 1) },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 2) },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .id = @as(i64, 3), .qty = @as(i32, 100) },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 150) },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 200) },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .id = @as(i64, 6), .qty = @as(i32, 1000) },
+        .{ .id = @as(i64, 7), .qty = @as(i32, 2000) },
+    });
+    try t.flush();
+
+    var base = try scan(allocator, t);
+    var q = try base.filter(leafExpr("qty", .eq, .{ .int = 150 }));
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        try ids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{4}, ids.items);
+
+    // Only seg1 should have been opened.
+    const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+    const scan_op: *exec.Scan = @ptrCast(@alignCast(filter_op.upstream.ptr));
+    try std.testing.expectEqual(@as(u32, 1), scan_op.segments_opened);
+}
+
 test "scan: segment-level pruning works for string leading-key predicates" {
     // Same shape as the bigint test but with a string order key,
     // exercising the prefix-encoded stats path.

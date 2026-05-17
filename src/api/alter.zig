@@ -212,7 +212,7 @@ pub fn execAlter(db: *Database, t: *Table, ops: []const AlterOp) !void {
     };
 
     // 3. Rewrite every segment under the new schema.
-    var new_manifest = storage.Manifest.empty(t.allocator, new_fp);
+    var new_manifest = storage.Manifest.empty(t.allocator, new_fp, @intCast(new_schema.columns.len));
     defer new_manifest.deinit();
 
     const sync = t.syncEnabled();
@@ -220,15 +220,13 @@ pub fn execAlter(db: *Database, t: *Table, ops: []const AlterOp) !void {
         new_schema.columnIndex(new_schema.order_key[0]) orelse return api.Error.SchemaMismatch
     else
         null;
-    const new_lk_has_stats = if (new_lk_idx) |idx|
-        storage.format.typeHasStats(new_schema.columns[idx].type)
-    else
-        false;
+    const new_has_stats = try @import("table.zig").buildColumnHasStats(t.allocator, new_schema);
+    defer t.allocator.free(new_has_stats);
     for (t.manifest.segments.items) |entry| {
         const info = try rewriteSegment(t, &plan, shadow_segs, entry, new_schema, new_fp, sync);
         defer info.deinit(t.allocator);
         try new_manifest.appendSegment(
-            storage.manifest.entryFromSegmentInfo(info, new_lk_idx, new_lk_has_stats),
+            try storage.manifest.entryFromSegmentInfo(t.allocator, info, new_lk_idx, new_has_stats),
         );
     }
 
@@ -362,7 +360,7 @@ fn reInitTableState(db: *Database, t: *Table, new_fp: u64) !void {
     t.schema = new_owner.view();
     t.schema_fingerprint = new_fp;
 
-    const new_manifest = try storage.readManifest(allocator, io, t.table_dir, new_fp);
+    const new_manifest = try storage.readManifest(allocator, io, t.table_dir, new_fp, @intCast(t.schema.columns.len));
     t.manifest.deinit();
     t.manifest = new_manifest;
 

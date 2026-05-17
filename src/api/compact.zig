@@ -227,7 +227,14 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
             if (first_dropped_idx == null) first_dropped_idx = idx;
             break;
         };
-        if (!is_input) keep.appendAssumeCapacity(entry);
+        if (!is_input) {
+            keep.appendAssumeCapacity(entry);
+        } else if (entry.column_stats.len > 0) {
+            // Dropped entry — Manifest no longer reaches its column_stats,
+            // so free it now (the kept entries keep their owned slices via
+            // pointer copy into `keep`).
+            t.allocator.free(entry.column_stats);
+        }
     }
 
     const sync = t.syncEnabled();
@@ -266,7 +273,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
     // Splice the new segment into the keep list at the position of the
     // first dropped input. Preserves order: older segments stay older.
     const insert_at = first_dropped_idx orelse keep.items.len;
-    const new_entry = t.entryFor(info);
+    const new_entry = try t.entryFor(info);
     try keep.insert(t.allocator, @min(insert_at, keep.items.len), new_entry);
 
     t.manifest.segments.clearRetainingCapacity();

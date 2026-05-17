@@ -220,27 +220,34 @@ pub const Scan = struct {
             .val = pred.val,
         });
 
-        // Segment-level pruning: only the leading order-key column has
-        // manifest-level stats. For predicates on it, evaluate against
-        // each segment's leading_key_stats once at plan time and mark
-        // non-matching segments as skippable. next() then never opens
-        // them.
+        // Segment-level pruning. The early-return above already proved
+        // this column's type has stats, so any manifest entry carrying
+        // per-column stats (v4+) has a valid slot at `col_idx`. Older
+        // manifests fall back to `leading_key_stats` when the predicate
+        // is on the leading order-key column.
         const order_key = self.table.schema.order_key;
-        if (order_key.len == 0) return;
-        if (!std.mem.eql(u8, pred.col, order_key[0])) return;
-
+        const is_leading = order_key.len > 0 and std.mem.eql(u8, pred.col, order_key[0]);
         const segs = self.table.manifest.segments.items[0..self.segment_count];
-        if (self.seg_skip == null) {
-            const buf = try self.allocator.alloc(bool, self.segment_count);
-            @memset(buf, false);
-            self.seg_skip = buf;
-        }
+        var any_skipped = false;
+        var skipped_buf: ?[]bool = self.seg_skip;
         for (segs, 0..) |entry, i| {
-            const lk = entry.leading_key_stats orelse continue;
+            const lk_opt: ?storage.format.Stats = blk: {
+                if (entry.column_stats.len > col_idx) break :blk entry.column_stats[col_idx];
+                if (is_leading) break :blk entry.leading_key_stats;
+                break :blk null;
+            };
+            const lk = lk_opt orelse continue;
             if (!statsOverlapPredicate(lk, pred.op, pred.val)) {
-                self.seg_skip.?[i] = true;
+                if (skipped_buf == null) {
+                    const buf = try self.allocator.alloc(bool, self.segment_count);
+                    @memset(buf, false);
+                    skipped_buf = buf;
+                }
+                skipped_buf.?[i] = true;
+                any_skipped = true;
             }
         }
+        if (any_skipped) self.seg_skip = skipped_buf;
     }
 
     fn rowGroupCanMatch(self: Scan, rg: storage.RowGroupMeta) bool {
