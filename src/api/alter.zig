@@ -216,9 +216,20 @@ pub fn execAlter(db: *Database, t: *Table, ops: []const AlterOp) !void {
     defer new_manifest.deinit();
 
     const sync = t.syncEnabled();
+    const new_lk_idx: ?usize = if (new_schema.order_key.len > 0)
+        new_schema.columnIndex(new_schema.order_key[0]) orelse return api.Error.SchemaMismatch
+    else
+        null;
+    const new_lk_has_stats = if (new_lk_idx) |idx|
+        storage.format.typeHasI64Stats(new_schema.columns[idx].type)
+    else
+        false;
     for (t.manifest.segments.items) |entry| {
-        try rewriteSegment(t, &plan, shadow_segs, entry, new_schema, new_fp, sync);
-        try new_manifest.appendSegment(.{ .segment_id = entry.segment_id, .row_count = entry.row_count });
+        const info = try rewriteSegment(t, &plan, shadow_segs, entry, new_schema, new_fp, sync);
+        defer info.deinit(t.allocator);
+        try new_manifest.appendSegment(
+            storage.manifest.entryFromSegmentInfo(info, new_lk_idx, new_lk_has_stats),
+        );
     }
 
     // 4. Write new schema and manifest into the shadow.
@@ -251,7 +262,7 @@ fn rewriteSegment(
     new_schema: Schema,
     new_fp: u64,
     sync: bool,
-) !void {
+) !storage.format.SegmentInfo {
     var name_buf: [32]u8 = undefined;
     const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
 
@@ -286,7 +297,7 @@ fn rewriteSegment(
     defer t.allocator.free(new_views);
     for (new_stores, 0..) |c, i| new_views[i] = c.view();
 
-    var info = try storage.writeSegment(
+    return try storage.writeSegment(
         t.allocator,
         t.io,
         shadow_segs,
@@ -298,7 +309,6 @@ fn rewriteSegment(
         new_views,
         sync,
     );
-    defer info.deinit(t.allocator);
 }
 
 /// Append `n` copies of `val` to `out`. For a nullable column, also marks

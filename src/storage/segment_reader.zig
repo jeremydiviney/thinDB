@@ -169,6 +169,7 @@ pub fn readSegment(
             .segment_id = segment_id,
             .row_count = row_count,
             .schema_fingerprint = schema_fingerprint,
+            .byte_size = @intCast(bytes.len),
             .row_groups = row_groups,
         },
     };

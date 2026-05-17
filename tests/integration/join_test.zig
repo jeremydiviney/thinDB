@@ -421,12 +421,12 @@ test "join: sort-merge handles duplicate keys on both sides (Cartesian per key)"
     try std.testing.expectEqual(@as(usize, 6), total);
 }
 
-test "scan: sort_state.global tracks single-segment post-compaction" {
+test "scan: sort_state.global tracks segment overlap via manifest v2 stats" {
     // Verifies Scan.stats() — the stat surface used by .auto's
-    // decision tree — reports global=true exactly when the scan's
-    // output is guaranteed sorted by the order key: 0 or 1 segments
-    // AND an empty memtable. After compact merges N segments into 1,
-    // the same table flips from global=false back to global=true.
+    // decision tree — reports global=true when the scan's output is
+    // guaranteed sorted by the order key. Manifest v2 stores per-
+    // segment leading-key min/max so Scan can prove non-overlap
+    // across multiple segments without opening any file.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -437,6 +437,7 @@ test "scan: sort_state.global tracks single-segment post-compaction" {
 
     const users = try db.table("users", users_schema, users_opts);
 
+    // Empty table: 0 segments, empty memtable → globally sorted.
     {
         var q = try thindb.scan(allocator, users);
         defer q.deinit();
@@ -446,6 +447,7 @@ test "scan: sort_state.global tracks single-segment post-compaction" {
         try std.testing.expectEqualStrings("uid", s.keys[0]);
     }
 
+    // Single segment, empty memtable → globally sorted.
     try users.insert(&.{.{ .uid = @as(i64, 1), .name = "alice" }});
     try users.flush();
     {
@@ -454,14 +456,17 @@ test "scan: sort_state.global tracks single-segment post-compaction" {
         try std.testing.expect(q.stats().sort_state.global);
     }
 
+    // Two segments with disjoint ranges in manifest order
+    // (seg1=[1], seg2=[2]) → still globally sorted thanks to v2 stats.
     try users.insert(&.{.{ .uid = @as(i64, 2), .name = "bob" }});
     try users.flush();
     {
         var q = try thindb.scan(allocator, users);
         defer q.deinit();
-        try std.testing.expect(!q.stats().sort_state.global);
+        try std.testing.expect(q.stats().sort_state.global);
     }
 
+    // Compact merges into one segment — still global=true.
     try users.compact();
     {
         var q = try thindb.scan(allocator, users);
@@ -469,12 +474,67 @@ test "scan: sort_state.global tracks single-segment post-compaction" {
         try std.testing.expect(q.stats().sort_state.global);
     }
 
+    // Non-empty memtable on top of a sorted segment → global=false:
+    // the memtable would emit as an unordered trailing batch.
     try users.insert(&.{.{ .uid = @as(i64, 3), .name = "carol" }});
     {
         var q = try thindb.scan(allocator, users);
         defer q.deinit();
         try std.testing.expect(!q.stats().sort_state.global);
     }
+}
+
+test "scan: sort_state.global false when segments overlap" {
+    // Two segments whose leading-key ranges overlap → scan output is
+    // NOT globally sorted (cross-segment key values interleave).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const users = try db.table("users", users_schema, users_opts);
+
+    try users.insert(&.{
+        .{ .uid = @as(i64, 1), .name = "alice" },
+        .{ .uid = @as(i64, 5), .name = "elaine" },
+    });
+    try users.flush();
+    try users.insert(&.{
+        .{ .uid = @as(i64, 3), .name = "carol" }, // 3 falls within [1, 5]
+        .{ .uid = @as(i64, 7), .name = "george" },
+    });
+    try users.flush();
+
+    var q = try thindb.scan(allocator, users);
+    defer q.deinit();
+    try std.testing.expect(!q.stats().sort_state.global);
+}
+
+test "scan: sort_state.global false when segments are in wrong manifest order" {
+    // Non-overlapping segment ranges but emitted in reverse manifest
+    // order: seg_old has higher leading-key values than seg_new.
+    // Scan emits seg_old first → output is not globally sorted.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const users = try db.table("users", users_schema, users_opts);
+
+    try users.insert(&.{ .{ .uid = @as(i64, 100), .name = "a" }, .{ .uid = @as(i64, 101), .name = "b" } });
+    try users.flush();
+    try users.insert(&.{ .{ .uid = @as(i64, 1), .name = "c" }, .{ .uid = @as(i64, 2), .name = "d" } });
+    try users.flush();
+
+    var q = try thindb.scan(allocator, users);
+    defer q.deinit();
+    try std.testing.expect(!q.stats().sort_state.global);
 }
 
 test "join: .auto picks SMJ for post-compaction tables joined on order key" {

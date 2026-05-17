@@ -221,19 +221,23 @@ pub const Scan = struct {
     /// snapshot row count gives the exact upper bound.
     ///
     /// Sort state is the table's order key. `global` is true when the
-    /// whole scan's output is guaranteed sorted by that key — currently
-    /// the post-compaction case: at most one segment AND an empty
-    /// memtable snapshot. (Segments are always written sorted; the
-    /// memtable is an unordered append buffer that would be emitted as
-    /// a trailing batch.) Multi-segment non-overlap detection requires
-    /// per-segment min/max in the manifest — a future enhancement.
+    /// whole scan's output is guaranteed sorted by that key:
+    ///   - zero or one segment AND the memtable snapshot is empty
+    ///     (segments are always written sorted; the memtable is an
+    ///     unordered append buffer that would emit as a trailing batch); OR
+    ///   - multiple segments whose leading-key min/max (from the
+    ///     manifest) form a strictly increasing run AND the memtable is
+    ///     empty. For single-column order keys the check is weak
+    ///     (`max[i] <= min[i+1]`); for multi-column order keys it's
+    ///     strict (`max[i] < min[i+1]`) since equal boundary values
+    ///     break secondary-key ordering across segments.
     pub fn stats(self: *Scan) exec.PipelineStats {
         const segs = self.table.manifest.segments.items[0..self.segment_count];
         var seg_rows: u64 = 0;
         for (segs) |s| seg_rows += s.row_count;
 
         const memtable_empty = self.memtable_row_count == 0;
-        const global = self.segment_count <= 1 and memtable_empty;
+        const global = memtable_empty and self.scanIsGloballySorted(segs);
 
         return .{
             .upper_rows = seg_rows + self.memtable_row_count,
@@ -242,6 +246,37 @@ pub const Scan = struct {
                 .global = global,
             },
         };
+    }
+
+    fn scanIsGloballySorted(self: *Scan, segs: []const storage.ManifestEntry) bool {
+        if (segs.len <= 1) return true;
+        if (self.table.schema.order_key.len == 0) return false;
+
+        // Need leading-key stats on every segment to prove non-overlap.
+        // v1 manifests (or string/float/largeint/decimal128/uuid leading
+        // keys) report null stats — we can't conclude anything then.
+        //
+        // Iterates in MANIFEST order (= the order Scan emits segments).
+        // For the scan's output to be globally sorted, each segment's
+        // leading-key min must be >= the previous segment's max — i.e.
+        // segments are non-overlapping AND manifest order matches
+        // leading-key order. The strict variant for multi-column order
+        // keys avoids equal boundary values breaking secondary-key
+        // ordering across the seam.
+        const multi_key = self.table.schema.order_key.len > 1;
+        var prev_max: i64 = std.math.minInt(i64);
+        for (segs, 0..) |entry, i| {
+            const lk = entry.leading_key_stats orelse return false;
+            if (i > 0) {
+                const overlap = if (multi_key)
+                    lk.min <= prev_max
+                else
+                    lk.min < prev_max;
+                if (overlap) return false;
+            }
+            prev_max = lk.max;
+        }
+        return true;
     }
 
     pub fn next(self: *Scan) !?Batch {

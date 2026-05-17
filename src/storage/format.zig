@@ -105,6 +105,10 @@ pub const SegmentInfo = struct {
     segment_id: u64,
     row_count: u64,
     schema_fingerprint: u64,
+    /// Size of the on-disk `.dat` file in bytes. Populated by both
+    /// `writeSegment` (from the buffered output length) and
+    /// `readSegment` (from the input slice length).
+    byte_size: u64,
     row_groups: []const RowGroupMeta,
 
     pub fn deinit(self: SegmentInfo, allocator: std.mem.Allocator) void {
@@ -112,6 +116,16 @@ pub const SegmentInfo = struct {
         allocator.free(self.row_groups);
     }
 };
+
+/// True iff a column of this type carries meaningful min/max in the
+/// per-row-group `Stats` slot. See `computeStats` in `segment_writer.zig`:
+/// types not listed here store `{0, 0}` (ignored).
+pub fn typeHasI64Stats(t: @import("../types.zig").Type) bool {
+    return switch (t) {
+        .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => true,
+        .largeint, .decimal128, .uuid, .varchar, .string, .char, .float, .double => false,
+    };
+}
 
 // ---------- byte helpers -------------------------------------------------
 

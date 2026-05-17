@@ -308,7 +308,6 @@ pub const Table = struct {
             return;
         }
 
-        const row_count = self.memtable.row_count;
         const seg_id = self.manifest.nextSegmentId();
 
         var name_buf: [32]u8 = undefined;
@@ -338,7 +337,7 @@ pub const Table = struct {
         );
         defer info.deinit(self.allocator);
 
-        try self.manifest.appendSegment(.{ .segment_id = seg_id, .row_count = row_count });
+        try self.manifest.appendSegment(self.entryFor(info));
         try storage.writeManifest(self.io, self.table_dir, self.manifest, sync);
 
         // WAL: the records preceding this flush are now redundant. Append a
@@ -417,6 +416,19 @@ pub const Table = struct {
 
     pub fn segmentCount(self: Table) usize {
         return self.manifest.segments.items.len;
+    }
+
+    /// Build a `ManifestEntry` for a freshly-written segment, populating
+    /// the v2 fields (byte_size, row_group_count, leading_key_stats)
+    /// from `info` under this table's schema. Used by flush + compact +
+    /// alter when appending or rewriting manifest entries.
+    pub fn entryFor(self: Table, info: storage.format.SegmentInfo) storage.manifest.ManifestEntry {
+        const lk_idx: ?usize = if (self.order_key_indices.len > 0) self.order_key_indices[0] else null;
+        const lk_has_stats = if (lk_idx) |idx|
+            storage.format.typeHasI64Stats(self.schema.columns[idx].type)
+        else
+            false;
+        return storage.manifest.entryFromSegmentInfo(info, lk_idx, lk_has_stats);
     }
 
     /// True iff this table is configured for durable writes (Config.sync_mode).

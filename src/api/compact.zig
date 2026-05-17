@@ -266,7 +266,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
     // Splice the new segment into the keep list at the position of the
     // first dropped input. Preserves order: older segments stay older.
     const insert_at = first_dropped_idx orelse keep.items.len;
-    const new_entry: storage.ManifestEntry = .{ .segment_id = new_seg_id, .row_count = work.row_count };
+    const new_entry = t.entryFor(info);
     try keep.insert(t.allocator, @min(insert_at, keep.items.len), new_entry);
 
     t.manifest.segments.clearRetainingCapacity();

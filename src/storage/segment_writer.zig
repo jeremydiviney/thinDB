@@ -112,12 +112,14 @@ pub fn writeSegment(
     try buf.appendSlice(allocator, &format.segment_magic);
 
     // ---- Flush to disk ----
+    const byte_size: u64 = @intCast(buf.items.len);
     try @import("storage.zig").writeFileSynced(io, dir, file_name, buf.items, sync_on_close);
 
     return SegmentInfo{
         .segment_id = segment_id,
         .row_count = row_count,
         .schema_fingerprint = schema_fingerprint,
+        .byte_size = byte_size,
         .row_groups = try row_groups.toOwnedSlice(allocator),
     };
 }
