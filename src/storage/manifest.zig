@@ -2,30 +2,33 @@
 //! write-tmp-then-rename so readers either see the old or new state, never a
 //! partial state.
 //!
-//! Format v2 (binary, little-endian):
+//! Format v3 (binary, little-endian):
 //!
 //!   [Header — 20 bytes]
 //!     magic "tDBM"            (4)
-//!     version u16             (2 — currently 2)
+//!     version u16             (2 — currently 3)
 //!     flags u16               (2 — reserved, written 0)
 //!     schema_fingerprint u64  (8)
 //!     segment_count u32       (4)
 //!
-//!   [Entries — 48 bytes each for v2; 16 bytes each for v1]
+//!   [Entries — 64 bytes each for v3; 48 bytes for v2; 16 bytes for v1]
 //!     For each segment:
 //!       segment_id u64        (8)
 //!       row_count u64         (8)
 //!       byte_size u64         (8) — .dat file size
 //!       row_group_count u32   (4)
 //!       flags u32             (4) — bit 0 = leading_key_stats valid
-//!       leading_key_min i64   (8)  — meaningful iff flags bit 0 set
-//!       leading_key_max i64   (8)
+//!       leading_key_min i128  (16) — meaningful iff flags bit 0 set
+//!       leading_key_max i128  (16)
 //!
 //!   [Trailer]
 //!     magic "tDBM"            (4)
 //!
-//! v1 manifests (16-byte entries: just segment_id + row_count) remain
-//! readable — new fields inflate to zeros and `leading_key_stats = null`.
+//! v1 (segment_id + row_count only) and v2 (i64 leading-key stats) manifests
+//! remain readable. v1 inflates to nulls; v2 sign-extends its i64 stats to
+//! i128. Only types whose v2 encoding fit i64 (numerics, 8-byte string
+//! prefix) are recoverable from a v2 manifest — uuid/largeint/decimal128
+//! columns had no v2 stats anyway, so the inflation loses nothing.
 
 const std = @import("std");
 const Io = std.Io;
@@ -34,12 +37,13 @@ const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
 
 pub const manifest_magic: [4]u8 = .{ 't', 'D', 'B', 'M' };
-pub const manifest_version: u16 = 2;
+pub const manifest_version: u16 = 3;
 pub const manifest_filename = "manifest";
 pub const manifest_tmp_filename = "manifest.tmp";
 pub const header_size: usize = 20;
 pub const entry_size_v1: usize = 16;
 pub const entry_size_v2: usize = 48;
+pub const entry_size_v3: usize = 64;
 pub const trailer_size: usize = 4;
 
 /// Per-entry flag bits.
@@ -117,16 +121,16 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
         try appendU32(m.allocator, &buf, e.row_group_count);
 
         var flags: u32 = 0;
-        var lk_min: i64 = 0;
-        var lk_max: i64 = 0;
+        var lk_min: i128 = 0;
+        var lk_max: i128 = 0;
         if (e.leading_key_stats) |s| {
             flags |= flag_leading_key_stats;
             lk_min = s.min;
             lk_max = s.max;
         }
         try appendU32(m.allocator, &buf, flags);
-        try appendI64(m.allocator, &buf, lk_min);
-        try appendI64(m.allocator, &buf, lk_max);
+        try appendI128(m.allocator, &buf, lk_min);
+        try appendI128(m.allocator, &buf, lk_max);
     }
 
     try buf.appendSlice(m.allocator, &manifest_magic);
@@ -154,14 +158,19 @@ pub fn readManifest(
     if (!std.mem.eql(u8, bytes[0..4], &manifest_magic)) return Error.ManifestBadMagic;
 
     const version = format.readU16(bytes[4..6]);
-    if (version != 1 and version != 2) return Error.ManifestUnsupportedVersion;
+    if (version != 1 and version != 2 and version != 3) return Error.ManifestUnsupportedVersion;
 
     const fp = format.readU64(bytes[8..16]);
     if (fp != schema_fingerprint) return Error.SchemaFingerprintMismatch;
 
     const count = format.readU32(bytes[16..20]);
 
-    const entry_size: usize = if (version == 1) entry_size_v1 else entry_size_v2;
+    const entry_size: usize = switch (version) {
+        1 => entry_size_v1,
+        2 => entry_size_v2,
+        3 => entry_size_v3,
+        else => unreachable,
+    };
     const expected_size: usize = header_size + @as(usize, count) * entry_size + trailer_size;
     if (bytes.len != expected_size) return Error.ManifestCorrupt;
 
@@ -190,10 +199,25 @@ pub fn readManifest(
             off += 4;
             const flags = format.readU32(bytes[off .. off + 4]);
             off += 4;
-            const lk_min = format.readI64(bytes[off .. off + 8]);
+            // v2 stored i64 stats — sign-extend to i128.
+            const lk_min: i128 = format.readI64(bytes[off .. off + 8]);
             off += 8;
-            const lk_max = format.readI64(bytes[off .. off + 8]);
+            const lk_max: i128 = format.readI64(bytes[off .. off + 8]);
             off += 8;
+            if ((flags & flag_leading_key_stats) != 0) {
+                entry.leading_key_stats = .{ .min = lk_min, .max = lk_max };
+            }
+        } else if (version == 3) {
+            entry.byte_size = format.readU64(bytes[off .. off + 8]);
+            off += 8;
+            entry.row_group_count = format.readU32(bytes[off .. off + 4]);
+            off += 4;
+            const flags = format.readU32(bytes[off .. off + 4]);
+            off += 4;
+            const lk_min = format.readI128(bytes[off .. off + 16]);
+            off += 16;
+            const lk_max = format.readI128(bytes[off .. off + 16]);
+            off += 16;
             if ((flags & flag_leading_key_stats) != 0) {
                 entry.leading_key_stats = .{ .min = lk_min, .max = lk_max };
             }
@@ -231,8 +255,8 @@ pub fn entryFromSegmentInfo(
 
     if (leading_key_idx) |idx| {
         if (leading_key_has_stats and info.row_groups.len > 0) {
-            var lo: i64 = std.math.maxInt(i64);
-            var hi: i64 = std.math.minInt(i64);
+            var lo: i128 = std.math.maxInt(i128);
+            var hi: i128 = std.math.minInt(i128);
             for (info.row_groups) |rg| {
                 const s = rg.stats[idx];
                 if (s.min < lo) lo = s.min;
@@ -252,7 +276,7 @@ pub fn entryFromSegmentInfo(
 const appendU16 = format.appendU16;
 const appendU32 = format.appendU32;
 const appendU64 = format.appendU64;
-const appendI64 = format.appendI64;
+const appendI128 = format.appendI128;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -303,8 +327,8 @@ test "manifest round-trips with entries" {
     try std.testing.expectEqual(@as(u64, 100), read.segments.items[0].row_count);
     try std.testing.expectEqual(@as(u64, 4096), read.segments.items[0].byte_size);
     try std.testing.expectEqual(@as(u32, 2), read.segments.items[0].row_group_count);
-    try std.testing.expectEqual(@as(i64, 1), read.segments.items[0].leading_key_stats.?.min);
-    try std.testing.expectEqual(@as(i64, 99), read.segments.items[0].leading_key_stats.?.max);
+    try std.testing.expectEqual(@as(i128, 1), read.segments.items[0].leading_key_stats.?.min);
+    try std.testing.expectEqual(@as(i128, 99), read.segments.items[0].leading_key_stats.?.max);
 
     try std.testing.expectEqual(@as(u64, 5), read.segments.items[2].segment_id);
     try std.testing.expectEqual(@as(u64, 73), read.segments.items[2].row_count);

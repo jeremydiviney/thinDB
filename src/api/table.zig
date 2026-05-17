@@ -425,7 +425,7 @@ pub const Table = struct {
     pub fn entryFor(self: Table, info: storage.format.SegmentInfo) storage.manifest.ManifestEntry {
         const lk_idx: ?usize = if (self.order_key_indices.len > 0) self.order_key_indices[0] else null;
         const lk_has_stats = if (lk_idx) |idx|
-            storage.format.typeHasI64Stats(self.schema.columns[idx].type)
+            storage.format.typeHasStats(self.schema.columns[idx].type)
         else
             false;
         return storage.manifest.entryFromSegmentInfo(info, lk_idx, lk_has_stats);

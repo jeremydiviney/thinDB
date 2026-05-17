@@ -90,6 +90,84 @@ test "uuid: equality predicate filters to the matching row" {
     try std.testing.expectEqual(id_b, matched_id);
 }
 
+test "uuid: segment-level pruning skips segments excluded by id predicate" {
+    // Three flushes with disjoint uuid ranges. A predicate on the
+    // leading uuid order-key should prune two of the three segments
+    // via the new i128 manifest stats.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("users", uuid_schema, uuid_opts);
+
+    // Three groups of UUIDs whose u128 ranges don't overlap.
+    const a1: u128 = 0x10000000_00000000_00000000_00000001;
+    const a2: u128 = 0x10000000_00000000_00000000_00000002;
+    const b1: u128 = 0x80000000_00000000_00000000_00000001;
+    const b2: u128 = 0x80000000_00000000_00000000_00000002;
+    const c1: u128 = 0xF0000000_00000000_00000000_00000001;
+    const c2: u128 = 0xF0000000_00000000_00000000_00000002;
+
+    try t.insert(&[_]struct { id: u128, name: []const u8 }{
+        .{ .id = a1, .name = "a1" },
+        .{ .id = a2, .name = "a2" },
+    });
+    try t.flush();
+    try t.insert(&[_]struct { id: u128, name: []const u8 }{
+        .{ .id = b1, .name = "b1" },
+        .{ .id = b2, .name = "b2" },
+    });
+    try t.flush();
+    try t.insert(&[_]struct { id: u128, name: []const u8 }{
+        .{ .id = c1, .name = "c1" },
+        .{ .id = c2, .name = "c2" },
+    });
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.filter(thindb.leafExpr("id", .eq, .{ .uuid = b2 }));
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 1), rows);
+
+    // Verify only one segment was actually opened (the middle one).
+    const filter_op: *thindb.exec.Filter = @ptrCast(@alignCast(q.ptr));
+    const scan_op: *thindb.exec.Scan = @ptrCast(@alignCast(filter_op.upstream.ptr));
+    try std.testing.expectEqual(@as(u32, 1), scan_op.segments_opened);
+}
+
+test "uuid: multi-segment globally sorted when ranges disjoint (i128 manifest stats)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("users", uuid_schema, uuid_opts);
+
+    try t.insert(&[_]struct { id: u128, name: []const u8 }{
+        .{ .id = 0x10000000_00000000_00000000_00000001, .name = "a" },
+        .{ .id = 0x10000000_00000000_00000000_00000002, .name = "b" },
+    });
+    try t.flush();
+    try t.insert(&[_]struct { id: u128, name: []const u8 }{
+        .{ .id = 0xF0000000_00000000_00000000_00000001, .name = "c" },
+    });
+    try t.flush();
+
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    // u128 with high bit set still orders correctly via the
+    // encodeUnsignedU128 top-bit XOR trick.
+    try std.testing.expect(q.stats().sort_state.global);
+}
+
 test "uuid: round-trips through the wire (in-process Connection)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -103,8 +103,8 @@ pub fn writeSegment(
         try appendU32(allocator, &buf, rg.length);
         try appendU32(allocator, &buf, rg.row_count);
         for (rg.stats) |s| {
-            try appendI64(allocator, &buf, s.min);
-            try appendI64(allocator, &buf, s.max);
+            try appendI128(allocator, &buf, s.min);
+            try appendI128(allocator, &buf, s.max);
         }
     }
     const footer_size: u32 = @intCast(buf.items.len - footer_start + format.footer_trailer_size);
@@ -130,6 +130,7 @@ pub fn writeSegment(
 
 const appendU16 = format.appendU16;
 const appendU32 = format.appendU32;
+const appendI128 = format.appendI128;
 const appendU64 = format.appendU64;
 const appendI32 = format.appendI32;
 const appendI64 = format.appendI64;
@@ -405,9 +406,29 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
             }
             break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
         },
-        // i128 doesn't fit in the i64 stats slot — skip stats. Filter
-        // pushdown on LARGEINT / DECIMAL(p>18) / UUID columns will scan all row groups.
-        .largeint, .decimal128, .uuid => .{ .min = 0, .max = 0 },
+        .largeint, .decimal128 => |data| blk: {
+            const slice = data[row_start..row_end];
+            var lo: i128 = std.math.maxInt(i128);
+            var hi: i128 = std.math.minInt(i128);
+            for (slice) |v| {
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            break :blk .{ .min = lo, .max = hi };
+        },
+        .uuid => |data| blk: {
+            // u128 → i128 via top-bit XOR so signed compare preserves
+            // unsigned ordering. See `format.encodeUnsignedU128`.
+            const slice = data[row_start..row_end];
+            var lo: i128 = std.math.maxInt(i128);
+            var hi: i128 = std.math.minInt(i128);
+            for (slice) |v| {
+                const enc = format.encodeUnsignedU128(v);
+                if (enc < lo) lo = enc;
+                if (enc > hi) hi = enc;
+            }
+            break :blk .{ .min = lo, .max = hi };
+        },
         .decimal64 => |data| blk: {
             const slice = data[row_start..row_end];
             var lo: i64 = std.math.maxInt(i64);
@@ -418,8 +439,8 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
             }
             break :blk .{ .min = lo, .max = hi };
         },
-        // Strings store the prefix-encoded i64 of the first 8 bytes of
-        // each row's value. See `format.encodeStringPrefix`.
+        // Strings store the prefix-encoded i128 of the first 16 bytes
+        // of each row's value. See `format.encodeStringPrefix`.
         .varchar, .string, .char => |sv| computeStringStats(sv, row_start, row_end),
         // Floats carry no stats today (NaN/sign handling deferred).
         .float, .double => .{ .min = 0, .max = 0 },
@@ -427,8 +448,8 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
 }
 
 fn computeStringStats(sv: StringView, row_start: usize, row_end: usize) format.Stats {
-    var lo: i64 = std.math.maxInt(i64);
-    var hi: i64 = std.math.minInt(i64);
+    var lo: i128 = std.math.maxInt(i128);
+    var hi: i128 = std.math.minInt(i128);
     var i = row_start;
     while (i < row_end) : (i += 1) {
         const enc = format.encodeStringPrefix(sv.rowBytes(i));

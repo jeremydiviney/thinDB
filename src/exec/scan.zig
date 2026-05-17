@@ -212,7 +212,7 @@ pub const Scan = struct {
         // Drop hints for types whose `Stats` slot is `{0, 0}` — no usable
         // min/max. statsOverlapPredicate would conservatively return true
         // anyway, but skipping the append avoids the per-row-group work.
-        if (!storage.format.typeHasI64Stats(self.table.schema.columns[col_idx].type)) return;
+        if (!storage.format.typeHasStats(self.table.schema.columns[col_idx].type)) return;
 
         try self.prunes.append(self.allocator, .{
             .col_idx = col_idx,
@@ -302,7 +302,7 @@ pub const Scan = struct {
         // keys avoids equal boundary values breaking secondary-key
         // ordering across the seam.
         const multi_key = self.table.schema.order_key.len > 1;
-        var prev_max: i64 = std.math.minInt(i64);
+        var prev_max: i128 = std.math.minInt(i128);
         for (segs, 0..) |entry, i| {
             const lk = entry.leading_key_stats orelse return false;
             if (i > 0) {

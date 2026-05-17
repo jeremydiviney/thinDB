@@ -133,7 +133,7 @@ pub fn readSegment(
     const footer_start = bytes.len - footer_size;
     const row_group_count = format.readU32(bytes[footer_start .. footer_start + 4]);
 
-    const stats_bytes_per_rg = schema.columns.len * 16; // 8 bytes min + 8 bytes max
+    const stats_bytes_per_rg = schema.columns.len * 32; // 16 bytes min + 16 bytes max
     const expected_footer = 4 + @as(usize, row_group_count) * (16 + stats_bytes_per_rg) + format.footer_trailer_size;
     if (expected_footer != footer_size) return format.Error.CorruptFooter;
 
@@ -153,10 +153,10 @@ pub fn readSegment(
 
         const stats = try allocator.alloc(format.Stats, schema.columns.len);
         for (stats) |*s| {
-            s.min = format.readI64(bytes[off .. off + 8]);
-            off += 8;
-            s.max = format.readI64(bytes[off .. off + 8]);
-            off += 8;
+            s.min = format.readI128(bytes[off .. off + 16]);
+            off += 16;
+            s.max = format.readI128(bytes[off .. off + 16]);
+            off += 16;
         }
         rg.stats = stats;
         inited_rg += 1;

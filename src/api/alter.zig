@@ -221,7 +221,7 @@ pub fn execAlter(db: *Database, t: *Table, ops: []const AlterOp) !void {
     else
         null;
     const new_lk_has_stats = if (new_lk_idx) |idx|
-        storage.format.typeHasI64Stats(new_schema.columns[idx].type)
+        storage.format.typeHasStats(new_schema.columns[idx].type)
     else
         false;
     for (t.manifest.segments.items) |entry| {
