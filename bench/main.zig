@@ -18,6 +18,7 @@ const common = @import("common.zig");
 const compact_bench = @import("compact_bench.zig");
 const durability_bench = @import("durability_bench.zig");
 const tcp_bench = @import("tcp_bench.zig");
+const join_bench = @import("join_bench.zig");
 
 const Allocator = common.Allocator;
 const Io = common.Io;
@@ -81,6 +82,8 @@ pub fn main() !void {
     std.debug.print("\nGroup commit (concurrent writers, wal=true, sync=per_flush)\n", .{});
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
     try durability_bench.benchGroupCommit(allocator, io);
+
+    try join_bench.runAll(allocator, io);
 
     std.debug.print("--------------------------------------------------------------------------------\n\n", .{});
 }

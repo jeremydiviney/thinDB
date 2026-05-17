@@ -1,0 +1,452 @@
+//! Join benchmarks. Covers size combinations (small × large, balanced),
+//! key types (bigint, string, uuid), single vs compound predicates, and
+//! both hash + sort-merge algorithms.
+//!
+//! Setup (insert + flush of both tables) happens outside the timed
+//! region. The measurement is the join itself — query create, drain
+//! every batch, count output rows. Output rows = the matched-row total.
+
+const std = @import("std");
+const thindb = @import("thindb");
+const common = @import("common.zig");
+
+const Allocator = common.Allocator;
+const Io = common.Io;
+const elapsedNs = common.elapsedNs;
+const freshDir = common.freshDir;
+
+// ----------------------------------------------------------------------------
+// Schemas
+// ----------------------------------------------------------------------------
+
+const bigint_left_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "k", .type = .bigint },
+        .{ .name = "lval", .type = .int },
+    },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const bigint_right_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "k", .type = .bigint },
+        .{ .name = "rval", .type = .int },
+    },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const bigint_ok = [_][]const u8{"k"};
+const bigint_opts = thindb.TableOptions{
+    .order_key = &bigint_ok,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+
+const string_schema_left = thindb.Schema{
+    .columns = &.{
+        .{ .name = "k", .type = .string },
+        .{ .name = "lval", .type = .int },
+    },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const string_schema_right = thindb.Schema{
+    .columns = &.{
+        .{ .name = "k", .type = .string },
+        .{ .name = "rval", .type = .int },
+    },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const string_ok = [_][]const u8{"k"};
+const string_opts = thindb.TableOptions{
+    .order_key = &string_ok,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+
+const uuid_schema_left = thindb.Schema{
+    .columns = &.{
+        .{ .name = "k", .type = .uuid },
+        .{ .name = "lval", .type = .int },
+    },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const uuid_schema_right = thindb.Schema{
+    .columns = &.{
+        .{ .name = "k", .type = .uuid },
+        .{ .name = "rval", .type = .int },
+    },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const uuid_ok = [_][]const u8{"k"};
+const uuid_opts = thindb.TableOptions{
+    .order_key = &uuid_ok,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+
+const compound_left_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "g", .type = .bigint },
+        .{ .name = "i", .type = .bigint },
+        .{ .name = "lval", .type = .int },
+    },
+    .order_key = &.{ "g", "i" },
+    .unique = true,
+};
+const compound_right_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "g", .type = .bigint },
+        .{ .name = "i", .type = .bigint },
+        .{ .name = "rval", .type = .int },
+    },
+    .order_key = &.{ "g", "i" },
+    .unique = true,
+};
+const compound_ok = [_][]const u8{ "g", "i" };
+const compound_opts = thindb.TableOptions{
+    .order_key = &compound_ok,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+
+// ----------------------------------------------------------------------------
+// Reporting
+// ----------------------------------------------------------------------------
+
+fn reportJoin(
+    label: []const u8,
+    algo: thindb.exec.join_op.Algorithm,
+    left_rows: usize,
+    right_rows: usize,
+    output_rows: usize,
+    elapsed_ns: u64,
+) void {
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
+    const ms = seconds * 1000.0;
+    const mout_per_sec = if (seconds > 0)
+        (@as(f64, @floatFromInt(output_rows)) / seconds) / 1e6
+    else
+        0.0;
+    const algo_name = switch (algo) {
+        .auto => "auto",
+        .hash => "hash",
+        .sort_merge => "smj ",
+    };
+    std.debug.print(
+        "  {s:<28} [{s}] L={d:>7} R={d:>7} out={d:>7}  {d:>8.2} ms  {d:>7.2} M out/s\n",
+        .{ label, algo_name, left_rows, right_rows, output_rows, ms, mout_per_sec },
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Bigint key
+// ----------------------------------------------------------------------------
+
+fn fillBigintLeft(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    // Insert in chunks so we don't allocate a giant single anytype literal.
+    const Row = struct { k: i64, lval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .k = @intCast(i), .lval = @intCast(i % 1000) };
+    try t.insert(rows);
+}
+fn fillBigintRight(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { k: i64, rval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .k = @intCast(i), .rval = @intCast(i % 1000) };
+    try t.insert(rows);
+}
+
+fn benchBigintJoin(
+    allocator: Allocator,
+    io: Io,
+    label: []const u8,
+    sub_path: []const u8,
+    left_rows: usize,
+    right_rows: usize,
+    algo: thindb.exec.join_op.Algorithm,
+) !void {
+    var dir = try freshDir(io, sub_path);
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", bigint_left_schema, bigint_opts);
+    try fillBigintLeft(l, left_rows, allocator);
+    try l.flush();
+
+    const r = try db.table("r", bigint_right_schema, bigint_opts);
+    try fillBigintRight(r, right_rows, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+
+    reportJoin(label, algo, left_rows, right_rows, output, elapsed);
+}
+
+// ----------------------------------------------------------------------------
+// String key — 16-char zero-padded sequential keys (lex order matches numeric)
+// ----------------------------------------------------------------------------
+
+fn buildStringKeys(allocator: Allocator, n: usize) ![][16]u8 {
+    const keys = try allocator.alloc([16]u8, n);
+    for (keys, 0..) |*k, i| {
+        _ = std.fmt.bufPrint(k[0..], "k_{d:0>13}", .{i}) catch unreachable;
+    }
+    return keys;
+}
+
+fn fillStringLeft(t: *thindb.Table, keys: [][16]u8, allocator: Allocator) !void {
+    const Row = struct { k: []const u8, lval: i32 };
+    const rows = try allocator.alloc(Row, keys.len);
+    defer allocator.free(rows);
+    for (rows, keys, 0..) |*r, *k, i| r.* = .{ .k = k[0..], .lval = @intCast(i % 1000) };
+    try t.insert(rows);
+}
+fn fillStringRight(t: *thindb.Table, keys: [][16]u8, allocator: Allocator) !void {
+    const Row = struct { k: []const u8, rval: i32 };
+    const rows = try allocator.alloc(Row, keys.len);
+    defer allocator.free(rows);
+    for (rows, keys, 0..) |*r, *k, i| r.* = .{ .k = k[0..], .rval = @intCast(i % 1000) };
+    try t.insert(rows);
+}
+
+fn benchStringJoin(
+    allocator: Allocator,
+    io: Io,
+    label: []const u8,
+    n: usize,
+    algo: thindb.exec.join_op.Algorithm,
+) !void {
+    var dir = try freshDir(io, ".bench-data/join_string");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const keys = try buildStringKeys(allocator, n);
+    defer allocator.free(keys);
+
+    const l = try db.table("l", string_schema_left, string_opts);
+    try fillStringLeft(l, keys, allocator);
+    try l.flush();
+
+    const r = try db.table("r", string_schema_right, string_opts);
+    try fillStringRight(r, keys, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+
+    reportJoin(label, algo, n, n, output, elapsed);
+}
+
+// ----------------------------------------------------------------------------
+// UUID key — sequential u128 with random-looking high bits
+// ----------------------------------------------------------------------------
+
+fn fillUuidLeft(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { k: u128, lval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| {
+        // High 64 bits: arbitrary pattern; low 64 bits: index. Together
+        // unique and sortable across both tables.
+        const hi: u128 = @as(u128, 0x1234567890ABCDEF) << 64;
+        r.* = .{ .k = hi | @as(u128, i), .lval = @intCast(i % 1000) };
+    }
+    try t.insert(rows);
+}
+fn fillUuidRight(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { k: u128, rval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| {
+        const hi: u128 = @as(u128, 0x1234567890ABCDEF) << 64;
+        r.* = .{ .k = hi | @as(u128, i), .rval = @intCast(i % 1000) };
+    }
+    try t.insert(rows);
+}
+
+fn benchUuidJoin(
+    allocator: Allocator,
+    io: Io,
+    label: []const u8,
+    n: usize,
+    algo: thindb.exec.join_op.Algorithm,
+) !void {
+    var dir = try freshDir(io, ".bench-data/join_uuid");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", uuid_schema_left, uuid_opts);
+    try fillUuidLeft(l, n, allocator);
+    try l.flush();
+
+    const r = try db.table("r", uuid_schema_right, uuid_opts);
+    try fillUuidRight(r, n, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+
+    reportJoin(label, algo, n, n, output, elapsed);
+}
+
+// ----------------------------------------------------------------------------
+// Compound (bigint, bigint) key — exercises multi-column key path
+// ----------------------------------------------------------------------------
+
+fn fillCompoundLeft(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    // group_size split: ~32 groups, n / 32 items each. Sequential so the
+    // single-segment scan is globally sorted on (g, i).
+    const groups: usize = 32;
+    const Row = struct { g: i64, i: i64, lval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, idx| {
+        r.* = .{
+            .g = @intCast(idx / (n / groups + 1)),
+            .i = @intCast(idx),
+            .lval = @intCast(idx % 1000),
+        };
+    }
+    try t.insert(rows);
+}
+fn fillCompoundRight(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const groups: usize = 32;
+    const Row = struct { g: i64, i: i64, rval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, idx| {
+        r.* = .{
+            .g = @intCast(idx / (n / groups + 1)),
+            .i = @intCast(idx),
+            .rval = @intCast(idx % 1000),
+        };
+    }
+    try t.insert(rows);
+}
+
+fn benchCompoundJoin(
+    allocator: Allocator,
+    io: Io,
+    label: []const u8,
+    n: usize,
+    algo: thindb.exec.join_op.Algorithm,
+) !void {
+    var dir = try freshDir(io, ".bench-data/join_compound");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", compound_left_schema, compound_opts);
+    try fillCompoundLeft(l, n, allocator);
+    try l.flush();
+
+    const r = try db.table("r", compound_right_schema, compound_opts);
+    try fillCompoundRight(r, n, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{
+            .{ .left = "g", .right = "g" },
+            .{ .left = "i", .right = "i" },
+        },
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+
+    reportJoin(label, algo, n, n, output, elapsed);
+}
+
+// ----------------------------------------------------------------------------
+// Entry point
+// ----------------------------------------------------------------------------
+
+pub fn runAll(allocator: Allocator, io: Io) !void {
+    std.debug.print("\nJoin (bigint key)\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+
+    const sizes = .{
+        .{ .label = "1k x 1k", .l = @as(usize, 1_000), .r = @as(usize, 1_000) },
+        .{ .label = "1k x 1M (dim x fact)", .l = @as(usize, 1_000), .r = @as(usize, 1_000_000) },
+        .{ .label = "100k x 100k", .l = @as(usize, 100_000), .r = @as(usize, 100_000) },
+        .{ .label = "1M x 1M", .l = @as(usize, 1_000_000), .r = @as(usize, 1_000_000) },
+    };
+
+    inline for (sizes) |sz| {
+        try benchBigintJoin(allocator, io, sz.label, ".bench-data/join_bigint", sz.l, sz.r, .hash);
+        try benchBigintJoin(allocator, io, sz.label, ".bench-data/join_bigint", sz.l, sz.r, .sort_merge);
+    }
+
+    std.debug.print("\nJoin (string key, 100k x 100k)\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    try benchStringJoin(allocator, io, "string 100k", 100_000, .hash);
+    try benchStringJoin(allocator, io, "string 100k", 100_000, .sort_merge);
+
+    std.debug.print("\nJoin (uuid key, 100k x 100k)\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    try benchUuidJoin(allocator, io, "uuid 100k", 100_000, .hash);
+    try benchUuidJoin(allocator, io, "uuid 100k", 100_000, .sort_merge);
+
+    std.debug.print("\nJoin (compound bigint+bigint key, 100k x 100k)\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    try benchCompoundJoin(allocator, io, "compound 100k", 100_000, .hash);
+    try benchCompoundJoin(allocator, io, "compound 100k", 100_000, .sort_merge);
+}
