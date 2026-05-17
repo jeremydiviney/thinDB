@@ -80,6 +80,10 @@ pub const Aggregate = struct {
     single_state: []AccState,
     /// Used only when grouping. Maps compound-key bytes → owned state array.
     groups: std.StringHashMapUnmanaged([]AccState),
+    /// Reusable buffer for building per-row group keys during accumulate.
+    /// Allocated once, grown to max-key-size, cleared+reused per row.
+    /// Saves ~1 arena alloc per row in the inner loop.
+    key_scratch: std.ArrayList(u8),
 
     emitted: bool = false,
 
@@ -168,6 +172,7 @@ pub const Aggregate = struct {
             .views = views,
             .single_state = single_state,
             .groups = .empty,
+            .key_scratch = .empty,
         };
         return makeQuery(allocator, self);
     }
@@ -182,6 +187,7 @@ pub const Aggregate = struct {
         self.allocator.free(self.group_col_indices);
         self.allocator.free(self.agg_col_indices);
         self.allocator.free(self.single_state);
+        self.key_scratch.deinit(self.allocator);
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -229,9 +235,21 @@ pub const Aggregate = struct {
         const aa = self.arena.allocator();
         var row: u32 = 0;
         while (row < n) : (row += 1) {
-            const key_bytes = try compoundGroupKey(aa, batch, self.group_col_indices, row);
-            const gop = try self.groups.getOrPut(aa, key_bytes);
+            // Build the key into a reusable scratch buffer instead of
+            // allocating fresh storage every row. Most rows hit existing
+            // groups — the scratch bytes only need to outlive the lookup
+            // itself, so we can wipe and reuse them next iteration. New
+            // groups get an arena-owned copy.
+            self.key_scratch.clearRetainingCapacity();
+            try buildCompoundGroupKey(self.allocator, &self.key_scratch, batch, self.group_col_indices, row);
+
+            const gop = try self.groups.getOrPut(aa, self.key_scratch.items);
             if (!gop.found_existing) {
+                // The hashmap kept a reference to our scratch slice — but
+                // we're about to reuse that buffer. Replace key_ptr with
+                // an arena-owned dup so it survives.
+                gop.key_ptr.* = try aa.dupe(u8, self.key_scratch.items);
+
                 const state = try aa.alloc(AccState, self.aggs.len);
                 const up_schema = self.upstream.outputSchema();
                 for (self.aggs, self.agg_col_indices, state) |a, maybe_idx, *s| {
@@ -620,68 +638,69 @@ fn appendAccToColumn(
     }
 }
 
-/// Pack the group-by columns of the current batch row into a byte buffer
-/// for hashing. Layout per type matches `comparison.appendColumnValueBytes`.
-fn compoundGroupKey(
-    aa: Allocator,
+/// Pack the group-by columns of the current batch row into `out`. Layout
+/// per type matches `comparison.appendColumnValueBytes`. `out` is owned
+/// by the caller and is cleared+reused across rows in the accumulate
+/// loop — only new groups get arena-owned copies.
+fn buildCompoundGroupKey(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
     batch: Batch,
     group_col_indices: []const usize,
     row: u32,
-) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
+) !void {
     for (group_col_indices) |ci| {
         const view = batch.values[ci];
         switch (view.data) {
-            .int => |s| try storage.format.appendI32(aa, &buf, s[row]),
-            .bigint => |s| try storage.format.appendI64(aa, &buf, s[row]),
-            .boolean => |s| try buf.append(aa, s[row]),
+            .int => |s| try storage.format.appendI32(allocator, out, s[row]),
+            .bigint => |s| try storage.format.appendI64(allocator, out, s[row]),
+            .boolean => |s| try out.append(allocator, s[row]),
             .varchar => |sv| {
                 const bytes = sv.rowBytes(row);
-                try storage.format.appendU32(aa, &buf, @intCast(bytes.len));
-                try buf.appendSlice(aa, bytes);
+                try storage.format.appendU32(allocator, out, @intCast(bytes.len));
+                try out.appendSlice(allocator, bytes);
             },
             .string => |sv| {
                 const bytes = sv.rowBytes(row);
-                try storage.format.appendU32(aa, &buf, @intCast(bytes.len));
-                try buf.appendSlice(aa, bytes);
+                try storage.format.appendU32(allocator, out, @intCast(bytes.len));
+                try out.appendSlice(allocator, bytes);
             },
             .float => |s| {
                 var b: [4]u8 = undefined;
                 storage.format.writeF32(&b, s[row]);
-                try buf.appendSlice(aa, &b);
+                try out.appendSlice(allocator, &b);
             },
             .double => |s| {
                 var b: [8]u8 = undefined;
                 storage.format.writeF64(&b, s[row]);
-                try buf.appendSlice(aa, &b);
+                try out.appendSlice(allocator, &b);
             },
-            .date => |s| try storage.format.appendI32(aa, &buf, s[row]),
-            .datetime => |s| try storage.format.appendI64(aa, &buf, s[row]),
-            .tinyint => |s| try buf.append(aa, @bitCast(s[row])),
+            .date => |s| try storage.format.appendI32(allocator, out, s[row]),
+            .datetime => |s| try storage.format.appendI64(allocator, out, s[row]),
+            .tinyint => |s| try out.append(allocator, @bitCast(s[row])),
             .smallint => |s| {
                 var b: [2]u8 = undefined;
                 std.mem.writeInt(i16, &b, s[row], .little);
-                try buf.appendSlice(aa, &b);
+                try out.appendSlice(allocator, &b);
             },
             .largeint => |s| {
                 var b: [16]u8 = undefined;
                 std.mem.writeInt(i128, &b, s[row], .little);
-                try buf.appendSlice(aa, &b);
+                try out.appendSlice(allocator, &b);
             },
             .char => |sv| {
                 const bytes = sv.rowBytes(row);
-                try storage.format.appendU32(aa, &buf, @intCast(bytes.len));
-                try buf.appendSlice(aa, bytes);
+                try storage.format.appendU32(allocator, out, @intCast(bytes.len));
+                try out.appendSlice(allocator, bytes);
             },
-            .decimal64 => |s| try storage.format.appendI64(aa, &buf, s[row]),
+            .decimal64 => |s| try storage.format.appendI64(allocator, out, s[row]),
             .decimal128 => |s| {
                 var b: [16]u8 = undefined;
                 std.mem.writeInt(i128, &b, s[row], .little);
-                try buf.appendSlice(aa, &b);
+                try out.appendSlice(allocator, &b);
             },
         }
     }
-    return buf.toOwnedSlice(aa);
 }
 
 /// Decode a packed group key back into the output columns (one value per
