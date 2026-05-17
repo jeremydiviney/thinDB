@@ -45,14 +45,43 @@ const wire = @import("wire.zig");
 
 pub const Error = error{
     TableNotFound,
+    TableAlreadyExists,
+    ColumnNotFound,
+    ColumnAlreadyExists,
+    SchemaMismatch,
+    TypeMismatch,
     UnsupportedOp,
-    /// The server returned a resp_error frame. (Detailed error info is
-    /// in the frame payload; surfacing it as a typed error is future work.)
+    /// Server requires authentication and the client either didn't
+    /// present a token or presented an invalid one.
+    AuthFailed,
+    /// Server-side error the client couldn't map to a known code.
+    /// The wire payload still carries the server's error name; pull it
+    /// via a future "last error message" accessor (not exposed yet).
     RemoteError,
+    /// Wire-format violation reported by the server (malformed request,
+    /// unknown message type, etc.).
+    BadRequest,
     /// The server sent a response frame whose type the client doesn't
     /// recognize (protocol mismatch, future server feature).
     UnexpectedResponse,
 } || ir.Error || wire.Error;
+
+/// Map a typed wire error code into the local Error set. Unknown
+/// codes (or `unknown_error`) fall through to `RemoteError`.
+pub fn errorFromCode(code: wire.WireErrorCode) Error {
+    return switch (code) {
+        .table_not_found => Error.TableNotFound,
+        .table_already_exists => Error.TableAlreadyExists,
+        .column_not_found => Error.ColumnNotFound,
+        .column_already_exists => Error.ColumnAlreadyExists,
+        .schema_mismatch => Error.SchemaMismatch,
+        .type_mismatch => Error.TypeMismatch,
+        .unsupported_op => Error.UnsupportedOp,
+        .bad_request => Error.BadRequest,
+        .auth_failed => Error.AuthFailed,
+        .unknown_error => Error.RemoteError,
+    };
+}
 
 /// Connection — abstracts over transports. Today: in-process (owns a
 /// Database that runs server-side queries in the same address space).
@@ -295,14 +324,22 @@ pub const Connection = struct {
         const resp_payload_len = std.mem.readInt(u32, hdr[4..8], .little);
 
         const resp_payload = try self.allocator.alloc(u8, resp_payload_len);
-        errdefer self.allocator.free(resp_payload);
-        try reader.interface.readSliceAll(resp_payload);
+        // Cleanup contract for the buffer after this point:
+        //   - resp_ok arm: returned to caller, who frees.
+        //   - any error path: free here. The arms below explicitly free
+        //     before returning. Don't use errdefer alongside that or
+        //     we double-free.
+        reader.interface.readSliceAll(resp_payload) catch |e| {
+            self.allocator.free(resp_payload);
+            return e;
+        };
 
         return switch (tag_byte) {
             @intFromEnum(wire.MsgType.resp_ok) => resp_payload,
             @intFromEnum(wire.MsgType.resp_error) => {
-                self.allocator.free(resp_payload);
-                return Error.RemoteError;
+                defer self.allocator.free(resp_payload);
+                const decoded = wire.decodeError(resp_payload) catch return Error.RemoteError;
+                return errorFromCode(decoded.code);
             },
             else => {
                 self.allocator.free(resp_payload);
@@ -636,7 +673,10 @@ pub const ClientQuery = struct {
                 tcp.done = true;
                 break :blk null;
             },
-            @intFromEnum(wire.MsgType.resp_error) => return Error.RemoteError,
+            @intFromEnum(wire.MsgType.resp_error) => {
+                const decoded = wire.decodeError(tcp.frame_payload.items) catch return Error.RemoteError;
+                return errorFromCode(decoded.code);
+            },
             else => return Error.UnexpectedResponse,
         };
     }

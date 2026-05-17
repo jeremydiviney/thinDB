@@ -444,6 +444,67 @@ test "tcp: alterTable add column populates default + appears in scan output" {
     if (sctx.err) |e| return e;
 }
 
+// Typed errors round-trip: trigger several distinct server-side
+// failures and verify each one surfaces as the expected typed
+// variant of `thindb.net.Error` on the client (not the catch-all
+// RemoteError). Locks in the wire error contract.
+test "tcp: resp_error carries a typed code, client maps to typed Error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 9;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+
+    // Seed one table so we can trigger TableAlreadyExists too.
+    _ = try server.db.table("existing", schema_v1, opts_v1);
+
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    // 3 connections: drop-missing, rename-collision, scan-missing.
+    var sctx: ServerCtx = .{ .server = server, .n = 3 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    var conn = try thindb.connect(allocator, io, listen_addr);
+    defer conn.close();
+
+    try std.testing.expectError(
+        thindb.net.Error.TableNotFound,
+        conn.dropTable("does-not-exist"),
+    );
+
+    try std.testing.expectError(
+        thindb.net.Error.TableAlreadyExists,
+        conn.renameTable("existing", "existing"),
+    );
+
+    var q = try conn.scan("nope");
+    defer q.deinit();
+    try std.testing.expectError(thindb.net.Error.TableNotFound, q.next());
+
+    if (sctx.err) |e| return e;
+}
+
 // Admin RPC: drop a table over TCP. Verify the on-disk directory is
 // gone AND that a follow-up scan fails. Server runs two requests in
 // a row (drop, then a fresh scan), so we need two acceptOne() calls.
@@ -495,11 +556,11 @@ test "tcp: dropTable removes the table and frees its directory" {
     const probe = tmp.dir.openDir(io, "victims", .{});
     try std.testing.expectError(error.FileNotFound, probe);
 
-    // Re-scan: server should reject with RemoteError (TableNotFound surfaces
-    // through the error string but the client just sees RemoteError).
+    // Re-scan: server replies with resp_error carrying the typed
+    // TableNotFound code; client maps it back to the local Error variant.
     var q = try conn.scan("victims");
     defer q.deinit();
-    try std.testing.expectError(thindb.net.Error.RemoteError, q.next());
+    try std.testing.expectError(thindb.net.Error.TableNotFound, q.next());
 
     if (sctx.err) |e| return e;
 }

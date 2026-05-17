@@ -79,6 +79,86 @@ pub const MsgType = enum(u8) {
     resp_end = 0x83,
 };
 
+/// Default TCP port for a thinDB server. Picked to avoid collisions
+/// with common DB defaults (Postgres 5432, MySQL 3306, MongoDB 27017,
+/// Redis 6379, ClickHouse 9000). Memorable + symmetric.
+pub const default_port: u16 = 7878;
+
+/// Typed error code carried in resp_error payloads. The client maps
+/// each code back to a variant of `local.Error` so callers can
+/// distinguish "table not found" from "schema mismatch" without
+/// string-matching the message. `unknown_error` is the catch-all for
+/// server-side errors we haven't mapped — the message string is still
+/// transmitted so logs are useful.
+///
+/// Wire format of resp_error:
+///   [code u16 LE][msg_len u32 LE][msg bytes]
+pub const WireErrorCode = enum(u16) {
+    unknown_error = 0,
+    table_not_found = 1,
+    table_already_exists = 2,
+    column_not_found = 3,
+    column_already_exists = 4,
+    schema_mismatch = 5,
+    type_mismatch = 6,
+    unsupported_op = 7,
+    bad_request = 8,
+    auth_failed = 9,
+};
+
+pub const error_header_size: usize = 6;
+
+/// Encode an error payload: [code u16][msg_len u32][msg].
+pub fn encodeError(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    code: WireErrorCode,
+    msg: []const u8,
+) !void {
+    var hdr: [error_header_size]u8 = undefined;
+    std.mem.writeInt(u16, hdr[0..2], @intFromEnum(code), .little);
+    std.mem.writeInt(u32, hdr[2..6], @intCast(msg.len), .little);
+    try out.appendSlice(allocator, &hdr);
+    try out.appendSlice(allocator, msg);
+}
+
+/// Decode error payload bytes into `(code, message)`. Returns
+/// `WireCorrupt` if the payload is too short.
+pub fn decodeError(payload: []const u8) !struct { code: WireErrorCode, msg: []const u8 } {
+    if (payload.len < error_header_size) return Error.WireCorrupt;
+    const code_raw = std.mem.readInt(u16, payload[0..2], .little);
+    const msg_len = std.mem.readInt(u32, payload[2..6], .little);
+    if (payload.len < error_header_size + msg_len) return Error.WireCorrupt;
+    return .{
+        .code = codeFromU16(code_raw),
+        .msg = payload[error_header_size .. error_header_size + msg_len],
+    };
+}
+
+fn codeFromU16(v: u16) WireErrorCode {
+    inline for (@typeInfo(WireErrorCode).@"enum".fields) |f| {
+        if (f.value == v) return @enumFromInt(v);
+    }
+    return .unknown_error;
+}
+
+/// Map a runtime error from the server's many error sets onto a
+/// closed WireErrorCode. Errors we don't recognize fall through to
+/// `unknown_error`; the error name still rides in the message field.
+pub fn codeFromError(err: anyerror) WireErrorCode {
+    return switch (err) {
+        error.TableNotFound => .table_not_found,
+        error.TableAlreadyExists => .table_already_exists,
+        error.ColumnNotFound => .column_not_found,
+        error.ColumnAlreadyExists => .column_already_exists,
+        error.SchemaMismatch => .schema_mismatch,
+        error.TypeMismatch => .type_mismatch,
+        error.UnsupportedOp, error.UnsupportedAlterOp => .unsupported_op,
+        error.WireCorrupt, error.WireTooSmall, error.WireUnknownMsgType, error.WireUnknownType => .bad_request,
+        else => .unknown_error,
+    };
+}
+
 pub const Error = error{
     WireBadMagic,
     WireTooSmall,

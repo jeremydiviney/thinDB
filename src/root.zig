@@ -56,6 +56,10 @@ pub const TcpServer = tcp_server.Server;
 pub const ir = @import("ir/ir.zig");
 pub const wire = @import("net/wire.zig");
 
+/// Default TCP port for a thinDB server. Servers and clients can pick
+/// any port, but examples / docs use this.
+pub const default_port: u16 = wire.default_port;
+
 test {
     // Pull in tests from sub-modules.
     std.testing.refAllDecls(@This());

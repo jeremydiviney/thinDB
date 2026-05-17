@@ -128,51 +128,51 @@ fn handleConnection(
     switch (msg_type_byte) {
         @intFromEnum(wire.MsgType.req_query) => {
             handleQuery(allocator, db, payload, &writer.interface) catch |err| {
-                try sendError(&writer.interface, @errorName(err));
+                try sendError(allocator, &writer.interface, err);
             };
         },
         @intFromEnum(wire.MsgType.req_create_table) => {
             handleCreateTable(allocator, db, payload, &writer.interface) catch |err| {
-                try sendError(&writer.interface, @errorName(err));
+                try sendError(allocator, &writer.interface, err);
             };
         },
         @intFromEnum(wire.MsgType.req_drop_table) => {
             handleDropTable(db, payload, &writer.interface) catch |err| {
-                try sendError(&writer.interface, @errorName(err));
+                try sendError(allocator, &writer.interface, err);
             };
         },
         @intFromEnum(wire.MsgType.req_rename_table) => {
             handleRenameTable(db, payload, &writer.interface) catch |err| {
-                try sendError(&writer.interface, @errorName(err));
+                try sendError(allocator, &writer.interface, err);
             };
         },
         @intFromEnum(wire.MsgType.req_alter_table) => {
             handleAlterTable(allocator, db, payload, &writer.interface) catch |err| {
-                try sendError(&writer.interface, @errorName(err));
+                try sendError(allocator, &writer.interface, err);
             };
         },
         @intFromEnum(wire.MsgType.req_flush) => {
             handleFlush(db, payload, &writer.interface) catch |err| {
-                try sendError(&writer.interface, @errorName(err));
+                try sendError(allocator, &writer.interface, err);
             };
         },
         @intFromEnum(wire.MsgType.req_compact) => {
             handleCompact(db, payload, &writer.interface) catch |err| {
-                try sendError(&writer.interface, @errorName(err));
+                try sendError(allocator, &writer.interface, err);
             };
         },
         @intFromEnum(wire.MsgType.req_delete) => {
             handleDelete(allocator, db, payload, &writer.interface) catch |err| {
-                try sendError(&writer.interface, @errorName(err));
+                try sendError(allocator, &writer.interface, err);
             };
         },
         @intFromEnum(wire.MsgType.req_insert) => {
             handleInsert(allocator, db, payload, &writer.interface) catch |err| {
-                try sendError(&writer.interface, @errorName(err));
+                try sendError(allocator, &writer.interface, err);
             };
         },
         else => {
-            try sendError(&writer.interface, "unknown request type");
+            try sendError(allocator, &writer.interface, error.UnsupportedOp);
         },
     }
     try writer.interface.flush();
@@ -205,8 +205,16 @@ fn handleQuery(
     try wire.writeFrameToIo(writer, .resp_end, &.{});
 }
 
-fn sendError(writer: *std.Io.Writer, msg: []const u8) !void {
-    try wire.writeFrameToIo(writer, .resp_error, msg);
+/// Send a resp_error frame carrying both a typed WireErrorCode and a
+/// human-readable message (the original error name). Client maps the
+/// code back to a local typed Error.
+fn sendError(allocator: Allocator, writer: *std.Io.Writer, err: anyerror) !void {
+    const code = wire.codeFromError(err);
+    const msg = @errorName(err);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    try wire.encodeError(allocator, &payload, code, msg);
+    try wire.writeFrameToIo(writer, .resp_error, payload.items);
 }
 
 fn sendOk(writer: *std.Io.Writer) !void {
