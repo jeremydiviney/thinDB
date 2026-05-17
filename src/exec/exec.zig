@@ -31,6 +31,21 @@ pub const Error = error{
     AggregateColumnRequired,
     AggregateUnsupportedType,
     ArithmeticOverflow,
+    /// Compute operator: no derived columns provided.
+    ComputeNoColumns,
+    /// Compute operator: derived column name collides with an upstream
+    /// column or another derived column.
+    ComputeNameCollision,
+    /// Compute operator: an expression shape not yet supported in v1
+    /// (nested calls, literal-only derived).
+    ComputeUnsupportedExpr,
+    /// Compute operator: no scalar function overload matches the call's
+    /// `(name, arg_types)`.
+    ComputeNoSuchOverload,
+    /// Compute operator: kernel call arity exceeds the internal fixed
+    /// buffer (currently 16). Wider arities need a heap-allocated arg
+    /// view buffer.
+    ComputeTooManyArgs,
 };
 
 // ---------------------------------------------------------------------------
@@ -124,6 +139,14 @@ pub const Query = struct {
         return @import("sort.zig").Sort.create(self.allocator, self, sort_specs);
     }
 
+    /// Add derived columns via scalar function calls. Each `Derived`
+    /// names the new column and supplies an `Expr` that resolves to a
+    /// function on upstream columns (v1: no nesting). Output schema
+    /// extends the upstream schema with these new columns appended.
+    pub fn compute(self: Query, derived: []const @import("compute.zig").Derived) !Query {
+        return @import("compute.zig").Compute.create(self.allocator, self, derived);
+    }
+
     /// `f` is either a function taking `Query` and returning `!Query`, or a
     /// function returning `Query` (we accept both by being generic).
     pub fn pipe(self: Query, f: anytype) !Query {
@@ -201,6 +224,15 @@ pub const aggregate_op = @import("aggregate.zig");
 pub const Aggregate = aggregate_op.Aggregate;
 pub const AggFunc = aggregate_op.AggFunc;
 pub const AggSpec = aggregate_op.AggSpec;
+
+pub const expr_mod = @import("expr.zig");
+pub const Expr = expr_mod.Expr;
+pub const scalar_fn = @import("scalar_fn.zig");
+pub const ScalarFn = scalar_fn.ScalarFn;
+
+pub const compute_op = @import("compute.zig");
+pub const Compute = compute_op.Compute;
+pub const Derived = compute_op.Derived;
 
 test {
     _ = predicate;
