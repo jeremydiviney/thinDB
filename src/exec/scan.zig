@@ -195,8 +195,10 @@ pub const Scan = struct {
             }
             return Error.ColumnNotFound;
         };
-        // Strings have no stats — skip silently.
-        if (self.table.schema.columns[col_idx].type.isString()) return;
+        // Drop hints for types whose `Stats` slot is `{0, 0}` — no usable
+        // min/max. statsOverlapPredicate would conservatively return true
+        // anyway, but skipping the append avoids the per-row-group work.
+        if (!storage.format.typeHasI64Stats(self.table.schema.columns[col_idx].type)) return;
 
         try self.prunes.append(self.allocator, .{
             .col_idx = col_idx,

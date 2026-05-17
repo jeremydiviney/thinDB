@@ -29,10 +29,12 @@
 const std = @import("std");
 
 pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
-/// v5: column blocks use zstd (level 3) instead of flate for compression.
-/// On-disk format is otherwise identical to v4; v4 segments aren't readable by
-/// v5 code because the per-block compression bytes have a different meaning.
-pub const segment_version: u16 = 5;
+/// v6: per-row-group `Stats` slot for string/varchar/char columns now
+/// carries the prefix-encoded min/max of the column's first 8 bytes
+/// (was `{0, 0}` in v5). On-disk layout is otherwise identical to v5,
+/// but a v5 reader would interpret v6's string-stat bytes as garbage
+/// i64 values — hence the version bump. See `encodeStringPrefix`.
+pub const segment_version: u16 = 6;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -70,13 +72,38 @@ pub const header_size: usize = 32;
 pub const row_group_header_size: usize = 8;
 pub const footer_trailer_size: usize = 8; // u32 footer_size + 4-byte magic
 
-/// Min/max for fixed-width columns. Stored as i64 (sign-extended) so the
-/// footer entry size is the same for INT, BIGINT, and BOOLEAN. Strings carry
-/// no stats in v0.2.
+/// Per-column min/max in the segment row-group footer. The 16-byte slot
+/// (two i64) is reinterpreted per column type:
+///   - integer / boolean / date / datetime / decimal64: sign-extended i64
+///   - varchar / string / char: prefix encoding (see `encodeStringPrefix`)
+///   - largeint / decimal128 / uuid / float / double: `{0, 0}` sentinel
+///     (no usable stats — these types carry no min/max today)
 pub const Stats = struct {
     min: i64,
     max: i64,
 };
+
+/// Encode an 8-byte prefix of `bytes` (zero-padded if shorter) into an
+/// i64 such that signed i64 comparison preserves lex byte order over
+/// the prefix:
+///   1. Take the first up-to-8 bytes, zero-pad on the right.
+///   2. Read as u64 big-endian → first byte becomes the MSB, so unsigned
+///      integer ordering matches lex byte ordering.
+///   3. XOR the top bit to flip the unsigned/signed ordering — turns
+///      values with high-bit-set bytes (negative in i64) into the upper
+///      half of the i64 range instead of the lower half.
+///
+/// Strings longer than 8 bytes contribute only their first 8 bytes; the
+/// resulting min/max is a CONSERVATIVE upper bound (a row's actual full
+/// value may differ from another row sharing the same 8-byte prefix).
+/// Callers that prune on these stats must treat ties as "could match".
+pub fn encodeStringPrefix(bytes: []const u8) i64 {
+    var buf: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    const n = @min(bytes.len, 8);
+    @memcpy(buf[0..n], bytes[0..n]);
+    const u = std.mem.readInt(u64, &buf, .big);
+    return @bitCast(u ^ (@as(u64, 1) << 63));
+}
 
 pub const Error = error{
     SchemaMismatch,
@@ -118,12 +145,15 @@ pub const SegmentInfo = struct {
 };
 
 /// True iff a column of this type carries meaningful min/max in the
-/// per-row-group `Stats` slot. See `computeStats` in `segment_writer.zig`:
-/// types not listed here store `{0, 0}` (ignored).
+/// per-row-group `Stats` slot (and in the manifest leading-key slot).
+/// Numeric types use sign-extended i64; string types use the prefix
+/// encoding (`encodeStringPrefix`). Types not listed here store
+/// `{0, 0}` and must be treated as "no stats" by pruning code.
 pub fn typeHasI64Stats(t: @import("../types.zig").Type) bool {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => true,
-        .largeint, .decimal128, .uuid, .varchar, .string, .char, .float, .double => false,
+        .varchar, .string, .char => true,
+        .largeint, .decimal128, .uuid, .float, .double => false,
     };
 }
 
@@ -201,6 +231,38 @@ pub fn appendI64(allocator: Allocator, buf: *std.ArrayList(u8), v: i64) !void {
     var b: [8]u8 = undefined;
     writeI64(&b, v);
     try buf.appendSlice(allocator, &b);
+}
+
+test "encodeStringPrefix preserves lex byte order across signed i64" {
+    const cases = [_]struct { a: []const u8, b: []const u8 }{
+        // Plain ASCII pairs.
+        .{ .a = "alice", .b = "bob" },
+        .{ .a = "alice", .b = "alicez" },
+        .{ .a = "a", .b = "alice" },
+        // Empty < anything non-empty.
+        .{ .a = "", .b = "a" },
+        // Strings whose first byte has the high bit set (would be negative
+        // if we naively reinterpreted as signed i64) must still order above
+        // ASCII strings. 0x80 > 'z' (0x7A).
+        .{ .a = "alice", .b = &[_]u8{ 0x80, 0, 0, 0, 0, 0, 0, 0 } },
+        // Strings sharing the full 8-byte prefix but differing afterward
+        // encode to the same i64 — callers must keep these conservatively.
+        // Verified separately below via the equality check.
+    };
+    for (cases) |c| {
+        const ea = encodeStringPrefix(c.a);
+        const eb = encodeStringPrefix(c.b);
+        try std.testing.expect(ea < eb);
+    }
+
+    // Tied prefixes (>8 byte strings sharing first 8 bytes) encode equal.
+    try std.testing.expectEqual(
+        encodeStringPrefix("abcdefgh_extra1"),
+        encodeStringPrefix("abcdefgh_extra2"),
+    );
+    // Empty string encodes to the minimum (all-zero bytes, then top-bit
+    // XOR → minInt(i64)) — every non-empty string sorts above it.
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), encodeStringPrefix(""));
 }
 
 test "byte helpers round-trip primitive types" {

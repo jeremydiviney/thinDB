@@ -211,6 +211,12 @@ fn cmp(comptime T: type, a: T, b: T, op: PredicateOp) bool {
 
 /// Returns true if the row-group stats could contain rows matching `op val`.
 /// Used by Scan and DELETE to decide whether to skip a row group entirely.
+///
+/// String predicates use the prefix-encoded form of `text` (see
+/// `format.encodeStringPrefix`). Range ops on strings are rejected by
+/// `validateExpr`, but for defensiveness this returns `true` for them
+/// (and for `.neq` on strings, where prefix ties make a precise skip
+/// unsafe — two rows with the same 8-byte prefix may differ in full).
 pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value) bool {
     const wanted: i64 = switch (v) {
         .int => |x| x,
@@ -221,9 +227,20 @@ pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value)
         .tinyint => |x| x,
         .smallint => |x| x,
         .decimal64 => |x| x,
-        // No stats on strings/floats/largeint/decimal128/uuid — can't fit
-        // i128 (or u128) in the i64 stats slot.
-        .text, .float, .double, .largeint, .decimal128, .uuid => return true,
+        .text => |x| {
+            // For prefix-encoded string stats:
+            //   eq: prune if want's 8-byte prefix falls outside [min, max].
+            //     A prefix match could still be a full-value mismatch, so
+            //     keep on match (conservative).
+            //   neq: never prune (prefix ties don't imply full-value ties).
+            //   range ops: rejected by validateExpr; defensive `true`.
+            if (op == .neq) return true;
+            if (op != .eq) return true;
+            const enc = storage.format.encodeStringPrefix(x);
+            return enc >= s.min and enc <= s.max;
+        },
+        // No stats on floats/largeint/decimal128/uuid yet.
+        .float, .double, .largeint, .decimal128, .uuid => return true,
     };
     return switch (op) {
         .eq => wanted >= s.min and wanted <= s.max,

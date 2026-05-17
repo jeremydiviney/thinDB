@@ -537,6 +537,190 @@ test "scan: sort_state.global false when segments are in wrong manifest order" {
     try std.testing.expect(!q.stats().sort_state.global);
 }
 
+test "scan: string-keyed multi-segment table reports global=true when disjoint" {
+    // Manifest v2 now stores prefix-encoded leading-key stats for
+    // string columns, so non-overlap detection works without compact().
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const slug_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "slug", .type = .string },
+            .{ .name = "payload", .type = .int },
+        },
+        .order_key = &.{"slug"},
+        .unique = true,
+    };
+    const slug_ok = [_][]const u8{"slug"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const t = try db.table("posts", slug_schema, .{ .order_key = &slug_ok, .unique = true });
+
+    // Two flushes producing disjoint string ranges in manifest order.
+    try t.insert(&.{
+        .{ .slug = @as([]const u8, "alpha"), .payload = @as(i32, 1) },
+        .{ .slug = @as([]const u8, "beta"), .payload = @as(i32, 2) },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .slug = @as([]const u8, "charlie"), .payload = @as(i32, 3) },
+        .{ .slug = @as([]const u8, "delta"), .payload = @as(i32, 4) },
+    });
+    try t.flush();
+
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    try std.testing.expect(q.stats().sort_state.global);
+}
+
+test "scan: string-keyed multi-segment table reports global=false when overlapping" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const slug_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "slug", .type = .string },
+            .{ .name = "payload", .type = .int },
+        },
+        .order_key = &.{"slug"},
+        .unique = true,
+    };
+    const slug_ok = [_][]const u8{"slug"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const t = try db.table("posts", slug_schema, .{ .order_key = &slug_ok, .unique = true });
+
+    // Overlapping ranges: seg1 covers ["alpha", "delta"], seg2 covers
+    // ["bravo", "echo"]. They interleave on prefix, so scan output
+    // can't be globally sorted.
+    try t.insert(&.{
+        .{ .slug = @as([]const u8, "alpha"), .payload = @as(i32, 1) },
+        .{ .slug = @as([]const u8, "delta"), .payload = @as(i32, 2) },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .slug = @as([]const u8, "bravo"), .payload = @as(i32, 3) },
+        .{ .slug = @as([]const u8, "echo"), .payload = @as(i32, 4) },
+    });
+    try t.flush();
+
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    try std.testing.expect(!q.stats().sort_state.global);
+}
+
+test "join: .auto picks SMJ for string-keyed multi-segment tables joined on slug" {
+    // End-to-end: two string-keyed tables with disjoint multi-flush
+    // ranges joined on the order key. .auto's decision tree should
+    // pick SMJ (output emitted in join-key sort order).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const post_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "slug", .type = .string },
+            .{ .name = "title", .type = .string },
+        },
+        .order_key = &.{"slug"},
+        .unique = true,
+    };
+    const author_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "slug", .type = .string },
+            .{ .name = "author", .type = .string },
+        },
+        .order_key = &.{"slug"},
+        .unique = true,
+    };
+    const post_ok = [_][]const u8{"slug"};
+    const author_ok = [_][]const u8{"slug"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const posts = try db.table("posts", post_schema, .{ .order_key = &post_ok, .unique = true });
+    try posts.insert(&.{
+        .{ .slug = @as([]const u8, "alpha"), .title = @as([]const u8, "A") },
+        .{ .slug = @as([]const u8, "beta"), .title = @as([]const u8, "B") },
+    });
+    try posts.flush();
+    try posts.insert(&.{
+        .{ .slug = @as([]const u8, "charlie"), .title = @as([]const u8, "C") },
+    });
+    try posts.flush();
+
+    const authors = try db.table("authors", author_schema, .{ .order_key = &author_ok, .unique = true });
+    try authors.insert(&.{
+        .{ .slug = @as([]const u8, "alpha"), .author = @as([]const u8, "Alice") },
+    });
+    try authors.flush();
+    try authors.insert(&.{
+        .{ .slug = @as([]const u8, "beta"), .author = @as([]const u8, "Bob") },
+        .{ .slug = @as([]const u8, "charlie"), .author = @as([]const u8, "Carol") },
+    });
+    try authors.flush();
+
+    // Both sides should report global=true → .auto picks SMJ → output
+    // is sorted by slug.
+    {
+        var pq = try thindb.scan(allocator, posts);
+        defer pq.deinit();
+        try std.testing.expect(pq.stats().sort_state.global);
+        var aq = try thindb.scan(allocator, authors);
+        defer aq.deinit();
+        try std.testing.expect(aq.stats().sort_state.global);
+    }
+
+    // First with explicit SMJ to know the expected output ordering.
+    var smj_slugs: std.ArrayList(u8) = .empty;
+    defer smj_slugs.deinit(allocator);
+    {
+        const left = try thindb.scan(allocator, posts);
+        const right = try thindb.scan(allocator, authors);
+        var q = try left.join(right, .{
+            .on = &.{.{ .left = "slug", .right = "slug" }},
+            .algorithm = .sort_merge,
+        });
+        defer q.deinit();
+        while (try q.next()) |b| {
+            for (0..b.row_count) |i| {
+                try smj_slugs.appendSlice(allocator, b.values[0].data.string.rowBytes(i));
+                try smj_slugs.append(allocator, '|');
+            }
+        }
+    }
+
+    // Then with default .auto — output should match SMJ exactly.
+    var auto_slugs: std.ArrayList(u8) = .empty;
+    defer auto_slugs.deinit(allocator);
+    {
+        const left = try thindb.scan(allocator, posts);
+        const right = try thindb.scan(allocator, authors);
+        var q = try left.join(right, .{
+            .on = &.{.{ .left = "slug", .right = "slug" }},
+        });
+        defer q.deinit();
+        while (try q.next()) |b| {
+            for (0..b.row_count) |i| {
+                try auto_slugs.appendSlice(allocator, b.values[0].data.string.rowBytes(i));
+                try auto_slugs.append(allocator, '|');
+            }
+        }
+    }
+
+    try std.testing.expectEqualStrings(smj_slugs.items, auto_slugs.items);
+}
+
 test "join: .auto picks SMJ for post-compaction tables joined on order key" {
     // End-to-end: two tables, each compacted to a single segment,
     // joined on their order key. .auto's decision tree should pick

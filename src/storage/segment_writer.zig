@@ -418,9 +418,24 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
             }
             break :blk .{ .min = lo, .max = hi };
         },
-        // Strings + floats + char carry no stats today.
-        .varchar, .string, .char, .float, .double => .{ .min = 0, .max = 0 },
+        // Strings store the prefix-encoded i64 of the first 8 bytes of
+        // each row's value. See `format.encodeStringPrefix`.
+        .varchar, .string, .char => |sv| computeStringStats(sv, row_start, row_end),
+        // Floats carry no stats today (NaN/sign handling deferred).
+        .float, .double => .{ .min = 0, .max = 0 },
     };
+}
+
+fn computeStringStats(sv: StringView, row_start: usize, row_end: usize) format.Stats {
+    var lo: i64 = std.math.maxInt(i64);
+    var hi: i64 = std.math.minInt(i64);
+    var i = row_start;
+    while (i < row_end) : (i += 1) {
+        const enc = format.encodeStringPrefix(sv.rowBytes(i));
+        if (enc < lo) lo = enc;
+        if (enc > hi) hi = enc;
+    }
+    return .{ .min = lo, .max = hi };
 }
 
 fn writeStringBlock(

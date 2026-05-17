@@ -874,3 +874,51 @@ test "pipe composes a chain" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3, 4 }, collected_ids.items);
     try std.testing.expectEqualStrings("bcd", collected_tags.items);
 }
+
+test "scan: string eq predicate prunes row groups via prefix stats" {
+    // Builds a segment with multiple row groups whose name-column
+    // ranges don't overlap, then runs `name = 'mike'` (which falls
+    // outside the first row group's stats). The filter must still
+    // return the matching row — proving prune+decode stays correct
+    // for prefix-encoded string stats.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "name", .type = .string },
+        },
+        .order_key = &.{"name"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 2 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"name"}, .row_group_size = 2 });
+
+    // Three row groups, name ranges: ["alice","bob"], ["carol","dave"],
+    // ["eve","frank"]. Predicate "carol" matches row group 2 only;
+    // row groups 1 and 3 should be skipped by the prefix-stat prune.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .name = @as([]const u8, "alice") },
+        .{ .id = @as(i64, 2), .name = @as([]const u8, "bob") },
+        .{ .id = @as(i64, 3), .name = @as([]const u8, "carol") },
+        .{ .id = @as(i64, 4), .name = @as([]const u8, "dave") },
+        .{ .id = @as(i64, 5), .name = @as([]const u8, "eve") },
+        .{ .id = @as(i64, 6), .name = @as([]const u8, "frank") },
+    });
+    try t.flush();
+
+    var base = try scan(allocator, t);
+    var q = try base.filter(leafExpr("name", .eq, .{ .text = "carol" }));
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        try ids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{3}, ids.items);
+}
