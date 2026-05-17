@@ -53,9 +53,25 @@ pub const JoinType = enum {
     // Future: left, right, full, semi, anti, cross.
 };
 
+pub const Algorithm = enum {
+    /// Build a hash table on the smaller side; probe with the other.
+    /// Best for equi-joins with at least one side fitting comfortably
+    /// in memory, no heavy skew.
+    hash,
+    /// Sort both sides on the join key, walk in lockstep. Predictable
+    /// memory + degrades smoothly under skew. Best when both sides
+    /// are large, skew is heavy, or output needs to be sorted.
+    sort_merge,
+    // Future: auto (decision tree picks per query), inlj, nlj
+};
+
 pub const Spec = struct {
     join_type: JoinType = .inner,
     on: []const KeyPair,
+    /// Explicit algorithm choice. v1: caller picks. Future v2: a
+    /// `.auto` variant runs the decision tree using the cheap stats
+    /// plus observed materialization stats.
+    algorithm: Algorithm = .hash,
 };
 
 /// Number of rows emitted per output batch. Bounded so emission stays
@@ -136,6 +152,11 @@ pub const Join = struct {
     ) !Query {
         if (spec.join_type != .inner) return Error.JoinUnsupportedType;
         if (spec.on.len == 0) return Error.JoinEmptyOnClause;
+        // Route to the SMJ implementation when explicitly requested.
+        // (Decision tree for `.auto` choice lands in a follow-up.)
+        if (spec.algorithm == .sort_merge) {
+            return @import("smj.zig").SortMergeJoin.create(allocator, left, right, spec);
+        }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();

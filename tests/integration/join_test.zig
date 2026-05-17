@@ -203,6 +203,131 @@ test "join: empty build side produces empty output" {
     try std.testing.expectEqual(@as(usize, 0), rows);
 }
 
+test "join: sort-merge algorithm produces same result as hash" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const users = try db.table("users", users_schema, users_opts);
+    try users.insert(&.{
+        .{ .uid = @as(i64, 1), .name = "alice" },
+        .{ .uid = @as(i64, 2), .name = "bob" },
+        .{ .uid = @as(i64, 3), .name = "carol" },
+    });
+    try users.flush();
+
+    const orders = try db.table("orders", orders_schema, orders_opts);
+    try orders.insert(&.{
+        .{ .oid = @as(i64, 100), .uid = @as(i64, 1), .qty = @as(i32, 10) },
+        .{ .oid = @as(i64, 101), .uid = @as(i64, 2), .qty = @as(i32, 20) },
+        .{ .oid = @as(i64, 102), .uid = @as(i64, 1), .qty = @as(i32, 30) },
+        .{ .oid = @as(i64, 103), .uid = @as(i64, 99), .qty = @as(i32, 40) },
+    });
+    try orders.flush();
+
+    const left = try thindb.scan(allocator, users);
+    const right = try thindb.scan(allocator, orders);
+    var q = try left.join(right, .{
+        .join_type = .inner,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .sort_merge,
+    });
+    defer q.deinit();
+
+    // Collect output: should match hash-join result (3 rows).
+    var uids: std.ArrayList(i64) = .empty;
+    defer uids.deinit(allocator);
+    var oids: std.ArrayList(i64) = .empty;
+    defer oids.deinit(allocator);
+    var qtys: std.ArrayList(i32) = .empty;
+    defer qtys.deinit(allocator);
+
+    while (try q.next()) |b| {
+        try uids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+        try oids.appendSlice(allocator, b.values[2].data.bigint[0..b.row_count]);
+        try qtys.appendSlice(allocator, b.values[3].data.int[0..b.row_count]);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), uids.items.len);
+
+    // SMJ emits in sorted-by-key order. The two uid=1 rows come first,
+    // then uid=2. Within uid=1, internal order depends on orders' scan
+    // order which is by oid (100 then 102 — both pre-sorted). So:
+    // (uid=1, oid=100), (uid=1, oid=102), (uid=2, oid=101).
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 1, 2 }, uids.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 102, 101 }, oids.items);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 30, 20 }, qtys.items);
+}
+
+test "join: sort-merge handles duplicate keys on both sides (Cartesian per key)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Both sides have multiple rows per join key, so the SMJ inner
+    // Cartesian product per key has to fire correctly.
+    const a_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "rowid", .type = .bigint },
+            .{ .name = "k", .type = .int },
+            .{ .name = "lval", .type = .string },
+        },
+        .order_key = &.{"rowid"},
+        .unique = true,
+    };
+    const b_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "b_rowid", .type = .bigint }, // distinct name to avoid join-collision
+            .{ .name = "k_other", .type = .int },
+            .{ .name = "rval", .type = .string },
+        },
+        .order_key = &.{"b_rowid"},
+        .unique = true,
+    };
+    const a_ok = [_][]const u8{"rowid"};
+    const b_ok = [_][]const u8{"b_rowid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const a = try db.table("a", a_schema, .{ .order_key = &a_ok, .unique = true });
+    try a.insert(&.{
+        .{ .rowid = @as(i64, 1), .k = @as(i32, 1), .lval = @as([]const u8, "L1a") },
+        .{ .rowid = @as(i64, 2), .k = @as(i32, 1), .lval = @as([]const u8, "L1b") },
+        .{ .rowid = @as(i64, 3), .k = @as(i32, 2), .lval = @as([]const u8, "L2") },
+    });
+    try a.flush();
+
+    const b = try db.table("b", b_schema, .{ .order_key = &b_ok, .unique = true });
+    try b.insert(&.{
+        .{ .b_rowid = @as(i64, 1), .k_other = @as(i32, 1), .rval = @as([]const u8, "R1a") },
+        .{ .b_rowid = @as(i64, 2), .k_other = @as(i32, 1), .rval = @as([]const u8, "R1b") },
+        .{ .b_rowid = @as(i64, 3), .k_other = @as(i32, 1), .rval = @as([]const u8, "R1c") },
+    });
+    try b.flush();
+
+    // a × b on (a.k = b.k_other):
+    //   k=1 (L=2 rows, R=3 rows) → 6 output rows
+    //   k=2 (L=1 row, R=0 rows) → 0 output rows
+    // Total: 6 rows
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k_other" }},
+        .algorithm = .sort_merge,
+    });
+    defer q.deinit();
+
+    var total: usize = 0;
+    while (try q.next()) |bat| total += bat.row_count;
+    try std.testing.expectEqual(@as(usize, 6), total);
+}
+
 test "join: type mismatch on join key errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
