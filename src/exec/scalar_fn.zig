@@ -194,6 +194,35 @@ pub const builtins = [_]ScalarFn{
     // Epoch conversion
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .kernel = fromUnixtimeKernel },
+    // --- conversion ---
+    // Numeric widening (int → bigint → double): always succeeds.
+    .{ .name = "to_bigint", .arg_types = &.{.int}, .return_type = .bigint, .kernel = intToBigintKernel },
+    .{ .name = "to_double", .arg_types = &.{.int}, .return_type = .double, .kernel = intToDoubleKernel },
+    .{ .name = "to_double", .arg_types = &.{.bigint}, .return_type = .double, .kernel = bigintToDoubleKernel },
+    // Numeric narrowing (truncates, may lose precision; overflow saturates).
+    .{ .name = "to_int", .arg_types = &.{.bigint}, .return_type = .int, .kernel = bigintToIntKernel },
+    .{ .name = "to_int", .arg_types = &.{.double}, .return_type = .int, .kernel = doubleToIntKernel },
+    .{ .name = "to_bigint", .arg_types = &.{.double}, .return_type = .bigint, .kernel = doubleToBigintKernel },
+    // String parsing — on parse failure returns 0 (NULL-on-failure
+    // would need .kernel_managed; deferred).
+    .{ .name = "to_int", .arg_types = &.{.string}, .return_type = .int, .kernel = stringToIntKernel },
+    .{ .name = "to_bigint", .arg_types = &.{.string}, .return_type = .bigint, .kernel = stringToBigintKernel },
+    .{ .name = "to_double", .arg_types = &.{.string}, .return_type = .double, .kernel = stringToDoubleKernel },
+    // Stringify numerics.
+    .{ .name = "to_string", .arg_types = &.{.int}, .return_type = .string, .kernel = intToStringKernel },
+    .{ .name = "to_string", .arg_types = &.{.bigint}, .return_type = .string, .kernel = bigintToStringKernel },
+    .{ .name = "to_string", .arg_types = &.{.double}, .return_type = .string, .kernel = doubleToStringKernel },
+    .{ .name = "to_string", .arg_types = &.{.boolean}, .return_type = .string, .kernel = boolToStringKernel },
+    // --- hash ---
+    .{ .name = "md5", .arg_types = &.{.string}, .return_type = .string, .kernel = md5Kernel },
+    .{ .name = "sha1", .arg_types = &.{.string}, .return_type = .string, .kernel = sha1Kernel },
+    .{ .name = "sha256", .arg_types = &.{.string}, .return_type = .string, .kernel = sha256Kernel },
+    .{ .name = "crc32", .arg_types = &.{.string}, .return_type = .bigint, .kernel = crc32Kernel },
+    // --- encoding ---
+    .{ .name = "hex", .arg_types = &.{.string}, .return_type = .string, .kernel = hexEncodeKernel },
+    .{ .name = "unhex", .arg_types = &.{.string}, .return_type = .string, .kernel = hexDecodeKernel },
+    .{ .name = "to_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = base64EncodeKernel },
+    .{ .name = "from_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = base64DecodeKernel },
 };
 
 // ---------------------------------------------------------------------------
@@ -835,6 +864,288 @@ fn fromUnixtimeKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
 }
 
 // ---------------------------------------------------------------------------
+// Conversion kernels
+// ---------------------------------------------------------------------------
+
+fn intToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, s[i]);
+}
+
+fn intToDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @floatFromInt(s[i]));
+}
+
+fn bigintToDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @floatFromInt(s[i]));
+}
+
+fn bigintToIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v = s[i];
+        const clamped: i32 = if (v > std.math.maxInt(i32))
+            std.math.maxInt(i32)
+        else if (v < std.math.minInt(i32))
+            std.math.minInt(i32)
+        else
+            @intCast(v);
+        try out.data.int.append(allocator, clamped);
+    }
+}
+
+fn doubleToIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v = s[i];
+        const trunc = @trunc(v);
+        const clamped: i32 = if (std.math.isNan(v) or trunc > @as(f64, @floatFromInt(std.math.maxInt(i32))))
+            std.math.maxInt(i32)
+        else if (trunc < @as(f64, @floatFromInt(std.math.minInt(i32))))
+            std.math.minInt(i32)
+        else
+            @intFromFloat(trunc);
+        try out.data.int.append(allocator, clamped);
+    }
+}
+
+fn doubleToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v = s[i];
+        const trunc = @trunc(v);
+        const clamped: i64 = if (std.math.isNan(v) or trunc > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+            std.math.maxInt(i64)
+        else if (trunc < @as(f64, @floatFromInt(std.math.minInt(i64))))
+            std.math.minInt(i64)
+        else
+            @intFromFloat(trunc);
+        try out.data.bigint.append(allocator, clamped);
+    }
+}
+
+fn stringToIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v = std.fmt.parseInt(i32, sv.rowBytes(i), 10) catch 0;
+        try out.data.int.append(allocator, v);
+    }
+}
+
+fn stringToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v = std.fmt.parseInt(i64, sv.rowBytes(i), 10) catch 0;
+        try out.data.bigint.append(allocator, v);
+    }
+}
+
+fn stringToDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v = std.fmt.parseFloat(f64, sv.rowBytes(i)) catch 0.0;
+        try out.data.double.append(allocator, v);
+    }
+}
+
+fn intToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.int;
+    const ss = stringStoreOf(out);
+    var buf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const text = try std.fmt.bufPrint(&buf, "{d}", .{s[i]});
+        try ss.appendValue(allocator, text);
+    }
+}
+
+fn bigintToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    const ss = stringStoreOf(out);
+    var buf: [24]u8 = undefined;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const text = try std.fmt.bufPrint(&buf, "{d}", .{s[i]});
+        try ss.appendValue(allocator, text);
+    }
+}
+
+fn doubleToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    const ss = stringStoreOf(out);
+    var buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const text = try std.fmt.bufPrint(&buf, "{d}", .{s[i]});
+        try ss.appendValue(allocator, text);
+    }
+}
+
+fn boolToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.boolean;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        try ss.appendValue(allocator, if (s[i] != 0) "true" else "false");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hash kernels
+// ---------------------------------------------------------------------------
+
+fn md5Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var digest: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        std.crypto.hash.Md5.hash(sv.rowBytes(i), &digest, .{});
+        const hex_str = std.fmt.bytesToHex(digest, .lower);
+        try ss.appendValue(allocator, &hex_str);
+    }
+}
+
+fn sha1Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var digest: [20]u8 = undefined;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        std.crypto.hash.Sha1.hash(sv.rowBytes(i), &digest, .{});
+        const hex_str = std.fmt.bytesToHex(digest, .lower);
+        try ss.appendValue(allocator, &hex_str);
+    }
+}
+
+fn sha256Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var digest: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        std.crypto.hash.sha2.Sha256.hash(sv.rowBytes(i), &digest, .{});
+        const hex_str = std.fmt.bytesToHex(digest, .lower);
+        try ss.appendValue(allocator, &hex_str);
+    }
+}
+
+fn crc32Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const c = std.hash.Crc32.hash(sv.rowBytes(i));
+        try out.data.bigint.append(allocator, @intCast(c));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoding kernels
+// ---------------------------------------------------------------------------
+
+fn hexEncodeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const dst = try allocator.alloc(u8, src.len * 2);
+        defer allocator.free(dst);
+        const charset = "0123456789abcdef";
+        for (src, 0..) |b, j| {
+            dst[j * 2] = charset[b >> 4];
+            dst[j * 2 + 1] = charset[b & 0x0F];
+        }
+        try ss.appendValue(allocator, dst);
+    }
+}
+
+fn hexDecodeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        // Odd-length input + invalid chars → produce empty string
+        // (MySQL convention is NULL but we'd need .kernel_managed).
+        if (src.len % 2 != 0) {
+            try ss.appendValue(allocator, "");
+            continue;
+        }
+        const dst = try allocator.alloc(u8, src.len / 2);
+        defer allocator.free(dst);
+        var ok = true;
+        for (dst, 0..) |*b, j| {
+            const hi = decodeHexNibble(src[j * 2]) orelse {
+                ok = false;
+                break;
+            };
+            const lo = decodeHexNibble(src[j * 2 + 1]) orelse {
+                ok = false;
+                break;
+            };
+            b.* = (hi << 4) | lo;
+        }
+        try ss.appendValue(allocator, if (ok) dst else "");
+    }
+}
+
+fn decodeHexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => 10 + (c - 'a'),
+        'A'...'F' => 10 + (c - 'A'),
+        else => null,
+    };
+}
+
+fn base64EncodeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    const enc = std.base64.standard.Encoder;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const dst = try allocator.alloc(u8, enc.calcSize(src.len));
+        defer allocator.free(dst);
+        const written = enc.encode(dst, src);
+        try ss.appendValue(allocator, written);
+    }
+}
+
+fn base64DecodeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    const dec = std.base64.standard.Decoder;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const out_len = dec.calcSizeForSlice(src) catch {
+            try ss.appendValue(allocator, "");
+            continue;
+        };
+        const dst = try allocator.alloc(u8, out_len);
+        defer allocator.free(dst);
+        dec.decode(dst, src) catch {
+            try ss.appendValue(allocator, "");
+            continue;
+        };
+        try ss.appendValue(allocator, dst);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Small helpers shared across kernels
 // ---------------------------------------------------------------------------
 
@@ -956,6 +1267,24 @@ pub fn dateAdd(arena: Allocator, d: Expr, n: Expr) !Expr { return expr_mod.call(
 pub fn dateSub(arena: Allocator, d: Expr, n: Expr) !Expr { return expr_mod.call(arena, "date_sub", &.{ d, n }); }
 pub fn unixTimestamp(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "unix_timestamp", &.{arg}); }
 pub fn fromUnixtime(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "from_unixtime", &.{arg}); }
+
+// --- conversion ---
+pub fn toInt(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "to_int", &.{arg}); }
+pub fn toBigint(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "to_bigint", &.{arg}); }
+pub fn toDouble(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "to_double", &.{arg}); }
+pub fn toString(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "to_string", &.{arg}); }
+
+// --- hash ---
+pub fn md5(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "md5", &.{arg}); }
+pub fn sha1(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "sha1", &.{arg}); }
+pub fn sha256(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "sha256", &.{arg}); }
+pub fn crc32(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "crc32", &.{arg}); }
+
+// --- encoding ---
+pub fn hex(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "hex", &.{arg}); }
+pub fn unhex(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "unhex", &.{arg}); }
+pub fn toBase64(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "to_base64", &.{arg}); }
+pub fn fromBase64(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "from_base64", &.{arg}); }
 
 // ---------------------------------------------------------------------------
 // Tests
