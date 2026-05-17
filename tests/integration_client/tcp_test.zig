@@ -224,6 +224,93 @@ test "tcp: insert rows + read back via scan, all over the socket" {
     if (sctx.err) |e| return e;
 }
 
+// Write RPC: nullable fields in an insert. The client encoder unwraps
+// `?T` field types, emits `nullable=1` in the column header, and
+// builds a validity bitmap alongside the data. Round-trip through a
+// scan should preserve the null/non-null pattern.
+test "tcp: insert with nullable fields preserves nulls through scan" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 8;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+
+    const nullable_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int, .nullable = true },
+            .{ .name = "note", .type = .string, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    _ = try server.db.table("events", nullable_schema, .{
+        .order_key = &ok,
+        .unique = true,
+        .row_group_size = 4,
+    });
+
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    var sctx: ServerCtx = .{ .server = server, .n = 3 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    var conn = try thindb.connect(allocator, io, listen_addr);
+    defer conn.close();
+
+    const Row = struct { id: i64, qty: ?i32, note: ?[]const u8 };
+    try conn.insert("events", &[_]Row{
+        .{ .id = 1, .qty = 10,   .note = "hello" },
+        .{ .id = 2, .qty = null, .note = "world" },
+        .{ .id = 3, .qty = 30,   .note = null },
+        .{ .id = 4, .qty = null, .note = null },
+    });
+    try conn.flush("events");
+
+    var q = try conn.scan("events");
+    defer q.deinit();
+
+    var qty_valid: std.ArrayList(bool) = .empty;
+    defer qty_valid.deinit(allocator);
+    var note_valid: std.ArrayList(bool) = .empty;
+    defer note_valid.deinit(allocator);
+
+    while (try q.next()) |batch| {
+        const qty_idx = batch.columnIndex("qty").?;
+        const note_idx = batch.columnIndex("note").?;
+        for (0..batch.row_count) |i| {
+            try qty_valid.append(allocator, batch.values[qty_idx].isValid(i));
+            try note_valid.append(allocator, batch.values[note_idx].isValid(i));
+        }
+    }
+    try std.testing.expectEqualSlices(bool, &[_]bool{ true, false, true, false }, qty_valid.items);
+    try std.testing.expectEqualSlices(bool, &[_]bool{ true, true, false, false }, note_valid.items);
+
+    if (sctx.err) |e| return e;
+}
+
 // Write RPC: tuple-shape insert (`&.{ .{...}, .{...} }`). Each tuple
 // element is its own anonymous struct type, so the encoder has to walk
 // fields-per-element rather than coerce to a common row type.

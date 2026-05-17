@@ -830,13 +830,20 @@ fn encodeRowsAsBatchFromIterable(
     try wire.appendU32(allocator, out, @intCast(fields.len));
 
     inline for (fields) |field| {
+        const Inner = comptime innerType(field.type);
+        const is_nullable = comptime isOptionalType(field.type);
+
         try wire.appendLenString(allocator, out, field.name);
-        try out.append(allocator, @intFromEnum(zigTypeToWireTag(field.type)));
-        try out.append(allocator, 0); // not nullable
+        try out.append(allocator, @intFromEnum(zigTypeToWireTag(Inner)));
+        try out.append(allocator, @intFromBool(is_nullable));
         try wire.appendU32(allocator, out, 0); // type_extra unused
 
-        try writeColumnFromRows(field.type, allocator, out, rows, field.name);
-        try wire.appendU32(allocator, out, 0); // empty null bitmap
+        if (is_nullable) {
+            try writeOptionalColumnFromRows(Inner, allocator, out, rows, field.name);
+        } else {
+            try writeColumnFromRows(field.type, allocator, out, rows, field.name);
+            try wire.appendU32(allocator, out, 0); // empty null bitmap
+        }
     }
 }
 
@@ -864,25 +871,111 @@ fn encodeRowsAsBatchFromTuple(
     try wire.appendU32(allocator, out, @intCast(row_fields.len));
 
     inline for (row_fields) |rf| {
+        const Inner = comptime innerType(rf.type);
+        const is_nullable = comptime isOptionalType(rf.type);
+
         try wire.appendLenString(allocator, out, rf.name);
-        try out.append(allocator, @intFromEnum(zigTypeToWireTag(rf.type)));
-        try out.append(allocator, 0);
+        try out.append(allocator, @intFromEnum(zigTypeToWireTag(Inner)));
+        try out.append(allocator, @intFromBool(is_nullable));
         try wire.appendU32(allocator, out, 0);
 
         // Per-field collection across tuple elements. Each tuple slot may
         // have its own anonymous-struct type, but `@field(row, rf.name)`
         // works regardless — the value coerces to the schema column type
-        // we declared above.
-        var typed: std.ArrayList(rf.type) = .empty;
-        defer typed.deinit(allocator);
-        try typed.ensureTotalCapacity(allocator, tuple_fields.len);
-        inline for (tuple_fields) |tf| {
-            const row = @field(tuple_ptr.*, tf.name);
-            typed.appendAssumeCapacity(@field(row, rf.name));
+        // we declared above. For nullable fields we collect Inner +
+        // build a validity bitmap in parallel.
+        if (is_nullable) {
+            var values: std.ArrayList(Inner) = .empty;
+            defer values.deinit(allocator);
+            try values.ensureTotalCapacity(allocator, tuple_fields.len);
+
+            const bitmap_len = (tuple_fields.len + 7) / 8;
+            const bitmap = try allocator.alloc(u8, bitmap_len);
+            defer allocator.free(bitmap);
+            @memset(bitmap, 0);
+
+            inline for (tuple_fields, 0..) |tf, i| {
+                const row = @field(tuple_ptr.*, tf.name);
+                const optv = @field(row, rf.name);
+                if (optv) |v| {
+                    values.appendAssumeCapacity(v);
+                    bitmap[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
+                } else {
+                    values.appendAssumeCapacity(comptime zeroValue(Inner));
+                }
+            }
+            try writeColumnFromTypedSlice(Inner, allocator, out, values.items);
+            try wire.appendU32(allocator, out, @intCast(bitmap_len));
+            try out.appendSlice(allocator, bitmap);
+        } else {
+            var typed: std.ArrayList(rf.type) = .empty;
+            defer typed.deinit(allocator);
+            try typed.ensureTotalCapacity(allocator, tuple_fields.len);
+            inline for (tuple_fields) |tf| {
+                const row = @field(tuple_ptr.*, tf.name);
+                typed.appendAssumeCapacity(@field(row, rf.name));
+            }
+            try writeColumnFromTypedSlice(rf.type, allocator, out, typed.items);
+            try wire.appendU32(allocator, out, 0); // empty null bitmap
         }
-        try writeColumnFromTypedSlice(rf.type, allocator, out, typed.items);
-        try wire.appendU32(allocator, out, 0); // empty null bitmap
     }
+}
+
+fn isOptionalType(comptime T: type) bool {
+    return @typeInfo(T) == .optional;
+}
+
+fn innerType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
+}
+
+/// Type-appropriate placeholder written into the data slot for a NULL
+/// row. Server ignores it (bitmap clears the valid bit) — only here so
+/// the data section keeps a fixed row stride for fixed-width types and
+/// a zero-length offset slot for strings.
+fn zeroValue(comptime T: type) T {
+    return switch (T) {
+        i8, i16, i32, i64, i128 => 0,
+        bool => false,
+        f32 => @as(f32, 0.0),
+        f64 => @as(f64, 0.0),
+        []const u8, []u8 => &.{},
+        else => @compileError("zeroValue: unsupported " ++ @typeName(T)),
+    };
+}
+
+fn writeOptionalColumnFromRows(
+    comptime Inner: type,
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    rows: anytype,
+    comptime field_name: []const u8,
+) !void {
+    var values: std.ArrayList(Inner) = .empty;
+    defer values.deinit(allocator);
+    try values.ensureTotalCapacity(allocator, rows.len);
+
+    const bitmap_len = (rows.len + 7) / 8;
+    const bitmap = try allocator.alloc(u8, bitmap_len);
+    defer allocator.free(bitmap);
+    @memset(bitmap, 0);
+
+    for (rows, 0..) |row, i| {
+        const optv = @field(row, field_name);
+        if (optv) |v| {
+            values.appendAssumeCapacity(v);
+            bitmap[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
+        } else {
+            values.appendAssumeCapacity(comptime zeroValue(Inner));
+        }
+    }
+
+    try writeColumnFromTypedSlice(Inner, allocator, out, values.items);
+    try wire.appendU32(allocator, out, @intCast(bitmap_len));
+    try out.appendSlice(allocator, bitmap);
 }
 
 fn writeColumnFromTypedSlice(

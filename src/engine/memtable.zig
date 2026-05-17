@@ -446,12 +446,21 @@ pub const Memtable = struct {
                 else => return Error.TypeMismatch,
             },
             .varchar, .string, .char => |sv| {
+                // Honor the wire's null bitmap if present. appendString
+                // always writes valid=true, so for null rows we have to
+                // route through appendNullToColumn instead.
                 var i: usize = 0;
                 while (i < row_count) : (i += 1) {
-                    try self.appendString(col_idx, sv.rowBytes(i));
+                    const valid = if (view.nulls) |bm|
+                        @import("../storage/column.zig").isValidBit(bm, i)
+                    else
+                        true;
+                    if (valid) {
+                        try self.appendString(col_idx, sv.rowBytes(i));
+                    } else {
+                        try self.appendNullToColumn(col_idx);
+                    }
                 }
-                // appendString writes valid bits — return so we don't
-                // double-process the bitmap below.
                 _ = sch_col;
                 return;
             },
