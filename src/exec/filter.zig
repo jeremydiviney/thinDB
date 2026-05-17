@@ -91,6 +91,13 @@ pub const Filter = struct {
         return self.upstream.addPrune(pred);
     }
 
+    /// Filter only restricts rows — upper bound is unchanged
+    /// (selectivity unknown without scanning). Sort state preserved
+    /// (Filter doesn't reorder).
+    pub fn stats(self: *Filter) exec.PipelineStats {
+        return self.upstream.stats();
+    }
+
     pub fn next(self: *Filter) !?Batch {
         while (true) {
             const upstream_batch = (try self.upstream.next()) orelse return null;

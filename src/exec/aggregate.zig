@@ -201,6 +201,19 @@ pub const Aggregate = struct {
         return self.upstream.addPrune(pred);
     }
 
+    /// Global aggregate (no group_cols): always emits exactly 1 row.
+    /// Grouped aggregate: emits at most NDV(group_cols) rows, which is
+    /// bounded above by the upstream row count. We don't have NDV
+    /// without HLL, so for grouped agg the upper bound = upstream's.
+    /// Sort state: hash-based aggregate destroys any prior sort.
+    pub fn stats(self: *Aggregate) exec.PipelineStats {
+        if (self.group_col_indices.len == 0) {
+            return .{ .upper_rows = 1 };
+        }
+        const up = self.upstream.stats();
+        return .{ .upper_rows = up.upper_rows };
+    }
+
     pub fn next(self: *Aggregate) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;

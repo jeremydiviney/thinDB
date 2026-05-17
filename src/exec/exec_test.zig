@@ -11,6 +11,108 @@ const leafExpr = exec.leafExpr;
 const types = @import("../types.zig");
 const api = @import("../api/api.zig");
 
+test "pipeline stats propagate through scan, filter, limit, project, sort" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20) },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30) },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 40) },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 50) },
+    });
+    // Flush so rows live in segments and survive across the multiple
+    // scans this test opens (the first scan retires the memtable, so
+    // without a flush subsequent scans see an empty active memtable).
+    try t.flush();
+
+    // Scan: 5 rows total, sorted on order key
+    {
+        var q = try scan(allocator, t);
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(u64, 5), s.upper_rows);
+        try std.testing.expectEqual(@as(usize, 1), s.sort_state.keys.len);
+        try std.testing.expectEqualStrings("id", s.sort_state.keys[0]);
+    }
+
+    // Filter: upper bound preserved, sort state preserved
+    {
+        var base = try scan(allocator, t);
+        var q = try base.filter(leafExpr("qty", .gt, .{ .int = 20 }));
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(u64, 5), s.upper_rows); // unchanged — selectivity unknown
+        try std.testing.expectEqual(@as(usize, 1), s.sort_state.keys.len);
+    }
+
+    // Limit: upper bound clamped to n
+    {
+        var base = try scan(allocator, t);
+        var q = try base.limit(2);
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(u64, 2), s.upper_rows);
+    }
+
+    // Project dropping the order-key column: sort state should empty out
+    {
+        var base = try scan(allocator, t);
+        var q = try base.project(&.{"qty"});
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(u64, 5), s.upper_rows);
+        try std.testing.expectEqual(@as(usize, 0), s.sort_state.keys.len);
+    }
+
+    // Sort by a new key: claims global sort on the new key
+    {
+        var base = try scan(allocator, t);
+        var q = try base.orderBy(&.{.{ .col = "qty", .desc = false }});
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(u64, 5), s.upper_rows);
+        try std.testing.expectEqual(@as(usize, 1), s.sort_state.keys.len);
+        try std.testing.expectEqualStrings("qty", s.sort_state.keys[0]);
+        try std.testing.expect(s.sort_state.global);
+    }
+
+    // Sort descending: no usable sort claim (we only claim ascending)
+    {
+        var base = try scan(allocator, t);
+        var q = try base.orderBy(&.{.{ .col = "qty", .desc = true }});
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(usize, 0), s.sort_state.keys.len);
+    }
+
+    // Global aggregate: 1 row out
+    {
+        var base = try scan(allocator, t);
+        var q = try base.aggregate(&.{.{ .func = .count, .as = "n" }});
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(u64, 1), s.upper_rows);
+    }
+}
+
 test "scan reads inserted rows from memtable" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

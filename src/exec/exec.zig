@@ -84,6 +84,36 @@ pub const VTable = struct {
     /// Operators that can act on hints (e.g. Scan) use them to skip row
     /// groups; others (Filter, Project, Limit) simply forward to upstream.
     addPrune: *const fn (ptr: *anyopaque, pred: predicate.Predicate) anyerror!void,
+    /// Pre-execution statistics on this operator's OUTPUT: upper bound
+    /// on rows, sort state. Cheap — computed from manifest + operator
+    /// definitions, no data read required. Used by downstream planners
+    /// (Join especially) to make algorithm decisions.
+    stats: *const fn (ptr: *anyopaque) PipelineStats,
+};
+
+/// Sort property of an operator's output stream.
+pub const SortState = struct {
+    /// Columns this stream is sorted by, in lexicographic order. Empty
+    /// slice = not sorted on any known prefix. A join planner can
+    /// check whether its join key matches a leading prefix of these.
+    keys: []const []const u8 = &.{},
+    /// `true` = sorted across the whole stream (globally). `false` =
+    /// sorted only within each emitted batch (e.g., scan of an
+    /// uncompacted table where each row group is sorted but segments
+    /// can overlap). Joins exploit `global=true` for the SMJ-merge-only
+    /// fast path.
+    global: bool = false,
+};
+
+/// Pre-execution statistics about an operator's output.
+pub const PipelineStats = struct {
+    /// Upper bound on the number of rows this operator will emit.
+    /// Never null — for operators with selectivity (Filter), this is
+    /// the conservative upper bound (input row count). Refined to
+    /// `exact_rows` only after the operator's input has been drained.
+    upper_rows: u64,
+    /// Sort property of the output stream. See `SortState`.
+    sort_state: SortState = .{},
 };
 
 pub const Query = struct {
@@ -106,6 +136,12 @@ pub const Query = struct {
 
     pub fn addPrune(self: *Query, pred: predicate.Predicate) !void {
         return self.vtable.addPrune(self.ptr, pred);
+    }
+
+    /// Pre-execution stats on this operator's output. Cheap; no data
+    /// scanned. See `PipelineStats`.
+    pub fn stats(self: Query) PipelineStats {
+        return self.vtable.stats(self.ptr);
     }
 
     // ----- Combinators -----
@@ -181,12 +217,17 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.addPrune(pred);
         }
+        fn statsWrap(ptr: *anyopaque) PipelineStats {
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.stats();
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
             .deinit = deinitWrap,
             .outputSchema = outputSchemaWrap,
             .addPrune = addPruneWrap,
+            .stats = statsWrap,
         };
     };
 
@@ -233,6 +274,8 @@ pub const ScalarFn = scalar_fn.ScalarFn;
 pub const compute_op = @import("compute.zig");
 pub const Compute = compute_op.Compute;
 pub const Derived = compute_op.Derived;
+
+// PipelineStats / SortState are defined above; re-exported for clarity.
 
 test {
     _ = predicate;

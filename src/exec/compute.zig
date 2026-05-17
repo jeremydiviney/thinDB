@@ -175,6 +175,15 @@ pub const Compute = struct {
         return self.upstream.addPrune(pred);
     }
 
+    /// Compute preserves row count (adds columns, doesn't drop rows).
+    /// Sort state preserved as long as the sort-state columns aren't
+    /// derived (derived columns can't be in upstream's sort_state, so
+    /// they can't appear in it; thus the upstream's claim is still
+    /// fully valid in our output schema).
+    pub fn stats(self: *Compute) exec.PipelineStats {
+        return self.upstream.stats();
+    }
+
     pub fn next(self: *Compute) !?Batch {
         const in = (try self.upstream.next()) orelse return null;
         const n = in.row_count;

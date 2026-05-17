@@ -207,14 +207,34 @@ pub const Scan = struct {
 
     fn rowGroupCanMatch(self: Scan, rg: storage.RowGroupMeta) bool {
         for (self.prunes.items) |hint| {
-            const stats = rg.stats[hint.col_idx];
-            if (!statsOverlapPredicate(stats, hint.op, hint.val)) return false;
+            const col_stats = rg.stats[hint.col_idx];
+            if (!statsOverlapPredicate(col_stats, hint.op, hint.val)) return false;
         }
         return true;
     }
 
     pub fn outputSchema(self: *Scan) []const Column {
         return self.table.schema.columns;
+    }
+
+    /// Pre-execution stats: sum of segment row counts + the memtable
+    /// snapshot row count gives the exact upper bound. Sort state is
+    /// the table's order key — sorted-per-segment (segments may
+    /// overlap pre-compaction, so we mark `global=false` to be safe).
+    /// Post-compaction the table is also globally sorted, but the
+    /// manifest alone doesn't tell us that today; a future enhancement
+    /// can refine `global=true` when the manifest shows non-overlapping
+    /// segments.
+    pub fn stats(self: *Scan) exec.PipelineStats {
+        var seg_rows: u64 = 0;
+        for (self.table.manifest.segments.items) |s| seg_rows += s.row_count;
+        return .{
+            .upper_rows = seg_rows + self.memtable_row_count,
+            .sort_state = .{
+                .keys = self.table.schema.order_key,
+                .global = false,
+            },
+        };
     }
 
     pub fn next(self: *Scan) !?Batch {

@@ -76,6 +76,32 @@ pub const Project = struct {
         return self.upstream.addPrune(pred);
     }
 
+    /// Project keeps row count unchanged. Sort state survives as long
+    /// as every key in the upstream's sort_state.keys is still in the
+    /// output schema; otherwise the sort claim is truncated to the
+    /// leading prefix that survived (a sort by `(a,b,c)` with `b`
+    /// projected away yields a stream sorted only by `a`).
+    pub fn stats(self: *Project) exec.PipelineStats {
+        const up = self.upstream.stats();
+        var kept_prefix_len: usize = 0;
+        outer: for (up.sort_state.keys) |key| {
+            for (self.output_schema) |c| {
+                if (std.mem.eql(u8, c.name, key)) {
+                    kept_prefix_len += 1;
+                    continue :outer;
+                }
+            }
+            break; // first missing key truncates the sort claim
+        }
+        return .{
+            .upper_rows = up.upper_rows,
+            .sort_state = .{
+                .keys = up.sort_state.keys[0..kept_prefix_len],
+                .global = up.sort_state.global,
+            },
+        };
+    }
+
     pub fn next(self: *Project) !?Batch {
         const batch = (try self.upstream.next()) orelse return null;
         for (self.column_map, 0..) |src_idx, dst_idx| {
@@ -127,6 +153,16 @@ pub const Limit = struct {
 
     pub fn addPrune(self: *Limit, pred: Predicate) !void {
         return self.upstream.addPrune(pred);
+    }
+
+    /// Limit clamps row count to `min(n, upstream.upper)`. Sort state
+    /// preserved (Limit just truncates, doesn't reorder).
+    pub fn stats(self: *Limit) exec.PipelineStats {
+        const up = self.upstream.stats();
+        return .{
+            .upper_rows = @min(@as(u64, self.remaining), up.upper_rows),
+            .sort_state = up.sort_state,
+        };
     }
 
     pub fn next(self: *Limit) !?Batch {
