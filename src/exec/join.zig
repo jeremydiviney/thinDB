@@ -508,6 +508,16 @@ pub const Join = struct {
             }
 
             if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                // If this was the last match in the list, retire the
+                // probe row too — otherwise the next call would re-run
+                // hash lookup on the same probe row and re-emit its
+                // matches. Without this, every probe row that lands on
+                // an exact batch boundary gets double-counted.
+                if (self.cur_match_pos >= self.cur_match_list.len) {
+                    self.cur_probe_row += 1;
+                    self.cur_match_list = &.{};
+                    self.cur_match_pos = 0;
+                }
                 return true;
             }
         }

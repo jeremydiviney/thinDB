@@ -852,6 +852,76 @@ test "join: SMJ output preserves natural order across i64 boundary values" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ -1, 0, 1, 256 }, ks.items);
 }
 
+test "join: hash output is exact across row-group boundaries" {
+    // Repro for an over-emit bug: at ~100k rows / row_group=65k, hash
+    // join emitted ~97 extra rows. Inner equi-join of two unique-keyed
+    // tables [0..N) must emit exactly N rows — no more, no less.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const left_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "lval", .type = .int },
+        },
+        .order_key = &.{"k"},
+        .unique = true,
+    };
+    const right_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "rval", .type = .int },
+        },
+        .order_key = &.{"k"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"k"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 1024 };
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const n: usize = 3000; // 3 row groups at row_group_size = 1024
+    const LRow = struct { k: i64, lval: i32 };
+    const RRow = struct { k: i64, rval: i32 };
+
+    const l = try db.table("l", left_schema, opts);
+    {
+        const rows = try allocator.alloc(LRow, n);
+        defer allocator.free(rows);
+        for (rows, 0..) |*r, i| r.* = .{ .k = @intCast(i), .lval = @intCast(i) };
+        try l.insert(rows);
+    }
+    try l.flush();
+
+    const r = try db.table("r", right_schema, opts);
+    {
+        const rows = try allocator.alloc(RRow, n);
+        defer allocator.free(rows);
+        for (rows, 0..) |*r2, i| r2.* = .{ .k = @intCast(i), .rval = @intCast(i) };
+        try r.insert(rows);
+    }
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var total: usize = 0;
+    while (try q.next()) |b| total += b.row_count;
+    try std.testing.expectEqual(n, total);
+}
+
 test "join: type mismatch on join key errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
