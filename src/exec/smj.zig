@@ -503,6 +503,21 @@ fn buildPermAndKeys(
     return try perm.toOwnedSlice(allocator);
 }
 
+/// Append a column value as an ORDER-PRESERVING byte sequence — i.e.,
+/// `std.mem.order(u8, encode(a), encode(b))` matches the natural value
+/// comparison `a <=> b`. Equal values produce equal byte sequences;
+/// unequal values never collide. Used to build SMJ compound keys so
+/// the sort step produces output in natural-value order.
+///
+/// Per-type encoding:
+///   - Signed ints (incl. decimal64/decimal128, date, datetime):
+///     big-endian with the top bit flipped (so signed compare maps to
+///     unsigned/lex compare).
+///   - Unsigned (boolean as u8, uuid as u128): big-endian.
+///   - Floats: IEEE 754 total ordering trick — XOR top bit for
+///     positives, XOR all bits for negatives.
+///   - Strings: byte-stuffed with 0x00 → (0x00, 0xFF) and a (0x00, 0x00)
+///     terminator. Unambiguous across compound-key components.
 fn appendColumnValueBytes(
     allocator: Allocator,
     out: *std.ArrayList(u8),
@@ -510,31 +525,62 @@ fn appendColumnValueBytes(
     row: u32,
 ) !void {
     switch (view.data) {
-        .int => |s| try appendInt(allocator, out, i32, s[row]),
-        .bigint => |s| try appendInt(allocator, out, i64, s[row]),
+        .int => |s| try appendSignedKey(allocator, out, i32, s[row]),
+        .bigint => |s| try appendSignedKey(allocator, out, i64, s[row]),
         .boolean => |s| try out.append(allocator, s[row]),
-        .float => |s| try appendInt(allocator, out, u32, @bitCast(s[row])),
-        .double => |s| try appendInt(allocator, out, u64, @bitCast(s[row])),
-        .date => |s| try appendInt(allocator, out, i32, s[row]),
-        .datetime => |s| try appendInt(allocator, out, i64, s[row]),
-        .tinyint => |s| try out.append(allocator, @bitCast(s[row])),
-        .smallint => |s| try appendInt(allocator, out, i16, s[row]),
-        .largeint => |s| try appendInt(allocator, out, i128, s[row]),
-        .decimal64 => |s| try appendInt(allocator, out, i64, s[row]),
-        .decimal128 => |s| try appendInt(allocator, out, i128, s[row]),
-        .uuid => |s| try appendInt(allocator, out, u128, s[row]),
-        .varchar, .string, .char => |sv| {
-            const bytes = sv.rowBytes(row);
-            try appendInt(allocator, out, u32, @intCast(bytes.len));
-            try out.appendSlice(allocator, bytes);
-        },
+        .float => |s| try appendFloatKey(allocator, out, f32, s[row]),
+        .double => |s| try appendFloatKey(allocator, out, f64, s[row]),
+        .date => |s| try appendSignedKey(allocator, out, i32, s[row]),
+        .datetime => |s| try appendSignedKey(allocator, out, i64, s[row]),
+        .tinyint => |s| try appendSignedKey(allocator, out, i8, s[row]),
+        .smallint => |s| try appendSignedKey(allocator, out, i16, s[row]),
+        .largeint => |s| try appendSignedKey(allocator, out, i128, s[row]),
+        .decimal64 => |s| try appendSignedKey(allocator, out, i64, s[row]),
+        .decimal128 => |s| try appendSignedKey(allocator, out, i128, s[row]),
+        .uuid => |s| try appendUnsignedKey(allocator, out, u128, s[row]),
+        .varchar, .string, .char => |sv| try appendStringKey(allocator, out, sv.rowBytes(row)),
     }
 }
 
-fn appendInt(allocator: Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
+fn appendSignedKey(allocator: Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
+    const bits = @bitSizeOf(T);
+    const U = std.meta.Int(.unsigned, bits);
+    const u: U = @bitCast(v);
+    const top_bit: U = @as(U, 1) << (bits - 1);
     var b: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &b, v, .little);
+    std.mem.writeInt(U, &b, u ^ top_bit, .big);
     try out.appendSlice(allocator, &b);
+}
+
+fn appendUnsignedKey(allocator: Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
+    var b: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &b, v, .big);
+    try out.appendSlice(allocator, &b);
+}
+
+fn appendFloatKey(allocator: Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
+    const bits = @bitSizeOf(T);
+    const U = std.meta.Int(.unsigned, bits);
+    var u: U = @bitCast(v);
+    const top_bit: U = @as(U, 1) << (bits - 1);
+    // IEEE total-ordering: positives XOR sign bit; negatives flip all bits.
+    if (u & top_bit != 0) {
+        u = ~u;
+    } else {
+        u ^= top_bit;
+    }
+    var b: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(U, &b, u, .big);
+    try out.appendSlice(allocator, &b);
+}
+
+fn appendStringKey(allocator: Allocator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+    for (bytes) |b| {
+        try out.append(allocator, b);
+        if (b == 0x00) try out.append(allocator, 0xFF);
+    }
+    try out.append(allocator, 0x00);
+    try out.append(allocator, 0x00);
 }
 
 /// Sort `perm` so the keys it references are in ascending lex order.

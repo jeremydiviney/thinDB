@@ -719,6 +719,9 @@ test "join: .auto picks SMJ for string-keyed multi-segment tables joined on slug
     }
 
     try std.testing.expectEqualStrings(smj_slugs.items, auto_slugs.items);
+    // The new order-preserving key encoding yields naturally-sorted
+    // SMJ output. Verify alphabetical slug order.
+    try std.testing.expectEqualStrings("alpha|beta|charlie|", smj_slugs.items);
 }
 
 test "join: .auto picks SMJ for post-compaction tables joined on order key" {
@@ -781,6 +784,72 @@ test "join: .auto picks SMJ for post-compaction tables joined on order key" {
         try uids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, uids.items);
+}
+
+test "join: SMJ output preserves natural order across i64 boundary values" {
+    // Spans values near 256 and across 0 so the LE-encoded byte order
+    // would have differed from numeric order (LE byte 0 = LSB). The new
+    // big-endian + sign-XOR encoding produces naturally-sorted output.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "rowid", .type = .bigint },
+        },
+        .order_key = &.{"rowid"},
+        .unique = true,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "b_rowid", .type = .bigint },
+        },
+        .order_key = &.{"b_rowid"},
+        .unique = true,
+    };
+    const a_ok = [_][]const u8{"rowid"};
+    const b_ok = [_][]const u8{"b_rowid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const a = try db.table("a", schema_a, .{ .order_key = &a_ok, .unique = true });
+    // Keys cross the LE byte-0 boundary: -1 < 0 < 1 < 256.
+    try a.insert(&.{
+        .{ .k = @as(i64, -1), .rowid = @as(i64, 1) },
+        .{ .k = @as(i64, 0), .rowid = @as(i64, 2) },
+        .{ .k = @as(i64, 1), .rowid = @as(i64, 3) },
+        .{ .k = @as(i64, 256), .rowid = @as(i64, 4) },
+    });
+    try a.flush();
+    const b = try db.table("b", schema_b, .{ .order_key = &b_ok, .unique = true });
+    try b.insert(&.{
+        .{ .k = @as(i64, 256), .b_rowid = @as(i64, 1) },
+        .{ .k = @as(i64, 1), .b_rowid = @as(i64, 2) },
+        .{ .k = @as(i64, 0), .b_rowid = @as(i64, 3) },
+        .{ .k = @as(i64, -1), .b_rowid = @as(i64, 4) },
+    });
+    try b.flush();
+
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = .sort_merge,
+    });
+    defer q.deinit();
+
+    var ks: std.ArrayList(i64) = .empty;
+    defer ks.deinit(allocator);
+    while (try q.next()) |bat| {
+        try ks.appendSlice(allocator, bat.values[0].data.bigint[0..bat.row_count]);
+    }
+    // Naturally sorted by k: -1, 0, 1, 256.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ -1, 0, 1, 256 }, ks.items);
 }
 
 test "join: type mismatch on join key errors" {
