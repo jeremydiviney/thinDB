@@ -592,7 +592,7 @@ pub const Memtable = struct {
             .decimal128 => |*list| try list.append(self.allocator, @as(i128, value)),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     /// Runtime i32 may only flow into columns where it fits without narrowing.
@@ -606,7 +606,7 @@ pub const Memtable = struct {
             .datetime => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendInt8(self: *Memtable, col_idx: usize, value: i8) !void {
@@ -615,7 +615,7 @@ pub const Memtable = struct {
             .tinyint => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendInt16(self: *Memtable, col_idx: usize, value: i16) !void {
@@ -624,7 +624,7 @@ pub const Memtable = struct {
             .smallint => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendInt128(self: *Memtable, col_idx: usize, value: i128) !void {
@@ -634,7 +634,7 @@ pub const Memtable = struct {
             .decimal128 => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendDate(self: *Memtable, col_idx: usize, days: i32) !void {
@@ -643,7 +643,7 @@ pub const Memtable = struct {
             .date => |*list| try list.append(self.allocator, days),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendDateTime(self: *Memtable, col_idx: usize, micros: i64) !void {
@@ -652,7 +652,7 @@ pub const Memtable = struct {
             .datetime => |*list| try list.append(self.allocator, micros),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendFloat32Like(self: *Memtable, col_idx: usize, comptime V: type, value: V) !void {
@@ -662,7 +662,7 @@ pub const Memtable = struct {
             .double => |*list| try list.append(self.allocator, @as(f64, value)),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendFloat64(self: *Memtable, col_idx: usize, value: f64) !void {
@@ -671,7 +671,7 @@ pub const Memtable = struct {
             .double => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendInt64(self: *Memtable, col_idx: usize, value: i64) !void {
@@ -684,7 +684,7 @@ pub const Memtable = struct {
             .decimal128 => |*list| try list.append(self.allocator, @as(i128, value)),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendBoolean(self: *Memtable, col_idx: usize, value: bool) !void {
@@ -693,7 +693,7 @@ pub const Memtable = struct {
             .boolean => |*list| try list.append(self.allocator, @intFromBool(value)),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     fn appendString(self: *Memtable, col_idx: usize, value: []const u8) !void {
@@ -704,7 +704,7 @@ pub const Memtable = struct {
             .char => |*ss| try ss.appendValue(self.allocator, value),
             else => return Error.TypeMismatch,
         }
-        try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
     }
 
     /// Append a NULL slot. The schema column at `col_idx` must be nullable.

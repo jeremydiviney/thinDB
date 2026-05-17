@@ -17,6 +17,7 @@ const thindb = @import("thindb");
 const common = @import("common.zig");
 const compact_bench = @import("compact_bench.zig");
 const durability_bench = @import("durability_bench.zig");
+const tcp_bench = @import("tcp_bench.zig");
 
 const Allocator = common.Allocator;
 const Io = common.Io;
@@ -55,6 +56,12 @@ pub fn main() !void {
     try benchScanFilterOrderKeyMid(allocator, io, n_rows);
     try benchAggregateGlobal(allocator, io, n_rows);
     try benchGroupByTag(allocator, io, n_rows);
+
+    std.debug.print("\nTCP transport (vs in-process baselines above)\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    try tcp_bench.benchTcpScan(allocator, io, n_rows);
+    try tcp_bench.benchTcpInsert(allocator, io, n_rows);
+    try tcp_bench.benchTcpInsertAndFlush(allocator, io, n_rows);
 
     std.debug.print("\nCompaction scenarios\n", .{});
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
