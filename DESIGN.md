@@ -706,7 +706,52 @@ Target Zig version: 0.16.
 
 ---
 
-## 15. References
+## 15. Client/server (v2 trajectory)
+
+Going forward, **all user queries flow through a `Connection`**. Existing `Database` / `Table` / `Query` types remain — they are the *server's* internals (and what tests use directly). The user-facing API is:
+
+```zig
+var conn = try thindb.local(allocator, io, data_dir, .{});  // in-process
+// or, future:
+// var conn = try thindb.connect(io, "tcp://host:5432");    // remote
+defer conn.close();
+
+var q = conn.scan("orders").limit(10);   // builds operator IR
+defer q.deinit();
+while (try q.next()) |batch| { ... }
+```
+
+The Connection abstracts a **transport**:
+- **In-process** (today): client and server in the same address space. The client encodes operator IR into bytes; the server-side dispatcher decodes and runs against the in-process `Database`. Exercises the wire path for tests with no socket overhead. (Walking skeleton currently passes `Batch` values directly across the boundary; batch wire-encoding lands with the TCP transport.)
+- **TCP** (later): same `Connection` API, bytes flow over a socket.
+
+### 15.1 Operator IR
+
+A single binary tree describes a query: tagged tree, each operator carries its upstream encoded immediately after the operator's payload. Format defined in `src/ir/ir.zig`. Versioned header (`tDBQ` magic + `u16` version) so future tag additions are forward-compatible.
+
+Walking-skeleton scope today: `Scan(table_name)` and `Limit(n)`. Roadmap:
+- `Where(predicate)` / `Filter` — alias for `where` at the canonical name
+- `Select(columns)` — whitelist projection
+- `Exclude(columns)` — drop columns; downstream cannot reference them
+- `OrderBy(specs)`, `GroupBy(keys, aggs)`
+- `Pipe(fn)` — compose a sub-pipeline (`fn(ClientQuery) → ClientQuery`)
+- (post-server) `PipeUdf(name)` — invoke a server-registered UDF; see §17
+
+### 15.2 User-defined functions (v2+)
+
+Endgame: clients in many languages (Rust, Zig, C, JS, TS, Python, Go) author UDFs and register them with the server. The server holds a UDF registry; queries reference UDFs by name via `.pipeUdf("name")`. Two runtime tiers behind a common adapter interface:
+
+| Tier | Runtime | Languages | Speed | Sandbox |
+|---|---|---|---|---|
+| **Native** | `dlopen` + C ABI | C, Zig, Rust, Go (`-buildmode=c-shared`), ... | Full native | None — trusted operator only |
+| **WASM** | wasmtime sandbox | C, Zig, Rust, AssemblyScript, others compiling to WASM | ~10–30% slower than native | Yes — multi-tenant safe |
+| **Scripting** (eventual) | QuickJS / MicroPython | JS, TS (transpiled), Python | 30–100× slower than native | Yes (engine-provided) |
+
+The wire-level UDF contract is a single C header (Arrow-style flat `Batch` struct + `OutputBuilder` accessors). Each supported language ships an idiomatic helper crate that wraps the raw struct. Embedded `.pipe(&op)` was considered as a stepping stone and dropped — the multi-language registry is the canonical UDF path; embedded users hit the same surface via the in-process Connection transport.
+
+---
+
+## 16. References
 
 - StarRocks columnar storage and compaction model (background influence — not used as a code source)
 - DuckDB decimal & overflow semantics (modeled after for arithmetic rules)

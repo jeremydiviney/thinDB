@@ -60,9 +60,24 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
+    // ---- Client/server integration tests: tests/integration_client/all.zig ----
+    // Exercises the new thindb.local() / Connection / ClientQuery surface
+    // that will eventually back the TCP transport. Kept separate from the
+    // existing integration tests so the long-standing library-level API
+    // tests stay unchanged.
+    const integration_client_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration_client/all.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_client_mod.addImport("thindb", thindb_mod);
+    const integration_client_tests = b.addTest(.{ .root_module = integration_client_mod });
+    const run_integration_client_tests = b.addRunArtifact(integration_client_tests);
+
     const test_step = b.step("test", "Run unit + integration tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_integration_client_tests.step);
 
     // ---- Benchmarks: bench/main.zig ----------------------------------------
     const bench_mod = b.createModule(.{

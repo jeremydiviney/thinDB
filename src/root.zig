@@ -38,6 +38,19 @@ pub const AggSpec = exec.AggSpec;
 pub const SortSpec = exec.SortSpec;
 pub const scan = exec.scan;
 
+// ---------------------------------------------------------------------------
+// Client/server surface (new, going forward — see DESIGN.md §16).
+// `thindb.local(...)` returns a Connection that wraps an in-process server.
+// Future TCP transport will use the same Connection type. The pre-existing
+// Database / Table API above remains usable for tests + the server's own
+// internals; new user code should go through a Connection.
+// ---------------------------------------------------------------------------
+pub const net = @import("net/local.zig");
+pub const Connection = net.Connection;
+pub const ClientQuery = net.ClientQuery;
+pub const local = net.local;
+pub const ir = @import("ir/ir.zig");
+
 test {
     // Pull in tests from sub-modules.
     std.testing.refAllDecls(@This());
