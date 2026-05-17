@@ -218,21 +218,28 @@ pub const Scan = struct {
     }
 
     /// Pre-execution stats: sum of segment row counts + the memtable
-    /// snapshot row count gives the exact upper bound. Sort state is
-    /// the table's order key — sorted-per-segment (segments may
-    /// overlap pre-compaction, so we mark `global=false` to be safe).
-    /// Post-compaction the table is also globally sorted, but the
-    /// manifest alone doesn't tell us that today; a future enhancement
-    /// can refine `global=true` when the manifest shows non-overlapping
-    /// segments.
+    /// snapshot row count gives the exact upper bound.
+    ///
+    /// Sort state is the table's order key. `global` is true when the
+    /// whole scan's output is guaranteed sorted by that key — currently
+    /// the post-compaction case: at most one segment AND an empty
+    /// memtable snapshot. (Segments are always written sorted; the
+    /// memtable is an unordered append buffer that would be emitted as
+    /// a trailing batch.) Multi-segment non-overlap detection requires
+    /// per-segment min/max in the manifest — a future enhancement.
     pub fn stats(self: *Scan) exec.PipelineStats {
+        const segs = self.table.manifest.segments.items[0..self.segment_count];
         var seg_rows: u64 = 0;
-        for (self.table.manifest.segments.items) |s| seg_rows += s.row_count;
+        for (segs) |s| seg_rows += s.row_count;
+
+        const memtable_empty = self.memtable_row_count == 0;
+        const global = self.segment_count <= 1 and memtable_empty;
+
         return .{
             .upper_rows = seg_rows + self.memtable_row_count,
             .sort_state = .{
                 .keys = self.table.schema.order_key,
-                .global = false,
+                .global = global,
             },
         };
     }

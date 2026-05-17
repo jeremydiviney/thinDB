@@ -421,6 +421,124 @@ test "join: sort-merge handles duplicate keys on both sides (Cartesian per key)"
     try std.testing.expectEqual(@as(usize, 6), total);
 }
 
+test "scan: sort_state.global tracks single-segment post-compaction" {
+    // Verifies Scan.stats() — the stat surface used by .auto's
+    // decision tree — reports global=true exactly when the scan's
+    // output is guaranteed sorted by the order key: 0 or 1 segments
+    // AND an empty memtable. After compact merges N segments into 1,
+    // the same table flips from global=false back to global=true.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const users = try db.table("users", users_schema, users_opts);
+
+    {
+        var q = try thindb.scan(allocator, users);
+        defer q.deinit();
+        const s = q.stats().sort_state;
+        try std.testing.expect(s.global);
+        try std.testing.expectEqual(@as(usize, 1), s.keys.len);
+        try std.testing.expectEqualStrings("uid", s.keys[0]);
+    }
+
+    try users.insert(&.{.{ .uid = @as(i64, 1), .name = "alice" }});
+    try users.flush();
+    {
+        var q = try thindb.scan(allocator, users);
+        defer q.deinit();
+        try std.testing.expect(q.stats().sort_state.global);
+    }
+
+    try users.insert(&.{.{ .uid = @as(i64, 2), .name = "bob" }});
+    try users.flush();
+    {
+        var q = try thindb.scan(allocator, users);
+        defer q.deinit();
+        try std.testing.expect(!q.stats().sort_state.global);
+    }
+
+    try users.compact();
+    {
+        var q = try thindb.scan(allocator, users);
+        defer q.deinit();
+        try std.testing.expect(q.stats().sort_state.global);
+    }
+
+    try users.insert(&.{.{ .uid = @as(i64, 3), .name = "carol" }});
+    {
+        var q = try thindb.scan(allocator, users);
+        defer q.deinit();
+        try std.testing.expect(!q.stats().sort_state.global);
+    }
+}
+
+test "join: .auto picks SMJ for post-compaction tables joined on order key" {
+    // End-to-end: two tables, each compacted to a single segment,
+    // joined on their order key. .auto's decision tree should pick
+    // SMJ — observable via the output ordering (SMJ emits in
+    // join-key order; hash join is unordered).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const emails_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "uid", .type = .bigint },
+            .{ .name = "email", .type = .string },
+        },
+        .order_key = &.{"uid"},
+        .unique = true,
+    };
+    const emails_ok = [_][]const u8{"uid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const users = try db.table("users", users_schema, users_opts);
+    // Two flushes → two segments.
+    try users.insert(&.{
+        .{ .uid = @as(i64, 3), .name = "carol" },
+        .{ .uid = @as(i64, 1), .name = "alice" },
+    });
+    try users.flush();
+    try users.insert(&.{.{ .uid = @as(i64, 2), .name = "bob" }});
+    try users.flush();
+    try users.compact();
+
+    const emails = try db.table("emails", emails_schema, .{
+        .order_key = &emails_ok,
+        .unique = true,
+    });
+    try emails.insert(&.{
+        .{ .uid = @as(i64, 2), .email = @as([]const u8, "b@x") },
+        .{ .uid = @as(i64, 1), .email = @as([]const u8, "a@x") },
+    });
+    try emails.flush();
+    try emails.insert(&.{.{ .uid = @as(i64, 3), .email = @as([]const u8, "c@x") }});
+    try emails.flush();
+    try emails.compact();
+
+    const left = try thindb.scan(allocator, users);
+    const right = try thindb.scan(allocator, emails);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+    });
+    defer q.deinit();
+
+    var uids: std.ArrayList(i64) = .empty;
+    defer uids.deinit(allocator);
+    while (try q.next()) |b| {
+        try uids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, uids.items);
+}
+
 test "join: type mismatch on join key errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
