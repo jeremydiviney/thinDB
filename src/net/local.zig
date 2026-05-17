@@ -31,6 +31,7 @@ const Config = thindb_api.Config;
 const exec = @import("../exec/exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
+const PredicateExpr = exec.PredicateExpr;
 
 const ir = @import("../ir/ir.zig");
 
@@ -81,10 +82,17 @@ pub const ClientQuery = struct {
     /// Heap-allocated so builder methods can return new ClientQuery values
     /// sharing the same underlying arena. Freed by `deinit`.
     arena: *std.heap.ArenaAllocator,
+    /// Encoded IR bytes, kept alive for the server_query's lifetime: the
+    /// decoded operator tree borrows string slices (table name, column
+    /// names, text values) from these bytes. We hold an ArrayList (not a
+    /// raw slice) because `toOwnedSlice` is allowed to relocate the
+    /// backing buffer, which would invalidate the borrows.
+    encoded_buffer: ?std.ArrayList(u8) = null,
     server_query: ?Query,
 
     pub fn deinit(self: *ClientQuery) void {
         if (self.server_query) |*q| q.deinit();
+        if (self.encoded_buffer) |*b| b.deinit(self.allocator);
         self.arena.deinit();
         self.allocator.destroy(self.arena);
     }
@@ -128,6 +136,24 @@ pub const ClientQuery = struct {
         return copy;
     }
 
+    /// Predicate filter. SQL-flavored canonical name; `.filter()` is the
+    /// alias for code that prefers the previous library spelling.
+    pub fn where(self: ClientQuery, expr: PredicateExpr) !ClientQuery {
+        var copy = self;
+        const aa = copy.arena.allocator();
+        const prev_root = copy.root;
+        const owned = try clonePredicate(aa, expr);
+        const upstream = try aa.create(ir.Op);
+        upstream.* = prev_root;
+        copy.root = .{ .filter = .{ .predicate = owned, .upstream = upstream } };
+        return copy;
+    }
+
+    /// Alias for `where`. Keeps existing-style call sites compiling.
+    pub fn filter(self: ClientQuery, expr: PredicateExpr) !ClientQuery {
+        return self.where(expr);
+    }
+
     /// Pull the next batch. On first call, serializes IR + dispatches to
     /// the server-side executor; on subsequent calls just pulls from the
     /// server Query.
@@ -143,16 +169,59 @@ pub const ClientQuery = struct {
         // in-process. When we add TCP, the bytes will flow over a socket
         // instead of straight back into a decoder.
         var encoded: std.ArrayList(u8) = .empty;
-        defer encoded.deinit(self.allocator);
+        errdefer encoded.deinit(self.allocator);
         try ir.encode(self.allocator, &encoded, self.root);
 
-        // Decode + build the server-side Query.
-        var decoded = try ir.decode(self.allocator, encoded.items);
-        defer decoded.deinitDecoded(self.allocator);
+        // Decode into the arena. The decoded tree's auxiliary allocations
+        // (children arrays, `not` child pointer, etc.) live in the arena
+        // for the ClientQuery's lifetime — no separate cleanup needed.
+        // String slices in the decoded tree (column names, value text)
+        // borrow from `encoded.items`, which the ClientQuery now owns
+        // (we move the ArrayList in).
+        const decoded = try ir.decode(self.arena.allocator(), encoded.items);
 
         self.server_query = try buildServerQuery(self.allocator, self.conn.db, decoded);
+        // Move the buffer onto self; if anything above failed, errdefer
+        // freed it.
+        self.encoded_buffer = encoded;
     }
 };
+
+/// Deep-clone a PredicateExpr into the given arena allocator. All strings
+/// (column names + `.text` value bytes) and children arrays are dup'd so
+/// the cloned predicate has no borrowed pointers — the arena owns
+/// everything, freed at ClientQuery.deinit.
+fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateExpr {
+    return switch (expr) {
+        .leaf => |p| PredicateExpr{ .leaf = .{
+            .col = try aa.dupe(u8, p.col),
+            .op = p.op,
+            .val = try cloneValue(aa, p.val),
+        } },
+        .is_null => |col| PredicateExpr{ .is_null = try aa.dupe(u8, col) },
+        .is_not_null => |col| PredicateExpr{ .is_not_null = try aa.dupe(u8, col) },
+        .@"and" => |children| PredicateExpr{ .@"and" = try cloneChildren(aa, children) },
+        .@"or" => |children| PredicateExpr{ .@"or" = try cloneChildren(aa, children) },
+        .not => |child| blk: {
+            const dup = try aa.create(PredicateExpr);
+            dup.* = try clonePredicate(aa, child.*);
+            break :blk PredicateExpr{ .not = dup };
+        },
+    };
+}
+
+fn cloneChildren(aa: Allocator, children: []const PredicateExpr) Allocator.Error![]PredicateExpr {
+    const out = try aa.alloc(PredicateExpr, children.len);
+    for (children, 0..) |c, i| out[i] = try clonePredicate(aa, c);
+    return out;
+}
+
+fn cloneValue(aa: Allocator, v: @import("../types.zig").Value) Allocator.Error!@import("../types.zig").Value {
+    return switch (v) {
+        .text => |s| .{ .text = try aa.dupe(u8, s) },
+        else => v, // fixed-width values are value-typed; no allocation
+    };
+}
 
 /// Helper used by `.select()` and `.exclude()`: move the current root
 /// into the arena as the new upstream, dupe `fields` into arena-owned
@@ -211,6 +280,14 @@ fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
             const remaining = try complementColumns(allocator, upstream_cols, e.columns);
             defer allocator.free(remaining);
             break :blk try upstream.project(remaining);
+        },
+        .filter => |f| blk: {
+            var upstream = try buildServerQuery(allocator, db, f.upstream.*);
+            errdefer upstream.deinit();
+            // exec.Query.filter validates the predicate against upstream's
+            // schema and pushes leaves through top-level ANDs down to Scan
+            // for row-group pruning.
+            break :blk try upstream.filter(f.predicate);
         },
     };
 }

@@ -198,6 +198,130 @@ test "strict semantic: selecting an excluded column fails" {
     try std.testing.expectError(error.ColumnNotFound, q.next());
 }
 
+test "where: leaf predicate filters rows server-side" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var conn = try thindb.local(allocator, io, tmp.dir, .{});
+    defer conn.close();
+
+    const db = thindb.net.underlyingDb(conn);
+    const orders = try db.table("orders", schema_v1, opts_v1);
+    try orders.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 100), .active = true,  .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 50),  .active = false, .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 200), .active = true,  .tag = "c" },
+    });
+    try orders.flush();
+
+    var base = try conn.scan("orders");
+    var q = try base.where(thindb.leafExpr("qty", .gt, .{ .int = 75 }));
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 3 }, ids.items);
+}
+
+test "where alias filter: same behavior under both names" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var conn = try thindb.local(allocator, io, tmp.dir, .{});
+    defer conn.close();
+
+    const db = thindb.net.underlyingDb(conn);
+    const orders = try db.table("orders", schema_v1, opts_v1);
+    try orders.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true,  .tag = "x" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "y" },
+    });
+    try orders.flush();
+
+    var base = try conn.scan("orders");
+    var q = try base.filter(thindb.leafExpr("active", .eq, .{ .boolean = true }));
+    defer q.deinit();
+
+    var total: usize = 0;
+    while (try q.next()) |batch| total += batch.row_count;
+    try std.testing.expectEqual(@as(usize, 1), total);
+}
+
+test "where + select + limit chain" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var conn = try thindb.local(allocator, io, tmp.dir, .{});
+    defer conn.close();
+
+    const db = thindb.net.underlyingDb(conn);
+    const orders = try db.table("orders", schema_v1, opts_v1);
+    try orders.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 100), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 200), .active = true, .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 300), .active = true, .tag = "c" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 400), .active = true, .tag = "d" },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 500), .active = true, .tag = "e" },
+    });
+    try orders.flush();
+
+    var base = try conn.scan("orders");
+    var filtered = try base.where(thindb.leafExpr("qty", .gte, .{ .int = 200 }));
+    var projected = try filtered.select(&.{ "id", "tag" });
+    var q = try projected.limit(2);
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |batch| {
+        rows += batch.row_count;
+        try std.testing.expectEqual(@as(usize, 2), batch.schema.len);
+        try std.testing.expectEqualStrings("id", batch.schema[0].name);
+        try std.testing.expectEqualStrings("tag", batch.schema[1].name);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "where on a string column with .eq" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var conn = try thindb.local(allocator, io, tmp.dir, .{});
+    defer conn.close();
+
+    const db = thindb.net.underlyingDb(conn);
+    const orders = try db.table("orders", schema_v1, opts_v1);
+    try orders.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "alpha" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "beta" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = true, .tag = "alpha" },
+    });
+    try orders.flush();
+
+    var base = try conn.scan("orders");
+    var q = try base.where(thindb.leafExpr("tag", .eq, .{ .text = "alpha" }));
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 3 }, ids.items);
+}
+
 test "select then limit chain works" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
