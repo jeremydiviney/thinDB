@@ -33,6 +33,13 @@ const Predicate = exec_predicate.Predicate;
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 
+const exec_sort = @import("../exec/sort.zig");
+pub const SortSpec = exec_sort.SortSpec;
+
+const exec_aggregate = @import("../exec/aggregate.zig");
+pub const AggFunc = exec_aggregate.AggFunc;
+pub const AggSpec = exec_aggregate.AggSpec;
+
 pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 pub const version: u16 = 1;
 pub const header_size: usize = 8;
@@ -58,6 +65,10 @@ pub const OpTag = enum(u8) {
     /// Predicate filter. `.where` and `.filter` on the client both encode
     /// to this tag — `.where` is the SQL-flavored canonical spelling.
     filter = 4,
+    /// Multi-column ORDER BY with per-key ASC/DESC.
+    order_by = 5,
+    /// GROUP BY (with empty group_cols, acts as a global aggregate).
+    group_by = 6,
 };
 
 /// In-memory operator tree, built by the client query-builder and decoded
@@ -69,6 +80,8 @@ pub const Op = union(OpTag) {
     select: Project,
     exclude: Project,
     filter: Filter,
+    order_by: OrderBy,
+    group_by: GroupBy,
 
     pub const Scan = struct {
         /// Table name. Borrowed from the encoded buffer on decode; owned
@@ -96,6 +109,21 @@ pub const Op = union(OpTag) {
         upstream: *Op,
     };
 
+    pub const OrderBy = struct {
+        /// Sort keys + per-key ASC/DESC.
+        specs: []const SortSpec,
+        upstream: *Op,
+    };
+
+    pub const GroupBy = struct {
+        /// Group-by column names. Empty slice = global aggregate (one
+        /// output row over the whole input).
+        group_cols: []const []const u8,
+        /// Aggregate specs (func + col + output name).
+        aggs: []const AggSpec,
+        upstream: *Op,
+    };
+
     /// Free any allocations made by `decode`. No-op for client-built trees
     /// whose strings come from caller storage.
     pub fn deinitDecoded(self: *Op, allocator: Allocator) void {
@@ -111,6 +139,17 @@ pub const Op = union(OpTag) {
                 freeDecodedPredicate(f.predicate, allocator);
                 f.upstream.deinitDecoded(allocator);
                 allocator.destroy(f.upstream);
+            },
+            .order_by => |o| {
+                allocator.free(o.specs);
+                o.upstream.deinitDecoded(allocator);
+                allocator.destroy(o.upstream);
+            },
+            .group_by => |g| {
+                allocator.free(g.group_cols);
+                allocator.free(g.aggs);
+                g.upstream.deinitDecoded(allocator);
+                allocator.destroy(g.upstream);
             },
         }
     }
@@ -153,7 +192,44 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .select => |p| try encodeProject(allocator, out, p),
         .exclude => |p| try encodeProject(allocator, out, p),
         .filter => |f| try encodeFilter(allocator, out, f),
+        .order_by => |o| try encodeOrderBy(allocator, out, o),
+        .group_by => |g| try encodeGroupBy(allocator, out, g),
     }
+}
+
+fn encodeOrderBy(allocator: Allocator, out: *std.ArrayList(u8), o: Op.OrderBy) EncodeError!void {
+    try appendU32(allocator, out, @intCast(o.specs.len));
+    for (o.specs) |s| {
+        try appendU32(allocator, out, @intCast(s.col.len));
+        try out.appendSlice(allocator, s.col);
+        try out.append(allocator, @intFromBool(s.desc));
+    }
+    try encodeOp(allocator, out, o.upstream.*);
+}
+
+fn encodeGroupBy(allocator: Allocator, out: *std.ArrayList(u8), g: Op.GroupBy) EncodeError!void {
+    try appendU32(allocator, out, @intCast(g.group_cols.len));
+    for (g.group_cols) |c| {
+        try appendU32(allocator, out, @intCast(c.len));
+        try out.appendSlice(allocator, c);
+    }
+    try appendU32(allocator, out, @intCast(g.aggs.len));
+    for (g.aggs) |a| {
+        // func (u8)
+        try out.append(allocator, @intFromEnum(a.func));
+        // optional column: 0 = null (COUNT(*)), 1 = present
+        if (a.col) |c| {
+            try out.append(allocator, 1);
+            try appendU32(allocator, out, @intCast(c.len));
+            try out.appendSlice(allocator, c);
+        } else {
+            try out.append(allocator, 0);
+        }
+        // alias (always present — server enforces this on the existing API)
+        try appendU32(allocator, out, @intCast(a.as.len));
+        try out.appendSlice(allocator, a.as);
+    }
+    try encodeOp(allocator, out, g.upstream.*);
 }
 
 fn encodeProject(allocator: Allocator, out: *std.ArrayList(u8), p: Op.Project) EncodeError!void {
@@ -318,7 +394,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.filter)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.group_by)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -351,6 +427,62 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             errdefer allocator.destroy(upstream);
             upstream.* = try decodeOp(allocator, bytes, cursor);
             break :blk Op{ .filter = .{ .predicate = pred, .upstream = upstream } };
+        },
+        .order_by => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const specs = try allocator.alloc(SortSpec, n);
+            errdefer allocator.free(specs);
+            for (specs) |*s| {
+                const col = try readString(bytes, cursor);
+                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+                const desc = bytes[cursor.*] != 0;
+                cursor.* += 1;
+                s.* = .{ .col = col, .desc = desc };
+            }
+            const upstream = try allocator.create(Op);
+            errdefer allocator.destroy(upstream);
+            upstream.* = try decodeOp(allocator, bytes, cursor);
+            break :blk Op{ .order_by = .{ .specs = specs, .upstream = upstream } };
+        },
+        .group_by => blk: {
+            // group_cols
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n_groups = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const group_cols = try allocator.alloc([]const u8, n_groups);
+            errdefer allocator.free(group_cols);
+            for (group_cols) |*c| c.* = try readString(bytes, cursor);
+
+            // aggs
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n_aggs = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const aggs = try allocator.alloc(AggSpec, n_aggs);
+            errdefer allocator.free(aggs);
+            for (aggs) |*a| {
+                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+                const func_byte = bytes[cursor.*];
+                cursor.* += 1;
+                if (func_byte > @intFromEnum(AggFunc.avg)) return Error.IrCorrupt;
+                const func: AggFunc = @enumFromInt(func_byte);
+                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+                const has_col = bytes[cursor.*];
+                cursor.* += 1;
+                const col: ?[]const u8 = if (has_col != 0) try readString(bytes, cursor) else null;
+                const as = try readString(bytes, cursor);
+                a.* = .{ .func = func, .col = col, .as = as };
+            }
+
+            const upstream = try allocator.create(Op);
+            errdefer allocator.destroy(upstream);
+            upstream.* = try decodeOp(allocator, bytes, cursor);
+            break :blk Op{ .group_by = .{
+                .group_cols = group_cols,
+                .aggs = aggs,
+                .upstream = upstream,
+            } };
         },
     };
 }

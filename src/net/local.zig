@@ -32,6 +32,8 @@ const exec = @import("../exec/exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
 const PredicateExpr = exec.PredicateExpr;
+const SortSpec = exec.SortSpec;
+const AggSpec = exec.AggSpec;
 
 const ir = @import("../ir/ir.zig");
 
@@ -50,6 +52,12 @@ pub const Connection = struct {
     pub fn close(self: *Connection) void {
         self.db.close();
         self.allocator.destroy(self);
+    }
+
+    /// SQL-flavored alias for `scan`. Same semantics; pick whichever
+    /// reads better at the call site.
+    pub fn from(self: *Connection, table_name: []const u8) !ClientQuery {
+        return self.scan(table_name);
     }
 
     /// Start a query against `table_name`. Returns a ClientQuery that
@@ -111,7 +119,12 @@ pub const ClientQuery = struct {
 
     /// Keep only `fields`, in the listed order. Errors if any field isn't
     /// present in upstream's schema (validated server-side at dispatch).
+    ///
+    /// `select(&.{})` is `SELECT *` — empty list means "keep upstream's
+    /// schema unchanged." We short-circuit by returning self as-is; no
+    /// IR node is added, no work is done.
     pub fn select(self: ClientQuery, fields: []const []const u8) !ClientQuery {
+        if (fields.len == 0) return self;
         var copy = self;
         const aa = copy.arena.allocator();
         // Snapshot the previous root BEFORE constructing the new one.
@@ -152,6 +165,75 @@ pub const ClientQuery = struct {
     /// Alias for `where`. Keeps existing-style call sites compiling.
     pub fn filter(self: ClientQuery, expr: PredicateExpr) !ClientQuery {
         return self.where(expr);
+    }
+
+    /// Sort upstream rows. Multi-column with per-key ASC/DESC. Blocking
+    /// at the server — sort materializes the full input before emitting.
+    pub fn orderBy(self: ClientQuery, specs: []const SortSpec) !ClientQuery {
+        var copy = self;
+        const aa = copy.arena.allocator();
+        const prev_root = copy.root;
+        // Dupe column names + the spec array into the arena so the
+        // client-side IR tree owns its strings (same convention as
+        // select/exclude/where).
+        const dup = try aa.alloc(SortSpec, specs.len);
+        for (specs, 0..) |s, i| dup[i] = .{
+            .col = try aa.dupe(u8, s.col),
+            .desc = s.desc,
+        };
+        const upstream = try aa.create(ir.Op);
+        upstream.* = prev_root;
+        copy.root = .{ .order_by = .{ .specs = dup, .upstream = upstream } };
+        return copy;
+    }
+
+    /// Grouped aggregation. Each AggSpec names its output column via `.as`.
+    /// `group_cols` lists the upstream columns to group by; one row per
+    /// distinct group. Empty `group_cols` = global aggregate (see
+    /// `.aggregate(...)`).
+    pub fn groupBy(
+        self: ClientQuery,
+        group_cols: []const []const u8,
+        aggs: []const AggSpec,
+    ) !ClientQuery {
+        var copy = self;
+        const aa = copy.arena.allocator();
+        const prev_root = copy.root;
+
+        const grp_dup = try aa.alloc([]const u8, group_cols.len);
+        for (group_cols, 0..) |c, i| grp_dup[i] = try aa.dupe(u8, c);
+
+        const aggs_dup = try aa.alloc(AggSpec, aggs.len);
+        for (aggs, 0..) |a, i| aggs_dup[i] = .{
+            .func = a.func,
+            .col = if (a.col) |c| try aa.dupe(u8, c) else null,
+            .as = try aa.dupe(u8, a.as),
+        };
+
+        const upstream = try aa.create(ir.Op);
+        upstream.* = prev_root;
+        copy.root = .{ .group_by = .{
+            .group_cols = grp_dup,
+            .aggs = aggs_dup,
+            .upstream = upstream,
+        } };
+        return copy;
+    }
+
+    /// Global aggregate (no group keys). Sugar for `.groupBy(&.{}, aggs)`.
+    pub fn aggregate(self: ClientQuery, aggs: []const AggSpec) !ClientQuery {
+        return self.groupBy(&.{}, aggs);
+    }
+
+    /// Compose a sub-pipeline. `f` takes the current ClientQuery and
+    /// returns a new one. Pure function composition — `pipe(a).pipe(b)`
+    /// runs a then b; `pipe(closure-that-itself-uses-pipe)` nests.
+    ///
+    /// Mirrors the existing `exec.Query.pipe`. Same plan-time semantic:
+    /// the IR is extended by whatever `f` adds, just like writing the
+    /// chain inline.
+    pub fn pipe(self: ClientQuery, f: anytype) !ClientQuery {
+        return f(self);
     }
 
     /// Pull the next batch. On first call, serializes IR + dispatches to
@@ -288,6 +370,18 @@ fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
             // schema and pushes leaves through top-level ANDs down to Scan
             // for row-group pruning.
             break :blk try upstream.filter(f.predicate);
+        },
+        .order_by => |o| blk: {
+            var upstream = try buildServerQuery(allocator, db, o.upstream.*);
+            errdefer upstream.deinit();
+            break :blk try upstream.orderBy(o.specs);
+        },
+        .group_by => |g| blk: {
+            var upstream = try buildServerQuery(allocator, db, g.upstream.*);
+            errdefer upstream.deinit();
+            // exec.Query.groupBy with empty group_cols is the same operator
+            // used by exec.Query.aggregate (global aggregate).
+            break :blk try upstream.groupBy(g.group_cols, g.aggs);
         },
     };
 }
