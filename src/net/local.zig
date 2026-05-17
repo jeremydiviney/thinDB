@@ -36,21 +36,46 @@ const SortSpec = exec.SortSpec;
 const AggSpec = exec.AggSpec;
 
 const ir = @import("../ir/ir.zig");
+const wire = @import("wire.zig");
 
 pub const Error = error{
     TableNotFound,
     UnsupportedOp,
-} || ir.Error;
+    /// The server returned a resp_error frame. (Detailed error info is
+    /// in the frame payload; surfacing it as a typed error is future work.)
+    RemoteError,
+    /// The server sent a response frame whose type the client doesn't
+    /// recognize (protocol mismatch, future server feature).
+    UnexpectedResponse,
+} || ir.Error || wire.Error;
 
-/// Connection — owns an in-process Database. Closing the Connection
-/// closes the Database.
+/// Connection — abstracts over transports. Today: in-process (owns a
+/// Database that runs server-side queries in the same address space).
+/// Future: TCP (owns the remote endpoint; opens a fresh stream per
+/// query).
 pub const Connection = struct {
     allocator: Allocator,
     io: Io,
-    db: *Database,
+    transport: Transport,
+
+    pub const Transport = union(enum) {
+        /// In-process — server runs in this process. The Connection
+        /// owns the Database.
+        in_process: *Database,
+        /// TCP — server runs in another process at this address.
+        /// Each query opens a fresh stream (stateless RPC model).
+        tcp: TcpEndpoint,
+    };
+
+    pub const TcpEndpoint = struct {
+        address: std.Io.net.IpAddress,
+    };
 
     pub fn close(self: *Connection) void {
-        self.db.close();
+        switch (self.transport) {
+            .in_process => |db| db.close(),
+            .tcp => {}, // no persistent connection-level state to release
+        }
         self.allocator.destroy(self);
     }
 
@@ -75,14 +100,14 @@ pub const Connection = struct {
             .conn = self,
             .root = .{ .scan = .{ .table_name = table_name } },
             .arena = arena,
-            .server_query = null,
+            .state = null,
         };
     }
 };
 
 /// Client-side query builder + executor handle. Holds an IR tree that
 /// grows as the user chains operators, plus (after the first call to
-/// `next()`) a handle to the running server-side Query.
+/// `next()`) transport-specific execution state.
 pub const ClientQuery = struct {
     allocator: Allocator,
     conn: *Connection,
@@ -90,17 +115,61 @@ pub const ClientQuery = struct {
     /// Heap-allocated so builder methods can return new ClientQuery values
     /// sharing the same underlying arena. Freed by `deinit`.
     arena: *std.heap.ArenaAllocator,
-    /// Encoded IR bytes, kept alive for the server_query's lifetime: the
-    /// decoded operator tree borrows string slices (table name, column
-    /// names, text values) from these bytes. We hold an ArrayList (not a
-    /// raw slice) because `toOwnedSlice` is allowed to relocate the
-    /// backing buffer, which would invalidate the borrows.
-    encoded_buffer: ?std.ArrayList(u8) = null,
-    server_query: ?Query,
+    /// Execution state. Null until `next()` triggers `dispatch()`. Variant
+    /// matches the Connection's transport.
+    state: ?ExecutingState = null,
+
+    pub const ExecutingState = union(enum) {
+        in_process: InProcessState,
+        /// Heap-allocated so the Reader/Writer interface pointers inside
+        /// it stay valid across union-variant assignments.
+        tcp: *TcpState,
+    };
+
+    pub const InProcessState = struct {
+        /// Server-side operator tree we drive via `q.next()`.
+        server_query: Query,
+        /// Encoded IR bytes kept alive: the decoded operator tree borrows
+        /// string slices (column names, text values) from these bytes.
+        /// ArrayList rather than raw slice so we own a stable address —
+        /// `toOwnedSlice` is allowed to relocate the backing buffer.
+        encoded_buffer: std.ArrayList(u8),
+    };
+
+    pub const TcpState = struct {
+        stream: std.Io.net.Stream,
+        /// Stream Reader/Writer with their own backing buffers. The
+        /// interface's vtable closures use `@fieldParentPtr` so the
+        /// Reader/Writer struct itself must live at a stable address —
+        /// that's why TcpState is heap-allocated.
+        read_buf: []u8,
+        write_buf: []u8,
+        reader: std.Io.net.Stream.Reader,
+        writer: std.Io.net.Stream.Writer,
+        /// Scratch buffer used to assemble each incoming frame payload.
+        frame_payload: std.ArrayList(u8),
+        /// Decoded current batch — kept alive so the Batch we returned
+        /// to the user via `next()` stays valid until the next call.
+        current_batch: ?wire.DecodedBatch = null,
+        /// Once `resp_end` arrives, future next() calls return null.
+        done: bool = false,
+    };
 
     pub fn deinit(self: *ClientQuery) void {
-        if (self.server_query) |*q| q.deinit();
-        if (self.encoded_buffer) |*b| b.deinit(self.allocator);
+        if (self.state) |*s| switch (s.*) {
+            .in_process => |*ip| {
+                ip.server_query.deinit();
+                ip.encoded_buffer.deinit(self.allocator);
+            },
+            .tcp => |tcp| {
+                if (tcp.current_batch) |*b| b.deinit();
+                tcp.frame_payload.deinit(self.allocator);
+                tcp.stream.close(self.conn.io);
+                self.allocator.free(tcp.read_buf);
+                self.allocator.free(tcp.write_buf);
+                self.allocator.destroy(tcp);
+            },
+        };
         self.arena.deinit();
         self.allocator.destroy(self.arena);
     }
@@ -236,36 +305,114 @@ pub const ClientQuery = struct {
         return f(self);
     }
 
-    /// Pull the next batch. On first call, serializes IR + dispatches to
-    /// the server-side executor; on subsequent calls just pulls from the
-    /// server Query.
+    /// Pull the next batch. On first call, dispatches to the appropriate
+    /// transport (in-process: builds server-side query directly; TCP:
+    /// opens stream and sends a req_query frame). On subsequent calls,
+    /// just pulls from whichever state we set up.
     pub fn next(self: *ClientQuery) !?Batch {
-        if (self.server_query == null) {
-            try self.dispatch();
-        }
-        return try self.server_query.?.next();
+        if (self.state == null) try self.dispatch();
+        return switch (self.state.?) {
+            .in_process => |*ip| try ip.server_query.next(),
+            .tcp => |tcp| try self.tcpNext(tcp),
+        };
     }
 
     fn dispatch(self: *ClientQuery) !void {
-        // Encode IR — exercises the wire path even though we're staying
-        // in-process. When we add TCP, the bytes will flow over a socket
-        // instead of straight back into a decoder.
+        // Encode IR — same encoding regardless of transport.
         var encoded: std.ArrayList(u8) = .empty;
         errdefer encoded.deinit(self.allocator);
         try ir.encode(self.allocator, &encoded, self.root);
 
-        // Decode into the arena. The decoded tree's auxiliary allocations
-        // (children arrays, `not` child pointer, etc.) live in the arena
-        // for the ClientQuery's lifetime — no separate cleanup needed.
-        // String slices in the decoded tree (column names, value text)
-        // borrow from `encoded.items`, which the ClientQuery now owns
-        // (we move the ArrayList in).
-        const decoded = try ir.decode(self.arena.allocator(), encoded.items);
+        switch (self.conn.transport) {
+            .in_process => |db| {
+                // In-process: decode the IR back, build the server-side
+                // query, hold both. The decoded tree's children allocs
+                // land in the arena (ClientQuery-lifetime); string slices
+                // borrow from encoded.items, which we keep alive in
+                // the InProcessState.
+                const decoded = try ir.decode(self.arena.allocator(), encoded.items);
+                const sq = try buildServerQuery(self.allocator, db, decoded);
+                self.state = .{ .in_process = .{
+                    .server_query = sq,
+                    .encoded_buffer = encoded,
+                } };
+            },
+            .tcp => |endpoint| {
+                // TCP: open a stream, send the request, set up read state.
+                // Each query gets its own stream (stateless RPC model).
+                const tcp = try self.allocator.create(TcpState);
+                errdefer self.allocator.destroy(tcp);
 
-        self.server_query = try buildServerQuery(self.allocator, self.conn.db, decoded);
-        // Move the buffer onto self; if anything above failed, errdefer
-        // freed it.
-        self.encoded_buffer = encoded;
+                const stream = try std.Io.net.IpAddress.connect(
+                    &endpoint.address,
+                    self.conn.io,
+                    .{ .mode = .stream, .protocol = .tcp },
+                );
+                errdefer stream.close(self.conn.io);
+
+                const read_buf = try self.allocator.alloc(u8, 8 * 1024);
+                errdefer self.allocator.free(read_buf);
+                const write_buf = try self.allocator.alloc(u8, 8 * 1024);
+                errdefer self.allocator.free(write_buf);
+
+                tcp.* = .{
+                    .stream = stream,
+                    .read_buf = read_buf,
+                    .write_buf = write_buf,
+                    .reader = stream.reader(self.conn.io, read_buf),
+                    .writer = stream.writer(self.conn.io, write_buf),
+                    .frame_payload = .empty,
+                };
+
+                // Write the request frame.
+                try wire.writeFrameToIo(&tcp.writer.interface, .req_query, encoded.items);
+                try tcp.writer.interface.flush();
+
+                // We can drop the encoded IR now — the server has its own copy.
+                encoded.deinit(self.allocator);
+
+                self.state = .{ .tcp = tcp };
+            },
+        }
+    }
+
+    /// Read the next response frame and yield a Batch (or null on
+    /// resp_end). Errors out on resp_error frames.
+    fn tcpNext(self: *ClientQuery, tcp: *TcpState) !?Batch {
+        if (tcp.done) return null;
+
+        // Release the previous batch's storage now that the caller is
+        // asking for the next one (mirrors how other operators reuse
+        // buffers across next() calls).
+        if (tcp.current_batch) |*b| {
+            b.deinit();
+            tcp.current_batch = null;
+        }
+
+        // Read a frame header.
+        var hdr: [wire.frame_header_size]u8 = undefined;
+        try tcp.reader.interface.readSliceAll(&hdr);
+        const tag_byte = hdr[0];
+        const payload_len = std.mem.readInt(u32, hdr[4..8], .little);
+
+        // Read payload into our scratch buffer.
+        tcp.frame_payload.clearRetainingCapacity();
+        try tcp.frame_payload.resize(self.allocator, payload_len);
+        try tcp.reader.interface.readSliceAll(tcp.frame_payload.items);
+
+        // Dispatch on type.
+        return switch (tag_byte) {
+            @intFromEnum(wire.MsgType.resp_batch) => blk: {
+                tcp.current_batch = try wire.decodeBatch(self.allocator, tcp.frame_payload.items);
+                break :blk tcp.current_batch.?.batch();
+            },
+            @intFromEnum(wire.MsgType.resp_end) => blk: {
+                tcp.done = true;
+                break :blk null;
+            },
+            @intFromEnum(wire.MsgType.resp_error) => return Error.RemoteError,
+            else => return Error.UnexpectedResponse,
+        };
     }
 };
 
@@ -329,7 +476,7 @@ fn cloneProject(
 /// Server-side IR dispatcher. Recursively walks the decoded IR tree and
 /// builds the corresponding exec.Query operator chain using existing
 /// in-process operators.
-fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
+pub fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
     return switch (op) {
         .scan => |s| blk: {
             const t = db.tables.get(s.table_name) orelse return Error.TableNotFound;
@@ -421,7 +568,28 @@ pub fn local(
     const db = try Database.open(allocator, io, data_dir, config);
     errdefer db.close();
     const conn = try allocator.create(Connection);
-    conn.* = .{ .allocator = allocator, .io = io, .db = db };
+    conn.* = .{
+        .allocator = allocator,
+        .io = io,
+        .transport = .{ .in_process = db },
+    };
+    return conn;
+}
+
+/// Open a TCP Connection. Each query opens a fresh stream to `address`
+/// (stateless RPC model — server handles the request, streams batches
+/// back, closes the stream).
+pub fn connect(
+    allocator: Allocator,
+    io: Io,
+    address: std.Io.net.IpAddress,
+) !*Connection {
+    const conn = try allocator.create(Connection);
+    conn.* = .{
+        .allocator = allocator,
+        .io = io,
+        .transport = .{ .tcp = .{ .address = address } },
+    };
     return conn;
 }
 
@@ -430,6 +598,12 @@ pub fn local(
 /// long-term plan is to move table creation + writes through the
 /// Connection too, but for the walking skeleton the existing
 /// `db.table(...)` / `t.insert(...)` API is the way to seed test data.
+///
+/// Asserts the connection is in-process — TCP connections have no
+/// local Database to return.
 pub fn underlyingDb(conn: *Connection) *Database {
-    return conn.db;
+    return switch (conn.transport) {
+        .in_process => |db| db,
+        .tcp => @panic("underlyingDb called on a TCP connection"),
+    };
 }

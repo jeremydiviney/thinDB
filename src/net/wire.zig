@@ -101,6 +101,21 @@ pub fn writeFrame(
     try out.appendSlice(allocator, payload);
 }
 
+/// Write a framed message directly to an Io.Writer (streaming variant
+/// of `writeFrame`). Used by the TCP server to push response frames
+/// straight onto the socket without an intermediate ArrayList.
+pub fn writeFrameToIo(
+    w: *std.Io.Writer,
+    msg_type: MsgType,
+    payload: []const u8,
+) std.Io.Writer.Error!void {
+    var hdr: [frame_header_size]u8 = .{0} ** frame_header_size;
+    hdr[0] = @intFromEnum(msg_type);
+    std.mem.writeInt(u32, hdr[4..8], @intCast(payload.len), .little);
+    try w.writeAll(&hdr);
+    try w.writeAll(payload);
+}
+
 /// Parse a single frame header from `bytes` starting at `offset`. Returns
 /// the message type + the payload slice (borrowed from `bytes`). Advances
 /// `*offset` past the payload.

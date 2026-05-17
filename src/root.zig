@@ -49,6 +49,10 @@ pub const net = @import("net/local.zig");
 pub const Connection = net.Connection;
 pub const ClientQuery = net.ClientQuery;
 pub const local = net.local;
+pub const connect = net.connect;
+pub const tcp_server = @import("net/tcp_server.zig");
+pub const serveTcp = tcp_server.serveTcp;
+pub const TcpServer = tcp_server.Server;
 pub const ir = @import("ir/ir.zig");
 pub const wire = @import("net/wire.zig");
 
