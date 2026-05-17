@@ -40,6 +40,14 @@ pub const Server = struct {
     db: *Database,
     listener: std.Io.net.Server,
 
+    /// Whether to zstd-compress outgoing batch frames whose payload
+    /// exceeds `wire.compression_threshold_bytes`. Default false — see
+    /// the matching field on Connection for the rationale (localhost
+    /// pays CPU without bandwidth gain). Flip after `serveTcp` returns
+    /// for bandwidth-constrained deployments. Decompression on incoming
+    /// requests is always supported regardless of this flag.
+    compress_writes: bool = false,
+
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
         self.db.close();
@@ -53,7 +61,7 @@ pub const Server = struct {
     pub fn acceptOne(self: *Server) !void {
         const stream = try self.listener.accept(self.io);
         defer stream.close(self.io);
-        try handleConnection(self.allocator, self.io, self.db, stream);
+        try handleConnection(self.allocator, self.io, self.db, stream, self.compress_writes);
     }
 
     /// Long-running accept loop. Breaks when `should_stop` flips to true
@@ -106,28 +114,25 @@ fn handleConnection(
     io: Io,
     db: *Database,
     stream: std.Io.net.Stream,
+    compress_writes: bool,
 ) !void {
     var read_buf: [8 * 1024]u8 = undefined;
     var write_buf: [8 * 1024]u8 = undefined;
     var reader = stream.reader(io, &read_buf);
     var writer = stream.writer(io, &write_buf);
 
-    // Read one frame — the request.
-    var hdr: [wire.frame_header_size]u8 = undefined;
-    try reader.interface.readSliceAll(&hdr);
-    const msg_type_byte = hdr[0];
-    const payload_len = std.mem.readInt(u32, hdr[4..8], .little);
-
-    const payload = try allocator.alloc(u8, payload_len);
-    defer allocator.free(payload);
-    try reader.interface.readSliceAll(payload);
+    // Read one frame — the request. readFramePayload handles
+    // decompression transparently if the client compressed.
+    const frame = try wire.readFramePayload(allocator, &reader.interface);
+    defer allocator.free(frame.payload);
+    const payload = frame.payload;
 
     // Dispatch on request type. Read-path streams batches via
     // handleQuery; admin/write requests reply with a single resp_ok
     // (optionally carrying a small payload) or a resp_error.
-    switch (msg_type_byte) {
+    switch (@intFromEnum(frame.msg_type)) {
         @intFromEnum(wire.MsgType.req_query) => {
-            handleQuery(allocator, db, payload, &writer.interface) catch |err| {
+            handleQuery(allocator, db, payload, &writer.interface, compress_writes) catch |err| {
                 try sendError(allocator, &writer.interface, err);
             };
         },
@@ -183,6 +188,7 @@ fn handleQuery(
     db: *Database,
     ir_bytes: []const u8,
     writer: *std.Io.Writer,
+    compress_writes: bool,
 ) !void {
     // Decode the operator tree.
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -193,13 +199,19 @@ fn handleQuery(
     var server_query = try local.buildServerQuery(allocator, db, op);
     defer server_query.deinit();
 
-    // Stream batches.
+    // Stream batches — resp_batch payloads are typically large
+    // (multi-KB up to MB per row group), so route through the
+    // opportunistic-compression writer.
     var enc: std.ArrayList(u8) = .empty;
     defer enc.deinit(allocator);
     while (try server_query.next()) |batch| {
         enc.clearRetainingCapacity();
         try wire.encodeBatch(allocator, &enc, batch);
-        try wire.writeFrameToIo(writer, .resp_batch, enc.items);
+        if (compress_writes) {
+            try wire.writeFrameToIoMaybeCompressed(allocator, writer, .resp_batch, enc.items);
+        } else {
+            try wire.writeFrameToIo(writer, .resp_batch, enc.items);
+        }
     }
 
     try wire.writeFrameToIo(writer, .resp_end, &.{});

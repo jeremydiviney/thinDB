@@ -92,6 +92,14 @@ pub const Connection = struct {
     io: Io,
     transport: Transport,
 
+    /// Whether to zstd-compress outgoing TCP frames whose payload
+    /// exceeds `wire.compression_threshold_bytes`. Default false:
+    /// compression costs CPU and is a loss on localhost / fast LANs
+    /// where bandwidth isn't the bottleneck. Flip to true for
+    /// bandwidth-constrained links (WAN, mobile, etc.). Decompression
+    /// is always supported on the read side regardless of this flag.
+    compress_writes: bool = false,
+
     pub const Transport = union(enum) {
         /// In-process — server runs in this process. The Connection
         /// owns the Database.
@@ -147,10 +155,12 @@ pub const Connection = struct {
                 try wire.appendLenString(self.allocator, &payload, table_name);
                 try encodeRowsAsBatch(self.allocator, &payload, rows);
 
+                // Insert payloads are typically large — route through
+                // the compressing path. sendAdminTcp does both compress
+                // (for the request) and decompress (for the response)
+                // when respective sizes warrant.
                 const resp = try self.sendAdminTcp(.req_insert, payload.items);
                 defer self.allocator.free(resp);
-                // Server replies with [count u64]; nothing useful to the
-                // caller today, but we validate the shape.
                 if (resp.len != 8) return Error.UnexpectedResponse;
             },
         }
@@ -315,34 +325,27 @@ pub const Connection = struct {
         var reader = stream.reader(self.io, &read_buf);
         var writer = stream.writer(self.io, &write_buf);
 
-        try wire.writeFrameToIo(&writer.interface, msg_type, payload);
+        if (self.compress_writes) {
+            try wire.writeFrameToIoMaybeCompressed(self.allocator, &writer.interface, msg_type, payload);
+        } else {
+            try wire.writeFrameToIo(&writer.interface, msg_type, payload);
+        }
         try writer.interface.flush();
 
-        var hdr: [wire.frame_header_size]u8 = undefined;
-        try reader.interface.readSliceAll(&hdr);
-        const tag_byte = hdr[0];
-        const resp_payload_len = std.mem.readInt(u32, hdr[4..8], .little);
-
-        const resp_payload = try self.allocator.alloc(u8, resp_payload_len);
-        // Cleanup contract for the buffer after this point:
-        //   - resp_ok arm: returned to caller, who frees.
-        //   - any error path: free here. The arms below explicitly free
-        //     before returning. Don't use errdefer alongside that or
-        //     we double-free.
-        reader.interface.readSliceAll(resp_payload) catch |e| {
-            self.allocator.free(resp_payload);
-            return e;
-        };
-
-        return switch (tag_byte) {
-            @intFromEnum(wire.MsgType.resp_ok) => resp_payload,
+        const frame = try wire.readFramePayload(self.allocator, &reader.interface);
+        // readFramePayload returns owned, uncompressed bytes regardless
+        // of whether the server compressed. Cleanup contract:
+        //   - resp_ok: hand the buffer to the caller.
+        //   - any other arm: free here.
+        return switch (@intFromEnum(frame.msg_type)) {
+            @intFromEnum(wire.MsgType.resp_ok) => frame.payload,
             @intFromEnum(wire.MsgType.resp_error) => {
-                defer self.allocator.free(resp_payload);
-                const decoded = wire.decodeError(resp_payload) catch return Error.RemoteError;
+                defer self.allocator.free(frame.payload);
+                const decoded = wire.decodeError(frame.payload) catch return Error.RemoteError;
                 return errorFromCode(decoded.code);
             },
             else => {
-                self.allocator.free(resp_payload);
+                self.allocator.free(frame.payload);
                 return Error.UnexpectedResponse;
             },
         };
@@ -652,19 +655,17 @@ pub const ClientQuery = struct {
             tcp.current_batch = null;
         }
 
-        // Read a frame header.
-        var hdr: [wire.frame_header_size]u8 = undefined;
-        try tcp.reader.interface.readSliceAll(&hdr);
-        const tag_byte = hdr[0];
-        const payload_len = std.mem.readInt(u32, hdr[4..8], .little);
+        // readFramePayload handles decompression transparently.
+        // Allocates the (uncompressed) payload buffer — we copy into
+        // our scratch ArrayList so the buffer lifetimes match the
+        // existing pattern (current_batch borrows from scratch).
+        const frame = try wire.readFramePayload(self.allocator, &tcp.reader.interface);
+        defer self.allocator.free(frame.payload);
 
-        // Read payload into our scratch buffer.
         tcp.frame_payload.clearRetainingCapacity();
-        try tcp.frame_payload.resize(self.allocator, payload_len);
-        try tcp.reader.interface.readSliceAll(tcp.frame_payload.items);
+        try tcp.frame_payload.appendSlice(self.allocator, frame.payload);
 
-        // Dispatch on type.
-        return switch (tag_byte) {
+        return switch (@intFromEnum(frame.msg_type)) {
             @intFromEnum(wire.MsgType.resp_batch) => blk: {
                 tcp.current_batch = try wire.decodeBatch(self.allocator, tcp.frame_payload.items);
                 break :blk tcp.current_batch.?.batch();

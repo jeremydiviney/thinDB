@@ -52,6 +52,7 @@ const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
 const StringView = storage.StringView;
 const column_mod = storage.column;
+const compression = storage.compression;
 
 const exec = @import("../exec/exec.zig");
 const Batch = exec.Batch;
@@ -169,6 +170,23 @@ pub const Error = error{
 
 pub const frame_header_size: usize = 8;
 
+/// Frame header layout (8 bytes):
+///   [msg_type u8][flags u8][reserved u16][payload_len u32 LE]
+///
+/// `flags` bits:
+///   0x01 = payload is zstd-compressed. When set, the payload itself
+///          is `[orig_size u32 LE][compressed bytes...]` — the on-the-
+///          wire byte count is what payload_len reports, but the
+///          decompressed buffer is orig_size bytes.
+pub const FrameFlags = packed struct(u8) {
+    compressed: bool = false,
+    _reserved: u7 = 0,
+};
+
+/// Compress payloads at least this large. Anything smaller pays more
+/// in framing+overhead than the compression saves on the wire.
+pub const compression_threshold_bytes: usize = 4096;
+
 /// Write a framed message into `out`: header + payload bytes.
 /// Caller owns `out`. Useful for both server-side response building and
 /// client-side request building.
@@ -199,6 +217,66 @@ pub fn writeFrameToIo(
     std.mem.writeInt(u32, hdr[4..8], @intCast(payload.len), .little);
     try w.writeAll(&hdr);
     try w.writeAll(payload);
+}
+
+/// Write a framed message, opportunistically compressing the payload
+/// with zstd when it exceeds `compression_threshold_bytes`. The
+/// compressed payload is prefixed with the original size so the
+/// receiver can sized-decompress in one shot.
+pub fn writeFrameToIoMaybeCompressed(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    msg_type: MsgType,
+    payload: []const u8,
+) !void {
+    if (payload.len < compression_threshold_bytes) {
+        return writeFrameToIo(w, msg_type, payload);
+    }
+    const compressed = try compression.compress(allocator, payload);
+    defer allocator.free(compressed);
+
+    var hdr: [frame_header_size]u8 = .{0} ** frame_header_size;
+    hdr[0] = @intFromEnum(msg_type);
+    hdr[1] = @bitCast(FrameFlags{ .compressed = true });
+    std.mem.writeInt(u32, hdr[4..8], @intCast(4 + compressed.len), .little);
+    try w.writeAll(&hdr);
+
+    var orig_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &orig_buf, @intCast(payload.len), .little);
+    try w.writeAll(&orig_buf);
+    try w.writeAll(compressed);
+}
+
+/// One-shot frame read: header + (decompressed) payload. The returned
+/// payload is always uncompressed and caller-owned. Handles both
+/// plain and zstd-compressed frames transparently.
+pub fn readFramePayload(
+    allocator: Allocator,
+    r: *std.Io.Reader,
+) !struct { msg_type: MsgType, payload: []u8 } {
+    var hdr: [frame_header_size]u8 = undefined;
+    try r.readSliceAll(&hdr);
+    const msg_type_byte = hdr[0];
+    const flags: FrameFlags = @bitCast(hdr[1]);
+    const wire_payload_len = std.mem.readInt(u32, hdr[4..8], .little);
+    const msg_type = validMsgType(msg_type_byte) orelse return Error.WireUnknownMsgType;
+
+    if (flags.compressed) {
+        if (wire_payload_len < 4) return Error.WireCorrupt;
+        var orig_buf: [4]u8 = undefined;
+        try r.readSliceAll(&orig_buf);
+        const orig_size = std.mem.readInt(u32, &orig_buf, .little);
+        const comp_bytes = try allocator.alloc(u8, wire_payload_len - 4);
+        defer allocator.free(comp_bytes);
+        try r.readSliceAll(comp_bytes);
+        const out = try compression.decompress(allocator, comp_bytes, orig_size);
+        return .{ .msg_type = msg_type, .payload = out };
+    } else {
+        const out = try allocator.alloc(u8, wire_payload_len);
+        errdefer allocator.free(out);
+        try r.readSliceAll(out);
+        return .{ .msg_type = msg_type, .payload = out };
+    }
 }
 
 /// Encode a `[len u32][bytes]` length-prefixed string into `out`.

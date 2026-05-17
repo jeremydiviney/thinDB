@@ -444,6 +444,74 @@ test "tcp: alterTable add column populates default + appears in scan output" {
     if (sctx.err) |e| return e;
 }
 
+// Compression: flip the opt-in flag on both ends and verify a big
+// scan still round-trips correctly. The wire frames cross the
+// threshold and get zstd-compressed; readFramePayload decompresses
+// on the way back in.
+test "tcp: compression round-trips a large scan when both sides opt in" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 10;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+    server.compress_writes = true; // opt-in on the server side
+
+    // Seed enough rows that the resulting batch payload exceeds the
+    // compression threshold (4 KB). 2_000 rows × ~20 bytes/row =
+    // ~40 KB raw — comfortably past the threshold.
+    const t = try server.db.table("big", schema_v1, opts_v1);
+    var i: i64 = 0;
+    while (i < 2_000) : (i += 1) {
+        try t.insert(&.{.{ .id = i, .qty = @as(i32, @intCast(i)), .active = true, .tag = "compressed" }});
+    }
+    try t.flush();
+
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var k: usize = 0;
+            while (k < self.n) : (k += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    var conn = try thindb.connect(allocator, io, listen_addr);
+    defer conn.close();
+    conn.compress_writes = true; // opt-in on the client side too
+
+    var q = try conn.scan("big");
+    defer q.deinit();
+
+    var total: usize = 0;
+    var id_sum: i64 = 0;
+    while (try q.next()) |batch| {
+        total += batch.row_count;
+        for (batch.values[0].data.bigint) |v| id_sum += v;
+    }
+    try std.testing.expectEqual(@as(usize, 2_000), total);
+    // 0+1+...+1999 = 1999*2000/2 = 1_999_000
+    try std.testing.expectEqual(@as(i64, 1_999_000), id_sum);
+
+    if (sctx.err) |e| return e;
+}
+
 // Typed errors round-trip: trigger several distinct server-side
 // failures and verify each one surfaces as the expected typed
 // variant of `thindb.net.Error` on the client (not the catch-all
