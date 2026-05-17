@@ -46,6 +46,18 @@ pub const Error = error{
     /// buffer (currently 16). Wider arities need a heap-allocated arg
     /// view buffer.
     ComputeTooManyArgs,
+    /// Join operator: the requested join_type isn't implemented yet.
+    /// v1 supports inner only; outer/semi/anti land in follow-ups.
+    JoinUnsupportedType,
+    /// Join operator: the `on` clause has no key pairs.
+    JoinEmptyOnClause,
+    /// Join operator: a key-pair's column types don't match (e.g.
+    /// joining bigint to string).
+    JoinKeyTypeMismatch,
+    /// Join operator: left and right outputs have a colliding column
+    /// name. v1 doesn't auto-alias; user must rename via .compute()
+    /// or .exclude() before the join.
+    JoinColumnNameCollision,
 };
 
 // ---------------------------------------------------------------------------
@@ -183,6 +195,15 @@ pub const Query = struct {
         return @import("compute.zig").Compute.create(self.allocator, self, derived);
     }
 
+    /// Inner equi-join with `other`. Output schema is this side's
+    /// columns followed by `other`'s columns; column names must not
+    /// collide (rename one side via `.compute()` if needed). Algorithm
+    /// is hash join in v1 — build side is whichever has the smaller
+    /// upper-bound row count.
+    pub fn join(self: Query, other: Query, spec: @import("join.zig").Spec) !Query {
+        return @import("join.zig").Join.create(self.allocator, self, other, spec);
+    }
+
     /// `f` is either a function taking `Query` and returning `!Query`, or a
     /// function returning `Query` (we accept both by being generic).
     pub fn pipe(self: Query, f: anytype) !Query {
@@ -274,6 +295,12 @@ pub const ScalarFn = scalar_fn.ScalarFn;
 pub const compute_op = @import("compute.zig");
 pub const Compute = compute_op.Compute;
 pub const Derived = compute_op.Derived;
+
+pub const join_op = @import("join.zig");
+pub const Join = join_op.Join;
+pub const JoinSpec = join_op.Spec;
+pub const JoinType = join_op.JoinType;
+pub const KeyPair = join_op.KeyPair;
 
 // PipelineStats / SortState are defined above; re-exported for clarity.
 
