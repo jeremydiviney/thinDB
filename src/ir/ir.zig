@@ -39,7 +39,13 @@ pub const Error = error{
 pub const OpTag = enum(u8) {
     scan = 0,
     limit = 1,
-    // (more land here as we expand: filter, project, aggregate, group_by, sort)
+    /// Whitelist projection: keep only these columns, in the listed order.
+    select = 2,
+    /// Anti-projection: drop these columns. Strict pipeline semantics —
+    /// after Exclude, downstream operators cannot reference the dropped
+    /// columns. (Server enforces this via the existing per-operator
+    /// schema-lookup error path.)
+    exclude = 3,
 };
 
 /// In-memory operator tree, built by the client query-builder and decoded
@@ -48,6 +54,8 @@ pub const OpTag = enum(u8) {
 pub const Op = union(OpTag) {
     scan: Scan,
     limit: Limit,
+    select: Project,
+    exclude: Project,
 
     pub const Scan = struct {
         /// Table name. Borrowed from the encoded buffer on decode; owned
@@ -60,6 +68,13 @@ pub const Op = union(OpTag) {
         upstream: *Op,
     };
 
+    pub const Project = struct {
+        /// Column names. Shared variant for both .select (keep) and
+        /// .exclude (drop) — disambiguated by the outer Op tag.
+        columns: []const []const u8,
+        upstream: *Op,
+    };
+
     /// Free any allocations made by `decode`. No-op for client-built trees
     /// whose strings come from caller storage.
     pub fn deinitDecoded(self: *Op, allocator: Allocator) void {
@@ -69,9 +84,20 @@ pub const Op = union(OpTag) {
                 l.upstream.deinitDecoded(allocator);
                 allocator.destroy(l.upstream);
             },
+            .select => |p| freeProject(p, allocator),
+            .exclude => |p| freeProject(p, allocator),
         }
     }
 };
+
+fn freeProject(p: Op.Project, allocator: Allocator) void {
+    // p.columns is a freshly-allocated slice of slices; the individual
+    // string slices are borrowed from the encoded buffer (not owned).
+    // Only free the outer slice.
+    allocator.free(p.columns);
+    p.upstream.deinitDecoded(allocator);
+    allocator.destroy(p.upstream);
+}
 
 // ---------------------------------------------------------------------------
 // Encode
@@ -85,7 +111,9 @@ pub fn encode(allocator: Allocator, out: *std.ArrayList(u8), root: Op) !void {
     try encodeOp(allocator, out, root);
 }
 
-fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) !void {
+const EncodeError = Allocator.Error;
+
+fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!void {
     try out.append(allocator, @intFromEnum(@as(OpTag, op)));
     switch (op) {
         .scan => |s| {
@@ -96,7 +124,18 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) !void {
             try appendU64(allocator, out, l.n);
             try encodeOp(allocator, out, l.upstream.*);
         },
+        .select => |p| try encodeProject(allocator, out, p),
+        .exclude => |p| try encodeProject(allocator, out, p),
     }
+}
+
+fn encodeProject(allocator: Allocator, out: *std.ArrayList(u8), p: Op.Project) EncodeError!void {
+    try appendU32(allocator, out, @intCast(p.columns.len));
+    for (p.columns) |c| {
+        try appendU32(allocator, out, @intCast(c.len));
+        try out.appendSlice(allocator, c);
+    }
+    try encodeOp(allocator, out, p.upstream.*);
 }
 
 // ---------------------------------------------------------------------------
@@ -116,11 +155,13 @@ pub fn decode(allocator: Allocator, bytes: []const u8) !Op {
     return try decodeOp(allocator, bytes, &cursor);
 }
 
-fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) !Op {
+const DecodeError = Error || Allocator.Error;
+
+fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!Op {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.limit)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.exclude)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -142,7 +183,33 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) !Op {
             upstream.* = try decodeOp(allocator, bytes, cursor);
             break :blk Op{ .limit = .{ .n = n, .upstream = upstream } };
         },
+        .select, .exclude => blk: {
+            const project = try decodeProject(allocator, bytes, cursor);
+            break :blk if (tag == .select) Op{ .select = project } else Op{ .exclude = project };
+        },
     };
+}
+
+fn decodeProject(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!Op.Project {
+    if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+    const n_cols = readU32(bytes[cursor.* .. cursor.* + 4]);
+    cursor.* += 4;
+
+    const cols = try allocator.alloc([]const u8, n_cols);
+    errdefer allocator.free(cols);
+    for (cols) |*c| {
+        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+        const col_len = readU32(bytes[cursor.* .. cursor.* + 4]);
+        cursor.* += 4;
+        if (cursor.* + col_len > bytes.len) return Error.IrCorrupt;
+        c.* = bytes[cursor.* .. cursor.* + col_len];
+        cursor.* += col_len;
+    }
+
+    const upstream = try allocator.create(Op);
+    errdefer allocator.destroy(upstream);
+    upstream.* = try decodeOp(allocator, bytes, cursor);
+    return .{ .columns = cols, .upstream = upstream };
 }
 
 // ---------------------------------------------------------------------------
@@ -218,4 +285,45 @@ test "ir: decode rejects truncated input" {
     const allocator = std.testing.allocator;
     const short = [_]u8{ 't', 'D', 'B' };
     try std.testing.expectError(Error.IrTooSmall, decode(allocator, &short));
+}
+
+test "ir: select round-trips with multiple columns" {
+    const allocator = std.testing.allocator;
+
+    var scan_storage: Op = .{ .scan = .{ .table_name = "orders" } };
+    const cols = [_][]const u8{ "id", "qty", "tag" };
+    const root: Op = .{ .select = .{ .columns = &cols, .upstream = &scan_storage } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    try std.testing.expect(decoded == .select);
+    try std.testing.expectEqual(@as(usize, 3), decoded.select.columns.len);
+    try std.testing.expectEqualStrings("id", decoded.select.columns[0]);
+    try std.testing.expectEqualStrings("qty", decoded.select.columns[1]);
+    try std.testing.expectEqualStrings("tag", decoded.select.columns[2]);
+    try std.testing.expect(decoded.select.upstream.* == .scan);
+    try std.testing.expectEqualStrings("orders", decoded.select.upstream.scan.table_name);
+}
+
+test "ir: exclude round-trips and is distinguishable from select" {
+    const allocator = std.testing.allocator;
+
+    var scan_storage: Op = .{ .scan = .{ .table_name = "t" } };
+    const cols = [_][]const u8{"secret"};
+    const root: Op = .{ .exclude = .{ .columns = &cols, .upstream = &scan_storage } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    try std.testing.expect(decoded == .exclude);
+    try std.testing.expectEqualStrings("secret", decoded.exclude.columns[0]);
 }

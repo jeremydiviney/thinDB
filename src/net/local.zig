@@ -54,14 +54,18 @@ pub const Connection = struct {
     /// Start a query against `table_name`. Returns a ClientQuery that
     /// the caller extends (`.limit`, future `.filter`, etc.) and drains
     /// via `.next()`. Caller `.deinit()`s the returned query.
-    pub fn scan(self: *Connection, table_name: []const u8) ClientQuery {
+    pub fn scan(self: *Connection, table_name: []const u8) !ClientQuery {
+        // Heap-allocate the arena so builder methods can clone the
+        // ClientQuery value (the chain `conn.scan(t).limit(5).select(...)`
+        // returns successive values; each shares the same underlying
+        // arena via this pointer).
+        const arena = try self.allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(self.allocator);
         return .{
             .allocator = self.allocator,
             .conn = self,
             .root = .{ .scan = .{ .table_name = table_name } },
-            // Trees of nested ops allocate their non-root nodes on this
-            // arena so the user doesn't have to think about ownership.
-            .arena = std.heap.ArenaAllocator.init(self.allocator),
+            .arena = arena,
             .server_query = null,
         };
     }
@@ -74,12 +78,15 @@ pub const ClientQuery = struct {
     allocator: Allocator,
     conn: *Connection,
     root: ir.Op,
-    arena: std.heap.ArenaAllocator,
+    /// Heap-allocated so builder methods can return new ClientQuery values
+    /// sharing the same underlying arena. Freed by `deinit`.
+    arena: *std.heap.ArenaAllocator,
     server_query: ?Query,
 
     pub fn deinit(self: *ClientQuery) void {
         if (self.server_query) |*q| q.deinit();
         self.arena.deinit();
+        self.allocator.destroy(self.arena);
     }
 
     /// Wrap the current root in a Limit. Returns self (mutated) by value
@@ -91,6 +98,33 @@ pub const ClientQuery = struct {
         const upstream = try copy.arena.allocator().create(ir.Op);
         upstream.* = copy.root;
         copy.root = .{ .limit = .{ .n = n, .upstream = upstream } };
+        return copy;
+    }
+
+    /// Keep only `fields`, in the listed order. Errors if any field isn't
+    /// present in upstream's schema (validated server-side at dispatch).
+    pub fn select(self: ClientQuery, fields: []const []const u8) !ClientQuery {
+        var copy = self;
+        const aa = copy.arena.allocator();
+        // Snapshot the previous root BEFORE constructing the new one.
+        // Zig's result-location semantics may initialize `copy.root`'s tag
+        // in place for the LHS struct literal, before evaluating the RHS;
+        // if we read `copy.root` inside the RHS we'd see the partially-
+        // mutated value (new tag, stale payload).
+        const prev_root = copy.root;
+        copy.root = .{ .select = try cloneProject(aa, prev_root, fields) };
+        return copy;
+    }
+
+    /// Drop `fields` from the working schema. Strict pipeline semantics:
+    /// downstream operators cannot reference the dropped fields. Errors
+    /// if any field isn't present in upstream's schema (validated server-
+    /// side at dispatch).
+    pub fn exclude(self: ClientQuery, fields: []const []const u8) !ClientQuery {
+        var copy = self;
+        const aa = copy.arena.allocator();
+        const prev_root = copy.root;
+        copy.root = .{ .exclude = try cloneProject(aa, prev_root, fields) };
         return copy;
     }
 
@@ -120,6 +154,27 @@ pub const ClientQuery = struct {
     }
 };
 
+/// Helper used by `.select()` and `.exclude()`: move the current root
+/// into the arena as the new upstream, dupe `fields` into arena-owned
+/// storage, return the Project carrier. Caller chooses whether to wrap
+/// it in `.select` or `.exclude`.
+///
+/// We dupe the bytes (not just slice headers) because callers commonly
+/// pass `&.{ "a", "b" }` — anonymous-tuple coercions whose backing
+/// temporary may not outlive the call expression. Owning the strings
+/// ourselves makes the lifetime obvious: arena until `deinit`.
+fn cloneProject(
+    aa: Allocator,
+    current_root: ir.Op,
+    fields: []const []const u8,
+) !ir.Op.Project {
+    const upstream = try aa.create(ir.Op);
+    upstream.* = current_root;
+    const cols = try aa.alloc([]const u8, fields.len);
+    for (fields, 0..) |f, i| cols[i] = try aa.dupe(u8, f);
+    return .{ .columns = cols, .upstream = upstream };
+}
+
 /// Server-side IR dispatcher. Recursively walks the decoded IR tree and
 /// builds the corresponding exec.Query operator chain using existing
 /// in-process operators.
@@ -134,7 +189,53 @@ fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
             // exec.Query.limit takes usize; cast safely.
             break :blk try upstream.limit(@intCast(l.n));
         },
+        .select => |s| blk: {
+            var upstream = try buildServerQuery(allocator, db, s.upstream.*);
+            // If project() fails (e.g. column doesn't exist in upstream's
+            // schema), tear the upstream down to avoid a leak.
+            errdefer upstream.deinit();
+            // .project already validates column refs against upstream's
+            // outputSchema — any missing column surfaces as an error.
+            break :blk try upstream.project(s.columns);
+        },
+        .exclude => |e| blk: {
+            var upstream = try buildServerQuery(allocator, db, e.upstream.*);
+            errdefer upstream.deinit();
+            // Translate exclude into a project of the complement: take
+            // upstream's current schema, drop the excluded columns, keep
+            // the rest in their original order. Strict pipeline semantic
+            // is enforced by the existing operators — once we project to
+            // the complement, downstream cannot reference the dropped
+            // columns.
+            const upstream_cols = upstream.outputSchema();
+            const remaining = try complementColumns(allocator, upstream_cols, e.columns);
+            defer allocator.free(remaining);
+            break :blk try upstream.project(remaining);
+        },
     };
+}
+
+/// Allocator-owned slice of column-name slices. Caller frees via
+/// `allocator.free(out)` once — the inner string slices are borrowed
+/// from `upstream_cols` and don't need separate freeing.
+fn complementColumns(
+    allocator: Allocator,
+    upstream_cols: []const @import("../types.zig").Column,
+    excluded: []const []const u8,
+) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (upstream_cols) |c| {
+        var dropped = false;
+        for (excluded) |ex| {
+            if (std.mem.eql(u8, c.name, ex)) {
+                dropped = true;
+                break;
+            }
+        }
+        if (!dropped) try out.append(allocator, c.name);
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 /// Open an in-process Connection. Equivalent to opening a Database, but
