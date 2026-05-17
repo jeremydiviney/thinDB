@@ -88,6 +88,79 @@ const uuid_opts = thindb.TableOptions{
     .row_group_size = 65_536,
 };
 
+// "Unsorted" schemas: rows are emitted in `rowid` order (the order key),
+// not in `k` order. SMJ must do a real sort. Same data otherwise — both
+// tables still cover k = [0..N) once each, so the inner join produces N
+// output rows.
+const bigint_unsorted_left_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "rowid", .type = .bigint },
+        .{ .name = "k", .type = .bigint },
+        .{ .name = "lval", .type = .int },
+    },
+    .order_key = &.{"rowid"},
+    .unique = true,
+};
+const bigint_unsorted_right_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "b_rowid", .type = .bigint },
+        .{ .name = "k", .type = .bigint },
+        .{ .name = "rval", .type = .int },
+    },
+    .order_key = &.{"b_rowid"},
+    .unique = true,
+};
+const bigint_unsorted_ok_left = [_][]const u8{"rowid"};
+const bigint_unsorted_ok_right = [_][]const u8{"b_rowid"};
+const bigint_unsorted_opts_left = thindb.TableOptions{
+    .order_key = &bigint_unsorted_ok_left,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+const bigint_unsorted_opts_right = thindb.TableOptions{
+    .order_key = &bigint_unsorted_ok_right,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+
+const string_unsorted_left_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "rowid", .type = .bigint },
+        .{ .name = "k", .type = .string },
+        .{ .name = "lval", .type = .int },
+    },
+    .order_key = &.{"rowid"},
+    .unique = true,
+};
+const string_unsorted_right_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "b_rowid", .type = .bigint },
+        .{ .name = "k", .type = .string },
+        .{ .name = "rval", .type = .int },
+    },
+    .order_key = &.{"b_rowid"},
+    .unique = true,
+};
+
+const uuid_unsorted_left_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "rowid", .type = .bigint },
+        .{ .name = "k", .type = .uuid },
+        .{ .name = "lval", .type = .int },
+    },
+    .order_key = &.{"rowid"},
+    .unique = true,
+};
+const uuid_unsorted_right_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "b_rowid", .type = .bigint },
+        .{ .name = "k", .type = .uuid },
+        .{ .name = "rval", .type = .int },
+    },
+    .order_key = &.{"b_rowid"},
+    .unique = true,
+};
+
 const compound_left_schema = thindb.Schema{
     .columns = &.{
         .{ .name = "g", .type = .bigint },
@@ -416,6 +489,208 @@ fn benchCompoundJoin(
 }
 
 // ----------------------------------------------------------------------------
+// Unsorted variants: same data sets, but rows scan in rowid order so SMJ
+// has to pay the real sort cost (no pdqsort fast-path on already-sorted
+// input).
+// ----------------------------------------------------------------------------
+
+/// Full-period LCG permutation: `(21*i + 1) mod n`. Coprime to 21 and 1
+/// when n is divisible by 100 (Hull-Dobell). Used to scramble k values
+/// across rowid values so scan-order is not k-sorted.
+inline fn permute(i: usize, n: usize) usize {
+    return (21 * i + 1) % n;
+}
+
+fn fillBigintUnsortedLeft(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { rowid: i64, k: i64, lval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| {
+        r.* = .{ .rowid = @intCast(i), .k = @intCast(permute(i, n)), .lval = @intCast(i % 1000) };
+    }
+    try t.insert(rows);
+}
+fn fillBigintUnsortedRight(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { b_rowid: i64, k: i64, rval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| {
+        r.* = .{ .b_rowid = @intCast(i), .k = @intCast(permute(i, n)), .rval = @intCast(i % 1000) };
+    }
+    try t.insert(rows);
+}
+
+fn benchBigintJoinUnsorted(
+    allocator: Allocator,
+    io: Io,
+    label: []const u8,
+    n: usize,
+    algo: thindb.exec.join_op.Algorithm,
+) !void {
+    var dir = try freshDir(io, ".bench-data/join_bigint_unsorted");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", bigint_unsorted_left_schema, bigint_unsorted_opts_left);
+    try fillBigintUnsortedLeft(l, n, allocator);
+    try l.flush();
+
+    const r = try db.table("r", bigint_unsorted_right_schema, bigint_unsorted_opts_right);
+    try fillBigintUnsortedRight(r, n, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+
+    reportJoin(label, algo, n, n, output, elapsed);
+}
+
+fn fillStringUnsortedLeft(t: *thindb.Table, keys: [][16]u8, allocator: Allocator) !void {
+    const Row = struct { rowid: i64, k: []const u8, lval: i32 };
+    const n = keys.len;
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| {
+        r.* = .{
+            .rowid = @intCast(i),
+            .k = keys[permute(i, n)][0..],
+            .lval = @intCast(i % 1000),
+        };
+    }
+    try t.insert(rows);
+}
+fn fillStringUnsortedRight(t: *thindb.Table, keys: [][16]u8, allocator: Allocator) !void {
+    const Row = struct { b_rowid: i64, k: []const u8, rval: i32 };
+    const n = keys.len;
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| {
+        r.* = .{
+            .b_rowid = @intCast(i),
+            .k = keys[permute(i, n)][0..],
+            .rval = @intCast(i % 1000),
+        };
+    }
+    try t.insert(rows);
+}
+
+fn benchStringJoinUnsorted(
+    allocator: Allocator,
+    io: Io,
+    label: []const u8,
+    n: usize,
+    algo: thindb.exec.join_op.Algorithm,
+) !void {
+    var dir = try freshDir(io, ".bench-data/join_string_unsorted");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const keys = try buildStringKeys(allocator, n);
+    defer allocator.free(keys);
+
+    const l = try db.table("l", string_unsorted_left_schema, bigint_unsorted_opts_left);
+    try fillStringUnsortedLeft(l, keys, allocator);
+    try l.flush();
+
+    const r = try db.table("r", string_unsorted_right_schema, bigint_unsorted_opts_right);
+    try fillStringUnsortedRight(r, keys, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+
+    reportJoin(label, algo, n, n, output, elapsed);
+}
+
+fn fillUuidUnsortedLeft(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { rowid: i64, k: u128, lval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    const hi: u128 = @as(u128, 0x1234567890ABCDEF) << 64;
+    for (rows, 0..) |*r, i| {
+        r.* = .{ .rowid = @intCast(i), .k = hi | @as(u128, permute(i, n)), .lval = @intCast(i % 1000) };
+    }
+    try t.insert(rows);
+}
+fn fillUuidUnsortedRight(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { b_rowid: i64, k: u128, rval: i32 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    const hi: u128 = @as(u128, 0x1234567890ABCDEF) << 64;
+    for (rows, 0..) |*r, i| {
+        r.* = .{ .b_rowid = @intCast(i), .k = hi | @as(u128, permute(i, n)), .rval = @intCast(i % 1000) };
+    }
+    try t.insert(rows);
+}
+
+fn benchUuidJoinUnsorted(
+    allocator: Allocator,
+    io: Io,
+    label: []const u8,
+    n: usize,
+    algo: thindb.exec.join_op.Algorithm,
+) !void {
+    var dir = try freshDir(io, ".bench-data/join_uuid_unsorted");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", uuid_unsorted_left_schema, bigint_unsorted_opts_left);
+    try fillUuidUnsortedLeft(l, n, allocator);
+    try l.flush();
+
+    const r = try db.table("r", uuid_unsorted_right_schema, bigint_unsorted_opts_right);
+    try fillUuidUnsortedRight(r, n, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+
+    reportJoin(label, algo, n, n, output, elapsed);
+}
+
+// ----------------------------------------------------------------------------
 // Entry point
 // ----------------------------------------------------------------------------
 
@@ -449,4 +724,19 @@ pub fn runAll(allocator: Allocator, io: Io) !void {
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
     try benchCompoundJoin(allocator, io, "compound 100k", 100_000, .hash);
     try benchCompoundJoin(allocator, io, "compound 100k", 100_000, .sort_merge);
+
+    // Unsorted variants: scan emits in rowid order, NOT join-key order,
+    // so SMJ pays the real sort cost (pdqsort's pre-sorted fast path
+    // doesn't apply). Side-by-side with the sorted SMJ numbers above
+    // shows the headroom a future merge-only fast-path would unlock.
+    std.debug.print("\nJoin — unsorted input (order_key != join_key)\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    try benchBigintJoinUnsorted(allocator, io, "bigint 100k unsorted", 100_000, .hash);
+    try benchBigintJoinUnsorted(allocator, io, "bigint 100k unsorted", 100_000, .sort_merge);
+    try benchBigintJoinUnsorted(allocator, io, "bigint 1M unsorted", 1_000_000, .hash);
+    try benchBigintJoinUnsorted(allocator, io, "bigint 1M unsorted", 1_000_000, .sort_merge);
+    try benchStringJoinUnsorted(allocator, io, "string 100k unsorted", 100_000, .hash);
+    try benchStringJoinUnsorted(allocator, io, "string 100k unsorted", 100_000, .sort_merge);
+    try benchUuidJoinUnsorted(allocator, io, "uuid 100k unsorted", 100_000, .hash);
+    try benchUuidJoinUnsorted(allocator, io, "uuid 100k unsorted", 100_000, .sort_merge);
 }
