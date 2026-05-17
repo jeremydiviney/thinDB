@@ -54,24 +54,30 @@ pub const JoinType = enum {
 };
 
 pub const Algorithm = enum {
+    /// Planner picks per-query using cheap stats (sort_state per
+    /// side, eventually Misra-Gries-observed skew). Default. Always
+    /// safe — the planner only ever picks an algorithm it can prove
+    /// won't catastrophically fail given the available signal.
+    auto,
     /// Build a hash table on the smaller side; probe with the other.
     /// Best for equi-joins with at least one side fitting comfortably
-    /// in memory, no heavy skew.
+    /// in memory, no heavy skew. Pick explicitly when you know the
+    /// shape and want to skip the planner.
     hash,
     /// Sort both sides on the join key, walk in lockstep. Predictable
     /// memory + degrades smoothly under skew. Best when both sides
     /// are large, skew is heavy, or output needs to be sorted.
     sort_merge,
-    // Future: auto (decision tree picks per query), inlj, nlj
+    // Future: inlj, nlj
 };
 
 pub const Spec = struct {
     join_type: JoinType = .inner,
     on: []const KeyPair,
-    /// Explicit algorithm choice. v1: caller picks. Future v2: a
-    /// `.auto` variant runs the decision tree using the cheap stats
-    /// plus observed materialization stats.
-    algorithm: Algorithm = .hash,
+    /// Algorithm choice. Default `.auto` lets the planner decide
+    /// from cheap stats. Override with `.hash` or `.sort_merge`
+    /// when you want to lock the choice (benchmarking, known shape).
+    algorithm: Algorithm = .auto,
 };
 
 /// Number of rows emitted per output batch. Bounded so emission stays
@@ -152,10 +158,22 @@ pub const Join = struct {
     ) !Query {
         if (spec.join_type != .inner) return Error.JoinUnsupportedType;
         if (spec.on.len == 0) return Error.JoinEmptyOnClause;
-        // Route to the SMJ implementation when explicitly requested.
-        // (Decision tree for `.auto` choice lands in a follow-up.)
-        if (spec.algorithm == .sort_merge) {
-            return @import("smj.zig").SortMergeJoin.create(allocator, left, right, spec);
+
+        // Resolve algorithm. .auto consults cheap stats — see chooseAlgorithm.
+        const chosen = if (spec.algorithm == .auto)
+            chooseAlgorithm(left, right, spec.on)
+        else
+            spec.algorithm;
+
+        if (chosen == .sort_merge) {
+            // Re-spec with explicit algorithm so SMJ doesn't recurse
+            // back through .auto if it ever calls back.
+            const sm_spec: Spec = .{
+                .join_type = spec.join_type,
+                .on = spec.on,
+                .algorithm = .sort_merge,
+            };
+            return @import("smj.zig").SortMergeJoin.create(allocator, left, right, sm_spec);
         }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -523,6 +541,58 @@ pub const Join = struct {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Decision tree — picks the best algorithm from cheap stats only.
+// ---------------------------------------------------------------------------
+//
+// v1 rules (extensible):
+//
+//   1. Both sides globally sorted on a prefix that covers the join
+//      keys → sort_merge (the merge-only fast path is essentially
+//      free; full SMJ here still beats hash by skipping the build).
+//   2. Otherwise → hash (the OLAP default — best for the common
+//      dim × fact shape).
+//
+// Future v2 refinements:
+//   - Detect "small × large pre-sorted" → INLJ
+//   - Materialize the smaller side first, observe max-frequency via
+//     Misra-Gries, route to SMJ if skew threshold exceeded
+//   - Use HLL-derived NDV estimates for output cardinality prediction
+//
+// The decision is intentionally conservative — we only route to SMJ
+// when we can prove the structural advantage (both sides sorted).
+// Hash remains the default for the broad middle of analytics shapes
+// where it wins.
+
+fn chooseAlgorithm(left: Query, right: Query, on: []const KeyPair) Algorithm {
+    const ls = left.stats();
+    const rs = right.stats();
+
+    // Build the list of join-key column names per side.
+    if (joinKeysCovered(ls.sort_state, on, .left) and
+        joinKeysCovered(rs.sort_state, on, .right) and
+        ls.sort_state.global and rs.sort_state.global)
+    {
+        return .sort_merge;
+    }
+
+    return .hash;
+}
+
+/// Returns true if `state.keys` is a leading prefix of (or equal to)
+/// the join-key columns on the named side of the `on` pairs.
+fn joinKeysCovered(state: exec.SortState, on: []const KeyPair, side: enum { left, right }) bool {
+    if (state.keys.len < on.len) return false;
+    for (on, 0..) |pair, i| {
+        const required = switch (side) {
+            .left => pair.left,
+            .right => pair.right,
+        };
+        if (!std.mem.eql(u8, state.keys[i], required)) return false;
+    }
+    return true;
+}
 
 fn columnIndex(schema: []const Column, name: []const u8) ?usize {
     for (schema, 0..) |c, i| {

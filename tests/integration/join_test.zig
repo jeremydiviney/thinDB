@@ -263,6 +263,99 @@ test "join: sort-merge algorithm produces same result as hash" {
     try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 30, 20 }, qtys.items);
 }
 
+test "join: .auto algorithm produces correct results (hash for un-sorted inputs)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const users = try db.table("users", users_schema, users_opts);
+    try users.insert(&.{
+        .{ .uid = @as(i64, 1), .name = "alice" },
+        .{ .uid = @as(i64, 2), .name = "bob" },
+    });
+    try users.flush();
+
+    const orders = try db.table("orders", orders_schema, orders_opts);
+    try orders.insert(&.{
+        .{ .oid = @as(i64, 100), .uid = @as(i64, 1), .qty = @as(i32, 10) },
+        .{ .oid = @as(i64, 101), .uid = @as(i64, 2), .qty = @as(i32, 20) },
+    });
+    try orders.flush();
+
+    // Default spec uses `.auto` algorithm. Scan publishes
+    // sort_state.global = false (pre-compaction; segments may
+    // overlap), so the decision tree's "both pre-sorted globally"
+    // condition is NOT met. Falls through to hash. Works fine.
+    const left = try thindb.scan(allocator, users);
+    const right = try thindb.scan(allocator, orders);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        // .algorithm defaults to .auto
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "join: .auto picks SMJ when both inputs come from a matching OrderBy" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const users = try db.table("users", users_schema, users_opts);
+    try users.insert(&.{
+        .{ .uid = @as(i64, 1), .name = "alice" },
+        .{ .uid = @as(i64, 2), .name = "bob" },
+        .{ .uid = @as(i64, 3), .name = "carol" },
+    });
+    try users.flush();
+
+    const orders = try db.table("orders", orders_schema, orders_opts);
+    try orders.insert(&.{
+        .{ .oid = @as(i64, 100), .uid = @as(i64, 1), .qty = @as(i32, 10) },
+        .{ .oid = @as(i64, 101), .uid = @as(i64, 2), .qty = @as(i32, 20) },
+        .{ .oid = @as(i64, 102), .uid = @as(i64, 3), .qty = @as(i32, 30) },
+    });
+    try orders.flush();
+
+    // Wrap each scan in an explicit OrderBy on `uid`. Sort publishes
+    // sort_state.global = true. The .auto algorithm should pick SMJ
+    // (the merge-only path is essentially free here — though v1 still
+    // re-sorts, the result is correct).
+    var left_base = try thindb.scan(allocator, users);
+    const left_sorted = try left_base.orderBy(&.{.{ .col = "uid", .desc = false }});
+    var right_base = try thindb.scan(allocator, orders);
+    const right_sorted = try right_base.orderBy(&.{.{ .col = "uid", .desc = false }});
+
+    var q = try left_sorted.join(right_sorted, .{
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+    });
+    defer q.deinit();
+
+    var uids: std.ArrayList(i64) = .empty;
+    defer uids.deinit(allocator);
+    var oids: std.ArrayList(i64) = .empty;
+    defer oids.deinit(allocator);
+
+    while (try q.next()) |b| {
+        try uids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+        try oids.appendSlice(allocator, b.values[2].data.bigint[0..b.row_count]);
+    }
+    // Output should be sorted on uid (SMJ side-effect): 1, 2, 3.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, uids.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 101, 102 }, oids.items);
+}
+
 test "join: sort-merge handles duplicate keys on both sides (Cartesian per key)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
