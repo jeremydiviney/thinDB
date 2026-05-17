@@ -50,6 +50,7 @@ pub const Connection = net.Connection;
 pub const ClientQuery = net.ClientQuery;
 pub const local = net.local;
 pub const ir = @import("ir/ir.zig");
+pub const wire = @import("net/wire.zig");
 
 test {
     // Pull in tests from sub-modules.
