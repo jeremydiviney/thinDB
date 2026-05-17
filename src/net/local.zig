@@ -99,6 +99,24 @@ pub const Connection = struct {
     // `resp_error`. Each call opens a fresh TCP stream (stateless model).
     // -----------------------------------------------------------------
 
+    /// Insert rows into a table. Rows have the same shape as
+    /// `Table.insert`'s argument: a slice/array/tuple of struct literals
+    /// whose fields map to schema columns.
+    ///
+    /// v1: in-process only. Over TCP this currently errors with
+    /// `UnsupportedOp` — wire-format batch insert lands in a follow-up
+    /// (needs row→columnar conversion + a new server-side
+    /// `Memtable.insertColumnarBatch` entry point).
+    pub fn insert(self: *Connection, table_name: []const u8, rows: anytype) !void {
+        switch (self.transport) {
+            .in_process => |db| {
+                const t = db.tables.get(table_name) orelse return Error.TableNotFound;
+                try t.insert(rows);
+            },
+            .tcp => return Error.UnsupportedOp,
+        }
+    }
+
     /// Create or open a table. If the table exists on disk its schema
     /// must match. `opts.row_group_size` falls back to the server's
     /// configured default. Same semantics as `Database.table`.
