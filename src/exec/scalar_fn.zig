@@ -112,9 +112,26 @@ pub fn overloadsOf(name: []const u8) []const ScalarFn {
 // More functions land in follow-up commits.
 
 pub const builtins = [_]ScalarFn{
+    // --- string → string ---
     .{ .name = "upper", .arg_types = &.{.string}, .return_type = .string, .kernel = upperKernel },
     .{ .name = "lower", .arg_types = &.{.string}, .return_type = .string, .kernel = lowerKernel },
+    .{ .name = "ltrim", .arg_types = &.{.string}, .return_type = .string, .kernel = ltrimKernel },
+    .{ .name = "rtrim", .arg_types = &.{.string}, .return_type = .string, .kernel = rtrimKernel },
+    .{ .name = "trim", .arg_types = &.{.string}, .return_type = .string, .kernel = trimKernel },
+    .{ .name = "reverse", .arg_types = &.{.string}, .return_type = .string, .kernel = reverseKernel },
+    // --- string → int ---
     .{ .name = "length", .arg_types = &.{.string}, .return_type = .int, .kernel = lengthKernel },
+    // octet_length is the SQL-standard byte-count alias for length.
+    .{ .name = "octet_length", .arg_types = &.{.string}, .return_type = .int, .kernel = lengthKernel },
+    // char_length is byte-length for ASCII; UTF-8-aware counterpart
+    // is a v2 follow-up (need codepoint iteration).
+    .{ .name = "char_length", .arg_types = &.{.string}, .return_type = .int, .kernel = lengthKernel },
+    // --- multi-arg string ---
+    .{ .name = "concat", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = concat2Kernel },
+    .{ .name = "concat", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = concat3Kernel },
+    .{ .name = "substring", .arg_types = &.{ .string, .int, .int }, .return_type = .string, .kernel = substringKernel },
+    .{ .name = "replace", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = replaceKernel },
+    // --- coalesce overloads ---
     .{ .name = "coalesce", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .absorbs, .kernel = coalesceStringKernel },
     .{ .name = "coalesce", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .absorbs, .kernel = coalesceIntKernel },
     .{ .name = "coalesce", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .absorbs, .kernel = coalesceBigintKernel },
@@ -153,6 +170,156 @@ fn lengthKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStor
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
         try out.data.int.append(allocator, @intCast(sv.rowBytes(i).len));
+    }
+}
+
+fn ltrimKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        var start: usize = 0;
+        while (start < src.len and std.ascii.isWhitespace(src[start])) : (start += 1) {}
+        try ss.appendValue(allocator, src[start..]);
+    }
+}
+
+fn rtrimKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        var end: usize = src.len;
+        while (end > 0 and std.ascii.isWhitespace(src[end - 1])) : (end -= 1) {}
+        try ss.appendValue(allocator, src[0..end]);
+    }
+}
+
+fn trimKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        var start: usize = 0;
+        while (start < src.len and std.ascii.isWhitespace(src[start])) : (start += 1) {}
+        var end: usize = src.len;
+        while (end > start and std.ascii.isWhitespace(src[end - 1])) : (end -= 1) {}
+        try ss.appendValue(allocator, src[start..end]);
+    }
+}
+
+fn reverseKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const dst = try allocator.alloc(u8, src.len);
+        defer allocator.free(dst);
+        for (src, 0..) |b, j| dst[src.len - 1 - j] = b;
+        try ss.appendValue(allocator, dst);
+    }
+}
+
+fn concat2Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = stringViewOf(args[0]);
+    const b = stringViewOf(args[1]);
+    const ss = stringStoreOf(out);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        scratch.clearRetainingCapacity();
+        try scratch.appendSlice(allocator, a.rowBytes(i));
+        try scratch.appendSlice(allocator, b.rowBytes(i));
+        try ss.appendValue(allocator, scratch.items);
+    }
+}
+
+fn concat3Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = stringViewOf(args[0]);
+    const b = stringViewOf(args[1]);
+    const c = stringViewOf(args[2]);
+    const ss = stringStoreOf(out);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        scratch.clearRetainingCapacity();
+        try scratch.appendSlice(allocator, a.rowBytes(i));
+        try scratch.appendSlice(allocator, b.rowBytes(i));
+        try scratch.appendSlice(allocator, c.rowBytes(i));
+        try ss.appendValue(allocator, scratch.items);
+    }
+}
+
+/// MySQL-style substring: 1-indexed start; negative start counts from
+/// end; length < 0 → empty string. Out-of-range returns empty string
+/// rather than erroring (matches MySQL).
+fn substringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const starts = args[1].data.int;
+    const lens = args[2].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const start_raw = starts[i];
+        const len_raw = lens[i];
+        if (len_raw <= 0 or src.len == 0) {
+            try ss.appendValue(allocator, "");
+            continue;
+        }
+        // 1-indexed; negative counts from end (-1 = last char).
+        const src_len_i: i64 = @intCast(src.len);
+        var start_0: i64 = if (start_raw > 0)
+            @as(i64, start_raw) - 1
+        else if (start_raw < 0)
+            src_len_i + @as(i64, start_raw)
+        else
+            0;
+        if (start_0 < 0) start_0 = 0;
+        if (start_0 >= src_len_i) {
+            try ss.appendValue(allocator, "");
+            continue;
+        }
+        const end_0 = @min(start_0 + @as(i64, len_raw), src_len_i);
+        const start_u: usize = @intCast(start_0);
+        const end_u: usize = @intCast(end_0);
+        try ss.appendValue(allocator, src[start_u..end_u]);
+    }
+}
+
+/// MySQL REPLACE(haystack, needle, replacement). Empty needle leaves
+/// the haystack unchanged (matches MySQL — avoids an infinite loop).
+fn replaceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const hay_view = stringViewOf(args[0]);
+    const needle_view = stringViewOf(args[1]);
+    const repl_view = stringViewOf(args[2]);
+    const ss = stringStoreOf(out);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const hay = hay_view.rowBytes(i);
+        const needle = needle_view.rowBytes(i);
+        const repl = repl_view.rowBytes(i);
+        if (needle.len == 0) {
+            try ss.appendValue(allocator, hay);
+            continue;
+        }
+        scratch.clearRetainingCapacity();
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, hay, pos, needle)) |found| {
+            try scratch.appendSlice(allocator, hay[pos..found]);
+            try scratch.appendSlice(allocator, repl);
+            pos = found + needle.len;
+        }
+        try scratch.appendSlice(allocator, hay[pos..]);
+        try ss.appendValue(allocator, scratch.items);
     }
 }
 
@@ -261,6 +428,42 @@ pub fn length(arena: Allocator, arg: Expr) !Expr {
 
 pub fn coalesce(arena: Allocator, a: Expr, b: Expr) !Expr {
     return expr_mod.call(arena, "coalesce", &.{ a, b });
+}
+
+pub fn ltrim(arena: Allocator, arg: Expr) !Expr {
+    return expr_mod.call(arena, "ltrim", &.{arg});
+}
+
+pub fn rtrim(arena: Allocator, arg: Expr) !Expr {
+    return expr_mod.call(arena, "rtrim", &.{arg});
+}
+
+pub fn trim(arena: Allocator, arg: Expr) !Expr {
+    return expr_mod.call(arena, "trim", &.{arg});
+}
+
+pub fn reverse(arena: Allocator, arg: Expr) !Expr {
+    return expr_mod.call(arena, "reverse", &.{arg});
+}
+
+pub fn octetLength(arena: Allocator, arg: Expr) !Expr {
+    return expr_mod.call(arena, "octet_length", &.{arg});
+}
+
+pub fn charLength(arena: Allocator, arg: Expr) !Expr {
+    return expr_mod.call(arena, "char_length", &.{arg});
+}
+
+pub fn concat(arena: Allocator, args: []const Expr) !Expr {
+    return expr_mod.call(arena, "concat", args);
+}
+
+pub fn substring(arena: Allocator, s: Expr, start: Expr, length_arg: Expr) !Expr {
+    return expr_mod.call(arena, "substring", &.{ s, start, length_arg });
+}
+
+pub fn replace(arena: Allocator, haystack: Expr, needle: Expr, repl: Expr) !Expr {
+    return expr_mod.call(arena, "replace", &.{ haystack, needle, repl });
 }
 
 // ---------------------------------------------------------------------------
