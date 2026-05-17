@@ -221,6 +221,41 @@ pub const Table = struct {
         try self.awaitWalDurable(wal_target);
     }
 
+    /// Bulk-insert a wire-decoded columnar batch. Used by the TCP write
+    /// path: client encodes rows into the wire batch format, server
+    /// decodes and lands here. Avoids the row-major detour `insert`
+    /// takes for `anytype` rows.
+    ///
+    /// Same lock + WAL + unique + auto-flush semantics as `insert`.
+    pub fn insertBatch(
+        self: *Table,
+        batch_schema: []const types.Column,
+        views: []const storage.ColumnView,
+        row_count: usize,
+    ) !void {
+        self.mutex.lockUncancelable(self.io);
+        var wal_target: ?u64 = null;
+        {
+            defer self.mutex.unlock(self.io);
+            const was_empty = self.memtable.isEmpty();
+            const before_count: usize = @intCast(self.memtable.row_count);
+            try self.memtable.insertColumnarBatch(batch_schema, views, row_count);
+            const after_count: usize = @intCast(self.memtable.row_count);
+
+            if (self.wal) |*w| {
+                wal_target = try w.appendInsert(self.memtable, before_count, after_count);
+            }
+            if (was_empty and !self.memtable.isEmpty()) {
+                self.first_write_ts = Io.Clock.awake.now(self.io);
+            }
+            if (self.schema.unique) {
+                try @import("upsert.zig").applyUpsertResolution(self);
+            }
+            try self.maybeAutoFlushLocked();
+        }
+        try self.awaitWalDurable(wal_target);
+    }
+
     /// Mutates the memtable + appends bytes to the WAL (no fsync). The
     /// returned offset is the cumulative WAL write_offset after our append,
     /// passed to `awaitDurable` once the Table mutex is released so a

@@ -166,6 +166,11 @@ fn handleConnection(
                 try sendError(&writer.interface, @errorName(err));
             };
         },
+        @intFromEnum(wire.MsgType.req_insert) => {
+            handleInsert(allocator, db, payload, &writer.interface) catch |err| {
+                try sendError(&writer.interface, @errorName(err));
+            };
+        },
         else => {
             try sendError(&writer.interface, "unknown request type");
         },
@@ -295,6 +300,26 @@ fn handleCompact(db: *Database, payload: []const u8, writer: *std.Io.Writer) !vo
     const t = db.tables.get(name) orelse return local.Error.TableNotFound;
     try t.compact();
     try sendOk(writer);
+}
+
+fn handleInsert(
+    allocator: Allocator,
+    db: *Database,
+    payload: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    var cursor: usize = 0;
+    const name = try wire.readLenString(payload, &cursor);
+    const t = db.tables.get(name) orelse return local.Error.TableNotFound;
+
+    var decoded = try wire.decodeBatch(allocator, payload[cursor..]);
+    defer decoded.deinit();
+
+    try t.insertBatch(decoded.schema, decoded.views, decoded.row_count);
+
+    var resp_payload: [8]u8 = undefined;
+    std.mem.writeInt(u64, &resp_payload, @intCast(decoded.row_count), .little);
+    try wire.writeFrameToIo(writer, .resp_ok, &resp_payload);
 }
 
 fn handleDelete(

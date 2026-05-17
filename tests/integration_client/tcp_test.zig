@@ -150,6 +150,136 @@ test "tcp: createTable round-trips a full schema (columns + order_key + unique)"
     if (sctx.err) |e| return e;
 }
 
+// Write RPC: insert rows over TCP, then read them back over TCP.
+// Round-trips through the columnar wire batch format both directions.
+test "tcp: insert rows + read back via scan, all over the socket" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 6;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+
+    // Pre-create the table in-process (createTable RPC is tested separately).
+    _ = try server.db.table("orders", schema_v1, opts_v1);
+
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    // Three connections: insert, flush, scan.
+    var sctx: ServerCtx = .{ .server = server, .n = 3 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    var conn = try thindb.connect(allocator, io, listen_addr);
+    defer conn.close();
+
+    const Row = struct { id: i64, qty: i32, active: bool, tag: []const u8 };
+    try conn.insert("orders", &[_]Row{
+        .{ .id = 1, .qty = 10, .active = true,  .tag = "a" },
+        .{ .id = 2, .qty = 20, .active = false, .tag = "bb" },
+        .{ .id = 3, .qty = 30, .active = true,  .tag = "ccc" },
+    });
+    try conn.flush("orders");
+
+    var q = try conn.scan("orders");
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    var qtys: std.ArrayList(i32) = .empty;
+    defer qtys.deinit(allocator);
+    var tags_concat: std.ArrayList(u8) = .empty;
+    defer tags_concat.deinit(allocator);
+
+    while (try q.next()) |batch| {
+        try ids.appendSlice(allocator, batch.values[0].data.bigint);
+        try qtys.appendSlice(allocator, batch.values[1].data.int);
+        for (batch.values[3].data.string.offsets[0..batch.row_count], batch.values[3].data.string.offsets[1 .. batch.row_count + 1]) |start, end| {
+            try tags_concat.appendSlice(allocator, batch.values[3].data.string.bytes[start..end]);
+        }
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids.items);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30 }, qtys.items);
+    try std.testing.expectEqualStrings("abbccc", tags_concat.items);
+
+    if (sctx.err) |e| return e;
+}
+
+// Write RPC: tuple-shape insert (`&.{ .{...}, .{...} }`). Each tuple
+// element is its own anonymous struct type, so the encoder has to walk
+// fields-per-element rather than coerce to a common row type.
+test "tcp: insert accepts the &.{ ... } tuple shape over the wire" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 7;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+
+    _ = try server.db.table("orders", schema_v1, opts_v1);
+
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    var sctx: ServerCtx = .{ .server = server, .n = 3 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    var conn = try thindb.connect(allocator, io, listen_addr);
+    defer conn.close();
+
+    try conn.insert("orders", &.{
+        .{ .id = @as(i64, 100), .qty = @as(i32, 1), .active = true,  .tag = @as([]const u8, "x") },
+        .{ .id = @as(i64, 200), .qty = @as(i32, 2), .active = false, .tag = @as([]const u8, "y") },
+    });
+    try conn.flush("orders");
+
+    var q = try conn.scan("orders");
+    defer q.deinit();
+    var total: usize = 0;
+    while (try q.next()) |batch| total += batch.row_count;
+    try std.testing.expectEqual(@as(usize, 2), total);
+
+    if (sctx.err) |e| return e;
+}
+
 // Admin RPC: alter a table over TCP. Add a column, then verify a scan
 // over TCP returns the new column in its schema with the supplied
 // default for the existing rows.

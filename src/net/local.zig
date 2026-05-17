@@ -103,17 +103,27 @@ pub const Connection = struct {
     /// `Table.insert`'s argument: a slice/array/tuple of struct literals
     /// whose fields map to schema columns.
     ///
-    /// v1: in-process only. Over TCP this currently errors with
-    /// `UnsupportedOp` — wire-format batch insert lands in a follow-up
-    /// (needs row→columnar conversion + a new server-side
-    /// `Memtable.insertColumnarBatch` entry point).
+    /// In-process: forwards to `Table.insert` directly.
+    /// TCP: comptime-encodes rows into a columnar wire batch, sends one
+    /// frame, server bulk-appends via `Memtable.insertColumnarBatch`.
     pub fn insert(self: *Connection, table_name: []const u8, rows: anytype) !void {
         switch (self.transport) {
             .in_process => |db| {
                 const t = db.tables.get(table_name) orelse return Error.TableNotFound;
                 try t.insert(rows);
             },
-            .tcp => return Error.UnsupportedOp,
+            .tcp => {
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                try wire.appendLenString(self.allocator, &payload, table_name);
+                try encodeRowsAsBatch(self.allocator, &payload, rows);
+
+                const resp = try self.sendAdminTcp(.req_insert, payload.items);
+                defer self.allocator.free(resp);
+                // Server replies with [count u64]; nothing useful to the
+                // caller today, but we validate the shape.
+                if (resp.len != 8) return Error.UnexpectedResponse;
+            },
         }
     }
 
@@ -770,6 +780,239 @@ fn complementColumns(
         if (!dropped) try out.append(allocator, c.name);
     }
     return try out.toOwnedSlice(allocator);
+}
+
+// ---------------------------------------------------------------------------
+// Row → wire batch encoder (TCP insert path)
+//
+// Walks the user's row struct at comptime, emits the column-major wire
+// format that `wire.decodeBatch` consumes on the server. Width-info
+// (varchar N, decimal precision) isn't conveyed from Zig types — the
+// client always picks the most general tag for a given Zig type, and
+// the server's column-family match in `Memtable.insertColumnarBatch`
+// accepts string-like tags interchangeably so `[]const u8` lands in
+// VARCHAR / STRING / CHAR columns alike.
+// ---------------------------------------------------------------------------
+
+fn encodeRowsAsBatch(allocator: Allocator, out: *std.ArrayList(u8), rows: anytype) !void {
+    const Rows = @TypeOf(rows);
+    const info = @typeInfo(Rows);
+    switch (info) {
+        .pointer => |p| switch (p.size) {
+            .slice => return encodeRowsAsBatchFromIterable(allocator, out, rows),
+            .one => {
+                const child_info = @typeInfo(p.child);
+                if (comptime child_info == .@"struct" and child_info.@"struct".is_tuple) {
+                    return encodeRowsAsBatchFromTuple(allocator, out, rows);
+                } else if (comptime child_info == .array) {
+                    return encodeRowsAsBatchFromIterable(allocator, out, rows);
+                } else {
+                    @compileError("encodeRowsAsBatch: expected slice/array/tuple, got " ++ @typeName(Rows));
+                }
+            },
+            else => @compileError("encodeRowsAsBatch: unsupported pointer shape " ++ @typeName(Rows)),
+        },
+        .array => return encodeRowsAsBatchFromIterable(allocator, out, &rows),
+        else => @compileError("encodeRowsAsBatch: unsupported rows type " ++ @typeName(Rows)),
+    }
+}
+
+fn encodeRowsAsBatchFromIterable(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    rows: anytype,
+) !void {
+    const Row = @TypeOf(rows[0]);
+    const fields = @typeInfo(Row).@"struct".fields;
+    const row_count = rows.len;
+
+    try wire.appendU32(allocator, out, @intCast(row_count));
+    try wire.appendU32(allocator, out, @intCast(fields.len));
+
+    inline for (fields) |field| {
+        try wire.appendLenString(allocator, out, field.name);
+        try out.append(allocator, @intFromEnum(zigTypeToWireTag(field.type)));
+        try out.append(allocator, 0); // not nullable
+        try wire.appendU32(allocator, out, 0); // type_extra unused
+
+        try writeColumnFromRows(field.type, allocator, out, rows, field.name);
+        try wire.appendU32(allocator, out, 0); // empty null bitmap
+    }
+}
+
+/// Tuples don't support runtime indexing AND each anonymous struct
+/// literal has its own type, so we can't trivially collect to a typed
+/// array. Instead, derive the row schema from element 0 and pull each
+/// column's values via comptime `@field` extraction from each tuple
+/// element independently. Works for any tuple whose elements all
+/// declare the same set of named fields with coercible types.
+fn encodeRowsAsBatchFromTuple(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    tuple_ptr: anytype,
+) !void {
+    const TupleT = @TypeOf(tuple_ptr.*);
+    const tuple_info = @typeInfo(TupleT).@"struct";
+    const tuple_fields = tuple_info.fields;
+    if (tuple_fields.len == 0) {
+        @compileError("encodeRowsAsBatch: empty tuple has no row type to infer");
+    }
+    const Row0 = tuple_fields[0].type;
+    const row_fields = @typeInfo(Row0).@"struct".fields;
+
+    try wire.appendU32(allocator, out, @intCast(tuple_fields.len));
+    try wire.appendU32(allocator, out, @intCast(row_fields.len));
+
+    inline for (row_fields) |rf| {
+        try wire.appendLenString(allocator, out, rf.name);
+        try out.append(allocator, @intFromEnum(zigTypeToWireTag(rf.type)));
+        try out.append(allocator, 0);
+        try wire.appendU32(allocator, out, 0);
+
+        // Per-field collection across tuple elements. Each tuple slot may
+        // have its own anonymous-struct type, but `@field(row, rf.name)`
+        // works regardless — the value coerces to the schema column type
+        // we declared above.
+        var typed: std.ArrayList(rf.type) = .empty;
+        defer typed.deinit(allocator);
+        try typed.ensureTotalCapacity(allocator, tuple_fields.len);
+        inline for (tuple_fields) |tf| {
+            const row = @field(tuple_ptr.*, tf.name);
+            typed.appendAssumeCapacity(@field(row, rf.name));
+        }
+        try writeColumnFromTypedSlice(rf.type, allocator, out, typed.items);
+        try wire.appendU32(allocator, out, 0); // empty null bitmap
+    }
+}
+
+fn writeColumnFromTypedSlice(
+    comptime T: type,
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    values: []const T,
+) !void {
+    switch (T) {
+        i8, i16, i32, i64, i128 => {
+            const size = @sizeOf(T);
+            try wire.appendU32(allocator, out, @intCast(values.len * size));
+            for (values) |v| {
+                var buf: [size]u8 = undefined;
+                std.mem.writeInt(T, &buf, v, .little);
+                try out.appendSlice(allocator, &buf);
+            }
+        },
+        bool => {
+            try wire.appendU32(allocator, out, @intCast(values.len));
+            for (values) |v| try out.append(allocator, @intFromBool(v));
+        },
+        f32 => {
+            try wire.appendU32(allocator, out, @intCast(values.len * 4));
+            for (values) |v| {
+                var buf: [4]u8 = undefined;
+                std.mem.writeInt(u32, &buf, @bitCast(v), .little);
+                try out.appendSlice(allocator, &buf);
+            }
+        },
+        f64 => {
+            try wire.appendU32(allocator, out, @intCast(values.len * 8));
+            for (values) |v| {
+                var buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, &buf, @bitCast(v), .little);
+                try out.appendSlice(allocator, &buf);
+            }
+        },
+        []const u8, []u8 => {
+            const row_count: u32 = @intCast(values.len);
+            try wire.appendU32(allocator, out, (row_count + 1) * 4);
+            var byte_total: u32 = 0;
+            var off_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &off_buf, 0, .little);
+            try out.appendSlice(allocator, &off_buf);
+            for (values) |s| {
+                byte_total += @intCast(s.len);
+                std.mem.writeInt(u32, &off_buf, byte_total, .little);
+                try out.appendSlice(allocator, &off_buf);
+            }
+            try wire.appendU32(allocator, out, byte_total);
+            for (values) |s| try out.appendSlice(allocator, s);
+        },
+        else => @compileError("writeColumnFromTypedSlice: unsupported type " ++ @typeName(T)),
+    }
+}
+
+fn zigTypeToWireTag(comptime T: type) @import("../types.zig").TypeTag {
+    return switch (T) {
+        i8 => .tinyint,
+        i16 => .smallint,
+        i32 => .int,
+        i64 => .bigint,
+        i128 => .largeint,
+        bool => .boolean,
+        f32 => .float,
+        f64 => .double,
+        []const u8, []u8 => .string,
+        else => @compileError("encodeRowsAsBatch: unsupported field type " ++ @typeName(T)),
+    };
+}
+
+fn writeColumnFromRows(
+    comptime T: type,
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    rows: anytype,
+    comptime field_name: []const u8,
+) !void {
+    switch (T) {
+        i8, i16, i32, i64, i128 => {
+            const size = @sizeOf(T);
+            try wire.appendU32(allocator, out, @intCast(rows.len * size));
+            for (rows) |row| {
+                var buf: [size]u8 = undefined;
+                std.mem.writeInt(T, &buf, @field(row, field_name), .little);
+                try out.appendSlice(allocator, &buf);
+            }
+        },
+        bool => {
+            try wire.appendU32(allocator, out, @intCast(rows.len));
+            for (rows) |row| try out.append(allocator, @intFromBool(@field(row, field_name)));
+        },
+        f32 => {
+            try wire.appendU32(allocator, out, @intCast(rows.len * 4));
+            for (rows) |row| {
+                const v: f32 = @field(row, field_name);
+                var buf: [4]u8 = undefined;
+                std.mem.writeInt(u32, &buf, @bitCast(v), .little);
+                try out.appendSlice(allocator, &buf);
+            }
+        },
+        f64 => {
+            try wire.appendU32(allocator, out, @intCast(rows.len * 8));
+            for (rows) |row| {
+                const v: f64 = @field(row, field_name);
+                var buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, &buf, @bitCast(v), .little);
+                try out.appendSlice(allocator, &buf);
+            }
+        },
+        []const u8, []u8 => {
+            // offsets: row_count+1 entries × 4 bytes
+            const row_count: u32 = @intCast(rows.len);
+            try wire.appendU32(allocator, out, (row_count + 1) * 4);
+            var byte_total: u32 = 0;
+            var off_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &off_buf, 0, .little);
+            try out.appendSlice(allocator, &off_buf);
+            for (rows) |row| {
+                const s = @field(row, field_name);
+                byte_total += @intCast(s.len);
+                std.mem.writeInt(u32, &off_buf, byte_total, .little);
+                try out.appendSlice(allocator, &off_buf);
+            }
+            try wire.appendU32(allocator, out, byte_total);
+            for (rows) |row| try out.appendSlice(allocator, @field(row, field_name));
+        },
+        else => @compileError("writeColumnFromRows: unsupported field type " ++ @typeName(T)),
+    }
 }
 
 /// Open an in-process Connection. Equivalent to opening a Database, but

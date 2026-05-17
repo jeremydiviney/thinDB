@@ -329,6 +329,157 @@ pub const Memtable = struct {
         }
     }
 
+    /// Append a wire-decoded columnar batch into the memtable. Each batch
+    /// column is matched to the memtable schema by NAME (column order
+    /// across the wire may differ); every memtable schema column must
+    /// have a matching batch column with the same type tag.
+    ///
+    /// Used by the TCP write path: the client encodes rows to the wire
+    /// batch format, the server hands the decoded batch here for bulk
+    /// per-column append. Avoids the row-major detour that
+    /// `insertOneRow` takes.
+    pub fn insertColumnarBatch(
+        self: *Memtable,
+        batch_schema: []const types.Column,
+        column_views: []const ColumnView,
+        row_count: usize,
+    ) !void {
+        // Build batch_to_memtable map: for each schema column, which batch
+        // column is it? Also enforces "every schema column present".
+        // Stack-allocated upper bound — schemas this wide don't happen in v1.
+        var batch_idx_for_schema: [256]usize = undefined;
+        if (self.schema.columns.len > batch_idx_for_schema.len) return Error.MissingColumn;
+
+        for (self.schema.columns, 0..) |sch_col, si| {
+            var found: ?usize = null;
+            for (batch_schema, 0..) |bc, bi| {
+                if (std.mem.eql(u8, bc.name, sch_col.name)) {
+                    found = bi;
+                    break;
+                }
+            }
+            const bi = found orelse return Error.MissingColumn;
+            // Type tag must match. Width-info inside the type (varchar N,
+            // decimal precision) is metadata; the storage layout only cares
+            // about the tag. The string-like family (.varchar/.string/.char)
+            // is treated as one — clients without schema knowledge ship
+            // `[]const u8` as the generic .string tag, server lands it in
+            // whichever string column the schema declares.
+            const sch_tag = @as(types.TypeTag, sch_col.type);
+            const batch_tag = @as(types.TypeTag, batch_schema[bi].type);
+            const ok = sch_tag == batch_tag or
+                (isStringTag(sch_tag) and isStringTag(batch_tag));
+            if (!ok) return Error.TypeMismatch;
+            // Wire-side nullable=true into a NOT-NULL schema column is a
+            // hazard (some incoming rows may be NULL); reject so the
+            // caller fixes their schema.
+            if (batch_schema[bi].nullable and !sch_col.nullable) return Error.TypeMismatch;
+            batch_idx_for_schema[si] = bi;
+        }
+
+        // Append each column. v1: no rollback on partial-column-append
+        // failure — the only realistic failure is OOM, which is terminal
+        // in practice. If that limitation matters later, swap in a snapshot/
+        // restore of every column's ArrayList lengths.
+        for (self.schema.columns, 0..) |sch_col, si| {
+            const view = column_views[batch_idx_for_schema[si]];
+            try self.appendColumnFromView(si, sch_col, view, row_count);
+        }
+        self.row_count += @intCast(row_count);
+    }
+
+    fn appendColumnFromView(
+        self: *Memtable,
+        col_idx: usize,
+        sch_col: types.Column,
+        view: ColumnView,
+        row_count: usize,
+    ) !void {
+        const col = &self.columns[col_idx];
+        switch (view.data) {
+            .int => |s| switch (col.data) {
+                .int => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .bigint => |s| switch (col.data) {
+                .bigint => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .boolean => |s| switch (col.data) {
+                .boolean => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .float => |s| switch (col.data) {
+                .float => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .double => |s| switch (col.data) {
+                .double => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .date => |s| switch (col.data) {
+                .date => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .datetime => |s| switch (col.data) {
+                .datetime => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .tinyint => |s| switch (col.data) {
+                .tinyint => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .smallint => |s| switch (col.data) {
+                .smallint => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .largeint => |s| switch (col.data) {
+                .largeint => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .decimal64 => |s| switch (col.data) {
+                .decimal64 => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .decimal128 => |s| switch (col.data) {
+                .decimal128 => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
+            .varchar, .string, .char => |sv| {
+                var i: usize = 0;
+                while (i < row_count) : (i += 1) {
+                    try self.appendString(col_idx, sv.rowBytes(i));
+                }
+                // appendString writes valid bits — return so we don't
+                // double-process the bitmap below.
+                _ = sch_col;
+                return;
+            },
+        }
+
+        // Fixed-width path: update the validity bitmap for the appended rows.
+        if (col.nulls != null) {
+            const new_row_count = col.data.rowCount();
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) {
+                const row = new_row_count - row_count + i;
+                const valid = if (view.nulls) |bm|
+                    @import("../storage/column.zig").isValidBit(bm, i)
+                else
+                    true;
+                try col.appendValidBit(self.allocator, row, valid);
+            }
+        }
+        _ = sch_col;
+    }
+
+    fn isStringTag(t: types.TypeTag) bool {
+        return switch (t) {
+            .varchar, .string, .char => true,
+            else => false,
+        };
+    }
+
     fn insertOneRow(self: *Memtable, row: anytype) !void {
         const R = @TypeOf(row);
         const info = @typeInfo(R);
