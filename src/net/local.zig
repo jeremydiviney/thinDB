@@ -27,6 +27,11 @@ const Io = std.Io;
 const thindb_api = @import("../api/api.zig");
 const Database = thindb_api.Database;
 const Config = thindb_api.Config;
+const TableOptions = thindb_api.TableOptions;
+const AlterOp = thindb_api.AlterOp;
+
+const types = @import("../types.zig");
+const Schema = types.Schema;
 
 const exec = @import("../exec/exec.zig");
 const Query = exec.Query;
@@ -94,6 +99,38 @@ pub const Connection = struct {
     // `resp_error`. Each call opens a fresh TCP stream (stateless model).
     // -----------------------------------------------------------------
 
+    /// Create or open a table. If the table exists on disk its schema
+    /// must match. `opts.row_group_size` falls back to the server's
+    /// configured default. Same semantics as `Database.table`.
+    pub fn createTable(
+        self: *Connection,
+        name: []const u8,
+        schema: Schema,
+        opts: TableOptions,
+    ) !void {
+        switch (self.transport) {
+            .in_process => |db| {
+                _ = try db.table(name, schema, opts);
+            },
+            .tcp => {
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                try wire.appendLenString(self.allocator, &payload, name);
+                try wire.encodeSchema(self.allocator, &payload, schema);
+                // row_group_size: 1-byte presence flag + u64 value if present.
+                if (opts.row_group_size) |rgs| {
+                    try payload.append(self.allocator, 1);
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &buf, @intCast(rgs), .little);
+                    try payload.appendSlice(self.allocator, &buf);
+                } else {
+                    try payload.append(self.allocator, 0);
+                }
+                _ = try self.sendAdminTcp(.req_create_table, payload.items);
+            },
+        }
+    }
+
     /// Drop a table. Removes the in-memory entry, waits for in-flight
     /// scans on this table to finish, then deletes the on-disk directory.
     pub fn dropTable(self: *Connection, name: []const u8) !void {
@@ -104,6 +141,23 @@ pub const Connection = struct {
                 defer payload.deinit(self.allocator);
                 try wire.appendLenString(self.allocator, &payload, name);
                 _ = try self.sendAdminTcp(.req_drop_table, payload.items);
+            },
+        }
+    }
+
+    /// Apply schema operations to a table. Same semantics as
+    /// `Database.alterTable` — caller must not hold active queries on
+    /// this table when calling.
+    pub fn alterTable(self: *Connection, name: []const u8, ops: []const AlterOp) !void {
+        switch (self.transport) {
+            .in_process => |db| try db.alterTable(name, ops),
+            .tcp => {
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                try wire.appendLenString(self.allocator, &payload, name);
+                try wire.appendU32(self.allocator, &payload, @intCast(ops.len));
+                for (ops) |op| try wire.encodeAlterOp(self.allocator, &payload, op);
+                _ = try self.sendAdminTcp(.req_alter_table, payload.items);
             },
         }
     }

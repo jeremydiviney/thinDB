@@ -89,6 +89,144 @@ test "tcp: scan round-trips a small batch over a real socket" {
     if (sctx.err) |e| return e;
 }
 
+// Admin RPC: create a table over TCP, then seed + flush + scan it via
+// the existing in-process Database (server-side). Verifies that the
+// wire schema is faithful enough that downstream operations work on
+// the table just like they would after a local createTable.
+test "tcp: createTable round-trips a full schema (columns + order_key + unique)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 4;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    // Two connections: createTable, then a verification scan.
+    var sctx: ServerCtx = .{ .server = server, .n = 2 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    var conn = try thindb.connect(allocator, io, listen_addr);
+    defer conn.close();
+
+    try conn.createTable("products", schema_v1, opts_v1);
+
+    // The server now has the table — seed it via the in-process Database
+    // pointer (insert RPC lands next), then verify by scanning over TCP.
+    const t = server.db.tables.get("products") orelse unreachable;
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" },
+    });
+    try t.flush();
+
+    var q = try conn.scan("products");
+    defer q.deinit();
+    var total: usize = 0;
+    while (try q.next()) |batch| total += batch.row_count;
+    try std.testing.expectEqual(@as(usize, 2), total);
+
+    if (sctx.err) |e| return e;
+}
+
+// Admin RPC: alter a table over TCP. Add a column, then verify a scan
+// over TCP returns the new column in its schema with the supplied
+// default for the existing rows.
+test "tcp: alterTable add column populates default + appears in scan output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 5;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+
+    // Seed in-process so we have rows to verify the default-fill against.
+    const t = try server.db.table("orders", schema_v1, opts_v1);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" },
+    });
+    try t.flush();
+
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    var sctx: ServerCtx = .{ .server = server, .n = 2 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    var conn = try thindb.connect(allocator, io, listen_addr);
+    defer conn.close();
+
+    const ops = [_]thindb.AlterOp{
+        .{ .add = .{
+            .name = "rank",
+            .type = .int,
+            .nullable = false,
+            .default = .{ .int = 99 },
+        } },
+    };
+    try conn.alterTable("orders", &ops);
+
+    var q = try conn.scan("orders");
+    defer q.deinit();
+
+    var saw_rank = false;
+    var rank_values: std.ArrayList(i32) = .empty;
+    defer rank_values.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (batch.schema, 0..) |col, i| {
+            if (std.mem.eql(u8, col.name, "rank")) {
+                saw_rank = true;
+                try rank_values.appendSlice(allocator, batch.values[i].data.int[0..batch.row_count]);
+            }
+        }
+    }
+    try std.testing.expect(saw_rank);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 99, 99 }, rank_values.items);
+
+    if (sctx.err) |e| return e;
+}
+
 // Admin RPC: drop a table over TCP. Verify the on-disk directory is
 // gone AND that a follow-up scan fails. Server runs two requests in
 // a row (drop, then a fresh scan), so we need two acceptOne() calls.

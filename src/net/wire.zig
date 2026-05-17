@@ -56,6 +56,11 @@ const column_mod = storage.column;
 const exec = @import("../exec/exec.zig");
 const Batch = exec.Batch;
 
+const api = @import("../api/api.zig");
+const AlterOp = api.AlterOp;
+
+const ir = @import("../ir/ir.zig");
+
 pub const MsgType = enum(u8) {
     // Request types (client → server)
     req_query = 0x01,
@@ -120,6 +125,142 @@ pub fn writeFrameToIo(
 pub fn appendLenString(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     try appendU32(allocator, out, @intCast(s.len));
     try out.appendSlice(allocator, s);
+}
+
+/// Encode a Schema into `out` (unique + columns + order_key).
+///
+/// Layout:
+///   [unique u8]
+///   [col_count u32]
+///   per column: [name_len u32][name][type_tag u8][nullable u8][type_extra u32]
+///   [order_key_count u32]
+///   per key: [name_len u32][name]
+pub fn encodeSchema(allocator: Allocator, out: *std.ArrayList(u8), schema: Schema) !void {
+    try out.append(allocator, @intFromBool(schema.unique));
+
+    try appendU32(allocator, out, @intCast(schema.columns.len));
+    for (schema.columns) |c| {
+        try appendLenString(allocator, out, c.name);
+        try out.append(allocator, @intFromEnum(@as(TypeTag, c.type)));
+        try out.append(allocator, @intFromBool(c.nullable));
+        try appendU32(allocator, out, typeExtra(c.type));
+    }
+
+    try appendU32(allocator, out, @intCast(schema.order_key.len));
+    for (schema.order_key) |k| try appendLenString(allocator, out, k);
+}
+
+/// Owned-decode counterpart of `encodeSchema`. All slices land in
+/// `allocator` (an arena works well — caller can drop everything in one
+/// shot). The strings themselves are dup'd because they're borrowed
+/// from the input buffer and outlive the request handler.
+pub fn decodeSchema(allocator: Allocator, bytes: []const u8, cursor: *usize) !Schema {
+    if (cursor.* + 1 > bytes.len) return Error.WireCorrupt;
+    const unique = bytes[cursor.*] != 0;
+    cursor.* += 1;
+
+    const col_count = try readU32(bytes, cursor);
+    const cols = try allocator.alloc(Column, col_count);
+    for (cols) |*c| {
+        const name = try readLenString(bytes, cursor);
+        if (cursor.* + 1 + 1 + 4 > bytes.len) return Error.WireCorrupt;
+        const tag_byte = bytes[cursor.*];
+        cursor.* += 1;
+        const nullable = bytes[cursor.*] != 0;
+        cursor.* += 1;
+        const extra = std.mem.readInt(u32, bytes[cursor.*..][0..4], .little);
+        cursor.* += 4;
+        const t = try typeFromTagAndExtra(tag_byte, extra);
+        c.* = .{
+            .name = try allocator.dupe(u8, name),
+            .type = t,
+            .nullable = nullable,
+        };
+    }
+
+    const order_key_count = try readU32(bytes, cursor);
+    const order_key = try allocator.alloc([]const u8, order_key_count);
+    for (order_key) |*k| {
+        const s = try readLenString(bytes, cursor);
+        k.* = try allocator.dupe(u8, s);
+    }
+
+    return .{ .columns = cols, .order_key = order_key, .unique = unique };
+}
+
+/// Encode one AlterOp. Layout:
+///   [op_tag u8]                          0=add, 1=drop, 2=rename
+///   add:     [name_len u32][name][type_tag u8][nullable u8][type_extra u32][value (tagged)]
+///   drop:    [name_len u32][name]
+///   rename:  [from_len u32][from][to_len u32][to]
+pub fn encodeAlterOp(allocator: Allocator, out: *std.ArrayList(u8), op: AlterOp) !void {
+    switch (op) {
+        .add => |a| {
+            try out.append(allocator, 0);
+            try appendLenString(allocator, out, a.name);
+            try out.append(allocator, @intFromEnum(@as(TypeTag, a.type)));
+            try out.append(allocator, @intFromBool(a.nullable));
+            try appendU32(allocator, out, typeExtra(a.type));
+            try ir.encodeValue(allocator, out, a.default);
+        },
+        .drop => |name| {
+            try out.append(allocator, 1);
+            try appendLenString(allocator, out, name);
+        },
+        .rename => |r| {
+            try out.append(allocator, 2);
+            try appendLenString(allocator, out, r.from);
+            try appendLenString(allocator, out, r.to);
+        },
+    }
+}
+
+/// Inverse of `encodeAlterOp`. Allocates into `allocator` — an arena
+/// is appropriate.
+pub fn decodeAlterOp(allocator: Allocator, bytes: []const u8, cursor: *usize) !AlterOp {
+    if (cursor.* + 1 > bytes.len) return Error.WireCorrupt;
+    const tag = bytes[cursor.*];
+    cursor.* += 1;
+    return switch (tag) {
+        0 => blk: {
+            const name = try readLenString(bytes, cursor);
+            if (cursor.* + 1 + 1 + 4 > bytes.len) return Error.WireCorrupt;
+            const tag_byte = bytes[cursor.*];
+            cursor.* += 1;
+            const nullable = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            const extra = std.mem.readInt(u32, bytes[cursor.*..][0..4], .little);
+            cursor.* += 4;
+            const t = try typeFromTagAndExtra(tag_byte, extra);
+            const v = ir.decodeValue(bytes, cursor) catch return Error.WireCorrupt;
+            break :blk AlterOp{ .add = .{
+                .name = try allocator.dupe(u8, name),
+                .type = t,
+                .nullable = nullable,
+                .default = try dupeValue(allocator, v),
+            } };
+        },
+        1 => blk: {
+            const name = try readLenString(bytes, cursor);
+            break :blk AlterOp{ .drop = try allocator.dupe(u8, name) };
+        },
+        2 => blk: {
+            const from = try readLenString(bytes, cursor);
+            const to = try readLenString(bytes, cursor);
+            break :blk AlterOp{ .rename = .{
+                .from = try allocator.dupe(u8, from),
+                .to = try allocator.dupe(u8, to),
+            } };
+        },
+        else => Error.WireCorrupt,
+    };
+}
+
+fn dupeValue(allocator: Allocator, v: @import("../types.zig").Value) !@import("../types.zig").Value {
+    return switch (v) {
+        .text => |s| .{ .text = try allocator.dupe(u8, s) },
+        else => v,
+    };
 }
 
 /// Inverse of appendLenString — returns a borrowed slice into `bytes`.
@@ -194,7 +335,7 @@ pub fn encodeBatch(allocator: Allocator, out: *std.ArrayList(u8), batch: Batch) 
     }
 }
 
-fn typeExtra(t: Type) u32 {
+pub fn typeExtra(t: Type) u32 {
     return switch (t) {
         .varchar => |n| n,
         .char => |n| n,
@@ -434,7 +575,7 @@ fn allocAlignedDup(allocator: Allocator, src: []const u8) ![]align(16) u8 {
     return dst;
 }
 
-fn typeFromTagAndExtra(tag: u8, extra: u32) !Type {
+pub fn typeFromTagAndExtra(tag: u8, extra: u32) !Type {
     if (tag > @intFromEnum(TypeTag.decimal128)) return Error.WireUnknownType;
     const tt: TypeTag = @enumFromInt(tag);
     return switch (tt) {
@@ -473,7 +614,7 @@ fn readU32(bytes: []const u8, cursor: *usize) !u32 {
 // Little-endian helpers
 // ---------------------------------------------------------------------------
 
-fn appendU32(allocator: Allocator, out: *std.ArrayList(u8), v: u32) !void {
+pub fn appendU32(allocator: Allocator, out: *std.ArrayList(u8), v: u32) !void {
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, v, .little);
     try out.appendSlice(allocator, &b);

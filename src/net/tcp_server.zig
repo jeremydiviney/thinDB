@@ -131,6 +131,11 @@ fn handleConnection(
                 try sendError(&writer.interface, @errorName(err));
             };
         },
+        @intFromEnum(wire.MsgType.req_create_table) => {
+            handleCreateTable(allocator, db, payload, &writer.interface) catch |err| {
+                try sendError(&writer.interface, @errorName(err));
+            };
+        },
         @intFromEnum(wire.MsgType.req_drop_table) => {
             handleDropTable(db, payload, &writer.interface) catch |err| {
                 try sendError(&writer.interface, @errorName(err));
@@ -138,6 +143,11 @@ fn handleConnection(
         },
         @intFromEnum(wire.MsgType.req_rename_table) => {
             handleRenameTable(db, payload, &writer.interface) catch |err| {
+                try sendError(&writer.interface, @errorName(err));
+            };
+        },
+        @intFromEnum(wire.MsgType.req_alter_table) => {
+            handleAlterTable(allocator, db, payload, &writer.interface) catch |err| {
                 try sendError(&writer.interface, @errorName(err));
             };
         },
@@ -198,10 +208,68 @@ fn sendOk(writer: *std.Io.Writer) !void {
     try wire.writeFrameToIo(writer, .resp_ok, &.{});
 }
 
+fn handleCreateTable(
+    allocator: Allocator,
+    db: *Database,
+    payload: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var cursor: usize = 0;
+    const name = try wire.readLenString(payload, &cursor);
+    const schema = try wire.decodeSchema(aa, payload, &cursor);
+
+    if (cursor + 1 > payload.len) return wire.Error.WireCorrupt;
+    const has_rgs = payload[cursor] != 0;
+    cursor += 1;
+    var rgs: ?usize = null;
+    if (has_rgs) {
+        if (cursor + 8 > payload.len) return wire.Error.WireCorrupt;
+        rgs = @intCast(std.mem.readInt(u64, payload[cursor..][0..8], .little));
+        cursor += 8;
+    }
+
+    const opts: @import("../api/api.zig").TableOptions = .{
+        .order_key = schema.order_key,
+        .unique = schema.unique,
+        .row_group_size = rgs,
+    };
+
+    _ = try db.table(name, schema, opts);
+    try sendOk(writer);
+}
+
 fn handleDropTable(db: *Database, payload: []const u8, writer: *std.Io.Writer) !void {
     var cursor: usize = 0;
     const name = try wire.readLenString(payload, &cursor);
     try db.dropTable(name);
+    try sendOk(writer);
+}
+
+fn handleAlterTable(
+    allocator: Allocator,
+    db: *Database,
+    payload: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var cursor: usize = 0;
+    const name = try wire.readLenString(payload, &cursor);
+
+    if (cursor + 4 > payload.len) return wire.Error.WireCorrupt;
+    const n_ops = std.mem.readInt(u32, payload[cursor..][0..4], .little);
+    cursor += 4;
+
+    const ops = try aa.alloc(thindb_api.AlterOp, n_ops);
+    for (ops) |*op| op.* = try wire.decodeAlterOp(aa, payload, &cursor);
+
+    try db.alterTable(name, ops);
     try sendOk(writer);
 }
 

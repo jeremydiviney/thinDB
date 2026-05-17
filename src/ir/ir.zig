@@ -318,7 +318,7 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
     }
 }
 
-fn encodeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) EncodeError!void {
+pub fn encodeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) EncodeError!void {
     try out.append(allocator, @intFromEnum(@as(ValueTag, v)));
     var b: [16]u8 = undefined;
     switch (v) {
@@ -551,7 +551,7 @@ fn readString(bytes: []const u8, cursor: *usize) DecodeError![]const u8 {
     return s;
 }
 
-fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
+pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
