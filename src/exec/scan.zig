@@ -67,6 +67,19 @@ pub const Scan = struct {
     /// Pushed-down predicates used to skip row groups via min/max stats.
     prunes: std.ArrayList(PruneHint),
 
+    /// When non-null, `seg_skip[i] == true` means segment at manifest
+    /// index `i` is excluded by a pushed-down predicate on the leading
+    /// order-key column (whose stats live in the manifest entry).
+    /// Built incrementally by `addPrune` — the segment file is never
+    /// opened for skipped segments. Null when no leading-key predicates
+    /// have been pushed.
+    seg_skip: ?[]bool = null,
+
+    /// Diagnostic counter: number of segments actually opened via
+    /// `readSegment`. Skipped segments don't increment it. Tests use
+    /// this to verify segment-level pruning fires.
+    segments_opened: u32 = 0,
+
     const Phase = enum { segments, memtable, done };
 
     pub const PruneHint = struct {
@@ -142,6 +155,7 @@ pub const Scan = struct {
         self.releaseBatch();
         self.closeCurSegment();
         self.prunes.deinit(self.allocator);
+        if (self.seg_skip) |s| self.allocator.free(s);
         if (self.filtered) |arr| {
             for (arr) |*c| c.deinit(self.allocator);
             self.allocator.free(arr);
@@ -205,6 +219,28 @@ pub const Scan = struct {
             .op = pred.op,
             .val = pred.val,
         });
+
+        // Segment-level pruning: only the leading order-key column has
+        // manifest-level stats. For predicates on it, evaluate against
+        // each segment's leading_key_stats once at plan time and mark
+        // non-matching segments as skippable. next() then never opens
+        // them.
+        const order_key = self.table.schema.order_key;
+        if (order_key.len == 0) return;
+        if (!std.mem.eql(u8, pred.col, order_key[0])) return;
+
+        const segs = self.table.manifest.segments.items[0..self.segment_count];
+        if (self.seg_skip == null) {
+            const buf = try self.allocator.alloc(bool, self.segment_count);
+            @memset(buf, false);
+            self.seg_skip = buf;
+        }
+        for (segs, 0..) |entry, i| {
+            const lk = entry.leading_key_stats orelse continue;
+            if (!statsOverlapPredicate(lk, pred.op, pred.val)) {
+                self.seg_skip.?[i] = true;
+            }
+        }
     }
 
     fn rowGroupCanMatch(self: Scan, rg: storage.RowGroupMeta) bool {
@@ -287,6 +323,11 @@ pub const Scan = struct {
         // Segments phase
         while (self.phase == .segments) {
             if (self.cur_segment == null) {
+                // Advance past segments excluded by leading-key predicates.
+                while (self.cur_seg_idx < self.segment_count) : (self.cur_seg_idx += 1) {
+                    const skip = if (self.seg_skip) |s| s[self.cur_seg_idx] else false;
+                    if (!skip) break;
+                }
                 if (self.cur_seg_idx >= self.segment_count) {
                     self.phase = .memtable;
                     break;
@@ -301,6 +342,7 @@ pub const Scan = struct {
                     file_name,
                     self.table.schema,
                 );
+                self.segments_opened += 1;
 
                 self.cur_segment_tomb = try storage.tombstone.read(
                     self.allocator,

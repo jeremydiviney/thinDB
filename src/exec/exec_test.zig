@@ -875,6 +875,111 @@ test "pipe composes a chain" {
     try std.testing.expectEqualStrings("bcd", collected_tags.items);
 }
 
+test "scan: segment-level pruning skips segments excluded by leading-key predicate" {
+    // Three flushes, each producing one segment with disjoint id ranges:
+    // seg0=[1..5], seg1=[11..15], seg2=[21..25]. A predicate
+    // `id = 22` should skip seg0 and seg1 entirely (no segment file
+    // opened), and open only seg2.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.Schema{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    try t.insert(&.{
+        .{ .id = @as(i64, 1) }, .{ .id = @as(i64, 2) }, .{ .id = @as(i64, 3) },
+        .{ .id = @as(i64, 4) }, .{ .id = @as(i64, 5) },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .id = @as(i64, 11) }, .{ .id = @as(i64, 12) }, .{ .id = @as(i64, 13) },
+        .{ .id = @as(i64, 14) }, .{ .id = @as(i64, 15) },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .id = @as(i64, 21) }, .{ .id = @as(i64, 22) }, .{ .id = @as(i64, 23) },
+        .{ .id = @as(i64, 24) }, .{ .id = @as(i64, 25) },
+    });
+    try t.flush();
+
+    var base = try scan(allocator, t);
+    var q = try base.filter(leafExpr("id", .eq, .{ .bigint = 22 }));
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        try ids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{22}, ids.items);
+
+    // Reach through Filter → Scan to verify only one segment was opened.
+    // Filter wraps Scan; Filter's `upstream` points at the Scan operator.
+    const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+    const scan_op: *exec.Scan = @ptrCast(@alignCast(filter_op.upstream.ptr));
+    try std.testing.expectEqual(@as(u32, 1), scan_op.segments_opened);
+}
+
+test "scan: segment-level pruning works for string leading-key predicates" {
+    // Same shape as the bigint test but with a string order key,
+    // exercising the prefix-encoded stats path.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.Schema{
+        .columns = &.{.{ .name = "slug", .type = .string }},
+        .order_key = &.{"slug"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"slug"}, .unique = true });
+
+    try t.insert(&.{
+        .{ .slug = @as([]const u8, "alpha") },
+        .{ .slug = @as([]const u8, "bravo") },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .slug = @as([]const u8, "delta") },
+        .{ .slug = @as([]const u8, "echo") },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .slug = @as([]const u8, "tango") },
+        .{ .slug = @as([]const u8, "victor") },
+    });
+    try t.flush();
+
+    var base = try scan(allocator, t);
+    var q = try base.filter(leafExpr("slug", .eq, .{ .text = "echo" }));
+    defer q.deinit();
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            try bytes.appendSlice(allocator, b.values[0].data.string.rowBytes(i));
+            try bytes.append(allocator, '|');
+        }
+    }
+    try std.testing.expectEqualStrings("echo|", bytes.items);
+
+    const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+    const scan_op: *exec.Scan = @ptrCast(@alignCast(filter_op.upstream.ptr));
+    try std.testing.expectEqual(@as(u32, 1), scan_op.segments_opened);
+}
+
 test "scan: string eq predicate prunes row groups via prefix stats" {
     // Builds a segment with multiple row groups whose name-column
     // ranges don't overlap, then runs `name = 'mike'` (which falls
