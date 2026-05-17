@@ -319,6 +319,15 @@ fn writeRawColumnBlock(
                 buf.appendSliceAssumeCapacity(&b);
             }
         },
+        .uuid => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 16);
+            for (slice) |v| {
+                var b: [16]u8 = undefined;
+                std.mem.writeInt(u128, &b, v, .little);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
     }
 }
 
@@ -395,8 +404,8 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
             break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
         },
         // i128 doesn't fit in the i64 stats slot — skip stats. Filter
-        // pushdown on LARGEINT / DECIMAL(p>18) columns will scan all row groups.
-        .largeint, .decimal128 => .{ .min = 0, .max = 0 },
+        // pushdown on LARGEINT / DECIMAL(p>18) / UUID columns will scan all row groups.
+        .largeint, .decimal128, .uuid => .{ .min = 0, .max = 0 },
         .decimal64 => |data| blk: {
             const slice = data[row_start..row_end];
             var lo: i64 = std.math.maxInt(i64);

@@ -85,6 +85,7 @@ fn predicateMatches(view: ColumnView, row: u32, op_byte: u8, val: Value) bool {
         .largeint => |s| cmpI(i128, s[row], val.largeint, op_byte),
         .decimal64 => |s| cmpI(i64, s[row], val.decimal64, op_byte),
         .decimal128 => |s| cmpI(i128, s[row], val.decimal128, op_byte),
+        .uuid => |s| cmpI(u128, s[row], val.uuid, op_byte),
         .varchar => |sv| cmpStr(sv.rowBytes(row), val.text, op_byte),
         .string => |sv| cmpStr(sv.rowBytes(row), val.text, op_byte),
         .char => |sv| cmpStr(sv.rowBytes(row), val.text, op_byte),
@@ -167,6 +168,7 @@ pub fn encodeColumnRange(
         .largeint => |s| try writePackedI128(allocator, out, s[from..to]),
         .decimal64 => |s| try writePackedI64(allocator, out, s[from..to]),
         .decimal128 => |s| try writePackedI128(allocator, out, s[from..to]),
+        .uuid => |s| try writePackedBytes(allocator, out, std.mem.sliceAsBytes(s[from..to])),
         .varchar, .string, .char => |sv| try writePackedStrings(allocator, out, sv, from, to),
     }
 }
@@ -241,6 +243,15 @@ fn decodeColumnRange(
             }
             cursor += want;
         },
+        .uuid => {
+            const want = @as(usize, n) * 16;
+            if (cursor + want > payload.len) return Error.WalCorrupt;
+            for (0..n) |i| {
+                const v = std.mem.readInt(u128, payload[cursor + i * 16 ..][0..16], .little);
+                try appendOne(allocator, col, schema_col, .{ .u128 = v }, nulls, i);
+            }
+            cursor += want;
+        },
         .float => {
             const want = @as(usize, n) * 4;
             if (cursor + want > payload.len) return Error.WalCorrupt;
@@ -281,6 +292,7 @@ const TypedValue = union(enum) {
     i64: i64,
     i128: i128,
     u8: u8,
+    u128: u128,
     f32: f32,
     f64: f64,
     bytes: []const u8,
@@ -313,6 +325,7 @@ fn appendOne(
         .datetime => |*l| try l.append(allocator, v.i64),
         .decimal64 => |*l| try l.append(allocator, v.i64),
         .decimal128 => |*l| try l.append(allocator, v.i128),
+        .uuid => |*l| try l.append(allocator, v.u128),
         .varchar => |*ss| try ss.appendValue(allocator, v.bytes),
         .string => |*ss| try ss.appendValue(allocator, v.bytes),
         .char => |*ss| try ss.appendValue(allocator, v.bytes),
@@ -418,6 +431,10 @@ pub fn encodeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) !voi
             std.mem.writeInt(i128, b[0..16], x, .little);
             try out.appendSlice(allocator, &b);
         },
+        .uuid => |x| {
+            std.mem.writeInt(u128, b[0..16], x, .little);
+            try out.appendSlice(allocator, &b);
+        },
         .text => |s| {
             format.writeU32(b[0..4], @intCast(s.len));
             try out.appendSlice(allocator, b[0..4]);
@@ -499,6 +516,12 @@ fn decodeValue(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
             const v = std.mem.readInt(i128, payload[c..][0..16], .little);
             cursor.* = c + 16;
             break :blk Value{ .decimal128 = v };
+        },
+        .uuid => blk: {
+            if (c + 16 > payload.len) return Error.WalCorrupt;
+            const v = std.mem.readInt(u128, payload[c..][0..16], .little);
+            cursor.* = c + 16;
+            break :blk Value{ .uuid = v };
         },
         .text => blk: {
             if (c + 4 > payload.len) return Error.WalCorrupt;

@@ -9,6 +9,7 @@ test {
     _ = @import("wal_test.zig");
     _ = @import("durability_test.zig");
     _ = @import("ddl_test.zig");
+    _ = @import("uuid_test.zig");
 }
 
 test "integration entry exists" {

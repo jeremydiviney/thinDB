@@ -32,6 +32,7 @@ pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
         .datetime => |l| std.math.order(l.items[a], l.items[b]),
         .decimal64 => |l| std.math.order(l.items[a], l.items[b]),
         .decimal128 => |l| std.math.order(l.items[a], l.items[b]),
+        .uuid => |l| std.math.order(l.items[a], l.items[b]),
     };
 }
 
@@ -108,6 +109,10 @@ pub fn appendAllColumn(
         },
         .decimal128 => |s| switch (out.data) {
             .decimal128 => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
+        .uuid => |s| switch (out.data) {
+            .uuid => |*list| try list.appendSlice(allocator, s),
             else => unreachable,
         },
     }
@@ -233,6 +238,13 @@ pub fn appendByIndices(
             },
             else => unreachable,
         },
+        .uuid => |s| switch (out.data) {
+            .uuid => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
     }
     if (out.nulls != null) {
         for (indices, 0..) |src_idx, j| {
@@ -336,6 +348,12 @@ pub fn appendMaskedColumn(
         },
         .decimal128 => |s| switch (out.data) {
             .decimal128 => |*list| for (s, mask) |v, m| {
+                if (m) try list.append(allocator, v);
+            },
+            else => unreachable,
+        },
+        .uuid => |s| switch (out.data) {
+            .uuid => |*list| for (s, mask) |v, m| {
                 if (m) try list.append(allocator, v);
             },
             else => unreachable,
@@ -449,6 +467,12 @@ pub fn applyPermutation(
             errdefer dst.deinit(allocator);
             for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
             break :blk DataStore{ .decimal128 = dst };
+        },
+        .uuid => |l| blk: {
+            var dst: std.ArrayList(u128) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .uuid = dst };
         },
     };
 

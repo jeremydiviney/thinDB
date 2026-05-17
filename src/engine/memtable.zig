@@ -167,6 +167,7 @@ pub const Memtable = struct {
                 .char => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
                 .decimal64 => |l| l.items.len * @sizeOf(i64),
                 .decimal128 => |l| l.items.len * @sizeOf(i128),
+                .uuid => |l| l.items.len * @sizeOf(u128),
             };
             if (col.nulls) |n| total += n.items.len;
         }
@@ -445,6 +446,10 @@ pub const Memtable = struct {
                 .decimal128 => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
                 else => return Error.TypeMismatch,
             },
+            .uuid => |s| switch (col.data) {
+                .uuid => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
             .varchar, .string, .char => |sv| {
                 // Honor the wire's null bitmap if present. appendString
                 // always writes valid=true, so for null rows we have to
@@ -563,6 +568,10 @@ pub const Memtable = struct {
             try self.appendInt64(col_idx, value);
         } else if (comptime V == i128) {
             try self.appendInt128(col_idx, value);
+        } else if (comptime V == u128) {
+            try self.appendUuid(col_idx, value);
+        } else if (comptime V == types.Uuid) {
+            try self.appendUuid(col_idx, value.value());
         } else if (comptime V == bool) {
             try self.appendBoolean(col_idx, value);
         } else if (comptime V == f32 or V == comptime_float) {
@@ -590,6 +599,7 @@ pub const Memtable = struct {
             .datetime => |*list| try list.append(self.allocator, @as(i64, value)),
             .decimal64 => |*list| try list.append(self.allocator, @as(i64, value)),
             .decimal128 => |*list| try list.append(self.allocator, @as(i128, value)),
+            .uuid => |*list| try list.append(self.allocator, @as(u128, value)),
             else => return Error.TypeMismatch,
         }
         if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -632,6 +642,15 @@ pub const Memtable = struct {
         switch (col.data) {
             .largeint => |*list| try list.append(self.allocator, value),
             .decimal128 => |*list| try list.append(self.allocator, value),
+            else => return Error.TypeMismatch,
+        }
+        if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
+    }
+
+    fn appendUuid(self: *Memtable, col_idx: usize, value: u128) !void {
+        const col = &self.columns[col_idx];
+        switch (col.data) {
+            .uuid => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
         if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);

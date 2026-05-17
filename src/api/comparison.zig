@@ -50,6 +50,7 @@ pub fn evalRow(view: storage.ColumnView, row: u32, pred: exec.Predicate) bool {
         .char => |sv| cmpStr(sv.rowBytes(row), pred.val.text, pred.op),
         .decimal64 => |s| cmpVal(i64, s[row], pred.val.decimal64, pred.op),
         .decimal128 => |s| cmpVal(i128, s[row], pred.val.decimal128, pred.op),
+        .uuid => |s| cmpVal(u128, s[row], pred.val.uuid, pred.op),
     };
 }
 
@@ -112,6 +113,11 @@ pub fn appendColumnValueBytes(
         .decimal128 => |s| {
             var b: [16]u8 = undefined;
             std.mem.writeInt(i128, &b, s[row], .little);
+            try buf.appendSlice(aa, &b);
+        },
+        .uuid => |s| {
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(u128, &b, s[row], .little);
             try buf.appendSlice(aa, &b);
         },
     }

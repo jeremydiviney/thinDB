@@ -528,6 +528,7 @@ fn encodeColumnData(
         .largeint => |s| try writeFixedBytes(allocator, out, std.mem.sliceAsBytes(s[0..row_count])),
         .decimal64 => |s| try writeFixedBytes(allocator, out, std.mem.sliceAsBytes(s[0..row_count])),
         .decimal128 => |s| try writeFixedBytes(allocator, out, std.mem.sliceAsBytes(s[0..row_count])),
+        .uuid => |s| try writeFixedBytes(allocator, out, std.mem.sliceAsBytes(s[0..row_count])),
         .varchar => |sv| try writeStringColumn(allocator, out, sv, row_count),
         .string => |sv| try writeStringColumn(allocator, out, sv, row_count),
         .char => |sv| try writeStringColumn(allocator, out, sv, row_count),
@@ -687,6 +688,7 @@ pub const OwnedColumnBuffers = struct {
             .largeint => .{ .largeint = std.mem.bytesAsSlice(i128, self.data)[0..n] },
             .decimal64 => .{ .decimal64 = std.mem.bytesAsSlice(i64, self.data)[0..n] },
             .decimal128 => .{ .decimal128 = std.mem.bytesAsSlice(i128, self.data)[0..n] },
+            .uuid => .{ .uuid = std.mem.bytesAsSlice(u128, self.data)[0..n] },
             .varchar => .{ .varchar = .{ .offsets = self.offsets.?, .bytes = self.data } },
             .string => .{ .string = .{ .offsets = self.offsets.?, .bytes = self.data } },
             .char => .{ .char = .{ .offsets = self.offsets.?, .bytes = self.data } },
@@ -739,7 +741,7 @@ fn allocAlignedDup(allocator: Allocator, src: []const u8) ![]align(16) u8 {
 }
 
 pub fn typeFromTagAndExtra(tag: u8, extra: u32) !Type {
-    if (tag > @intFromEnum(TypeTag.decimal128)) return Error.WireUnknownType;
+    if (tag > @intFromEnum(TypeTag.uuid)) return Error.WireUnknownType;
     const tt: TypeTag = @enumFromInt(tag);
     return switch (tt) {
         .int => .int,
@@ -763,6 +765,7 @@ pub fn typeFromTagAndExtra(tag: u8, extra: u32) !Type {
             .p = @intCast((extra >> 8) & 0xFF),
             .s = @intCast(extra & 0xFF),
         } },
+        .uuid => .uuid,
     };
 }
 

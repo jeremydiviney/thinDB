@@ -1008,7 +1008,7 @@ fn innerType(comptime T: type) type {
 /// a zero-length offset slot for strings.
 fn zeroValue(comptime T: type) T {
     return switch (T) {
-        i8, i16, i32, i64, i128 => 0,
+        i8, i16, i32, i64, i128, u128 => 0,
         bool => false,
         f32 => @as(f32, 0.0),
         f64 => @as(f64, 0.0),
@@ -1055,7 +1055,7 @@ fn writeColumnFromTypedSlice(
     values: []const T,
 ) !void {
     switch (T) {
-        i8, i16, i32, i64, i128 => {
+        i8, i16, i32, i64, i128, u128 => {
             const size = @sizeOf(T);
             try wire.appendU32(allocator, out, @intCast(values.len * size));
             for (values) |v| {
@@ -1110,6 +1110,7 @@ fn zigTypeToWireTag(comptime T: type) @import("../types.zig").TypeTag {
         i32 => .int,
         i64 => .bigint,
         i128 => .largeint,
+        u128 => .uuid,
         bool => .boolean,
         f32 => .float,
         f64 => .double,
@@ -1126,7 +1127,7 @@ fn writeColumnFromRows(
     comptime field_name: []const u8,
 ) !void {
     switch (T) {
-        i8, i16, i32, i64, i128 => {
+        i8, i16, i32, i64, i128, u128 => {
             const size = @sizeOf(T);
             try wire.appendU32(allocator, out, @intCast(rows.len * size));
             for (rows) |row| {

@@ -381,6 +381,14 @@ fn decodeRawColumn(
             }
             return .{ .data = .{ .decimal128 = data }, .nulls = nulls };
         },
+        .uuid => {
+            const data = try allocator.alloc(u128, row_count);
+            errdefer allocator.free(data);
+            for (data, 0..) |*slot, i| {
+                slot.* = std.mem.readInt(u128, values[i * 16 ..][0..16], .little);
+            }
+            return .{ .data = .{ .uuid = data }, .nulls = nulls };
+        },
     }
 }
 

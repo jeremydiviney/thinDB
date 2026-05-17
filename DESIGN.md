@@ -700,6 +700,8 @@ Target Zig version: 0.16.
 | ~~Crash durability of in-memory writes~~ | ✅ done in v0.8 | WAL with leader-follower group commit (§8.1); `wal_enabled = true` + `sync_mode = .per_flush`. |
 | Upserts | v2 | Explicit `.upsert()` method that fuses delete+insert against the order key. |
 | `TIMESTAMPTZ` | v2 | Add as a new type; existing `DATETIME` columns unaffected. |
+| Auto-increment columns + column default properties | v2 | New column metadata (`default`, `auto_increment`, future: `on_update`). Memtable insert resolves defaults / picks next ID when the row omits the field. Schema serialization carries the new metadata; migrations untouched. |
+| MySQL wire-protocol compat (listener) | v3 | Second listener alongside the native TCP transport. MySQL clients (CLI, BI tools, ORMs) connect without custom drivers. Scalar function names already align with MySQL via the StarRocks/MySQL parity work. Pick a separate default port and document. |
 | Schema evolution via in-place changes (order-key changes, column reorder) | v3+ if at all | The v1 copy-and-swap covers most needs. |
 | Replication / multi-node | not planned | Explicitly out of scope. |
 | Cost-based optimizer / statistics | not planned | The "thin" ethos says no. |

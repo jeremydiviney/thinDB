@@ -24,6 +24,12 @@ pub const TypeTag = enum(u8) {
     decimal64 = 14,
     /// Fixed-point decimal with i128 backing (19 <= precision <= 38).
     decimal128 = 15,
+    /// 128-bit unsigned identifier. Storage: u128 little-endian. Ordering
+    /// is the natural unsigned numeric order (matches lexicographic over
+    /// the canonical 8-4-4-4-12 hex form). Insertion accepts u128 or
+    /// `Uuid` (logical wrapper); inserts of textual UUIDs are surfaced
+    /// later via the uuid_from_string scalar function.
+    uuid = 16,
 };
 
 /// Precision/scale carried by both decimal type variants.
@@ -65,6 +71,7 @@ pub const Type = union(TypeTag) {
     char: u32,
     decimal64: DecimalSpec,
     decimal128: DecimalSpec,
+    uuid,
 
     pub fn fixedSize(self: Type) ?usize {
         return switch (self) {
@@ -80,6 +87,7 @@ pub const Type = union(TypeTag) {
             .largeint => @sizeOf(i128),
             .decimal64 => @sizeOf(i64),
             .decimal128 => @sizeOf(i128),
+            .uuid => @sizeOf(u128),
             .varchar, .string, .char => null,
         };
     }
@@ -142,8 +150,24 @@ pub const Type = union(TypeTag) {
             .largeint => T == i128 or T == comptime_int,
             .decimal64 => T == i64 or T == comptime_int,
             .decimal128 => T == i128 or T == comptime_int,
+            .uuid => T == Uuid or T == u128 or T == comptime_int,
             .varchar, .string, .char => isStringLikeType(T),
         };
+    }
+};
+
+/// Logical wrapper around a stored `u128` UUID. Mirrors `Date`/`DateTime`
+/// — gives `@as(Uuid, ...)` ergonomics for insert without colliding with
+/// LARGEINT columns. `.value` accesses the raw u128. UUIDs are
+/// big-endian when serialized to the canonical 8-4-4-4-12 hex form, but
+/// stored as u128 in native byte order — the formatter converts.
+pub const Uuid = enum(u128) {
+    _,
+    pub fn fromU128(v: u128) Uuid {
+        return @enumFromInt(v);
+    }
+    pub fn value(self: Uuid) u128 {
+        return @intFromEnum(self);
     }
 };
 
@@ -208,6 +232,7 @@ pub const ValueTag = enum(u8) {
     largeint = 11,
     decimal64 = 12,
     decimal128 = 13,
+    uuid = 14,
 
     pub fn fromType(t: Type) ValueTag {
         return switch (t) {
@@ -224,6 +249,7 @@ pub const ValueTag = enum(u8) {
             .largeint => .largeint,
             .decimal64 => .decimal64,
             .decimal128 => .decimal128,
+            .uuid => .uuid,
         };
     }
 };
@@ -242,6 +268,7 @@ pub const Value = union(ValueTag) {
     largeint: i128,
     decimal64: i64,
     decimal128: i128,
+    uuid: u128,
 
     pub fn compare(self: Value, other: Value) std.math.Order {
         std.debug.assert(std.meta.activeTag(self) == std.meta.activeTag(other));
@@ -258,6 +285,7 @@ pub const Value = union(ValueTag) {
             .largeint => |a| std.math.order(a, other.largeint),
             .decimal64 => |a| std.math.order(a, other.decimal64),
             .decimal128 => |a| std.math.order(a, other.decimal128),
+            .uuid => |a| std.math.order(a, other.uuid),
             .text => |a| switch (std.mem.order(u8, a, other.text)) {
                 .lt => .lt,
                 .gt => .gt,

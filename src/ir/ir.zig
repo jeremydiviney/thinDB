@@ -368,6 +368,10 @@ pub fn encodeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) Enco
             std.mem.writeInt(i128, b[0..16], x, .little);
             try out.appendSlice(allocator, &b);
         },
+        .uuid => |x| {
+            std.mem.writeInt(u128, b[0..16], x, .little);
+            try out.appendSlice(allocator, &b);
+        },
     }
 }
 
@@ -626,6 +630,11 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
             if (c + 16 > bytes.len) return Error.IrCorrupt;
             cursor.* = c + 16;
             break :blk Value{ .decimal128 = std.mem.readInt(i128, bytes[c..][0..16], .little) };
+        },
+        .uuid => blk: {
+            if (c + 16 > bytes.len) return Error.IrCorrupt;
+            cursor.* = c + 16;
+            break :blk Value{ .uuid = std.mem.readInt(u128, bytes[c..][0..16], .little) };
         },
     };
 }

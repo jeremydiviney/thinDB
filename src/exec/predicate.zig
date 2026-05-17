@@ -185,6 +185,10 @@ pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bo
             const want = p.val.decimal128;
             for (s[0..n], 0..) |v, i| mask[i] = cmp(i128, v, want, op);
         },
+        .uuid => |s| {
+            const want = p.val.uuid;
+            for (s[0..n], 0..) |v, i| mask[i] = cmp(u128, v, want, op);
+        },
     }
     // Two-valued logic: a NULL value never matches a comparison.
     if (view.nulls != null) {
@@ -217,8 +221,9 @@ pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value)
         .tinyint => |x| x,
         .smallint => |x| x,
         .decimal64 => |x| x,
-        // No stats on strings/floats/largeint/decimal128 — can't fit i128 in the i64 stats slot.
-        .text, .float, .double, .largeint, .decimal128 => return true,
+        // No stats on strings/floats/largeint/decimal128/uuid — can't fit
+        // i128 (or u128) in the i64 stats slot.
+        .text, .float, .double, .largeint, .decimal128, .uuid => return true,
     };
     return switch (op) {
         .eq => wanted >= s.min and wanted <= s.max,

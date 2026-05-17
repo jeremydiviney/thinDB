@@ -158,6 +158,7 @@ pub const DataStore = union(TypeTag) {
     char: StringStore,
     decimal64: std.ArrayList(i64),
     decimal128: std.ArrayList(i128),
+    uuid: std.ArrayList(u128),
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return initCapacity(allocator, t, 0, 0);
@@ -185,6 +186,7 @@ pub const DataStore = union(TypeTag) {
             .char => .{ .char = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
             .decimal64 => .{ .decimal64 = try ensuredCapList(i64, allocator, rows_cap) },
             .decimal128 => .{ .decimal128 = try ensuredCapList(i128, allocator, rows_cap) },
+            .uuid => .{ .uuid = try ensuredCapList(u128, allocator, rows_cap) },
         };
     }
 
@@ -211,6 +213,7 @@ pub const DataStore = union(TypeTag) {
             .char => |*ss| ss.deinit(allocator),
             .decimal64 => |*list| list.deinit(allocator),
             .decimal128 => |*list| list.deinit(allocator),
+            .uuid => |*list| list.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -232,6 +235,7 @@ pub const DataStore = union(TypeTag) {
             .char => |s| s.rowCount(),
             .decimal64 => |l| l.items.len,
             .decimal128 => |l| l.items.len,
+            .uuid => |l| l.items.len,
         };
     }
 
@@ -252,6 +256,7 @@ pub const DataStore = union(TypeTag) {
             .char => |s| .{ .char = s.view() },
             .decimal64 => |l| .{ .decimal64 = l.items },
             .decimal128 => |l| .{ .decimal128 = l.items },
+            .uuid => |l| .{ .uuid = l.items },
         };
     }
 
@@ -272,6 +277,7 @@ pub const DataStore = union(TypeTag) {
             .char => |*s| s.clear(),
             .decimal64 => |*l| l.clearRetainingCapacity(),
             .decimal128 => |*l| l.clearRetainingCapacity(),
+            .uuid => |*l| l.clearRetainingCapacity(),
         }
     }
 
@@ -295,6 +301,7 @@ pub const DataStore = union(TypeTag) {
             .char => |*s| try s.appendValue(allocator, ""),
             .decimal64 => |*l| try l.append(allocator, 0),
             .decimal128 => |*l| try l.append(allocator, 0),
+            .uuid => |*l| try l.append(allocator, 0),
         }
     }
 };

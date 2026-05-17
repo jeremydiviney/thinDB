@@ -174,6 +174,7 @@ fn valueTagMatchesType(v: Value, t: Type) bool {
         .largeint => vt == .largeint,
         .decimal64 => vt == .decimal64,
         .decimal128 => vt == .decimal128,
+        .uuid => vt == .uuid,
         .varchar, .string, .char => vt == .text,
     };
 }
@@ -324,6 +325,7 @@ fn fillDefault(
         .datetime => |*list| while (i < n) : (i += 1) try list.append(allocator, val.datetime),
         .decimal64 => |*list| while (i < n) : (i += 1) try list.append(allocator, val.decimal64),
         .decimal128 => |*list| while (i < n) : (i += 1) try list.append(allocator, val.decimal128),
+        .uuid => |*list| while (i < n) : (i += 1) try list.append(allocator, val.uuid),
         .varchar => |*ss| while (i < n) : (i += 1) try ss.appendValue(allocator, val.text),
         .string => |*ss| while (i < n) : (i += 1) try ss.appendValue(allocator, val.text),
         .char => |*ss| while (i < n) : (i += 1) try ss.appendValue(allocator, val.text),

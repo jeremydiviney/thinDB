@@ -329,6 +329,7 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
             .char => |sv| sv.offsets.len * 4 + sv.bytes.len,
             .decimal64 => |s| s.len * 8,
             .decimal128 => |s| s.len * 16,
+            .uuid => |s| s.len * 16,
         };
     }
 

@@ -699,6 +699,11 @@ fn buildCompoundGroupKey(
                 std.mem.writeInt(i128, &b, s[row], .little);
                 try out.appendSlice(allocator, &b);
             },
+            .uuid => |s| {
+                var b: [16]u8 = undefined;
+                std.mem.writeInt(u128, &b, s[row], .little);
+                try out.appendSlice(allocator, &b);
+            },
         }
     }
 }
@@ -787,6 +792,11 @@ fn appendGroupKey(
                 const v = std.mem.readInt(i128, key_bytes[cursor..][0..16], .little);
                 cursor += 16;
                 try out_cols[i].data.decimal128.append(allocator, v);
+            },
+            .uuid => {
+                const v = std.mem.readInt(u128, key_bytes[cursor..][0..16], .little);
+                cursor += 16;
+                try out_cols[i].data.uuid.append(allocator, v);
             },
         }
     }
