@@ -102,8 +102,11 @@ pub const Table = struct {
         var segments_dir = try table_dir.createDirPathOpen(io, "segments", .{});
         errdefer segments_dir.close(io);
 
-        var manifest = try storage.readManifest(allocator, io, table_dir, fp, @intCast(schema.columns.len));
+        var manifest = try storage.readManifest(allocator, io, table_dir, fp);
         errdefer manifest.deinit();
+        // Fresh manifests (no file on disk) carry column_count=0; set
+        // from the schema so future writes emit the right per-entry size.
+        if (manifest.column_count == 0) manifest.column_count = @intCast(schema.columns.len);
 
         const memtable = try engine.Memtable.create(allocator, schema);
         errdefer memtable.release();

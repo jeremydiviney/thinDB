@@ -360,7 +360,7 @@ fn reInitTableState(db: *Database, t: *Table, new_fp: u64) !void {
     t.schema = new_owner.view();
     t.schema_fingerprint = new_fp;
 
-    const new_manifest = try storage.readManifest(allocator, io, t.table_dir, new_fp, @intCast(t.schema.columns.len));
+    const new_manifest = try storage.readManifest(allocator, io, t.table_dir, new_fp);
     t.manifest.deinit();
     t.manifest = new_manifest;
 
