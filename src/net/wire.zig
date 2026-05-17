@@ -116,6 +116,23 @@ pub fn writeFrameToIo(
     try w.writeAll(payload);
 }
 
+/// Encode a `[len u32][bytes]` length-prefixed string into `out`.
+pub fn appendLenString(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try appendU32(allocator, out, @intCast(s.len));
+    try out.appendSlice(allocator, s);
+}
+
+/// Inverse of appendLenString — returns a borrowed slice into `bytes`.
+pub fn readLenString(bytes: []const u8, cursor: *usize) ![]const u8 {
+    if (cursor.* + 4 > bytes.len) return Error.WireCorrupt;
+    const len = std.mem.readInt(u32, bytes[cursor.*..][0..4], .little);
+    cursor.* += 4;
+    if (cursor.* + len > bytes.len) return Error.WireCorrupt;
+    const s = bytes[cursor.* .. cursor.* + len];
+    cursor.* += len;
+    return s;
+}
+
 /// Parse a single frame header from `bytes` starting at `offset`. Returns
 /// the message type + the payload slice (borrowed from `bytes`). Advances
 /// `*offset` past the payload.

@@ -122,11 +122,37 @@ fn handleConnection(
     defer allocator.free(payload);
     try reader.interface.readSliceAll(payload);
 
-    // Dispatch on request type. Today: just QUERY. Future: DELETE,
-    // INSERT, CREATE_TABLE, etc.
+    // Dispatch on request type. Read-path streams batches via
+    // handleQuery; admin/write requests reply with a single resp_ok
+    // (optionally carrying a small payload) or a resp_error.
     switch (msg_type_byte) {
         @intFromEnum(wire.MsgType.req_query) => {
             handleQuery(allocator, db, payload, &writer.interface) catch |err| {
+                try sendError(&writer.interface, @errorName(err));
+            };
+        },
+        @intFromEnum(wire.MsgType.req_drop_table) => {
+            handleDropTable(db, payload, &writer.interface) catch |err| {
+                try sendError(&writer.interface, @errorName(err));
+            };
+        },
+        @intFromEnum(wire.MsgType.req_rename_table) => {
+            handleRenameTable(db, payload, &writer.interface) catch |err| {
+                try sendError(&writer.interface, @errorName(err));
+            };
+        },
+        @intFromEnum(wire.MsgType.req_flush) => {
+            handleFlush(db, payload, &writer.interface) catch |err| {
+                try sendError(&writer.interface, @errorName(err));
+            };
+        },
+        @intFromEnum(wire.MsgType.req_compact) => {
+            handleCompact(db, payload, &writer.interface) catch |err| {
+                try sendError(&writer.interface, @errorName(err));
+            };
+        },
+        @intFromEnum(wire.MsgType.req_delete) => {
+            handleDelete(allocator, db, payload, &writer.interface) catch |err| {
                 try sendError(&writer.interface, @errorName(err));
             };
         },
@@ -166,4 +192,68 @@ fn handleQuery(
 
 fn sendError(writer: *std.Io.Writer, msg: []const u8) !void {
     try wire.writeFrameToIo(writer, .resp_error, msg);
+}
+
+fn sendOk(writer: *std.Io.Writer) !void {
+    try wire.writeFrameToIo(writer, .resp_ok, &.{});
+}
+
+fn handleDropTable(db: *Database, payload: []const u8, writer: *std.Io.Writer) !void {
+    var cursor: usize = 0;
+    const name = try wire.readLenString(payload, &cursor);
+    try db.dropTable(name);
+    try sendOk(writer);
+}
+
+fn handleRenameTable(db: *Database, payload: []const u8, writer: *std.Io.Writer) !void {
+    var cursor: usize = 0;
+    const old_name = try wire.readLenString(payload, &cursor);
+    const new_name = try wire.readLenString(payload, &cursor);
+    try db.renameTable(old_name, new_name);
+    try sendOk(writer);
+}
+
+fn handleFlush(db: *Database, payload: []const u8, writer: *std.Io.Writer) !void {
+    var cursor: usize = 0;
+    const name = try wire.readLenString(payload, &cursor);
+    const t = db.tables.get(name) orelse return local.Error.TableNotFound;
+    try t.flush();
+    try sendOk(writer);
+}
+
+fn handleCompact(db: *Database, payload: []const u8, writer: *std.Io.Writer) !void {
+    var cursor: usize = 0;
+    const name = try wire.readLenString(payload, &cursor);
+    const t = db.tables.get(name) orelse return local.Error.TableNotFound;
+    try t.compact();
+    try sendOk(writer);
+}
+
+fn handleDelete(
+    allocator: Allocator,
+    db: *Database,
+    payload: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    var cursor: usize = 0;
+    const name = try wire.readLenString(payload, &cursor);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const expr = try ir.decodePredicate(aa, payload, &cursor);
+    // v1: Table.delete takes a scalar Predicate. Reject tree shapes
+    // until that API gains tree support.
+    const leaf = switch (expr) {
+        .leaf => |p| p,
+        else => return local.Error.UnsupportedOp,
+    };
+
+    const t = db.tables.get(name) orelse return local.Error.TableNotFound;
+    const deleted = try t.delete(leaf);
+
+    var resp_payload: [8]u8 = undefined;
+    std.mem.writeInt(u64, &resp_payload, @intCast(deleted), .little);
+    try wire.writeFrameToIo(writer, .resp_ok, &resp_payload);
 }

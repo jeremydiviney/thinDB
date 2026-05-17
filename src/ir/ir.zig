@@ -282,7 +282,7 @@ const PredTag = enum(u8) {
     p_not = 5,
 };
 
-fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: PredicateExpr) EncodeError!void {
+pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: PredicateExpr) EncodeError!void {
     switch (expr) {
         .leaf => |p| {
             try out.append(allocator, @intFromEnum(PredTag.leaf));
@@ -487,7 +487,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     };
 }
 
-fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!PredicateExpr {
+pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!PredicateExpr {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
@@ -630,7 +630,7 @@ fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
     };
 }
 
-fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
+pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     switch (expr) {
         .leaf, .is_null, .is_not_null => {},
         .@"and", .@"or" => |children| {

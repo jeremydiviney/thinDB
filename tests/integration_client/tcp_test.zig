@@ -89,6 +89,130 @@ test "tcp: scan round-trips a small batch over a real socket" {
     if (sctx.err) |e| return e;
 }
 
+// Admin RPC: drop a table over TCP. Verify the on-disk directory is
+// gone AND that a follow-up scan fails. Server runs two requests in
+// a row (drop, then a fresh scan), so we need two acceptOne() calls.
+test "tcp: dropTable removes the table and frees its directory" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 2;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+
+    const t = try server.db.table("victims", schema_v1, opts_v1);
+    try t.insert(&.{.{ .id = @as(i64, 1), .qty = @as(i32, 5), .active = true, .tag = "x" }});
+    try t.flush();
+
+    // Server loop that handles N connections then stops.
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    // 2 connections expected: dropTable + a probe scan that should fail.
+    var sctx: ServerCtx = .{ .server = server, .n = 2 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    var conn = try thindb.connect(allocator, io, listen_addr);
+    defer conn.close();
+
+    try conn.dropTable("victims");
+
+    // Disk: directory should be gone.
+    const probe = tmp.dir.openDir(io, "victims", .{});
+    try std.testing.expectError(error.FileNotFound, probe);
+
+    // Re-scan: server should reject with RemoteError (TableNotFound surfaces
+    // through the error string but the client just sees RemoteError).
+    var q = try conn.scan("victims");
+    defer q.deinit();
+    try std.testing.expectError(thindb.net.Error.RemoteError, q.next());
+
+    if (sctx.err) |e| return e;
+}
+
+// Admin RPC: delete rows over TCP using a leaf predicate. Verify the
+// returned count + that a follow-up scan only returns the surviving rows.
+test "tcp: delete with leaf predicate removes matching rows + returns count" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const port: u16 = test_port_base + 3;
+    const listen_addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = port,
+    } };
+    var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.close();
+
+    const t = try server.db.table("orders", schema_v1, opts_v1);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true,  .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = false, .tag = "c" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 40), .active = true,  .tag = "d" },
+    });
+    try t.flush();
+
+    // Two connections: delete, then a scan to verify.
+    const ServerCtx = struct {
+        server: *thindb.TcpServer,
+        n: usize,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) {
+                self.server.acceptOne() catch |e| {
+                    self.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    var sctx: ServerCtx = .{ .server = server, .n = 2 };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer server_thread.join();
+
+    var conn = try thindb.connect(allocator, io, listen_addr);
+    defer conn.close();
+
+    const deleted = try conn.delete(
+        "orders",
+        thindb.leafExpr("active", .eq, .{ .boolean = false }),
+    );
+    try std.testing.expectEqual(@as(usize, 2), deleted);
+
+    var q = try conn.scan("orders");
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 4 }, ids.items);
+
+    if (sctx.err) |e| return e;
+}
+
 test "tcp: query with where + limit returns the right rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

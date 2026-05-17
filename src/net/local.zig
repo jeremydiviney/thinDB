@@ -85,6 +85,150 @@ pub const Connection = struct {
         return self.scan(table_name);
     }
 
+    // -----------------------------------------------------------------
+    // Admin RPCs — wrap the existing Database/Table operations behind
+    // the Connection API so client code never reaches past the boundary.
+    //
+    // Wire framing for these is one-shot: client sends one request,
+    // server replies with `resp_ok` (optionally carrying a u64 count) or
+    // `resp_error`. Each call opens a fresh TCP stream (stateless model).
+    // -----------------------------------------------------------------
+
+    /// Drop a table. Removes the in-memory entry, waits for in-flight
+    /// scans on this table to finish, then deletes the on-disk directory.
+    pub fn dropTable(self: *Connection, name: []const u8) !void {
+        switch (self.transport) {
+            .in_process => |db| try db.dropTable(name),
+            .tcp => {
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                try wire.appendLenString(self.allocator, &payload, name);
+                _ = try self.sendAdminTcp(.req_drop_table, payload.items);
+            },
+        }
+    }
+
+    /// Rename a table. Blocks until in-flight scans on the source table
+    /// drain (DDL semantics — same as the in-process API).
+    pub fn renameTable(self: *Connection, old_name: []const u8, new_name: []const u8) !void {
+        switch (self.transport) {
+            .in_process => |db| try db.renameTable(old_name, new_name),
+            .tcp => {
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                try wire.appendLenString(self.allocator, &payload, old_name);
+                try wire.appendLenString(self.allocator, &payload, new_name);
+                _ = try self.sendAdminTcp(.req_rename_table, payload.items);
+            },
+        }
+    }
+
+    /// Force a flush of the table's memtable to disk. Useful in tests
+    /// and at shutdown.
+    pub fn flush(self: *Connection, table_name: []const u8) !void {
+        switch (self.transport) {
+            .in_process => |db| {
+                const t = db.tables.get(table_name) orelse return Error.TableNotFound;
+                try t.flush();
+            },
+            .tcp => {
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                try wire.appendLenString(self.allocator, &payload, table_name);
+                _ = try self.sendAdminTcp(.req_flush, payload.items);
+            },
+        }
+    }
+
+    /// Compact all segments of a table into one. Background compaction
+    /// usually handles this; this is the manual escape hatch.
+    pub fn compact(self: *Connection, table_name: []const u8) !void {
+        switch (self.transport) {
+            .in_process => |db| {
+                const t = db.tables.get(table_name) orelse return Error.TableNotFound;
+                try t.compact();
+            },
+            .tcp => {
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                try wire.appendLenString(self.allocator, &payload, table_name);
+                _ = try self.sendAdminTcp(.req_compact, payload.items);
+            },
+        }
+    }
+
+    /// Delete rows matching `pred`. Returns the number of rows deleted.
+    /// `pred` is encoded as a full predicate tree on the wire; v1
+    /// only honors a single leaf (matches `Table.delete`'s capability).
+    /// Tree-shaped predicates surface as `UnsupportedOp` from the server.
+    pub fn delete(self: *Connection, table_name: []const u8, pred: PredicateExpr) !usize {
+        switch (self.transport) {
+            .in_process => |db| {
+                const t = db.tables.get(table_name) orelse return Error.TableNotFound;
+                // v1 in-process matches v1 wire: only leaf predicates flow
+                // through to Table.delete (which takes a scalar Predicate).
+                switch (pred) {
+                    .leaf => |p| return try t.delete(p),
+                    else => return Error.UnsupportedOp,
+                }
+            },
+            .tcp => {
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                try wire.appendLenString(self.allocator, &payload, table_name);
+                try ir.encodePredicate(self.allocator, &payload, pred);
+
+                const resp = try self.sendAdminTcp(.req_delete, payload.items);
+                defer self.allocator.free(resp);
+                if (resp.len != 8) return Error.UnexpectedResponse;
+                return @intCast(std.mem.readInt(u64, resp[0..8], .little));
+            },
+        }
+    }
+
+    /// One-shot admin TCP round-trip. Opens a fresh stream, sends one
+    /// request frame, reads the first response frame, returns its
+    /// payload (caller-owned, freed by caller). Errors out on
+    /// `resp_error`. Used by every admin method's TCP branch.
+    fn sendAdminTcp(self: *Connection, msg_type: wire.MsgType, payload: []const u8) ![]u8 {
+        const endpoint = self.transport.tcp;
+        const stream = try std.Io.net.IpAddress.connect(
+            &endpoint.address,
+            self.io,
+            .{ .mode = .stream, .protocol = .tcp },
+        );
+        defer stream.close(self.io);
+
+        var read_buf: [4 * 1024]u8 = undefined;
+        var write_buf: [4 * 1024]u8 = undefined;
+        var reader = stream.reader(self.io, &read_buf);
+        var writer = stream.writer(self.io, &write_buf);
+
+        try wire.writeFrameToIo(&writer.interface, msg_type, payload);
+        try writer.interface.flush();
+
+        var hdr: [wire.frame_header_size]u8 = undefined;
+        try reader.interface.readSliceAll(&hdr);
+        const tag_byte = hdr[0];
+        const resp_payload_len = std.mem.readInt(u32, hdr[4..8], .little);
+
+        const resp_payload = try self.allocator.alloc(u8, resp_payload_len);
+        errdefer self.allocator.free(resp_payload);
+        try reader.interface.readSliceAll(resp_payload);
+
+        return switch (tag_byte) {
+            @intFromEnum(wire.MsgType.resp_ok) => resp_payload,
+            @intFromEnum(wire.MsgType.resp_error) => {
+                self.allocator.free(resp_payload);
+                return Error.RemoteError;
+            },
+            else => {
+                self.allocator.free(resp_payload);
+                return Error.UnexpectedResponse;
+            },
+        };
+    }
+
     /// Start a query against `table_name`. Returns a ClientQuery that
     /// the caller extends (`.limit`, future `.filter`, etc.) and drains
     /// via `.next()`. Caller `.deinit()`s the returned query.
