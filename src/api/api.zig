@@ -121,6 +121,21 @@ pub const Config = struct {
     /// — a single insert(big_batch) is one fsync regardless of row count.
     wal_enabled: bool = false,
 
+    /// Per-query memory ceiling for blocking operators (Sort, hash
+    /// GroupBy, hash Join build, SMJ sort buffers, materialize-with-
+    /// stats). When the estimated or actual usage of any blocking
+    /// operator would exceed this, the query is refused (pre-flight)
+    /// or aborted (runtime) with `error.MemoryBudgetExceeded` rather
+    /// than spilling to disk.
+    ///
+    /// Spilling support is a future enhancement. v1's contract is:
+    /// every query either runs entirely within `query_memory_budget`
+    /// or fails fast with a clear error — never silently degrades.
+    ///
+    /// Default 256 MB: small enough that local dev/tests don't trip
+    /// it accidentally, large enough that typical 1-10 M row joins
+    /// fit easily. Production deployments override.
+    query_memory_budget: usize = 256 * 1024 * 1024,
 };
 
 pub const TableOptions = struct {

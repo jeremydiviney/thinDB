@@ -6,6 +6,9 @@ const std = @import("std");
 pub const version = "0.1.0-dev";
 
 pub const types = @import("types.zig");
+
+pub const memory = @import("memory.zig");
+pub const MemoryAccountant = memory.MemoryAccountant;
 pub const Type = types.Type;
 pub const Value = types.Value;
 pub const Column = types.Column;
