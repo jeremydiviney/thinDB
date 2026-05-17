@@ -39,11 +39,16 @@ pub const NullStrategy = enum {
     /// Default: if any input row is null, output is null. The
     /// Compute operator pre-builds a combined null mask before
     /// invoking the kernel — kernels can assume non-null inputs.
+    /// Compute writes the bitmap as AND of input validities.
     propagates,
-    /// Kernel handles nulls itself. Compute does NOT pre-mask; the
-    /// kernel sees the raw inputs and must inspect `view.nulls` per
-    /// arg. Used by `coalesce`, `ifnull`, etc.
+    /// Kernel handles nulls itself. Compute writes the bitmap as OR
+    /// of input validities (default: output non-null iff ANY input
+    /// non-null — matches coalesce / ifnull semantics).
     absorbs,
+    /// Kernel writes both data AND validity bits. Compute does no
+    /// post-processing of the bitmap. Used by functions that can
+    /// produce null from non-null inputs (e.g. nullif).
+    kernel_managed,
 };
 
 pub const Kernel = *const fn (
@@ -135,6 +140,35 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "coalesce", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .absorbs, .kernel = coalesceStringKernel },
     .{ .name = "coalesce", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .absorbs, .kernel = coalesceIntKernel },
     .{ .name = "coalesce", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .absorbs, .kernel = coalesceBigintKernel },
+    // --- math ---
+    .{ .name = "abs", .arg_types = &.{.int}, .return_type = .int, .kernel = absIntKernel },
+    .{ .name = "abs", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = absBigintKernel },
+    .{ .name = "abs", .arg_types = &.{.double}, .return_type = .double, .kernel = absDoubleKernel },
+    .{ .name = "ceil", .arg_types = &.{.double}, .return_type = .double, .kernel = ceilKernel },
+    .{ .name = "floor", .arg_types = &.{.double}, .return_type = .double, .kernel = floorKernel },
+    .{ .name = "round", .arg_types = &.{.double}, .return_type = .double, .kernel = roundKernel },
+    .{ .name = "sign", .arg_types = &.{.double}, .return_type = .int, .kernel = signKernel },
+    .{ .name = "mod", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = modIntKernel },
+    .{ .name = "mod", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = modBigintKernel },
+    .{ .name = "pow", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = powKernel },
+    .{ .name = "sqrt", .arg_types = &.{.double}, .return_type = .double, .kernel = sqrtKernel },
+    .{ .name = "exp", .arg_types = &.{.double}, .return_type = .double, .kernel = expKernel },
+    .{ .name = "ln", .arg_types = &.{.double}, .return_type = .double, .kernel = lnKernel },
+    .{ .name = "log10", .arg_types = &.{.double}, .return_type = .double, .kernel = log10Kernel },
+    .{ .name = "log2", .arg_types = &.{.double}, .return_type = .double, .kernel = log2Kernel },
+    .{ .name = "greatest", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = greatestIntKernel },
+    .{ .name = "greatest", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = greatestBigintKernel },
+    .{ .name = "greatest", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = greatestDoubleKernel },
+    .{ .name = "least", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = leastIntKernel },
+    .{ .name = "least", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = leastBigintKernel },
+    .{ .name = "least", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = leastDoubleKernel },
+    // --- conditional ---
+    .{ .name = "ifnull", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .absorbs, .kernel = ifnullStringKernel },
+    .{ .name = "ifnull", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .absorbs, .kernel = ifnullIntKernel },
+    .{ .name = "ifnull", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .absorbs, .kernel = ifnullBigintKernel },
+    .{ .name = "nullif", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = nullifIntKernel },
+    .{ .name = "nullif", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = nullifBigintKernel },
+    .{ .name = "nullif", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = nullifStringKernel },
 };
 
 // ---------------------------------------------------------------------------
@@ -379,6 +413,242 @@ fn coalesceBigintKernel(allocator: Allocator, args: []const ColumnView, out: *Co
 }
 
 // ---------------------------------------------------------------------------
+// Math kernels
+// ---------------------------------------------------------------------------
+
+fn absIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        // INT_MIN's abs overflows; saturate to INT_MAX to avoid trap.
+        const v = s[i];
+        const r: i32 = if (v == std.math.minInt(i32)) std.math.maxInt(i32) else if (v < 0) -v else v;
+        try out.data.int.append(allocator, r);
+    }
+}
+
+fn absBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v = s[i];
+        const r: i64 = if (v == std.math.minInt(i64)) std.math.maxInt(i64) else if (v < 0) -v else v;
+        try out.data.bigint.append(allocator, r);
+    }
+}
+
+fn absDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @abs(s[i]));
+}
+
+fn ceilKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @ceil(s[i]));
+}
+
+fn floorKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @floor(s[i]));
+}
+
+fn roundKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @round(s[i]));
+}
+
+fn signKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v = s[i];
+        const r: i32 = if (v > 0) 1 else if (v < 0) -1 else 0;
+        try out.data.int.append(allocator, r);
+    }
+}
+
+fn modIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.int;
+    const b = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        // MySQL convention: MOD by 0 returns 0 (we don't have nullable
+        // output by default; surfacing NULL would require kernel_managed).
+        const r: i32 = if (b[i] == 0) 0 else @rem(a[i], b[i]);
+        try out.data.int.append(allocator, r);
+    }
+}
+
+fn modBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.bigint;
+    const b = args[1].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const r: i64 = if (b[i] == 0) 0 else @rem(a[i], b[i]);
+        try out.data.bigint.append(allocator, r);
+    }
+}
+
+fn powKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.double;
+    const b = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.pow(f64, a[i], b[i]));
+}
+
+fn sqrtKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @sqrt(s[i]));
+}
+
+fn expKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @exp(s[i]));
+}
+
+fn lnKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @log(s[i]));
+}
+
+fn log10Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @log10(s[i]));
+}
+
+fn log2Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @log2(s[i]));
+}
+
+fn greatestIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.int;
+    const b = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, @max(a[i], b[i]));
+}
+
+fn greatestBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.bigint;
+    const b = args[1].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, @max(a[i], b[i]));
+}
+
+fn greatestDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.double;
+    const b = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @max(a[i], b[i]));
+}
+
+fn leastIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.int;
+    const b = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, @min(a[i], b[i]));
+}
+
+fn leastBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.bigint;
+    const b = args[1].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, @min(a[i], b[i]));
+}
+
+fn leastDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.double;
+    const b = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @min(a[i], b[i]));
+}
+
+// ---------------------------------------------------------------------------
+// Conditional kernels
+// ---------------------------------------------------------------------------
+//
+// IFNULL is structurally identical to a 2-arg coalesce — same null
+// semantics, same dispatch. We register dedicated overloads so the
+// query-builder helper reads naturally at call sites; the kernels are
+// thin aliases.
+
+fn ifnullStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    return coalesceStringKernel(allocator, args, out, row_count);
+}
+fn ifnullIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    return coalesceIntKernel(allocator, args, out, row_count);
+}
+fn ifnullBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    return coalesceBigintKernel(allocator, args, out, row_count);
+}
+
+// NULLIF(a, b) returns NULL when a == b, otherwise a. Can produce
+// nulls from non-null inputs, so we manage the bitmap directly.
+
+fn nullifIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0];
+    const b = args[1];
+    const base = out.data.rowCount();
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        // Equality compares only when both sides are non-null. If a is
+        // null, output stays null (mirrors a). If b is null, can't
+        // match a, so output is a.
+        const a_valid = a.isValid(i);
+        const av = a.data.int[i];
+        const bv = b.data.int[i];
+        const should_null = a_valid and b.isValid(i) and av == bv;
+        try out.data.int.append(allocator, if (should_null) 0 else av);
+        try out.appendValidBit(allocator, base + i, a_valid and !should_null);
+    }
+}
+
+fn nullifBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0];
+    const b = args[1];
+    const base = out.data.rowCount();
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const a_valid = a.isValid(i);
+        const av = a.data.bigint[i];
+        const bv = b.data.bigint[i];
+        const should_null = a_valid and b.isValid(i) and av == bv;
+        try out.data.bigint.append(allocator, if (should_null) 0 else av);
+        try out.appendValidBit(allocator, base + i, a_valid and !should_null);
+    }
+}
+
+fn nullifStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0];
+    const b = args[1];
+    const a_sv = stringViewOf(a);
+    const b_sv = stringViewOf(b);
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const a_valid = a.isValid(i);
+        const a_bytes = a_sv.rowBytes(i);
+        const matches = a_valid and b.isValid(i) and std.mem.eql(u8, a_bytes, b_sv.rowBytes(i));
+        if (matches or !a_valid) {
+            try ss.appendValue(allocator, "");
+        } else {
+            try ss.appendValue(allocator, a_bytes);
+        }
+        try out.appendValidBit(allocator, base + i, a_valid and !matches);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Small helpers shared across kernels
 // ---------------------------------------------------------------------------
 
@@ -465,6 +735,26 @@ pub fn substring(arena: Allocator, s: Expr, start: Expr, length_arg: Expr) !Expr
 pub fn replace(arena: Allocator, haystack: Expr, needle: Expr, repl: Expr) !Expr {
     return expr_mod.call(arena, "replace", &.{ haystack, needle, repl });
 }
+
+// --- math ---
+pub fn abs(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "abs", &.{arg}); }
+pub fn ceil(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "ceil", &.{arg}); }
+pub fn floor(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "floor", &.{arg}); }
+pub fn round(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "round", &.{arg}); }
+pub fn sign(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "sign", &.{arg}); }
+pub fn mod(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "mod", &.{ a, b }); }
+pub fn pow(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "pow", &.{ a, b }); }
+pub fn sqrt(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "sqrt", &.{arg}); }
+pub fn exp(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "exp", &.{arg}); }
+pub fn ln(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "ln", &.{arg}); }
+pub fn log10(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "log10", &.{arg}); }
+pub fn log2(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "log2", &.{arg}); }
+pub fn greatest(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "greatest", &.{ a, b }); }
+pub fn least(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "least", &.{ a, b }); }
+
+// --- conditional ---
+pub fn ifnull(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "ifnull", &.{ a, b }); }
+pub fn nullif(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "nullif", &.{ a, b }); }
 
 // ---------------------------------------------------------------------------
 // Tests

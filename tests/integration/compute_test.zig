@@ -210,6 +210,133 @@ test "compute: substring with 1-indexed start, negative start, out-of-range" {
     try std.testing.expectEqualStrings("hel|ell|ll|||hello|", got.items);
 }
 
+test "compute: math — abs, ceil, floor, round, sign, mod, pow, sqrt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_math = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "i", .type = .int },
+            .{ .name = "d", .type = .double },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 8 };
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("m", schema_math, opts);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .i = @as(i32, -7), .d = @as(f64, 2.7) },
+        .{ .id = @as(i64, 2), .i = @as(i32, 10), .d = @as(f64, -3.4) },
+        .{ .id = @as(i64, 3), .i = @as(i32, 0), .d = @as(f64, 9.0) },
+    });
+    try t.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const E = thindb.exec.expr_mod;
+    const F = thindb.exec.scalar_fn;
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{
+        .{ .name = "abs_i", .expr = try F.abs(aa, E.col("i")) },
+        .{ .name = "ceil_d", .expr = try F.ceil(aa, E.col("d")) },
+        .{ .name = "floor_d", .expr = try F.floor(aa, E.col("d")) },
+        .{ .name = "sqrt_d", .expr = try F.sqrt(aa, E.col("d")) },
+    });
+    defer q.deinit();
+
+    var abs_i: std.ArrayList(i32) = .empty;
+    defer abs_i.deinit(allocator);
+    var ceil_d: std.ArrayList(f64) = .empty;
+    defer ceil_d.deinit(allocator);
+    var floor_d: std.ArrayList(f64) = .empty;
+    defer floor_d.deinit(allocator);
+
+    while (try q.next()) |b| {
+        try abs_i.appendSlice(allocator, b.values[3].data.int[0..b.row_count]);
+        try ceil_d.appendSlice(allocator, b.values[4].data.double[0..b.row_count]);
+        try floor_d.appendSlice(allocator, b.values[5].data.double[0..b.row_count]);
+    }
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 7, 10, 0 }, abs_i.items);
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 3.0, -3.0, 9.0 }, ceil_d.items);
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 2.0, -4.0, 9.0 }, floor_d.items);
+}
+
+test "compute: conditional — ifnull, nullif" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_cond = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "a", .type = .int, .nullable = true },
+            .{ .name = "b", .type = .int, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 8 };
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("c", schema_cond, opts);
+    try t.insert(&[_]struct { id: i64, a: ?i32, b: ?i32 }{
+        .{ .id = 1, .a = 5, .b = 5 }, // nullif → null; ifnull → 5
+        .{ .id = 2, .a = 5, .b = 9 }, // nullif → 5; ifnull → 5
+        .{ .id = 3, .a = null, .b = 9 }, // nullif → null (a is null); ifnull → 9
+        .{ .id = 4, .a = null, .b = null }, // both null for both
+    });
+    try t.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const E = thindb.exec.expr_mod;
+    const F = thindb.exec.scalar_fn;
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{
+        .{ .name = "merged", .expr = try F.ifnull(aa, E.col("a"), E.col("b")) },
+        .{ .name = "diff", .expr = try F.nullif(aa, E.col("a"), E.col("b")) },
+    });
+    defer q.deinit();
+
+    var ifnull_valid: std.ArrayList(bool) = .empty;
+    defer ifnull_valid.deinit(allocator);
+    var ifnull_val: std.ArrayList(i32) = .empty;
+    defer ifnull_val.deinit(allocator);
+    var nullif_valid: std.ArrayList(bool) = .empty;
+    defer nullif_valid.deinit(allocator);
+    var nullif_val: std.ArrayList(i32) = .empty;
+    defer nullif_val.deinit(allocator);
+
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            try ifnull_valid.append(allocator, b.values[3].isValid(i));
+            try ifnull_val.append(allocator, b.values[3].data.int[i]);
+            try nullif_valid.append(allocator, b.values[4].isValid(i));
+            try nullif_val.append(allocator, b.values[4].data.int[i]);
+        }
+    }
+    // ifnull: rows 1,2 → first non-null is a; row 3 → b; row 4 → null
+    try std.testing.expectEqualSlices(bool, &[_]bool{ true, true, true, false }, ifnull_valid.items);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 5, 5, 9, 0 }, ifnull_val.items);
+    // nullif: row 1 (a==b) → null; row 2 (a!=b) → 5; row 3 (a null) → null; row 4 (both null) → null
+    try std.testing.expectEqualSlices(bool, &[_]bool{ false, true, false, false }, nullif_valid.items);
+    try std.testing.expectEqual(@as(i32, 5), nullif_val.items[1]); // only the non-null one matters
+}
+
 test "compute: coalesce returns first non-null + bookkeeps the output bitmap" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

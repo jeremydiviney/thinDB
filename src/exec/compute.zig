@@ -198,6 +198,7 @@ pub const Compute = struct {
                         switch (c.func.null_strategy) {
                             .propagates => try writePropagatedNulls(self.allocator, out_col, arg_views, n),
                             .absorbs => try writeAbsorbedNulls(self.allocator, out_col, arg_views, n),
+                            .kernel_managed => {}, // kernel already wrote the bitmap
                         }
                     }
                 },
@@ -266,9 +267,14 @@ fn derivedNullable(r: ResolvedDerived, up_schema: []const Column) bool {
     return switch (r.kind) {
         .rename => |rn| up_schema[rn.src_idx].nullable,
         .call => |c| blk: {
-            // Any arg nullable OR absorbs strategy (can produce null
-            // from all-null inputs) → output nullable.
-            if (c.func.null_strategy == .absorbs) break :blk true;
+            // .absorbs: can produce null from all-null inputs.
+            // .kernel_managed: kernel decides per-row, may emit null
+            // even on non-null inputs (e.g. nullif).
+            // Either way → always nullable.
+            switch (c.func.null_strategy) {
+                .absorbs, .kernel_managed => break :blk true,
+                .propagates => {},
+            }
             for (c.arg_indices) |idx| {
                 if (up_schema[idx].nullable) break :blk true;
             }
