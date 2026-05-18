@@ -366,6 +366,77 @@ test "plan: explain renders compute with call expression" {
     , text);
 }
 
+test "plan: CTE-style subtree shared across two parents (inline semantics)" {
+    // SQL equivalent: WITH big_a AS (SELECT * FROM a WHERE k >= 200)
+    //                 SELECT * FROM big_a x JOIN big_a y ON x.k = y.k
+    //
+    // Same filtered-scan subtree appears on BOTH sides of the join.
+    // Current PlanBuilder API allows multiple parents to reference the
+    // same *ir.Op — compile() walks the IR read-only and instantiates
+    // independent exec operators per call site, so the shared node
+    // produces independent runtime instances. Confirms "inline-CTE"
+    // semantics work without explicit materialization.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedTables(db);
+
+    var pb = PlanBuilder.init(allocator);
+    defer pb.deinit();
+
+    // The shared CTE: rows from `a` with k >= 200. Built once.
+    const big_a = try pb.filter(
+        try pb.scan("a"),
+        .{ .leaf = .{ .col = "k", .op = .gte, .val = .{ .int = 200 } } },
+    );
+
+    // Self-join the CTE on k. Need to compute a renamed `k` on the
+    // right side to avoid the existing JoinColumnNameCollision (left
+    // and right both have a `label` and `id` too — we project the
+    // right side first to be a single renamed column).
+    const big_a_right = try pb.select(big_a, &.{"k"});
+    const joined = try pb.join(big_a, big_a_right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = .auto,
+    });
+
+    var q = try pb.compile(allocator, db, joined);
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |batch| rows += batch.row_count;
+    // big_a has 2 rows (k=200, k=300). Self-join on k → 2 matched
+    // pairs (each row matches itself on the inner join).
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "plan: explain shows shared subtree expanded at both reference sites" {
+    // The IR has tree-shape — when a node is referenced from two
+    // parents, explain renders it twice (inline expansion). Document
+    // the behavior so future readers know what to expect.
+    const allocator = std.testing.allocator;
+    var pb = PlanBuilder.init(allocator);
+    defer pb.deinit();
+
+    const shared = try pb.scan("a");
+    const right_branch = try pb.select(shared, &.{"k"});
+    const root = try pb.join(shared, right_branch, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = .auto,
+    });
+    const text = try pb.explain(root);
+    try std.testing.expectEqualStrings(
+        \\Join algorithm=auto type=inner on=[k=k]
+        \\  Scan a
+        \\  Select [k]
+        \\    Scan a
+        \\
+    , text);
+}
+
 test "plan: same PlanBuilder produces two independent Queries" {
     // Compile a plan twice — each call returns its own owning Query.
     // Confirms the plan tree itself is reusable and doesn't get
