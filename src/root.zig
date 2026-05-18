@@ -46,6 +46,9 @@ pub const plan = @import("api/plan.zig");
 pub const PlanBuilder = plan.PlanBuilder;
 pub const JoinSpec = plan.JoinSpec;
 
+// SQL parser — produces ir.Op trees from SQL text.
+pub const sql = @import("sql/sql.zig");
+
 // ---------------------------------------------------------------------------
 // Client/server surface (new, going forward — see DESIGN.md §16).
 // `thindb.local(...)` returns a Connection that wraps an in-process server.
@@ -76,4 +79,5 @@ test {
     _ = engine;
     _ = api;
     _ = exec;
+    _ = sql;
 }

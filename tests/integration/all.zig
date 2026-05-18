@@ -15,6 +15,7 @@ test {
     _ = @import("join_test.zig");
     _ = @import("aggregate_test.zig");
     _ = @import("plan_test.zig");
+    _ = @import("sql_test.zig");
 }
 
 test "integration entry exists" {
