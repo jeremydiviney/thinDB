@@ -247,10 +247,204 @@ fn benchFilterCteSelfJoin(
 }
 
 // ----------------------------------------------------------------------------
+// 3-source star pipeline: events ⊕ dim_a, dim_b
+//
+// Real-world shape: one big "fact" table gets aggregated by group key,
+// and two dimension tables each look up that aggregate before being
+// joined together on a foreign key. The aggregate is referenced twice
+// (once per dim join), so auto-detect refcount ≥ 2 wraps it in a
+// Materialize node — both lookups read from the same drained buffer
+// instead of redoing the full scan + GROUP BY.
+// ----------------------------------------------------------------------------
+
+const events_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "eid", .type = .bigint },
+        .{ .name = "group_k", .type = .int },
+        .{ .name = "val", .type = .int },
+    },
+    .order_key = &.{"eid"},
+    .unique = true,
+};
+const events_ok = [_][]const u8{"eid"};
+const events_opts = thindb.TableOptions{
+    .order_key = &events_ok,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+
+const dim_a_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "a_id", .type = .bigint },
+        .{ .name = "a_group", .type = .int },
+        .{ .name = "a_name", .type = .{ .varchar = 16 } },
+    },
+    .order_key = &.{"a_id"},
+    .unique = true,
+};
+const dim_a_ok = [_][]const u8{"a_id"};
+const dim_a_opts = thindb.TableOptions{
+    .order_key = &dim_a_ok,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+
+const dim_b_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "b_id", .type = .bigint },
+        .{ .name = "b_group", .type = .int },
+        .{ .name = "b_score", .type = .int },
+    },
+    .order_key = &.{"b_id"},
+    .unique = true,
+};
+const dim_b_ok = [_][]const u8{"b_id"};
+const dim_b_opts = thindb.TableOptions{
+    .order_key = &dim_b_ok,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+
+const EventRow = struct { eid: i64, group_k: i32, val: i32 };
+const DimARow = struct { a_id: i64, a_group: i32, a_name: []const u8 };
+const DimBRow = struct { b_id: i64, b_group: i32, b_score: i32 };
+
+const num_groups: usize = 200;
+
+fn buildEvents(allocator: Allocator, n: usize) ![]EventRow {
+    const rows = try allocator.alloc(EventRow, n);
+    for (rows, 0..) |*r, i| {
+        r.* = .{
+            .eid = @intCast(i),
+            .group_k = @intCast(i % num_groups),
+            .val = @intCast(i % 1000),
+        };
+    }
+    return rows;
+}
+
+fn buildDimA(allocator: Allocator, n: usize) ![]DimARow {
+    const rows = try allocator.alloc(DimARow, n);
+    for (rows, 0..) |*r, i| {
+        r.* = .{
+            .a_id = @intCast(i),
+            .a_group = @intCast(i % num_groups),
+            .a_name = tag_pool[i % tag_pool.len],
+        };
+    }
+    return rows;
+}
+
+fn buildDimB(allocator: Allocator, n: usize) ![]DimBRow {
+    const rows = try allocator.alloc(DimBRow, n);
+    for (rows, 0..) |*r, i| {
+        r.* = .{
+            .b_id = @intCast(i),
+            .b_group = @intCast(i % num_groups),
+            .b_score = @intCast(i % 10_000),
+        };
+    }
+    return rows;
+}
+
+fn benchStarPipeline(
+    allocator: Allocator,
+    io: Io,
+    n_events: usize,
+    n_dim: usize,
+) !void {
+    var dir = try freshDir(io, ".bench-data/materialize_star");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{});
+    defer db.close();
+
+    const events = try db.table("events", events_schema, events_opts);
+    const dim_a = try db.table("dim_a", dim_a_schema, dim_a_opts);
+    const dim_b = try db.table("dim_b", dim_b_schema, dim_b_opts);
+
+    const erows = try buildEvents(allocator, n_events);
+    defer allocator.free(erows);
+    const arows = try buildDimA(allocator, n_dim);
+    defer allocator.free(arows);
+    const brows = try buildDimB(allocator, n_dim);
+    defer allocator.free(brows);
+
+    try events.insert(erows);
+    try events.flush();
+    try dim_a.insert(arows);
+    try dim_a.flush();
+    try dim_b.insert(brows);
+    try dim_b.flush();
+
+    std.debug.print(
+        "\nMaterialized CTE — 3-source star pipeline  (events={d}, dim_a=dim_b={d})\n",
+        .{ n_events, n_dim },
+    );
+    std.debug.print(
+        "  agg     = GROUP BY group_k from events  (≈{d} groups)\n",
+        .{num_groups},
+    );
+    std.debug.print(
+        "  with_a  = dim_a JOIN agg  ON a_group = group_k\n",
+        .{},
+    );
+    std.debug.print(
+        "  with_b  = dim_b JOIN agg  ON b_group = group_k\n",
+        .{},
+    );
+    std.debug.print(
+        "  final   = with_a JOIN with_b ON a_id = b_id\n",
+        .{},
+    );
+    std.debug.print(
+        "  agg is referenced twice → auto-materialize should kick in.\n",
+        .{},
+    );
+    std.debug.print(
+        "--------------------------------------------------------------------------------\n",
+        .{},
+    );
+
+    const not_mat =
+        \\WITH
+        \\  agg AS NOT MATERIALIZED (SELECT group_k, sum(val) AS total FROM events GROUP BY group_k),
+        \\  with_a AS (SELECT a_id, a_name FROM dim_a JOIN agg ON dim_a.a_group = agg.group_k),
+        \\  with_b AS (SELECT b_id, b_score FROM dim_b JOIN agg ON dim_b.b_group = agg.group_k)
+        \\SELECT count(*) FROM with_a JOIN with_b ON with_a.a_id = with_b.b_id
+    ;
+    const force_mat =
+        \\WITH
+        \\  agg AS MATERIALIZED (SELECT group_k, sum(val) AS total FROM events GROUP BY group_k),
+        \\  with_a AS (SELECT a_id, a_name FROM dim_a JOIN agg ON dim_a.a_group = agg.group_k),
+        \\  with_b AS (SELECT b_id, b_score FROM dim_b JOIN agg ON dim_b.b_group = agg.group_k)
+        \\SELECT count(*) FROM with_a JOIN with_b ON with_a.a_id = with_b.b_id
+    ;
+    const auto_mat =
+        \\WITH
+        \\  agg AS (SELECT group_k, sum(val) AS total FROM events GROUP BY group_k),
+        \\  with_a AS (SELECT a_id, a_name FROM dim_a JOIN agg ON dim_a.a_group = agg.group_k),
+        \\  with_b AS (SELECT b_id, b_score FROM dim_b JOIN agg ON dim_b.b_group = agg.group_k)
+        \\SELECT count(*) FROM with_a JOIN with_b ON with_a.a_id = with_b.b_id
+    ;
+
+    _ = try runQuery(allocator, io, db, not_mat);
+
+    const r_no = try runQuery(allocator, io, db, not_mat);
+    const r_force = try runQuery(allocator, io, db, force_mat);
+    const r_auto = try runQuery(allocator, io, db, auto_mat);
+
+    reportRow("NOT MATERIALIZED (agg drained 2x)", r_no);
+    reportRow("MATERIALIZED     (agg drained 1x)", r_force);
+    reportRow("(auto-detect, refcount=2)", r_auto);
+    reportSpeedup(r_no.elapsed_ns, r_force.elapsed_ns);
+}
+
+// ----------------------------------------------------------------------------
 // Entry point
 // ----------------------------------------------------------------------------
 
 pub fn runAll(allocator: Allocator, io: Io) !void {
     try benchSortedCteSelfJoin(allocator, io, 1_000_000);
     try benchFilterCteSelfJoin(allocator, io, 1_000_000);
+    try benchStarPipeline(allocator, io, 1_000_000, 50_000);
 }
