@@ -12,6 +12,7 @@ test {
     _ = @import("uuid_test.zig");
     _ = @import("compute_test.zig");
     _ = @import("join_test.zig");
+    _ = @import("aggregate_test.zig");
 }
 
 test "integration entry exists" {

@@ -32,6 +32,7 @@ pub const Error = error{
     AggregateNoSpecs,
     AggregateColumnRequired,
     AggregateUnsupportedType,
+    AggregateInvalidParam,
     ArithmeticOverflow,
     /// Compute operator: no derived columns provided.
     ComputeNoColumns,

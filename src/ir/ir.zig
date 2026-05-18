@@ -228,6 +228,22 @@ fn encodeGroupBy(allocator: Allocator, out: *std.ArrayList(u8), g: Op.GroupBy) E
         // alias (always present — server enforces this on the existing API)
         try appendU32(allocator, out, @intCast(a.as.len));
         try out.appendSlice(allocator, a.as);
+        // params tag (u8) + payload (matches decoder)
+        switch (a.params) {
+            .none => try out.append(allocator, 0),
+            .percentile => |p| {
+                try out.append(allocator, 1);
+                const bits: u64 = @bitCast(p);
+                var b: [8]u8 = undefined;
+                std.mem.writeInt(u64, &b, bits, .little);
+                try out.appendSlice(allocator, &b);
+            },
+            .separator => |sep| {
+                try out.append(allocator, 2);
+                try appendU32(allocator, out, @intCast(sep.len));
+                try out.appendSlice(allocator, sep);
+            },
+        }
     }
     try encodeOp(allocator, out, g.upstream.*);
 }
@@ -469,14 +485,32 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
                 const func_byte = bytes[cursor.*];
                 cursor.* += 1;
-                if (func_byte > @intFromEnum(AggFunc.avg)) return Error.IrCorrupt;
+                if (func_byte > @intFromEnum(AggFunc.group_concat)) return Error.IrCorrupt;
                 const func: AggFunc = @enumFromInt(func_byte);
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
                 const has_col = bytes[cursor.*];
                 cursor.* += 1;
                 const col: ?[]const u8 = if (has_col != 0) try readString(bytes, cursor) else null;
                 const as = try readString(bytes, cursor);
-                a.* = .{ .func = func, .col = col, .as = as };
+                // AggParams tag: 0=none, 1=percentile (f64 payload),
+                // 2=separator (string payload). Older encoders omit
+                // it; we treat absence as .none for back-compat with
+                // pre-params IR.
+                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+                const params_tag = bytes[cursor.*];
+                cursor.* += 1;
+                const params: exec_aggregate.AggParams = switch (params_tag) {
+                    0 => .none,
+                    1 => blk2: {
+                        if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;
+                        const bits = std.mem.readInt(u64, bytes[cursor.*..][0..8], .little);
+                        cursor.* += 8;
+                        break :blk2 .{ .percentile = @as(f64, @bitCast(bits)) };
+                    },
+                    2 => .{ .separator = try readString(bytes, cursor) },
+                    else => return Error.IrCorrupt,
+                };
+                a.* = .{ .func = func, .col = col, .as = as, .params = params };
             }
 
             const upstream = try allocator.create(Op);

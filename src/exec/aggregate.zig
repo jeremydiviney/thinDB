@@ -27,7 +27,38 @@ const makeQuery = exec.makeQuery;
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 
-pub const AggFunc = enum { count, sum, min, max, avg };
+pub const AggFunc = enum {
+    count,
+    sum,
+    min,
+    max,
+    avg,
+    /// Population stddev. sqrt(sum((x-mean)^2) / n). 0 when n=0.
+    stddev_pop,
+    /// Sample stddev. sqrt(sum((x-mean)^2) / (n-1)). 0 when n<2.
+    stddev_samp,
+    /// Population variance. sum((x-mean)^2) / n.
+    var_pop,
+    /// Sample variance. sum((x-mean)^2) / (n-1).
+    var_samp,
+    /// Exact distinct count. Hash set of dup'd value bytes; output bigint.
+    count_distinct,
+    /// Exact continuous percentile. params.percentile in [0, 1].
+    /// O(N) memory; sorts at finalize. Output double.
+    percentile,
+    /// Concatenate string values with a separator. params.separator
+    /// is prepended before every value after the first. Output string.
+    group_concat,
+};
+
+/// Per-aggregate parameters not expressible via `col` / `as`. `.none`
+/// covers all existing aggregates; percentile and group_concat carry
+/// their own payload.
+pub const AggParams = union(enum) {
+    none,
+    percentile: f64,
+    separator: []const u8,
+};
 
 pub const AggSpec = struct {
     func: AggFunc,
@@ -35,6 +66,9 @@ pub const AggSpec = struct {
     col: ?[]const u8 = null,
     /// Output column name.
     as: []const u8,
+    /// Per-function payload. Defaults to `.none` so existing call
+    /// sites compile unchanged.
+    params: AggParams = .none,
 };
 
 /// Per-aggregate accumulator state. Integer types accumulate into i64
@@ -53,11 +87,33 @@ const AccState = union(enum) {
     min_large: ?i128,
     max_large: ?i128,
     avg: AvgAcc,
+    /// Welford's online algorithm: numerically stable variance/stddev.
+    /// Covers stddev_pop, stddev_samp, var_pop, var_samp.
+    welford: WelfordAcc,
+    /// Exact distinct count: set of arena-dup'd value bytes.
+    distinct: std.StringHashMapUnmanaged(void),
+    /// Exact percentile: keep every observed value (as f64), sort + interpolate at finalize.
+    percentile_values: std.ArrayListUnmanaged(f64),
+    /// group_concat buffer + a flag so an empty first value is still
+    /// distinguishable from "nothing appended yet" (the latter must
+    /// NOT prepend a separator on the next append).
+    concat: ConcatAcc,
 };
 
 const AvgAcc = struct {
     sum: f64,
     count: u64,
+};
+
+const WelfordAcc = struct {
+    mean: f64 = 0.0,
+    m2: f64 = 0.0,
+    count: u64 = 0,
+};
+
+const ConcatAcc = struct {
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    nonempty: bool = false,
 };
 
 pub const Aggregate = struct {
@@ -135,7 +191,7 @@ pub const Aggregate = struct {
 
         for (aggs, agg_col_indices) |a, maybe_idx| {
             const t = if (maybe_idx) |idx| up_schema[idx].type else null;
-            try validateAggFn(a.func, t);
+            try validateAggFn(a.func, t, a.params);
         }
 
         const output_columns = try allocator.alloc(ColumnStore, output_schema.len);
@@ -242,9 +298,10 @@ pub const Aggregate = struct {
 
     fn accumulateBatch(self: *Aggregate, batch: Batch) !void {
         const n = batch.row_count;
+        const aa_state = self.arena.allocator();
         if (self.group_col_indices.len == 0) {
             for (self.aggs, 0..) |a, ai| {
-                try updateState(&self.single_state[ai], a.func, batch, self.agg_col_indices[ai], 0, @intCast(n));
+                try updateState(aa_state, &self.single_state[ai], a, batch, self.agg_col_indices[ai], 0, @intCast(n));
             }
             return;
         }
@@ -284,14 +341,14 @@ pub const Aggregate = struct {
             }
             const state = gop.value_ptr.*;
             for (self.aggs, 0..) |a, ai| {
-                try updateState(&state[ai], a.func, batch, self.agg_col_indices[ai], row, row + 1);
+                try updateState(aa_state, &state[ai], a, batch, self.agg_col_indices[ai], row, row + 1);
             }
         }
     }
 
     fn appendSingleResult(self: *Aggregate) !void {
         for (self.aggs, 0..) |a, ai| {
-            try appendAccToColumn(self.allocator, a.func, self.single_state[ai], &self.output_columns[ai], self.output_schema[ai].type);
+            try appendAccToColumn(self.allocator, a, self.single_state[ai], &self.output_columns[ai], self.output_schema[ai].type);
         }
     }
 
@@ -305,7 +362,7 @@ pub const Aggregate = struct {
 
             for (self.aggs, 0..) |a, ai| {
                 const out_idx = self.group_col_indices.len + ai;
-                try appendAccToColumn(self.allocator, a.func, state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type);
+                try appendAccToColumn(self.allocator, a, state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type);
             }
         }
     }
@@ -332,12 +389,16 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
         else
             .{ .max_int = null },
         .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
+        .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
+        .count_distinct => .{ .distinct = .empty },
+        .percentile => .{ .percentile_values = .empty },
+        .group_concat => .{ .concat = .{} },
     };
 }
 
 fn aggOutputType(func: AggFunc, in: ?Type) !Type {
     return switch (func) {
-        .count => .bigint,
+        .count, .count_distinct => .bigint,
         .sum => blk: {
             const t = in orelse return Error.AggregateColumnRequired;
             // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s).
@@ -347,14 +408,15 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
             break :blk .bigint;
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
-        .avg => .double,
+        .avg, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile => .double,
+        .group_concat => .string,
     };
 }
 
-fn validateAggFn(func: AggFunc, in: ?Type) !void {
+fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams) !void {
     switch (func) {
         .count => return,
-        .sum, .avg => {
+        .sum, .avg, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
             const t = in orelse return Error.AggregateColumnRequired;
             if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double)) {
                 return Error.AggregateUnsupportedType;
@@ -366,17 +428,41 @@ fn validateAggFn(func: AggFunc, in: ?Type) !void {
                 return Error.AggregateUnsupportedType;
             }
         },
+        .count_distinct => {
+            // Any column type works (we hash the encoded bytes).
+            _ = in orelse return Error.AggregateColumnRequired;
+        },
+        .percentile => {
+            const t = in orelse return Error.AggregateColumnRequired;
+            if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double or t == .date or t == .datetime)) {
+                return Error.AggregateUnsupportedType;
+            }
+            switch (params) {
+                .percentile => |p| if (p < 0.0 or p > 1.0) return Error.AggregateInvalidParam,
+                else => return Error.AggregateInvalidParam,
+            }
+        },
+        .group_concat => {
+            const t = in orelse return Error.AggregateColumnRequired;
+            if (!t.isString()) return Error.AggregateUnsupportedType;
+            switch (params) {
+                .separator => {},
+                else => return Error.AggregateInvalidParam,
+            }
+        },
     }
 }
 
 fn updateState(
+    aa: Allocator,
     s: *AccState,
-    func: AggFunc,
+    spec: AggSpec,
     batch: Batch,
     col_idx: ?usize,
     row_start: u32,
     row_end: u32,
 ) !void {
+    const func = spec.func;
     switch (func) {
         .count => {
             // COUNT(*) counts every row. COUNT(col) skips NULLs.
@@ -575,6 +661,156 @@ fn updateState(
                 else => unreachable,
             }
         },
+        .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
+            try welfordUpdate(s, batch.values[col_idx.?], row_start, row_end);
+        },
+        .count_distinct => {
+            try distinctUpdate(aa, s, batch.values[col_idx.?], row_start, row_end);
+        },
+        .percentile => {
+            try percentileUpdate(aa, s, batch.values[col_idx.?], row_start, row_end);
+        },
+        .group_concat => {
+            const sep = switch (spec.params) {
+                .separator => |sv| sv,
+                else => return Error.AggregateInvalidParam,
+            };
+            try groupConcatUpdate(aa, s, batch.values[col_idx.?], row_start, row_end, sep);
+        },
+    }
+}
+
+/// Welford's online algorithm — numerically stable mean + M2 (sum of
+/// squared deviations from the running mean). Variance = M2 / n or
+/// M2 / (n-1) depending on population vs sample. Updates one row at a
+/// time so the result is invariant to batch boundaries.
+fn welfordUpdate(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
+    switch (view.data) {
+        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128 => |slice| {
+            for (slice[row_start..row_end], row_start..) |v, r| {
+                if (!view.isValid(r)) continue;
+                welfordStep(&s.welford, @as(f64, @floatFromInt(v)));
+            }
+        },
+        inline .float, .double => |slice| {
+            for (slice[row_start..row_end], row_start..) |v, r| {
+                if (!view.isValid(r)) continue;
+                welfordStep(&s.welford, @as(f64, v));
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn welfordStep(w: *WelfordAcc, x: f64) void {
+    w.count += 1;
+    const n: f64 = @floatFromInt(w.count);
+    const delta = x - w.mean;
+    w.mean += delta / n;
+    const delta2 = x - w.mean;
+    w.m2 += delta * delta2;
+}
+
+/// COUNT(DISTINCT col): hash the encoded value bytes; first sighting
+/// arena-dups the key for storage. Validation rejects NULL — SQL
+/// semantics say NULL is excluded from DISTINCT counts.
+fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(aa);
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!view.isValid(r)) continue;
+        scratch.clearRetainingCapacity();
+        try encodeOneValue(aa, &scratch, view, r);
+        const gop = try s.distinct.getOrPut(aa, scratch.items);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try aa.dupe(u8, scratch.items);
+        }
+    }
+}
+
+/// PERCENTILE_CONT(p): collect every valid value as f64, sort at
+/// finalize, linear-interpolate at p×(n-1). Memory O(N).
+fn percentileUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
+    switch (view.data) {
+        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .date, .datetime, .decimal64, .decimal128 => |slice| {
+            for (slice[row_start..row_end], row_start..) |v, r| {
+                if (!view.isValid(r)) continue;
+                try s.percentile_values.append(aa, @as(f64, @floatFromInt(v)));
+            }
+        },
+        inline .float, .double => |slice| {
+            for (slice[row_start..row_end], row_start..) |v, r| {
+                if (!view.isValid(r)) continue;
+                try s.percentile_values.append(aa, @as(f64, v));
+            }
+        },
+        else => unreachable,
+    }
+}
+
+/// GROUP_CONCAT: append separator + value bytes for each non-null row.
+/// `nonempty` distinguishes "no values yet" from "first value was empty".
+fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32, sep: []const u8) !void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!view.isValid(r)) continue;
+        const bytes = switch (view.data) {
+            .string => |sv| sv.rowBytes(r),
+            .varchar => |sv| sv.rowBytes(r),
+            .char => |sv| sv.rowBytes(r),
+            else => unreachable,
+        };
+        if (s.concat.nonempty) try s.concat.buf.appendSlice(aa, sep);
+        try s.concat.buf.appendSlice(aa, bytes);
+        s.concat.nonempty = true;
+    }
+}
+
+/// Encode a single value as bytes for hashing (count_distinct). Mirrors
+/// the layout in buildCompoundGroupKey but for one row, one column.
+fn encodeOneValue(aa: Allocator, out: *std.ArrayList(u8), view: ColumnView, row: u32) !void {
+    switch (view.data) {
+        .int, .date => |s| try storage.format.appendI32(aa, out, s[row]),
+        .bigint, .datetime => |s| try storage.format.appendI64(aa, out, s[row]),
+        .boolean => |s| try out.append(aa, s[row]),
+        .tinyint => |s| try out.append(aa, @bitCast(s[row])),
+        .smallint => |s| {
+            var b: [2]u8 = undefined;
+            std.mem.writeInt(i16, &b, s[row], .little);
+            try out.appendSlice(aa, &b);
+        },
+        .largeint => |s| {
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(i128, &b, s[row], .little);
+            try out.appendSlice(aa, &b);
+        },
+        .decimal64 => |s| try storage.format.appendI64(aa, out, s[row]),
+        .decimal128 => |s| {
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(i128, &b, s[row], .little);
+            try out.appendSlice(aa, &b);
+        },
+        .uuid => |s| {
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(u128, &b, s[row], .little);
+            try out.appendSlice(aa, &b);
+        },
+        .float => |s| {
+            var b: [4]u8 = undefined;
+            storage.format.writeF32(&b, s[row]);
+            try out.appendSlice(aa, &b);
+        },
+        .double => |s| {
+            var b: [8]u8 = undefined;
+            storage.format.writeF64(&b, s[row]);
+            try out.appendSlice(aa, &b);
+        },
+        .string, .varchar, .char => |sv| {
+            const bytes = sv.rowBytes(row);
+            try storage.format.appendU32(aa, out, @intCast(bytes.len));
+            try out.appendSlice(aa, bytes);
+        },
     }
 }
 
@@ -593,11 +829,12 @@ fn avgUpdateInt(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) vo
 
 fn appendAccToColumn(
     allocator: Allocator,
-    func: AggFunc,
+    spec: AggSpec,
     state: AccState,
     col: *ColumnStore,
     out_type: Type,
 ) !void {
+    const func = spec.func;
     switch (func) {
         .count => {
             try col.data.bigint.append(allocator, @intCast(state.count));
@@ -658,6 +895,51 @@ fn appendAccToColumn(
             // NULLs yet). Guard against div-by-zero.
             const v: f64 = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count));
             try col.data.double.append(allocator, v);
+        },
+        .var_pop, .var_samp, .stddev_pop, .stddev_samp => {
+            const w = state.welford;
+            const variance: f64 = blk: {
+                if (w.count == 0) break :blk 0.0;
+                switch (func) {
+                    .var_pop, .stddev_pop => break :blk w.m2 / @as(f64, @floatFromInt(w.count)),
+                    .var_samp, .stddev_samp => {
+                        if (w.count < 2) break :blk 0.0;
+                        break :blk w.m2 / @as(f64, @floatFromInt(w.count - 1));
+                    },
+                    else => unreachable,
+                }
+            };
+            const out: f64 = if (func == .stddev_pop or func == .stddev_samp) @sqrt(variance) else variance;
+            try col.data.double.append(allocator, out);
+        },
+        .count_distinct => {
+            try col.data.bigint.append(allocator, @intCast(state.distinct.count()));
+        },
+        .percentile => {
+            const p: f64 = switch (spec.params) {
+                .percentile => |pv| pv,
+                else => 0.5,
+            };
+            const vals = state.percentile_values.items;
+            if (vals.len == 0) {
+                try col.data.double.append(allocator, 0.0);
+            } else {
+                // Sort in place — arena owns the backing slice; nothing
+                // outside this aggregate observes the buffer.
+                std.mem.sortUnstable(f64, @constCast(vals), {}, std.sort.asc(f64));
+                const n: f64 = @floatFromInt(vals.len);
+                // Linear interpolation (PostgreSQL percentile_cont rule):
+                //   idx = p * (n - 1); blend floor and ceil.
+                const idx = p * (n - 1);
+                const lo: usize = @intFromFloat(@floor(idx));
+                const hi: usize = @intFromFloat(@ceil(idx));
+                const frac = idx - @floor(idx);
+                const v = if (lo == hi) vals[lo] else vals[lo] + (vals[hi] - vals[lo]) * frac;
+                try col.data.double.append(allocator, v);
+            }
+        },
+        .group_concat => {
+            try col.data.string.appendValue(allocator, state.concat.buf.items);
         },
     }
 }
