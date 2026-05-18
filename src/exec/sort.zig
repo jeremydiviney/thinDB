@@ -159,6 +159,10 @@ pub const Sort = struct {
         };
     }
 
+    pub fn accountant(self: *Sort) ?*exec.memory.MemoryAccountant {
+        return self.upstream.accountant();
+    }
+
     pub fn next(self: *Sort) !?Batch {
         if (!self.drained) try self.drainAndSort();
 
@@ -182,7 +186,11 @@ pub const Sort = struct {
     }
 
     fn drainAndSort(self: *Sort) !void {
+        const acc = self.upstream.accountant();
+        const row_bytes = exec.memory.estimateRowBytes(self.upstream.outputSchema());
+
         while (try self.upstream.next()) |batch| {
+            if (acc) |a| try a.reserve(batch.row_count * row_bytes);
             for (batch.values, 0..) |view, ci| {
                 try engine.memtable.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
             }
@@ -194,6 +202,8 @@ pub const Sort = struct {
             self.drained = true;
             return;
         }
+        // Account for the perm array (u32 per row).
+        if (acc) |a| try a.reserve(n * @sizeOf(u32));
         self.perm = try self.allocator.alloc(u32, n);
         for (self.perm, 0..) |*p, i| p.* = @intCast(i);
 

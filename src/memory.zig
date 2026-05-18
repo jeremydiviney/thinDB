@@ -55,6 +55,33 @@ pub const MemoryAccountant = struct {
     }
 };
 
+const types = @import("types.zig");
+
+/// Approximate per-row bytes for a schema. Fixed-width types are exact.
+/// Variable-width (string/varchar/char) uses a 32-byte conservative
+/// estimate — actual size varies with data. Hash table and bucket
+/// overhead are NOT included; callers add their own factor.
+pub fn estimateRowBytes(schema: []const types.Column) usize {
+    var total: usize = 0;
+    for (schema) |col| {
+        total += estimateColumnBytes(col.type);
+        // Validity bit, rounded up to a full byte for simplicity.
+        if (col.nullable) total += 1;
+    }
+    return total;
+}
+
+pub fn estimateColumnBytes(t: types.Type) usize {
+    return switch (t) {
+        .boolean, .tinyint => 1,
+        .smallint => 2,
+        .int, .date, .float => 4,
+        .bigint, .datetime, .decimal64, .double => 8,
+        .largeint, .decimal128, .uuid => 16,
+        .varchar, .string, .char => 32,
+    };
+}
+
 test "memory: reserve then release returns budget" {
     var a = MemoryAccountant.init(1024);
     try a.reserve(512);

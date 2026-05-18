@@ -467,6 +467,12 @@ pub const Join = struct {
     /// Pre-execution stats on join output.
     /// Upper bound: left × right (cross-product worst case for inner).
     /// Sort state: empty (hash join output is unordered).
+    pub fn accountant(self: *Join) ?*exec.memory.MemoryAccountant {
+        // Both inputs share the same accountant (set by the bottom-
+        // most Scan); return either.
+        return self.left.accountant();
+    }
+
     pub fn stats(self: *Join) exec.PipelineStats {
         const l = self.left.stats();
         const r = self.right.stats();
@@ -521,9 +527,15 @@ pub const Join = struct {
     fn buildPhase(self: *Join) !void {
         var up = if (self.build_is_left) &self.left else &self.right;
         const key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
+        const acc = up.accountant();
+        // Build-side row width + hash-table overhead estimate.
+        // Bucket overhead ~32 bytes (entry + small array list).
+        const row_bytes = exec.memory.estimateRowBytes(up.outputSchema());
+        const per_row_overhead = row_bytes + 32;
 
         while (try up.next()) |batch| {
             const n = batch.row_count;
+            if (acc) |a| try a.reserve(n * per_row_overhead);
             // Append batch into build_columns.
             for (batch.values, 0..) |v, i| {
                 try transform.appendAllColumn(self.allocator, v, &self.build_columns[i]);

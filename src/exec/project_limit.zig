@@ -102,6 +102,10 @@ pub const Project = struct {
         };
     }
 
+    pub fn accountant(self: *Project) ?*exec.memory.MemoryAccountant {
+        return self.upstream.accountant();
+    }
+
     pub fn next(self: *Project) !?Batch {
         const batch = (try self.upstream.next()) orelse return null;
         for (self.column_map, 0..) |src_idx, dst_idx| {
@@ -163,6 +167,10 @@ pub const Limit = struct {
             .upper_rows = @min(@as(u64, self.remaining), up.upper_rows),
             .sort_state = up.sort_state,
         };
+    }
+
+    pub fn accountant(self: *Limit) ?*exec.memory.MemoryAccountant {
+        return self.upstream.accountant();
     }
 
     pub fn next(self: *Limit) !?Batch {

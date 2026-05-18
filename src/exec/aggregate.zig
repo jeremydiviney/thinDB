@@ -214,6 +214,10 @@ pub const Aggregate = struct {
         return .{ .upper_rows = up.upper_rows };
     }
 
+    pub fn accountant(self: *Aggregate) ?*exec.memory.MemoryAccountant {
+        return self.upstream.accountant();
+    }
+
     pub fn next(self: *Aggregate) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;
@@ -258,6 +262,13 @@ pub const Aggregate = struct {
 
             const gop = try self.groups.getOrPut(aa, self.key_scratch.items);
             if (!gop.found_existing) {
+                // New group — reserve its memory against the query
+                // budget. Approximate: key bytes + per-agg state +
+                // ~32 bytes hashmap overhead.
+                if (self.upstream.accountant()) |acct| {
+                    const approx = self.key_scratch.items.len + self.aggs.len * @sizeOf(AccState) + 32;
+                    try acct.reserve(approx);
+                }
                 // The hashmap kept a reference to our scratch slice — but
                 // we're about to reuse that buffer. Replace key_ptr with
                 // an arena-owned dup so it survives.

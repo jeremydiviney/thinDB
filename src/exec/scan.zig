@@ -67,6 +67,11 @@ pub const Scan = struct {
     /// Pushed-down predicates used to skip row groups via min/max stats.
     prunes: std.ArrayList(PruneHint),
 
+    /// Owned by this Scan when `Table.query_memory_budget > 0`. All
+    /// operators in this query inherit it via `Query.accountant()`.
+    /// Null = no tracking.
+    owned_accountant: ?*exec.memory.MemoryAccountant = null,
+
     /// When non-null, `seg_skip[i] == true` means segment at manifest
     /// index `i` is excluded by a pushed-down predicate on the leading
     /// order-key column (whose stats live in the manifest entry).
@@ -136,6 +141,17 @@ pub const Scan = struct {
         }
         table.mutex.unlock(table.io);
 
+        // Allocate the per-query memory accountant if the Table's
+        // config sets a non-zero budget. Heap-allocated so all
+        // operators in the pipeline can share via a pointer.
+        var owned_accountant: ?*exec.memory.MemoryAccountant = null;
+        if (table.query_memory_budget > 0) {
+            const acc = try allocator.create(exec.memory.MemoryAccountant);
+            acc.* = exec.memory.MemoryAccountant.init(table.query_memory_budget);
+            owned_accountant = acc;
+        }
+        errdefer if (owned_accountant) |a| allocator.destroy(a);
+
         self.* = .{
             .allocator = allocator,
             .io = table.io,
@@ -146,15 +162,21 @@ pub const Scan = struct {
             .decoded = decoded,
             .views = views,
             .prunes = .empty,
+            .owned_accountant = owned_accountant,
         };
 
         return makeQuery(allocator, self);
+    }
+
+    pub fn accountant(self: *Scan) ?*exec.memory.MemoryAccountant {
+        return self.owned_accountant;
     }
 
     pub fn deinit(self: *Scan) void {
         self.releaseBatch();
         self.closeCurSegment();
         self.prunes.deinit(self.allocator);
+        if (self.owned_accountant) |a| self.allocator.destroy(a);
         if (self.seg_skip) |s| self.allocator.free(s);
         if (self.filtered) |arr| {
             for (arr) |*c| c.deinit(self.allocator);

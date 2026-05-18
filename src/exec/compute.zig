@@ -184,6 +184,10 @@ pub const Compute = struct {
         return self.upstream.stats();
     }
 
+    pub fn accountant(self: *Compute) ?*exec.memory.MemoryAccountant {
+        return self.upstream.accountant();
+    }
+
     pub fn next(self: *Compute) !?Batch {
         const in = (try self.upstream.next()) orelse return null;
         const n = in.row_count;

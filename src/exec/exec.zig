@@ -21,6 +21,8 @@ const ColumnView = storage.ColumnView;
 const api = @import("../api/api.zig");
 const Table = api.Table;
 
+pub const memory = @import("../memory.zig");
+
 pub const Error = error{
     ColumnNotFound,
     TypeMismatch,
@@ -58,6 +60,11 @@ pub const Error = error{
     /// name. v1 doesn't auto-alias; user must rename via .compute()
     /// or .exclude() before the join.
     JoinColumnNameCollision,
+    /// A blocking operator (Sort, Aggregate, Join build, SMJ, NLJ)
+    /// would exceed `Config.query_memory_budget` if it kept
+    /// materializing. Aborts mid-build with a clear error rather
+    /// than letting the underlying allocator OOM the process.
+    MemoryBudgetExceeded,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,6 +108,10 @@ pub const VTable = struct {
     /// definitions, no data read required. Used by downstream planners
     /// (Join especially) to make algorithm decisions.
     stats: *const fn (ptr: *anyopaque) PipelineStats,
+    /// Per-query memory accountant. Returns the same pointer
+    /// throughout the query pipeline (operators inherit from their
+    /// upstream). Null = no budget tracking (default; common in tests).
+    accountant: *const fn (ptr: *anyopaque) ?*memory.MemoryAccountant,
 };
 
 /// Sort property of an operator's output stream.
@@ -154,6 +165,13 @@ pub const Query = struct {
     /// scanned. See `PipelineStats`.
     pub fn stats(self: Query) PipelineStats {
         return self.vtable.stats(self.ptr);
+    }
+
+    /// Per-query memory accountant. Set up by the bottom-most Scan
+    /// when Table.query_memory_budget > 0. Combinators upstream
+    /// inherit by calling this method on their input.
+    pub fn accountant(self: Query) ?*memory.MemoryAccountant {
+        return self.vtable.accountant(self.ptr);
     }
 
     // ----- Combinators -----
@@ -242,6 +260,10 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.stats();
         }
+        fn accountantWrap(ptr: *anyopaque) ?*memory.MemoryAccountant {
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.accountant();
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
@@ -249,6 +271,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .outputSchema = outputSchemaWrap,
             .addPrune = addPruneWrap,
             .stats = statsWrap,
+            .accountant = accountantWrap,
         };
     };
 

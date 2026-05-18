@@ -41,6 +41,10 @@ pub const Table = struct {
     auto_flush_min_rows: u64,
     auto_flush_min_bytes: usize,
 
+    /// Per-query memory ceiling for blocking operators. 0 = unlimited
+    /// (no tracking). Copied from Config.query_memory_budget at open.
+    query_memory_budget: usize,
+
     /// Durability mode (copied from Database.Config at open time).
     sync_mode: SyncMode,
     /// Timestamp at which the current (post-flush) memtable received its
@@ -147,6 +151,7 @@ pub const Table = struct {
             .auto_flush_secs = cfg.auto_flush_secs,
             .auto_flush_min_rows = cfg.auto_flush_min_rows,
             .auto_flush_min_bytes = cfg.auto_flush_min_bytes,
+            .query_memory_budget = cfg.query_memory_budget,
             .sync_mode = cfg.sync_mode,
             .table_dir = table_dir,
             .segments_dir = segments_dir,

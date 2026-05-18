@@ -279,6 +279,10 @@ pub const NestedLoopJoin = struct {
         };
     }
 
+    pub fn accountant(self: *NestedLoopJoin) ?*exec.memory.MemoryAccountant {
+        return self.left.accountant();
+    }
+
     pub fn stats(self: *NestedLoopJoin) exec.PipelineStats {
         const l = self.left.stats();
         const r = self.right.stats();
@@ -323,13 +327,19 @@ pub const NestedLoopJoin = struct {
     }
 
     fn materialize(self: *NestedLoopJoin) !void {
+        const acc = self.left.accountant();
+        const left_row_bytes = exec.memory.estimateRowBytes(self.left.outputSchema());
+        const right_row_bytes = exec.memory.estimateRowBytes(self.right.outputSchema());
+
         while (try self.left.next()) |batch| {
+            if (acc) |a| try a.reserve(batch.row_count * left_row_bytes);
             for (batch.values, 0..) |v, i| {
                 try transform.appendAllColumn(self.allocator, v, &self.left_materialized[i]);
             }
             self.left_rows += @intCast(batch.row_count);
         }
         while (try self.right.next()) |batch| {
+            if (acc) |a| try a.reserve(batch.row_count * right_row_bytes);
             for (batch.values, 0..) |v, i| {
                 try transform.appendAllColumn(self.allocator, v, &self.right_materialized[i]);
             }

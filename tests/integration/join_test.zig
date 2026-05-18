@@ -1931,6 +1931,87 @@ test "join: FULL OUTER via NLJ + range — both-side orphans" {
     try std.testing.expectEqual(@as(usize, 4), rows);
 }
 
+test "memory: sort over tight budget errors with MemoryBudgetExceeded" {
+    // Budget = 100 bytes. We try to sort 100 rows (each ~16 bytes
+    // accounted, so ~1600 bytes total). Should fail with the typed
+    // error rather than an underlying allocator OOM.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .query_memory_budget = 100,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const schema = thindb.Schema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "v", .type = .bigint } },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("t", schema, .{ .order_key = &ok, .unique = true });
+
+    const Row = struct { id: i64, v: i64 };
+    const rows = try allocator.alloc(Row, 100);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .id = @intCast(i), .v = @intCast(100 - @as(i64, @intCast(i))) };
+    try t.insert(rows);
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.orderBy(&.{.{ .col = "v", .desc = false }});
+    defer q.deinit();
+
+    // Drain triggers the sort, which should overshoot the budget.
+    const result = q.next();
+    try std.testing.expectError(thindb.memory.Error.MemoryBudgetExceeded, result);
+}
+
+test "memory: budget = 0 disables tracking (default)" {
+    // With the default config (budget = 0), even huge sorts succeed.
+    // This is the existing behavior — verify the new instrumentation
+    // doesn't regress queries that previously worked.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const schema = thindb.Schema{
+        .columns = &.{ .{ .name = "id", .type = .bigint } },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("t", schema, .{ .order_key = &ok, .unique = true });
+
+    const Row = struct { id: i64 };
+    const rows = try allocator.alloc(Row, 1000);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .id = @intCast(999 - @as(i64, @intCast(i))) };
+    try t.insert(rows);
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.orderBy(&.{.{ .col = "id", .desc = false }});
+    defer q.deinit();
+
+    var rows_seen: usize = 0;
+    while (try q.next()) |b| rows_seen += b.row_count;
+    try std.testing.expectEqual(@as(usize, 1000), rows_seen);
+}
+
 test "join: type mismatch on join key errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

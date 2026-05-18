@@ -98,6 +98,10 @@ pub const Filter = struct {
         return self.upstream.stats();
     }
 
+    pub fn accountant(self: *Filter) ?*exec.memory.MemoryAccountant {
+        return self.upstream.accountant();
+    }
+
     pub fn next(self: *Filter) !?Batch {
         while (true) {
             const upstream_batch = (try self.upstream.next()) orelse return null;
