@@ -40,6 +40,10 @@ const transform = @import("../engine/transform.zig");
 const join_mod = @import("join.zig");
 const Spec = join_mod.Spec;
 
+const cell_io = @import("cell_io.zig");
+const appendNullTo = cell_io.appendNullTo;
+const appendOneFromBuild = cell_io.appendOneFromBuild;
+
 const output_batch_rows: usize = 1024;
 
 pub const NestedLoopJoin = struct {
@@ -446,30 +450,24 @@ pub const NestedLoopJoin = struct {
     }
 
     fn emitLeftOnlyRow(self: *NestedLoopJoin, left_row: u32) !void {
-        var out_idx: usize = 0;
-        for (self.left_materialized) |*col| {
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, left_row);
-            out_idx += 1;
-        }
-        for (self.right_kept_mask) |kept| {
-            if (!kept) continue;
-            try appendNullTo(self.allocator, &self.output_columns[out_idx]);
-            out_idx += 1;
-        }
+        try cell_io.emitLeftOnlyRow(
+            self.allocator,
+            self.output_columns,
+            self.left_materialized,
+            left_row,
+            self.right_kept_mask,
+        );
     }
 
     fn emitRightOnlyRow(self: *NestedLoopJoin, right_row: u32) !void {
-        var out_idx: usize = 0;
-        var i: usize = 0;
-        while (i < self.left_col_count) : (i += 1) {
-            try appendNullTo(self.allocator, &self.output_columns[out_idx]);
-            out_idx += 1;
-        }
-        for (self.right_materialized, 0..) |*col, idx| {
-            if (!self.right_kept_mask[idx]) continue;
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, right_row);
-            out_idx += 1;
-        }
+        try cell_io.emitRightOnlyRow(
+            self.allocator,
+            self.output_columns,
+            self.right_materialized,
+            right_row,
+            self.right_kept_mask,
+            self.left_col_count,
+        );
     }
 
     fn outerHasNullKey(self: NestedLoopJoin) bool {
@@ -515,16 +513,15 @@ pub const NestedLoopJoin = struct {
     }
 
     fn emitRow(self: *NestedLoopJoin) !void {
-        var out_idx: usize = 0;
-        for (self.left_materialized) |*col| {
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, self.left_cursor);
-            out_idx += 1;
-        }
-        for (self.right_materialized, 0..) |*col, i| {
-            if (!self.right_kept_mask[i]) continue;
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, self.right_cursor);
-            out_idx += 1;
-        }
+        try cell_io.emitMatchedRow(
+            self.allocator,
+            self.output_columns,
+            self.left_materialized,
+            self.left_cursor,
+            self.right_materialized,
+            self.right_cursor,
+            self.right_kept_mask,
+        );
     }
 
     fn flushOutput(self: *NestedLoopJoin) !?Batch {
@@ -554,56 +551,3 @@ fn isStringTag(t: TypeTag) bool {
     };
 }
 
-/// Append a NULL placeholder + clear validity bit.
-fn appendNullTo(allocator: Allocator, dst: *ColumnStore) !void {
-    switch (dst.data) {
-        .int => |*l| try l.append(allocator, 0),
-        .bigint => |*l| try l.append(allocator, 0),
-        .boolean => |*l| try l.append(allocator, 0),
-        .float => |*l| try l.append(allocator, 0),
-        .double => |*l| try l.append(allocator, 0),
-        .date => |*l| try l.append(allocator, 0),
-        .datetime => |*l| try l.append(allocator, 0),
-        .tinyint => |*l| try l.append(allocator, 0),
-        .smallint => |*l| try l.append(allocator, 0),
-        .largeint => |*l| try l.append(allocator, 0),
-        .decimal64 => |*l| try l.append(allocator, 0),
-        .decimal128 => |*l| try l.append(allocator, 0),
-        .uuid => |*l| try l.append(allocator, 0),
-        .varchar => |*s| try s.appendValue(allocator, ""),
-        .string => |*s| try s.appendValue(allocator, ""),
-        .char => |*s| try s.appendValue(allocator, ""),
-    }
-    try dst.appendValidBit(allocator, dst.data.rowCount() - 1, false);
-}
-
-fn appendOneFromBuild(
-    allocator: Allocator,
-    dst: *ColumnStore,
-    src: *const ColumnStore,
-    row: u32,
-) !void {
-    const v = src.view();
-    const valid = v.isValid(row);
-    switch (v.data) {
-        .int => |s| try dst.data.int.append(allocator, s[row]),
-        .bigint => |s| try dst.data.bigint.append(allocator, s[row]),
-        .boolean => |s| try dst.data.boolean.append(allocator, s[row]),
-        .float => |s| try dst.data.float.append(allocator, s[row]),
-        .double => |s| try dst.data.double.append(allocator, s[row]),
-        .date => |s| try dst.data.date.append(allocator, s[row]),
-        .datetime => |s| try dst.data.datetime.append(allocator, s[row]),
-        .tinyint => |s| try dst.data.tinyint.append(allocator, s[row]),
-        .smallint => |s| try dst.data.smallint.append(allocator, s[row]),
-        .largeint => |s| try dst.data.largeint.append(allocator, s[row]),
-        .decimal64 => |s| try dst.data.decimal64.append(allocator, s[row]),
-        .decimal128 => |s| try dst.data.decimal128.append(allocator, s[row]),
-        .uuid => |s| try dst.data.uuid.append(allocator, s[row]),
-        .varchar => |sv| try dst.data.varchar.appendValue(allocator, sv.rowBytes(row)),
-        .string => |sv| try dst.data.string.appendValue(allocator, sv.rowBytes(row)),
-        .char => |sv| try dst.data.char.appendValue(allocator, sv.rowBytes(row)),
-    }
-    if (dst.nulls != null) {
-        try dst.appendValidBit(allocator, dst.data.rowCount() - 1, valid);
-    }
-}

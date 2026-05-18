@@ -48,6 +48,8 @@ const transform = @import("../engine/transform.zig");
 const join_mod = @import("join.zig");
 const Spec = join_mod.Spec;
 
+const cell_io = @import("cell_io.zig");
+
 const output_batch_rows: usize = 1024;
 
 pub const RangeSweepJoin = struct {
@@ -412,15 +414,15 @@ pub const RangeSweepJoin = struct {
     }
 
     fn emitOutputRow(self: *RangeSweepJoin, left_row: u32, right_row: u32) !void {
-        var out_idx: usize = 0;
-        for (self.left_materialized) |*col| {
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, left_row);
-            out_idx += 1;
-        }
-        for (self.right_materialized) |*col| {
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, right_row);
-            out_idx += 1;
-        }
+        try cell_io.emitMatchedRow(
+            self.allocator,
+            self.output_columns,
+            self.left_materialized,
+            left_row,
+            self.right_materialized,
+            right_row,
+            null,
+        );
     }
 
     fn flushOutput(self: *RangeSweepJoin) !?Batch {
@@ -509,33 +511,3 @@ fn cmpInColumn(col: ColumnView, a: u32, b: u32) std.math.Order {
     };
 }
 
-fn appendOneFromBuild(
-    allocator: Allocator,
-    dst: *ColumnStore,
-    src: *const ColumnStore,
-    row: u32,
-) !void {
-    const v = src.view();
-    const valid = v.isValid(row);
-    switch (v.data) {
-        .int => |s| try dst.data.int.append(allocator, s[row]),
-        .bigint => |s| try dst.data.bigint.append(allocator, s[row]),
-        .boolean => |s| try dst.data.boolean.append(allocator, s[row]),
-        .float => |s| try dst.data.float.append(allocator, s[row]),
-        .double => |s| try dst.data.double.append(allocator, s[row]),
-        .date => |s| try dst.data.date.append(allocator, s[row]),
-        .datetime => |s| try dst.data.datetime.append(allocator, s[row]),
-        .tinyint => |s| try dst.data.tinyint.append(allocator, s[row]),
-        .smallint => |s| try dst.data.smallint.append(allocator, s[row]),
-        .largeint => |s| try dst.data.largeint.append(allocator, s[row]),
-        .decimal64 => |s| try dst.data.decimal64.append(allocator, s[row]),
-        .decimal128 => |s| try dst.data.decimal128.append(allocator, s[row]),
-        .uuid => |s| try dst.data.uuid.append(allocator, s[row]),
-        .varchar => |sv| try dst.data.varchar.appendValue(allocator, sv.rowBytes(row)),
-        .string => |sv| try dst.data.string.appendValue(allocator, sv.rowBytes(row)),
-        .char => |sv| try dst.data.char.appendValue(allocator, sv.rowBytes(row)),
-    }
-    if (dst.nulls != null) {
-        try dst.appendValidBit(allocator, dst.data.rowCount() - 1, valid);
-    }
-}

@@ -46,6 +46,10 @@ const transform = @import("../engine/transform.zig");
 const join_mod = @import("join.zig");
 const Spec = join_mod.Spec;
 
+const cell_io = @import("cell_io.zig");
+const appendNullTo = cell_io.appendNullTo;
+const appendOneFromBuild = cell_io.appendOneFromBuild;
+
 const output_batch_rows: usize = 1024;
 
 pub const SortMergeJoin = struct {
@@ -130,6 +134,24 @@ pub const SortMergeJoin = struct {
         right: Query,
         spec: Spec,
     ) !Query {
+        const self = try createSelf(allocator, left, right, spec);
+        return wrapAsQuery(allocator, self, spec);
+    }
+
+    fn wrapAsQuery(allocator: Allocator, self: *SortMergeJoin, spec: Spec) !Query {
+        const q = makeQuery(allocator, self);
+        if (spec.extra_predicate) |pred| {
+            return @import("filter.zig").Filter.create(allocator, q, pred);
+        }
+        return q;
+    }
+
+    fn createSelf(
+        allocator: Allocator,
+        left: Query,
+        right: Query,
+        spec: Spec,
+    ) !*SortMergeJoin {
         if (spec.on.len == 0) return Error.JoinEmptyOnClause;
 
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -271,11 +293,7 @@ pub const SortMergeJoin = struct {
             .join_type = spec.join_type,
             .ranges = resolved_ranges,
         };
-        const q = makeQuery(allocator, self);
-        if (spec.extra_predicate) |pred| {
-            return @import("filter.zig").Filter.create(allocator, q, pred);
-        }
-        return q;
+        return self;
     }
 
     /// Construct an SMJ where one side is already materialized
@@ -294,14 +312,9 @@ pub const SortMergeJoin = struct {
         pre_rows: u32,
         pre_is_left: bool,
     ) !Query {
-        // Build SMJ via the normal create path — it sets up output
-        // columns + key indices + everything. Then patch in the
-        // pre-materialized side and free the empty one SMJ allocated.
-        const q = try SortMergeJoin.create(allocator, left_q, right_q, spec);
-        const self: *SortMergeJoin = @ptrCast(@alignCast(q.ptr));
+        const self = try createSelf(allocator, left_q, right_q, spec);
 
         if (pre_is_left) {
-            // Free the empty allocation SMJ made for left_materialized.
             for (self.left_materialized) |*c| c.deinit(allocator);
             allocator.free(self.left_materialized);
             self.left_materialized = pre_columns;
@@ -314,7 +327,7 @@ pub const SortMergeJoin = struct {
             self.right_rows = pre_rows;
             self.pre_right_materialized = true;
         }
-        return q;
+        return wrapAsQuery(allocator, self, spec);
     }
 
     pub fn deinit(self: *SortMergeJoin) void {
@@ -614,36 +627,25 @@ pub const SortMergeJoin = struct {
         return true;
     }
 
-    /// Emit an unmatched LEFT row: left columns from left_materialized,
-    /// NULL for kept right columns.
     fn emitLeftOnlyRow(self: *SortMergeJoin, left_row: u32) !void {
-        var out_idx: usize = 0;
-        for (self.left_materialized) |*col| {
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, left_row);
-            out_idx += 1;
-        }
-        for (self.right_kept_mask) |kept| {
-            if (!kept) continue;
-            try appendNullTo(self.allocator, &self.output_columns[out_idx]);
-            out_idx += 1;
-        }
+        try cell_io.emitLeftOnlyRow(
+            self.allocator,
+            self.output_columns,
+            self.left_materialized,
+            left_row,
+            self.right_kept_mask,
+        );
     }
 
-    /// Emit an unmatched RIGHT row: NULL for left columns (including
-    /// USING-merged join key positions — same SQL deviation as Join.zig),
-    /// right columns from right_materialized (skipping join keys).
     fn emitRightOnlyRow(self: *SortMergeJoin, right_row: u32) !void {
-        var out_idx: usize = 0;
-        var i: usize = 0;
-        while (i < self.left_col_count) : (i += 1) {
-            try appendNullTo(self.allocator, &self.output_columns[out_idx]);
-            out_idx += 1;
-        }
-        for (self.right_materialized, 0..) |*col, idx2| {
-            if (!self.right_kept_mask[idx2]) continue;
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, right_row);
-            out_idx += 1;
-        }
+        try cell_io.emitRightOnlyRow(
+            self.allocator,
+            self.output_columns,
+            self.right_materialized,
+            right_row,
+            self.right_kept_mask,
+            self.left_col_count,
+        );
     }
 
     // Helpers used by mid-run cursor save. v1's mergeStep always
@@ -661,18 +663,15 @@ pub const SortMergeJoin = struct {
     }
 
     fn emitOutputRow(self: *SortMergeJoin, left_row: u32, right_row: u32) !void {
-        var out_idx: usize = 0;
-        // Left side: all columns from left_materialized.
-        for (self.left_materialized) |*col| {
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, left_row);
-            out_idx += 1;
-        }
-        // Right side: skip join keys.
-        for (self.right_materialized, 0..) |*col, i| {
-            if (!self.right_kept_mask[i]) continue;
-            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, right_row);
-            out_idx += 1;
-        }
+        try cell_io.emitMatchedRow(
+            self.allocator,
+            self.output_columns,
+            self.left_materialized,
+            left_row,
+            self.right_materialized,
+            right_row,
+            self.right_kept_mask,
+        );
     }
 
     fn flushOutput(self: *SortMergeJoin) !?Batch {
@@ -849,61 +848,4 @@ fn sortByKeys(perm: []u32, keys: [][]const u8) void {
         }
     };
     std.sort.pdqContext(0, perm.len, SortCtx{ .perm = perm, .keys = keys });
-}
-
-/// Append one row's data from `src` (build-side) into `dst`.
-/// Copied verbatim from join.zig — keep until we extract a common helper.
-/// Append a NULL placeholder + clear validity bit. Mirrors the
-/// helper in join.zig; duplicated to keep smj.zig self-contained.
-fn appendNullTo(allocator: Allocator, dst: *ColumnStore) !void {
-    switch (dst.data) {
-        .int => |*l| try l.append(allocator, 0),
-        .bigint => |*l| try l.append(allocator, 0),
-        .boolean => |*l| try l.append(allocator, 0),
-        .float => |*l| try l.append(allocator, 0),
-        .double => |*l| try l.append(allocator, 0),
-        .date => |*l| try l.append(allocator, 0),
-        .datetime => |*l| try l.append(allocator, 0),
-        .tinyint => |*l| try l.append(allocator, 0),
-        .smallint => |*l| try l.append(allocator, 0),
-        .largeint => |*l| try l.append(allocator, 0),
-        .decimal64 => |*l| try l.append(allocator, 0),
-        .decimal128 => |*l| try l.append(allocator, 0),
-        .uuid => |*l| try l.append(allocator, 0),
-        .varchar => |*s| try s.appendValue(allocator, ""),
-        .string => |*s| try s.appendValue(allocator, ""),
-        .char => |*s| try s.appendValue(allocator, ""),
-    }
-    try dst.appendValidBit(allocator, dst.data.rowCount() - 1, false);
-}
-
-fn appendOneFromBuild(
-    allocator: Allocator,
-    dst: *ColumnStore,
-    src: *const ColumnStore,
-    row: u32,
-) !void {
-    const v = src.view();
-    const valid = v.isValid(row);
-    switch (v.data) {
-        .int => |s| try dst.data.int.append(allocator, s[row]),
-        .bigint => |s| try dst.data.bigint.append(allocator, s[row]),
-        .boolean => |s| try dst.data.boolean.append(allocator, s[row]),
-        .float => |s| try dst.data.float.append(allocator, s[row]),
-        .double => |s| try dst.data.double.append(allocator, s[row]),
-        .date => |s| try dst.data.date.append(allocator, s[row]),
-        .datetime => |s| try dst.data.datetime.append(allocator, s[row]),
-        .tinyint => |s| try dst.data.tinyint.append(allocator, s[row]),
-        .smallint => |s| try dst.data.smallint.append(allocator, s[row]),
-        .largeint => |s| try dst.data.largeint.append(allocator, s[row]),
-        .decimal64 => |s| try dst.data.decimal64.append(allocator, s[row]),
-        .decimal128 => |s| try dst.data.decimal128.append(allocator, s[row]),
-        .uuid => |s| try dst.data.uuid.append(allocator, s[row]),
-        .varchar => |sv| try dst.data.varchar.appendValue(allocator, sv.rowBytes(row)),
-        .string => |sv| try dst.data.string.appendValue(allocator, sv.rowBytes(row)),
-        .char => |sv| try dst.data.char.appendValue(allocator, sv.rowBytes(row)),
-    }
-    if (dst.nulls != null) {
-        try dst.appendValidBit(allocator, dst.data.rowCount() - 1, valid);
-    }
 }

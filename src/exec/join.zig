@@ -42,6 +42,11 @@ const Predicate = predicate.Predicate;
 
 const transform = @import("../engine/transform.zig");
 
+const cell_io = @import("cell_io.zig");
+const appendNullTo = cell_io.appendNullTo;
+const appendOneFromBuild = cell_io.appendOneFromBuild;
+const appendOneFromView = cell_io.appendOneFromView;
+
 /// One column-pair equality in the ON clause.
 pub const KeyPair = struct {
     left: []const u8,
@@ -893,7 +898,7 @@ pub const Join = struct {
                 // Left side = probe. All probe columns are left.
                 var i: usize = 0;
                 while (i < left_count) : (i += 1) {
-                    try appendOneFromBatch(self.allocator, &self.output_columns[out_idx], batch.values[i], probe_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], batch.values[i], probe_row);
                     out_idx += 1;
                 }
             }
@@ -903,7 +908,7 @@ pub const Join = struct {
                 // Right side = probe. Skip right-key columns.
                 for (batch.values, 0..) |v, i| {
                     if (!self.right_kept_mask[i]) continue;
-                    try appendOneFromBatch(self.allocator, &self.output_columns[out_idx], v, probe_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], v, probe_row);
                     out_idx += 1;
                 }
             } else {
@@ -1024,14 +1029,14 @@ pub const Join = struct {
             // Right (probe) columns, skipping right-key columns.
             for (batch.values, 0..) |v, idx2| {
                 if (!self.right_kept_mask[idx2]) continue;
-                try appendOneFromBatch(self.allocator, &self.output_columns[out_idx], v, probe_row);
+                try appendOneFromView(self.allocator, &self.output_columns[out_idx], v, probe_row);
                 out_idx += 1;
             }
         } else {
             // Build = right → probe = left. Left (probe) cols normal.
             var i: usize = 0;
             while (i < left_count) : (i += 1) {
-                try appendOneFromBatch(self.allocator, &self.output_columns[out_idx], batch.values[i], probe_row);
+                try appendOneFromView(self.allocator, &self.output_columns[out_idx], batch.values[i], probe_row);
                 out_idx += 1;
             }
             // Right (build) columns all NULL, skipping right-key cols.
@@ -1236,24 +1241,6 @@ fn appendBits(allocator: Allocator, out: *std.ArrayList(u8), comptime T: type, v
 
 /// Append one row's worth of data from `src` (a build-side
 /// ColumnStore) into `dst` (an output ColumnStore).
-fn appendOneFromBuild(
-    allocator: Allocator,
-    dst: *ColumnStore,
-    src: *const ColumnStore,
-    row: u32,
-) !void {
-    try appendOneFromView(allocator, dst, src.view(), row);
-}
-
-fn appendOneFromBatch(
-    allocator: Allocator,
-    dst: *ColumnStore,
-    src: ColumnView,
-    row: u32,
-) !void {
-    try appendOneFromView(allocator, dst, src, row);
-}
-
 /// Compare two cells from same-typed columns with the given op.
 /// Returns false for NULL on either side (two-valued logic). Strings
 /// use lex byte order. Floats use IEEE compare (NaN never compares
@@ -1303,59 +1290,3 @@ fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
     };
 }
 
-/// Append a NULL placeholder to a nullable destination column.
-/// Writes a zero / empty placeholder into the data backing AND clears
-/// the validity bit for the new row. Errors if the destination column
-/// isn't nullable (callers must ensure the output schema marks columns
-/// nullable when outer joins can emit NULLs there).
-fn appendNullTo(allocator: Allocator, dst: *ColumnStore) !void {
-    switch (dst.data) {
-        .int => |*l| try l.append(allocator, 0),
-        .bigint => |*l| try l.append(allocator, 0),
-        .boolean => |*l| try l.append(allocator, 0),
-        .float => |*l| try l.append(allocator, 0),
-        .double => |*l| try l.append(allocator, 0),
-        .date => |*l| try l.append(allocator, 0),
-        .datetime => |*l| try l.append(allocator, 0),
-        .tinyint => |*l| try l.append(allocator, 0),
-        .smallint => |*l| try l.append(allocator, 0),
-        .largeint => |*l| try l.append(allocator, 0),
-        .decimal64 => |*l| try l.append(allocator, 0),
-        .decimal128 => |*l| try l.append(allocator, 0),
-        .uuid => |*l| try l.append(allocator, 0),
-        .varchar => |*s| try s.appendValue(allocator, ""),
-        .string => |*s| try s.appendValue(allocator, ""),
-        .char => |*s| try s.appendValue(allocator, ""),
-    }
-    try dst.appendValidBit(allocator, dst.data.rowCount() - 1, false);
-}
-
-fn appendOneFromView(
-    allocator: Allocator,
-    dst: *ColumnStore,
-    src: ColumnView,
-    row: u32,
-) !void {
-    const valid = src.isValid(row);
-    switch (src.data) {
-        .int => |s| try dst.data.int.append(allocator, s[row]),
-        .bigint => |s| try dst.data.bigint.append(allocator, s[row]),
-        .boolean => |s| try dst.data.boolean.append(allocator, s[row]),
-        .float => |s| try dst.data.float.append(allocator, s[row]),
-        .double => |s| try dst.data.double.append(allocator, s[row]),
-        .date => |s| try dst.data.date.append(allocator, s[row]),
-        .datetime => |s| try dst.data.datetime.append(allocator, s[row]),
-        .tinyint => |s| try dst.data.tinyint.append(allocator, s[row]),
-        .smallint => |s| try dst.data.smallint.append(allocator, s[row]),
-        .largeint => |s| try dst.data.largeint.append(allocator, s[row]),
-        .decimal64 => |s| try dst.data.decimal64.append(allocator, s[row]),
-        .decimal128 => |s| try dst.data.decimal128.append(allocator, s[row]),
-        .uuid => |s| try dst.data.uuid.append(allocator, s[row]),
-        .varchar => |sv| try dst.data.varchar.appendValue(allocator, sv.rowBytes(row)),
-        .string => |sv| try dst.data.string.appendValue(allocator, sv.rowBytes(row)),
-        .char => |sv| try dst.data.char.appendValue(allocator, sv.rowBytes(row)),
-    }
-    if (dst.nulls != null) {
-        try dst.appendValidBit(allocator, dst.data.rowCount() - 1, valid);
-    }
-}
