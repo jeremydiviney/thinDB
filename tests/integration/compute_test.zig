@@ -915,3 +915,136 @@ test "compute: coalesce returns first non-null + bookkeeps the output bitmap" {
     // Last row's data slot is "" (the placeholder we wrote) but bitmap marks null.
     try std.testing.expectEqualStrings("alpha|beta|gamma||", values.items);
 }
+
+// ---------------------------------------------------------------------------
+// Implicit type coercion (DuckDB-style promotion graph in src/exec/cast.zig)
+// ---------------------------------------------------------------------------
+
+const schema_mixed = thindb.Schema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "small", .type = .int },
+        .{ .name = "big", .type = .bigint },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const ok_mixed = [_][]const u8{"id"};
+const opts_mixed = thindb.TableOptions{
+    .order_key = &ok_mixed,
+    .unique = true,
+    .row_group_size = 4,
+};
+
+test "coercion: sqrt(bigint_col) routes via implicit bigint→double" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema_mixed, opts_mixed);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .small = @as(i32, 4), .big = @as(i64, 9) },
+        .{ .id = @as(i64, 2), .small = @as(i32, 16), .big = @as(i64, 25) },
+    });
+    try t.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{
+        // sqrt is registered only as (double). big is bigint → must
+        // coerce. Output column type = double.
+        .{ .name = "root", .expr = try thindb.exec.scalar_fn.sqrt(aa, thindb.exec.expr_mod.col("big")) },
+    });
+    defer q.deinit();
+
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(@as(thindb.types.TypeTag, .double), @as(thindb.types.TypeTag, schema[3].type));
+
+    var roots: std.ArrayList(f64) = .empty;
+    defer roots.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| try roots.append(allocator, b.values[3].data.double[i]);
+    }
+    try std.testing.expectEqual(@as(usize, 2), roots.items.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), roots.items[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), roots.items[1], 0.0001);
+}
+
+test "coercion: mod(int_col, bigint_col) picks bigint overload + casts int" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema_mixed, opts_mixed);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .small = @as(i32, 17), .big = @as(i64, 5) },
+        .{ .id = @as(i64, 2), .small = @as(i32, 23), .big = @as(i64, 7) },
+    });
+    try t.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{
+        .{ .name = "rem", .expr = try thindb.exec.scalar_fn.mod(
+            aa,
+            thindb.exec.expr_mod.col("small"),
+            thindb.exec.expr_mod.col("big"),
+        ) },
+    });
+    defer q.deinit();
+
+    // (int, bigint) → resolved to (bigint, bigint); return type bigint.
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(@as(thindb.types.TypeTag, .bigint), @as(thindb.types.TypeTag, schema[3].type));
+
+    var rems: std.ArrayList(i64) = .empty;
+    defer rems.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| try rems.append(allocator, b.values[3].data.bigint[i]);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2 }, rems.items);
+}
+
+test "coercion: no implicit string ↔ number — concat(string, int) still errors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema_mixed, opts_mixed);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .small = @as(i32, 4), .big = @as(i64, 9) },
+    });
+    try t.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var base = try thindb.scan(allocator, t);
+    // Two-arg concat exists only as (string, string). small is int.
+    // Per DuckDB/StarRocks convention, string ↔ number requires an
+    // explicit cast — verify we don't silently auto-stringify.
+    const result = base.compute(&.{
+        .{ .name = "joined", .expr = try thindb.exec.scalar_fn.concat(aa, &.{
+            thindb.exec.expr_mod.col("small"),
+            thindb.exec.expr_mod.col("small"),
+        }) },
+    });
+    try std.testing.expectError(thindb.exec.Error.ComputeNoSuchOverload, result);
+    base.deinit();
+}

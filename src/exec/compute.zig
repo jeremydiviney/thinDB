@@ -36,6 +36,9 @@ const scalar_fn = @import("scalar_fn.zig");
 const ScalarFn = scalar_fn.ScalarFn;
 const NullStrategy = scalar_fn.NullStrategy;
 
+const cast = @import("cast.zig");
+const CastKernel = cast.CastKernel;
+
 const exec = @import("exec.zig");
 const Batch = exec.Batch;
 const Query = exec.Query;
@@ -51,12 +54,27 @@ pub const Derived = struct {
 
 /// Resolved per-derived plan: either a function call with arg column
 /// indices, or a simple column rename.
+///
+/// `arg_casts` is populated only when at least one arg needs implicit
+/// coercion (e.g. `mod(int_col, bigint_col)` routes to the (bigint,
+/// bigint) overload via a cast on arg 0). Per-arg slot is null when
+/// that arg type already matches the overload — only the args that
+/// differ pay any runtime cost.
+///
+/// `cast_buffers` parallels `arg_casts`: a scratch ColumnStore is
+/// allocated once per coerced arg at Compute init time, then refilled
+/// (clear + cast kernel) per batch. Non-coerced slots stay empty.
 const ResolvedDerived = struct {
     name: []const u8,
     output_type: Type,
     kind: union(enum) {
         rename: struct { src_idx: usize },
-        call: struct { func: ScalarFn, arg_indices: []const usize },
+        call: struct {
+            func: ScalarFn,
+            arg_indices: []const usize,
+            arg_casts: ?[]const ?CastKernel,
+            cast_buffers: ?[]?ColumnStore,
+        },
     },
 };
 
@@ -90,7 +108,7 @@ pub const Compute = struct {
         const aa = arena.allocator();
 
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
-        for (derived, resolved) |d, *r| r.* = try resolveDerived(aa, d, up_schema);
+        for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema);
 
         // Validate no duplicate derived names AND no collision with
         // upstream column names (downstream wouldn't be able to
@@ -152,6 +170,19 @@ pub const Compute = struct {
         up.deinit();
         for (self.derived_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.derived_cols);
+        for (self.derived) |r| {
+            switch (r.kind) {
+                .call => |c| {
+                    if (c.cast_buffers) |buffers| {
+                        for (buffers) |*slot| {
+                            if (slot.*) |*cs| cs.deinit(self.allocator);
+                        }
+                        self.allocator.free(buffers);
+                    }
+                },
+                else => {},
+            }
+        }
         self.allocator.free(self.output_schema);
         self.allocator.free(self.views);
         self.arena.deinit();
@@ -203,6 +234,22 @@ pub const Compute = struct {
                     const arg_views = arg_views_buf[0..c.arg_indices.len];
                     for (c.arg_indices, arg_views) |src_idx, *view| view.* = in.values[src_idx];
 
+                    // Apply implicit casts in place: for each coerced arg,
+                    // refill the scratch ColumnStore from the upstream
+                    // view, then swap the cast view into arg_views.
+                    if (c.arg_casts) |casts| {
+                        const buffers = c.cast_buffers.?;
+                        var one_cast_view: [1]ColumnView = undefined;
+                        for (casts, buffers, 0..) |kfn, *buf_slot, arg_i| {
+                            const k = kfn orelse continue;
+                            const buf = &buf_slot.*.?;
+                            buf.clear();
+                            one_cast_view[0] = arg_views[arg_i];
+                            try k(self.allocator, &one_cast_view, buf, n);
+                            arg_views[arg_i] = buf.view();
+                        }
+                    }
+
                     try c.func.kernel(self.allocator, arg_views, out_col, n);
 
                     // Null bookkeeping. Skip when output isn't nullable
@@ -234,7 +281,12 @@ pub const Compute = struct {
 // Resolution
 // ---------------------------------------------------------------------------
 
-fn resolveDerived(aa: Allocator, d: Derived, up_schema: []const Column) !ResolvedDerived {
+fn resolveDerived(
+    runtime_allocator: Allocator,
+    aa: Allocator,
+    d: Derived,
+    up_schema: []const Column,
+) !ResolvedDerived {
     switch (d.expr) {
         .col_ref => |name| {
             const idx = columnIndex(up_schema, name) orelse return Error.ColumnNotFound;
@@ -259,11 +311,34 @@ fn resolveDerived(aa: Allocator, d: Derived, up_schema: []const Column) !Resolve
                     else => return Error.ComputeUnsupportedExpr, // v1: nested + lits not yet
                 }
             }
-            const func = scalar_fn.resolve(c.fn_name, arg_types) orelse return Error.ComputeNoSuchOverload;
+            const r = (try scalar_fn.resolve(aa, c.fn_name, arg_types)) orelse return Error.ComputeNoSuchOverload;
+            // Allocate scratch ColumnStores only for the args that
+            // actually need coercion. The buffers themselves live on
+            // the runtime allocator (the long-lived parent of `aa`)
+            // so they outlive the resolve phase; `cast_buffers`
+            // metadata is in the arena.
+            var cast_buffers: ?[]?ColumnStore = null;
+            if (r.arg_casts) |casts| {
+                const buffers = try runtime_allocator.alloc(?ColumnStore, casts.len);
+                for (casts, r.func.arg_types, arg_indices, buffers) |k, declared, src_idx, *slot| {
+                    if (k == null) {
+                        slot.* = null;
+                        continue;
+                    }
+                    const src_nullable = up_schema[src_idx].nullable;
+                    slot.* = try ColumnStore.init(runtime_allocator, declared, src_nullable);
+                }
+                cast_buffers = buffers;
+            }
             return .{
                 .name = try aa.dupe(u8, d.name),
-                .output_type = func.return_type,
-                .kind = .{ .call = .{ .func = func, .arg_indices = arg_indices } },
+                .output_type = r.func.return_type,
+                .kind = .{ .call = .{
+                    .func = r.func,
+                    .arg_indices = arg_indices,
+                    .arg_casts = r.arg_casts,
+                    .cast_buffers = cast_buffers,
+                } },
             };
         },
     }

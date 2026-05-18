@@ -35,6 +35,9 @@ const Expr = @import("expr.zig").Expr;
 const exec = @import("exec.zig");
 const Error = exec.Error;
 
+const cast = @import("cast.zig");
+const CastKernel = cast.CastKernel;
+
 pub const NullStrategy = enum {
     /// Default: if any input row is null, output is null. The
     /// Compute operator pre-builds a combined null mask before
@@ -70,11 +73,35 @@ pub const ScalarFn = struct {
 // Registry
 // ---------------------------------------------------------------------------
 
-/// Look up the first registered overload whose name + arg types match.
-/// Type comparison is by `TypeTag` only — width metadata (varchar
-/// length, decimal precision) doesn't affect overload selection.
-/// Returns null when no overload matches.
-pub fn resolve(name: []const u8, arg_types: []const Type) ?ScalarFn {
+/// Resolved overload + per-arg coercion plan returned by `resolve`.
+///
+/// On an EXACT match, `arg_casts` is null — the fast path avoids any
+/// per-arg work in the resolver and per-batch work in the executor.
+/// On an IMPLICIT-CAST match, `arg_casts[i]` is the cast kernel to
+/// apply to arg `i` (or null if that arg didn't need coercion).
+pub const ResolvedOverload = struct {
+    func: ScalarFn,
+    arg_casts: ?[]const ?CastKernel,
+};
+
+/// Look up the best-matching overload for `name(arg_types)`.
+///
+/// Resolution order:
+///   1. Exact `TypeTag` match → return immediately (zero overhead).
+///   2. Implicit-cast match: for each name-matching overload, check that
+///      every arg can implicitly cast to the declared type and sum the
+///      per-arg costs (see cast.zig). Pick the lowest-cost overload;
+///      ties → first-registered.
+///   3. No castable overload → null (caller surfaces ComputeNoSuchOverload).
+///
+/// Width metadata (varchar length, decimal precision) doesn't affect
+/// selection — only the TypeTag matters.
+pub fn resolve(
+    aa: Allocator,
+    name: []const u8,
+    arg_types: []const Type,
+) !?ResolvedOverload {
+    // Fast path: exact TypeTag match. No allocation, no cost calc.
     for (builtins) |f| {
         if (!std.mem.eql(u8, f.name, name)) continue;
         if (f.arg_types.len != arg_types.len) continue;
@@ -85,9 +112,41 @@ pub fn resolve(name: []const u8, arg_types: []const Type) ?ScalarFn {
                 break;
             }
         }
-        if (all_match) return f;
+        if (all_match) return ResolvedOverload{ .func = f, .arg_casts = null };
     }
-    return null;
+
+    // Slow path: rank by cumulative cast cost. Iterate name-matching
+    // overloads, compute cost, keep the cheapest.
+    var best: ?ScalarFn = null;
+    var best_cost: u64 = std.math.maxInt(u64);
+    for (builtins) |f| {
+        if (!std.mem.eql(u8, f.name, name)) continue;
+        if (f.arg_types.len != arg_types.len) continue;
+        var total_cost: u64 = 0;
+        var castable = true;
+        for (f.arg_types, arg_types) |declared, given| {
+            const c = cast.castCost(@as(TypeTag, given), @as(TypeTag, declared)) orelse {
+                castable = false;
+                break;
+            };
+            total_cost += c;
+        }
+        if (!castable) continue;
+        if (total_cost < best_cost) {
+            best_cost = total_cost;
+            best = f;
+        }
+    }
+
+    const chosen = best orelse return null;
+    // Build per-arg cast plan.
+    const arg_casts = try aa.alloc(?CastKernel, chosen.arg_types.len);
+    for (chosen.arg_types, arg_types, arg_casts) |declared, given, *slot| {
+        const ft: TypeTag = @as(TypeTag, given);
+        const tt: TypeTag = @as(TypeTag, declared);
+        slot.* = if (ft == tt) null else cast.kernelFor(ft, tt);
+    }
+    return ResolvedOverload{ .func = chosen, .arg_casts = arg_casts };
 }
 
 /// Inverse lookup: return ALL registered overloads matching `name`.
@@ -1286,29 +1345,4 @@ pub fn unhex(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "u
 pub fn toBase64(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "to_base64", &.{arg}); }
 pub fn fromBase64(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "from_base64", &.{arg}); }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-test "scalar_fn: resolve picks the matching overload" {
-    const f = resolve("upper", &.{.string}) orelse return error.NotFound;
-    try std.testing.expectEqualStrings("upper", f.name);
-    try std.testing.expectEqual(@as(TypeTag, .string), @as(TypeTag, f.return_type));
-
-    // No overload for int → null
-    try std.testing.expect(resolve("upper", &.{.int}) == null);
-
-    // Unknown name → null
-    try std.testing.expect(resolve("definitely_not_a_function", &.{.string}) == null);
-}
-
-test "scalar_fn: coalesce has multiple overloads, picks by arg type" {
-    const f_str = resolve("coalesce", &.{ .string, .string }) orelse return error.NotFound;
-    try std.testing.expectEqual(@as(TypeTag, .string), @as(TypeTag, f_str.return_type));
-
-    const f_int = resolve("coalesce", &.{ .int, .int }) orelse return error.NotFound;
-    try std.testing.expectEqual(@as(TypeTag, .int), @as(TypeTag, f_int.return_type));
-
-    // No mixed-type overload → null
-    try std.testing.expect(resolve("coalesce", &.{ .int, .string }) == null);
-}
+// Tests live in scalar_fn_test.zig (companion).

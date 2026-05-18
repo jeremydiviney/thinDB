@@ -336,4 +336,6 @@ test {
     _ = Sort;
     _ = Aggregate;
     _ = @import("exec_test.zig");
+    _ = @import("scalar_fn_test.zig");
+    _ = @import("cast.zig");
 }
