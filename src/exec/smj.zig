@@ -104,8 +104,14 @@ pub const SortMergeJoin = struct {
 
     /// Range predicates resolved to column indices. AND-combined;
     /// every range must hold for the pair to be emitted. Empty when
-    /// the user didn't supply any. Restricted to INNER joins.
+    /// the user didn't supply any.
     ranges: []const join_mod.Join.ResolvedRange,
+
+    /// Reusable scratch buffers for per-key-run "any actual match"
+    /// tracking under outer + range. Sized to the current run's
+    /// length each iteration; capacity persists.
+    li_match_scratch: std.ArrayList(bool) = .empty,
+    ri_match_scratch: std.ArrayList(bool) = .empty,
 
     phase: Phase = .materializing,
 
@@ -118,9 +124,6 @@ pub const SortMergeJoin = struct {
         spec: Spec,
     ) !Query {
         if (spec.on.len == 0) return Error.JoinEmptyOnClause;
-        if (spec.ranges.len > 0 and spec.join_type != .inner) {
-            return Error.JoinUnsupportedType;
-        }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -273,6 +276,8 @@ pub const SortMergeJoin = struct {
         l.deinit();
         var r = self.right;
         r.deinit();
+        self.li_match_scratch.deinit(self.allocator);
+        self.ri_match_scratch.deinit(self.allocator);
         for (self.left_materialized) |*c| c.deinit(self.allocator);
         self.allocator.free(self.left_materialized);
         for (self.right_materialized) |*c| c.deinit(self.allocator);
@@ -454,7 +459,30 @@ pub const SortMergeJoin = struct {
                     var r_end = self.right_cursor + 1;
                     while (r_end < self.right_perm.len and std.mem.eql(u8, self.right_keys_bytes[r_end], rkey)) : (r_end += 1) {}
 
-                    // Emit cartesian product of left[cursor..l_end] × right[cursor..r_end].
+                    // Outer + range needs per-row "any actual match"
+                    // tracking — a left row may have all candidates
+                    // rejected by the range filter, in which case
+                    // LEFT/FULL OUTER still null-extends it. Same for
+                    // right under RIGHT/FULL. Scratch buffers grow on
+                    // demand; capacity persists across runs.
+                    const l_size = l_end - self.left_cursor;
+                    const r_size = r_end - self.right_cursor;
+                    var li_match: []bool = &.{};
+                    var ri_match: []bool = &.{};
+                    if (preserve_left) {
+                        try self.li_match_scratch.resize(self.allocator, l_size);
+                        @memset(self.li_match_scratch.items, false);
+                        li_match = self.li_match_scratch.items;
+                    }
+                    if (preserve_right) {
+                        try self.ri_match_scratch.resize(self.allocator, r_size);
+                        @memset(self.ri_match_scratch.items, false);
+                        ri_match = self.ri_match_scratch.items;
+                    }
+
+                    // Cartesian. No mid-run buffer check — batches may
+                    // exceed output_batch_rows temporarily; we flush at
+                    // the run boundary.
                     var li = self.left_cursor;
                     while (li < l_end) : (li += 1) {
                         var ri = self.right_cursor;
@@ -463,35 +491,30 @@ pub const SortMergeJoin = struct {
                             const rr = self.right_perm[ri];
                             if (!self.passesAllRanges(lr, rr)) continue;
                             try self.emitOutputRow(lr, rr);
-                            if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
-                                // Flush full batch. Save cursors so we
-                                // can resume from the next (left, right)
-                                // pair in this same run on the next call.
-                                // We've already consumed (li, ri); resume
-                                // from (li, ri+1).
-                                self.left_cursor = li;
-                                self.right_cursor = ri + 1;
-                                // BUT if ri was the last in the right run,
-                                // we need to advance left and restart right
-                                // at the start of the right run.
-                                if (self.right_cursor >= r_end) {
-                                    self.left_cursor = li + 1;
-                                    self.right_cursor = self.firstOfRun(self.right_keys_bytes, self.right_cursor - (r_end - self.lastRunStartRight(r_end)), rkey);
-                                    // Simpler: when batch is full mid-run,
-                                    // we'd need careful cursor save. v1
-                                    // takes a simpler approach: only check
-                                    // batch fullness at run boundaries.
-                                    // Fall through; this won't happen
-                                    // because we always finish a run fully
-                                    // — see comment below.
-                                }
-                                return try self.flushOutput();
-                            }
+                            if (preserve_left) li_match[li - self.left_cursor] = true;
+                            if (preserve_right) ri_match[ri - self.right_cursor] = true;
+                        }
+                    }
+
+                    // Emit null-extended rows for preserved-side rows
+                    // that had no actual match.
+                    if (preserve_left) {
+                        for (li_match, 0..) |m, i| {
+                            if (!m) try self.emitLeftOnlyRow(self.left_perm[self.left_cursor + i]);
+                        }
+                    }
+                    if (preserve_right) {
+                        for (ri_match, 0..) |m, i| {
+                            if (!m) try self.emitRightOnlyRow(self.right_perm[self.right_cursor + i]);
                         }
                     }
 
                     self.left_cursor = l_end;
                     self.right_cursor = r_end;
+
+                    if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                        return try self.flushOutput();
+                    }
                 },
             }
         }

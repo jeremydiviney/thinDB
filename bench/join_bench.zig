@@ -740,4 +740,261 @@ pub fn runAll(allocator: Allocator, io: Io) !void {
     try benchStringJoinUnsorted(allocator, io, "string 100k unsorted", 100_000, .sort_merge);
     try benchUuidJoinUnsorted(allocator, io, "uuid 100k unsorted", 100_000, .hash);
     try benchUuidJoinUnsorted(allocator, io, "uuid 100k unsorted", 100_000, .sort_merge);
+
+    // Range / mixed-predicate joins.
+    std.debug.print("\nJoin — range + mixed predicates\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    try benchEquiPlusRange(allocator, io, 100_000, .hash);
+    try benchEquiPlusRange(allocator, io, 100_000, .sort_merge);
+    try benchEquiPlusBetween(allocator, io, 100_000, .hash);
+    try benchEquiPlusBetween(allocator, io, 100_000, .sort_merge);
+    try benchPureRangeNlj(allocator, io, 1_000, 1_000);
+    try benchPureRangeNlj(allocator, io, 5_000, 5_000);
+    try benchLeftOuterRange(allocator, io, 100_000, .hash);
+    try benchLeftOuterRange(allocator, io, 100_000, .sort_merge);
+}
+
+// ----------------------------------------------------------------------------
+// Range / mixed-predicate benchmarks
+// ----------------------------------------------------------------------------
+
+const range_l_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "k", .type = .bigint },
+        .{ .name = "x", .type = .bigint },
+    },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const range_r_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "k", .type = .bigint },
+        .{ .name = "y", .type = .bigint },
+    },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const between_r_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "k", .type = .bigint },
+        .{ .name = "lo", .type = .bigint },
+        .{ .name = "hi", .type = .bigint },
+    },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const range_l_ok = [_][]const u8{"k"};
+const range_r_ok = [_][]const u8{"k"};
+const range_opts = thindb.TableOptions{
+    .order_key = &range_l_ok,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+const between_r_opts = thindb.TableOptions{
+    .order_key = &range_r_ok,
+    .unique = true,
+    .row_group_size = 65_536,
+};
+
+fn fillRangeLeft(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { k: i64, x: i64 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .k = @intCast(i), .x = @intCast(i * 3) };
+    try t.insert(rows);
+}
+fn fillRangeRight(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { k: i64, y: i64 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    // y = x * 2 — about half the pairs pass `x < y` (since y = 2*k, x = 3*k; 3k < 2k is FALSE for k>0).
+    // Adjust: y = x * 4 so most pass.
+    for (rows, 0..) |*r, i| r.* = .{ .k = @intCast(i), .y = @intCast(i * 4) };
+    try t.insert(rows);
+}
+
+fn benchEquiPlusRange(allocator: Allocator, io: Io, n: usize, algo: thindb.exec.join_op.Algorithm) !void {
+    var dir = try freshDir(io, ".bench-data/join_equi_range");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", range_l_schema, range_opts);
+    try fillRangeLeft(l, n, allocator);
+    try l.flush();
+    const r = try db.table("r", range_r_schema, range_opts);
+    try fillRangeRight(r, n, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+    reportJoin("equi + 1 range", algo, n, n, output, elapsed);
+}
+
+fn fillBetweenLeft(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { k: i64, x: i64 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .k = @intCast(i), .x = @intCast(i % 100) };
+    try t.insert(rows);
+}
+fn fillBetweenRight(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { k: i64, lo: i64, hi: i64 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{
+        .k = @intCast(i),
+        .lo = @intCast(i % 50),
+        .hi = @intCast(i % 50 + 80),
+    };
+    try t.insert(rows);
+}
+
+fn benchEquiPlusBetween(allocator: Allocator, io: Io, n: usize, algo: thindb.exec.join_op.Algorithm) !void {
+    var dir = try freshDir(io, ".bench-data/join_equi_between");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", range_l_schema, range_opts);
+    try fillBetweenLeft(l, n, allocator);
+    try l.flush();
+    const r = try db.table("r", between_r_schema, between_r_opts);
+    try fillBetweenRight(r, n, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .ranges = &.{
+            .{ .left = "x", .op = .gte, .right = "lo" },
+            .{ .left = "x", .op = .lt, .right = "hi" },
+        },
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+    reportJoin("equi + BETWEEN (2 ranges)", algo, n, n, output, elapsed);
+}
+
+// Distinct schemas for pure-range NLJ — no shared `k` column to drop
+// since there's no equi `on`.
+const pure_l_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "l_rowid", .type = .bigint },
+        .{ .name = "x", .type = .bigint },
+    },
+    .order_key = &.{"l_rowid"},
+    .unique = true,
+};
+const pure_r_schema = thindb.Schema{
+    .columns = &.{
+        .{ .name = "r_rowid", .type = .bigint },
+        .{ .name = "y", .type = .bigint },
+    },
+    .order_key = &.{"r_rowid"},
+    .unique = true,
+};
+const pure_l_ok = [_][]const u8{"l_rowid"};
+const pure_r_ok = [_][]const u8{"r_rowid"};
+
+fn fillPureLeft(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { l_rowid: i64, x: i64 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .l_rowid = @intCast(i), .x = @intCast(i * 3) };
+    try t.insert(rows);
+}
+fn fillPureRight(t: *thindb.Table, n: usize, allocator: Allocator) !void {
+    const Row = struct { r_rowid: i64, y: i64 };
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .r_rowid = @intCast(i), .y = @intCast(i * 4) };
+    try t.insert(rows);
+}
+
+fn benchPureRangeNlj(allocator: Allocator, io: Io, l_rows: usize, r_rows: usize) !void {
+    var dir = try freshDir(io, ".bench-data/join_pure_range");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", pure_l_schema, .{ .order_key = &pure_l_ok, .unique = true });
+    try fillPureLeft(l, l_rows, allocator);
+    try l.flush();
+    const r = try db.table("r", pure_r_schema, .{ .order_key = &pure_r_ok, .unique = true });
+    try fillPureRight(r, r_rows, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{}, // pure range → NLJ
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+    reportJoin("pure range (no equi)", .nested_loop, l_rows, r_rows, output, elapsed);
+}
+
+fn benchLeftOuterRange(allocator: Allocator, io: Io, n: usize, algo: thindb.exec.join_op.Algorithm) !void {
+    var dir = try freshDir(io, ".bench-data/join_left_outer_range");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", range_l_schema, range_opts);
+    try fillRangeLeft(l, n, allocator);
+    try l.flush();
+    const r = try db.table("r", range_r_schema, range_opts);
+    try fillRangeRight(r, n, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+        .algorithm = algo,
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+    reportJoin("LEFT OUTER + range", algo, n, n, output, elapsed);
 }

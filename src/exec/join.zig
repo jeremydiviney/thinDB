@@ -192,6 +192,12 @@ pub const Join = struct {
     /// position within it.
     cur_match_list: []const u32 = &.{},
     cur_match_pos: usize = 0,
+    /// For outer joins with range: tracks whether the current probe
+    /// row has had any actual emit (passed range checks). Reset on
+    /// new probe row, set true on each successful emit. When the
+    /// match list exhausts with this still false AND probe-side is
+    /// preserved, we emit one null-extended row.
+    cur_probe_any_match: bool = false,
     /// True if we just flushed a batch and the next emit should
     /// clear output_columns before appending. We can't clear at the
     /// end of flushOutput because the returned Batch's views still
@@ -226,11 +232,6 @@ pub const Join = struct {
         right: Query,
         spec: Spec,
     ) !Query {
-        // v1: ranges only allowed on INNER. Outer + range needs per-row
-        // "any actual match" tracking that isn't implemented yet.
-        if (spec.ranges.len > 0 and spec.join_type != .inner) {
-            return Error.JoinUnsupportedType;
-        }
         // Resolve algorithm. .auto picks nested_loop for empty `on`,
         // otherwise consults cheap stats (chooseAlgorithm).
         const chosen = if (spec.algorithm == .auto)
@@ -566,8 +567,20 @@ pub const Join = struct {
             if (self.cur_match_pos < self.cur_match_list.len) {
                 const consumed_full = try self.emitMatchesUntilFull(probe_key_indices);
                 if (consumed_full) return try self.flushOutput();
-                // Otherwise we exhausted the current match list; fall
-                // through to advance to the next probe row.
+                // List exhausted. If outer + range filtered out all
+                // candidates (any_match still false), emit one null-
+                // extended row for the probe side now.
+                if (!self.cur_probe_any_match and self.probeSidePreserved()) {
+                    const b = self.cur_probe_batch.?;
+                    const full_after = try self.emitProbeOnlyRow(b, self.cur_probe_row);
+                    self.cur_probe_row += 1;
+                    self.cur_probe_any_match = false;
+                    if (full_after) return try self.flushOutput();
+                    continue;
+                }
+                self.cur_probe_row += 1;
+                self.cur_probe_any_match = false;
+                continue;
             }
 
             // Advance within the current probe batch, or fetch next.
@@ -584,17 +597,12 @@ pub const Join = struct {
                     if (self.hash_table.get(self.key_scratch.items)) |bucket| {
                         self.cur_match_list = bucket.items;
                         self.cur_match_pos = 0;
-                        // FULL OUTER: mark these build rows as matched
-                        // so the drain phase doesn't re-emit them.
-                        if (self.matched_build) |*mb| {
-                            for (bucket.items) |br| mb.set(br);
-                        }
+                        self.cur_probe_any_match = false;
                         continue; // emit matches in next loop iteration
                     }
                 }
-                // No match for this probe row. If the probe side is
-                // preserved (LEFT/RIGHT/FULL OUTER with this side as
-                // probe), emit one null-extended row before advancing.
+                // No bucket → no candidates at all. If outer, emit
+                // one null-extended row before advancing.
                 if (self.probeSidePreserved()) {
                     const full_after = try self.emitProbeOnlyRow(batch, self.cur_probe_row);
                     self.cur_probe_row += 1;
@@ -646,6 +654,12 @@ pub const Join = struct {
             // NULL on either side fails (two-valued logic).
             if (!self.passesAllRanges(batch, probe_row, build_row)) continue;
 
+            // Actual match — record so probeStep doesn't null-extend
+            // this probe row, and (FULL) so drainStep skips this
+            // build row.
+            self.cur_probe_any_match = true;
+            if (self.matched_build) |*mb| mb.set(build_row);
+
             // Append left-side columns first.
             var out_idx: usize = 0;
             if (self.build_is_left) {
@@ -691,13 +705,15 @@ pub const Join = struct {
                     self.cur_probe_row += 1;
                     self.cur_match_list = &.{};
                     self.cur_match_pos = 0;
+                    self.cur_probe_any_match = false;
                 }
                 return true;
             }
         }
 
-        // Match list exhausted. Advance probe row.
-        self.cur_probe_row += 1;
+        // Match list exhausted. Reset list state but DON'T advance
+        // probe_row — probeStep does that after checking
+        // cur_probe_any_match for the outer-with-range case.
         self.cur_match_list = &.{};
         self.cur_match_pos = 0;
         return false;

@@ -106,7 +106,19 @@ All sizes use unique `bigint` keys [0..N) on both sides → inner equi-join emit
 | string 100k unsorted | 23 ms | 42 ms | 2.2× (vs 19 ms sorted) |
 | uuid 100k unsorted | 17 ms | 39 ms | 2.4× (vs 16 ms sorted) |
 
-**Key insight:** pdqsort's already-sorted fast-path saves ~2–3× on SMJ. A future merge-only fast-path (skip sort when stats prove pre-sorted) would unlock this.
+**Key insight:** pdqsort's already-sorted fast-path saves ~2–3× on SMJ. The merge-only fast-path (skip sort when stats prove pre-sorted) now skips that work entirely when both inputs are pre-sorted on the join keys.
+
+### Range and mixed-predicate joins (100k × 100k unless noted)
+
+| Shape | Hash | SMJ | NLJ |
+|---|---:|---:|---:|
+| equi + 1 range | 17 ms | 15 ms | — |
+| equi + BETWEEN (2 ranges) | 18 ms | 15 ms | — |
+| LEFT OUTER + range | 23 ms | 16 ms | — |
+| pure range, 1k × 1k (624k pairs) | — | — | 12 ms |
+| pure range, 5k × 5k (15.6M pairs) | — | — | 300 ms |
+
+Range overhead is small (~5-15%) on top of plain equi-joins — the per-pair check fits inside the Cartesian emit loop. NLJ on pure range produces ~52 M output rows/sec regardless of N; total time scales as O(N×M) since every pair must be evaluated.
 
 ---
 

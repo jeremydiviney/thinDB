@@ -1389,28 +1389,163 @@ test "join: range predicate works under SMJ" {
     try std.testing.expectEqual(@as(usize, 3), rows);
 }
 
-test "join: range + outer is rejected" {
+// Same-typed columns fixture used by outer+range tests.
+fn outerRangeFixture(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !struct {
+    db: *thindb.Database,
+    l: *thindb.Table,
+    r: *thindb.Table,
+} {
+    const lschema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "x", .type = .bigint },
+        },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const rschema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "y", .type = .bigint },
+        },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const l_ok = [_][]const u8{"k"};
+    const r_ok = [_][]const u8{"k"};
+
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    errdefer db.close();
+
+    const l = try db.table("l", lschema, .{ .order_key = &l_ok });
+    try l.insert(&.{
+        .{ .k = @as(i64, 1), .x = @as(i64, 10) }, // for k=1
+        .{ .k = @as(i64, 2), .x = @as(i64, 20) }, // for k=2
+        .{ .k = @as(i64, 3), .x = @as(i64, 30) }, // for k=3 (orphan, no r row)
+    });
+    try l.flush();
+
+    const r = try db.table("r", rschema, .{ .order_key = &r_ok });
+    try r.insert(&.{
+        .{ .k = @as(i64, 1), .y = @as(i64, 5) }, // k=1: l.x=10 > r.y=5
+        .{ .k = @as(i64, 1), .y = @as(i64, 15) }, // k=1: l.x=10 < r.y=15
+        .{ .k = @as(i64, 2), .y = @as(i64, 5) }, // k=2: l.x=20 > r.y=5
+        .{ .k = @as(i64, 4), .y = @as(i64, 100) }, // orphan, no l row
+    });
+    try r.flush();
+
+    return .{ .db = db, .l = l, .r = r };
+}
+
+test "join: LEFT OUTER + range — preserved rows null-extend when range fails (hash)" {
+    // l ⋈ r ON k AND l.x < r.y
+    //   k=1, l.x=10: r.y=5 fails, r.y=15 passes → 1 emit
+    //   k=2, l.x=20: r.y=5 fails (no other r) → all rejected → null-extend
+    //   k=3: no r → null-extend
+    // Total: 1 actual + 2 null-extended = 3 rows.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var f = try outerFixture(allocator, io, tmp.dir);
+    var f = try outerRangeFixture(allocator, io, tmp.dir);
     defer f.db.close();
 
-    var left = try thindb.scan(allocator, f.users);
-    var right = try thindb.scan(allocator, f.orders);
-    try std.testing.expectError(
-        thindb.exec.Error.JoinUnsupportedType,
-        left.join(right, .{
-            .join_type = .left,
-            .on = &.{.{ .left = "uid", .right = "uid" }},
-            .ranges = &.{.{ .left = "uid", .op = .lt, .right = "qty" }},
-            .algorithm = .hash,
-        }),
-    );
-    left.deinit();
-    right.deinit();
+    const left = try thindb.scan(allocator, f.l);
+    const right = try thindb.scan(allocator, f.r);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var nulls: usize = 0;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        // schema: k, x, y. y is at index 2.
+        for (0..b.row_count) |i| {
+            if (!b.values[2].isValid(i)) nulls += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows);
+    try std.testing.expectEqual(@as(usize, 2), nulls);
+}
+
+test "join: LEFT OUTER + range — all candidates rejected → null-extended (SMJ)" {
+    // Same shape, run via SMJ to exercise its outer+range path.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerRangeFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.l);
+    const right = try thindb.scan(allocator, f.r);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+        .algorithm = .sort_merge,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var nulls: usize = 0;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        for (0..b.row_count) |i| {
+            if (!b.values[2].isValid(i)) nulls += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows);
+    try std.testing.expectEqual(@as(usize, 2), nulls);
+}
+
+test "join: FULL OUTER + range — both-side orphans + range-rejected null-extension" {
+    // Same fixture: l ⋈ r ON k AND l.x < r.y
+    //   k=1: 1 actual match (l.x=10 < r.y=15). Note r.y=5 fails the range
+    //     but is still considered "matched" on the build side for FULL
+    //     since the equi key matched — but we want to be precise: build
+    //     rows that pass range get marked. r row (k=1, y=5) does NOT get
+    //     marked → drained later. So:
+    //       1 emit (k=1, x=10, y=15)
+    //       drain: r (k=1, y=5) unmatched → null-extended on left.
+    //   k=2: r.y=5 fails range, all candidates rejected.
+    //     LEFT null-extension fires for l (k=2). r row stays unmatched.
+    //       1 left-only emit, 1 right-only (k=2, y=5) emit.
+    //   k=3: no r → null-extended once.
+    //   k=4 (right-only orphan): drained at end → null-extended once.
+    // Total: 1 + 1 + 1 + 1 + 1 + 1 = 6 rows.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerRangeFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.l);
+    const right = try thindb.scan(allocator, f.r);
+    var q = try left.join(right, .{
+        .join_type = .full,
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 6), rows);
 }
 
 test "join: NLJ handles pure range (no equi part)" {
@@ -1604,6 +1739,196 @@ test "join: NLJ handles equi + multiple ranges (BETWEEN-style)" {
     var rows: usize = 0;
     while (try q.next()) |bat| rows += bat.row_count;
     try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "join: LEFT OUTER via NLJ + pure range" {
+    // NLJ-only path: no equi keys, just a range. LEFT OUTER preserves
+    // left rows that have no qualifying right match.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
+        .order_key = &.{"rowid"},
+        .unique = true,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{ .{ .name = "b_rowid", .type = .bigint }, .{ .name = "y", .type = .bigint } },
+        .order_key = &.{"b_rowid"},
+        .unique = true,
+    };
+    const a_ok = [_][]const u8{"rowid"};
+    const b_ok = [_][]const u8{"b_rowid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const a = try db.table("a", schema_a, .{ .order_key = &a_ok, .unique = true });
+    try a.insert(&.{
+        .{ .rowid = @as(i64, 1), .x = @as(i64, 10) }, // any y > 10 matches
+        .{ .rowid = @as(i64, 2), .x = @as(i64, 100) }, // no y > 100
+    });
+    try a.flush();
+    const b = try db.table("b", schema_b, .{ .order_key = &b_ok, .unique = true });
+    try b.insert(&.{
+        .{ .b_rowid = @as(i64, 1), .y = @as(i64, 50) },
+        .{ .b_rowid = @as(i64, 2), .y = @as(i64, 75) },
+    });
+    try b.flush();
+
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{}, // pure range → NLJ
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var saw_unmatched_x100 = false;
+    while (try q.next()) |bat| {
+        rows += bat.row_count;
+        for (0..bat.row_count) |i| {
+            if (bat.values[1].data.bigint[i] == 100 and !bat.values[3].isValid(i)) {
+                saw_unmatched_x100 = true;
+            }
+        }
+    }
+    // x=10: matches y=50 and y=75 → 2 rows.
+    // x=100: matches none → 1 null-extended row.
+    try std.testing.expectEqual(@as(usize, 3), rows);
+    try std.testing.expect(saw_unmatched_x100);
+}
+
+test "join: equi + multiple ranges + extra_predicate (the kitchen sink)" {
+    // tenant equi + (x >= lo AND x < hi) + WHERE x > 5 (extra_predicate).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{
+            .{ .name = "tenant", .type = .bigint },
+            .{ .name = "x", .type = .bigint },
+        },
+        .order_key = &.{"tenant"},
+        .unique = false,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{
+            .{ .name = "tenant", .type = .bigint },
+            .{ .name = "lo", .type = .bigint },
+            .{ .name = "hi", .type = .bigint },
+        },
+        .order_key = &.{"tenant"},
+        .unique = false,
+    };
+    const a_ok = [_][]const u8{"tenant"};
+    const b_ok = [_][]const u8{"tenant"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const a = try db.table("a", schema_a, .{ .order_key = &a_ok });
+    try a.insert(&.{
+        .{ .tenant = @as(i64, 1), .x = @as(i64, 3) }, // fits range [0,10) but fails x>5
+        .{ .tenant = @as(i64, 1), .x = @as(i64, 8) }, // fits range AND x>5 → keep
+        .{ .tenant = @as(i64, 2), .x = @as(i64, 50) }, // fits range AND x>5 → keep
+    });
+    try a.flush();
+    const b = try db.table("b", schema_b, .{ .order_key = &b_ok });
+    try b.insert(&.{
+        .{ .tenant = @as(i64, 1), .lo = @as(i64, 0), .hi = @as(i64, 10) },
+        .{ .tenant = @as(i64, 2), .lo = @as(i64, 40), .hi = @as(i64, 60) },
+    });
+    try b.flush();
+
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "tenant", .right = "tenant" }},
+        .ranges = &.{
+            .{ .left = "x", .op = .gte, .right = "lo" },
+            .{ .left = "x", .op = .lt, .right = "hi" },
+        },
+        .extra_predicate = thindb.leafExpr("x", .gt, .{ .bigint = 5 }),
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b2| rows += b2.row_count;
+    // a=(1,3) matches range but fails extra → drop. (1,8) and (2,50) keep.
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "join: FULL OUTER via NLJ + range — both-side orphans" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
+        .order_key = &.{"rowid"},
+        .unique = true,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{ .{ .name = "b_rowid", .type = .bigint }, .{ .name = "y", .type = .bigint } },
+        .order_key = &.{"b_rowid"},
+        .unique = true,
+    };
+    const a_ok = [_][]const u8{"rowid"};
+    const b_ok = [_][]const u8{"b_rowid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const a = try db.table("a", schema_a, .{ .order_key = &a_ok, .unique = true });
+    try a.insert(&.{
+        .{ .rowid = @as(i64, 1), .x = @as(i64, 10) }, // matches y=50,75
+        .{ .rowid = @as(i64, 2), .x = @as(i64, 100) }, // no match
+    });
+    try a.flush();
+    const b = try db.table("b", schema_b, .{ .order_key = &b_ok, .unique = true });
+    try b.insert(&.{
+        .{ .b_rowid = @as(i64, 1), .y = @as(i64, 50) }, // matched by x=10
+        .{ .b_rowid = @as(i64, 2), .y = @as(i64, 75) }, // matched by x=10
+        .{ .b_rowid = @as(i64, 3), .y = @as(i64, 5) }, // not matched
+    });
+    try b.flush();
+
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    var q = try left.join(right, .{
+        .join_type = .full,
+        .on = &.{},
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |bat| rows += bat.row_count;
+    // x=10 matches y=50,75 → 2 rows.
+    // x=100 matches nothing → 1 left-only row.
+    // y=5 matches nothing → 1 right-only row.
+    try std.testing.expectEqual(@as(usize, 4), rows);
 }
 
 test "join: type mismatch on join key errors" {

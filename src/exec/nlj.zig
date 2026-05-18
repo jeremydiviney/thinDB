@@ -72,6 +72,21 @@ pub const NestedLoopJoin = struct {
     left_cursor: u32 = 0,
     right_cursor: u32 = 0,
 
+    // Outer join state.
+    join_type: join_mod.JoinType,
+    /// Tracks whether the current LEFT (outer) row has had any
+    /// actual match. Reset when left_cursor advances. When the
+    /// inner loop completes with this still false AND the left
+    /// side is preserved (LEFT/FULL), we emit one null-extended
+    /// left row.
+    cur_left_any_match: bool = false,
+    /// FULL/RIGHT OUTER: bitmap of matched RIGHT (inner) rows.
+    /// After the main loop completes, unmarked rows get emitted
+    /// null-extended on the left side.
+    matched_right: ?std.DynamicBitSetUnmanaged = null,
+    /// Drain cursor for the post-loop unmatched-right phase.
+    drain_cursor: u32 = 0,
+
     // Output staging.
     output_columns: []ColumnStore,
     views: []ColumnView,
@@ -79,7 +94,15 @@ pub const NestedLoopJoin = struct {
 
     phase: Phase = .materializing,
 
-    const Phase = enum { materializing, looping, done };
+    const Phase = enum {
+        materializing,
+        looping,
+        /// RIGHT / FULL OUTER: walk matched_right after the main
+        /// loop, emitting null-extended rows for unmatched right
+        /// rows.
+        draining_right,
+        done,
+    };
 
     pub fn create(
         allocator: Allocator,
@@ -87,13 +110,6 @@ pub const NestedLoopJoin = struct {
         right: Query,
         spec: Spec,
     ) !Query {
-        if (spec.ranges.len > 0 and spec.join_type != .inner) {
-            return Error.JoinUnsupportedType;
-        }
-        if (spec.join_type != .inner) {
-            // NLJ outer would also need per-row match tracking. Defer.
-            return Error.JoinUnsupportedType;
-        }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -141,9 +157,22 @@ pub const NestedLoopJoin = struct {
             if (m) right_kept_count += 1;
         }
 
+        // Outer joins force the "other" side's columns to nullable.
+        const left_nullable_in_output = switch (spec.join_type) {
+            .inner, .left => false,
+            .right, .full => true,
+        };
+        const right_nullable_in_output = switch (spec.join_type) {
+            .inner, .right => false,
+            .left, .full => true,
+        };
+
         const output_schema = try allocator.alloc(Column, left_schema.len + right_kept_count);
         errdefer allocator.free(output_schema);
-        for (left_schema, 0..) |c, i| output_schema[i] = c;
+        for (left_schema, 0..) |c, i| {
+            output_schema[i] = c;
+            if (left_nullable_in_output) output_schema[i].nullable = true;
+        }
         var out_idx: usize = left_schema.len;
         for (right_schema, 0..) |c, i| {
             if (!right_kept_mask[i]) continue;
@@ -151,6 +180,7 @@ pub const NestedLoopJoin = struct {
                 if (std.mem.eql(u8, prior.name, c.name)) return Error.JoinColumnNameCollision;
             }
             output_schema[out_idx] = c;
+            if (right_nullable_in_output) output_schema[out_idx].nullable = true;
             out_idx += 1;
         }
 
@@ -205,6 +235,7 @@ pub const NestedLoopJoin = struct {
             .right_materialized = right_mat,
             .output_columns = output_columns,
             .views = views,
+            .join_type = spec.join_type,
         };
         const q = makeQuery(allocator, self);
         if (spec.extra_predicate) |pred| {
@@ -227,6 +258,7 @@ pub const NestedLoopJoin = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.output_schema);
         self.allocator.free(self.right_kept_mask);
+        if (self.matched_right) |*mb| mb.deinit(self.allocator);
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -259,10 +291,28 @@ pub const NestedLoopJoin = struct {
             switch (self.phase) {
                 .materializing => {
                     try self.materialize();
+                    // RIGHT/FULL OUTER: allocate matched-right bitmap
+                    // so the draining phase can find unmatched rows.
+                    if (self.join_type == .right or self.join_type == .full) {
+                        self.matched_right = try std.DynamicBitSetUnmanaged.initEmpty(
+                            self.allocator,
+                            self.right_rows,
+                        );
+                    }
                     self.phase = .looping;
                 },
                 .looping => {
                     if (try self.loopStep()) |batch| return batch;
+                    if (self.matched_right != null) {
+                        self.phase = .draining_right;
+                        continue;
+                    }
+                    self.phase = .done;
+                    if (try self.flushOutput()) |batch| return batch;
+                    return null;
+                },
+                .draining_right => {
+                    if (try self.drainRightStep()) |batch| return batch;
                     self.phase = .done;
                     if (try self.flushOutput()) |batch| return batch;
                     return null;
@@ -293,14 +343,27 @@ pub const NestedLoopJoin = struct {
             self.pending_clear = false;
         }
 
-        while (self.left_cursor < self.left_rows) : ({
-            self.left_cursor += 1;
-            self.right_cursor = 0;
-        }) {
-            // NULL key handling: when there's an equi part, NULL keys
-            // on the outer row never match (standard SQL). Skip without
-            // evaluating ranges.
-            if (self.left_key_indices.len > 0 and self.outerHasNullKey()) continue;
+        const preserve_left = switch (self.join_type) {
+            .left, .full => true,
+            else => false,
+        };
+
+        while (self.left_cursor < self.left_rows) {
+            // NULL outer key: under inner semantics we skip silently;
+            // under LEFT/FULL we still preserve the row by emitting
+            // null-extended (NULL never matches anyone).
+            if (self.left_key_indices.len > 0 and self.outerHasNullKey()) {
+                if (preserve_left) {
+                    try self.emitLeftOnlyRow(self.left_cursor);
+                }
+                self.left_cursor += 1;
+                self.right_cursor = 0;
+                self.cur_left_any_match = false;
+                if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                    return try self.flushOutput();
+                }
+                continue;
+            }
 
             while (self.right_cursor < self.right_rows) : (self.right_cursor += 1) {
                 if (self.right_key_indices.len > 0 and self.innerHasNullKey()) continue;
@@ -308,14 +371,73 @@ pub const NestedLoopJoin = struct {
                 if (!self.passesAllRanges()) continue;
 
                 try self.emitRow();
+                self.cur_left_any_match = true;
+                if (self.matched_right) |*mb| mb.set(self.right_cursor);
                 if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
                     self.right_cursor += 1;
                     return try self.flushOutput();
                 }
             }
+            // Inner loop done for this outer row. Emit null-extended
+            // if outer is preserved and no match occurred.
+            if (preserve_left and !self.cur_left_any_match) {
+                try self.emitLeftOnlyRow(self.left_cursor);
+            }
+            self.left_cursor += 1;
+            self.right_cursor = 0;
+            self.cur_left_any_match = false;
+            if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                return try self.flushOutput();
+            }
         }
 
         return null;
+    }
+
+    /// RIGHT/FULL OUTER drain: walk matched_right and emit
+    /// null-extended rows for unmatched right rows.
+    fn drainRightStep(self: *NestedLoopJoin) !?Batch {
+        const mb = if (self.matched_right) |*m| m else return null;
+        if (self.pending_clear) {
+            for (self.output_columns) |*c| c.clear();
+            self.pending_clear = false;
+        }
+        while (self.drain_cursor < self.right_rows) : (self.drain_cursor += 1) {
+            if (mb.isSet(self.drain_cursor)) continue;
+            try self.emitRightOnlyRow(self.drain_cursor);
+            if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                self.drain_cursor += 1;
+                return try self.flushOutput();
+            }
+        }
+        return null;
+    }
+
+    fn emitLeftOnlyRow(self: *NestedLoopJoin, left_row: u32) !void {
+        var out_idx: usize = 0;
+        for (self.left_materialized) |*col| {
+            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, left_row);
+            out_idx += 1;
+        }
+        for (self.right_kept_mask) |kept| {
+            if (!kept) continue;
+            try appendNullTo(self.allocator, &self.output_columns[out_idx]);
+            out_idx += 1;
+        }
+    }
+
+    fn emitRightOnlyRow(self: *NestedLoopJoin, right_row: u32) !void {
+        var out_idx: usize = 0;
+        var i: usize = 0;
+        while (i < self.left_col_count) : (i += 1) {
+            try appendNullTo(self.allocator, &self.output_columns[out_idx]);
+            out_idx += 1;
+        }
+        for (self.right_materialized, 0..) |*col, idx| {
+            if (!self.right_kept_mask[idx]) continue;
+            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, right_row);
+            out_idx += 1;
+        }
     }
 
     fn outerHasNullKey(self: NestedLoopJoin) bool {
@@ -388,6 +510,29 @@ fn isStringTag(t: TypeTag) bool {
         .varchar, .string, .char => true,
         else => false,
     };
+}
+
+/// Append a NULL placeholder + clear validity bit.
+fn appendNullTo(allocator: Allocator, dst: *ColumnStore) !void {
+    switch (dst.data) {
+        .int => |*l| try l.append(allocator, 0),
+        .bigint => |*l| try l.append(allocator, 0),
+        .boolean => |*l| try l.append(allocator, 0),
+        .float => |*l| try l.append(allocator, 0),
+        .double => |*l| try l.append(allocator, 0),
+        .date => |*l| try l.append(allocator, 0),
+        .datetime => |*l| try l.append(allocator, 0),
+        .tinyint => |*l| try l.append(allocator, 0),
+        .smallint => |*l| try l.append(allocator, 0),
+        .largeint => |*l| try l.append(allocator, 0),
+        .decimal64 => |*l| try l.append(allocator, 0),
+        .decimal128 => |*l| try l.append(allocator, 0),
+        .uuid => |*l| try l.append(allocator, 0),
+        .varchar => |*s| try s.appendValue(allocator, ""),
+        .string => |*s| try s.appendValue(allocator, ""),
+        .char => |*s| try s.appendValue(allocator, ""),
+    }
+    try dst.appendValidBit(allocator, dst.data.rowCount() - 1, false);
 }
 
 fn appendOneFromBuild(
