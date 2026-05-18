@@ -39,7 +39,7 @@ pub fn appendNullTo(allocator: Allocator, dst: *ColumnStore) !void {
     try dst.appendValidBit(allocator, dst.data.rowCount() - 1, false);
 }
 
-pub fn appendOneFromView(
+pub inline fn appendOneFromView(
     allocator: Allocator,
     dst: *ColumnStore,
     src: ColumnView,
@@ -69,7 +69,7 @@ pub fn appendOneFromView(
     }
 }
 
-pub fn appendOneFromBuild(
+pub inline fn appendOneFromBuild(
     allocator: Allocator,
     dst: *ColumnStore,
     src: *const ColumnStore,
@@ -85,7 +85,7 @@ pub fn appendOneFromBuild(
 // range-sweep which has no USING-key elision).
 // ---------------------------------------------------------------------------
 
-pub fn emitMatchedRow(
+pub inline fn emitMatchedRow(
     allocator: Allocator,
     output_columns: []ColumnStore,
     left_columns: []const ColumnStore,
@@ -99,12 +99,23 @@ pub fn emitMatchedRow(
         try appendOneFromBuild(allocator, &output_columns[out_idx], col, left_row);
         out_idx += 1;
     }
-    for (right_columns, 0..) |*col, i| {
-        if (right_kept_mask) |m| {
+    // Hot path: hoist the mask check out of the inner loop. For
+    // range-sweep / pure-Cartesian shapes (mask = null) this lets the
+    // compiler unroll a tight no-branch emit; the mask case keeps the
+    // per-column skip. Before this split, the per-iteration `?[]const bool`
+    // optional-unwrap was a measurable 20-30% drag on high-output-rate
+    // pure-range joins (90 → 70 M out/s).
+    if (right_kept_mask) |m| {
+        for (right_columns, 0..) |*col, i| {
             if (!m[i]) continue;
+            try appendOneFromBuild(allocator, &output_columns[out_idx], col, right_row);
+            out_idx += 1;
         }
-        try appendOneFromBuild(allocator, &output_columns[out_idx], col, right_row);
-        out_idx += 1;
+    } else {
+        for (right_columns) |*col| {
+            try appendOneFromBuild(allocator, &output_columns[out_idx], col, right_row);
+            out_idx += 1;
+        }
     }
 }
 

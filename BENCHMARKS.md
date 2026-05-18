@@ -94,27 +94,27 @@ All sizes use unique `bigint` keys [0..N) on both sides → inner equi-join emit
 
 | Shape | Hash | SMJ | Winner |
 |---|---:|---:|---|
-| 1k × 1k | 2.6 ms | 3.2 ms | ≈ tied (sub-ms variance) |
-| 1k × 1M (dim × fact) | **30 ms** | 40 ms | hash 1.3× |
-| 100k × 100k | 15 ms | 14 ms | tied |
-| **1M × 1M** | 348 ms | **89 ms** | **smj 3.9×** |
+| 1k × 1k | 0.4 ms | 0.5 ms | ≈ tied (sub-ms variance) |
+| 1k × 1M (dim × fact) | **29 ms** | 38 ms | hash 1.3× |
+| 100k × 100k | 14 ms | 13 ms | tied |
+| **1M × 1M** | 319 ms | **83 ms** | **smj 3.8×** |
 
 ### Other key types, 100k × 100k (sorted)
 
 | Key | Hash | SMJ |
 |---|---:|---:|
-| string (varchar 16) | 27 ms | 17 ms |
-| uuid (u128) | 25 ms | 13 ms |
-| compound (bigint, bigint) | 25 ms | 14 ms |
+| string (varchar 16) | 20 ms | 16 ms |
+| uuid (u128) | 16 ms | 12 ms |
+| compound (bigint, bigint) | 17 ms | 12 ms |
 
 ### Unsorted input (order_key ≠ join_key) — SMJ pays real sort cost
 
 | Shape | Hash | SMJ | SMJ slowdown vs sorted |
 |---|---:|---:|---:|
-| bigint 100k unsorted | 21 ms | 31 ms | 2.2× (vs 14 ms sorted) |
-| **bigint 1M unsorted** | 387 ms | 291 ms | **3.3×** (vs 89 ms sorted) |
-| string 100k unsorted | 29 ms | 47 ms | 2.8× (vs 17 ms sorted) |
-| uuid 100k unsorted | 21 ms | 40 ms | 3.1× (vs 13 ms sorted) |
+| bigint 100k unsorted | 19 ms | 31 ms | 2.4× (vs 13 ms sorted) |
+| **bigint 1M unsorted** | 336 ms | 280 ms | **3.4×** (vs 83 ms sorted) |
+| string 100k unsorted | 24 ms | 43 ms | 2.7× (vs 16 ms sorted) |
+| uuid 100k unsorted | 18 ms | 47 ms | 3.9× (vs 12 ms sorted) |
 
 **Key insight:** pdqsort's already-sorted fast-path saves ~2–3× on SMJ. The merge-only fast-path (skip sort when stats prove pre-sorted) now skips that work entirely when both inputs are pre-sorted on the join keys.
 
@@ -122,14 +122,14 @@ All sizes use unique `bigint` keys [0..N) on both sides → inner equi-join emit
 
 | Shape | Hash | SMJ | Sweep | NLJ |
 |---|---:|---:|---:|---:|
-| equi + 1 range | 21 ms | 17 ms | — | — |
-| equi + BETWEEN (2 ranges) | 21 ms | 15 ms | — | — |
-| LEFT OUTER + range | 24 ms | 19 ms | — | — |
-| pure range, 1k × 1k (624k pairs) | — | — | **7 ms (85 M/s)** | 14 ms (43 M/s) |
-| pure range, 5k × 5k (15.6M pairs) | — | — | **180 ms (87 M/s)** | 324 ms (48 M/s) |
-| pure range, 10k × 10k (62.5M pairs) | — | — | 693 ms (90 M/s) | — |
+| equi + 1 range | 16 ms | 16 ms | — | — |
+| equi + BETWEEN (2 ranges) | 16 ms | 15 ms | — | — |
+| LEFT OUTER + range | 24 ms | 17 ms | — | — |
+| pure range, 1k × 1k (624k pairs) | — | — | **8 ms (82 M/s)** | 10 ms (60 M/s) |
+| pure range, 5k × 5k (15.6M pairs) | — | — | **105 ms (149 M/s)** | 263 ms (59 M/s) |
+| pure range, 10k × 10k (62.5M pairs) | — | — | **432 ms (145 M/s)** | — |
 
-Range overhead is small (~5-15%) on top of plain equi-joins — the per-pair check fits inside the Cartesian emit loop. Sweep is **~2× faster than NLJ** on pure-range joins because it advances both sides via merge-style cursors instead of nested loops. Output rate stays ~90 M rows/s sustained.
+Range overhead is small (~5-15%) on top of plain equi-joins — the per-pair check fits inside the Cartesian emit loop. Sweep is **~2.5× faster than NLJ** on pure-range joins because it advances both sides via merge-style cursors instead of nested loops. After marking the row-emit helpers in `cell_io.zig` as `inline`, sustained throughput jumped from ~90 to ~145 M rows/s — the per-row type-switch in `appendOneFromView` now fully inlines across the module boundary, and the no-mask code path in `emitMatchedRow` is hoisted into a tight branch-free loop.
 
 ### Skew detection & opaque predicates
 
@@ -137,7 +137,7 @@ Range overhead is small (~5-15%) on top of plain equi-joins — the per-pair che
 |---|---:|---|
 | hash 100k × 100k, no detection | 17 ms | `skew_ratio_threshold = 0.0` |
 | hash 100k × 100k, detection on (ratio=0.9) | 16–18 ms | within noise of no-detection |
-| opaque NLJ 100k × 1k (fact × dim) | 880 ms | 0.76 M out/s, 666k pairs survived |
+| opaque NLJ 100k × 1k (fact × dim) | 787 ms | 0.85 M out/s, 666k pairs survived |
 
 Detection cost is essentially zero after routing the Misra-Gries detector through the join's arena (was 50% when using GPA: uniform keys cycle counters constantly, churning malloc/free per sampled observation). Default `skew_ratio_threshold = 0.3` keeps detection on out-of-the-box; auto-route to SMJ fires when ratio AND absolute (≥20k bucket) both clear.
 
