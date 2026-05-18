@@ -141,7 +141,14 @@ pub const Spec = struct {
     /// Default 0.0 disables detection (no overhead, no abort).
     /// A typical guard value is 0.5 (50% of rows in one key).
     /// Only applies to `.hash` / `.auto`-routed hash joins.
+    ///
+    /// Detection samples 1 in `skew_sample_interval` build rows
+    /// (default 10). Misra-Gries with sampling preserves the
+    /// fractional detection threshold in expectation. Lower
+    /// intervals (1 = no sampling) cost more per build row;
+    /// higher intervals lose accuracy on borderline thresholds.
     skew_threshold: f32 = 0.0,
+    skew_sample_interval: u32 = 10,
     /// Opaque per-pair predicate evaluated during NLJ. Returns true
     /// to keep the (left_row, right_row) pair, false to drop it.
     /// Enables arbitrary cross-side predicates (fuzzy matching,
@@ -191,6 +198,8 @@ pub const Join = struct {
     /// the join's arena.
     skew_detector: ?*@import("skew.zig").MisraGries,
     skew_threshold: f32,
+    /// Sampling interval for the detector. Observe 1 in N rows.
+    skew_sample_interval: u32,
 
     /// Range predicates resolved to column indices. Each candidate
     /// (probe_row, build_row) pair must satisfy ALL of them. Empty
@@ -487,6 +496,7 @@ pub const Join = struct {
             .ranges = resolved_ranges,
             .skew_detector = skew_det,
             .skew_threshold = spec.skew_threshold,
+            .skew_sample_interval = if (spec.skew_sample_interval == 0) 1 else spec.skew_sample_interval,
             .build_is_left = build_is_left,
             .output_schema = output_schema,
             .left_col_count = left_schema.len,
@@ -639,19 +649,26 @@ pub const Join = struct {
                     gop.value_ptr.* = .empty;
                 }
                 try gop.value_ptr.append(aa, self.build_rows + i);
-                if (self.skew_detector) |det| try det.observe(self.key_scratch.items);
+                // Sampling: observe one in every `skew_sample_interval`
+                // rows. Misra-Gries preserves the fractional detection
+                // threshold in expectation under uniform sampling.
+                if (self.skew_detector) |det| {
+                    if ((self.build_rows + i) % self.skew_sample_interval == 0) {
+                        try det.observe(self.key_scratch.items);
+                    }
+                }
             }
             self.build_rows += @intCast(n);
         }
 
-        // After build, check skew. Top frequency from Misra-Gries is
-        // an UNDER-estimate of the true heavy hitter's count — if it
-        // already exceeds threshold * build_rows, the true skew is at
-        // least that bad.
+        // After build, check skew. Misra-Gries reports an UNDER-
+        // estimate of the heavy hitter's frequency. Compare against
+        // the SAMPLED total (det.observed_total), not build_rows —
+        // sampling preserves the fractional ratio in expectation.
         if (self.skew_detector) |det| {
-            if (self.build_rows > 0) {
+            if (det.observed_total > 0) {
                 const top: f32 = @floatFromInt(det.topFrequency());
-                const total: f32 = @floatFromInt(self.build_rows);
+                const total: f32 = @floatFromInt(det.observed_total);
                 if (top / total >= self.skew_threshold) {
                     return Error.JoinHeavySkew;
                 }
