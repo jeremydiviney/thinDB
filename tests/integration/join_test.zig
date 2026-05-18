@@ -1314,7 +1314,7 @@ test "join: range predicate filters cartesian pairs (hash, INNER)" {
     const right = try thindb.scan(allocator, r);
     var q = try left.join(right, .{
         .on = &.{.{ .left = "tenant", .right = "tenant" }},
-        .range = .{ .left = "lstart", .op = .lte, .right = "revent" },
+        .ranges = &.{.{ .left = "lstart", .op = .lte, .right = "revent" }},
         .algorithm = .hash,
     });
     defer q.deinit();
@@ -1379,7 +1379,7 @@ test "join: range predicate works under SMJ" {
     const right = try thindb.scan(allocator, b);
     var q = try left.join(right, .{
         .on = &.{.{ .left = "k", .right = "k" }},
-        .range = .{ .left = "x", .op = .lt, .right = "y" },
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
         .algorithm = .sort_merge,
     });
     defer q.deinit();
@@ -1405,12 +1405,205 @@ test "join: range + outer is rejected" {
         left.join(right, .{
             .join_type = .left,
             .on = &.{.{ .left = "uid", .right = "uid" }},
-            .range = .{ .left = "uid", .op = .lt, .right = "qty" },
+            .ranges = &.{.{ .left = "uid", .op = .lt, .right = "qty" }},
             .algorithm = .hash,
         }),
     );
     left.deinit();
     right.deinit();
+}
+
+test "join: NLJ handles pure range (no equi part)" {
+    // Empty `on`, one range. .auto routes to nested_loop.
+    // a.x = [10, 20, 100]; b.y = [15, 25, 50].
+    // Pairs where a.x < b.y:
+    //   x=10: y=15,25,50 → 3
+    //   x=20: y=25,50 → 2
+    //   x=100: 0
+    // Total 5.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
+        .order_key = &.{"rowid"},
+        .unique = true,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{ .{ .name = "b_rowid", .type = .bigint }, .{ .name = "y", .type = .bigint } },
+        .order_key = &.{"b_rowid"},
+        .unique = true,
+    };
+    const ok_a = [_][]const u8{"rowid"};
+    const ok_b = [_][]const u8{"b_rowid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const a = try db.table("a", schema_a, .{ .order_key = &ok_a, .unique = true });
+    try a.insert(&.{
+        .{ .rowid = @as(i64, 1), .x = @as(i64, 10) },
+        .{ .rowid = @as(i64, 2), .x = @as(i64, 20) },
+        .{ .rowid = @as(i64, 3), .x = @as(i64, 100) },
+    });
+    try a.flush();
+    const b = try db.table("b", schema_b, .{ .order_key = &ok_b, .unique = true });
+    try b.insert(&.{
+        .{ .b_rowid = @as(i64, 1), .y = @as(i64, 15) },
+        .{ .b_rowid = @as(i64, 2), .y = @as(i64, 25) },
+        .{ .b_rowid = @as(i64, 3), .y = @as(i64, 50) },
+    });
+    try b.flush();
+
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    var q = try left.join(right, .{
+        .on = &.{}, // pure range
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |bat| rows += bat.row_count;
+    try std.testing.expectEqual(@as(usize, 5), rows);
+}
+
+test "join: NLJ handles multiple range predicates" {
+    // a.x BETWEEN-style: x >= y_lo AND x < y_hi for each (y_lo, y_hi).
+    // Effectively: which a.x falls inside any b's [lo, hi) interval.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
+        .order_key = &.{"rowid"},
+        .unique = true,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{
+            .{ .name = "b_rowid", .type = .bigint },
+            .{ .name = "y_lo", .type = .bigint },
+            .{ .name = "y_hi", .type = .bigint },
+        },
+        .order_key = &.{"b_rowid"},
+        .unique = true,
+    };
+    const ok_a = [_][]const u8{"rowid"};
+    const ok_b = [_][]const u8{"b_rowid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const a = try db.table("a", schema_a, .{ .order_key = &ok_a, .unique = true });
+    try a.insert(&.{
+        .{ .rowid = @as(i64, 1), .x = @as(i64, 5) }, // in [0,10)
+        .{ .rowid = @as(i64, 2), .x = @as(i64, 15) }, // in [10,20)
+        .{ .rowid = @as(i64, 3), .x = @as(i64, 25) }, // outside both
+    });
+    try a.flush();
+    const b = try db.table("b", schema_b, .{ .order_key = &ok_b, .unique = true });
+    try b.insert(&.{
+        .{ .b_rowid = @as(i64, 1), .y_lo = @as(i64, 0), .y_hi = @as(i64, 10) },
+        .{ .b_rowid = @as(i64, 2), .y_lo = @as(i64, 10), .y_hi = @as(i64, 20) },
+    });
+    try b.flush();
+
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    // x >= y_lo AND x < y_hi for each (a, b) pair.
+    var q = try left.join(right, .{
+        .on = &.{},
+        .ranges = &.{
+            .{ .left = "x", .op = .gte, .right = "y_lo" },
+            .{ .left = "x", .op = .lt, .right = "y_hi" },
+        },
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |bat| rows += bat.row_count;
+    // x=5  matches b1 only → 1
+    // x=15 matches b2 only → 1
+    // x=25 matches neither → 0
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "join: NLJ handles equi + multiple ranges (BETWEEN-style)" {
+    // tenant equi + a.x in [b.lo, b.hi).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{
+            .{ .name = "tenant", .type = .bigint },
+            .{ .name = "x", .type = .bigint },
+        },
+        .order_key = &.{"tenant"},
+        .unique = false,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{
+            .{ .name = "tenant", .type = .bigint },
+            .{ .name = "lo", .type = .bigint },
+            .{ .name = "hi", .type = .bigint },
+        },
+        .order_key = &.{"tenant"},
+        .unique = false,
+    };
+    const ok_a = [_][]const u8{"tenant"};
+    const ok_b = [_][]const u8{"tenant"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const a = try db.table("a", schema_a, .{ .order_key = &ok_a });
+    try a.insert(&.{
+        .{ .tenant = @as(i64, 1), .x = @as(i64, 50) }, // matches t=1 window
+        .{ .tenant = @as(i64, 1), .x = @as(i64, 150) }, // outside t=1 window
+        .{ .tenant = @as(i64, 2), .x = @as(i64, 200) }, // matches t=2 window
+    });
+    try a.flush();
+    const b = try db.table("b", schema_b, .{ .order_key = &ok_b });
+    try b.insert(&.{
+        .{ .tenant = @as(i64, 1), .lo = @as(i64, 0), .hi = @as(i64, 100) },
+        .{ .tenant = @as(i64, 2), .lo = @as(i64, 150), .hi = @as(i64, 250) },
+    });
+    try b.flush();
+
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    // Even with equi `on`, multiple ranges work via hash/SMJ Cartesian.
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "tenant", .right = "tenant" }},
+        .ranges = &.{
+            .{ .left = "x", .op = .gte, .right = "lo" },
+            .{ .left = "x", .op = .lt, .right = "hi" },
+        },
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |bat| rows += bat.row_count;
+    try std.testing.expectEqual(@as(usize, 2), rows);
 }
 
 test "join: type mismatch on join key errors" {

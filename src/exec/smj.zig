@@ -102,10 +102,10 @@ pub const SortMergeJoin = struct {
     /// and post-merge drain.
     join_type: join_mod.JoinType,
 
-    /// Optional range predicate, resolved to column indices.
-    /// Evaluated during Cartesian emit; pairs that fail are skipped.
-    /// Restricted to INNER joins by validation in create().
-    range: ?join_mod.Join.ResolvedRange,
+    /// Range predicates resolved to column indices. AND-combined;
+    /// every range must hold for the pair to be emitted. Empty when
+    /// the user didn't supply any. Restricted to INNER joins.
+    ranges: []const join_mod.Join.ResolvedRange,
 
     phase: Phase = .materializing,
 
@@ -118,7 +118,7 @@ pub const SortMergeJoin = struct {
         spec: Spec,
     ) !Query {
         if (spec.on.len == 0) return Error.JoinEmptyOnClause;
-        if (spec.range != null and spec.join_type != .inner) {
+        if (spec.ranges.len > 0 and spec.join_type != .inner) {
             return Error.JoinUnsupportedType;
         }
 
@@ -141,7 +141,8 @@ pub const SortMergeJoin = struct {
             }
         }
 
-        const resolved_range: ?join_mod.Join.ResolvedRange = if (spec.range) |rp| blk: {
+        const resolved_ranges = try aa.alloc(join_mod.Join.ResolvedRange, spec.ranges.len);
+        for (spec.ranges, 0..) |rp, i| {
             const lidx = columnIndex(left_schema, rp.left) orelse return Error.ColumnNotFound;
             const ridx = columnIndex(right_schema, rp.right) orelse return Error.ColumnNotFound;
             const lt: TypeTag = left_schema[lidx].type;
@@ -153,8 +154,8 @@ pub const SortMergeJoin = struct {
                 .lt, .lte, .gt, .gte => {},
                 else => return Error.UnsupportedOperatorForType,
             }
-            break :blk .{ .left_col = lidx, .right_col = ridx, .op = rp.op };
-        } else null;
+            resolved_ranges[i] = .{ .left_col = lidx, .right_col = ridx, .op = rp.op };
+        }
 
         const right_kept_mask = try aa.alloc(bool, right_schema.len);
         for (right_kept_mask) |*m| m.* = true;
@@ -258,7 +259,7 @@ pub const SortMergeJoin = struct {
             .output_columns = output_columns,
             .views = views,
             .join_type = spec.join_type,
-            .range = resolved_range,
+            .ranges = resolved_ranges,
         };
         const q = makeQuery(allocator, self);
         if (spec.extra_predicate) |pred| {
@@ -460,9 +461,7 @@ pub const SortMergeJoin = struct {
                         while (ri < r_end) : (ri += 1) {
                             const lr = self.left_perm[li];
                             const rr = self.right_perm[ri];
-                            if (self.range) |rg| {
-                                if (!self.passesRange(lr, rr, rg)) continue;
-                            }
+                            if (!self.passesAllRanges(lr, rr)) continue;
                             try self.emitOutputRow(lr, rr);
                             if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
                                 // Flush full batch. Save cursors so we
@@ -521,13 +520,15 @@ pub const SortMergeJoin = struct {
         return null;
     }
 
-    /// Evaluate the range predicate against materialized rows.
-    /// Both sides are already buffered in left_materialized /
-    /// right_materialized; pull the cells and compare.
-    fn passesRange(self: SortMergeJoin, left_row: u32, right_row: u32, rg: join_mod.Join.ResolvedRange) bool {
-        const lv = self.left_materialized[rg.left_col].view();
-        const rv = self.right_materialized[rg.right_col].view();
-        return join_mod.compareCellsOp(lv, left_row, rv, right_row, rg.op);
+    /// Evaluate every range predicate against materialized rows.
+    /// AND semantics: any failing range rejects the pair.
+    fn passesAllRanges(self: SortMergeJoin, left_row: u32, right_row: u32) bool {
+        for (self.ranges) |rg| {
+            const lv = self.left_materialized[rg.left_col].view();
+            const rv = self.right_materialized[rg.right_col].view();
+            if (!join_mod.compareCellsOp(lv, left_row, rv, right_row, rg.op)) return false;
+        }
+        return true;
     }
 
     /// Emit an unmatched LEFT row: left columns from left_materialized,

@@ -208,6 +208,7 @@ fn reportJoin(
         .auto => "auto",
         .hash => "hash",
         .sort_merge => "smj ",
+        .nested_loop => "nlj ",
     };
     std.debug.print(
         "  {s:<28} [{s}] L={d:>7} R={d:>7} out={d:>7}  {d:>8.2} ms  {d:>7.2} M out/s\n",

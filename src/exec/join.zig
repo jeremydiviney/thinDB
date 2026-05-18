@@ -80,7 +80,13 @@ pub const Algorithm = enum {
     /// memory + degrades smoothly under skew. Best when both sides
     /// are large, skew is heavy, or output needs to be sorted.
     sort_merge,
-    // Future: inlj, nlj
+    /// Materialize both sides, double-loop, evaluate ranges +
+    /// extra_predicate per pair. O(N*M) — use only when there's no
+    /// equi join key to exploit (pure range, opaque predicates) or
+    /// when at least one side is tiny. Auto picks this when `on` is
+    /// empty and `ranges` is non-empty.
+    nested_loop,
+    // Future: inlj
 };
 
 /// A column-pair range predicate: `left.<col> OP right.<col>` where
@@ -108,12 +114,15 @@ pub const Spec = struct {
     /// predicate references the null side will fail (NULL never
     /// compares true) and get dropped.
     extra_predicate: ?predicate.PredicateExpr = null,
-    /// Optional inequality between a left column and a right column,
-    /// AND'd onto the equi join. Pairs that satisfy the equi keys
-    /// but fail this range get dropped from the output. v1 supports
-    /// this on INNER joins only — outer + range would need per-row
-    /// match tracking that isn't implemented yet.
-    range: ?RangePredicate = null,
+    /// Inequality predicates between left columns and right columns,
+    /// AND'd together AND'd onto the equi join. Pairs that satisfy
+    /// the equi keys but fail any range get dropped. Empty slice =
+    /// no range constraints. v1 supports ranges on INNER joins only —
+    /// outer + range would need per-row match tracking.
+    ///
+    /// When `on` is empty AND `ranges` is non-empty, the planner
+    /// picks the nested-loop algorithm (no equi prefix to exploit).
+    ranges: []const RangePredicate = &.{},
 };
 
 /// Number of rows emitted per output batch. Bounded so emission stays
@@ -133,11 +142,10 @@ pub const Join = struct {
     left_key_indices: []usize,
     right_key_indices: []usize,
 
-    /// Optional range predicate, resolved to column indices. When
-    /// non-null, each candidate (probe_row, build_row) pair must
-    /// satisfy `left[range.left_col] OP right[range.right_col]`
-    /// before being emitted.
-    range: ?ResolvedRange,
+    /// Range predicates resolved to column indices. Each candidate
+    /// (probe_row, build_row) pair must satisfy ALL of them. Empty
+    /// slice = no range constraints. Owned in the arena.
+    ranges: []const ResolvedRange,
 
     /// True iff left is the smaller side and is therefore the build
     /// side. False iff right is build. Build is materialized fully;
@@ -218,18 +226,34 @@ pub const Join = struct {
         right: Query,
         spec: Spec,
     ) !Query {
-        if (spec.on.len == 0) return Error.JoinEmptyOnClause;
-        // v1: range only allowed on INNER. Outer + range needs per-row
+        // v1: ranges only allowed on INNER. Outer + range needs per-row
         // "any actual match" tracking that isn't implemented yet.
-        if (spec.range != null and spec.join_type != .inner) {
+        if (spec.ranges.len > 0 and spec.join_type != .inner) {
             return Error.JoinUnsupportedType;
         }
-
-        // Resolve algorithm. .auto consults cheap stats — see chooseAlgorithm.
+        // Resolve algorithm. .auto picks nested_loop for empty `on`,
+        // otherwise consults cheap stats (chooseAlgorithm).
         const chosen = if (spec.algorithm == .auto)
-            chooseAlgorithm(left, right, spec.on)
+            (if (spec.on.len == 0) .nested_loop else chooseAlgorithm(left, right, spec.on))
         else
             spec.algorithm;
+
+        // Nested-loop is the only algorithm that handles an empty
+        // `on` clause. Reject empty-on with any other algorithm.
+        if (spec.on.len == 0 and chosen != .nested_loop) {
+            return Error.JoinEmptyOnClause;
+        }
+
+        if (chosen == .nested_loop) {
+            const nl_spec: Spec = .{
+                .join_type = spec.join_type,
+                .on = spec.on,
+                .algorithm = .nested_loop,
+                .extra_predicate = spec.extra_predicate,
+                .ranges = spec.ranges,
+            };
+            return @import("nlj.zig").NestedLoopJoin.create(allocator, left, right, nl_spec);
+        }
 
         if (chosen == .sort_merge) {
             // Re-spec with explicit algorithm so SMJ doesn't recurse
@@ -239,7 +263,7 @@ pub const Join = struct {
                 .on = spec.on,
                 .algorithm = .sort_merge,
                 .extra_predicate = spec.extra_predicate,
-                .range = spec.range,
+                .ranges = spec.ranges,
             };
             return @import("smj.zig").SortMergeJoin.create(allocator, left, right, sm_spec);
         }
@@ -266,8 +290,9 @@ pub const Join = struct {
             }
         }
 
-        // Resolve optional range predicate.
-        const resolved_range: ?Join.ResolvedRange = if (spec.range) |rp| blk: {
+        // Resolve range predicates into column indices.
+        const resolved_ranges = try aa.alloc(Join.ResolvedRange, spec.ranges.len);
+        for (spec.ranges, 0..) |rp, i| {
             const lidx = columnIndex(left_schema, rp.left) orelse return Error.ColumnNotFound;
             const ridx = columnIndex(right_schema, rp.right) orelse return Error.ColumnNotFound;
             const lt: TypeTag = left_schema[lidx].type;
@@ -279,8 +304,8 @@ pub const Join = struct {
                 .lt, .lte, .gt, .gte => {},
                 else => return Error.UnsupportedOperatorForType,
             }
-            break :blk .{ .left_col = lidx, .right_col = ridx, .op = rp.op };
-        } else null;
+            resolved_ranges[i] = .{ .left_col = lidx, .right_col = ridx, .op = rp.op };
+        }
 
         // Build right-side column index → keep? map. The right side's
         // join-key columns are DROPPED from the output (USING-clause
@@ -382,7 +407,7 @@ pub const Join = struct {
             .join_type = spec.join_type,
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
-            .range = resolved_range,
+            .ranges = resolved_ranges,
             .build_is_left = build_is_left,
             .output_schema = output_schema,
             .left_col_count = left_schema.len,
@@ -617,11 +642,9 @@ pub const Join = struct {
             const build_row = self.cur_match_list[self.cur_match_pos];
             self.cur_match_pos += 1;
 
-            // Range filter — drop the pair if `left.col OP right.col`
-            // is false. NULL on either side fails (two-valued logic).
-            if (self.range) |rg| {
-                if (!self.passesRange(batch, probe_row, build_row, rg)) continue;
-            }
+            // Range filter — every range must hold (AND-combined).
+            // NULL on either side fails (two-valued logic).
+            if (!self.passesAllRanges(batch, probe_row, build_row)) continue;
 
             // Append left-side columns first.
             var out_idx: usize = 0;
@@ -680,22 +703,24 @@ pub const Join = struct {
         return false;
     }
 
-    /// Evaluate the range predicate for one (probe_row, build_row)
-    /// candidate. Maps the resolved column indices back to the right
-    /// physical side based on `build_is_left`. NULL on either side
-    /// fails (two-valued logic).
-    fn passesRange(self: Join, batch: Batch, probe_row: u32, build_row: u32, rg: ResolvedRange) bool {
-        const left_view: ColumnView = if (self.build_is_left)
-            self.build_columns[rg.left_col].view()
-        else
-            batch.values[rg.left_col];
-        const right_view: ColumnView = if (self.build_is_left)
-            batch.values[rg.right_col]
-        else
-            self.build_columns[rg.right_col].view();
-        const lrow: u32 = if (self.build_is_left) build_row else probe_row;
-        const rrow: u32 = if (self.build_is_left) probe_row else build_row;
-        return compareCellsOp(left_view, lrow, right_view, rrow, rg.op);
+    /// Evaluate every range predicate against one (probe_row,
+    /// build_row) candidate. AND semantics: any failing range
+    /// rejects the pair. NULL on either side fails (two-valued logic).
+    fn passesAllRanges(self: Join, batch: Batch, probe_row: u32, build_row: u32) bool {
+        for (self.ranges) |rg| {
+            const left_view: ColumnView = if (self.build_is_left)
+                self.build_columns[rg.left_col].view()
+            else
+                batch.values[rg.left_col];
+            const right_view: ColumnView = if (self.build_is_left)
+                batch.values[rg.right_col]
+            else
+                self.build_columns[rg.right_col].view();
+            const lrow: u32 = if (self.build_is_left) build_row else probe_row;
+            const rrow: u32 = if (self.build_is_left) probe_row else build_row;
+            if (!compareCellsOp(left_view, lrow, right_view, rrow, rg.op)) return false;
+        }
+        return true;
     }
 
     fn flushOutput(self: *Join) !?Batch {
