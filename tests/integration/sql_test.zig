@@ -618,6 +618,187 @@ test "sql: three-table JOIN (A JOIN B ON ... JOIN C ON ...)" {
     try std.testing.expectEqual(@as(usize, 2), ids.items.len);
 }
 
+// ---------------------------------------------------------------------------
+// CTE (WITH) + FROM-clause subqueries — multi-source via SQL
+// ---------------------------------------------------------------------------
+
+test "sql: single-reference CTE inlined as the FROM target" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\WITH big AS (SELECT * FROM t WHERE k >= 200)
+        \\SELECT id FROM big ORDER BY id ASC
+    );
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4, 5 }, ids.items);
+}
+
+test "sql: CTE referenced twice in a self-join (inline DAG)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // The CTE expression compiles into a single *ir.Op; both join
+    // sides reference it. Compile produces two independent runtime
+    // operators (inline semantics) — proven correct here by row count.
+    // CTE exposes ONLY the join-key column; v1 SQL can't yet
+    // disambiguate same-named non-key columns across join sides,
+    // so the test uses the simplest shape that exercises the
+    // DAG-shared-subtree path without hitting that limit.
+    var q = try runSql(allocator, db,
+        \\WITH big AS (SELECT k FROM t WHERE k >= 200)
+        \\SELECT k FROM big JOIN big AS other ON big.k = other.k
+    );
+    defer q.deinit();
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    // big = {200,200,300}. Self-join on k:
+    //   k=200 pairs: 2×2 = 4 matches
+    //   k=300 pairs: 1×1 = 1 match
+    //   total = 5
+    try std.testing.expectEqual(@as(usize, 5), rows);
+}
+
+test "sql: chained CTEs — later CTE references an earlier one" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\WITH
+        \\  big AS (SELECT * FROM t WHERE k >= 200),
+        \\  ordered AS (SELECT id FROM big ORDER BY id DESC)
+        \\SELECT id FROM ordered LIMIT 2
+    );
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 4 }, ids.items);
+}
+
+test "sql: redefining a CTE name errors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const res = runSql(allocator, db,
+        \\WITH x AS (SELECT * FROM t), x AS (SELECT * FROM t) SELECT * FROM x
+    );
+    try std.testing.expectError(thindb.sql.ParseError.SqlCteRedefined, res);
+}
+
+test "sql: FROM-clause subquery (anonymous CTE)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT id FROM (SELECT * FROM t WHERE k >= 200) AS sub ORDER BY id ASC
+    );
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4, 5 }, ids.items);
+}
+
+test "sql: aggregate-then-join via FROM-subquery (the canonical pattern)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedOrdersItems(db);
+
+    // Aggregate orders by item_id, then join the result against items.
+    // The aggregation runs on one branch of the join — previously only
+    // expressible via PlanBuilder; now ergonomic in SQL.
+    var q = try runSql(allocator, db,
+        \\SELECT items.name, t.total_qty
+        \\FROM items
+        \\JOIN (SELECT item_id, sum(qty) AS total_qty FROM orders GROUP BY item_id) AS t
+        \\  ON items.iid = t.item_id
+    );
+    defer q.deinit();
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(allocator);
+    while (try q.next()) |b| {
+        const sv = b.values[0].data.string;
+        for (0..b.row_count) |i| {
+            try got.appendSlice(allocator, sv.rowBytes(i));
+            try got.append(allocator, ':');
+            const tot = b.values[1].data.bigint[i];
+            var nbuf: [16]u8 = undefined;
+            const n = try std.fmt.bufPrint(&nbuf, "{d}", .{tot});
+            try got.appendSlice(allocator, n);
+            try got.append(allocator, '|');
+        }
+    }
+    // orders k=100: qty=2, k=200: qty=5, k=999: qty=1.
+    // After GROUP BY k → (100,2), (200,5), (999,1).
+    // Join with items (iid in {100,200,300}) → (alpha, 2), (beta, 5).
+    // Order is hash-routed → unstable; compare as a multiset by sorting.
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var it = std.mem.tokenizeScalar(u8, got.items, '|');
+    while (it.next()) |line| try lines.append(allocator, line);
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expectEqualStrings("alpha:2", lines.items[0]);
+    try std.testing.expectEqualStrings("beta:5", lines.items[1]);
+}
+
+test "sql: subquery without alias errors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const res = runSql(allocator, db, "SELECT id FROM (SELECT * FROM t)");
+    try std.testing.expectError(thindb.sql.ParseError.SqlSubqueryNeedsAlias, res);
+}
+
 test "sql: case-insensitive keywords + line comments + trailing semicolon" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

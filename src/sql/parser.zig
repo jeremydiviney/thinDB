@@ -63,6 +63,8 @@ pub const ParseError = error{
     SqlExpectedJoinOn,
     SqlOnRefsUnknownTable,
     SqlOnNonEquiUnsupported,
+    SqlCteRedefined,
+    SqlSubqueryNeedsAlias,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -114,6 +116,14 @@ const Parser = struct {
     arena: Allocator,
     lex: *Lexer,
     cur: Token,
+    /// CTE registry: name → already-compiled *ir.Op subtree. Populated
+    /// by `parseCteList` when a WITH clause is encountered; consulted
+    /// in `parseFromTarget` so a reference to a CTE name resolves to
+    /// its IR tree (multi-parent DAG reference — IR + compile already
+    /// handle independent runtime materializations per reference).
+    /// Flat scope: nested SELECTs can reference outer CTEs but
+    /// redefining an existing name errors.
+    ctes: std.StringHashMapUnmanaged(*ir.Op) = .empty,
 
     fn advance(self: *Parser) ParseError!void {
         self.cur = try self.lex.next();
@@ -130,6 +140,12 @@ const Parser = struct {
     }
 
     fn parseStatement(self: *Parser) ParseError!*ir.Op {
+        // Optional WITH clause: zero-or-more named CTEs precede the
+        // main SELECT. Stored in self.ctes so the FROM clause can
+        // resolve references.
+        if (self.cur.tag == .kw_with) {
+            try self.parseCteList();
+        }
         if (self.cur.tag != .kw_select) return ParseError.SqlExpectedSelect;
         try self.advance();
 
@@ -507,26 +523,24 @@ const Parser = struct {
     // will lift those restrictions.
     // -----------------------------------------------------------------------
     fn parseFromClause(self: *Parser) ParseError!*ir.Op {
-        const first_table = try self.expectIdent();
-        const first_dup = try self.arena.dupe(u8, first_table);
-        var root = try self.allocOp(.{ .scan = .{ .table_name = first_dup } });
+        const first = try self.parseFromTarget();
+        var root = first.op;
 
-        // Running set of table names that constitute the current left
+        // Running set of names that constitute the current left
         // subtree. Each new JOIN's ON clause must reference one of
-        // these + the new right table.
+        // these + the new right target's name. CTE references and
+        // subquery aliases participate alongside plain table names.
         var left_names: std.ArrayList([]const u8) = .empty;
-        try left_names.append(self.arena, first_dup);
+        try left_names.append(self.arena, first.name);
         defer left_names.deinit(self.arena);
 
         while (isJoinStart(self.cur.tag)) {
             const jtype = try self.parseJoinKind();
-            const right_table = try self.expectIdent();
-            const right_dup = try self.arena.dupe(u8, right_table);
-            const right_scan = try self.allocOp(.{ .scan = .{ .table_name = right_dup } });
+            const right = try self.parseFromTarget();
 
             if (self.cur.tag != .kw_on) return ParseError.SqlExpectedJoinOn;
             try self.advance();
-            const pairs = try self.parseOnEquiJoin(left_names.items, right_dup);
+            const pairs = try self.parseOnEquiJoin(left_names.items, right.name);
 
             root = try self.allocOp(.{ .join = .{
                 .algorithm = .auto,
@@ -538,11 +552,78 @@ const Parser = struct {
                 .skew_absolute_threshold = 20_000,
                 .skew_sample_interval = 10,
                 .left = root,
-                .right = right_scan,
+                .right = right.op,
             } });
-            try left_names.append(self.arena, right_dup);
+            try left_names.append(self.arena, right.name);
         }
         return root;
+    }
+
+    /// One source in a FROM clause: bare identifier (table or CTE
+    /// reference) or a parenthesized subquery with an alias. Returns
+    /// the resolved *ir.Op plus the name to use for ON-clause
+    /// qualifier resolution.
+    fn parseFromTarget(self: *Parser) ParseError!struct { name: []const u8, op: *ir.Op } {
+        if (self.cur.tag == .lparen) {
+            // Anonymous subquery: ( select_stmt ) [AS] alias
+            try self.advance();
+            const op = try self.parseStatement();
+            try self.expect(.rparen);
+            // Optional AS, mandatory alias.
+            if (self.cur.tag == .kw_as) try self.advance();
+            if (self.cur.tag != .identifier) return ParseError.SqlSubqueryNeedsAlias;
+            const alias = try self.arena.dupe(u8, self.cur.text);
+            try self.advance();
+            return .{ .name = alias, .op = op };
+        }
+        // Plain identifier — first check the CTE map, then fall back
+        // to a Scan against a real table by that name. Both forms
+        // accept an optional `[AS] alias` (alias becomes the ON-clause
+        // qualifier for the target).
+        const name = try self.expectIdent();
+        const name_dup = try self.arena.dupe(u8, name);
+        const op = self.ctes.get(name) orelse try self.allocOp(.{ .scan = .{ .table_name = name_dup } });
+
+        // Optional AS alias.
+        var resolved_name = name_dup;
+        if (self.cur.tag == .kw_as) {
+            try self.advance();
+            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+            resolved_name = try self.arena.dupe(u8, self.cur.text);
+            try self.advance();
+        } else if (self.cur.tag == .identifier) {
+            // Implicit alias: bare identifier after the FROM target.
+            // SQL clause keywords (JOIN/WHERE/ON/...) aren't .identifier
+            // tokens so they don't trigger this.
+            resolved_name = try self.arena.dupe(u8, self.cur.text);
+            try self.advance();
+        }
+        return .{ .name = resolved_name, .op = op };
+    }
+
+    /// Parse a `WITH cte AS (...) [, cte AS (...)]*` block. Each CTE
+    /// is added to `self.ctes`; later CTEs in the same WITH can
+    /// reference earlier ones (each parseStatement call sees the
+    /// already-populated map).
+    fn parseCteList(self: *Parser) ParseError!void {
+        try self.advance(); // consume WITH
+        while (true) {
+            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+            const name = try self.arena.dupe(u8, self.cur.text);
+            try self.advance();
+            if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            try self.expect(.lparen);
+            const op = try self.parseStatement();
+            try self.expect(.rparen);
+
+            const gop = try self.ctes.getOrPut(self.arena, name);
+            if (gop.found_existing) return ParseError.SqlCteRedefined;
+            gop.value_ptr.* = op;
+
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
     }
 
     fn isJoinStart(tag: TokenTag) bool {
