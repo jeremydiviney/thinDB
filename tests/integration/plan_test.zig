@@ -271,6 +271,101 @@ test "plan: compute on one branch before joining + aggregate over result" {
     try std.testing.expectEqual(@as(i64, 2), batch.values[0].data.bigint[0]);
 }
 
+test "plan: explain renders linear pipeline as indented text" {
+    const allocator = std.testing.allocator;
+    var pb = PlanBuilder.init(allocator);
+    defer pb.deinit();
+
+    const root = try pb.select(
+        try pb.filter(
+            try pb.scan("orders"),
+            .{ .leaf = .{ .col = "qty", .op = .gt, .val = .{ .int = 5 } } },
+        ),
+        &.{ "id", "qty" },
+    );
+    const text = try pb.explain(root);
+    try std.testing.expectEqualStrings(
+        \\Select [id, qty]
+        \\  Filter (qty > 5)
+        \\    Scan orders
+        \\
+    , text);
+}
+
+test "plan: explain renders multi-branched join with both sides" {
+    const allocator = std.testing.allocator;
+    var pb = PlanBuilder.init(allocator);
+    defer pb.deinit();
+
+    const root = try pb.join(
+        try pb.filter(
+            try pb.scan("a"),
+            .{ .leaf = .{ .col = "k", .op = .gte, .val = .{ .int = 200 } } },
+        ),
+        try pb.scan("b"),
+        .{ .on = &.{.{ .left = "k", .right = "k" }}, .algorithm = .auto },
+    );
+    const text = try pb.explain(root);
+    try std.testing.expectEqualStrings(
+        \\Join algorithm=auto type=inner on=[k=k]
+        \\  Filter (k >= 200)
+        \\    Scan a
+        \\  Scan b
+        \\
+    , text);
+}
+
+test "plan: explain renders join-of-join with nested indentation" {
+    const allocator = std.testing.allocator;
+    var pb = PlanBuilder.init(allocator);
+    defer pb.deinit();
+
+    const ab = try pb.join(
+        try pb.scan("a"),
+        try pb.scan("b"),
+        .{ .on = &.{.{ .left = "k", .right = "k" }}, .algorithm = .auto },
+    );
+    const abc = try pb.join(
+        ab,
+        try pb.scan("c"),
+        .{
+            .on = &.{.{ .left = "label", .right = "label" }},
+            .algorithm = .sort_merge,
+        },
+    );
+    const root = try pb.groupBy(abc, &.{}, &.{.{ .func = .count, .as = "n" }});
+
+    const text = try pb.explain(root);
+    try std.testing.expectEqualStrings(
+        \\GroupBy keys=[] aggs=[count(*) AS n]
+        \\  Join algorithm=sort_merge type=inner on=[label=label]
+        \\    Join algorithm=auto type=inner on=[k=k]
+        \\      Scan a
+        \\      Scan b
+        \\    Scan c
+        \\
+    , text);
+}
+
+test "plan: explain renders compute with call expression" {
+    const allocator = std.testing.allocator;
+    var pb = PlanBuilder.init(allocator);
+    defer pb.deinit();
+    const aa = pb.arenaAllocator();
+
+    const upper_expr = try thindb.exec.scalar_fn.upper(aa, thindb.exec.expr_mod.col("name"));
+    const root = try pb.compute(
+        try pb.scan("users"),
+        &.{.{ .name = "u", .expr = upper_expr }},
+    );
+    const text = try pb.explain(root);
+    try std.testing.expectEqualStrings(
+        \\Compute [u := upper(name)]
+        \\  Scan users
+        \\
+    , text);
+}
+
 test "plan: same PlanBuilder produces two independent Queries" {
     // Compile a plan twice — each call returns its own owning Query.
     // Confirms the plan tree itself is reusable and doesn't get

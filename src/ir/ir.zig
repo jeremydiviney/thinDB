@@ -959,6 +959,222 @@ pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EXPLAIN — render an Op tree as indented text. Binary ops (Join) recurse
+// into both branches so the output reflects the full plan shape.
+//
+// Output style: one line per operator, two-space indent per depth level,
+// each line "OpName <key=value …>" with the most useful spec fields. The
+// goal is debuggability, not a stable machine-readable schema — call
+// formats are intentionally lightweight.
+// ---------------------------------------------------------------------------
+
+pub fn explain(allocator: Allocator, out: *std.ArrayList(u8), root: Op) !void {
+    try explainOp(allocator, out, root, 0);
+}
+
+fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize) !void {
+    try writeIndent(allocator, out, depth);
+    switch (op) {
+        .scan => |s| try writeAll(allocator, out, "Scan ", s.table_name, "\n"),
+        .limit => |l| {
+            var buf: [48]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "Limit n={d}\n", .{l.n});
+            try out.appendSlice(allocator, s);
+            try explainOp(allocator, out, l.upstream.*, depth + 1);
+        },
+        .select => |p| {
+            try out.appendSlice(allocator, "Select [");
+            try writeJoinedNames(allocator, out, p.columns);
+            try out.appendSlice(allocator, "]\n");
+            try explainOp(allocator, out, p.upstream.*, depth + 1);
+        },
+        .exclude => |p| {
+            try out.appendSlice(allocator, "Exclude [");
+            try writeJoinedNames(allocator, out, p.columns);
+            try out.appendSlice(allocator, "]\n");
+            try explainOp(allocator, out, p.upstream.*, depth + 1);
+        },
+        .filter => |f| {
+            try out.appendSlice(allocator, "Filter (");
+            try explainPredicate(allocator, out, f.predicate);
+            try out.appendSlice(allocator, ")\n");
+            try explainOp(allocator, out, f.upstream.*, depth + 1);
+        },
+        .order_by => |o| {
+            try out.appendSlice(allocator, "OrderBy [");
+            for (o.specs, 0..) |s, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, s.col);
+                try out.appendSlice(allocator, if (s.desc) " DESC" else " ASC");
+            }
+            try out.appendSlice(allocator, "]\n");
+            try explainOp(allocator, out, o.upstream.*, depth + 1);
+        },
+        .group_by => |g| {
+            try out.appendSlice(allocator, "GroupBy keys=[");
+            try writeJoinedNames(allocator, out, g.group_cols);
+            try out.appendSlice(allocator, "] aggs=[");
+            for (g.aggs, 0..) |a, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, @tagName(a.func));
+                try out.append(allocator, '(');
+                if (a.col) |c| try out.appendSlice(allocator, c) else try out.append(allocator, '*');
+                try out.appendSlice(allocator, ") AS ");
+                try out.appendSlice(allocator, a.as);
+            }
+            try out.appendSlice(allocator, "]\n");
+            try explainOp(allocator, out, g.upstream.*, depth + 1);
+        },
+        .compute => |c| {
+            try out.appendSlice(allocator, "Compute [");
+            for (c.derived, 0..) |d, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, d.name);
+                try out.appendSlice(allocator, " := ");
+                try explainExpr(allocator, out, d.expr);
+            }
+            try out.appendSlice(allocator, "]\n");
+            try explainOp(allocator, out, c.upstream.*, depth + 1);
+        },
+        .join => |j| {
+            var buf: [128]u8 = undefined;
+            const s = try std.fmt.bufPrint(
+                &buf,
+                "Join algorithm={s} type={s} on=[",
+                .{ @tagName(j.algorithm), @tagName(j.join_type) },
+            );
+            try out.appendSlice(allocator, s);
+            for (j.on, 0..) |kp, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, kp.left);
+                try out.append(allocator, '=');
+                try out.appendSlice(allocator, kp.right);
+            }
+            try out.append(allocator, ']');
+            if (j.ranges.len > 0) {
+                try out.appendSlice(allocator, " ranges=[");
+                for (j.ranges, 0..) |rg, i| {
+                    if (i > 0) try out.appendSlice(allocator, ", ");
+                    try out.appendSlice(allocator, rg.left);
+                    try out.append(allocator, ' ');
+                    try out.appendSlice(allocator, opSymbol(rg.op));
+                    try out.append(allocator, ' ');
+                    try out.appendSlice(allocator, rg.right);
+                }
+                try out.append(allocator, ']');
+            }
+            if (j.extra_predicate) |pred| {
+                try out.appendSlice(allocator, " extra=(");
+                try explainPredicate(allocator, out, pred);
+                try out.append(allocator, ')');
+            }
+            try out.append(allocator, '\n');
+            // Render LEFT side first (depth + 1), then RIGHT — readers expect
+            // a top-down left-to-right reading order on the page.
+            try explainOp(allocator, out, j.left.*, depth + 1);
+            try explainOp(allocator, out, j.right.*, depth + 1);
+        },
+    }
+}
+
+fn writeIndent(allocator: Allocator, out: *std.ArrayList(u8), depth: usize) !void {
+    var i: usize = 0;
+    while (i < depth) : (i += 1) try out.appendSlice(allocator, "  ");
+}
+
+fn writeAll(allocator: Allocator, out: *std.ArrayList(u8), a: []const u8, b: []const u8, c: []const u8) !void {
+    try out.appendSlice(allocator, a);
+    try out.appendSlice(allocator, b);
+    try out.appendSlice(allocator, c);
+}
+
+fn writeJoinedNames(allocator: Allocator, out: *std.ArrayList(u8), names: []const []const u8) !void {
+    for (names, 0..) |n, i| {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, n);
+    }
+}
+
+fn opSymbol(op: PredicateOp) []const u8 {
+    return switch (op) {
+        .eq => "=",
+        .neq => "!=",
+        .lt => "<",
+        .lte => "<=",
+        .gt => ">",
+        .gte => ">=",
+    };
+}
+
+fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!void {
+    switch (e) {
+        .col_ref => |name| try out.appendSlice(allocator, name),
+        .lit => |v| try writeValue(allocator, out, v),
+        .call => |c| {
+            try out.appendSlice(allocator, c.fn_name);
+            try out.append(allocator, '(');
+            for (c.args, 0..) |arg, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try explainExpr(allocator, out, arg);
+            }
+            try out.append(allocator, ')');
+        },
+    }
+}
+
+fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateExpr) anyerror!void {
+    switch (p) {
+        .leaf => |l| {
+            try out.appendSlice(allocator, l.col);
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, opSymbol(l.op));
+            try out.append(allocator, ' ');
+            try writeValue(allocator, out, l.val);
+        },
+        .is_null => |col| try writeAll(allocator, out, col, " IS NULL", ""),
+        .is_not_null => |col| try writeAll(allocator, out, col, " IS NOT NULL", ""),
+        .@"and" => |children| try joinPredicates(allocator, out, children, " AND "),
+        .@"or" => |children| try joinPredicates(allocator, out, children, " OR "),
+        .not => |child| {
+            try out.appendSlice(allocator, "NOT (");
+            try explainPredicate(allocator, out, child.*);
+            try out.append(allocator, ')');
+        },
+    }
+}
+
+fn joinPredicates(allocator: Allocator, out: *std.ArrayList(u8), children: []const PredicateExpr, sep: []const u8) anyerror!void {
+    for (children, 0..) |c, i| {
+        if (i > 0) try out.appendSlice(allocator, sep);
+        try explainPredicate(allocator, out, c);
+    }
+}
+
+fn writeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) anyerror!void {
+    var buf: [64]u8 = undefined;
+    switch (v) {
+        .int => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
+        .bigint => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
+        .smallint => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
+        .tinyint => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
+        .largeint => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
+        .float => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
+        .double => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
+        .boolean => |x| try out.appendSlice(allocator, if (x) "true" else "false"),
+        .text => |s| {
+            try out.append(allocator, '\'');
+            try out.appendSlice(allocator, s);
+            try out.append(allocator, '\'');
+        },
+        .date => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "date({d})", .{x})),
+        .datetime => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "datetime({d})", .{x})),
+        .decimal64 => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "decimal64({d})", .{x})),
+        .decimal128 => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "decimal128({d})", .{x})),
+        .uuid => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "uuid({d})", .{x})),
+    }
+}
+
 fn decodeProject(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!Op.Project {
     if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
     const n_cols = readU32(bytes[cursor.* .. cursor.* + 4]);

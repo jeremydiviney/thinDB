@@ -188,6 +188,16 @@ pub const PlanBuilder = struct {
         _ = self;
         return local.buildServerQuery(query_allocator, db, root.*);
     }
+
+    /// Render `root` as indented text. The returned slice lives in
+    /// the PlanBuilder's arena; copy it out before pb.deinit() if you
+    /// need it longer.
+    pub fn explain(self: *PlanBuilder, root: *ir.Op) ![]const u8 {
+        const aa = self.arena.allocator();
+        var buf: std.ArrayList(u8) = .empty;
+        try ir.explain(aa, &buf, root.*);
+        return buf.toOwnedSlice(aa);
+    }
 };
 
 /// Mirror of `exec.join.Spec` minus the opaque_predicate (not
