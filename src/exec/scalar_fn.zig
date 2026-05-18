@@ -282,6 +282,39 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "unhex", .arg_types = &.{.string}, .return_type = .string, .kernel = hexDecodeKernel },
     .{ .name = "to_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = base64EncodeKernel },
     .{ .name = "from_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = base64DecodeKernel },
+
+    // --- string (expanded set; matches DuckDB / MySQL / StarRocks parity) ---
+    .{ .name = "lpad", .arg_types = &.{ .string, .int, .string }, .return_type = .string, .kernel = lpadKernel },
+    .{ .name = "rpad", .arg_types = &.{ .string, .int, .string }, .return_type = .string, .kernel = rpadKernel },
+    .{ .name = "repeat", .arg_types = &.{ .string, .int }, .return_type = .string, .kernel = repeatKernel },
+    .{ .name = "space", .arg_types = &.{.int}, .return_type = .string, .kernel = spaceKernel },
+    .{ .name = "ascii", .arg_types = &.{.string}, .return_type = .int, .kernel = asciiKernel },
+    .{ .name = "position", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = positionKernel },
+    .{ .name = "instr", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = instrKernel },
+    .{ .name = "substring_index", .arg_types = &.{ .string, .string, .int }, .return_type = .string, .kernel = substringIndexKernel },
+    .{ .name = "strcmp", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = strcmpKernel },
+    .{ .name = "greatest", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = greatestStringKernel },
+    .{ .name = "least", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = leastStringKernel },
+
+    // --- math (expanded) ---
+    .{ .name = "truncate", .arg_types = &.{ .double, .int }, .return_type = .double, .kernel = truncateKernel },
+    .{ .name = "degrees", .arg_types = &.{.double}, .return_type = .double, .kernel = degreesKernel },
+    .{ .name = "radians", .arg_types = &.{.double}, .return_type = .double, .kernel = radiansKernel },
+    .{ .name = "atan2", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = atan2Kernel },
+
+    // --- date (expanded) ---
+    .{ .name = "dayofweek", .arg_types = &.{.date}, .return_type = .int, .kernel = dayofweekFromDateKernel },
+    .{ .name = "dayofweek", .arg_types = &.{.datetime}, .return_type = .int, .kernel = dayofweekFromDatetimeKernel },
+    .{ .name = "dayofyear", .arg_types = &.{.date}, .return_type = .int, .kernel = dayofyearFromDateKernel },
+    .{ .name = "dayofyear", .arg_types = &.{.datetime}, .return_type = .int, .kernel = dayofyearFromDatetimeKernel },
+    .{ .name = "quarter", .arg_types = &.{.date}, .return_type = .int, .kernel = quarterFromDateKernel },
+    .{ .name = "quarter", .arg_types = &.{.datetime}, .return_type = .int, .kernel = quarterFromDatetimeKernel },
+    .{ .name = "last_day", .arg_types = &.{.date}, .return_type = .date, .kernel = lastDayFromDateKernel },
+    .{ .name = "last_day", .arg_types = &.{.datetime}, .return_type = .date, .kernel = lastDayFromDatetimeKernel },
+
+    // --- coalesce / ifnull (double overload — int families coerce here via cast.zig) ---
+    .{ .name = "coalesce", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .absorbs, .kernel = coalesceDoubleKernel },
+    .{ .name = "ifnull", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .absorbs, .kernel = ifnullDoubleKernel },
 };
 
 // ---------------------------------------------------------------------------
@@ -1238,6 +1271,394 @@ inline fn stringStoreOf(out: *ColumnStore) *store.StringStore {
 // single helper that takes any matching arg type.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Expanded string kernels
+// ---------------------------------------------------------------------------
+
+fn lpadKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const lens = args[1].data.int;
+    const pad_sv = stringViewOf(args[2]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const target_len_i32 = lens[i];
+        const pad = pad_sv.rowBytes(i);
+        if (target_len_i32 <= 0 or pad.len == 0) {
+            try ss.appendValue(allocator, src[0..@min(src.len, @as(usize, @intCast(@max(target_len_i32, 0))))]);
+            continue;
+        }
+        const target_len: usize = @intCast(target_len_i32);
+        if (src.len >= target_len) {
+            try ss.appendValue(allocator, src[0..target_len]);
+            continue;
+        }
+        var buf = try allocator.alloc(u8, target_len);
+        defer allocator.free(buf);
+        const pad_needed = target_len - src.len;
+        var written: usize = 0;
+        while (written < pad_needed) : (written += 1) buf[written] = pad[written % pad.len];
+        @memcpy(buf[pad_needed..], src);
+        try ss.appendValue(allocator, buf);
+    }
+}
+
+fn rpadKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const lens = args[1].data.int;
+    const pad_sv = stringViewOf(args[2]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const target_len_i32 = lens[i];
+        const pad = pad_sv.rowBytes(i);
+        if (target_len_i32 <= 0 or pad.len == 0) {
+            try ss.appendValue(allocator, src[0..@min(src.len, @as(usize, @intCast(@max(target_len_i32, 0))))]);
+            continue;
+        }
+        const target_len: usize = @intCast(target_len_i32);
+        if (src.len >= target_len) {
+            try ss.appendValue(allocator, src[0..target_len]);
+            continue;
+        }
+        var buf = try allocator.alloc(u8, target_len);
+        defer allocator.free(buf);
+        @memcpy(buf[0..src.len], src);
+        var j: usize = src.len;
+        while (j < target_len) : (j += 1) buf[j] = pad[(j - src.len) % pad.len];
+        try ss.appendValue(allocator, buf);
+    }
+}
+
+fn repeatKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ns = args[1].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const n = ns[i];
+        if (n <= 0 or src.len == 0) {
+            try ss.appendValue(allocator, "");
+            continue;
+        }
+        const total: usize = src.len * @as(usize, @intCast(n));
+        var buf = try allocator.alloc(u8, total);
+        defer allocator.free(buf);
+        var k: usize = 0;
+        while (k < @as(usize, @intCast(n))) : (k += 1) {
+            @memcpy(buf[k * src.len ..][0..src.len], src);
+        }
+        try ss.appendValue(allocator, buf);
+    }
+}
+
+fn spaceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ns = args[0].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const n = ns[i];
+        if (n <= 0) {
+            try ss.appendValue(allocator, "");
+            continue;
+        }
+        const len: usize = @intCast(n);
+        const buf = try allocator.alloc(u8, len);
+        defer allocator.free(buf);
+        @memset(buf, ' ');
+        try ss.appendValue(allocator, buf);
+    }
+}
+
+fn asciiKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const v: i32 = if (src.len == 0) 0 else @intCast(src[0]);
+        try out.data.int.append(allocator, v);
+    }
+}
+
+/// 1-based offset of `needle` in `haystack`, or 0 if absent. Matches MySQL /
+/// StarRocks / DuckDB. An empty needle returns 1 (consistent with most engines).
+fn positionKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const needle_sv = stringViewOf(args[0]);
+    const hay_sv = stringViewOf(args[1]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const needle = needle_sv.rowBytes(i);
+        const hay = hay_sv.rowBytes(i);
+        const v: i32 = if (needle.len == 0) 1 else if (std.mem.indexOf(u8, hay, needle)) |idx| @intCast(idx + 1) else 0;
+        try out.data.int.append(allocator, v);
+    }
+}
+
+/// MySQL's INSTR(haystack, needle). Same semantics as position; args swapped.
+fn instrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const hay_sv = stringViewOf(args[0]);
+    const needle_sv = stringViewOf(args[1]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const hay = hay_sv.rowBytes(i);
+        const needle = needle_sv.rowBytes(i);
+        const v: i32 = if (needle.len == 0) 1 else if (std.mem.indexOf(u8, hay, needle)) |idx| @intCast(idx + 1) else 0;
+        try out.data.int.append(allocator, v);
+    }
+}
+
+/// SUBSTRING_INDEX(s, delim, count). Positive count: keep first N parts;
+/// negative count: keep last |N| parts. count=0 → empty string. Matches MySQL.
+fn substringIndexKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const delim_sv = stringViewOf(args[1]);
+    const counts = args[2].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const delim = delim_sv.rowBytes(i);
+        const n = counts[i];
+        if (n == 0 or delim.len == 0) {
+            try ss.appendValue(allocator, if (delim.len == 0) src else "");
+            continue;
+        }
+        if (n > 0) {
+            var remaining: i32 = n;
+            var cursor: usize = 0;
+            while (remaining > 0 and cursor < src.len) {
+                if (std.mem.indexOfPos(u8, src, cursor, delim)) |idx| {
+                    remaining -= 1;
+                    if (remaining == 0) {
+                        try ss.appendValue(allocator, src[0..idx]);
+                        break;
+                    }
+                    cursor = idx + delim.len;
+                } else break;
+            } else {
+                try ss.appendValue(allocator, src);
+                continue;
+            }
+            if (remaining > 0) try ss.appendValue(allocator, src);
+        } else {
+            // Find the |n|-th delimiter from the right.
+            var want: i32 = -n;
+            var idx_opt: ?usize = src.len;
+            while (want > 0) : (want -= 1) {
+                const upper_bound = idx_opt orelse 0;
+                if (upper_bound == 0) {
+                    idx_opt = null;
+                    break;
+                }
+                idx_opt = std.mem.lastIndexOf(u8, src[0..upper_bound], delim);
+                if (idx_opt == null) break;
+            }
+            if (idx_opt) |idx| {
+                try ss.appendValue(allocator, src[idx + delim.len ..]);
+            } else {
+                try ss.appendValue(allocator, src);
+            }
+        }
+    }
+}
+
+fn strcmpKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a_sv = stringViewOf(args[0]);
+    const b_sv = stringViewOf(args[1]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const a = a_sv.rowBytes(i);
+        const b = b_sv.rowBytes(i);
+        const v: i32 = switch (std.mem.order(u8, a, b)) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        };
+        try out.data.int.append(allocator, v);
+    }
+}
+
+fn greatestStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a_sv = stringViewOf(args[0]);
+    const b_sv = stringViewOf(args[1]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const a = a_sv.rowBytes(i);
+        const b = b_sv.rowBytes(i);
+        try ss.appendValue(allocator, if (std.mem.order(u8, a, b) == .lt) b else a);
+    }
+}
+
+fn leastStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a_sv = stringViewOf(args[0]);
+    const b_sv = stringViewOf(args[1]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const a = a_sv.rowBytes(i);
+        const b = b_sv.rowBytes(i);
+        try ss.appendValue(allocator, if (std.mem.order(u8, a, b) == .gt) b else a);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expanded math kernels
+// ---------------------------------------------------------------------------
+
+fn truncateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const x = args[0].data.double;
+    const d = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const scale: f64 = std.math.pow(f64, 10.0, @floatFromInt(d[i]));
+        const v = @trunc(x[i] * scale) / scale;
+        try out.data.double.append(allocator, v);
+    }
+}
+
+fn degreesKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, s[i] * (180.0 / std.math.pi));
+}
+
+fn radiansKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, s[i] * (std.math.pi / 180.0));
+}
+
+fn atan2Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const y = args[0].data.double;
+    const x = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.atan2(y[i], x[i]));
+}
+
+// ---------------------------------------------------------------------------
+// Expanded date kernels
+// ---------------------------------------------------------------------------
+
+/// Days-since-epoch → ISO weekday index, then mapped to MySQL's
+/// 1=Sunday … 7=Saturday convention (matches StarRocks).
+fn dayofweekFromDays(days: i32) i32 {
+    // 1970-01-01 was a Thursday. Thursday = 5 in MySQL convention
+    // (Sun=1, Mon=2, …, Sat=7). Days arithmetic in mod 7.
+    const d = @mod(days, 7);
+    const offset_from_thu: i32 = @mod(d + 4, 7); // 4 = (Thu in MySQL=5) - 1
+    return offset_from_thu + 1;
+}
+
+fn dayofweekFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, dayofweekFromDays(s[i]));
+}
+
+fn dayofweekFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, dayofweekFromDays(daysFromDatetime(s[i])));
+}
+
+fn dayofyearFromDays(days: i32) i32 {
+    if (days < 0) return 0;
+    const u_days: u47 = @intCast(days);
+    const epoch_day = std.time.epoch.EpochDay{ .day = u_days };
+    const year_day = epoch_day.calculateYearDay();
+    return @as(i32, year_day.day) + 1;
+}
+
+fn dayofyearFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, dayofyearFromDays(s[i]));
+}
+
+fn dayofyearFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, dayofyearFromDays(daysFromDatetime(s[i])));
+}
+
+fn quarterFromDays(days: i32) i32 {
+    const ymd = daysToYmd(days) orelse return 0;
+    return @divTrunc(@as(i32, ymd.month) - 1, 3) + 1;
+}
+
+fn quarterFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, quarterFromDays(s[i]));
+}
+
+fn quarterFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, quarterFromDays(daysFromDatetime(s[i])));
+}
+
+/// LAST_DAY: return the date corresponding to the last day of the given
+/// month. Days-since-epoch backed; pre-epoch returns 0.
+fn lastDayFromDays(days: i32) i32 {
+    const ymd = daysToYmd(days) orelse return 0;
+    const last = daysInMonth(ymd.year, ymd.month);
+    // Re-encode (year, month, last) as days-since-epoch. Built by stepping
+    // from the start of the month: `days - (ymd.day - 1) + (last - 1)`.
+    return days - @as(i32, ymd.day - 1) + @as(i32, last - 1);
+}
+
+fn daysInMonth(yr: u16, mo: u4) u5 {
+    return switch (mo) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(yr)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn isLeapYear(yr: u16) bool {
+    if (yr % 400 == 0) return true;
+    if (yr % 100 == 0) return false;
+    return yr % 4 == 0;
+}
+
+fn lastDayFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.date.append(allocator, lastDayFromDays(s[i]));
+}
+
+fn lastDayFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.date.append(allocator, lastDayFromDays(daysFromDatetime(s[i])));
+}
+
+// ---------------------------------------------------------------------------
+// Coalesce / ifnull — double overload
+// ---------------------------------------------------------------------------
+
+fn coalesceDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v: f64 = if (args[0].isValid(i)) args[0].data.double[i] else if (args[1].isValid(i)) args[1].data.double[i] else 0.0;
+        try out.data.double.append(allocator, v);
+    }
+}
+
+fn ifnullDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v: f64 = if (args[0].isValid(i)) args[0].data.double[i] else args[1].data.double[i];
+        try out.data.double.append(allocator, v);
+    }
+}
+
 const expr_mod = @import("expr.zig");
 
 pub fn upper(arena: Allocator, arg: Expr) !Expr {
@@ -1344,5 +1765,28 @@ pub fn hex(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "hex
 pub fn unhex(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "unhex", &.{arg}); }
 pub fn toBase64(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "to_base64", &.{arg}); }
 pub fn fromBase64(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "from_base64", &.{arg}); }
+
+// --- expanded string ---
+pub fn lpad(arena: Allocator, s: Expr, n: Expr, pad: Expr) !Expr { return expr_mod.call(arena, "lpad", &.{ s, n, pad }); }
+pub fn rpad(arena: Allocator, s: Expr, n: Expr, pad: Expr) !Expr { return expr_mod.call(arena, "rpad", &.{ s, n, pad }); }
+pub fn repeat(arena: Allocator, s: Expr, n: Expr) !Expr { return expr_mod.call(arena, "repeat", &.{ s, n }); }
+pub fn space(arena: Allocator, n: Expr) !Expr { return expr_mod.call(arena, "space", &.{n}); }
+pub fn ascii(arena: Allocator, s: Expr) !Expr { return expr_mod.call(arena, "ascii", &.{s}); }
+pub fn position(arena: Allocator, needle: Expr, hay: Expr) !Expr { return expr_mod.call(arena, "position", &.{ needle, hay }); }
+pub fn instr(arena: Allocator, hay: Expr, needle: Expr) !Expr { return expr_mod.call(arena, "instr", &.{ hay, needle }); }
+pub fn substringIndex(arena: Allocator, s: Expr, delim: Expr, count: Expr) !Expr { return expr_mod.call(arena, "substring_index", &.{ s, delim, count }); }
+pub fn strcmp(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "strcmp", &.{ a, b }); }
+
+// --- expanded math ---
+pub fn truncate(arena: Allocator, x: Expr, d: Expr) !Expr { return expr_mod.call(arena, "truncate", &.{ x, d }); }
+pub fn degrees(arena: Allocator, x: Expr) !Expr { return expr_mod.call(arena, "degrees", &.{x}); }
+pub fn radians(arena: Allocator, x: Expr) !Expr { return expr_mod.call(arena, "radians", &.{x}); }
+pub fn atan2(arena: Allocator, y: Expr, x: Expr) !Expr { return expr_mod.call(arena, "atan2", &.{ y, x }); }
+
+// --- expanded date ---
+pub fn dayofweek(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "dayofweek", &.{arg}); }
+pub fn dayofyear(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "dayofyear", &.{arg}); }
+pub fn quarter(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "quarter", &.{arg}); }
+pub fn lastDay(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "last_day", &.{arg}); }
 
 // Tests live in scalar_fn_test.zig (companion).

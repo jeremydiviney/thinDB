@@ -91,3 +91,75 @@ test "scalar_fn: exact match short-circuits before cost calc" {
     try std.testing.expect(r.arg_casts == null);
     try std.testing.expectEqual(@as(TypeTag, .bigint), @as(TypeTag, r.func.return_type));
 }
+
+// ---------------------------------------------------------------------------
+// Expanded scalar function registry (lpad/rpad/repeat/space/ascii/position/
+// instr/substring_index/strcmp + truncate/degrees/radians/atan2 + date funcs
+// + double-overload coalesce/ifnull). Coverage focused on overload selection;
+// per-row correctness is exercised via integration tests in
+// tests/integration/compute_test.zig.
+// ---------------------------------------------------------------------------
+
+test "scalar_fn: lpad/rpad/repeat resolve with (string, int, string) and (string, int)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    try std.testing.expect((try resolve(aa, "lpad", &.{ .string, .int, .string })) != null);
+    try std.testing.expect((try resolve(aa, "rpad", &.{ .string, .int, .string })) != null);
+    try std.testing.expect((try resolve(aa, "repeat", &.{ .string, .int })) != null);
+    try std.testing.expect((try resolve(aa, "space", &.{.int})) != null);
+}
+
+test "scalar_fn: position/instr return int; greatest/least for strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const pos = (try resolve(aa, "position", &.{ .string, .string })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .int), @as(TypeTag, pos.func.return_type));
+    const ins = (try resolve(aa, "instr", &.{ .string, .string })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .int), @as(TypeTag, ins.func.return_type));
+    const g = (try resolve(aa, "greatest", &.{ .string, .string })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .string), @as(TypeTag, g.func.return_type));
+}
+
+test "scalar_fn: date helpers — dayofweek/dayofyear/quarter/last_day overloads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    try std.testing.expect((try resolve(aa, "dayofweek", &.{.date})) != null);
+    try std.testing.expect((try resolve(aa, "dayofweek", &.{.datetime})) != null);
+    try std.testing.expect((try resolve(aa, "dayofyear", &.{.date})) != null);
+    try std.testing.expect((try resolve(aa, "quarter", &.{.datetime})) != null);
+    const ld = (try resolve(aa, "last_day", &.{.date})) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .date), @as(TypeTag, ld.func.return_type));
+}
+
+test "scalar_fn: coalesce(double, double) now resolves directly + via float coercion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Exact (double, double) → no cast.
+    const r1 = (try resolve(aa, "coalesce", &.{ .double, .double })) orelse return error.NotFound;
+    try std.testing.expect(r1.arg_casts == null);
+
+    // (float, float) → coerces to (double, double) via cast.zig.
+    const r2 = (try resolve(aa, "coalesce", &.{ .float, .float })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .double), @as(TypeTag, r2.func.return_type));
+    const casts = r2.arg_casts orelse return error.ExpectedCastPlan;
+    try std.testing.expect(casts[0] != null);
+    try std.testing.expect(casts[1] != null);
+}
+
+test "scalar_fn: truncate routes via int → double coercion for bigint arg" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // truncate is (double, int). bigint arg position 0 must coerce.
+    const r = (try resolve(aa, "truncate", &.{ .bigint, .int })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .double), @as(TypeTag, r.func.return_type));
+    const casts = r.arg_casts orelse return error.ExpectedCastPlan;
+    try std.testing.expect(casts[0] != null);
+    try std.testing.expect(casts[1] == null);
+}
