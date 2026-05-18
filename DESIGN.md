@@ -2,7 +2,9 @@
 
 A single-node, columnar analytics database with a tight, fast core and deliberately small surface area. Inspired by StarRocks/Doris in storage shape, but stripped of every multi-node, optimizer, and ecosystem concern that doesn't earn its keep on one machine.
 
-This document is the working spec for v1. Decisions are presented as decisions, not options. Rationale is included where it isn't obvious; alternatives we considered and rejected are listed in `## Alternatives considered`.
+This document is the working spec. v1 is effectively complete as of 2026-05-18 — joins (every algorithm), range/opaque predicates, skew auto-routing, upserts, WAL, type coercion, and a substantial scalar/aggregate function set have all landed. Section 14 tracks what's been deferred to v2 and v3.
+
+Decisions are presented as decisions, not options. Rationale is included where it isn't obvious; alternatives we considered and rejected are listed in `## Alternatives considered`.
 
 ---
 
@@ -18,17 +20,25 @@ This document is the working spec for v1. Decisions are presented as decisions, 
 
 ### Non-goals (v1)
 - Distribution, replication, sharding.
-- A SQL parser/dialect.
-- A network server or wire protocol.
-- Client APIs for non-Zig languages.
-- Joins, subqueries, CTEs, window functions.
-- Transactions or multi-statement atomicity.
-- Crash durability of in-memory writes.
-- Upserts (use delete + insert).
-- Timezone-aware datetimes.
-- Cost-based query planning or statistics-driven optimization.
+- A SQL parser/dialect (v2).
+- A user-facing network server or wire protocol — though an in-process `Connection` exists (`thindb.local`) and TCP transport stubs are wired (v2 ships the parser; v3 ships MySQL wire-compat).
+- Client APIs for non-Zig languages (v2).
+- Subqueries, CTEs, window functions (v2). **Joins are in v1** (hash / sort-merge / nested-loop / range-sweep, with auto routing and skew detection).
+- Transactions or multi-statement atomicity (not currently planned).
+- Timezone-aware datetimes (v2 — `TIMESTAMPTZ`).
+- Cost-based query planning or statistics-driven optimization (rejected for the "thin" ethos).
+- Implicit string ↔ number coercion (matches DuckDB/StarRocks; users call `to_int` / `to_string`).
 
-Items deferred to v2 are tracked in `## 14. Out of scope for v1` with the migration path noted.
+### Shipped beyond the original v1 plan
+
+Items the early spec listed as v2 that landed in v1:
+
+- **Joins** — hash, sort-merge, nested-loop, range-sweep, with `.auto` routing via manifest stats and Misra-Gries skew detection that re-routes hash → SMJ in-place.
+- **Upserts** — `Table.upsert()`; inserts on unique tables transparently apply last-writer-wins resolution (StarRocks-style).
+- **Crash durability** — WAL with leader-follower group commit.
+- **Implicit type coercion** in scalar functions (DuckDB-style cost-ranked overload selection).
+
+Items genuinely deferred to v2/v3 are listed in `## 14`.
 
 ---
 
@@ -331,13 +341,20 @@ pub fn deinit(self: *Self) void
 
 | Operator | Purpose |
 |---|---|
-| `Scan` | Read row groups from a table; prunes via min/max; applies tombstones via bitset |
+| `Scan` | Read row groups from a table; prunes via manifest stats; applies tombstones via bitset |
 | `Filter` | Evaluates predicate; produces a bitmap-selected batch |
-| `Project` | Selects/renames/computes columns |
-| `Aggregate` | Hash-group + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` |
+| `Project` | Selects / renames / excludes columns |
+| `Compute` | Derived columns via scalar functions (with implicit coercion) |
+| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`), `COUNT_DISTINCT`, `PERCENTILE_CONT`, `GROUP_CONCAT` |
 | `Sort` | Materializes, sorts by key columns, streams sorted batches |
 | `Limit` | Stops after N rows |
+| `Join` (hash) | Build smaller side, probe with the larger; compound keys via order-preserving byte encoding |
+| `SortMergeJoin` | Materialize + sort both sides, streaming merge; merge-only fast-path when manifest stats prove pre-sorted |
+| `NestedLoopJoin` | Cartesian eval with per-pair predicates; used for pure-range, opaque-callback, or no-equi-keys joins |
+| `RangeSweepJoin` | Single inequality `a OP b` between two side-sorted columns — cursor-style merge, ~2× faster than NLJ on pure-range shapes |
 | `Sink` | Terminal — collects results or yields batches to caller |
+
+Join routing (`.algorithm = .auto`): opaque predicate → NLJ; pure single-range shape → range_sweep; both sides sorted on the join keys (per manifest stats) → SMJ; otherwise hash. Hash join's build phase runs Misra-Gries sampling — under heavy skew it transfers ownership of the built columns to an SMJ at execute time.
 
 **Memtable scan**: every Scan also reads from the (potentially non-empty) memtable of the table. Memtable rows are processed identically to segment rows. This gives read-your-writes consistency.
 
@@ -587,16 +604,31 @@ Both forms are fully typed at comptime. `.pipe(f)` is zero-cost — Zig inlines 
 
 ### 9.8 Errors
 
-All fallible API calls return a Zig error union. The public error set is `thindb.Error`:
+All fallible API calls return a Zig error union. The public error surface is split between `thindb.Error` (API/catalog) and `thindb.exec.Error` (query execution):
 
+**API-level (`src/api/api.zig`):**
 ```
-SchemaInvalid, TableNotFound, TableAlreadyExists, ColumnNotFound,
-TypeMismatch, NullInNotNullColumn, UniqueKeyViolation,
-ArithmeticOverflow, ArithmeticDivideByZero,
-IoError, CorruptSegment, ManifestCorrupt,
-OutOfMemory, CacheFull,
-NotSupported,
+SchemaMismatch, UnsupportedUniqueKeyType, UpsertRequiresUniqueKey,
+TableNotFound, TableAlreadyExists, ColumnNotFound,
+ColumnAlreadyExists, UnsupportedAlterOp,
 ```
+
+**Execution-level (`src/exec/exec.zig`):**
+```
+ColumnNotFound, TypeMismatch, PredicateTypeMismatch,
+UnsupportedOperatorForType,
+SortNoKeys,
+AggregateNoSpecs, AggregateColumnRequired,
+AggregateUnsupportedType, AggregateInvalidParam,
+ArithmeticOverflow,
+ComputeNoColumns, ComputeNameCollision, ComputeUnsupportedExpr,
+ComputeNoSuchOverload, ComputeTooManyArgs,
+JoinUnsupportedType, JoinEmptyOnClause, JoinKeyTypeMismatch,
+JoinColumnNameCollision,
+MemoryBudgetExceeded,
+```
+
+Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
 
 No transactions, no rollback. Each top-level API call either fully succeeds or fully fails with no side effect (e.g., a failed `insert` leaves the memtable untouched; a failed `ALTER` leaves the shadow table to be cleaned up but the original is intact).
 
@@ -642,7 +674,7 @@ No transactions, no rollback. Each top-level API call either fully succeeds or f
 - **Go for the engine.** Rejected: GC pauses during scans, no first-class SIMD, awkward FFI for future client libraries.
 - **Row-oriented storage as a co-equal option.** Rejected: doubles the engine surface for an OLTP workload that isn't the target.
 - **Parquet for the segment format.** Rejected: significant external dependency surface and ABI complexity for benefits we don't need (cross-engine interop is a non-goal in v1).
-- **Postgres wire protocol for the future server.** Deferred — the function-chain API for non-Zig clients (v2) doesn't map cleanly onto the Postgres protocol, so we'll design a custom protocol alongside it.
+- **Postgres wire protocol for the future server.** Rejected in favor of MySQL wire-compat (v3, task #139). MySQL has more BI-tool / ORM ecosystem in the StarRocks-adjacent space we sit in, and our scalar-function naming already aligns with MySQL via the parity work.
 - **In-place column updates / inline tombstones inside segment files.** Rejected: breaks immutability, which is the foundation of lock-free concurrent reads.
 - **Strict schema as a perf concern.** Rejected based on review: strict schema is actually faster than dynamic, not slower. No tradeoff.
 - **Runtime query optimizer.** Rejected: explicitly out of scope. Query execution order is what the user wrote. Pre-execution rewrites are allowed (constant folding, predicate normalization) but no plan-cost-based reordering.
@@ -655,20 +687,25 @@ No transactions, no rollback. Each top-level API call either fully succeeds or f
 
 ```
 src/
-  api/                          public Database, Table, Query builder
+  api/                          public Database, Table, Query builder, Connection
   engine/                       writer thread, memtable, flush, compaction, alter
-  exec/                         operators (scan, filter, project, aggregate, sort, limit, sink)
+  exec/                         operators (scan, filter, project, compute, sort, limit,
+                                aggregate, joins, nlj, smj, range_sweep, cast, cell_io, skew)
   storage/                      segment reader/writer, manifest, encodings, compression, tombstones
-  types/                        type system, decimal kernel, datetime helpers
+  ir/                           operator-tree IR + serialization (foundation for v2 SQL parser)
+  net/                          in-process Connection + TCP transport stubs
   cache/                        LRU row-group cache
   util/                         allocator helpers, small primitives
 tests/
   integration/                  end-to-end scenarios
-  property/                     property-based correctness (v2 target)
+  integration_client/           Connection-mediated query surface
 bench/
-  scan_throughput.zig
-  insert_rate.zig
-  harness.zig
+  main.zig                      entry + dispatch
+  join_bench.zig                join algorithm benchmarks
+  durability_bench.zig          WAL / sync mode benchmarks
+  compact_bench.zig             compaction scenarios
+  tcp_bench.zig                 transport overhead vs in-process
+  harness.zig                   shared timer + report helpers
 build.zig
 DESIGN.md
 CLAUDE.md
@@ -688,23 +725,63 @@ Target Zig version: 0.16.
 
 ---
 
-## 14. Out of scope for v1
+## 14. Roadmap — v2 and beyond
 
-| Feature | When | Migration path |
-|---|---|---|
-| SQL parser & dialect | v2 | Parser emits the same operator tree as the typed API. No engine changes needed. |
-| Network server + wire protocol | v2 | Thin wrapper over the library; queries serialized as operator-tree IR. |
-| Non-Zig client libraries (JS/TS, Python, Go, …) | v2 | Each client library builds the operator-tree IR locally and sends it over the wire protocol. |
-| Joins, subqueries, CTEs, window functions | v2 | New operators (`Join`, `Apply`, `Window`). The pipeline framework supports them without redesign. |
-| Transactions | post-v2 if at all | Multi-statement atomicity would require coordinating manifest updates across commands. Not currently planned. |
-| ~~Crash durability of in-memory writes~~ | ✅ done in v0.8 | WAL with leader-follower group commit (§8.1); `wal_enabled = true` + `sync_mode = .per_flush`. |
-| Upserts | v2 | Explicit `.upsert()` method that fuses delete+insert against the order key. |
-| `TIMESTAMPTZ` | v2 | Add as a new type; existing `DATETIME` columns unaffected. |
-| Auto-increment columns + column default properties | v2 | New column metadata (`default`, `auto_increment`, future: `on_update`). Memtable insert resolves defaults / picks next ID when the row omits the field. Schema serialization carries the new metadata; migrations untouched. |
-| MySQL wire-protocol compat (listener) | v3 | Second listener alongside the native TCP transport. MySQL clients (CLI, BI tools, ORMs) connect without custom drivers. Scalar function names already align with MySQL via the StarRocks/MySQL parity work. Pick a separate default port and document. |
-| Schema evolution via in-place changes (order-key changes, column reorder) | v3+ if at all | The v1 copy-and-swap covers most needs. |
-| Replication / multi-node | not planned | Explicitly out of scope. |
-| Cost-based optimizer / statistics | not planned | The "thin" ethos says no. |
+### Shipped in v1 (originally planned for later)
+
+| Feature | Notes |
+|---|---|
+| **Joins** | hash / SMJ / NLJ / range_sweep. `.auto` routing via manifest stats + Misra-Gries skew detection that re-routes hash → SMJ in-place when one key dominates the build side. |
+| **Range / opaque predicates** | Single inequality `a OP b`, multi-range (BETWEEN), `extra_predicate` post-join filter, opaque callback via NLJ. Skew detection + auto-route on top. |
+| **Upserts** | StarRocks-style last-writer-wins on tables with `unique = true`. Insert auto-resolves; `Table.upsert()` is the self-documenting alias. |
+| **Crash durability** | WAL with leader-follower group commit (§8.1). `wal_enabled = true` + `sync_mode = .per_flush`. |
+| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. |
+| **Statistical / set-oriented aggregates** | `STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COUNT_DISTINCT`, `PERCENTILE_CONT`, `GROUP_CONCAT`. |
+| **In-process Connection** | `thindb.local(...)` returns a Connection that mediates queries — same surface a future remote-mode Connection will expose. |
+
+### v2 — next major band (user-facing query surface)
+
+The biggest piece is a **compiled query-plan tree** as IR — most of v2 builds on it.
+
+| Feature | Notes |
+|---|---|
+| Multi-source pipelines / CTEs | Compile builder calls into an explicit plan tree before exec. Foundation for everything else in v2. |
+| SQL parser + execution | MySQL/StarRocks dialect; parser emits the same IR as the builder. |
+| Database / namespace system | 2-level (catalog.schema.table) per Postgres/Iceberg/BI-tool convention. Each level a directory under the Database root. |
+| Temp tables + per-connection sessions | Sessions own a temp-table overlay isolated from other connections. Per-session timezone, isolation knobs later. |
+| EXPLAIN plan output | Render the plan tree as text (and later JSON). Cheap once the plan-tree IR exists. |
+| Scalar UDFs | User-registered scalar fns participate in the existing coercion machinery automatically. |
+| Window functions | `ROW_NUMBER`, `RANK`, `LAG`/`LEAD`, framed aggregates (`OVER PARTITION BY … ORDER BY … ROWS BETWEEN …`). Likely a new `Window` operator. |
+| Column defaults + auto-increment | New column metadata (`default`, `auto_increment`, future: `on_update`). Memtable insert resolves defaults / picks next ID when the row omits the field. |
+| `TIMESTAMPTZ` | New type alongside `DATETIME`; existing columns unaffected. |
+| Non-Zig client libraries | Each library builds the operator-tree IR locally and sends it over the wire protocol. |
+| SIMD optimization pass | Audit hot paths for `@Vector(N, T)` opportunities (cast kernels, filter, aggregate accumulators, join key compare). |
+
+### v3 — later (server / parallelism / extensibility)
+
+| Feature | Notes |
+|---|---|
+| MySQL wire-protocol compatibility | Listener that speaks the MySQL client/server protocol so any mysql/MariaDB client connects. Replaces the "design our own protocol" path. |
+| Table-valued UDFs | TVFs act as pipeline operators; invokable from SQL once the parser ships. |
+| Auto-partitioned parallel execution | Split safely-partitionable queries into N parallel sub-queries; partial graph splits where safe. Single-threaded today; revisit after the plan-tree IR. |
+| Partition key on tables | Per-key-value or hash-bucket physical partitioning. Natural parallelism axis for the auto-parallel work above. |
+| Schema evolution via in-place changes | Order-key changes, column reorder. v1's copy-and-swap covers most needs. |
+
+### Explicitly deferred — revisit much later
+
+| Feature | Notes |
+|---|---|
+| External sort / spillable operators | Memory accountant exists; spill-to-disk for Sort and Aggregate when over budget. Today they throw `MemoryBudgetExceeded`. |
+| Property-based tests | Random-input invariants (round-trip, join-algorithm equivalence, aggregate split-invariance). |
+
+### Not planned
+
+| Feature | Notes |
+|---|---|
+| Transactions / multi-statement atomicity | Would require coordinating manifest updates across commands. |
+| Replication / multi-node | Explicitly out of scope. |
+| Cost-based optimizer / statistics-driven plans | The "thin" ethos rejects this. Pre-execution rewrites (constant folding, predicate normalization) are fine; plan-cost reordering is not. |
+| Implicit string ↔ number coercion | Footgun-prone (MySQL behavior); explicit `to_int` / `to_string` instead (Postgres/DuckDB/StarRocks consensus). |
 
 ---
 
