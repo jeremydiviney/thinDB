@@ -41,6 +41,11 @@ pub const AggSpec = exec.AggSpec;
 pub const SortSpec = exec.SortSpec;
 pub const scan = exec.scan;
 
+// Plan-tree builder for multi-source / multi-branched pipelines.
+pub const plan = @import("api/plan.zig");
+pub const PlanBuilder = plan.PlanBuilder;
+pub const JoinSpec = plan.JoinSpec;
+
 // ---------------------------------------------------------------------------
 // Client/server surface (new, going forward — see DESIGN.md §16).
 // `thindb.local(...)` returns a Connection that wraps an in-process server.

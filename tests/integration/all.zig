@@ -14,6 +14,7 @@ test {
     _ = @import("compute_scalar_test.zig");
     _ = @import("join_test.zig");
     _ = @import("aggregate_test.zig");
+    _ = @import("plan_test.zig");
 }
 
 test "integration entry exists" {
