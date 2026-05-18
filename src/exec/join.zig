@@ -83,9 +83,17 @@ pub const Algorithm = enum {
     /// Materialize both sides, double-loop, evaluate ranges +
     /// extra_predicate per pair. O(N*M) — use only when there's no
     /// equi join key to exploit (pure range, opaque predicates) or
-    /// when at least one side is tiny. Auto picks this when `on` is
-    /// empty and `ranges` is non-empty.
+    /// when at least one side is tiny. Auto picks this for pure
+    /// joins that don't fit the more specialized range_sweep
+    /// shape (multi-range, non-range ops, etc.).
     nested_loop,
+    /// Materialize both sides, sort each on the range column,
+    /// two-pointer walk to emit matching pairs. O((N+M) log + matches)
+    /// — much faster than nested_loop for selective range joins.
+    /// Restricted to: empty `on`, exactly one range predicate with
+    /// op in {lt, lte, gt, gte}. .auto picks this when those
+    /// conditions hold.
+    range_sweep,
     // Future: inlj
 };
 
@@ -232,17 +240,32 @@ pub const Join = struct {
         right: Query,
         spec: Spec,
     ) !Query {
-        // Resolve algorithm. .auto picks nested_loop for empty `on`,
-        // otherwise consults cheap stats (chooseAlgorithm).
+        // Resolve algorithm. .auto picks range_sweep for the
+        // specialized pure-single-range shape; otherwise nested_loop
+        // for empty `on`; otherwise the equi-driven algorithms via
+        // chooseAlgorithm.
         const chosen = if (spec.algorithm == .auto)
-            (if (spec.on.len == 0) .nested_loop else chooseAlgorithm(left, right, spec.on))
+            (if (canUseRangeSweep(spec)) .range_sweep
+                else if (spec.on.len == 0) .nested_loop
+                else chooseAlgorithm(left, right, spec.on))
         else
             spec.algorithm;
 
-        // Nested-loop is the only algorithm that handles an empty
-        // `on` clause. Reject empty-on with any other algorithm.
-        if (spec.on.len == 0 and chosen != .nested_loop) {
+        // Nested-loop / range_sweep are the only algorithms that
+        // handle an empty `on` clause. Reject empty-on with any other.
+        if (spec.on.len == 0 and chosen != .nested_loop and chosen != .range_sweep) {
             return Error.JoinEmptyOnClause;
+        }
+
+        if (chosen == .range_sweep) {
+            const rs_spec: Spec = .{
+                .join_type = spec.join_type,
+                .on = spec.on,
+                .algorithm = .range_sweep,
+                .extra_predicate = spec.extra_predicate,
+                .ranges = spec.ranges,
+            };
+            return @import("range_sweep.zig").RangeSweepJoin.create(allocator, left, right, rs_spec);
         }
 
         if (chosen == .nested_loop) {
@@ -913,6 +936,19 @@ pub const Join = struct {
 // when we can prove the structural advantage (both sides sorted).
 // Hash remains the default for the broad middle of analytics shapes
 // where it wins.
+
+/// True iff the spec fits range_sweep's narrow contract: pure range
+/// (empty `on`), exactly one range predicate, op in {lt, lte, gt, gte},
+/// INNER join. Multi-range / outer / opaque shapes fall back to NLJ.
+fn canUseRangeSweep(spec: Spec) bool {
+    if (spec.join_type != .inner) return false;
+    if (spec.on.len != 0) return false;
+    if (spec.ranges.len != 1) return false;
+    return switch (spec.ranges[0].op) {
+        .lt, .lte, .gt, .gte => true,
+        else => false,
+    };
+}
 
 fn chooseAlgorithm(left: Query, right: Query, on: []const KeyPair) Algorithm {
     const ls = left.stats();

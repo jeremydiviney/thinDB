@@ -1931,6 +1931,84 @@ test "join: FULL OUTER via NLJ + range — both-side orphans" {
     try std.testing.expectEqual(@as(usize, 4), rows);
 }
 
+test "join: range_sweep output matches NLJ for same data" {
+    // Stress test: 5000 x 5000 with x=3i, y=4j data shape. Both algorithms
+    // must produce the same output count.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{ .{ .name = "l_rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
+        .order_key = &.{"l_rowid"},
+        .unique = true,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{ .{ .name = "r_rowid", .type = .bigint }, .{ .name = "y", .type = .bigint } },
+        .order_key = &.{"r_rowid"},
+        .unique = true,
+    };
+    const ok_a = [_][]const u8{"l_rowid"};
+    const ok_b = [_][]const u8{"r_rowid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const N: usize = 5000;
+    const a = try db.table("a", schema_a, .{ .order_key = &ok_a, .unique = true });
+    {
+        const ARow = struct { l_rowid: i64, x: i64 };
+        const rows = try allocator.alloc(ARow, N);
+        defer allocator.free(rows);
+        for (rows, 0..) |*r, i| r.* = .{ .l_rowid = @intCast(i), .x = @intCast(i * 3) };
+        try a.insert(rows);
+    }
+    try a.flush();
+    const b = try db.table("b", schema_b, .{ .order_key = &ok_b, .unique = true });
+    {
+        const BRow = struct { r_rowid: i64, y: i64 };
+        const rows = try allocator.alloc(BRow, N);
+        defer allocator.free(rows);
+        for (rows, 0..) |*r, i| r.* = .{ .r_rowid = @intCast(i), .y = @intCast(i * 4) };
+        try b.insert(rows);
+    }
+    try b.flush();
+
+    // Count via sweep (.auto routes here).
+    var sweep_count: usize = 0;
+    {
+        const left = try thindb.scan(allocator, a);
+        const right = try thindb.scan(allocator, b);
+        var q = try left.join(right, .{
+            .on = &.{},
+            .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+        });
+        defer q.deinit();
+        while (try q.next()) |bat| sweep_count += bat.row_count;
+    }
+
+    // Count via explicit NLJ.
+    var nlj_count: usize = 0;
+    {
+        const left = try thindb.scan(allocator, a);
+        const right = try thindb.scan(allocator, b);
+        var q = try left.join(right, .{
+            .on = &.{},
+            .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+            .algorithm = .nested_loop,
+        });
+        defer q.deinit();
+        while (try q.next()) |bat| nlj_count += bat.row_count;
+    }
+
+    try std.testing.expectEqual(nlj_count, sweep_count);
+}
+
 test "memory: sort over tight budget errors with MemoryBudgetExceeded" {
     // Budget = 100 bytes. We try to sort 100 rows (each ~16 bytes
     // accounted, so ~1600 bytes total). Should fail with the typed

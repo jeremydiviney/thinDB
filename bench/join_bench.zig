@@ -209,6 +209,7 @@ fn reportJoin(
         .hash => "hash",
         .sort_merge => "smj ",
         .nested_loop => "nlj ",
+        .range_sweep => "sweep",
     };
     std.debug.print(
         "  {s:<28} [{s}] L={d:>7} R={d:>7} out={d:>7}  {d:>8.2} ms  {d:>7.2} M out/s\n",
@@ -749,7 +750,10 @@ pub fn runAll(allocator: Allocator, io: Io) !void {
     try benchEquiPlusBetween(allocator, io, 100_000, .hash);
     try benchEquiPlusBetween(allocator, io, 100_000, .sort_merge);
     try benchPureRangeNlj(allocator, io, 1_000, 1_000);
+    try benchPureRangeNljExplicit(allocator, io, 1_000, 1_000);
     try benchPureRangeNlj(allocator, io, 5_000, 5_000);
+    try benchPureRangeNljExplicit(allocator, io, 5_000, 5_000);
+    try benchPureRangeNlj(allocator, io, 50_000, 50_000);
     try benchLeftOuterRange(allocator, io, 100_000, .hash);
     try benchLeftOuterRange(allocator, io, 100_000, .sort_merge);
 }
@@ -956,8 +960,41 @@ fn benchPureRangeNlj(allocator: Allocator, io: Io, l_rows: usize, r_rows: usize)
     const right = try thindb.scan(allocator, r);
     const t0 = Io.Clock.awake.now(io);
     var q = try left.join(right, .{
-        .on = &.{}, // pure range → NLJ
+        .on = &.{}, // pure range → range_sweep via .auto
         .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+    reportJoin("pure range (no equi)", .range_sweep, l_rows, r_rows, output, elapsed);
+}
+
+/// Same shape, explicit nested_loop algorithm for comparison.
+fn benchPureRangeNljExplicit(allocator: Allocator, io: Io, l_rows: usize, r_rows: usize) !void {
+    var dir = try freshDir(io, ".bench-data/join_pure_range_nlj");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", pure_l_schema, .{ .order_key = &pure_l_ok, .unique = true });
+    try fillPureLeft(l, l_rows, allocator);
+    try l.flush();
+    const r = try db.table("r", pure_r_schema, .{ .order_key = &pure_r_ok, .unique = true });
+    try fillPureRight(r, r_rows, allocator);
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{},
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+        .algorithm = .nested_loop,
     });
     defer q.deinit();
     var output: usize = 0;
