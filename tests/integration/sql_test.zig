@@ -338,7 +338,7 @@ test "sql: scalar function with single col-ref arg + WHERE + ORDER BY" {
     try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 1, 1 }, got_lens.items);
 }
 
-test "sql: literal-arg scalar function rejected — col_ref-only restriction" {
+test "sql: scalar function with literal args (Compute literal-buffer path)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -347,10 +347,26 @@ test "sql: literal-arg scalar function rejected — col_ref-only restriction" {
     defer db.close();
     _ = try seedT(db);
 
-    // v1 of the SQL parser only allows col_ref args in scalar calls
-    // (the Compute operator's restriction — task #154 lifts it).
-    const res = runSql(allocator, db, "SELECT lpad(tag, 3, '_') FROM t");
-    try std.testing.expectError(thindb.sql.ParseError.SqlInvalidProjection, res);
+    // lpad(tag, 3, '_') — column + int literal + string literal.
+    // Each literal arg materializes as a per-batch constant column
+    // inside Compute, then the kernel sees uniform-width arg slices.
+    var q = try runSql(allocator, db,
+        \\SELECT id, lpad(tag, 3, '_') AS padded
+        \\FROM t
+        \\WHERE k >= 200
+        \\ORDER BY id ASC
+    );
+    defer q.deinit();
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(allocator);
+    while (try q.next()) |b| {
+        const sv = b.values[1].data.string;
+        for (0..b.row_count) |i| {
+            try got.appendSlice(allocator, sv.rowBytes(i));
+            try got.append(allocator, '|');
+        }
+    }
+    try std.testing.expectEqualStrings("__a|__b|__c|", got.items);
 }
 
 test "sql: nested call rejected — col_ref-only restriction" {

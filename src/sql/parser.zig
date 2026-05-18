@@ -376,21 +376,18 @@ const Parser = struct {
     }
 
     /// Finish parsing a scalar function call (`funcname (args...)`) after
-    /// the lookahead determines it isn't an aggregate. Returns the
-    /// resulting Expr.
-    ///
-    /// v1 restriction: every arg must be a simple column reference. The
-    /// Compute operator doesn't yet evaluate nested calls or literal
-    /// args (those need an expression-evaluator extension; tracked as
-    /// a follow-up). Reject them at parse time with a clear error.
+    /// the lookahead determines it isn't an aggregate. Each arg may be a
+    /// column reference (optionally qualified) or a literal — Compute
+    /// materializes literals into a per-batch constant column. Nested
+    /// scalar calls are rejected (task #154 covers the recursive
+    /// evaluator).
     fn finishScalarCall(self: *Parser, func_name: []const u8) ParseError!ir.Expr {
         try self.advance(); // consume '('
         const fname_dup = try self.arena.dupe(u8, func_name);
         var args: std.ArrayList(ir.Expr) = .empty;
         if (self.cur.tag != .rparen) {
             while (true) {
-                if (self.cur.tag != .identifier) return ParseError.SqlInvalidProjection;
-                const a = try self.parseColRefExpr();
+                const a = try self.parseCallArg();
                 try args.append(self.arena, a);
                 if (self.cur.tag != .comma) break;
                 try self.advance();
@@ -401,9 +398,20 @@ const Parser = struct {
         return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args_slice } };
     }
 
-    /// Parse a bare column reference (possibly qualified). Used inside
-    /// scalar function arguments where v1 doesn't yet accept literals
-    /// or nested calls.
+    /// One argument to a scalar function call. v1 accepts col_ref +
+    /// literal; nested calls rejected.
+    fn parseCallArg(self: *Parser) ParseError!ir.Expr {
+        switch (self.cur.tag) {
+            .identifier => return try self.parseColRefExpr(),
+            .integer, .floating, .string, .kw_true, .kw_false => {
+                const v = try self.parseValue();
+                return ir.Expr{ .lit = v };
+            },
+            else => return ParseError.SqlExpectedValue,
+        }
+    }
+
+    /// Parse a bare column reference (possibly qualified).
     fn parseColRefExpr(self: *Parser) ParseError!ir.Expr {
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const name = self.cur.text;

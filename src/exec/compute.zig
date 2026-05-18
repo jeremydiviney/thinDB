@@ -52,8 +52,18 @@ pub const Derived = struct {
     expr: Expr,
 };
 
-/// Resolved per-derived plan: either a function call with arg column
-/// indices, or a simple column rename.
+/// Where a function-call arg's row data comes from at exec time.
+const ArgSource = union(enum) {
+    /// Index into the upstream batch's values.
+    col_idx: usize,
+    /// Index into the call's `lit_buffers` — a ColumnStore that's
+    /// refilled with row_count copies of the literal each batch.
+    lit_idx: usize,
+};
+
+/// Resolved per-derived plan: either a function call (each arg sourced
+/// from an upstream col or a literal-replicated buffer), or a simple
+/// column rename.
 ///
 /// `arg_casts` is populated only when at least one arg needs implicit
 /// coercion (e.g. `mod(int_col, bigint_col)` routes to the (bigint,
@@ -64,6 +74,10 @@ pub const Derived = struct {
 /// `cast_buffers` parallels `arg_casts`: a scratch ColumnStore is
 /// allocated once per coerced arg at Compute init time, then refilled
 /// (clear + cast kernel) per batch. Non-coerced slots stay empty.
+///
+/// `lit_buffers` parallels `arg_sources` for `.lit_idx` entries: a
+/// long-lived ColumnStore (typed to the literal) is refilled with
+/// row_count copies of the literal value at each batch.
 const ResolvedDerived = struct {
     name: []const u8,
     output_type: Type,
@@ -71,9 +85,13 @@ const ResolvedDerived = struct {
         rename: struct { src_idx: usize },
         call: struct {
             func: ScalarFn,
-            arg_indices: []const usize,
+            arg_sources: []const ArgSource,
             arg_casts: ?[]const ?CastKernel,
             cast_buffers: ?[]?ColumnStore,
+            /// Indexed by `ArgSource.lit_idx`; the parallel `lit_values`
+            /// holds the literal payloads to replicate each batch.
+            lit_buffers: []ColumnStore,
+            lit_values: []const types.Value,
         },
     },
 };
@@ -179,6 +197,8 @@ pub const Compute = struct {
                         }
                         self.allocator.free(buffers);
                     }
+                    for (c.lit_buffers) |*buf| buf.deinit(self.allocator);
+                    self.allocator.free(c.lit_buffers);
                 },
                 else => {},
             }
@@ -228,11 +248,25 @@ pub const Compute = struct {
             switch (r.kind) {
                 .rename => |rn| try appendCopiedColumn(self.allocator, out_col, in.values[rn.src_idx], n),
                 .call => |c| {
-                    // Gather arg views.
+                    // Refill literal buffers for this batch: each one
+                    // holds `n` copies of its literal value so the
+                    // kernel sees a uniformly-sized column view.
+                    for (c.lit_buffers, c.lit_values) |*buf, v| {
+                        buf.clear();
+                        try fillLiteralColumn(self.allocator, buf, v, n);
+                    }
+
+                    // Gather arg views — sources are either upstream
+                    // columns or refilled literal buffers.
                     var arg_views_buf: [16]ColumnView = undefined;
-                    if (c.arg_indices.len > arg_views_buf.len) return Error.ComputeTooManyArgs;
-                    const arg_views = arg_views_buf[0..c.arg_indices.len];
-                    for (c.arg_indices, arg_views) |src_idx, *view| view.* = in.values[src_idx];
+                    if (c.arg_sources.len > arg_views_buf.len) return Error.ComputeTooManyArgs;
+                    const arg_views = arg_views_buf[0..c.arg_sources.len];
+                    for (c.arg_sources, arg_views) |src, *view| {
+                        view.* = switch (src) {
+                            .col_idx => |idx| in.values[idx],
+                            .lit_idx => |idx| c.lit_buffers[idx].view(),
+                        };
+                    }
 
                     // Apply implicit casts in place: for each coerced arg,
                     // refill the scratch ColumnStore from the upstream
@@ -296,22 +330,40 @@ fn resolveDerived(
                 .kind = .{ .rename = .{ .src_idx = idx } },
             };
         },
-        .lit => return Error.ComputeUnsupportedExpr, // v1: no literal-only derived
+        .lit => return Error.ComputeUnsupportedExpr, // v1: no literal-only derived (use a wrapping function call)
         .call => |c| {
-            // v1: only flat calls. Every arg must be .col_ref.
-            const arg_indices = try aa.alloc(usize, c.args.len);
+            // v1 of the call path: each arg is either a column ref OR
+            // a literal. Nested calls still rejected (task #154 covers
+            // the recursive evaluator).
+            const arg_sources = try aa.alloc(ArgSource, c.args.len);
             const arg_types = try aa.alloc(Type, c.args.len);
+            var lit_values: std.ArrayList(types.Value) = .empty;
             for (c.args, 0..) |arg, i| {
                 switch (arg) {
                     .col_ref => |aname| {
                         const idx = columnIndex(up_schema, aname) orelse return Error.ColumnNotFound;
-                        arg_indices[i] = idx;
+                        arg_sources[i] = .{ .col_idx = idx };
                         arg_types[i] = up_schema[idx].type;
                     },
-                    else => return Error.ComputeUnsupportedExpr, // v1: nested + lits not yet
+                    .lit => |v| {
+                        const lit_idx = lit_values.items.len;
+                        try lit_values.append(aa, v);
+                        arg_sources[i] = .{ .lit_idx = lit_idx };
+                        arg_types[i] = literalType(v);
+                    },
+                    .call => return Error.ComputeUnsupportedExpr, // nested calls: task #154
                 }
             }
             const r = (try scalar_fn.resolve(aa, c.fn_name, arg_types)) orelse return Error.ComputeNoSuchOverload;
+
+            // Long-lived literal buffers — refilled per batch.
+            const lit_values_slice = try lit_values.toOwnedSlice(aa);
+            const lit_buffers = try runtime_allocator.alloc(ColumnStore, lit_values_slice.len);
+            errdefer runtime_allocator.free(lit_buffers);
+            for (lit_values_slice, lit_buffers) |v, *buf| {
+                buf.* = try ColumnStore.init(runtime_allocator, literalType(v), false);
+            }
+
             // Allocate scratch ColumnStores only for the args that
             // actually need coercion. The buffers themselves live on
             // the runtime allocator (the long-lived parent of `aa`)
@@ -320,12 +372,15 @@ fn resolveDerived(
             var cast_buffers: ?[]?ColumnStore = null;
             if (r.arg_casts) |casts| {
                 const buffers = try runtime_allocator.alloc(?ColumnStore, casts.len);
-                for (casts, r.func.arg_types, arg_indices, buffers) |k, declared, src_idx, *slot| {
+                for (casts, r.func.arg_types, arg_sources, buffers) |k, declared, src, *slot| {
                     if (k == null) {
                         slot.* = null;
                         continue;
                     }
-                    const src_nullable = up_schema[src_idx].nullable;
+                    const src_nullable = switch (src) {
+                        .col_idx => |idx| up_schema[idx].nullable,
+                        .lit_idx => false, // literals are always non-null
+                    };
                     slot.* = try ColumnStore.init(runtime_allocator, declared, src_nullable);
                 }
                 cast_buffers = buffers;
@@ -335,13 +390,40 @@ fn resolveDerived(
                 .output_type = r.func.return_type,
                 .kind = .{ .call = .{
                     .func = r.func,
-                    .arg_indices = arg_indices,
+                    .arg_sources = arg_sources,
                     .arg_casts = r.arg_casts,
                     .cast_buffers = cast_buffers,
+                    .lit_buffers = lit_buffers,
+                    .lit_values = lit_values_slice,
                 } },
             };
         },
     }
+}
+
+/// Infer the ColumnStore-compatible Type for a literal Value. Mirrors
+/// the active union tag — int literals stay int (not promoted to bigint);
+/// promotion happens via the existing implicit-cast machinery if the
+/// resolved overload requires it.
+fn literalType(v: types.Value) Type {
+    return switch (v) {
+        .int => .int,
+        .bigint => .bigint,
+        .smallint => .smallint,
+        .tinyint => .tinyint,
+        .largeint => .largeint,
+        .float => .float,
+        .double => .double,
+        .boolean => .boolean,
+        .text => .string,
+        .date => .date,
+        .datetime => .datetime,
+        // Decimal Values carry just the raw int payload (no precision/
+        // scale). Compute can't materialize a typed decimal column
+        // without those — caller must explicitly cast / project.
+        .decimal64, .decimal128 => @panic("Compute: decimal literal args not supported"),
+        .uuid => .uuid,
+    };
 }
 
 fn columnIndex(schema: []const Column, name: []const u8) ?usize {
@@ -363,8 +445,11 @@ fn derivedNullable(r: ResolvedDerived, up_schema: []const Column) bool {
                 .absorbs, .kernel_managed => break :blk true,
                 .propagates => {},
             }
-            for (c.arg_indices) |idx| {
-                if (up_schema[idx].nullable) break :blk true;
+            for (c.arg_sources) |src| {
+                switch (src) {
+                    .col_idx => |idx| if (up_schema[idx].nullable) break :blk true,
+                    .lit_idx => {}, // literals are non-null
+                }
             }
             break :blk false;
         },
@@ -432,4 +517,26 @@ fn appendCopiedColumn(
     // appendAllColumn used by Sort/Filter for output staging.
     try @import("../engine/transform.zig").appendAllColumn(allocator, src, out);
     _ = n;
+}
+
+/// Append `n` copies of `v` into `buf`. Used by Compute's call path to
+/// materialize a constant-valued column matching the current batch's
+/// row count, so scalar kernels see uniform-width arg slices.
+fn fillLiteralColumn(allocator: Allocator, buf: *ColumnStore, v: types.Value, n: usize) !void {
+    var i: usize = 0;
+    switch (v) {
+        .int => |x| while (i < n) : (i += 1) try buf.data.int.append(allocator, x),
+        .bigint => |x| while (i < n) : (i += 1) try buf.data.bigint.append(allocator, x),
+        .smallint => |x| while (i < n) : (i += 1) try buf.data.smallint.append(allocator, x),
+        .tinyint => |x| while (i < n) : (i += 1) try buf.data.tinyint.append(allocator, x),
+        .largeint => |x| while (i < n) : (i += 1) try buf.data.largeint.append(allocator, x),
+        .float => |x| while (i < n) : (i += 1) try buf.data.float.append(allocator, x),
+        .double => |x| while (i < n) : (i += 1) try buf.data.double.append(allocator, x),
+        .boolean => |x| while (i < n) : (i += 1) try buf.data.boolean.append(allocator, @intFromBool(x)),
+        .text => |s| while (i < n) : (i += 1) try buf.data.string.appendValue(allocator, s),
+        .date => |x| while (i < n) : (i += 1) try buf.data.date.append(allocator, x),
+        .datetime => |x| while (i < n) : (i += 1) try buf.data.datetime.append(allocator, x),
+        .decimal64, .decimal128 => unreachable, // literalType() panics before we get here
+        .uuid => |x| while (i < n) : (i += 1) try buf.data.uuid.append(allocator, x),
+    }
 }
