@@ -2009,6 +2009,100 @@ test "join: range_sweep output matches NLJ for same data" {
     try std.testing.expectEqual(nlj_count, sweep_count);
 }
 
+test "opaque: cross-side predicate via NLJ callback" {
+    // 100 left rows, 100 right rows. Opaque predicate: keep pairs
+    // where (a.x + a.y) > b.threshold. Can't be expressed as equi
+    // or simple range — needs a computed value across sides.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{
+            .{ .name = "rowid", .type = .bigint },
+            .{ .name = "x", .type = .bigint },
+            .{ .name = "y", .type = .bigint },
+        },
+        .order_key = &.{"rowid"},
+        .unique = true,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{
+            .{ .name = "b_rowid", .type = .bigint },
+            .{ .name = "threshold", .type = .bigint },
+        },
+        .order_key = &.{"b_rowid"},
+        .unique = true,
+    };
+    const ok_a = [_][]const u8{"rowid"};
+    const ok_b = [_][]const u8{"b_rowid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const a = try db.table("a", schema_a, .{ .order_key = &ok_a, .unique = true });
+    {
+        const Row = struct { rowid: i64, x: i64, y: i64 };
+        const rows = try allocator.alloc(Row, 100);
+        defer allocator.free(rows);
+        // x + y = 2i. So row i has sum 2i.
+        for (rows, 0..) |*r, i| r.* = .{ .rowid = @intCast(i), .x = @intCast(i), .y = @intCast(i) };
+        try a.insert(rows);
+    }
+    try a.flush();
+    const b = try db.table("b", schema_b, .{ .order_key = &ok_b, .unique = true });
+    {
+        const Row = struct { b_rowid: i64, threshold: i64 };
+        const rows = try allocator.alloc(Row, 3);
+        defer allocator.free(rows);
+        rows[0] = .{ .b_rowid = 0, .threshold = 50 };
+        rows[1] = .{ .b_rowid = 1, .threshold = 100 };
+        rows[2] = .{ .b_rowid = 2, .threshold = 150 };
+        try b.insert(rows);
+    }
+    try b.flush();
+
+    // Predicate: a.x + a.y > b.threshold.
+    // For each b.threshold T, # of a's with 2i > T: i > T/2 → 100 - ceil(T/2 + 1).
+    //   T=50:  i > 25 → i ∈ [26..99] → 74 a's.
+    //   T=100: i > 50 → i ∈ [51..99] → 49 a's.
+    //   T=150: i > 75 → i ∈ [76..99] → 24 a's.
+    // Total: 74 + 49 + 24 = 147.
+    const Pred = struct {
+        fn eval(
+            ctx: ?*anyopaque,
+            left: []const thindb.storage.ColumnView,
+            lrow: u32,
+            right: []const thindb.storage.ColumnView,
+            rrow: u32,
+        ) bool {
+            _ = ctx;
+            // Output schema: a.rowid(0), a.x(1), a.y(2), b.b_rowid(0), b.threshold(1).
+            const x = left[1].data.bigint[lrow];
+            const y = left[2].data.bigint[lrow];
+            const t = right[1].data.bigint[rrow];
+            return (x + y) > t;
+        }
+    };
+
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    var q = try left.join(right, .{
+        .on = &.{}, // no equi
+        .opaque_predicate = .{ .eval = Pred.eval },
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |bat| rows += bat.row_count;
+    try std.testing.expectEqual(@as(usize, 147), rows);
+}
+
 test "skew: heavy build-side skew triggers JoinHeavySkew" {
     // Build side has 100 rows all with k=42 → 100% in one key.
     // With threshold = 0.5, this should abort.

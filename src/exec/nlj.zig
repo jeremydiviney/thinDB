@@ -57,6 +57,15 @@ pub const NestedLoopJoin = struct {
     /// Range predicates resolved to column indices. AND-combined.
     ranges: []const join_mod.Join.ResolvedRange,
 
+    /// Optional opaque per-pair predicate. Evaluated after equi +
+    /// range checks; pairs returning false get dropped.
+    opaque_predicate: ?join_mod.OpaquePredicate,
+
+    // Scratch ColumnView buffers reused per-call to feed the
+    // opaque predicate callback (so we don't allocate per pair).
+    left_view_buf: []ColumnView,
+    right_view_buf: []ColumnView,
+
     output_schema: []Column,
     left_col_count: usize,
     /// Per right-side column: true if we emit it (false for join keys).
@@ -218,6 +227,13 @@ pub const NestedLoopJoin = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
+        // Scratch view buffers for the opaque-predicate callback path.
+        // Sized to each side's schema; reused per (lrow, rrow) pair.
+        const lvb = try allocator.alloc(ColumnView, left_schema.len);
+        errdefer allocator.free(lvb);
+        const rvb = try allocator.alloc(ColumnView, right_schema.len);
+        errdefer allocator.free(rvb);
+
         const self = try allocator.create(NestedLoopJoin);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -228,6 +244,9 @@ pub const NestedLoopJoin = struct {
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
             .ranges = resolved_ranges,
+            .opaque_predicate = spec.opaque_predicate,
+            .left_view_buf = lvb,
+            .right_view_buf = rvb,
             .output_schema = output_schema,
             .left_col_count = left_schema.len,
             .right_kept_mask = right_kept_mask_owned,
@@ -258,6 +277,8 @@ pub const NestedLoopJoin = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.output_schema);
         self.allocator.free(self.right_kept_mask);
+        self.allocator.free(self.left_view_buf);
+        self.allocator.free(self.right_view_buf);
         if (self.matched_right) |*mb| mb.deinit(self.allocator);
         self.arena.deinit();
         const allocator = self.allocator;
@@ -379,6 +400,7 @@ pub const NestedLoopJoin = struct {
                 if (self.right_key_indices.len > 0 and self.innerHasNullKey()) continue;
                 if (!self.passesEquiKeys()) continue;
                 if (!self.passesAllRanges()) continue;
+                if (!self.passesOpaque()) continue;
 
                 try self.emitRow();
                 self.cur_left_any_match = true;
@@ -471,6 +493,16 @@ pub const NestedLoopJoin = struct {
             if (!join_mod.compareCellsOp(lv, self.left_cursor, rv, self.right_cursor, .eq)) return false;
         }
         return true;
+    }
+
+    fn passesOpaque(self: *NestedLoopJoin) bool {
+        const op = self.opaque_predicate orelse return true;
+        // Fill the per-side ColumnView scratch buffers from the
+        // materialized columns. (We do this on every pair; the
+        // buffers are reused.)
+        for (self.left_materialized, 0..) |*col, i| self.left_view_buf[i] = col.view();
+        for (self.right_materialized, 0..) |*col, i| self.right_view_buf[i] = col.view();
+        return op.eval(op.ctx, self.left_view_buf, self.left_cursor, self.right_view_buf, self.right_cursor);
     }
 
     fn passesAllRanges(self: NestedLoopJoin) bool {

@@ -142,6 +142,31 @@ pub const Spec = struct {
     /// A typical guard value is 0.5 (50% of rows in one key).
     /// Only applies to `.hash` / `.auto`-routed hash joins.
     skew_threshold: f32 = 0.0,
+    /// Opaque per-pair predicate evaluated during NLJ. Returns true
+    /// to keep the (left_row, right_row) pair, false to drop it.
+    /// Enables arbitrary cross-side predicates (fuzzy matching,
+    /// geo prefilter, computed comparisons) that don't fit equi /
+    /// range. Setting this forces the join to NLJ regardless of
+    /// other settings — equi/range can still be specified and run
+    /// alongside as cheaper first-cut filters.
+    ///
+    /// INNER joins only in v1.
+    opaque_predicate: ?OpaquePredicate = null,
+};
+
+/// User-supplied cross-side predicate callback. Receives the
+/// materialized columns + row indices for left and right.
+/// Return true to emit the pair, false to drop. The callback must
+/// NOT retain references to the views past its own return.
+pub const OpaquePredicate = struct {
+    eval: *const fn (
+        ctx: ?*anyopaque,
+        left: []const ColumnView,
+        left_row: u32,
+        right: []const ColumnView,
+        right_row: u32,
+    ) bool,
+    ctx: ?*anyopaque = null,
 };
 
 /// Number of rows emitted per output batch. Bounded so emission stays
@@ -257,11 +282,14 @@ pub const Join = struct {
         right: Query,
         spec: Spec,
     ) !Query {
-        // Resolve algorithm. .auto picks range_sweep for the
-        // specialized pure-single-range shape; otherwise nested_loop
-        // for empty `on`; otherwise the equi-driven algorithms via
-        // chooseAlgorithm.
-        const chosen = if (spec.algorithm == .auto)
+        // Resolve algorithm. Opaque predicate forces NLJ (the only
+        // algorithm that evaluates per-pair callbacks). Otherwise
+        // .auto picks range_sweep for the specialized pure-single-
+        // range shape; nested_loop for empty `on`; the equi-driven
+        // algorithms via chooseAlgorithm.
+        const chosen = if (spec.opaque_predicate != null)
+            .nested_loop
+        else if (spec.algorithm == .auto)
             (if (canUseRangeSweep(spec)) .range_sweep
                 else if (spec.on.len == 0) .nested_loop
                 else chooseAlgorithm(left, right, spec.on))
@@ -292,6 +320,7 @@ pub const Join = struct {
                 .algorithm = .nested_loop,
                 .extra_predicate = spec.extra_predicate,
                 .ranges = spec.ranges,
+                .opaque_predicate = spec.opaque_predicate,
             };
             return @import("nlj.zig").NestedLoopJoin.create(allocator, left, right, nl_spec);
         }

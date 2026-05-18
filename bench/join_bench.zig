@@ -756,6 +756,108 @@ pub fn runAll(allocator: Allocator, io: Io) !void {
     try benchPureRangeNlj(allocator, io, 50_000, 50_000);
     try benchLeftOuterRange(allocator, io, 100_000, .hash);
     try benchLeftOuterRange(allocator, io, 100_000, .sort_merge);
+
+    // Skew detection + opaque-predicate paths.
+    std.debug.print("\nJoin — skew + opaque predicate\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    try benchSkewDetectOverhead(allocator, io, 100_000);
+    try benchOpaquePredicateNlj(allocator, io, 1_000);
+    try benchOpaquePredicateNlj(allocator, io, 5_000);
+}
+
+// ----------------------------------------------------------------------------
+// Skew detection / opaque-predicate benchmarks
+// ----------------------------------------------------------------------------
+
+/// Measures the per-build-row overhead of running Misra-Gries on a
+/// uniform-key dataset (no actual skew). Compares vs the same join
+/// with detection disabled.
+fn benchSkewDetectOverhead(allocator: Allocator, io: Io, n: usize) !void {
+    inline for ([_]struct { label: []const u8, threshold: f32 }{
+        .{ .label = "hash equi (no detection)", .threshold = 0.0 },
+        .{ .label = "hash equi (skew_threshold=0.9)", .threshold = 0.9 },
+    }) |variant| {
+        var dir = try freshDir(io, ".bench-data/join_skew_overhead");
+        defer dir.close(io);
+        var db = try thindb.Database.open(allocator, io, dir, .{
+            .auto_flush_rows = std.math.maxInt(u64),
+            .auto_flush_bytes = std.math.maxInt(usize),
+            .auto_flush_secs = 0,
+        });
+        defer db.close();
+
+        const l = try db.table("l", bigint_left_schema, bigint_opts);
+        try fillBigintLeft(l, n, allocator);
+        try l.flush();
+        const r = try db.table("r", bigint_right_schema, bigint_opts);
+        try fillBigintRight(r, n, allocator);
+        try r.flush();
+
+        const left = try thindb.scan(allocator, l);
+        const right = try thindb.scan(allocator, r);
+        const t0 = Io.Clock.awake.now(io);
+        var q = try left.join(right, .{
+            .on = &.{.{ .left = "k", .right = "k" }},
+            .algorithm = .hash,
+            .skew_threshold = variant.threshold,
+        });
+        defer q.deinit();
+        var output: usize = 0;
+        while (try q.next()) |b| output += b.row_count;
+        const elapsed = elapsedNs(io, t0);
+        reportJoin(variant.label, .hash, n, n, output, elapsed);
+    }
+}
+
+/// Opaque-predicate NLJ: same shape as pure-range NLJ but routed
+/// via the callback path. Should be roughly 1.5-2x slower than the
+/// hard-coded range NLJ because the predicate call adds per-pair
+/// indirection.
+fn benchOpaquePredicateNlj(allocator: Allocator, io: Io, n: usize) !void {
+    var dir = try freshDir(io, ".bench-data/join_opaque_nlj");
+    defer dir.close(io);
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", pure_l_schema, .{ .order_key = &pure_l_ok, .unique = true });
+    try fillPureLeft(l, n, allocator);
+    try l.flush();
+    const r = try db.table("r", pure_r_schema, .{ .order_key = &pure_r_ok, .unique = true });
+    try fillPureRight(r, n, allocator);
+    try r.flush();
+
+    // Same predicate as the test: a.x < b.y, but via callback.
+    const Pred = struct {
+        fn eval(
+            ctx: ?*anyopaque,
+            left: []const thindb.storage.ColumnView,
+            lrow: u32,
+            right: []const thindb.storage.ColumnView,
+            rrow: u32,
+        ) bool {
+            _ = ctx;
+            // pure_l_schema: l_rowid(0), x(1)
+            // pure_r_schema: r_rowid(0), y(1)
+            return left[1].data.bigint[lrow] < right[1].data.bigint[rrow];
+        }
+    };
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    const t0 = Io.Clock.awake.now(io);
+    var q = try left.join(right, .{
+        .on = &.{},
+        .opaque_predicate = .{ .eval = Pred.eval },
+    });
+    defer q.deinit();
+    var output: usize = 0;
+    while (try q.next()) |b| output += b.row_count;
+    const elapsed = elapsedNs(io, t0);
+    reportJoin("opaque NLJ (a.x<b.y via callback)", .nested_loop, n, n, output, elapsed);
 }
 
 // ----------------------------------------------------------------------------

@@ -20,12 +20,20 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const K: usize = 64;
+/// Number of Misra-Gries counters. Smaller K → cheaper per-observe
+/// (fewer compares + decrements) but a higher minimum-detectable
+/// skew threshold. With K=16, any key with frequency > N/17 (≈6%)
+/// is guaranteed to be tracked — comfortably below typical skew
+/// thresholds (50%+).
+pub const K: usize = 16;
 
 pub const MisraGries = struct {
     // Fixed-size array of counters. Keys are owned byte slices
     // allocated from the user's allocator on first assignment.
+    // A separately-tracked u64 hash per slot is used as a fast-
+    // reject filter (most non-matches differ in the hash too).
     counters: [K]Counter,
+    hashes: [K]u64,
     allocator: Allocator,
     observed_total: u64 = 0,
 
@@ -37,9 +45,11 @@ pub const MisraGries = struct {
     pub fn init(allocator: Allocator) MisraGries {
         var self: MisraGries = .{
             .counters = undefined,
+            .hashes = undefined,
             .allocator = allocator,
         };
         for (&self.counters) |*c| c.* = .{};
+        for (&self.hashes) |*h| h.* = 0;
         return self;
     }
 
@@ -52,20 +62,23 @@ pub const MisraGries = struct {
 
     pub fn observe(self: *MisraGries, key: []const u8) !void {
         self.observed_total += 1;
-        // Existing counter for this key? Increment.
-        for (&self.counters) |*c| {
-            if (c.key) |k| {
-                if (std.mem.eql(u8, k, key)) {
-                    c.count += 1;
-                    return;
-                }
+        const key_hash = std.hash.Wyhash.hash(0, key);
+        // Existing counter for this key? Increment. Hash reject first
+        // — only a full eql when hashes match (rare for distinct keys).
+        for (&self.counters, &self.hashes) |*c, h| {
+            if (c.count == 0) continue;
+            if (h != key_hash) continue;
+            if (std.mem.eql(u8, c.key.?, key)) {
+                c.count += 1;
+                return;
             }
         }
         // Empty slot? Assign.
-        for (&self.counters) |*c| {
+        for (&self.counters, &self.hashes) |*c, *h| {
             if (c.count == 0) {
                 c.key = try self.allocator.dupe(u8, key);
                 c.count = 1;
+                h.* = key_hash;
                 return;
             }
         }
