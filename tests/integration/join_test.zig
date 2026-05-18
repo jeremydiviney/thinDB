@@ -1175,6 +1175,67 @@ test "join: FULL OUTER preserves orphans from both sides" {
     try std.testing.expect(saw_oid103_orphan);
 }
 
+test "join: extra_predicate filters output after equi-join" {
+    // INNER join on uid, plus an extra predicate qty > 15. Hash join
+    // emits 3 rows (uid=1×2 + uid=2); the predicate keeps qty=20 and
+    // qty=30 only.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.users);
+    const right = try thindb.scan(allocator, f.orders);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .extra_predicate = thindb.leafExpr("qty", .gt, .{ .int = 15 }),
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "join: extra_predicate works under SMJ + outer join (WHERE semantics)" {
+    // LEFT OUTER via SMJ + extra_predicate qty > 25. The equi-join
+    // emits 4 rows (uid=1×2, uid=2, uid=3 null-extended). The filter
+    // drops uid=1's two rows (qty 10, 20) and keeps uid=2 (qty=30).
+    // The null-extended uid=3 row has qty=NULL → predicate fails → dropped.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.users);
+    const right = try thindb.scan(allocator, f.orders);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .extra_predicate = thindb.leafExpr("qty", .gt, .{ .int = 25 }),
+        .algorithm = .sort_merge,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var saw_uid2 = false;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        for (0..b.row_count) |i| {
+            if (b.values[0].data.bigint[i] == 2) saw_uid2 = true;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows);
+    try std.testing.expect(saw_uid2);
+}
+
 test "join: type mismatch on join key errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

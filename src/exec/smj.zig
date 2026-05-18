@@ -236,7 +236,11 @@ pub const SortMergeJoin = struct {
             .views = views,
             .join_type = spec.join_type,
         };
-        return makeQuery(allocator, self);
+        const q = makeQuery(allocator, self);
+        if (spec.extra_predicate) |pred| {
+            return @import("filter.zig").Filter.create(allocator, q, pred);
+        }
+        return q;
     }
 
     pub fn deinit(self: *SortMergeJoin) void {

@@ -90,6 +90,14 @@ pub const Spec = struct {
     /// from cheap stats. Override with `.hash` or `.sort_merge`
     /// when you want to lock the choice (benchmarking, known shape).
     algorithm: Algorithm = .auto,
+    /// Optional non-equi predicate evaluated AFTER the equi-join.
+    /// Column references resolve against the output schema (left
+    /// columns + right_kept columns). Semantically equivalent to
+    /// chaining a `.filter()` after the join: WHERE-clause behavior,
+    /// not ON-clause. For outer joins, null-extended rows where the
+    /// predicate references the null side will fail (NULL never
+    /// compares true) and get dropped.
+    extra_predicate: ?predicate.PredicateExpr = null,
 };
 
 /// Number of rows emitted per output batch. Bounded so emission stays
@@ -197,6 +205,7 @@ pub const Join = struct {
                 .join_type = spec.join_type,
                 .on = spec.on,
                 .algorithm = .sort_merge,
+                .extra_predicate = spec.extra_predicate,
             };
             return @import("smj.zig").SortMergeJoin.create(allocator, left, right, sm_spec);
         }
@@ -333,7 +342,11 @@ pub const Join = struct {
             .output_columns = output_columns,
             .views = views,
         };
-        return makeQuery(allocator, self);
+        const q = makeQuery(allocator, self);
+        if (spec.extra_predicate) |pred| {
+            return @import("filter.zig").Filter.create(allocator, q, pred);
+        }
+        return q;
     }
 
     pub fn deinit(self: *Join) void {
