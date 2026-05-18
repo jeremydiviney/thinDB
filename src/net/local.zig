@@ -851,6 +851,141 @@ pub fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
             };
             break :blk try left.join(right, spec);
         },
+        .materialize => {
+            // Plans containing Materialize nodes must go through
+            // `compile()` instead — it threads a CompileCtx that
+            // shares buffers across multi-references.
+            return Error.UnsupportedOp;
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Compile path with materialization support.
+//
+// Threads a CompileCtx through the recursion so a `*ir.Op.materialize`
+// referenced from multiple parents resolves to ONE drained buffer with
+// multiple Reader cursors (instead of N independent drains). The ctx
+// owns the buffers; CompiledQuery bundles the resulting Query with the
+// ctx so deinit tears down both in order.
+//
+// Plans that contain no `.materialize` nodes route exactly like
+// buildServerQuery (the recursive cases are duplicated for now;
+// could be unified later via an internal context-taking helper).
+// ---------------------------------------------------------------------------
+
+pub const CompileCtx = struct {
+    allocator: Allocator,
+    db: *Database,
+    materialized: std.AutoHashMapUnmanaged(*const ir.Op, *@import("../exec/materialize.zig").MaterializedBuffer) = .empty,
+
+    pub fn deinit(self: *CompileCtx) void {
+        var it = self.materialized.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.deinit();
+        self.materialized.deinit(self.allocator);
+    }
+};
+
+pub const CompiledQuery = struct {
+    query: Query,
+    ctx: CompileCtx,
+
+    pub fn deinit(self: *CompiledQuery) void {
+        self.query.deinit();
+        self.ctx.deinit();
+    }
+
+    pub fn next(self: *CompiledQuery) !?exec.Batch {
+        return self.query.next();
+    }
+
+    pub fn outputSchema(self: *CompiledQuery) []const @import("../types.zig").Column {
+        return self.query.outputSchema();
+    }
+};
+
+pub fn compile(allocator: Allocator, db: *Database, root: *const ir.Op) !CompiledQuery {
+    var ctx = CompileCtx{ .allocator = allocator, .db = db };
+    errdefer ctx.deinit();
+    const q = try compileOp(&ctx, root);
+    return .{ .query = q, .ctx = ctx };
+}
+
+fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
+    return switch (op.*) {
+        .scan => |s| blk: {
+            const t = ctx.db.tables.get(s.table_name) orelse return Error.TableNotFound;
+            break :blk try exec.scan(ctx.allocator, t);
+        },
+        .limit => |l| blk: {
+            const upstream = try compileOp(ctx, l.upstream);
+            break :blk try upstream.limit(@intCast(l.n));
+        },
+        .select => |s| blk: {
+            var upstream = try compileOp(ctx, s.upstream);
+            errdefer upstream.deinit();
+            break :blk try upstream.project(s.columns);
+        },
+        .exclude => |e| blk: {
+            var upstream = try compileOp(ctx, e.upstream);
+            errdefer upstream.deinit();
+            const upstream_cols = upstream.outputSchema();
+            const remaining = try complementColumns(ctx.allocator, upstream_cols, e.columns);
+            defer ctx.allocator.free(remaining);
+            break :blk try upstream.project(remaining);
+        },
+        .filter => |f| blk: {
+            var upstream = try compileOp(ctx, f.upstream);
+            errdefer upstream.deinit();
+            break :blk try upstream.filter(f.predicate);
+        },
+        .order_by => |o| blk: {
+            var upstream = try compileOp(ctx, o.upstream);
+            errdefer upstream.deinit();
+            break :blk try upstream.orderBy(o.specs);
+        },
+        .group_by => |g| blk: {
+            var upstream = try compileOp(ctx, g.upstream);
+            errdefer upstream.deinit();
+            break :blk try upstream.groupBy(g.group_cols, g.aggs);
+        },
+        .compute => |c| blk: {
+            var upstream = try compileOp(ctx, c.upstream);
+            errdefer upstream.deinit();
+            break :blk try upstream.compute(c.derived);
+        },
+        .join => |j| blk: {
+            var left = try compileOp(ctx, j.left);
+            errdefer left.deinit();
+            const right = try compileOp(ctx, j.right);
+            const spec: ir.JoinSpec = .{
+                .join_type = j.join_type,
+                .algorithm = j.algorithm,
+                .on = j.on,
+                .ranges = j.ranges,
+                .extra_predicate = j.extra_predicate,
+                .skew_ratio_threshold = j.skew_ratio_threshold,
+                .skew_absolute_threshold = j.skew_absolute_threshold,
+                .skew_sample_interval = j.skew_sample_interval,
+            };
+            break :blk try left.join(right, spec);
+        },
+        .materialize => |m| blk: {
+            const mat = @import("../exec/materialize.zig");
+            // Cache hit → another Reader over the existing buffer
+            // (no redrain).
+            if (ctx.materialized.get(op)) |existing| {
+                break :blk try mat.Reader.create(ctx.allocator, existing);
+            }
+            // First reference: build the upstream, wrap in a buffer,
+            // cache, hand back a Reader. The buffer drains lazily
+            // when the first reader's next() is called.
+            const upstream = try compileOp(ctx, m.upstream);
+            const buf = try mat.MaterializedBuffer.init(ctx.allocator, upstream);
+            errdefer buf.deinit();
+            try ctx.materialized.put(ctx.allocator, op, buf);
+            break :blk try mat.Reader.create(ctx.allocator, buf);
+        },
     };
 }
 

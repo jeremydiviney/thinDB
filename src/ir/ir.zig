@@ -86,6 +86,12 @@ pub const OpTag = enum(u8) {
     compute = 7,
     /// Inner / outer / range / opaque join. Two upstreams.
     join = 8,
+    /// Materialization barrier: drain the upstream once into a
+    /// shared buffer; multiple references to this node share the
+    /// buffer (one drain, many readers). Parser inserts this for
+    /// CTEs marked MATERIALIZED, or auto-inserts when a CTE has
+    /// refcount >= 2 and lacks NOT MATERIALIZED.
+    materialize = 9,
 };
 
 /// In-memory operator tree, built by the client query-builder and decoded
@@ -101,6 +107,7 @@ pub const Op = union(OpTag) {
     group_by: GroupBy,
     compute: Compute,
     join: Join,
+    materialize: Materialize,
 
     pub const Scan = struct {
         /// Table name. Borrowed from the encoded buffer on decode; owned
@@ -147,6 +154,14 @@ pub const Op = union(OpTag) {
         /// Derived columns to append. Each carries an output name +
         /// an Expr tree (col_ref / lit / call).
         derived: []const Derived,
+        upstream: *Op,
+    };
+
+    pub const Materialize = struct {
+        /// The subtree to drain once into a shared buffer. Multiple
+        /// parent pointers can reference the SAME *Op.materialize
+        /// node — compile() detects that and routes them to one
+        /// buffer with multiple reader cursors.
         upstream: *Op,
     };
 
@@ -213,6 +228,10 @@ pub const Op = union(OpTag) {
                 j.right.deinitDecoded(allocator);
                 allocator.destroy(j.right);
             },
+            .materialize => |m| {
+                m.upstream.deinitDecoded(allocator);
+                allocator.destroy(m.upstream);
+            },
         }
     }
 };
@@ -258,6 +277,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .group_by => |g| try encodeGroupBy(allocator, out, g),
         .compute => |c| try encodeCompute(allocator, out, c),
         .join => |j| try encodeJoin(allocator, out, j),
+        .materialize => |m| try encodeOp(allocator, out, m.upstream.*),
     }
 }
 
@@ -554,7 +574,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.join)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.materialize)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -758,6 +778,12 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 .left = left_up,
                 .right = right_up,
             } };
+        },
+        .materialize => blk: {
+            const upstream = try allocator.create(Op);
+            errdefer allocator.destroy(upstream);
+            upstream.* = try decodeOp(allocator, bytes, cursor);
+            break :blk Op{ .materialize = .{ .upstream = upstream } };
         },
     };
 }
@@ -1074,6 +1100,10 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             // a top-down left-to-right reading order on the page.
             try explainOp(allocator, out, j.left.*, depth + 1);
             try explainOp(allocator, out, j.right.*, depth + 1);
+        },
+        .materialize => |m| {
+            try out.appendSlice(allocator, "Materialize\n");
+            try explainOp(allocator, out, m.upstream.*, depth + 1);
         },
     }
 }

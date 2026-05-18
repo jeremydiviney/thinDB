@@ -36,24 +36,26 @@ fn seedT(db: anytype) !*thindb.Table {
 }
 
 /// Parse + compile in one go. The IR arena's lifetime is tied to the
-/// returned Query — operators borrow slices (column names, predicates,
-/// agg specs) directly from the IR tree, so the arena must outlive the
-/// Query. Callers `pair.deinit()` once they're done with results.
+/// returned CompiledQuery — operators borrow slices (column names,
+/// predicates, agg specs) directly from the IR tree, so the arena must
+/// outlive the query. The query itself is built via `net.compile`, which
+/// threads a CompileCtx so multi-referenced `.materialize` nodes share
+/// one drained buffer instead of redraining per reference.
 const RunResult = struct {
     arena: std.heap.ArenaAllocator,
-    q: thindb.Query,
+    cq: thindb.net.CompiledQuery,
 
     pub fn deinit(self: *RunResult) void {
-        self.q.deinit();
+        self.cq.deinit();
         self.arena.deinit();
     }
 
     pub fn next(self: *RunResult) !?thindb.Batch {
-        return self.q.next();
+        return self.cq.next();
     }
 
     pub fn outputSchema(self: *RunResult) []const thindb.Column {
-        return self.q.outputSchema();
+        return self.cq.outputSchema();
     }
 };
 
@@ -61,8 +63,8 @@ fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const root = try thindb.sql.parse(arena.allocator(), sql);
-    const q = try thindb.net.buildServerQuery(allocator, db, root.*);
-    return .{ .arena = arena, .q = q };
+    const cq = try thindb.net.compile(allocator, db, root);
+    return .{ .arena = arena, .cq = cq };
 }
 
 test "sql: SELECT * FROM t returns all rows" {
@@ -797,6 +799,108 @@ test "sql: subquery without alias errors" {
 
     const res = runSql(allocator, db, "SELECT id FROM (SELECT * FROM t)");
     try std.testing.expectError(thindb.sql.ParseError.SqlSubqueryNeedsAlias, res);
+}
+
+test "sql: MATERIALIZED hint forces buffer even on single use" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\WITH big AS MATERIALIZED (SELECT id FROM t WHERE k >= 200)
+        \\SELECT id FROM big ORDER BY id ASC
+    );
+    defer q.deinit();
+
+    // Even with one reference, MATERIALIZED forces a buffer entry.
+    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count());
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4, 5 }, ids.items);
+}
+
+test "sql: NOT MATERIALIZED disables auto-materialization on multi-use CTE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\WITH big AS NOT MATERIALIZED (SELECT k FROM t WHERE k >= 200)
+        \\SELECT k FROM big JOIN big AS other ON big.k = other.k
+    );
+    defer q.deinit();
+
+    // NOT MATERIALIZED suppresses the wrap — the IR tree is shared but
+    // the runtime sees no .materialize node, so the ctx cache stays empty.
+    try std.testing.expectEqual(@as(u32, 0), q.cq.ctx.materialized.count());
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 5), rows);
+}
+
+test "sql: auto-materialize wraps a CTE referenced twice (single shared buffer)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // Same self-join shape as the inline DAG test, but without
+    // NOT MATERIALIZED — the auto-detect refcount pass should wrap it
+    // in a Materialize node, and compile should produce exactly ONE
+    // buffer with two Readers sharing it.
+    var q = try runSql(allocator, db,
+        \\WITH big AS (SELECT k FROM t WHERE k >= 200)
+        \\SELECT k FROM big JOIN big AS other ON big.k = other.k
+    );
+    defer q.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count());
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 5), rows);
+}
+
+test "sql: single-use CTE stays unmaterialized under auto hint" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\WITH big AS (SELECT id FROM t WHERE k >= 200)
+        \\SELECT id FROM big ORDER BY id ASC
+    );
+    defer q.deinit();
+
+    // refcount = 1, no hint → stays inlined.
+    try std.testing.expectEqual(@as(u32, 0), q.cq.ctx.materialized.count());
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4, 5 }, ids.items);
 }
 
 test "sql: case-insensitive keywords + line comments + trailing semicolon" {

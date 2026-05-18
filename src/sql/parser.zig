@@ -94,6 +94,11 @@ pub fn parse(arena: Allocator, sql: []const u8) ParseError!*ir.Op {
     // Optional trailing semicolon already consumed; everything after
     // it should be EOF.
     try parser.expectEof();
+    // Post-parse pass: refcount each *ir.Op reachable from the root,
+    // then wrap CTE roots in Materialize per their hint (force / never /
+    // auto + refcount ≥ 2). Mutates CTE ops in place so existing
+    // references see the new wrapper.
+    try parser.applyAutoMaterialize(op);
     return op;
 }
 
@@ -112,18 +117,29 @@ const ProjItem = struct {
     },
 };
 
+/// Per-CTE materialization hint from the SQL surface.
+///   .auto  — refcount-driven: wrap when references ≥ 2.
+///   .force — `MATERIALIZED` keyword: always wrap.
+///   .never — `NOT MATERIALIZED` keyword: always inline.
+pub const MaterializeHint = enum { auto, force, never };
+
+const CteEntry = struct {
+    op: *ir.Op,
+    hint: MaterializeHint,
+};
+
 const Parser = struct {
     arena: Allocator,
     lex: *Lexer,
     cur: Token,
-    /// CTE registry: name → already-compiled *ir.Op subtree. Populated
-    /// by `parseCteList` when a WITH clause is encountered; consulted
-    /// in `parseFromTarget` so a reference to a CTE name resolves to
-    /// its IR tree (multi-parent DAG reference — IR + compile already
-    /// handle independent runtime materializations per reference).
+    /// CTE registry: name → resolved *ir.Op + materialization hint.
+    /// Populated by `parseCteList`; consulted in `parseFromTarget`.
     /// Flat scope: nested SELECTs can reference outer CTEs but
     /// redefining an existing name errors.
-    ctes: std.StringHashMapUnmanaged(*ir.Op) = .empty,
+    ctes: std.StringHashMapUnmanaged(CteEntry) = .empty,
+    /// Ordered list of CTE root *Op for the post-parse auto-detect
+    /// refcount pass. Order matches declaration in the WITH clause.
+    cte_roots: std.ArrayListUnmanaged(*ir.Op) = .empty,
 
     fn advance(self: *Parser) ParseError!void {
         self.cur = try self.lex.next();
@@ -582,7 +598,10 @@ const Parser = struct {
         // qualifier for the target).
         const name = try self.expectIdent();
         const name_dup = try self.arena.dupe(u8, name);
-        const op = self.ctes.get(name) orelse try self.allocOp(.{ .scan = .{ .table_name = name_dup } });
+        const op = if (self.ctes.get(name)) |entry|
+            entry.op
+        else
+            try self.allocOp(.{ .scan = .{ .table_name = name_dup } });
 
         // Optional AS alias.
         var resolved_name = name_dup;
@@ -601,10 +620,10 @@ const Parser = struct {
         return .{ .name = resolved_name, .op = op };
     }
 
-    /// Parse a `WITH cte AS (...) [, cte AS (...)]*` block. Each CTE
-    /// is added to `self.ctes`; later CTEs in the same WITH can
-    /// reference earlier ones (each parseStatement call sees the
-    /// already-populated map).
+    /// Parse a `WITH cte AS [MATERIALIZED|NOT MATERIALIZED]? (...) [, ...]*`
+    /// block. Each CTE is added to `self.ctes` with its hint; later CTEs
+    /// in the same WITH can reference earlier ones (each parseStatement
+    /// call sees the already-populated map).
     fn parseCteList(self: *Parser) ParseError!void {
         try self.advance(); // consume WITH
         while (true) {
@@ -613,13 +632,30 @@ const Parser = struct {
             try self.advance();
             if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
             try self.advance();
+
+            // Optional materialization hint between AS and (.
+            //   MATERIALIZED        → force
+            //   NOT MATERIALIZED    → never
+            //   (no hint)           → auto (refcount-driven post-pass)
+            var hint: MaterializeHint = .auto;
+            if (self.cur.tag == .kw_materialized) {
+                hint = .force;
+                try self.advance();
+            } else if (self.cur.tag == .kw_not) {
+                try self.advance();
+                if (self.cur.tag != .kw_materialized) return ParseError.SqlExpectedKeyword;
+                try self.advance();
+                hint = .never;
+            }
+
             try self.expect(.lparen);
             const op = try self.parseStatement();
             try self.expect(.rparen);
 
             const gop = try self.ctes.getOrPut(self.arena, name);
             if (gop.found_existing) return ParseError.SqlCteRedefined;
-            gop.value_ptr.* = op;
+            gop.value_ptr.* = .{ .op = op, .hint = hint };
+            try self.cte_roots.append(self.arena, op);
 
             if (self.cur.tag != .comma) break;
             try self.advance();
@@ -876,7 +912,82 @@ const Parser = struct {
         out.* = op;
         return out;
     }
+
+    // -----------------------------------------------------------------------
+    // Post-parse auto-detect refcount pass: walks the final IR tree, counts
+    // parent references per *ir.Op, then wraps each CTE's stored op in a
+    // Materialize node when the hint says so or when the op has ≥ 2
+    // references and no NOT-MATERIALIZED override. The wrap is in-place
+    // (mutates *cte_op contents); existing references still hold the old
+    // pointer, which now resolves to a Materialize.
+    // -----------------------------------------------------------------------
+
+    fn applyAutoMaterialize(self: *Parser, root: *ir.Op) ParseError!void {
+        if (self.ctes.count() == 0) return;
+
+        var refs: std.AutoHashMapUnmanaged(*ir.Op, u32) = .empty;
+        defer refs.deinit(self.arena);
+        try countRefs(self.arena, &refs, root);
+
+        var it = self.ctes.iterator();
+        while (it.next()) |entry| {
+            const cte_op = entry.value_ptr.op;
+            const count = refs.get(cte_op) orelse 0;
+            const should_wrap = switch (entry.value_ptr.hint) {
+                .never => false,
+                .force => true,
+                .auto => count >= 2,
+            };
+            if (!should_wrap) continue;
+            // In-place wrap: move the existing contents into a new
+            // arena-owned Op, then overwrite the original with a
+            // Materialize variant pointing at it. All references that
+            // already hold &cte_op continue to work — they now see the
+            // Materialize wrapper.
+            const inner = try self.arena.create(ir.Op);
+            inner.* = cte_op.*;
+            cte_op.* = .{ .materialize = .{ .upstream = inner } };
+        }
+    }
 };
+
+fn countRefs(
+    arena: Allocator,
+    refs: *std.AutoHashMapUnmanaged(*ir.Op, u32),
+    op: *ir.Op,
+) ParseError!void {
+    switch (op.*) {
+        .scan => {},
+        .limit => |l| try visitChild(arena, refs, l.upstream),
+        .select => |p| try visitChild(arena, refs, p.upstream),
+        .exclude => |p| try visitChild(arena, refs, p.upstream),
+        .filter => |f| try visitChild(arena, refs, f.upstream),
+        .order_by => |o| try visitChild(arena, refs, o.upstream),
+        .group_by => |g| try visitChild(arena, refs, g.upstream),
+        .compute => |c| try visitChild(arena, refs, c.upstream),
+        .join => |j| {
+            try visitChild(arena, refs, j.left);
+            try visitChild(arena, refs, j.right);
+        },
+        .materialize => |m| try visitChild(arena, refs, m.upstream),
+    }
+}
+
+fn visitChild(
+    arena: Allocator,
+    refs: *std.AutoHashMapUnmanaged(*ir.Op, u32),
+    child: *ir.Op,
+) ParseError!void {
+    const gop = try refs.getOrPut(arena, child);
+    if (gop.found_existing) {
+        // Already counted via another parent — bump count but DON'T
+        // re-walk the subtree (would double-count grandchildren).
+        gop.value_ptr.* += 1;
+        return;
+    }
+    gop.value_ptr.* = 1;
+    try countRefs(arena, refs, child);
+}
 
 /// Returns true when the projection's name+order already match the
 /// natural output of a GroupBy: `[group_cols..., agg_aliases...]`.

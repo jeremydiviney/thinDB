@@ -23,6 +23,7 @@ pub const LexError = lexer.LexError;
 
 pub const parse = parser.parse;
 pub const ParseError = parser.ParseError;
+pub const MaterializeHint = parser.MaterializeHint;
 
 test {
     _ = lexer;
