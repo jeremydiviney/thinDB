@@ -102,6 +102,11 @@ pub const SortMergeJoin = struct {
     /// and post-merge drain.
     join_type: join_mod.JoinType,
 
+    /// Optional range predicate, resolved to column indices.
+    /// Evaluated during Cartesian emit; pairs that fail are skipped.
+    /// Restricted to INNER joins by validation in create().
+    range: ?join_mod.Join.ResolvedRange,
+
     phase: Phase = .materializing,
 
     const Phase = enum { materializing, merging, done };
@@ -113,6 +118,9 @@ pub const SortMergeJoin = struct {
         spec: Spec,
     ) !Query {
         if (spec.on.len == 0) return Error.JoinEmptyOnClause;
+        if (spec.range != null and spec.join_type != .inner) {
+            return Error.JoinUnsupportedType;
+        }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -132,6 +140,21 @@ pub const SortMergeJoin = struct {
                 return Error.JoinKeyTypeMismatch;
             }
         }
+
+        const resolved_range: ?join_mod.Join.ResolvedRange = if (spec.range) |rp| blk: {
+            const lidx = columnIndex(left_schema, rp.left) orelse return Error.ColumnNotFound;
+            const ridx = columnIndex(right_schema, rp.right) orelse return Error.ColumnNotFound;
+            const lt: TypeTag = left_schema[lidx].type;
+            const rt: TypeTag = right_schema[ridx].type;
+            if (lt != rt and !(isStringTag(lt) and isStringTag(rt))) {
+                return Error.JoinKeyTypeMismatch;
+            }
+            switch (rp.op) {
+                .lt, .lte, .gt, .gte => {},
+                else => return Error.UnsupportedOperatorForType,
+            }
+            break :blk .{ .left_col = lidx, .right_col = ridx, .op = rp.op };
+        } else null;
 
         const right_kept_mask = try aa.alloc(bool, right_schema.len);
         for (right_kept_mask) |*m| m.* = true;
@@ -235,6 +258,7 @@ pub const SortMergeJoin = struct {
             .output_columns = output_columns,
             .views = views,
             .join_type = spec.join_type,
+            .range = resolved_range,
         };
         const q = makeQuery(allocator, self);
         if (spec.extra_predicate) |pred| {
@@ -434,7 +458,12 @@ pub const SortMergeJoin = struct {
                     while (li < l_end) : (li += 1) {
                         var ri = self.right_cursor;
                         while (ri < r_end) : (ri += 1) {
-                            try self.emitOutputRow(self.left_perm[li], self.right_perm[ri]);
+                            const lr = self.left_perm[li];
+                            const rr = self.right_perm[ri];
+                            if (self.range) |rg| {
+                                if (!self.passesRange(lr, rr, rg)) continue;
+                            }
+                            try self.emitOutputRow(lr, rr);
                             if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
                                 // Flush full batch. Save cursors so we
                                 // can resume from the next (left, right)
@@ -490,6 +519,15 @@ pub const SortMergeJoin = struct {
         }
 
         return null;
+    }
+
+    /// Evaluate the range predicate against materialized rows.
+    /// Both sides are already buffered in left_materialized /
+    /// right_materialized; pull the cells and compare.
+    fn passesRange(self: SortMergeJoin, left_row: u32, right_row: u32, rg: join_mod.Join.ResolvedRange) bool {
+        const lv = self.left_materialized[rg.left_col].view();
+        const rv = self.right_materialized[rg.right_col].view();
+        return join_mod.compareCellsOp(lv, left_row, rv, right_row, rg.op);
     }
 
     /// Emit an unmatched LEFT row: left columns from left_materialized,

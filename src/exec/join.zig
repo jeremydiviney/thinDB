@@ -83,6 +83,16 @@ pub const Algorithm = enum {
     // Future: inlj, nlj
 };
 
+/// A column-pair range predicate: `left.<col> OP right.<col>` where
+/// OP is one of `<`, `<=`, `>`, `>=`. Combined with the equi `on`
+/// pairs via AND. The pair must reference numeric / comparable types
+/// of matching shape (per JoinKeyTypeMismatch rules).
+pub const RangePredicate = struct {
+    left: []const u8,
+    op: predicate.PredicateOp,
+    right: []const u8,
+};
+
 pub const Spec = struct {
     join_type: JoinType = .inner,
     on: []const KeyPair,
@@ -98,6 +108,12 @@ pub const Spec = struct {
     /// predicate references the null side will fail (NULL never
     /// compares true) and get dropped.
     extra_predicate: ?predicate.PredicateExpr = null,
+    /// Optional inequality between a left column and a right column,
+    /// AND'd onto the equi join. Pairs that satisfy the equi keys
+    /// but fail this range get dropped from the output. v1 supports
+    /// this on INNER joins only — outer + range would need per-row
+    /// match tracking that isn't implemented yet.
+    range: ?RangePredicate = null,
 };
 
 /// Number of rows emitted per output batch. Bounded so emission stays
@@ -116,6 +132,12 @@ pub const Join = struct {
     /// the `on` spec. Used by the compound-key builder.
     left_key_indices: []usize,
     right_key_indices: []usize,
+
+    /// Optional range predicate, resolved to column indices. When
+    /// non-null, each candidate (probe_row, build_row) pair must
+    /// satisfy `left[range.left_col] OP right[range.right_col]`
+    /// before being emitted.
+    range: ?ResolvedRange,
 
     /// True iff left is the smaller side and is therefore the build
     /// side. False iff right is build. Build is materialized fully;
@@ -175,6 +197,12 @@ pub const Join = struct {
     /// FULL OUTER drain cursor — index into build_columns.
     drain_cursor: u32 = 0,
 
+    pub const ResolvedRange = struct {
+        left_col: usize,
+        right_col: usize,
+        op: predicate.PredicateOp,
+    };
+
     const Phase = enum {
         building,
         probing,
@@ -191,6 +219,11 @@ pub const Join = struct {
         spec: Spec,
     ) !Query {
         if (spec.on.len == 0) return Error.JoinEmptyOnClause;
+        // v1: range only allowed on INNER. Outer + range needs per-row
+        // "any actual match" tracking that isn't implemented yet.
+        if (spec.range != null and spec.join_type != .inner) {
+            return Error.JoinUnsupportedType;
+        }
 
         // Resolve algorithm. .auto consults cheap stats — see chooseAlgorithm.
         const chosen = if (spec.algorithm == .auto)
@@ -206,6 +239,7 @@ pub const Join = struct {
                 .on = spec.on,
                 .algorithm = .sort_merge,
                 .extra_predicate = spec.extra_predicate,
+                .range = spec.range,
             };
             return @import("smj.zig").SortMergeJoin.create(allocator, left, right, sm_spec);
         }
@@ -231,6 +265,22 @@ pub const Join = struct {
                 return Error.JoinKeyTypeMismatch;
             }
         }
+
+        // Resolve optional range predicate.
+        const resolved_range: ?Join.ResolvedRange = if (spec.range) |rp| blk: {
+            const lidx = columnIndex(left_schema, rp.left) orelse return Error.ColumnNotFound;
+            const ridx = columnIndex(right_schema, rp.right) orelse return Error.ColumnNotFound;
+            const lt: TypeTag = left_schema[lidx].type;
+            const rt: TypeTag = right_schema[ridx].type;
+            if (lt != rt and !(isStringTag(lt) and isStringTag(rt))) {
+                return Error.JoinKeyTypeMismatch;
+            }
+            switch (rp.op) {
+                .lt, .lte, .gt, .gte => {},
+                else => return Error.UnsupportedOperatorForType,
+            }
+            break :blk .{ .left_col = lidx, .right_col = ridx, .op = rp.op };
+        } else null;
 
         // Build right-side column index → keep? map. The right side's
         // join-key columns are DROPPED from the output (USING-clause
@@ -332,6 +382,7 @@ pub const Join = struct {
             .join_type = spec.join_type,
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
+            .range = resolved_range,
             .build_is_left = build_is_left,
             .output_schema = output_schema,
             .left_col_count = left_schema.len,
@@ -566,6 +617,12 @@ pub const Join = struct {
             const build_row = self.cur_match_list[self.cur_match_pos];
             self.cur_match_pos += 1;
 
+            // Range filter — drop the pair if `left.col OP right.col`
+            // is false. NULL on either side fails (two-valued logic).
+            if (self.range) |rg| {
+                if (!self.passesRange(batch, probe_row, build_row, rg)) continue;
+            }
+
             // Append left-side columns first.
             var out_idx: usize = 0;
             if (self.build_is_left) {
@@ -621,6 +678,24 @@ pub const Join = struct {
         self.cur_match_list = &.{};
         self.cur_match_pos = 0;
         return false;
+    }
+
+    /// Evaluate the range predicate for one (probe_row, build_row)
+    /// candidate. Maps the resolved column indices back to the right
+    /// physical side based on `build_is_left`. NULL on either side
+    /// fails (two-valued logic).
+    fn passesRange(self: Join, batch: Batch, probe_row: u32, build_row: u32, rg: ResolvedRange) bool {
+        const left_view: ColumnView = if (self.build_is_left)
+            self.build_columns[rg.left_col].view()
+        else
+            batch.values[rg.left_col];
+        const right_view: ColumnView = if (self.build_is_left)
+            batch.values[rg.right_col]
+        else
+            self.build_columns[rg.right_col].view();
+        const lrow: u32 = if (self.build_is_left) build_row else probe_row;
+        const rrow: u32 = if (self.build_is_left) probe_row else build_row;
+        return compareCellsOp(left_view, lrow, right_view, rrow, rg.op);
     }
 
     fn flushOutput(self: *Join) !?Batch {
@@ -903,6 +978,55 @@ fn appendOneFromBatch(
     row: u32,
 ) !void {
     try appendOneFromView(allocator, dst, src, row);
+}
+
+/// Compare two cells from same-typed columns with the given op.
+/// Returns false for NULL on either side (two-valued logic). Strings
+/// use lex byte order. Floats use IEEE compare (NaN never compares
+/// true to anything — handled implicitly).
+pub fn compareCellsOp(left: ColumnView, lrow: u32, right: ColumnView, rrow: u32, op: predicate.PredicateOp) bool {
+    if (!left.isValid(lrow) or !right.isValid(rrow)) return false;
+    switch (left.data) {
+        .int => |s| return cmpOp(i32, s[lrow], right.data.int[rrow], op),
+        .bigint => |s| return cmpOp(i64, s[lrow], right.data.bigint[rrow], op),
+        .boolean => |s| return cmpOp(u8, s[lrow], right.data.boolean[rrow], op),
+        .float => |s| return cmpOp(f32, s[lrow], right.data.float[rrow], op),
+        .double => |s| return cmpOp(f64, s[lrow], right.data.double[rrow], op),
+        .date => |s| return cmpOp(i32, s[lrow], right.data.date[rrow], op),
+        .datetime => |s| return cmpOp(i64, s[lrow], right.data.datetime[rrow], op),
+        .tinyint => |s| return cmpOp(i8, s[lrow], right.data.tinyint[rrow], op),
+        .smallint => |s| return cmpOp(i16, s[lrow], right.data.smallint[rrow], op),
+        .largeint => |s| return cmpOp(i128, s[lrow], right.data.largeint[rrow], op),
+        .decimal64 => |s| return cmpOp(i64, s[lrow], right.data.decimal64[rrow], op),
+        .decimal128 => |s| return cmpOp(i128, s[lrow], right.data.decimal128[rrow], op),
+        .uuid => |s| return cmpOp(u128, s[lrow], right.data.uuid[rrow], op),
+        .varchar => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.varchar.rowBytes(rrow), op),
+        .string => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.string.rowBytes(rrow), op),
+        .char => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.char.rowBytes(rrow), op),
+    }
+}
+
+fn cmpOp(comptime T: type, a: T, b: T, op: predicate.PredicateOp) bool {
+    return switch (op) {
+        .eq => a == b,
+        .neq => a != b,
+        .lt => a < b,
+        .lte => a <= b,
+        .gt => a > b,
+        .gte => a >= b,
+    };
+}
+
+fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
+    const ord = std.mem.order(u8, a, b);
+    return switch (op) {
+        .eq => ord == .eq,
+        .neq => ord != .eq,
+        .lt => ord == .lt,
+        .lte => ord != .gt,
+        .gt => ord == .gt,
+        .gte => ord != .lt,
+    };
 }
 
 /// Append a NULL placeholder to a nullable destination column.

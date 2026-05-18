@@ -1236,6 +1236,183 @@ test "join: extra_predicate works under SMJ + outer join (WHERE semantics)" {
     try std.testing.expect(saw_uid2);
 }
 
+test "join: range predicate filters cartesian pairs (hash, INNER)" {
+    // Two tables share `tenant`. Range adds `lstart <= revent < lend`:
+    //   left: (tenant, lstart, lend)
+    //   right: (tenant, revent)
+    // Match: same tenant AND lstart <= revent AND revent < lend.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const left_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "tenant", .type = .bigint },
+            .{ .name = "lstart", .type = .bigint },
+            .{ .name = "lend", .type = .bigint },
+        },
+        .order_key = &.{ "tenant", "lstart" },
+        .unique = false,
+    };
+    const right_schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "tenant", .type = .bigint },
+            .{ .name = "revent", .type = .bigint },
+        },
+        .order_key = &.{ "tenant", "revent" },
+        .unique = false,
+    };
+    const l_ok = [_][]const u8{ "tenant", "lstart" };
+    const r_ok = [_][]const u8{ "tenant", "revent" };
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", left_schema, .{ .order_key = &l_ok });
+    try l.insert(&.{
+        // tenant=1: window [100..200), [200..300)
+        .{ .tenant = @as(i64, 1), .lstart = @as(i64, 100), .lend = @as(i64, 200) },
+        .{ .tenant = @as(i64, 1), .lstart = @as(i64, 200), .lend = @as(i64, 300) },
+        // tenant=2: [50..150)
+        .{ .tenant = @as(i64, 2), .lstart = @as(i64, 50), .lend = @as(i64, 150) },
+    });
+    try l.flush();
+
+    const r = try db.table("r", right_schema, .{ .order_key = &r_ok });
+    try r.insert(&.{
+        .{ .tenant = @as(i64, 1), .revent = @as(i64, 150) }, // in [100, 200)
+        .{ .tenant = @as(i64, 1), .revent = @as(i64, 250) }, // in [200, 300)
+        .{ .tenant = @as(i64, 1), .revent = @as(i64, 50) }, // before any window
+        .{ .tenant = @as(i64, 2), .revent = @as(i64, 100) }, // in [50, 150)
+        .{ .tenant = @as(i64, 2), .revent = @as(i64, 200) }, // after window
+        .{ .tenant = @as(i64, 3), .revent = @as(i64, 100) }, // no matching tenant
+    });
+    try r.flush();
+
+    // First condition: tenant equi. Second: lstart <= revent (range).
+    // Third: revent < lend (a second range). We do this as a chain —
+    // single Spec.range supports ONE inequality, so apply the other
+    // via extra_predicate against the joined output (revent < lend).
+    // Wait — extra_predicate references output columns by name, not
+    // cross-side. To keep this test focused on Spec.range, use just
+    // the first range condition.
+    //
+    // Expected with `tenant = AND lstart <= revent`:
+    //   tenant=1, lstart=100, revent=150  ✓
+    //   tenant=1, lstart=100, revent=250  ✓
+    //   tenant=1, lstart=200, revent=250  ✓
+    //   tenant=2, lstart=50, revent=100   ✓
+    //   tenant=2, lstart=50, revent=200   ✓
+    //   (revent=50 / revent=100-tenant3 are excluded)
+    // = 5 rows
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "tenant", .right = "tenant" }},
+        .range = .{ .left = "lstart", .op = .lte, .right = "revent" },
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 5), rows);
+}
+
+test "join: range predicate works under SMJ" {
+    // Same shape, SMJ path. Validates the inner Cartesian's range
+    // filter when SMJ is the engine.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_a = thindb.Schema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "x", .type = .bigint },
+        },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const schema_b = thindb.Schema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "y", .type = .bigint },
+        },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const a_ok = [_][]const u8{"k"};
+    const b_ok = [_][]const u8{"k"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const a = try db.table("a", schema_a, .{ .order_key = &a_ok });
+    try a.insert(&.{
+        .{ .k = @as(i64, 1), .x = @as(i64, 10) },
+        .{ .k = @as(i64, 1), .x = @as(i64, 20) },
+        .{ .k = @as(i64, 2), .x = @as(i64, 100) },
+    });
+    try a.flush();
+
+    const b = try db.table("b", schema_b, .{ .order_key = &b_ok });
+    try b.insert(&.{
+        .{ .k = @as(i64, 1), .y = @as(i64, 15) }, // matches x=10 (10<15), not x=20
+        .{ .k = @as(i64, 1), .y = @as(i64, 25) }, // matches x=10, x=20
+        .{ .k = @as(i64, 2), .y = @as(i64, 50) }, // doesn't match x=100
+    });
+    try b.flush();
+
+    // Predicate: a.x < b.y. For k=1: 3 matches. For k=2: 0. Total 3.
+    const left = try thindb.scan(allocator, a);
+    const right = try thindb.scan(allocator, b);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .range = .{ .left = "x", .op = .lt, .right = "y" },
+        .algorithm = .sort_merge,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b2| rows += b2.row_count;
+    try std.testing.expectEqual(@as(usize, 3), rows);
+}
+
+test "join: range + outer is rejected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    var left = try thindb.scan(allocator, f.users);
+    var right = try thindb.scan(allocator, f.orders);
+    try std.testing.expectError(
+        thindb.exec.Error.JoinUnsupportedType,
+        left.join(right, .{
+            .join_type = .left,
+            .on = &.{.{ .left = "uid", .right = "uid" }},
+            .range = .{ .left = "uid", .op = .lt, .right = "qty" },
+            .algorithm = .hash,
+        }),
+    );
+    left.deinit();
+    right.deinit();
+}
+
 test "join: type mismatch on join key errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
