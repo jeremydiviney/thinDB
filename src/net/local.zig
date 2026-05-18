@@ -826,6 +826,31 @@ pub fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
             // used by exec.Query.aggregate (global aggregate).
             break :blk try upstream.groupBy(g.group_cols, g.aggs);
         },
+        .compute => |c| blk: {
+            var upstream = try buildServerQuery(allocator, db, c.upstream.*);
+            errdefer upstream.deinit();
+            // Pass the IR Derived slice straight through — Compute.create
+            // takes the same shape (it's a re-export).
+            break :blk try upstream.compute(c.derived);
+        },
+        .join => |j| blk: {
+            var left = try buildServerQuery(allocator, db, j.left.*);
+            errdefer left.deinit();
+            const right = try buildServerQuery(allocator, db, j.right.*);
+            // No errdefer on right: exec.Query.join consumes both on
+            // success AND failure (it always takes ownership for cleanup).
+            const spec: ir.JoinSpec = .{
+                .join_type = j.join_type,
+                .algorithm = j.algorithm,
+                .on = j.on,
+                .ranges = j.ranges,
+                .extra_predicate = j.extra_predicate,
+                .skew_ratio_threshold = j.skew_ratio_threshold,
+                .skew_absolute_threshold = j.skew_absolute_threshold,
+                .skew_sample_interval = j.skew_sample_interval,
+            };
+            break :blk try left.join(right, spec);
+        },
     };
 }
 
