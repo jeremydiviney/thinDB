@@ -922,6 +922,259 @@ test "join: hash output is exact across row-group boundaries" {
     try std.testing.expectEqual(n, total);
 }
 
+// Outer joins (hash algorithm). Fixture: users[1,2,3] LEFT JOIN
+// orders ON uid=uid, where orders has rows for uid=1 (two), uid=2,
+// and uid=99 (orphan). Expected per join type:
+//   inner: uid=1×2, uid=2 → 3 rows
+//   left:  uid=1×2, uid=2, uid=3 (no orders) → 4 rows
+//   right: uid=1×2, uid=2, uid=99 (no user) → 4 rows
+//   full:  uid=1×2, uid=2, uid=3, uid=99 → 5 rows
+fn outerFixture(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !struct {
+    db: *thindb.Database,
+    users: *thindb.Table,
+    orders: *thindb.Table,
+} {
+    var db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    errdefer db.close();
+
+    const users = try db.table("users", users_schema, users_opts);
+    try users.insert(&.{
+        .{ .uid = @as(i64, 1), .name = "alice" },
+        .{ .uid = @as(i64, 2), .name = "bob" },
+        .{ .uid = @as(i64, 3), .name = "carol" }, // no orders
+    });
+    try users.flush();
+
+    const orders = try db.table("orders", orders_schema, orders_opts);
+    try orders.insert(&.{
+        .{ .oid = @as(i64, 100), .uid = @as(i64, 1), .qty = @as(i32, 10) },
+        .{ .oid = @as(i64, 101), .uid = @as(i64, 1), .qty = @as(i32, 20) },
+        .{ .oid = @as(i64, 102), .uid = @as(i64, 2), .qty = @as(i32, 30) },
+        .{ .oid = @as(i64, 103), .uid = @as(i64, 99), .qty = @as(i32, 40) }, // no user
+    });
+    try orders.flush();
+
+    return .{ .db = db, .users = users, .orders = orders };
+}
+
+test "join: LEFT OUTER preserves unmatched left rows with NULL right" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.users);
+    const right = try thindb.scan(allocator, f.orders);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var unmatched_uid3: bool = false;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        // Schema: uid, name, oid, qty. oid is at idx 2.
+        for (0..b.row_count) |i| {
+            if (b.values[0].data.bigint[i] == 3) {
+                unmatched_uid3 = true;
+                // oid (right side) must be NULL for this row.
+                try std.testing.expect(!b.values[2].isValid(i));
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), rows); // 2 + 1 + 1 unmatched
+    try std.testing.expect(unmatched_uid3);
+}
+
+test "join: RIGHT OUTER preserves unmatched right rows with NULL left" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.users);
+    const right = try thindb.scan(allocator, f.orders);
+    var q = try left.join(right, .{
+        .join_type = .right,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var unmatched_oid103: bool = false;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        // Schema: uid, name, oid, qty. Check the right's orphan oid=103.
+        for (0..b.row_count) |i| {
+            if (b.values[2].data.bigint[i] == 103) {
+                unmatched_oid103 = true;
+                // uid (left side, USING-merged column) is NULL here —
+                // see JoinType.right comment for the SQL deviation.
+                try std.testing.expect(!b.values[0].isValid(i));
+                // name (left side) is also NULL.
+                try std.testing.expect(!b.values[1].isValid(i));
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), rows); // 2 + 1 + 1 unmatched
+    try std.testing.expect(unmatched_oid103);
+}
+
+test "join: LEFT OUTER via SMJ" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.users);
+    const right = try thindb.scan(allocator, f.orders);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .sort_merge,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var unmatched_uid3 = false;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        for (0..b.row_count) |i| {
+            if (b.values[0].data.bigint[i] == 3) {
+                unmatched_uid3 = true;
+                try std.testing.expect(!b.values[2].isValid(i));
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), rows);
+    try std.testing.expect(unmatched_uid3);
+}
+
+test "join: RIGHT OUTER via SMJ" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.users);
+    const right = try thindb.scan(allocator, f.orders);
+    var q = try left.join(right, .{
+        .join_type = .right,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .sort_merge,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var unmatched_oid103 = false;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        for (0..b.row_count) |i| {
+            if (b.values[2].data.bigint[i] == 103) {
+                unmatched_oid103 = true;
+                try std.testing.expect(!b.values[0].isValid(i));
+                try std.testing.expect(!b.values[1].isValid(i));
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), rows);
+    try std.testing.expect(unmatched_oid103);
+}
+
+test "join: FULL OUTER via SMJ" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.users);
+    const right = try thindb.scan(allocator, f.orders);
+    var q = try left.join(right, .{
+        .join_type = .full,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .sort_merge,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var saw_uid3 = false;
+    var saw_oid103 = false;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        for (0..b.row_count) |i| {
+            const uv = b.values[0].isValid(i);
+            const ov = b.values[2].isValid(i);
+            if (uv and !ov and b.values[0].data.bigint[i] == 3) saw_uid3 = true;
+            if (!uv and ov and b.values[2].data.bigint[i] == 103) saw_oid103 = true;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), rows);
+    try std.testing.expect(saw_uid3);
+    try std.testing.expect(saw_oid103);
+}
+
+test "join: FULL OUTER preserves orphans from both sides" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const left = try thindb.scan(allocator, f.users);
+    const right = try thindb.scan(allocator, f.orders);
+    var q = try left.join(right, .{
+        .join_type = .full,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var saw_uid3_orphan = false;
+    var saw_oid103_orphan = false;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        for (0..b.row_count) |i| {
+            const uid_valid = b.values[0].isValid(i);
+            const oid_valid = b.values[2].isValid(i);
+            if (uid_valid and !oid_valid and b.values[0].data.bigint[i] == 3) {
+                saw_uid3_orphan = true;
+            }
+            if (!uid_valid and oid_valid and b.values[2].data.bigint[i] == 103) {
+                saw_oid103_orphan = true;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), rows); // 3 inner + 1 left orphan + 1 right orphan
+    try std.testing.expect(saw_uid3_orphan);
+    try std.testing.expect(saw_oid103_orphan);
+}
+
 test "join: type mismatch on join key errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

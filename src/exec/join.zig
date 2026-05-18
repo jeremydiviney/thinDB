@@ -50,7 +50,19 @@ pub const KeyPair = struct {
 
 pub const JoinType = enum {
     inner,
-    // Future: left, right, full, semi, anti, cross.
+    /// Preserve every left row. Right-side columns are NULL when no
+    /// match exists. Right-side join-key columns are dropped from the
+    /// output (USING semantic) — the kept left key is always present.
+    left,
+    /// Preserve every right row. Left-side columns are NULL when no
+    /// match exists. For unmatched right rows, the left's copy of the
+    /// join key in the output is also NULL (USING-semantic deviation
+    /// from strict SQL, which would COALESCE; documented limitation).
+    right,
+    /// Preserve every row from both sides. Same USING caveat as RIGHT
+    /// applies to unmatched right rows.
+    full,
+    // Future: semi, anti, cross.
 };
 
 pub const Algorithm = enum {
@@ -148,7 +160,21 @@ pub const Join = struct {
     /// borrow into output_columns' buffers.
     pending_clear: bool = false,
 
-    const Phase = enum { building, probing, done };
+    /// FULL OUTER: bitmap of matched build rows, allocated after build
+    /// phase. The `draining_unmatched` phase walks it to emit unmatched
+    /// build rows with NULLs on the probe side. Null for other join types.
+    matched_build: ?std.DynamicBitSetUnmanaged = null,
+    /// FULL OUTER drain cursor — index into build_columns.
+    drain_cursor: u32 = 0,
+
+    const Phase = enum {
+        building,
+        probing,
+        /// FULL OUTER only — after probe drains, walk matched_build
+        /// and emit unmatched build rows with NULLs on the probe side.
+        draining_unmatched,
+        done,
+    };
 
     pub fn create(
         allocator: Allocator,
@@ -156,7 +182,6 @@ pub const Join = struct {
         right: Query,
         spec: Spec,
     ) !Query {
-        if (spec.join_type != .inner) return Error.JoinUnsupportedType;
         if (spec.on.len == 0) return Error.JoinEmptyOnClause;
 
         // Resolve algorithm. .auto consults cheap stats — see chooseAlgorithm.
@@ -212,13 +237,28 @@ pub const Join = struct {
             if (m) right_kept_count += 1;
         }
 
+        // Outer joins: the "other" side's columns become nullable in
+        // the output (unmatched preserved rows have NULL on the other
+        // side). Inner keeps original nullability.
+        const left_nullable_in_output = switch (spec.join_type) {
+            .inner, .left => false,
+            .right, .full => true,
+        };
+        const right_nullable_in_output = switch (spec.join_type) {
+            .inner, .right => false,
+            .left, .full => true,
+        };
+
         // Compose output schema: left columns + right columns minus
         // join keys. Refuse if any NON-KEY column name collides — the
         // user must explicitly rename via .compute() / .exclude() in
         // that case.
         const output_schema = try allocator.alloc(Column, left_schema.len + right_kept_count);
         errdefer allocator.free(output_schema);
-        for (left_schema, 0..) |c, i| output_schema[i] = c;
+        for (left_schema, 0..) |c, i| {
+            output_schema[i] = c;
+            if (left_nullable_in_output) output_schema[i].nullable = true;
+        }
         var out_idx: usize = left_schema.len;
         for (right_schema, 0..) |c, i| {
             if (!right_kept_mask[i]) continue;
@@ -227,6 +267,7 @@ pub const Join = struct {
                 if (std.mem.eql(u8, prior.name, c.name)) return Error.JoinColumnNameCollision;
             }
             output_schema[out_idx] = c;
+            if (right_nullable_in_output) output_schema[out_idx].nullable = true;
             out_idx += 1;
         }
 
@@ -235,10 +276,17 @@ pub const Join = struct {
         @memcpy(right_kept_mask_owned, right_kept_mask);
         errdefer allocator.free(right_kept_mask_owned);
 
-        // Pick build side by upper-bound row count.
+        // Build-side selection. INNER + FULL: pick smaller side (less
+        // memory, less hashing). LEFT/RIGHT: build is the NON-preserved
+        // side (the preserved side must be the probe so we walk every
+        // row and know per-row whether a match occurred).
         const left_stats = left.stats();
         const right_stats = right.stats();
-        const build_is_left = left_stats.upper_rows <= right_stats.upper_rows;
+        const build_is_left = switch (spec.join_type) {
+            .inner, .full => left_stats.upper_rows <= right_stats.upper_rows,
+            .left => false, // preserve left → probe = left → build = right
+            .right => true, // preserve right → probe = right → build = left
+        };
 
         const build_schema = if (build_is_left) left_schema else right_schema;
 
@@ -301,6 +349,7 @@ pub const Join = struct {
         self.allocator.free(self.output_schema);
         self.allocator.free(self.right_kept_mask);
         self.key_scratch.deinit(self.allocator);
+        if (self.matched_build) |*mb| mb.deinit(self.allocator);
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -340,13 +389,32 @@ pub const Join = struct {
             switch (self.phase) {
                 .building => {
                     try self.buildPhase();
+                    // FULL OUTER needs a matched-row bitmap so we can
+                    // emit the unmatched build rows at the end.
+                    if (self.join_type == .full) {
+                        self.matched_build = try std.DynamicBitSetUnmanaged.initEmpty(
+                            self.allocator,
+                            self.build_rows,
+                        );
+                    }
                     self.phase = .probing;
                 },
                 .probing => {
                     if (try self.probeStep()) |batch| return batch;
                     // probeStep returned null → exhausted
+                    if (self.join_type == .full) {
+                        self.phase = .draining_unmatched;
+                        // Don't flush here — the drain phase will keep
+                        // appending into the same output buffer.
+                        continue;
+                    }
                     self.phase = .done;
-                    // Flush any remaining staged output before going to done.
+                    if (try self.flushOutput()) |batch| return batch;
+                    return null;
+                },
+                .draining_unmatched => {
+                    if (try self.drainStep()) |batch| return batch;
+                    self.phase = .done;
                     if (try self.flushOutput()) |batch| return batch;
                     return null;
                 },
@@ -427,10 +495,23 @@ pub const Join = struct {
                     if (self.hash_table.get(self.key_scratch.items)) |bucket| {
                         self.cur_match_list = bucket.items;
                         self.cur_match_pos = 0;
+                        // FULL OUTER: mark these build rows as matched
+                        // so the drain phase doesn't re-emit them.
+                        if (self.matched_build) |*mb| {
+                            for (bucket.items) |br| mb.set(br);
+                        }
                         continue; // emit matches in next loop iteration
                     }
                 }
-                // No matches for this probe row — advance.
+                // No match for this probe row. If the probe side is
+                // preserved (LEFT/RIGHT/FULL OUTER with this side as
+                // probe), emit one null-extended row before advancing.
+                if (self.probeSidePreserved()) {
+                    const full_after = try self.emitProbeOnlyRow(batch, self.cur_probe_row);
+                    self.cur_probe_row += 1;
+                    if (full_after) return try self.flushOutput();
+                    continue;
+                }
                 self.cur_probe_row += 1;
                 continue;
             }
@@ -545,6 +626,123 @@ pub const Join = struct {
         // synchronously before calling next() again.
         self.pending_clear = true;
         return batch;
+    }
+
+    /// True iff the side currently being probed (= the not-build side
+    /// per `build_is_left`) is preserved by the join semantics.
+    /// - LEFT  preserves left → probe is left when build_is_left == false.
+    /// - RIGHT preserves right → probe is right when build_is_left == true.
+    /// - FULL  preserves both.
+    fn probeSidePreserved(self: Join) bool {
+        return switch (self.join_type) {
+            .inner => false,
+            .left => !self.build_is_left, // probe == left
+            .right => self.build_is_left, // probe == right
+            .full => true,
+        };
+    }
+
+    /// True iff the build side is preserved (only matters for FULL
+    /// in v1; LEFT/RIGHT force build to the NON-preserved side).
+    fn buildSidePreserved(self: Join) bool {
+        return self.join_type == .full;
+    }
+
+    /// Emit one output row for an unmatched probe row: probe-side
+    /// columns from `batch[probe_row]`, NULL for build-side columns.
+    /// Special-cases the USING-dropped right-side join key columns:
+    /// when build == right (i.e., probe == left, LEFT/FULL OUTER), the
+    /// left-side join-key columns in output already hold the probe's
+    /// value naturally. When build == left (i.e., probe == right,
+    /// RIGHT OUTER), the left side's copy of the join key is NULL —
+    /// see the JoinType.right comment for the SQL deviation.
+    /// Returns `true` if the output buffer hit its threshold.
+    fn emitProbeOnlyRow(self: *Join, batch: Batch, probe_row: u32) !bool {
+        if (self.pending_clear) {
+            for (self.output_columns) |*c| c.clear();
+            self.pending_clear = false;
+        }
+        const left_count = self.left_col_count;
+        var out_idx: usize = 0;
+
+        if (self.build_is_left) {
+            // Build = left → probe = right. Left columns get NULL.
+            var i: usize = 0;
+            while (i < left_count) : (i += 1) {
+                try appendNullTo(self.allocator, &self.output_columns[out_idx]);
+                out_idx += 1;
+            }
+            // Right (probe) columns, skipping right-key columns.
+            for (batch.values, 0..) |v, idx2| {
+                if (!self.right_kept_mask[idx2]) continue;
+                try appendOneFromBatch(self.allocator, &self.output_columns[out_idx], v, probe_row);
+                out_idx += 1;
+            }
+        } else {
+            // Build = right → probe = left. Left (probe) cols normal.
+            var i: usize = 0;
+            while (i < left_count) : (i += 1) {
+                try appendOneFromBatch(self.allocator, &self.output_columns[out_idx], batch.values[i], probe_row);
+                out_idx += 1;
+            }
+            // Right (build) columns all NULL, skipping right-key cols.
+            for (self.right_kept_mask) |kept| {
+                if (!kept) continue;
+                try appendNullTo(self.allocator, &self.output_columns[out_idx]);
+                out_idx += 1;
+            }
+        }
+        return self.output_columns[0].data.rowCount() >= output_batch_rows;
+    }
+
+    /// FULL OUTER drain phase: walk matched_build, emit one
+    /// null-extended row per unmatched build row.
+    fn drainStep(self: *Join) !?Batch {
+        const mb = if (self.matched_build) |*m| m else return null;
+        if (self.pending_clear) {
+            for (self.output_columns) |*c| c.clear();
+            self.pending_clear = false;
+        }
+        const left_count = self.left_col_count;
+        while (self.drain_cursor < self.build_rows) : (self.drain_cursor += 1) {
+            if (mb.isSet(self.drain_cursor)) continue;
+            const build_row = self.drain_cursor;
+            var out_idx: usize = 0;
+
+            if (self.build_is_left) {
+                // Build = left. Emit left (build) cols normally,
+                // right cols NULL (skipping dropped right-key cols).
+                var i: usize = 0;
+                while (i < left_count) : (i += 1) {
+                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], &self.build_columns[i], build_row);
+                    out_idx += 1;
+                }
+                for (self.right_kept_mask) |kept| {
+                    if (!kept) continue;
+                    try appendNullTo(self.allocator, &self.output_columns[out_idx]);
+                    out_idx += 1;
+                }
+            } else {
+                // Build = right. Emit NULL for left cols, right (build)
+                // cols normally (skipping dropped right-key cols).
+                var i: usize = 0;
+                while (i < left_count) : (i += 1) {
+                    try appendNullTo(self.allocator, &self.output_columns[out_idx]);
+                    out_idx += 1;
+                }
+                for (self.build_columns, 0..) |*bc, idx2| {
+                    if (!self.right_kept_mask[idx2]) continue;
+                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], bc, build_row);
+                    out_idx += 1;
+                }
+            }
+
+            if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                self.drain_cursor += 1; // retire this build row
+                return try self.flushOutput();
+            }
+        }
+        return null;
     }
 };
 
@@ -692,6 +890,33 @@ fn appendOneFromBatch(
     row: u32,
 ) !void {
     try appendOneFromView(allocator, dst, src, row);
+}
+
+/// Append a NULL placeholder to a nullable destination column.
+/// Writes a zero / empty placeholder into the data backing AND clears
+/// the validity bit for the new row. Errors if the destination column
+/// isn't nullable (callers must ensure the output schema marks columns
+/// nullable when outer joins can emit NULLs there).
+fn appendNullTo(allocator: Allocator, dst: *ColumnStore) !void {
+    switch (dst.data) {
+        .int => |*l| try l.append(allocator, 0),
+        .bigint => |*l| try l.append(allocator, 0),
+        .boolean => |*l| try l.append(allocator, 0),
+        .float => |*l| try l.append(allocator, 0),
+        .double => |*l| try l.append(allocator, 0),
+        .date => |*l| try l.append(allocator, 0),
+        .datetime => |*l| try l.append(allocator, 0),
+        .tinyint => |*l| try l.append(allocator, 0),
+        .smallint => |*l| try l.append(allocator, 0),
+        .largeint => |*l| try l.append(allocator, 0),
+        .decimal64 => |*l| try l.append(allocator, 0),
+        .decimal128 => |*l| try l.append(allocator, 0),
+        .uuid => |*l| try l.append(allocator, 0),
+        .varchar => |*s| try s.appendValue(allocator, ""),
+        .string => |*s| try s.appendValue(allocator, ""),
+        .char => |*s| try s.appendValue(allocator, ""),
+    }
+    try dst.appendValidBit(allocator, dst.data.rowCount() - 1, false);
 }
 
 fn appendOneFromView(

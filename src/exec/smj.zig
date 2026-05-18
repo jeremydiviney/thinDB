@@ -98,6 +98,10 @@ pub const SortMergeJoin = struct {
     views: []ColumnView,
     pending_clear: bool = false,
 
+    /// Join semantics — drives unmatched-row emission during merge
+    /// and post-merge drain.
+    join_type: join_mod.JoinType,
+
     phase: Phase = .materializing,
 
     const Phase = enum { materializing, merging, done };
@@ -108,7 +112,6 @@ pub const SortMergeJoin = struct {
         right: Query,
         spec: Spec,
     ) !Query {
-        if (spec.join_type != .inner) return Error.JoinUnsupportedType;
         if (spec.on.len == 0) return Error.JoinEmptyOnClause;
 
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -139,9 +142,24 @@ pub const SortMergeJoin = struct {
             if (m) right_kept_count += 1;
         }
 
+        // Outer joins: the "other" side's columns become nullable in
+        // the output (unmatched preserved rows have NULL on the other
+        // side). See join.zig for the same logic.
+        const left_nullable_in_output = switch (spec.join_type) {
+            .inner, .left => false,
+            .right, .full => true,
+        };
+        const right_nullable_in_output = switch (spec.join_type) {
+            .inner, .right => false,
+            .left, .full => true,
+        };
+
         const output_schema = try allocator.alloc(Column, left_schema.len + right_kept_count);
         errdefer allocator.free(output_schema);
-        for (left_schema, 0..) |c, i| output_schema[i] = c;
+        for (left_schema, 0..) |c, i| {
+            output_schema[i] = c;
+            if (left_nullable_in_output) output_schema[i].nullable = true;
+        }
         var out_idx: usize = left_schema.len;
         for (right_schema, 0..) |c, i| {
             if (!right_kept_mask[i]) continue;
@@ -149,6 +167,7 @@ pub const SortMergeJoin = struct {
                 if (std.mem.eql(u8, prior.name, c.name)) return Error.JoinColumnNameCollision;
             }
             output_schema[out_idx] = c;
+            if (right_nullable_in_output) output_schema[out_idx].nullable = true;
             out_idx += 1;
         }
 
@@ -215,6 +234,7 @@ pub const SortMergeJoin = struct {
             .skip_right_sort = skip_right,
             .output_columns = output_columns,
             .views = views,
+            .join_type = spec.join_type,
         };
         return makeQuery(allocator, self);
     }
@@ -365,12 +385,39 @@ pub const SortMergeJoin = struct {
             self.pending_clear = false;
         }
 
+        const preserve_left = switch (self.join_type) {
+            .left, .full => true,
+            else => false,
+        };
+        const preserve_right = switch (self.join_type) {
+            .right, .full => true,
+            else => false,
+        };
+
         while (self.left_cursor < self.left_perm.len and self.right_cursor < self.right_perm.len) {
             const lkey = self.left_keys_bytes[self.left_cursor];
             const rkey = self.right_keys_bytes[self.right_cursor];
             switch (std.mem.order(u8, lkey, rkey)) {
-                .lt => self.left_cursor += 1,
-                .gt => self.right_cursor += 1,
+                .lt => {
+                    if (preserve_left) {
+                        try self.emitLeftOnlyRow(self.left_perm[self.left_cursor]);
+                        if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                            self.left_cursor += 1;
+                            return try self.flushOutput();
+                        }
+                    }
+                    self.left_cursor += 1;
+                },
+                .gt => {
+                    if (preserve_right) {
+                        try self.emitRightOnlyRow(self.right_perm[self.right_cursor]);
+                        if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                            self.right_cursor += 1;
+                            return try self.flushOutput();
+                        }
+                    }
+                    self.right_cursor += 1;
+                },
                 .eq => {
                     // Find runs of equal keys on both sides.
                     var l_end = self.left_cursor + 1;
@@ -417,7 +464,60 @@ pub const SortMergeJoin = struct {
             }
         }
 
+        // Post-loop drain: when one side is exhausted, drain remaining
+        // rows on the other side as unmatched (if preserved).
+        if (preserve_left) {
+            while (self.left_cursor < self.left_perm.len) {
+                try self.emitLeftOnlyRow(self.left_perm[self.left_cursor]);
+                self.left_cursor += 1;
+                if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                    return try self.flushOutput();
+                }
+            }
+        }
+        if (preserve_right) {
+            while (self.right_cursor < self.right_perm.len) {
+                try self.emitRightOnlyRow(self.right_perm[self.right_cursor]);
+                self.right_cursor += 1;
+                if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                    return try self.flushOutput();
+                }
+            }
+        }
+
         return null;
+    }
+
+    /// Emit an unmatched LEFT row: left columns from left_materialized,
+    /// NULL for kept right columns.
+    fn emitLeftOnlyRow(self: *SortMergeJoin, left_row: u32) !void {
+        var out_idx: usize = 0;
+        for (self.left_materialized) |*col| {
+            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, left_row);
+            out_idx += 1;
+        }
+        for (self.right_kept_mask) |kept| {
+            if (!kept) continue;
+            try appendNullTo(self.allocator, &self.output_columns[out_idx]);
+            out_idx += 1;
+        }
+    }
+
+    /// Emit an unmatched RIGHT row: NULL for left columns (including
+    /// USING-merged join key positions — same SQL deviation as Join.zig),
+    /// right columns from right_materialized (skipping join keys).
+    fn emitRightOnlyRow(self: *SortMergeJoin, right_row: u32) !void {
+        var out_idx: usize = 0;
+        var i: usize = 0;
+        while (i < self.left_col_count) : (i += 1) {
+            try appendNullTo(self.allocator, &self.output_columns[out_idx]);
+            out_idx += 1;
+        }
+        for (self.right_materialized, 0..) |*col, idx2| {
+            if (!self.right_kept_mask[idx2]) continue;
+            try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], col, right_row);
+            out_idx += 1;
+        }
     }
 
     // Helpers used by mid-run cursor save. v1's mergeStep always
@@ -627,6 +727,30 @@ fn sortByKeys(perm: []u32, keys: [][]const u8) void {
 
 /// Append one row's data from `src` (build-side) into `dst`.
 /// Copied verbatim from join.zig — keep until we extract a common helper.
+/// Append a NULL placeholder + clear validity bit. Mirrors the
+/// helper in join.zig; duplicated to keep smj.zig self-contained.
+fn appendNullTo(allocator: Allocator, dst: *ColumnStore) !void {
+    switch (dst.data) {
+        .int => |*l| try l.append(allocator, 0),
+        .bigint => |*l| try l.append(allocator, 0),
+        .boolean => |*l| try l.append(allocator, 0),
+        .float => |*l| try l.append(allocator, 0),
+        .double => |*l| try l.append(allocator, 0),
+        .date => |*l| try l.append(allocator, 0),
+        .datetime => |*l| try l.append(allocator, 0),
+        .tinyint => |*l| try l.append(allocator, 0),
+        .smallint => |*l| try l.append(allocator, 0),
+        .largeint => |*l| try l.append(allocator, 0),
+        .decimal64 => |*l| try l.append(allocator, 0),
+        .decimal128 => |*l| try l.append(allocator, 0),
+        .uuid => |*l| try l.append(allocator, 0),
+        .varchar => |*s| try s.appendValue(allocator, ""),
+        .string => |*s| try s.appendValue(allocator, ""),
+        .char => |*s| try s.appendValue(allocator, ""),
+    }
+    try dst.appendValidBit(allocator, dst.data.rowCount() - 1, false);
+}
+
 fn appendOneFromBuild(
     allocator: Allocator,
     dst: *ColumnStore,
