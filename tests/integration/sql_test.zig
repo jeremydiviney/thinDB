@@ -264,6 +264,181 @@ test "sql: IS NULL / IS NOT NULL on nullable column" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 3 }, ids.items);
 }
 
+// ---------------------------------------------------------------------------
+// JOIN support
+// ---------------------------------------------------------------------------
+
+const schema_orders = thindb.Schema{
+    .columns = &.{
+        .{ .name = "oid", .type = .bigint },
+        .{ .name = "item_id", .type = .int },
+        .{ .name = "qty", .type = .int },
+    },
+    .order_key = &.{"oid"},
+    .unique = true,
+};
+const schema_items = thindb.Schema{
+    .columns = &.{
+        .{ .name = "iid", .type = .int },
+        .{ .name = "name", .type = .string },
+    },
+    .order_key = &.{"iid"},
+    .unique = true,
+};
+const ok_orders = [_][]const u8{"oid"};
+const ok_items = [_][]const u8{"iid"};
+
+fn seedOrdersItems(db: anytype) !void {
+    const o = try db.table("orders", schema_orders, .{ .order_key = &ok_orders, .unique = true, .row_group_size = 8 });
+    const i = try db.table("items", schema_items, .{ .order_key = &ok_items, .unique = true, .row_group_size = 8 });
+    try o.insert(&.{
+        .{ .oid = @as(i64, 1), .item_id = @as(i32, 100), .qty = @as(i32, 2) },
+        .{ .oid = @as(i64, 2), .item_id = @as(i32, 200), .qty = @as(i32, 5) },
+        .{ .oid = @as(i64, 3), .item_id = @as(i32, 999), .qty = @as(i32, 1) }, // no item
+    });
+    try i.insert(&.{
+        .{ .iid = @as(i32, 100), .name = "alpha" },
+        .{ .iid = @as(i32, 200), .name = "beta" },
+        .{ .iid = @as(i32, 300), .name = "gamma" }, // no order
+    });
+    try o.flush();
+    try i.flush();
+}
+
+test "sql: simple INNER JOIN with qualified ON" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedOrdersItems(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT oid, qty, name
+        \\FROM orders INNER JOIN items ON orders.item_id = items.iid
+    );
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    // Inner: 2 matches (orders 1 and 2 join to items 100 and 200; order 3 has no match).
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "sql: JOIN keyword alone defaults to INNER" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedOrdersItems(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT name FROM orders JOIN items ON orders.item_id = items.iid
+    );
+    defer q.deinit();
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "sql: LEFT OUTER JOIN preserves unmatched left rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedOrdersItems(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT oid FROM orders LEFT OUTER JOIN items ON orders.item_id = items.iid
+    );
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    // All three orders survive (order 3 has no items match but LEFT JOIN preserves it).
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids.items);
+}
+
+test "sql: JOIN feeds into WHERE + ORDER BY + LIMIT downstream" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedOrdersItems(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT name, qty
+        \\FROM orders JOIN items ON orders.item_id = items.iid
+        \\WHERE qty >= 2
+        \\ORDER BY qty DESC
+        \\LIMIT 1
+    );
+    defer q.deinit();
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expectEqualStrings("beta", b.values[0].data.string.rowBytes(0));
+    try std.testing.expectEqual(@as(i32, 5), b.values[1].data.int[0]);
+}
+
+test "sql: three-table JOIN (A JOIN B ON ... JOIN C ON ...)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedOrdersItems(db);
+
+    // Add a third table that joins to items.name.
+    const schema_cats = thindb.Schema{
+        .columns = &.{
+            .{ .name = "cid", .type = .int },
+            .{ .name = "name", .type = .string },
+            .{ .name = "category", .type = .string },
+        },
+        .order_key = &.{"cid"},
+        .unique = true,
+    };
+    const ok_cats = [_][]const u8{"cid"};
+    const cats = try db.table("cats", schema_cats, .{ .order_key = &ok_cats, .unique = true, .row_group_size = 8 });
+    try cats.insert(&.{
+        .{ .cid = @as(i32, 1), .name = "alpha", .category = "fruit" },
+        .{ .cid = @as(i32, 2), .name = "beta", .category = "vege" },
+    });
+    try cats.flush();
+
+    // Three-table join: orders ⋈ items on item_id=iid, then ⋈ cats on items.name=cats.name.
+    // No name collision: the second join uses `name` as a join key, so USING-style
+    // elision drops the duplicate.
+    var q = try runSql(allocator, db,
+        \\SELECT oid FROM orders
+        \\  JOIN items ON orders.item_id = items.iid
+        \\  JOIN cats ON items.name = cats.name
+    );
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    // orders {1,2,3} ⋈ items {100,200,300} ⋈ cats {alpha,beta}:
+    //   order 1 (item_id=100, name=alpha, cat=fruit)  → kept
+    //   order 2 (item_id=200, name=beta,  cat=vege)   → kept
+    //   order 3 (item_id=999) — no items match — dropped before cat join
+    try std.testing.expectEqual(@as(usize, 2), ids.items.len);
+}
+
 test "sql: case-insensitive keywords + line comments + trailing semicolon" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

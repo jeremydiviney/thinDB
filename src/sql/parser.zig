@@ -60,6 +60,9 @@ pub const ParseError = error{
     SqlInvalidProjection,
     SqlMixedAggAndPlainProjection,
     SqlTrailingTokens,
+    SqlExpectedJoinOn,
+    SqlOnRefsUnknownTable,
+    SqlOnNonEquiUnsupported,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -135,13 +138,10 @@ const Parser = struct {
         // Projection list.
         const proj = try self.parseProjection();
 
-        // FROM ident.
+        // FROM clause — supports a single table or chained JOINs.
         if (self.cur.tag != .kw_from) return ParseError.SqlExpectedFrom;
         try self.advance();
-        const table_name = try self.expectIdent();
-
-        // Build the bottom of the pipeline.
-        var root = try self.allocOp(.{ .scan = .{ .table_name = try self.arena.dupe(u8, table_name) } });
+        var root = try self.parseFromClause();
 
         // Optional WHERE.
         if (self.cur.tag == .kw_where) {
@@ -348,6 +348,139 @@ const Parser = struct {
         return fallback;
     }
 
+    // -----------------------------------------------------------------------
+    // FROM clause + JOIN chaining.
+    //
+    //   from_clause := ident (join_kind 'JOIN' ident 'ON' equi_conds)*
+    //   join_kind   := 'INNER'? | 'LEFT' 'OUTER'? | 'RIGHT' 'OUTER'? | 'FULL' 'OUTER'?
+    //   equi_conds  := qualified_col '=' qualified_col ('AND' qualified_col '=' qualified_col)*
+    //
+    // Each ON clause must be a conjunction of pure equi-conditions
+    // between qualified column refs. The parser resolves which side
+    // (left subtree vs new right table) each column belongs to by
+    // tracking the running set of "left-side" table names. v1 doesn't
+    // support inequality / range joins or general predicates in ON —
+    // a follow-up that adds Op.Join.ranges + extra_predicate handling
+    // will lift those restrictions.
+    // -----------------------------------------------------------------------
+    fn parseFromClause(self: *Parser) ParseError!*ir.Op {
+        const first_table = try self.expectIdent();
+        const first_dup = try self.arena.dupe(u8, first_table);
+        var root = try self.allocOp(.{ .scan = .{ .table_name = first_dup } });
+
+        // Running set of table names that constitute the current left
+        // subtree. Each new JOIN's ON clause must reference one of
+        // these + the new right table.
+        var left_names: std.ArrayList([]const u8) = .empty;
+        try left_names.append(self.arena, first_dup);
+        defer left_names.deinit(self.arena);
+
+        while (isJoinStart(self.cur.tag)) {
+            const jtype = try self.parseJoinKind();
+            const right_table = try self.expectIdent();
+            const right_dup = try self.arena.dupe(u8, right_table);
+            const right_scan = try self.allocOp(.{ .scan = .{ .table_name = right_dup } });
+
+            if (self.cur.tag != .kw_on) return ParseError.SqlExpectedJoinOn;
+            try self.advance();
+            const pairs = try self.parseOnEquiJoin(left_names.items, right_dup);
+
+            root = try self.allocOp(.{ .join = .{
+                .algorithm = .auto,
+                .join_type = jtype,
+                .on = pairs,
+                .ranges = &.{},
+                .extra_predicate = null,
+                .skew_ratio_threshold = 0.3,
+                .skew_absolute_threshold = 20_000,
+                .skew_sample_interval = 10,
+                .left = root,
+                .right = right_scan,
+            } });
+            try left_names.append(self.arena, right_dup);
+        }
+        return root;
+    }
+
+    fn isJoinStart(tag: TokenTag) bool {
+        return switch (tag) {
+            .kw_join, .kw_inner, .kw_left, .kw_right, .kw_full => true,
+            else => false,
+        };
+    }
+
+    fn parseJoinKind(self: *Parser) ParseError!ir.JoinType {
+        // Default join kind is INNER. Modifiers: INNER, LEFT, RIGHT, FULL
+        // (any of those may be followed by 'OUTER' which we accept and
+        // ignore — it's syntactic noise per SQL standard).
+        var jtype: ir.JoinType = .inner;
+        switch (self.cur.tag) {
+            .kw_inner => {
+                try self.advance();
+            },
+            .kw_left => {
+                jtype = .left;
+                try self.advance();
+                if (self.cur.tag == .kw_outer) try self.advance();
+            },
+            .kw_right => {
+                jtype = .right;
+                try self.advance();
+                if (self.cur.tag == .kw_outer) try self.advance();
+            },
+            .kw_full => {
+                jtype = .full;
+                try self.advance();
+                if (self.cur.tag == .kw_outer) try self.advance();
+            },
+            else => {},
+        }
+        if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
+        try self.advance();
+        return jtype;
+    }
+
+    fn parseOnEquiJoin(
+        self: *Parser,
+        left_table_names: []const []const u8,
+        right_table_name: []const u8,
+    ) ParseError![]const ir.JoinKeyPair {
+        var pairs: std.ArrayList(ir.JoinKeyPair) = .empty;
+        while (true) {
+            // One condition: qualified.col '=' qualified.col
+            const a_tbl = try self.expectIdent();
+            try self.expect(.dot);
+            const a_col = try self.expectIdent();
+            if (self.cur.tag != .eq) return ParseError.SqlOnNonEquiUnsupported;
+            try self.advance();
+            const b_tbl = try self.expectIdent();
+            try self.expect(.dot);
+            const b_col = try self.expectIdent();
+
+            // Resolve which side each column belongs to.
+            const a_is_left = nameIn(a_tbl, left_table_names);
+            const a_is_right = std.mem.eql(u8, a_tbl, right_table_name);
+            const b_is_left = nameIn(b_tbl, left_table_names);
+            const b_is_right = std.mem.eql(u8, b_tbl, right_table_name);
+
+            const left_col_dup = try self.arena.dupe(u8, a_col);
+            const right_col_dup = try self.arena.dupe(u8, b_col);
+
+            if (a_is_left and b_is_right) {
+                try pairs.append(self.arena, .{ .left = left_col_dup, .right = right_col_dup });
+            } else if (a_is_right and b_is_left) {
+                // Swap so canonical (left, right) ordering is preserved.
+                try pairs.append(self.arena, .{ .left = right_col_dup, .right = left_col_dup });
+            } else {
+                return ParseError.SqlOnRefsUnknownTable;
+            }
+
+            if (self.cur.tag != .kw_and) break;
+            try self.advance();
+        }
+        return try pairs.toOwnedSlice(self.arena);
+    }
+
     fn parseOrderBy(self: *Parser) ParseError![]const @import("../exec/sort.zig").SortSpec {
         const SortSpec = @import("../exec/sort.zig").SortSpec;
         var items: std.ArrayList(SortSpec) = .empty;
@@ -550,4 +683,9 @@ fn countAggs(proj: []const ProjItem) usize {
         else => {},
     };
     return n;
+}
+
+fn nameIn(needle: []const u8, names: []const []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, needle)) return true;
+    return false;
 }
