@@ -23,7 +23,17 @@ To regenerate: `zig build bench -Doptimize=ReleaseFast`.
 | filter `id < 50k` (order-key, narrow, 5% match) | 6 ms | **177 M rows/s** | 6 |
 | filter `id >= N/2` (order-key, 50% match) | 17 ms | 60 M rows/s | 17 |
 | aggregate count + sum + min + max | 18 ms | 55 M rows/s | 18 |
-| groupBy tag (8 groups), count + sum | 34 ms | 30 M rows/s | 34 |
+| aggregate stddev_pop + var_pop (Welford) | 28 ms | 36 M rows/s | 28 |
+| aggregate count_distinct (~8 unique) | 28 ms | 36 M rows/s | 28 |
+| aggregate percentile_cont(0.5) [exact] | 29 ms | 34 M rows/s | 29 |
+| aggregate group_concat (~8 groups) | 43 ms | 23 M rows/s | 43 |
+| groupBy tag (8 groups), count + sum | 40 ms | 25 M rows/s | 40 |
+
+**Notes on the post-baseline aggregates:**
+- `stddev_pop` / `var_pop` use Welford's algorithm — numerically stable, ~1.5× the cost of plain sum.
+- `count_distinct` at 8-unique saturates the hash set quickly; cost is dominated by hashing every row's encoded value.
+- `percentile_cont(0.5)` is **exact**: O(N) memory for the value buffer + a final sort. Roughly 1.6× the count+sum+min+max baseline.
+- `group_concat` cost scales with output bytes — at ~125k rows/group × short tag values, the per-row buffer-append dominates.
 
 ## Flush internals (1 M rows)
 

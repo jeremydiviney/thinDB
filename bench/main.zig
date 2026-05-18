@@ -57,6 +57,10 @@ pub fn main() !void {
     try benchScanFilterOrderKeyMid(allocator, io, n_rows);
     try benchAggregateGlobal(allocator, io, n_rows);
     try benchGroupByTag(allocator, io, n_rows);
+    try benchStatAggregates(allocator, io, n_rows);
+    try benchCountDistinct(allocator, io, n_rows);
+    try benchPercentile(allocator, io, n_rows);
+    try benchGroupConcat(allocator, io, n_rows);
 
     std.debug.print("\nTCP transport (vs in-process baselines above)\n", .{});
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
@@ -582,6 +586,119 @@ fn benchAggregateGlobal(allocator: Allocator, io: Io, n_rows: usize) !void {
     const elapsed = elapsedNs(io, t0);
 
     try report("aggregate count+sum+min+max", n_rows, elapsed, null);
+}
+
+/// Welford-based stddev_pop + var_pop over the full qty column. Compared
+/// against count+sum+min+max above to see what the second-moment cost adds.
+fn benchStatAggregates(allocator: Allocator, io: Io, n_rows: usize) !void {
+    var dir = try freshDir(io, ".bench-data/aggregate_stats");
+    defer dir.close(io);
+
+    var db = try thindb.Database.open(allocator, io, dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, options);
+    const rows = try buildRows(allocator, n_rows);
+    defer allocator.free(rows);
+    try t.insert(rows);
+    try t.flush();
+
+    const t0 = Io.Clock.awake.now(io);
+    var base = try thindb.scan(allocator, t);
+    var q = try base.aggregate(&.{
+        .{ .func = .stddev_pop, .col = "qty", .as = "sd" },
+        .{ .func = .var_pop, .col = "qty", .as = "vr" },
+    });
+    defer q.deinit();
+    const b = (try q.next()).?;
+    const checksum = b.values[0].data.double[0] + b.values[1].data.double[0];
+    std.mem.doNotOptimizeAway(&checksum);
+    const elapsed = elapsedNs(io, t0);
+    try report("aggregate stddev_pop + var_pop", n_rows, elapsed, null);
+}
+
+/// COUNT_DISTINCT over the `tag` column (low cardinality, ~8 unique values).
+/// Exercises the StringHashMap-of-arena-dup'd-keys path; cheap because the
+/// hash set saturates after the first few unique values.
+fn benchCountDistinct(allocator: Allocator, io: Io, n_rows: usize) !void {
+    var dir = try freshDir(io, ".bench-data/aggregate_count_distinct");
+    defer dir.close(io);
+
+    var db = try thindb.Database.open(allocator, io, dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, options);
+    const rows = try buildRows(allocator, n_rows);
+    defer allocator.free(rows);
+    try t.insert(rows);
+    try t.flush();
+
+    const t0 = Io.Clock.awake.now(io);
+    var base = try thindb.scan(allocator, t);
+    var q = try base.aggregate(&.{
+        .{ .func = .count_distinct, .col = "tag", .as = "nd" },
+    });
+    defer q.deinit();
+    const b = (try q.next()).?;
+    const checksum = b.values[0].data.bigint[0];
+    std.mem.doNotOptimizeAway(&checksum);
+    const elapsed = elapsedNs(io, t0);
+    try report("aggregate count_distinct (~8 unique)", n_rows, elapsed, null);
+}
+
+/// Exact PERCENTILE_CONT(0.5) over qty. Forces full materialization + sort
+/// of every observed value — meaningful contrast with the O(1)-state aggs.
+fn benchPercentile(allocator: Allocator, io: Io, n_rows: usize) !void {
+    var dir = try freshDir(io, ".bench-data/aggregate_percentile");
+    defer dir.close(io);
+
+    var db = try thindb.Database.open(allocator, io, dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, options);
+    const rows = try buildRows(allocator, n_rows);
+    defer allocator.free(rows);
+    try t.insert(rows);
+    try t.flush();
+
+    const t0 = Io.Clock.awake.now(io);
+    var base = try thindb.scan(allocator, t);
+    var q = try base.aggregate(&.{
+        .{ .func = .percentile, .col = "qty", .as = "p50", .params = .{ .percentile = 0.5 } },
+    });
+    defer q.deinit();
+    const b = (try q.next()).?;
+    const checksum = b.values[0].data.double[0];
+    std.mem.doNotOptimizeAway(&checksum);
+    const elapsed = elapsedNs(io, t0);
+    try report("aggregate percentile_cont(0.5) [exact]", n_rows, elapsed, null);
+}
+
+/// GROUP_CONCAT(tag) within each group. Each group accumulates all its tag
+/// values; backing buffer grows linearly with group size.
+fn benchGroupConcat(allocator: Allocator, io: Io, n_rows: usize) !void {
+    var dir = try freshDir(io, ".bench-data/aggregate_group_concat");
+    defer dir.close(io);
+
+    var db = try thindb.Database.open(allocator, io, dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, options);
+    const rows = try buildRows(allocator, n_rows);
+    defer allocator.free(rows);
+    try t.insert(rows);
+    try t.flush();
+
+    const t0 = Io.Clock.awake.now(io);
+    var base = try thindb.scan(allocator, t);
+    var q = try base.groupBy(&.{"tag"}, &.{
+        .{ .func = .group_concat, .col = "tag", .as = "ts", .params = .{ .separator = "," } },
+    });
+    defer q.deinit();
+    var total_bytes: usize = 0;
+    while (try q.next()) |b| {
+        const sv = b.values[1].data.string;
+        for (0..b.row_count) |i| total_bytes += sv.rowBytes(i).len;
+    }
+    std.mem.doNotOptimizeAway(&total_bytes);
+    const elapsed = elapsedNs(io, t0);
+    try report("aggregate group_concat (~8 groups)", n_rows, elapsed, null);
 }
 
 /// GROUP BY tag (~8 groups), aggregating COUNT + SUM(qty).
