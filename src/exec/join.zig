@@ -131,6 +131,17 @@ pub const Spec = struct {
     /// When `on` is empty AND `ranges` is non-empty, the planner
     /// picks the nested-loop algorithm (no equi prefix to exploit).
     ranges: []const RangePredicate = &.{},
+    /// Skew-detection threshold for hash joins: if a single join
+    /// key's observed frequency exceeds `skew_threshold × build_rows`
+    /// during the build phase, the join aborts with
+    /// `error.JoinHeavySkew`. The caller can retry with
+    /// `.algorithm = .sort_merge` (better cache locality on long
+    /// bucket walks).
+    ///
+    /// Default 0.0 disables detection (no overhead, no abort).
+    /// A typical guard value is 0.5 (50% of rows in one key).
+    /// Only applies to `.hash` / `.auto`-routed hash joins.
+    skew_threshold: f32 = 0.0,
 };
 
 /// Number of rows emitted per output batch. Bounded so emission stays
@@ -149,6 +160,12 @@ pub const Join = struct {
     /// the `on` spec. Used by the compound-key builder.
     left_key_indices: []usize,
     right_key_indices: []usize,
+
+    /// Optional skew detector. Set when Spec.skew_threshold > 0;
+    /// observed during buildPhase, checked at end. Allocated in
+    /// the join's arena.
+    skew_detector: ?*@import("skew.zig").MisraGries,
+    skew_threshold: f32,
 
     /// Range predicates resolved to column indices. Each candidate
     /// (probe_row, build_row) pair must satisfy ALL of them. Empty
@@ -423,6 +440,13 @@ pub const Join = struct {
 
         const self = try allocator.create(Join);
         errdefer allocator.destroy(self);
+        // Optional skew detector (arena-allocated; freed with arena).
+        const skew_det: ?*@import("skew.zig").MisraGries = if (spec.skew_threshold > 0.0) blk: {
+            const det = try aa.create(@import("skew.zig").MisraGries);
+            det.* = @import("skew.zig").MisraGries.init(allocator);
+            break :blk det;
+        } else null;
+
         self.* = .{
             .allocator = allocator,
             .arena = arena,
@@ -432,6 +456,8 @@ pub const Join = struct {
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
             .ranges = resolved_ranges,
+            .skew_detector = skew_det,
+            .skew_threshold = spec.skew_threshold,
             .build_is_left = build_is_left,
             .output_schema = output_schema,
             .left_col_count = left_schema.len,
@@ -463,6 +489,7 @@ pub const Join = struct {
         self.allocator.free(self.right_kept_mask);
         self.key_scratch.deinit(self.allocator);
         if (self.matched_build) |*mb| mb.deinit(self.allocator);
+        if (self.skew_detector) |det| det.deinit();
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -583,8 +610,23 @@ pub const Join = struct {
                     gop.value_ptr.* = .empty;
                 }
                 try gop.value_ptr.append(aa, self.build_rows + i);
+                if (self.skew_detector) |det| try det.observe(self.key_scratch.items);
             }
             self.build_rows += @intCast(n);
+        }
+
+        // After build, check skew. Top frequency from Misra-Gries is
+        // an UNDER-estimate of the true heavy hitter's count — if it
+        // already exceeds threshold * build_rows, the true skew is at
+        // least that bad.
+        if (self.skew_detector) |det| {
+            if (self.build_rows > 0) {
+                const top: f32 = @floatFromInt(det.topFrequency());
+                const total: f32 = @floatFromInt(self.build_rows);
+                if (top / total >= self.skew_threshold) {
+                    return Error.JoinHeavySkew;
+                }
+            }
         }
     }
 

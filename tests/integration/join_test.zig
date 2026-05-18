@@ -2009,6 +2009,118 @@ test "join: range_sweep output matches NLJ for same data" {
     try std.testing.expectEqual(nlj_count, sweep_count);
 }
 
+test "skew: heavy build-side skew triggers JoinHeavySkew" {
+    // Build side has 100 rows all with k=42 → 100% in one key.
+    // With threshold = 0.5, this should abort.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_l = thindb.Schema{
+        .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "k", .type = .bigint } },
+        .order_key = &.{"rowid"},
+        .unique = true,
+    };
+    const schema_r = thindb.Schema{
+        .columns = &.{ .{ .name = "b_rowid", .type = .bigint }, .{ .name = "k", .type = .bigint } },
+        .order_key = &.{"b_rowid"},
+        .unique = true,
+    };
+    const ok_l = [_][]const u8{"rowid"};
+    const ok_r = [_][]const u8{"b_rowid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    // Skewed side must be the SMALLER one so that .auto/ hash picks
+    // it as the build side (Misra-Gries only watches build).
+    const l = try db.table("l", schema_l, .{ .order_key = &ok_l, .unique = true });
+    {
+        const Row = struct { rowid: i64, k: i64 };
+        const rows = try allocator.alloc(Row, 100);
+        defer allocator.free(rows);
+        // 100 rows all with k=42 → 100% skew on build.
+        for (rows, 0..) |*r, i| r.* = .{ .rowid = @intCast(i), .k = 42 };
+        try l.insert(rows);
+    }
+    try l.flush();
+    const r = try db.table("r", schema_r, .{ .order_key = &ok_r, .unique = true });
+    {
+        const Row = struct { b_rowid: i64, k: i64 };
+        const rows = try allocator.alloc(Row, 1000);
+        defer allocator.free(rows);
+        for (rows, 0..) |*row, i| row.* = .{ .b_rowid = @intCast(i), .k = @intCast(i) };
+        try r.insert(rows);
+    }
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = .hash,
+        .skew_threshold = 0.5,
+    });
+    defer q.deinit();
+
+    // Drain → triggers buildPhase → detection fires.
+    try std.testing.expectError(thindb.exec.Error.JoinHeavySkew, q.next());
+}
+
+test "skew: no-skew query with detection enabled runs normally" {
+    // 100 distinct keys, no heavy hitter. With threshold = 0.5,
+    // detection should NOT fire — query completes.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema_l = thindb.Schema{
+        .columns = &.{ .{ .name = "k", .type = .bigint } },
+        .order_key = &.{"k"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"k"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(usize),
+        .auto_flush_secs = 0,
+    });
+    defer db.close();
+
+    const l = try db.table("l", schema_l, .{ .order_key = &ok, .unique = true });
+    const r = try db.table("r", schema_l, .{ .order_key = &ok, .unique = true });
+    {
+        const Row = struct { k: i64 };
+        const rows = try allocator.alloc(Row, 100);
+        defer allocator.free(rows);
+        for (rows, 0..) |*row, i| row.* = .{ .k = @intCast(i) };
+        try l.insert(rows);
+        try r.insert(rows);
+    }
+    try l.flush();
+    try r.flush();
+
+    const left = try thindb.scan(allocator, l);
+    const right = try thindb.scan(allocator, r);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .algorithm = .hash,
+        .skew_threshold = 0.5,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 100), rows);
+}
+
 test "memory: sort over tight budget errors with MemoryBudgetExceeded" {
     // Budget = 100 bytes. We try to sort 100 rows (each ~16 bytes
     // accounted, so ~1600 bytes total). Should fail with the typed
