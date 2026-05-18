@@ -104,6 +104,9 @@ const ProjItem = struct {
         /// Aggregate call. `agg_func` is the function; `agg_col` is the
         /// argument column name (null for COUNT(*)).
         agg: struct { func: ir.AggFunc, col: ?[]const u8 },
+        /// Scalar function call expression. Lowered to a Compute step
+        /// before the final projection.
+        expr: ir.Expr,
     },
 };
 
@@ -167,6 +170,19 @@ const Parser = struct {
             };
             break :blk false;
         };
+        const has_expr = blk: {
+            for (proj) |p| switch (p.kind) {
+                .expr => break :blk true,
+                else => {},
+            };
+            break :blk false;
+        };
+        if (has_expr and (has_agg or group_cols.len > 0)) {
+            // v1 keeps these mutually exclusive — scalar expressions
+            // combined with aggregation needs a clear pre-vs-post
+            // aggregate decision the parser doesn't yet make.
+            return ParseError.SqlMixedAggAndPlainProjection;
+        }
 
         // Parse-time peek for ORDER BY and LIMIT clauses — we need to
         // know the pipeline shape before deciding where to insert
@@ -205,6 +221,7 @@ const Parser = struct {
                     if (!found) return ParseError.SqlMixedAggAndPlainProjection;
                 },
                 .agg => {},
+                .expr => unreachable, // gated above (has_expr & has_agg/group_cols rejected)
             };
 
             // Build agg specs from the projection.
@@ -238,8 +255,20 @@ const Parser = struct {
                 root = try self.allocOp(.{ .select = .{ .columns = out_names, .upstream = root } });
             }
         } else {
-            // Non-aggregated. OrderBy applies BEFORE the Project so it
-            // can reference any column from the input schema.
+            // Non-aggregated. ORDER BY applies BEFORE the Project so it
+            // can reference any column from the input schema. If we have
+            // scalar expressions, materialize them via a Compute step
+            // BEFORE the OrderBy (so OrderBy can reference computed
+            // column aliases too).
+            if (has_expr) {
+                var derived_buf: std.ArrayList(ir.Derived) = .empty;
+                for (proj) |p| switch (p.kind) {
+                    .expr => |e| try derived_buf.append(self.arena, .{ .name = p.name, .expr = e }),
+                    else => {},
+                };
+                const derived_slice = try derived_buf.toOwnedSlice(self.arena);
+                root = try self.allocOp(.{ .compute = .{ .derived = derived_slice, .upstream = root } });
+            }
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
             }
@@ -247,7 +276,14 @@ const Parser = struct {
             // is encoded as an empty proj slice → no Project node added.
             if (proj.len > 0) {
                 const cols = try self.arena.alloc([]const u8, proj.len);
-                for (proj, cols) |p, *out| out.* = p.kind.col;
+                for (proj, cols) |p, *out| {
+                    switch (p.kind) {
+                        .col => |c| out.* = c,
+                        // Computed exprs surface under their derived name (alias).
+                        .expr => out.* = p.name,
+                        .agg => unreachable, // already handled by the agg branch
+                    }
+                }
                 root = try self.allocOp(.{ .select = .{ .columns = cols, .upstream = root } });
             }
         }
@@ -279,40 +315,24 @@ const Parser = struct {
     }
 
     fn parseProjItem(self: *Parser) ParseError!ProjItem {
-        // Identifier or aggregate call. Look two tokens ahead: if `(`
-        // follows an identifier, it's a call.
+        // Identifier or function call. Look ahead: `(` after an identifier
+        // means a call.
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const first = self.cur.text;
         try self.advance();
 
         // Function call?
         if (self.cur.tag == .lparen) {
-            try self.advance();
-            const func = aggForName(first) orelse return ParseError.SqlExpectedAggKnown;
-            // `count(*)` or `func(col)`.
-            var arg_col: ?[]const u8 = null;
-            if (self.cur.tag == .star) {
-                try self.advance();
-            } else if (self.cur.tag == .identifier) {
-                arg_col = try self.arena.dupe(u8, self.cur.text);
-                try self.advance();
-            } else return ParseError.SqlExpectedIdent;
-            try self.expect(.rparen);
-            // Optional AS alias.
-            const alias = try self.maybeAlias(blk: {
-                // Default name: `func(arg)`.
-                var buf: std.ArrayList(u8) = .empty;
-                defer buf.deinit(self.arena);
-                try buf.appendSlice(self.arena, first);
-                try buf.append(self.arena, '(');
-                try buf.appendSlice(self.arena, arg_col orelse "*");
-                try buf.append(self.arena, ')');
-                break :blk try buf.toOwnedSlice(self.arena);
-            });
-            return ProjItem{
-                .name = alias,
-                .kind = .{ .agg = .{ .func = func, .col = arg_col } },
-            };
+            // Try aggregate first; fall through to scalar otherwise.
+            if (aggForName(first)) |func| {
+                return try self.finishAggCall(first, func);
+            }
+            // Scalar function call → record as an Expr; lowered to a
+            // Compute step later.
+            const expr = try self.finishScalarCall(first);
+            const default_name = try self.exprDefaultName(expr);
+            const alias = try self.maybeAlias(default_name);
+            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
 
         // Qualified column? `table.col` — for the parser's v1 we accept
@@ -328,6 +348,104 @@ const Parser = struct {
         const dup_col = try self.arena.dupe(u8, col_name);
         const alias = try self.maybeAlias(dup_col);
         return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
+    }
+
+    /// Finish parsing an aggregate call after seeing `funcname (`. Cursor
+    /// is positioned on whatever follows the open paren.
+    fn finishAggCall(self: *Parser, func_name: []const u8, func: ir.AggFunc) ParseError!ProjItem {
+        try self.advance(); // consume '('
+        var arg_col: ?[]const u8 = null;
+        if (self.cur.tag == .star) {
+            try self.advance();
+        } else if (self.cur.tag == .identifier) {
+            arg_col = try self.arena.dupe(u8, self.cur.text);
+            try self.advance();
+        } else return ParseError.SqlExpectedIdent;
+        try self.expect(.rparen);
+        const default_name = blk: {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(self.arena);
+            try buf.appendSlice(self.arena, func_name);
+            try buf.append(self.arena, '(');
+            try buf.appendSlice(self.arena, arg_col orelse "*");
+            try buf.append(self.arena, ')');
+            break :blk try buf.toOwnedSlice(self.arena);
+        };
+        const alias = try self.maybeAlias(default_name);
+        return ProjItem{ .name = alias, .kind = .{ .agg = .{ .func = func, .col = arg_col } } };
+    }
+
+    /// Finish parsing a scalar function call (`funcname (args...)`) after
+    /// the lookahead determines it isn't an aggregate. Returns the
+    /// resulting Expr.
+    ///
+    /// v1 restriction: every arg must be a simple column reference. The
+    /// Compute operator doesn't yet evaluate nested calls or literal
+    /// args (those need an expression-evaluator extension; tracked as
+    /// a follow-up). Reject them at parse time with a clear error.
+    fn finishScalarCall(self: *Parser, func_name: []const u8) ParseError!ir.Expr {
+        try self.advance(); // consume '('
+        const fname_dup = try self.arena.dupe(u8, func_name);
+        var args: std.ArrayList(ir.Expr) = .empty;
+        if (self.cur.tag != .rparen) {
+            while (true) {
+                if (self.cur.tag != .identifier) return ParseError.SqlInvalidProjection;
+                const a = try self.parseColRefExpr();
+                try args.append(self.arena, a);
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+        }
+        try self.expect(.rparen);
+        const args_slice = try args.toOwnedSlice(self.arena);
+        return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args_slice } };
+    }
+
+    /// Parse a bare column reference (possibly qualified). Used inside
+    /// scalar function arguments where v1 doesn't yet accept literals
+    /// or nested calls.
+    fn parseColRefExpr(self: *Parser) ParseError!ir.Expr {
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const name = self.cur.text;
+        try self.advance();
+        // Nested function call attempt → reject with the unified projection
+        // error so callers see a clear "v1 doesn't support this" signal.
+        if (self.cur.tag == .lparen) return ParseError.SqlInvalidProjection;
+        // Qualified column? use last segment.
+        var col_name = name;
+        if (self.cur.tag == .dot) {
+            try self.advance();
+            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+            col_name = self.cur.text;
+            try self.advance();
+        }
+        return ir.Expr{ .col_ref = try self.arena.dupe(u8, col_name) };
+    }
+
+    /// Default name when a scalar expression has no AS alias — use the
+    /// function's invocation text. For nested calls, the user really
+    /// should provide an alias; we render a best-effort name from the
+    /// outer call.
+    fn exprDefaultName(self: *Parser, e: ir.Expr) ParseError![]const u8 {
+        switch (e) {
+            .col_ref => |c| return try self.arena.dupe(u8, c),
+            .lit => return try self.arena.dupe(u8, "literal"),
+            .call => |c| {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(self.arena);
+                try buf.appendSlice(self.arena, c.fn_name);
+                try buf.append(self.arena, '(');
+                for (c.args, 0..) |arg, i| {
+                    if (i > 0) try buf.appendSlice(self.arena, ", ");
+                    switch (arg) {
+                        .col_ref => |cn| try buf.appendSlice(self.arena, cn),
+                        else => try buf.appendSlice(self.arena, "..."),
+                    }
+                }
+                try buf.append(self.arena, ')');
+                return try buf.toOwnedSlice(self.arena);
+            },
+        }
     }
 
     fn maybeAlias(self: *Parser, fallback: []const u8) ParseError![]const u8 {
@@ -666,7 +784,8 @@ fn projMatchesGroupByOrder(proj: []const ProjItem, group_cols: []const []const u
             else => return false,
         }
     }
-    // Remaining items must be aggs.
+    // Remaining items must be aggs (expr is rejected upstream when
+    // combined with aggregation).
     while (i < proj.len) : (i += 1) {
         switch (proj[i].kind) {
             .agg => {},

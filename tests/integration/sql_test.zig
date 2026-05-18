@@ -265,6 +265,125 @@ test "sql: IS NULL / IS NOT NULL on nullable column" {
 }
 
 // ---------------------------------------------------------------------------
+// Scalar function calls in SELECT (Compute step)
+// ---------------------------------------------------------------------------
+
+test "sql: scalar function in SELECT — upper(tag)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT id, upper(tag) AS u FROM t");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqualStrings("id", schema[0].name);
+    try std.testing.expectEqualStrings("u", schema[1].name);
+
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(allocator);
+    while (try q.next()) |b| {
+        const sv = b.values[1].data.string;
+        for (0..b.row_count) |i| {
+            try seen.appendSlice(allocator, sv.rowBytes(i));
+            try seen.append(allocator, '|');
+        }
+    }
+    try std.testing.expectEqualStrings("A|B|A|B|C|", seen.items);
+}
+
+test "sql: scalar function default alias derived from call form" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT length(tag) FROM t");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqualStrings("length(tag)", schema[0].name);
+}
+
+test "sql: scalar function with single col-ref arg + WHERE + ORDER BY" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT id, length(tag) AS taglen
+        \\FROM t
+        \\WHERE k >= 200
+        \\ORDER BY id ASC
+    );
+    defer q.deinit();
+    var got_ids: std.ArrayList(i64) = .empty;
+    defer got_ids.deinit(allocator);
+    var got_lens: std.ArrayList(i32) = .empty;
+    defer got_lens.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try got_ids.append(allocator, v);
+        for (b.values[1].data.int[0..b.row_count]) |v| try got_lens.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4, 5 }, got_ids.items);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 1, 1 }, got_lens.items);
+}
+
+test "sql: literal-arg scalar function rejected — col_ref-only restriction" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // v1 of the SQL parser only allows col_ref args in scalar calls
+    // (the Compute operator's restriction — task #154 lifts it).
+    const res = runSql(allocator, db, "SELECT lpad(tag, 3, '_') FROM t");
+    try std.testing.expectError(thindb.sql.ParseError.SqlInvalidProjection, res);
+}
+
+test "sql: nested call rejected — col_ref-only restriction" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const res = runSql(allocator, db, "SELECT length(upper(tag)) FROM t");
+    try std.testing.expectError(thindb.sql.ParseError.SqlInvalidProjection, res);
+}
+
+test "sql: scalar functions disallowed alongside aggregates (v1 limit)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // The parser currently errors when a scalar expression sits in
+    // the same SELECT list as an aggregate or a GROUP BY query.
+    const res = runSql(allocator, db,
+        \\SELECT upper(tag), count(*) FROM t GROUP BY tag
+    );
+    try std.testing.expectError(thindb.sql.ParseError.SqlMixedAggAndPlainProjection, res);
+}
+
+// ---------------------------------------------------------------------------
 // JOIN support
 // ---------------------------------------------------------------------------
 
