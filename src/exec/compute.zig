@@ -52,47 +52,49 @@ pub const Derived = struct {
     expr: Expr,
 };
 
-/// Where a function-call arg's row data comes from at exec time.
-const ArgSource = union(enum) {
-    /// Index into the upstream batch's values.
-    col_idx: usize,
-    /// Index into the call's `lit_buffers` — a ColumnStore that's
-    /// refilled with row_count copies of the literal each batch.
-    lit_idx: usize,
+/// One argument to a function call inside the resolved expression
+/// tree. Args can be: an upstream column reference, a literal (which
+/// materializes as a per-batch replicated constant column), or a
+/// nested function call (which evaluates recursively).
+const ArgPlan = union(enum) {
+    col: usize,
+    lit: *LitSlot,
+    call: *CallPlan,
 };
 
-/// Resolved per-derived plan: either a function call (each arg sourced
-/// from an upstream col or a literal-replicated buffer), or a simple
-/// column rename.
-///
-/// `arg_casts` is populated only when at least one arg needs implicit
-/// coercion (e.g. `mod(int_col, bigint_col)` routes to the (bigint,
-/// bigint) overload via a cast on arg 0). Per-arg slot is null when
-/// that arg type already matches the overload — only the args that
-/// differ pay any runtime cost.
-///
-/// `cast_buffers` parallels `arg_casts`: a scratch ColumnStore is
-/// allocated once per coerced arg at Compute init time, then refilled
-/// (clear + cast kernel) per batch. Non-coerced slots stay empty.
-///
-/// `lit_buffers` parallels `arg_sources` for `.lit_idx` entries: a
-/// long-lived ColumnStore (typed to the literal) is refilled with
-/// row_count copies of the literal value at each batch.
+/// Per-literal scratch — typed ColumnStore refilled each batch with
+/// `row_count` copies of `value`.
+const LitSlot = struct {
+    value: types.Value,
+    buf: ColumnStore,
+};
+
+/// Resolved call node: ScalarFn + per-arg evaluation plan + optional
+/// coercion machinery + output buffer. Roots of derived columns
+/// alias `Compute.derived_cols[i]` as their output (avoids one copy);
+/// internal nodes own their scratch.
+const CallPlan = struct {
+    func: ScalarFn,
+    args: []ArgPlan,
+    arg_casts: ?[]const ?CastKernel,
+    cast_buffers: ?[]?ColumnStore,
+    /// Where this call writes its result. Aliased to a parent slot
+    /// (derived_cols[i] at the root) OR owned scratch (internal nodes).
+    /// `output_owned = true` means Compute.deinit will free it.
+    output: *ColumnStore,
+    output_owned: bool,
+    output_type: Type,
+};
+
+/// Resolved per-derived plan: rename, literal-only (constant column),
+/// or a function-call tree.
 const ResolvedDerived = struct {
     name: []const u8,
     output_type: Type,
     kind: union(enum) {
         rename: struct { src_idx: usize },
-        call: struct {
-            func: ScalarFn,
-            arg_sources: []const ArgSource,
-            arg_casts: ?[]const ?CastKernel,
-            cast_buffers: ?[]?ColumnStore,
-            /// Indexed by `ArgSource.lit_idx`; the parallel `lit_values`
-            /// holds the literal payloads to replicate each batch.
-            lit_buffers: []ColumnStore,
-            lit_values: []const types.Value,
-        },
+        lit_only: *LitSlot,
+        call: *CallPlan,
     },
 };
 
@@ -190,17 +192,9 @@ pub const Compute = struct {
         self.allocator.free(self.derived_cols);
         for (self.derived) |r| {
             switch (r.kind) {
-                .call => |c| {
-                    if (c.cast_buffers) |buffers| {
-                        for (buffers) |*slot| {
-                            if (slot.*) |*cs| cs.deinit(self.allocator);
-                        }
-                        self.allocator.free(buffers);
-                    }
-                    for (c.lit_buffers) |*buf| buf.deinit(self.allocator);
-                    self.allocator.free(c.lit_buffers);
-                },
-                else => {},
+                .call => |plan| freeCallPlan(self.allocator, plan),
+                .lit_only => |slot| slot.buf.deinit(self.allocator),
+                .rename => {},
             }
         }
         self.allocator.free(self.output_schema);
@@ -243,61 +237,22 @@ pub const Compute = struct {
         const in = (try self.upstream.next()) orelse return null;
         const n = in.row_count;
 
-        for (self.derived, self.derived_cols, 0..) |r, *out_col, di| {
+        for (self.derived, self.derived_cols) |r, *out_col| {
             out_col.clear();
             switch (r.kind) {
                 .rename => |rn| try appendCopiedColumn(self.allocator, out_col, in.values[rn.src_idx], n),
-                .call => |c| {
-                    // Refill literal buffers for this batch: each one
-                    // holds `n` copies of its literal value so the
-                    // kernel sees a uniformly-sized column view.
-                    for (c.lit_buffers, c.lit_values) |*buf, v| {
-                        buf.clear();
-                        try fillLiteralColumn(self.allocator, buf, v, n);
-                    }
-
-                    // Gather arg views — sources are either upstream
-                    // columns or refilled literal buffers.
-                    var arg_views_buf: [16]ColumnView = undefined;
-                    if (c.arg_sources.len > arg_views_buf.len) return Error.ComputeTooManyArgs;
-                    const arg_views = arg_views_buf[0..c.arg_sources.len];
-                    for (c.arg_sources, arg_views) |src, *view| {
-                        view.* = switch (src) {
-                            .col_idx => |idx| in.values[idx],
-                            .lit_idx => |idx| c.lit_buffers[idx].view(),
-                        };
-                    }
-
-                    // Apply implicit casts in place: for each coerced arg,
-                    // refill the scratch ColumnStore from the upstream
-                    // view, then swap the cast view into arg_views.
-                    if (c.arg_casts) |casts| {
-                        const buffers = c.cast_buffers.?;
-                        var one_cast_view: [1]ColumnView = undefined;
-                        for (casts, buffers, 0..) |kfn, *buf_slot, arg_i| {
-                            const k = kfn orelse continue;
-                            const buf = &buf_slot.*.?;
-                            buf.clear();
-                            one_cast_view[0] = arg_views[arg_i];
-                            try k(self.allocator, &one_cast_view, buf, n);
-                            arg_views[arg_i] = buf.view();
-                        }
-                    }
-
-                    try c.func.kernel(self.allocator, arg_views, out_col, n);
-
-                    // Null bookkeeping. Skip when output isn't nullable
-                    // (e.g. neither input nullable, propagates strategy).
-                    if (out_col.nulls != null) {
-                        switch (c.func.null_strategy) {
-                            .propagates => try writePropagatedNulls(self.allocator, out_col, arg_views, n),
-                            .absorbs => try writeAbsorbedNulls(self.allocator, out_col, arg_views, n),
-                            .kernel_managed => {}, // kernel already wrote the bitmap
-                        }
-                    }
+                .lit_only => |slot| {
+                    slot.buf.clear();
+                    try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
+                    try appendCopiedColumn(self.allocator, out_col, slot.buf.view(), n);
+                },
+                .call => |plan| {
+                    try self.evalCall(plan, in.values, n);
+                    // Root's owned output → derived_cols slot. Copies
+                    // both data + validity (transform.appendAllColumn).
+                    try appendCopiedColumn(self.allocator, out_col, plan.output.view(), n);
                 },
             }
-            _ = di;
         }
 
         for (in.values, 0..) |v, i| self.views[i] = v;
@@ -308,6 +263,64 @@ pub const Compute = struct {
             .values = self.views,
             .row_count = n,
         };
+    }
+
+    /// Recursively evaluate one CallPlan into its `output` ColumnStore.
+    /// Post-order: literals refill, sub-calls evaluate first; then args
+    /// are coerced and the kernel runs. Null bookkeeping fires at every
+    /// level so `length(upper(tag))` with a NULL tag produces NULL.
+    fn evalCall(self: *Compute, plan: *CallPlan, in_values: []const ColumnView, n: usize) !void {
+        // Output buffer is cleared by the caller for the root; for
+        // internal nodes we clear before refilling here.
+        if (plan.output_owned) plan.output.clear();
+
+        // 1. Evaluate each arg (post-order). Build per-arg ColumnViews.
+        var arg_views_buf: [16]ColumnView = undefined;
+        if (plan.args.len > arg_views_buf.len) return Error.ComputeTooManyArgs;
+        const arg_views = arg_views_buf[0..plan.args.len];
+        for (plan.args, arg_views) |arg, *view| {
+            switch (arg) {
+                .col => |idx| view.* = in_values[idx],
+                .lit => |slot| {
+                    slot.buf.clear();
+                    try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
+                    view.* = slot.buf.view();
+                },
+                .call => |sub| {
+                    try self.evalCall(sub, in_values, n);
+                    view.* = sub.output.view();
+                },
+            }
+        }
+
+        // 2. Apply implicit casts.
+        if (plan.arg_casts) |casts| {
+            const buffers = plan.cast_buffers.?;
+            var one_cast_view: [1]ColumnView = undefined;
+            for (casts, buffers, 0..) |kfn, *buf_slot, arg_i| {
+                const k = kfn orelse continue;
+                const buf = &buf_slot.*.?;
+                buf.clear();
+                one_cast_view[0] = arg_views[arg_i];
+                try k(self.allocator, &one_cast_view, buf, n);
+                arg_views[arg_i] = buf.view();
+            }
+        }
+
+        // 3. Run the kernel.
+        try plan.func.kernel(self.allocator, arg_views, plan.output, n);
+
+        // 4. Null bookkeeping. Internal calls always have a nullable
+        // output (we allocated it that way) so the parent's null-check
+        // sees correct validity; root calls only write when their
+        // declared schema column is nullable.
+        if (plan.output.nulls != null) {
+            switch (plan.func.null_strategy) {
+                .propagates => try writePropagatedNulls(self.allocator, plan.output, arg_views, n),
+                .absorbs => try writeAbsorbedNulls(self.allocator, plan.output, arg_views, n),
+                .kernel_managed => {}, // kernel already wrote the bitmap
+            }
+        }
     }
 };
 
@@ -330,74 +343,132 @@ fn resolveDerived(
                 .kind = .{ .rename = .{ .src_idx = idx } },
             };
         },
-        .lit => return Error.ComputeUnsupportedExpr, // v1: no literal-only derived (use a wrapping function call)
-        .call => |c| {
-            // v1 of the call path: each arg is either a column ref OR
-            // a literal. Nested calls still rejected (task #154 covers
-            // the recursive evaluator).
-            const arg_sources = try aa.alloc(ArgSource, c.args.len);
-            const arg_types = try aa.alloc(Type, c.args.len);
-            var lit_values: std.ArrayList(types.Value) = .empty;
-            for (c.args, 0..) |arg, i| {
-                switch (arg) {
-                    .col_ref => |aname| {
-                        const idx = columnIndex(up_schema, aname) orelse return Error.ColumnNotFound;
-                        arg_sources[i] = .{ .col_idx = idx };
-                        arg_types[i] = up_schema[idx].type;
-                    },
-                    .lit => |v| {
-                        const lit_idx = lit_values.items.len;
-                        try lit_values.append(aa, v);
-                        arg_sources[i] = .{ .lit_idx = lit_idx };
-                        arg_types[i] = literalType(v);
-                    },
-                    .call => return Error.ComputeUnsupportedExpr, // nested calls: task #154
-                }
-            }
-            const r = (try scalar_fn.resolve(aa, c.fn_name, arg_types)) orelse return Error.ComputeNoSuchOverload;
-
-            // Long-lived literal buffers — refilled per batch.
-            const lit_values_slice = try lit_values.toOwnedSlice(aa);
-            const lit_buffers = try runtime_allocator.alloc(ColumnStore, lit_values_slice.len);
-            errdefer runtime_allocator.free(lit_buffers);
-            for (lit_values_slice, lit_buffers) |v, *buf| {
-                buf.* = try ColumnStore.init(runtime_allocator, literalType(v), false);
-            }
-
-            // Allocate scratch ColumnStores only for the args that
-            // actually need coercion. The buffers themselves live on
-            // the runtime allocator (the long-lived parent of `aa`)
-            // so they outlive the resolve phase; `cast_buffers`
-            // metadata is in the arena.
-            var cast_buffers: ?[]?ColumnStore = null;
-            if (r.arg_casts) |casts| {
-                const buffers = try runtime_allocator.alloc(?ColumnStore, casts.len);
-                for (casts, r.func.arg_types, arg_sources, buffers) |k, declared, src, *slot| {
-                    if (k == null) {
-                        slot.* = null;
-                        continue;
-                    }
-                    const src_nullable = switch (src) {
-                        .col_idx => |idx| up_schema[idx].nullable,
-                        .lit_idx => false, // literals are always non-null
-                    };
-                    slot.* = try ColumnStore.init(runtime_allocator, declared, src_nullable);
-                }
-                cast_buffers = buffers;
-            }
+        .lit => |v| {
+            const slot = try aa.create(LitSlot);
+            slot.* = .{
+                .value = v,
+                .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
+            };
             return .{
                 .name = try aa.dupe(u8, d.name),
-                .output_type = r.func.return_type,
-                .kind = .{ .call = .{
-                    .func = r.func,
-                    .arg_sources = arg_sources,
-                    .arg_casts = r.arg_casts,
-                    .cast_buffers = cast_buffers,
-                    .lit_buffers = lit_buffers,
-                    .lit_values = lit_values_slice,
-                } },
+                .output_type = literalType(v),
+                .kind = .{ .lit_only = slot },
             };
         },
+        .call => {
+            const plan = try buildCallPlan(runtime_allocator, aa, d.expr, up_schema);
+            return .{
+                .name = try aa.dupe(u8, d.name),
+                .output_type = plan.output_type,
+                .kind = .{ .call = plan },
+            };
+        },
+    }
+}
+
+/// Recursively resolve an Expr into a CallPlan. The Expr must be a
+/// `.call` at the entry point; nested args may themselves be calls,
+/// literals, or column refs.
+///
+/// Every CallPlan — root or internal — owns its output ColumnStore.
+/// At eval time the operator memcpy's the root's output into the
+/// derived_cols slot. Keeps the resolver shape simple at the cost of
+/// one bulk copy per derived column per batch (cheap relative to
+/// kernel work).
+fn buildCallPlan(
+    runtime_allocator: Allocator,
+    aa: Allocator,
+    expr: Expr,
+    up_schema: []const Column,
+) !*CallPlan {
+    const c = switch (expr) {
+        .call => |x| x,
+        else => return Error.ComputeUnsupportedExpr,
+    };
+
+    const arg_plans = try aa.alloc(ArgPlan, c.args.len);
+    const arg_types = try aa.alloc(Type, c.args.len);
+    for (c.args, 0..) |arg, i| {
+        switch (arg) {
+            .col_ref => |name| {
+                const idx = columnIndex(up_schema, name) orelse return Error.ComputeUnsupportedExpr;
+                arg_plans[i] = .{ .col = idx };
+                arg_types[i] = up_schema[idx].type;
+            },
+            .lit => |v| {
+                const slot = try aa.create(LitSlot);
+                slot.* = .{
+                    .value = v,
+                    .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
+                };
+                arg_plans[i] = .{ .lit = slot };
+                arg_types[i] = literalType(v);
+            },
+            .call => {
+                const sub = try buildCallPlan(runtime_allocator, aa, arg, up_schema);
+                arg_plans[i] = .{ .call = sub };
+                arg_types[i] = sub.output_type;
+            },
+        }
+    }
+
+    const r = (try scalar_fn.resolve(aa, c.fn_name, arg_types)) orelse return Error.ComputeNoSuchOverload;
+
+    // Cast scratch buffers (one per coerced arg).
+    var cast_buffers: ?[]?ColumnStore = null;
+    if (r.arg_casts) |casts| {
+        const buffers = try runtime_allocator.alloc(?ColumnStore, casts.len);
+        for (casts, r.func.arg_types, arg_plans, buffers) |k, declared, ap, *slot| {
+            if (k == null) {
+                slot.* = null;
+                continue;
+            }
+            const src_nullable = switch (ap) {
+                .col => |idx| up_schema[idx].nullable,
+                .lit => false,
+                // Sub-call outputs are nullable (allocated below).
+                .call => true,
+            };
+            slot.* = try ColumnStore.init(runtime_allocator, declared, src_nullable);
+        }
+        cast_buffers = buffers;
+    }
+
+    // Own a nullable output ColumnStore so the next level up's null
+    // propagation can see the correct validity bits.
+    const output_buf = try runtime_allocator.create(ColumnStore);
+    output_buf.* = try ColumnStore.init(runtime_allocator, r.func.return_type, true);
+
+    const plan = try aa.create(CallPlan);
+    plan.* = .{
+        .func = r.func,
+        .args = arg_plans,
+        .arg_casts = r.arg_casts,
+        .cast_buffers = cast_buffers,
+        .output = output_buf,
+        .output_owned = true,
+        .output_type = r.func.return_type,
+    };
+    return plan;
+}
+
+/// Walk a CallPlan and release every runtime-allocated buffer
+/// (cast scratches, owned outputs, recursive sub-calls' buffers).
+/// Called from Compute.deinit. The CallPlan struct itself lives in
+/// the arena and is freed there.
+fn freeCallPlan(runtime_allocator: Allocator, plan: *CallPlan) void {
+    for (plan.args) |arg| switch (arg) {
+        .col => {},
+        .lit => |slot| slot.buf.deinit(runtime_allocator),
+        .call => |sub| freeCallPlan(runtime_allocator, sub),
+    };
+    if (plan.cast_buffers) |buffers| {
+        for (buffers) |*slot| if (slot.*) |*cs| cs.deinit(runtime_allocator);
+        runtime_allocator.free(buffers);
+    }
+    if (plan.output_owned) {
+        plan.output.deinit(runtime_allocator);
+        runtime_allocator.destroy(plan.output);
     }
 }
 
@@ -436,24 +507,25 @@ fn columnIndex(schema: []const Column, name: []const u8) ?usize {
 fn derivedNullable(r: ResolvedDerived, up_schema: []const Column) bool {
     return switch (r.kind) {
         .rename => |rn| up_schema[rn.src_idx].nullable,
-        .call => |c| blk: {
-            // .absorbs: can produce null from all-null inputs.
-            // .kernel_managed: kernel decides per-row, may emit null
-            // even on non-null inputs (e.g. nullif).
-            // Either way → always nullable.
-            switch (c.func.null_strategy) {
-                .absorbs, .kernel_managed => break :blk true,
-                .propagates => {},
-            }
-            for (c.arg_sources) |src| {
-                switch (src) {
-                    .col_idx => |idx| if (up_schema[idx].nullable) break :blk true,
-                    .lit_idx => {}, // literals are non-null
-                }
-            }
-            break :blk false;
-        },
+        .lit_only => false, // literal-only derived: constant column, never null
+        .call => |plan| callPlanNullable(plan, up_schema),
     };
+}
+
+/// Walks a CallPlan tree and reports whether the result column is
+/// nullable. Conservative: any null-producing path makes the column
+/// nullable. Mirrors the eval-time null bookkeeping decision.
+fn callPlanNullable(plan: *CallPlan, up_schema: []const Column) bool {
+    switch (plan.func.null_strategy) {
+        .absorbs, .kernel_managed => return true,
+        .propagates => {},
+    }
+    for (plan.args) |arg| switch (arg) {
+        .col => |idx| if (up_schema[idx].nullable) return true,
+        .lit => {},
+        .call => |sub| if (callPlanNullable(sub, up_schema)) return true,
+    };
+    return false;
 }
 
 // ---------------------------------------------------------------------------

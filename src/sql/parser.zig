@@ -398,11 +398,30 @@ const Parser = struct {
         return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args_slice } };
     }
 
-    /// One argument to a scalar function call. v1 accepts col_ref +
-    /// literal; nested calls rejected.
+    /// One argument to a scalar function call — column ref, literal,
+    /// or nested scalar call. Aggregates can't nest inside any call.
     fn parseCallArg(self: *Parser) ParseError!ir.Expr {
         switch (self.cur.tag) {
-            .identifier => return try self.parseColRefExpr(),
+            .identifier => {
+                const name = self.cur.text;
+                try self.advance();
+                if (self.cur.tag == .lparen) {
+                    // Nested call. Aggregates aren't allowed here per
+                    // standard SQL — they belong at the top level of
+                    // the SELECT list.
+                    if (aggForName(name)) |_| return ParseError.SqlInvalidProjection;
+                    return try self.finishScalarCall(name);
+                }
+                // Qualified column? use last segment.
+                var col_name = name;
+                if (self.cur.tag == .dot) {
+                    try self.advance();
+                    if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+                    col_name = self.cur.text;
+                    try self.advance();
+                }
+                return ir.Expr{ .col_ref = try self.arena.dupe(u8, col_name) };
+            },
             .integer, .floating, .string, .kw_true, .kw_false => {
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
@@ -411,15 +430,13 @@ const Parser = struct {
         }
     }
 
-    /// Parse a bare column reference (possibly qualified).
+    /// Parse a bare column reference (possibly qualified). Used inside
+    /// contexts that don't accept full expressions.
     fn parseColRefExpr(self: *Parser) ParseError!ir.Expr {
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const name = self.cur.text;
         try self.advance();
-        // Nested function call attempt → reject with the unified projection
-        // error so callers see a clear "v1 doesn't support this" signal.
         if (self.cur.tag == .lparen) return ParseError.SqlInvalidProjection;
-        // Qualified column? use last segment.
         var col_name = name;
         if (self.cur.tag == .dot) {
             try self.advance();

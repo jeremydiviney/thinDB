@@ -369,7 +369,7 @@ test "sql: scalar function with literal args (Compute literal-buffer path)" {
     try std.testing.expectEqualStrings("__a|__b|__c|", got.items);
 }
 
-test "sql: nested call rejected — col_ref-only restriction" {
+test "sql: nested scalar calls — length(upper(tag))" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -378,7 +378,51 @@ test "sql: nested call rejected — col_ref-only restriction" {
     defer db.close();
     _ = try seedT(db);
 
-    const res = runSql(allocator, db, "SELECT length(upper(tag)) FROM t");
+    var q = try runSql(allocator, db, "SELECT length(upper(tag)) AS n FROM t");
+    defer q.deinit();
+    var lens: std.ArrayList(i32) = .empty;
+    defer lens.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.int[0..b.row_count]) |v| try lens.append(allocator, v);
+    }
+    // All five tags are single-char → length 1 each.
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 1, 1, 1, 1 }, lens.items);
+}
+
+test "sql: nested call with literal arg — lpad(upper(tag), 3, '_')" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT lpad(upper(tag), 3, '_') AS p FROM t ORDER BY id ASC");
+    defer q.deinit();
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(allocator);
+    while (try q.next()) |b| {
+        const sv = b.values[0].data.string;
+        for (0..b.row_count) |i| {
+            try got.appendSlice(allocator, sv.rowBytes(i));
+            try got.append(allocator, '|');
+        }
+    }
+    try std.testing.expectEqualStrings("__A|__B|__A|__B|__C|", got.items);
+}
+
+test "sql: nested aggregate-inside-scalar rejected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // Aggregates inside scalar calls aren't allowed.
+    const res = runSql(allocator, db, "SELECT upper(count(*)) FROM t");
     try std.testing.expectError(thindb.sql.ParseError.SqlInvalidProjection, res);
 }
 
