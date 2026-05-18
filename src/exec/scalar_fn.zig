@@ -315,6 +315,17 @@ pub const builtins = [_]ScalarFn{
     // --- coalesce / ifnull (double overload — int families coerce here via cast.zig) ---
     .{ .name = "coalesce", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .absorbs, .kernel = coalesceDoubleKernel },
     .{ .name = "ifnull", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .absorbs, .kernel = ifnullDoubleKernel },
+
+    // --- date_format: MySQL-style strftime subset ---
+    .{ .name = "date_format", .arg_types = &.{ .datetime, .string }, .return_type = .string, .kernel = dateFormatDatetimeKernel },
+    .{ .name = "date_format", .arg_types = &.{ .date, .string }, .return_type = .string, .kernel = dateFormatDateKernel },
+
+    // --- MySQL aliases over existing kernels (zero new code) ---
+    .{ .name = "lcase", .arg_types = &.{.string}, .return_type = .string, .kernel = lowerKernel },
+    .{ .name = "ucase", .arg_types = &.{.string}, .return_type = .string, .kernel = upperKernel },
+    .{ .name = "power", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = powKernel },
+    .{ .name = "ceiling", .arg_types = &.{.double}, .return_type = .double, .kernel = ceilKernel },
+    .{ .name = "chr", .arg_types = &.{.int}, .return_type = .string, .kernel = chrKernel },
 };
 
 // ---------------------------------------------------------------------------
@@ -1659,6 +1670,123 @@ fn ifnullDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
     }
 }
 
+// ---------------------------------------------------------------------------
+// chr(int) — inverse of ascii. Out-of-range / negative input → empty string.
+// ---------------------------------------------------------------------------
+fn chrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const codes = args[0].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const c = codes[i];
+        if (c < 0 or c > 255) {
+            try ss.appendValue(allocator, "");
+        } else {
+            const b: [1]u8 = .{@intCast(c)};
+            try ss.appendValue(allocator, &b);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// date_format — MySQL-style strftime. Recognised specifiers:
+//   %Y  4-digit year   %y  2-digit year (last two digits)
+//   %m  month 01-12    %d  day 01-31
+//   %H  hour 00-23     %i  minute 00-59  %s  second 00-59
+//   %%  literal '%'
+// Other %X sequences pass through with the '%' stripped (matches MySQL's
+// "unknown specifier" behavior); bare text is copied verbatim.
+//
+// Per-row format strings are allowed but rare — most callers pass a literal
+// format. We don't precompile (would require constant folding); each row
+// re-parses, which is fine at ~few hundred ns per row.
+// ---------------------------------------------------------------------------
+
+fn appendDigits2(buf: *std.ArrayList(u8), aa: Allocator, v: u64) !void {
+    try buf.append(aa, @intCast('0' + (v / 10) % 10));
+    try buf.append(aa, @intCast('0' + (v % 10)));
+}
+
+fn appendDigits4(buf: *std.ArrayList(u8), aa: Allocator, v: u64) !void {
+    try buf.append(aa, @intCast('0' + (v / 1000) % 10));
+    try buf.append(aa, @intCast('0' + (v / 100) % 10));
+    try buf.append(aa, @intCast('0' + (v / 10) % 10));
+    try buf.append(aa, @intCast('0' + (v % 10)));
+}
+
+fn dateFormatRow(
+    allocator: Allocator,
+    out: *ColumnStore,
+    fmt: []const u8,
+    days: i32,
+    micros_into_day: i64,
+) !void {
+    const ymd_opt = daysToYmd(days);
+    var hh: u32 = 0;
+    var mm: u32 = 0;
+    var ss_v: u32 = 0;
+    if (micros_into_day >= 0) {
+        const total_secs = @divTrunc(micros_into_day, 1_000_000);
+        hh = @intCast(@divTrunc(total_secs, 3600));
+        mm = @intCast(@mod(@divTrunc(total_secs, 60), 60));
+        ss_v = @intCast(@mod(total_secs, 60));
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < fmt.len) {
+        if (fmt[i] != '%') {
+            try buf.append(allocator, fmt[i]);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= fmt.len) {
+            // Trailing '%' with no specifier — emit as literal.
+            try buf.append(allocator, '%');
+            i += 1;
+            continue;
+        }
+        const spec = fmt[i + 1];
+        i += 2;
+        switch (spec) {
+            'Y' => if (ymd_opt) |ymd| try appendDigits4(&buf, allocator, ymd.year) else try buf.appendSlice(allocator, "0000"),
+            'y' => if (ymd_opt) |ymd| try appendDigits2(&buf, allocator, @as(u64, ymd.year) % 100) else try buf.appendSlice(allocator, "00"),
+            'm' => if (ymd_opt) |ymd| try appendDigits2(&buf, allocator, ymd.month) else try buf.appendSlice(allocator, "00"),
+            'd' => if (ymd_opt) |ymd| try appendDigits2(&buf, allocator, ymd.day) else try buf.appendSlice(allocator, "00"),
+            'H' => try appendDigits2(&buf, allocator, hh),
+            'i' => try appendDigits2(&buf, allocator, mm),
+            's' => try appendDigits2(&buf, allocator, ss_v),
+            '%' => try buf.append(allocator, '%'),
+            else => try buf.append(allocator, spec), // unknown: pass through stripped
+        }
+    }
+
+    try stringStoreOf(out).appendValue(allocator, buf.items);
+}
+
+fn dateFormatDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const dts = args[0].data.datetime;
+    const fmt_sv = stringViewOf(args[1]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const micros = dts[i];
+        const days = daysFromDatetime(micros);
+        const micros_into_day = @mod(micros, std.time.us_per_day);
+        try dateFormatRow(allocator, out, fmt_sv.rowBytes(i), days, micros_into_day);
+    }
+}
+
+fn dateFormatDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ds = args[0].data.date;
+    const fmt_sv = stringViewOf(args[1]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        try dateFormatRow(allocator, out, fmt_sv.rowBytes(i), ds[i], 0);
+    }
+}
+
 const expr_mod = @import("expr.zig");
 
 pub fn upper(arena: Allocator, arg: Expr) !Expr {
@@ -1788,5 +1916,13 @@ pub fn dayofweek(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena
 pub fn dayofyear(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "dayofyear", &.{arg}); }
 pub fn quarter(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "quarter", &.{arg}); }
 pub fn lastDay(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "last_day", &.{arg}); }
+pub fn dateFormat(arena: Allocator, dt: Expr, fmt: Expr) !Expr { return expr_mod.call(arena, "date_format", &.{ dt, fmt }); }
+
+// --- MySQL aliases / one-off additions ---
+pub fn lcase(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "lcase", &.{arg}); }
+pub fn ucase(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "ucase", &.{arg}); }
+pub fn power(arena: Allocator, a: Expr, b: Expr) !Expr { return expr_mod.call(arena, "power", &.{ a, b }); }
+pub fn ceiling(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "ceiling", &.{arg}); }
+pub fn chr(arena: Allocator, arg: Expr) !Expr { return expr_mod.call(arena, "chr", &.{arg}); }
 
 // Tests live in scalar_fn_test.zig (companion).

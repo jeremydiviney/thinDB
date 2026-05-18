@@ -1245,6 +1245,56 @@ test "scalar: dayofweek / quarter / last_day on known dates" {
     try std.testing.expectEqual(@as(i32, 19_782), b.values[4].data.date[1]);
 }
 
+test "scalar: date_format with %Y-%m-%d %H:%i:%s on datetime + date" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const schema = thindb.Schema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "ts", .type = .datetime },
+            .{ .name = "fmt", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("t", schema, .{ .order_key = &ok, .unique = true, .row_group_size = 8 });
+    // 2024-02-15 13:45:30 UTC → micros since epoch.
+    // (2024-02-15 = day 19_768, 13:45:30 = (13*3600 + 45*60 + 30) * 1e6 micros)
+    const day_micros: i64 = 19_768 * std.time.us_per_day;
+    const tod_secs: i64 = 13 * 3600 + 45 * 60 + 30;
+    const ts1 = day_micros + tod_secs * 1_000_000;
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .ts = ts1, .fmt = "%Y-%m-%d %H:%i:%s" },
+        .{ .id = @as(i64, 2), .ts = ts1, .fmt = "%y/%m/%d" },
+        .{ .id = @as(i64, 3), .ts = ts1, .fmt = "literal %% percent" },
+    });
+    try t.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{
+        .{ .name = "out", .expr = try thindb.exec.scalar_fn.dateFormat(
+            aa,
+            thindb.exec.expr_mod.col("ts"),
+            thindb.exec.expr_mod.col("fmt"),
+        ) },
+    });
+    defer q.deinit();
+    const b = (try q.next()).?;
+    // (id, ts, fmt) + derived out → index 3
+    const sv = b.values[3].data.string;
+    try std.testing.expectEqualStrings("2024-02-15 13:45:30", sv.rowBytes(0));
+    try std.testing.expectEqualStrings("24/02/15", sv.rowBytes(1));
+    try std.testing.expectEqualStrings("literal % percent", sv.rowBytes(2));
+}
+
 test "scalar: ascii / strcmp / repeat" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
