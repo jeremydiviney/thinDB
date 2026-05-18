@@ -13,66 +13,66 @@ To regenerate: `zig build bench -Doptimize=ReleaseFast`.
 
 | Operation | Time | Throughput | ns/row |
 |---|---:|---:|---:|
-| insert memtable | 48 ms | 21 M rows/s | 48 |
-| insert + flush | 85 ms | 12 M rows/s | 85 |
+| insert memtable | 49 ms | 20 M rows/s | 49 |
+| insert + flush | 88 ms | 11 M rows/s | 88 |
 | sustained insert (1000 × 1k → 100 segs) | 179 ms | 5.6 M rows/s | 179 |
-| scan flushed | 19 ms | 52 M rows/s | 19 |
-| scan cold (cache populating) | 18 ms | 56 M rows/s | 18 |
-| scan warm (cache hits) | 15 ms | 67 M rows/s | 15 |
-| filter `qty > 50` (non-order-key, 49% match) | 23 ms | 43 M rows/s | 23 |
-| filter `id < 50k` (order-key, narrow, 5% match) | 6 ms | **165 M rows/s** | 6 |
-| filter `id >= N/2` (order-key, 50% match) | 16 ms | 64 M rows/s | 16 |
+| scan flushed | 16 ms | 62 M rows/s | 16 |
+| scan cold (cache populating) | 17 ms | 58 M rows/s | 17 |
+| scan warm (cache hits) | 15 ms | 68 M rows/s | 15 |
+| filter `qty > 50` (non-order-key, 49% match) | 23 ms | 44 M rows/s | 23 |
+| filter `id < 50k` (order-key, narrow, 5% match) | 6 ms | **177 M rows/s** | 6 |
+| filter `id >= N/2` (order-key, 50% match) | 17 ms | 60 M rows/s | 17 |
 | aggregate count + sum + min + max | 18 ms | 55 M rows/s | 18 |
-| groupBy tag (8 groups), count + sum | 32 ms | 31 M rows/s | 32 |
+| groupBy tag (8 groups), count + sum | 34 ms | 30 M rows/s | 34 |
 
 ## Flush internals (1 M rows)
 
 | Phase | Time | Notes |
 |---|---:|---|
 | sort | 12 ms | pdqsort |
-| zstd compress (level 3) | 17 ms (alone) | 20.7 MB → 3.7 MB, **5.66× ratio** |
+| zstd compress (level 3) | 14 ms (alone) | 20.7 MB → 3.7 MB, **5.66× ratio** |
 | segment write to disk | 1–4 ms typical | NVMe ~3 GB/s for segment-sized writes |
-| total flush | 37 ms | 558 MB/s raw throughput |
+| total flush | 36 ms | 581 MB/s raw throughput |
 
 ## TCP transport (in-process Connection vs above)
 
 | Operation | TCP | In-process | TCP overhead |
 |---|---:|---:|---:|
-| scan | 22 ms | 19 ms | ~16% |
-| insert (memtable) | 43 ms | 48 ms | none (effectively parallel) |
-| insert + flush | 81 ms | 85 ms | none |
+| scan | 23 ms | 16 ms | ~40% |
+| insert (memtable) | 44 ms | 49 ms | none (effectively parallel) |
+| insert + flush | 82 ms | 88 ms | none |
 
 ## Durability
 
 | Mode | 1 M rows insert + flush | Throughput |
 |---|---:|---:|
-| `sync=.none` | 87 ms | 11.5 M rows/s |
-| `sync=.per_flush` | 88 ms | 11.4 M rows/s |
-| sustained 100 flushes, sync=.none | 78 ms / 100k | 1.3 M rows/s |
-| sustained 100 flushes, sync=.per_flush | 147 ms / 100k | 0.7 M rows/s |
-| insert 1 M with WAL | 104 ms | 9.6 M rows/s |
-| 1000 × 1k inserts with WAL | 84 ms | 12 M rows/s |
+| `sync=.none` | 99 ms | 10.1 M rows/s |
+| `sync=.per_flush` | 98 ms | 10.2 M rows/s |
+| sustained 100 flushes, sync=.none | 85 ms / 100k | 1.2 M rows/s |
+| sustained 100 flushes, sync=.per_flush | 153 ms / 100k | 0.7 M rows/s |
+| insert 1 M with WAL | 115 ms | 8.7 M rows/s |
+| 1000 × 1k inserts with WAL | 99 ms | 10.1 M rows/s |
 
 ## WAL group commit (concurrent writers)
 
 | Threads | Total rows | Time | fsyncs | inserts/fsync |
 |---:|---:|---:|---:|---:|
-| 1 | 250 | 67 ms | 250 | 1.00 |
-| 2 | 500 | 72 ms | 255 | 1.96 |
-| 4 | 1000 | 87 ms | 281 | 3.56 |
-| 8 | 2000 | 127 ms | 370 | 5.41 |
+| 1 | 250 | 73 ms | 250 | 1.00 |
+| 2 | 500 | 75 ms | 261 | 1.92 |
+| 4 | 1000 | 97 ms | 296 | 3.38 |
+| 8 | 2000 | 152 ms | 452 | 4.42 |
 
-Leader-follower coalescing amortizes fsync cost ~5× at 8 threads.
+Leader-follower coalescing amortizes fsync cost ~4–5× at 8 threads.
 
 ## Compaction
 
 | Scenario | Result |
 |---|---|
-| 200 segs, no compact | ingest 156 ms, scan 17 ms (12 M rows/s) |
-| 5 segs, with compact | ingest 516 ms, scan 3.5 ms (**57 M rows/s**) |
-| tombstone-pressure compact | delete 50k in 7 ms, compact in 9 ms |
+| 200 segs, no compact | ingest 164 ms, scan 18 ms (11 M rows/s) |
+| 5 segs, with compact | ingest 532 ms, scan 3.6 ms (**55 M rows/s**) |
+| tombstone-pressure compact | delete 50k in 6 ms, compact in 10 ms |
 
-Compaction reclaims **4.7×** scan speed (12 → 57 M rows/s).
+Compaction reclaims **~5×** scan speed (11 → 55 M rows/s).
 
 ---
 
@@ -84,41 +84,54 @@ All sizes use unique `bigint` keys [0..N) on both sides → inner equi-join emit
 
 | Shape | Hash | SMJ | Winner |
 |---|---:|---:|---|
-| 1k × 1k | 2.6 ms | **0.5 ms** | smj 5× |
-| 1k × 1M (dim × fact) | **29 ms** | 45 ms | hash 1.5× |
-| 100k × 100k | 15 ms | 15 ms | tied |
-| **1M × 1M** | 302 ms | **91 ms** | **smj 3.3×** |
+| 1k × 1k | 2.6 ms | 3.2 ms | ≈ tied (sub-ms variance) |
+| 1k × 1M (dim × fact) | **30 ms** | 40 ms | hash 1.3× |
+| 100k × 100k | 15 ms | 14 ms | tied |
+| **1M × 1M** | 348 ms | **89 ms** | **smj 3.9×** |
 
 ### Other key types, 100k × 100k (sorted)
 
 | Key | Hash | SMJ |
 |---|---:|---:|
-| string (varchar 16) | 20 ms | 19 ms |
-| uuid (u128) | 14 ms | 16 ms |
-| compound (bigint, bigint) | 16 ms | 16 ms |
+| string (varchar 16) | 27 ms | 17 ms |
+| uuid (u128) | 25 ms | 13 ms |
+| compound (bigint, bigint) | 25 ms | 14 ms |
 
 ### Unsorted input (order_key ≠ join_key) — SMJ pays real sort cost
 
 | Shape | Hash | SMJ | SMJ slowdown vs sorted |
 |---|---:|---:|---:|
-| bigint 100k unsorted | 19 ms | 31 ms | 2.0× (vs 15 ms sorted) |
-| **bigint 1M unsorted** | 331 ms | 276 ms | **3.0×** (vs 91 ms sorted) |
-| string 100k unsorted | 23 ms | 42 ms | 2.2× (vs 19 ms sorted) |
-| uuid 100k unsorted | 17 ms | 39 ms | 2.4× (vs 16 ms sorted) |
+| bigint 100k unsorted | 21 ms | 31 ms | 2.2× (vs 14 ms sorted) |
+| **bigint 1M unsorted** | 387 ms | 291 ms | **3.3×** (vs 89 ms sorted) |
+| string 100k unsorted | 29 ms | 47 ms | 2.8× (vs 17 ms sorted) |
+| uuid 100k unsorted | 21 ms | 40 ms | 3.1× (vs 13 ms sorted) |
 
 **Key insight:** pdqsort's already-sorted fast-path saves ~2–3× on SMJ. The merge-only fast-path (skip sort when stats prove pre-sorted) now skips that work entirely when both inputs are pre-sorted on the join keys.
 
 ### Range and mixed-predicate joins (100k × 100k unless noted)
 
-| Shape | Hash | SMJ | NLJ |
-|---|---:|---:|---:|
-| equi + 1 range | 17 ms | 15 ms | — |
-| equi + BETWEEN (2 ranges) | 18 ms | 15 ms | — |
-| LEFT OUTER + range | 23 ms | 16 ms | — |
-| pure range, 1k × 1k (624k pairs) | — | — | 12 ms |
-| pure range, 5k × 5k (15.6M pairs) | — | — | 300 ms |
+| Shape | Hash | SMJ | Sweep | NLJ |
+|---|---:|---:|---:|---:|
+| equi + 1 range | 21 ms | 17 ms | — | — |
+| equi + BETWEEN (2 ranges) | 21 ms | 15 ms | — | — |
+| LEFT OUTER + range | 24 ms | 19 ms | — | — |
+| pure range, 1k × 1k (624k pairs) | — | — | **7 ms (85 M/s)** | 14 ms (43 M/s) |
+| pure range, 5k × 5k (15.6M pairs) | — | — | **180 ms (87 M/s)** | 324 ms (48 M/s) |
+| pure range, 10k × 10k (62.5M pairs) | — | — | 693 ms (90 M/s) | — |
 
-Range overhead is small (~5-15%) on top of plain equi-joins — the per-pair check fits inside the Cartesian emit loop. NLJ on pure range produces ~52 M output rows/sec regardless of N; total time scales as O(N×M) since every pair must be evaluated.
+Range overhead is small (~5-15%) on top of plain equi-joins — the per-pair check fits inside the Cartesian emit loop. Sweep is **~2× faster than NLJ** on pure-range joins because it advances both sides via merge-style cursors instead of nested loops. Output rate stays ~90 M rows/s sustained.
+
+### Skew detection & opaque predicates
+
+| Variant | Time | Notes |
+|---|---:|---|
+| hash 100k × 100k, no detection | 17 ms | `skew_ratio_threshold = 0.0` |
+| hash 100k × 100k, detection on (ratio=0.9) | 16–18 ms | within noise of no-detection |
+| opaque NLJ 100k × 1k (fact × dim) | 880 ms | 0.76 M out/s, 666k pairs survived |
+
+Detection cost is essentially zero after routing the Misra-Gries detector through the join's arena (was 50% when using GPA: uniform keys cycle counters constantly, churning malloc/free per sampled observation). Default `skew_ratio_threshold = 0.3` keeps detection on out-of-the-box; auto-route to SMJ fires when ratio AND absolute (≥20k bucket) both clear.
+
+Opaque-predicate NLJ at 100k × 1k (realistic fact × dim shape) emits ~6.6 matches per left row through the callback. Output rate is ~0.8 M/s vs ~50 M/s for hard-coded range — the indirect call dominates when the loop body is otherwise tiny.
 
 ---
 
@@ -130,7 +143,7 @@ Cross-system join/scan benchmarks vary wildly with hardware, schema, and methodo
 
 | System | Bigint column scan |
 |---|---:|
-| **thinDB (warm)** | **67 M rows/s** |
+| **thinDB (warm)** | **68 M rows/s** |
 | DuckDB | ~100–500 M rows/s (vectorized, similar) |
 | ClickHouse | 100s of M rows/s (SIMD-heavy aggregate paths) |
 | Polars | 50–200 M rows/s |
@@ -142,7 +155,7 @@ thinDB sits in the same order of magnitude as DuckDB / Polars for raw scan. Head
 
 | System | Hash join | Sort-merge |
 |---|---:|---:|
-| **thinDB** | **302 ms** | **91 ms** (pre-sorted) / 276 ms (unsorted) |
+| **thinDB** | **348 ms** | **89 ms** (pre-sorted) / 291 ms (unsorted) |
 | DuckDB | 50–150 ms (parallel hash) | n/a (uses hash) |
 | ClickHouse | 100–300 ms (depending on settings) | n/a |
 | Polars | 100–300 ms | n/a |
@@ -171,10 +184,11 @@ Honest list of things competitors do that we don't:
 
 ### What we do well
 
-- **Cold-cache scan ≈ warm-cache scan** (18 vs 15 ms): zstd decode is fast and the LRU cache mostly serves repeated row groups, but cold reads still hit good IO throughput.
-- **Order-key pruning** (165 M rows/s on narrow filter): hits the manifest-stats segment-skip + row-group-skip paths.
-- **SMJ pre-sorted fast path on large symmetric joins** (3.3× over hash at 1M × 1M): the manifest-v4 stats let `.auto` route correctly without explicit hints.
-- **Compaction win for scan** (4.7× speedup): segment count matters; the compactor pays off quickly.
+- **Cold-cache scan ≈ warm-cache scan** (17 vs 15 ms): zstd decode is fast and the LRU cache mostly serves repeated row groups, but cold reads still hit good IO throughput.
+- **Order-key pruning** (177 M rows/s on narrow filter): hits the manifest-stats segment-skip + row-group-skip paths.
+- **SMJ pre-sorted fast path on large symmetric joins** (3.9× over hash at 1M × 1M): the manifest-v4 stats let `.auto` route correctly without explicit hints.
+- **Range-sweep on pure-range joins** (~90 M rows/s output, ~2× over NLJ): cursor-style merge replaces nested loops when both sides are sortable on the range key.
+- **Compaction win for scan** (~5× speedup): segment count matters; the compactor pays off quickly.
 
 **Bottom line:** thinDB's single-thread performance is in the same league as DuckDB/Polars on the operations we cover. The biggest gap is multi-core parallelism, which is intentional for v1 (single-node, single-writer-thread per table). v2+ can revisit.
 

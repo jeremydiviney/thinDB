@@ -131,23 +131,37 @@ pub const Spec = struct {
     /// When `on` is empty AND `ranges` is non-empty, the planner
     /// picks the nested-loop algorithm (no equi prefix to exploit).
     ranges: []const RangePredicate = &.{},
-    /// Skew-detection threshold for hash joins: if a single join
-    /// key's observed frequency exceeds `skew_threshold × build_rows`
-    /// during the build phase, the join aborts with
-    /// `error.JoinHeavySkew`. The caller can retry with
-    /// `.algorithm = .sort_merge` (better cache locality on long
-    /// bucket walks).
+    /// Skew detection for hash joins. When BOTH conditions hold at end
+    /// of build phase, the join transparently re-routes to sort-merge:
+    ///   ratio:    top_freq / observed_total >= skew_ratio_threshold
+    ///   absolute: estimated_bucket_size       >= skew_absolute_threshold
+    /// where estimated_bucket_size = top_freq * skew_sample_interval.
     ///
-    /// Default 0.0 disables detection (no overhead, no abort).
-    /// A typical guard value is 0.5 (50% of rows in one key).
-    /// Only applies to `.hash` / `.auto`-routed hash joins.
+    /// Both gates are needed. The ratio catches "is the heavy bucket
+    /// actually hit by a meaningful fraction of probes?"; the absolute
+    /// catches "is the bucket actually slow to walk?". Either alone
+    /// produces false positives:
+    ///   - high ratio, low absolute → small build, small bucket. Hash
+    ///     bucket walk is L1/L2-resident and faster than SMJ's setup.
+    ///   - low ratio, high absolute → huge build with a tail-heavy bucket.
+    ///     Only a small fraction of probes pay the slow walk; resorting
+    ///     the entire build+probe up front is far more expensive.
+    ///
+    /// Defaults — `skew_ratio_threshold = 0.3` and
+    /// `skew_absolute_threshold = 20_000`. The absolute floor lines up
+    /// with the L2 cache boundary (20k × 8 bytes per row index ≈ 160KB)
+    /// where bucket walks begin to actually feel slow. Set
+    /// `skew_ratio_threshold` to 0.0 to disable detection entirely
+    /// (skip the per-build-row sampling overhead). Only applies to
+    /// `.hash` / `.auto`-routed hash joins.
     ///
     /// Detection samples 1 in `skew_sample_interval` build rows
     /// (default 10). Misra-Gries with sampling preserves the
     /// fractional detection threshold in expectation. Lower
     /// intervals (1 = no sampling) cost more per build row;
     /// higher intervals lose accuracy on borderline thresholds.
-    skew_threshold: f32 = 0.0,
+    skew_ratio_threshold: f32 = 0.3,
+    skew_absolute_threshold: u32 = 20_000,
     skew_sample_interval: u32 = 10,
     /// Opaque per-pair predicate evaluated during NLJ. Returns true
     /// to keep the (left_row, right_row) pair, false to drop it.
@@ -193,13 +207,21 @@ pub const Join = struct {
     left_key_indices: []usize,
     right_key_indices: []usize,
 
-    /// Optional skew detector. Set when Spec.skew_threshold > 0;
+    /// Optional skew detector. Set when Spec.skew_ratio_threshold > 0;
     /// observed during buildPhase, checked at end. Allocated in
     /// the join's arena.
     skew_detector: ?*@import("skew.zig").MisraGries,
-    skew_threshold: f32,
+    skew_ratio_threshold: f32,
+    skew_absolute_threshold: u32,
     /// Sampling interval for the detector. Observe 1 in N rows.
     skew_sample_interval: u32,
+    /// When skew is detected at end of buildPhase, Join transfers
+    /// build_columns + both Queries to a SortMergeJoin and delegates
+    /// next() to it. Join.deinit must then NOT also deinit those.
+    skew_smj: ?Query = null,
+    /// True once the skew route has taken ownership of left/right/
+    /// build_columns. Gates Join.deinit so we don't double-free.
+    transferred_to_skew: bool = false,
 
     /// Range predicates resolved to column indices. Each candidate
     /// (probe_row, build_row) pair must satisfy ALL of them. Empty
@@ -478,12 +500,6 @@ pub const Join = struct {
 
         const self = try allocator.create(Join);
         errdefer allocator.destroy(self);
-        // Optional skew detector (arena-allocated; freed with arena).
-        const skew_det: ?*@import("skew.zig").MisraGries = if (spec.skew_threshold > 0.0) blk: {
-            const det = try aa.create(@import("skew.zig").MisraGries);
-            det.* = @import("skew.zig").MisraGries.init(allocator);
-            break :blk det;
-        } else null;
 
         self.* = .{
             .allocator = allocator,
@@ -494,8 +510,9 @@ pub const Join = struct {
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
             .ranges = resolved_ranges,
-            .skew_detector = skew_det,
-            .skew_threshold = spec.skew_threshold,
+            .skew_detector = null,
+            .skew_ratio_threshold = spec.skew_ratio_threshold,
+            .skew_absolute_threshold = spec.skew_absolute_threshold,
             .skew_sample_interval = if (spec.skew_sample_interval == 0) 1 else spec.skew_sample_interval,
             .build_is_left = build_is_left,
             .output_schema = output_schema,
@@ -507,6 +524,17 @@ pub const Join = struct {
             .output_columns = output_columns,
             .views = views,
         };
+        // Skew detector must be constructed AFTER `self.* = ...` so its
+        // captured Allocator points to the arena INSIDE `self`, not the
+        // local stack value that just got moved. The struct AND its key
+        // dupes live in the arena — uniform data otherwise churns
+        // malloc/free per sampled observation in the build hot loop.
+        if (spec.skew_ratio_threshold > 0.0) {
+            const arena_alloc = self.arena.allocator();
+            const det = try arena_alloc.create(@import("skew.zig").MisraGries);
+            det.* = @import("skew.zig").MisraGries.init(arena_alloc);
+            self.skew_detector = det;
+        }
         const q = makeQuery(allocator, self);
         if (spec.extra_predicate) |pred| {
             return @import("filter.zig").Filter.create(allocator, q, pred);
@@ -515,12 +543,21 @@ pub const Join = struct {
     }
 
     pub fn deinit(self: *Join) void {
-        var l = self.left;
-        l.deinit();
-        var r = self.right;
-        r.deinit();
-        for (self.build_columns) |*c| c.deinit(self.allocator);
-        self.allocator.free(self.build_columns);
+        if (self.transferred_to_skew) {
+            // skew_smj owns left, right, and build_columns. Calling
+            // its deinit cascades to those resources.
+            if (self.skew_smj) |sm| {
+                var s = sm;
+                s.deinit();
+            }
+        } else {
+            var l = self.left;
+            l.deinit();
+            var r = self.right;
+            r.deinit();
+            for (self.build_columns) |*c| c.deinit(self.allocator);
+            self.allocator.free(self.build_columns);
+        }
         for (self.output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_columns);
         self.allocator.free(self.views);
@@ -570,10 +607,15 @@ pub const Join = struct {
     }
 
     pub fn next(self: *Join) !?Batch {
+        // Skew auto-route: if buildPhase detected heavy skew and
+        // handed off to SMJ, all subsequent next() calls delegate.
+        if (self.skew_smj) |*sm| return sm.next();
+
         while (true) {
             switch (self.phase) {
                 .building => {
                     try self.buildPhase();
+                    if (self.skew_smj) |*sm| return sm.next();
                     // FULL OUTER needs a matched-row bitmap so we can
                     // emit the unmatched build rows at the end.
                     if (self.join_type == .full) {
@@ -661,19 +703,74 @@ pub const Join = struct {
             self.build_rows += @intCast(n);
         }
 
-        // After build, check skew. Misra-Gries reports an UNDER-
-        // estimate of the heavy hitter's frequency. Compare against
-        // the SAMPLED total (det.observed_total), not build_rows —
-        // sampling preserves the fractional ratio in expectation.
+        // After build, check skew via two-gate AND:
+        //   ratio:    top_freq / observed_total >= skew_ratio_threshold
+        //   absolute: top_freq * sample_interval >= skew_absolute_threshold
+        //
+        // Misra-Gries reports an UNDER-estimate of the heavy hitter's
+        // frequency. Compare ratio against det.observed_total (the SAMPLED
+        // total, not build_rows) — sampling preserves the fractional
+        // ratio in expectation. For absolute, scale the sampled top_freq
+        // back up by skew_sample_interval to estimate true bucket size.
+        //
+        // On detection: skip probe entirely. Transfer the already-
+        // materialized build_columns to a SortMergeJoin (it owns
+        // them now; we null them out so deinit doesn't double-free).
+        // SMJ drains the unconsumed probe side itself.
         if (self.skew_detector) |det| {
             if (det.observed_total > 0) {
-                const top: f32 = @floatFromInt(det.topFrequency());
+                const top_sampled = det.topFrequency();
+                const top: f32 = @floatFromInt(top_sampled);
                 const total: f32 = @floatFromInt(det.observed_total);
-                if (top / total >= self.skew_threshold) {
-                    return Error.JoinHeavySkew;
+                const ratio_hit = top / total >= self.skew_ratio_threshold;
+                const est_bucket: u64 = @as(u64, top_sampled) * @as(u64, self.skew_sample_interval);
+                const absolute_hit = est_bucket >= self.skew_absolute_threshold;
+                if (ratio_hit and absolute_hit) {
+                    try self.routeToSmjOnSkew();
                 }
             }
         }
+    }
+
+    fn routeToSmjOnSkew(self: *Join) !void {
+        // INNER joins only for the auto-route path in v1. Outer +
+        // skew would need to thread the preserve semantics through
+        // and is more invasive.
+        if (self.join_type != .inner) return;
+        if (self.ranges.len > 0) return;
+
+        const smj_spec: Spec = .{
+            .join_type = .inner,
+            .on = blk: {
+                // Reconstruct an `on` slice from the resolved key
+                // indices + the operator's output schema. We have
+                // left/right key indices; we need column names.
+                const pairs = try self.allocator.alloc(KeyPair, self.left_key_indices.len);
+                const left_schema = self.left.outputSchema();
+                const right_schema = self.right.outputSchema();
+                for (self.left_key_indices, self.right_key_indices, 0..) |li, ri, i| {
+                    pairs[i] = .{ .left = left_schema[li].name, .right = right_schema[ri].name };
+                }
+                break :blk pairs;
+            },
+            .algorithm = .sort_merge,
+        };
+        defer self.allocator.free(@constCast(smj_spec.on));
+
+        const smj_q = try @import("smj.zig").SortMergeJoin.createForSkewRoute(
+            self.allocator,
+            self.left,
+            self.right,
+            smj_spec,
+            self.build_columns,
+            self.build_rows,
+            self.build_is_left,
+        );
+        // SMJ now owns the Queries + the transferred build_columns.
+        self.skew_smj = smj_q;
+        self.transferred_to_skew = true;
+        // Empty the slice so the deinit loop is a no-op for these.
+        self.build_columns = &.{};
     }
 
     // -----------------------------------------------------------------

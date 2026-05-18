@@ -2103,9 +2103,12 @@ test "opaque: cross-side predicate via NLJ callback" {
     try std.testing.expectEqual(@as(usize, 147), rows);
 }
 
-test "skew: heavy build-side skew triggers JoinHeavySkew" {
-    // Build side has 100 rows all with k=42 → 100% in one key.
-    // With threshold = 0.5, this should abort.
+test "skew: heavy build-side skew auto-routes to sort-merge" {
+    // Build side has 100 rows all with k=42 → 100% in one key. Right
+    // side has exactly one matching row. Test overrides absolute floor
+    // down to 5 (sampled top * sample_interval = 10 * 10 = 100 >= 5) so
+    // detection fires on a small dataset; production default is 20k.
+    // Auto-route hands off to SMJ which emits the same 100 matches.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2138,7 +2141,6 @@ test "skew: heavy build-side skew triggers JoinHeavySkew" {
         const Row = struct { rowid: i64, k: i64 };
         const rows = try allocator.alloc(Row, 100);
         defer allocator.free(rows);
-        // 100 rows all with k=42 → 100% skew on build.
         for (rows, 0..) |*r, i| r.* = .{ .rowid = @intCast(i), .k = 42 };
         try l.insert(rows);
     }
@@ -2158,17 +2160,20 @@ test "skew: heavy build-side skew triggers JoinHeavySkew" {
     var q = try left.join(right, .{
         .on = &.{.{ .left = "k", .right = "k" }},
         .algorithm = .hash,
-        .skew_threshold = 0.5,
+        .skew_ratio_threshold = 0.5,
+        .skew_absolute_threshold = 5,
     });
     defer q.deinit();
 
-    // Drain → triggers buildPhase → detection fires.
-    try std.testing.expectError(thindb.exec.Error.JoinHeavySkew, q.next());
+    // 100 left rows × 1 matching right row (k=42) = 100 pairs.
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 100), rows);
 }
 
 test "skew: no-skew query with detection enabled runs normally" {
-    // 100 distinct keys, no heavy hitter. With threshold = 0.5,
-    // detection should NOT fire — query completes.
+    // 100 distinct keys, no heavy hitter. Ratio gate stays well below
+    // 0.5, so detection should NOT fire — query completes via hash.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2206,7 +2211,8 @@ test "skew: no-skew query with detection enabled runs normally" {
     var q = try left.join(right, .{
         .on = &.{.{ .left = "k", .right = "k" }},
         .algorithm = .hash,
-        .skew_threshold = 0.5,
+        .skew_ratio_threshold = 0.5,
+        .skew_absolute_threshold = 5,
     });
     defer q.deinit();
 

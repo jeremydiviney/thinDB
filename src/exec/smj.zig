@@ -70,6 +70,13 @@ pub const SortMergeJoin = struct {
     right_materialized: []ColumnStore,
     left_rows: u32 = 0,
     right_rows: u32 = 0,
+
+    // When true, materializeAndSort skips draining that side — caller
+    // pre-filled left_materialized / right_materialized + row counts.
+    // Used by Join's skew-route path to hand its already-built side
+    // directly to SMJ without re-materializing.
+    pre_left_materialized: bool = false,
+    pre_right_materialized: bool = false,
     left_perm: []u32 = &.{},
     right_perm: []u32 = &.{},
     /// Pre-built compound key bytes per row (for fast comparison
@@ -271,6 +278,45 @@ pub const SortMergeJoin = struct {
         return q;
     }
 
+    /// Construct an SMJ where one side is already materialized
+    /// (by the caller, typically hash join's skew-route path). The
+    /// pre-materialized columns are TRANSFERRED to SMJ — it owns them
+    /// and frees on deinit. The unpopulated side will be drained from
+    /// its Query normally.
+    ///
+    /// Used internally; users should not call this directly.
+    pub fn createForSkewRoute(
+        allocator: Allocator,
+        left_q: Query,
+        right_q: Query,
+        spec: Spec,
+        pre_columns: []ColumnStore,
+        pre_rows: u32,
+        pre_is_left: bool,
+    ) !Query {
+        // Build SMJ via the normal create path — it sets up output
+        // columns + key indices + everything. Then patch in the
+        // pre-materialized side and free the empty one SMJ allocated.
+        const q = try SortMergeJoin.create(allocator, left_q, right_q, spec);
+        const self: *SortMergeJoin = @ptrCast(@alignCast(q.ptr));
+
+        if (pre_is_left) {
+            // Free the empty allocation SMJ made for left_materialized.
+            for (self.left_materialized) |*c| c.deinit(allocator);
+            allocator.free(self.left_materialized);
+            self.left_materialized = pre_columns;
+            self.left_rows = pre_rows;
+            self.pre_left_materialized = true;
+        } else {
+            for (self.right_materialized) |*c| c.deinit(allocator);
+            allocator.free(self.right_materialized);
+            self.right_materialized = pre_columns;
+            self.right_rows = pre_rows;
+            self.pre_right_materialized = true;
+        }
+        return q;
+    }
+
     pub fn deinit(self: *SortMergeJoin) void {
         var l = self.left;
         l.deinit();
@@ -376,21 +422,25 @@ pub const SortMergeJoin = struct {
         const left_row_bytes = exec.memory.estimateRowBytes(self.left.outputSchema());
         const right_row_bytes = exec.memory.estimateRowBytes(self.right.outputSchema());
 
-        // Drain left into left_materialized.
-        while (try self.left.next()) |batch| {
-            if (acc) |a| try a.reserve(batch.row_count * left_row_bytes);
-            for (batch.values, 0..) |v, i| {
-                try transform.appendAllColumn(self.allocator, v, &self.left_materialized[i]);
+        // Drain left into left_materialized (skip if pre-filled).
+        if (!self.pre_left_materialized) {
+            while (try self.left.next()) |batch| {
+                if (acc) |a| try a.reserve(batch.row_count * left_row_bytes);
+                for (batch.values, 0..) |v, i| {
+                    try transform.appendAllColumn(self.allocator, v, &self.left_materialized[i]);
+                }
+                self.left_rows += @intCast(batch.row_count);
             }
-            self.left_rows += @intCast(batch.row_count);
         }
-        // Drain right.
-        while (try self.right.next()) |batch| {
-            if (acc) |a| try a.reserve(batch.row_count * right_row_bytes);
-            for (batch.values, 0..) |v, i| {
-                try transform.appendAllColumn(self.allocator, v, &self.right_materialized[i]);
+        // Drain right (skip if pre-filled).
+        if (!self.pre_right_materialized) {
+            while (try self.right.next()) |batch| {
+                if (acc) |a| try a.reserve(batch.row_count * right_row_bytes);
+                for (batch.values, 0..) |v, i| {
+                    try transform.appendAllColumn(self.allocator, v, &self.right_materialized[i]);
+                }
+                self.right_rows += @intCast(batch.row_count);
             }
-            self.right_rows += @intCast(batch.row_count);
         }
 
         // Build compound key bytes per row + filter out NULL-key rows.

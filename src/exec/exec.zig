@@ -65,10 +65,6 @@ pub const Error = error{
     /// materializing. Aborts mid-build with a clear error rather
     /// than letting the underlying allocator OOM the process.
     MemoryBudgetExceeded,
-    /// Hash join's build phase observed a key whose frequency
-    /// exceeds `Spec.skew_threshold × build_rows`. Retry with
-    /// `.algorithm = .sort_merge` for cache-friendlier bucket walks.
-    JoinHeavySkew,
 };
 
 // ---------------------------------------------------------------------------

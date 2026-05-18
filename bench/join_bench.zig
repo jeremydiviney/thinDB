@@ -753,7 +753,7 @@ pub fn runAll(allocator: Allocator, io: Io) !void {
     try benchPureRangeNljExplicit(allocator, io, 1_000, 1_000);
     try benchPureRangeNlj(allocator, io, 5_000, 5_000);
     try benchPureRangeNljExplicit(allocator, io, 5_000, 5_000);
-    try benchPureRangeNlj(allocator, io, 50_000, 50_000);
+    try benchPureRangeNlj(allocator, io, 10_000, 10_000);
     try benchLeftOuterRange(allocator, io, 100_000, .hash);
     try benchLeftOuterRange(allocator, io, 100_000, .sort_merge);
 
@@ -761,8 +761,8 @@ pub fn runAll(allocator: Allocator, io: Io) !void {
     std.debug.print("\nJoin — skew + opaque predicate\n", .{});
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
     try benchSkewDetectOverhead(allocator, io, 100_000);
-    try benchOpaquePredicateNlj(allocator, io, 1_000);
-    try benchOpaquePredicateNlj(allocator, io, 5_000);
+    // Realistic shape: large fact joined to small dimension via opaque predicate.
+    try benchOpaquePredicateNlj(allocator, io, 100_000, 1_000);
 }
 
 // ----------------------------------------------------------------------------
@@ -773,9 +773,9 @@ pub fn runAll(allocator: Allocator, io: Io) !void {
 /// uniform-key dataset (no actual skew). Compares vs the same join
 /// with detection disabled.
 fn benchSkewDetectOverhead(allocator: Allocator, io: Io, n: usize) !void {
-    inline for ([_]struct { label: []const u8, threshold: f32 }{
-        .{ .label = "hash equi (no detection)", .threshold = 0.0 },
-        .{ .label = "hash equi (skew_threshold=0.9)", .threshold = 0.9 },
+    inline for ([_]struct { label: []const u8, ratio: f32 }{
+        .{ .label = "hash equi (no detection)", .ratio = 0.0 },
+        .{ .label = "hash equi (skew_ratio=0.9)", .ratio = 0.9 },
     }) |variant| {
         var dir = try freshDir(io, ".bench-data/join_skew_overhead");
         defer dir.close(io);
@@ -799,7 +799,11 @@ fn benchSkewDetectOverhead(allocator: Allocator, io: Io, n: usize) !void {
         var q = try left.join(right, .{
             .on = &.{.{ .left = "k", .right = "k" }},
             .algorithm = .hash,
-            .skew_threshold = variant.threshold,
+            .skew_ratio_threshold = variant.ratio,
+            // Bench measures the per-build-row sampling overhead of
+            // Misra-Gries; we want detection plumbing live regardless
+            // of actual data shape, so drop the absolute floor.
+            .skew_absolute_threshold = 1,
         });
         defer q.deinit();
         var output: usize = 0;
@@ -813,7 +817,7 @@ fn benchSkewDetectOverhead(allocator: Allocator, io: Io, n: usize) !void {
 /// via the callback path. Should be roughly 1.5-2x slower than the
 /// hard-coded range NLJ because the predicate call adds per-pair
 /// indirection.
-fn benchOpaquePredicateNlj(allocator: Allocator, io: Io, n: usize) !void {
+fn benchOpaquePredicateNlj(allocator: Allocator, io: Io, l_rows: usize, r_rows: usize) !void {
     var dir = try freshDir(io, ".bench-data/join_opaque_nlj");
     defer dir.close(io);
     var db = try thindb.Database.open(allocator, io, dir, .{
@@ -824,10 +828,10 @@ fn benchOpaquePredicateNlj(allocator: Allocator, io: Io, n: usize) !void {
     defer db.close();
 
     const l = try db.table("l", pure_l_schema, .{ .order_key = &pure_l_ok, .unique = true });
-    try fillPureLeft(l, n, allocator);
+    try fillPureLeft(l, l_rows, allocator);
     try l.flush();
     const r = try db.table("r", pure_r_schema, .{ .order_key = &pure_r_ok, .unique = true });
-    try fillPureRight(r, n, allocator);
+    try fillPureRight(r, r_rows, allocator);
     try r.flush();
 
     // Same predicate as the test: a.x < b.y, but via callback.
@@ -857,7 +861,7 @@ fn benchOpaquePredicateNlj(allocator: Allocator, io: Io, n: usize) !void {
     var output: usize = 0;
     while (try q.next()) |b| output += b.row_count;
     const elapsed = elapsedNs(io, t0);
-    reportJoin("opaque NLJ (a.x<b.y via callback)", .nested_loop, n, n, output, elapsed);
+    reportJoin("opaque NLJ (a.x<b.y via callback)", .nested_loop, l_rows, r_rows, output, elapsed);
 }
 
 // ----------------------------------------------------------------------------
