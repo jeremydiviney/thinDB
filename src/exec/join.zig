@@ -590,9 +590,11 @@ fn chooseAlgorithm(left: Query, right: Query, on: []const KeyPair) Algorithm {
     return .hash;
 }
 
+pub const KeySide = enum { left, right };
+
 /// Returns true if `state.keys` is a leading prefix of (or equal to)
 /// the join-key columns on the named side of the `on` pairs.
-fn joinKeysCovered(state: exec.SortState, on: []const KeyPair, side: enum { left, right }) bool {
+pub fn joinKeysCovered(state: exec.SortState, on: []const KeyPair, side: KeySide) bool {
     if (state.keys.len < on.len) return false;
     for (on, 0..) |pair, i| {
         const required = switch (side) {

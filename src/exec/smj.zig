@@ -85,6 +85,14 @@ pub const SortMergeJoin = struct {
     left_cursor: usize = 0,
     right_cursor: usize = 0,
 
+    // Fast-path: skip the `sortByKeys` step when the upstream is
+    // already globally sorted on the join keys. buildPermAndKeys
+    // emits perm + keys_bytes in source order; if the source is
+    // sorted, the resulting arrays are too (per-row order-preserving
+    // encoding — see `appendColumnValueBytes`).
+    skip_left_sort: bool,
+    skip_right_sort: bool,
+
     // Output staging.
     output_columns: []ColumnStore,
     views: []ColumnView,
@@ -179,6 +187,16 @@ pub const SortMergeJoin = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
+        // Fast-path detection: stats are cheap and captured upstream
+        // at scan-create time. If both sides report global sort on a
+        // prefix that covers the join keys, sortByKeys becomes a no-op.
+        const left_stats = left.stats();
+        const right_stats = right.stats();
+        const skip_left = left_stats.sort_state.global and
+            join_mod.joinKeysCovered(left_stats.sort_state, spec.on, .left);
+        const skip_right = right_stats.sort_state.global and
+            join_mod.joinKeysCovered(right_stats.sort_state, spec.on, .right);
+
         const self = try allocator.create(SortMergeJoin);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -193,6 +211,8 @@ pub const SortMergeJoin = struct {
             .right_kept_mask = right_kept_mask_owned,
             .left_materialized = left_mat,
             .right_materialized = right_mat,
+            .skip_left_sort = skip_left,
+            .skip_right_sort = skip_right,
             .output_columns = output_columns,
             .views = views,
         };
@@ -328,8 +348,11 @@ pub const SortMergeJoin = struct {
         );
 
         // Sort perm by corresponding key bytes (in place via a context).
-        sortByKeys(self.left_perm, self.left_keys_bytes);
-        sortByKeys(self.right_perm, self.right_keys_bytes);
+        // Skipped per-side when stats prove the source is already
+        // sorted on the join keys — buildPermAndKeys emits in source
+        // order, so a pre-sorted source produces a pre-sorted perm.
+        if (!self.skip_left_sort) sortByKeys(self.left_perm, self.left_keys_bytes);
+        if (!self.skip_right_sort) sortByKeys(self.right_perm, self.right_keys_bytes);
     }
 
     // -----------------------------------------------------------------
