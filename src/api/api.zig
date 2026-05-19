@@ -128,6 +128,19 @@ pub const Config = struct {
     /// it accidentally, large enough that typical 1-10 M row joins
     /// fit easily. Production deployments override.
     query_memory_budget: usize = 256 * 1024 * 1024,
+
+    /// Max concurrent client connections across all wire protocols.
+    /// Server-wide cap; reject (close immediately) when exceeded.
+    /// Default 256 — generous for embedded use; bump for high-
+    /// concurrency deployments.
+    max_connections: u32 = 256,
+
+    /// Per-connection idle timeout in seconds. If a client sends no
+    /// command for this duration, the server closes the connection.
+    /// Default 0 = disabled (matches Postgres's default; pool drivers
+    /// won't have their idle pool members killed). Common production
+    /// values: 1800 (30 min), 3600 (1 hour).
+    idle_timeout_secs: u32 = 0,
 };
 
 pub const TableOptions = struct {

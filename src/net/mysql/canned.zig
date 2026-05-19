@@ -53,6 +53,11 @@ pub fn match(
         return Outcome{ .ok_packet = {} };
     }
 
+    if (std.mem.eql(u8, lc, "reset connection")) return Outcome{ .ok_packet = {} };
+
+    if (std.mem.eql(u8, lc, "select 1"))
+        return Outcome{ .single_value = .{ .col = "1", .val = "1" } };
+
     if (std.mem.eql(u8, lc, "select @@version_comment") or
         std.mem.eql(u8, lc, "select @@version_comment limit 1"))
         return Outcome{ .single_value = .{ .col = "@@version_comment", .val = "thinDB" } };

@@ -238,7 +238,7 @@ test "pg wire: startup + SELECT 1" {
 
     const port: u16 = test_port_base + 0;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -275,7 +275,7 @@ test "pg wire: SELECT version() returns canned PostgreSQL banner" {
 
     const port: u16 = test_port_base + 1;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -320,7 +320,7 @@ test "pg wire: SELECT * FROM orders returns seeded rows" {
 
     const port: u16 = test_port_base + 2;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -360,7 +360,7 @@ test "pg wire: query against missing table returns 42P01 error" {
 
     const port: u16 = test_port_base + 3;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -394,7 +394,7 @@ test "pg wire: CREATE DATABASE round-trips" {
 
     const port: u16 = test_port_base + 4;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -437,7 +437,7 @@ test "pg wire: SET search_path is silently accepted" {
 
     const port: u16 = test_port_base + 5;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -471,7 +471,7 @@ test "pg wire: SSLRequest is denied with N + startup continues" {
 
     const port: u16 = test_port_base + 6;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -496,6 +496,121 @@ test "pg wire: SSLRequest is denied with N + startup continues" {
     try std.testing.expectEqual(@as(usize, 1), reply.rows.len);
 
     try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: DISCARD ALL returns CommandComplete with DISCARD ALL tag" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 7;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", null);
+
+    try client.sendQuery("DISCARD ALL");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqualStrings("DISCARD ALL", reply.command_tag);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: RESET ALL returns CommandComplete with RESET ALL tag" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 8;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", null);
+
+    try client.sendQuery("RESET ALL");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqualStrings("RESET ALL", reply.command_tag);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: limiter at zero capacity emits 53300 too_many_connections" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try thindb.Catalog.open(allocator, io, tmp.dir, .{});
+    defer catalog.close();
+    _ = try catalog.createDatabase("main");
+
+    var limiter = thindb.ConnectionLimiter.init(0);
+
+    const port: u16 = test_port_base + 9;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, &limiter);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var c = try TestClient.connect(allocator, io, addr);
+    defer c.close();
+
+    var saw_too_many = false;
+    while (true) {
+        const f = pg_packet.readFrame(allocator, &c.reader.interface) catch break;
+        defer allocator.free(f.payload);
+        if (f.type_byte == 'E') {
+            var cursor: usize = 0;
+            while (cursor < f.payload.len and f.payload[cursor] != 0) {
+                const tag_byte = f.payload[cursor];
+                cursor += 1;
+                const val = try pg_packet.readCString(f.payload, &cursor);
+                if (tag_byte == 'C' and std.mem.eql(u8, val, "53300")) {
+                    saw_too_many = true;
+                }
+            }
+            break;
+        }
+    }
+    try std.testing.expect(saw_too_many);
+
     if (sctx.err) |e| return e;
 }
 
@@ -563,7 +678,7 @@ test "psql CLI: SELECT 1 when psql is on PATH" {
 
     const port: u16 = test_port_base + 100;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -598,7 +713,7 @@ test "psql CLI: \\l lists databases when psql is on PATH" {
 
     const port: u16 = test_port_base + 101;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -642,7 +757,7 @@ test "psql CLI: SELECT * FROM seeded table when psql is on PATH" {
 
     const port: u16 = test_port_base + 102;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.servePg(allocator, io, catalog, addr);
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };

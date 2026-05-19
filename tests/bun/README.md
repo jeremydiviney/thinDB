@@ -48,58 +48,46 @@ temp data directory.
 | `basic.test.ts`   | Connect, `SELECT 1` (canned `?column?`), `SELECT version()`, `SELECT current_database()`.     |
 | `namespace.test.ts` | `pg_catalog.pg_database`, `CREATE DATABASE`, `pg_namespace`, `CREATE SCHEMA`, `SHOW server_version`, `SET search_path`. |
 | `errors.test.ts`  | Unknown table → `42P01`, syntax error → `42000`, `DROP DATABASE no_such_db` → `3D000`.        |
+| `pool.test.ts`    | `pg.Pool` with `max=4` runs 8 parallel queries; `DISCARD ALL` and `RESET ALL` round-trip.     |
 | `table.test.ts`   | Empty `pg_class` listing round-trips; `CREATE TABLE` / `INSERT` are `test.todo` (parser gap). |
 | `types.test.ts`   | All `test.todo` (depends on INSERT via SQL).                                                  |
 
-### MySQL (`mysql/`) — handshake only
-
-The `mysql2` driver and the thinDB MySQL wire are **not compatible**
-at the COM_QUERY result-set level right now — see the **Known gaps**
-section below. The MySQL suite verifies what *is* reachable
-(handshake, COM_INIT_DB, ERR_Packet at init-db time) and uses
-`test.todo` for everything that requires result-set traffic.
+### MySQL (`mysql/`) — driver-verified
 
 | File                | Asserts                                                                                |
 |---------------------|----------------------------------------------------------------------------------------|
-| `basic.test.ts`     | Listener accepts connections; handshake + COM_INIT_DB succeed for `main__public`; init-db with a bogus DB yields ER_BAD_DB_ERROR (1049). |
-| `namespace.test.ts` | COM_INIT_DB resolves the flattened `db__schema` form; SHOW DATABASES variants are `test.todo`. |
-| `errors.test.ts`    | Unknown initial DB → `1049` / `42000`. Query-time errors are `test.todo`.              |
-| `table.test.ts`     | All `test.todo` (parser + wire gaps).                                                  |
+| `basic.test.ts`     | Handshake; empty initial DB stays at `main/public`; init-db with a bogus DB → `ER_BAD_DB_ERROR` (1049); `SELECT @@version`, `SELECT @@version_comment`, bare `SELECT 1`. |
+| `namespace.test.ts` | Flattened `db__schema` init-db; `SHOW DATABASES`; `CREATE DATABASE` then `SHOW DATABASES`; `DROP DATABASE` removes the entry. |
+| `errors.test.ts`    | Unknown initial DB → `1049` / `42000`; missing table → `1146` / `42S02`; syntax error → `1064` / `42000`. |
+| `pool.test.ts`      | `mysql2.createPool` with `connectionLimit=4` runs 8 parallel `SELECT`s; `RESET CONNECTION` round-trips. |
+| `table.test.ts`     | All `test.todo` (parser gap — no CREATE TABLE / INSERT via SQL).                       |
 | `types.test.ts`     | All `test.todo`.                                                                       |
 
 ## Known gaps surfaced by this suite
 
-These are real product issues to fix before the MySQL surface is
-useful from off-the-shelf drivers:
+These remain after the v2 round of fixes:
 
-1. **MySQL result-set format ignores client capabilities.** The
-   server unconditionally writes result sets in `CLIENT_DEPRECATE_EOF`
-   form (no EOF packet between column defs and rows, single OK-shaped
-   EOF after rows). `mysql2` never advertises `DEPRECATE_EOF` — it
-   defaults to the older format with two EOF packets — so it errors
-   with `PROTOCOL_UNEXPECTED_PACKET` on the very first SELECT and
-   tears the connection down. Fix would be either honoring the
-   negotiated capability bits on the server side, or advertising
-   `DEPRECATE_EOF` from the server and emitting two EOF packets
-   when the client doesn't set it.
-
-2. **MySQL empty initial-DB is treated as a missing DB.** `mysql2`
-   always sets `CLIENT_CONNECT_WITH_DB` and sends an empty string
-   when no `database` is configured. The server's `applyInitDb`
-   tries to resolve the empty string as a real lookup and returns
-   `DatabaseNotFound`. Should be a no-op (leave session at the
-   default `main/public`).
-
-3. **No CREATE TABLE / INSERT via SQL.** The parser supports
+1. **No CREATE TABLE / INSERT via SQL.** The parser supports
    CREATE/DROP DATABASE | SCHEMA, USE, SHOW DATABASES/SCHEMAS/TABLES,
    and SELECT. Until INSERT and CREATE TABLE are added, type
    round-trip tests over the wire have nothing to seed against.
+2. **Windows: keepalive + idle-timeout are no-ops.** On Linux/macOS,
+   `SO_KEEPALIVE` is set on every accepted socket and
+   `SO_RCVTIMEO` enforces `--idle-timeout-secs`. On Windows the
+   `Io.net` sockets are AFD-backed NT handles that `ws2_32!setsockopt`
+   rejects, so the helpers silently no-op. Documented in
+   `src/net/sock_opts.zig`.
 
-4. **MySQL canned matcher doesn't recognize bare `SELECT 1`.** Only
-   `@@version`, `@@version_comment`, `SELECT DATABASE()`, etc. are
-   matched. Plain expression selects fall through to the parser,
-   which doesn't (yet) accept bare expressions. The PG canned
-   matcher *does* recognize `select 1` and the PG suite asserts that.
+## Fixed since the v1 audit
+
+- MySQL result-set format now honors the client's `CLIENT_DEPRECATE_EOF`
+  bit — legacy clients (`mysql2`) get the two-EOF terminator they
+  expect.
+- MySQL empty initial-DB is treated as a no-op (session stays at the
+  default `main/public`).
+- MySQL canned matcher now answers bare `SELECT 1`.
+- Pool-friendly probes added: MySQL `RESET CONNECTION` and PG
+  `DISCARD TEMP` / `DISCARD PLANS` / `RESET ALL`.
 
 ## Layout
 

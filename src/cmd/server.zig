@@ -30,6 +30,8 @@ const usage_text =
     \\  --pg-port PORT          Postgres wire listener port (default 5432; 0 disables).
     \\  --native-port PORT      Native thinDB wire listener port (default 7878; 0 disables).
     \\  --bind ADDR             Interface to bind (default 0.0.0.0).
+    \\  --max-connections N     Cap on concurrent client connections across all wires (default 256).
+    \\  --idle-timeout-secs N   Close a connection after N seconds of read silence (default 0 = disabled).
     \\  --help                  Show this help and exit.
     \\  --version               Print version and exit.
     \\
@@ -52,6 +54,8 @@ pub fn main(init: std.process.Init) !u8 {
     var pg_port: u16 = thindb.pg_default_port;
     var native_port: u16 = thindb.default_port;
     var bind: []const u8 = default_bind;
+    var max_connections: u32 = 256;
+    var idle_timeout_secs: u32 = 0;
 
     var stderr_buf: [4096]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
@@ -91,6 +95,14 @@ pub fn main(init: std.process.Init) !u8 {
             native_port = p;
             continue;
         }
+        if (try takeU32(arg, "--max-connections", &args_iter, err_w)) |v| {
+            max_connections = v;
+            continue;
+        }
+        if (try takeU32(arg, "--idle-timeout-secs", &args_iter, err_w)) |v| {
+            idle_timeout_secs = v;
+            continue;
+        }
         try err_w.print("thindb-server: unknown argument: {s}\n\n", .{arg});
         try err_w.writeAll(usage_text);
         try err_w.flush();
@@ -117,12 +129,18 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer data_root.close(io);
 
-    var catalog = thindb.Catalog.open(gpa, io, data_root, .{}) catch |err| {
+    const cfg: thindb.Config = .{
+        .max_connections = max_connections,
+        .idle_timeout_secs = idle_timeout_secs,
+    };
+    var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
         try err_w.flush();
         return 1;
     };
     defer catalog.close();
+
+    var shared_limiter = thindb.ConnectionLimiter.init(max_connections);
 
     installSignalHandler();
 
@@ -146,9 +164,9 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         };
         listeners[n_listeners] = switch (spec.kind) {
-            .mysql => .{ .mysql = try thindb.serveMysql(gpa, io, catalog, addr) },
-            .pg => .{ .pg = try thindb.servePg(gpa, io, catalog, addr) },
-            .native => .{ .native = try thindb.serveTcpCatalog(gpa, io, catalog, addr) },
+            .mysql => .{ .mysql = try thindb.serveMysql(gpa, io, catalog, addr, &shared_limiter) },
+            .pg => .{ .pg = try thindb.servePg(gpa, io, catalog, addr, &shared_limiter) },
+            .native => .{ .native = try thindb.serveTcpCatalog(gpa, io, catalog, addr, &shared_limiter) },
         };
         n_listeners += 1;
         try out_w.print("  {s} listening on {s}:{d}\n", .{ spec.label, bind, spec.port });
@@ -234,6 +252,20 @@ fn takePort(
         try err_w.print("thindb-server: {s} expects a port number, got '{s}': {t}\n", .{ name, v, err });
         try err_w.flush();
         return error.BadPortValue;
+    };
+}
+
+fn takeU32(
+    arg: []const u8,
+    name: []const u8,
+    iter: *std.process.Args.Iterator,
+    err_w: *std.Io.Writer,
+) !?u32 {
+    const v = try takeValue(arg, name, iter, err_w) orelse return null;
+    return std.fmt.parseInt(u32, v, 10) catch |err| {
+        try err_w.print("thindb-server: {s} expects a non-negative integer, got '{s}': {t}\n", .{ name, v, err });
+        try err_w.flush();
+        return error.BadIntValue;
     };
 }
 

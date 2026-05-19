@@ -33,6 +33,8 @@ const Query = exec.Query;
 const ir = @import("../ir/ir.zig");
 const wire = @import("wire.zig");
 const local = @import("local.zig");
+const ConnectionLimiter = @import("conn_limit.zig").ConnectionLimiter;
+const sock_opts = @import("sock_opts.zig");
 
 pub const Error = error{
     ServerClosed,
@@ -47,6 +49,9 @@ pub const Server = struct {
     /// when the caller passed in a Catalog-rooted Database via
     /// `serveTcpCatalog` and is responsible for that Database's lifetime.
     owns_db: bool,
+    limiter: *ConnectionLimiter,
+    owns_limiter: bool,
+    idle_timeout_secs: u32 = 0,
 
     /// Whether to zstd-compress outgoing batch frames whose payload
     /// exceeds `wire.compression_threshold_bytes`. Default false — see
@@ -68,6 +73,7 @@ pub const Server = struct {
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
         if (self.owns_db) self.db.close();
+        if (self.owns_limiter) self.allocator.destroy(self.limiter);
         self.allocator.destroy(self);
     }
 
@@ -78,18 +84,81 @@ pub const Server = struct {
     pub fn acceptOne(self: *Server) !void {
         const stream = try self.listener.accept(self.io);
         defer stream.close(self.io);
+
+        _ = sock_opts.enableKeepalive(stream.socket.handle);
+        if (self.idle_timeout_secs > 0) {
+            _ = sock_opts.setReadTimeoutSeconds(stream.socket.handle, self.idle_timeout_secs);
+        }
+
+        if (!self.limiter.acquire()) {
+            sendTooManyConnectionsNative(self.allocator, stream, self.io) catch {};
+            return;
+        }
+        defer self.limiter.release();
+
         try handleConnection(self.allocator, self.io, self.db, stream, self.compress_writes, self.auth_token);
     }
 
-    /// Long-running accept loop. Breaks when `should_stop` flips to true
-    /// AFTER an accept returns (so currently in-flight connections drain).
+    /// Long-running accept loop. Each connection runs on its own thread
+    /// so multiple clients can be in-flight concurrently. Breaks when
+    /// `should_stop` flips to true AFTER an accept returns (so currently
+    /// in-flight connections drain).
     pub fn run(self: *Server, should_stop: *std.atomic.Value(bool)) !void {
         while (!should_stop.load(.acquire)) {
-            self.acceptOne() catch |err| {
-                // Don't bring the server down on a per-connection error.
-                std.debug.print("tcp_server: connection error: {s}\n", .{@errorName(err)});
+            const stream = self.listener.accept(self.io) catch |err| {
+                std.debug.print("tcp_server: accept error: {s}\n", .{@errorName(err)});
+                continue;
             };
+            _ = sock_opts.enableKeepalive(stream.socket.handle);
+            if (self.idle_timeout_secs > 0) {
+                _ = sock_opts.setReadTimeoutSeconds(stream.socket.handle, self.idle_timeout_secs);
+            }
+            if (!self.limiter.acquire()) {
+                sendTooManyConnectionsNative(self.allocator, stream, self.io) catch {};
+                stream.close(self.io);
+                continue;
+            }
+            const job = self.allocator.create(ConnJob) catch {
+                self.limiter.release();
+                stream.close(self.io);
+                continue;
+            };
+            job.* = .{
+                .allocator = self.allocator,
+                .io = self.io,
+                .db = self.db,
+                .stream = stream,
+                .compress_writes = self.compress_writes,
+                .auth_token = self.auth_token,
+                .limiter = self.limiter,
+            };
+            const thread = std.Thread.spawn(.{}, ConnJob.run, .{job}) catch {
+                self.limiter.release();
+                stream.close(self.io);
+                self.allocator.destroy(job);
+                continue;
+            };
+            thread.detach();
         }
+    }
+};
+
+const ConnJob = struct {
+    allocator: Allocator,
+    io: Io,
+    db: *Database,
+    stream: std.Io.net.Stream,
+    compress_writes: bool,
+    auth_token: ?[]const u8,
+    limiter: *ConnectionLimiter,
+
+    fn run(self: *ConnJob) void {
+        defer self.allocator.destroy(self);
+        defer self.limiter.release();
+        defer self.stream.close(self.io);
+        handleConnection(self.allocator, self.io, self.db, self.stream, self.compress_writes, self.auth_token) catch |err| {
+            std.debug.print("tcp_server: connection error: {s}\n", .{@errorName(err)});
+        };
     }
 };
 
@@ -113,6 +182,10 @@ pub fn serveTcp(
         .reuse_address = true,
     });
 
+    const limiter = try allocator.create(ConnectionLimiter);
+    errdefer allocator.destroy(limiter);
+    limiter.* = ConnectionLimiter.init(config.max_connections);
+
     const self = try allocator.create(Server);
     self.* = .{
         .allocator = allocator,
@@ -120,6 +193,9 @@ pub fn serveTcp(
         .db = db,
         .listener = listener,
         .owns_db = true,
+        .limiter = limiter,
+        .owns_limiter = true,
+        .idle_timeout_secs = config.idle_timeout_secs,
     };
     return self;
 }
@@ -129,11 +205,15 @@ pub fn serveTcp(
 /// the caller owns the Catalog (and therefore the Database) and must
 /// keep it alive for the Server's lifetime. Use this when several wire
 /// protocols need to share one on-disk dataset.
+/// When `limiter` is null the Server allocates a private one sized from
+/// `catalog.config.max_connections`; pass an external limiter
+/// (caller-owned) to share a single budget across multiple wires.
 pub fn serveTcpCatalog(
     allocator: Allocator,
     io: Io,
     catalog: *Catalog,
     address: std.Io.net.IpAddress,
+    limiter: ?*ConnectionLimiter,
 ) !*Server {
     const db = catalog.database(back_compat_database_name) orelse
         try catalog.createDatabase(back_compat_database_name);
@@ -145,6 +225,13 @@ pub fn serveTcpCatalog(
         .reuse_address = true,
     });
 
+    const effective_limiter = if (limiter) |lim| lim else blk: {
+        const lp = try allocator.create(ConnectionLimiter);
+        lp.* = ConnectionLimiter.init(catalog.config.max_connections);
+        break :blk lp;
+    };
+    errdefer if (limiter == null) allocator.destroy(effective_limiter);
+
     const self = try allocator.create(Server);
     self.* = .{
         .allocator = allocator,
@@ -152,8 +239,27 @@ pub fn serveTcpCatalog(
         .db = db,
         .listener = listener,
         .owns_db = false,
+        .limiter = effective_limiter,
+        .owns_limiter = limiter == null,
+        .idle_timeout_secs = catalog.config.idle_timeout_secs,
     };
     return self;
+}
+
+/// Emit resp_error(too_many_connections) and close. Best-effort.
+fn sendTooManyConnectionsNative(
+    allocator: Allocator,
+    stream: std.Io.net.Stream,
+    io: Io,
+) !void {
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    try wire.encodeError(allocator, &payload, .unknown_error, "too many connections");
+    try wire.writeFrameToIo(w, .resp_error, payload.items);
+    try w.flush();
 }
 
 // ---------------------------------------------------------------------------

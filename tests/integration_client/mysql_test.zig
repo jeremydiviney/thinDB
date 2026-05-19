@@ -66,6 +66,14 @@ const TestClient = struct {
     }
 
     fn doHandshake(self: *TestClient, initial_db: ?[]const u8) !void {
+        try self.doHandshakeWithCaps(initial_db, true);
+    }
+
+    fn doHandshakeWithCaps(
+        self: *TestClient,
+        initial_db: ?[]const u8,
+        deprecate_eof: bool,
+    ) !void {
         const greet = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
         defer self.allocator.free(greet.payload);
 
@@ -76,7 +84,7 @@ const TestClient = struct {
             mysql_handshake.CLIENT_SECURE_CONNECTION |
             mysql_handshake.CLIENT_PLUGIN_AUTH |
             (if (initial_db != null) mysql_handshake.CLIENT_CONNECT_WITH_DB else 0) |
-            mysql_handshake.CLIENT_DEPRECATE_EOF;
+            (if (deprecate_eof) mysql_handshake.CLIENT_DEPRECATE_EOF else 0);
 
         var buf4: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf4, caps, .little);
@@ -201,7 +209,7 @@ test "mysql wire: standalone client handshake + SELECT 1" {
 
     const port: u16 = test_port_base + 0;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.serveMysql(allocator, io, catalog, addr);
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -239,7 +247,7 @@ test "mysql wire: SHOW DATABASES returns flattened db__schema" {
 
     const port: u16 = test_port_base + 1;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.serveMysql(allocator, io, catalog, addr);
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -290,7 +298,7 @@ test "mysql wire: COM_QUERY against seeded table returns rows" {
 
     const port: u16 = test_port_base + 2;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.serveMysql(allocator, io, catalog, addr);
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -329,7 +337,7 @@ test "mysql wire: SET / SHOW VARIABLES probes return canned OK / rows" {
 
     const port: u16 = test_port_base + 3;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.serveMysql(allocator, io, catalog, addr);
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -374,7 +382,7 @@ test "mysql wire: CREATE DATABASE then SHOW DATABASES includes new db" {
 
     const port: u16 = test_port_base + 5;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.serveMysql(allocator, io, catalog, addr);
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -422,7 +430,7 @@ test "mysql wire: COM_INIT_DB on bogus name returns ER_BAD_DB" {
 
     const port: u16 = test_port_base + 4;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.serveMysql(allocator, io, catalog, addr);
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -448,6 +456,167 @@ test "mysql wire: COM_INIT_DB on bogus name returns ER_BAD_DB" {
     try std.testing.expectEqual(@as(u16, 1049), code);
 
     try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: legacy client (no DEPRECATE_EOF) gets two EOF packets" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 6;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshakeWithCaps(null, false);
+
+    try client.sendQuery("SELECT @@version");
+
+    const col_count_pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(col_count_pkt.payload);
+    try std.testing.expectEqual(@as(usize, 1), col_count_pkt.payload.len);
+
+    const col_def_pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(col_def_pkt.payload);
+
+    const sep_eof = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(sep_eof.payload);
+    try std.testing.expectEqual(@as(usize, 5), sep_eof.payload.len);
+    try std.testing.expectEqual(@as(u8, 0xFE), sep_eof.payload[0]);
+
+    const row_pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(row_pkt.payload);
+    try std.testing.expect(row_pkt.payload[0] != 0xFE);
+
+    const tail_eof = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(tail_eof.payload);
+    try std.testing.expectEqual(@as(usize, 5), tail_eof.payload.len);
+    try std.testing.expectEqual(@as(u8, 0xFE), tail_eof.payload[0]);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: empty initial_db leaves session at main/public" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 7), .qty = @as(i32, 70), .tag = "ok" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 7;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("");
+
+    try client.sendQuery("SELECT * FROM orders");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("ok", rows[0][2].?);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: RESET CONNECTION returns OK" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 8;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendQuery("RESET CONNECTION");
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expect(pkt.payload.len > 0);
+    try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: limiter at zero capacity emits ER_CON_COUNT_ERROR on accept" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try thindb.Catalog.open(allocator, io, tmp.dir, .{});
+    defer catalog.close();
+    _ = try catalog.createDatabase("main");
+
+    var limiter = thindb.ConnectionLimiter.init(0);
+
+    const port: u16 = test_port_base + 9;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, &limiter);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var c = try TestClient.connect(allocator, io, addr);
+    defer c.close();
+
+    const pkt = try mysql_packet.readPacket(allocator, &c.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expect(pkt.payload.len > 3);
+    try std.testing.expectEqual(@as(u8, 0xFF), pkt.payload[0]);
+    const code = std.mem.readInt(u16, pkt.payload[1..3], .little);
+    try std.testing.expectEqual(@as(u16, 1040), code);
+
     if (sctx.err) |e| return e;
 }
 
@@ -526,7 +695,7 @@ test "mysql CLI: SELECT @@version round-trips when mysql is on PATH" {
 
     const port: u16 = test_port_base + 100;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.serveMysql(allocator, io, catalog, addr);
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -570,7 +739,7 @@ test "mysql CLI: SELECT * FROM orders streams seeded rows when mysql is on PATH"
 
     const port: u16 = test_port_base + 101;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
-    var server = try thindb.serveMysql(allocator, io, catalog, addr);
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };

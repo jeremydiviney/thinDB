@@ -1,6 +1,9 @@
 //! Encode an `exec.Batch` stream as MySQL text-protocol result-set packets.
 //! Walks the executable Query, emits ColumnCount + per-column ColumnDef41
-//! + per-row ResultsetRow + an OK-style end marker (CLIENT_DEPRECATE_EOF).
+//! + per-row ResultsetRow + a terminating EOF marker. Terminator format
+//! depends on whether the client advertised CLIENT_DEPRECATE_EOF: the
+//! flag also controls whether a separator EOF is sent between the
+//! column-def sequence and the first DataRow.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -128,6 +131,38 @@ fn formatCell(scratch: *std.ArrayList(u8), allocator: Allocator, schema_col: Col
     return scratch.items;
 }
 
+/// Emit the appropriate result-set terminator for `client_caps`.
+/// DEPRECATE_EOF set: one OK-shaped EOF packet (header 0xFE, OK body).
+/// DEPRECATE_EOF clear: legacy EOF_Packet (header 0xFE + warnings + status).
+pub fn sendResultTerminator(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    if ((client_caps & handshake.CLIENT_DEPRECATE_EOF) != 0) {
+        try handshake.sendEofOkPacket(allocator, w, seq_id.*);
+    } else {
+        try handshake.sendLegacyEofPacket(allocator, w, seq_id.*);
+    }
+    seq_id.* +%= 1;
+}
+
+/// Emit the column-def → row-data boundary if the client expects it.
+/// Legacy clients require a single EOF packet between the ColumnDef
+/// sequence and the first DataRow; DEPRECATE_EOF clients omit it.
+pub fn sendColumnDefBoundary(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    if ((client_caps & handshake.CLIENT_DEPRECATE_EOF) == 0) {
+        try handshake.sendLegacyEofPacket(allocator, w, seq_id.*);
+        seq_id.* +%= 1;
+    }
+}
+
 /// Stream a Query's batches as a MySQL text-protocol result set. The
 /// passed `*Query` is owned by the caller — caller deinits.
 pub fn sendQueryResult(
@@ -137,9 +172,11 @@ pub fn sendQueryResult(
     schema_name: []const u8,
     table_name: []const u8,
     seq_id: *u8,
+    client_caps: u32,
 ) !void {
     const schema = query.outputSchema();
     try sendResultHeader(allocator, w, schema, schema_name, table_name, seq_id);
+    try sendColumnDefBoundary(allocator, w, seq_id, client_caps);
 
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
@@ -163,8 +200,7 @@ pub fn sendQueryResult(
         }
     }
 
-    try handshake.sendEofOkPacket(allocator, w, seq_id.*);
-    seq_id.* +%= 1;
+    try sendResultTerminator(allocator, w, seq_id, client_caps);
 }
 
 /// Send only the ColumnCount + ColumnDef41 packets. Used by canned-row
@@ -221,13 +257,14 @@ pub fn sendSingleValueResult(
     col_name: []const u8,
     value: ?[]const u8,
     seq_id: *u8,
+    client_caps: u32,
 ) !void {
     const cols = [_]Column{.{ .name = col_name, .type = .string, .nullable = value == null }};
     try sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
+    try sendColumnDefBoundary(allocator, w, seq_id, client_caps);
     const cells = [_]?[]const u8{value};
     try sendTextRow(allocator, w, cells[0..], seq_id);
-    try handshake.sendEofOkPacket(allocator, w, seq_id.*);
-    seq_id.* +%= 1;
+    try sendResultTerminator(allocator, w, seq_id, client_caps);
 }
 
 /// Send a `SHOW VARIABLES`-style two-column row.
@@ -237,27 +274,28 @@ pub fn sendVariableRow(
     name: []const u8,
     value: []const u8,
     seq_id: *u8,
+    client_caps: u32,
 ) !void {
     const cols = [_]Column{
         .{ .name = "Variable_name", .type = .string },
         .{ .name = "Value", .type = .string },
     };
     try sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
+    try sendColumnDefBoundary(allocator, w, seq_id, client_caps);
     const cells = [_]?[]const u8{ name, value };
     try sendTextRow(allocator, w, cells[0..], seq_id);
-    try handshake.sendEofOkPacket(allocator, w, seq_id.*);
-    seq_id.* +%= 1;
+    try sendResultTerminator(allocator, w, seq_id, client_caps);
 }
 
 /// Send an empty `SHOW VARIABLES`-shaped result set.
-pub fn sendEmptyVariables(allocator: Allocator, w: *std.Io.Writer, seq_id: *u8) !void {
+pub fn sendEmptyVariables(allocator: Allocator, w: *std.Io.Writer, seq_id: *u8, client_caps: u32) !void {
     const cols = [_]Column{
         .{ .name = "Variable_name", .type = .string },
         .{ .name = "Value", .type = .string },
     };
     try sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
-    try handshake.sendEofOkPacket(allocator, w, seq_id.*);
-    seq_id.* +%= 1;
+    try sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+    try sendResultTerminator(allocator, w, seq_id, client_caps);
 }
 
 /// Send a single-column result set whose rows are textual strings (e.g.,
@@ -268,14 +306,15 @@ pub fn sendSingleColumnRows(
     col_name: []const u8,
     values: []const []const u8,
     seq_id: *u8,
+    client_caps: u32,
 ) !void {
     const cols = [_]Column{.{ .name = col_name, .type = .string }};
     try sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
+    try sendColumnDefBoundary(allocator, w, seq_id, client_caps);
     for (values) |v| {
         const cells = [_]?[]const u8{v};
         try sendTextRow(allocator, w, cells[0..], seq_id);
     }
-    try handshake.sendEofOkPacket(allocator, w, seq_id.*);
-    seq_id.* +%= 1;
+    try sendResultTerminator(allocator, w, seq_id, client_caps);
 }
 

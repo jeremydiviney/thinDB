@@ -85,6 +85,9 @@ pub const pg_default_port: u16 = pg.default_port;
 
 pub const serveTcpCatalog = tcp_server.serveTcpCatalog;
 
+pub const conn_limit = @import("net/conn_limit.zig");
+pub const ConnectionLimiter = conn_limit.ConnectionLimiter;
+
 /// Default TCP port for a thinDB server. Servers and clients can pick
 /// any port, but examples / docs use this.
 pub const default_port: u16 = wire.default_port;

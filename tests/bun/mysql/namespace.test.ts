@@ -1,16 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import mysql, { type Connection } from "mysql2/promise";
 import { startServer, type ServerHandle } from "../helpers/server.ts";
-import { todo } from "../helpers/todo.ts";
 
-// SHOW DATABASES + COM_INIT_DB (USE) both round-trip through the
-// MySQL wire as result-sets, so they're blocked by the same
-// CLIENT_DEPRECATE_EOF mismatch documented in mysql/basic.test.ts.
-// We test what we can: COM_INIT_DB on its own (which the server
-// answers with a bare OK packet — no result set), and document the
-// gaps as todos.
-
-describe("mysql namespace — handshake-only", () => {
+describe("mysql namespace", () => {
   let server: ServerHandle;
 
   beforeAll(async () => {
@@ -30,15 +22,72 @@ describe("mysql namespace — handshake-only", () => {
       database: "main__public",
     });
     try {
-      // No assertion error means the wire accepted the COM_INIT_DB
-      // resolution of "main__public" → (db=main, schema=public).
       expect(conn).toBeDefined();
     } finally {
       await conn.end().catch(() => undefined);
     }
   });
 
-  todo("SHOW DATABASES lists main__public (blocked: DEPRECATE_EOF mismatch)");
-  todo("CREATE DATABASE then SHOW DATABASES (blocked: DEPRECATE_EOF mismatch)");
-  todo("DROP DATABASE then SHOW DATABASES (blocked: DEPRECATE_EOF mismatch)");
+  test("SHOW DATABASES lists main__public", async () => {
+    const conn = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+    });
+    try {
+      const [rows] = (await conn.query("SHOW DATABASES")) as [
+        Array<Record<string, string>>,
+        unknown,
+      ];
+      const names = rows.map((r) => r.Database);
+      expect(names).toContain("main__public");
+    } finally {
+      await conn.end().catch(() => undefined);
+    }
+  });
+
+  test("CREATE DATABASE then SHOW DATABASES picks up the new entry", async () => {
+    const conn = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+    });
+    try {
+      await conn.query("CREATE DATABASE analytics_ns");
+      const [rows] = (await conn.query("SHOW DATABASES")) as [
+        Array<Record<string, string>>,
+        unknown,
+      ];
+      const names = rows.map((r) => r.Database);
+      expect(names).toContain("analytics_ns__public");
+    } finally {
+      await conn.end().catch(() => undefined);
+    }
+  });
+
+  test("DROP DATABASE removes the entry from SHOW DATABASES", async () => {
+    const conn = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+    });
+    try {
+      await conn.query("CREATE DATABASE droppable_ns");
+      await conn.query("DROP DATABASE droppable_ns");
+      const [rows] = (await conn.query("SHOW DATABASES")) as [
+        Array<Record<string, string>>,
+        unknown,
+      ];
+      const names = rows.map((r) => r.Database);
+      expect(names).not.toContain("droppable_ns__public");
+    } finally {
+      await conn.end().catch(() => undefined);
+    }
+  });
 });

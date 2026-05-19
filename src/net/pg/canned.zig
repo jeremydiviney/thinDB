@@ -62,6 +62,12 @@ pub fn match(
         return Probe{ .accept = "ROLLBACK" };
     if (std.mem.eql(u8, lc, "discard all"))
         return Probe{ .accept = "DISCARD ALL" };
+    if (std.mem.eql(u8, lc, "discard temp") or std.mem.eql(u8, lc, "discard temporary"))
+        return Probe{ .accept = "DISCARD TEMP" };
+    if (std.mem.eql(u8, lc, "discard plans"))
+        return Probe{ .accept = "DISCARD PLANS" };
+    if (std.mem.eql(u8, lc, "reset all"))
+        return Probe{ .accept = "RESET ALL" };
 
     if (std.mem.eql(u8, lc, "select version()") or std.mem.eql(u8, lc, "select pg_catalog.version()"))
         return Probe{ .single_value = .{ .col = "version", .val = "PostgreSQL 16.0 (thinDB)" } };

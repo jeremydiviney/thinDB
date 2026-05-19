@@ -29,6 +29,8 @@ const startup = @import("startup.zig");
 const result = @import("result.zig");
 const canned = @import("canned.zig");
 const errors = @import("errors.zig");
+const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
+const sock_opts = @import("../sock_opts.zig");
 
 pub const Error = error{
     ServerClosed,
@@ -40,37 +42,111 @@ pub const Server = struct {
     catalog: *Catalog,
     listener: Io.net.Server,
     connection_counter: std.atomic.Value(u32) = .{ .raw = 0 },
+    limiter: *ConnectionLimiter,
+    owns_limiter: bool,
+    idle_timeout_secs: u32 = 0,
 
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
+        if (self.owns_limiter) self.allocator.destroy(self.limiter);
         self.allocator.destroy(self);
     }
 
+    /// Accept ONE connection and serve it synchronously on the calling
+    /// thread. Used by tests that want a deterministic accept count.
     pub fn acceptOne(self: *Server) !void {
         const stream = try self.listener.accept(self.io);
         defer stream.close(self.io);
+
+        _ = sock_opts.enableKeepalive(stream.socket.handle);
+        if (self.idle_timeout_secs > 0) {
+            _ = sock_opts.setReadTimeoutSeconds(stream.socket.handle, self.idle_timeout_secs);
+        }
+
+        if (!self.limiter.acquire()) {
+            sendTooManyConnections(self.allocator, stream, self.io) catch {};
+            return;
+        }
+        defer self.limiter.release();
+
         const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
         handleConnection(self.allocator, self.io, self.catalog, stream, cid) catch |err| {
             std.debug.print("pg: connection error: {s}\n", .{@errorName(err)});
         };
     }
 
+    /// Long-running accept loop. Each connection runs on its own thread
+    /// so multiple clients (and pool drivers) can be in-flight at once.
+    /// The shared limiter enforces the global concurrency cap.
     pub fn run(self: *Server, should_stop: *std.atomic.Value(bool)) !void {
         while (!should_stop.load(.acquire)) {
-            self.acceptOne() catch |err| {
+            const stream = self.listener.accept(self.io) catch |err| {
                 std.debug.print("pg: accept error: {s}\n", .{@errorName(err)});
+                continue;
             };
+            _ = sock_opts.enableKeepalive(stream.socket.handle);
+            if (self.idle_timeout_secs > 0) {
+                _ = sock_opts.setReadTimeoutSeconds(stream.socket.handle, self.idle_timeout_secs);
+            }
+            if (!self.limiter.acquire()) {
+                sendTooManyConnections(self.allocator, stream, self.io) catch {};
+                stream.close(self.io);
+                continue;
+            }
+            const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
+            const job = self.allocator.create(ConnJob) catch {
+                self.limiter.release();
+                stream.close(self.io);
+                continue;
+            };
+            job.* = .{
+                .allocator = self.allocator,
+                .io = self.io,
+                .catalog = self.catalog,
+                .stream = stream,
+                .connection_id = cid,
+                .limiter = self.limiter,
+            };
+            const thread = std.Thread.spawn(.{}, ConnJob.run, .{job}) catch {
+                self.limiter.release();
+                stream.close(self.io);
+                self.allocator.destroy(job);
+                continue;
+            };
+            thread.detach();
         }
+    }
+};
+
+const ConnJob = struct {
+    allocator: Allocator,
+    io: Io,
+    catalog: *Catalog,
+    stream: Io.net.Stream,
+    connection_id: u32,
+    limiter: *ConnectionLimiter,
+
+    fn run(self: *ConnJob) void {
+        defer self.allocator.destroy(self);
+        defer self.limiter.release();
+        defer self.stream.close(self.io);
+        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id) catch |err| {
+            std.debug.print("pg: connection error: {s}\n", .{@errorName(err)});
+        };
     }
 };
 
 /// Bind a PostgreSQL listener on `address` for queries against `catalog`.
 /// The Server does NOT own the catalog — caller manages its lifetime.
+/// When `limiter` is null the Server allocates a private limiter sized
+/// from `catalog.config.max_connections`; pass an external limiter
+/// (caller-owned) to share a single budget across multiple wires.
 pub fn servePg(
     allocator: Allocator,
     io: Io,
     catalog: *Catalog,
     address: Io.net.IpAddress,
+    limiter: ?*ConnectionLimiter,
 ) !*Server {
     var listen_addr = address;
     const listener = try Io.net.IpAddress.listen(&listen_addr, io, .{
@@ -78,14 +154,38 @@ pub fn servePg(
         .protocol = .tcp,
         .reuse_address = true,
     });
+    const effective_limiter = if (limiter) |lim| lim else blk: {
+        const lp = try allocator.create(ConnectionLimiter);
+        lp.* = ConnectionLimiter.init(catalog.config.max_connections);
+        break :blk lp;
+    };
+    errdefer if (limiter == null) allocator.destroy(effective_limiter);
+
     const self = try allocator.create(Server);
     self.* = .{
         .allocator = allocator,
         .io = io,
         .catalog = catalog,
         .listener = listener,
+        .limiter = effective_limiter,
+        .owns_limiter = limiter == null,
+        .idle_timeout_secs = catalog.config.idle_timeout_secs,
     };
     return self;
+}
+
+/// Emit ErrorResponse 53300 / too_many_connections and close. Used when
+/// the server-wide limiter rejected the slot at accept time. Best-effort.
+fn sendTooManyConnections(
+    allocator: Allocator,
+    stream: Io.net.Stream,
+    io: Io,
+) !void {
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+    try errors.sendErrorResponse(allocator, w, "53300".*, "too many connections");
+    try w.flush();
 }
 
 const SessionState = struct {

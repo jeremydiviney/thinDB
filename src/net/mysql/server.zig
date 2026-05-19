@@ -28,6 +28,8 @@ const handshake = @import("handshake.zig");
 const result = @import("result.zig");
 const canned = @import("canned.zig");
 const errors = @import("errors.zig");
+const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
+const sock_opts = @import("../sock_opts.zig");
 
 pub const Error = error{
     ServerClosed,
@@ -39,57 +41,167 @@ pub const Server = struct {
     catalog: *Catalog,
     listener: Io.net.Server,
     connection_counter: std.atomic.Value(u32) = .{ .raw = 0 },
+    /// Shared across every wire when started from the binary; per-Server
+    /// when started from a test. Slot is taken on accept, released when
+    /// the per-connection handler returns.
+    limiter: *ConnectionLimiter,
+    /// True when this Server created its own limiter and must free it
+    /// on close. False when the limiter was passed in by the caller.
+    owns_limiter: bool,
+    /// Per-connection read timeout. Pulled from `Config.idle_timeout_secs`
+    /// and applied via SO_RCVTIMEO on accepted sockets. 0 disables.
+    idle_timeout_secs: u32 = 0,
 
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
+        if (self.owns_limiter) self.allocator.destroy(self.limiter);
         self.allocator.destroy(self);
     }
 
+    /// Accept ONE connection and serve it synchronously on the calling
+    /// thread. Used by tests that want a deterministic accept count.
     pub fn acceptOne(self: *Server) !void {
         const stream = try self.listener.accept(self.io);
         defer stream.close(self.io);
+
+        _ = sock_opts.enableKeepalive(stream.socket.handle);
+        if (self.idle_timeout_secs > 0) {
+            _ = sock_opts.setReadTimeoutSeconds(stream.socket.handle, self.idle_timeout_secs);
+        }
+
+        if (!self.limiter.acquire()) {
+            sendTooManyConnections(self.allocator, stream, self.io) catch {};
+            return;
+        }
+        defer self.limiter.release();
+
         const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
         handleConnection(self.allocator, self.io, self.catalog, stream, cid) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
     }
 
+    /// Long-running accept loop. Each connection runs on its own thread
+    /// so multiple clients (and pool drivers) can be in-flight at once.
+    /// The shared limiter enforces the global concurrency cap.
     pub fn run(self: *Server, should_stop: *std.atomic.Value(bool)) !void {
         while (!should_stop.load(.acquire)) {
-            self.acceptOne() catch |err| {
+            const stream = self.listener.accept(self.io) catch |err| {
                 std.debug.print("mysql: accept error: {s}\n", .{@errorName(err)});
+                continue;
             };
+            _ = sock_opts.enableKeepalive(stream.socket.handle);
+            if (self.idle_timeout_secs > 0) {
+                _ = sock_opts.setReadTimeoutSeconds(stream.socket.handle, self.idle_timeout_secs);
+            }
+            if (!self.limiter.acquire()) {
+                sendTooManyConnections(self.allocator, stream, self.io) catch {};
+                stream.close(self.io);
+                continue;
+            }
+            const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
+            const job = self.allocator.create(ConnJob) catch {
+                self.limiter.release();
+                stream.close(self.io);
+                continue;
+            };
+            job.* = .{
+                .allocator = self.allocator,
+                .io = self.io,
+                .catalog = self.catalog,
+                .stream = stream,
+                .connection_id = cid,
+                .limiter = self.limiter,
+            };
+            const thread = std.Thread.spawn(.{}, ConnJob.run, .{job}) catch {
+                self.limiter.release();
+                stream.close(self.io);
+                self.allocator.destroy(job);
+                continue;
+            };
+            thread.detach();
         }
+    }
+};
+
+const ConnJob = struct {
+    allocator: Allocator,
+    io: Io,
+    catalog: *Catalog,
+    stream: Io.net.Stream,
+    connection_id: u32,
+    limiter: *ConnectionLimiter,
+
+    fn run(self: *ConnJob) void {
+        defer self.allocator.destroy(self);
+        defer self.limiter.release();
+        defer self.stream.close(self.io);
+        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id) catch |err| {
+            std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
+        };
     }
 };
 
 /// Bind a MySQL listener on `address` for queries against `catalog`.
 /// The Server does NOT own the catalog — caller manages its lifetime.
+/// When `limiter` is null the Server allocates a private limiter sized
+/// from `catalog.config.max_connections`; pass an external limiter
+/// (caller-owned) to share a single budget across multiple wires.
 pub fn serveMysql(
     allocator: Allocator,
     io: Io,
     catalog: *Catalog,
     address: Io.net.IpAddress,
+    limiter: ?*ConnectionLimiter,
 ) !*Server {
     const listener = try Io.net.IpAddress.listen(&address, io, .{
         .mode = .stream,
         .protocol = .tcp,
         .reuse_address = true,
     });
+    const effective_limiter = if (limiter) |lim| lim else blk: {
+        const lp = try allocator.create(ConnectionLimiter);
+        lp.* = ConnectionLimiter.init(catalog.config.max_connections);
+        break :blk lp;
+    };
+    errdefer if (limiter == null) allocator.destroy(effective_limiter);
+
     const self = try allocator.create(Server);
     self.* = .{
         .allocator = allocator,
         .io = io,
         .catalog = catalog,
         .listener = listener,
+        .limiter = effective_limiter,
+        .owns_limiter = limiter == null,
+        .idle_timeout_secs = catalog.config.idle_timeout_secs,
     };
     return self;
+}
+
+/// Emit ER_CON_COUNT_ERROR (1040 / 08004) and close. Used when the
+/// server-wide limiter rejected the slot at accept time. Best-effort:
+/// any I/O failure here is silently swallowed by the caller.
+fn sendTooManyConnections(
+    allocator: Allocator,
+    stream: Io.net.Stream,
+    io: Io,
+) !void {
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+    try handshake.sendErrPacket(allocator, w, 0, 1040, "08004".*, "Too many connections");
+    try w.flush();
 }
 
 const SessionState = struct {
     current_db: []u8,
     current_schema: []u8,
     allocator: Allocator,
+    /// Snapshot of the client's HandshakeResponse41 capability bits.
+    /// Controls result-set terminator format (DEPRECATE_EOF) and any
+    /// future per-connection feature toggles. Zero before handshake.
+    client_caps: u32 = 0,
 
     fn init(allocator: Allocator) !SessionState {
         return .{
@@ -146,14 +258,17 @@ fn handleConnection(
         try w.flush();
         return;
     };
+    session.client_caps = client.capabilities;
 
     if (client.initial_database) |db_name| {
-        applyInitDb(catalog, &session, db_name) catch |err| {
-            const mapped = errors.mapInternal(err, @errorName(err));
-            try handshake.sendErrPacket(allocator, w, 2, mapped.code, mapped.sqlstate, mapped.message);
-            try w.flush();
-            return;
-        };
+        if (db_name.len > 0) {
+            applyInitDb(catalog, &session, db_name) catch |err| {
+                const mapped = errors.mapInternal(err, @errorName(err));
+                try handshake.sendErrPacket(allocator, w, 2, mapped.code, mapped.sqlstate, mapped.message);
+                try w.flush();
+                return;
+            };
+        }
     }
 
     try handshake.sendHandshakeOk(allocator, w);
@@ -212,6 +327,10 @@ fn handleInitDb(
     session: *SessionState,
     payload: []const u8,
 ) !void {
+    if (payload.len == 0) {
+        try handshake.sendOkPacket(allocator, w, 1, 0, 0);
+        return;
+    }
     applyInitDb(catalog, session, payload) catch |err| {
         const mapped = errors.mapInternal(err, @errorName(err));
         try handshake.sendErrPacket(allocator, w, 1, mapped.code, mapped.sqlstate, mapped.message);
@@ -228,20 +347,21 @@ fn handleQuery(
     payload: []const u8,
 ) !void {
     var seq_id: u8 = 1;
+    const caps = session.client_caps;
 
     if (try canned.match(allocator, payload, session.current_schema)) |outcome| {
         switch (outcome) {
             .ok_packet => try handshake.sendOkPacket(allocator, w, seq_id, 0, 0),
-            .single_value => |sv| try result.sendSingleValueResult(allocator, w, sv.col, sv.val, &seq_id),
-            .single_null => |col| try result.sendSingleValueResult(allocator, w, col, null, &seq_id),
-            .variable_row => |vr| try result.sendVariableRow(allocator, w, vr.name, vr.value, &seq_id),
-            .empty_variables => try result.sendEmptyVariables(allocator, w, &seq_id),
+            .single_value => |sv| try result.sendSingleValueResult(allocator, w, sv.col, sv.val, &seq_id, caps),
+            .single_null => |col| try result.sendSingleValueResult(allocator, w, col, null, &seq_id, caps),
+            .variable_row => |vr| try result.sendVariableRow(allocator, w, vr.name, vr.value, &seq_id, caps),
+            .empty_variables => try result.sendEmptyVariables(allocator, w, &seq_id, caps),
         }
         return;
     }
 
     if (isShowDatabases(payload)) {
-        try sendFlattenedDatabases(allocator, w, catalog, &seq_id);
+        try sendFlattenedDatabases(allocator, w, catalog, &seq_id, caps);
         return;
     }
 
@@ -259,6 +379,7 @@ fn sendFlattenedDatabases(
     w: *std.Io.Writer,
     catalog: *Catalog,
     seq_id: *u8,
+    client_caps: u32,
 ) !void {
     const db_names = try catalog.listDatabases(allocator);
     defer {
@@ -290,7 +411,7 @@ fn sendFlattenedDatabases(
     try as_const.ensureTotalCapacity(allocator, flat.items.len);
     for (flat.items) |s| as_const.appendAssumeCapacity(s);
 
-    try result.sendSingleColumnRows(allocator, w, "Database", as_const.items, seq_id);
+    try result.sendSingleColumnRows(allocator, w, "Database", as_const.items, seq_id, client_caps);
 }
 
 fn runEngineQuery(
@@ -334,7 +455,7 @@ fn runEngineQuery(
         return;
     }
 
-    try result.sendQueryResult(allocator, w, &compiled, session.current_db, "", seq_id);
+    try result.sendQueryResult(allocator, w, &compiled, session.current_db, "", seq_id, session.client_caps);
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);

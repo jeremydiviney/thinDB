@@ -181,6 +181,27 @@ pub fn sendEofOkPacket(allocator: Allocator, w: *std.Io.Writer, seq_id: u8) !voi
     try packet.writePacket(w, seq_id, payload.items);
 }
 
+/// Legacy EOF_Packet (header 0xFE + warnings(2) + status_flags(2)).
+/// Emitted as the column-def / row-set terminator when the client did
+/// NOT negotiate CLIENT_DEPRECATE_EOF. Older clients (mysql2,
+/// MySQL Connector/J pre-5.1.x) require this between column defs and
+/// rows, and again after the rows.
+pub fn sendLegacyEofPacket(allocator: Allocator, w: *std.Io.Writer, seq_id: u8) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+
+    try payload.append(allocator, 0xFE);
+
+    var warn_buf: [2]u8 = .{ 0, 0 };
+    try payload.appendSlice(allocator, &warn_buf);
+
+    var status_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &status_buf, SERVER_STATUS_AUTOCOMMIT, .little);
+    try payload.appendSlice(allocator, &status_buf);
+
+    try packet.writePacket(w, seq_id, payload.items);
+}
+
 /// Send an ERR_Packet at the given sequence id.
 pub fn sendErrPacket(
     allocator: Allocator,
