@@ -29,6 +29,7 @@ const startup = @import("startup.zig");
 const result = @import("result.zig");
 const canned = @import("canned.zig");
 const errors = @import("errors.zig");
+const auth = @import("auth.zig");
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
 const sock_opts = @import("../sock_opts.zig");
 
@@ -45,6 +46,24 @@ pub const Server = struct {
     limiter: *ConnectionLimiter,
     owns_limiter: bool,
     idle_timeout_secs: u32 = 0,
+    /// Optional SCRAM-SHA-256 credentials. When null (default), the
+    /// server runs in trust mode and accepts any SASL response (or no
+    /// SASL exchange at all). Derived once via setAuthPassword from
+    /// the cleartext password; the cleartext is not retained on the
+    /// Server. Set after servePg() returns and before run().
+    auth_credentials: ?auth.Credentials = null,
+
+    /// Configure the SCRAM-SHA-256 password. Derives credentials
+    /// (salt + StoredKey + ServerKey) once and stores them on the
+    /// Server. Subsequent connections will require correct
+    /// SASLResponse before AuthenticationOk.
+    pub fn setAuthPassword(self: *Server, password: ?[]const u8) void {
+        if (password) |pw| {
+            self.auth_credentials = auth.deriveCredentials(pw);
+        } else {
+            self.auth_credentials = null;
+        }
+    }
 
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
@@ -70,7 +89,7 @@ pub const Server = struct {
         defer self.limiter.release();
 
         const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
-        handleConnection(self.allocator, self.io, self.catalog, stream, cid) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_credentials) catch |err| {
             std.debug.print("pg: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -106,6 +125,7 @@ pub const Server = struct {
                 .stream = stream,
                 .connection_id = cid,
                 .limiter = self.limiter,
+                .auth_credentials = self.auth_credentials,
             };
             const thread = std.Thread.spawn(.{}, ConnJob.run, .{job}) catch {
                 self.limiter.release();
@@ -125,12 +145,13 @@ const ConnJob = struct {
     stream: Io.net.Stream,
     connection_id: u32,
     limiter: *ConnectionLimiter,
+    auth_credentials: ?auth.Credentials,
 
     fn run(self: *ConnJob) void {
         defer self.allocator.destroy(self);
         defer self.limiter.release();
         defer self.stream.close(self.io);
-        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id, self.auth_credentials) catch |err| {
             std.debug.print("pg: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -249,6 +270,7 @@ fn handleConnection(
     catalog: *Catalog,
     stream: Io.net.Stream,
     connection_id: u32,
+    auth_creds: ?auth.Credentials,
 ) !void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
@@ -260,7 +282,7 @@ fn handleConnection(
     var session = try SessionState.init(allocator);
     defer session.deinit();
 
-    if (!try completeStartup(allocator, w, r, catalog, &session, connection_id)) return;
+    if (!try completeStartup(allocator, w, r, catalog, &session, connection_id, auth_creds)) return;
 
     while (true) {
         const frame = packet.readFrame(allocator, r) catch |err| switch (err) {
@@ -295,6 +317,7 @@ fn completeStartup(
     catalog: *Catalog,
     session: *SessionState,
     connection_id: u32,
+    auth_creds: ?auth.Credentials,
 ) !bool {
     const first = try packet.readStartupFrame(allocator, r);
     defer allocator.free(first.payload);
@@ -327,6 +350,10 @@ fn completeStartup(
     }
     if (params.application_name) |an| try session.replaceAppName(an);
 
+    if (auth_creds) |creds| {
+        if (!try runScramSha256(allocator, w, r, creds)) return false;
+    }
+
     try startup.sendAuthenticationOk(allocator, w);
     try startup.sendStandardParameterStatus(
         allocator,
@@ -338,6 +365,127 @@ fn completeStartup(
     try startup.sendReadyForQuery(allocator, w, 'I');
     try w.flush();
     return true;
+}
+
+/// Execute the SCRAM-SHA-256 SASL exchange. Returns true on auth
+/// success. On any failure (malformed messages, proof mismatch,
+/// client picked unsupported mechanism) the client gets an
+/// ErrorResponse with SQLSTATE 28P01 and the function returns false.
+fn runScramSha256(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    creds: auth.Credentials,
+) !bool {
+    // 1. Server -> AuthenticationSASL (mechanism list).
+    const mechs = [_][]const u8{"SCRAM-SHA-256"};
+    try startup.sendAuthenticationSASL(allocator, w, &mechs);
+    try w.flush();
+
+    // 2. Client -> SASLInitialResponse ('p' frame): mechanism name +
+    // int32 length + initial-response bytes.
+    const f1 = try packet.readFrame(allocator, r);
+    defer allocator.free(f1.payload);
+    if (f1.type_byte != 'p') return scramReject(allocator, w, "expected SASLInitialResponse");
+
+    var cursor: usize = 0;
+    const selected_mech = try packet.readCString(f1.payload, &cursor);
+    if (!std.mem.eql(u8, selected_mech, "SCRAM-SHA-256"))
+        return scramReject(allocator, w, "unsupported SASL mechanism");
+    const initial_len = try packet.readU32(f1.payload, &cursor);
+    if (cursor + initial_len > f1.payload.len)
+        return scramReject(allocator, w, "truncated SASLInitialResponse");
+    const client_first = f1.payload[cursor .. cursor + initial_len];
+
+    const cf = auth.parseClientFirst(allocator, client_first) catch {
+        return scramReject(allocator, w, "malformed client-first-message");
+    };
+
+    // 3. Server -> AuthenticationSASLContinue (server-first-message).
+    var server_nonce_raw: [18]u8 = undefined;
+    auth.randomServerNonce(&server_nonce_raw);
+    var server_nonce_b64: [24]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&server_nonce_b64, &server_nonce_raw);
+
+    var salt_b64_buf: [32]u8 = undefined;
+    const salt_b64 = std.base64.standard.Encoder.encode(&salt_b64_buf, &creds.salt);
+
+    var server_first: std.ArrayList(u8) = .empty;
+    defer server_first.deinit(allocator);
+    try server_first.appendSlice(allocator, "r=");
+    try server_first.appendSlice(allocator, cf.client_nonce);
+    try server_first.appendSlice(allocator, &server_nonce_b64);
+    try server_first.appendSlice(allocator, ",s=");
+    try server_first.appendSlice(allocator, salt_b64);
+    try server_first.appendSlice(allocator, ",i=");
+    var iter_buf: [16]u8 = undefined;
+    const iter_str = try std.fmt.bufPrint(&iter_buf, "{d}", .{creds.iter_count});
+    try server_first.appendSlice(allocator, iter_str);
+
+    try startup.sendAuthenticationSASLContinue(allocator, w, server_first.items);
+    try w.flush();
+
+    // 4. Client -> SASLResponse ('p' frame): client-final-message.
+    const f2 = try packet.readFrame(allocator, r);
+    defer allocator.free(f2.payload);
+    if (f2.type_byte != 'p') return scramReject(allocator, w, "expected SASLResponse");
+    const client_final = f2.payload;
+
+    const cfinal = auth.parseClientFinal(client_final) catch {
+        return scramReject(allocator, w, "malformed client-final-message");
+    };
+
+    // Combined-nonce check: client must echo exactly client_nonce ++
+    // server_nonce.
+    var expected_nonce: std.ArrayList(u8) = .empty;
+    defer expected_nonce.deinit(allocator);
+    try expected_nonce.appendSlice(allocator, cf.client_nonce);
+    try expected_nonce.appendSlice(allocator, &server_nonce_b64);
+    if (!std.mem.eql(u8, expected_nonce.items, cfinal.combined_nonce))
+        return scramReject(allocator, w, "nonce mismatch");
+
+    // AuthMessage = client-first-bare + "," + server-first-message +
+    //               "," + client-final-without-proof
+    var auth_msg: std.ArrayList(u8) = .empty;
+    defer auth_msg.deinit(allocator);
+    try auth_msg.appendSlice(allocator, cf.bare);
+    try auth_msg.append(allocator, ',');
+    try auth_msg.appendSlice(allocator, server_first.items);
+    try auth_msg.append(allocator, ',');
+    try auth_msg.appendSlice(allocator, cfinal.without_proof);
+
+    // Decode the base64 ClientProof.
+    var proof: [auth.HASH_LEN]u8 = undefined;
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(cfinal.client_proof_b64) catch {
+        return scramReject(allocator, w, "invalid ClientProof base64");
+    };
+    if (decoded_len != auth.HASH_LEN) return scramReject(allocator, w, "wrong ClientProof length");
+    decoder.decode(&proof, cfinal.client_proof_b64) catch {
+        return scramReject(allocator, w, "invalid ClientProof base64");
+    };
+
+    if (!auth.verifyClientProof(creds, auth_msg.items, proof))
+        return scramReject(allocator, w, "authentication failed");
+
+    // 5. Server -> AuthenticationSASLFinal (server-final-message).
+    const sig = auth.serverSignature(creds, auth_msg.items);
+    var sig_b64_buf: [64]u8 = undefined;
+    const sig_b64 = std.base64.standard.Encoder.encode(&sig_b64_buf, &sig);
+    var server_final: std.ArrayList(u8) = .empty;
+    defer server_final.deinit(allocator);
+    try server_final.appendSlice(allocator, "v=");
+    try server_final.appendSlice(allocator, sig_b64);
+    try startup.sendAuthenticationSASLFinal(allocator, w, server_final.items);
+    try w.flush();
+
+    return true;
+}
+
+fn scramReject(allocator: Allocator, w: *std.Io.Writer, message: []const u8) !bool {
+    try errors.sendErrorResponse(allocator, w, "28P01".*, message);
+    try w.flush();
+    return false;
 }
 
 fn applyDatabase(catalog: *Catalog, session: *SessionState, name: []const u8) !void {

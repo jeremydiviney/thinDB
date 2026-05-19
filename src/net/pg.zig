@@ -6,6 +6,7 @@ pub const startup = @import("pg/startup.zig");
 pub const result = @import("pg/result.zig");
 pub const canned = @import("pg/canned.zig");
 pub const errors = @import("pg/errors.zig");
+pub const auth = @import("pg/auth.zig");
 pub const server = @import("pg/server.zig");
 
 pub const Server = server.Server;
@@ -19,5 +20,6 @@ test {
     _ = result;
     _ = canned;
     _ = errors;
+    _ = auth;
     _ = server;
 }

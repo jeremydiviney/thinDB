@@ -35,6 +35,9 @@ const usage_text =
     \\  --mysql-password PW     Require this password on the MySQL wire (mysql_native_password).
     \\                          Without this flag the MySQL wire is in trust mode and accepts any
     \\                          password. Does not affect the PG or native wires.
+    \\  --pg-password PW        Require this password on the PG wire (SCRAM-SHA-256). Without this
+    \\                          flag the PG wire is in trust mode and accepts any password. Does
+    \\                          not affect the MySQL or native wires.
     \\  --help                  Show this help and exit.
     \\  --version               Print version and exit.
     \\
@@ -60,6 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
     var max_connections: u32 = 256;
     var idle_timeout_secs: u32 = 0;
     var mysql_password: ?[]const u8 = null;
+    var pg_password: ?[]const u8 = null;
 
     var stderr_buf: [4096]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
@@ -109,6 +113,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (try takeValue(arg, "--mysql-password", &args_iter, err_w)) |v| {
             mysql_password = v;
+            continue;
+        }
+        if (try takeValue(arg, "--pg-password", &args_iter, err_w)) |v| {
+            pg_password = v;
             continue;
         }
         try err_w.print("thindb-server: unknown argument: {s}\n\n", .{arg});
@@ -177,7 +185,11 @@ pub fn main(init: std.process.Init) !u8 {
                 s.auth_password = mysql_password;
                 break :blk .{ .mysql = s };
             },
-            .pg => .{ .pg = try thindb.servePg(gpa, io, catalog, addr, &shared_limiter) },
+            .pg => blk: {
+                const s = try thindb.servePg(gpa, io, catalog, addr, &shared_limiter);
+                s.setAuthPassword(pg_password);
+                break :blk .{ .pg = s };
+            },
             .native => .{ .native = try thindb.serveTcpCatalog(gpa, io, catalog, addr, &shared_limiter) },
         };
         n_listeners += 1;

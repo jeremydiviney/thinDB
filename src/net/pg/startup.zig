@@ -89,6 +89,38 @@ pub fn sendAuthenticationOk(allocator: Allocator, w: *std.Io.Writer) !void {
     try packet.writeFrame(w, 'R', payload.items);
 }
 
+/// AuthenticationSASL — auth code 10, followed by a list of supported
+/// SASL mechanism names, each NUL-terminated, then a final empty NUL
+/// to mark the list end.
+pub fn sendAuthenticationSASL(allocator: Allocator, w: *std.Io.Writer, mechanisms: []const []const u8) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    try packet.appendU32(allocator, &payload, 10);
+    for (mechanisms) |m| try packet.appendCString(allocator, &payload, m);
+    try payload.append(allocator, 0);
+    try packet.writeFrame(w, 'R', payload.items);
+}
+
+/// AuthenticationSASLContinue — auth code 11 + raw server-first-message
+/// bytes (server feeds the SCRAM message body directly).
+pub fn sendAuthenticationSASLContinue(allocator: Allocator, w: *std.Io.Writer, sasl_body: []const u8) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    try packet.appendU32(allocator, &payload, 11);
+    try payload.appendSlice(allocator, sasl_body);
+    try packet.writeFrame(w, 'R', payload.items);
+}
+
+/// AuthenticationSASLFinal — auth code 12 + raw server-final-message
+/// bytes.
+pub fn sendAuthenticationSASLFinal(allocator: Allocator, w: *std.Io.Writer, sasl_body: []const u8) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    try packet.appendU32(allocator, &payload, 12);
+    try payload.appendSlice(allocator, sasl_body);
+    try packet.writeFrame(w, 'R', payload.items);
+}
+
 /// ParameterStatus: `S` frame carrying name + value (both NUL-terminated).
 pub fn sendParameterStatus(
     allocator: Allocator,

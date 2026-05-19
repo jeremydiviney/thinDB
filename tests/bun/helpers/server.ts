@@ -10,6 +10,12 @@ export type ServerConfig = {
   bind?: string;
   /** Identifying string for tmp-dir naming. */
   label?: string;
+  /** When set, server requires this password on the MySQL wire
+   * (mysql_native_password). Without it the wire is in trust mode. */
+  mysqlPassword?: string;
+  /** When set, server requires this password on the PG wire
+   * (SCRAM-SHA-256). Without it the wire is in trust mode. */
+  pgPassword?: string;
 };
 
 export type ServerHandle = {
@@ -51,6 +57,12 @@ export async function startServer(cfg: ServerConfig = {}): Promise<ServerHandle>
     "--bind",
     bind,
   ];
+  if (cfg.mysqlPassword !== undefined) {
+    args.push("--mysql-password", cfg.mysqlPassword);
+  }
+  if (cfg.pgPassword !== undefined) {
+    args.push("--pg-password", cfg.pgPassword);
+  }
 
   const proc = spawn({
     cmd: [BIN, ...args],
