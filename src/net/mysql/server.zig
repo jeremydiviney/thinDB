@@ -28,6 +28,7 @@ const handshake = @import("handshake.zig");
 const result = @import("result.zig");
 const canned = @import("canned.zig");
 const errors = @import("errors.zig");
+const auth = @import("auth.zig");
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
 const sock_opts = @import("../sock_opts.zig");
 
@@ -51,6 +52,13 @@ pub const Server = struct {
     /// Per-connection read timeout. Pulled from `Config.idle_timeout_secs`
     /// and applied via SO_RCVTIMEO on accepted sockets. 0 disables.
     idle_timeout_secs: u32 = 0,
+    /// Optional `mysql_native_password` cleartext. When null (default),
+    /// the server runs in trust mode and accepts any auth response.
+    /// When set, the client must respond with the correct 20-byte
+    /// SHA1 challenge or the handshake is rejected (ER_ACCESS_DENIED).
+    /// Caller-owned slice; must outlive the Server. Set after
+    /// serveMysql() returns and before run().
+    auth_password: ?[]const u8 = null,
 
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
@@ -76,7 +84,7 @@ pub const Server = struct {
         defer self.limiter.release();
 
         const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
-        handleConnection(self.allocator, self.io, self.catalog, stream, cid) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_password) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -112,6 +120,7 @@ pub const Server = struct {
                 .stream = stream,
                 .connection_id = cid,
                 .limiter = self.limiter,
+                .auth_password = self.auth_password,
             };
             const thread = std.Thread.spawn(.{}, ConnJob.run, .{job}) catch {
                 self.limiter.release();
@@ -131,12 +140,13 @@ const ConnJob = struct {
     stream: Io.net.Stream,
     connection_id: u32,
     limiter: *ConnectionLimiter,
+    auth_password: ?[]const u8,
 
     fn run(self: *ConnJob) void {
         defer self.allocator.destroy(self);
         defer self.limiter.release();
         defer self.stream.close(self.io);
-        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id, self.auth_password) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -250,6 +260,7 @@ fn handleConnection(
     catalog: *Catalog,
     stream: Io.net.Stream,
     connection_id: u32,
+    auth_password: ?[]const u8,
 ) !void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
@@ -261,7 +272,10 @@ fn handleConnection(
     var session = try SessionState.init(allocator);
     defer session.deinit();
 
-    try handshake.sendInitialHandshake(allocator, w, connection_id);
+    var salt: [auth.SALT_LEN]u8 = undefined;
+    auth.randomSalt(&salt);
+
+    try handshake.sendInitialHandshake(allocator, w, connection_id, salt);
     try w.flush();
 
     const hs_packet = try packet.readPacket(allocator, r);
@@ -272,6 +286,14 @@ fn handleConnection(
         return;
     };
     session.client_caps = client.capabilities;
+
+    if (auth_password) |pw| {
+        if (!auth.verify(pw, salt, client.auth_response)) {
+            try handshake.sendErrPacket(allocator, w, 2, 1045, "28000".*, "Access denied");
+            try w.flush();
+            return;
+        }
+    }
 
     if (client.initial_database) |db_name| {
         if (db_name.len > 0) {

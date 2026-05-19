@@ -62,14 +62,23 @@ pub const ClientHandshake = struct {
     username: []const u8,
     initial_database: ?[]const u8,
     auth_plugin: ?[]const u8,
+    /// Raw client auth response bytes. For mysql_native_password
+    /// this is a 20-byte hash; for other plugins (caching_sha2,
+    /// etc.) the length varies. Empty when the client supplied no
+    /// auth response.
+    auth_response: []const u8,
 };
 
 /// Write the server's HandshakeV10 greeting packet (always seq_id=0).
-/// `connection_id` is a server-chosen identifier surfaced to the client.
+/// `connection_id` is a server-chosen identifier surfaced to the
+/// client. `salt` is the 20-byte mysql_native_password challenge —
+/// embedded as auth-plugin-data-part-1 (first 8 bytes) +
+/// auth-plugin-data-part-2 (next 12 bytes + a trailing null).
 pub fn sendInitialHandshake(
     allocator: Allocator,
     w: *std.Io.Writer,
     connection_id: u32,
+    salt: [20]u8,
 ) !void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
@@ -81,8 +90,7 @@ pub fn sendInitialHandshake(
     std.mem.writeInt(u32, &cid_buf, connection_id, .little);
     try payload.appendSlice(allocator, &cid_buf);
 
-    const auth_part1 = [_]u8{ 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h' };
-    try payload.appendSlice(allocator, &auth_part1);
+    try payload.appendSlice(allocator, salt[0..8]);
     try payload.append(allocator, 0);
 
     var cap_buf: [4]u8 = undefined;
@@ -102,8 +110,8 @@ pub fn sendInitialHandshake(
     const reserved = [_]u8{0} ** 10;
     try payload.appendSlice(allocator, &reserved);
 
-    const auth_part2 = [_]u8{ 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 0 };
-    try payload.appendSlice(allocator, &auth_part2);
+    try payload.appendSlice(allocator, salt[8..20]);
+    try payload.append(allocator, 0);
 
     try packet.appendNulString(allocator, &payload, "mysql_native_password");
 
@@ -122,14 +130,16 @@ pub fn parseHandshakeResponse(bytes: []const u8) !ClientHandshake {
     cursor += 23;
     const username = try packet.readNulString(bytes, &cursor);
 
+    var auth_response: []const u8 = &[_]u8{};
     if ((caps & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) != 0) {
-        _ = try packet.readLenEncString(bytes, &cursor);
+        auth_response = try packet.readLenEncString(bytes, &cursor);
     } else if ((caps & CLIENT_SECURE_CONNECTION) != 0) {
         const auth_len = try packet.readFixedU8(bytes, &cursor);
         if (cursor + auth_len > bytes.len) return packet.Error.PacketTruncated;
+        auth_response = bytes[cursor .. cursor + auth_len];
         cursor += auth_len;
     } else {
-        _ = try packet.readNulString(bytes, &cursor);
+        auth_response = try packet.readNulString(bytes, &cursor);
     }
 
     var initial_db: ?[]const u8 = null;
@@ -149,6 +159,7 @@ pub fn parseHandshakeResponse(bytes: []const u8) !ClientHandshake {
         .username = username,
         .initial_database = initial_db,
         .auth_plugin = auth_plugin,
+        .auth_response = auth_response,
     };
 }
 

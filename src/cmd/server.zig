@@ -32,6 +32,9 @@ const usage_text =
     \\  --bind ADDR             Interface to bind (default 0.0.0.0).
     \\  --max-connections N     Cap on concurrent client connections across all wires (default 256).
     \\  --idle-timeout-secs N   Close a connection after N seconds of read silence (default 0 = disabled).
+    \\  --mysql-password PW     Require this password on the MySQL wire (mysql_native_password).
+    \\                          Without this flag the MySQL wire is in trust mode and accepts any
+    \\                          password. Does not affect the PG or native wires.
     \\  --help                  Show this help and exit.
     \\  --version               Print version and exit.
     \\
@@ -56,6 +59,7 @@ pub fn main(init: std.process.Init) !u8 {
     var bind: []const u8 = default_bind;
     var max_connections: u32 = 256;
     var idle_timeout_secs: u32 = 0;
+    var mysql_password: ?[]const u8 = null;
 
     var stderr_buf: [4096]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
@@ -101,6 +105,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (try takeU32(arg, "--idle-timeout-secs", &args_iter, err_w)) |v| {
             idle_timeout_secs = v;
+            continue;
+        }
+        if (try takeValue(arg, "--mysql-password", &args_iter, err_w)) |v| {
+            mysql_password = v;
             continue;
         }
         try err_w.print("thindb-server: unknown argument: {s}\n\n", .{arg});
@@ -164,7 +172,11 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         };
         listeners[n_listeners] = switch (spec.kind) {
-            .mysql => .{ .mysql = try thindb.serveMysql(gpa, io, catalog, addr, &shared_limiter) },
+            .mysql => blk: {
+                const s = try thindb.serveMysql(gpa, io, catalog, addr, &shared_limiter);
+                s.auth_password = mysql_password;
+                break :blk .{ .mysql = s };
+            },
             .pg => .{ .pg = try thindb.servePg(gpa, io, catalog, addr, &shared_limiter) },
             .native => .{ .native = try thindb.serveTcpCatalog(gpa, io, catalog, addr, &shared_limiter) },
         };

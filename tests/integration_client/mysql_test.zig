@@ -31,6 +31,32 @@ const opts_orders = thindb.TableOptions{
     .row_group_size = 4,
 };
 
+/// Extract the 20-byte mysql_native_password salt from a HandshakeV10
+/// greeting payload. Layout: see src/net/mysql/handshake.zig —
+/// auth-plugin-data is split as 8 bytes after the connection_id and
+/// 12 bytes after the 10-byte reserved block.
+fn parseGreetingSalt(payload: []const u8) ![20]u8 {
+    // protocol_version(1) + server_version(NUL-terminated) + conn_id(4)
+    var cursor: usize = 1;
+    while (cursor < payload.len and payload[cursor] != 0) cursor += 1;
+    if (cursor >= payload.len) return error.MalformedGreeting;
+    cursor += 1; // skip NUL
+    cursor += 4; // connection_id
+
+    if (cursor + 8 > payload.len) return error.MalformedGreeting;
+    var salt: [20]u8 = undefined;
+    @memcpy(salt[0..8], payload[cursor .. cursor + 8]);
+    cursor += 8;
+
+    // filler(1) + cap_lower(2) + charset(1) + status(2) + cap_upper(2)
+    //   + auth_plugin_data_len(1) + reserved(10) = 19 bytes
+    cursor += 19;
+
+    if (cursor + 12 > payload.len) return error.MalformedGreeting;
+    @memcpy(salt[8..20], payload[cursor .. cursor + 12]);
+    return salt;
+}
+
 /// Minimal in-Zig MySQL client. Speaks just enough to complete a
 /// handshake and exchange one COM_QUERY round-trip.
 const TestClient = struct {
@@ -74,8 +100,30 @@ const TestClient = struct {
         initial_db: ?[]const u8,
         deprecate_eof: bool,
     ) !void {
+        try self.doHandshakeFull(initial_db, deprecate_eof, null);
+    }
+
+    /// Full HandshakeResponse41 with an optional password. When
+    /// `password` is null we send an empty auth response (matches
+    /// the legacy trust-mode tests). When set, we parse the 20-byte
+    /// salt out of the greeting and reply with the proper
+    /// mysql_native_password 20-byte hash.
+    fn doHandshakeFull(
+        self: *TestClient,
+        initial_db: ?[]const u8,
+        deprecate_eof: bool,
+        password: ?[]const u8,
+    ) !void {
         const greet = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
         defer self.allocator.free(greet.payload);
+
+        var auth_bytes: [20]u8 = undefined;
+        var send_hash = false;
+        if (password) |pw| {
+            const salt = try parseGreetingSalt(greet.payload);
+            auth_bytes = thindb.mysql.auth.nativeHash(pw, salt);
+            send_hash = true;
+        }
 
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
@@ -98,7 +146,12 @@ const TestClient = struct {
 
         try payload.appendSlice(self.allocator, "test\x00");
 
-        try payload.append(self.allocator, 0);
+        if (send_hash) {
+            try payload.append(self.allocator, 20);
+            try payload.appendSlice(self.allocator, &auth_bytes);
+        } else {
+            try payload.append(self.allocator, 0);
+        }
 
         if (initial_db) |db| {
             try payload.appendSlice(self.allocator, db);
@@ -647,6 +700,118 @@ test "mysql wire: RESET CONNECTION returns OK" {
     try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
 
     try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: auth — trust mode accepts any password" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 30;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    // auth_password stays null → trust mode.
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    // Client claims password "anything"; server should ignore.
+    try client.doHandshakeFull(null, true, "anything");
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: auth — correct password accepted" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 31;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.auth_password = "hunter2";
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshakeFull(null, true, "hunter2");
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: auth — wrong password rejected with 1045 / 28000" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 32;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.auth_password = "hunter2";
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    const rc = client.doHandshakeFull(null, true, "wrong");
+    try std.testing.expectError(error.AuthRejected, rc);
+
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: auth — empty client response rejected when password set" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 33;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.auth_password = "hunter2";
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    // No password passed → empty auth_response sent. Should be rejected.
+    const rc = client.doHandshakeFull(null, true, null);
+    try std.testing.expectError(error.AuthRejected, rc);
+
     if (sctx.err) |e| return e;
 }
 

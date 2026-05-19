@@ -6,6 +6,7 @@ pub const handshake = @import("mysql/handshake.zig");
 pub const result = @import("mysql/result.zig");
 pub const canned = @import("mysql/canned.zig");
 pub const errors = @import("mysql/errors.zig");
+pub const auth = @import("mysql/auth.zig");
 pub const server = @import("mysql/server.zig");
 
 pub const Server = server.Server;
@@ -19,5 +20,6 @@ test {
     _ = result;
     _ = canned;
     _ = errors;
+    _ = auth;
     _ = server;
 }
