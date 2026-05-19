@@ -17,21 +17,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const packet = @import("packet.zig");
-const handshake = @import("handshake.zig");
 const result_mod = @import("result.zig");
-const errors = @import("errors.zig");
 
 const lexer_mod = @import("../../sql/lexer.zig");
-const sql_mod = @import("../../sql/sql.zig");
-const ir = @import("../../ir/ir.zig");
-const local = @import("../local.zig");
 const types = @import("../../types.zig");
 const Column = types.Column;
 const wire_format = @import("../wire_format.zig");
-
-const thindb_api = @import("../../api/api.zig");
-const Catalog = thindb_api.Catalog;
-const Session = thindb_api.Session;
+const sql_text = @import("../sql_text.zig");
 
 /// Single per-connection prepared-statement entry. Strings stored
 /// directly on the stmt outlive the SQL frame's payload buffer (which
@@ -125,23 +117,7 @@ pub fn createPreparedStmt(
     return stmt;
 }
 
-/// Try to infer the SELECT output schema by substituting every `?` with
-/// the literal `0` and compiling against the active session. Failure
-/// (parse error, type mismatch in a string-column predicate, etc.) is
-/// silently swallowed — the EXECUTE path still emits the real schema.
-pub fn inferSchema(
-    allocator: Allocator,
-    catalog: *Catalog,
-    session: Session,
-    sql: []const u8,
-) !void {
-    _ = allocator;
-    _ = catalog;
-    _ = session;
-    _ = sql;
-}
-
-/// Walk the original SQL substituting placeholder positions with rendered
+/// Walk the original SQL substituting `?` positions with rendered
 /// literal text. `params` is a list of optional rendered-literal strings
 /// (null = SQL NULL). Returns an allocator-owned slice the caller frees.
 pub fn substituteSql(
@@ -149,90 +125,7 @@ pub fn substituteSql(
     sql: []const u8,
     params: []const ?[]const u8,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    var i: usize = 0;
-    var param_idx: usize = 0;
-    while (i < sql.len) {
-        const c = sql[i];
-        switch (c) {
-            '\'' => {
-                // Single-quoted string. Copy verbatim through the
-                // closing quote, handling `''` SQL escape.
-                try out.append(allocator, c);
-                i += 1;
-                while (i < sql.len) {
-                    const ch = sql[i];
-                    if (ch == '\'') {
-                        if (i + 1 < sql.len and sql[i + 1] == '\'') {
-                            try out.appendSlice(allocator, sql[i .. i + 2]);
-                            i += 2;
-                            continue;
-                        }
-                        try out.append(allocator, ch);
-                        i += 1;
-                        break;
-                    }
-                    try out.append(allocator, ch);
-                    i += 1;
-                }
-            },
-            '`' => {
-                try out.append(allocator, c);
-                i += 1;
-                while (i < sql.len) {
-                    const ch = sql[i];
-                    try out.append(allocator, ch);
-                    i += 1;
-                    if (ch == '`') break;
-                }
-            },
-            '-' => {
-                if (i + 1 < sql.len and sql[i + 1] == '-') {
-                    while (i < sql.len and sql[i] != '\n') : (i += 1) {
-                        try out.append(allocator, sql[i]);
-                    }
-                } else {
-                    try out.append(allocator, c);
-                    i += 1;
-                }
-            },
-            '/' => {
-                if (i + 1 < sql.len and sql[i + 1] == '*') {
-                    try out.appendSlice(allocator, sql[i .. i + 2]);
-                    i += 2;
-                    while (i + 1 < sql.len) : (i += 1) {
-                        try out.append(allocator, sql[i]);
-                        if (sql[i] == '*' and sql[i + 1] == '/') {
-                            try out.append(allocator, sql[i + 1]);
-                            i += 2;
-                            break;
-                        }
-                    }
-                } else {
-                    try out.append(allocator, c);
-                    i += 1;
-                }
-            },
-            '?' => {
-                if (param_idx >= params.len) return error.MissingParameter;
-                const text = params[param_idx];
-                param_idx += 1;
-                if (text) |t| {
-                    try out.appendSlice(allocator, t);
-                } else {
-                    try out.appendSlice(allocator, "NULL");
-                }
-                i += 1;
-            },
-            else => {
-                try out.append(allocator, c);
-                i += 1;
-            },
-        }
-    }
-    return try out.toOwnedSlice(allocator);
+    return sql_text.substituteQuestionPlaceholders(allocator, sql, params);
 }
 
 /// Convenience: render a substituted SQL with all placeholders bound to
@@ -356,7 +249,7 @@ pub fn decodeExecuteParams(
 /// SQL string literal. We treat long data as text/varchar — binary
 /// blobs are out of scope for v1.
 fn renderLongData(arena: Allocator, bytes: []const u8) ![]const u8 {
-    return try renderStringLiteral(arena, bytes);
+    return try sql_text.renderStringLiteral(arena, bytes);
 }
 
 /// Decode one binary parameter value at `body[cursor.*]`. Advances
@@ -419,7 +312,7 @@ fn decodeBinaryValue(
         result_mod.MYSQL_TYPE_NEWDECIMAL,
         => blk: {
             const s = try packet.readLenEncString(body, cursor);
-            break :blk try renderStringLiteral(arena, s);
+            break :blk try sql_text.renderStringLiteral(arena, s);
         },
         result_mod.MYSQL_TYPE_DATE,
         result_mod.MYSQL_TYPE_DATETIME,
@@ -428,24 +321,6 @@ fn decodeBinaryValue(
         result_mod.MYSQL_TYPE_NULL => "NULL",
         else => return error.UnsupportedParamType,
     };
-}
-
-/// Render a byte slice as a SQL string literal: wrap in single quotes,
-/// double up any embedded `'`.
-fn renderStringLiteral(arena: Allocator, s: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(arena);
-    try out.append(arena, '\'');
-    for (s) |b| {
-        if (b == '\'') {
-            try out.append(arena, '\'');
-            try out.append(arena, '\'');
-        } else {
-            try out.append(arena, b);
-        }
-    }
-    try out.append(arena, '\'');
-    return try out.toOwnedSlice(arena);
 }
 
 /// Decode a MySQL binary DATE / DATETIME / TIMESTAMP payload (length-
@@ -478,28 +353,13 @@ fn decodeBinaryTemporal(arena: Allocator, body: []const u8, cursor: *usize) ![]c
     }
     cursor.* += len;
 
-    const days_since_epoch = daysFromYmd(year, month, day);
+    const days_since_epoch: i64 = wire_format.daysFromCivil(@intCast(year), month, day);
     if (len == 4) {
         return try std.fmt.allocPrint(arena, "{d}", .{days_since_epoch});
     }
     const seconds_of_day: i64 = (@as(i64, hour) * 3600) + (@as(i64, minute) * 60) + @as(i64, second);
     const total_micros: i64 = days_since_epoch * 86_400_000_000 + seconds_of_day * 1_000_000 + @as(i64, micros);
     return try std.fmt.allocPrint(arena, "{d}", .{total_micros});
-}
-
-/// Civil days from a Gregorian date (inverse of `wire_format.civilFromDays`).
-/// Returns days since 1970-01-01. Cribbed from Howard Hinnant's algorithm.
-fn daysFromYmd(year_u: u16, month_u: u8, day_u: u8) i64 {
-    var y: i64 = year_u;
-    const m: i64 = month_u;
-    const d: i64 = day_u;
-    y -= @intFromBool(m <= 2);
-    const era: i64 = if (y >= 0) @divFloor(y, 400) else @divFloor(y - 399, 400);
-    const yoe: u64 = @intCast(y - era * 400);
-    const mp: i64 = if (m > 2) m - 3 else m + 9;
-    const doy: u64 = @intCast(@divFloor(153 * mp + 2, 5) + d - 1);
-    const doe: u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + @as(i64, @intCast(doe)) - 719468;
 }
 
 // ---------------------------------------------------------------------------
@@ -742,21 +602,4 @@ test "substituteSql replaces in order, preserves strings + comments" {
         "SELECT * FROM t WHERE a = 42 AND b = 'hello''world' AND c = '?' AND d = NULL",
         out,
     );
-}
-
-test "renderStringLiteral escapes embedded quotes" {
-    const allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const got = try renderStringLiteral(arena.allocator(), "it's");
-    try std.testing.expectEqualStrings("'it''s'", got);
-}
-
-test "daysFromYmd round-trips against civilFromDays" {
-    // 2024-05-19 = ? days
-    const days = daysFromYmd(2024, 5, 19);
-    const ymd = wire_format.civilFromDays(days);
-    try std.testing.expectEqual(@as(i32, 2024), ymd.y);
-    try std.testing.expectEqual(@as(u32, 5), ymd.m);
-    try std.testing.expectEqual(@as(u32, 19), ymd.d);
 }

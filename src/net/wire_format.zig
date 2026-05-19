@@ -26,6 +26,19 @@ pub fn civilFromDays(days_since_epoch: i64) Ymd {
     return .{ .y = @intCast(y), .m = @intCast(m), .d = @intCast(d) };
 }
 
+/// Inverse of `civilFromDays`. Howard Hinnant's "days_from_civil"
+/// algorithm. Returns days since 1970-01-01. Returns `error.InvalidDate`
+/// when month or day is zero so callers can surface a typed failure.
+pub fn daysFromCivil(year: i32, month: u32, day: u32) i32 {
+    const y: i32 = year - @as(i32, @intFromBool(month <= 2));
+    const era: i32 = if (y >= 0) @divFloor(y, 400) else @divFloor(y - 399, 400);
+    const yoe: u32 = @intCast(y - era * 400);
+    const m: u32 = if (month > 2) month - 3 else month + 9;
+    const doy: u32 = (153 * m + 2) / 5 + day - 1;
+    const doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146_097 + @as(i32, @intCast(doe)) - 719_468;
+}
+
 pub fn formatDate(buf: []u8, days_since_epoch: i32) ![]const u8 {
     const ymd = civilFromDays(@intCast(days_since_epoch));
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(ymd.y)), ymd.m, ymd.d });
@@ -122,4 +135,21 @@ test "formatDate produces YYYY-MM-DD" {
     var buf: [16]u8 = undefined;
     const text = try formatDate(&buf, 0);
     try std.testing.expectEqualStrings("1970-01-01", text);
+}
+
+test "daysFromCivil round-trips against civilFromDays" {
+    const cases = [_]struct { y: i32, m: u32, d: u32 }{
+        .{ .y = 1970, .m = 1, .d = 1 },
+        .{ .y = 2000, .m = 2, .d = 29 },
+        .{ .y = 2024, .m = 5, .d = 19 },
+        .{ .y = 1969, .m = 12, .d = 31 },
+        .{ .y = 1900, .m = 3, .d = 1 },
+    };
+    for (cases) |c| {
+        const days = daysFromCivil(c.y, c.m, c.d);
+        const back = civilFromDays(@intCast(days));
+        try std.testing.expectEqual(c.y, back.y);
+        try std.testing.expectEqual(c.m, back.m);
+        try std.testing.expectEqual(c.d, back.d);
+    }
 }

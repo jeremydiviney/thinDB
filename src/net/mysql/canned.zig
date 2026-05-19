@@ -7,8 +7,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const packet = @import("packet.zig");
 const handshake = @import("handshake.zig");
+const sql_text = @import("../sql_text.zig");
 
 /// Canned outcome to surface back at the wire layer.
 pub const Outcome = union(enum) {
@@ -34,16 +34,6 @@ pub const Outcome = union(enum) {
     kill: u32,
 };
 
-/// Trim trailing semicolons + whitespace; lowercase ascii only for
-/// case-insensitive matching.
-fn normalize(allocator: Allocator, sql: []const u8) ![]u8 {
-    var s = std.mem.trim(u8, sql, " \t\r\n");
-    while (s.len > 0 and s[s.len - 1] == ';') s = std.mem.trim(u8, s[0 .. s.len - 1], " \t\r\n");
-    const out = try allocator.alloc(u8, s.len);
-    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
-    return out;
-}
-
 /// Returns null if `sql` is not a probe query we recognize.
 /// `current_schema` (possibly empty) is the value reported by DATABASE().
 pub fn match(
@@ -51,7 +41,7 @@ pub fn match(
     sql: []const u8,
     current_schema: []const u8,
 ) !?Outcome {
-    const lc = try normalize(allocator, sql);
+    const lc = try sql_text.normalizeForCannedMatch(allocator, sql);
     defer allocator.free(lc);
 
     if (lc.len == 0) return Outcome{ .ok_packet = {} };

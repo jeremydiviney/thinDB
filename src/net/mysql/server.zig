@@ -313,7 +313,7 @@ fn handleConnection(
     // any in-flight query; tying it to this stack frame is fine
     // because handleConnection only returns after the connection
     // closes.
-    var conn_state = ConnectionState.init(connection_id, connection_id ^ 0xA1B2C3D4);
+    var conn_state = ConnectionState.init(connection_id, ConnectionState.deriveSecret(connection_id));
     if (registry) |reg| {
         try reg.register(&conn_state);
     }
@@ -363,7 +363,7 @@ fn handleConnection(
     if (client.initial_database) |db_name| {
         if (db_name.len > 0) {
             applyInitDb(catalog, &session, db_name) catch |err| {
-                const mapped = errors.mapInternal(err, @errorName(err));
+                const mapped = errors.mapInternal(err, null);
                 try handshake.sendErrPacket(allocator, w, 2, mapped.code, mapped.sqlstate, mapped.message);
                 try w.flush();
                 return;
@@ -471,7 +471,7 @@ fn handleInitDb(
         return;
     }
     applyInitDb(catalog, session, payload) catch |err| {
-        const mapped = errors.mapInternal(err, @errorName(err));
+        const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, 1, mapped.code, mapped.sqlstate, mapped.message);
         return;
     };
@@ -542,7 +542,7 @@ fn handleChangeUser(
     try session.replace("main", "public");
     if (schema_name.len > 0) {
         applyInitDb(catalog, session, schema_name) catch |err| {
-            const mapped = errors.mapInternal(err, @errorName(err));
+            const mapped = errors.mapInternal(err, null);
             try handshake.sendErrPacket(allocator, w, 1, mapped.code, mapped.sqlstate, mapped.message);
             return;
         };
@@ -746,7 +746,7 @@ fn runSingleStatement(
     };
 
     var compiled = local.compileWithSession(allocator, main_db, session.asSession(), op) catch |err| {
-        const mapped = errors.mapInternal(err, @errorName(err));
+        const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
         return;
     };
@@ -763,7 +763,7 @@ fn runSingleStatement(
 
     if (isSideEffectOp(op.*)) {
         _ = compiled.next() catch |err| {
-            const mapped = errors.mapInternal(err, @errorName(err));
+            const mapped = errors.mapInternal(err, null);
             try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
             return;
         };
@@ -959,7 +959,7 @@ fn handleStmtExecute(
     }
 
     const op = sql.parse(arena_alloc, substituted) catch |err| {
-        const mapped = errors.mapInternal(err, @errorName(err));
+        const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
         return;
     };
@@ -975,7 +975,7 @@ fn handleStmtExecute(
     };
 
     var compiled = local.compileWithSession(allocator, main_db, session.asSession(), op) catch |err| {
-        const mapped = errors.mapInternal(err, @errorName(err));
+        const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
         return;
     };
@@ -988,7 +988,7 @@ fn handleStmtExecute(
 
     if (isSideEffectOp(op.*)) {
         _ = compiled.next() catch |err| {
-            const mapped = errors.mapInternal(err, @errorName(err));
+            const mapped = errors.mapInternal(err, null);
             try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
             return;
         };

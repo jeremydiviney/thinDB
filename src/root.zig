@@ -107,5 +107,7 @@ test {
     _ = sql;
     _ = @import("net/wire_format.zig");
     _ = @import("net/error_map.zig");
+    _ = @import("net/sql_text.zig");
+    _ = @import("net/random_seed.zig");
     _ = @import("util/snapshot.zig");
 }

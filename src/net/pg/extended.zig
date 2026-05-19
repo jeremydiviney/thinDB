@@ -17,10 +17,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const packet = @import("packet.zig");
-const startup = @import("startup.zig");
-const result_mod = @import("result.zig");
-const errors = @import("errors.zig");
 const wire_format = @import("../wire_format.zig");
+const sql_text = @import("../sql_text.zig");
 
 const lexer_mod = @import("../../sql/lexer.zig");
 const sql_mod = @import("../../sql/sql.zig");
@@ -28,7 +26,6 @@ const ir = @import("../../ir/ir.zig");
 const local = @import("../local.zig");
 const types = @import("../../types.zig");
 const Column = types.Column;
-const Type = types.Type;
 
 const thindb_api = @import("../../api/api.zig");
 const Catalog = thindb_api.Catalog;
@@ -208,107 +205,11 @@ pub fn substituteDollarSql(
     sql: []const u8,
     params: []const ?[]const u8,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < sql.len) {
-        const c = sql[i];
-        switch (c) {
-            '\'' => {
-                try out.append(allocator, c);
-                i += 1;
-                while (i < sql.len) {
-                    const ch = sql[i];
-                    if (ch == '\'') {
-                        if (i + 1 < sql.len and sql[i + 1] == '\'') {
-                            try out.appendSlice(allocator, sql[i .. i + 2]);
-                            i += 2;
-                            continue;
-                        }
-                        try out.append(allocator, ch);
-                        i += 1;
-                        break;
-                    }
-                    try out.append(allocator, ch);
-                    i += 1;
-                }
-            },
-            '"' => {
-                try out.append(allocator, c);
-                i += 1;
-                while (i < sql.len) {
-                    const ch = sql[i];
-                    try out.append(allocator, ch);
-                    i += 1;
-                    if (ch == '"') break;
-                }
-            },
-            '`' => {
-                try out.append(allocator, c);
-                i += 1;
-                while (i < sql.len) {
-                    const ch = sql[i];
-                    try out.append(allocator, ch);
-                    i += 1;
-                    if (ch == '`') break;
-                }
-            },
-            '-' => {
-                if (i + 1 < sql.len and sql[i + 1] == '-') {
-                    while (i < sql.len and sql[i] != '\n') : (i += 1) {
-                        try out.append(allocator, sql[i]);
-                    }
-                } else {
-                    try out.append(allocator, c);
-                    i += 1;
-                }
-            },
-            '/' => {
-                if (i + 1 < sql.len and sql[i + 1] == '*') {
-                    try out.appendSlice(allocator, sql[i .. i + 2]);
-                    i += 2;
-                    while (i + 1 < sql.len) : (i += 1) {
-                        try out.append(allocator, sql[i]);
-                        if (sql[i] == '*' and sql[i + 1] == '/') {
-                            try out.append(allocator, sql[i + 1]);
-                            i += 2;
-                            break;
-                        }
-                    }
-                } else {
-                    try out.append(allocator, c);
-                    i += 1;
-                }
-            },
-            '$' => {
-                const digits_start = i + 1;
-                var j = digits_start;
-                while (j < sql.len and sql[j] >= '0' and sql[j] <= '9') : (j += 1) {}
-                if (j == digits_start) {
-                    // Lone `$` — pass through verbatim.
-                    try out.append(allocator, c);
-                    i += 1;
-                    continue;
-                }
-                const idx = std.fmt.parseInt(u32, sql[digits_start..j], 10) catch {
-                    return Error.MalformedBindParam;
-                };
-                if (idx == 0 or idx > params.len) return Error.BindParamCountMismatch;
-                if (params[idx - 1]) |lit| {
-                    try out.appendSlice(allocator, lit);
-                } else {
-                    try out.appendSlice(allocator, "NULL");
-                }
-                i = j;
-            },
-            else => {
-                try out.append(allocator, c);
-                i += 1;
-            },
-        }
-    }
-    return try out.toOwnedSlice(allocator);
+    return sql_text.substituteDollarPlaceholders(allocator, sql, params) catch |err| switch (err) {
+        sql_text.DollarError.MalformedBindParam => Error.MalformedBindParam,
+        sql_text.DollarError.BindParamCountMismatch => Error.BindParamCountMismatch,
+        else => err,
+    };
 }
 
 /// Count the highest `$N` referenced in `sql` (skipping string/comment
@@ -346,7 +247,7 @@ pub fn parseParseFrame(
 ) !ParsePayload {
     var cursor: usize = 0;
     const stmt_name = try packet.readCString(payload, &cursor);
-    const sql_text = try packet.readCString(payload, &cursor);
+    const sql_bytes = try packet.readCString(payload, &cursor);
     const n_oids = try packet.readU16(payload, &cursor);
     const oids = try allocator.alloc(u32, n_oids);
     errdefer allocator.free(oids);
@@ -354,7 +255,7 @@ pub fn parseParseFrame(
     while (i < n_oids) : (i += 1) oids[i] = try packet.readU32(payload, &cursor);
     return .{
         .statement_name = stmt_name,
-        .sql = sql_text,
+        .sql = sql_bytes,
         .type_oids = oids,
     };
 }
@@ -615,19 +516,7 @@ fn renderBinaryParam(arena: Allocator, raw: []const u8, oid: u32) ![]const u8 {
 }
 
 fn renderStringLiteral(arena: Allocator, s: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(arena);
-    try out.append(arena, '\'');
-    for (s) |b| {
-        if (b == '\'') {
-            try out.append(arena, '\'');
-            try out.append(arena, '\'');
-        } else {
-            try out.append(arena, b);
-        }
-    }
-    try out.append(arena, '\'');
-    return try out.toOwnedSlice(arena);
+    return sql_text.renderStringLiteral(arena, s);
 }
 
 // ---------------------------------------------------------------------------

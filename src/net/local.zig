@@ -50,6 +50,7 @@ const storage = @import("../storage/storage.zig");
 
 const ir = @import("../ir/ir.zig");
 const wire = @import("wire.zig");
+const wire_format = @import("wire_format.zig");
 
 pub const Error = error{
     TableNotFound,
@@ -1259,7 +1260,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
 /// INSERT, then hand them to `Table.insertBatch` as ColumnView slices.
 /// Each fixed-width column owns an aligned-byte slab so `bytesAsSlice(T)`
 /// returns a properly-aligned typed slice without an extra copy.
-const InsertColumnBuilder = struct {
+pub const InsertColumnBuilder = struct {
     allocator: Allocator,
     schema_copy: []types.Column,
     /// 16-byte aligned slabs sized for the full row count up front.
@@ -1273,7 +1274,7 @@ const InsertColumnBuilder = struct {
     view_slice: []storage.ColumnView,
     row_count: usize,
 
-    fn init(allocator: Allocator, table_schema: TableSchema, row_count: usize) !InsertColumnBuilder {
+    pub fn init(allocator: Allocator, table_schema: TableSchema, row_count: usize) !InsertColumnBuilder {
         const n_cols = table_schema.columns.len;
         const schema_copy = try allocator.alloc(types.Column, n_cols);
         errdefer allocator.free(schema_copy);
@@ -1336,7 +1337,7 @@ const InsertColumnBuilder = struct {
         };
     }
 
-    fn deinit(self: *InsertColumnBuilder) void {
+    pub fn deinit(self: *InsertColumnBuilder) void {
         for (self.fixed_slabs) |s| if (s.len > 0) self.allocator.free(s);
         for (self.string_offsets) |*b| b.deinit(self.allocator);
         for (self.string_bytes) |*b| b.deinit(self.allocator);
@@ -1350,11 +1351,11 @@ const InsertColumnBuilder = struct {
         self.allocator.free(self.view_slice);
     }
 
-    fn schemaSlice(self: *InsertColumnBuilder) []const types.Column {
+    pub fn schemaSlice(self: *InsertColumnBuilder) []const types.Column {
         return self.schema_copy;
     }
 
-    fn appendCell(self: *InsertColumnBuilder, col_idx: usize, col: types.Column, maybe_val: ?Value) !void {
+    pub fn appendCell(self: *InsertColumnBuilder, col_idx: usize, col: types.Column, maybe_val: ?Value) !void {
         const row_in_col = self.currentRow(col_idx, col);
         if (maybe_val == null) {
             try self.appendPlaceholder(col_idx, col);
@@ -1441,7 +1442,7 @@ const InsertColumnBuilder = struct {
         self.writeFixedBytes(col_idx, &buf);
     }
 
-    fn views(self: *InsertColumnBuilder) []const storage.ColumnView {
+    pub fn views(self: *InsertColumnBuilder) []const storage.ColumnView {
         for (self.schema_copy, 0..) |col, i| {
             const data: @import("../storage/column.zig").ValueView = switch (col.type) {
                 .int => .{ .int = std.mem.bytesAsSlice(i32, self.fixed_slabs[i])[0..self.row_count] },
@@ -1616,7 +1617,7 @@ fn scaleIntToDecimal(comptime T: type, x: anytype, scale: u8) !T {
     return out;
 }
 
-fn parseDecimalLiteral(comptime T: type, s: []const u8, spec: @import("../types.zig").DecimalSpec) !T {
+pub fn parseDecimalLiteral(comptime T: type, s: []const u8, spec: @import("../types.zig").DecimalSpec) !T {
     // Accept optional sign, digits, optional '.' followed by digits. Right-
     // pad or truncate the fractional part to the column's scale.
     var idx: usize = 0;
@@ -1655,7 +1656,7 @@ fn parseDecimalLiteral(comptime T: type, s: []const u8, spec: @import("../types.
 
 /// `YYYY-MM-DD` → days since the Unix epoch. Uses civil-from-days math
 /// (Howard Hinnant's algorithm) for correctness across leap years.
-fn parseDateLiteral(s: []const u8) !i32 {
+pub fn parseDateLiteral(s: []const u8) !i32 {
     if (s.len < 10) return Error.TypeMismatch;
     if (s[4] != '-' or s[7] != '-') return Error.TypeMismatch;
     const year = try parseIntField(i32, s[0..4]);
@@ -1665,7 +1666,7 @@ fn parseDateLiteral(s: []const u8) !i32 {
     return civilToDays(year, month, day);
 }
 
-fn parseDateTimeLiteral(s: []const u8) !i64 {
+pub fn parseDateTimeLiteral(s: []const u8) !i64 {
     if (s.len < 19) return Error.TypeMismatch;
     if (s[4] != '-' or s[7] != '-') return Error.TypeMismatch;
     const sep = s[10];
@@ -1696,7 +1697,7 @@ fn parseDateTimeLiteral(s: []const u8) !i64 {
     return @as(i64, days) * 86_400 * 1_000_000 + day_secs * 1_000_000 + @as(i64, @intCast(micros));
 }
 
-fn parseUuidLiteral(s: []const u8) !u128 {
+pub fn parseUuidLiteral(s: []const u8) !u128 {
     if (s.len != 36) return Error.TypeMismatch;
     if (s[8] != '-' or s[13] != '-' or s[18] != '-' or s[23] != '-') return Error.TypeMismatch;
     var out: u128 = 0;
@@ -1720,17 +1721,9 @@ fn parseIntField(comptime T: type, s: []const u8) !T {
     return std.fmt.parseInt(T, s, 10) catch return Error.TypeMismatch;
 }
 
-/// Howard Hinnant's "days_from_civil" algorithm: converts a proleptic
-/// Gregorian date (y, m, d) to days since 1970-01-01.
 fn civilToDays(year: i32, month: u32, day: u32) !i32 {
     if (month == 0 or day == 0) return Error.TypeMismatch;
-    const y = if (month <= 2) year - 1 else year;
-    const era = if (y >= 0) @divFloor(y, 400) else @divFloor(y - 399, 400);
-    const yoe: u32 = @intCast(y - era * 400);
-    const m: u32 = if (month > 2) month - 3 else month + 9;
-    const doy: u32 = (153 * m + 2) / 5 + day - 1;
-    const doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return @as(i32, era) * 146_097 + @as(i32, @intCast(doe)) - 719_468;
+    return wire_format.daysFromCivil(year, month, day);
 }
 
 fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {

@@ -37,6 +37,17 @@ pub const ConnectionState = struct {
         return .{ .backend_id = backend_id, .secret_key = secret_key };
     }
 
+    /// Derive a stable secret key from a backend id alone. Used by
+    /// transports that don't have a separate crypto context (the
+    /// MySQL HandshakeV10 connection_id is the only token they have;
+    /// PG mints the BackendKeyData secret from the same id). The
+    /// derivation is intentionally not cryptographically strong — the
+    /// PG `CancelRequest` protocol just needs "an attacker who didn't
+    /// see the OK handshake can't predict the secret from the pid."
+    pub fn deriveSecret(backend_id: u32) u32 {
+        return backend_id ^ 0xA1B2C3D4;
+    }
+
     pub fn requestCancel(self: *ConnectionState) void {
         self.cancel_flag.store(true, .release);
     }

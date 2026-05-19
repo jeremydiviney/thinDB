@@ -309,7 +309,7 @@ fn handleConnection(
     var session = try SessionState.init(allocator);
     defer session.deinit();
 
-    var conn_state = ConnectionState.init(connection_id, connection_id ^ 0xA1B2C3D4);
+    var conn_state = ConnectionState.init(connection_id, ConnectionState.deriveSecret(connection_id));
     if (registry) |reg| {
         try reg.register(&conn_state);
     }
@@ -690,7 +690,7 @@ fn completeStartup(
         session.application_name,
         if (params.user.len > 0) params.user else "thindb",
     );
-    try startup.sendBackendKeyData(allocator, w, connection_id, connection_id ^ 0xA1B2C3D4);
+    try startup.sendBackendKeyData(allocator, w, connection_id, ConnectionState.deriveSecret(connection_id));
     try startup.sendReadyForQuery(allocator, w, 'I');
     try w.flush();
     return true;

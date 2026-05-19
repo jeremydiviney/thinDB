@@ -33,6 +33,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const random_seed = @import("../random_seed.zig");
 
 pub const HASH_LEN: usize = 32;
 pub const SALT_LEN: usize = 16;
@@ -200,29 +201,13 @@ pub fn parseClientFinal(message: []const u8) !struct {
     };
 }
 
-/// Same predictable-counter-mix used by the MySQL wire's salt: we
-/// only need each connection's server-nonce to be unpredictable to a
-/// passive observer, not cryptographically random. 18 raw bytes ->
-/// 24 base64 chars per RFC convention.
-var server_nonce_counter: std.atomic.Value(u64) = .{ .raw = 0 };
-var server_nonce_anchor: std.atomic.Value(u64) = .{ .raw = 0 };
+/// Per-connection server-nonce. We only need each one to be
+/// unpredictable to a passive observer, not cryptographically random.
+/// 18 raw bytes → 24 base64 chars per RFC convention.
+var server_nonce_state: random_seed.State = .{ .anchor_mix = 0x5A5A_A5A5_C0FF_EE17 };
 
 pub fn randomServerNonce(out: *[18]u8) void {
-    var anchor = server_nonce_anchor.load(.monotonic);
-    if (anchor == 0) {
-        anchor = @as(u64, @truncate(@intFromPtr(out))) ^ 0x5A5A_A5A5_C0FF_EE17;
-        if (anchor == 0) anchor = 1;
-        server_nonce_anchor.store(anchor, .monotonic);
-    }
-    const ctr = server_nonce_counter.fetchAdd(1, .monotonic);
-    var seed: [24]u8 = undefined;
-    std.mem.writeInt(u64, seed[0..8], anchor, .little);
-    std.mem.writeInt(u64, seed[8..16], ctr, .little);
-    const sp: usize = @intFromPtr(out);
-    std.mem.writeInt(u64, seed[16..24], @as(u64, @truncate(sp)), .little);
-    var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(&seed, &digest, .{});
-    @memcpy(out, digest[0..18]);
+    random_seed.fill(&server_nonce_state, out);
 }
 
 test "deriveCredentials + verifyClientProof round-trip" {

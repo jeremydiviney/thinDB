@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const startup = @import("startup.zig");
+const sql_text = @import("../sql_text.zig");
 
 pub const Probe = union(enum) {
     /// Silently accept (no rows, no side-effects). Tag is the literal
@@ -38,14 +39,6 @@ pub const StaticRows = struct {
     rows: []const []const ?[]const u8,
 };
 
-fn normalize(allocator: Allocator, sql: []const u8) ![]u8 {
-    var s = std.mem.trim(u8, sql, " \t\r\n");
-    while (s.len > 0 and s[s.len - 1] == ';') s = std.mem.trim(u8, s[0 .. s.len - 1], " \t\r\n");
-    const out = try allocator.alloc(u8, s.len);
-    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
-    return out;
-}
-
 /// Extract the `<pid>` from a normalized SQL string of the form
 /// `<prefix><pid>)` where prefix is e.g. "select pg_cancel_backend(".
 /// Returns null on any parse failure.
@@ -59,11 +52,11 @@ fn parseCancelBackend(lc: []const u8, prefix: []const u8) ?u32 {
 /// Returns null if `sql` is not a probe query we recognize.
 pub fn match(
     allocator: Allocator,
-    sql_text: []const u8,
+    sql: []const u8,
     current_db: []const u8,
     current_schema: []const u8,
 ) !?Probe {
-    const lc = try normalize(allocator, sql_text);
+    const lc = try sql_text.normalizeForCannedMatch(allocator, sql);
     defer allocator.free(lc);
 
     if (lc.len == 0) return Probe{ .accept = "" };

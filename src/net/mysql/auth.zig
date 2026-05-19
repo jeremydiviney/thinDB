@@ -13,42 +13,21 @@
 
 const std = @import("std");
 const Sha1 = std.crypto.hash.Sha1;
+const random_seed = @import("../random_seed.zig");
 
 pub const SALT_LEN: usize = 20;
 pub const HASH_LEN: usize = 20;
 
-var salt_counter: std.atomic.Value(u64) = .{ .raw = 0 };
-/// Mutable process-start seed, written once on the first randomSalt
-/// call and mixed into every subsequent salt. Seeded from the stack
-/// pointer of the first caller, which is essentially "address-space
-/// randomization gave us this much entropy at startup."
-var salt_anchor: std.atomic.Value(u64) = .{ .raw = 0 };
+var salt_state: random_seed.State = .{ .anchor_mix = 0xA5A5_5A5A_DEAD_BEEF };
 
 /// Fill `out` with 20 unpredictable non-zero bytes. The salt is sent
 /// in cleartext as part of the HandshakeV10 packet, so the security
 /// requirement is only that a passive observer can't predict the
-/// next connection's salt from THIS one. SHA1 of (anchor || counter
-/// || stack-pointer) gives us that, deterministic-but-distinct per
-/// call, without depending on a crypto RNG. Zig 0.16's stdlib has
-/// no cross-platform crypto-random surface; the dep added when we
-/// implement TLS can be reused here.
+/// next connection's salt from THIS one. Zero bytes are scrubbed
+/// because MySQL frames the salt with a NUL terminator.
 pub fn randomSalt(out: *[SALT_LEN]u8) void {
-    var anchor = salt_anchor.load(.monotonic);
-    if (anchor == 0) {
-        anchor = @as(u64, @truncate(@intFromPtr(out))) ^ 0xA5A5_5A5A_DEAD_BEEF;
-        if (anchor == 0) anchor = 1;
-        salt_anchor.store(anchor, .monotonic);
-    }
-    const ctr = salt_counter.fetchAdd(1, .monotonic);
-    var seed: [24]u8 = undefined;
-    std.mem.writeInt(u64, seed[0..8], anchor, .little);
-    std.mem.writeInt(u64, seed[8..16], ctr, .little);
-    const sp: usize = @intFromPtr(out);
-    std.mem.writeInt(u64, seed[16..24], @as(u64, @truncate(sp)), .little);
-    Sha1.hash(&seed, out, .{});
-    for (out[0..]) |*b| {
-        if (b.* == 0) b.* = 1;
-    }
+    random_seed.fill(&salt_state, out);
+    random_seed.replaceZeroBytes(out);
 }
 
 /// Compute the expected 20-byte hash for a given password + salt.
