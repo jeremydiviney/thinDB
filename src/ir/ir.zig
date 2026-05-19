@@ -145,6 +145,143 @@ pub const CopyOp = struct {
     columns: ?[]const []const u8,
 };
 
+/// Window function payload. A single Window operator carries zero-or-more
+/// `WindowSpec`s (one per unique PARTITION/ORDER/frame combination found
+/// in the SELECT) and N `WindowCall`s, each call referencing a spec by
+/// index. Spec-deduplication happens at parse / IR-build time so the
+/// downstream executor can sort once per spec and run all of that spec's
+/// calls in a single sweep.
+pub const WindowOp = struct {
+    specs: []const WindowSpec,
+    calls: []const WindowCall,
+    upstream: *Op,
+};
+
+pub const WindowSpec = struct {
+    partition_by: []const []const u8,
+    order_by: []const SortSpec,
+    frame: Frame,
+};
+
+pub const Frame = struct {
+    kind: FrameKind,
+    start: FrameBound,
+    end: FrameBound,
+
+    pub const default_no_order: Frame = .{
+        .kind = .rows,
+        .start = .unbounded_preceding,
+        .end = .unbounded_following,
+    };
+
+    pub const default_with_order: Frame = .{
+        .kind = .range,
+        .start = .unbounded_preceding,
+        .end = .current_row,
+    };
+};
+
+pub const FrameKind = enum(u8) { rows = 0, range = 1, groups = 2 };
+
+pub const FrameBound = union(enum) {
+    unbounded_preceding,
+    /// N PRECEDING. Non-negative offset (0 is treated as CURRENT ROW
+    /// per SQL standard; the parser folds that case).
+    preceding: u64,
+    current_row,
+    following: u64,
+    unbounded_following,
+};
+
+pub const WindowCall = struct {
+    spec_idx: u32,
+    func: WindowFunc,
+    /// Function arguments. ROW_NUMBER/RANK/DENSE_RANK take none.
+    /// LAG/LEAD take (expr [, offset [, default]]).
+    /// FIRST_VALUE/LAST_VALUE/NTH_VALUE take (expr [, n]).
+    /// SUM/AVG/COUNT/MIN/MAX take (expr).
+    args: []const Expr,
+    /// Honor IGNORE NULLS for null-skipping functions. False = RESPECT
+    /// NULLS (the default). Operator decides whether the flag is
+    /// meaningful for the function and rejects it where it isn't.
+    ignore_nulls: bool,
+    /// Output column name — user's AS alias, or a parser-derived label
+    /// from the call form (e.g. "rank()").
+    output_name: []const u8,
+};
+
+pub const WindowFunc = enum(u8) {
+    // Ranking.
+    row_number = 0,
+    rank = 1,
+    dense_rank = 2,
+    // Value access.
+    lag = 3,
+    lead = 4,
+    first_value = 5,
+    last_value = 6,
+    nth_value = 7,
+    // Aggregates (window-context flavors).
+    sum = 8,
+    avg = 9,
+    count = 10,
+    min = 11,
+    max = 12,
+    // Tier 2 — reserved, parser will reject until implemented.
+    ntile = 13,
+    cume_dist = 14,
+    percent_rank = 15,
+};
+
+/// Lookup table: window-function name → enum, or null when the name
+/// isn't a window function. The set is fixed; ordering matches the
+/// `WindowFunc` enum for readability.
+pub fn windowFuncForName(name: []const u8) ?WindowFunc {
+    const table = [_]struct { name: []const u8, func: WindowFunc }{
+        .{ .name = "row_number", .func = .row_number },
+        .{ .name = "rank", .func = .rank },
+        .{ .name = "dense_rank", .func = .dense_rank },
+        .{ .name = "lag", .func = .lag },
+        .{ .name = "lead", .func = .lead },
+        .{ .name = "first_value", .func = .first_value },
+        .{ .name = "last_value", .func = .last_value },
+        .{ .name = "nth_value", .func = .nth_value },
+        .{ .name = "sum", .func = .sum },
+        .{ .name = "avg", .func = .avg },
+        .{ .name = "count", .func = .count },
+        .{ .name = "min", .func = .min },
+        .{ .name = "max", .func = .max },
+        .{ .name = "ntile", .func = .ntile },
+        .{ .name = "cume_dist", .func = .cume_dist },
+        .{ .name = "percent_rank", .func = .percent_rank },
+    };
+    for (table) |e| {
+        if (std.ascii.eqlIgnoreCase(name, e.name)) return e.func;
+    }
+    return null;
+}
+
+pub fn windowFuncName(f: WindowFunc) []const u8 {
+    return switch (f) {
+        .row_number => "row_number",
+        .rank => "rank",
+        .dense_rank => "dense_rank",
+        .lag => "lag",
+        .lead => "lead",
+        .first_value => "first_value",
+        .last_value => "last_value",
+        .nth_value => "nth_value",
+        .sum => "sum",
+        .avg => "avg",
+        .count => "count",
+        .min => "min",
+        .max => "max",
+        .ntile => "ntile",
+        .cume_dist => "cume_dist",
+        .percent_rank => "percent_rank",
+    };
+}
+
 pub const Error = error{
     IrBadMagic,
     IrUnsupportedVersion,
@@ -200,6 +337,12 @@ pub const OpTag = enum(u8) {
     /// the PG dispatcher handles it directly; `compileWithSession`
     /// rejects it because the operator interleaves with the client.
     copy = 14,
+    /// Window functions: ranking, value-access, and aggregate variants
+    /// over PARTITION BY / ORDER BY / frame. One Window op carries
+    /// multiple WindowSpecs (deduped) and N calls referencing those
+    /// specs; the operator does one sort per spec and runs all of that
+    /// spec's calls in a single sweep.
+    window = 15,
 };
 
 pub const BatchOp = struct {
@@ -225,6 +368,7 @@ pub const Op = union(OpTag) {
     insert: InsertOp,
     batch: BatchOp,
     copy: CopyOp,
+    window: WindowOp,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -368,6 +512,20 @@ pub const Op = union(OpTag) {
             .copy => |c| {
                 if (c.columns) |cols| allocator.free(cols);
             },
+            .window => |w| {
+                for (w.specs) |sp| {
+                    allocator.free(sp.partition_by);
+                    allocator.free(sp.order_by);
+                }
+                allocator.free(w.specs);
+                for (w.calls) |c| {
+                    for (c.args) |a| freeDecodedExpr(a, allocator);
+                    allocator.free(c.args);
+                }
+                allocator.free(w.calls);
+                w.upstream.deinitDecoded(allocator);
+                allocator.destroy(w.upstream);
+            },
         }
     }
 };
@@ -429,6 +587,54 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             for (b.statements) |sub| try encodeOp(allocator, out, sub.*);
         },
         .copy => |c| try encodeCopy(allocator, out, c),
+        .window => |w| try encodeWindow(allocator, out, w),
+    }
+}
+
+fn encodeWindow(allocator: Allocator, out: *std.ArrayList(u8), w: WindowOp) EncodeError!void {
+    try appendU32(allocator, out, @intCast(w.specs.len));
+    for (w.specs) |sp| {
+        try appendU32(allocator, out, @intCast(sp.partition_by.len));
+        for (sp.partition_by) |c| {
+            try appendU32(allocator, out, @intCast(c.len));
+            try out.appendSlice(allocator, c);
+        }
+        try appendU32(allocator, out, @intCast(sp.order_by.len));
+        for (sp.order_by) |s| {
+            try appendU32(allocator, out, @intCast(s.col.len));
+            try out.appendSlice(allocator, s.col);
+            try out.append(allocator, @intFromBool(s.desc));
+        }
+        try out.append(allocator, @intFromEnum(sp.frame.kind));
+        try encodeFrameBound(allocator, out, sp.frame.start);
+        try encodeFrameBound(allocator, out, sp.frame.end);
+    }
+    try appendU32(allocator, out, @intCast(w.calls.len));
+    for (w.calls) |c| {
+        try appendU32(allocator, out, c.spec_idx);
+        try out.append(allocator, @intFromEnum(c.func));
+        try out.append(allocator, @intFromBool(c.ignore_nulls));
+        try appendU32(allocator, out, @intCast(c.output_name.len));
+        try out.appendSlice(allocator, c.output_name);
+        try appendU32(allocator, out, @intCast(c.args.len));
+        for (c.args) |a| try encodeExpr(allocator, out, a);
+    }
+    try encodeOp(allocator, out, w.upstream.*);
+}
+
+fn encodeFrameBound(allocator: Allocator, out: *std.ArrayList(u8), b: FrameBound) EncodeError!void {
+    switch (b) {
+        .unbounded_preceding => try out.append(allocator, 0),
+        .preceding => |n| {
+            try out.append(allocator, 1);
+            try appendU64(allocator, out, n);
+        },
+        .current_row => try out.append(allocator, 2),
+        .following => |n| {
+            try out.append(allocator, 3);
+            try appendU64(allocator, out, n);
+        },
+        .unbounded_following => try out.append(allocator, 4),
     }
 }
 
@@ -976,7 +1182,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.copy)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.window)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1206,6 +1412,129 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             break :blk Op{ .batch = .{ .statements = subs } };
         },
         .copy => Op{ .copy = try decodeCopy(allocator, bytes, cursor) },
+        .window => try decodeWindow(allocator, bytes, cursor),
+    };
+}
+
+fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!Op {
+    if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+    const n_specs = readU32(bytes[cursor.* .. cursor.* + 4]);
+    cursor.* += 4;
+    const specs = try allocator.alloc(WindowSpec, n_specs);
+    errdefer allocator.free(specs);
+    var initialized_specs: usize = 0;
+    errdefer for (specs[0..initialized_specs]) |sp| {
+        allocator.free(sp.partition_by);
+        allocator.free(sp.order_by);
+    };
+    var i: u32 = 0;
+    while (i < n_specs) : (i += 1) {
+        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+        const n_pb = readU32(bytes[cursor.* .. cursor.* + 4]);
+        cursor.* += 4;
+        const pb = try allocator.alloc([]const u8, n_pb);
+        errdefer allocator.free(pb);
+        for (pb) |*c| c.* = try readString(bytes, cursor);
+
+        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+        const n_ob = readU32(bytes[cursor.* .. cursor.* + 4]);
+        cursor.* += 4;
+        const ob = try allocator.alloc(SortSpec, n_ob);
+        errdefer allocator.free(ob);
+        for (ob) |*s| {
+            const col = try readString(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const desc = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            s.* = .{ .col = col, .desc = desc };
+        }
+
+        if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+        const kind_byte = bytes[cursor.*];
+        cursor.* += 1;
+        if (kind_byte > @intFromEnum(FrameKind.groups)) return Error.IrCorrupt;
+        const kind: FrameKind = @enumFromInt(kind_byte);
+        const start = try decodeFrameBound(bytes, cursor);
+        const end = try decodeFrameBound(bytes, cursor);
+
+        specs[i] = .{
+            .partition_by = pb,
+            .order_by = ob,
+            .frame = .{ .kind = kind, .start = start, .end = end },
+        };
+        initialized_specs = i + 1;
+    }
+
+    if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+    const n_calls = readU32(bytes[cursor.* .. cursor.* + 4]);
+    cursor.* += 4;
+    const calls = try allocator.alloc(WindowCall, n_calls);
+    errdefer allocator.free(calls);
+    var initialized_calls: usize = 0;
+    errdefer for (calls[0..initialized_calls]) |c| {
+        for (c.args) |a| freeDecodedExpr(a, allocator);
+        allocator.free(c.args);
+    };
+    var j: u32 = 0;
+    while (j < n_calls) : (j += 1) {
+        if (cursor.* + 4 + 1 + 1 > bytes.len) return Error.IrCorrupt;
+        const spec_idx = readU32(bytes[cursor.* .. cursor.* + 4]);
+        cursor.* += 4;
+        const func_byte = bytes[cursor.*];
+        cursor.* += 1;
+        if (func_byte > @intFromEnum(WindowFunc.percent_rank)) return Error.IrCorrupt;
+        const func: WindowFunc = @enumFromInt(func_byte);
+        const ignore_nulls = bytes[cursor.*] != 0;
+        cursor.* += 1;
+        const output_name = try readString(bytes, cursor);
+        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+        const n_args = readU32(bytes[cursor.* .. cursor.* + 4]);
+        cursor.* += 4;
+        const args = try allocator.alloc(Expr, n_args);
+        errdefer allocator.free(args);
+        var inited_args: usize = 0;
+        errdefer for (args[0..inited_args]) |a| freeDecodedExpr(a, allocator);
+        for (args) |*a| {
+            a.* = try decodeExpr(allocator, bytes, cursor);
+            inited_args += 1;
+        }
+        calls[j] = .{
+            .spec_idx = spec_idx,
+            .func = func,
+            .args = args,
+            .ignore_nulls = ignore_nulls,
+            .output_name = output_name,
+        };
+        initialized_calls = j + 1;
+    }
+
+    const upstream = try allocator.create(Op);
+    errdefer allocator.destroy(upstream);
+    upstream.* = try decodeOp(allocator, bytes, cursor);
+    return Op{ .window = .{ .specs = specs, .calls = calls, .upstream = upstream } };
+}
+
+fn decodeFrameBound(bytes: []const u8, cursor: *usize) DecodeError!FrameBound {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const tag = bytes[cursor.*];
+    cursor.* += 1;
+    return switch (tag) {
+        0 => FrameBound{ .unbounded_preceding = {} },
+        1 => blk: {
+            if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;
+            const n = readU64(bytes[cursor.* .. cursor.* + 8]);
+            cursor.* += 8;
+            break :blk FrameBound{ .preceding = n };
+        },
+        2 => FrameBound{ .current_row = {} },
+        3 => blk: {
+            if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;
+            const n = readU64(bytes[cursor.* .. cursor.* + 8]);
+            cursor.* += 8;
+            break :blk FrameBound{ .following = n };
+        },
+        4 => FrameBound{ .unbounded_following = {} },
+        else => Error.IrCorrupt,
     };
 }
 
@@ -1694,6 +2023,79 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             for (b.statements) |sub| try explainOp(allocator, out, sub.*, depth + 1);
         },
         .copy => |c| try explainCopy(allocator, out, c),
+        .window => |w| {
+            try out.appendSlice(allocator, "Window");
+            for (w.calls, 0..) |call, i| {
+                try out.appendSlice(allocator, if (i == 0) " [" else ", ");
+                try out.appendSlice(allocator, call.output_name);
+                try out.appendSlice(allocator, " = ");
+                try out.appendSlice(allocator, windowFuncName(call.func));
+                try out.append(allocator, '(');
+                for (call.args, 0..) |a, ai| {
+                    if (ai > 0) try out.appendSlice(allocator, ", ");
+                    try explainExpr(allocator, out, a);
+                }
+                try out.append(allocator, ')');
+                if (call.ignore_nulls) try out.appendSlice(allocator, " IGNORE NULLS");
+                try out.appendSlice(allocator, " OVER #");
+                var buf: [12]u8 = undefined;
+                const s = try std.fmt.bufPrint(&buf, "{d}", .{call.spec_idx});
+                try out.appendSlice(allocator, s);
+            }
+            if (w.calls.len > 0) try out.append(allocator, ']');
+            try out.append(allocator, '\n');
+            for (w.specs, 0..) |sp, si| {
+                try writeIndent(allocator, out, depth);
+                var indent_buf: [64]u8 = undefined;
+                const indent = try std.fmt.bufPrint(&indent_buf, "  spec #{d}: ", .{si});
+                try out.appendSlice(allocator, indent);
+                try out.appendSlice(allocator, "PARTITION BY ");
+                if (sp.partition_by.len == 0)
+                    try out.appendSlice(allocator, "()")
+                else
+                    try writeJoinedNames(allocator, out, sp.partition_by);
+                try out.appendSlice(allocator, " ORDER BY ");
+                if (sp.order_by.len == 0) {
+                    try out.appendSlice(allocator, "()");
+                } else {
+                    for (sp.order_by, 0..) |ob, oi| {
+                        if (oi > 0) try out.appendSlice(allocator, ", ");
+                        try out.appendSlice(allocator, ob.col);
+                        try out.appendSlice(allocator, if (ob.desc) " DESC" else " ASC");
+                    }
+                }
+                try out.appendSlice(allocator, " FRAME ");
+                try out.appendSlice(allocator, switch (sp.frame.kind) {
+                    .rows => "ROWS",
+                    .range => "RANGE",
+                    .groups => "GROUPS",
+                });
+                try out.appendSlice(allocator, " BETWEEN ");
+                try explainFrameBound(allocator, out, sp.frame.start);
+                try out.appendSlice(allocator, " AND ");
+                try explainFrameBound(allocator, out, sp.frame.end);
+                try out.append(allocator, '\n');
+            }
+            try explainOp(allocator, out, w.upstream.*, depth + 1);
+        },
+    }
+}
+
+fn explainFrameBound(allocator: Allocator, out: *std.ArrayList(u8), b: FrameBound) !void {
+    switch (b) {
+        .unbounded_preceding => try out.appendSlice(allocator, "UNBOUNDED PRECEDING"),
+        .preceding => |n| {
+            var buf: [32]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{d} PRECEDING", .{n});
+            try out.appendSlice(allocator, s);
+        },
+        .current_row => try out.appendSlice(allocator, "CURRENT ROW"),
+        .following => |n| {
+            var buf: [32]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{d} FOLLOWING", .{n});
+            try out.appendSlice(allocator, s);
+        },
+        .unbounded_following => try out.appendSlice(allocator, "UNBOUNDED FOLLOWING"),
     }
 }
 

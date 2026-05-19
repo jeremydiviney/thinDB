@@ -65,6 +65,22 @@ pub const TokenTag = enum {
     kw_copy,
     kw_temp,
     kw_temporary,
+    // Window-function keywords.
+    kw_over,
+    kw_partition,
+    kw_window,
+    kw_rows,
+    kw_range,
+    kw_groups,
+    kw_between,
+    kw_preceding,
+    kw_following,
+    kw_unbounded,
+    kw_current,
+    kw_row,
+    kw_ignore,
+    kw_respect,
+    kw_nulls,
 
     // Operators / punctuation.
     eq, // =
@@ -393,6 +409,21 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "copy", .tag = .kw_copy },
         .{ .name = "temp", .tag = .kw_temp },
         .{ .name = "temporary", .tag = .kw_temporary },
+        .{ .name = "over", .tag = .kw_over },
+        .{ .name = "partition", .tag = .kw_partition },
+        .{ .name = "window", .tag = .kw_window },
+        .{ .name = "rows", .tag = .kw_rows },
+        .{ .name = "range", .tag = .kw_range },
+        .{ .name = "groups", .tag = .kw_groups },
+        .{ .name = "between", .tag = .kw_between },
+        .{ .name = "preceding", .tag = .kw_preceding },
+        .{ .name = "following", .tag = .kw_following },
+        .{ .name = "unbounded", .tag = .kw_unbounded },
+        .{ .name = "current", .tag = .kw_current },
+        .{ .name = "row", .tag = .kw_row },
+        .{ .name = "ignore", .tag = .kw_ignore },
+        .{ .name = "respect", .tag = .kw_respect },
+        .{ .name = "nulls", .tag = .kw_nulls },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;

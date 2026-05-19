@@ -1467,6 +1467,7 @@ fn countRefs(
         .materialize => |m| try visitChild(arena, refs, m.upstream),
         .ddl, .show, .insert, .copy => {},
         .batch => |b| for (b.statements) |sub| try visitChild(arena, refs, sub),
+        .window => |w| try visitChild(arena, refs, w.upstream),
     }
 }
 

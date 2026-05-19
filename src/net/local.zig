@@ -918,6 +918,12 @@ pub fn buildServerQuerySession(
             // generic compile path.
             return Error.UnsupportedOp;
         },
+        .window => {
+            // Phase 2 of the window-function rollout wires this up.
+            // For now the parser produces the IR but compile rejects
+            // it so SQL using OVER (...) returns a clear error.
+            return Error.UnsupportedOp;
+        },
     };
 }
 
@@ -1123,6 +1129,11 @@ fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .batch => Error.UnsupportedOp,
         // COPY is wire-driven; only the PG dispatcher handles it.
         .copy => Error.UnsupportedOp,
+        // Phase 2 of the window-function rollout wires this up to a
+        // real Window operator. For now the parser produces the IR
+        // but compile rejects it so SQL that uses OVER (...) returns
+        // a clear error instead of a silently-wrong result.
+        .window => Error.UnsupportedOp,
     };
 }
 
