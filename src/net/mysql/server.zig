@@ -202,6 +202,12 @@ const SessionState = struct {
     /// Controls result-set terminator format (DEPRECATE_EOF) and any
     /// future per-connection feature toggles. Zero before handshake.
     client_caps: u32 = 0,
+    /// Tracks whether a BEGIN/START TRANSACTION has been issued without
+    /// a matching COMMIT/ROLLBACK. Reflected in OK/EOF status_flags via
+    /// SERVER_STATUS_IN_TRANS so drivers know not to issue savepoints
+    /// against a fresh connection. thinDB doesn't enforce real
+    /// transactions yet; the bit is bookkeeping for client tooling.
+    in_transaction: bool = false,
 
     fn init(allocator: Allocator) !SessionState {
         return .{
@@ -228,6 +234,13 @@ const SessionState = struct {
 
     fn asSession(self: SessionState) Session {
         return .{ .current_db = self.current_db, .current_schema = self.current_schema };
+    }
+
+    /// OR-able status bits derived from session state. Callers combine
+    /// with any per-response extra flags (e.g. SERVER_MORE_RESULTS_EXISTS)
+    /// before passing to OK/EOF emitters.
+    fn transactionStatus(self: SessionState) u16 {
+        return if (self.in_transaction) handshake.SERVER_STATUS_IN_TRANS else 0;
     }
 };
 
@@ -349,9 +362,34 @@ fn handleQuery(
     var seq_id: u8 = 1;
     const caps = session.client_caps;
 
+    // Transaction verbs are handled before the canned matcher so the
+    // OK packet carries the freshly-flipped SERVER_STATUS_IN_TRANS bit.
+    if (matchTxnVerb(payload)) |verb| {
+        switch (verb) {
+            .begin => session.in_transaction = true,
+            .commit, .rollback => session.in_transaction = false,
+        }
+        try handshake.sendOkPacketStatus(
+            allocator,
+            w,
+            seq_id,
+            0,
+            0,
+            session.transactionStatus(),
+        );
+        return;
+    }
+
     if (try canned.match(allocator, payload, session.current_schema)) |outcome| {
         switch (outcome) {
-            .ok_packet => try handshake.sendOkPacket(allocator, w, seq_id, 0, 0),
+            .ok_packet => try handshake.sendOkPacketStatus(
+                allocator,
+                w,
+                seq_id,
+                0,
+                0,
+                session.transactionStatus(),
+            ),
             .single_value => |sv| try result.sendSingleValueResult(allocator, w, sv.col, sv.val, &seq_id, caps),
             .single_null => |col| try result.sendSingleValueResult(allocator, w, col, null, &seq_id, caps),
             .variable_row => |vr| try result.sendVariableRow(allocator, w, vr.name, vr.value, &seq_id, caps),
@@ -366,6 +404,21 @@ fn handleQuery(
     }
 
     try runEngineQuery(allocator, w, catalog, session, payload, &seq_id);
+}
+
+const TxnVerb = enum { begin, commit, rollback };
+
+fn matchTxnVerb(sql_text: []const u8) ?TxnVerb {
+    var s = std.mem.trim(u8, sql_text, " \t\r\n");
+    while (s.len > 0 and s[s.len - 1] == ';') s = std.mem.trim(u8, s[0 .. s.len - 1], " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(s, "begin")) return .begin;
+    if (std.ascii.eqlIgnoreCase(s, "begin work")) return .begin;
+    if (std.ascii.eqlIgnoreCase(s, "start transaction")) return .begin;
+    if (std.ascii.eqlIgnoreCase(s, "commit")) return .commit;
+    if (std.ascii.eqlIgnoreCase(s, "commit work")) return .commit;
+    if (std.ascii.eqlIgnoreCase(s, "rollback")) return .rollback;
+    if (std.ascii.eqlIgnoreCase(s, "rollback work")) return .rollback;
+    return null;
 }
 
 fn isShowDatabases(sql_text: []const u8) bool {
@@ -446,13 +499,14 @@ fn runEngineQuery(
         const stmts = op.batch.statements;
         for (stmts, 0..) |stmt, i| {
             const is_last = i + 1 == stmts.len;
-            const extra: u16 = if (is_last) 0 else handshake.SERVER_MORE_RESULTS_EXISTS;
+            const base: u16 = session.transactionStatus();
+            const extra: u16 = if (is_last) base else base | handshake.SERVER_MORE_RESULTS_EXISTS;
             try runSingleStatement(allocator, w, catalog, session, stmt, seq_id, extra);
         }
         return;
     }
 
-    try runSingleStatement(allocator, w, catalog, session, op, seq_id, 0);
+    try runSingleStatement(allocator, w, catalog, session, op, seq_id, session.transactionStatus());
 }
 
 /// Compile + emit ONE statement's packets. `extra_status` is OR'd into

@@ -41,6 +41,11 @@ pub const server_capabilities: u32 =
     CLIENT_PLUGIN_AUTH |
     CLIENT_DEPRECATE_EOF;
 
+/// Set when a transaction is open (BEGIN/START TRANSACTION issued
+/// without a matching COMMIT/ROLLBACK). thinDB doesn't enforce real
+/// transactions yet, but tracking the bit keeps drivers happy —
+/// some ORMs use it to decide whether issuing a savepoint is safe.
+pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 pub const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
 /// Set on the status_flags of all OK/EOF packets that terminate a
 /// non-final result set in a multi-statement response. The client

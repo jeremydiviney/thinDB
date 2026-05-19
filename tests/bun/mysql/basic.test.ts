@@ -140,4 +140,35 @@ describe("mysql basic", () => {
       await conn.end().catch(() => undefined);
     }
   });
+
+  test("BEGIN/COMMIT/ROLLBACK flip SERVER_STATUS_IN_TRANS on OK packets", async () => {
+    // mysql2 surfaces the OK packet's status_flags as `serverStatus`.
+    // SERVER_STATUS_AUTOCOMMIT = 0x0002, SERVER_STATUS_IN_TRANS = 0x0001.
+    const conn = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+    });
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const [begin] = (await conn.query("BEGIN")) as [any, unknown];
+      expect((begin.serverStatus & 0x0001) !== 0).toBe(true);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const [commit] = (await conn.query("COMMIT")) as [any, unknown];
+      expect((commit.serverStatus & 0x0001) === 0).toBe(true);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const [start] = (await conn.query("START TRANSACTION")) as [any, unknown];
+      expect((start.serverStatus & 0x0001) !== 0).toBe(true);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const [rb] = (await conn.query("ROLLBACK")) as [any, unknown];
+      expect((rb.serverStatus & 0x0001) === 0).toBe(true);
+    } finally {
+      await conn.end().catch(() => undefined);
+    }
+  });
 });
