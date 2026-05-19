@@ -33,9 +33,24 @@ const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_STRING: u8 = 0xfe;
 
 const NOT_NULL_FLAG: u16 = 0x0001;
+/// Numeric-type column marker. mysql CLI right-aligns columns that
+/// advertise this flag; some drivers also use it as a hint for
+/// integer-vs-string typing decisions when type_byte alone is
+/// ambiguous (e.g., NEWDECIMAL).
+const NUM_FLAG: u16 = 0x8000;
 
 const CHARSET_UTF8MB4: u16 = 0x21;
 const CHARSET_BINARY: u16 = 0x3f;
+
+fn isNumericType(t: types.Type) bool {
+    return switch (t) {
+        .tinyint, .smallint, .int, .bigint, .largeint => true,
+        .boolean => true,
+        .float, .double => true,
+        .decimal64, .decimal128 => true,
+        else => false,
+    };
+}
 
 fn mysqlTypeOf(t: types.Type) struct { type_byte: u8, decimals: u8, len: u32, charset: u16 } {
     return switch (t) {
@@ -86,6 +101,7 @@ fn appendColumnDef(
 
     var flags: u16 = 0;
     if (!col.nullable) flags |= NOT_NULL_FLAG;
+    if (isNumericType(col.type)) flags |= NUM_FLAG;
     var flag_buf: [2]u8 = undefined;
     std.mem.writeInt(u16, &flag_buf, flags, .little);
     try out.appendSlice(allocator, &flag_buf);
