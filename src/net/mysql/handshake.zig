@@ -17,6 +17,13 @@ pub const CLIENT_CONNECT_WITH_DB: u32 = 0x00000008;
 /// but the last terminator.
 pub const CLIENT_MULTI_STATEMENTS: u32 = 0x00010000;
 pub const CLIENT_PROTOCOL_41: u32 = 0x00000200;
+/// Advertised so drivers know transaction-related status bits in
+/// OK/EOF packets are meaningful. thinDB doesn't actually run
+/// transactions yet — BEGIN/COMMIT/ROLLBACK are accepted as no-ops —
+/// but ORMs like mysql2 inspect server_capabilities on connect and
+/// behave differently when this is absent (e.g., re-sending setup
+/// queries on every borrow from a pool).
+pub const CLIENT_TRANSACTIONS: u32 = 0x00002000;
 pub const CLIENT_SECURE_CONNECTION: u32 = 0x00008000;
 pub const CLIENT_PLUGIN_AUTH: u32 = 0x00080000;
 pub const CLIENT_CONNECT_ATTRS: u32 = 0x00100000;
@@ -29,6 +36,7 @@ pub const server_capabilities: u32 =
     CLIENT_CONNECT_WITH_DB |
     CLIENT_MULTI_STATEMENTS |
     CLIENT_PROTOCOL_41 |
+    CLIENT_TRANSACTIONS |
     CLIENT_SECURE_CONNECTION |
     CLIENT_PLUGIN_AUTH |
     CLIENT_DEPRECATE_EOF;
