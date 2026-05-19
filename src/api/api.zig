@@ -62,15 +62,24 @@ pub const Config = struct {
     row_group_size: usize = 65_536,
 
     /// Auto-flush triggers. A flush fires inline (from `insert` or `delete`)
-    /// when ANY of these conditions hold against the current memtable.
+    /// when ANY of these conditions hold against the current memtable, and
+    /// also fires from `backgroundFlushSweep` when the time trigger condition
+    /// is met. `thindb-server` always spawns the background flusher; embedded
+    /// callers must spawn `Database.runBackgroundFlusher` (or call
+    /// `backgroundFlushSweep` manually) to drive the time-based path.
     auto_flush_bytes: usize = 64 * 1024 * 1024,
     auto_flush_rows: u64 = 1_000_000,
     /// Seconds since the memtable's first write. 0 disables the time trigger.
-    auto_flush_secs: u32 = 5,
-    /// Time-based trigger only fires once both these are met (avoids tiny
-    /// segments on low-volume tables).
-    auto_flush_min_rows: u64 = 1_000,
-    auto_flush_min_bytes: usize = 1 * 1024 * 1024,
+    /// 30s is the default: a memtable that's seen any write but hasn't crossed
+    /// the row/byte triggers will flush within ~30s + poll interval. The
+    /// background flusher uses a 1s poll, so worst-case visible latency is
+    /// ~31s from first write.
+    auto_flush_secs: u32 = 30,
+    /// Lower bounds the time trigger respects so an empty memtable doesn't
+    /// thrash the flush path. 1 row / 0 bytes means: anything in the memtable
+    /// eventually flushes. Compaction handles the tiny-segment cleanup later.
+    auto_flush_min_rows: u64 = 1,
+    auto_flush_min_bytes: usize = 0,
 
     /// LRU cache budget for decompressed column blocks. 0 disables caching.
     cache_size_bytes: usize = 256 * 1024 * 1024,

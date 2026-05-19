@@ -210,11 +210,19 @@ pub fn main(init: std.process.Init) !u8 {
         threads[i] = try std.Thread.spawn(.{}, runListener, .{l});
     }
 
+    // Always-on background flush sweep. Drives the time-based auto-flush
+    // trigger so a memtable that crosses `auto_flush_secs` gets persisted
+    // even if no further inserts arrive. 1s poll is short enough that
+    // worst-case visible latency stays at ~auto_flush_secs + 1s.
+    var flusher_ctx: FlusherCtx = .{ .catalog = catalog, .io = io };
+    const flusher_thread = try std.Thread.spawn(.{}, FlusherCtx.run, .{&flusher_ctx});
+
     waitForStop(io);
 
     for (listeners[0..n_listeners]) |*l| l.close();
     closed = true;
     for (threads[0..n_listeners]) |t| t.join();
+    flusher_thread.join();
 
     try out_w.writeAll("thindb-server shutting down\n");
     try out_w.flush();
@@ -250,6 +258,15 @@ const Listener = union(WireKind) {
 fn runListener(l: *Listener) void {
     l.run();
 }
+
+const FlusherCtx = struct {
+    catalog: *thindb.Catalog,
+    io: Io,
+
+    fn run(self: *FlusherCtx) void {
+        self.catalog.runBackgroundFlusher(self.io, 1000, &stop_flag);
+    }
+};
 
 /// If `arg` is `name`, pull the next argv token. If `arg` is `name=VAL`,
 /// return the inline value. Returns null if `arg` is unrelated.
