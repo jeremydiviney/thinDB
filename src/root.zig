@@ -72,6 +72,10 @@ pub const TcpServer = tcp_server.Server;
 pub const ir = @import("ir/ir.zig");
 pub const wire = @import("net/wire.zig");
 
+pub const mysql = @import("net/mysql.zig");
+pub const serveMysql = mysql.serveMysql;
+pub const MysqlServer = mysql.Server;
+
 /// Default TCP port for a thinDB server. Servers and clients can pick
 /// any port, but examples / docs use this.
 pub const default_port: u16 = wire.default_port;

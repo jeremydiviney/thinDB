@@ -7,6 +7,7 @@ const thindb = @import("thindb");
 test {
     _ = @import("basic_test.zig");
     _ = @import("tcp_test.zig");
+    _ = @import("mysql_test.zig");
 }
 
 test "integration_client entry exists" {
