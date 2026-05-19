@@ -443,7 +443,7 @@ fn runEngineQuery(
     };
     defer compiled.deinit();
 
-    if (isDdl(op.*)) {
+    if (isSideEffectOp(op.*)) {
         _ = compiled.next() catch |err| {
             const mapped = errors.mapInternal(err, @errorName(err));
             try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
@@ -451,7 +451,7 @@ fn runEngineQuery(
         };
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
-        try handshake.sendOkPacket(allocator, w, seq_id.*, 0, 0);
+        try handshake.sendOkPacket(allocator, w, seq_id.*, compiled.affectedRows(), 0);
         return;
     }
 
@@ -461,9 +461,9 @@ fn runEngineQuery(
     try session.replace(new_session.current_db, new_session.current_schema);
 }
 
-fn isDdl(op: ir.Op) bool {
+fn isSideEffectOp(op: ir.Op) bool {
     return switch (op) {
-        .ddl => true,
+        .ddl, .insert => true,
         else => false,
     };
 }

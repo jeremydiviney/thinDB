@@ -156,12 +156,13 @@ const Parser = struct {
     }
 
     fn parseStatement(self: *Parser) ParseError!*ir.Op {
-        // DDL / SHOW are leading-keyword forms that don't combine with
-        // WITH. They have no projection / FROM / WHERE / etc.; dispatch
-        // before the SELECT-only path.
+        // DDL / SHOW / INSERT are leading-keyword forms that don't combine
+        // with WITH. They have no projection / FROM / WHERE / etc.;
+        // dispatch before the SELECT-only path.
         switch (self.cur.tag) {
             .kw_create, .kw_drop, .kw_use => return try self.parseDdl(),
             .kw_show => return try self.parseShow(),
+            .kw_insert => return try self.parseInsert(),
             else => {},
         }
         // Optional WITH clause: zero-or-more named CTEs precede the
@@ -350,6 +351,10 @@ const Parser = struct {
                     const name = try self.dupedIdent();
                     return try self.allocOp(.{ .ddl = .{ .create_schema = name } });
                 }
+                if (self.cur.tag == .kw_table) {
+                    try self.advance();
+                    return try self.parseCreateTableBody();
+                }
                 return ParseError.SqlExpectedKeyword;
             },
             .kw_drop => {
@@ -362,6 +367,10 @@ const Parser = struct {
                     try self.advance();
                     const name = try self.dupedIdent();
                     return try self.allocOp(.{ .ddl = .{ .drop_schema = name } });
+                }
+                if (self.cur.tag == .kw_table) {
+                    try self.advance();
+                    return try self.parseDropTableBody();
                 }
                 return ParseError.SqlExpectedKeyword;
             },
@@ -379,6 +388,260 @@ const Parser = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// CREATE TABLE [IF NOT EXISTS] [db.][schema.]name ( column_def, ... [, PRIMARY KEY (..)] )
+    fn parseCreateTableBody(self: *Parser) ParseError!*ir.Op {
+        var if_not_exists = false;
+        if (self.cur.tag == .kw_if) {
+            try self.advance();
+            if (self.cur.tag != .kw_not) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            if (self.cur.tag != .kw_exists) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            if_not_exists = true;
+        }
+        const ref = try self.parseTableRef();
+        try self.expect(.lparen);
+
+        var cols: std.ArrayList(ir.ColumnDef) = .empty;
+        defer cols.deinit(self.arena);
+        var inline_pk: ?[]const u8 = null;
+        var table_pk: ?[]const []const u8 = null;
+
+        while (true) {
+            if (self.cur.tag == .kw_primary) {
+                try self.advance();
+                if (self.cur.tag != .kw_key) return ParseError.SqlExpectedKeyword;
+                try self.advance();
+                try self.expect(.lparen);
+                table_pk = try self.parseIdentList();
+                try self.expect(.rparen);
+            } else {
+                const col = try self.parseColumnDef();
+                try cols.append(self.arena, col.def);
+                if (col.is_pk) {
+                    if (inline_pk != null) return ParseError.SqlInvalidProjection;
+                    inline_pk = col.def.name;
+                }
+            }
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        try self.expect(.rparen);
+
+        // Tolerate trailing engine-options noise like `ENGINE=...` / `CHARSET=...`
+        // by eating any tokens up to EOF or semicolon. Keeps MySQL clients happy.
+        while (self.cur.tag != .eof and self.cur.tag != .semicolon) {
+            try self.advance();
+        }
+
+        if (inline_pk != null and table_pk != null) {
+            return ParseError.SqlInvalidProjection;
+        }
+        const order_key: []const []const u8 = if (table_pk) |tpk|
+            tpk
+        else if (inline_pk) |ipk| blk: {
+            const one = try self.arena.alloc([]const u8, 1);
+            one[0] = ipk;
+            break :blk one;
+        } else return ParseError.SqlInvalidProjection;
+
+        const owned_cols = try self.arena.alloc(ir.ColumnDef, cols.items.len);
+        for (cols.items, 0..) |c, i| owned_cols[i] = c;
+
+        return try self.allocOp(.{ .ddl = .{ .create_table = .{
+            .table = ref,
+            .if_not_exists = if_not_exists,
+            .columns = owned_cols,
+            .order_key = order_key,
+        } } });
+    }
+
+    fn parseDropTableBody(self: *Parser) ParseError!*ir.Op {
+        var if_exists = false;
+        if (self.cur.tag == .kw_if) {
+            try self.advance();
+            if (self.cur.tag != .kw_exists) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            if_exists = true;
+        }
+        const ref = try self.parseTableRef();
+        return try self.allocOp(.{ .ddl = .{ .drop_table = .{
+            .table = ref,
+            .if_exists = if_exists,
+        } } });
+    }
+
+    fn parseInsert(self: *Parser) ParseError!*ir.Op {
+        try self.advance(); // consume INSERT
+        if (self.cur.tag != .kw_into) return ParseError.SqlExpectedKeyword;
+        try self.advance();
+        const ref = try self.parseTableRef();
+
+        var cols_opt: ?[]const []const u8 = null;
+        if (self.cur.tag == .lparen) {
+            try self.advance();
+            cols_opt = try self.parseIdentList();
+            try self.expect(.rparen);
+        }
+
+        if (self.cur.tag != .kw_values) return ParseError.SqlExpectedKeyword;
+        try self.advance();
+
+        var rows: std.ArrayList([]const ?Value) = .empty;
+        defer rows.deinit(self.arena);
+        while (true) {
+            try self.expect(.lparen);
+            var row_vals: std.ArrayList(?Value) = .empty;
+            defer row_vals.deinit(self.arena);
+            while (true) {
+                const v = try self.parseInsertValue();
+                try row_vals.append(self.arena, v);
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+            try self.expect(.rparen);
+            const row_owned = try self.arena.alloc(?Value, row_vals.items.len);
+            for (row_vals.items, 0..) |v, i| row_owned[i] = v;
+            try rows.append(self.arena, row_owned);
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        const rows_owned = try self.arena.alloc([]const ?Value, rows.items.len);
+        for (rows.items, 0..) |r, i| rows_owned[i] = r;
+
+        return try self.allocOp(.{ .insert = .{
+            .table = ref,
+            .columns = cols_opt,
+            .rows = rows_owned,
+        } });
+    }
+
+    fn parseTableRef(self: *Parser) ParseError!ir.TableRef {
+        var parts_buf: [3][]const u8 = undefined;
+        var n: usize = 0;
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        parts_buf[0] = try self.arena.dupe(u8, self.cur.text);
+        n = 1;
+        try self.advance();
+        while (self.cur.tag == .dot) {
+            if (n == parts_buf.len) return ParseError.SqlExpectedIdent;
+            try self.advance();
+            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+            parts_buf[n] = try self.arena.dupe(u8, self.cur.text);
+            n += 1;
+            try self.advance();
+        }
+        return switch (n) {
+            1 => ir.TableRef{ .name = parts_buf[0] },
+            2 => ir.TableRef{ .schema = parts_buf[0], .name = parts_buf[1] },
+            3 => ir.TableRef{ .database = parts_buf[0], .schema = parts_buf[1], .name = parts_buf[2] },
+            else => unreachable,
+        };
+    }
+
+    const ColDefResult = struct { def: ir.ColumnDef, is_pk: bool };
+
+    fn parseColumnDef(self: *Parser) ParseError!ColDefResult {
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const name = try self.arena.dupe(u8, self.cur.text);
+        try self.advance();
+
+        const ty = try self.parseColumnType();
+
+        var nullable = true; // SQL standard default; flipped to false by NOT NULL or PRIMARY KEY
+        var is_pk = false;
+        var saw_not_null = false;
+        while (true) {
+            switch (self.cur.tag) {
+                .kw_not => {
+                    try self.advance();
+                    if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
+                    try self.advance();
+                    nullable = false;
+                    saw_not_null = true;
+                },
+                .kw_primary => {
+                    try self.advance();
+                    if (self.cur.tag != .kw_key) return ParseError.SqlExpectedKeyword;
+                    try self.advance();
+                    is_pk = true;
+                    nullable = false;
+                },
+                .kw_null => {
+                    if (saw_not_null) return ParseError.SqlExpectedKeyword;
+                    try self.advance();
+                    nullable = true;
+                },
+                else => break,
+            }
+        }
+        return .{
+            .def = .{ .name = name, .column_type = ty, .nullable = nullable },
+            .is_pk = is_pk,
+        };
+    }
+
+    fn parseColumnType(self: *Parser) ParseError!types.Type {
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const name = self.cur.text;
+        try self.advance();
+
+        // BIGINT / INT / INTEGER / SMALLINT / TINYINT
+        if (asciiEqlAny(name, &.{"bigint"})) return .bigint;
+        if (asciiEqlAny(name, &.{ "int", "integer" })) return .int;
+        if (asciiEqlAny(name, &.{"smallint"})) return .smallint;
+        if (asciiEqlAny(name, &.{"tinyint"})) return .smallint;
+        if (asciiEqlAny(name, &.{ "float", "real" })) return .float;
+        if (asciiEqlAny(name, &.{"double"})) {
+            // Optional PRECISION trailing keyword.
+            if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "precision")) {
+                try self.advance();
+            }
+            return .double;
+        }
+        if (asciiEqlAny(name, &.{ "decimal", "numeric" })) {
+            try self.expect(.lparen);
+            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+            const p_raw = self.cur.value.integer;
+            try self.advance();
+            try self.expect(.comma);
+            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+            const s_raw = self.cur.value.integer;
+            try self.advance();
+            try self.expect(.rparen);
+            if (p_raw < 1 or p_raw > 38 or s_raw < 0 or s_raw > p_raw) return ParseError.SqlExpectedValue;
+            const p_u: u8 = @intCast(p_raw);
+            const s_u: u8 = @intCast(s_raw);
+            return if (p_u <= 18)
+                types.Type{ .decimal64 = .{ .p = p_u, .s = s_u } }
+            else
+                types.Type{ .decimal128 = .{ .p = p_u, .s = s_u } };
+        }
+        if (asciiEqlAny(name, &.{"varchar"})) {
+            try self.expect(.lparen);
+            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+            const n_raw = self.cur.value.integer;
+            try self.advance();
+            try self.expect(.rparen);
+            if (n_raw < 1) return ParseError.SqlExpectedValue;
+            return types.Type{ .varchar = @intCast(n_raw) };
+        }
+        if (asciiEqlAny(name, &.{ "text", "string" })) return .string;
+        if (asciiEqlAny(name, &.{ "boolean", "bool" })) return .boolean;
+        if (asciiEqlAny(name, &.{"date"})) return .date;
+        if (asciiEqlAny(name, &.{ "datetime", "timestamp" })) return .datetime;
+        if (asciiEqlAny(name, &.{"uuid"})) return .uuid;
+        return ParseError.SqlExpectedKeyword;
+    }
+
+    fn parseInsertValue(self: *Parser) ParseError!?Value {
+        if (self.cur.tag == .kw_null) {
+            try self.advance();
+            return null;
+        }
+        return try self.parseValue();
     }
 
     fn parseShow(self: *Parser) ParseError!*ir.Op {
@@ -1087,7 +1350,7 @@ fn countRefs(
             try visitChild(arena, refs, j.right);
         },
         .materialize => |m| try visitChild(arena, refs, m.upstream),
-        .ddl, .show => {},
+        .ddl, .show, .insert => {},
     }
 }
 
@@ -1141,5 +1404,12 @@ fn countAggs(proj: []const ProjItem) usize {
 
 fn nameIn(needle: []const u8, names: []const []const u8) bool {
     for (names) |n| if (std.mem.eql(u8, n, needle)) return true;
+    return false;
+}
+
+fn asciiEqlAny(s: []const u8, candidates: []const []const u8) bool {
+    for (candidates) |c| {
+        if (std.ascii.eqlIgnoreCase(s, c)) return true;
+    }
     return false;
 }

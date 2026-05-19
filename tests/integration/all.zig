@@ -17,6 +17,7 @@ test {
     _ = @import("plan_test.zig");
     _ = @import("sql_test.zig");
     _ = @import("sql_namespace_test.zig");
+    _ = @import("sql_ddl_test.zig");
     _ = @import("catalog_test.zig");
 }
 

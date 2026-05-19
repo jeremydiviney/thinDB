@@ -37,6 +37,7 @@ const ApiTable = thindb_api.Table;
 
 const types = @import("../types.zig");
 const TableSchema = types.TableSchema;
+const Value = types.Value;
 
 const exec = @import("../exec/exec.zig");
 const Query = exec.Query;
@@ -884,7 +885,7 @@ pub fn buildServerQuerySession(
             // shares buffers across multi-references.
             return Error.UnsupportedOp;
         },
-        .ddl, .show => {
+        .ddl, .show, .insert => {
             // Side-effect / introspection ops aren't recursive — they
             // can't appear as the upstream of another op. The top-level
             // compile() routes them straight to their dedicated builder.
@@ -918,6 +919,10 @@ pub const CompileCtx = struct {
     /// Strings duplicated into `allocator` to back Session updates from
     /// `USE` statements. Freed at `deinit`.
     session_strings: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Rows affected by a top-level side-effect statement (INSERT today).
+    /// Wire layers (MySQL OK_Packet, PG CommandComplete) read this after
+    /// running the CompiledQuery. Zero for ops that don't mutate data.
+    affected_rows: u64 = 0,
 
     pub fn deinit(self: *CompileCtx) void {
         var it = self.materialized.iterator();
@@ -960,6 +965,12 @@ pub const CompiledQuery = struct {
     /// executed during a DDL pipeline).
     pub fn sessionValue(self: *CompiledQuery) Session {
         return self.session_cell.*;
+    }
+
+    /// Rows touched by the most recent side-effect statement (INSERT
+    /// today; DELETE eventually). Zero for SELECT and metadata-only DDL.
+    pub fn affectedRows(self: *const CompiledQuery) u64 {
+        return self.ctx.affected_rows;
     }
 };
 
@@ -1067,6 +1078,7 @@ fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         },
         .ddl => |d| try compileDdl(ctx, d),
         .show => |s| try compileShow(ctx, s),
+        .insert => |i| try compileInsert(ctx, i),
     };
 }
 
@@ -1100,8 +1112,591 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             ctx.session.current_db = db_owned;
             ctx.session.current_schema = sc_owned;
         },
+        .create_table => |ct| {
+            const db_name = ct.table.database orelse ctx.session.current_db;
+            const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
+            const sc_name = ct.table.schema orelse ctx.session.current_schema;
+            const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
+
+            sc.tables_mutex.lockUncancelable(sc.io);
+            const exists = sc.tables.get(ct.table.name) != null;
+            sc.tables_mutex.unlock(sc.io);
+            if (exists) {
+                if (ct.if_not_exists) return try EmptyOp.create(ctx.allocator);
+                return Error.TableAlreadyExists;
+            }
+
+            const cols = try ctx.allocator.alloc(types.Column, ct.columns.len);
+            defer ctx.allocator.free(cols);
+            for (ct.columns, 0..) |c, ci| {
+                cols[ci] = .{ .name = c.name, .type = c.column_type, .nullable = c.nullable };
+            }
+            const schema_def: TableSchema = .{
+                .columns = cols,
+                .order_key = ct.order_key,
+                .unique = true,
+            };
+            const opts: TableOptions = .{
+                .order_key = ct.order_key,
+                .unique = true,
+                .row_group_size = null,
+            };
+            _ = sc.table(ct.table.name, schema_def, opts) catch |e| return thindb_api.remapError(Error, e);
+        },
+        .drop_table => |dt| {
+            const db_name = dt.table.database orelse ctx.session.current_db;
+            const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
+            const sc_name = dt.table.schema orelse ctx.session.current_schema;
+            const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
+            sc.dropTable(dt.table.name) catch |e| switch (e) {
+                ApiError.TableNotFound => if (!dt.if_exists) return Error.TableNotFound,
+                else => return thindb_api.remapError(Error, e),
+            };
+        },
     }
     return try EmptyOp.create(ctx.allocator);
+}
+
+fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
+    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const t = try resolveTable(catalog, ctx.session.*, op.table);
+    const tbl_schema = t.schema;
+
+    const source_widths = if (op.columns) |cols| cols.len else tbl_schema.columns.len;
+    if (op.columns) |cols| {
+        for (cols) |cname| {
+            _ = tbl_schema.columnIndex(cname) orelse return Error.ColumnNotFound;
+        }
+    } else {
+        if (source_widths != tbl_schema.columns.len) return Error.BadRequest;
+    }
+
+    // schema_to_source[i] = which source column feeds table column i, or null
+    // (meaning: not in the user-supplied list; must be NULL-fillable).
+    const schema_to_source = try ctx.allocator.alloc(?usize, tbl_schema.columns.len);
+    defer ctx.allocator.free(schema_to_source);
+    for (schema_to_source) |*s| s.* = null;
+    if (op.columns) |cols| {
+        for (cols, 0..) |cname, src_idx| {
+            const si = tbl_schema.columnIndex(cname).?;
+            schema_to_source[si] = src_idx;
+        }
+    } else {
+        for (schema_to_source, 0..) |*s, i| s.* = i;
+    }
+
+    for (schema_to_source, 0..) |maybe_src, si| {
+        if (maybe_src == null and !tbl_schema.columns[si].nullable) return Error.ColumnNotFound;
+    }
+    for (op.rows) |row| {
+        if (row.len != source_widths) return Error.BadRequest;
+        for (schema_to_source, 0..) |maybe_src, si| {
+            if (maybe_src) |src| {
+                if (row[src] == null and !tbl_schema.columns[si].nullable) {
+                    return Error.TypeMismatch;
+                }
+            }
+        }
+    }
+
+    const row_count = op.rows.len;
+    if (row_count == 0) {
+        return try EmptyOp.createWithCount(ctx.allocator, 0);
+    }
+
+    var builder = try InsertColumnBuilder.init(ctx.allocator, tbl_schema, row_count);
+    defer builder.deinit();
+
+    for (op.rows) |row| {
+        for (tbl_schema.columns, 0..) |col, si| {
+            const maybe_src = schema_to_source[si];
+            const cell: ?Value = if (maybe_src) |src| row[src] else null;
+            try builder.appendCell(si, col, cell);
+        }
+    }
+
+    try t.insertBatch(builder.schemaSlice(), builder.views(), row_count);
+
+    ctx.affected_rows = @intCast(row_count);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(row_count));
+}
+
+/// Per-column buffer used to bulk-collect literal Value rows for an
+/// INSERT, then hand them to `Table.insertBatch` as ColumnView slices.
+/// Each fixed-width column owns an aligned-byte slab so `bytesAsSlice(T)`
+/// returns a properly-aligned typed slice without an extra copy.
+const InsertColumnBuilder = struct {
+    allocator: Allocator,
+    schema_copy: []types.Column,
+    /// 16-byte aligned slabs sized for the full row count up front.
+    /// Indexed by column index, length = row_count * size_of_type.
+    fixed_slabs: [][]align(16) u8,
+    /// Per-column write cursor into `fixed_slabs[i]` (bytes written so far).
+    fixed_cursor: []usize,
+    string_offsets: []std.ArrayListUnmanaged(u32),
+    string_bytes: []std.ArrayListUnmanaged(u8),
+    nulls: []std.ArrayListUnmanaged(u8),
+    view_slice: []storage.ColumnView,
+    row_count: usize,
+
+    fn init(allocator: Allocator, table_schema: TableSchema, row_count: usize) !InsertColumnBuilder {
+        const n_cols = table_schema.columns.len;
+        const schema_copy = try allocator.alloc(types.Column, n_cols);
+        errdefer allocator.free(schema_copy);
+        for (table_schema.columns, 0..) |c, i| schema_copy[i] = c;
+
+        const fixed_slabs = try allocator.alloc([]align(16) u8, n_cols);
+        errdefer allocator.free(fixed_slabs);
+        var slabs_inited: usize = 0;
+        errdefer for (fixed_slabs[0..slabs_inited]) |s| if (s.len > 0) allocator.free(s);
+        for (table_schema.columns, 0..) |c, i| {
+            const per_row: usize = switch (c.type) {
+                .int, .date, .float => 4,
+                .bigint, .double, .datetime, .decimal64 => 8,
+                .smallint => 2,
+                .tinyint, .boolean => 1,
+                .largeint, .decimal128, .uuid => 16,
+                .varchar, .string, .char => 0,
+            };
+            fixed_slabs[i] = if (per_row == 0)
+                &[_]u8{}
+            else
+                try allocator.alignedAlloc(u8, .@"16", per_row * row_count);
+            slabs_inited = i + 1;
+        }
+
+        const fixed_cursor = try allocator.alloc(usize, n_cols);
+        errdefer allocator.free(fixed_cursor);
+        for (fixed_cursor) |*c| c.* = 0;
+
+        const string_offsets = try allocator.alloc(std.ArrayListUnmanaged(u32), n_cols);
+        errdefer allocator.free(string_offsets);
+        for (string_offsets) |*b| b.* = .empty;
+
+        const string_bytes = try allocator.alloc(std.ArrayListUnmanaged(u8), n_cols);
+        errdefer allocator.free(string_bytes);
+        for (string_bytes) |*b| b.* = .empty;
+
+        const nulls = try allocator.alloc(std.ArrayListUnmanaged(u8), n_cols);
+        errdefer allocator.free(nulls);
+        for (nulls) |*b| b.* = .empty;
+
+        const view_slice = try allocator.alloc(storage.ColumnView, n_cols);
+        errdefer allocator.free(view_slice);
+
+        const bitmap_len = (row_count + 7) / 8;
+        for (table_schema.columns, 0..) |c, i| {
+            if (c.nullable) try nulls[i].appendNTimes(allocator, 0, bitmap_len);
+            if (c.type.isString()) try string_offsets[i].append(allocator, 0);
+        }
+        return .{
+            .allocator = allocator,
+            .schema_copy = schema_copy,
+            .fixed_slabs = fixed_slabs,
+            .fixed_cursor = fixed_cursor,
+            .string_offsets = string_offsets,
+            .string_bytes = string_bytes,
+            .nulls = nulls,
+            .view_slice = view_slice,
+            .row_count = row_count,
+        };
+    }
+
+    fn deinit(self: *InsertColumnBuilder) void {
+        for (self.fixed_slabs) |s| if (s.len > 0) self.allocator.free(s);
+        for (self.string_offsets) |*b| b.deinit(self.allocator);
+        for (self.string_bytes) |*b| b.deinit(self.allocator);
+        for (self.nulls) |*b| b.deinit(self.allocator);
+        self.allocator.free(self.fixed_slabs);
+        self.allocator.free(self.fixed_cursor);
+        self.allocator.free(self.string_offsets);
+        self.allocator.free(self.string_bytes);
+        self.allocator.free(self.nulls);
+        self.allocator.free(self.schema_copy);
+        self.allocator.free(self.view_slice);
+    }
+
+    fn schemaSlice(self: *InsertColumnBuilder) []const types.Column {
+        return self.schema_copy;
+    }
+
+    fn appendCell(self: *InsertColumnBuilder, col_idx: usize, col: types.Column, maybe_val: ?Value) !void {
+        const row_in_col = self.currentRow(col_idx, col);
+        if (maybe_val == null) {
+            try self.appendPlaceholder(col_idx, col);
+            return;
+        }
+        const v = maybe_val.?;
+        if (col.nullable) {
+            self.nulls[col_idx].items[row_in_col >> 3] |= @as(u8, 1) << @intCast(row_in_col & 7);
+        }
+        try self.appendCoerced(col_idx, col, v);
+    }
+
+    fn currentRow(self: *InsertColumnBuilder, col_idx: usize, col: types.Column) usize {
+        return switch (col.type) {
+            .int, .date, .float => self.fixed_cursor[col_idx] / 4,
+            .bigint, .double, .datetime, .decimal64 => self.fixed_cursor[col_idx] / 8,
+            .smallint => self.fixed_cursor[col_idx] / 2,
+            .tinyint, .boolean => self.fixed_cursor[col_idx],
+            .largeint, .decimal128, .uuid => self.fixed_cursor[col_idx] / 16,
+            .varchar, .string, .char => self.string_offsets[col_idx].items.len - 1,
+        };
+    }
+
+    fn appendPlaceholder(self: *InsertColumnBuilder, col_idx: usize, col: types.Column) !void {
+        switch (col.type) {
+            .int, .date, .float => self.writeFixedZero(col_idx, 4),
+            .bigint, .double, .datetime, .decimal64 => self.writeFixedZero(col_idx, 8),
+            .smallint => self.writeFixedZero(col_idx, 2),
+            .tinyint, .boolean => self.writeFixedZero(col_idx, 1),
+            .largeint, .decimal128, .uuid => self.writeFixedZero(col_idx, 16),
+            .varchar, .string, .char => {
+                const cur = self.string_offsets[col_idx].items[self.string_offsets[col_idx].items.len - 1];
+                try self.string_offsets[col_idx].append(self.allocator, cur);
+            },
+        }
+    }
+
+    fn writeFixedZero(self: *InsertColumnBuilder, col_idx: usize, width: usize) void {
+        const cursor = self.fixed_cursor[col_idx];
+        @memset(self.fixed_slabs[col_idx][cursor .. cursor + width], 0);
+        self.fixed_cursor[col_idx] = cursor + width;
+    }
+
+    fn writeFixedBytes(self: *InsertColumnBuilder, col_idx: usize, bytes: []const u8) void {
+        const cursor = self.fixed_cursor[col_idx];
+        @memcpy(self.fixed_slabs[col_idx][cursor .. cursor + bytes.len], bytes);
+        self.fixed_cursor[col_idx] = cursor + bytes.len;
+    }
+
+    fn appendCoerced(self: *InsertColumnBuilder, col_idx: usize, col: types.Column, v: Value) !void {
+        switch (col.type) {
+            .int => self.writeFixedInt(col_idx, i32, try coerceToI32(v)),
+            .bigint => self.writeFixedInt(col_idx, i64, try coerceToI64(v)),
+            .smallint => self.writeFixedInt(col_idx, i16, try coerceToI16(v)),
+            .tinyint => self.writeFixedBytes(col_idx, &[_]u8{@as(u8, @bitCast(try coerceToI8(v)))}),
+            .largeint => self.writeFixedInt(col_idx, i128, try coerceToI128(v)),
+            .boolean => self.writeFixedBytes(col_idx, &[_]u8{@intFromBool(try coerceToBool(v))}),
+            .float => self.writeFixedFloat(col_idx, f32, try coerceToF32(v)),
+            .double => self.writeFixedFloat(col_idx, f64, try coerceToF64(v)),
+            .date => self.writeFixedInt(col_idx, i32, try coerceToDate(v)),
+            .datetime => self.writeFixedInt(col_idx, i64, try coerceToDateTime(v)),
+            .decimal64 => |spec| self.writeFixedInt(col_idx, i64, try coerceToDecimal64(v, spec)),
+            .decimal128 => |spec| self.writeFixedInt(col_idx, i128, try coerceToDecimal128(v, spec)),
+            .uuid => self.writeFixedInt(col_idx, u128, try coerceToUuid(v)),
+            .varchar, .string, .char => {
+                const s = try coerceToText(v);
+                const sb = &self.string_bytes[col_idx];
+                try sb.appendSlice(self.allocator, s);
+                try self.string_offsets[col_idx].append(self.allocator, @intCast(sb.items.len));
+            },
+        }
+    }
+
+    fn writeFixedInt(self: *InsertColumnBuilder, col_idx: usize, comptime T: type, v: T) void {
+        var buf: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &buf, v, .little);
+        self.writeFixedBytes(col_idx, &buf);
+    }
+
+    fn writeFixedFloat(self: *InsertColumnBuilder, col_idx: usize, comptime T: type, v: T) void {
+        const Bits = if (T == f32) u32 else u64;
+        var buf: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(Bits, &buf, @bitCast(v), .little);
+        self.writeFixedBytes(col_idx, &buf);
+    }
+
+    fn views(self: *InsertColumnBuilder) []const storage.ColumnView {
+        for (self.schema_copy, 0..) |col, i| {
+            const data: @import("../storage/column.zig").ValueView = switch (col.type) {
+                .int => .{ .int = std.mem.bytesAsSlice(i32, self.fixed_slabs[i])[0..self.row_count] },
+                .bigint => .{ .bigint = std.mem.bytesAsSlice(i64, self.fixed_slabs[i])[0..self.row_count] },
+                .smallint => .{ .smallint = std.mem.bytesAsSlice(i16, self.fixed_slabs[i])[0..self.row_count] },
+                .tinyint => .{ .tinyint = std.mem.bytesAsSlice(i8, self.fixed_slabs[i])[0..self.row_count] },
+                .largeint => .{ .largeint = std.mem.bytesAsSlice(i128, self.fixed_slabs[i])[0..self.row_count] },
+                .boolean => .{ .boolean = self.fixed_slabs[i][0..self.row_count] },
+                .float => .{ .float = std.mem.bytesAsSlice(f32, self.fixed_slabs[i])[0..self.row_count] },
+                .double => .{ .double = std.mem.bytesAsSlice(f64, self.fixed_slabs[i])[0..self.row_count] },
+                .date => .{ .date = std.mem.bytesAsSlice(i32, self.fixed_slabs[i])[0..self.row_count] },
+                .datetime => .{ .datetime = std.mem.bytesAsSlice(i64, self.fixed_slabs[i])[0..self.row_count] },
+                .decimal64 => .{ .decimal64 = std.mem.bytesAsSlice(i64, self.fixed_slabs[i])[0..self.row_count] },
+                .decimal128 => .{ .decimal128 = std.mem.bytesAsSlice(i128, self.fixed_slabs[i])[0..self.row_count] },
+                .uuid => .{ .uuid = std.mem.bytesAsSlice(u128, self.fixed_slabs[i])[0..self.row_count] },
+                .varchar => .{ .varchar = .{
+                    .offsets = self.string_offsets[i].items,
+                    .bytes = self.string_bytes[i].items,
+                } },
+                .string => .{ .string = .{
+                    .offsets = self.string_offsets[i].items,
+                    .bytes = self.string_bytes[i].items,
+                } },
+                .char => .{ .char = .{
+                    .offsets = self.string_offsets[i].items,
+                    .bytes = self.string_bytes[i].items,
+                } },
+            };
+            self.view_slice[i] = .{ .data = data, .nulls = if (col.nullable) self.nulls[i].items else null };
+        }
+        return self.view_slice;
+    }
+};
+
+fn coerceToI64(v: Value) !i64 {
+    return switch (v) {
+        .int => |x| @as(i64, x),
+        .bigint => |x| x,
+        .smallint => |x| @as(i64, x),
+        .tinyint => |x| @as(i64, x),
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToI32(v: Value) !i32 {
+    return switch (v) {
+        .int => |x| x,
+        .bigint => |x| if (x >= std.math.minInt(i32) and x <= std.math.maxInt(i32)) @intCast(x) else Error.TypeMismatch,
+        .smallint => |x| @as(i32, x),
+        .tinyint => |x| @as(i32, x),
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToI16(v: Value) !i16 {
+    return switch (v) {
+        .int => |x| if (x >= std.math.minInt(i16) and x <= std.math.maxInt(i16)) @intCast(x) else Error.TypeMismatch,
+        .bigint => |x| if (x >= std.math.minInt(i16) and x <= std.math.maxInt(i16)) @intCast(x) else Error.TypeMismatch,
+        .smallint => |x| x,
+        .tinyint => |x| @as(i16, x),
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToI8(v: Value) !i8 {
+    return switch (v) {
+        .int => |x| if (x >= std.math.minInt(i8) and x <= std.math.maxInt(i8)) @intCast(x) else Error.TypeMismatch,
+        .bigint => |x| if (x >= std.math.minInt(i8) and x <= std.math.maxInt(i8)) @intCast(x) else Error.TypeMismatch,
+        .smallint => |x| if (x >= std.math.minInt(i8) and x <= std.math.maxInt(i8)) @intCast(x) else Error.TypeMismatch,
+        .tinyint => |x| x,
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToI128(v: Value) !i128 {
+    return switch (v) {
+        .int => |x| @as(i128, x),
+        .bigint => |x| @as(i128, x),
+        .smallint => |x| @as(i128, x),
+        .tinyint => |x| @as(i128, x),
+        .largeint => |x| x,
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToBool(v: Value) !bool {
+    return switch (v) {
+        .boolean => |x| x,
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToF32(v: Value) !f32 {
+    return switch (v) {
+        .float => |x| x,
+        .double => |x| @floatCast(x),
+        .int => |x| @floatFromInt(x),
+        .bigint => |x| @floatFromInt(x),
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToF64(v: Value) !f64 {
+    return switch (v) {
+        .float => |x| @floatCast(x),
+        .double => |x| x,
+        .int => |x| @floatFromInt(x),
+        .bigint => |x| @floatFromInt(x),
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToText(v: Value) ![]const u8 {
+    return switch (v) {
+        .text => |s| s,
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToDate(v: Value) !i32 {
+    return switch (v) {
+        .date => |d| d,
+        .text => |s| parseDateLiteral(s) catch Error.TypeMismatch,
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToDateTime(v: Value) !i64 {
+    return switch (v) {
+        .datetime => |d| d,
+        .text => |s| parseDateTimeLiteral(s) catch Error.TypeMismatch,
+        .date => |d| @as(i64, d) * (86_400 * 1_000_000),
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToUuid(v: Value) !u128 {
+    return switch (v) {
+        .uuid => |u| u,
+        .text => |s| parseUuidLiteral(s) catch Error.TypeMismatch,
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToDecimal64(v: Value, spec: @import("../types.zig").DecimalSpec) !i64 {
+    return switch (v) {
+        .decimal64 => |d| d,
+        .int => |x| try scaleIntToDecimal(i64, x, spec.s),
+        .bigint => |x| try scaleIntToDecimal(i64, x, spec.s),
+        .text => |s| try parseDecimalLiteral(i64, s, spec),
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToDecimal128(v: Value, spec: @import("../types.zig").DecimalSpec) !i128 {
+    return switch (v) {
+        .decimal64 => |d| @as(i128, d),
+        .decimal128 => |d| d,
+        .int => |x| try scaleIntToDecimal(i128, x, spec.s),
+        .bigint => |x| try scaleIntToDecimal(i128, x, spec.s),
+        .text => |s| try parseDecimalLiteral(i128, s, spec),
+        else => Error.TypeMismatch,
+    };
+}
+
+fn scaleIntToDecimal(comptime T: type, x: anytype, scale: u8) !T {
+    var out: T = @intCast(x);
+    var i: u8 = 0;
+    while (i < scale) : (i += 1) {
+        out = std.math.mul(T, out, 10) catch return Error.TypeMismatch;
+    }
+    return out;
+}
+
+fn parseDecimalLiteral(comptime T: type, s: []const u8, spec: @import("../types.zig").DecimalSpec) !T {
+    // Accept optional sign, digits, optional '.' followed by digits. Right-
+    // pad or truncate the fractional part to the column's scale.
+    var idx: usize = 0;
+    var negate = false;
+    if (idx < s.len and (s[idx] == '-' or s[idx] == '+')) {
+        negate = s[idx] == '-';
+        idx += 1;
+    }
+    var int_part: T = 0;
+    while (idx < s.len and s[idx] >= '0' and s[idx] <= '9') : (idx += 1) {
+        int_part = std.math.mul(T, int_part, 10) catch return Error.TypeMismatch;
+        int_part = std.math.add(T, int_part, @as(T, s[idx] - '0')) catch return Error.TypeMismatch;
+    }
+    var frac_digits: u8 = 0;
+    var frac_part: T = 0;
+    if (idx < s.len and s[idx] == '.') {
+        idx += 1;
+        while (idx < s.len and s[idx] >= '0' and s[idx] <= '9' and frac_digits < spec.s) : (idx += 1) {
+            frac_part = std.math.mul(T, frac_part, 10) catch return Error.TypeMismatch;
+            frac_part = std.math.add(T, frac_part, @as(T, s[idx] - '0')) catch return Error.TypeMismatch;
+            frac_digits += 1;
+        }
+        // Skip trailing digits beyond the target scale (truncate).
+        while (idx < s.len and s[idx] >= '0' and s[idx] <= '9') : (idx += 1) {}
+    }
+    if (idx != s.len) return Error.TypeMismatch;
+    // Right-pad the fractional part to the target scale.
+    while (frac_digits < spec.s) : (frac_digits += 1) {
+        frac_part = std.math.mul(T, frac_part, 10) catch return Error.TypeMismatch;
+    }
+    var scaled = std.math.mul(T, int_part, std.math.powi(T, 10, spec.s) catch return Error.TypeMismatch) catch return Error.TypeMismatch;
+    scaled = std.math.add(T, scaled, frac_part) catch return Error.TypeMismatch;
+    if (negate) scaled = -scaled;
+    return scaled;
+}
+
+/// `YYYY-MM-DD` → days since the Unix epoch. Uses civil-from-days math
+/// (Howard Hinnant's algorithm) for correctness across leap years.
+fn parseDateLiteral(s: []const u8) !i32 {
+    if (s.len < 10) return Error.TypeMismatch;
+    if (s[4] != '-' or s[7] != '-') return Error.TypeMismatch;
+    const year = try parseIntField(i32, s[0..4]);
+    const month = try parseIntField(u32, s[5..7]);
+    const day = try parseIntField(u32, s[8..10]);
+    if (month < 1 or month > 12 or day < 1 or day > 31) return Error.TypeMismatch;
+    return civilToDays(year, month, day);
+}
+
+fn parseDateTimeLiteral(s: []const u8) !i64 {
+    if (s.len < 19) return Error.TypeMismatch;
+    if (s[4] != '-' or s[7] != '-') return Error.TypeMismatch;
+    const sep = s[10];
+    if (sep != ' ' and sep != 'T') return Error.TypeMismatch;
+    if (s[13] != ':' or s[16] != ':') return Error.TypeMismatch;
+    const year = try parseIntField(i32, s[0..4]);
+    const month = try parseIntField(u32, s[5..7]);
+    const day = try parseIntField(u32, s[8..10]);
+    const hour = try parseIntField(u32, s[11..13]);
+    const minute = try parseIntField(u32, s[14..16]);
+    const second = try parseIntField(u32, s[17..19]);
+    if (hour > 23 or minute > 59 or second > 59) return Error.TypeMismatch;
+    var micros: u64 = 0;
+    if (s.len > 19) {
+        if (s[19] != '.') return Error.TypeMismatch;
+        var idx: usize = 20;
+        var digits: usize = 0;
+        while (idx < s.len and digits < 6 and s[idx] >= '0' and s[idx] <= '9') : (idx += 1) {
+            micros = micros * 10 + (s[idx] - '0');
+            digits += 1;
+        }
+        // Right-pad to microseconds.
+        while (digits < 6) : (digits += 1) micros *= 10;
+        if (idx != s.len) return Error.TypeMismatch;
+    }
+    const days = try civilToDays(year, month, day);
+    const day_secs: i64 = @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+    return @as(i64, days) * 86_400 * 1_000_000 + day_secs * 1_000_000 + @as(i64, @intCast(micros));
+}
+
+fn parseUuidLiteral(s: []const u8) !u128 {
+    if (s.len != 36) return Error.TypeMismatch;
+    if (s[8] != '-' or s[13] != '-' or s[18] != '-' or s[23] != '-') return Error.TypeMismatch;
+    var out: u128 = 0;
+    var idx: usize = 0;
+    for (s) |ch| {
+        if (ch == '-') continue;
+        const nib: u128 = switch (ch) {
+            '0'...'9' => ch - '0',
+            'a'...'f' => ch - 'a' + 10,
+            'A'...'F' => ch - 'A' + 10,
+            else => return Error.TypeMismatch,
+        };
+        out = (out << 4) | nib;
+        idx += 1;
+    }
+    if (idx != 32) return Error.TypeMismatch;
+    return out;
+}
+
+fn parseIntField(comptime T: type, s: []const u8) !T {
+    return std.fmt.parseInt(T, s, 10) catch return Error.TypeMismatch;
+}
+
+/// Howard Hinnant's "days_from_civil" algorithm: converts a proleptic
+/// Gregorian date (y, m, d) to days since 1970-01-01.
+fn civilToDays(year: i32, month: u32, day: u32) !i32 {
+    if (month == 0 or day == 0) return Error.TypeMismatch;
+    const y = if (month <= 2) year - 1 else year;
+    const era = if (y >= 0) @divFloor(y, 400) else @divFloor(y - 399, 400);
+    const yoe: u32 = @intCast(y - era * 400);
+    const m: u32 = if (month > 2) month - 3 else month + 9;
+    const doy: u32 = (153 * m + 2) / 5 + day - 1;
+    const doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return @as(i32, era) * 146_097 + @as(i32, @intCast(doe)) - 719_468;
 }
 
 fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
@@ -1148,13 +1743,23 @@ fn freeOwnedNames(allocator: Allocator, names: [][]u8) void {
 const EmptyOp = struct {
     allocator: Allocator,
     schema: [1]types.Column,
+    /// Affected-row count carried by side-effect operators (today: only
+    /// INSERT). Wire layers (MySQL OK_Packet.affected_rows, PG
+    /// CommandComplete "INSERT 0 N") read this off the CompiledQuery
+    /// before tearing it down.
+    affected_rows: u64 = 0,
 
     fn create(allocator: Allocator) !Query {
+        return createWithCount(allocator, 0);
+    }
+
+    fn createWithCount(allocator: Allocator, affected: u64) !Query {
         const self = try allocator.create(EmptyOp);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .schema = .{.{ .name = "result", .type = .string }},
+            .affected_rows = affected,
         };
         return exec.makeQuery(allocator, self);
     }

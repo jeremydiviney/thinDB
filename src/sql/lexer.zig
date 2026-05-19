@@ -54,6 +54,14 @@ pub const TokenTag = enum {
     kw_use,
     kw_show,
     kw_tables,
+    kw_table,
+    kw_primary,
+    kw_key,
+    kw_if,
+    kw_exists,
+    kw_into,
+    kw_values,
+    kw_insert,
 
     // Operators / punctuation.
     eq, // =
@@ -335,6 +343,14 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "use", .tag = .kw_use },
         .{ .name = "show", .tag = .kw_show },
         .{ .name = "tables", .tag = .kw_tables },
+        .{ .name = "table", .tag = .kw_table },
+        .{ .name = "primary", .tag = .kw_primary },
+        .{ .name = "key", .tag = .kw_key },
+        .{ .name = "if", .tag = .kw_if },
+        .{ .name = "exists", .tag = .kw_exists },
+        .{ .name = "into", .tag = .kw_into },
+        .{ .name = "values", .tag = .kw_values },
+        .{ .name = "insert", .tag = .kw_insert },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;

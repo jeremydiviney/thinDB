@@ -462,7 +462,14 @@ fn runEngineQuery(
         _ = try compiled.next();
         const new_session = compiled.sessionValue();
         try session.replaceDbSchema(new_session.current_db, new_session.current_schema);
-        try result.sendCommandComplete(allocator, w, commandTagFor(op.*));
+        switch (op.*) {
+            .insert => {
+                var tag_buf: [48]u8 = undefined;
+                const tag = try std.fmt.bufPrint(&tag_buf, "INSERT 0 {d}", .{compiled.affectedRows()});
+                try result.sendCommandComplete(allocator, w, tag);
+            },
+            else => try result.sendCommandComplete(allocator, w, commandTagFor(op.*)),
+        }
         return;
     }
 
@@ -477,7 +484,7 @@ fn runEngineQuery(
 
 fn isSideEffectOp(op: ir.Op) bool {
     return switch (op) {
-        .ddl => true,
+        .ddl, .insert => true,
         else => false,
     };
 }
@@ -489,6 +496,8 @@ fn commandTagFor(op: ir.Op) []const u8 {
             .drop_database => "DROP DATABASE",
             .create_schema => "CREATE SCHEMA",
             .drop_schema => "DROP SCHEMA",
+            .create_table => "CREATE TABLE",
+            .drop_table => "DROP TABLE",
             .use_schema, .use_database_schema => "SET",
         },
         else => "OK",

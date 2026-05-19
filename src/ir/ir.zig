@@ -78,6 +78,41 @@ pub const DdlOp = union(enum) {
     use_schema: []const u8,
     /// `USE db.schema` — set current database AND schema.
     use_database_schema: struct { database: []const u8, schema: []const u8 },
+    create_table: CreateTable,
+    drop_table: DropTable,
+};
+
+pub const ColumnDef = struct {
+    name: []const u8,
+    column_type: @import("../types.zig").Type,
+    nullable: bool,
+};
+
+pub const CreateTable = struct {
+    table: TableRef,
+    if_not_exists: bool,
+    columns: []const ColumnDef,
+    order_key: []const []const u8,
+};
+
+pub const DropTable = struct {
+    table: TableRef,
+    if_exists: bool,
+};
+
+/// Side-effect: bulk insert literal rows. Lives outside DdlOp because
+/// INSERT isn't DDL (it mutates data, not metadata) and its execution
+/// path produces an affected-row count.
+pub const InsertOp = struct {
+    table: TableRef,
+    /// `null` means positional against the resolved table's schema; a
+    /// non-null slice names the target columns in declared order.
+    columns: ?[]const []const u8,
+    /// `rows[i][j]` is the literal supplied for column j of row i. A
+    /// null inner cell means SQL NULL. Inner-slice length must match
+    /// `columns.?.len` (when named) or the table schema width
+    /// (positional).
+    rows: []const []const ?Value,
 };
 
 /// Introspection statement payload. SHOW ops materialize one column
@@ -131,6 +166,10 @@ pub const OpTag = enum(u8) {
     /// Introspection (SHOW DATABASES/SCHEMAS/TABLES). Produces one
     /// string column.
     show = 11,
+    /// INSERT INTO ... VALUES (...). Side-effect; produces no rows, but
+    /// the execution path returns the affected-row count via the wire
+    /// layer's command-complete machinery.
+    insert = 12,
 };
 
 /// In-memory operator tree, built by the client query-builder and decoded
@@ -149,6 +188,7 @@ pub const Op = union(OpTag) {
     materialize: Materialize,
     ddl: DdlOp,
     show: ShowOp,
+    insert: InsertOp,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -275,10 +315,26 @@ pub const Op = union(OpTag) {
                 m.upstream.deinitDecoded(allocator);
                 allocator.destroy(m.upstream);
             },
-            .ddl, .show => {},
+            .ddl => |d| freeDecodedDdl(d, allocator),
+            .show => {},
+            .insert => |i| {
+                if (i.columns) |cols| allocator.free(cols);
+                for (i.rows) |row| allocator.free(row);
+                allocator.free(i.rows);
+            },
         }
     }
 };
+
+fn freeDecodedDdl(d: DdlOp, allocator: Allocator) void {
+    switch (d) {
+        .create_table => |ct| {
+            allocator.free(ct.columns);
+            allocator.free(ct.order_key);
+        },
+        else => {},
+    }
+}
 
 fn freeProject(p: Op.Project, allocator: Allocator) void {
     // p.columns is a freshly-allocated slice of slices; the individual
@@ -321,6 +377,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .materialize => |m| try encodeOp(allocator, out, m.upstream.*),
         .ddl => |d| try encodeDdl(allocator, out, d),
         .show => |s| try encodeShow(allocator, out, s),
+        .insert => |i| try encodeInsert(allocator, out, i),
     }
 }
 
@@ -348,7 +405,111 @@ const DdlTag = enum(u8) {
     drop_schema = 3,
     use_schema = 4,
     use_database_schema = 5,
+    create_table = 6,
+    drop_table = 7,
 };
+
+const TypeWireTag = enum(u8) {
+    int = 0,
+    bigint = 1,
+    boolean = 2,
+    varchar = 3,
+    string = 4,
+    float = 5,
+    double = 6,
+    date = 7,
+    datetime = 8,
+    tinyint = 9,
+    smallint = 10,
+    largeint = 11,
+    char = 12,
+    decimal64 = 13,
+    decimal128 = 14,
+    uuid = 15,
+};
+
+fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) EncodeError!void {
+    switch (t) {
+        .int => try out.append(allocator, @intFromEnum(TypeWireTag.int)),
+        .bigint => try out.append(allocator, @intFromEnum(TypeWireTag.bigint)),
+        .boolean => try out.append(allocator, @intFromEnum(TypeWireTag.boolean)),
+        .varchar => |n| {
+            try out.append(allocator, @intFromEnum(TypeWireTag.varchar));
+            try appendU32(allocator, out, n);
+        },
+        .string => try out.append(allocator, @intFromEnum(TypeWireTag.string)),
+        .float => try out.append(allocator, @intFromEnum(TypeWireTag.float)),
+        .double => try out.append(allocator, @intFromEnum(TypeWireTag.double)),
+        .date => try out.append(allocator, @intFromEnum(TypeWireTag.date)),
+        .datetime => try out.append(allocator, @intFromEnum(TypeWireTag.datetime)),
+        .tinyint => try out.append(allocator, @intFromEnum(TypeWireTag.tinyint)),
+        .smallint => try out.append(allocator, @intFromEnum(TypeWireTag.smallint)),
+        .largeint => try out.append(allocator, @intFromEnum(TypeWireTag.largeint)),
+        .char => |n| {
+            try out.append(allocator, @intFromEnum(TypeWireTag.char));
+            try appendU32(allocator, out, n);
+        },
+        .decimal64 => |spec| {
+            try out.append(allocator, @intFromEnum(TypeWireTag.decimal64));
+            try out.append(allocator, spec.p);
+            try out.append(allocator, spec.s);
+        },
+        .decimal128 => |spec| {
+            try out.append(allocator, @intFromEnum(TypeWireTag.decimal128));
+            try out.append(allocator, spec.p);
+            try out.append(allocator, spec.s);
+        },
+        .uuid => try out.append(allocator, @intFromEnum(TypeWireTag.uuid)),
+    }
+}
+
+fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const t = bytes[cursor.*];
+    cursor.* += 1;
+    if (t > @intFromEnum(TypeWireTag.uuid)) return Error.IrCorrupt;
+    const tag: TypeWireTag = @enumFromInt(t);
+    return switch (tag) {
+        .int => .int,
+        .bigint => .bigint,
+        .boolean => .boolean,
+        .varchar => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            break :blk types.Type{ .varchar = n };
+        },
+        .string => .string,
+        .float => .float,
+        .double => .double,
+        .date => .date,
+        .datetime => .datetime,
+        .tinyint => .tinyint,
+        .smallint => .smallint,
+        .largeint => .largeint,
+        .char => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            break :blk types.Type{ .char = n };
+        },
+        .decimal64 => blk: {
+            if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
+            const p = bytes[cursor.*];
+            const s = bytes[cursor.* + 1];
+            cursor.* += 2;
+            break :blk types.Type{ .decimal64 = .{ .p = p, .s = s } };
+        },
+        .decimal128 => blk: {
+            if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
+            const p = bytes[cursor.*];
+            const s = bytes[cursor.* + 1];
+            cursor.* += 2;
+            break :blk types.Type{ .decimal128 = .{ .p = p, .s = s } };
+        },
+        .uuid => .uuid,
+    };
+}
 
 fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeError!void {
     switch (d) {
@@ -384,6 +545,54 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try appendU32(allocator, out, @intCast(p.schema.len));
             try out.appendSlice(allocator, p.schema);
         },
+        .create_table => |ct| {
+            try out.append(allocator, @intFromEnum(DdlTag.create_table));
+            try encodeTableRef(allocator, out, ct.table);
+            try out.append(allocator, @intFromBool(ct.if_not_exists));
+            try appendU32(allocator, out, @intCast(ct.columns.len));
+            for (ct.columns) |c| {
+                try appendU32(allocator, out, @intCast(c.name.len));
+                try out.appendSlice(allocator, c.name);
+                try encodeType(allocator, out, c.column_type);
+                try out.append(allocator, @intFromBool(c.nullable));
+            }
+            try appendU32(allocator, out, @intCast(ct.order_key.len));
+            for (ct.order_key) |k| {
+                try appendU32(allocator, out, @intCast(k.len));
+                try out.appendSlice(allocator, k);
+            }
+        },
+        .drop_table => |dt| {
+            try out.append(allocator, @intFromEnum(DdlTag.drop_table));
+            try encodeTableRef(allocator, out, dt.table);
+            try out.append(allocator, @intFromBool(dt.if_exists));
+        },
+    }
+}
+
+fn encodeInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) EncodeError!void {
+    try encodeTableRef(allocator, out, i.table);
+    if (i.columns) |cols| {
+        try out.append(allocator, 1);
+        try appendU32(allocator, out, @intCast(cols.len));
+        for (cols) |c| {
+            try appendU32(allocator, out, @intCast(c.len));
+            try out.appendSlice(allocator, c);
+        }
+    } else {
+        try out.append(allocator, 0);
+    }
+    try appendU32(allocator, out, @intCast(i.rows.len));
+    for (i.rows) |row| {
+        try appendU32(allocator, out, @intCast(row.len));
+        for (row) |maybe_v| {
+            if (maybe_v) |v| {
+                try out.append(allocator, 1);
+                try encodeValue(allocator, out, v);
+            } else {
+                try out.append(allocator, 0);
+            }
+        }
     }
 }
 
@@ -700,7 +909,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.show)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.insert)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -906,8 +1115,9 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             upstream.* = try decodeOp(allocator, bytes, cursor);
             break :blk Op{ .materialize = .{ .upstream = upstream } };
         },
-        .ddl => Op{ .ddl = try decodeDdl(bytes, cursor) },
+        .ddl => Op{ .ddl = try decodeDdl(allocator, bytes, cursor) },
         .show => Op{ .show = try decodeShow(bytes, cursor) },
+        .insert => Op{ .insert = try decodeInsert(allocator, bytes, cursor) },
     };
 }
 
@@ -927,11 +1137,11 @@ fn decodeOptString(bytes: []const u8, cursor: *usize) DecodeError!?[]const u8 {
     return try readString(bytes, cursor);
 }
 
-fn decodeDdl(bytes: []const u8, cursor: *usize) DecodeError!DdlOp {
+fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!DdlOp {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(DdlTag.use_database_schema)) return Error.IrCorrupt;
+    if (t > @intFromEnum(DdlTag.drop_table)) return Error.IrCorrupt;
     const tag: DdlTag = @enumFromInt(t);
     return switch (tag) {
         .create_database => DdlOp{ .create_database = try readString(bytes, cursor) },
@@ -944,7 +1154,86 @@ fn decodeDdl(bytes: []const u8, cursor: *usize) DecodeError!DdlOp {
             const sc = try readString(bytes, cursor);
             break :blk DdlOp{ .use_database_schema = .{ .database = db, .schema = sc } };
         },
+        .create_table => blk: {
+            const ref = try decodeTableRef(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const ine = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const ncols = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const cols = try allocator.alloc(ColumnDef, ncols);
+            errdefer allocator.free(cols);
+            for (cols) |*c| {
+                const name = try readString(bytes, cursor);
+                const ty = try decodeType(bytes, cursor);
+                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+                const nullable = bytes[cursor.*] != 0;
+                cursor.* += 1;
+                c.* = .{ .name = name, .column_type = ty, .nullable = nullable };
+            }
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const nkeys = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const keys = try allocator.alloc([]const u8, nkeys);
+            errdefer allocator.free(keys);
+            for (keys) |*k| k.* = try readString(bytes, cursor);
+            break :blk DdlOp{ .create_table = .{
+                .table = ref,
+                .if_not_exists = ine,
+                .columns = cols,
+                .order_key = keys,
+            } };
+        },
+        .drop_table => blk: {
+            const ref = try decodeTableRef(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const ie = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            break :blk DdlOp{ .drop_table = .{ .table = ref, .if_exists = ie } };
+        },
     };
+}
+
+fn decodeInsert(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!InsertOp {
+    const ref = try decodeTableRef(bytes, cursor);
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const has_cols = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    const cols_opt: ?[]const []const u8 = if (has_cols) blk: {
+        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+        const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+        cursor.* += 4;
+        const out = try allocator.alloc([]const u8, n);
+        errdefer allocator.free(out);
+        for (out) |*c| c.* = try readString(bytes, cursor);
+        break :blk out;
+    } else null;
+    errdefer if (cols_opt) |c| allocator.free(c);
+
+    if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+    const nrows = readU32(bytes[cursor.* .. cursor.* + 4]);
+    cursor.* += 4;
+    const rows = try allocator.alloc([]const ?Value, nrows);
+    errdefer allocator.free(rows);
+    var inited: usize = 0;
+    errdefer for (rows[0..inited]) |r| allocator.free(r);
+    for (rows) |*r| {
+        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+        const ncells = readU32(bytes[cursor.* .. cursor.* + 4]);
+        cursor.* += 4;
+        const cells = try allocator.alloc(?Value, ncells);
+        errdefer allocator.free(cells);
+        for (cells) |*v| {
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const present = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            v.* = if (present) try decodeValue(bytes, cursor) else null;
+        }
+        r.* = cells;
+        inited += 1;
+    }
+    return .{ .table = ref, .columns = cols_opt, .rows = rows };
 }
 
 fn decodeShow(bytes: []const u8, cursor: *usize) DecodeError!ShowOp {
@@ -1283,7 +1572,21 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
         },
         .ddl => |d| try explainDdl(allocator, out, d),
         .show => |s| try explainShow(allocator, out, s),
+        .insert => |i| try explainInsert(allocator, out, i),
     }
+}
+
+fn explainInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) !void {
+    try out.appendSlice(allocator, "Insert ");
+    try writeTableRef(allocator, out, i.table);
+    if (i.columns) |cols| {
+        try out.appendSlice(allocator, " cols=[");
+        try writeJoinedNames(allocator, out, cols);
+        try out.append(allocator, ']');
+    }
+    var buf: [32]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, " rows={d}\n", .{i.rows.len});
+    try out.appendSlice(allocator, s);
 }
 
 fn writeTableRef(allocator: Allocator, out: *std.ArrayList(u8), ref: TableRef) !void {
@@ -1310,6 +1613,28 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
             try out.appendSlice(allocator, p.database);
             try out.append(allocator, '.');
             try out.appendSlice(allocator, p.schema);
+            try out.append(allocator, '\n');
+        },
+        .create_table => |ct| {
+            try out.appendSlice(allocator, "CreateTable ");
+            try writeTableRef(allocator, out, ct.table);
+            if (ct.if_not_exists) try out.appendSlice(allocator, " if_not_exists");
+            try out.appendSlice(allocator, " cols=[");
+            for (ct.columns, 0..) |c, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, c.name);
+                try out.append(allocator, ' ');
+                try out.appendSlice(allocator, @tagName(c.column_type));
+                if (c.nullable) try out.appendSlice(allocator, " NULL");
+            }
+            try out.appendSlice(allocator, "] key=[");
+            try writeJoinedNames(allocator, out, ct.order_key);
+            try out.appendSlice(allocator, "]\n");
+        },
+        .drop_table => |dt| {
+            try out.appendSlice(allocator, "DropTable ");
+            try writeTableRef(allocator, out, dt.table);
+            if (dt.if_exists) try out.appendSlice(allocator, " if_exists");
             try out.append(allocator, '\n');
         },
     }

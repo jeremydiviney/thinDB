@@ -43,13 +43,17 @@ pub fn formatDateTime(buf: []u8, micros_since_epoch: i64) ![]const u8 {
     var tod = @rem(s, 86_400);
     if (tod < 0) tod += 86_400;
     const ymd = civilFromDays(@intCast(day));
-    const hours = @divFloor(tod, 3600);
-    const minutes = @divFloor(@rem(tod, 3600), 60);
-    const seconds = @rem(tod, 60);
+    // Zig 0.16's `{d:0>N}` prints a leading `+` for signed values; cast
+    // to unsigned before formatting (values are guaranteed non-negative
+    // after the normalization above).
+    const hours: u32 = @intCast(@divFloor(tod, 3600));
+    const minutes: u32 = @intCast(@divFloor(@rem(tod, 3600), 60));
+    const seconds: u32 = @intCast(@rem(tod, 60));
+    const us_u: u32 = @intCast(us);
     const year_u: u32 = @intCast(ymd.y);
     if (us == 0)
         return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ year_u, ymd.m, ymd.d, hours, minutes, seconds });
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ year_u, ymd.m, ymd.d, hours, minutes, seconds, us });
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ year_u, ymd.m, ymd.d, hours, minutes, seconds, us_u });
 }
 
 pub fn formatUuid(buf: []u8, v: u128) ![]const u8 {
