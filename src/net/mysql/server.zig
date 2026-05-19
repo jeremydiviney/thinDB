@@ -218,6 +218,10 @@ const SessionState = struct {
     /// against a fresh connection. thinDB doesn't enforce real
     /// transactions yet; the bit is bookkeeping for client tooling.
     in_transaction: bool = false,
+    /// Salt sent in the HandshakeV10 greeting. Retained on the
+    /// SessionState so COM_CHANGE_USER can re-verify the client's
+    /// hash against the same challenge.
+    auth_salt: [auth.SALT_LEN]u8 = .{0} ** auth.SALT_LEN,
 
     fn init(allocator: Allocator) !SessionState {
         return .{
@@ -274,6 +278,7 @@ fn handleConnection(
 
     var salt: [auth.SALT_LEN]u8 = undefined;
     auth.randomSalt(&salt);
+    session.auth_salt = salt;
 
     try handshake.sendInitialHandshake(allocator, w, connection_id, salt);
     try w.flush();
@@ -336,6 +341,12 @@ fn handleConnection(
                 try session.replace("main", "public");
                 try handshake.sendOkPacketStatus(allocator, w, 1, 0, 0, session.transactionStatus());
             },
+            // COM_CHANGE_USER — re-authenticate over the existing
+            // connection. ProxySQL and similar use this to recycle a
+            // pooled connection as a different user. We share the
+            // verifier path with the initial handshake (same salt is
+            // retained on SessionState).
+            0x11 => try handleChangeUser(allocator, w, catalog, &session, body, auth_password),
             else => try handshake.sendErrPacket(allocator, w, 1, 1047, "HY000".*, "Unknown command"),
         }
         try w.flush();
@@ -384,6 +395,79 @@ fn handleInitDb(
         return;
     };
     try handshake.sendOkPacket(allocator, w, 1, 0, 0);
+}
+
+/// COM_CHANGE_USER payload layout (CLIENT_SECURE_CONNECTION +
+/// CLIENT_PLUGIN_AUTH negotiated):
+///   string<NUL>  user
+///   int<1>       auth_response_length
+///   string<var>  auth_response
+///   string<NUL>  schema  (database name; may be empty)
+///   int<2>       character_set
+///   string<NUL>  auth_plugin_name
+///   [optional CLIENT_CONNECT_ATTRS payload — skipped]
+fn handleChangeUser(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+    auth_password: ?[]const u8,
+) !void {
+    // Parse user (NUL-terminated).
+    var i: usize = 0;
+    while (i < payload.len and payload[i] != 0) i += 1;
+    if (i >= payload.len) {
+        try handshake.sendErrPacket(allocator, w, 1, 1064, "42000".*, "malformed COM_CHANGE_USER");
+        return;
+    }
+    i += 1; // skip NUL after user
+
+    if (i >= payload.len) {
+        try handshake.sendErrPacket(allocator, w, 1, 1064, "42000".*, "malformed COM_CHANGE_USER");
+        return;
+    }
+    const auth_len: usize = payload[i];
+    i += 1;
+    if (i + auth_len > payload.len) {
+        try handshake.sendErrPacket(allocator, w, 1, 1064, "42000".*, "malformed COM_CHANGE_USER");
+        return;
+    }
+    const client_auth = payload[i .. i + auth_len];
+    i += auth_len;
+
+    // Parse schema (NUL-terminated; empty allowed).
+    var schema_end = i;
+    while (schema_end < payload.len and payload[schema_end] != 0) schema_end += 1;
+    if (schema_end >= payload.len) {
+        try handshake.sendErrPacket(allocator, w, 1, 1064, "42000".*, "malformed COM_CHANGE_USER");
+        return;
+    }
+    const schema_name = payload[i..schema_end];
+
+    if (auth_password) |pw| {
+        if (!auth.verify(pw, session.auth_salt, client_auth)) {
+            try handshake.sendErrPacket(allocator, w, 1, 1045, "28000".*, "Access denied");
+            return;
+        }
+    }
+
+    // Reset session state. COM_CHANGE_USER is more aggressive than
+    // COM_RESET_CONNECTION: it explicitly re-authenticates and
+    // optionally switches DB. We don't have temp tables / prepared
+    // statements yet, so reset = clear txn + reapply default schema +
+    // honor whatever schema the client passed.
+    session.in_transaction = false;
+    try session.replace("main", "public");
+    if (schema_name.len > 0) {
+        applyInitDb(catalog, session, schema_name) catch |err| {
+            const mapped = errors.mapInternal(err, @errorName(err));
+            try handshake.sendErrPacket(allocator, w, 1, mapped.code, mapped.sqlstate, mapped.message);
+            return;
+        };
+    }
+
+    try handshake.sendOkPacketStatus(allocator, w, 1, 0, 0, session.transactionStatus());
 }
 
 fn handleQuery(

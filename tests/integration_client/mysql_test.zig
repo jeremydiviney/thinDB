@@ -67,6 +67,9 @@ const TestClient = struct {
     write_buf: []u8,
     reader: std.Io.net.Stream.Reader,
     writer: std.Io.net.Stream.Writer,
+    /// Salt captured from the most recent greeting. Used by
+    /// COM_CHANGE_USER tests to recompute the SHA1 hash.
+    last_salt: [20]u8 = .{0} ** 20,
 
     fn connect(allocator: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress) !TestClient {
         const stream = try std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream, .protocol = .tcp });
@@ -117,11 +120,13 @@ const TestClient = struct {
         const greet = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
         defer self.allocator.free(greet.payload);
 
+        // Always capture the salt so COM_CHANGE_USER tests have it.
+        self.last_salt = try parseGreetingSalt(greet.payload);
+
         var auth_bytes: [20]u8 = undefined;
         var send_hash = false;
         if (password) |pw| {
-            const salt = try parseGreetingSalt(greet.payload);
-            auth_bytes = thindb.mysql.auth.nativeHash(pw, salt);
+            auth_bytes = thindb.mysql.auth.nativeHash(pw, self.last_salt);
             send_hash = true;
         }
 
@@ -188,6 +193,34 @@ const TestClient = struct {
     fn sendResetConnection(self: *TestClient) !void {
         const buf = [_]u8{0x1F};
         try mysql_packet.writePacket(&self.writer.interface, 0, &buf);
+        try self.writer.interface.flush();
+    }
+
+    /// Send COM_CHANGE_USER (0x11). `auth_response` must be the
+    /// 20-byte SHA1 challenge response using whatever salt was sent
+    /// in the original HandshakeV10 greeting (we store the salt on
+    /// the client after `doHandshakeFull` if the caller wants to
+    /// re-use it via `last_salt`).
+    fn sendChangeUser(
+        self: *TestClient,
+        user: []const u8,
+        auth_response: []const u8,
+        schema: []const u8,
+    ) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try payload.append(self.allocator, 0x11);
+        try payload.appendSlice(self.allocator, user);
+        try payload.append(self.allocator, 0);
+        try payload.append(self.allocator, @intCast(auth_response.len));
+        try payload.appendSlice(self.allocator, auth_response);
+        try payload.appendSlice(self.allocator, schema);
+        try payload.append(self.allocator, 0);
+        // character_set (2 bytes, utf8mb4)
+        try payload.append(self.allocator, 0xff);
+        try payload.append(self.allocator, 0x00);
+        try payload.appendSlice(self.allocator, "mysql_native_password\x00");
+        try mysql_packet.writePacket(&self.writer.interface, 0, payload.items);
         try self.writer.interface.flush();
     }
 
@@ -811,6 +844,133 @@ test "mysql wire: auth — empty client response rejected when password set" {
     // No password passed → empty auth_response sent. Should be rejected.
     const rc = client.doHandshakeFull(null, true, null);
     try std.testing.expectError(error.AuthRejected, rc);
+
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_CHANGE_USER (0x11) — trust mode resets session state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    const main_db = catalog.database("main").?;
+    _ = try main_db.createSchema("warehouse");
+
+    const port: u16 = test_port_base + 40;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    // Trust mode — no auth_password set.
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    // Open a transaction in the original session.
+    try client.sendQuery("BEGIN");
+    {
+        const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+    }
+
+    // COM_CHANGE_USER as a new user, switching to a different schema.
+    try client.sendChangeUser("newuser", "", "warehouse");
+    {
+        const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+    }
+
+    // SELECT DATABASE() should now report the new schema.
+    try client.sendQuery("SELECT DATABASE()");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("warehouse", rows[0][0].?);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_CHANGE_USER — correct password accepted" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 41;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.auth_password = "hunter2";
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshakeFull(null, true, "hunter2");
+
+    // Recompute hash against the same salt for COM_CHANGE_USER.
+    const new_hash = thindb.mysql.auth.nativeHash("hunter2", client.last_salt);
+    try client.sendChangeUser("otheruser", &new_hash, "");
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_CHANGE_USER — wrong password rejected with 1045 / 28000" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 42;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.auth_password = "hunter2";
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshakeFull(null, true, "hunter2");
+
+    // Hash for the wrong password.
+    const bad_hash = thindb.mysql.auth.nativeHash("wrong", client.last_salt);
+    try client.sendChangeUser("otheruser", &bad_hash, "");
+
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expect(pkt.payload.len > 3);
+    try std.testing.expectEqual(@as(u8, 0xFF), pkt.payload[0]); // ERR
+    const code = std.mem.readInt(u16, pkt.payload[1..3], .little);
+    try std.testing.expectEqual(@as(u16, 1045), code);
 
     if (sctx.err) |e| return e;
 }
