@@ -25,6 +25,13 @@ pub const Outcome = union(enum) {
     variable_row: struct { name: []const u8, value: []const u8 },
     /// Reply with an empty two-column result set (Variable_name, Value).
     empty_variables,
+    /// `KILL [QUERY|CONNECTION] <id>` — wire layer looks up the
+    /// target in the connection registry, sets its cancel flag, and
+    /// replies OK (or ERR 1094 if no such id). We don't distinguish
+    /// KILL QUERY vs KILL CONNECTION yet; both abort the current
+    /// query at the next batch boundary and leave the connection
+    /// open.
+    kill: u32,
 };
 
 /// Trim trailing semicolons + whitespace; lowercase ascii only for
@@ -54,6 +61,20 @@ pub fn match(
     }
 
     if (std.mem.eql(u8, lc, "reset connection")) return Outcome{ .ok_packet = {} };
+
+    // KILL [QUERY|CONNECTION] <id> — strip the optional verb, then
+    // parse the trailing integer.
+    if (std.mem.startsWith(u8, lc, "kill ")) {
+        var rest: []const u8 = lc[5..];
+        if (std.mem.startsWith(u8, rest, "query ")) {
+            rest = rest[6..];
+        } else if (std.mem.startsWith(u8, rest, "connection ")) {
+            rest = rest[11..];
+        }
+        rest = std.mem.trim(u8, rest, " \t\r\n");
+        const id = std.fmt.parseInt(u32, rest, 10) catch return null;
+        return Outcome{ .kill = id };
+    }
 
     if (std.mem.eql(u8, lc, "select 1"))
         return Outcome{ .single_value = .{ .col = "1", .val = "1" } };

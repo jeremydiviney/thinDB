@@ -23,6 +23,12 @@ pub const Probe = union(enum) {
     /// Reply with a multi-row, multi-column SELECT result. Each row's
     /// cells must match `cols.len`. Built once at match time.
     static_rows: StaticRows,
+    /// `pg_cancel_backend(<pid>)` — wire layer looks up the target in
+    /// the connection registry, sets its cancel flag, and replies a
+    /// single-row "t"/"f" boolean. `pg_terminate_backend` shares the
+    /// same shape; we don't distinguish (we have no way to forcibly
+    /// close the target's socket).
+    cancel_backend: u32,
 };
 
 pub const ListingKind = enum { databases, schemas, tables };
@@ -38,6 +44,16 @@ fn normalize(allocator: Allocator, sql: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, s.len);
     for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
     return out;
+}
+
+/// Extract the `<pid>` from a normalized SQL string of the form
+/// `<prefix><pid>)` where prefix is e.g. "select pg_cancel_backend(".
+/// Returns null on any parse failure.
+fn parseCancelBackend(lc: []const u8, prefix: []const u8) ?u32 {
+    if (!std.mem.startsWith(u8, lc, prefix)) return null;
+    if (lc.len <= prefix.len or lc[lc.len - 1] != ')') return null;
+    const inner = std.mem.trim(u8, lc[prefix.len .. lc.len - 1], " \t");
+    return std.fmt.parseInt(u32, inner, 10) catch null;
 }
 
 /// Returns null if `sql` is not a probe query we recognize.
@@ -64,6 +80,14 @@ pub fn match(
         return Probe{ .accept = "COMMIT" };
     if (std.mem.eql(u8, lc, "rollback") or std.mem.startsWith(u8, lc, "rollback "))
         return Probe{ .accept = "ROLLBACK" };
+
+    // pg_cancel_backend(<pid>) / pg_terminate_backend(<pid>) — both
+    // route to the connection registry's requestCancel. PG returns a
+    // bool indicating success.
+    if (parseCancelBackend(lc, "select pg_cancel_backend(")) |pid|
+        return Probe{ .cancel_backend = pid };
+    if (parseCancelBackend(lc, "select pg_terminate_backend(")) |pid|
+        return Probe{ .cancel_backend = pid };
     if (std.mem.eql(u8, lc, "discard all"))
         return Probe{ .accept = "DISCARD ALL" };
     if (std.mem.eql(u8, lc, "discard temp") or std.mem.eql(u8, lc, "discard temporary"))

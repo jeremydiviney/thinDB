@@ -1106,6 +1106,84 @@ test "mysql wire: COM_CHANGE_USER — wrong password rejected with 1045 / 28000"
     if (sctx.err) |e| return e;
 }
 
+test "mysql wire: KILL <unknown_id> → ER_NO_SUCH_THREAD (1094)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 60;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.registry = &registry;
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendQuery("KILL 99999");
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expect(pkt.payload.len > 3);
+    try std.testing.expectEqual(@as(u8, 0xFF), pkt.payload[0]);
+    const code = std.mem.readInt(u16, pkt.payload[1..3], .little);
+    try std.testing.expectEqual(@as(u16, 1094), code);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: KILL <self_id> sets the cancel flag (no registry → no-op success)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 61;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.registry = &registry;
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    // The first connection's id is the value after the first
+    // fetchAdd, which is 1 (server.connection_counter starts at 0;
+    // fetchAdd returns 0 and we +1). KILLing it should succeed.
+    try client.sendQuery("KILL 1");
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
 test "mysql wire: limiter at zero capacity emits ER_CON_COUNT_ERROR on accept" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

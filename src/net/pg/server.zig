@@ -31,6 +31,9 @@ const canned = @import("canned.zig");
 const errors = @import("errors.zig");
 const auth = @import("auth.zig");
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
+const conn_registry = @import("../conn_registry.zig");
+const ConnectionState = conn_registry.ConnectionState;
+const ConnectionRegistry = conn_registry.Registry;
 const sock_opts = @import("../sock_opts.zig");
 
 pub const Error = error{
@@ -52,6 +55,12 @@ pub const Server = struct {
     /// the cleartext password; the cleartext is not retained on the
     /// Server. Set after servePg() returns and before run().
     auth_credentials: ?auth.Credentials = null,
+    /// Optional shared connection registry for cross-connection
+    /// cancellation (CancelRequest / pg_cancel_backend / pg_terminate_backend).
+    /// When null, those become no-ops. The binary supplies a registry
+    /// shared with the MySQL wire so cancels can target connections on
+    /// either. Caller-owned; must outlive the Server.
+    registry: ?*ConnectionRegistry = null,
 
     /// Configure the SCRAM-SHA-256 password. Derives credentials
     /// (salt + StoredKey + ServerKey) once and stores them on the
@@ -89,7 +98,7 @@ pub const Server = struct {
         defer self.limiter.release();
 
         const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
-        handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_credentials) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_credentials, self.registry) catch |err| {
             std.debug.print("pg: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -126,6 +135,7 @@ pub const Server = struct {
                 .connection_id = cid,
                 .limiter = self.limiter,
                 .auth_credentials = self.auth_credentials,
+                .registry = self.registry,
             };
             const thread = std.Thread.spawn(.{}, ConnJob.run, .{job}) catch {
                 self.limiter.release();
@@ -146,12 +156,13 @@ const ConnJob = struct {
     connection_id: u32,
     limiter: *ConnectionLimiter,
     auth_credentials: ?auth.Credentials,
+    registry: ?*ConnectionRegistry,
 
     fn run(self: *ConnJob) void {
         defer self.allocator.destroy(self);
         defer self.limiter.release();
         defer self.stream.close(self.io);
-        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id, self.auth_credentials) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id, self.auth_credentials, self.registry) catch |err| {
             std.debug.print("pg: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -220,6 +231,14 @@ const SessionState = struct {
     /// START TRANSACTION and clear on COMMIT / ROLLBACK; thinDB doesn't
     /// enforce real transactions yet — bookkeeping only.
     in_transaction: bool = false,
+    /// Pointer into the shared registry entry for this connection.
+    /// Used to wire the cancel_flag into the in-flight CompiledQuery
+    /// so a peer CancelRequest / pg_cancel_backend aborts at the
+    /// next batch boundary.
+    conn_state: ?*ConnectionState = null,
+    /// Shared registry pointer so this connection's
+    /// pg_cancel_backend / pg_terminate_backend can reach peers.
+    registry: ?*ConnectionRegistry = null,
 
     fn init(allocator: Allocator) !SessionState {
         return .{
@@ -271,6 +290,7 @@ fn handleConnection(
     stream: Io.net.Stream,
     connection_id: u32,
     auth_creds: ?auth.Credentials,
+    registry: ?*ConnectionRegistry,
 ) !void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
@@ -282,7 +302,15 @@ fn handleConnection(
     var session = try SessionState.init(allocator);
     defer session.deinit();
 
-    if (!try completeStartup(allocator, w, r, catalog, &session, connection_id, auth_creds)) return;
+    var conn_state = ConnectionState.init(connection_id, connection_id ^ 0xA1B2C3D4);
+    if (registry) |reg| {
+        try reg.register(&conn_state);
+    }
+    defer if (registry) |reg| reg.unregister(connection_id);
+    session.conn_state = &conn_state;
+    session.registry = registry;
+
+    if (!try completeStartup(allocator, w, r, catalog, &session, connection_id, auth_creds, registry)) return;
 
     while (true) {
         const frame = packet.readFrame(allocator, r) catch |err| switch (err) {
@@ -318,6 +346,7 @@ fn completeStartup(
     session: *SessionState,
     connection_id: u32,
     auth_creds: ?auth.Credentials,
+    registry: ?*ConnectionRegistry,
 ) !bool {
     const first = try packet.readStartupFrame(allocator, r);
     defer allocator.free(first.payload);
@@ -336,7 +365,16 @@ fn completeStartup(
 
     const params = switch (classified) {
         .startup => |p| p,
-        .cancel_request => return false,
+        .cancel_request => |cr| {
+            // CancelRequest is a one-shot side connection: client
+            // opens fresh socket, sends pid+secret, server applies
+            // the cancel to the matching connection's in-flight
+            // query, then both sides close. No response packet.
+            if (registry) |reg| {
+                _ = reg.requestCancel(cr.process_id, cr.secret_key);
+            }
+            return false;
+        },
         .ssl_request, .gss_request => return false,
     };
 
@@ -568,6 +606,15 @@ fn dispatchProbe(
             for (sr.rows) |row| try result.sendDataRow(allocator, w, row);
             try sendSelectComplete(allocator, w, sr.rows.len);
         },
+        .cancel_backend => |pid| {
+            const success = if (session.registry) |reg| reg.requestCancel(pid, 0) else false;
+            const cols = [_]@import("../../types.zig").Column{.{ .name = "pg_cancel_backend", .type = .boolean, .nullable = false }};
+            try result.sendRowDescription(allocator, w, cols[0..]);
+            const cell: ?[]const u8 = if (success) "t" else "f";
+            const cells = [_]?[]const u8{cell};
+            try result.sendDataRow(allocator, w, cells[0..]);
+            try sendSelectComplete(allocator, w, 1);
+        },
     }
 }
 
@@ -658,6 +705,14 @@ fn runSingleStatement(
 
     var compiled = try local.compileWithSession(allocator, main_db, session.asSession(), op);
     defer compiled.deinit();
+
+    // Wire the connection's cancel flag into the compiled query so a
+    // peer CancelRequest / pg_cancel_backend aborts at the next batch
+    // boundary. Clear any stale cancel from a previous statement.
+    if (session.conn_state) |state| {
+        state.clearCancel();
+        compiled.cancel_flag = &state.cancel_flag;
+    }
 
     if (isSideEffectOp(op.*)) {
         _ = try compiled.next();

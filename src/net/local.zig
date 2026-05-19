@@ -63,6 +63,11 @@ pub const Error = error{
     DatabaseAlreadyExists,
     SchemaNotFound,
     SchemaAlreadyExists,
+    /// In-flight query was cancelled by a peer (MySQL KILL or PG
+    /// CancelRequest / pg_cancel_backend). Caller should map this to
+    /// the protocol-specific abort code and continue serving the
+    /// connection (KILL doesn't close the socket).
+    QueryCancelled,
     /// Server requires authentication and the client either didn't
     /// present a token or presented an invalid one.
     AuthFailed,
@@ -951,6 +956,13 @@ pub const CompiledQuery = struct {
     /// across the lifetime of this CompiledQuery (CompiledQuery itself
     /// is returned by value).
     session_cell: *Session,
+    /// Optional cancel flag — when non-null, polled before each
+    /// `query.next()` call. Wire frontends set this to the
+    /// per-connection ConnectionState.cancel_flag so KILL /
+    /// CancelRequest from a peer connection can abort an in-flight
+    /// query at the next batch boundary. Cost is one atomic load
+    /// per batch; trivial compared to the work a batch represents.
+    cancel_flag: ?*std.atomic.Value(bool) = null,
 
     pub fn deinit(self: *CompiledQuery) void {
         self.query.deinit();
@@ -960,6 +972,9 @@ pub const CompiledQuery = struct {
     }
 
     pub fn next(self: *CompiledQuery) !?exec.Batch {
+        if (self.cancel_flag) |f| {
+            if (f.load(.acquire)) return Error.QueryCancelled;
+        }
         return self.query.next();
     }
 

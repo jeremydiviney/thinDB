@@ -158,6 +158,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     var shared_limiter = thindb.ConnectionLimiter.init(max_connections);
 
+    // Process-wide registry for cross-connection cancellation. Shared
+    // across all wire frontends so a KILL from MySQL can target a PG
+    // connection (and vice versa).
+    var shared_registry = thindb.ConnectionRegistry.init(gpa);
+    defer shared_registry.deinit();
+
     installSignalHandler();
 
     try out_w.print("thindb-server starting\n  data-dir: {s}\n", .{data_dir});
@@ -183,11 +189,13 @@ pub fn main(init: std.process.Init) !u8 {
             .mysql => blk: {
                 const s = try thindb.serveMysql(gpa, io, catalog, addr, &shared_limiter);
                 s.auth_password = mysql_password;
+                s.registry = &shared_registry;
                 break :blk .{ .mysql = s };
             },
             .pg => blk: {
                 const s = try thindb.servePg(gpa, io, catalog, addr, &shared_limiter);
                 s.setAuthPassword(pg_password);
+                s.registry = &shared_registry;
                 break :blk .{ .pg = s };
             },
             .native => .{ .native = try thindb.serveTcpCatalog(gpa, io, catalog, addr, &shared_limiter) },

@@ -29,6 +29,9 @@ const result = @import("result.zig");
 const canned = @import("canned.zig");
 const errors = @import("errors.zig");
 const auth = @import("auth.zig");
+const conn_registry = @import("../conn_registry.zig");
+const ConnectionState = conn_registry.ConnectionState;
+const ConnectionRegistry = conn_registry.Registry;
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
 const sock_opts = @import("../sock_opts.zig");
 
@@ -59,6 +62,12 @@ pub const Server = struct {
     /// Caller-owned slice; must outlive the Server. Set after
     /// serveMysql() returns and before run().
     auth_password: ?[]const u8 = null,
+    /// Optional shared connection registry for cross-connection
+    /// cancellation (KILL <id>). When null, KILL becomes a no-op
+    /// canned response. The binary supplies a registry shared with
+    /// the PG wire so a KILL from one wire can target connections
+    /// on either. Caller-owned; must outlive the Server.
+    registry: ?*ConnectionRegistry = null,
 
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
@@ -84,7 +93,7 @@ pub const Server = struct {
         defer self.limiter.release();
 
         const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
-        handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_password) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_password, self.registry) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -121,6 +130,7 @@ pub const Server = struct {
                 .connection_id = cid,
                 .limiter = self.limiter,
                 .auth_password = self.auth_password,
+                .registry = self.registry,
             };
             const thread = std.Thread.spawn(.{}, ConnJob.run, .{job}) catch {
                 self.limiter.release();
@@ -141,12 +151,13 @@ const ConnJob = struct {
     connection_id: u32,
     limiter: *ConnectionLimiter,
     auth_password: ?[]const u8,
+    registry: ?*ConnectionRegistry,
 
     fn run(self: *ConnJob) void {
         defer self.allocator.destroy(self);
         defer self.limiter.release();
         defer self.stream.close(self.io);
-        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id, self.auth_password) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id, self.auth_password, self.registry) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -222,6 +233,15 @@ const SessionState = struct {
     /// SessionState so COM_CHANGE_USER can re-verify the client's
     /// hash against the same challenge.
     auth_salt: [auth.SALT_LEN]u8 = .{0} ** auth.SALT_LEN,
+    /// Pointer into the shared registry entry for this connection.
+    /// Used by handleQuery to wire the cancel_flag into the
+    /// in-flight CompiledQuery so a peer KILL aborts at the next
+    /// batch boundary. Null when no registry is configured.
+    conn_state: ?*ConnectionState = null,
+    /// Shared registry pointer so this connection's KILL can reach
+    /// peer connections. Null when no registry is configured (KILL
+    /// becomes a no-op success).
+    registry: ?*ConnectionRegistry = null,
 
     fn init(allocator: Allocator) !SessionState {
         return .{
@@ -265,6 +285,7 @@ fn handleConnection(
     stream: Io.net.Stream,
     connection_id: u32,
     auth_password: ?[]const u8,
+    registry: ?*ConnectionRegistry,
 ) !void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
@@ -275,6 +296,19 @@ fn handleConnection(
 
     var session = try SessionState.init(allocator);
     defer session.deinit();
+
+    // Register in the shared registry so peer connections can KILL
+    // this one's in-flight query. The connection state must outlive
+    // any in-flight query; tying it to this stack frame is fine
+    // because handleConnection only returns after the connection
+    // closes.
+    var conn_state = ConnectionState.init(connection_id, connection_id ^ 0xA1B2C3D4);
+    if (registry) |reg| {
+        try reg.register(&conn_state);
+    }
+    defer if (registry) |reg| reg.unregister(connection_id);
+    session.conn_state = &conn_state;
+    session.registry = registry;
 
     var salt: [auth.SALT_LEN]u8 = undefined;
     auth.randomSalt(&salt);
@@ -536,6 +570,25 @@ fn handleQuery(
             .single_null => |col| try result.sendSingleValueResult(allocator, w, col, null, &seq_id, caps),
             .variable_row => |vr| try result.sendVariableRow(allocator, w, vr.name, vr.value, &seq_id, caps),
             .empty_variables => try result.sendEmptyVariables(allocator, w, &seq_id, caps),
+            .kill => |target_id| {
+                // No registry → KILL is a no-op success. With a
+                // registry, look up the target and set its cancel
+                // flag. Unknown id → ER_NO_SUCH_THREAD (1094).
+                if (session.registry) |reg| {
+                    if (!reg.requestCancel(target_id, 0)) {
+                        try handshake.sendErrPacket(allocator, w, seq_id, 1094, "HY000".*, "Unknown thread id");
+                        return;
+                    }
+                }
+                try handshake.sendOkPacketStatus(
+                    allocator,
+                    w,
+                    seq_id,
+                    0,
+                    0,
+                    session.transactionStatus(),
+                );
+            },
         }
         return;
     }
@@ -675,6 +728,15 @@ fn runSingleStatement(
         return;
     };
     defer compiled.deinit();
+
+    // Clear any stale cancel flag from a previous statement on this
+    // connection, then wire the connection's cancel flag into the
+    // compiled query. CompiledQuery.next() polls the flag at each
+    // batch boundary; a peer KILL sets it via the shared registry.
+    if (session.conn_state) |state| {
+        state.clearCancel();
+        compiled.cancel_flag = &state.cancel_flag;
+    }
 
     if (isSideEffectOp(op.*)) {
         _ = compiled.next() catch |err| {

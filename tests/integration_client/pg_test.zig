@@ -625,6 +625,86 @@ test "pg wire: limiter at zero capacity emits 53300 too_many_connections" {
     if (sctx.err) |e| return e;
 }
 
+test "pg wire: pg_cancel_backend on unknown pid returns 'f'" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 11;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.registry = &registry;
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try client.sendQuery("SELECT pg_cancel_backend(99999)");
+    const r = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("f", r.rows[0][0].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: pg_cancel_backend on self returns 't' and sets the cancel flag" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 12;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.registry = &registry;
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    // The first PG connection's backend_id is 1 (counter starts at 0,
+    // fetchAdd returns 0, we add 1).
+    try client.sendQuery("SELECT pg_cancel_backend(1)");
+    const r = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("t", r.rows[0][0].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
 test "pg wire: BEGIN/COMMIT/ROLLBACK flip the ReadyForQuery tx_status byte" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

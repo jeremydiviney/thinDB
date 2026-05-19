@@ -88,6 +88,10 @@ pub const serveTcpCatalog = tcp_server.serveTcpCatalog;
 pub const conn_limit = @import("net/conn_limit.zig");
 pub const ConnectionLimiter = conn_limit.ConnectionLimiter;
 
+pub const conn_registry = @import("net/conn_registry.zig");
+pub const ConnectionRegistry = conn_registry.Registry;
+pub const ConnectionState = conn_registry.ConnectionState;
+
 /// Default TCP port for a thinDB server. Servers and clients can pick
 /// any port, but examples / docs use this.
 pub const default_port: u16 = wire.default_port;
