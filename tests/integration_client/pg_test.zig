@@ -131,6 +131,8 @@ const TestClient = struct {
         command_tag: []const u8,
         error_code: ?[]const u8 = null,
         error_message: ?[]const u8 = null,
+        /// 'I' / 'T' / 'E' — value of the ReadyForQuery payload byte.
+        tx_status: u8 = 'I',
     };
 
     /// Drain a Simple Query reply: RowDescription? + DataRow* +
@@ -191,7 +193,16 @@ const TestClient = struct {
                         }
                     }
                 },
-                'Z' => break,
+                'Z' => {
+                    const tx: u8 = if (f.payload.len >= 1) f.payload[0] else 'I';
+                    return .{
+                        .rows = try rows.toOwnedSlice(arena),
+                        .command_tag = command_tag,
+                        .error_code = err_code,
+                        .error_message = err_msg,
+                        .tx_status = tx,
+                    };
+                },
                 else => {},
             }
         }
@@ -611,6 +622,64 @@ test "pg wire: limiter at zero capacity emits 53300 too_many_connections" {
     }
     try std.testing.expect(saw_too_many);
 
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: BEGIN/COMMIT/ROLLBACK flip the ReadyForQuery tx_status byte" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 10;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Fresh session — idle.
+    try client.sendQuery("SELECT 1");
+    var r = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(u8, 'I'), r.tx_status);
+
+    // After BEGIN — in transaction.
+    try client.sendQuery("BEGIN");
+    r = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(u8, 'T'), r.tx_status);
+
+    // Mid-transaction SELECT — still 'T'.
+    try client.sendQuery("SELECT 1");
+    r = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(u8, 'T'), r.tx_status);
+
+    // COMMIT clears.
+    try client.sendQuery("COMMIT");
+    r = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(u8, 'I'), r.tx_status);
+
+    // START TRANSACTION / ROLLBACK.
+    try client.sendQuery("START TRANSACTION");
+    r = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(u8, 'T'), r.tx_status);
+    try client.sendQuery("ROLLBACK");
+    r = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(u8, 'I'), r.tx_status);
+
+    try client.sendTerminate();
     if (sctx.err) |e| return e;
 }
 

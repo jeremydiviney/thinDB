@@ -193,6 +193,12 @@ const SessionState = struct {
     current_schema: []u8,
     application_name: []u8,
     allocator: Allocator,
+    /// Reflected in the trailing ReadyForQuery byte. Drivers (notably
+    /// node-pg and asyncpg) inspect this to decide whether the next
+    /// statement opens an implicit transaction. We flip on BEGIN /
+    /// START TRANSACTION and clear on COMMIT / ROLLBACK; thinDB doesn't
+    /// enforce real transactions yet — bookkeeping only.
+    in_transaction: bool = false,
 
     fn init(allocator: Allocator) !SessionState {
         return .{
@@ -201,6 +207,13 @@ const SessionState = struct {
             .current_schema = try allocator.dupe(u8, "public"),
             .application_name = try allocator.dupe(u8, ""),
         };
+    }
+
+    /// 'I' = idle (no transaction). 'T' = in a transaction. 'E' = in
+    /// a failed transaction (we don't enter this state; placeholder
+    /// for the day we add real transactions).
+    fn txStatusByte(self: SessionState) u8 {
+        return if (self.in_transaction) 'T' else 'I';
     }
 
     fn deinit(self: *SessionState) void {
@@ -260,12 +273,12 @@ fn handleConnection(
             'X' => return,
             'Q' => try handleQuery(allocator, w, catalog, &session, frame.payload),
             'S' => {
-                try startup.sendReadyForQuery(allocator, w, 'I');
+                try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
                 try w.flush();
             },
             else => {
                 try errors.sendErrorResponse(allocator, w, "0A000".*, "unsupported message type");
-                try startup.sendReadyForQuery(allocator, w, 'I');
+                try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
                 try w.flush();
             },
         }
@@ -344,7 +357,7 @@ fn handleQuery(
 ) !void {
     if (payload.len == 0) {
         try errors.sendErrorResponse(allocator, w, "42000".*, "empty query");
-        try startup.sendReadyForQuery(allocator, w, 'I');
+        try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
         try w.flush();
         return;
     }
@@ -355,7 +368,7 @@ fn handleQuery(
 
     if (try canned.match(allocator, sql_text, session.current_db, session.current_schema)) |probe| {
         try dispatchProbe(allocator, w, catalog, session, probe);
-        try startup.sendReadyForQuery(allocator, w, 'I');
+        try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
         try w.flush();
         return;
     }
@@ -365,7 +378,7 @@ fn handleQuery(
         try errors.sendErrorResponse(allocator, w, mapped.sqlstate, mapped.message);
     };
 
-    try startup.sendReadyForQuery(allocator, w, 'I');
+    try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
     try w.flush();
 }
 
@@ -377,7 +390,20 @@ fn dispatchProbe(
     probe: canned.Probe,
 ) !void {
     switch (probe) {
-        .accept => |tag| try result.sendCommandComplete(allocator, w, tag),
+        .accept => |tag| {
+            // BEGIN / COMMIT / ROLLBACK flip the session's transaction
+            // bookkeeping so the trailing ReadyForQuery byte reflects
+            // the new state. SAVEPOINT / RELEASE / etc. are silently
+            // accepted with no state change.
+            if (std.ascii.eqlIgnoreCase(tag, "BEGIN")) {
+                session.in_transaction = true;
+            } else if (std.ascii.eqlIgnoreCase(tag, "COMMIT") or
+                std.ascii.eqlIgnoreCase(tag, "ROLLBACK"))
+            {
+                session.in_transaction = false;
+            }
+            try result.sendCommandComplete(allocator, w, tag);
+        },
         .single_value => |sv| {
             const cols = [_]@import("../../types.zig").Column{.{ .name = sv.col, .type = .string, .nullable = sv.val == null }};
             try result.sendRowDescription(allocator, w, cols[0..]);

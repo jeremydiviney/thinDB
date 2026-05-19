@@ -56,6 +56,10 @@ pub fn match(
         return Probe{ .accept = "SET" };
     if (std.mem.eql(u8, lc, "begin") or std.mem.startsWith(u8, lc, "begin "))
         return Probe{ .accept = "BEGIN" };
+    // PG accepts START TRANSACTION as a synonym for BEGIN. The
+    // CommandComplete tag PG itself emits is "BEGIN" in both cases.
+    if (std.mem.eql(u8, lc, "start transaction") or std.mem.startsWith(u8, lc, "start transaction "))
+        return Probe{ .accept = "BEGIN" };
     if (std.mem.eql(u8, lc, "commit") or std.mem.startsWith(u8, lc, "commit "))
         return Probe{ .accept = "COMMIT" };
     if (std.mem.eql(u8, lc, "rollback") or std.mem.startsWith(u8, lc, "rollback "))
