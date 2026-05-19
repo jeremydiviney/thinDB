@@ -431,6 +431,43 @@ fn runEngineQuery(
         return;
     };
 
+    if (op.* == .batch) {
+        if ((session.client_caps & handshake.CLIENT_MULTI_STATEMENTS) == 0) {
+            try handshake.sendErrPacket(
+                allocator,
+                w,
+                seq_id.*,
+                1064,
+                "42000".*,
+                "Multi-statement requires CLIENT_MULTI_STATEMENTS capability",
+            );
+            return;
+        }
+        const stmts = op.batch.statements;
+        for (stmts, 0..) |stmt, i| {
+            const is_last = i + 1 == stmts.len;
+            const extra: u16 = if (is_last) 0 else handshake.SERVER_MORE_RESULTS_EXISTS;
+            try runSingleStatement(allocator, w, catalog, session, stmt, seq_id, extra);
+        }
+        return;
+    }
+
+    try runSingleStatement(allocator, w, catalog, session, op, seq_id, 0);
+}
+
+/// Compile + emit ONE statement's packets. `extra_status` is OR'd into
+/// the terminator's status_flags — multi-statement responses pass
+/// SERVER_MORE_RESULTS_EXISTS for every non-final statement so the
+/// client keeps reading the chain.
+fn runSingleStatement(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    op: *const ir.Op,
+    seq_id: *u8,
+    extra_status: u16,
+) !void {
     const main_db = catalog.database(session.current_db) orelse {
         try handshake.sendErrPacket(allocator, w, seq_id.*, 1049, "42000".*, "Unknown database");
         return;
@@ -451,11 +488,28 @@ fn runEngineQuery(
         };
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
-        try handshake.sendOkPacket(allocator, w, seq_id.*, compiled.affectedRows(), 0);
+        try handshake.sendOkPacketStatus(
+            allocator,
+            w,
+            seq_id.*,
+            compiled.affectedRows(),
+            0,
+            extra_status,
+        );
+        seq_id.* +%= 1;
         return;
     }
 
-    try result.sendQueryResult(allocator, w, &compiled, session.current_db, "", seq_id, session.client_caps);
+    try result.sendQueryResultStatus(
+        allocator,
+        w,
+        &compiled,
+        session.current_db,
+        "",
+        seq_id,
+        session.client_caps,
+        extra_status,
+    );
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);

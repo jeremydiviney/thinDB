@@ -18,6 +18,7 @@ test {
     _ = @import("sql_test.zig");
     _ = @import("sql_namespace_test.zig");
     _ = @import("sql_ddl_test.zig");
+    _ = @import("multi_statement_test.zig");
     _ = @import("catalog_test.zig");
     _ = @import("bug_repro_test.zig");
 }

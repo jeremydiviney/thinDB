@@ -140,10 +140,23 @@ pub fn sendResultTerminator(
     seq_id: *u8,
     client_caps: u32,
 ) !void {
+    try sendResultTerminatorStatus(allocator, w, seq_id, client_caps, 0);
+}
+
+/// Same as sendResultTerminator but ORs `extra_status` into the
+/// status_flags. Used by multi-statement handlers to set
+/// SERVER_MORE_RESULTS_EXISTS on non-final result-set terminators.
+pub fn sendResultTerminatorStatus(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    seq_id: *u8,
+    client_caps: u32,
+    extra_status: u16,
+) !void {
     if ((client_caps & handshake.CLIENT_DEPRECATE_EOF) != 0) {
-        try handshake.sendEofOkPacket(allocator, w, seq_id.*);
+        try handshake.sendEofOkPacketStatus(allocator, w, seq_id.*, extra_status);
     } else {
-        try handshake.sendLegacyEofPacket(allocator, w, seq_id.*);
+        try handshake.sendLegacyEofPacketStatus(allocator, w, seq_id.*, extra_status);
     }
     seq_id.* +%= 1;
 }
@@ -174,6 +187,22 @@ pub fn sendQueryResult(
     seq_id: *u8,
     client_caps: u32,
 ) !void {
+    try sendQueryResultStatus(allocator, w, query, schema_name, table_name, seq_id, client_caps, 0);
+}
+
+/// Same as sendQueryResult but ORs `extra_status` into the terminator's
+/// status_flags. Multi-statement responses pass SERVER_MORE_RESULTS_EXISTS
+/// here for every non-final result set.
+pub fn sendQueryResultStatus(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    query: anytype,
+    schema_name: []const u8,
+    table_name: []const u8,
+    seq_id: *u8,
+    client_caps: u32,
+    extra_status: u16,
+) !void {
     const schema = query.outputSchema();
     try sendResultHeader(allocator, w, schema, schema_name, table_name, seq_id);
     try sendColumnDefBoundary(allocator, w, seq_id, client_caps);
@@ -200,7 +229,7 @@ pub fn sendQueryResult(
         }
     }
 
-    try sendResultTerminator(allocator, w, seq_id, client_caps);
+    try sendResultTerminatorStatus(allocator, w, seq_id, client_caps, extra_status);
 }
 
 /// Send only the ColumnCount + ColumnDef41 packets. Used by canned-row

@@ -143,13 +143,48 @@ describe("pg complex queries", () => {
     }
   });
 
-  test("multi-statement in one Query frame is rejected", async () => {
+  test("multi-statement: two SELECTs in one Query frame — pg returns array of results", async () => {
+    // PG's simple-Query protocol natively supports `;`-separated
+    // statements. The node-pg driver surfaces the chain as an array
+    // when more than one result set comes back.
+    const r = (await client.query(
+      "SELECT id FROM events LIMIT 1; SELECT id FROM events LIMIT 2",
+    )) as unknown as Array<{ rows: Array<Record<string, unknown>> }>;
+    expect(Array.isArray(r)).toBe(true);
+    expect(r.length).toBe(2);
+    expect(r[0].rows.length).toBe(1);
+    expect(r[1].rows.length).toBe(2);
+  });
+
+  test("multi-statement: CREATE + INSERT + SELECT count(*) lands the data", async () => {
+    try {
+      // node-pg returns an array-of-results; CREATE + INSERT show as
+      // command tags (rows=[]), the final SELECT carries the row.
+      const r = (await client.query(
+        "CREATE TABLE multi_t (id BIGINT PRIMARY KEY); " +
+          "INSERT INTO multi_t VALUES (1),(2),(3); " +
+          "SELECT count(*) AS n FROM multi_t",
+      )) as unknown as Array<{ rows: Array<Record<string, unknown>> }>;
+      expect(Array.isArray(r)).toBe(true);
+      const last = r[r.length - 1];
+      expect(last.rows.length).toBe(1);
+      expect(Number(last.rows[0].n)).toBe(3);
+    } finally {
+      await client.query("DROP TABLE multi_t").catch(() => undefined);
+    }
+  });
+
+  test("multi-statement: error in the middle does not deadlock the connection", async () => {
     let threw = false;
     try {
-      await client.query("SELECT id FROM events LIMIT 1; SELECT id FROM events LIMIT 2");
+      await client.query(
+        "SELECT id FROM events LIMIT 1; SELECT id FROM ghost_table; SELECT id FROM events LIMIT 1",
+      );
     } catch {
       threw = true;
     }
     expect(threw).toBe(true);
+    const after = await client.query("SELECT id FROM events LIMIT 1");
+    expect(after.rows.length).toBe(1);
   });
 });

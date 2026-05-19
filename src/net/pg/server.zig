@@ -453,6 +453,33 @@ fn runEngineQuery(
 
     const op = try sql.parse(arena.allocator(), sql_text);
 
+    if (op.* == .batch) {
+        // PG simple-Query protocol natively supports `;`-separated
+        // statements: emit each statement's response packets in turn,
+        // then a single ReadyForQuery (sent by handleQuery, not here).
+        // Per spec, if any statement errors the remaining ones are
+        // skipped; we propagate the error to handleQuery which emits
+        // ErrorResponse + ReadyForQuery.
+        for (op.batch.statements) |stmt| {
+            try runSingleStatement(allocator, w, catalog, session, stmt);
+        }
+        return;
+    }
+
+    try runSingleStatement(allocator, w, catalog, session, op);
+}
+
+/// Run + emit the response packets for ONE statement (RowDescription/
+/// DataRow*/CommandComplete for SELECT, or CommandComplete-only for
+/// side-effect statements). Caller (or the multi-statement loop) emits
+/// the single trailing ReadyForQuery.
+fn runSingleStatement(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    op: *const ir.Op,
+) !void {
     const main_db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
 
     var compiled = try local.compileWithSession(allocator, main_db, session.asSession(), op);

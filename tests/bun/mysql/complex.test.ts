@@ -152,7 +152,7 @@ describe("mysql complex queries", () => {
     }
   });
 
-  test("multi-statement in one Query frame is rejected", async () => {
+  test("multi-statement requires CLIENT_MULTI_STATEMENTS — default conn rejects", async () => {
     let threw = false;
     try {
       await conn.query("SELECT id FROM events LIMIT 1; SELECT id FROM events LIMIT 2");
@@ -160,5 +160,94 @@ describe("mysql complex queries", () => {
       threw = true;
     }
     expect(threw).toBe(true);
+  });
+
+  test("multi-statement: with multipleStatements=true, two SELECTs return array-of-result-sets", async () => {
+    const multi = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+      multipleStatements: true,
+    });
+    try {
+      const [results] = (await multi.query(
+        "SELECT id FROM events LIMIT 1; SELECT id FROM events LIMIT 2",
+      )) as [Array<Array<Record<string, unknown>>>, unknown];
+      expect(results.length).toBe(2);
+      expect(results[0].length).toBe(1);
+      expect(results[1].length).toBe(2);
+    } finally {
+      await multi.end().catch(() => undefined);
+    }
+  });
+
+  test("multi-statement: CREATE + INSERT + SELECT count(*) round-trips", async () => {
+    const multi = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+      multipleStatements: true,
+    });
+    try {
+      const [results] = (await multi.query(
+        "CREATE TABLE multi_t (id BIGINT PRIMARY KEY); " +
+          "INSERT INTO multi_t VALUES (1),(2),(3); " +
+          "SELECT count(*) AS n FROM multi_t",
+      )) as [Array<unknown>, unknown];
+      // Last entry in the result chain is the SELECT — mysql2 returns
+      // rows for SELECTs and OkPacket-shaped objects for side-effect
+      // statements.
+      const last = results[results.length - 1] as Array<Record<string, unknown>>;
+      expect(Array.isArray(last)).toBe(true);
+      expect(Number(last[0]?.n)).toBe(3);
+    } finally {
+      await multi.query("DROP TABLE multi_t").catch(() => undefined);
+      await multi.end().catch(() => undefined);
+    }
+  });
+
+  test("multi-statement: error in the middle does not deadlock the server", async () => {
+    // mysql2 by design marks the connection closed on any error from a
+    // multi-statement query; we only verify that the error surfaces and
+    // a *fresh* connection still works (the server itself is healthy).
+    const multi = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+      multipleStatements: true,
+    });
+    let threw = false;
+    try {
+      await multi.query(
+        "SELECT id FROM events LIMIT 1; SELECT id FROM ghost_table; SELECT id FROM events LIMIT 1",
+      );
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    await multi.end().catch(() => undefined);
+
+    const fresh = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+    });
+    try {
+      const [rows] = (await fresh.query("SELECT id FROM events LIMIT 1")) as [
+        Array<Record<string, unknown>>,
+        unknown,
+      ];
+      expect(rows.length).toBe(1);
+    } finally {
+      await fresh.end().catch(() => undefined);
+    }
   });
 });

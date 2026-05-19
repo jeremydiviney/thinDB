@@ -170,6 +170,16 @@ pub const OpTag = enum(u8) {
     /// the execution path returns the affected-row count via the wire
     /// layer's command-complete machinery.
     insert = 12,
+    /// Multi-statement bundle: an ordered list of independent statements
+    /// parsed from a single `;`-separated SQL frame. Only ever appears
+    /// as the root of a parse — wire layers iterate the sub-statements
+    /// and compile each one independently. `compileWithSession` rejects
+    /// this tag (it isn't a unified pipeline).
+    batch = 13,
+};
+
+pub const BatchOp = struct {
+    statements: []const *Op,
 };
 
 /// In-memory operator tree, built by the client query-builder and decoded
@@ -189,6 +199,7 @@ pub const Op = union(OpTag) {
     ddl: DdlOp,
     show: ShowOp,
     insert: InsertOp,
+    batch: BatchOp,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -322,6 +333,13 @@ pub const Op = union(OpTag) {
                 for (i.rows) |row| allocator.free(row);
                 allocator.free(i.rows);
             },
+            .batch => |b| {
+                for (b.statements) |sub| {
+                    sub.deinitDecoded(allocator);
+                    allocator.destroy(sub);
+                }
+                allocator.free(b.statements);
+            },
         }
     }
 };
@@ -378,6 +396,10 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .ddl => |d| try encodeDdl(allocator, out, d),
         .show => |s| try encodeShow(allocator, out, s),
         .insert => |i| try encodeInsert(allocator, out, i),
+        .batch => |b| {
+            try appendU32(allocator, out, @intCast(b.statements.len));
+            for (b.statements) |sub| try encodeOp(allocator, out, sub.*);
+        },
     }
 }
 
@@ -909,7 +931,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.insert)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.batch)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1118,6 +1140,26 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
         .ddl => Op{ .ddl = try decodeDdl(allocator, bytes, cursor) },
         .show => Op{ .show = try decodeShow(bytes, cursor) },
         .insert => Op{ .insert = try decodeInsert(allocator, bytes, cursor) },
+        .batch => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const subs = try allocator.alloc(*Op, n);
+            errdefer allocator.free(subs);
+            var inited: usize = 0;
+            errdefer for (subs[0..inited]) |s| {
+                s.deinitDecoded(allocator);
+                allocator.destroy(s);
+            };
+            for (subs) |*slot| {
+                const sub = try allocator.create(Op);
+                errdefer allocator.destroy(sub);
+                sub.* = try decodeOp(allocator, bytes, cursor);
+                slot.* = sub;
+                inited += 1;
+            }
+            break :blk Op{ .batch = .{ .statements = subs } };
+        },
     };
 }
 
@@ -1573,6 +1615,12 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
         .ddl => |d| try explainDdl(allocator, out, d),
         .show => |s| try explainShow(allocator, out, s),
         .insert => |i| try explainInsert(allocator, out, i),
+        .batch => |b| {
+            var buf: [48]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "Batch n={d}\n", .{b.statements.len});
+            try out.appendSlice(allocator, s);
+            for (b.statements) |sub| try explainOp(allocator, out, sub.*, depth + 1);
+        },
     }
 }
 

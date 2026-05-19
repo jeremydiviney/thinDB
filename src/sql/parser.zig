@@ -90,16 +90,40 @@ fn aggForName(name: []const u8) ?ir.AggFunc {
 pub fn parse(arena: Allocator, sql: []const u8) ParseError!*ir.Op {
     var lex = Lexer.init(arena, sql);
     var parser = Parser{ .arena = arena, .lex = &lex, .cur = try lex.next() };
-    const op = try parser.parseStatement();
-    // Optional trailing semicolon already consumed; everything after
-    // it should be EOF.
-    try parser.expectEof();
-    // Post-parse pass: refcount each *ir.Op reachable from the root,
-    // then wrap CTE roots in Materialize per their hint (force / never /
-    // auto + refcount ≥ 2). Mutates CTE ops in place so existing
-    // references see the new wrapper.
-    try parser.applyAutoMaterialize(op);
-    return op;
+
+    // Skip leading empty statements (e.g. ";;SELECT ...").
+    while (parser.cur.tag == .semicolon) try parser.advance();
+    if (parser.cur.tag == .eof) return ParseError.SqlExpectedSelect;
+
+    var statements: std.ArrayList(*ir.Op) = .empty;
+    defer statements.deinit(arena);
+
+    while (true) {
+        const op = try parser.parseStatement();
+        // Post-parse pass: refcount each *ir.Op reachable from this
+        // statement's root, then wrap CTE roots in Materialize per
+        // their hint. CTE scope is per-statement.
+        try parser.applyAutoMaterialize(op);
+        try statements.append(arena, op);
+        // Reset CTE state — each statement parses with a fresh scope.
+        parser.ctes.clearRetainingCapacity();
+        parser.cte_roots.clearRetainingCapacity();
+
+        // Consume any number of `;` and stop at EOF.
+        var saw_sep = false;
+        while (parser.cur.tag == .semicolon) {
+            try parser.advance();
+            saw_sep = true;
+        }
+        if (parser.cur.tag == .eof) break;
+        if (!saw_sep) return ParseError.SqlTrailingTokens;
+    }
+
+    if (statements.items.len == 1) return statements.items[0];
+
+    const owned = try arena.alloc(*ir.Op, statements.items.len);
+    for (statements.items, 0..) |s, i| owned[i] = s;
+    return try parser.allocOp(.{ .batch = .{ .statements = owned } });
 }
 
 const ProjItem = struct {
@@ -1351,6 +1375,7 @@ fn countRefs(
         },
         .materialize => |m| try visitChild(arena, refs, m.upstream),
         .ddl, .show, .insert => {},
+        .batch => |b| for (b.statements) |sub| try visitChild(arena, refs, sub),
     }
 }
 

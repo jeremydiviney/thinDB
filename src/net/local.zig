@@ -891,6 +891,12 @@ pub fn buildServerQuerySession(
             // compile() routes them straight to their dedicated builder.
             return Error.UnsupportedOp;
         },
+        .batch => {
+            // Multi-statement batches aren't a single pipeline. Wire
+            // layers iterate sub-statements and compile each one
+            // separately.
+            return Error.UnsupportedOp;
+        },
     };
 }
 
@@ -1079,6 +1085,11 @@ fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .ddl => |d| try compileDdl(ctx, d),
         .show => |s| try compileShow(ctx, s),
         .insert => |i| try compileInsert(ctx, i),
+        // Multi-statement batches are not a single pipeline — wire
+        // layers (mysql/server.zig, pg/server.zig) iterate sub-statements
+        // and compile each one independently. Reaching this branch means
+        // a caller compiled a batch op directly; that's a bug.
+        .batch => Error.UnsupportedOp,
     };
 }
 

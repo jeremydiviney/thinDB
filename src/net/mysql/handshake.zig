@@ -11,6 +11,11 @@ pub const server_version: []const u8 = "8.0.32-thinDB";
 pub const CLIENT_LONG_PASSWORD: u32 = 0x00000001;
 pub const CLIENT_LONG_FLAG: u32 = 0x00000004;
 pub const CLIENT_CONNECT_WITH_DB: u32 = 0x00000008;
+/// Clients that negotiate this bit may pack multiple `;`-separated
+/// statements into a single COM_QUERY frame. Server responds with a
+/// chain of result sets, setting SERVER_MORE_RESULTS_EXISTS on all
+/// but the last terminator.
+pub const CLIENT_MULTI_STATEMENTS: u32 = 0x00010000;
 pub const CLIENT_PROTOCOL_41: u32 = 0x00000200;
 pub const CLIENT_SECURE_CONNECTION: u32 = 0x00008000;
 pub const CLIENT_PLUGIN_AUTH: u32 = 0x00080000;
@@ -22,12 +27,17 @@ pub const server_capabilities: u32 =
     CLIENT_LONG_PASSWORD |
     CLIENT_LONG_FLAG |
     CLIENT_CONNECT_WITH_DB |
+    CLIENT_MULTI_STATEMENTS |
     CLIENT_PROTOCOL_41 |
     CLIENT_SECURE_CONNECTION |
     CLIENT_PLUGIN_AUTH |
     CLIENT_DEPRECATE_EOF;
 
 pub const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
+/// Set on the status_flags of all OK/EOF packets that terminate a
+/// non-final result set in a multi-statement response. The client
+/// keeps reading until it gets a terminator with this bit cleared.
+pub const SERVER_MORE_RESULTS_EXISTS: u16 = 0x0008;
 
 /// What we learned from the client's HandshakeResponse41 packet. All
 /// borrowed views into the response payload; copy before the payload
@@ -143,6 +153,20 @@ pub fn sendOkPacket(
     affected_rows: u64,
     last_insert_id: u64,
 ) !void {
+    try sendOkPacketStatus(allocator, w, seq_id, affected_rows, last_insert_id, 0);
+}
+
+/// Like `sendOkPacket` but ORs `extra_status` into the status_flags
+/// (e.g. SERVER_MORE_RESULTS_EXISTS for non-final results in a
+/// multi-statement response).
+pub fn sendOkPacketStatus(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    seq_id: u8,
+    affected_rows: u64,
+    last_insert_id: u64,
+    extra_status: u16,
+) !void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
 
@@ -151,7 +175,7 @@ pub fn sendOkPacket(
     try packet.appendLenEncInt(allocator, &payload, last_insert_id);
 
     var status_buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &status_buf, SERVER_STATUS_AUTOCOMMIT, .little);
+    std.mem.writeInt(u16, &status_buf, SERVER_STATUS_AUTOCOMMIT | extra_status, .little);
     try payload.appendSlice(allocator, &status_buf);
 
     var warn_buf: [2]u8 = .{ 0, 0 };
@@ -164,6 +188,15 @@ pub fn sendOkPacket(
 /// CLIENT_DEPRECATE_EOF is advertised. Same shape as OK but with the
 /// 0xFE header byte.
 pub fn sendEofOkPacket(allocator: Allocator, w: *std.Io.Writer, seq_id: u8) !void {
+    try sendEofOkPacketStatus(allocator, w, seq_id, 0);
+}
+
+pub fn sendEofOkPacketStatus(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    seq_id: u8,
+    extra_status: u16,
+) !void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
 
@@ -172,7 +205,7 @@ pub fn sendEofOkPacket(allocator: Allocator, w: *std.Io.Writer, seq_id: u8) !voi
     try packet.appendLenEncInt(allocator, &payload, 0);
 
     var status_buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &status_buf, SERVER_STATUS_AUTOCOMMIT, .little);
+    std.mem.writeInt(u16, &status_buf, SERVER_STATUS_AUTOCOMMIT | extra_status, .little);
     try payload.appendSlice(allocator, &status_buf);
 
     var warn_buf: [2]u8 = .{ 0, 0 };
@@ -187,6 +220,15 @@ pub fn sendEofOkPacket(allocator: Allocator, w: *std.Io.Writer, seq_id: u8) !voi
 /// MySQL Connector/J pre-5.1.x) require this between column defs and
 /// rows, and again after the rows.
 pub fn sendLegacyEofPacket(allocator: Allocator, w: *std.Io.Writer, seq_id: u8) !void {
+    try sendLegacyEofPacketStatus(allocator, w, seq_id, 0);
+}
+
+pub fn sendLegacyEofPacketStatus(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    seq_id: u8,
+    extra_status: u16,
+) !void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
 
@@ -196,7 +238,7 @@ pub fn sendLegacyEofPacket(allocator: Allocator, w: *std.Io.Writer, seq_id: u8) 
     try payload.appendSlice(allocator, &warn_buf);
 
     var status_buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &status_buf, SERVER_STATUS_AUTOCOMMIT, .little);
+    std.mem.writeInt(u16, &status_buf, SERVER_STATUS_AUTOCOMMIT | extra_status, .little);
     try payload.appendSlice(allocator, &status_buf);
 
     try packet.writePacket(w, seq_id, payload.items);
