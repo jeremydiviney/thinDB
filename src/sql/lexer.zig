@@ -83,6 +83,13 @@ pub const TokenTag = enum {
     /// prepared-statement registry) can count `?` outside string/
     /// backtick context to learn the parameter count.
     question, // ?
+    /// `$N` numbered placeholder used by PostgreSQL Extended Query
+    /// clients (asyncpg, psycopg, JDBC, node-pg). The numeric index is
+    /// carried in `Token.value.dollar_param`. Same role as `.question`:
+    /// the parser doesn't accept this in the v1 grammar; the PG
+    /// Extended-Query layer rewrites occurrences to literals before
+    /// re-parsing.
+    dollar_param, // $1, $2, ...
 
     eof,
 };
@@ -102,6 +109,9 @@ pub const Token = struct {
         /// by the lexer's arena when un-escaping happens; otherwise a
         /// borrowed slice into the input.
         string: []const u8,
+        /// Numbered placeholder index (`$1` → 1). Populated only for
+        /// the `.dollar_param` token tag.
+        dollar_param: u32,
     } = .none,
 };
 
@@ -162,6 +172,7 @@ pub const Lexer = struct {
                 self.pos += 1;
                 return Token{ .tag = .question, .text = self.src[start..self.pos] };
             },
+            '$' => return try self.lexDollarParam(),
             '!' => {
                 if (self.peekChar(1) == '=') {
                     self.pos += 2;
@@ -297,6 +308,21 @@ pub const Lexer = struct {
         const lowered = try self.arena.alloc(u8, text.len);
         for (text, 0..) |c, i| lowered[i] = std.ascii.toLower(c);
         return Token{ .tag = .identifier, .text = lowered };
+    }
+
+    fn lexDollarParam(self: *Lexer) LexError!Token {
+        const start = self.pos;
+        self.pos += 1; // consume '$'
+        const digits_start = self.pos;
+        while (self.pos < self.src.len and std.ascii.isDigit(self.src[self.pos])) : (self.pos += 1) {}
+        const digits = self.src[digits_start..self.pos];
+        if (digits.len == 0) return LexError.LexUnexpectedChar;
+        const n = std.fmt.parseInt(u32, digits, 10) catch return LexError.LexInvalidNumber;
+        return Token{
+            .tag = .dollar_param,
+            .text = self.src[start..self.pos],
+            .value = .{ .dollar_param = n },
+        };
     }
 
     fn lexBacktickIdent(self: *Lexer) LexError!Token {
@@ -493,6 +519,47 @@ test "lexer: question mark inside string literal is content, not a placeholder" 
     try std.testing.expectEqual(@as(TokenTag, .string), tok.tag);
     try std.testing.expectEqualStrings("why?", tok.value.string);
     try std.testing.expectEqual(@as(TokenTag, .question), (try lx.next()).tag);
+}
+
+test "lexer: $N outside strings produces .dollar_param token with index" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "SELECT * FROM t WHERE a = $1 AND b = $42");
+    const expected_tags = [_]TokenTag{
+        .kw_select,  .star, .kw_from,      .identifier, .kw_where,
+        .identifier, .eq,   .dollar_param, .kw_and,     .identifier,
+        .eq,         .dollar_param,
+    };
+    var idx: u32 = 0;
+    for (expected_tags) |tag| {
+        const tok = try lx.next();
+        try std.testing.expectEqual(tag, tok.tag);
+        if (tok.tag == .dollar_param) {
+            idx += 1;
+            const want: u32 = if (idx == 1) 1 else 42;
+            try std.testing.expectEqual(want, tok.value.dollar_param);
+        }
+    }
+    try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+}
+
+test "lexer: $N inside string literal is content, not a placeholder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "'price: $1' $2");
+    const tok = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .string), tok.tag);
+    try std.testing.expectEqualStrings("price: $1", tok.value.string);
+    const param = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .dollar_param), param.tag);
+    try std.testing.expectEqual(@as(u32, 2), param.value.dollar_param);
+}
+
+test "lexer: $ without trailing digits errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "$");
+    try std.testing.expectError(LexError.LexUnexpectedChar, lx.next());
 }
 
 test "lexer: unterminated string errors cleanly" {

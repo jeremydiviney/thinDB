@@ -31,6 +31,7 @@ const canned = @import("canned.zig");
 const errors = @import("errors.zig");
 const auth = @import("auth.zig");
 const copy = @import("copy.zig");
+const extended = @import("extended.zig");
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
 const conn_registry = @import("../conn_registry.zig");
 const ConnectionState = conn_registry.ConnectionState;
@@ -240,6 +241,10 @@ const SessionState = struct {
     /// Shared registry pointer so this connection's
     /// pg_cancel_backend / pg_terminate_backend can reach peers.
     registry: ?*ConnectionRegistry = null,
+    /// Per-connection Extended Query state — prepared statements,
+    /// portals, and the error-skip latch that survives until the next
+    /// Sync.
+    ext: extended.ExtendedState = .{},
 
     fn init(allocator: Allocator) !SessionState {
         return .{
@@ -258,6 +263,7 @@ const SessionState = struct {
     }
 
     fn deinit(self: *SessionState) void {
+        self.ext.deinit(self.allocator);
         self.allocator.free(self.current_db);
         self.allocator.free(self.current_schema);
         self.allocator.free(self.application_name);
@@ -320,9 +326,32 @@ fn handleConnection(
         };
         defer allocator.free(frame.payload);
 
+        // Extended-Query error-skip latch: once a frame in an Extended
+        // sequence (P/B/D/E/C/H) fails, the server discards every
+        // subsequent frame until Sync. Terminate must still close the
+        // connection cleanly.
+        if (session.ext.in_error_until_sync) {
+            switch (frame.type_byte) {
+                'X' => return,
+                'S' => {
+                    session.ext.in_error_until_sync = false;
+                    try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
+                    try w.flush();
+                },
+                else => continue,
+            }
+            continue;
+        }
+
         switch (frame.type_byte) {
             'X' => return,
             'Q' => try handleQuery(allocator, w, r, catalog, &session, frame.payload),
+            'P' => try handleExtendedFrame(allocator, w, catalog, &session, .parse, frame.payload),
+            'B' => try handleExtendedFrame(allocator, w, catalog, &session, .bind, frame.payload),
+            'D' => try handleExtendedFrame(allocator, w, catalog, &session, .describe, frame.payload),
+            'E' => try handleExtendedFrame(allocator, w, catalog, &session, .execute, frame.payload),
+            'C' => try handleExtendedFrame(allocator, w, catalog, &session, .close_stmt, frame.payload),
+            'H' => try w.flush(),
             'S' => {
                 try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
                 try w.flush();
@@ -334,6 +363,267 @@ fn handleConnection(
             },
         }
     }
+}
+
+const ExtendedKind = enum { parse, bind, describe, execute, close_stmt };
+
+/// Generic Extended-Query frame entrypoint. Catches any handler error,
+/// emits an ErrorResponse, and engages the error-skip latch so the
+/// remaining frames in the current Extended sequence are silently
+/// dropped until Sync. Does NOT emit ReadyForQuery — Sync owns that.
+fn handleExtendedFrame(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    kind: ExtendedKind,
+    payload: []const u8,
+) !void {
+    const handler_result = switch (kind) {
+        .parse => extended_handleParse(allocator, w, catalog, session, payload),
+        .bind => extended_handleBind(allocator, w, session, payload),
+        .describe => extended_handleDescribe(allocator, w, session, payload),
+        .execute => extended_handleExecute(allocator, w, catalog, session, payload),
+        .close_stmt => extended_handleClose(allocator, w, session, payload),
+    };
+    handler_result catch |err| {
+        const mapped = errors.mapInternal(err);
+        try errors.sendErrorResponse(allocator, w, mapped.sqlstate, mapped.message);
+        session.ext.in_error_until_sync = true;
+    };
+}
+
+fn extended_handleParse(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+) !void {
+    var temp_arena = std.heap.ArenaAllocator.init(allocator);
+    defer temp_arena.deinit();
+    const parsed = try extended.parseParseFrame(temp_arena.allocator(), payload);
+
+    // Per PG spec: client may understate num_params. We size from the
+    // max `$N` actually referenced, then take the larger of the
+    // type-hint list length and that count.
+    const max_idx = try extended.maxDollarIndex(temp_arena.allocator(), parsed.sql);
+    const num_params: u32 = @max(@as(u32, @intCast(parsed.type_oids.len)), max_idx);
+
+    // Replace any pre-existing statement under this name (per spec).
+    session.ext.dropStatement(allocator, parsed.statement_name);
+
+    const stmt = try allocator.create(extended.PreparedStmt);
+    errdefer allocator.destroy(stmt);
+
+    const name_copy = try allocator.dupe(u8, parsed.statement_name);
+    errdefer allocator.free(name_copy);
+    const sql_copy = try allocator.dupe(u8, parsed.sql);
+    errdefer allocator.free(sql_copy);
+    const oids_copy = try allocator.alloc(u32, num_params);
+    errdefer allocator.free(oids_copy);
+    var i: usize = 0;
+    while (i < num_params) : (i += 1) {
+        oids_copy[i] = if (i < parsed.type_oids.len) parsed.type_oids[i] else 0;
+    }
+
+    stmt.* = .{
+        .name = name_copy,
+        .sql = sql_copy,
+        .num_params = num_params,
+        .param_oids = oids_copy,
+        .arena = std.heap.ArenaAllocator.init(allocator),
+    };
+
+    // Best-effort schema inference; failure is silently swallowed and
+    // Describe-statement reports NoData.
+    if (extended.dryCompileSchema(allocator, catalog, session.asSession(), parsed.sql, num_params) catch null) |inferred| {
+        stmt.column_schema = inferred.columns;
+        stmt.column_names = inferred.names;
+    }
+
+    // Statements are keyed by their stored name (owned by stmt). We
+    // also need a copy of the key bytes for the map itself — keep the
+    // key slot pointing at the same bytes as stmt.name to avoid double
+    // ownership.
+    const map_key = try allocator.dupe(u8, parsed.statement_name);
+    errdefer allocator.free(map_key);
+    try session.ext.statements.put(allocator, map_key, stmt);
+
+    try extended.sendParseComplete(w);
+}
+
+fn extended_handleBind(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    session: *SessionState,
+    payload: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const bind = try extended.parseBindFrame(aa, payload);
+
+    const stmt = session.ext.statements.get(bind.statement_name) orelse {
+        return extended.Error.UnknownStatement;
+    };
+
+    if (bind.param_values.len != stmt.num_params) {
+        return extended.Error.BindParamCountMismatch;
+    }
+
+    const literals = try extended.renderBindParams(aa, bind, stmt.param_oids);
+    const bound_sql = try extended.substituteDollarSql(allocator, stmt.sql, literals);
+    errdefer allocator.free(bound_sql);
+
+    const result_formats = try allocator.alloc(u16, bind.result_formats.len);
+    errdefer allocator.free(result_formats);
+    for (bind.result_formats, 0..) |f, idx| result_formats[idx] = f;
+
+    // Replace any portal currently sharing this name (per spec).
+    session.ext.dropPortal(allocator, bind.portal_name);
+
+    const portal_name = try allocator.dupe(u8, bind.portal_name);
+    errdefer allocator.free(portal_name);
+
+    const portal = try allocator.create(extended.Portal);
+    errdefer allocator.destroy(portal);
+    portal.* = .{
+        .name = portal_name,
+        .stmt = stmt,
+        .bound_sql = bound_sql,
+        .result_formats = result_formats,
+    };
+
+    const map_key = try allocator.dupe(u8, bind.portal_name);
+    errdefer allocator.free(map_key);
+    try session.ext.portals.put(allocator, map_key, portal);
+
+    try extended.sendBindComplete(w);
+}
+
+fn extended_handleDescribe(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    session: *SessionState,
+    payload: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const desc = try extended.parseDescribeFrame(payload);
+
+    switch (desc.kind) {
+        'S' => {
+            const stmt = session.ext.statements.get(desc.name) orelse {
+                return extended.Error.UnknownStatement;
+            };
+            const oids = try extended.paramOidsForDescribe(arena.allocator(), stmt.param_oids, stmt.num_params);
+            try extended.sendParameterDescription(allocator, w, oids);
+            if (stmt.column_schema) |schema| {
+                try result.sendRowDescription(allocator, w, schema);
+            } else {
+                try extended.sendNoData(w);
+            }
+        },
+        'P' => {
+            const portal = session.ext.portals.get(desc.name) orelse {
+                return extended.Error.UnknownPortal;
+            };
+            if (portal.stmt.column_schema) |schema| {
+                try result.sendRowDescription(allocator, w, schema);
+            } else {
+                try extended.sendNoData(w);
+            }
+        },
+        else => return extended.Error.InvalidDescribeTarget,
+    }
+}
+
+fn extended_handleExecute(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+) !void {
+    const exec_payload = try extended.parseExecuteFrame(payload);
+    const portal = session.ext.portals.get(exec_payload.portal_name) orelse {
+        return extended.Error.UnknownPortal;
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const op = try sql.parse(aa, portal.bound_sql);
+
+    if (op.* == .batch) {
+        for (op.batch.statements) |stmt| {
+            if (stmt.* == .copy) return copy.Error.CopyMustBeSoleStatement;
+            try runExtendedStatement(allocator, w, catalog, session, stmt);
+        }
+        return;
+    }
+
+    try runExtendedStatement(allocator, w, catalog, session, op);
+}
+
+fn runExtendedStatement(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    op: *const ir.Op,
+) !void {
+    if (op.* == .copy) return copy.Error.CopyMustBeSoleStatement;
+
+    const main_db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
+
+    var compiled = try local.compileWithSession(allocator, main_db, session.asSession(), op);
+    defer compiled.deinit();
+
+    if (session.conn_state) |state| {
+        state.clearCancel();
+        compiled.cancel_flag = &state.cancel_flag;
+    }
+
+    if (isSideEffectOp(op.*)) {
+        _ = try compiled.next();
+        const new_session = compiled.sessionValue();
+        try session.replaceDbSchema(new_session.current_db, new_session.current_schema);
+        switch (op.*) {
+            .insert => {
+                var tag_buf: [48]u8 = undefined;
+                const tag = try std.fmt.bufPrint(&tag_buf, "INSERT 0 {d}", .{compiled.affectedRows()});
+                try result.sendCommandComplete(allocator, w, tag);
+            },
+            else => try result.sendCommandComplete(allocator, w, commandTagFor(op.*)),
+        }
+        return;
+    }
+
+    const rows = try result.sendQueryResult(allocator, w, &compiled);
+    const new_session = compiled.sessionValue();
+    try session.replaceDbSchema(new_session.current_db, new_session.current_schema);
+
+    var tag_buf: [40]u8 = undefined;
+    const tag = try std.fmt.bufPrint(&tag_buf, "SELECT {d}", .{rows});
+    try result.sendCommandComplete(allocator, w, tag);
+}
+
+fn extended_handleClose(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    session: *SessionState,
+    payload: []const u8,
+) !void {
+    const cls = try extended.parseCloseFrame(payload);
+    switch (cls.kind) {
+        'S' => session.ext.dropStatement(allocator, cls.name),
+        'P' => session.ext.dropPortal(allocator, cls.name),
+        else => return extended.Error.InvalidCloseTarget,
+    }
+    try extended.sendCloseComplete(w);
 }
 
 /// Handles SSLRequest negotiation if needed, then the real StartupMessage

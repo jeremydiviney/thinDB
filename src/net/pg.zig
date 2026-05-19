@@ -8,6 +8,7 @@ pub const canned = @import("pg/canned.zig");
 pub const errors = @import("pg/errors.zig");
 pub const auth = @import("pg/auth.zig");
 pub const copy = @import("pg/copy.zig");
+pub const extended = @import("pg/extended.zig");
 pub const server = @import("pg/server.zig");
 
 pub const Server = server.Server;
@@ -23,5 +24,6 @@ test {
     _ = errors;
     _ = auth;
     _ = copy;
+    _ = extended;
     _ = server;
 }

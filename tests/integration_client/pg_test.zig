@@ -125,6 +125,185 @@ const TestClient = struct {
         try self.writer.interface.flush();
     }
 
+    // -----------------------------------------------------------------------
+    // Extended Query helpers (Parse / Bind / Describe / Execute / Close /
+    // Sync / Flush). All frames go to the writer; callers normally chain
+    // multiple sends then a single `sendSync()` and `readExtendedReplies()`.
+    // -----------------------------------------------------------------------
+
+    fn sendParse(
+        self: *TestClient,
+        stmt_name: []const u8,
+        sql_text: []const u8,
+        type_oids: []const u32,
+    ) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try pg_packet.appendCString(self.allocator, &payload, stmt_name);
+        try pg_packet.appendCString(self.allocator, &payload, sql_text);
+        try pg_packet.appendI16(self.allocator, &payload, @intCast(type_oids.len));
+        for (type_oids) |oid| try pg_packet.appendU32(self.allocator, &payload, oid);
+        try pg_packet.writeFrame(&self.writer.interface, 'P', payload.items);
+        try self.writer.interface.flush();
+    }
+
+    const BindParam = struct { value: ?[]const u8, format: u16 };
+
+    fn sendBind(
+        self: *TestClient,
+        portal: []const u8,
+        stmt_name: []const u8,
+        params: []const BindParam,
+        result_formats: []const u16,
+    ) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try pg_packet.appendCString(self.allocator, &payload, portal);
+        try pg_packet.appendCString(self.allocator, &payload, stmt_name);
+        // One format code per param (no special "all the same" compression).
+        try pg_packet.appendI16(self.allocator, &payload, @intCast(params.len));
+        for (params) |p| try pg_packet.appendI16(self.allocator, &payload, @intCast(p.format));
+        try pg_packet.appendI16(self.allocator, &payload, @intCast(params.len));
+        for (params) |p| {
+            if (p.value) |bytes| {
+                try pg_packet.appendI32(self.allocator, &payload, @intCast(bytes.len));
+                try payload.appendSlice(self.allocator, bytes);
+            } else {
+                try pg_packet.appendI32(self.allocator, &payload, -1);
+            }
+        }
+        try pg_packet.appendI16(self.allocator, &payload, @intCast(result_formats.len));
+        for (result_formats) |f| try pg_packet.appendI16(self.allocator, &payload, @intCast(f));
+        try pg_packet.writeFrame(&self.writer.interface, 'B', payload.items);
+        try self.writer.interface.flush();
+    }
+
+    fn sendDescribe(self: *TestClient, kind: u8, name: []const u8) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try payload.append(self.allocator, kind);
+        try pg_packet.appendCString(self.allocator, &payload, name);
+        try pg_packet.writeFrame(&self.writer.interface, 'D', payload.items);
+        try self.writer.interface.flush();
+    }
+
+    fn sendExecute(self: *TestClient, portal: []const u8, max_rows: u32) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try pg_packet.appendCString(self.allocator, &payload, portal);
+        try pg_packet.appendU32(self.allocator, &payload, max_rows);
+        try pg_packet.writeFrame(&self.writer.interface, 'E', payload.items);
+        try self.writer.interface.flush();
+    }
+
+    fn sendClose(self: *TestClient, kind: u8, name: []const u8) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try payload.append(self.allocator, kind);
+        try pg_packet.appendCString(self.allocator, &payload, name);
+        try pg_packet.writeFrame(&self.writer.interface, 'C', payload.items);
+        try self.writer.interface.flush();
+    }
+
+    fn sendSync(self: *TestClient) !void {
+        try pg_packet.writeFrame(&self.writer.interface, 'S', "");
+        try self.writer.interface.flush();
+    }
+
+    fn sendFlush(self: *TestClient) !void {
+        try pg_packet.writeFrame(&self.writer.interface, 'H', "");
+        try self.writer.interface.flush();
+    }
+
+    const ExtendedReplies = struct {
+        parse_complete: u32 = 0,
+        bind_complete: u32 = 0,
+        close_complete: u32 = 0,
+        no_data: u32 = 0,
+        portal_suspended: u32 = 0,
+        param_description: ?[]const u32 = null,
+        row_description_cols: u32 = 0,
+        rows: []const Row = &.{},
+        command_tags: []const []const u8 = &.{},
+        error_code: ?[]const u8 = null,
+        error_message: ?[]const u8 = null,
+        tx_status: u8 = 'I',
+    };
+
+    /// Drain frames until ReadyForQuery (`Z`) arrives. Aggregates the
+    /// counts of acknowledgement frames + any rows + command tags so
+    /// the assertion code can read the whole sequence at once.
+    fn readExtendedReplies(self: *TestClient, arena: std.mem.Allocator) !ExtendedReplies {
+        var out: ExtendedReplies = .{};
+        var rows: std.ArrayList(Row) = .empty;
+        var tags: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            const f = try pg_packet.readFrame(self.allocator, &self.reader.interface);
+            defer self.allocator.free(f.payload);
+            switch (f.type_byte) {
+                '1' => out.parse_complete += 1,
+                '2' => out.bind_complete += 1,
+                '3' => out.close_complete += 1,
+                'n' => out.no_data += 1,
+                's' => out.portal_suspended += 1,
+                't' => {
+                    var cursor: usize = 0;
+                    const n = try pg_packet.readU16(f.payload, &cursor);
+                    const oids = try arena.alloc(u32, n);
+                    var i: usize = 0;
+                    while (i < n) : (i += 1) oids[i] = try pg_packet.readU32(f.payload, &cursor);
+                    out.param_description = oids;
+                },
+                'T' => {
+                    var cursor: usize = 0;
+                    out.row_description_cols = try pg_packet.readU16(f.payload, &cursor);
+                },
+                'D' => {
+                    var cursor: usize = 0;
+                    const ncells = try pg_packet.readU16(f.payload, &cursor);
+                    var cells: std.ArrayList(?[]const u8) = .empty;
+                    var i: usize = 0;
+                    while (i < ncells) : (i += 1) {
+                        const len = try pg_packet.readU32(f.payload, &cursor);
+                        if (len == 0xFFFFFFFF) {
+                            try cells.append(arena, null);
+                        } else {
+                            const cell = f.payload[cursor .. cursor + len];
+                            cursor += len;
+                            try cells.append(arena, try arena.dupe(u8, cell));
+                        }
+                    }
+                    try rows.append(arena, try cells.toOwnedSlice(arena));
+                },
+                'C' => {
+                    var cursor: usize = 0;
+                    const tag = try pg_packet.readCString(f.payload, &cursor);
+                    try tags.append(arena, try arena.dupe(u8, tag));
+                },
+                'E' => {
+                    var cursor: usize = 0;
+                    while (cursor < f.payload.len and f.payload[cursor] != 0) {
+                        const tb = f.payload[cursor];
+                        cursor += 1;
+                        const val = try pg_packet.readCString(f.payload, &cursor);
+                        switch (tb) {
+                            'C' => out.error_code = try arena.dupe(u8, val),
+                            'M' => out.error_message = try arena.dupe(u8, val),
+                            else => {},
+                        }
+                    }
+                },
+                'Z' => {
+                    out.tx_status = if (f.payload.len >= 1) f.payload[0] else 'I';
+                    out.rows = try rows.toOwnedSlice(arena);
+                    out.command_tags = try tags.toOwnedSlice(arena);
+                    return out;
+                },
+                else => {},
+            }
+        }
+    }
+
     /// COPY: send a `d` frame carrying raw row bytes (typically one
     /// text-format line including its trailing '\n'). Multiple rows
     /// may share a frame.
@@ -1479,5 +1658,550 @@ test "psql CLI: SELECT * FROM seeded table when psql is on PATH" {
         std.debug.print("psql stdout: {s}\npsql stderr: {s}\n", .{ r.stdout, r.stderr });
         return error.MissingRowText;
     }
+    if (sctx.err) |e| return e;
+}
+
+// ---------------------------------------------------------------------------
+// Extended Query protocol (Parse / Bind / Describe / Execute / Close / Sync)
+// ---------------------------------------------------------------------------
+
+const schema_ext = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "qty", .type = .int },
+        .{ .name = "tag", .type = .string },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const ok_ext = [_][]const u8{"id"};
+const opts_ext = thindb.TableOptions{
+    .order_key = &ok_ext,
+    .unique = true,
+    .row_group_size = 4,
+};
+
+test "pg wire ext: Parse + Bind (text params) + Execute returns matching row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("ext_sel", schema_ext, opts_ext);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30), .tag = "c" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 60;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    // Filter by `qty` (an INT column) so the int-typed literal we
+    // substitute for $1 doesn't need cross-width coercion (thinDB has
+    // no implicit int→bigint in predicates).
+    try client.sendParse("", "SELECT id, qty, tag FROM ext_sel WHERE qty = $1", &.{});
+    const params = [_]TestClient.BindParam{.{ .value = "20", .format = 0 }};
+    try client.sendBind("", "", params[0..], &.{});
+    try client.sendExecute("", 0);
+    try client.sendSync();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(u32, 1), r.parse_complete);
+    try std.testing.expectEqual(@as(u32, 1), r.bind_complete);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("2", r.rows[0][0].?);
+    try std.testing.expectEqualStrings("20", r.rows[0][1].?);
+    try std.testing.expectEqualStrings("b", r.rows[0][2].?);
+    try std.testing.expectEqual(@as(usize, 1), r.command_tags.len);
+    try std.testing.expectEqualStrings("SELECT 1", r.command_tags[0]);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire ext: Parse + Describe(S) on SELECT returns ParamDescription + RowDescription" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    _ = try sc.table("ext_desc", schema_ext, opts_ext);
+
+    const port: u16 = test_port_base + 61;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    const hints = [_]u32{23};
+    try client.sendParse("s1", "SELECT id, qty, tag FROM ext_desc WHERE qty = $1", hints[0..]);
+    try client.sendDescribe('S', "s1");
+    try client.sendSync();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(u32, 1), r.parse_complete);
+    try std.testing.expect(r.param_description != null);
+    try std.testing.expectEqual(@as(usize, 1), r.param_description.?.len);
+    try std.testing.expectEqual(@as(u32, 23), r.param_description.?[0]);
+    try std.testing.expectEqual(@as(u32, 3), r.row_description_cols);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire ext: Parse + Describe(S) on INSERT returns ParamDescription + NoData" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    _ = try sc.table("ext_ins_desc", schema_ext, opts_ext);
+
+    const port: u16 = test_port_base + 62;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendParse("s2", "INSERT INTO ext_ins_desc VALUES ($1, $2, $3)", &.{});
+    try client.sendDescribe('S', "s2");
+    try client.sendSync();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(u32, 1), r.parse_complete);
+    try std.testing.expect(r.param_description != null);
+    try std.testing.expectEqual(@as(usize, 3), r.param_description.?.len);
+    try std.testing.expectEqual(@as(u32, 1), r.no_data);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire ext: rebinding the unnamed portal cleanly replaces the prior" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("ext_rebind", schema_ext, opts_ext);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .tag = "b" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 63;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendParse("", "SELECT id FROM ext_rebind WHERE qty = $1", &.{});
+
+    const params1 = [_]TestClient.BindParam{.{ .value = "10", .format = 0 }};
+    try client.sendBind("", "", params1[0..], &.{});
+    try client.sendExecute("", 0);
+
+    const params2 = [_]TestClient.BindParam{.{ .value = "20", .format = 0 }};
+    try client.sendBind("", "", params2[0..], &.{});
+    try client.sendExecute("", 0);
+    try client.sendSync();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(u32, 2), r.bind_complete);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows[0][0].?);
+    try std.testing.expectEqualStrings("2", r.rows[1][0].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire ext: Parse + Bind (binary int4 param) + Execute returns matching row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("ext_bin", schema_ext, opts_ext);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 100), .qty = @as(i32, 5), .tag = "x" },
+        .{ .id = @as(i64, 200), .qty = @as(i32, 6), .tag = "y" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 64;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    // Filter by qty (an INT column) with a binary int4 BE param.
+    const oids = [_]u32{23};
+    try client.sendParse("", "SELECT id, qty FROM ext_bin WHERE qty = $1", oids[0..]);
+    var raw: [4]u8 = undefined;
+    std.mem.writeInt(i32, &raw, 6, .big);
+    const params = [_]TestClient.BindParam{.{ .value = raw[0..], .format = 1 }};
+    try client.sendBind("", "", params[0..], &.{});
+    try client.sendExecute("", 0);
+    try client.sendSync();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("200", r.rows[0][0].?);
+    try std.testing.expectEqualStrings("6", r.rows[0][1].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire ext: syntax error → ErrorResponse + frames skipped until Sync" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("ext_err", schema_ext, opts_ext);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 65;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    // Parse a SELECT with a wholly invalid leading keyword. Following
+    // Bind / Execute should be dropped silently; Sync emits
+    // ReadyForQuery and we recover.
+    try client.sendParse("bad", "SELEKT garbage from where when", &.{});
+    const params = [_]TestClient.BindParam{.{ .value = "1", .format = 0 }};
+    try client.sendBind("", "bad", params[0..], &.{});
+    try client.sendExecute("", 0);
+    try client.sendSync();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code != null);
+    // The bind + execute frames after the error should be ignored —
+    // no BindComplete, no rows, no command tag.
+    try std.testing.expectEqual(@as(u32, 0), r.bind_complete);
+    try std.testing.expectEqual(@as(usize, 0), r.rows.len);
+    try std.testing.expectEqual(@as(usize, 0), r.command_tags.len);
+
+    // Connection survives — a fresh Parse works.
+    try client.sendParse("ok", "SELECT id FROM ext_err", &.{});
+    try client.sendBind("", "ok", &.{}, &.{});
+    try client.sendExecute("", 0);
+    try client.sendSync();
+    const r2 = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r2.error_code == null);
+    try std.testing.expectEqual(@as(u32, 1), r2.parse_complete);
+    try std.testing.expectEqual(@as(u32, 1), r2.bind_complete);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire ext: Close statement → Bind on its name returns UnknownStatement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 66;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendParse("doomed", "SELECT 1", &.{});
+    try client.sendClose('S', "doomed");
+    try client.sendSync();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(u32, 1), r.parse_complete);
+    try std.testing.expectEqual(@as(u32, 1), r.close_complete);
+
+    try client.sendBind("", "doomed", &.{}, &.{});
+    try client.sendSync();
+    const r2 = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r2.error_code != null);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire ext: Close portal → Execute on it returns UnknownPortal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 67;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendParse("p1", "SELECT 1", &.{});
+    try client.sendBind("port1", "p1", &.{}, &.{});
+    try client.sendClose('P', "port1");
+    try client.sendSync();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(u32, 1), r.close_complete);
+
+    try client.sendExecute("port1", 0);
+    try client.sendSync();
+    const r2 = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r2.error_code != null);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire ext: parameterized INSERT via Extended Query lands rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    _ = try sc.table("ext_ins", schema_ext, opts_ext);
+
+    const port: u16 = test_port_base + 68;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendParse("ins", "INSERT INTO ext_ins VALUES ($1, $2, $3)", &.{});
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const rows = [_][3][]const u8{
+        .{ "10", "100", "alpha" },
+        .{ "11", "110", "beta" },
+        .{ "12", "120", "gamma" },
+    };
+    for (rows) |row| {
+        const ps = [_]TestClient.BindParam{
+            .{ .value = row[0], .format = 0 },
+            .{ .value = row[1], .format = 0 },
+            .{ .value = row[2], .format = 0 },
+        };
+        try client.sendBind("", "ins", ps[0..], &.{});
+        try client.sendExecute("", 0);
+    }
+    try client.sendSync();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(u32, 3), r.bind_complete);
+    try std.testing.expectEqual(@as(usize, 3), r.command_tags.len);
+    for (r.command_tags) |tag| try std.testing.expectEqualStrings("INSERT 0 1", tag);
+
+    // Verify the rows landed via a Simple Query.
+    try client.sendQuery("SELECT id FROM ext_ins ORDER BY id");
+    const sel = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 3), sel.rows.len);
+    try std.testing.expectEqualStrings("10", sel.rows[0][0].?);
+    try std.testing.expectEqualStrings("12", sel.rows[2][0].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire ext: pipelined Parse + Bind + Execute + Sync collects all replies" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("ext_pipe", schema_ext, opts_ext);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 1), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 2), .tag = "b" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 69;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    // Send everything before flushing or reading anything. Server must
+    // buffer until Sync, then drain.
+    try client.sendParse("pp", "SELECT id FROM ext_pipe WHERE qty = $1", &.{});
+    const params = [_]TestClient.BindParam{.{ .value = "1", .format = 0 }};
+    try client.sendBind("pport", "pp", params[0..], &.{});
+    try client.sendExecute("pport", 0);
+    try client.sendSync();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const r = try client.readExtendedReplies(arena.allocator());
+    try std.testing.expect(r.error_code == null);
+    try std.testing.expectEqual(@as(u32, 1), r.parse_complete);
+    try std.testing.expectEqual(@as(u32, 1), r.bind_complete);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows[0][0].?);
+
+    try client.sendTerminate();
     if (sctx.err) |e| return e;
 }
