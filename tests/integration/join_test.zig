@@ -7,7 +7,7 @@
 const std = @import("std");
 const thindb = @import("thindb");
 
-const users_schema = thindb.Schema{
+const users_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "uid", .type = .bigint },
         .{ .name = "name", .type = .string },
@@ -25,7 +25,7 @@ const users_opts = thindb.TableOptions{
 // orders shares no column names with users → no collision on join.
 // Join key is `uid` on both sides — right-side `uid` is dropped from
 // output per USING-semantic.
-const orders_schema = thindb.Schema{
+const orders_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "oid", .type = .bigint },
         .{ .name = "uid", .type = .bigint },
@@ -135,7 +135,7 @@ test "join: NULL join key never matches" {
     defer db.close();
 
     // Use nullable join key on the orders side.
-    const orders_nullable = thindb.Schema{
+    const orders_nullable = thindb.TableSchema{
         .columns = &.{
             .{ .name = "oid", .type = .bigint },
             .{ .name = "uid", .type = .bigint, .nullable = true },
@@ -364,7 +364,7 @@ test "join: sort-merge handles duplicate keys on both sides (Cartesian per key)"
 
     // Both sides have multiple rows per join key, so the SMJ inner
     // Cartesian product per key has to fire correctly.
-    const a_schema = thindb.Schema{
+    const a_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "rowid", .type = .bigint },
             .{ .name = "k", .type = .int },
@@ -373,7 +373,7 @@ test "join: sort-merge handles duplicate keys on both sides (Cartesian per key)"
         .order_key = &.{"rowid"},
         .unique = true,
     };
-    const b_schema = thindb.Schema{
+    const b_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "b_rowid", .type = .bigint }, // distinct name to avoid join-collision
             .{ .name = "k_other", .type = .int },
@@ -545,7 +545,7 @@ test "scan: string-keyed multi-segment table reports global=true when disjoint" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const slug_schema = thindb.Schema{
+    const slug_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "slug", .type = .string },
             .{ .name = "payload", .type = .int },
@@ -583,7 +583,7 @@ test "scan: string-keyed multi-segment table reports global=false when overlappi
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const slug_schema = thindb.Schema{
+    const slug_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "slug", .type = .string },
             .{ .name = "payload", .type = .int },
@@ -626,7 +626,7 @@ test "join: .auto picks SMJ for string-keyed multi-segment tables joined on slug
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const post_schema = thindb.Schema{
+    const post_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "slug", .type = .string },
             .{ .name = "title", .type = .string },
@@ -634,7 +634,7 @@ test "join: .auto picks SMJ for string-keyed multi-segment tables joined on slug
         .order_key = &.{"slug"},
         .unique = true,
     };
-    const author_schema = thindb.Schema{
+    const author_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "slug", .type = .string },
             .{ .name = "author", .type = .string },
@@ -734,7 +734,7 @@ test "join: .auto picks SMJ for post-compaction tables joined on order key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const emails_schema = thindb.Schema{
+    const emails_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "uid", .type = .bigint },
             .{ .name = "email", .type = .string },
@@ -795,7 +795,7 @@ test "join: SMJ output preserves natural order across i64 boundary values" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{
             .{ .name = "k", .type = .bigint },
             .{ .name = "rowid", .type = .bigint },
@@ -803,7 +803,7 @@ test "join: SMJ output preserves natural order across i64 boundary values" {
         .order_key = &.{"rowid"},
         .unique = true,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{
             .{ .name = "k", .type = .bigint },
             .{ .name = "b_rowid", .type = .bigint },
@@ -861,7 +861,7 @@ test "join: hash output is exact across row-group boundaries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const left_schema = thindb.Schema{
+    const left_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "k", .type = .bigint },
             .{ .name = "lval", .type = .int },
@@ -869,7 +869,7 @@ test "join: hash output is exact across row-group boundaries" {
         .order_key = &.{"k"},
         .unique = true,
     };
-    const right_schema = thindb.Schema{
+    const right_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "k", .type = .bigint },
             .{ .name = "rval", .type = .int },
@@ -1246,7 +1246,7 @@ test "join: range predicate filters cartesian pairs (hash, INNER)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const left_schema = thindb.Schema{
+    const left_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "tenant", .type = .bigint },
             .{ .name = "lstart", .type = .bigint },
@@ -1255,7 +1255,7 @@ test "join: range predicate filters cartesian pairs (hash, INNER)" {
         .order_key = &.{ "tenant", "lstart" },
         .unique = false,
     };
-    const right_schema = thindb.Schema{
+    const right_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "tenant", .type = .bigint },
             .{ .name = "revent", .type = .bigint },
@@ -1332,7 +1332,7 @@ test "join: range predicate works under SMJ" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{
             .{ .name = "k", .type = .bigint },
             .{ .name = "x", .type = .bigint },
@@ -1340,7 +1340,7 @@ test "join: range predicate works under SMJ" {
         .order_key = &.{"k"},
         .unique = false,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{
             .{ .name = "k", .type = .bigint },
             .{ .name = "y", .type = .bigint },
@@ -1395,7 +1395,7 @@ fn outerRangeFixture(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) 
     l: *thindb.Table,
     r: *thindb.Table,
 } {
-    const lschema = thindb.Schema{
+    const lschema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "k", .type = .bigint },
             .{ .name = "x", .type = .bigint },
@@ -1403,7 +1403,7 @@ fn outerRangeFixture(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) 
         .order_key = &.{"k"},
         .unique = false,
     };
-    const rschema = thindb.Schema{
+    const rschema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "k", .type = .bigint },
             .{ .name = "y", .type = .bigint },
@@ -1561,12 +1561,12 @@ test "join: NLJ handles pure range (no equi part)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
         .order_key = &.{"rowid"},
         .unique = true,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{ .{ .name = "b_rowid", .type = .bigint }, .{ .name = "y", .type = .bigint } },
         .order_key = &.{"b_rowid"},
         .unique = true,
@@ -1617,12 +1617,12 @@ test "join: NLJ handles multiple range predicates" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
         .order_key = &.{"rowid"},
         .unique = true,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{
             .{ .name = "b_rowid", .type = .bigint },
             .{ .name = "y_lo", .type = .bigint },
@@ -1682,7 +1682,7 @@ test "join: NLJ handles equi + multiple ranges (BETWEEN-style)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{
             .{ .name = "tenant", .type = .bigint },
             .{ .name = "x", .type = .bigint },
@@ -1690,7 +1690,7 @@ test "join: NLJ handles equi + multiple ranges (BETWEEN-style)" {
         .order_key = &.{"tenant"},
         .unique = false,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{
             .{ .name = "tenant", .type = .bigint },
             .{ .name = "lo", .type = .bigint },
@@ -1749,12 +1749,12 @@ test "join: LEFT OUTER via NLJ + pure range" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
         .order_key = &.{"rowid"},
         .unique = true,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{ .{ .name = "b_rowid", .type = .bigint }, .{ .name = "y", .type = .bigint } },
         .order_key = &.{"b_rowid"},
         .unique = true,
@@ -1814,7 +1814,7 @@ test "join: equi + multiple ranges + extra_predicate (the kitchen sink)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{
             .{ .name = "tenant", .type = .bigint },
             .{ .name = "x", .type = .bigint },
@@ -1822,7 +1822,7 @@ test "join: equi + multiple ranges + extra_predicate (the kitchen sink)" {
         .order_key = &.{"tenant"},
         .unique = false,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{
             .{ .name = "tenant", .type = .bigint },
             .{ .name = "lo", .type = .bigint },
@@ -1880,12 +1880,12 @@ test "join: FULL OUTER via NLJ + range — both-side orphans" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
         .order_key = &.{"rowid"},
         .unique = true,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{ .{ .name = "b_rowid", .type = .bigint }, .{ .name = "y", .type = .bigint } },
         .order_key = &.{"b_rowid"},
         .unique = true,
@@ -1939,12 +1939,12 @@ test "join: range_sweep output matches NLJ for same data" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{ .{ .name = "l_rowid", .type = .bigint }, .{ .name = "x", .type = .bigint } },
         .order_key = &.{"l_rowid"},
         .unique = true,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{ .{ .name = "r_rowid", .type = .bigint }, .{ .name = "y", .type = .bigint } },
         .order_key = &.{"r_rowid"},
         .unique = true,
@@ -2018,7 +2018,7 @@ test "opaque: cross-side predicate via NLJ callback" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{
             .{ .name = "rowid", .type = .bigint },
             .{ .name = "x", .type = .bigint },
@@ -2027,7 +2027,7 @@ test "opaque: cross-side predicate via NLJ callback" {
         .order_key = &.{"rowid"},
         .unique = true,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{
             .{ .name = "b_rowid", .type = .bigint },
             .{ .name = "threshold", .type = .bigint },
@@ -2114,12 +2114,12 @@ test "skew: heavy build-side skew auto-routes to sort-merge" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_l = thindb.Schema{
+    const schema_l = thindb.TableSchema{
         .columns = &.{ .{ .name = "rowid", .type = .bigint }, .{ .name = "k", .type = .bigint } },
         .order_key = &.{"rowid"},
         .unique = true,
     };
-    const schema_r = thindb.Schema{
+    const schema_r = thindb.TableSchema{
         .columns = &.{ .{ .name = "b_rowid", .type = .bigint }, .{ .name = "k", .type = .bigint } },
         .order_key = &.{"b_rowid"},
         .unique = true,
@@ -2179,7 +2179,7 @@ test "skew: no-skew query with detection enabled runs normally" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_l = thindb.Schema{
+    const schema_l = thindb.TableSchema{
         .columns = &.{ .{ .name = "k", .type = .bigint } },
         .order_key = &.{"k"},
         .unique = true,
@@ -2238,7 +2238,7 @@ test "memory: sort over tight budget errors with MemoryBudgetExceeded" {
     });
     defer db.close();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "v", .type = .bigint } },
         .order_key = &.{"id"},
         .unique = true,
@@ -2278,7 +2278,7 @@ test "memory: budget = 0 disables tracking (default)" {
     });
     defer db.close();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{ .{ .name = "id", .type = .bigint } },
         .order_key = &.{"id"},
         .unique = true,
@@ -2308,7 +2308,7 @@ test "join: type mismatch on join key errors" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_a = thindb.Schema{
+    const schema_a = thindb.TableSchema{
         .columns = &.{
             .{ .name = "a_id", .type = .bigint },
             .{ .name = "a_val", .type = .string },
@@ -2316,7 +2316,7 @@ test "join: type mismatch on join key errors" {
         .order_key = &.{"a_id"},
         .unique = true,
     };
-    const schema_b = thindb.Schema{
+    const schema_b = thindb.TableSchema{
         .columns = &.{
             .{ .name = "b_id", .type = .int }, // i32, not i64
             .{ .name = "b_val", .type = .string },

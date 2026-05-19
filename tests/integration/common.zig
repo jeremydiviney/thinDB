@@ -4,7 +4,7 @@
 
 const thindb = @import("thindb");
 
-pub const schema_v1 = thindb.Schema{
+pub const schema_v1 = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "qty", .type = .int },

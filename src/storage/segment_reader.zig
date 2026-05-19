@@ -7,7 +7,7 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 const Type = types.Type;
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 
 const format = @import("format.zig");
 const column = @import("column.zig");
@@ -42,7 +42,7 @@ pub const ReadSegment = struct {
     pub fn decodeColumn(
         self: ReadSegment,
         allocator: Allocator,
-        schema: Schema,
+        schema: TableSchema,
         row_group_idx: usize,
         column_idx: usize,
     ) !OwnedColumn {
@@ -56,7 +56,7 @@ pub const ReadSegment = struct {
     pub fn decodeColumnMaybeCached(
         self: ReadSegment,
         allocator: Allocator,
-        schema: Schema,
+        schema: TableSchema,
         row_group_idx: usize,
         column_idx: usize,
         c: ?*storage_cache.Cache,
@@ -102,7 +102,7 @@ pub fn readSegment(
     io: Io,
     dir: Io.Dir,
     file_name: []const u8,
-    schema: Schema,
+    schema: TableSchema,
 ) !ReadSegment {
     const bytes = try dir.readFileAlloc(io, file_name, allocator, .unlimited);
     errdefer allocator.free(bytes);

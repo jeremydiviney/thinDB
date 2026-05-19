@@ -6,7 +6,7 @@
 const std = @import("std");
 const thindb = @import("thindb");
 
-const schema_nums = thindb.Schema{
+const schema_nums = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "x", .type = .double },
@@ -95,7 +95,7 @@ test "aggregate: count_distinct excludes NULLs and dedupes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "tag", .type = .string, .nullable = true },

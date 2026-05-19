@@ -15,7 +15,7 @@ const mysql_handshake = thindb.mysql.handshake;
 
 const test_port_base: u16 = 28543;
 
-const schema_orders = thindb.Schema{
+const schema_orders = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "qty", .type = .int },

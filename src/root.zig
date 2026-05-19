@@ -12,7 +12,7 @@ pub const MemoryAccountant = memory.MemoryAccountant;
 pub const Type = types.Type;
 pub const Value = types.Value;
 pub const Column = types.Column;
-pub const Schema = types.Schema;
+pub const TableSchema = types.TableSchema;
 pub const decimal = types.decimal;
 pub const DecimalSpec = types.DecimalSpec;
 
@@ -23,9 +23,10 @@ pub const exec = @import("exec/exec.zig");
 
 pub const Database = api.Database;
 pub const Catalog = api.Catalog;
-/// Database-schema namespace type (Catalog → Database → Schema → Table).
-/// Exposed under a distinct name from the table-schema type
-/// `thindb.Schema = types.Schema` re-exported above.
+/// Namespace type in the Catalog → Database → Schema → Table hierarchy.
+/// Distinct from the table column-schema type `thindb.TableSchema`.
+pub const Schema = api.Schema;
+/// Deprecated alias for `Schema`. Will be removed in a future release.
 pub const DbSchema = api.Schema;
 pub const Table = api.Table;
 pub const Config = api.Config;
@@ -93,4 +94,7 @@ test {
     _ = api;
     _ = exec;
     _ = sql;
+    _ = @import("net/wire_format.zig");
+    _ = @import("net/error_map.zig");
+    _ = @import("util/snapshot.zig");
 }

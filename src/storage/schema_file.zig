@@ -25,7 +25,7 @@ const types = @import("../types.zig");
 const Type = types.Type;
 const TypeTag = types.TypeTag;
 const Column = types.Column;
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 
 const format = @import("format.zig");
 
@@ -52,7 +52,7 @@ pub const SchemaOwner = struct {
     order_key: [][]const u8,
     unique: bool,
 
-    pub fn view(self: *const SchemaOwner) Schema {
+    pub fn view(self: *const SchemaOwner) TableSchema {
         return .{
             .columns = self.columns,
             .order_key = self.order_key,
@@ -66,7 +66,7 @@ pub const SchemaOwner = struct {
     }
 
     /// Deep-copy an existing Schema into a fresh arena-owned SchemaOwner.
-    pub fn clone(parent_allocator: Allocator, src: Schema) !SchemaOwner {
+    pub fn clone(parent_allocator: Allocator, src: TableSchema) !SchemaOwner {
         var arena = std.heap.ArenaAllocator.init(parent_allocator);
         errdefer arena.deinit();
         const aa = arena.allocator();
@@ -94,7 +94,7 @@ pub const SchemaOwner = struct {
     }
 };
 
-pub fn writeSchema(io: Io, dir: Io.Dir, schema: Schema, scratch: Allocator) !void {
+pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(scratch);
 
@@ -224,7 +224,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
 
 /// True iff two schemas are structurally identical: same column count, same
 /// column name+type at each position, same order_key, same unique flag.
-pub fn schemasEqual(a: Schema, b: Schema) bool {
+pub fn schemasEqual(a: TableSchema, b: TableSchema) bool {
     if (a.columns.len != b.columns.len) return false;
     if (a.order_key.len != b.order_key.len) return false;
     if (a.unique != b.unique) return false;
@@ -261,7 +261,7 @@ test "round-trip schema (simple)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -288,7 +288,7 @@ test "round-trip schema (composite order key)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "user_id", .type = .bigint },
             .{ .name = "ts", .type = .bigint },
@@ -309,12 +309,12 @@ test "round-trip schema (composite order key)" {
 }
 
 test "schemasEqual detects type mismatch" {
-    const a = Schema{
+    const a = TableSchema{
         .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"id"},
         .unique = false,
     };
-    const b = Schema{
+    const b = TableSchema{
         .columns = &.{.{ .name = "id", .type = .int }},
         .order_key = &.{"id"},
         .unique = false,
@@ -324,7 +324,7 @@ test "schemasEqual detects type mismatch" {
 
 test "SchemaOwner.clone deep-copies into a fresh arena" {
     const allocator = std.testing.allocator;
-    const src = Schema{
+    const src = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "tag", .type = .string },

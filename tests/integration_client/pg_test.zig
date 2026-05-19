@@ -14,7 +14,7 @@ const pg_startup = thindb.pg.startup;
 
 const test_port_base: u16 = 29543;
 
-const schema_orders = thindb.Schema{
+const schema_orders = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "qty", .type = .int },

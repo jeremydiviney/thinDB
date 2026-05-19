@@ -159,6 +159,22 @@ pub const Session = struct {
     current_schema: []const u8 = "public",
 };
 
+/// Translate any `api.Error` into the equivalently-named variant of
+/// `DstError`. IO / allocator / unknown errors pass through unchanged.
+/// Used by transports that expose their own `Error` set so internal
+/// catalog errors surface with stable names on the wire.
+pub fn remapError(comptime DstError: type, e: anyerror) anyerror {
+    return switch (e) {
+        Error.DatabaseNotFound => DstError.DatabaseNotFound,
+        Error.DatabaseAlreadyExists => DstError.DatabaseAlreadyExists,
+        Error.SchemaNotFound => DstError.SchemaNotFound,
+        Error.SchemaAlreadyExists => DstError.SchemaAlreadyExists,
+        Error.TableNotFound => DstError.TableNotFound,
+        Error.TableAlreadyExists => DstError.TableAlreadyExists,
+        else => e,
+    };
+}
+
 test {
     _ = @import("table.zig");
     _ = @import("api_test.zig");

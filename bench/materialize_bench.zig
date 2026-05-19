@@ -28,7 +28,7 @@ const freshDir = common.freshDir;
 // Schema
 // ----------------------------------------------------------------------------
 
-const mat_schema = thindb.Schema{
+const mat_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "qty", .type = .int },
@@ -257,7 +257,7 @@ fn benchFilterCteSelfJoin(
 // instead of redoing the full scan + GROUP BY.
 // ----------------------------------------------------------------------------
 
-const events_schema = thindb.Schema{
+const events_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "eid", .type = .bigint },
         .{ .name = "group_k", .type = .int },
@@ -273,7 +273,7 @@ const events_opts = thindb.TableOptions{
     .row_group_size = 65_536,
 };
 
-const dim_a_schema = thindb.Schema{
+const dim_a_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "a_id", .type = .bigint },
         .{ .name = "a_group", .type = .int },
@@ -289,7 +289,7 @@ const dim_a_opts = thindb.TableOptions{
     .row_group_size = 65_536,
 };
 
-const dim_b_schema = thindb.Schema{
+const dim_b_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "b_id", .type = .bigint },
         .{ .name = "b_group", .type = .int },

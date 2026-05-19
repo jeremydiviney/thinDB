@@ -18,7 +18,7 @@ test "pipeline stats propagate through scan, filter, limit, project, sort" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -120,7 +120,7 @@ test "scan reads inserted rows from memtable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -157,7 +157,7 @@ test "scan reads across flushed segments then memtable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"id"},
         .unique = false,
@@ -201,7 +201,7 @@ test "filter on bigint column" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "qty", .type = .int } },
         .order_key = &.{"id"},
         .unique = false,
@@ -235,7 +235,7 @@ test "project narrows column set" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -271,7 +271,7 @@ test "limit cuts off after N rows" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"id"},
         .unique = false,
@@ -304,7 +304,7 @@ test "aggregate: ungrouped COUNT + SUM + MIN + MAX" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -348,7 +348,7 @@ test "aggregate: groupBy with COUNT and SUM" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "user_id", .type = .bigint },
@@ -404,7 +404,7 @@ test "aggregate: groupBy with string column" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "status", .type = .string },
@@ -462,7 +462,7 @@ test "aggregate: empty input emits zeroed counters" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -494,7 +494,7 @@ test "filter with AND" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -532,7 +532,7 @@ test "filter with OR" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "tag", .type = .string },
@@ -569,7 +569,7 @@ test "filter with NOT" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -603,7 +603,7 @@ test "filter with nested AND inside OR" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -646,7 +646,7 @@ test "sort: orderBy single bigint column ASC" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -680,7 +680,7 @@ test "sort: orderBy DESC" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -714,7 +714,7 @@ test "sort: multi-column with mixed direction" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "user", .type = .bigint },
             .{ .name = "ts", .type = .bigint },
@@ -760,7 +760,7 @@ test "sort: empty input emits nothing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"id"},
         .unique = false,
@@ -781,7 +781,7 @@ test "sort: groupBy then orderBy (composed)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "user", .type = .bigint },
@@ -831,7 +831,7 @@ test "pipe composes a chain" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -885,7 +885,7 @@ test "scan: segment-level pruning skips segments excluded by leading-key predica
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"id"},
         .unique = true,
@@ -938,7 +938,7 @@ test "scan: segment-level pruning works for non-leading-column predicates" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -994,7 +994,7 @@ test "scan: segment-level pruning works for string leading-key predicates" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{.{ .name = "slug", .type = .string }},
         .order_key = &.{"slug"},
         .unique = true,
@@ -1049,7 +1049,7 @@ test "scan: string eq predicate prunes row groups via prefix stats" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = types.Schema{
+    const schema = types.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "name", .type = .string },

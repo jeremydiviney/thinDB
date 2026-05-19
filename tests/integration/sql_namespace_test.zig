@@ -5,7 +5,7 @@
 const std = @import("std");
 const thindb = @import("thindb");
 
-const schema_t = thindb.Schema{
+const schema_t = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "qty", .type = .int },

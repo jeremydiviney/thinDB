@@ -14,6 +14,8 @@ const Error = api.Error;
 const DatabaseMod = @import("database.zig");
 const Database = DatabaseMod.Database;
 
+const snapshot = @import("../util/snapshot.zig");
+
 pub const Catalog = struct {
     allocator: Allocator,
     io: Io,
@@ -138,8 +140,8 @@ pub const Catalog = struct {
     /// flush sweep. Errors from individual sweeps are swallowed — the
     /// background loop keeps running.
     pub fn backgroundFlushSweep(self: *Catalog) !void {
-        const names = try self.snapshotDatabaseNames();
-        defer self.freeDatabaseNames(names);
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.databases_mutex, self.databases);
+        defer snapshot.freeNames(self.allocator, names);
         for (names) |name| {
             const db = self.database(name) orelse continue;
             db.backgroundFlushSweep() catch {};
@@ -161,8 +163,8 @@ pub const Catalog = struct {
     }
 
     pub fn backgroundCompactSweep(self: *Catalog) !void {
-        const names = try self.snapshotDatabaseNames();
-        defer self.freeDatabaseNames(names);
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.databases_mutex, self.databases);
+        defer snapshot.freeNames(self.allocator, names);
         for (names) |name| {
             const db = self.database(name) orelse continue;
             db.backgroundCompactSweep() catch {};
@@ -183,22 +185,4 @@ pub const Catalog = struct {
         }
     }
 
-    fn snapshotDatabaseNames(self: *Catalog) ![][]u8 {
-        self.databases_mutex.lockUncancelable(self.io);
-        defer self.databases_mutex.unlock(self.io);
-        const out = try self.allocator.alloc([]u8, self.databases.count());
-        errdefer self.allocator.free(out);
-        var i: usize = 0;
-        errdefer for (out[0..i]) |s| self.allocator.free(s);
-        var it = self.databases.keyIterator();
-        while (it.next()) |k| : (i += 1) {
-            out[i] = try self.allocator.dupe(u8, k.*);
-        }
-        return out;
-    }
-
-    fn freeDatabaseNames(self: *Catalog, names: [][]u8) void {
-        for (names) |s| self.allocator.free(s);
-        self.allocator.free(names);
-    }
 };

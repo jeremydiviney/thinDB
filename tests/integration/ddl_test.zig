@@ -153,7 +153,7 @@ test "alterTable: rename column preserves data" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    const new_schema = thindb.Schema{
+    const new_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "quantity", .type = .int },

@@ -130,7 +130,7 @@ test "wal: works with nullable columns and a unique-key table" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "v", .type = .int, .nullable = true },
@@ -225,7 +225,7 @@ test "wal: concurrent writers preserve all rows + group-commit fsync amortizes" 
     // Non-unique schema so we don't trigger applyUpsertResolution between
     // threads (each thread inserts a disjoint id range; unique resolution
     // would still be a no-op, but it adds CPU work we don't need).
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -292,7 +292,7 @@ test "wal: concurrent writers survive close + reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },

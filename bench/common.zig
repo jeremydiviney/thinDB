@@ -16,7 +16,7 @@ pub const Row = struct {
     tag: []const u8,
 };
 
-pub const schema = thindb.Schema{
+pub const schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "qty", .type = .int },

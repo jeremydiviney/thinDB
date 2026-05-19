@@ -9,7 +9,7 @@
 const std = @import("std");
 const thindb = @import("thindb");
 
-const schema_t = thindb.Schema{
+const schema_t = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "k", .type = .int },
@@ -231,7 +231,7 @@ test "sql: IS NULL / IS NOT NULL on nullable column" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "note", .type = .string, .nullable = true },
@@ -449,7 +449,7 @@ test "sql: scalar functions disallowed alongside aggregates (v1 limit)" {
 // JOIN support
 // ---------------------------------------------------------------------------
 
-const schema_orders = thindb.Schema{
+const schema_orders = thindb.TableSchema{
     .columns = &.{
         .{ .name = "oid", .type = .bigint },
         .{ .name = "item_id", .type = .int },
@@ -458,7 +458,7 @@ const schema_orders = thindb.Schema{
     .order_key = &.{"oid"},
     .unique = true,
 };
-const schema_items = thindb.Schema{
+const schema_items = thindb.TableSchema{
     .columns = &.{
         .{ .name = "iid", .type = .int },
         .{ .name = "name", .type = .string },
@@ -582,7 +582,7 @@ test "sql: three-table JOIN (A JOIN B ON ... JOIN C ON ...)" {
     try seedOrdersItems(db);
 
     // Add a third table that joins to items.name.
-    const schema_cats = thindb.Schema{
+    const schema_cats = thindb.TableSchema{
         .columns = &.{
             .{ .name = "cid", .type = .int },
             .{ .name = "name", .type = .string },

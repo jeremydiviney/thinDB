@@ -24,7 +24,7 @@ test "snapshot: scan sees stable row count even as concurrent inserts continue" 
     });
     defer db.close();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -165,7 +165,7 @@ test "snapshot: scan survives concurrent delete via retire-replace" {
     });
     defer db.close();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },

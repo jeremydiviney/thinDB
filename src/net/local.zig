@@ -36,7 +36,7 @@ const ApiError = thindb_api.Error;
 const ApiTable = thindb_api.Table;
 
 const types = @import("../types.zig");
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 
 const exec = @import("../exec/exec.zig");
 const Query = exec.Query;
@@ -193,7 +193,7 @@ pub const Connection = struct {
     pub fn createTable(
         self: *Connection,
         name: []const u8,
-        schema: Schema,
+        schema: TableSchema,
         opts: TableOptions,
     ) !void {
         switch (self.transport) {
@@ -1073,15 +1073,15 @@ fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
 fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     switch (d) {
-        .create_database => |name| _ = catalog.createDatabase(name) catch |e| return mapApiError(e),
-        .drop_database => |name| catalog.dropDatabase(name) catch |e| return mapApiError(e),
+        .create_database => |name| _ = catalog.createDatabase(name) catch |e| return thindb_api.remapError(Error, e),
+        .drop_database => |name| catalog.dropDatabase(name) catch |e| return thindb_api.remapError(Error, e),
         .create_schema => |name| {
             const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
-            _ = db.createSchema(name) catch |e| return mapApiError(e);
+            _ = db.createSchema(name) catch |e| return thindb_api.remapError(Error, e);
         },
         .drop_schema => |name| {
             const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
-            db.dropSchema(name) catch |e| return mapApiError(e);
+            db.dropSchema(name) catch |e| return thindb_api.remapError(Error, e);
         },
         .use_schema => |name| {
             const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
@@ -1134,21 +1134,6 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
 fn freeOwnedNames(allocator: Allocator, names: [][]u8) void {
     for (names) |n| allocator.free(n);
     allocator.free(names);
-}
-
-/// Translate the API-layer error set into local.Error. Allocator and
-/// IO errors propagate unchanged; namespace-specific errors map onto
-/// the local Error set so transports + tests can pattern-match them.
-fn mapApiError(e: anyerror) anyerror {
-    return switch (e) {
-        ApiError.DatabaseNotFound => Error.DatabaseNotFound,
-        ApiError.DatabaseAlreadyExists => Error.DatabaseAlreadyExists,
-        ApiError.SchemaNotFound => Error.SchemaNotFound,
-        ApiError.SchemaAlreadyExists => Error.SchemaAlreadyExists,
-        ApiError.TableNotFound => Error.TableNotFound,
-        ApiError.TableAlreadyExists => Error.TableAlreadyExists,
-        else => e,
-    };
 }
 
 // ---------------------------------------------------------------------------

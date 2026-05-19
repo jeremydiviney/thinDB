@@ -6,7 +6,7 @@
 const std = @import("std");
 const thindb = @import("thindb");
 
-const uuid_schema = thindb.Schema{
+const uuid_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .uuid },
         .{ .name = "name", .type = .string },

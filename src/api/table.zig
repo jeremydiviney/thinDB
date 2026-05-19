@@ -9,7 +9,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const types = @import("../types.zig");
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 const TypeTag = types.TypeTag;
 
 const storage = @import("../storage/storage.zig");
@@ -26,7 +26,7 @@ pub const Table = struct {
     io: Io,
     name: []u8,
     schema_owner: storage.schema_file.SchemaOwner,
-    schema: Schema,
+    schema: TableSchema,
     schema_fingerprint: u64,
     row_group_size: usize,
     order_key_indices: []usize,
@@ -85,7 +85,7 @@ pub const Table = struct {
         io: Io,
         parent_dir: Io.Dir,
         name: []const u8,
-        maybe_schema: ?Schema,
+        maybe_schema: ?TableSchema,
         cfg: Config,
         row_group_size: usize,
     ) !*Table {
@@ -495,7 +495,7 @@ fn acquireSchema(
     allocator: Allocator,
     io: Io,
     table_dir: Io.Dir,
-    maybe_schema: ?Schema,
+    maybe_schema: ?TableSchema,
 ) !storage.schema_file.SchemaOwner {
     if (storage.schema_file.readSchema(allocator, io, table_dir)) |loaded| {
         if (maybe_schema) |s| {
@@ -523,7 +523,7 @@ fn acquireSchema(
 /// v0.3: any compound key built from scalar types (`INT`, `BIGINT`, `BOOLEAN`,
 /// `VARCHAR(N)`, `STRING`) is allowed. No-op currently — all supported types
 /// pass.
-fn validateUniqueKey(schema: Schema) !void {
+fn validateUniqueKey(schema: TableSchema) !void {
     if (schema.order_key.len == 0) return Error.UnsupportedUniqueKeyType;
     for (schema.order_key) |k| {
         const idx = schema.columnIndex(k) orelse return Error.SchemaMismatch;
@@ -534,7 +534,7 @@ fn validateUniqueKey(schema: Schema) !void {
 
 /// Build a per-column "has_stats" bitvec under the given schema.
 /// Caller owns the returned slice.
-pub fn buildColumnHasStats(allocator: Allocator, schema: Schema) ![]bool {
+pub fn buildColumnHasStats(allocator: Allocator, schema: TableSchema) ![]bool {
     const out = try allocator.alloc(bool, schema.columns.len);
     for (schema.columns, 0..) |c, i| out[i] = storage.format.typeHasStats(c.type);
     return out;
@@ -542,7 +542,7 @@ pub fn buildColumnHasStats(allocator: Allocator, schema: Schema) ![]bool {
 
 /// Stable hash of a schema's column names, types, order key, and unique flag.
 /// Used to detect schema drift when reopening a table.
-pub fn schemaFingerprint(schema: Schema) u64 {
+pub fn schemaFingerprint(schema: TableSchema) u64 {
     var hasher = std.hash.Wyhash.init(0);
     for (schema.columns) |c| {
         hasher.update(c.name);

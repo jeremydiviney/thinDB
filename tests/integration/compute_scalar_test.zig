@@ -13,7 +13,7 @@ const thindb = @import("thindb");
 // Implicit type coercion (DuckDB-style promotion graph in src/exec/cast.zig)
 // ---------------------------------------------------------------------------
 
-const schema_mixed = thindb.Schema{
+const schema_mixed = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "small", .type = .int },
@@ -146,7 +146,7 @@ test "coercion: no implicit string ↔ number — concat(string, int) still erro
 // Expanded scalar functions: per-row correctness through Compute.
 // ---------------------------------------------------------------------------
 
-const schema_str = thindb.Schema{
+const schema_str = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "s", .type = .string },
@@ -201,7 +201,7 @@ test "scalar: position / instr with present + absent needles" {
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "needle", .type = .string },
@@ -243,7 +243,7 @@ test "scalar: substring_index smoke through Compute (delim = column)" {
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "s", .type = .string },
@@ -289,7 +289,7 @@ test "scalar: dayofweek / quarter / last_day on known dates" {
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "d", .type = .date },
@@ -335,7 +335,7 @@ test "scalar: date_format with %Y-%m-%d %H:%i:%s on datetime + date" {
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "ts", .type = .datetime },

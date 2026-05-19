@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const packet = @import("packet.zig");
+const error_map = @import("../error_map.zig");
 
 pub const Mapped = struct {
     sqlstate: [5]u8,
@@ -16,21 +17,16 @@ pub const Mapped = struct {
 /// `@errorName(err)` as the message.
 pub fn mapInternal(err: anyerror) Mapped {
     const name = @errorName(err);
-    if (std.mem.eql(u8, name, "TableNotFound"))
-        return .{ .sqlstate = "42P01".*, .message = "relation does not exist" };
-    if (std.mem.eql(u8, name, "DatabaseNotFound"))
-        return .{ .sqlstate = "3D000".*, .message = "database does not exist" };
-    if (std.mem.eql(u8, name, "DatabaseAlreadyExists"))
-        return .{ .sqlstate = "42P04".*, .message = "database already exists" };
-    if (std.mem.eql(u8, name, "SchemaNotFound"))
-        return .{ .sqlstate = "3F000".*, .message = "schema does not exist" };
-    if (std.mem.eql(u8, name, "SchemaAlreadyExists"))
-        return .{ .sqlstate = "42P06".*, .message = "schema already exists" };
-    if (std.mem.eql(u8, name, "TableAlreadyExists"))
-        return .{ .sqlstate = "42P07".*, .message = "relation already exists" };
-    if (std.mem.eql(u8, name, "ColumnNotFound"))
-        return .{ .sqlstate = "42703".*, .message = "column does not exist" };
-    return .{ .sqlstate = "42000".*, .message = name };
+    return switch (error_map.classify(name)) {
+        .table_not_found => .{ .sqlstate = "42P01".*, .message = "relation does not exist" },
+        .database_not_found => .{ .sqlstate = "3D000".*, .message = "database does not exist" },
+        .database_already_exists => .{ .sqlstate = "42P04".*, .message = "database already exists" },
+        .schema_not_found => .{ .sqlstate = "3F000".*, .message = "schema does not exist" },
+        .schema_already_exists => .{ .sqlstate = "42P06".*, .message = "schema already exists" },
+        .table_already_exists => .{ .sqlstate = "42P07".*, .message = "relation already exists" },
+        .column_not_found => .{ .sqlstate = "42703".*, .message = "column does not exist" },
+        .unknown => .{ .sqlstate = "42000".*, .message = name },
+    };
 }
 
 /// Send an ErrorResponse `E` frame with severity ERROR + the supplied

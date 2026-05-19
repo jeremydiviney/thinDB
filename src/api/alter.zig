@@ -18,7 +18,7 @@ const types = @import("../types.zig");
 const Type = types.Type;
 const Value = types.Value;
 const Column = types.Column;
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 const TypeTag = types.TypeTag;
 const ValueTag = types.ValueTag;
 
@@ -56,7 +56,7 @@ pub const AlterPlan = struct {
         self.* = undefined;
     }
 
-    pub fn newSchema(self: *const AlterPlan) Schema {
+    pub fn newSchema(self: *const AlterPlan) TableSchema {
         return .{
             .columns = self.new_columns,
             .order_key = self.new_order_key,
@@ -69,7 +69,7 @@ pub const AlterPlan = struct {
 ///   - No duplicate column names.
 ///   - No dropping a column that's part of the order key.
 ///   - `add` default tag matches the new column's type.
-pub fn planAlter(parent_allocator: Allocator, old: Schema, ops: []const AlterOp) !AlterPlan {
+pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const AlterOp) !AlterPlan {
     var arena = std.heap.ArenaAllocator.init(parent_allocator);
     errdefer arena.deinit();
     const aa = arena.allocator();
@@ -136,7 +136,7 @@ pub fn planAlter(parent_allocator: Allocator, old: Schema, ops: []const AlterOp)
     const owned_cols = try cols.toOwnedSlice(aa);
     const owned_sources = try sources.toOwnedSlice(aa);
 
-    const schema_view: Schema = .{
+    const schema_view: TableSchema = .{
         .columns = owned_cols,
         .order_key = new_ok,
         .unique = old.unique,
@@ -257,7 +257,7 @@ fn rewriteSegment(
     plan: *const AlterPlan,
     shadow_segs: Io.Dir,
     entry: storage.ManifestEntry,
-    new_schema: Schema,
+    new_schema: TableSchema,
     new_fp: u64,
     sync: bool,
 ) !storage.format.SegmentInfo {

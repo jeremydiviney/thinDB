@@ -304,42 +304,42 @@ pub const Column = struct {
     nullable: bool = false,
 };
 
-pub const SchemaError = error{
+pub const TableSchemaError = error{
     DuplicateColumn,
     OrderKeyColumnMissing,
     EmptyColumns,
     EmptyOrderKey,
 };
 
-pub const Schema = struct {
+pub const TableSchema = struct {
     columns: []const Column,
     order_key: []const []const u8,
     unique: bool,
 
     /// Validate basic invariants. Does not allocate.
-    pub fn validate(self: Schema) SchemaError!void {
-        if (self.columns.len == 0) return SchemaError.EmptyColumns;
-        if (self.order_key.len == 0) return SchemaError.EmptyOrderKey;
+    pub fn validate(self: TableSchema) TableSchemaError!void {
+        if (self.columns.len == 0) return TableSchemaError.EmptyColumns;
+        if (self.order_key.len == 0) return TableSchemaError.EmptyOrderKey;
 
         for (self.columns, 0..) |c, i| {
             for (self.columns[0..i]) |prior| {
-                if (std.mem.eql(u8, c.name, prior.name)) return SchemaError.DuplicateColumn;
+                if (std.mem.eql(u8, c.name, prior.name)) return TableSchemaError.DuplicateColumn;
             }
         }
 
         for (self.order_key) |key| {
-            if (self.columnIndex(key) == null) return SchemaError.OrderKeyColumnMissing;
+            if (self.columnIndex(key) == null) return TableSchemaError.OrderKeyColumnMissing;
         }
     }
 
-    pub fn columnIndex(self: Schema, name: []const u8) ?usize {
+    pub fn columnIndex(self: TableSchema, name: []const u8) ?usize {
         for (self.columns, 0..) |c, i| {
             if (std.mem.eql(u8, c.name, name)) return i;
         }
         return null;
     }
 
-    pub fn column(self: Schema, name: []const u8) ?Column {
+    pub fn column(self: TableSchema, name: []const u8) ?Column {
         const idx = self.columnIndex(name) orelse return null;
         return self.columns[idx];
     }
@@ -386,8 +386,8 @@ test "Value.compare on text" {
     try std.testing.expectEqual(std.math.Order.lt, a.compare(b));
 }
 
-test "Schema.validate accepts a well-formed schema" {
-    const schema = Schema{
+test "TableSchema.validate accepts a well-formed schema" {
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "name", .type = .string },
@@ -402,8 +402,8 @@ test "Schema.validate accepts a well-formed schema" {
     try std.testing.expectEqual(@as(?usize, null), schema.columnIndex("missing"));
 }
 
-test "Schema.validate rejects duplicate columns" {
-    const schema = Schema{
+test "TableSchema.validate rejects duplicate columns" {
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "id", .type = .int },
@@ -411,23 +411,23 @@ test "Schema.validate rejects duplicate columns" {
         .order_key = &.{"id"},
         .unique = false,
     };
-    try std.testing.expectError(SchemaError.DuplicateColumn, schema.validate());
+    try std.testing.expectError(TableSchemaError.DuplicateColumn, schema.validate());
 }
 
-test "Schema.validate rejects order key that isn't a column" {
-    const schema = Schema{
+test "TableSchema.validate rejects order key that isn't a column" {
+    const schema = TableSchema{
         .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"missing"},
         .unique = false,
     };
-    try std.testing.expectError(SchemaError.OrderKeyColumnMissing, schema.validate());
+    try std.testing.expectError(TableSchemaError.OrderKeyColumnMissing, schema.validate());
 }
 
-test "Schema.validate rejects empty columns" {
-    const schema = Schema{
+test "TableSchema.validate rejects empty columns" {
+    const schema = TableSchema{
         .columns = &.{},
         .order_key = &.{"id"},
         .unique = false,
     };
-    try std.testing.expectError(SchemaError.EmptyColumns, schema.validate());
+    try std.testing.expectError(TableSchemaError.EmptyColumns, schema.validate());
 }

@@ -15,7 +15,7 @@ const PlanBuilder = thindb.PlanBuilder;
 
 // Three small tables, two of them joinable on `k`.
 
-const schema_a = thindb.Schema{
+const schema_a = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "k", .type = .int },
@@ -24,7 +24,7 @@ const schema_a = thindb.Schema{
     .order_key = &.{"id"},
     .unique = true,
 };
-const schema_b = thindb.Schema{
+const schema_b = thindb.TableSchema{
     .columns = &.{
         .{ .name = "bid", .type = .bigint },
         .{ .name = "k", .type = .int },
@@ -33,7 +33,7 @@ const schema_b = thindb.Schema{
     .order_key = &.{"bid"},
     .unique = true,
 };
-const schema_c = thindb.Schema{
+const schema_c = thindb.TableSchema{
     .columns = &.{
         .{ .name = "cid", .type = .bigint },
         .{ .name = "label", .type = .string },

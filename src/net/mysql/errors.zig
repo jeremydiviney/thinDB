@@ -1,6 +1,7 @@
 //! Error-code mapping from thinDB's internal error set to MySQL wire codes.
 
 const std = @import("std");
+const error_map = @import("../error_map.zig");
 
 pub const Mapped = struct {
     code: u16,
@@ -12,22 +13,16 @@ pub const Mapped = struct {
 /// `fallback_msg` is used for the default 1064 mapping when we don't
 /// recognize the error name.
 pub fn mapInternal(err: anyerror, fallback_msg: []const u8) Mapped {
-    const name = @errorName(err);
-    if (std.mem.eql(u8, name, "TableNotFound"))
-        return .{ .code = 1146, .sqlstate = "42S02".*, .message = "Table not found" };
-    if (std.mem.eql(u8, name, "DatabaseNotFound"))
-        return .{ .code = 1049, .sqlstate = "42000".*, .message = "Unknown database" };
-    if (std.mem.eql(u8, name, "DatabaseAlreadyExists"))
-        return .{ .code = 1007, .sqlstate = "HY000".*, .message = "Database exists" };
-    if (std.mem.eql(u8, name, "SchemaNotFound"))
-        return .{ .code = 1146, .sqlstate = "42S02".*, .message = "Schema not found" };
-    if (std.mem.eql(u8, name, "SchemaAlreadyExists"))
-        return .{ .code = 1050, .sqlstate = "42S01".*, .message = "Schema exists" };
-    if (std.mem.eql(u8, name, "TableAlreadyExists"))
-        return .{ .code = 1050, .sqlstate = "42S01".*, .message = "Table exists" };
-    if (std.mem.eql(u8, name, "ColumnNotFound"))
-        return .{ .code = 1054, .sqlstate = "42S22".*, .message = "Unknown column" };
-    return .{ .code = 1064, .sqlstate = "42000".*, .message = fallback_msg };
+    return switch (error_map.classify(@errorName(err))) {
+        .table_not_found => .{ .code = 1146, .sqlstate = "42S02".*, .message = "Table not found" },
+        .database_not_found => .{ .code = 1049, .sqlstate = "42000".*, .message = "Unknown database" },
+        .database_already_exists => .{ .code = 1007, .sqlstate = "HY000".*, .message = "Database exists" },
+        .schema_not_found => .{ .code = 1146, .sqlstate = "42S02".*, .message = "Schema not found" },
+        .schema_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Schema exists" },
+        .table_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Table exists" },
+        .column_not_found => .{ .code = 1054, .sqlstate = "42S22".*, .message = "Unknown column" },
+        .unknown => .{ .code = 1064, .sqlstate = "42000".*, .message = fallback_msg },
+    };
 }
 
 test "mapInternal recognizes catalog errors" {

@@ -6,7 +6,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 
 pub const format = @import("format.zig");
 pub const column = @import("column.zig");
@@ -63,7 +63,7 @@ test "round-trip a single row group with all v0.1 types" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -157,7 +157,7 @@ test "round-trip with multiple row groups" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },

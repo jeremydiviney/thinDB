@@ -9,7 +9,7 @@
 const std = @import("std");
 const thindb = @import("thindb");
 
-const schema_v1 = thindb.Schema{
+const schema_v1 = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "qty", .type = .int },
@@ -243,7 +243,7 @@ test "tcp: insert with nullable fields preserves nulls through scan" {
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
     defer server.close();
 
-    const nullable_schema = thindb.Schema{
+    const nullable_schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int, .nullable = true },

@@ -19,7 +19,7 @@ const freshDir = common.freshDir;
 // Schemas
 // ----------------------------------------------------------------------------
 
-const bigint_left_schema = thindb.Schema{
+const bigint_left_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "k", .type = .bigint },
         .{ .name = "lval", .type = .int },
@@ -27,7 +27,7 @@ const bigint_left_schema = thindb.Schema{
     .order_key = &.{"k"},
     .unique = true,
 };
-const bigint_right_schema = thindb.Schema{
+const bigint_right_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "k", .type = .bigint },
         .{ .name = "rval", .type = .int },
@@ -42,7 +42,7 @@ const bigint_opts = thindb.TableOptions{
     .row_group_size = 65_536,
 };
 
-const string_schema_left = thindb.Schema{
+const string_schema_left = thindb.TableSchema{
     .columns = &.{
         .{ .name = "k", .type = .string },
         .{ .name = "lval", .type = .int },
@@ -50,7 +50,7 @@ const string_schema_left = thindb.Schema{
     .order_key = &.{"k"},
     .unique = true,
 };
-const string_schema_right = thindb.Schema{
+const string_schema_right = thindb.TableSchema{
     .columns = &.{
         .{ .name = "k", .type = .string },
         .{ .name = "rval", .type = .int },
@@ -65,7 +65,7 @@ const string_opts = thindb.TableOptions{
     .row_group_size = 65_536,
 };
 
-const uuid_schema_left = thindb.Schema{
+const uuid_schema_left = thindb.TableSchema{
     .columns = &.{
         .{ .name = "k", .type = .uuid },
         .{ .name = "lval", .type = .int },
@@ -73,7 +73,7 @@ const uuid_schema_left = thindb.Schema{
     .order_key = &.{"k"},
     .unique = true,
 };
-const uuid_schema_right = thindb.Schema{
+const uuid_schema_right = thindb.TableSchema{
     .columns = &.{
         .{ .name = "k", .type = .uuid },
         .{ .name = "rval", .type = .int },
@@ -92,7 +92,7 @@ const uuid_opts = thindb.TableOptions{
 // not in `k` order. SMJ must do a real sort. Same data otherwise — both
 // tables still cover k = [0..N) once each, so the inner join produces N
 // output rows.
-const bigint_unsorted_left_schema = thindb.Schema{
+const bigint_unsorted_left_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "rowid", .type = .bigint },
         .{ .name = "k", .type = .bigint },
@@ -101,7 +101,7 @@ const bigint_unsorted_left_schema = thindb.Schema{
     .order_key = &.{"rowid"},
     .unique = true,
 };
-const bigint_unsorted_right_schema = thindb.Schema{
+const bigint_unsorted_right_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "b_rowid", .type = .bigint },
         .{ .name = "k", .type = .bigint },
@@ -123,7 +123,7 @@ const bigint_unsorted_opts_right = thindb.TableOptions{
     .row_group_size = 65_536,
 };
 
-const string_unsorted_left_schema = thindb.Schema{
+const string_unsorted_left_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "rowid", .type = .bigint },
         .{ .name = "k", .type = .string },
@@ -132,7 +132,7 @@ const string_unsorted_left_schema = thindb.Schema{
     .order_key = &.{"rowid"},
     .unique = true,
 };
-const string_unsorted_right_schema = thindb.Schema{
+const string_unsorted_right_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "b_rowid", .type = .bigint },
         .{ .name = "k", .type = .string },
@@ -142,7 +142,7 @@ const string_unsorted_right_schema = thindb.Schema{
     .unique = true,
 };
 
-const uuid_unsorted_left_schema = thindb.Schema{
+const uuid_unsorted_left_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "rowid", .type = .bigint },
         .{ .name = "k", .type = .uuid },
@@ -151,7 +151,7 @@ const uuid_unsorted_left_schema = thindb.Schema{
     .order_key = &.{"rowid"},
     .unique = true,
 };
-const uuid_unsorted_right_schema = thindb.Schema{
+const uuid_unsorted_right_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "b_rowid", .type = .bigint },
         .{ .name = "k", .type = .uuid },
@@ -161,7 +161,7 @@ const uuid_unsorted_right_schema = thindb.Schema{
     .unique = true,
 };
 
-const compound_left_schema = thindb.Schema{
+const compound_left_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "g", .type = .bigint },
         .{ .name = "i", .type = .bigint },
@@ -170,7 +170,7 @@ const compound_left_schema = thindb.Schema{
     .order_key = &.{ "g", "i" },
     .unique = true,
 };
-const compound_right_schema = thindb.Schema{
+const compound_right_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "g", .type = .bigint },
         .{ .name = "i", .type = .bigint },
@@ -868,7 +868,7 @@ fn benchOpaquePredicateNlj(allocator: Allocator, io: Io, l_rows: usize, r_rows: 
 // Range / mixed-predicate benchmarks
 // ----------------------------------------------------------------------------
 
-const range_l_schema = thindb.Schema{
+const range_l_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "k", .type = .bigint },
         .{ .name = "x", .type = .bigint },
@@ -876,7 +876,7 @@ const range_l_schema = thindb.Schema{
     .order_key = &.{"k"},
     .unique = true,
 };
-const range_r_schema = thindb.Schema{
+const range_r_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "k", .type = .bigint },
         .{ .name = "y", .type = .bigint },
@@ -884,7 +884,7 @@ const range_r_schema = thindb.Schema{
     .order_key = &.{"k"},
     .unique = true,
 };
-const between_r_schema = thindb.Schema{
+const between_r_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "k", .type = .bigint },
         .{ .name = "lo", .type = .bigint },
@@ -1011,7 +1011,7 @@ fn benchEquiPlusBetween(allocator: Allocator, io: Io, n: usize, algo: thindb.exe
 
 // Distinct schemas for pure-range NLJ — no shared `k` column to drop
 // since there's no equi `on`.
-const pure_l_schema = thindb.Schema{
+const pure_l_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "l_rowid", .type = .bigint },
         .{ .name = "x", .type = .bigint },
@@ -1019,7 +1019,7 @@ const pure_l_schema = thindb.Schema{
     .order_key = &.{"l_rowid"},
     .unique = true,
 };
-const pure_r_schema = thindb.Schema{
+const pure_r_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "r_rowid", .type = .bigint },
         .{ .name = "y", .type = .bigint },

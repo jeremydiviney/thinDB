@@ -5,7 +5,7 @@
 const std = @import("std");
 const thindb = @import("thindb");
 
-const schema_basic = thindb.Schema{
+const schema_basic = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "name", .type = .string },
@@ -156,7 +156,7 @@ test "compute: substring with 1-indexed start, negative start, out-of-range" {
     defer tmp.cleanup();
 
     // Schema with the start/len columns so we can vary them per row.
-    const schema_sub = thindb.Schema{
+    const schema_sub = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "s", .type = .string },
@@ -216,7 +216,7 @@ test "compute: math — abs, ceil, floor, round, sign, mod, pow, sqrt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_math = thindb.Schema{
+    const schema_math = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "i", .type = .int },
@@ -276,7 +276,7 @@ test "compute: conditional — ifnull, nullif" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_cond = thindb.Schema{
+    const schema_cond = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "a", .type = .int, .nullable = true },
@@ -343,7 +343,7 @@ test "compute: date/time — calendar extractors + datediff + date_add" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_dt = thindb.Schema{
+    const schema_dt = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "d", .type = .date },
@@ -422,7 +422,7 @@ test "compute: conversion — numeric widening, narrowing, parsing, stringifying
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_conv = thindb.Schema{
+    const schema_conv = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "i", .type = .int },
@@ -685,7 +685,7 @@ test "compute: kitchen sink — every registered scalar function asserts" {
 
     // Single row, diverse columns. Values picked so the function
     // outputs are unambiguous.
-    const schema_all = thindb.Schema{
+    const schema_all = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "s", .type = .string },     // "  Hello  "
@@ -857,7 +857,7 @@ test "compute: coalesce returns first non-null + bookkeeps the output bitmap" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema_nullable = thindb.Schema{
+    const schema_nullable = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "a", .type = .string, .nullable = true },

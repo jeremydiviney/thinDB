@@ -6,7 +6,7 @@
 const std = @import("std");
 const thindb = @import("thindb");
 
-const schema_v1 = thindb.Schema{
+const schema_v1 = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "qty", .type = .int },
@@ -156,7 +156,7 @@ test "roundtrip: scan reads memtable without a flush" {
 // Nullable columns
 // ---------------------------------------------------------------------------
 
-const nullable_schema = thindb.Schema{
+const nullable_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "qty", .type = .int, .nullable = true },
@@ -306,7 +306,7 @@ test "nullable: SUM, MIN, MAX, COUNT(col) skip NULL rows" {
 // FLOAT / DOUBLE columns
 // ---------------------------------------------------------------------------
 
-const float_schema = thindb.Schema{
+const float_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "price", .type = .float },
@@ -395,7 +395,7 @@ test "float: nullable column with SUM skipping NULLs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "x", .type = .float, .nullable = true },
@@ -433,7 +433,7 @@ test "avg: int, float, with nulls and grouping" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "grp", .type = .int },
@@ -508,7 +508,7 @@ test "date/datetime: insert, flush, reread, comparison filter, MIN/MAX" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "d", .type = .date },
@@ -628,7 +628,7 @@ test "tinyint/smallint/largeint/char: insert, flush, reread, filter, MIN/MAX" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "tiny", .type = .tinyint },
@@ -734,7 +734,7 @@ test "decimal: insert, flush, reread, filter, SUM/MIN/MAX over both backings" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             // DECIMAL(10, 2) — i64 backing. Values are raw mantissa
@@ -844,7 +844,7 @@ test "decimal: p=38 holds the maximum i128 range" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             // Max precision, scale=0 (pure i128 integer-shaped storage).
@@ -883,7 +883,7 @@ test "decimal: scale == precision (all fractional digits)" {
     const io = std.testing.io;
 
     // DECIMAL(5, 5) — values in [-0.99999, 0.99999], i64 backing.
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "frac", .type = thindb.decimal(5, 5) },
@@ -1039,7 +1039,7 @@ test "error: filter predicate type mismatch on each new type" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "small", .type = .smallint },
@@ -1146,7 +1146,7 @@ test "error: insert with wrong-type value into typed column" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "v", .type = .{ .char = 8 } },
@@ -1477,7 +1477,7 @@ test "upsert: errors on non-unique tables" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "v", .type = .int },

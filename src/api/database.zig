@@ -23,6 +23,8 @@ const Schema = SchemaMod.Schema;
 const CatalogMod = @import("catalog.zig");
 const Catalog = CatalogMod.Catalog;
 
+const snapshot = @import("../util/snapshot.zig");
+
 pub const default_schema_name: []const u8 = "public";
 pub const back_compat_database_name: []const u8 = "main";
 
@@ -191,7 +193,7 @@ pub const Database = struct {
     pub fn table(
         self: *Database,
         name: []const u8,
-        table_schema: @import("../types.zig").Schema,
+        table_schema: @import("../types.zig").TableSchema,
         options: TableOptions,
     ) !*Table {
         const s = self.schema(default_schema_name) orelse return Error.SchemaNotFound;
@@ -230,8 +232,8 @@ pub const Database = struct {
 
     /// Walk every schema in this database and run one flush sweep on each.
     pub fn backgroundFlushSweep(self: *Database) !void {
-        const names = try self.snapshotSchemaNames();
-        defer self.freeSchemaNames(names);
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.schemas_mutex, self.schemas);
+        defer snapshot.freeNames(self.allocator, names);
         for (names) |name| {
             const s = self.schema(name) orelse continue;
             try s.backgroundFlushSweep();
@@ -253,8 +255,8 @@ pub const Database = struct {
     }
 
     pub fn backgroundCompactSweep(self: *Database) !void {
-        const names = try self.snapshotSchemaNames();
-        defer self.freeSchemaNames(names);
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.schemas_mutex, self.schemas);
+        defer snapshot.freeNames(self.allocator, names);
         for (names) |name| {
             const s = self.schema(name) orelse continue;
             try s.backgroundCompactSweep();
@@ -275,22 +277,4 @@ pub const Database = struct {
         }
     }
 
-    fn snapshotSchemaNames(self: *Database) ![][]u8 {
-        self.schemas_mutex.lockUncancelable(self.io);
-        defer self.schemas_mutex.unlock(self.io);
-        const out = try self.allocator.alloc([]u8, self.schemas.count());
-        errdefer self.allocator.free(out);
-        var i: usize = 0;
-        errdefer for (out[0..i]) |s| self.allocator.free(s);
-        var it = self.schemas.keyIterator();
-        while (it.next()) |k| : (i += 1) {
-            out[i] = try self.allocator.dupe(u8, k.*);
-        }
-        return out;
-    }
-
-    fn freeSchemaNames(self: *Database, names: [][]u8) void {
-        for (names) |s| self.allocator.free(s);
-        self.allocator.free(names);
-    }
 };

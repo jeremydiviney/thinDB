@@ -7,7 +7,7 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 const Type = types.Type;
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -47,7 +47,7 @@ pub const SortedSnapshot = struct {
 
 pub const Memtable = struct {
     allocator: Allocator,
-    schema: Schema,
+    schema: TableSchema,
     columns: []ColumnStore,
     row_count: u64 = 0,
 
@@ -65,7 +65,7 @@ pub const Memtable = struct {
     /// Heap-allocate a Memtable with refcount = 1. Use this for any Memtable
     /// owned by a Table (the value-returning `init` is kept for unit tests
     /// that own the struct on the stack).
-    pub fn create(allocator: Allocator, schema: Schema) !*Memtable {
+    pub fn create(allocator: Allocator, schema: TableSchema) !*Memtable {
         return createCapacity(allocator, schema, 0, 0);
     }
 
@@ -75,7 +75,7 @@ pub const Memtable = struct {
     /// pointers a snapshot-pinned scan is iterating.
     pub fn createCapacity(
         allocator: Allocator,
-        schema: Schema,
+        schema: TableSchema,
         rows_cap: usize,
         bytes_cap: usize,
     ) !*Memtable {
@@ -85,13 +85,13 @@ pub const Memtable = struct {
         return self;
     }
 
-    pub fn init(allocator: Allocator, schema: Schema) !Memtable {
+    pub fn init(allocator: Allocator, schema: TableSchema) !Memtable {
         return initCapacity(allocator, schema, 0, 0);
     }
 
     pub fn initCapacity(
         allocator: Allocator,
-        schema: Schema,
+        schema: TableSchema,
         rows_cap: usize,
         bytes_cap: usize,
     ) !Memtable {
@@ -758,7 +758,7 @@ fn asConstSlice(v: anytype) []const u8 {
 
 test "memtable insertRows accumulates and exposes ColumnViews" {
     const allocator = std.testing.allocator;
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -793,7 +793,7 @@ test "memtable insertRows accumulates and exposes ColumnViews" {
 
 test "memtable insertRows rejects missing column" {
     const allocator = std.testing.allocator;
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -810,7 +810,7 @@ test "memtable insertRows rejects missing column" {
 
 test "memtable insertRows rejects unknown column" {
     const allocator = std.testing.allocator;
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"id"},
         .unique = false,
@@ -824,7 +824,7 @@ test "memtable insertRows rejects unknown column" {
 
 test "memtable clear resets row count but preserves capacity" {
     const allocator = std.testing.allocator;
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "tag", .type = .string },

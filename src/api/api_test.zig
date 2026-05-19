@@ -8,7 +8,7 @@ const Table = api.Table;
 const Error = api.Error;
 
 const types = @import("../types.zig");
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 
 const storage = @import("../storage/storage.zig");
 const exec = @import("../exec/exec.zig");
@@ -33,7 +33,7 @@ test "Table insert + flush writes a segment, manifest reflects it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -101,7 +101,7 @@ test "Flush writes segment sorted by order key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "tag", .type = .string },
@@ -153,7 +153,7 @@ test "Flush sorts by composite order key (lexicographic)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "user_id", .type = .bigint },
             .{ .name = "ts", .type = .bigint },
@@ -202,7 +202,7 @@ test "Table reopen with different schema returns mismatch" {
         var db = try Database.open(allocator, io, tmp.dir, .{});
         defer db.close();
 
-        const schema_a = Schema{
+        const schema_a = TableSchema{
             .columns = &.{.{ .name = "id", .type = .bigint }},
             .order_key = &.{"id"},
             .unique = false,
@@ -216,7 +216,7 @@ test "Table reopen with different schema returns mismatch" {
         var db = try Database.open(allocator, io, tmp.dir, .{});
         defer db.close();
 
-        const schema_b = Schema{
+        const schema_b = TableSchema{
             .columns = &.{.{ .name = "id", .type = .int }}, // <-- changed type
             .order_key = &.{"id"},
             .unique = false,
@@ -233,7 +233,7 @@ test "openTable reads persisted schema without caller supplying it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "tag", .type = .string },
@@ -270,7 +270,7 @@ test "delete tombstones matching rows in flushed segments" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "status", .type = .{ .varchar = 16 } },
@@ -317,7 +317,7 @@ test "upsert works with compound (bigint, bigint) order key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "user_id", .type = .bigint },
             .{ .name = "ts", .type = .bigint },
@@ -369,7 +369,7 @@ test "upsert works with single STRING order key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "code", .type = .string },
             .{ .name = "qty", .type = .int },
@@ -417,7 +417,7 @@ test "upsert works with mixed (string, bigint) compound key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "tenant", .type = .string },
             .{ .name = "event_id", .type = .bigint },
@@ -459,7 +459,7 @@ test "compact merges segments and absorbs tombstones" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "tag", .type = .string },
@@ -515,7 +515,7 @@ test "auto-flush fires when row count threshold is hit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -549,7 +549,7 @@ test "auto-flush does NOT fire below thresholds" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"id"},
         .unique = false,
@@ -578,7 +578,7 @@ test "compact on empty table is a no-op" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"id"},
         .unique = false,
@@ -598,7 +598,7 @@ test "upsert: re-inserting the same key tombstones the old row" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "val", .type = .int },
@@ -648,7 +648,7 @@ test "upsert: duplicate keys within a single insert keep the last one" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "val", .type = .int },
@@ -682,7 +682,7 @@ test "delete removes matching rows from memtable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const schema = Schema{
+    const schema = TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },

@@ -42,7 +42,7 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 const Type = types.Type;
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 const TypeTag = types.TypeTag;
 const ValueTag = types.ValueTag;
 const Value = types.Value;

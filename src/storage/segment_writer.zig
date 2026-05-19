@@ -8,7 +8,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 
 const format = @import("format.zig");
 const column = @import("column.zig");
@@ -23,7 +23,7 @@ pub fn writeSegment(
     io: Io,
     dir: Io.Dir,
     file_name: []const u8,
-    schema: Schema,
+    schema: TableSchema,
     segment_id: u64,
     schema_fingerprint: u64,
     row_group_size: usize,

@@ -45,7 +45,7 @@ const types = @import("../types.zig");
 const Type = types.Type;
 const TypeTag = types.TypeTag;
 const ValueTag = types.ValueTag;
-const Schema = types.Schema;
+const TableSchema = types.TableSchema;
 const Column = types.Column;
 
 const storage = @import("../storage/storage.zig");
@@ -298,7 +298,7 @@ pub fn appendLenString(allocator: Allocator, out: *std.ArrayList(u8), s: []const
 ///   per column: [name_len u32][name][type_tag u8][nullable u8][type_extra u32]
 ///   [order_key_count u32]
 ///   per key: [name_len u32][name]
-pub fn encodeSchema(allocator: Allocator, out: *std.ArrayList(u8), schema: Schema) !void {
+pub fn encodeSchema(allocator: Allocator, out: *std.ArrayList(u8), schema: TableSchema) !void {
     try out.append(allocator, @intFromBool(schema.unique));
 
     try appendU32(allocator, out, @intCast(schema.columns.len));
@@ -317,7 +317,7 @@ pub fn encodeSchema(allocator: Allocator, out: *std.ArrayList(u8), schema: Schem
 /// `allocator` (an arena works well — caller can drop everything in one
 /// shot). The strings themselves are dup'd because they're borrowed
 /// from the input buffer and outlive the request handler.
-pub fn decodeSchema(allocator: Allocator, bytes: []const u8, cursor: *usize) !Schema {
+pub fn decodeSchema(allocator: Allocator, bytes: []const u8, cursor: *usize) !TableSchema {
     if (cursor.* + 1 > bytes.len) return Error.WireCorrupt;
     const unique = bytes[cursor.*] != 0;
     cursor.* += 1;
@@ -857,7 +857,7 @@ test "wire: encodeBatch produces sensible length-prefixed output" {
     var conn = try thindb.local(allocator, std.testing.io, tmp.dir, .{});
     defer conn.close();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },
@@ -900,7 +900,7 @@ test "wire: batch encode -> decode round-trip preserves data" {
     var conn = try thindb.local(allocator, std.testing.io, tmp.dir, .{});
     defer conn.close();
 
-    const schema = thindb.Schema{
+    const schema = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
             .{ .name = "qty", .type = .int },

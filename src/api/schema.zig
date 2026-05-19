@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const types = @import("../types.zig");
-const TableSchema = types.Schema;
+const TableSchema = types.TableSchema;
 
 const api = @import("api.zig");
 const Config = api.Config;
@@ -19,6 +19,8 @@ const AlterOp = api.AlterOp;
 const Table = api.Table;
 
 const schemaFingerprint = api.schemaFingerprint;
+
+const snapshot = @import("../util/snapshot.zig");
 
 pub const Schema = struct {
     allocator: Allocator,
@@ -79,8 +81,8 @@ pub const Schema = struct {
     /// to it. Then calls `tryBackgroundFlush` (non-blocking on the per-
     /// table write mutex).
     pub fn backgroundFlushSweep(self: *Schema) !void {
-        const names = try self.snapshotTableNames();
-        defer self.freeTableNames(names);
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.tables_mutex, self.tables);
+        defer snapshot.freeNames(self.allocator, names);
 
         for (names) |name| {
             if (self.acquireTableShared(name)) |t| {
@@ -88,28 +90,6 @@ pub const Schema = struct {
                 t.tryBackgroundFlush() catch {};
             }
         }
-    }
-
-    /// Snapshot the current set of table names. Names are duplicated so
-    /// they survive a concurrent drop. Caller frees with `freeTableNames`.
-    fn snapshotTableNames(self: *Schema) ![][]u8 {
-        self.tables_mutex.lockUncancelable(self.io);
-        defer self.tables_mutex.unlock(self.io);
-
-        const out = try self.allocator.alloc([]u8, self.tables.count());
-        errdefer self.allocator.free(out);
-        var i: usize = 0;
-        errdefer for (out[0..i]) |s| self.allocator.free(s);
-        var it = self.tables.keyIterator();
-        while (it.next()) |k| : (i += 1) {
-            out[i] = try self.allocator.dupe(u8, k.*);
-        }
-        return out;
-    }
-
-    fn freeTableNames(self: *Schema, names: [][]u8) void {
-        for (names) |s| self.allocator.free(s);
-        self.allocator.free(names);
     }
 
     /// Re-resolve `name` under `tables_mutex` AND grab its `ddl_lock`
@@ -142,8 +122,8 @@ pub const Schema = struct {
     /// lock acquisition so a concurrent drop can't free the Table out
     /// from under us.
     pub fn backgroundCompactSweep(self: *Schema) !void {
-        const names = try self.snapshotTableNames();
-        defer self.freeTableNames(names);
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.tables_mutex, self.tables);
+        defer snapshot.freeNames(self.allocator, names);
 
         const min_segs = self.config.compact_min_segments;
         const tomb_thresh = self.config.compact_tombstone_threshold;
