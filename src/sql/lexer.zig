@@ -1,11 +1,10 @@
 //! SQL lexer — tokenizes a single SQL statement into a stream of
-//! tokens for the parser. Keywords are case-insensitive; identifiers
-//! preserve the original case; string literals are single-quoted with
-//! `''` for an embedded quote.
-//!
-//! v1 scope: enough tokens to support SELECT with WHERE / GROUP BY /
-//! ORDER BY / LIMIT. JOIN tokens (JOIN/INNER/ON/etc.) are recognized
-//! so the lexer doesn't need changes when the parser grows.
+//! tokens for the parser. Keywords are case-insensitive. Unquoted
+//! identifiers are case-folded to ASCII lowercase so MySQL clients
+//! (with `lower_case_table_names=1`) and PG clients (which lowercase
+//! unquoted) behave the same. Backtick-quoted identifiers preserve
+//! case and may contain any non-backtick byte. String literals are
+//! single-quoted with `''` for an embedded quote.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -46,6 +45,15 @@ pub const TokenTag = enum {
     kw_having,
     kw_with,
     kw_materialized,
+    kw_create,
+    kw_drop,
+    kw_database,
+    kw_databases,
+    kw_schema,
+    kw_schemas,
+    kw_use,
+    kw_show,
+    kw_tables,
 
     // Operators / punctuation.
     eq, // =
@@ -84,6 +92,7 @@ pub const Token = struct {
 
 pub const LexError = error{
     LexUnterminatedString,
+    LexUnterminatedIdentifier,
     LexInvalidNumber,
     LexUnexpectedChar,
 } || Allocator.Error;
@@ -162,8 +171,9 @@ pub const Lexer = struct {
                 return Token{ .tag = .gt, .text = self.src[start..self.pos] };
             },
             '\'' => return try self.lexString(),
+            '`' => return try self.lexBacktickIdent(),
             '0'...'9' => return try self.lexNumber(),
-            'a'...'z', 'A'...'Z', '_' => return self.lexIdent(),
+            'a'...'z', 'A'...'Z', '_' => return try self.lexIdent(),
             else => return LexError.LexUnexpectedChar,
         }
     }
@@ -257,16 +267,31 @@ pub const Lexer = struct {
         }
     }
 
-    fn lexIdent(self: *Lexer) Token {
+    fn lexIdent(self: *Lexer) LexError!Token {
         const start = self.pos;
         while (self.pos < self.src.len) : (self.pos += 1) {
             const c = self.src[self.pos];
             if (!std.ascii.isAlphanumeric(c) and c != '_') break;
         }
         const text = self.src[start..self.pos];
-        // Case-insensitive keyword match.
         if (keywordFor(text)) |kw| return Token{ .tag = kw, .text = text };
-        return Token{ .tag = .identifier, .text = text };
+        const lowered = try self.arena.alloc(u8, text.len);
+        for (text, 0..) |c, i| lowered[i] = std.ascii.toLower(c);
+        return Token{ .tag = .identifier, .text = lowered };
+    }
+
+    fn lexBacktickIdent(self: *Lexer) LexError!Token {
+        const start = self.pos;
+        self.pos += 1;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            if (self.src[self.pos] == '`') {
+                const text = self.src[start + 1 .. self.pos];
+                self.pos += 1;
+                if (text.len == 0) return LexError.LexUnexpectedChar;
+                return Token{ .tag = .identifier, .text = text };
+            }
+        }
+        return LexError.LexUnterminatedIdentifier;
     }
 };
 
@@ -301,6 +326,15 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "having", .tag = .kw_having },
         .{ .name = "with", .tag = .kw_with },
         .{ .name = "materialized", .tag = .kw_materialized },
+        .{ .name = "create", .tag = .kw_create },
+        .{ .name = "drop", .tag = .kw_drop },
+        .{ .name = "database", .tag = .kw_database },
+        .{ .name = "databases", .tag = .kw_databases },
+        .{ .name = "schema", .tag = .kw_schema },
+        .{ .name = "schemas", .tag = .kw_schemas },
+        .{ .name = "use", .tag = .kw_use },
+        .{ .name = "show", .tag = .kw_show },
+        .{ .name = "tables", .tag = .kw_tables },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;
@@ -326,15 +360,36 @@ test "lexer: simple SELECT" {
     try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
 }
 
-test "lexer: case-insensitive keywords + identifiers preserve case" {
+test "lexer: case-insensitive keywords + unquoted idents lowercased" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lx = Lexer.init(arena.allocator(), "select Foo from Bar");
     try std.testing.expectEqual(@as(TokenTag, .kw_select), (try lx.next()).tag);
     const id1 = try lx.next();
     try std.testing.expectEqual(@as(TokenTag, .identifier), id1.tag);
-    try std.testing.expectEqualStrings("Foo", id1.text);
+    try std.testing.expectEqualStrings("foo", id1.text);
     try std.testing.expectEqual(@as(TokenTag, .kw_from), (try lx.next()).tag);
+    const id2 = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .identifier), id2.tag);
+    try std.testing.expectEqualStrings("bar", id2.text);
+}
+
+test "lexer: backtick-quoted identifier preserves case + allows spaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "select `Foo Bar`");
+    try std.testing.expectEqual(@as(TokenTag, .kw_select), (try lx.next()).tag);
+    const id = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .identifier), id.tag);
+    try std.testing.expectEqualStrings("Foo Bar", id.text);
+    try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+}
+
+test "lexer: unterminated backtick errors cleanly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "`open ident");
+    try std.testing.expectError(LexError.LexUnterminatedIdentifier, lx.next());
 }
 
 test "lexer: operators including != <> <= >=" {

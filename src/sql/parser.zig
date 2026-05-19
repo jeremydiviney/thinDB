@@ -156,6 +156,14 @@ const Parser = struct {
     }
 
     fn parseStatement(self: *Parser) ParseError!*ir.Op {
+        // DDL / SHOW are leading-keyword forms that don't combine with
+        // WITH. They have no projection / FROM / WHERE / etc.; dispatch
+        // before the SELECT-only path.
+        switch (self.cur.tag) {
+            .kw_create, .kw_drop, .kw_use => return try self.parseDdl(),
+            .kw_show => return try self.parseShow(),
+            else => {},
+        }
         // Optional WITH clause: zero-or-more named CTEs precede the
         // main SELECT. Stored in self.ctes so the FROM clause can
         // resolve references.
@@ -325,6 +333,95 @@ const Parser = struct {
         }
 
         return root;
+    }
+
+    fn parseDdl(self: *Parser) ParseError!*ir.Op {
+        const head = self.cur.tag;
+        try self.advance();
+        switch (head) {
+            .kw_create => {
+                if (self.cur.tag == .kw_database) {
+                    try self.advance();
+                    const name = try self.dupedIdent();
+                    return try self.allocOp(.{ .ddl = .{ .create_database = name } });
+                }
+                if (self.cur.tag == .kw_schema) {
+                    try self.advance();
+                    const name = try self.dupedIdent();
+                    return try self.allocOp(.{ .ddl = .{ .create_schema = name } });
+                }
+                return ParseError.SqlExpectedKeyword;
+            },
+            .kw_drop => {
+                if (self.cur.tag == .kw_database) {
+                    try self.advance();
+                    const name = try self.dupedIdent();
+                    return try self.allocOp(.{ .ddl = .{ .drop_database = name } });
+                }
+                if (self.cur.tag == .kw_schema) {
+                    try self.advance();
+                    const name = try self.dupedIdent();
+                    return try self.allocOp(.{ .ddl = .{ .drop_schema = name } });
+                }
+                return ParseError.SqlExpectedKeyword;
+            },
+            .kw_use => {
+                const first = try self.dupedIdent();
+                if (self.cur.tag == .dot) {
+                    try self.advance();
+                    const second = try self.dupedIdent();
+                    return try self.allocOp(.{ .ddl = .{ .use_database_schema = .{
+                        .database = first,
+                        .schema = second,
+                    } } });
+                }
+                return try self.allocOp(.{ .ddl = .{ .use_schema = first } });
+            },
+            else => unreachable,
+        }
+    }
+
+    fn parseShow(self: *Parser) ParseError!*ir.Op {
+        try self.advance(); // consume SHOW
+        switch (self.cur.tag) {
+            .kw_databases => {
+                try self.advance();
+                return try self.allocOp(.{ .show = .databases });
+            },
+            .kw_schemas => {
+                try self.advance();
+                var db: ?[]const u8 = null;
+                if (self.cur.tag == .kw_from) {
+                    try self.advance();
+                    db = try self.dupedIdent();
+                }
+                return try self.allocOp(.{ .show = .{ .schemas = db } });
+            },
+            .kw_tables => {
+                try self.advance();
+                var ref: ir.TableRef = .{ .name = "" };
+                if (self.cur.tag == .kw_from) {
+                    try self.advance();
+                    const first = try self.dupedIdent();
+                    if (self.cur.tag == .dot) {
+                        try self.advance();
+                        const second = try self.dupedIdent();
+                        ref = .{ .database = first, .schema = second, .name = "" };
+                    } else {
+                        ref = .{ .schema = first, .name = "" };
+                    }
+                }
+                return try self.allocOp(.{ .show = .{ .tables = ref } });
+            },
+            else => return ParseError.SqlExpectedKeyword,
+        }
+    }
+
+    fn dupedIdent(self: *Parser) ParseError![]const u8 {
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const out = try self.arena.dupe(u8, self.cur.text);
+        try self.advance();
+        return out;
     }
 
     fn parseProjection(self: *Parser) ParseError![]const ProjItem {
@@ -592,19 +689,39 @@ const Parser = struct {
             try self.advance();
             return .{ .name = alias, .op = op };
         }
-        // Plain identifier — first check the CTE map, then fall back
-        // to a Scan against a real table by that name. Both forms
-        // accept an optional `[AS] alias` (alias becomes the ON-clause
-        // qualifier for the target).
-        const name = try self.expectIdent();
-        const name_dup = try self.arena.dupe(u8, name);
-        const op = if (self.ctes.get(name)) |entry|
-            entry.op
-        else
-            try self.allocOp(.{ .scan = .{ .table_name = name_dup } });
+        // Plain identifier — first check the CTE map (single-part name
+        // only). If it's a CTE, use the stored op. Otherwise parse 1-,
+        // 2-, or 3-part `[db.][schema.]table` into a TableRef-backed
+        // Scan.
+        const first = try self.expectIdent();
+        const first_dup = try self.arena.dupe(u8, first);
+        var op: *ir.Op = undefined;
+        var resolved_name: []const u8 = first_dup;
+        if (self.cur.tag != .dot and self.ctes.get(first) != null) {
+            op = self.ctes.get(first).?.op;
+        } else {
+            var parts_buf: [3][]const u8 = undefined;
+            parts_buf[0] = first_dup;
+            var parts_len: usize = 1;
+            while (self.cur.tag == .dot) {
+                if (parts_len == parts_buf.len) return ParseError.SqlExpectedIdent;
+                try self.advance();
+                if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+                parts_buf[parts_len] = try self.arena.dupe(u8, self.cur.text);
+                parts_len += 1;
+                try self.advance();
+            }
+            const ref: ir.TableRef = switch (parts_len) {
+                1 => .{ .name = parts_buf[0] },
+                2 => .{ .schema = parts_buf[0], .name = parts_buf[1] },
+                3 => .{ .database = parts_buf[0], .schema = parts_buf[1], .name = parts_buf[2] },
+                else => unreachable,
+            };
+            op = try self.allocOp(.{ .scan = .{ .table = ref } });
+            resolved_name = parts_buf[parts_len - 1];
+        }
 
         // Optional AS alias.
-        var resolved_name = name_dup;
         if (self.cur.tag == .kw_as) {
             try self.advance();
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
@@ -970,6 +1087,7 @@ fn countRefs(
             try visitChild(arena, refs, j.right);
         },
         .materialize => |m| try visitChild(arena, refs, m.upstream),
+        .ddl, .show => {},
     }
 }
 

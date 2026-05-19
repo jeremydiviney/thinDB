@@ -57,6 +57,39 @@ pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 pub const version: u16 = 1;
 pub const header_size: usize = 8;
 
+/// Qualified table reference. Either segment may be null when the
+/// user left it implicit — resolution against the active Session
+/// happens at compile time, not parse time.
+pub const TableRef = struct {
+    database: ?[]const u8 = null,
+    schema: ?[]const u8 = null,
+    name: []const u8,
+};
+
+/// Side-effect statement payload. DDL ops don't produce rows; their
+/// `Query` returns null on the first `next()` call after invoking the
+/// side effect against the active Session.
+pub const DdlOp = union(enum) {
+    create_database: []const u8,
+    drop_database: []const u8,
+    create_schema: []const u8,
+    drop_schema: []const u8,
+    /// `USE name` — set current schema (one identifier).
+    use_schema: []const u8,
+    /// `USE db.schema` — set current database AND schema.
+    use_database_schema: struct { database: []const u8, schema: []const u8 },
+};
+
+/// Introspection statement payload. SHOW ops materialize one column
+/// of row names into a single Batch.
+pub const ShowOp = union(enum) {
+    databases,
+    /// `null` schema-target → list schemas in current_db.
+    schemas: ?[]const u8,
+    /// All three fields fall back to the Session as needed.
+    tables: TableRef,
+};
+
 pub const Error = error{
     IrBadMagic,
     IrUnsupportedVersion,
@@ -92,6 +125,12 @@ pub const OpTag = enum(u8) {
     /// CTEs marked MATERIALIZED, or auto-inserts when a CTE has
     /// refcount >= 2 and lacks NOT MATERIALIZED.
     materialize = 9,
+    /// Side-effect DDL statement (CREATE/DROP DATABASE|SCHEMA, USE).
+    /// Produces no rows.
+    ddl = 10,
+    /// Introspection (SHOW DATABASES/SCHEMAS/TABLES). Produces one
+    /// string column.
+    show = 11,
 };
 
 /// In-memory operator tree, built by the client query-builder and decoded
@@ -108,11 +147,15 @@ pub const Op = union(OpTag) {
     compute: Compute,
     join: Join,
     materialize: Materialize,
+    ddl: DdlOp,
+    show: ShowOp,
 
     pub const Scan = struct {
-        /// Table name. Borrowed from the encoded buffer on decode; owned
-        /// by the client on encode. Lifetime matches the surrounding Op.
-        table_name: []const u8,
+        /// Qualified table reference. Each segment is null when the user
+        /// left it implicit (resolved against the Session at compile time).
+        /// Strings borrowed from the encoded buffer on decode; owned by
+        /// the client on encode.
+        table: TableRef,
     };
 
     pub const Limit = struct {
@@ -232,6 +275,7 @@ pub const Op = union(OpTag) {
                 m.upstream.deinitDecoded(allocator);
                 allocator.destroy(m.upstream);
             },
+            .ddl, .show => {},
         }
     }
 };
@@ -262,10 +306,7 @@ const EncodeError = Allocator.Error;
 fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!void {
     try out.append(allocator, @intFromEnum(@as(OpTag, op)));
     switch (op) {
-        .scan => |s| {
-            try appendU32(allocator, out, @intCast(s.table_name.len));
-            try out.appendSlice(allocator, s.table_name);
-        },
+        .scan => |s| try encodeTableRef(allocator, out, s.table),
         .limit => |l| {
             try appendU64(allocator, out, l.n);
             try encodeOp(allocator, out, l.upstream.*);
@@ -278,6 +319,91 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .compute => |c| try encodeCompute(allocator, out, c),
         .join => |j| try encodeJoin(allocator, out, j),
         .materialize => |m| try encodeOp(allocator, out, m.upstream.*),
+        .ddl => |d| try encodeDdl(allocator, out, d),
+        .show => |s| try encodeShow(allocator, out, s),
+    }
+}
+
+fn encodeTableRef(allocator: Allocator, out: *std.ArrayList(u8), ref: TableRef) EncodeError!void {
+    try encodeOptString(allocator, out, ref.database);
+    try encodeOptString(allocator, out, ref.schema);
+    try appendU32(allocator, out, @intCast(ref.name.len));
+    try out.appendSlice(allocator, ref.name);
+}
+
+fn encodeOptString(allocator: Allocator, out: *std.ArrayList(u8), s: ?[]const u8) EncodeError!void {
+    if (s) |v| {
+        try out.append(allocator, 1);
+        try appendU32(allocator, out, @intCast(v.len));
+        try out.appendSlice(allocator, v);
+    } else {
+        try out.append(allocator, 0);
+    }
+}
+
+const DdlTag = enum(u8) {
+    create_database = 0,
+    drop_database = 1,
+    create_schema = 2,
+    drop_schema = 3,
+    use_schema = 4,
+    use_database_schema = 5,
+};
+
+fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeError!void {
+    switch (d) {
+        .create_database => |n| {
+            try out.append(allocator, @intFromEnum(DdlTag.create_database));
+            try appendU32(allocator, out, @intCast(n.len));
+            try out.appendSlice(allocator, n);
+        },
+        .drop_database => |n| {
+            try out.append(allocator, @intFromEnum(DdlTag.drop_database));
+            try appendU32(allocator, out, @intCast(n.len));
+            try out.appendSlice(allocator, n);
+        },
+        .create_schema => |n| {
+            try out.append(allocator, @intFromEnum(DdlTag.create_schema));
+            try appendU32(allocator, out, @intCast(n.len));
+            try out.appendSlice(allocator, n);
+        },
+        .drop_schema => |n| {
+            try out.append(allocator, @intFromEnum(DdlTag.drop_schema));
+            try appendU32(allocator, out, @intCast(n.len));
+            try out.appendSlice(allocator, n);
+        },
+        .use_schema => |n| {
+            try out.append(allocator, @intFromEnum(DdlTag.use_schema));
+            try appendU32(allocator, out, @intCast(n.len));
+            try out.appendSlice(allocator, n);
+        },
+        .use_database_schema => |p| {
+            try out.append(allocator, @intFromEnum(DdlTag.use_database_schema));
+            try appendU32(allocator, out, @intCast(p.database.len));
+            try out.appendSlice(allocator, p.database);
+            try appendU32(allocator, out, @intCast(p.schema.len));
+            try out.appendSlice(allocator, p.schema);
+        },
+    }
+}
+
+const ShowTag = enum(u8) {
+    databases = 0,
+    schemas = 1,
+    tables = 2,
+};
+
+fn encodeShow(allocator: Allocator, out: *std.ArrayList(u8), s: ShowOp) EncodeError!void {
+    switch (s) {
+        .databases => try out.append(allocator, @intFromEnum(ShowTag.databases)),
+        .schemas => |db| {
+            try out.append(allocator, @intFromEnum(ShowTag.schemas));
+            try encodeOptString(allocator, out, db);
+        },
+        .tables => |ref| {
+            try out.append(allocator, @intFromEnum(ShowTag.tables));
+            try encodeTableRef(allocator, out, ref);
+        },
     }
 }
 
@@ -574,18 +700,13 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.materialize)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.show)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
         .scan => blk: {
-            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
-            const name_len = readU32(bytes[cursor.* .. cursor.* + 4]);
-            cursor.* += 4;
-            if (cursor.* + name_len > bytes.len) return Error.IrCorrupt;
-            const name = bytes[cursor.* .. cursor.* + name_len];
-            cursor.* += name_len;
-            break :blk Op{ .scan = .{ .table_name = name } };
+            const ref = try decodeTableRef(bytes, cursor);
+            break :blk Op{ .scan = .{ .table = ref } };
         },
         .limit => blk: {
             if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;
@@ -785,6 +906,57 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             upstream.* = try decodeOp(allocator, bytes, cursor);
             break :blk Op{ .materialize = .{ .upstream = upstream } };
         },
+        .ddl => Op{ .ddl = try decodeDdl(bytes, cursor) },
+        .show => Op{ .show = try decodeShow(bytes, cursor) },
+    };
+}
+
+fn decodeTableRef(bytes: []const u8, cursor: *usize) DecodeError!TableRef {
+    const database = try decodeOptString(bytes, cursor);
+    const schema = try decodeOptString(bytes, cursor);
+    const name = try readString(bytes, cursor);
+    return .{ .database = database, .schema = schema, .name = name };
+}
+
+fn decodeOptString(bytes: []const u8, cursor: *usize) DecodeError!?[]const u8 {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const present = bytes[cursor.*];
+    cursor.* += 1;
+    if (present == 0) return null;
+    if (present != 1) return Error.IrCorrupt;
+    return try readString(bytes, cursor);
+}
+
+fn decodeDdl(bytes: []const u8, cursor: *usize) DecodeError!DdlOp {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const t = bytes[cursor.*];
+    cursor.* += 1;
+    if (t > @intFromEnum(DdlTag.use_database_schema)) return Error.IrCorrupt;
+    const tag: DdlTag = @enumFromInt(t);
+    return switch (tag) {
+        .create_database => DdlOp{ .create_database = try readString(bytes, cursor) },
+        .drop_database => DdlOp{ .drop_database = try readString(bytes, cursor) },
+        .create_schema => DdlOp{ .create_schema = try readString(bytes, cursor) },
+        .drop_schema => DdlOp{ .drop_schema = try readString(bytes, cursor) },
+        .use_schema => DdlOp{ .use_schema = try readString(bytes, cursor) },
+        .use_database_schema => blk: {
+            const db = try readString(bytes, cursor);
+            const sc = try readString(bytes, cursor);
+            break :blk DdlOp{ .use_database_schema = .{ .database = db, .schema = sc } };
+        },
+    };
+}
+
+fn decodeShow(bytes: []const u8, cursor: *usize) DecodeError!ShowOp {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const t = bytes[cursor.*];
+    cursor.* += 1;
+    if (t > @intFromEnum(ShowTag.tables)) return Error.IrCorrupt;
+    const tag: ShowTag = @enumFromInt(t);
+    return switch (tag) {
+        .databases => ShowOp.databases,
+        .schemas => ShowOp{ .schemas = try decodeOptString(bytes, cursor) },
+        .tables => ShowOp{ .tables = try decodeTableRef(bytes, cursor) },
     };
 }
 
@@ -1002,7 +1174,11 @@ pub fn explain(allocator: Allocator, out: *std.ArrayList(u8), root: Op) !void {
 fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize) !void {
     try writeIndent(allocator, out, depth);
     switch (op) {
-        .scan => |s| try writeAll(allocator, out, "Scan ", s.table_name, "\n"),
+        .scan => |s| {
+            try out.appendSlice(allocator, "Scan ");
+            try writeTableRef(allocator, out, s.table);
+            try out.append(allocator, '\n');
+        },
         .limit => |l| {
             var buf: [48]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "Limit n={d}\n", .{l.n});
@@ -1104,6 +1280,56 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
         .materialize => |m| {
             try out.appendSlice(allocator, "Materialize\n");
             try explainOp(allocator, out, m.upstream.*, depth + 1);
+        },
+        .ddl => |d| try explainDdl(allocator, out, d),
+        .show => |s| try explainShow(allocator, out, s),
+    }
+}
+
+fn writeTableRef(allocator: Allocator, out: *std.ArrayList(u8), ref: TableRef) !void {
+    if (ref.database) |d| {
+        try out.appendSlice(allocator, d);
+        try out.append(allocator, '.');
+    }
+    if (ref.schema) |s| {
+        try out.appendSlice(allocator, s);
+        try out.append(allocator, '.');
+    }
+    try out.appendSlice(allocator, ref.name);
+}
+
+fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
+    switch (d) {
+        .create_database => |n| try writeAll(allocator, out, "CreateDatabase ", n, "\n"),
+        .drop_database => |n| try writeAll(allocator, out, "DropDatabase ", n, "\n"),
+        .create_schema => |n| try writeAll(allocator, out, "CreateSchema ", n, "\n"),
+        .drop_schema => |n| try writeAll(allocator, out, "DropSchema ", n, "\n"),
+        .use_schema => |n| try writeAll(allocator, out, "Use ", n, "\n"),
+        .use_database_schema => |p| {
+            try out.appendSlice(allocator, "Use ");
+            try out.appendSlice(allocator, p.database);
+            try out.append(allocator, '.');
+            try out.appendSlice(allocator, p.schema);
+            try out.append(allocator, '\n');
+        },
+    }
+}
+
+fn explainShow(allocator: Allocator, out: *std.ArrayList(u8), s: ShowOp) !void {
+    switch (s) {
+        .databases => try out.appendSlice(allocator, "ShowDatabases\n"),
+        .schemas => |db| {
+            try out.appendSlice(allocator, "ShowSchemas");
+            if (db) |name| {
+                try out.appendSlice(allocator, " from=");
+                try out.appendSlice(allocator, name);
+            }
+            try out.append(allocator, '\n');
+        },
+        .tables => |ref| {
+            try out.appendSlice(allocator, "ShowTables ");
+            try writeTableRef(allocator, out, ref);
+            try out.append(allocator, '\n');
         },
     }
 }
@@ -1268,7 +1494,7 @@ fn readU64(b: []const u8) u64 {
 test "ir: scan + limit round-trips through encode/decode" {
     const allocator = std.testing.allocator;
 
-    var limit_upstream_storage: Op = .{ .scan = .{ .table_name = "orders" } };
+    var limit_upstream_storage: Op = .{ .scan = .{ .table = .{ .name = "orders" } } };
     const root: Op = .{ .limit = .{ .n = 42, .upstream = &limit_upstream_storage } };
 
     var buf: std.ArrayList(u8) = .empty;
@@ -1281,7 +1507,7 @@ test "ir: scan + limit round-trips through encode/decode" {
     try std.testing.expect(decoded == .limit);
     try std.testing.expectEqual(@as(u64, 42), decoded.limit.n);
     try std.testing.expect(decoded.limit.upstream.* == .scan);
-    try std.testing.expectEqualStrings("orders", decoded.limit.upstream.scan.table_name);
+    try std.testing.expectEqualStrings("orders", decoded.limit.upstream.scan.table.name);
 }
 
 test "ir: decode rejects bad magic" {
@@ -1305,7 +1531,7 @@ test "ir: decode rejects truncated input" {
 test "ir: select round-trips with multiple columns" {
     const allocator = std.testing.allocator;
 
-    var scan_storage: Op = .{ .scan = .{ .table_name = "orders" } };
+    var scan_storage: Op = .{ .scan = .{ .table = .{ .name = "orders" } } };
     const cols = [_][]const u8{ "id", "qty", "tag" };
     const root: Op = .{ .select = .{ .columns = &cols, .upstream = &scan_storage } };
 
@@ -1322,13 +1548,13 @@ test "ir: select round-trips with multiple columns" {
     try std.testing.expectEqualStrings("qty", decoded.select.columns[1]);
     try std.testing.expectEqualStrings("tag", decoded.select.columns[2]);
     try std.testing.expect(decoded.select.upstream.* == .scan);
-    try std.testing.expectEqualStrings("orders", decoded.select.upstream.scan.table_name);
+    try std.testing.expectEqualStrings("orders", decoded.select.upstream.scan.table.name);
 }
 
 test "ir: exclude round-trips and is distinguishable from select" {
     const allocator = std.testing.allocator;
 
-    var scan_storage: Op = .{ .scan = .{ .table_name = "t" } };
+    var scan_storage: Op = .{ .scan = .{ .table = .{ .name = "t" } } };
     const cols = [_][]const u8{"secret"};
     const root: Op = .{ .exclude = .{ .columns = &cols, .upstream = &scan_storage } };
 
@@ -1346,7 +1572,7 @@ test "ir: exclude round-trips and is distinguishable from select" {
 test "ir: compute round-trips with a call expr over a col_ref" {
     const allocator = std.testing.allocator;
 
-    var scan_storage: Op = .{ .scan = .{ .table_name = "users" } };
+    var scan_storage: Op = .{ .scan = .{ .table = .{ .name = "users" } } };
     const arg = Expr{ .col_ref = "name" };
     const args = [_]Expr{arg};
     const expr_call = Expr{ .call = .{ .fn_name = "upper", .args = &args } };
@@ -1373,8 +1599,8 @@ test "ir: compute round-trips with a call expr over a col_ref" {
 test "ir: join round-trips with on + range + extra_predicate + skew" {
     const allocator = std.testing.allocator;
 
-    var left_scan: Op = .{ .scan = .{ .table_name = "orders" } };
-    var right_scan: Op = .{ .scan = .{ .table_name = "items" } };
+    var left_scan: Op = .{ .scan = .{ .table = .{ .name = "orders" } } };
+    var right_scan: Op = .{ .scan = .{ .table = .{ .name = "items" } } };
     const on_pairs = [_]JoinKeyPair{.{ .left = "item_id", .right = "id" }};
     const ranges = [_]JoinRangePredicate{.{ .left = "qty", .right = "min_qty", .op = .gte }};
     // Post-join filter on a column that exists in the joined output.
@@ -1411,16 +1637,16 @@ test "ir: join round-trips with on + range + extra_predicate + skew" {
     try std.testing.expectEqual(@as(f32, 0.5), decoded.join.skew_ratio_threshold);
     try std.testing.expectEqual(@as(u32, 50_000), decoded.join.skew_absolute_threshold);
     try std.testing.expect(decoded.join.left.* == .scan);
-    try std.testing.expectEqualStrings("orders", decoded.join.left.scan.table_name);
+    try std.testing.expectEqualStrings("orders", decoded.join.left.scan.table.name);
     try std.testing.expect(decoded.join.right.* == .scan);
-    try std.testing.expectEqualStrings("items", decoded.join.right.scan.table_name);
+    try std.testing.expectEqualStrings("items", decoded.join.right.scan.table.name);
 }
 
 test "ir: join with no on/ranges and no extra_predicate (pure-NLJ shape)" {
     const allocator = std.testing.allocator;
 
-    var left_scan: Op = .{ .scan = .{ .table_name = "a" } };
-    var right_scan: Op = .{ .scan = .{ .table_name = "b" } };
+    var left_scan: Op = .{ .scan = .{ .table = .{ .name = "a" } } };
+    var right_scan: Op = .{ .scan = .{ .table = .{ .name = "b" } } };
     const root: Op = .{ .join = .{
         .algorithm = .nested_loop,
         .join_type = .inner,

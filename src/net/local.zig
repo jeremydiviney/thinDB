@@ -26,9 +26,14 @@ const Io = std.Io;
 
 const thindb_api = @import("../api/api.zig");
 const Database = thindb_api.Database;
+const Catalog = thindb_api.Catalog;
+const DbSchema = thindb_api.Schema;
 const Config = thindb_api.Config;
+const Session = thindb_api.Session;
 const TableOptions = thindb_api.TableOptions;
 const AlterOp = thindb_api.AlterOp;
+const ApiError = thindb_api.Error;
+const ApiTable = thindb_api.Table;
 
 const types = @import("../types.zig");
 const Schema = types.Schema;
@@ -39,6 +44,8 @@ const Batch = exec.Batch;
 const PredicateExpr = exec.PredicateExpr;
 const SortSpec = exec.SortSpec;
 const AggSpec = exec.AggSpec;
+
+const storage = @import("../storage/storage.zig");
 
 const ir = @import("../ir/ir.zig");
 const wire = @import("wire.zig");
@@ -51,6 +58,10 @@ pub const Error = error{
     SchemaMismatch,
     TypeMismatch,
     UnsupportedOp,
+    DatabaseNotFound,
+    DatabaseAlreadyExists,
+    SchemaNotFound,
+    SchemaAlreadyExists,
     /// Server requires authentication and the client either didn't
     /// present a token or presented an invalid one.
     AuthFailed,
@@ -387,7 +398,7 @@ pub const Connection = struct {
         return .{
             .allocator = self.allocator,
             .conn = self,
-            .root = .{ .scan = .{ .table_name = table_name } },
+            .root = .{ .scan = .{ .table = .{ .name = table_name } } },
             .arena = arena,
             .state = null,
         };
@@ -769,76 +780,92 @@ fn cloneProject(
     return .{ .columns = cols, .upstream = upstream };
 }
 
+/// Pick the *Catalog this Database hangs off of — non-owning `catalog`
+/// pointer first (set by `Catalog.createDatabase`), then the implicit
+/// `owned_catalog` (set by the back-compat `Database.open` shim).
+pub fn catalogFor(db: *Database) ?*Catalog {
+    if (db.catalog) |c| return c;
+    if (db.owned_catalog) |c| return c;
+    return null;
+}
+
+/// Resolve a `TableRef` against the active Session. Null segments fall
+/// back to `session.current_db` / `session.current_schema`. Each
+/// resolution step returns a precise typed error so callers can map
+/// failures back to user-facing messages.
+pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*ApiTable {
+    const db_name = ref.database orelse session.current_db;
+    const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
+    const schema_name = ref.schema orelse session.current_schema;
+    const sc = db.schema(schema_name) orelse return Error.SchemaNotFound;
+    sc.tables_mutex.lockUncancelable(sc.io);
+    defer sc.tables_mutex.unlock(sc.io);
+    return sc.tables.get(ref.name) orelse return Error.TableNotFound;
+}
+
 /// Server-side IR dispatcher. Recursively walks the decoded IR tree and
 /// builds the corresponding exec.Query operator chain using existing
-/// in-process operators.
+/// in-process operators. Uses a default Session — call sites needing
+/// a non-default `current_db` / `current_schema` should go through
+/// `compile()` instead.
 pub fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
+    const session: Session = .{};
+    return buildServerQuerySession(allocator, db, session, op);
+}
+
+pub fn buildServerQuerySession(
+    allocator: Allocator,
+    db: *Database,
+    session: Session,
+    op: ir.Op,
+) !Query {
     return switch (op) {
         .scan => |s| blk: {
-            const t = db.findTable(s.table_name) orelse return Error.TableNotFound;
+            const catalog = catalogFor(db) orelse return Error.DatabaseNotFound;
+            const t = try resolveTable(catalog, session, s.table);
             break :blk try exec.scan(allocator, t);
         },
         .limit => |l| blk: {
-            const upstream = try buildServerQuery(allocator, db, l.upstream.*);
-            // exec.Query.limit takes usize; cast safely.
+            const upstream = try buildServerQuerySession(allocator, db, session, l.upstream.*);
             break :blk try upstream.limit(@intCast(l.n));
         },
         .select => |s| blk: {
-            var upstream = try buildServerQuery(allocator, db, s.upstream.*);
-            // If project() fails (e.g. column doesn't exist in upstream's
-            // schema), tear the upstream down to avoid a leak.
+            var upstream = try buildServerQuerySession(allocator, db, session, s.upstream.*);
             errdefer upstream.deinit();
-            // .project already validates column refs against upstream's
-            // outputSchema — any missing column surfaces as an error.
             break :blk try upstream.project(s.columns);
         },
         .exclude => |e| blk: {
-            var upstream = try buildServerQuery(allocator, db, e.upstream.*);
+            var upstream = try buildServerQuerySession(allocator, db, session, e.upstream.*);
             errdefer upstream.deinit();
-            // Translate exclude into a project of the complement: take
-            // upstream's current schema, drop the excluded columns, keep
-            // the rest in their original order. Strict pipeline semantic
-            // is enforced by the existing operators — once we project to
-            // the complement, downstream cannot reference the dropped
-            // columns.
             const upstream_cols = upstream.outputSchema();
             const remaining = try complementColumns(allocator, upstream_cols, e.columns);
             defer allocator.free(remaining);
             break :blk try upstream.project(remaining);
         },
         .filter => |f| blk: {
-            var upstream = try buildServerQuery(allocator, db, f.upstream.*);
+            var upstream = try buildServerQuerySession(allocator, db, session, f.upstream.*);
             errdefer upstream.deinit();
-            // exec.Query.filter validates the predicate against upstream's
-            // schema and pushes leaves through top-level ANDs down to Scan
-            // for row-group pruning.
             break :blk try upstream.filter(f.predicate);
         },
         .order_by => |o| blk: {
-            var upstream = try buildServerQuery(allocator, db, o.upstream.*);
+            var upstream = try buildServerQuerySession(allocator, db, session, o.upstream.*);
             errdefer upstream.deinit();
             break :blk try upstream.orderBy(o.specs);
         },
         .group_by => |g| blk: {
-            var upstream = try buildServerQuery(allocator, db, g.upstream.*);
+            var upstream = try buildServerQuerySession(allocator, db, session, g.upstream.*);
             errdefer upstream.deinit();
-            // exec.Query.groupBy with empty group_cols is the same operator
-            // used by exec.Query.aggregate (global aggregate).
             break :blk try upstream.groupBy(g.group_cols, g.aggs);
         },
         .compute => |c| blk: {
-            var upstream = try buildServerQuery(allocator, db, c.upstream.*);
+            var upstream = try buildServerQuerySession(allocator, db, session, c.upstream.*);
             errdefer upstream.deinit();
-            // Pass the IR Derived slice straight through — Compute.create
-            // takes the same shape (it's a re-export).
             break :blk try upstream.compute(c.derived);
         },
         .join => |j| blk: {
-            var left = try buildServerQuery(allocator, db, j.left.*);
+            var left = try buildServerQuerySession(allocator, db, session, j.left.*);
             errdefer left.deinit();
-            const right = try buildServerQuery(allocator, db, j.right.*);
-            // No errdefer on right: exec.Query.join consumes both on
-            // success AND failure (it always takes ownership for cleanup).
+            const right = try buildServerQuerySession(allocator, db, session, j.right.*);
             const spec: ir.JoinSpec = .{
                 .join_type = j.join_type,
                 .algorithm = j.algorithm,
@@ -855,6 +882,12 @@ pub fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
             // Plans containing Materialize nodes must go through
             // `compile()` instead — it threads a CompileCtx that
             // shares buffers across multi-references.
+            return Error.UnsupportedOp;
+        },
+        .ddl, .show => {
+            // Side-effect / introspection ops aren't recursive — they
+            // can't appear as the upstream of another op. The top-level
+            // compile() routes them straight to their dedicated builder.
             return Error.UnsupportedOp;
         },
     };
@@ -877,22 +910,42 @@ pub fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
 pub const CompileCtx = struct {
     allocator: Allocator,
     db: *Database,
+    /// Mutable so DDL `USE` statements can update `current_db` /
+    /// `current_schema` for subsequent statements that share the
+    /// same Session. Borrowed; caller owns the value.
+    session: *Session,
     materialized: std.AutoHashMapUnmanaged(*const ir.Op, *@import("../exec/materialize.zig").MaterializedBuffer) = .empty,
+    /// Strings duplicated into `allocator` to back Session updates from
+    /// `USE` statements. Freed at `deinit`.
+    session_strings: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn deinit(self: *CompileCtx) void {
         var it = self.materialized.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit();
         self.materialized.deinit(self.allocator);
+        for (self.session_strings.items) |s| self.allocator.free(s);
+        self.session_strings.deinit(self.allocator);
     }
 };
 
+/// Result of `compile()`. Holds the executable Query plus the
+/// CompileCtx (which owns shared materialization buffers). The
+/// CompileCtx's `session` field is a stable pointer into a heap-
+/// allocated cell that survives until `deinit()` — DDL ops mutate
+/// it in place; callers read the post-run value via `sessionValue()`.
 pub const CompiledQuery = struct {
     query: Query,
     ctx: CompileCtx,
+    /// Heap-allocated so the address inside `ctx.session` stays stable
+    /// across the lifetime of this CompiledQuery (CompiledQuery itself
+    /// is returned by value).
+    session_cell: *Session,
 
     pub fn deinit(self: *CompiledQuery) void {
         self.query.deinit();
         self.ctx.deinit();
+        const allocator = self.ctx.allocator;
+        allocator.destroy(self.session_cell);
     }
 
     pub fn next(self: *CompiledQuery) !?exec.Batch {
@@ -902,19 +955,45 @@ pub const CompiledQuery = struct {
     pub fn outputSchema(self: *CompiledQuery) []const @import("../types.zig").Column {
         return self.query.outputSchema();
     }
+
+    /// Current session bound to this query (reflects any USE that
+    /// executed during a DDL pipeline).
+    pub fn sessionValue(self: *CompiledQuery) Session {
+        return self.session_cell.*;
+    }
 };
 
+/// Back-compat shim: route a plan through `compile` with a default
+/// Session (current_db="main", current_schema="public").
 pub fn compile(allocator: Allocator, db: *Database, root: *const ir.Op) !CompiledQuery {
-    var ctx = CompileCtx{ .allocator = allocator, .db = db };
+    return compileWithSession(allocator, db, .{}, root);
+}
+
+/// Compile with an explicit initial Session. The Session is copied
+/// into a heap cell on the returned CompiledQuery; in-flight DDL
+/// statements mutate that cell. Multi-statement connections pass the
+/// post-run value back in via `cq.sessionValue()` before re-compiling.
+pub fn compileWithSession(
+    allocator: Allocator,
+    db: *Database,
+    session: Session,
+    root: *const ir.Op,
+) !CompiledQuery {
+    const session_cell = try allocator.create(Session);
+    session_cell.* = session;
+    errdefer allocator.destroy(session_cell);
+
+    var ctx = CompileCtx{ .allocator = allocator, .db = db, .session = session_cell };
     errdefer ctx.deinit();
     const q = try compileOp(&ctx, root);
-    return .{ .query = q, .ctx = ctx };
+    return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
 }
 
 fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
-            const t = ctx.db.findTable(s.table_name) orelse return Error.TableNotFound;
+            const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+            const t = try resolveTable(catalog, ctx.session.*, s.table);
             break :blk try exec.scan(ctx.allocator, t);
         },
         .limit => |l| blk: {
@@ -986,8 +1065,217 @@ fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             try ctx.materialized.put(ctx.allocator, op, buf);
             break :blk try mat.Reader.create(ctx.allocator, buf);
         },
+        .ddl => |d| try compileDdl(ctx, d),
+        .show => |s| try compileShow(ctx, s),
     };
 }
+
+fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
+    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    switch (d) {
+        .create_database => |name| _ = catalog.createDatabase(name) catch |e| return mapApiError(e),
+        .drop_database => |name| catalog.dropDatabase(name) catch |e| return mapApiError(e),
+        .create_schema => |name| {
+            const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
+            _ = db.createSchema(name) catch |e| return mapApiError(e);
+        },
+        .drop_schema => |name| {
+            const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
+            db.dropSchema(name) catch |e| return mapApiError(e);
+        },
+        .use_schema => |name| {
+            const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
+            _ = db.schema(name) orelse return Error.SchemaNotFound;
+            const owned = try ctx.allocator.dupe(u8, name);
+            try ctx.session_strings.append(ctx.allocator, owned);
+            ctx.session.current_schema = owned;
+        },
+        .use_database_schema => |p| {
+            const db = catalog.database(p.database) orelse return Error.DatabaseNotFound;
+            _ = db.schema(p.schema) orelse return Error.SchemaNotFound;
+            const db_owned = try ctx.allocator.dupe(u8, p.database);
+            try ctx.session_strings.append(ctx.allocator, db_owned);
+            const sc_owned = try ctx.allocator.dupe(u8, p.schema);
+            try ctx.session_strings.append(ctx.allocator, sc_owned);
+            ctx.session.current_db = db_owned;
+            ctx.session.current_schema = sc_owned;
+        },
+    }
+    return try EmptyOp.create(ctx.allocator);
+}
+
+fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
+    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    return switch (s) {
+        .databases => blk: {
+            const names = try catalog.listDatabases(ctx.allocator);
+            defer freeOwnedNames(ctx.allocator, names);
+            break :blk try NamesOp.create(ctx.allocator, "name", names);
+        },
+        .schemas => |db_arg| blk: {
+            const db_name = db_arg orelse ctx.session.current_db;
+            const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
+            const names = try db.listSchemas(ctx.allocator);
+            defer freeOwnedNames(ctx.allocator, names);
+            break :blk try NamesOp.create(ctx.allocator, "name", names);
+        },
+        .tables => |ref| blk: {
+            const db_name = ref.database orelse ctx.session.current_db;
+            const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
+            const sc_name = ref.schema orelse ctx.session.current_schema;
+            const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
+            const names = try sc.listTables(ctx.allocator);
+            defer freeOwnedNames(ctx.allocator, names);
+            break :blk try NamesOp.create(ctx.allocator, "name", names);
+        },
+    };
+}
+
+fn freeOwnedNames(allocator: Allocator, names: [][]u8) void {
+    for (names) |n| allocator.free(n);
+    allocator.free(names);
+}
+
+/// Translate the API-layer error set into local.Error. Allocator and
+/// IO errors propagate unchanged; namespace-specific errors map onto
+/// the local Error set so transports + tests can pattern-match them.
+fn mapApiError(e: anyerror) anyerror {
+    return switch (e) {
+        ApiError.DatabaseNotFound => Error.DatabaseNotFound,
+        ApiError.DatabaseAlreadyExists => Error.DatabaseAlreadyExists,
+        ApiError.SchemaNotFound => Error.SchemaNotFound,
+        ApiError.SchemaAlreadyExists => Error.SchemaAlreadyExists,
+        ApiError.TableNotFound => Error.TableNotFound,
+        ApiError.TableAlreadyExists => Error.TableAlreadyExists,
+        else => e,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic operators for DDL / SHOW.
+//
+// DDL ops return `EmptyOp` — single output column carrying a status name
+// only when needed (today: nothing — `.next()` returns null on first
+// call). SHOW ops return `NamesOp`, which materializes a list of names
+// into one string column and emits a single Batch.
+// ---------------------------------------------------------------------------
+
+const EmptyOp = struct {
+    allocator: Allocator,
+    schema: [1]types.Column,
+
+    fn create(allocator: Allocator) !Query {
+        const self = try allocator.create(EmptyOp);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .schema = .{.{ .name = "result", .type = .string }},
+        };
+        return exec.makeQuery(allocator, self);
+    }
+
+    pub fn next(_: *EmptyOp) !?exec.Batch {
+        return null;
+    }
+
+    pub fn deinit(self: *EmptyOp) void {
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    pub fn outputSchema(self: *EmptyOp) []const types.Column {
+        return self.schema[0..];
+    }
+
+    pub fn addPrune(_: *EmptyOp, _: exec.Predicate) !void {}
+
+    pub fn stats(_: *EmptyOp) exec.PipelineStats {
+        return .{ .upper_rows = 0 };
+    }
+
+    pub fn accountant(_: *EmptyOp) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+};
+
+const NamesOp = struct {
+    allocator: Allocator,
+    schema: [1]types.Column,
+    offsets: []u32,
+    bytes: []u8,
+    views: [1]storage.ColumnView,
+    row_count: usize,
+    emitted: bool,
+
+    fn create(allocator: Allocator, col_name: []const u8, names: [][]u8) !Query {
+        const owned_name = try allocator.dupe(u8, col_name);
+        errdefer allocator.free(owned_name);
+
+        const offsets = try allocator.alloc(u32, names.len + 1);
+        errdefer allocator.free(offsets);
+
+        var total: u32 = 0;
+        offsets[0] = 0;
+        for (names, 0..) |n, i| {
+            total += @intCast(n.len);
+            offsets[i + 1] = total;
+        }
+
+        const bytes = try allocator.alloc(u8, total);
+        errdefer allocator.free(bytes);
+        var pos: usize = 0;
+        for (names) |n| {
+            @memcpy(bytes[pos .. pos + n.len], n);
+            pos += n.len;
+        }
+
+        const self = try allocator.create(NamesOp);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .schema = .{.{ .name = owned_name, .type = .string }},
+            .offsets = offsets,
+            .bytes = bytes,
+            .views = undefined,
+            .row_count = names.len,
+            .emitted = false,
+        };
+        self.views[0] = .{ .data = .{ .string = .{ .offsets = self.offsets, .bytes = self.bytes } } };
+        return exec.makeQuery(allocator, self);
+    }
+
+    pub fn next(self: *NamesOp) !?exec.Batch {
+        if (self.emitted) return null;
+        self.emitted = true;
+        return exec.Batch{
+            .schema = self.schema[0..],
+            .values = self.views[0..],
+            .row_count = self.row_count,
+        };
+    }
+
+    pub fn deinit(self: *NamesOp) void {
+        const allocator = self.allocator;
+        allocator.free(self.schema[0].name);
+        allocator.free(self.offsets);
+        allocator.free(self.bytes);
+        allocator.destroy(self);
+    }
+
+    pub fn outputSchema(self: *NamesOp) []const types.Column {
+        return self.schema[0..];
+    }
+
+    pub fn addPrune(_: *NamesOp, _: exec.Predicate) !void {}
+
+    pub fn stats(self: *NamesOp) exec.PipelineStats {
+        return .{ .upper_rows = self.row_count };
+    }
+
+    pub fn accountant(_: *NamesOp) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+};
 
 /// Allocator-owned slice of column-name slices. Caller frees via
 /// `allocator.free(out)` once — the inner string slices are borrowed

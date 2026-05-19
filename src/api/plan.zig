@@ -63,9 +63,28 @@ pub const PlanBuilder = struct {
     // -----------------------------------------------------------------------
 
     pub fn scan(self: *PlanBuilder, table_name: []const u8) !*ir.Op {
+        return self.scanQualified(null, null, table_name);
+    }
+
+    /// Build a Scan node with explicit database/schema qualifiers.
+    /// Either qualifier may be null — null falls back to the active
+    /// Session at compile time. Symmetric with the 1-/2-/3-part SQL
+    /// surface.
+    pub fn scanQualified(
+        self: *PlanBuilder,
+        database: ?[]const u8,
+        schema: ?[]const u8,
+        table_name: []const u8,
+    ) !*ir.Op {
         const aa = self.arena.allocator();
         const op = try aa.create(ir.Op);
-        op.* = .{ .scan = .{ .table_name = try aa.dupe(u8, table_name) } };
+        const db_dup: ?[]const u8 = if (database) |d| try aa.dupe(u8, d) else null;
+        const sc_dup: ?[]const u8 = if (schema) |s| try aa.dupe(u8, s) else null;
+        op.* = .{ .scan = .{ .table = .{
+            .database = db_dup,
+            .schema = sc_dup,
+            .name = try aa.dupe(u8, table_name),
+        } } };
         return op;
     }
 
