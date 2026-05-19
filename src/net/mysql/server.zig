@@ -298,10 +298,22 @@ fn handleConnection(
         const cmd = pkt.payload[0];
         const body = pkt.payload[1..];
         switch (cmd) {
-            0x01 => return,
+            0x01 => return, // COM_QUIT
             0x02 => try handleInitDb(allocator, w, catalog, &session, body),
             0x03 => try handleQuery(allocator, w, catalog, &session, body),
-            0x0E => try handshake.sendOkPacket(allocator, w, 1, 0, 0),
+            0x0E => try handshake.sendOkPacket(allocator, w, 1, 0, 0), // COM_PING
+            // COM_RESET_CONNECTION — wipes per-connection state without
+            // closing the socket. Connection poolers (e.g. ProxySQL,
+            // mysql2's pool with `connectionLimit`) send this when
+            // returning a borrowed connection to scrub session state.
+            // We have no temp tables / prepared statements yet, so the
+            // only state to reset is the txn flag + reverting the
+            // current schema to the default.
+            0x1F => {
+                session.in_transaction = false;
+                try session.replace("main", "public");
+                try handshake.sendOkPacketStatus(allocator, w, 1, 0, 0, session.transactionStatus());
+            },
             else => try handshake.sendErrPacket(allocator, w, 1, 1047, "HY000".*, "Unknown command"),
         }
         try w.flush();

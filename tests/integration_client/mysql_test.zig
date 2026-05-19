@@ -132,6 +132,12 @@ const TestClient = struct {
         try self.writer.interface.flush();
     }
 
+    fn sendResetConnection(self: *TestClient) !void {
+        const buf = [_]u8{0x1F};
+        try mysql_packet.writePacket(&self.writer.interface, 0, &buf);
+        try self.writer.interface.flush();
+    }
+
     /// Drain a result set after a COM_QUERY. Returns a flattened slice
     /// of rows, each row a slice of optional column-text slices owned
     /// by `dest_arena`.
@@ -547,6 +553,65 @@ test "mysql wire: empty initial_db leaves session at main/public" {
     const rows = try client.readResultSet(arena.allocator());
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqualStrings("ok", rows[0][2].?);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_RESET_CONNECTION (0x1F) clears session state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    const main_db = catalog.database("main").?;
+    _ = try main_db.createSchema("scratch");
+
+    const port: u16 = test_port_base + 20;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    // Open a transaction and switch to a non-default schema.
+    try client.sendQuery("BEGIN");
+    {
+        const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+    }
+    try client.sendQuery("USE scratch");
+    {
+        const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+    }
+
+    // Binary RESET_CONNECTION wipes both.
+    try client.sendResetConnection();
+    {
+        const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+    }
+
+    // SELECT DATABASE() should now return "public" again.
+    try client.sendQuery("SELECT DATABASE()");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("public", rows[0][0].?);
 
     try client.sendQuit();
     if (sctx.err) |e| return e;
