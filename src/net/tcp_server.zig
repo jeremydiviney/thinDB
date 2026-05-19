@@ -347,7 +347,7 @@ fn handleRenameTable(db: *Database, payload: []const u8, writer: *std.Io.Writer)
 fn handleFlush(db: *Database, payload: []const u8, writer: *std.Io.Writer) !void {
     var cursor: usize = 0;
     const name = try wire.readLenString(payload, &cursor);
-    const t = db.tables.get(name) orelse return local.Error.TableNotFound;
+    const t = db.findTable(name) orelse return local.Error.TableNotFound;
     try t.flush();
     try sendOk(writer);
 }
@@ -355,7 +355,7 @@ fn handleFlush(db: *Database, payload: []const u8, writer: *std.Io.Writer) !void
 fn handleCompact(db: *Database, payload: []const u8, writer: *std.Io.Writer) !void {
     var cursor: usize = 0;
     const name = try wire.readLenString(payload, &cursor);
-    const t = db.tables.get(name) orelse return local.Error.TableNotFound;
+    const t = db.findTable(name) orelse return local.Error.TableNotFound;
     try t.compact();
     try sendOk(writer);
 }
@@ -368,7 +368,7 @@ fn handleInsert(
 ) !void {
     var cursor: usize = 0;
     const name = try wire.readLenString(payload, &cursor);
-    const t = db.tables.get(name) orelse return local.Error.TableNotFound;
+    const t = db.findTable(name) orelse return local.Error.TableNotFound;
 
     var decoded = try wire.decodeBatch(allocator, payload[cursor..]);
     defer decoded.deinit();
@@ -401,7 +401,7 @@ fn handleDelete(
         else => return local.Error.UnsupportedOp,
     };
 
-    const t = db.tables.get(name) orelse return local.Error.TableNotFound;
+    const t = db.findTable(name) orelse return local.Error.TableNotFound;
     const deleted = try t.delete(leaf);
 
     var resp_payload: [8]u8 = undefined;

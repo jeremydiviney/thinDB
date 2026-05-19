@@ -22,6 +22,11 @@ pub const api = @import("api/api.zig");
 pub const exec = @import("exec/exec.zig");
 
 pub const Database = api.Database;
+pub const Catalog = api.Catalog;
+/// Database-schema namespace type (Catalog → Database → Schema → Table).
+/// Exposed under a distinct name from the table-schema type
+/// `thindb.Schema = types.Schema` re-exported above.
+pub const DbSchema = api.Schema;
 pub const Table = api.Table;
 pub const Config = api.Config;
 pub const SyncMode = api.SyncMode;

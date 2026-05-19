@@ -83,13 +83,13 @@ pub const Table = struct {
     pub fn open(
         allocator: Allocator,
         io: Io,
-        data_dir: Io.Dir,
+        parent_dir: Io.Dir,
         name: []const u8,
         maybe_schema: ?Schema,
         cfg: Config,
         row_group_size: usize,
     ) !*Table {
-        var table_dir = try data_dir.createDirPathOpen(io, name, .{});
+        var table_dir = try parent_dir.createDirPathOpen(io, name, .{});
         errdefer table_dir.close(io);
 
         var schema_owner = try acquireSchema(allocator, io, table_dir, maybe_schema);

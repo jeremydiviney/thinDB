@@ -29,7 +29,7 @@ const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 
 const api = @import("api.zig");
-const Database = api.Database;
+const NsSchema = api.Schema;
 const Table = api.Table;
 const AlterOp = api.AlterOp;
 
@@ -182,7 +182,7 @@ fn valueTagMatchesType(v: Value, t: Type) bool {
 /// Shadow-rewrite the table. Holds `ddl_lock` exclusive AND `table.mutex`
 /// for the duration — blocks readers (waiting on in-flight scans),
 /// writers (via the existing mutex), and any other DDL.
-pub fn execAlter(db: *Database, t: *Table, ops: []const AlterOp) !void {
+pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     t.ddl_lock.lockUncancelable(t.io);
     defer t.ddl_lock.unlock(t.io);
     t.mutex.lockUncancelable(t.io);
@@ -199,9 +199,9 @@ pub fn execAlter(db: *Database, t: *Table, ops: []const AlterOp) !void {
     // 2. Create (or recreate, after a prior failed alter) the shadow directory.
     var shadow_name_buf: [256]u8 = undefined;
     const shadow_name = try std.fmt.bufPrint(&shadow_name_buf, "__alter_{s}", .{t.name});
-    db.data_dir.deleteTree(t.io, shadow_name) catch {};
+    s.schema_dir.deleteTree(t.io, shadow_name) catch {};
 
-    var shadow_dir = try db.data_dir.createDirPathOpen(t.io, shadow_name, .{});
+    var shadow_dir = try s.schema_dir.createDirPathOpen(t.io, shadow_name, .{});
     var shadow_segs = try shadow_dir.createDirPathOpen(t.io, "segments", .{});
     // After we close + rename below we don't want defer to double-close,
     // so close explicitly when done and set flags.
@@ -242,11 +242,11 @@ pub fn execAlter(db: *Database, t: *Table, ops: []const AlterOp) !void {
     shadow_dir.close(t.io);
     shadow_open = false;
 
-    try db.data_dir.deleteTree(t.io, t.name);
-    try db.data_dir.rename(shadow_name, db.data_dir, t.name, t.io);
+    try s.schema_dir.deleteTree(t.io, t.name);
+    try s.schema_dir.rename(shadow_name, s.schema_dir, t.name, t.io);
 
     // 6. Re-open Table state under the new schema.
-    try reInitTableState(db, t, new_fp);
+    try reInitTableState(s, t, new_fp);
 }
 
 /// Build a new segment in `shadow_segs` carrying `entry`'s rows but reshaped
@@ -347,11 +347,11 @@ fn fillDefault(
 /// Re-initialize the Table after the on-disk swap. Reopens dir handles,
 /// reloads schema + manifest, replaces the memtable with a fresh one
 /// matching the new schema. Caller holds `table.mutex`.
-fn reInitTableState(db: *Database, t: *Table, new_fp: u64) !void {
+fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64) !void {
     const allocator = t.allocator;
     const io = t.io;
 
-    t.table_dir = try db.data_dir.openDir(io, t.name, .{});
+    t.table_dir = try s.schema_dir.openDir(io, t.name, .{});
     t.segments_dir = try t.table_dir.openDir(io, "segments", .{});
 
     var new_owner = try storage.schema_file.readSchema(allocator, io, t.table_dir);

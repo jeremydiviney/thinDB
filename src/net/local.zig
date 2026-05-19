@@ -156,7 +156,7 @@ pub const Connection = struct {
     pub fn insert(self: *Connection, table_name: []const u8, rows: anytype) !void {
         switch (self.transport) {
             .in_process => |db| {
-                const t = db.tables.get(table_name) orelse return Error.TableNotFound;
+                const t = db.findTable(table_name) orelse return Error.TableNotFound;
                 try t.insert(rows);
             },
             .tcp => {
@@ -259,7 +259,7 @@ pub const Connection = struct {
     pub fn flush(self: *Connection, table_name: []const u8) !void {
         switch (self.transport) {
             .in_process => |db| {
-                const t = db.tables.get(table_name) orelse return Error.TableNotFound;
+                const t = db.findTable(table_name) orelse return Error.TableNotFound;
                 try t.flush();
             },
             .tcp => {
@@ -276,7 +276,7 @@ pub const Connection = struct {
     pub fn compact(self: *Connection, table_name: []const u8) !void {
         switch (self.transport) {
             .in_process => |db| {
-                const t = db.tables.get(table_name) orelse return Error.TableNotFound;
+                const t = db.findTable(table_name) orelse return Error.TableNotFound;
                 try t.compact();
             },
             .tcp => {
@@ -295,7 +295,7 @@ pub const Connection = struct {
     pub fn delete(self: *Connection, table_name: []const u8, pred: PredicateExpr) !usize {
         switch (self.transport) {
             .in_process => |db| {
-                const t = db.tables.get(table_name) orelse return Error.TableNotFound;
+                const t = db.findTable(table_name) orelse return Error.TableNotFound;
                 // v1 in-process matches v1 wire: only leaf predicates flow
                 // through to Table.delete (which takes a scalar Predicate).
                 switch (pred) {
@@ -775,7 +775,7 @@ fn cloneProject(
 pub fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
     return switch (op) {
         .scan => |s| blk: {
-            const t = db.tables.get(s.table_name) orelse return Error.TableNotFound;
+            const t = db.findTable(s.table_name) orelse return Error.TableNotFound;
             break :blk try exec.scan(allocator, t);
         },
         .limit => |l| blk: {
@@ -914,7 +914,7 @@ pub fn compile(allocator: Allocator, db: *Database, root: *const ir.Op) !Compile
 fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
-            const t = ctx.db.tables.get(s.table_name) orelse return Error.TableNotFound;
+            const t = ctx.db.findTable(s.table_name) orelse return Error.TableNotFound;
             break :blk try exec.scan(ctx.allocator, t);
         },
         .limit => |l| blk: {
