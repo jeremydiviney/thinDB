@@ -9,6 +9,7 @@ test {
     _ = @import("tcp_test.zig");
     _ = @import("mysql_test.zig");
     _ = @import("pg_test.zig");
+    _ = @import("server_binary_test.zig");
 }
 
 test "integration_client entry exists" {

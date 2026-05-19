@@ -21,7 +21,11 @@ const Io = std.Io;
 
 const thindb_api = @import("../api/api.zig");
 const Database = thindb_api.Database;
+const Catalog = thindb_api.Catalog;
 const Config = thindb_api.Config;
+
+const database_mod = @import("../api/database.zig");
+const back_compat_database_name = database_mod.back_compat_database_name;
 
 const exec = @import("../exec/exec.zig");
 const Query = exec.Query;
@@ -39,6 +43,10 @@ pub const Server = struct {
     io: Io,
     db: *Database,
     listener: std.Io.net.Server,
+    /// True when this Server owns `db` (created via `serveTcp`); false
+    /// when the caller passed in a Catalog-rooted Database via
+    /// `serveTcpCatalog` and is responsible for that Database's lifetime.
+    owns_db: bool,
 
     /// Whether to zstd-compress outgoing batch frames whose payload
     /// exceeds `wire.compression_threshold_bytes`. Default false — see
@@ -59,7 +67,7 @@ pub const Server = struct {
 
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
-        self.db.close();
+        if (self.owns_db) self.db.close();
         self.allocator.destroy(self);
     }
 
@@ -86,7 +94,8 @@ pub const Server = struct {
 };
 
 /// Open a Database at `data_dir`, start listening on `address`. Caller
-/// owns the returned *Server and must call `server.close()`.
+/// owns the returned *Server and must call `server.close()`. The Server
+/// owns the internal Database — `close()` tears it down.
 pub fn serveTcp(
     allocator: Allocator,
     io: Io,
@@ -110,6 +119,39 @@ pub fn serveTcp(
         .io = io,
         .db = db,
         .listener = listener,
+        .owns_db = true,
+    };
+    return self;
+}
+
+/// Bind a native-wire listener on `address` that serves queries against
+/// the "main" database inside an existing Catalog. Unlike `serveTcp`,
+/// the caller owns the Catalog (and therefore the Database) and must
+/// keep it alive for the Server's lifetime. Use this when several wire
+/// protocols need to share one on-disk dataset.
+pub fn serveTcpCatalog(
+    allocator: Allocator,
+    io: Io,
+    catalog: *Catalog,
+    address: std.Io.net.IpAddress,
+) !*Server {
+    const db = catalog.database(back_compat_database_name) orelse
+        try catalog.createDatabase(back_compat_database_name);
+
+    var listen_addr = address;
+    const listener = try std.Io.net.IpAddress.listen(&listen_addr, io, .{
+        .mode = .stream,
+        .protocol = .tcp,
+        .reuse_address = true,
+    });
+
+    const self = try allocator.create(Server);
+    self.* = .{
+        .allocator = allocator,
+        .io = io,
+        .db = db,
+        .listener = listener,
+        .owns_db = false,
     };
     return self;
 }

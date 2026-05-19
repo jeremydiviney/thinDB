@@ -98,4 +98,24 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Run benchmarks (recommended: -Doptimize=ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
+
+    // ---- thindb-server executable: standalone multi-wire server -------------
+    const server_mod = b.createModule(.{
+        .root_source_file = b.path("src/cmd/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_mod.addImport("thindb", thindb_mod);
+
+    const server_exe = b.addExecutable(.{
+        .name = "thindb-server",
+        .root_module = server_mod,
+    });
+    b.installArtifact(server_exe);
+
+    const run_server = b.addRunArtifact(server_exe);
+    run_server.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_server.addArgs(args);
+    const server_step = b.step("server", "Run thindb-server (pass --data-dir etc via -- ...)");
+    server_step.dependOn(&run_server.step);
 }

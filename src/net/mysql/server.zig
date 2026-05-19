@@ -10,6 +10,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+/// Default TCP port for a MySQL-wire listener. Matches the upstream
+/// MySQL default so existing client tooling Just Works.
+pub const default_port: u16 = 3306;
+
 const thindb_api = @import("../../api/api.zig");
 const Catalog = thindb_api.Catalog;
 const Session = thindb_api.Session;

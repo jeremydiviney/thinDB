@@ -11,6 +11,7 @@ pub const server = @import("pg/server.zig");
 pub const Server = server.Server;
 pub const Error = server.Error;
 pub const servePg = server.servePg;
+pub const default_port = server.default_port;
 
 test {
     _ = packet;
