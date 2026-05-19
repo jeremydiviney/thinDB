@@ -32,6 +32,10 @@ pub const Outcome = union(enum) {
     /// query at the next batch boundary and leave the connection
     /// open.
     kill: u32,
+    /// `RESET CONNECTION` — the wire layer drops the session's temp
+    /// namespace (if any), clears the txn flag, reverts the current
+    /// schema to defaults, then replies OK.
+    reset_connection,
 };
 
 /// Returns null if `sql` is not a probe query we recognize.
@@ -50,7 +54,7 @@ pub fn match(
         return Outcome{ .ok_packet = {} };
     }
 
-    if (std.mem.eql(u8, lc, "reset connection")) return Outcome{ .ok_packet = {} };
+    if (std.mem.eql(u8, lc, "reset connection")) return Outcome{ .reset_connection = {} };
 
     // KILL [QUERY|CONNECTION] <id> — strip the optional verb, then
     // parse the trailing integer.

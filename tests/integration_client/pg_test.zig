@@ -2205,3 +2205,235 @@ test "pg wire ext: pipelined Parse + Bind + Execute + Sync collects all replies"
     try client.sendTerminate();
     if (sctx.err) |e| return e;
 }
+
+test "pg wire: CREATE TEMP TABLE round-trip + DISCARD ALL drops it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 70;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    {
+        try client.sendQuery("CREATE TEMP TABLE scratch (id BIGINT PRIMARY KEY, val INT)");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+    }
+    {
+        try client.sendQuery("INSERT INTO scratch VALUES (1, 10), (2, 20)");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+    }
+    {
+        try client.sendQuery("SELECT id FROM scratch ORDER BY id ASC");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+        try std.testing.expectEqual(@as(usize, 2), reply.rows.len);
+    }
+
+    {
+        try client.sendQuery("DISCARD ALL");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+        try std.testing.expectEqualStrings("DISCARD ALL", reply.command_tag);
+    }
+
+    {
+        try client.sendQuery("SELECT id FROM scratch");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code != null);
+    }
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: DISCARD TEMP drops temp tables" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 71;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    {
+        try client.sendQuery("CREATE TEMP TABLE wipe_me (id BIGINT PRIMARY KEY)");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+    }
+
+    {
+        try client.sendQuery("DISCARD TEMP");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+        try std.testing.expectEqualStrings("DISCARD TEMP", reply.command_tag);
+    }
+
+    {
+        try client.sendQuery("SELECT id FROM wipe_me");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code != null);
+    }
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: RESET ALL does NOT drop temp tables (PG spec)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 72;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    {
+        try client.sendQuery("CREATE TEMP TABLE survivor (id BIGINT PRIMARY KEY)");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+    }
+    {
+        try client.sendQuery("INSERT INTO survivor VALUES (7)");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+    }
+    {
+        try client.sendQuery("RESET ALL");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+    }
+
+    {
+        try client.sendQuery("SELECT id FROM survivor");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+        try std.testing.expectEqual(@as(usize, 1), reply.rows.len);
+    }
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: two connections, A's temp invisible to B" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 73;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    // Two sessions need two concurrent server threads — `acceptOne` runs
+    // a session synchronously, so a single-threaded `n=2` would deadlock.
+    var sctx_a: ServerCtx = .{ .server = server, .n = 1 };
+    const ta = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx_a});
+    defer ta.join();
+
+    var client_a = try TestClient.connect(allocator, io, addr);
+    defer client_a.close();
+    try client_a.completeStartup("postgres", "main");
+
+    {
+        try client_a.sendQuery("CREATE TEMP TABLE only_a (id BIGINT PRIMARY KEY)");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client_a.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+    }
+
+    var sctx_b: ServerCtx = .{ .server = server, .n = 1 };
+    const tb = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx_b});
+    defer tb.join();
+
+    var client_b = try TestClient.connect(allocator, io, addr);
+    defer client_b.close();
+    try client_b.completeStartup("postgres", "main");
+
+    {
+        try client_b.sendQuery("SELECT id FROM only_a");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = try client_b.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code != null);
+    }
+
+    try client_a.sendTerminate();
+    try client_b.sendTerminate();
+    if (sctx_a.err) |e| return e;
+    if (sctx_b.err) |e| return e;
+}

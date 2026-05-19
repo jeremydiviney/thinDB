@@ -23,6 +23,7 @@ pub const exec = @import("exec/exec.zig");
 
 pub const Database = api.Database;
 pub const Catalog = api.Catalog;
+pub const TempNamespace = api.TempNamespace;
 /// Namespace type in the Catalog → Database → Schema → Table hierarchy.
 /// Distinct from the table column-schema type `thindb.TableSchema`.
 pub const Schema = api.Schema;

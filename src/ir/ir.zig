@@ -91,6 +91,10 @@ pub const ColumnDef = struct {
 pub const CreateTable = struct {
     table: TableRef,
     if_not_exists: bool,
+    /// Session-local temp table. Lives in the connection's per-session
+    /// temp namespace, not the persistent catalog. Dropped on disconnect
+    /// / RESET CONNECTION / DISCARD ALL.
+    is_temp: bool = false,
     columns: []const ColumnDef,
     order_key: []const []const u8,
 };
@@ -611,6 +615,7 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try out.append(allocator, @intFromEnum(DdlTag.create_table));
             try encodeTableRef(allocator, out, ct.table);
             try out.append(allocator, @intFromBool(ct.if_not_exists));
+            try out.append(allocator, @intFromBool(ct.is_temp));
             try appendU32(allocator, out, @intCast(ct.columns.len));
             for (ct.columns) |c| {
                 try appendU32(allocator, out, @intCast(c.name.len));
@@ -1264,6 +1269,9 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const ine = bytes[cursor.*] != 0;
             cursor.* += 1;
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const is_temp = bytes[cursor.*] != 0;
+            cursor.* += 1;
             if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
             const ncols = readU32(bytes[cursor.* .. cursor.* + 4]);
             cursor.* += 4;
@@ -1286,6 +1294,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             break :blk DdlOp{ .create_table = .{
                 .table = ref,
                 .if_not_exists = ine,
+                .is_temp = is_temp,
                 .columns = cols,
                 .order_key = keys,
             } };
@@ -1742,7 +1751,11 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
             try out.append(allocator, '\n');
         },
         .create_table => |ct| {
-            try out.appendSlice(allocator, "CreateTable ");
+            if (ct.is_temp) {
+                try out.appendSlice(allocator, "CreateTempTable ");
+            } else {
+                try out.appendSlice(allocator, "CreateTable ");
+            }
             try writeTableRef(allocator, out, ct.table);
             if (ct.if_not_exists) try out.appendSlice(allocator, " if_not_exists");
             try out.appendSlice(allocator, " cols=[");

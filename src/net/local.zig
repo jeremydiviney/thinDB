@@ -800,7 +800,16 @@ pub fn catalogFor(db: *Database) ?*Catalog {
 /// back to `session.current_db` / `session.current_schema`. Each
 /// resolution step returns a precise typed error so callers can map
 /// failures back to user-facing messages.
+///
+/// Unqualified refs (no database / schema) consult the session's temp
+/// namespace first, so a temp table named `foo` shadows any persistent
+/// table named `foo` for the creating session only.
 pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*ApiTable {
+    if (ref.database == null and ref.schema == null) {
+        if (session.temp_namespace) |ns| {
+            if (ns.findTable(ref.name)) |t| return t;
+        }
+    }
     const db_name = ref.database orelse session.current_db;
     const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
     const schema_name = ref.schema orelse session.current_schema;
@@ -1148,19 +1157,6 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             ctx.session.current_schema = sc_owned;
         },
         .create_table => |ct| {
-            const db_name = ct.table.database orelse ctx.session.current_db;
-            const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
-            const sc_name = ct.table.schema orelse ctx.session.current_schema;
-            const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
-
-            sc.tables_mutex.lockUncancelable(sc.io);
-            const exists = sc.tables.get(ct.table.name) != null;
-            sc.tables_mutex.unlock(sc.io);
-            if (exists) {
-                if (ct.if_not_exists) return try EmptyOp.create(ctx.allocator);
-                return Error.TableAlreadyExists;
-            }
-
             const cols = try ctx.allocator.alloc(types.Column, ct.columns.len);
             defer ctx.allocator.free(cols);
             for (ct.columns, 0..) |c, ci| {
@@ -1176,9 +1172,43 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                 .unique = true,
                 .row_group_size = null,
             };
-            _ = sc.table(ct.table.name, schema_def, opts) catch |e| return thindb_api.remapError(Error, e);
+
+            if (ct.is_temp) {
+                const ns = ctx.session.temp_namespace orelse return Error.UnsupportedOp;
+                if (ns.contains(ct.table.name)) {
+                    if (ct.if_not_exists) return try EmptyOp.create(ctx.allocator);
+                    return Error.TableAlreadyExists;
+                }
+                _ = ns.createTable(ct.table.name, schema_def, opts) catch |e| return thindb_api.remapError(Error, e);
+            } else {
+                const db_name = ct.table.database orelse ctx.session.current_db;
+                const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
+                const sc_name = ct.table.schema orelse ctx.session.current_schema;
+                const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
+
+                sc.tables_mutex.lockUncancelable(sc.io);
+                const exists = sc.tables.get(ct.table.name) != null;
+                sc.tables_mutex.unlock(sc.io);
+                if (exists) {
+                    if (ct.if_not_exists) return try EmptyOp.create(ctx.allocator);
+                    return Error.TableAlreadyExists;
+                }
+
+                _ = sc.table(ct.table.name, schema_def, opts) catch |e| return thindb_api.remapError(Error, e);
+            }
         },
         .drop_table => |dt| {
+            // Unqualified refs hit the temp namespace first. Per spec:
+            // DROP TABLE foo drops the temp if it shadows; the persistent
+            // table (if any) stays put.
+            if (dt.table.database == null and dt.table.schema == null) {
+                if (ctx.session.temp_namespace) |ns| {
+                    if (ns.contains(dt.table.name)) {
+                        ns.dropTable(dt.table.name) catch |e| return thindb_api.remapError(Error, e);
+                        return try EmptyOp.create(ctx.allocator);
+                    }
+                }
+            }
             const db_name = dt.table.database orelse ctx.session.current_db;
             const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
             const sc_name = dt.table.schema orelse ctx.session.current_schema;
@@ -1746,7 +1776,7 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
             const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
             const sc_name = ref.schema orelse ctx.session.current_schema;
             const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
-            const names = try sc.listTables(ctx.allocator);
+            const names = try unionSchemaAndTempTables(ctx.allocator, sc, ctx.session.temp_namespace, ref);
             defer freeOwnedNames(ctx.allocator, names);
             break :blk try NamesOp.create(ctx.allocator, "name", names);
         },
@@ -1756,6 +1786,46 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
 fn freeOwnedNames(allocator: Allocator, names: [][]u8) void {
     for (names) |n| allocator.free(n);
     allocator.free(names);
+}
+
+/// Build the union of a schema's persistent tables with the active
+/// session's temp tables. Temp tables only appear when the SHOW TABLES
+/// target schema matches the session's current schema (the temp
+/// namespace is conceptually session-local, not schema-local — listing
+/// them in some other schema would surprise users).
+fn unionSchemaAndTempTables(
+    allocator: Allocator,
+    sc: *DbSchema,
+    temp_ns: ?*thindb_api.TempNamespace,
+    ref: ir.TableRef,
+) ![][]u8 {
+    const include_temps = ref.database == null and ref.schema == null and temp_ns != null;
+    if (!include_temps) return sc.listTables(allocator);
+
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+
+    const persistent = try sc.listTables(allocator);
+    defer allocator.free(persistent);
+    for (persistent) |n| try out.append(allocator, n);
+
+    const temps = try temp_ns.?.listTables(allocator);
+    defer freeOwnedNames(allocator, temps);
+    for (temps) |n| {
+        var clash = false;
+        for (persistent) |p| {
+            if (std.mem.eql(u8, p, n)) {
+                clash = true;
+                break;
+            }
+        }
+        if (clash) continue;
+        try out.append(allocator, try allocator.dupe(u8, n));
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 // ---------------------------------------------------------------------------

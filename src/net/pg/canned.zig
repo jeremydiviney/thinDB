@@ -14,6 +14,11 @@ pub const Probe = union(enum) {
     /// Silently accept (no rows, no side-effects). Tag is the literal
     /// command-complete payload (e.g. "SET", "BEGIN").
     accept: []const u8,
+    /// `DISCARD ALL` / `DISCARD TEMP` / `DISCARD TEMPORARY` — wire layer
+    /// drops the session's temp namespace before replying with the
+    /// CommandComplete tag below. `RESET ALL` does NOT discard temps
+    /// per PG spec; only DISCARD does.
+    discard_temp: []const u8,
     /// Reply with a single-row, single-column SELECT result. Column
     /// header is `col`; value is `val` (NULL if `val` is null).
     single_value: struct { col: []const u8, val: ?[]const u8 },
@@ -82,9 +87,9 @@ pub fn match(
     if (parseCancelBackend(lc, "select pg_terminate_backend(")) |pid|
         return Probe{ .cancel_backend = pid };
     if (std.mem.eql(u8, lc, "discard all"))
-        return Probe{ .accept = "DISCARD ALL" };
+        return Probe{ .discard_temp = "DISCARD ALL" };
     if (std.mem.eql(u8, lc, "discard temp") or std.mem.eql(u8, lc, "discard temporary"))
-        return Probe{ .accept = "DISCARD TEMP" };
+        return Probe{ .discard_temp = "DISCARD TEMP" };
     if (std.mem.eql(u8, lc, "discard plans"))
         return Probe{ .accept = "DISCARD PLANS" };
     if (std.mem.eql(u8, lc, "reset all"))

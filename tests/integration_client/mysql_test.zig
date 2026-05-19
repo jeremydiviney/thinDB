@@ -2106,3 +2106,174 @@ test "mysql wire: COM_STMT_SEND_LONG_DATA accumulates string consumed by EXECUTE
     }
     try std.testing.expect(saw_match);
 }
+
+test "mysql wire: CREATE TEMP TABLE round-trip + RESET CONNECTION drops it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 210;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendQuery("CREATE TEMP TABLE scratch (id BIGINT PRIMARY KEY, val INT)");
+    {
+        const ok = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+
+    try client.sendQuery("INSERT INTO scratch VALUES (1, 10), (2, 20)");
+    {
+        const ok = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+
+    try client.sendQuery("SELECT id FROM scratch ORDER BY id ASC");
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const rows = try client.readResultSet(arena.allocator());
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expectEqualStrings("1", rows[0][0].?);
+        try std.testing.expectEqualStrings("2", rows[1][0].?);
+    }
+
+    // RESET CONNECTION drops the temp namespace.
+    try client.sendQuery("RESET CONNECTION");
+    {
+        const ok = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+
+    // Same name now fails to resolve.
+    try client.sendQuery("SELECT id FROM scratch");
+    {
+        const err_pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(err_pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0xFF), err_pkt.payload[0]);
+    }
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_RESET_CONNECTION binary command drops temp namespace" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 211;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendQuery("CREATE TEMP TABLE wipe_me (id BIGINT PRIMARY KEY)");
+    {
+        const ok = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+
+    // Send COM_RESET_CONNECTION (0x1F) directly.
+    try mysql_packet.writePacket(&client.writer.interface, 0, &[_]u8{0x1F});
+    try client.writer.interface.flush();
+    {
+        const ok = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+
+    try client.sendQuery("SELECT id FROM wipe_me");
+    {
+        const err_pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(err_pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0xFF), err_pkt.payload[0]);
+    }
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: two connections, A's temp invisible to B" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 212;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    // Two sessions need two concurrent server threads — `acceptOne` runs
+    // a session synchronously, so a single-threaded `n=2` would deadlock
+    // (A's session can't drain while we're driving B from the main thread).
+    var sctx_a: ServerCtx = .{ .server = server, .n = 1 };
+    const ta = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx_a});
+    defer ta.join();
+
+    var client_a = try TestClient.connect(allocator, io, addr);
+    defer client_a.close();
+    try client_a.doHandshake(null);
+
+    try client_a.sendQuery("CREATE TEMP TABLE only_a (id BIGINT PRIMARY KEY)");
+    {
+        const ok = try mysql_packet.readPacket(allocator, &client_a.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+
+    var sctx_b: ServerCtx = .{ .server = server, .n = 1 };
+    const tb = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx_b});
+    defer tb.join();
+
+    var client_b = try TestClient.connect(allocator, io, addr);
+    defer client_b.close();
+    try client_b.doHandshake(null);
+
+    try client_b.sendQuery("SELECT id FROM only_a");
+    {
+        const err_pkt = try mysql_packet.readPacket(allocator, &client_b.reader.interface);
+        defer allocator.free(err_pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0xFF), err_pkt.payload[0]);
+    }
+
+    try client_a.sendQuit();
+    try client_b.sendQuit();
+    if (sctx_a.err) |e| return e;
+    if (sctx_b.err) |e| return e;
+}

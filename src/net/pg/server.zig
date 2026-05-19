@@ -18,6 +18,7 @@ pub const default_port: u16 = 5432;
 const thindb_api = @import("../../api/api.zig");
 const Catalog = thindb_api.Catalog;
 const Session = thindb_api.Session;
+const TempNamespace = thindb_api.TempNamespace;
 const ApiError = thindb_api.Error;
 
 const local = @import("../local.zig");
@@ -227,6 +228,16 @@ const SessionState = struct {
     current_schema: []u8,
     application_name: []u8,
     allocator: Allocator,
+    /// Catalog root used to lazily open the per-session temp namespace
+    /// when the first `CREATE TEMP TABLE` arrives. Borrowed.
+    catalog: *Catalog,
+    /// Backend / connection id; used as the per-session subdir name
+    /// inside `_temp/`.
+    backend_id: u32,
+    /// Session-local temp table namespace. Lazily allocated on the
+    /// first CREATE TEMP TABLE. Closed (and its on-disk dir removed)
+    /// in `deinit` and on `DISCARD ALL` / `DISCARD TEMP`.
+    temp_namespace: ?*TempNamespace = null,
     /// Reflected in the trailing ReadyForQuery byte. Drivers (notably
     /// node-pg and asyncpg) inspect this to decide whether the next
     /// statement opens an implicit transaction. We flip on BEGIN /
@@ -246,13 +257,39 @@ const SessionState = struct {
     /// Sync.
     ext: extended.ExtendedState = .{},
 
-    fn init(allocator: Allocator) !SessionState {
+    fn init(allocator: Allocator, catalog: *Catalog, backend_id: u32) !SessionState {
         return .{
             .allocator = allocator,
+            .catalog = catalog,
+            .backend_id = backend_id,
             .current_db = try allocator.dupe(u8, "main"),
             .current_schema = try allocator.dupe(u8, "public"),
             .application_name = try allocator.dupe(u8, ""),
         };
+    }
+
+    /// Open the per-session temp namespace if it hasn't been opened yet.
+    /// Returns the existing one on repeat calls.
+    fn ensureTempNamespace(self: *SessionState) !*TempNamespace {
+        if (self.temp_namespace) |ns| return ns;
+        const ns = try TempNamespace.open(
+            self.allocator,
+            self.catalog.io,
+            self.catalog.root_dir,
+            self.backend_id,
+            self.catalog.config,
+        );
+        self.temp_namespace = ns;
+        return ns;
+    }
+
+    /// Tear down the session's temp namespace if open. Used on
+    /// disconnect, DISCARD ALL, DISCARD TEMP.
+    fn dropTempNamespace(self: *SessionState) void {
+        if (self.temp_namespace) |ns| {
+            ns.close();
+            self.temp_namespace = null;
+        }
     }
 
     /// 'I' = idle (no transaction). 'T' = in a transaction. 'E' = in
@@ -263,6 +300,7 @@ const SessionState = struct {
     }
 
     fn deinit(self: *SessionState) void {
+        self.dropTempNamespace();
         self.ext.deinit(self.allocator);
         self.allocator.free(self.current_db);
         self.allocator.free(self.current_schema);
@@ -286,7 +324,11 @@ const SessionState = struct {
     }
 
     fn asSession(self: SessionState) Session {
-        return .{ .current_db = self.current_db, .current_schema = self.current_schema };
+        return .{
+            .current_db = self.current_db,
+            .current_schema = self.current_schema,
+            .temp_namespace = self.temp_namespace,
+        };
     }
 };
 
@@ -306,7 +348,7 @@ fn handleConnection(
     const w = &writer.interface;
     const r = &reader.interface;
 
-    var session = try SessionState.init(allocator);
+    var session = try SessionState.init(allocator, catalog, connection_id);
     defer session.deinit();
 
     var conn_state = ConnectionState.init(connection_id, ConnectionState.deriveSecret(connection_id));
@@ -578,6 +620,10 @@ fn runExtendedStatement(
     if (op.* == .copy) return copy.Error.CopyMustBeSoleStatement;
 
     const main_db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
+
+    if (needsTempNamespace(op.*)) {
+        _ = try session.ensureTempNamespace();
+    }
 
     var compiled = try local.compileWithSession(allocator, main_db, session.asSession(), op);
     defer compiled.deinit();
@@ -882,6 +928,10 @@ fn dispatchProbe(
             }
             try result.sendCommandComplete(allocator, w, tag);
         },
+        .discard_temp => |tag| {
+            session.dropTempNamespace();
+            try result.sendCommandComplete(allocator, w, tag);
+        },
         .single_value => |sv| {
             const cols = [_]@import("../../types.zig").Column{.{ .name = sv.col, .type = .string, .nullable = sv.val == null }};
             try result.sendRowDescription(allocator, w, cols[0..]);
@@ -942,6 +992,24 @@ fn dispatchCatalogListing(
             const table_names = try sc.listTables(allocator);
             defer allocator.free(table_names);
             for (table_names) |n| try names.append(allocator, n);
+            if (session.temp_namespace) |ns| {
+                const temps = try ns.listTables(allocator);
+                defer allocator.free(temps);
+                for (temps) |n| {
+                    var clash = false;
+                    for (table_names) |p| {
+                        if (std.mem.eql(u8, p, n)) {
+                            clash = true;
+                            break;
+                        }
+                    }
+                    if (clash) {
+                        allocator.free(n);
+                        continue;
+                    }
+                    try names.append(allocator, n);
+                }
+            }
         },
     }
 
@@ -1006,6 +1074,10 @@ fn runSingleStatement(
 
     const main_db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
 
+    if (needsTempNamespace(op.*)) {
+        _ = try session.ensureTempNamespace();
+    }
+
     var compiled = try local.compileWithSession(allocator, main_db, session.asSession(), op);
     defer compiled.deinit();
 
@@ -1048,6 +1120,19 @@ fn isSideEffectOp(op: ir.Op) bool {
     };
 }
 
+/// True when an op is a `CREATE TEMP TABLE`. The wire layer
+/// pre-allocates the session's temp namespace before compile so
+/// the compile path can rely on it being non-null.
+fn needsTempNamespace(op: ir.Op) bool {
+    return switch (op) {
+        .ddl => |d| switch (d) {
+            .create_table => |ct| ct.is_temp,
+            else => false,
+        },
+        else => false,
+    };
+}
+
 fn commandTagFor(op: ir.Op) []const u8 {
     return switch (op) {
         .ddl => |d| switch (d) {
@@ -1077,7 +1162,7 @@ test "applyDatabase resolves an existing database" {
     var c = try Catalog.open(allocator, io, tmp.dir, .{});
     defer c.close();
     _ = try c.createDatabase("alpha");
-    var session = try SessionState.init(allocator);
+    var session = try SessionState.init(allocator, c, 1);
     defer session.deinit();
     try applyDatabase(c, &session, "alpha");
     try std.testing.expectEqualStrings("alpha", session.current_db);
@@ -1091,7 +1176,7 @@ test "applyDatabase fails on unknown database" {
     defer tmp.cleanup();
     var c = try Catalog.open(allocator, io, tmp.dir, .{});
     defer c.close();
-    var session = try SessionState.init(allocator);
+    var session = try SessionState.init(allocator, c, 2);
     defer session.deinit();
     try std.testing.expectError(error.DatabaseNotFound, applyDatabase(c, &session, "ghost"));
 }

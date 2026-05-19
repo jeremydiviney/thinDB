@@ -44,6 +44,12 @@ pub const Catalog = struct {
         root_dir: Io.Dir,
         config: Config,
     ) !*Catalog {
+        // Best-effort sweep of any `_temp/` left behind by an ungraceful
+        // exit. Per-session dirs only ever belong to a process that's
+        // currently alive; if we're booting fresh, every previous tenant
+        // is gone.
+        @import("temp_namespace.zig").sweepStaleTempDirs(io, root_dir);
+
         const self = try allocator.create(Catalog);
         errdefer allocator.destroy(self);
         self.* = .{

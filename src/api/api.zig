@@ -162,14 +162,22 @@ pub const schemaFingerprint = @import("table.zig").schemaFingerprint;
 pub const Schema = @import("schema.zig").Schema;
 pub const Database = @import("database.zig").Database;
 pub const Catalog = @import("catalog.zig").Catalog;
+pub const TempNamespace = @import("temp_namespace.zig").TempNamespace;
+pub const sweepStaleTempDirs = @import("temp_namespace.zig").sweepStaleTempDirs;
 
 /// Per-connection resolution context. `compile()` consults this to fill
 /// in any null database/schema fields on a `TableRef`, and DDL `USE`
 /// statements mutate it. Callers own the value — pass by mutable
 /// pointer so DDL can update it.
+///
+/// `temp_namespace` is borrowed; the wire layer (mysql/pg server) owns
+/// the per-session TempNamespace and threads a pointer through here so
+/// CREATE TEMP TABLE / unqualified resolution / DROP TABLE can consult
+/// it ahead of the persistent catalog.
 pub const Session = struct {
     current_db: []const u8 = "main",
     current_schema: []const u8 = "public",
+    temp_namespace: ?*TempNamespace = null,
 };
 
 /// Translate any `api.Error` into the equivalently-named variant of

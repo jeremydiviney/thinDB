@@ -17,6 +17,7 @@ pub const default_port: u16 = 3306;
 const thindb_api = @import("../../api/api.zig");
 const Catalog = thindb_api.Catalog;
 const Session = thindb_api.Session;
+const TempNamespace = thindb_api.TempNamespace;
 const ApiError = thindb_api.Error;
 
 const local = @import("../local.zig");
@@ -221,6 +222,16 @@ const SessionState = struct {
     current_db: []u8,
     current_schema: []u8,
     allocator: Allocator,
+    /// Catalog root used to lazily open the per-session temp namespace
+    /// when the first `CREATE TEMP TABLE` arrives. Borrowed.
+    catalog: *Catalog,
+    /// Backend / connection id; used as the per-session subdir name
+    /// inside `_temp/`.
+    backend_id: u32,
+    /// Session-local temp table namespace. Lazily allocated on the
+    /// first CREATE TEMP TABLE. Closed (and its on-disk dir removed)
+    /// in `deinit` and on COM_RESET_CONNECTION / COM_CHANGE_USER.
+    temp_namespace: ?*TempNamespace = null,
     /// Snapshot of the client's HandshakeResponse41 capability bits.
     /// Controls result-set terminator format (DEPRECATE_EOF) and any
     /// future per-connection feature toggles. Zero before handshake.
@@ -251,20 +262,47 @@ const SessionState = struct {
     /// numbering scheme; just needs to be stable per-connection.
     next_stmt_id: u32 = 1,
 
-    fn init(allocator: Allocator) !SessionState {
+    fn init(allocator: Allocator, catalog: *Catalog, backend_id: u32) !SessionState {
         return .{
             .allocator = allocator,
+            .catalog = catalog,
+            .backend_id = backend_id,
             .current_db = try allocator.dupe(u8, "main"),
             .current_schema = try allocator.dupe(u8, "public"),
         };
     }
 
     fn deinit(self: *SessionState) void {
+        self.dropTempNamespace();
         self.allocator.free(self.current_db);
         self.allocator.free(self.current_schema);
         var it = self.prepared_statements.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit();
         self.prepared_statements.deinit(self.allocator);
+    }
+
+    /// Open the per-session temp namespace if it hasn't been opened yet.
+    /// Returns the existing one on repeat calls.
+    fn ensureTempNamespace(self: *SessionState) !*TempNamespace {
+        if (self.temp_namespace) |ns| return ns;
+        const ns = try TempNamespace.open(
+            self.allocator,
+            self.catalog.io,
+            self.catalog.root_dir,
+            self.backend_id,
+            self.catalog.config,
+        );
+        self.temp_namespace = ns;
+        return ns;
+    }
+
+    /// Tear down the session's temp namespace if open. Used on
+    /// disconnect, COM_RESET_CONNECTION, COM_CHANGE_USER.
+    fn dropTempNamespace(self: *SessionState) void {
+        if (self.temp_namespace) |ns| {
+            ns.close();
+            self.temp_namespace = null;
+        }
     }
 
     fn replace(self: *SessionState, db: []const u8, schema: []const u8) !void {
@@ -278,7 +316,11 @@ const SessionState = struct {
     }
 
     fn asSession(self: SessionState) Session {
-        return .{ .current_db = self.current_db, .current_schema = self.current_schema };
+        return .{
+            .current_db = self.current_db,
+            .current_schema = self.current_schema,
+            .temp_namespace = self.temp_namespace,
+        };
     }
 
     /// OR-able status bits derived from session state. Callers combine
@@ -305,7 +347,7 @@ fn handleConnection(
     const w = &writer.interface;
     const r = &reader.interface;
 
-    var session = try SessionState.init(allocator);
+    var session = try SessionState.init(allocator, catalog, connection_id);
     defer session.deinit();
 
     // Register in the shared registry so peer connections can KILL
@@ -414,10 +456,10 @@ fn handleConnection(
             // closing the socket. Connection poolers (e.g. ProxySQL,
             // mysql2's pool with `connectionLimit`) send this when
             // returning a borrowed connection to scrub session state.
-            // We have no temp tables / prepared statements yet, so the
-            // only state to reset is the txn flag + reverting the
-            // current schema to the default.
+            // Resets: txn flag, current schema to default, session temp
+            // tables (drops + deletes the per-session _temp dir).
             0x1F => {
+                session.dropTempNamespace();
                 session.in_transaction = false;
                 try session.replace("main", "public");
                 try handshake.sendOkPacketStatus(allocator, w, 1, 0, 0, session.transactionStatus());
@@ -535,9 +577,9 @@ fn handleChangeUser(
 
     // Reset session state. COM_CHANGE_USER is more aggressive than
     // COM_RESET_CONNECTION: it explicitly re-authenticates and
-    // optionally switches DB. We don't have temp tables / prepared
-    // statements yet, so reset = clear txn + reapply default schema +
-    // honor whatever schema the client passed.
+    // optionally switches DB. Reset = drop temp namespace, clear txn,
+    // reapply default schema, honor whatever schema the client passed.
+    session.dropTempNamespace();
     session.in_transaction = false;
     try session.replace("main", "public");
     if (schema_name.len > 0) {
@@ -589,6 +631,19 @@ fn handleQuery(
                 0,
                 session.transactionStatus(),
             ),
+            .reset_connection => {
+                session.dropTempNamespace();
+                session.in_transaction = false;
+                try session.replace("main", "public");
+                try handshake.sendOkPacketStatus(
+                    allocator,
+                    w,
+                    seq_id,
+                    0,
+                    0,
+                    session.transactionStatus(),
+                );
+            },
             .single_value => |sv| try result.sendSingleValueResult(allocator, w, sv.col, sv.val, &seq_id, caps),
             .single_null => |col| try result.sendSingleValueResult(allocator, w, col, null, &seq_id, caps),
             .variable_row => |vr| try result.sendVariableRow(allocator, w, vr.name, vr.value, &seq_id, caps),
@@ -745,6 +800,14 @@ fn runSingleStatement(
         return;
     };
 
+    if (needsTempNamespace(op.*)) {
+        _ = session.ensureTempNamespace() catch |err| {
+            const mapped = errors.mapInternal(err, null);
+            try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
+            return;
+        };
+    }
+
     var compiled = local.compileWithSession(allocator, main_db, session.asSession(), op) catch |err| {
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
@@ -799,6 +862,20 @@ fn runSingleStatement(
 fn isSideEffectOp(op: ir.Op) bool {
     return switch (op) {
         .ddl, .insert => true,
+        else => false,
+    };
+}
+
+/// True when an op (or one of its sub-statements in a batch) is a
+/// `CREATE TEMP TABLE` — the wire layer pre-allocates the session's
+/// temp namespace before compiling so the compile path can rely on
+/// it being non-null.
+fn needsTempNamespace(op: ir.Op) bool {
+    return switch (op) {
+        .ddl => |d| switch (d) {
+            .create_table => |ct| ct.is_temp,
+            else => false,
+        },
         else => false,
     };
 }
@@ -974,6 +1051,14 @@ fn handleStmtExecute(
         return;
     };
 
+    if (needsTempNamespace(op.*)) {
+        _ = session.ensureTempNamespace() catch |err| {
+            const mapped = errors.mapInternal(err, null);
+            try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+            return;
+        };
+    }
+
     var compiled = local.compileWithSession(allocator, main_db, session.asSession(), op) catch |err| {
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
@@ -1107,7 +1192,7 @@ test "applyInitDb resolves flat db__schema name" {
     var c = try Catalog.open(allocator, io, tmp.dir, .{});
     defer c.close();
     _ = try c.createDatabase("alpha");
-    var session = try SessionState.init(allocator);
+    var session = try SessionState.init(allocator, c, 1);
     defer session.deinit();
     try applyInitDb(c, &session, "alpha__public");
     try std.testing.expectEqualStrings("alpha", session.current_db);
@@ -1123,7 +1208,7 @@ test "applyInitDb honors schema-within-current-db lookup" {
     defer c.close();
     const main_db = try c.createDatabase("main");
     _ = try main_db.createSchema("reports");
-    var session = try SessionState.init(allocator);
+    var session = try SessionState.init(allocator, c, 2);
     defer session.deinit();
     try applyInitDb(c, &session, "reports");
     try std.testing.expectEqualStrings("main", session.current_db);

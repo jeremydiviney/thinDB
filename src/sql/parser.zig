@@ -382,9 +382,14 @@ const Parser = struct {
                     const name = try self.dupedIdent();
                     return try self.allocOp(.{ .ddl = .{ .create_schema = name } });
                 }
+                var is_temp = false;
+                if (self.cur.tag == .kw_temp or self.cur.tag == .kw_temporary) {
+                    is_temp = true;
+                    try self.advance();
+                }
                 if (self.cur.tag == .kw_table) {
                     try self.advance();
-                    return try self.parseCreateTableBody();
+                    return try self.parseCreateTableBody(is_temp);
                 }
                 return ParseError.SqlExpectedKeyword;
             },
@@ -398,6 +403,9 @@ const Parser = struct {
                     try self.advance();
                     const name = try self.dupedIdent();
                     return try self.allocOp(.{ .ddl = .{ .drop_schema = name } });
+                }
+                if (self.cur.tag == .kw_temp or self.cur.tag == .kw_temporary) {
+                    try self.advance();
                 }
                 if (self.cur.tag == .kw_table) {
                     try self.advance();
@@ -421,8 +429,8 @@ const Parser = struct {
         }
     }
 
-    /// CREATE TABLE [IF NOT EXISTS] [db.][schema.]name ( column_def, ... [, PRIMARY KEY (..)] )
-    fn parseCreateTableBody(self: *Parser) ParseError!*ir.Op {
+    /// CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] [db.][schema.]name ( column_def, ... [, PRIMARY KEY (..)] )
+    fn parseCreateTableBody(self: *Parser, is_temp: bool) ParseError!*ir.Op {
         var if_not_exists = false;
         if (self.cur.tag == .kw_if) {
             try self.advance();
@@ -484,6 +492,7 @@ const Parser = struct {
         return try self.allocOp(.{ .ddl = .{ .create_table = .{
             .table = ref,
             .if_not_exists = if_not_exists,
+            .is_temp = is_temp,
             .columns = owned_cols,
             .order_key = order_key,
         } } });
