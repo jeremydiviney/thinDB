@@ -116,29 +116,18 @@ pub const Scan = struct {
         // pair. Pin the memtable via `acquire` so a subsequent flush/delete
         // swap doesn't invalidate our pointer.
         //
-        // We additionally FORCE a retire-replace when the captured memtable
-        // has rows: install a fresh empty memtable as the table's active
-        // one, hand the old (now frozen) memtable to this scan. Writers'
-        // subsequent appends go to the fresh memtable and cannot trigger an
-        // ArrayList realloc on the buffers this scan is iterating — closing
-        // the last concurrent-write hazard. An empty captured memtable
-        // already has nothing for the scan to iterate (row_count == 0), so
-        // we skip the swap in that case.
+        // Iteration is bounded by the row count we capture here, so any rows
+        // appended after we release the mutex are invisible to this scan.
+        // The remaining hazard — a concurrent writer reallocating an
+        // ArrayList we're iterating — is handled in the writer paths:
+        // `Table.insertLocked` / `insertBatch` detect a pinned memtable
+        // (`Memtable.hasSnapshotReaders`) and clone-then-replace before
+        // mutating, leaving our snapshot's buffers untouched.
         table.mutex.lockUncancelable(table.io);
         const segment_count = table.manifest.segments.items.len;
-        var memtable_snap = table.memtable;
+        const memtable_snap = table.memtable;
         memtable_snap.acquire();
         const memtable_row_count = memtable_snap.row_count;
-        if (memtable_row_count > 0) {
-            const fresh = engine.Memtable.create(allocator, table.schema) catch |err| {
-                memtable_snap.release();
-                table.mutex.unlock(table.io);
-                return err;
-            };
-            table.memtable = fresh;
-            memtable_snap.retire();
-            memtable_snap.release(); // drop the table's prior reference
-        }
         table.mutex.unlock(table.io);
 
         // Allocate the per-query memory accountant if the Table's

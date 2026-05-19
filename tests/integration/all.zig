@@ -19,6 +19,7 @@ test {
     _ = @import("sql_namespace_test.zig");
     _ = @import("sql_ddl_test.zig");
     _ = @import("catalog_test.zig");
+    _ = @import("bug_repro_test.zig");
 }
 
 test "integration entry exists" {

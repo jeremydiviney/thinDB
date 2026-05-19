@@ -245,6 +245,7 @@ pub const Table = struct {
         var wal_target: ?u64 = null;
         {
             defer self.mutex.unlock(self.io);
+            try self.cloneMemtableIfPinnedLocked();
             const was_empty = self.memtable.isEmpty();
             const before_count: usize = @intCast(self.memtable.row_count);
             try self.memtable.insertColumnarBatch(batch_schema, views, row_count);
@@ -270,6 +271,7 @@ pub const Table = struct {
     /// concurrent batch of writers can amortize a single fsync syscall.
     /// Returns null when no WAL is configured.
     fn insertLocked(self: *Table, rows: anytype) !?u64 {
+        try self.cloneMemtableIfPinnedLocked();
         const was_empty = self.memtable.isEmpty();
         const before_count: usize = @intCast(self.memtable.row_count);
         try self.memtable.insertRows(rows);
@@ -288,6 +290,21 @@ pub const Table = struct {
         }
         try self.maybeAutoFlushLocked();
         return wal_target;
+    }
+
+    /// Snapshot-isolation guard for in-place memtable mutation. If any scan
+    /// has pinned the current memtable (`refcount > 1`), build a fresh
+    /// memtable carrying the same rows, retire-replace the table's pointer,
+    /// and leave the old one alive for the pinned reader. Caller holds the
+    /// table mutex. No-op when no reader is pinned, so the steady-state
+    /// (write-only) cost is one atomic load.
+    fn cloneMemtableIfPinnedLocked(self: *Table) !void {
+        if (!self.memtable.hasSnapshotReaders()) return;
+        const cloned = try self.memtable.cloneAll(self.allocator);
+        const old_mt = self.memtable;
+        self.memtable = cloned;
+        old_mt.retire();
+        old_mt.release();
     }
 
     /// Called outside the Table mutex (after releasing it) to wait for the

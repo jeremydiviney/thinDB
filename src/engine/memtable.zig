@@ -214,6 +214,29 @@ pub const Memtable = struct {
         return kept;
     }
 
+    /// Build a fresh heap-allocated Memtable carrying the same rows as `self`.
+    /// Used by writers (`insertLocked`, `insertColumnarBatch`) when a concurrent
+    /// scan has pinned the current memtable: instead of mutating in place
+    /// (which would alias the reader's slices), we clone, retire-replace, and
+    /// then mutate the new one.
+    pub fn cloneAll(self: *const Memtable, allocator: Allocator) !*Memtable {
+        const new = try Memtable.create(allocator, self.schema);
+        errdefer new.release();
+        for (self.columns, 0..) |src, ci| {
+            try transform.appendAllColumn(allocator, src.view(), &new.columns[ci]);
+        }
+        new.row_count = self.row_count;
+        return new;
+    }
+
+    /// True iff another holder (a scan snapshot) is pinning this memtable.
+    /// The table's own reference counts as 1; anything above that means an
+    /// in-flight reader has acquired. Writers consult this to decide whether
+    /// to mutate in place or clone-then-replace.
+    pub fn hasSnapshotReaders(self: *const Memtable) bool {
+        return self.refcount.load(.acquire) > 1;
+    }
+
     /// Build a fresh heap-allocated Memtable containing only the rows from
     /// `self` where `keep[i] == true`. Returns null if `keep` is all-true
     /// (caller should skip the swap). Used by the snapshot-isolated delete
