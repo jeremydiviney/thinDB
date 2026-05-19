@@ -7,6 +7,7 @@ pub const result = @import("mysql/result.zig");
 pub const canned = @import("mysql/canned.zig");
 pub const errors = @import("mysql/errors.zig");
 pub const auth = @import("mysql/auth.zig");
+pub const prepared = @import("mysql/prepared.zig");
 pub const server = @import("mysql/server.zig");
 
 pub const Server = server.Server;
@@ -21,5 +22,6 @@ test {
     _ = canned;
     _ = errors;
     _ = auth;
+    _ = prepared;
     _ = server;
 }

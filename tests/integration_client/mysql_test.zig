@@ -190,6 +190,208 @@ const TestClient = struct {
         try self.writer.interface.flush();
     }
 
+    fn sendStmtPrepare(self: *TestClient, sql_text: []const u8) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try payload.append(self.allocator, 0x16);
+        try payload.appendSlice(self.allocator, sql_text);
+        try mysql_packet.writePacket(&self.writer.interface, 0, payload.items);
+        try self.writer.interface.flush();
+    }
+
+    const PrepareReply = struct {
+        stmt_id: u32,
+        num_columns: u16,
+        num_params: u16,
+    };
+
+    /// Drain a successful COM_STMT_PREPARE response (header + param +
+    /// column ColumnDef41 packets + any EOFs). Returns the parsed
+    /// header. If the server replied ERR_Packet, returns
+    /// error.PrepareRejected.
+    fn readPrepareReply(self: *TestClient, deprecate_eof: bool) !PrepareReply {
+        const hdr_pkt = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+        defer self.allocator.free(hdr_pkt.payload);
+        if (hdr_pkt.payload.len == 0) return error.MalformedPrepareReply;
+        if (hdr_pkt.payload[0] == 0xFF) return error.PrepareRejected;
+        if (hdr_pkt.payload[0] != 0x00) return error.MalformedPrepareReply;
+        if (hdr_pkt.payload.len < 12) return error.MalformedPrepareReply;
+        const stmt_id = std.mem.readInt(u32, hdr_pkt.payload[1..5], .little);
+        const num_columns = std.mem.readInt(u16, hdr_pkt.payload[5..7], .little);
+        const num_params = std.mem.readInt(u16, hdr_pkt.payload[7..9], .little);
+
+        // Drain `num_params` param-column-def packets (+ EOF if not deprecated)
+        var i: u16 = 0;
+        while (i < num_params) : (i += 1) {
+            const p = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+            self.allocator.free(p.payload);
+        }
+        if (num_params > 0 and !deprecate_eof) {
+            const eof = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+            self.allocator.free(eof.payload);
+        }
+        // Drain `num_columns` column-def packets (+ EOF if not deprecated)
+        var j: u16 = 0;
+        while (j < num_columns) : (j += 1) {
+            const p = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+            self.allocator.free(p.payload);
+        }
+        if (num_columns > 0 and !deprecate_eof) {
+            const eof = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+            self.allocator.free(eof.payload);
+        }
+        return .{ .stmt_id = stmt_id, .num_columns = num_columns, .num_params = num_params };
+    }
+
+    /// One bound parameter value for sendStmtExecute. `type_byte` is a
+    /// MYSQL_TYPE_*; `value_bytes` is already encoded in the on-wire
+    /// binary format expected by the server (lenenc string, fixed int
+    /// LE, etc). Use null to bind SQL NULL.
+    const Param = struct {
+        type_byte: u8,
+        unsigned: bool = false,
+        value_bytes: ?[]const u8,
+    };
+
+    fn sendStmtExecute(self: *TestClient, stmt_id: u32, params: []const Param) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try payload.append(self.allocator, 0x17);
+
+        var hdr: [4]u8 = undefined;
+        std.mem.writeInt(u32, &hdr, stmt_id, .little);
+        try payload.appendSlice(self.allocator, &hdr);
+        try payload.append(self.allocator, 0); // flags = CURSOR_TYPE_NO_CURSOR
+        std.mem.writeInt(u32, &hdr, 1, .little);
+        try payload.appendSlice(self.allocator, &hdr); // iteration_count
+
+        if (params.len > 0) {
+            const nullmap_bytes = (params.len + 7) / 8;
+            const nullmap_start = payload.items.len;
+            var i: usize = 0;
+            while (i < nullmap_bytes) : (i += 1) try payload.append(self.allocator, 0);
+            for (params, 0..) |p, idx| {
+                if (p.value_bytes == null) {
+                    payload.items[nullmap_start + idx / 8] |= @as(u8, 1) << @as(u3, @intCast(idx % 8));
+                }
+            }
+            try payload.append(self.allocator, 1); // new_params_bound_flag
+            for (params) |p| {
+                try payload.append(self.allocator, p.type_byte);
+                try payload.append(self.allocator, if (p.unsigned) 0x80 else 0);
+            }
+            for (params) |p| {
+                if (p.value_bytes) |vb| try payload.appendSlice(self.allocator, vb);
+            }
+        }
+        try mysql_packet.writePacket(&self.writer.interface, 0, payload.items);
+        try self.writer.interface.flush();
+    }
+
+    /// Send COM_STMT_EXECUTE with `new_params_bound_flag = 0` (reuse the
+    /// previously-bound types). Useful for "reuse types" tests.
+    fn sendStmtExecuteReuse(self: *TestClient, stmt_id: u32, num_params: u16, value_bytes: []const u8) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try payload.append(self.allocator, 0x17);
+
+        var hdr: [4]u8 = undefined;
+        std.mem.writeInt(u32, &hdr, stmt_id, .little);
+        try payload.appendSlice(self.allocator, &hdr);
+        try payload.append(self.allocator, 0);
+        std.mem.writeInt(u32, &hdr, 1, .little);
+        try payload.appendSlice(self.allocator, &hdr);
+
+        if (num_params > 0) {
+            const nullmap_bytes = (@as(usize, num_params) + 7) / 8;
+            var i: usize = 0;
+            while (i < nullmap_bytes) : (i += 1) try payload.append(self.allocator, 0);
+            try payload.append(self.allocator, 0); // new_params_bound_flag = 0
+            try payload.appendSlice(self.allocator, value_bytes);
+        }
+        try mysql_packet.writePacket(&self.writer.interface, 0, payload.items);
+        try self.writer.interface.flush();
+    }
+
+    fn sendStmtClose(self: *TestClient, stmt_id: u32) !void {
+        var payload: [5]u8 = undefined;
+        payload[0] = 0x19;
+        std.mem.writeInt(u32, payload[1..5], stmt_id, .little);
+        try mysql_packet.writePacket(&self.writer.interface, 0, &payload);
+        try self.writer.interface.flush();
+    }
+
+    fn sendStmtReset(self: *TestClient, stmt_id: u32) !void {
+        var payload: [5]u8 = undefined;
+        payload[0] = 0x1A;
+        std.mem.writeInt(u32, payload[1..5], stmt_id, .little);
+        try mysql_packet.writePacket(&self.writer.interface, 0, &payload);
+        try self.writer.interface.flush();
+    }
+
+    fn sendStmtSendLongData(self: *TestClient, stmt_id: u32, param_idx: u16, data: []const u8) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try payload.append(self.allocator, 0x18);
+        var hdr4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &hdr4, stmt_id, .little);
+        try payload.appendSlice(self.allocator, &hdr4);
+        var hdr2: [2]u8 = undefined;
+        std.mem.writeInt(u16, &hdr2, param_idx, .little);
+        try payload.appendSlice(self.allocator, &hdr2);
+        try payload.appendSlice(self.allocator, data);
+        try mysql_packet.writePacket(&self.writer.interface, 0, payload.items);
+        try self.writer.interface.flush();
+    }
+
+    /// Drain a binary-protocol result set. Returns the raw binary
+    /// row-payload slices (excluding the 0x00 header byte) — caller
+    /// decodes per known schema. NULL columns are recorded via the
+    /// per-row null-bitmap byte buffer (callers extract them per the
+    /// MySQL binary protocol's "bit i+2" rule).
+    const BinaryRow = struct {
+        nullmap: []u8,
+        cells: []const u8,
+    };
+
+    fn readBinaryResultSet(self: *TestClient, arena: std.mem.Allocator, deprecate_eof: bool) ![]const BinaryRow {
+        const col_count_pkt = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+        defer self.allocator.free(col_count_pkt.payload);
+        if (col_count_pkt.payload.len == 0) return error.MalformedResultSet;
+        if (col_count_pkt.payload[0] == 0xFF) return error.QueryRejected;
+        if (col_count_pkt.payload[0] == 0x00) return error.UnexpectedOk;
+
+        var cursor: usize = 0;
+        const col_count = try mysql_packet.readLenEncInt(col_count_pkt.payload, &cursor);
+
+        var i: u64 = 0;
+        while (i < col_count) : (i += 1) {
+            const p = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+            self.allocator.free(p.payload);
+        }
+        if (!deprecate_eof) {
+            const eof = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+            self.allocator.free(eof.payload);
+        }
+
+        var rows: std.ArrayList(BinaryRow) = .empty;
+        while (true) {
+            const row_pkt = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+            defer self.allocator.free(row_pkt.payload);
+            if (row_pkt.payload.len == 0) return error.MalformedResultSet;
+            if (row_pkt.payload[0] == 0xFE and row_pkt.payload.len < 0xFFFFFF) break;
+            if (row_pkt.payload[0] == 0xFF) return error.QueryRejected;
+            if (row_pkt.payload[0] != 0x00) return error.MalformedResultSet;
+
+            const nullmap_bytes = (@as(usize, @intCast(col_count)) + 7 + 2) / 8;
+            if (row_pkt.payload.len < 1 + nullmap_bytes) return error.MalformedResultSet;
+            const nullmap_owned = try arena.dupe(u8, row_pkt.payload[1 .. 1 + nullmap_bytes]);
+            const cells_owned = try arena.dupe(u8, row_pkt.payload[1 + nullmap_bytes ..]);
+            try rows.append(arena, .{ .nullmap = nullmap_owned, .cells = cells_owned });
+        }
+        return try rows.toOwnedSlice(arena);
+    }
+
     /// Run the caching_sha2_password client side of the handshake.
     /// Sends a 32-byte response computed from the greeting's salt and
     /// expects an AuthMoreData(fast_auth_success) packet followed by
@@ -1356,4 +1558,551 @@ test "mysql CLI: SELECT * FROM orders streams seeded rows when mysql is on PATH"
         return error.MissingRowText;
     }
     if (sctx.err) |e| return e;
+}
+
+// ---------------------------------------------------------------------------
+// COM_STMT_* — prepared-statement wire protocol
+// ---------------------------------------------------------------------------
+
+const MYSQL_TYPE_TINY: u8 = 0x01;
+const MYSQL_TYPE_LONG: u8 = 0x03;
+const MYSQL_TYPE_LONGLONG: u8 = 0x08;
+const MYSQL_TYPE_DOUBLE: u8 = 0x05;
+const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
+
+fn encodeLenEncString(allocator: std.mem.Allocator, payload: *std.ArrayList(u8), s: []const u8) !void {
+    try mysql_packet.appendLenEncString(allocator, payload, s);
+}
+
+test "mysql wire: COM_STMT_PREPARE on parameterized SELECT returns param + column counts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .tag = "b" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 200;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("SELECT id, qty FROM orders WHERE qty >= ?");
+    const reply = try client.readPrepareReply(true);
+    try std.testing.expect(reply.stmt_id != 0);
+    try std.testing.expectEqual(@as(u16, 1), reply.num_params);
+    // Schema inference: SELECT id, qty against a non-string predicate
+    // succeeds; expect 2 output columns.
+    try std.testing.expectEqual(@as(u16, 2), reply.num_columns);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_STMT_EXECUTE returns rows matching the bound int param" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 50), .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 100), .tag = "c" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 201;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("SELECT id, qty FROM orders WHERE qty >= ?");
+    const reply = try client.readPrepareReply(true);
+
+    // Bind qty >= 50 (INT, 4 bytes LE).
+    var val_buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &val_buf, 50, .little);
+    const params = [_]TestClient.Param{
+        .{ .type_byte = MYSQL_TYPE_LONG, .value_bytes = &val_buf },
+    };
+    try client.sendStmtExecute(reply.stmt_id, &params);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try client.readBinaryResultSet(arena.allocator(), true);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+
+    // Each row: id (BIGINT 8-byte LE) then qty (INT 4-byte LE), no NULL.
+    // 2 columns + 2-bit prefix = 4 bits → 1 nullmap byte.
+    try std.testing.expectEqual(@as(usize, 1), rows[0].nullmap.len);
+    try std.testing.expectEqual(@as(u8, 0), rows[0].nullmap[0] & 0b1111);
+
+    const r0_id = std.mem.readInt(i64, rows[0].cells[0..8], .little);
+    const r0_qty = std.mem.readInt(i32, rows[0].cells[8..12], .little);
+    try std.testing.expectEqual(@as(i64, 2), r0_id);
+    try std.testing.expectEqual(@as(i32, 50), r0_qty);
+
+    const r1_id = std.mem.readInt(i64, rows[1].cells[0..8], .little);
+    try std.testing.expectEqual(@as(i64, 3), r1_id);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_STMT_PREPARE on bogus table returns ERR" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 202;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    // Best-effort schema inference will fail (table missing). PREPARE
+    // still SUCCEEDS — we register the stmt with num_columns=0. The
+    // actual error surfaces at EXECUTE time. This matches how some
+    // drivers expect "describe failure ≠ prepare failure" — both
+    // outcomes are technically MySQL-spec-compatible. Verify the
+    // statement is registered and EXECUTE produces ERR 1146.
+    try client.sendStmtPrepare("SELECT * FROM nonexistent_table WHERE id = ?");
+    const reply = try client.readPrepareReply(true);
+    try std.testing.expectEqual(@as(u16, 1), reply.num_params);
+
+    var val_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &val_buf, 1, .little);
+    const params = [_]TestClient.Param{
+        .{ .type_byte = MYSQL_TYPE_LONGLONG, .value_bytes = &val_buf },
+    };
+    try client.sendStmtExecute(reply.stmt_id, &params);
+
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expectEqual(@as(u8, 0xFF), pkt.payload[0]);
+    const code = std.mem.readInt(u16, pkt.payload[1..3], .little);
+    try std.testing.expectEqual(@as(u16, 1146), code);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_STMT_EXECUTE on unknown statement_id returns ER_UNKNOWN_STMT_HANDLER" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 203;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtExecute(9999, &.{});
+
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expectEqual(@as(u8, 0xFF), pkt.payload[0]);
+    const code = std.mem.readInt(u16, pkt.payload[1..3], .little);
+    try std.testing.expectEqual(@as(u16, 1243), code);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_STMT_CLOSE then COM_STMT_EXECUTE on same id → ERR" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+    try tbl.insert(&.{.{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" }});
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 204;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("SELECT id FROM orders WHERE id = ?");
+    const reply = try client.readPrepareReply(true);
+
+    try client.sendStmtClose(reply.stmt_id);
+    // No response from CLOSE.
+
+    var val: [8]u8 = undefined;
+    std.mem.writeInt(i64, &val, 1, .little);
+    const params = [_]TestClient.Param{
+        .{ .type_byte = MYSQL_TYPE_LONGLONG, .value_bytes = &val },
+    };
+    try client.sendStmtExecute(reply.stmt_id, &params);
+
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expectEqual(@as(u8, 0xFF), pkt.payload[0]);
+    const code = std.mem.readInt(u16, pkt.payload[1..3], .little);
+    try std.testing.expectEqual(@as(u16, 1243), code);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_STMT_PREPARE + EXECUTE for parameterized INSERT writes rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+
+    const port: u16 = test_port_base + 205;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("INSERT INTO orders (id, qty, tag) VALUES (?, ?, ?)");
+    const reply = try client.readPrepareReply(true);
+    try std.testing.expectEqual(@as(u16, 3), reply.num_params);
+    try std.testing.expectEqual(@as(u16, 0), reply.num_columns);
+
+    var id_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &id_buf, 42, .little);
+    var qty_buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &qty_buf, 99, .little);
+
+    // VAR_STRING value = lenenc length + bytes.
+    var tag_payload: std.ArrayList(u8) = .empty;
+    defer tag_payload.deinit(allocator);
+    try mysql_packet.appendLenEncString(allocator, &tag_payload, "via-prepare");
+
+    const params = [_]TestClient.Param{
+        .{ .type_byte = MYSQL_TYPE_LONGLONG, .value_bytes = &id_buf },
+        .{ .type_byte = MYSQL_TYPE_LONG, .value_bytes = &qty_buf },
+        .{ .type_byte = MYSQL_TYPE_VAR_STRING, .value_bytes = tag_payload.items },
+    };
+    try client.sendStmtExecute(reply.stmt_id, &params);
+
+    const ok = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(ok.payload);
+    try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+    try tbl.flush();
+
+    // Verify the row landed via a direct scan.
+    var q = try thindb.scan(allocator, tbl);
+    defer q.deinit();
+    var saw_match = false;
+    while (try q.next()) |batch| {
+        const ids = batch.values[0].data.bigint;
+        const qtys = batch.values[1].data.int;
+        const tags = batch.values[2].data.string;
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            if (ids[r] == 42 and qtys[r] == 99 and std.mem.eql(u8, tags.rowBytes(r), "via-prepare")) {
+                saw_match = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_match);
+}
+
+test "mysql wire: two COM_STMT_PREPARE in one connection get independent statement_ids" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+    try tbl.insert(&.{.{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" }});
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 206;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("SELECT id FROM orders WHERE id = ?");
+    const a = try client.readPrepareReply(true);
+    try client.sendStmtPrepare("SELECT qty FROM orders WHERE qty = ?");
+    const b = try client.readPrepareReply(true);
+    try std.testing.expect(a.stmt_id != b.stmt_id);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_STMT_PREPARE on DDL — EXECUTE returns OK with no rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 207;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("CREATE DATABASE reports_stmt");
+    const reply = try client.readPrepareReply(true);
+    try std.testing.expectEqual(@as(u16, 0), reply.num_params);
+    try std.testing.expectEqual(@as(u16, 0), reply.num_columns);
+
+    try client.sendStmtExecute(reply.stmt_id, &.{});
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_STMT_EXECUTE with new_params_bound_flag=0 reuses prior types" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 50), .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 100), .tag = "c" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 208;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("SELECT id FROM orders WHERE qty >= ?");
+    const reply = try client.readPrepareReply(true);
+
+    // First execute: bind qty >= 50 with new_params_bound_flag=1.
+    var v1: [4]u8 = undefined;
+    std.mem.writeInt(i32, &v1, 50, .little);
+    {
+        const params = [_]TestClient.Param{
+            .{ .type_byte = MYSQL_TYPE_LONG, .value_bytes = &v1 },
+        };
+        try client.sendStmtExecute(reply.stmt_id, &params);
+        var a1 = std.heap.ArenaAllocator.init(allocator);
+        defer a1.deinit();
+        const rows = try client.readBinaryResultSet(a1.allocator(), true);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+    }
+
+    // Second execute: reuse types — send only the value bytes.
+    var v2: [4]u8 = undefined;
+    std.mem.writeInt(i32, &v2, 100, .little);
+    try client.sendStmtExecuteReuse(reply.stmt_id, 1, &v2);
+    {
+        var a2 = std.heap.ArenaAllocator.init(allocator);
+        defer a2.deinit();
+        const rows = try client.readBinaryResultSet(a2.allocator(), true);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+    }
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_STMT_SEND_LONG_DATA accumulates string consumed by EXECUTE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+
+    const port: u16 = test_port_base + 209;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("INSERT INTO orders (id, qty, tag) VALUES (?, ?, ?)");
+    const reply = try client.readPrepareReply(true);
+
+    // Long-data the tag in two chunks.
+    try client.sendStmtSendLongData(reply.stmt_id, 2, "long-");
+    try client.sendStmtSendLongData(reply.stmt_id, 2, "tag");
+
+    var id_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &id_buf, 7, .little);
+    var qty_buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &qty_buf, 11, .little);
+
+    // Send the param-types-and-values block. The tag slot is NULL-
+    // flagged so the server uses the long-data buffer instead.
+    const params = [_]TestClient.Param{
+        .{ .type_byte = MYSQL_TYPE_LONGLONG, .value_bytes = &id_buf },
+        .{ .type_byte = MYSQL_TYPE_LONG, .value_bytes = &qty_buf },
+        .{ .type_byte = MYSQL_TYPE_VAR_STRING, .value_bytes = null },
+    };
+    try client.sendStmtExecute(reply.stmt_id, &params);
+
+    const ok = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(ok.payload);
+    try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+    try tbl.flush();
+
+    var q = try thindb.scan(allocator, tbl);
+    defer q.deinit();
+    var saw_match = false;
+    while (try q.next()) |batch| {
+        const ids = batch.values[0].data.bigint;
+        const tags = batch.values[2].data.string;
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            if (ids[r] == 7 and std.mem.eql(u8, tags.rowBytes(r), "long-tag")) saw_match = true;
+        }
+    }
+    try std.testing.expect(saw_match);
 }

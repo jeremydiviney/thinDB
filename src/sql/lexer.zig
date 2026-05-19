@@ -77,6 +77,12 @@ pub const TokenTag = enum {
     lparen, // (
     rparen, // )
     semicolon, // ;
+    /// `?` placeholder used by MySQL prepared-statement clients. The
+    /// SQL parser does not accept this in the v1 SELECT/INSERT grammar;
+    /// it surfaces as a token so callers that pre-tokenize (the
+    /// prepared-statement registry) can count `?` outside string/
+    /// backtick context to learn the parameter count.
+    question, // ?
 
     eof,
 };
@@ -151,6 +157,10 @@ pub const Lexer = struct {
             '*' => {
                 self.pos += 1;
                 return Token{ .tag = .star, .text = self.src[start..self.pos] };
+            },
+            '?' => {
+                self.pos += 1;
+                return Token{ .tag = .question, .text = self.src[start..self.pos] };
             },
             '!' => {
                 if (self.peekChar(1) == '=') {
@@ -459,6 +469,30 @@ test "lexer: skips line and block comments" {
     try std.testing.expectEqual(@as(TokenTag, .identifier), (try lx.next()).tag);
     try std.testing.expectEqual(@as(TokenTag, .kw_from), (try lx.next()).tag);
     try std.testing.expectEqual(@as(TokenTag, .identifier), (try lx.next()).tag);
+}
+
+test "lexer: question mark outside strings produces .question token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "SELECT * FROM t WHERE a = ? AND b = ?");
+    const tags = [_]TokenTag{
+        .kw_select, .star, .kw_from, .identifier, .kw_where,
+        .identifier, .eq, .question, .kw_and, .identifier,
+        .eq, .question, .eof,
+    };
+    for (tags) |tag| {
+        try std.testing.expectEqual(tag, (try lx.next()).tag);
+    }
+}
+
+test "lexer: question mark inside string literal is content, not a placeholder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "'why?' ?");
+    const tok = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .string), tok.tag);
+    try std.testing.expectEqualStrings("why?", tok.value.string);
+    try std.testing.expectEqual(@as(TokenTag, .question), (try lx.next()).tag);
 }
 
 test "lexer: unterminated string errors cleanly" {

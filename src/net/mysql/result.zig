@@ -20,17 +20,19 @@ const handshake = @import("handshake.zig");
 const canned = @import("canned.zig");
 const wire_format = @import("../wire_format.zig");
 
-const MYSQL_TYPE_TINY: u8 = 0x01;
-const MYSQL_TYPE_SHORT: u8 = 0x02;
-const MYSQL_TYPE_LONG: u8 = 0x03;
-const MYSQL_TYPE_FLOAT: u8 = 0x04;
-const MYSQL_TYPE_DOUBLE: u8 = 0x05;
-const MYSQL_TYPE_LONGLONG: u8 = 0x08;
-const MYSQL_TYPE_DATE: u8 = 0x0a;
-const MYSQL_TYPE_DATETIME: u8 = 0x0c;
-const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
-const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
-const MYSQL_TYPE_STRING: u8 = 0xfe;
+pub const MYSQL_TYPE_TINY: u8 = 0x01;
+pub const MYSQL_TYPE_SHORT: u8 = 0x02;
+pub const MYSQL_TYPE_LONG: u8 = 0x03;
+pub const MYSQL_TYPE_FLOAT: u8 = 0x04;
+pub const MYSQL_TYPE_DOUBLE: u8 = 0x05;
+pub const MYSQL_TYPE_NULL: u8 = 0x06;
+pub const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
+pub const MYSQL_TYPE_LONGLONG: u8 = 0x08;
+pub const MYSQL_TYPE_DATE: u8 = 0x0a;
+pub const MYSQL_TYPE_DATETIME: u8 = 0x0c;
+pub const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
+pub const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
+pub const MYSQL_TYPE_STRING: u8 = 0xfe;
 
 const NOT_NULL_FLAG: u16 = 0x0001;
 /// Numeric-type column marker. mysql CLI right-aligns columns that
@@ -72,7 +74,11 @@ fn mysqlTypeOf(t: types.Type) struct { type_byte: u8, decimals: u8, len: u32, ch
     };
 }
 
-fn appendColumnDef(
+pub fn mysqlTypeInfo(t: types.Type) struct { type_byte: u8, decimals: u8, len: u32, charset: u16 } {
+    return mysqlTypeOf(t);
+}
+
+pub fn appendColumnDef(
     allocator: Allocator,
     out: *std.ArrayList(u8),
     schema_name: []const u8,

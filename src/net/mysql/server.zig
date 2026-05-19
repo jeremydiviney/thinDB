@@ -22,6 +22,7 @@ const ApiError = thindb_api.Error;
 const local = @import("../local.zig");
 const ir = @import("../../ir/ir.zig");
 const sql = @import("../../sql/sql.zig");
+const types = @import("../../types.zig");
 
 const packet = @import("packet.zig");
 const handshake = @import("handshake.zig");
@@ -29,6 +30,7 @@ const result = @import("result.zig");
 const canned = @import("canned.zig");
 const errors = @import("errors.zig");
 const auth = @import("auth.zig");
+const prepared = @import("prepared.zig");
 const conn_registry = @import("../conn_registry.zig");
 const ConnectionState = conn_registry.ConnectionState;
 const ConnectionRegistry = conn_registry.Registry;
@@ -242,6 +244,12 @@ const SessionState = struct {
     /// peer connections. Null when no registry is configured (KILL
     /// becomes a no-op success).
     registry: ?*ConnectionRegistry = null,
+    /// Per-connection prepared-statement registry. Statements are owned
+    /// here and freed on COM_STMT_CLOSE or at connection teardown.
+    prepared_statements: std.AutoHashMapUnmanaged(u32, *prepared.PreparedStmt) = .empty,
+    /// Next stmt id to hand out. MySQL drivers don't care about the
+    /// numbering scheme; just needs to be stable per-connection.
+    next_stmt_id: u32 = 1,
 
     fn init(allocator: Allocator) !SessionState {
         return .{
@@ -254,6 +262,9 @@ const SessionState = struct {
     fn deinit(self: *SessionState) void {
         self.allocator.free(self.current_db);
         self.allocator.free(self.current_schema);
+        var it = self.prepared_statements.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.deinit();
+        self.prepared_statements.deinit(self.allocator);
     }
 
     fn replace(self: *SessionState, db: []const u8, schema: []const u8) !void {
@@ -386,6 +397,18 @@ fn handleConnection(
             0x01 => return, // COM_QUIT
             0x02 => try handleInitDb(allocator, w, catalog, &session, body),
             0x03 => try handleQuery(allocator, w, catalog, &session, body),
+            // COM_STMT_PREPARE (0x16) — parse SQL, count `?` placeholders,
+            // register a per-connection statement id, return prepare-ok.
+            0x16 => try handleStmtPrepare(allocator, w, catalog, &session, body),
+            // COM_STMT_EXECUTE (0x17) — bind parameters + run.
+            0x17 => try handleStmtExecute(allocator, w, catalog, &session, body),
+            // COM_STMT_SEND_LONG_DATA (0x18) — accumulate long-data
+            // bytes into a per-stmt per-param buffer. No response.
+            0x18 => try handleStmtSendLongData(&session, body),
+            // COM_STMT_CLOSE (0x19) — free the stmt entry. No response.
+            0x19 => try handleStmtClose(&session, body),
+            // COM_STMT_RESET (0x1A) — clear long-data buffers; reply OK.
+            0x1A => try handleStmtReset(allocator, w, &session, body),
             0x0E => try handshake.sendOkPacket(allocator, w, 1, 0, 0), // COM_PING
             // COM_RESET_CONNECTION — wipes per-connection state without
             // closing the socket. Connection poolers (e.g. ProxySQL,
@@ -778,6 +801,302 @@ fn isSideEffectOp(op: ir.Op) bool {
         .ddl, .insert => true,
         else => false,
     };
+}
+
+// ---------------------------------------------------------------------------
+// COM_STMT_* handlers
+// ---------------------------------------------------------------------------
+
+/// Prepare a statement: tokenize to count `?`, register a stmt id, and
+/// best-effort compile a `?`-substituted version against the active
+/// session to derive output-column metadata. Compile failures (e.g.
+/// `WHERE name = ?` against a VARCHAR column when the dummy literal is
+/// `0`) are swallowed — we still register the stmt and emit
+/// num_columns=0; the real schema rides the EXECUTE response.
+fn handleStmtPrepare(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+) !void {
+    var seq_id: u8 = 1;
+    const caps = session.client_caps;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const num_params = prepared.countPlaceholders(arena.allocator(), payload) catch 0;
+
+    const stmt_id = session.next_stmt_id;
+    session.next_stmt_id +%= 1;
+    const stmt = try prepared.createPreparedStmt(allocator, stmt_id, payload, num_params);
+
+    // Best-effort schema inference. We substitute `?` → `0` so the
+    // existing parser+compiler can produce an output schema; failures
+    // here fall back to num_columns=0. Side-effect ops (DDL, INSERT)
+    // are skipped before compile so the prepare-time pass has no
+    // observable effect on the catalog or data.
+    blk: {
+        const dummy_sql = prepared.renderDummySubstitution(arena.allocator(), payload, num_params) catch break :blk;
+        const dummy_op = sql.parse(arena.allocator(), dummy_sql) catch break :blk;
+        if (dummy_op.* == .batch) break :blk;
+        if (isSideEffectOp(dummy_op.*)) break :blk;
+        const main_db = catalog.database(session.current_db) orelse break :blk;
+        var compiled = local.compileWithSession(arena.allocator(), main_db, session.asSession(), dummy_op) catch break :blk;
+        defer compiled.deinit();
+        const schema = compiled.outputSchema();
+
+        const names = allocator.alloc([]u8, schema.len) catch break :blk;
+        var names_inited: usize = 0;
+        errdefer {
+            for (names[0..names_inited]) |n| allocator.free(n);
+            allocator.free(names);
+        }
+        for (schema) |col| {
+            names[names_inited] = allocator.dupe(u8, col.name) catch break :blk;
+            names_inited += 1;
+        }
+        const cols = allocator.alloc(types.Column, schema.len) catch break :blk;
+        for (schema, 0..) |col, i| {
+            cols[i] = .{ .name = names[i], .type = col.type, .nullable = col.nullable };
+        }
+        stmt.column_schema = cols;
+        stmt.column_names = names;
+        stmt.num_columns = @intCast(schema.len);
+    }
+
+    try session.prepared_statements.put(allocator, stmt_id, stmt);
+
+    try prepared.sendPrepareOkHeader(allocator, w, &seq_id, stmt_id, stmt.num_columns, num_params);
+
+    // Param column-defs. Real MySQL emits one per `?` with empty
+    // table/name and type=VAR_STRING. Mirror that.
+    var pi: u16 = 0;
+    while (pi < num_params) : (pi += 1) {
+        try prepared.sendParamColumnDef(allocator, w, &seq_id);
+    }
+    if (num_params > 0 and (caps & handshake.CLIENT_DEPRECATE_EOF) == 0) {
+        try handshake.sendLegacyEofPacket(allocator, w, seq_id);
+        seq_id +%= 1;
+    }
+
+    // Column column-defs.
+    if (stmt.num_columns > 0) {
+        var coldef: std.ArrayList(u8) = .empty;
+        defer coldef.deinit(allocator);
+        const schema = stmt.column_schema.?;
+        for (schema) |col| {
+            coldef.clearRetainingCapacity();
+            try result.appendColumnDef(allocator, &coldef, session.current_db, "", col);
+            try packet.writePacket(w, seq_id, coldef.items);
+            seq_id +%= 1;
+        }
+        if ((caps & handshake.CLIENT_DEPRECATE_EOF) == 0) {
+            try handshake.sendLegacyEofPacket(allocator, w, seq_id);
+            seq_id +%= 1;
+        }
+    }
+}
+
+/// Execute a previously-prepared statement: bind parameters from the
+/// binary wire format, substitute them as SQL literals into the saved
+/// SQL, compile, and stream results back as binary rows.
+fn handleStmtExecute(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+) !void {
+    var seq_id: u8 = 1;
+    const caps = session.client_caps;
+
+    if (payload.len < 9) {
+        try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, "malformed COM_STMT_EXECUTE");
+        return;
+    }
+    const stmt_id = std.mem.readInt(u32, payload[0..4], .little);
+
+    const stmt = session.prepared_statements.get(stmt_id) orelse {
+        try handshake.sendErrPacket(allocator, w, seq_id, 1243, "HY000".*, "Unknown prepared statement handler");
+        return;
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const after_header: usize = 9;
+    const params = prepared.decodeExecuteParams(arena_alloc, stmt, payload, after_header) catch |err| {
+        const msg = switch (err) {
+            error.NoBoundParamTypes => "missing parameter types on first execute",
+            error.LongDataAndValueBoth => "long-data and value both bound for same param",
+            error.UnsupportedParamType => "unsupported parameter type",
+            else => "malformed COM_STMT_EXECUTE",
+        };
+        try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, msg);
+        return;
+    };
+
+    const substituted = prepared.substituteSql(arena_alloc, stmt.sql, params) catch |err| {
+        const msg = switch (err) {
+            error.MissingParameter => "missing parameter for placeholder",
+            else => "parameter substitution failure",
+        };
+        try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, msg);
+        return;
+    };
+
+    // Clear long-data buffers after consuming them — MySQL semantics:
+    // long-data accumulates across SEND_LONG_DATA calls but is consumed
+    // by the next EXECUTE. Subsequent EXECUTEs start fresh.
+    for (stmt.long_data) |*ld| {
+        if (ld.*) |*buf| {
+            buf.deinit(stmt.allocator);
+            ld.* = null;
+        }
+    }
+
+    const op = sql.parse(arena_alloc, substituted) catch |err| {
+        const mapped = errors.mapInternal(err, @errorName(err));
+        try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+        return;
+    };
+
+    if (op.* == .batch) {
+        try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, "Multi-statement not supported in prepared mode");
+        return;
+    }
+
+    const main_db = catalog.database(session.current_db) orelse {
+        try handshake.sendErrPacket(allocator, w, seq_id, 1049, "42000".*, "Unknown database");
+        return;
+    };
+
+    var compiled = local.compileWithSession(allocator, main_db, session.asSession(), op) catch |err| {
+        const mapped = errors.mapInternal(err, @errorName(err));
+        try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+        return;
+    };
+    defer compiled.deinit();
+
+    if (session.conn_state) |state| {
+        state.clearCancel();
+        compiled.cancel_flag = &state.cancel_flag;
+    }
+
+    if (isSideEffectOp(op.*)) {
+        _ = compiled.next() catch |err| {
+            const mapped = errors.mapInternal(err, @errorName(err));
+            try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+            return;
+        };
+        const new_session = compiled.sessionValue();
+        try session.replace(new_session.current_db, new_session.current_schema);
+        try handshake.sendOkPacketStatus(
+            allocator,
+            w,
+            seq_id,
+            compiled.affectedRows(),
+            0,
+            session.transactionStatus(),
+        );
+        return;
+    }
+
+    // Binary result set.
+    const schema = compiled.outputSchema();
+
+    var col_count_buf: std.ArrayList(u8) = .empty;
+    defer col_count_buf.deinit(allocator);
+    try packet.appendLenEncInt(allocator, &col_count_buf, @intCast(schema.len));
+    try packet.writePacket(w, seq_id, col_count_buf.items);
+    seq_id +%= 1;
+
+    var coldef: std.ArrayList(u8) = .empty;
+    defer coldef.deinit(allocator);
+    for (schema) |col| {
+        coldef.clearRetainingCapacity();
+        try result.appendColumnDef(allocator, &coldef, session.current_db, "", col);
+        try packet.writePacket(w, seq_id, coldef.items);
+        seq_id +%= 1;
+    }
+
+    if ((caps & handshake.CLIENT_DEPRECATE_EOF) == 0) {
+        try handshake.sendLegacyEofPacket(allocator, w, seq_id);
+        seq_id +%= 1;
+    }
+
+    var row_payload: std.ArrayList(u8) = .empty;
+    defer row_payload.deinit(allocator);
+
+    while (try compiled.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            row_payload.clearRetainingCapacity();
+            try prepared.appendBinaryRow(allocator, &row_payload, batch.schema, batch.values, r);
+            try packet.writePacket(w, seq_id, row_payload.items);
+            seq_id +%= 1;
+        }
+    }
+
+    try result.sendResultTerminatorStatus(allocator, w, &seq_id, caps, session.transactionStatus());
+
+    const new_session = compiled.sessionValue();
+    try session.replace(new_session.current_db, new_session.current_schema);
+}
+
+/// COM_STMT_CLOSE — destroy the prepared statement. No response.
+fn handleStmtClose(session: *SessionState, payload: []const u8) !void {
+    if (payload.len < 4) return;
+    const stmt_id = std.mem.readInt(u32, payload[0..4], .little);
+    if (session.prepared_statements.fetchRemove(stmt_id)) |kv| {
+        kv.value.deinit();
+    }
+}
+
+/// COM_STMT_RESET — drop any accumulated long-data buffers. Reply OK
+/// even if the stmt id is unknown (matches mysqld behavior in practice).
+fn handleStmtReset(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    session: *SessionState,
+    payload: []const u8,
+) !void {
+    const seq_id: u8 = 1;
+    if (payload.len < 4) {
+        try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, "malformed COM_STMT_RESET");
+        return;
+    }
+    const stmt_id = std.mem.readInt(u32, payload[0..4], .little);
+    if (session.prepared_statements.get(stmt_id)) |stmt| {
+        for (stmt.long_data) |*ld| {
+            if (ld.*) |*buf| {
+                buf.deinit(stmt.allocator);
+                ld.* = null;
+            }
+        }
+    }
+    try handshake.sendOkPacketStatus(allocator, w, seq_id, 0, 0, session.transactionStatus());
+}
+
+/// COM_STMT_SEND_LONG_DATA — append bytes to a per-stmt per-param
+/// accumulator. No response. Unknown stmt id / bad layout silently
+/// drops the data (matches mysqld behavior).
+fn handleStmtSendLongData(session: *SessionState, payload: []const u8) !void {
+    if (payload.len < 6) return;
+    const stmt_id = std.mem.readInt(u32, payload[0..4], .little);
+    const param_index = std.mem.readInt(u16, payload[4..6], .little);
+    const data = payload[6..];
+
+    const stmt = session.prepared_statements.get(stmt_id) orelse return;
+    if (param_index >= stmt.long_data.len) return;
+    if (stmt.long_data[param_index] == null) {
+        stmt.long_data[param_index] = .empty;
+    }
+    var buf = &stmt.long_data[param_index].?;
+    try buf.appendSlice(stmt.allocator, data);
 }
 
 test "applyInitDb resolves flat db__schema name" {
