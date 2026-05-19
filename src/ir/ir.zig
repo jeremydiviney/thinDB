@@ -125,6 +125,22 @@ pub const ShowOp = union(enum) {
     tables: TableRef,
 };
 
+/// PostgreSQL `COPY ... FROM STDIN` / `COPY ... TO STDOUT` bulk
+/// transfer. Execution is wire-driven (the operator interleaves
+/// CopyData frames with the client), so this op never appears
+/// inside `compileWithSession` — the PG dispatcher handles it
+/// directly and only sees a top-level Copy.
+pub const CopyOp = struct {
+    pub const Direction = enum(u8) { from_stdin = 0, to_stdout = 1 };
+
+    direction: Direction,
+    table: TableRef,
+    /// Optional column list. `null` means "use every table column in
+    /// schema-declared order". A non-null list reorders the source
+    /// columns to the named slots; missing columns must be nullable.
+    columns: ?[]const []const u8,
+};
+
 pub const Error = error{
     IrBadMagic,
     IrUnsupportedVersion,
@@ -176,6 +192,10 @@ pub const OpTag = enum(u8) {
     /// and compile each one independently. `compileWithSession` rejects
     /// this tag (it isn't a unified pipeline).
     batch = 13,
+    /// PostgreSQL bulk COPY (FROM STDIN / TO STDOUT). Wire-driven —
+    /// the PG dispatcher handles it directly; `compileWithSession`
+    /// rejects it because the operator interleaves with the client.
+    copy = 14,
 };
 
 pub const BatchOp = struct {
@@ -200,6 +220,7 @@ pub const Op = union(OpTag) {
     show: ShowOp,
     insert: InsertOp,
     batch: BatchOp,
+    copy: CopyOp,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -340,6 +361,9 @@ pub const Op = union(OpTag) {
                 }
                 allocator.free(b.statements);
             },
+            .copy => |c| {
+                if (c.columns) |cols| allocator.free(cols);
+            },
         }
     }
 };
@@ -400,6 +424,22 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             try appendU32(allocator, out, @intCast(b.statements.len));
             for (b.statements) |sub| try encodeOp(allocator, out, sub.*);
         },
+        .copy => |c| try encodeCopy(allocator, out, c),
+    }
+}
+
+fn encodeCopy(allocator: Allocator, out: *std.ArrayList(u8), c: CopyOp) EncodeError!void {
+    try out.append(allocator, @intFromEnum(c.direction));
+    try encodeTableRef(allocator, out, c.table);
+    if (c.columns) |cols| {
+        try out.append(allocator, 1);
+        try appendU32(allocator, out, @intCast(cols.len));
+        for (cols) |name| {
+            try appendU32(allocator, out, @intCast(name.len));
+            try out.appendSlice(allocator, name);
+        }
+    } else {
+        try out.append(allocator, 0);
     }
 }
 
@@ -931,7 +971,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.batch)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.copy)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1160,7 +1200,30 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             }
             break :blk Op{ .batch = .{ .statements = subs } };
         },
+        .copy => Op{ .copy = try decodeCopy(allocator, bytes, cursor) },
     };
+}
+
+fn decodeCopy(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!CopyOp {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const dir_byte = bytes[cursor.*];
+    cursor.* += 1;
+    if (dir_byte > @intFromEnum(CopyOp.Direction.to_stdout)) return Error.IrCorrupt;
+    const direction: CopyOp.Direction = @enumFromInt(dir_byte);
+    const ref = try decodeTableRef(bytes, cursor);
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const has_cols = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    const cols_opt: ?[]const []const u8 = if (has_cols) blk: {
+        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+        const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+        cursor.* += 4;
+        const out = try allocator.alloc([]const u8, n);
+        errdefer allocator.free(out);
+        for (out) |*c| c.* = try readString(bytes, cursor);
+        break :blk out;
+    } else null;
+    return .{ .direction = direction, .table = ref, .columns = cols_opt };
 }
 
 fn decodeTableRef(bytes: []const u8, cursor: *usize) DecodeError!TableRef {
@@ -1621,7 +1684,22 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try out.appendSlice(allocator, s);
             for (b.statements) |sub| try explainOp(allocator, out, sub.*, depth + 1);
         },
+        .copy => |c| try explainCopy(allocator, out, c),
     }
+}
+
+fn explainCopy(allocator: Allocator, out: *std.ArrayList(u8), c: CopyOp) !void {
+    try out.appendSlice(allocator, switch (c.direction) {
+        .from_stdin => "CopyFromStdin ",
+        .to_stdout => "CopyToStdout ",
+    });
+    try writeTableRef(allocator, out, c.table);
+    if (c.columns) |cols| {
+        try out.appendSlice(allocator, " cols=[");
+        try writeJoinedNames(allocator, out, cols);
+        try out.append(allocator, ']');
+    }
+    try out.append(allocator, '\n');
 }
 
 fn explainInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) !void {

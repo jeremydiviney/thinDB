@@ -902,6 +902,12 @@ pub fn buildServerQuerySession(
             // separately.
             return Error.UnsupportedOp;
         },
+        .copy => {
+            // COPY interleaves with the wire (CopyData frames) so it
+            // can only run from the PG dispatcher, never through the
+            // generic compile path.
+            return Error.UnsupportedOp;
+        },
     };
 }
 
@@ -1105,6 +1111,8 @@ fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         // and compile each one independently. Reaching this branch means
         // a caller compiled a batch op directly; that's a bug.
         .batch => Error.UnsupportedOp,
+        // COPY is wire-driven; only the PG dispatcher handles it.
+        .copy => Error.UnsupportedOp,
     };
 }
 

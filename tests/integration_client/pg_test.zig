@@ -125,6 +125,102 @@ const TestClient = struct {
         try self.writer.interface.flush();
     }
 
+    /// COPY: send a `d` frame carrying raw row bytes (typically one
+    /// text-format line including its trailing '\n'). Multiple rows
+    /// may share a frame.
+    fn sendCopyData(self: *TestClient, bytes: []const u8) !void {
+        try pg_packet.writeFrame(&self.writer.interface, 'd', bytes);
+        try self.writer.interface.flush();
+    }
+
+    /// COPY: terminator. Empty `c` frame; the server replies with
+    /// CommandComplete "COPY N\0" + ReadyForQuery.
+    fn sendCopyDone(self: *TestClient) !void {
+        try pg_packet.writeFrame(&self.writer.interface, 'c', "");
+        try self.writer.interface.flush();
+    }
+
+    /// COPY: client-initiated abort. NUL-terminated reason in an `f`
+    /// frame; the server replies with ErrorResponse + ReadyForQuery.
+    fn sendCopyFail(self: *TestClient, reason: []const u8) !void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try pg_packet.appendCString(self.allocator, &payload, reason);
+        try pg_packet.writeFrame(&self.writer.interface, 'f', payload.items);
+        try self.writer.interface.flush();
+    }
+
+    /// COPY: drain the server's CopyInResponse (`G`) or
+    /// CopyOutResponse (`H`). Returns the column count from the
+    /// frame's payload. Errors if the next frame is anything else
+    /// (e.g., the server pre-emptively ErrorResponse'd).
+    const CopyResponse = struct {
+        type_byte: u8,
+        column_count: u16,
+    };
+
+    fn readCopyResponse(self: *TestClient) !CopyResponse {
+        const f = try pg_packet.readFrame(self.allocator, &self.reader.interface);
+        defer self.allocator.free(f.payload);
+        if (f.type_byte != 'G' and f.type_byte != 'H') return error.UnexpectedFrame;
+        var cursor: usize = 0;
+        // Skip the 1-byte overall format flag.
+        if (f.payload.len < 1) return error.MalformedCopyResponse;
+        cursor += 1;
+        const cc = try pg_packet.readU16(f.payload, &cursor);
+        return .{ .type_byte = f.type_byte, .column_count = cc };
+    }
+
+    /// COPY TO: drain the server-emitted CopyData frames + CopyDone +
+    /// CommandComplete + ReadyForQuery. Returns the row bodies and
+    /// the command tag.
+    const CopyToReply = struct {
+        rows: []const []const u8,
+        command_tag: []const u8,
+        error_code: ?[]const u8 = null,
+        error_message: ?[]const u8 = null,
+    };
+
+    fn readCopyToReply(self: *TestClient, arena: std.mem.Allocator) !CopyToReply {
+        var rows: std.ArrayList([]const u8) = .empty;
+        var command_tag: []const u8 = "";
+        var err_code: ?[]const u8 = null;
+        var err_msg: ?[]const u8 = null;
+        while (true) {
+            const f = try pg_packet.readFrame(self.allocator, &self.reader.interface);
+            defer self.allocator.free(f.payload);
+            switch (f.type_byte) {
+                'd' => try rows.append(arena, try arena.dupe(u8, f.payload)),
+                'c' => {},
+                'C' => {
+                    var cursor: usize = 0;
+                    const tag = try pg_packet.readCString(f.payload, &cursor);
+                    command_tag = try arena.dupe(u8, tag);
+                },
+                'E' => {
+                    var cursor: usize = 0;
+                    while (cursor < f.payload.len and f.payload[cursor] != 0) {
+                        const tb = f.payload[cursor];
+                        cursor += 1;
+                        const val = try pg_packet.readCString(f.payload, &cursor);
+                        switch (tb) {
+                            'C' => err_code = try arena.dupe(u8, val),
+                            'M' => err_msg = try arena.dupe(u8, val),
+                            else => {},
+                        }
+                    }
+                },
+                'Z' => return .{
+                    .rows = try rows.toOwnedSlice(arena),
+                    .command_tag = command_tag,
+                    .error_code = err_code,
+                    .error_message = err_msg,
+                },
+                else => {},
+            }
+        }
+    }
+
     const Row = []const ?[]const u8;
     const QueryReply = struct {
         rows: []const Row,
@@ -758,6 +854,466 @@ test "pg wire: BEGIN/COMMIT/ROLLBACK flip the ReadyForQuery tx_status byte" {
     try client.sendQuery("ROLLBACK");
     r = try client.readQueryReply(arena.allocator());
     try std.testing.expectEqual(@as(u8, 'I'), r.tx_status);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+// ---------------------------------------------------------------------------
+// COPY ... FROM STDIN / COPY ... TO STDOUT
+// ---------------------------------------------------------------------------
+
+/// Schema used by the COPY tests. Three nullable string-ish columns
+/// keep the wire-format encoding/escape tests deterministic without
+/// pulling in integer-parse failure modes.
+const schema_copy = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "name", .type = .string, .nullable = true },
+        .{ .name = "note", .type = .string, .nullable = true },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const ok_copy = [_][]const u8{"id"};
+const opts_copy = thindb.TableOptions{
+    .order_key = &ok_copy,
+    .unique = true,
+    .row_group_size = 4,
+};
+
+test "pg wire: COPY FROM STDIN happy path inserts three rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("copy_basic", schema_copy, opts_copy);
+    _ = tbl;
+
+    const port: u16 = test_port_base + 30;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendQuery("COPY copy_basic FROM STDIN");
+    const cr = try client.readCopyResponse();
+    try std.testing.expectEqual(@as(u8, 'G'), cr.type_byte);
+    try std.testing.expectEqual(@as(u16, 3), cr.column_count);
+
+    try client.sendCopyData("1\talpha\tone\n");
+    try client.sendCopyData("2\tbeta\ttwo\n");
+    try client.sendCopyData("3\tgamma\tthree\n");
+    try client.sendCopyDone();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Drain the CommandComplete + ReadyForQuery that close the COPY.
+    var saw_tag = false;
+    var saw_ready = false;
+    while (!saw_ready) {
+        const f = try pg_packet.readFrame(allocator, &client.reader.interface);
+        defer allocator.free(f.payload);
+        switch (f.type_byte) {
+            'C' => {
+                var cursor: usize = 0;
+                const tag = try pg_packet.readCString(f.payload, &cursor);
+                try std.testing.expectEqualStrings("COPY 3", tag);
+                saw_tag = true;
+            },
+            'Z' => saw_ready = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_tag);
+
+    // Verify the rows landed via a follow-up SELECT.
+    try client.sendQuery("SELECT id, name, note FROM copy_basic");
+    const reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqual(@as(usize, 3), reply.rows.len);
+    try std.testing.expectEqualStrings("1", reply.rows[0][0].?);
+    try std.testing.expectEqualStrings("alpha", reply.rows[0][1].?);
+    try std.testing.expectEqualStrings("one", reply.rows[0][2].?);
+    try std.testing.expectEqualStrings("3", reply.rows[2][0].?);
+    try std.testing.expectEqualStrings("gamma", reply.rows[2][1].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: COPY FROM STDIN honours an explicit column list" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    _ = try sc.table("copy_cols", schema_copy, opts_copy);
+
+    const port: u16 = test_port_base + 31;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    // Source rows have (name, id) first; with the explicit column list
+    // they should land in the right schema slots regardless.
+    try client.sendQuery("COPY copy_cols (name, id) FROM STDIN");
+    const cr = try client.readCopyResponse();
+    try std.testing.expectEqual(@as(u16, 2), cr.column_count);
+
+    try client.sendCopyData("alpha\t1\n");
+    try client.sendCopyData("beta\t2\n");
+    try client.sendCopyDone();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var saw_ready = false;
+    while (!saw_ready) {
+        const f = try pg_packet.readFrame(allocator, &client.reader.interface);
+        defer allocator.free(f.payload);
+        if (f.type_byte == 'Z') saw_ready = true;
+    }
+
+    try client.sendQuery("SELECT id, name, note FROM copy_cols");
+    const reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqual(@as(usize, 2), reply.rows.len);
+    try std.testing.expectEqualStrings("1", reply.rows[0][0].?);
+    try std.testing.expectEqualStrings("alpha", reply.rows[0][1].?);
+    try std.testing.expect(reply.rows[0][2] == null); // unmentioned -> NULL
+    try std.testing.expectEqualStrings("beta", reply.rows[1][1].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: COPY FROM STDIN parses \\N as NULL on a nullable column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    _ = try sc.table("copy_null", schema_copy, opts_copy);
+
+    const port: u16 = test_port_base + 32;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendQuery("COPY copy_null FROM STDIN");
+    _ = try client.readCopyResponse();
+    try client.sendCopyData("1\thas-name\t\\N\n");
+    try client.sendCopyDone();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var saw_ready = false;
+    while (!saw_ready) {
+        const f = try pg_packet.readFrame(allocator, &client.reader.interface);
+        defer allocator.free(f.payload);
+        if (f.type_byte == 'Z') saw_ready = true;
+    }
+
+    try client.sendQuery("SELECT id, name, note FROM copy_null");
+    const reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqual(@as(usize, 1), reply.rows.len);
+    try std.testing.expectEqualStrings("has-name", reply.rows[0][1].?);
+    try std.testing.expect(reply.rows[0][2] == null);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: COPY FROM STDIN round-trips embedded escapes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    _ = try sc.table("copy_esc", schema_copy, opts_copy);
+
+    const port: u16 = test_port_base + 33;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendQuery("COPY copy_esc FROM STDIN");
+    _ = try client.readCopyResponse();
+    // Source bytes: literal "with\ttab", "two\nlines", "back\\slash"
+    // are sent escaped. The server should land them as raw tab /
+    // newline / backslash inside the string column.
+    try client.sendCopyData("1\twith\\ttab\ttwo\\nlines\n");
+    try client.sendCopyData("2\thello\tback\\\\slash\n");
+    try client.sendCopyDone();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var saw_ready = false;
+    while (!saw_ready) {
+        const f = try pg_packet.readFrame(allocator, &client.reader.interface);
+        defer allocator.free(f.payload);
+        if (f.type_byte == 'Z') saw_ready = true;
+    }
+
+    try client.sendQuery("SELECT id, name, note FROM copy_esc");
+    const reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqual(@as(usize, 2), reply.rows.len);
+    try std.testing.expectEqualStrings("with\ttab", reply.rows[0][1].?);
+    try std.testing.expectEqualStrings("two\nlines", reply.rows[0][2].?);
+    try std.testing.expectEqualStrings("back\\slash", reply.rows[1][2].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: COPY FROM STDIN CopyFail aborts cleanly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    _ = try sc.table("copy_fail", schema_copy, opts_copy);
+
+    const port: u16 = test_port_base + 34;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendQuery("COPY copy_fail FROM STDIN");
+    _ = try client.readCopyResponse();
+    try client.sendCopyData("1\talpha\tx\n");
+    try client.sendCopyFail("client-changed-its-mind");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var saw_err = false;
+    var saw_ready = false;
+    while (!saw_ready) {
+        const f = try pg_packet.readFrame(allocator, &client.reader.interface);
+        defer allocator.free(f.payload);
+        switch (f.type_byte) {
+            'E' => saw_err = true,
+            'Z' => saw_ready = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_err);
+
+    // Connection survives — a follow-up SELECT must succeed and see
+    // zero rows (nothing was committed pre-abort).
+    try client.sendQuery("SELECT id FROM copy_fail");
+    const reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqual(@as(usize, 0), reply.rows.len);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: COPY TO STDOUT streams three rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("copy_out", schema_copy, opts_copy);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .name = @as(?[]const u8, "alpha"), .note = @as(?[]const u8, "one") },
+        .{ .id = @as(i64, 2), .name = @as(?[]const u8, "beta"), .note = @as(?[]const u8, "two") },
+        .{ .id = @as(i64, 3), .name = @as(?[]const u8, "gamma"), .note = @as(?[]const u8, null) },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 35;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendQuery("COPY copy_out TO STDOUT");
+    const cr = try client.readCopyResponse();
+    try std.testing.expectEqual(@as(u8, 'H'), cr.type_byte);
+    try std.testing.expectEqual(@as(u16, 3), cr.column_count);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const reply = try client.readCopyToReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqualStrings("COPY 3", reply.command_tag);
+    try std.testing.expectEqual(@as(usize, 3), reply.rows.len);
+    try std.testing.expectEqualStrings("1\talpha\tone\n", reply.rows[0]);
+    try std.testing.expectEqualStrings("2\tbeta\ttwo\n", reply.rows[1]);
+    try std.testing.expectEqualStrings("3\tgamma\t\\N\n", reply.rows[2]);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: COPY TO STDOUT escapes tab newline backslash in cells" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("copy_out_esc", schema_copy, opts_copy);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .name = @as(?[]const u8, "with\ttab"), .note = @as(?[]const u8, "two\nlines") },
+        .{ .id = @as(i64, 2), .name = @as(?[]const u8, "back\\slash"), .note = @as(?[]const u8, "ok") },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 36;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendQuery("COPY copy_out_esc TO STDOUT");
+    _ = try client.readCopyResponse();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const reply = try client.readCopyToReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqualStrings("1\twith\\ttab\ttwo\\nlines\n", reply.rows[0]);
+    try std.testing.expectEqualStrings("2\tback\\\\slash\tok\n", reply.rows[1]);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: COPY FROM file path is rejected with 0A000" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    _ = try sc.table("copy_file_path", schema_copy, opts_copy);
+
+    const port: u16 = test_port_base + 37;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    try client.sendQuery("COPY copy_file_path FROM '/etc/passwd'");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code != null);
+    try std.testing.expectEqualStrings("0A000", reply.error_code.?);
 
     try client.sendTerminate();
     if (sctx.err) |e| return e;

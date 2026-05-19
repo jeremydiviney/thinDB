@@ -65,6 +65,12 @@ pub const ParseError = error{
     SqlOnNonEquiUnsupported,
     SqlCteRedefined,
     SqlSubqueryNeedsAlias,
+    /// COPY with a file-path source/target. thinDB only speaks
+    /// `STDIN`/`STDOUT`; server-side file paths have auth implications
+    /// we don't want to inherit from upstream PG.
+    SqlCopyFileNotSupported,
+    /// COPY with an unsupported FORMAT option (we only do text).
+    SqlCopyUnsupportedFormat,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -187,6 +193,7 @@ const Parser = struct {
             .kw_create, .kw_drop, .kw_use => return try self.parseDdl(),
             .kw_show => return try self.parseShow(),
             .kw_insert => return try self.parseInsert(),
+            .kw_copy => return try self.parseCopy(),
             else => {},
         }
         // Optional WITH clause: zero-or-more named CTEs precede the
@@ -540,6 +547,81 @@ const Parser = struct {
             .columns = cols_opt,
             .rows = rows_owned,
         } });
+    }
+
+    /// COPY [db.][schema.]table [(col, ...)] FROM STDIN [WITH (...)]
+    /// COPY [db.][schema.]table [(col, ...)] TO STDOUT [WITH (...)]
+    /// File-path forms (`FROM 'path'` / `TO 'path'`) are rejected.
+    ///
+    /// `TO`, `STDIN`, `STDOUT`, `FORMAT`, `TEXT` are NOT lexer keywords
+    /// (they collide with column-type names like `TEXT`). We accept
+    /// them as identifiers and match case-insensitively here.
+    fn parseCopy(self: *Parser) ParseError!*ir.Op {
+        try self.advance(); // consume COPY
+        const ref = try self.parseTableRef();
+
+        var cols_opt: ?[]const []const u8 = null;
+        if (self.cur.tag == .lparen) {
+            try self.advance();
+            cols_opt = try self.parseIdentList();
+            try self.expect(.rparen);
+        }
+
+        // Direction: FROM is a real keyword; TO is an identifier whose
+        // text we compare ASCII-case-insensitively.
+        const direction: ir.CopyOp.Direction = switch (self.cur.tag) {
+            .kw_from => .from_stdin,
+            .identifier => blk: {
+                if (std.ascii.eqlIgnoreCase(self.cur.text, "to")) break :blk .to_stdout;
+                return ParseError.SqlExpectedKeyword;
+            },
+            else => return ParseError.SqlExpectedKeyword,
+        };
+        try self.advance();
+
+        switch (self.cur.tag) {
+            .identifier => {
+                const text = self.cur.text;
+                if (std.ascii.eqlIgnoreCase(text, "stdin")) {
+                    if (direction != .from_stdin) return ParseError.SqlExpectedKeyword;
+                } else if (std.ascii.eqlIgnoreCase(text, "stdout")) {
+                    if (direction != .to_stdout) return ParseError.SqlExpectedKeyword;
+                } else return ParseError.SqlExpectedKeyword;
+                try self.advance();
+            },
+            .string => return ParseError.SqlCopyFileNotSupported,
+            else => return ParseError.SqlExpectedKeyword,
+        }
+
+        // Optional WITH (...) options. Recognized: `FORMAT TEXT`. Any
+        // other option is rejected — we only do text-format COPY.
+        if (self.cur.tag == .kw_with) {
+            try self.advance();
+            try self.expect(.lparen);
+            while (true) {
+                try self.parseCopyOption();
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+            try self.expect(.rparen);
+        }
+
+        return try self.allocOp(.{ .copy = .{
+            .direction = direction,
+            .table = ref,
+            .columns = cols_opt,
+        } });
+    }
+
+    fn parseCopyOption(self: *Parser) ParseError!void {
+        if (self.cur.tag != .identifier or
+            !std.ascii.eqlIgnoreCase(self.cur.text, "format"))
+            return ParseError.SqlCopyUnsupportedFormat;
+        try self.advance();
+        if (self.cur.tag != .identifier or
+            !std.ascii.eqlIgnoreCase(self.cur.text, "text"))
+            return ParseError.SqlCopyUnsupportedFormat;
+        try self.advance();
     }
 
     fn parseTableRef(self: *Parser) ParseError!ir.TableRef {
@@ -1374,7 +1456,7 @@ fn countRefs(
             try visitChild(arena, refs, j.right);
         },
         .materialize => |m| try visitChild(arena, refs, m.upstream),
-        .ddl, .show, .insert => {},
+        .ddl, .show, .insert, .copy => {},
         .batch => |b| for (b.statements) |sub| try visitChild(arena, refs, sub),
     }
 }

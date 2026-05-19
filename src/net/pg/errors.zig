@@ -17,6 +17,22 @@ pub const Mapped = struct {
 /// `@errorName(err)` as the message.
 pub fn mapInternal(err: anyerror) Mapped {
     const name = @errorName(err);
+    // COPY-specific errors get human-readable messages and the closest
+    // matching PG sqlstate; the parser/protocol errors share the
+    // "syntax error or access rule violation" 42000 family.
+    if (std.mem.eql(u8, name, "SqlCopyFileNotSupported"))
+        return .{ .sqlstate = "0A000".*, .message = "thinDB COPY supports only STDIN/STDOUT" };
+    if (std.mem.eql(u8, name, "SqlCopyUnsupportedFormat"))
+        return .{ .sqlstate = "0A000".*, .message = "only FORMAT TEXT is supported" };
+    if (std.mem.eql(u8, name, "CopyFromClientAborted"))
+        return .{ .sqlstate = "57014".*, .message = "COPY from stdin failed: aborted by client" };
+    if (std.mem.eql(u8, name, "CopyUnexpectedFrame"))
+        return .{ .sqlstate = "08P01".*, .message = "unexpected frame during COPY" };
+    if (std.mem.eql(u8, name, "CopyMalformedRow"))
+        return .{ .sqlstate = "22P04".*, .message = "malformed COPY row" };
+    if (std.mem.eql(u8, name, "CopyMustBeSoleStatement"))
+        return .{ .sqlstate = "0A000".*, .message = "COPY must be the only statement in its query" };
+
     return switch (error_map.classify(name)) {
         .table_not_found => .{ .sqlstate = "42P01".*, .message = "relation does not exist" },
         .database_not_found => .{ .sqlstate = "3D000".*, .message = "database does not exist" },

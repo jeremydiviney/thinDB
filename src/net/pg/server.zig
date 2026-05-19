@@ -30,6 +30,7 @@ const result = @import("result.zig");
 const canned = @import("canned.zig");
 const errors = @import("errors.zig");
 const auth = @import("auth.zig");
+const copy = @import("copy.zig");
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
 const conn_registry = @import("../conn_registry.zig");
 const ConnectionState = conn_registry.ConnectionState;
@@ -321,7 +322,7 @@ fn handleConnection(
 
         switch (frame.type_byte) {
             'X' => return,
-            'Q' => try handleQuery(allocator, w, catalog, &session, frame.payload),
+            'Q' => try handleQuery(allocator, w, r, catalog, &session, frame.payload),
             'S' => {
                 try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
                 try w.flush();
@@ -537,6 +538,7 @@ fn applyDatabase(catalog: *Catalog, session: *SessionState, name: []const u8) !v
 fn handleQuery(
     allocator: Allocator,
     w: *std.Io.Writer,
+    r: *std.Io.Reader,
     catalog: *Catalog,
     session: *SessionState,
     payload: []const u8,
@@ -559,7 +561,7 @@ fn handleQuery(
         return;
     }
 
-    runEngineQuery(allocator, w, catalog, session, sql_text) catch |err| {
+    runEngineQuery(allocator, w, r, catalog, session, sql_text) catch |err| {
         const mapped = errors.mapInternal(err);
         try errors.sendErrorResponse(allocator, w, mapped.sqlstate, mapped.message);
     };
@@ -665,6 +667,7 @@ fn dispatchCatalogListing(
 fn runEngineQuery(
     allocator: Allocator,
     w: *std.Io.Writer,
+    r: *std.Io.Reader,
     catalog: *Catalog,
     session: *SessionState,
     sql_text: []const u8,
@@ -682,12 +685,15 @@ fn runEngineQuery(
         // skipped; we propagate the error to handleQuery which emits
         // ErrorResponse + ReadyForQuery.
         for (op.batch.statements) |stmt| {
-            try runSingleStatement(allocator, w, catalog, session, stmt);
+            // COPY can't co-mingle with other statements — its wire
+            // protocol takes over the connection until CopyDone.
+            if (stmt.* == .copy) return copy.Error.CopyMustBeSoleStatement;
+            try runSingleStatement(allocator, w, r, catalog, session, stmt);
         }
         return;
     }
 
-    try runSingleStatement(allocator, w, catalog, session, op);
+    try runSingleStatement(allocator, w, r, catalog, session, op);
 }
 
 /// Run + emit the response packets for ONE statement (RowDescription/
@@ -697,10 +703,17 @@ fn runEngineQuery(
 fn runSingleStatement(
     allocator: Allocator,
     w: *std.Io.Writer,
+    r: *std.Io.Reader,
     catalog: *Catalog,
     session: *SessionState,
     op: *const ir.Op,
 ) !void {
+    // COPY is wire-driven and can't ride the generic compile path —
+    // hand it off before we open a CompileCtx.
+    if (op.* == .copy) {
+        return copy.handleCopy(allocator, w, r, catalog, session.asSession(), op.copy);
+    }
+
     const main_db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
 
     var compiled = try local.compileWithSession(allocator, main_db, session.asSession(), op);
