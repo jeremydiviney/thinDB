@@ -292,8 +292,23 @@ fn handleConnection(
     };
     session.client_caps = client.capabilities;
 
+    // Plugin dispatch: client.auth_plugin tells us which math to apply.
+    // Both `mysql_native_password` (20-byte hash) and
+    // `caching_sha2_password` (32-byte hash) are accepted unconditionally;
+    // the server doesn't care which plugin the client picked — only that
+    // the response math verifies. When auth_password is null (trust
+    // mode), all responses pass regardless of plugin choice.
+    const using_caching_sha2 = blk: {
+        const plugin = client.auth_plugin orelse break :blk false;
+        break :blk std.mem.eql(u8, plugin, "caching_sha2_password");
+    };
+
     if (auth_password) |pw| {
-        if (!auth.verify(pw, salt, client.auth_response)) {
+        const ok = if (using_caching_sha2)
+            auth.verifyCachingSha2(auth.deriveCachingSha2Credentials(pw), salt, client.auth_response)
+        else
+            auth.verify(pw, salt, client.auth_response);
+        if (!ok) {
             try handshake.sendErrPacket(allocator, w, 2, 1045, "28000".*, "Access denied");
             try w.flush();
             return;
@@ -311,7 +326,16 @@ fn handleConnection(
         }
     }
 
-    try handshake.sendHandshakeOk(allocator, w);
+    if (using_caching_sha2) {
+        // caching_sha2_password protocol: server must send an
+        // AuthMoreData packet with body byte 0x03 (fast_auth_success)
+        // before the OK packet. Seq advances: response=1, AuthMoreData=2,
+        // OK=3.
+        try handshake.sendAuthMoreData(allocator, w, 2, &[_]u8{0x03});
+        try handshake.sendOkPacket(allocator, w, 3, 0, 0);
+    } else {
+        try handshake.sendHandshakeOk(allocator, w);
+    }
     try w.flush();
 
     while (true) {

@@ -169,6 +169,17 @@ pub fn sendHandshakeOk(allocator: Allocator, w: *std.Io.Writer) !void {
     try sendOkPacket(allocator, w, 2, 0, 0);
 }
 
+/// AuthMoreData packet — header 0x01 followed by plugin-specific
+/// data. caching_sha2_password uses this to signal fast_auth_success
+/// (single body byte 0x03) before sending the final OK packet.
+pub fn sendAuthMoreData(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, body: []const u8) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    try payload.append(allocator, 0x01);
+    try payload.appendSlice(allocator, body);
+    try packet.writePacket(w, seq_id, payload.items);
+}
+
 /// Build and send an OK_Packet at the given sequence id.
 pub fn sendOkPacket(
     allocator: Allocator,

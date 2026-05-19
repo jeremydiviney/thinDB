@@ -190,6 +190,53 @@ const TestClient = struct {
         try self.writer.interface.flush();
     }
 
+    /// Run the caching_sha2_password client side of the handshake.
+    /// Sends a 32-byte response computed from the greeting's salt and
+    /// expects an AuthMoreData(fast_auth_success) packet followed by
+    /// OK. Returns error.AuthRejected if the server replies with ERR.
+    fn doHandshakeCachingSha2(self: *TestClient, password: []const u8) !void {
+        const greet = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+        defer self.allocator.free(greet.payload);
+        self.last_salt = try parseGreetingSalt(greet.payload);
+
+        const hash = thindb.mysql.auth.cachingSha2ClientHash(password, self.last_salt);
+
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+
+        const caps = mysql_handshake.CLIENT_PROTOCOL_41 |
+            mysql_handshake.CLIENT_SECURE_CONNECTION |
+            mysql_handshake.CLIENT_PLUGIN_AUTH |
+            mysql_handshake.CLIENT_DEPRECATE_EOF;
+
+        var buf4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf4, caps, .little);
+        try payload.appendSlice(self.allocator, &buf4);
+        std.mem.writeInt(u32, &buf4, 0x01000000, .little);
+        try payload.appendSlice(self.allocator, &buf4);
+        try payload.append(self.allocator, 0xff);
+        try payload.appendSlice(self.allocator, &([_]u8{0} ** 23));
+        try payload.appendSlice(self.allocator, "test\x00");
+        try payload.append(self.allocator, 32);
+        try payload.appendSlice(self.allocator, &hash);
+        try payload.appendSlice(self.allocator, "caching_sha2_password\x00");
+
+        try mysql_packet.writePacket(&self.writer.interface, 1, payload.items);
+        try self.writer.interface.flush();
+
+        // Server: AuthMoreData(0x01, 0x03) — fast_auth_success.
+        const more = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+        defer self.allocator.free(more.payload);
+        if (more.payload.len == 0 or more.payload[0] == 0xFF) return error.AuthRejected;
+        if (more.payload[0] != 0x01 or more.payload.len < 2 or more.payload[1] != 0x03)
+            return error.UnexpectedAuthMoreData;
+
+        // Server: OK packet.
+        const ok = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
+        defer self.allocator.free(ok.payload);
+        if (ok.payload.len == 0 or ok.payload[0] != 0x00) return error.AuthRejected;
+    }
+
     fn sendResetConnection(self: *TestClient) !void {
         const buf = [_]u8{0x1F};
         try mysql_packet.writePacket(&self.writer.interface, 0, &buf);
@@ -845,6 +892,90 @@ test "mysql wire: auth — empty client response rejected when password set" {
     const rc = client.doHandshakeFull(null, true, null);
     try std.testing.expectError(error.AuthRejected, rc);
 
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: caching_sha2_password — correct password accepted" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 50;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.auth_password = "hunter2";
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshakeCachingSha2("hunter2");
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: caching_sha2_password — wrong password rejected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 51;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    server.auth_password = "hunter2";
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try std.testing.expectError(error.AuthRejected, client.doHandshakeCachingSha2("wrong"));
+
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: caching_sha2_password — trust mode accepts any hash" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 52;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+    // auth_password stays null — trust mode.
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    // Trust mode: server doesn't verify the hash for either plugin.
+    try client.doHandshakeCachingSha2("whatever");
+
+    try client.sendQuit();
     if (sctx.err) |e| return e;
 }
 
