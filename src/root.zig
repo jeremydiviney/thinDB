@@ -76,6 +76,10 @@ pub const mysql = @import("net/mysql.zig");
 pub const serveMysql = mysql.serveMysql;
 pub const MysqlServer = mysql.Server;
 
+pub const pg = @import("net/pg.zig");
+pub const servePg = pg.servePg;
+pub const PgServer = pg.Server;
+
 /// Default TCP port for a thinDB server. Servers and clients can pick
 /// any port, but examples / docs use this.
 pub const default_port: u16 = wire.default_port;
