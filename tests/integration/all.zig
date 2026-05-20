@@ -22,6 +22,7 @@ test {
     _ = @import("catalog_test.zig");
     _ = @import("temp_tables_test.zig");
     _ = @import("window_test.zig");
+    _ = @import("window_matrix_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 
