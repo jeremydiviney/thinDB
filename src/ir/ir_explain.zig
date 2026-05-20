@@ -226,6 +226,11 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try out.append(allocator, '\n');
             try explainOp(allocator, out, i.source.*, depth + 1);
         },
+        .set_var => |sv| {
+            try out.appendSlice(allocator, "SetVar @");
+            try out.appendSlice(allocator, sv.name);
+            try out.append(allocator, '\n');
+        },
     }
 }
 
@@ -406,6 +411,10 @@ fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!
         },
         .scalar_subquery => try out.appendSlice(allocator, "(SELECT …)"),
         .exists_subquery => try out.appendSlice(allocator, "EXISTS(SELECT …)"),
+        .var_ref => |name| {
+            try out.append(allocator, '@');
+            try out.appendSlice(allocator, name);
+        },
     }
 }
 
@@ -505,6 +514,13 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
             var buf: [24]u8 = undefined;
             const s_count = try std.fmt.bufPrint(&buf, " [{d} groups]", .{s.groups.len});
             try out.appendSlice(allocator, s_count);
+        },
+        .leaf_var => |v| {
+            try out.appendSlice(allocator, v.col);
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, opSymbol(v.op));
+            try out.appendSlice(allocator, " @");
+            try out.appendSlice(allocator, v.var_name);
         },
     }
 }

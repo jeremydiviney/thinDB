@@ -204,6 +204,7 @@ pub const Filter = struct {
             .correlated_set => |s| try predicate.evaluateCorrelatedSetMask(s, self.schema, batch, out),
             .correlated_scalar => |s| try predicate.evaluateCorrelatedScalarMask(s, self.schema, batch, out),
             .correlated_range => |s| try predicate.evaluateCorrelatedRangeMask(s, self.schema, batch, out),
+            .leaf_var => return Error.PredicateTypeMismatch,
         }
     }
 };

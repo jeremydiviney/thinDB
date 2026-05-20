@@ -8,9 +8,15 @@ const thindb = @import("thindb");
 pub const RunResult = struct {
     arena: std.heap.ArenaAllocator,
     cq: thindb.net.CompiledQuery,
+    /// SessionVars created by an earlier SET in the same batch (or
+    /// during the final statement's compile). Owned by RunResult so
+    /// it survives across substatements and gets cleaned up here.
+    owned_vars: ?*thindb.SessionVars,
+    backing_allocator: std.mem.Allocator,
 
     pub fn deinit(self: *RunResult) void {
         self.cq.deinit();
+        thindb.net.CompiledQuery.freeSessionVars(self.backing_allocator, self.owned_vars);
         self.arena.deinit();
     }
 
@@ -27,14 +33,45 @@ pub const RunResult = struct {
     }
 };
 
-/// Parse + compile a SQL statement against `db`. Caller owns the
-/// returned `RunResult` and must `deinit` it.
+/// Parse + compile a SQL statement against `db`. If the input is a
+/// multi-statement batch (`SET @x = 1; SELECT ...`), the non-final
+/// statements are compiled + drained eagerly with the session
+/// threaded through, so user-defined variables persist into the
+/// final statement that the caller drains. Caller owns the returned
+/// `RunResult` and must `deinit` it.
 pub fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const root = try thindb.sql.parse(arena.allocator(), sql);
-    const cq = try thindb.net.compile(allocator, db, root);
-    return .{ .arena = arena, .cq = cq };
+
+    if (root.* != .batch) {
+        const cq = try thindb.net.compile(allocator, db, root);
+        return .{
+            .arena = arena,
+            .cq = cq,
+            .owned_vars = cq.sessionValue().vars,
+            .backing_allocator = allocator,
+        };
+    }
+
+    // Batch: drain everything except the last statement eagerly,
+    // threading the Session (with any SET-created vars) forward.
+    var session: thindb.Session = .{};
+    const stmts = root.batch.statements;
+    if (stmts.len == 0) return error.EmptyBatch;
+    for (stmts[0 .. stmts.len - 1]) |stmt| {
+        var cq = try thindb.net.compileWithSession(allocator, db, session, stmt);
+        while (try cq.next()) |_| {}
+        session = cq.sessionValue();
+        cq.deinit();
+    }
+    const final = try thindb.net.compileWithSession(allocator, db, session, stmts[stmts.len - 1]);
+    return .{
+        .arena = arena,
+        .cq = final,
+        .owned_vars = final.sessionValue().vars,
+        .backing_allocator = allocator,
+    };
 }
 
 /// Convenience wrapper for fire-and-forget statements (DDL, INSERT

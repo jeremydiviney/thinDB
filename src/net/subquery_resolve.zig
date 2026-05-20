@@ -46,6 +46,14 @@ const local = @import("local.zig");
 const CompileCtx = local.CompileCtx;
 const Error = local.Error;
 
+/// Look up a session variable by name. Returns the resolved Value or
+/// errors with `Error.UnknownSessionVar` (mapped to `UnsupportedOp`
+/// at the public boundary for now) when the var isn't set.
+fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !@import("../types.zig").Value {
+    const vars = ctx.session.vars orelse return Error.UnsupportedOp;
+    return vars.get(name) orelse Error.UnsupportedOp;
+}
+
 // =============================================================================
 // Entry points — invoked by compileWithSession() before the dispatcher runs.
 // =============================================================================
@@ -53,6 +61,7 @@ const Error = local.Error;
 pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
     switch (op.*) {
         .scan, .ddl, .show, .insert, .copy => {},
+        .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value),
         .limit => |l| try resolveSubqueriesInOp(ctx, @constCast(l.upstream)),
         .select, .exclude => |p| try resolveSubqueriesInOp(ctx, @constCast(p.upstream)),
         .filter => |*f| {
@@ -85,6 +94,10 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
     switch (pred.*) {
         .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range => {},
+        .leaf_var => |v| {
+            const resolved = try lookupSessionVar(ctx, v.var_name);
+            pred.* = .{ .leaf = .{ .col = v.col, .op = v.op, .val = resolved } };
+        },
         .scalar_subquery => |sq| {
             if (try maybeResolveCorrelatedScalar(ctx, pred, sq)) return;
             const val = try runScalarSubquery(ctx, sq.source);
@@ -128,6 +141,10 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
 fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
     switch (e.*) {
         .col_ref, .lit => {},
+        .var_ref => |name| {
+            const resolved = try lookupSessionVar(ctx, name);
+            e.* = .{ .lit = resolved };
+        },
         .call => |c| for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg)),
         .case => |cs| {
             for (cs.branches) |*br| {

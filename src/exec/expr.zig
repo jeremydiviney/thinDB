@@ -49,6 +49,11 @@ pub const Expr = union(enum) {
     /// a `.lit = .{ .boolean = true|false }`. Opaque pointer for
     /// the same cycle reason.
     exists_subquery: *const anyopaque,
+    /// MySQL-style user-defined variable reference `@name`. The
+    /// pre-compile pass looks up the value in the active Session's
+    /// vars map and rewrites this into a `.lit`. Operators never
+    /// see this variant.
+    var_ref: []const u8,
 
     pub const Call = struct {
         fn_name: []const u8,
@@ -126,6 +131,7 @@ pub fn deepClone(out_arena: Allocator, e: Expr) Allocator.Error!Expr {
         // Opaque pointer aliased — the IR arena owns the pointee.
         .scalar_subquery => |p| .{ .scalar_subquery = p },
         .exists_subquery => |p| .{ .exists_subquery = p },
+        .var_ref => |name| .{ .var_ref = try out_arena.dupe(u8, name) },
     };
 }
 

@@ -109,6 +109,17 @@ pub const PredicateExpr = union(enum) {
     /// Combined with optional equi-key correlation (`outer_keys`),
     /// the lookup happens within the matching group only.
     correlated_range: CorrelatedRange,
+    /// Predicate RHS is a pending var-ref (`WHERE qty > @threshold`).
+    /// The pre-compile pass looks up `var_name` in the active Session's
+    /// vars and rewrites this into a `.leaf` with the resolved Value.
+    /// Operators never see this variant.
+    leaf_var: VarPred,
+};
+
+pub const VarPred = struct {
+    col: []const u8,
+    op: PredicateOp,
+    var_name: []const u8,
 };
 
 pub const LikePred = struct {
@@ -336,6 +347,11 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
             dup.* = try deepClonePredicate(out_arena, child.*);
             break :blk .{ .not = dup };
         },
+        .leaf_var => |v| .{ .leaf_var = .{
+            .col = try out_arena.dupe(u8, v.col),
+            .op = v.op,
+            .var_name = try out_arena.dupe(u8, v.var_name),
+        } },
     };
 }
 
@@ -443,6 +459,9 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                 _ = findCol(schema, c_name) orelse return Error.ColumnNotFound;
             }
         },
+        // `.leaf_var` must have been resolved by the pre-compile
+        // pass. Reaching here means the resolver missed a node.
+        .leaf_var => return Error.PredicateTypeMismatch,
     }
 }
 
@@ -617,6 +636,7 @@ pub fn evaluatePredicate(
         .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out),
         .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out),
         .correlated_range => |s| try evaluateCorrelatedRangeMask(s, schema, batch, out),
+        .leaf_var => return Error.PredicateTypeMismatch,
     }
 }
 

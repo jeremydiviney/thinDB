@@ -363,6 +363,9 @@ pub const OpTag = enum(u8) {
     /// rows into an existing table. Compile-time validation of the
     /// schema match against the target.
     insert_select = 18,
+    /// MySQL-style user-defined variable assignment: `SET @name = expr`.
+    /// Side-effect — mutates the session's vars map. Produces no rows.
+    set_var = 19,
 };
 
 pub const BatchOp = struct {
@@ -379,6 +382,15 @@ pub const SetUnion = struct {
     /// `true` = UNION ALL (no dedup); `false` is reserved for the
     /// future distinct variant. v1 only emits `all = true`.
     all: bool,
+};
+
+/// `SET @name = expr` — assign a session-scoped variable. Compile
+/// resolves any subqueries inside `value`, then evaluates it as a
+/// constant (the expression must constant-fold to a single literal)
+/// and writes the result into `Session.vars` under `name`.
+pub const SetVar = struct {
+    name: []const u8,
+    value: Expr,
 };
 
 /// CREATE TABLE name AS SELECT ... — schema inferred from the
@@ -424,6 +436,7 @@ pub const Op = union(OpTag) {
     set_union: SetUnion,
     create_table_as: CreateTableAs,
     insert_select: InsertSelect,
+    set_var: SetVar,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -602,6 +615,8 @@ pub const Op = union(OpTag) {
                 i.source.deinitDecoded(allocator);
                 allocator.destroy(i.source);
             },
+            // Never reached: SET @var isn't wire-decoded.
+            .set_var => {},
         }
     }
 };
@@ -692,6 +707,10 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             }
             try encodeOp(allocator, out, i.source.*);
         },
+        // `SET @name = expr` is a server-local statement; the in-process
+        // SQL path executes it without wire round-trip. Wire-encoding
+        // it would require resolving the Expr to a literal first.
+        .set_var => return EncodeError.OutOfMemory,
     }
 }
 
@@ -1134,7 +1153,7 @@ pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) Encode
         // Subqueries are parse-time only — they get resolved into
         // literals before any wire round-trip would happen. Surface
         // loudly if someone tries to encode an unresolved tree.
-        .scalar_subquery, .exists_subquery => return EncodeError.OutOfMemory,
+        .scalar_subquery, .exists_subquery, .var_ref => return EncodeError.OutOfMemory,
         .case => |cs| {
             try out.append(allocator, @intFromEnum(ExprTag.case));
             try appendU32(allocator, out, @intCast(cs.branches.len));
@@ -1225,7 +1244,7 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
         // `.always` / `.in_set` / `.correlated_set` are post-resolution
         // forms that also shouldn't appear in wire IR (callers re-emit
         // via SQL).
-        .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range => return EncodeError.OutOfMemory,
+        .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var => return EncodeError.OutOfMemory,
         .@"and" => |children| {
             try out.append(allocator, @intFromEnum(PredTag.p_and));
             try appendU32(allocator, out, @intCast(children.len));
@@ -1323,7 +1342,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.insert_select)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.set_var)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1609,6 +1628,9 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 .source = source,
             } };
         },
+        // SET @var is never wire-encoded (encodeOp errors on it). If
+        // a decoder somehow sees its tag, that's a corrupted stream.
+        .set_var => return Error.IrCorrupt,
     };
 }
 
@@ -1936,7 +1958,7 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
 
 pub fn freeDecodedExpr(e: Expr, allocator: Allocator) void {
     switch (e) {
-        .col_ref, .lit, .scalar_subquery, .exists_subquery => {},
+        .col_ref, .lit, .scalar_subquery, .exists_subquery, .var_ref => {},
         .call => |c| {
             for (c.args) |child| freeDecodedExpr(child, allocator);
             allocator.free(c.args);
@@ -2120,7 +2142,7 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
 
 pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     switch (expr) {
-        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range => {},
+        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var => {},
         .@"and", .@"or" => |children| {
             for (children) |c| freeDecodedPredicate(c, allocator);
             allocator.free(children);

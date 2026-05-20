@@ -223,6 +223,7 @@ pub const Parser = struct {
             .kw_show => return try parse_ddl.parseShow(self),
             .kw_insert => return try parse_ddl.parseInsert(self),
             .kw_copy => return try parse_ddl.parseCopy(self),
+            .kw_set => return try self.parseSetVar(),
             else => {},
         }
         // Optional WITH clause: zero-or-more named CTEs precede the
@@ -1054,6 +1055,11 @@ pub const Parser = struct {
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
             },
+            .at_identifier => {
+                const var_name = try self.arena.dupe(u8, self.cur.text);
+                try self.advance();
+                return ir.Expr{ .var_ref = var_name };
+            },
             .lparen => {
                 // Parenthesized sub-expression OR scalar subquery.
                 // `(SELECT ...)` / `(WITH ... SELECT ...)` is captured
@@ -1136,6 +1142,12 @@ pub const Parser = struct {
             .case => return try self.arena.dupe(u8, "case"),
             .scalar_subquery => return try self.arena.dupe(u8, "subquery"),
             .exists_subquery => return try self.arena.dupe(u8, "exists"),
+            .var_ref => |name| {
+                const buf = try self.arena.alloc(u8, name.len + 1);
+                buf[0] = '@';
+                @memcpy(buf[1..], name);
+                return buf;
+            },
         }
     }
 
@@ -1401,6 +1413,21 @@ pub const Parser = struct {
         return try pairs.toOwnedSlice(self.arena);
     }
 
+    /// Parse `SET @name = expr`. The RHS is a general Expr so users
+    /// can write `SET @cutoff = (SELECT MAX(amount) FROM orders)` —
+    /// the pre-compile pass resolves any scalar subquery into a
+    /// literal, and `compileSetVar` requires the result to be a `.lit`.
+    pub fn parseSetVar(self: *Parser) ParseError!*ir.Op {
+        try self.expect(.kw_set);
+        if (self.cur.tag != .at_identifier) return ParseError.SqlExpectedIdent;
+        const name = try self.arena.dupe(u8, self.cur.text);
+        try self.advance();
+        if (self.cur.tag != .eq) return ParseError.SqlExpectedToken;
+        try self.advance();
+        const value_expr = try self.parseAddSub();
+        return try self.allocOp(.{ .set_var = .{ .name = name, .value = value_expr } });
+    }
+
     pub fn parseOrderBy(self: *Parser) ParseError![]const @import("../exec/sort.zig").SortSpec {
         const SortSpec = @import("../exec/sort.zig").SortSpec;
         var items: std.ArrayList(SortSpec) = .empty;
@@ -1611,7 +1638,7 @@ fn countRefs(
             try visitChild(arena, refs, j.right);
         },
         .materialize => |m| try visitChild(arena, refs, m.upstream),
-        .ddl, .show, .insert, .copy => {},
+        .ddl, .show, .insert, .copy, .set_var => {},
         .batch => |b| for (b.statements) |sub| try visitChild(arena, refs, sub),
         .window => |w| try visitChild(arena, refs, w.upstream),
         .set_union => |u| {

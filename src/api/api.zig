@@ -187,6 +187,46 @@ pub const Session = struct {
     current_db: []const u8 = "main",
     current_schema: []const u8 = "public",
     temp_namespace: ?*TempNamespace = null,
+    /// MySQL-style user-defined variables (`@name`). Lazily heap-
+    /// allocated on first `SET @name = ...`. Owned by the Connection;
+    /// Session copies share the same pointer so mutations from one
+    /// statement are visible to the next.
+    vars: ?*SessionVars = null,
+};
+
+/// Per-connection variable storage. Names and string values are
+/// duped into the backing arena so they outlive the SQL statement
+/// that defined them.
+pub const SessionVars = struct {
+    arena: std.heap.ArenaAllocator,
+    map: std.StringHashMapUnmanaged(@import("../types.zig").Value) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) SessionVars {
+        return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    }
+
+    pub fn deinit(self: *SessionVars) void {
+        const backing = self.arena.child_allocator;
+        self.map.deinit(backing);
+        self.arena.deinit();
+    }
+
+    pub fn get(self: *const SessionVars, name: []const u8) ?@import("../types.zig").Value {
+        return self.map.get(name);
+    }
+
+    /// Set / overwrite a variable. String values are dup'd into the
+    /// arena so the caller's backing storage can go away. Numeric
+    /// values are value-typed and stored inline.
+    pub fn set(self: *SessionVars, name: []const u8, value: @import("../types.zig").Value) !void {
+        const arena_alloc = self.arena.allocator();
+        const owned_name = try arena_alloc.dupe(u8, name);
+        const owned_value: @import("../types.zig").Value = switch (value) {
+            .text => |s| .{ .text = try arena_alloc.dupe(u8, s) },
+            else => value,
+        };
+        try self.map.put(self.arena.child_allocator, owned_name, owned_value);
+    }
 };
 
 /// Translate any `api.Error` into the equivalently-named variant of

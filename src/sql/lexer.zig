@@ -100,6 +100,15 @@ pub const TokenTag = enum {
     kw_interval,
     kw_union,
     kw_all,
+    /// MySQL-style `SET` for user-defined variables: `SET @name = expr`.
+    /// Same `SET` keyword used for session config in PG; thinDB v1
+    /// only accepts the MySQL form.
+    kw_set,
+
+    /// MySQL-style user-defined variable: `@name`. The `text` field
+    /// carries the name without the `@` prefix. Resolved to a literal
+    /// by the pre-compile pass using the active Session.vars.
+    at_identifier,
 
     // Operators / punctuation.
     eq, // =
@@ -234,6 +243,7 @@ pub const Lexer = struct {
                 return Token{ .tag = .question, .text = self.src[start..self.pos] };
             },
             '$' => return try self.lexDollarParam(),
+            '@' => return try self.lexAtVar(),
             '!' => {
                 if (self.peekChar(1) == '=') {
                     self.pos += 2;
@@ -386,6 +396,18 @@ pub const Lexer = struct {
         };
     }
 
+    fn lexAtVar(self: *Lexer) LexError!Token {
+        self.pos += 1; // consume '@'
+        const name_start = self.pos;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const c = self.src[self.pos];
+            if (!(std.ascii.isAlphanumeric(c) or c == '_')) break;
+        }
+        const name = self.src[name_start..self.pos];
+        if (name.len == 0) return LexError.LexUnexpectedChar;
+        return Token{ .tag = .at_identifier, .text = name };
+    }
+
     fn lexBacktickIdent(self: *Lexer) LexError!Token {
         const start = self.pos;
         self.pos += 1;
@@ -480,6 +502,7 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "interval", .tag = .kw_interval },
         .{ .name = "union", .tag = .kw_union },
         .{ .name = "all", .tag = .kw_all },
+        .{ .name = "set", .tag = .kw_set },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;

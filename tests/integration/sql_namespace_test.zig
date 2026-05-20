@@ -40,7 +40,12 @@ fn runSqlSession(
     errdefer arena.deinit();
     const root = try thindb.sql.parse(arena.allocator(), sql);
     const cq = try thindb.net.compileWithSession(allocator, db, session, root);
-    return .{ .arena = arena, .cq = cq };
+    return .{
+        .arena = arena,
+        .cq = cq,
+        .owned_vars = cq.sessionValue().vars,
+        .backing_allocator = allocator,
+    };
 }
 
 fn collectIds(allocator: std.mem.Allocator, q: *RunResult) ![]i64 {

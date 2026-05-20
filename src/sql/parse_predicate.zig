@@ -253,6 +253,15 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         return PE.SqlExpectedValue;
     }
 
+    // Session var on the RHS: `col op @name`. Build a leaf_var
+    // placeholder; the pre-compile pass resolves it to a `.leaf`
+    // using the active Session's vars map.
+    if (p.cur.tag == .at_identifier) {
+        const var_name = try p.arena.dupe(u8, p.cur.text);
+        try p.advance();
+        return .{ .leaf_var = .{ .col = col_dup, .op = op, .var_name = var_name } };
+    }
+
     const val = try p.parseValue();
     return .{ .leaf = .{ .col = col_dup, .op = op, .val = val } };
 }

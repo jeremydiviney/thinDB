@@ -836,6 +836,11 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             dup.* = try clonePredicate(aa, child.*);
             break :blk PredicateExpr{ .not = dup };
         },
+        .leaf_var => |v| PredicateExpr{ .leaf_var = .{
+            .col = try aa.dupe(u8, v.col),
+            .op = v.op,
+            .var_name = try aa.dupe(u8, v.var_name),
+        } },
     };
 }
 
@@ -1022,7 +1027,7 @@ pub fn buildServerQuerySession(
         // CTAS / INSERT-SELECT come from SQL parsing and only go
         // through the CompileCtx path. The plan-builder + wire path
         // doesn't construct these.
-        .create_table_as, .insert_select => return Error.UnsupportedOp,
+        .create_table_as, .insert_select, .set_var => return Error.UnsupportedOp,
     };
 }
 
@@ -1102,9 +1107,25 @@ pub const CompiledQuery = struct {
 
     pub fn deinit(self: *CompiledQuery) void {
         self.query.deinit();
+        // SessionVars (if any) is intentionally NOT freed here —
+        // it must survive across statements in a multi-statement
+        // batch so SET @x persists into a later SELECT. Callers
+        // (test helpers, wire connections) own the lifetime and
+        // free it via `freeSessionVars` at end-of-connection.
         self.ctx.deinit();
         const allocator = self.ctx.allocator;
         allocator.destroy(self.session_cell);
+    }
+
+    /// Free a SessionVars previously created by a SET statement.
+    /// Callers that iterate multi-statement batches retrieve the
+    /// vars pointer from `sessionValue().vars` after the last
+    /// statement and pass it here.
+    pub fn freeSessionVars(allocator: std.mem.Allocator, vars: ?*thindb_api.SessionVars) void {
+        if (vars) |v| {
+            v.deinit();
+            allocator.destroy(v);
+        }
     }
 
     pub fn next(self: *CompiledQuery) !?exec.Batch {
@@ -1120,7 +1141,7 @@ pub const CompiledQuery = struct {
 
     /// Current session bound to this query (reflects any USE that
     /// executed during a DDL pipeline).
-    pub fn sessionValue(self: *CompiledQuery) Session {
+    pub fn sessionValue(self: *const CompiledQuery) Session {
         return self.session_cell.*;
     }
 
@@ -1268,7 +1289,31 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         },
         .create_table_as => |c| try compileCreateTableAs(ctx, c),
         .insert_select => |i| try compileInsertSelect(ctx, i),
+        .set_var => |sv| try compileSetVar(ctx, sv),
     };
+}
+
+/// `SET @name = expr` — evaluate the RHS Expr (which may contain a
+/// scalar subquery resolved by the pre-compile pass into a `.lit`)
+/// and write it into `Session.vars` for use by subsequent
+/// statements. Errors if the Expr didn't constant-fold to a single
+/// literal.
+fn compileSetVar(ctx: *CompileCtx, sv: ir.SetVar) !Query {
+    const value: Value = switch (sv.value) {
+        .lit => |v| v,
+        else => return Error.UnsupportedOp,
+    };
+
+    // Lazily create the session's var map. Owned by the CompileCtx's
+    // allocator so it outlives the statement.
+    if (ctx.session.vars == null) {
+        const vars = try ctx.allocator.create(thindb_api.SessionVars);
+        vars.* = thindb_api.SessionVars.init(ctx.allocator);
+        ctx.session.vars = vars;
+    }
+    try ctx.session.vars.?.set(sv.name, value);
+
+    return try EmptyOp.createWithCount(ctx.allocator, 0);
 }
 
 fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
