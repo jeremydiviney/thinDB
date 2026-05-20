@@ -747,6 +747,11 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             .col = try aa.dupe(u8, lp.col),
             .pattern = try aa.dupe(u8, lp.pattern),
         } },
+        .scalar_subquery => |sq| PredicateExpr{ .scalar_subquery = .{
+            .col = try aa.dupe(u8, sq.col),
+            .op = sq.op,
+            .source = sq.source,
+        } },
         .@"and" => |children| PredicateExpr{ .@"and" = try cloneChildren(aa, children) },
         .@"or" => |children| PredicateExpr{ .@"or" = try cloneChildren(aa, children) },
         .not => |child| blk: {
@@ -1056,8 +1061,131 @@ pub fn compileWithSession(
 
     var ctx = CompileCtx{ .allocator = allocator, .db = db, .session = session_cell };
     errdefer ctx.deinit();
+    // Pre-compile pass: walk the IR and run each uncorrelated scalar
+    // subquery once, replacing the `.scalar_subquery` marker with a
+    // concrete `.leaf` / `.lit`. After this pass operators never see
+    // subquery nodes — they're a parse-time-only construct.
+    try resolveSubqueriesInOp(&ctx, @constCast(root));
     const q = try compileOp(&ctx, root);
     return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
+}
+
+// ---------------------------------------------------------------------------
+// Scalar-subquery pre-compile pass.
+//
+// Walks the IR tree, finds every `.scalar_subquery` node in
+// PredicateExpr / Expr position, runs the inner once, freezes the
+// single value, and rewrites the node into a plain `.leaf` / `.lit`.
+// Postgres semantics: multi-row → error, zero rows → NULL, multi-col
+// → error.
+// ---------------------------------------------------------------------------
+
+fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
+    switch (op.*) {
+        .scan, .ddl, .show, .insert, .copy => {},
+        .limit => |l| try resolveSubqueriesInOp(ctx, @constCast(l.upstream)),
+        .select, .exclude => |p| try resolveSubqueriesInOp(ctx, @constCast(p.upstream)),
+        .filter => |*f| {
+            try resolveSubqueriesInPredicate(ctx, &f.predicate);
+            try resolveSubqueriesInOp(ctx, @constCast(f.upstream));
+        },
+        .order_by => |o| try resolveSubqueriesInOp(ctx, @constCast(o.upstream)),
+        .group_by => |g| try resolveSubqueriesInOp(ctx, @constCast(g.upstream)),
+        .compute => |c| {
+            for (c.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr));
+            try resolveSubqueriesInOp(ctx, @constCast(c.upstream));
+        },
+        .join => |*j| {
+            if (j.extra_predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
+            try resolveSubqueriesInOp(ctx, @constCast(j.left));
+            try resolveSubqueriesInOp(ctx, @constCast(j.right));
+        },
+        .materialize => |m| try resolveSubqueriesInOp(ctx, @constCast(m.upstream)),
+        .batch => |b| for (b.statements) |sub| try resolveSubqueriesInOp(ctx, @constCast(sub)),
+        .window => |w| try resolveSubqueriesInOp(ctx, @constCast(w.upstream)),
+        .set_union => |u| {
+            try resolveSubqueriesInOp(ctx, @constCast(u.left));
+            try resolveSubqueriesInOp(ctx, @constCast(u.right));
+        },
+        .create_table_as => |c| try resolveSubqueriesInOp(ctx, @constCast(c.source)),
+        .insert_select => |i| try resolveSubqueriesInOp(ctx, @constCast(i.source)),
+    }
+}
+
+fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
+    switch (pred.*) {
+        .leaf, .is_null, .is_not_null, .like => {},
+        .scalar_subquery => |sq| {
+            const val = try runScalarSubquery(ctx, sq.source);
+            pred.* = .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = val } };
+        },
+        .@"and" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
+        .@"or" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
+        .not => |child| try resolveSubqueriesInPredicate(ctx, @constCast(child)),
+    }
+}
+
+fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
+    switch (e.*) {
+        .col_ref, .lit => {},
+        .call => |c| for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg)),
+        .case => |cs| {
+            for (cs.branches) |*br| {
+                try resolveSubqueriesInPredicate(ctx, @constCast(&br.cond));
+                try resolveSubqueriesInExpr(ctx, @constCast(&br.then));
+            }
+            if (cs.else_branch) |eb| try resolveSubqueriesInExpr(ctx, @constCast(eb));
+        },
+        .scalar_subquery => |opaque_ptr| {
+            const val = try runScalarSubquery(ctx, opaque_ptr);
+            e.* = .{ .lit = val };
+        },
+    }
+}
+
+/// Compile + drain an inner Op, expecting exactly one row × one
+/// column. Returns the extracted scalar. Multi-row → error,
+/// multi-col → error, zero rows in Tier 1 also errors (NULL handling
+/// in PredicateExpr.leaf isn't well-defined yet — the caller can
+/// re-emit IS NULL if they want zero-or-one semantics).
+fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !Value {
+    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(source_opaque)));
+    // Resolve any further-nested subqueries first.
+    try resolveSubqueriesInOp(ctx, inner);
+
+    var q = try compileOp(ctx, inner);
+    defer q.deinit();
+
+    const schema = q.outputSchema();
+    if (schema.len != 1) return Error.BadRequest;
+
+    const first_batch: Batch = (try q.next()) orelse return Error.BadRequest; // zero rows
+    if (first_batch.row_count != 1) return Error.BadRequest;
+    if (try q.next() != null) return Error.BadRequest; // multi-row
+
+    const view = first_batch.values[0];
+    return try extractScalarValue(ctx.allocator, view);
+}
+
+fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {
+    return switch (view.data) {
+        .int => |s| .{ .int = s[0] },
+        .bigint => |s| .{ .bigint = s[0] },
+        .smallint => |s| .{ .smallint = s[0] },
+        .tinyint => |s| .{ .tinyint = s[0] },
+        .largeint => |s| .{ .largeint = s[0] },
+        .float => |s| .{ .float = s[0] },
+        .double => |s| .{ .double = s[0] },
+        .boolean => |s| .{ .boolean = s[0] != 0 },
+        .date => |s| .{ .date = s[0] },
+        .datetime => |s| .{ .datetime = s[0] },
+        .decimal64 => |s| .{ .decimal64 = s[0] },
+        .decimal128 => |s| .{ .decimal128 = s[0] },
+        .uuid => |s| .{ .uuid = s[0] },
+        .varchar => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
+        .string => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
+        .char => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
+    };
 }
 
 fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {

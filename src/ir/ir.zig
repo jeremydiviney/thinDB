@@ -1122,6 +1122,10 @@ pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) Encode
             try appendU32(allocator, out, @intCast(c.args.len));
             for (c.args) |child| try encodeExpr(allocator, out, child);
         },
+        // Subqueries are parse-time only — they get resolved into
+        // literals before any wire round-trip would happen. Surface
+        // loudly if someone tries to encode an unresolved tree.
+        .scalar_subquery => return EncodeError.OutOfMemory,
         .case => |cs| {
             try out.append(allocator, @intFromEnum(ExprTag.case));
             try appendU32(allocator, out, @intCast(cs.branches.len));
@@ -1198,6 +1202,9 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
             try appendU32(allocator, out, @intCast(lp.pattern.len));
             try out.appendSlice(allocator, lp.pattern);
         },
+        // Subqueries are parse-time only — resolved before any wire
+        // round-trip. Surface loudly if we hit an unresolved one.
+        .scalar_subquery => return EncodeError.OutOfMemory,
         .@"and" => |children| {
             try out.append(allocator, @intFromEnum(PredTag.p_and));
             try appendU32(allocator, out, @intCast(children.len));
@@ -1907,7 +1914,7 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
 
 pub fn freeDecodedExpr(e: Expr, allocator: Allocator) void {
     switch (e) {
-        .col_ref, .lit => {},
+        .col_ref, .lit, .scalar_subquery => {},
         .call => |c| {
             for (c.args) |child| freeDecodedExpr(child, allocator);
             allocator.free(c.args);
@@ -2081,7 +2088,7 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
 
 pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     switch (expr) {
-        .leaf, .is_null, .is_not_null, .like => {},
+        .leaf, .is_null, .is_not_null, .like, .scalar_subquery => {},
         .@"and", .@"or" => |children| {
             for (children) |c| freeDecodedPredicate(c, allocator);
             allocator.free(children);

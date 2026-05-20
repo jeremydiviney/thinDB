@@ -400,6 +400,7 @@ fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!
             }
             try out.appendSlice(allocator, " END");
         },
+        .scalar_subquery => try out.appendSlice(allocator, "(SELECT …)"),
     }
 }
 
@@ -426,6 +427,12 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
             try out.appendSlice(allocator, "NOT (");
             try explainPredicate(allocator, out, child.*);
             try out.append(allocator, ')');
+        },
+        .scalar_subquery => |sq| {
+            try out.appendSlice(allocator, sq.col);
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, opSymbol(sq.op));
+            try out.appendSlice(allocator, " (SELECT …)");
         },
     }
 }

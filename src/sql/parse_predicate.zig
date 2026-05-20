@@ -178,6 +178,29 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         else => return PE.SqlExpectedToken,
     };
     try p.advance();
+
+    // Scalar subquery on the RHS: `col cmp (SELECT ...)`. The parser
+    // captures the inner Op; a pre-compile pass runs it once and
+    // rewrites this predicate node into a `.leaf` literal.
+    if (p.cur.tag == .lparen) {
+        const saved = p.cur;
+        try p.advance();
+        if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
+            const source = try p.parseStatement();
+            try p.expect(.rparen);
+            return .{ .scalar_subquery = .{
+                .col = col_dup,
+                .op = op,
+                .source = @ptrCast(source),
+            } };
+        }
+        // Not a subquery — restore the `(` token so parseValue sees a
+        // parenthesized literal. parseValue doesn't accept that today
+        // (literals are bare); surface the same error parseValue would.
+        _ = saved;
+        return PE.SqlExpectedValue;
+    }
+
     const val = try p.parseValue();
     return .{ .leaf = .{ .col = col_dup, .op = op, .val = val } };
 }

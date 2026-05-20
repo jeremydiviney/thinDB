@@ -203,6 +203,8 @@ pub const Filter = struct {
                 try self.evaluateExpr(child.*, batch, out);
                 for (out) |*o| o.* = !o.*;
             },
+            // Resolved away by the pre-compile pass.
+            .scalar_subquery => return Error.PredicateTypeMismatch,
         }
     }
 };

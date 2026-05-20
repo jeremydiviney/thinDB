@@ -37,6 +37,13 @@ pub const Expr = union(enum) {
     /// `else_branch` wins (NULL if absent). All branch `then` results
     /// must resolve to the same type.
     case: Case,
+    /// Uncorrelated scalar subquery — `(SELECT single_col FROM ...)`.
+    /// The pointer is `*const ir.Op`; opaqued here to break the
+    /// expr → ir → expr import cycle. A pre-compile resolution pass
+    /// runs the subquery once, extracts the single value, and
+    /// substitutes a `.lit` node before any operator is built —
+    /// operators never see this variant.
+    scalar_subquery: *const anyopaque,
 
     pub const Call = struct {
         fn_name: []const u8,
@@ -111,6 +118,8 @@ pub fn deepClone(out_arena: Allocator, e: Expr) Allocator.Error!Expr {
             }
             break :blk .{ .case = .{ .branches = branches_dup, .else_branch = else_dup } };
         },
+        // Opaque pointer aliased — the IR arena owns the pointee.
+        .scalar_subquery => |p| .{ .scalar_subquery = p },
     };
 }
 

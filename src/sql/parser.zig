@@ -984,9 +984,16 @@ pub const Parser = struct {
                 return ir.Expr{ .lit = v };
             },
             .lparen => {
-                // Parenthesized sub-expression. `(expr)` — parens
-                // override precedence; recurse on parseAddSub.
+                // Parenthesized sub-expression OR scalar subquery.
+                // `(SELECT ...)` / `(WITH ... SELECT ...)` is captured
+                // as a scalar_subquery node; everything else recurses
+                // through the binary expression parser.
                 try self.advance();
+                if (self.cur.tag == .kw_select or self.cur.tag == .kw_with) {
+                    const source = try self.parseStatement();
+                    try self.expect(.rparen);
+                    return ir.Expr{ .scalar_subquery = @ptrCast(source) };
+                }
                 const inner = try self.parseAddSub();
                 try self.expect(.rparen);
                 return inner;
@@ -1044,6 +1051,7 @@ pub const Parser = struct {
                 return try buf.toOwnedSlice(self.arena);
             },
             .case => return try self.arena.dupe(u8, "case"),
+            .scalar_subquery => return try self.arena.dupe(u8, "subquery"),
         }
     }
 

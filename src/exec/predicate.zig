@@ -47,11 +47,23 @@ pub const PredicateExpr = union(enum) {
     @"and": []const PredicateExpr,
     @"or": []const PredicateExpr,
     not: *const PredicateExpr,
+    /// `col cmp_op (SELECT single_value_from_anywhere)`. Resolved at
+    /// compile time by running the inner once, freezing the single
+    /// value, and rewriting this node into a `.leaf`. The `source`
+    /// pointer is `*const ir.Op` opaqued to dodge the cycle with the
+    /// IR module. Operators never see this variant.
+    scalar_subquery: ScalarSubquery,
 };
 
 pub const LikePred = struct {
     col: []const u8,
     pattern: []const u8,
+};
+
+pub const ScalarSubquery = struct {
+    col: []const u8,
+    op: PredicateOp,
+    source: *const anyopaque,
 };
 
 pub fn likeExpr(col: []const u8, pattern: []const u8) PredicateExpr {
@@ -86,6 +98,11 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
         .like => |lp| .{ .like = .{
             .col = try out_arena.dupe(u8, lp.col),
             .pattern = try out_arena.dupe(u8, lp.pattern),
+        } },
+        .scalar_subquery => |sq| .{ .scalar_subquery = .{
+            .col = try out_arena.dupe(u8, sq.col),
+            .op = sq.op,
+            .source = sq.source,
         } },
         .@"and" => |kids| blk: {
             const dup = try out_arena.alloc(PredicateExpr, kids.len);
@@ -160,6 +177,10 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             for (children) |*c| try validateExpr(@constCast(c), schema);
         },
         .not => |child| try validateExpr(@constCast(child), schema),
+        // Scalar subqueries must be resolved (rewritten to `.leaf`) by
+        // the pre-compile pass before validation runs. Reaching this
+        // branch means the resolver missed a node — surface loudly.
+        .scalar_subquery => return Error.PredicateTypeMismatch,
     }
 }
 
@@ -335,6 +356,8 @@ pub fn evaluatePredicate(
             try evaluatePredicate(allocator, child.*, schema, batch, out);
             for (out) |*o| o.* = !o.*;
         },
+        // Resolved by the pre-compile pass.
+        .scalar_subquery => return Error.PredicateTypeMismatch,
     }
 }
 
