@@ -21,6 +21,7 @@ const tcp_bench = @import("tcp_bench.zig");
 const join_bench = @import("join_bench.zig");
 const materialize_bench = @import("materialize_bench.zig");
 const window_bench = @import("window_bench.zig");
+const mutation_bench = @import("mutation_bench.zig");
 
 const Allocator = common.Allocator;
 const Io = common.Io;
@@ -94,6 +95,10 @@ pub fn main() !void {
     try materialize_bench.runAll(allocator, io);
 
     try window_bench.runAll(allocator, io);
+
+    std.debug.print("\nMutation (DELETE / UPDATE)\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    try mutation_bench.run(allocator, io, n_rows);
 
     std.debug.print("--------------------------------------------------------------------------------\n\n", .{});
 }
