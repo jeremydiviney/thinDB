@@ -46,6 +46,7 @@ test {
     _ = @import("agg_on_expr_test.zig");
     _ = @import("qualified_col_test.zig");
     _ = @import("range_correlated_test.zig");
+    _ = @import("case_subquery_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 
