@@ -1296,6 +1296,35 @@ pub const Parser = struct {
             return pe;
         }
 
+        // IN (lit, lit, ...) — desugar to OR-chain of equality leaves.
+        // NOT IN wraps the OR-chain in .not.
+        if (self.cur.tag == .kw_in) {
+            try self.advance();
+            try self.expect(.lparen);
+            var values: std.ArrayList(Value) = .empty;
+            defer values.deinit(self.arena);
+            while (true) {
+                const v = try self.parseValue();
+                try values.append(self.arena, v);
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+            try self.expect(.rparen);
+            if (values.items.len == 0) return ParseError.SqlExpectedValue;
+
+            const kids = try self.arena.alloc(PredicateExpr, values.items.len);
+            for (values.items, kids) |v, *kid| {
+                kid.* = .{ .leaf = .{ .col = col_dup, .op = .eq, .val = v } };
+            }
+            var pe: PredicateExpr = if (kids.len == 1) kids[0] else .{ .@"or" = kids };
+            if (negate_predicate) {
+                const child = try self.arena.create(PredicateExpr);
+                child.* = pe;
+                pe = .{ .not = child };
+            }
+            return pe;
+        }
+
         // Any other use of bare NOT inside parseAtom is a parse error —
         // boolean-level NOT was already consumed by parseNot.
         if (negate_predicate) return ParseError.SqlExpectedKeyword;

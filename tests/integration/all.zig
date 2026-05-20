@@ -29,6 +29,7 @@ test {
     _ = @import("case_when_test.zig");
     _ = @import("between_test.zig");
     _ = @import("like_test.zig");
+    _ = @import("in_list_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 
