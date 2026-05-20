@@ -145,6 +145,54 @@ Opaque-predicate NLJ at 100k × 1k (realistic fact × dim shape) emits ~6.6 matc
 
 ---
 
+## Window functions (1 M rows)
+
+Sort-based partitioning. Most benches use `PARTITION BY grp_lo` (100 partitions × 10k rows each) over a BIGINT value column. Output is materialized (drained) in every run.
+
+### Per-function cost
+
+| Function | Time | Throughput | ns/row | Notes |
+|---|---:|---:|---:|---|
+| `row_number()` | 199 ms | 5.0 M rows/s | 199 | sort + 1 counter per row |
+| `rank()` (with ties) | 127 ms | 7.9 M rows/s | 127 | order-key compare on each transition |
+| `dense_rank()` (with ties) | 129 ms | 7.8 M rows/s | 129 | same shape as `rank()` |
+| `lag(qty)` | 199 ms | 5.0 M rows/s | 199 | direct index access in perm space |
+| `first_value(qty)` | 198 ms | 5.0 M rows/s | 198 | one read, copy across partition |
+| `sum(qty)` running (default frame) | 198 ms | 5.1 M rows/s | 198 | **prefix fast path** — single forward sweep |
+| **`sum(qty)` whole partition** | **79 ms** | **12.7 M rows/s** | **79** | **broadcast fast path** — accumulate once, copy |
+| `sum(qty) ROWS 10 PRECEDING` | 208 ms | 4.8 M rows/s | 208 | naive O(N×W); sliding-deque is future work |
+| `avg(qty)` running | 200 ms | 5.0 M rows/s | 200 | running sum + count |
+| `min+max` (both calls, shared spec) | 213 ms | 4.7 M rows/s | 213 | one sort serves both functions |
+| `ntile(10)` | 198 ms | 5.1 M rows/s | 198 | position-based bucket assignment |
+| `percent_rank()` | 131 ms | 7.7 M rows/s | 131 | same shape as `rank()` + division |
+| `cume_dist()` | 129 ms | 7.7 M rows/s | 129 | peer-group counter |
+
+### Spec sharing (verifies parser dedup + operator single-sort path)
+
+| Shape | Time | Throughput | Note |
+|---|---:|---:|---|
+| 2 calls / **same** spec (1 sort) | 209 ms | 4.8 M rows/s | ≈ cost of 1 call — dedup works |
+| 2 calls / **different** specs (2 sorts) | 322 ms | 3.1 M rows/s | ~1.5× the single-spec cost |
+| 4 calls / **same** spec (1 sort) | 233 ms | 4.3 M rows/s | extra function cost only, not extra sort |
+
+### Partition cardinality sweep
+
+| Partitioning | Partitions | Rows/partition | Time | Throughput |
+|---|---:|---:|---:|---:|
+| no PARTITION BY | 1 | 1,000,000 | 45 ms | **22.1 M rows/s** |
+| `PARTITION BY grp_lo` | 100 | 10,000 | 200 ms | 5.0 M rows/s |
+| `PARTITION BY grp_hi` | 10,000 | 100 | 160 ms | 6.2 M rows/s |
+
+**Reading the numbers:**
+- Sort dominates: the `partition=1` case has no partition-boundary scan, only one sort + a linear sweep → **4× faster** than the 100-partition case. The bulk of per-function time is in the pdqsort over 1M rows.
+- **The whole-partition broadcast fast path is the biggest win in the operator**: at 12.7 M rows/s it's 2.5× faster than the running-aggregate path. The algorithmic recognition pays off whenever the user writes `OVER (PARTITION BY x)` (no ORDER BY) — common pattern for "running total over all of partition X".
+- **Spec dedup is verifiable**: 2 calls / same spec runs at 209 ms (essentially the single-call cost of 199 ms + a touch of per-call evaluation). 2 calls / different specs runs at 322 ms — two full sorts.
+- Ranking functions (`rank`, `dense_rank`, `percent_rank`, `cume_dist`) are faster than `row_number` because they pay no per-row writes when the sort key doesn't change between consecutive rows. With many ties they reuse the prior rank.
+
+**Headroom:** the naive sliding-frame path (`ROWS 10 PRECEDING`) shows we're an algorithmic improvement away from O(N) per-row aggregates. Combined with #145 SIMD, the perf pass should pull the per-function cost down 3–5×.
+
+---
+
 ## How does this compare?
 
 Cross-system join/scan benchmarks vary wildly with hardware, schema, and methodology — these are **order-of-magnitude** comparisons drawn from public sources and my own past measurements, not apples-to-apples.
@@ -184,6 +232,18 @@ DuckDB beats us on hash join because it parallelizes across cores; we're single-
 
 Competitive with vectorized analytical DBs; ~10× faster than Pandas.
 
+### Window functions (1M rows, `ROW_NUMBER() OVER (PARTITION BY x ORDER BY y)`)
+
+| System | Throughput |
+|---|---:|
+| PostgreSQL 16 | 3–6 M rows/s |
+| **thinDB** | **5 M rows/s** |
+| StarRocks | 15–25 M rows/s |
+| DuckDB | 20–50 M rows/s |
+| ClickHouse | 30–80 M rows/s |
+
+Order-of-magnitude only; competitor numbers drawn from public benchmarks and vary widely by hardware/methodology. Bottom line: we're in PostgreSQL's neighborhood, **~3–5× behind the vectorized analytics engines**. The gap is mostly the absence of SIMD inner loops + a sliding-deque algorithm for framed aggregates, which #145 will close most of.
+
 ### What we don't do (yet)
 
 Honest list of things competitors do that we don't:
@@ -212,4 +272,4 @@ zig build bench -Doptimize=ReleaseFast
 
 Output is to stdout; this file captures the current state. Re-run and update on perf-affecting changes (per CLAUDE.md guidance: track baseline numbers in PR descriptions).
 
-To run a subset: bench bodies live in `bench/main.zig`, `bench/join_bench.zig`, `bench/compact_bench.zig`, `bench/durability_bench.zig`, `bench/tcp_bench.zig`. Comment out the ones you don't need from `bench/main.zig`'s `pub fn main()`.
+To run a subset: bench bodies live in `bench/main.zig`, `bench/join_bench.zig`, `bench/compact_bench.zig`, `bench/durability_bench.zig`, `bench/tcp_bench.zig`, `bench/window_bench.zig`, `bench/materialize_bench.zig`. Comment out the ones you don't need from `bench/main.zig`'s `pub fn main()`.
