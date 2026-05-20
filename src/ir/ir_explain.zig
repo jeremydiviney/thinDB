@@ -240,6 +240,22 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             }
             try out.append(allocator, '\n');
         },
+        .update_op => |u| {
+            try out.appendSlice(allocator, "Update ");
+            try writeTableRef(allocator, out, u.table);
+            try out.appendSlice(allocator, " SET ");
+            for (u.assignments, 0..) |asn, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, asn.col);
+                try out.appendSlice(allocator, " = ");
+                try explainExpr(allocator, out, asn.value);
+            }
+            if (u.predicate) |p| {
+                try out.appendSlice(allocator, " WHERE ");
+                try explainPredicate(allocator, out, p);
+            }
+            try out.append(allocator, '\n');
+        },
     }
 }
 

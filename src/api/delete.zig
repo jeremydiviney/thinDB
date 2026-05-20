@@ -104,20 +104,17 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
 /// via clone-and-swap, same as the simple `execDelete` path.
 ///
 /// `pred_or_null == null` means delete every row.
-pub fn execDeleteByExpr(t: *Table, pred_or_null: ?predicate.PredicateExpr) !usize {
+pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
     var total: usize = 0;
 
-    // Type-widen + schema-check the predicate once before walking
-    // segments. Same lossless widening Filter does at create-time
-    // (e.g. INT literal against a BIGINT column → mutated to bigint).
-    if (pred_or_null) |*p_const| {
-        // validateExpr mutates leaves in place; we need a mutable
-        // reference but the IR's predicate is by-value here. Cast
-        // is safe: we own the in-memory IR for the duration of
-        // this call.
-        const p_mut: *predicate.PredicateExpr = @constCast(p_const);
-        try predicate.validateExpr(p_mut, t.schema.columns);
+    // Make a local mutable copy of the predicate so validateExpr can
+    // widen literals in place (Zig function parameters are immutable,
+    // so we can't mutate `pred_in` directly even via a const-cast).
+    var pred_local: ?predicate.PredicateExpr = pred_in;
+    if (pred_local) |*p| {
+        try predicate.validateExpr(p, t.schema.columns);
     }
+    const pred_or_null = pred_local;
 
     // ---- Segments ----
     for (t.manifest.segments.items) |entry| {

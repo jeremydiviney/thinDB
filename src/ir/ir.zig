@@ -370,6 +370,10 @@ pub const OpTag = enum(u8) {
     /// (segments) and clone the memtable without them. Streaming;
     /// memory bounded by per-segment tombstone list.
     delete_op = 20,
+    /// `UPDATE t SET col = expr [, ...] [WHERE ...]` — modeled as
+    /// DELETE-old + INSERT-new under the table mutex, streaming
+    /// per row group so memory stays bounded.
+    update_op = 21,
 };
 
 pub const BatchOp = struct {
@@ -403,6 +407,23 @@ pub const SetVar = struct {
 /// forms all work after the pre-compile resolver passes).
 pub const DeleteOp = struct {
     table: TableRef,
+    predicate: ?@import("../exec/predicate.zig").PredicateExpr,
+};
+
+/// One `col = expr` assignment in an UPDATE statement.
+pub const Assignment = struct {
+    col: []const u8,
+    value: Expr,
+};
+
+/// `UPDATE t SET col = expr [, ...] [WHERE ...]` — modeled as
+/// DELETE-old + INSERT-new under the table mutex. The
+/// assignment exprs can reference the original row's columns
+/// (`SET x = x + 1`); evaluation snapshots the original Batch
+/// before any write.
+pub const UpdateOp = struct {
+    table: TableRef,
+    assignments: []const Assignment,
     predicate: ?@import("../exec/predicate.zig").PredicateExpr,
 };
 
@@ -451,6 +472,7 @@ pub const Op = union(OpTag) {
     insert_select: InsertSelect,
     set_var: SetVar,
     delete_op: DeleteOp,
+    update_op: UpdateOp,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -629,8 +651,8 @@ pub const Op = union(OpTag) {
                 i.source.deinitDecoded(allocator);
                 allocator.destroy(i.source);
             },
-            // Never reached: SET @var / DELETE aren't wire-decoded.
-            .set_var, .delete_op => {},
+            // Never reached: SET / DELETE / UPDATE aren't wire-decoded.
+            .set_var, .delete_op, .update_op => {},
         }
     }
 };
@@ -725,10 +747,10 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         // SQL path executes it without wire round-trip. Wire-encoding
         // it would require resolving the Expr to a literal first.
         .set_var => return EncodeError.OutOfMemory,
-        // DELETE is server-local in v1; wire encoding would need a
-        // predicate-encode path that handles every resolved variant.
-        // Add when a remote-client builder needs it.
-        .delete_op => return EncodeError.OutOfMemory,
+        // DELETE / UPDATE are server-local in v1; wire encoding
+        // would need a predicate-encode path that handles every
+        // resolved variant. Add when a remote-client builder needs it.
+        .delete_op, .update_op => return EncodeError.OutOfMemory,
     }
 }
 
@@ -1360,7 +1382,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.delete_op)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.update_op)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1646,9 +1668,9 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 .source = source,
             } };
         },
-        // SET @var is never wire-encoded (encodeOp errors on it). If
-        // a decoder somehow sees its tag, that's a corrupted stream.
-        .set_var, .delete_op => return Error.IrCorrupt,
+        // SET / DELETE / UPDATE are never wire-encoded. If decoder
+        // somehow sees their tag, the stream is corrupt.
+        .set_var, .delete_op, .update_op => return Error.IrCorrupt,
     };
 }
 

@@ -105,6 +105,7 @@ pub const TokenTag = enum {
     /// only accepts the MySQL form.
     kw_set,
     kw_delete,
+    kw_update,
 
     /// MySQL-style user-defined variable: `@name`. The `text` field
     /// carries the name without the `@` prefix. Resolved to a literal
@@ -505,6 +506,7 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "all", .tag = .kw_all },
         .{ .name = "set", .tag = .kw_set },
         .{ .name = "delete", .tag = .kw_delete },
+        .{ .name = "update", .tag = .kw_update },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;

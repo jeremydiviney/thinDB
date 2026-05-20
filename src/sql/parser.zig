@@ -225,6 +225,7 @@ pub const Parser = struct {
             .kw_copy => return try parse_ddl.parseCopy(self),
             .kw_set => return try self.parseSetVar(),
             .kw_delete => return try self.parseDelete(),
+            .kw_update => return try self.parseUpdate(),
             else => {},
         }
         // Optional WITH clause: zero-or-more named CTEs precede the
@@ -1431,6 +1432,43 @@ pub const Parser = struct {
         return try self.allocOp(.{ .delete_op = .{ .table = tref, .predicate = pred } });
     }
 
+    /// Parse `UPDATE <table> SET col = expr [, ...] [WHERE <bool_expr>]`.
+    /// RHS exprs use the full Expr grammar so users can write
+    /// `SET x = x + 1`, `SET label = lower(name)`, or
+    /// `SET y = (SELECT AVG(y) FROM t)`. Subqueries / `@vars` resolve
+    /// in the pre-compile pass before the per-row evaluation runs.
+    pub fn parseUpdate(self: *Parser) ParseError!*ir.Op {
+        try self.expect(.kw_update);
+        const tref = try self.parseTableRef();
+        try self.expect(.kw_set);
+
+        var assigns: std.ArrayList(ir.Assignment) = .empty;
+        defer assigns.deinit(self.arena);
+        while (true) {
+            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+            const col_name = try self.arena.dupe(u8, self.cur.text);
+            try self.advance();
+            if (self.cur.tag != .eq) return ParseError.SqlExpectedToken;
+            try self.advance();
+            const val = try self.parseAddSub();
+            try assigns.append(self.arena, .{ .col = col_name, .value = val });
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        const assigns_owned = try assigns.toOwnedSlice(self.arena);
+
+        var pred: ?PredicateExpr = null;
+        if (self.cur.tag == .kw_where) {
+            try self.advance();
+            pred = try self.parseBoolExpr();
+        }
+        return try self.allocOp(.{ .update_op = .{
+            .table = tref,
+            .assignments = assigns_owned,
+            .predicate = pred,
+        } });
+    }
+
     /// Parse `SET @name = expr`. The RHS is a general Expr so users
     /// can write `SET @cutoff = (SELECT MAX(amount) FROM orders)` —
     /// the pre-compile pass resolves any scalar subquery into a
@@ -1656,7 +1694,7 @@ fn countRefs(
             try visitChild(arena, refs, j.right);
         },
         .materialize => |m| try visitChild(arena, refs, m.upstream),
-        .ddl, .show, .insert, .copy, .set_var, .delete_op => {},
+        .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
         .batch => |b| for (b.statements) |sub| try visitChild(arena, refs, sub),
         .window => |w| try visitChild(arena, refs, w.upstream),
         .set_union => |u| {

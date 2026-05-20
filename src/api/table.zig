@@ -563,6 +563,30 @@ pub const Table = struct {
         return try @import("delete.zig").execDeleteByExpr(self, pred);
     }
 
+    /// SQL `UPDATE t SET ... [WHERE expr]` — atomic DELETE-old +
+    /// INSERT-new under the table mutex. Caller has pre-computed the
+    /// replacement rows in `sink` (a transient Memtable owned by the
+    /// caller). This method:
+    ///   1. Tombstones segment rows matching `pred` + filters the
+    ///      memtable for non-matching rows (same path as `deleteByExpr`).
+    ///   2. Appends every row in `sink` to the now-filtered memtable
+    ///      as a single columnar batch.
+    /// Both steps run while holding the table mutex so concurrent
+    /// SELECT readers either see the all-old or the all-new state.
+    pub fn applyUpdate(self: *Table, pred: ?exec.PredicateExpr, sink: *@import("../engine/engine.zig").Memtable) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        _ = try @import("delete.zig").execDeleteByExpr(self, pred);
+
+        // Append sink's rows into the table memtable via insertColumnarBatch.
+        const n = @as(usize, @intCast(sink.row_count));
+        if (n == 0) return;
+        const views_buf = try self.allocator.alloc(@import("../storage/storage.zig").ColumnView, sink.columns.len);
+        defer self.allocator.free(views_buf);
+        for (sink.columns, views_buf) |*c, *v| v.* = c.view();
+        try self.memtable.insertColumnarBatch(sink.schema.columns, views_buf, n);
+    }
+
     /// Merge all segments into a single new segment. Drops tombstoned rows.
     /// No-op if there's at most one segment.
     pub fn compact(self: *Table) !void {

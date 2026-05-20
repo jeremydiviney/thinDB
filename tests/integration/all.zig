@@ -49,6 +49,7 @@ test {
     _ = @import("case_subquery_test.zig");
     _ = @import("session_vars_test.zig");
     _ = @import("delete_sql_test.zig");
+    _ = @import("update_sql_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 
