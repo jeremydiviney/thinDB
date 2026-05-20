@@ -1412,8 +1412,70 @@ pub const Parser = struct {
                 try self.advance();
                 return .{ .boolean = false };
             },
+            // Typed temporal literals: DATE '2024-01-15',
+            //   DATETIME '2024-01-15 12:34:56', TIMESTAMP alias.
+            // The keyword sits in the identifier namespace today
+            // (parsed as `.identifier` because the CREATE TABLE
+            // grammar uses these as column-type names) — detected
+            // here by name + a lookahead at the following string.
+            .identifier => {
+                const word = tok.text;
+                if (std.ascii.eqlIgnoreCase(word, "date")) {
+                    try self.advance();
+                    if (self.cur.tag != .string) return ParseError.SqlExpectedValue;
+                    const s = self.cur.value.string;
+                    const days = parseDateString(s) catch return ParseError.SqlExpectedValue;
+                    try self.advance();
+                    return .{ .date = days };
+                }
+                if (std.ascii.eqlIgnoreCase(word, "datetime") or
+                    std.ascii.eqlIgnoreCase(word, "timestamp"))
+                {
+                    try self.advance();
+                    if (self.cur.tag != .string) return ParseError.SqlExpectedValue;
+                    const s = self.cur.value.string;
+                    const micros = parseDateTimeString(s) catch return ParseError.SqlExpectedValue;
+                    try self.advance();
+                    return .{ .datetime = micros };
+                }
+                return ParseError.SqlExpectedValue;
+            },
             else => return ParseError.SqlExpectedValue,
         }
+    }
+
+    /// Inline copy of `net.local.parseDateLiteral` — keeping parser.zig
+    /// free of the net layer dep.
+    fn parseDateString(s: []const u8) !i32 {
+        if (s.len < 10) return error.Invalid;
+        if (s[4] != '-' or s[7] != '-') return error.Invalid;
+        const year = try std.fmt.parseInt(i32, s[0..4], 10);
+        const month = try std.fmt.parseInt(u32, s[5..7], 10);
+        const day = try std.fmt.parseInt(u32, s[8..10], 10);
+        if (month < 1 or month > 12 or day < 1 or day > 31) return error.Invalid;
+        return ymdToDays(year, month, day);
+    }
+
+    fn parseDateTimeString(s: []const u8) !i64 {
+        if (s.len < 19) return error.Invalid;
+        if (s[4] != '-' or s[7] != '-') return error.Invalid;
+        const sep = s[10];
+        if (sep != ' ' and sep != 'T') return error.Invalid;
+        if (s[13] != ':' or s[16] != ':') return error.Invalid;
+        const year = try std.fmt.parseInt(i32, s[0..4], 10);
+        const month = try std.fmt.parseInt(u32, s[5..7], 10);
+        const day = try std.fmt.parseInt(u32, s[8..10], 10);
+        const hour = try std.fmt.parseInt(u32, s[11..13], 10);
+        const minute = try std.fmt.parseInt(u32, s[14..16], 10);
+        const second = try std.fmt.parseInt(u32, s[17..19], 10);
+        if (hour > 23 or minute > 59 or second > 59) return error.Invalid;
+        const days = ymdToDays(year, month, day);
+        const day_secs: i64 = @as(i64, days) * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+        return day_secs * 1_000_000;
+    }
+
+    fn ymdToDays(year: i32, month: u32, day: u32) i32 {
+        return @import("../exec/scalar_fn_common.zig").ymdToDays(year, month, day);
     }
 
     pub fn allocOp(self: *Parser, op: ir.Op) ParseError!*ir.Op {

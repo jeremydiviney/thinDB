@@ -41,6 +41,7 @@ test {
     _ = @import("col_col_predicate_test.zig");
     _ = @import("correlated_subquery_test.zig");
     _ = @import("correlated_scalar_test.zig");
+    _ = @import("typed_temporal_literal_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 

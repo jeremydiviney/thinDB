@@ -204,10 +204,10 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     try p.advance();
 
     // Column-vs-column comparison: `col1 op col2`. Detected when the
-    // RHS starts with an identifier rather than a literal. Supports
-    // optional `qualifier.col` on the RHS too — qualifier dropped,
-    // matches the LHS behavior.
-    if (p.cur.tag == .identifier) {
+    // RHS starts with a plain identifier rather than a literal —
+    // EXCEPT for the temporal-literal keywords `DATE` / `DATETIME` /
+    // `TIMESTAMP`, which `parseValue` claims (see below).
+    if (p.cur.tag == .identifier and !isTypedLiteralKeyword(p.cur.text)) {
         var rhs_col = p.cur.text;
         try p.advance();
         if (p.cur.tag == .dot) {
@@ -244,6 +244,12 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
 
     const val = try p.parseValue();
     return .{ .leaf = .{ .col = col_dup, .op = op, .val = val } };
+}
+
+fn isTypedLiteralKeyword(s: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(s, "date") or
+        std.ascii.eqlIgnoreCase(s, "datetime") or
+        std.ascii.eqlIgnoreCase(s, "timestamp");
 }
 
 fn makeBetween(p: anytype, col: []const u8, lo: Value, hi: Value, negate: bool) !PredicateExpr {
