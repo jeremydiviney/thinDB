@@ -51,6 +51,7 @@ const PredicateOp = exec_predicate.PredicateOp;
 const parse_window = @import("parse_window.zig");
 pub const ParsedWindowCall = parse_window.ParsedWindowCall;
 const parse_ddl = @import("parse_ddl.zig");
+const parse_predicate = @import("parse_predicate.zig");
 
 pub const ParseError = error{
     SqlExpectedSelect,
@@ -1347,171 +1348,10 @@ pub const Parser = struct {
     // WHERE / boolean expression parsing.
     // -----------------------------------------------------------------------
 
+    // Predicate parsing lives in `parse_predicate.zig`; thin delegate
+    // here so the SELECT pipeline keeps its existing call sites.
     fn parseBoolExpr(self: *Parser) ParseError!PredicateExpr {
-        return try self.parseOr();
-    }
-
-    fn parseOr(self: *Parser) ParseError!PredicateExpr {
-        var lhs = try self.parseAnd();
-        while (self.cur.tag == .kw_or) {
-            try self.advance();
-            const rhs = try self.parseAnd();
-            const children = try self.arena.alloc(PredicateExpr, 2);
-            children[0] = lhs;
-            children[1] = rhs;
-            lhs = .{ .@"or" = children };
-        }
-        return lhs;
-    }
-
-    fn parseAnd(self: *Parser) ParseError!PredicateExpr {
-        var lhs = try self.parseNot();
-        while (self.cur.tag == .kw_and) {
-            try self.advance();
-            const rhs = try self.parseNot();
-            const children = try self.arena.alloc(PredicateExpr, 2);
-            children[0] = lhs;
-            children[1] = rhs;
-            lhs = .{ .@"and" = children };
-        }
-        return lhs;
-    }
-
-    fn parseNot(self: *Parser) ParseError!PredicateExpr {
-        if (self.cur.tag == .kw_not) {
-            try self.advance();
-            const inner = try self.parseNot();
-            const child = try self.arena.create(PredicateExpr);
-            child.* = inner;
-            return .{ .not = child };
-        }
-        return try self.parseAtom();
-    }
-
-    fn parseAtom(self: *Parser) ParseError!PredicateExpr {
-        if (self.cur.tag == .lparen) {
-            try self.advance();
-            const inner = try self.parseOr();
-            try self.expect(.rparen);
-            return inner;
-        }
-        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-        var col_name = self.cur.text;
-        try self.advance();
-        // Optional qualifier table.col — use last segment.
-        if (self.cur.tag == .dot) {
-            try self.advance();
-            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-            col_name = self.cur.text;
-            try self.advance();
-        }
-        const col_dup = try self.arena.dupe(u8, col_name);
-
-        // IS NULL / IS NOT NULL.
-        if (self.cur.tag == .kw_is) {
-            try self.advance();
-            var negated = false;
-            if (self.cur.tag == .kw_not) {
-                negated = true;
-                try self.advance();
-            }
-            if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
-            try self.advance();
-            return if (negated) .{ .is_not_null = col_dup } else .{ .is_null = col_dup };
-        }
-
-        // Optional NOT — turns BETWEEN into NOT BETWEEN (and reserves
-        // the same slot for future LIKE / IN follow-ups).
-        var negate_predicate = false;
-        if (self.cur.tag == .kw_not) {
-            try self.advance();
-            negate_predicate = true;
-        }
-
-        // BETWEEN lo AND hi  →  (col >= lo) AND (col <= hi)
-        // NOT BETWEEN        →  (col <  lo) OR  (col >  hi)
-        if (self.cur.tag == .kw_between) {
-            try self.advance();
-            const lo = try self.parseValue();
-            if (self.cur.tag != .kw_and) return ParseError.SqlExpectedKeyword;
-            try self.advance();
-            const hi = try self.parseValue();
-            return try self.makeBetween(col_dup, lo, hi, negate_predicate);
-        }
-
-        // LIKE 'pattern'  /  NOT LIKE 'pattern'
-        if (self.cur.tag == .kw_like) {
-            try self.advance();
-            if (self.cur.tag != .string) return ParseError.SqlExpectedValue;
-            const pattern = try self.arena.dupe(u8, self.cur.value.string);
-            try self.advance();
-            var pe: PredicateExpr = .{ .like = .{ .col = col_dup, .pattern = pattern } };
-            if (negate_predicate) {
-                const child = try self.arena.create(PredicateExpr);
-                child.* = pe;
-                pe = .{ .not = child };
-            }
-            return pe;
-        }
-
-        // IN (lit, lit, ...) — desugar to OR-chain of equality leaves.
-        // NOT IN wraps the OR-chain in .not.
-        if (self.cur.tag == .kw_in) {
-            try self.advance();
-            try self.expect(.lparen);
-            var values: std.ArrayList(Value) = .empty;
-            defer values.deinit(self.arena);
-            while (true) {
-                const v = try self.parseValue();
-                try values.append(self.arena, v);
-                if (self.cur.tag != .comma) break;
-                try self.advance();
-            }
-            try self.expect(.rparen);
-            if (values.items.len == 0) return ParseError.SqlExpectedValue;
-
-            const kids = try self.arena.alloc(PredicateExpr, values.items.len);
-            for (values.items, kids) |v, *kid| {
-                kid.* = .{ .leaf = .{ .col = col_dup, .op = .eq, .val = v } };
-            }
-            var pe: PredicateExpr = if (kids.len == 1) kids[0] else .{ .@"or" = kids };
-            if (negate_predicate) {
-                const child = try self.arena.create(PredicateExpr);
-                child.* = pe;
-                pe = .{ .not = child };
-            }
-            return pe;
-        }
-
-        // Any other use of bare NOT inside parseAtom is a parse error —
-        // boolean-level NOT was already consumed by parseNot.
-        if (negate_predicate) return ParseError.SqlExpectedKeyword;
-
-        // Comparison.
-        const op: PredicateOp = switch (self.cur.tag) {
-            .eq => .eq,
-            .neq => .neq,
-            .lt => .lt,
-            .lte => .lte,
-            .gt => .gt,
-            .gte => .gte,
-            else => return ParseError.SqlExpectedToken,
-        };
-        try self.advance();
-        const val = try self.parseValue();
-        return .{ .leaf = .{ .col = col_dup, .op = op, .val = val } };
-    }
-
-    fn makeBetween(self: *Parser, col: []const u8, lo: Value, hi: Value, negate: bool) ParseError!PredicateExpr {
-        const kids = try self.arena.alloc(PredicateExpr, 2);
-        if (negate) {
-            kids[0] = .{ .leaf = .{ .col = col, .op = .lt, .val = lo } };
-            kids[1] = .{ .leaf = .{ .col = col, .op = .gt, .val = hi } };
-            return .{ .@"or" = kids };
-        }
-        kids[0] = .{ .leaf = .{ .col = col, .op = .gte, .val = lo } };
-        kids[1] = .{ .leaf = .{ .col = col, .op = .lte, .val = hi } };
-        return .{ .@"and" = kids };
+        return try parse_predicate.parseBoolExpr(self);
     }
 
     pub fn parseValue(self: *Parser) ParseError!Value {
