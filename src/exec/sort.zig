@@ -65,10 +65,7 @@ pub const Sort = struct {
 
         var all_asc = true;
         for (sort_specs, 0..) |spec, i| {
-            sort_col_indices[i] = blk: {
-                for (schema, 0..) |c, j| if (std.mem.eql(u8, c.name, spec.col)) break :blk j;
-                return Error.ColumnNotFound;
-            };
+            sort_col_indices[i] = types.findColumn(schema, spec.col) orelse return Error.ColumnNotFound;
             sort_desc[i] = spec.desc;
             if (spec.desc) all_asc = false;
         }

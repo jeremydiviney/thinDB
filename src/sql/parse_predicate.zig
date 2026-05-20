@@ -105,15 +105,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         };
         try p.advance();
         if (p.cur.tag == .identifier and !isTypedLiteralKeyword(p.cur.text)) {
-            var rhs_col = p.cur.text;
-            try p.advance();
-            if (p.cur.tag == .dot) {
-                try p.advance();
-                if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
-                rhs_col = p.cur.text;
-                try p.advance();
-            }
-            const col_dup = try p.arena.dupe(u8, rhs_col);
+            const col_dup = try parseQualifiedColRef(p);
             return .{ .leaf = .{ .col = col_dup, .op = reverseOp(op_lhs), .val = lhs_val } };
         }
         if (isLiteralTokenStart(p.cur.tag, p.cur.text)) {
@@ -124,16 +116,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         return PE.SqlExpectedValue;
     }
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
-    var col_name = p.cur.text;
-    try p.advance();
-    // Optional qualifier table.col — use last segment.
-    if (p.cur.tag == .dot) {
-        try p.advance();
-        if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
-        col_name = p.cur.text;
-        try p.advance();
-    }
-    const col_dup = try p.arena.dupe(u8, col_name);
+    const col_dup = try parseQualifiedColRef(p);
 
     // IS NULL / IS NOT NULL.
     if (p.cur.tag == .kw_is) {
@@ -244,15 +227,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // EXCEPT for the temporal-literal keywords `DATE` / `DATETIME` /
     // `TIMESTAMP`, which `parseValue` claims (see below).
     if (p.cur.tag == .identifier and !isTypedLiteralKeyword(p.cur.text)) {
-        var rhs_col = p.cur.text;
-        try p.advance();
-        if (p.cur.tag == .dot) {
-            try p.advance();
-            if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
-            rhs_col = p.cur.text;
-            try p.advance();
-        }
-        const rhs_dup = try p.arena.dupe(u8, rhs_col);
+        const rhs_dup = try parseQualifiedColRef(p);
         return .{ .leaf_col_col = .{ .left = col_dup, .op = op, .right = rhs_dup } };
     }
 
@@ -280,6 +255,30 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
 
     const val = try p.parseValue();
     return .{ .leaf = .{ .col = col_dup, .op = op, .val = val } };
+}
+
+/// Parse an `identifier (. identifier)?` column reference at the
+/// current position. The two-segment form is preserved as the dotted
+/// string `qualifier.col` so a downstream lookup against a scan
+/// renamed via `FROM t AS alias` finds the right column. The plain
+/// form is preserved verbatim. Caller has already verified the
+/// current token is `.identifier`.
+pub fn parseQualifiedColRef(p: anytype) @TypeOf(p.*).Err![]const u8 {
+    const PE = @TypeOf(p.*).Err;
+    const first = p.cur.text;
+    try p.advance();
+    if (p.cur.tag != .dot) {
+        return try p.arena.dupe(u8, first);
+    }
+    try p.advance();
+    if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
+    const second = p.cur.text;
+    try p.advance();
+    const buf = try p.arena.alloc(u8, first.len + 1 + second.len);
+    @memcpy(buf[0..first.len], first);
+    buf[first.len] = '.';
+    @memcpy(buf[first.len + 1 ..], second);
+    return buf;
 }
 
 fn isTypedLiteralKeyword(s: []const u8) bool {

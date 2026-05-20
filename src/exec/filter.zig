@@ -134,12 +134,7 @@ pub const Filter = struct {
     fn evaluateExpr(self: *Filter, expr: PredicateExpr, batch: Batch, out: []bool) anyerror!void {
         switch (expr) {
             .leaf => |p| {
-                const col_idx = blk: {
-                    for (self.schema, 0..) |c, i| {
-                        if (std.mem.eql(u8, c.name, p.col)) break :blk i;
-                    }
-                    return Error.ColumnNotFound;
-                };
+                const col_idx = types.findColumn(self.schema, p.col) orelse return Error.ColumnNotFound;
                 try predicate.evaluateMaskWithPred(batch.values[col_idx], p, batch.row_count, out);
                 const view = batch.values[col_idx];
                 if (view.nulls != null) {
@@ -149,43 +144,22 @@ pub const Filter = struct {
                 }
             },
             .leaf_col_col => |lc| {
-                const li = blk: {
-                    for (self.schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.left)) break :blk i;
-                    return Error.ColumnNotFound;
-                };
-                const ri = blk: {
-                    for (self.schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.right)) break :blk i;
-                    return Error.ColumnNotFound;
-                };
+                const li = types.findColumn(self.schema, lc.left) orelse return Error.ColumnNotFound;
+                const ri = types.findColumn(self.schema, lc.right) orelse return Error.ColumnNotFound;
                 try predicate.evaluateColColMask(batch.values[li], batch.values[ri], lc.op, batch.row_count, out);
             },
             .is_null => |col_name| {
-                const col_idx = blk: {
-                    for (self.schema, 0..) |c, i| {
-                        if (std.mem.eql(u8, c.name, col_name)) break :blk i;
-                    }
-                    return Error.ColumnNotFound;
-                };
+                const col_idx = types.findColumn(self.schema, col_name) orelse return Error.ColumnNotFound;
                 const view = batch.values[col_idx];
                 for (0..batch.row_count) |i| out[i] = !view.isValid(i);
             },
             .is_not_null => |col_name| {
-                const col_idx = blk: {
-                    for (self.schema, 0..) |c, i| {
-                        if (std.mem.eql(u8, c.name, col_name)) break :blk i;
-                    }
-                    return Error.ColumnNotFound;
-                };
+                const col_idx = types.findColumn(self.schema, col_name) orelse return Error.ColumnNotFound;
                 const view = batch.values[col_idx];
                 for (0..batch.row_count) |i| out[i] = view.isValid(i);
             },
             .like => |lp| {
-                const col_idx = blk: {
-                    for (self.schema, 0..) |c, i| {
-                        if (std.mem.eql(u8, c.name, lp.col)) break :blk i;
-                    }
-                    return Error.ColumnNotFound;
-                };
+                const col_idx = types.findColumn(self.schema, lp.col) orelse return Error.ColumnNotFound;
                 try predicate.evaluateLikeMask(batch.values[col_idx], lp.pattern, batch.row_count, out);
             },
             .@"and" => |children| {
@@ -224,10 +198,7 @@ pub const Filter = struct {
             .scalar_subquery, .exists_subquery, .in_subquery => return Error.PredicateTypeMismatch,
             .always => |b| @memset(out, b),
             .in_set => |s| {
-                const col_idx = blk: {
-                    for (self.schema, 0..) |c, i| if (std.mem.eql(u8, c.name, s.col)) break :blk i;
-                    return Error.ColumnNotFound;
-                };
+                const col_idx = types.findColumn(self.schema, s.col) orelse return Error.ColumnNotFound;
                 try predicate.evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
             },
             .correlated_set => |s| try predicate.evaluateCorrelatedSetMask(s, self.schema, batch, out),

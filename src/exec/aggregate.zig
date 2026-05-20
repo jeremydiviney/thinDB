@@ -156,12 +156,7 @@ pub const Aggregate = struct {
         const group_col_indices = try allocator.alloc(usize, group_cols.len);
         errdefer allocator.free(group_col_indices);
         for (group_cols, 0..) |name, i| {
-            group_col_indices[i] = blk: {
-                for (up_schema, 0..) |c, j| {
-                    if (std.mem.eql(u8, c.name, name)) break :blk j;
-                }
-                return Error.ColumnNotFound;
-            };
+            group_col_indices[i] = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
         }
 
         // Resolve agg column indices and build output schema.
@@ -176,12 +171,10 @@ pub const Aggregate = struct {
         }
 
         for (aggs, 0..) |a, i| {
-            agg_col_indices[i] = if (a.col) |name| blk: {
-                for (up_schema, 0..) |c, j| {
-                    if (std.mem.eql(u8, c.name, name)) break :blk j;
-                }
-                return Error.ColumnNotFound;
-            } else null;
+            agg_col_indices[i] = if (a.col) |name|
+                (types.findColumn(up_schema, name) orelse return Error.ColumnNotFound)
+            else
+                null;
 
             output_schema[group_cols.len + i] = .{
                 .name = a.as,

@@ -1751,7 +1751,12 @@ fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .scan => |s| blk: {
             const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
             const t = try resolveTable(catalog, ctx.session.*, s.table);
-            break :blk try exec.scan(ctx.allocator, t);
+            const base = try exec.scan(ctx.allocator, t);
+            if (s.alias) |alias| {
+                errdefer @constCast(&base).deinit();
+                break :blk try exec.AliasRename.create(ctx.allocator, base, alias);
+            }
+            break :blk base;
         },
         .limit => |l| blk: {
             const upstream = try compileOp(ctx, l.upstream);

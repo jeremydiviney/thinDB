@@ -38,6 +38,10 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
         .scan => |s| {
             try out.appendSlice(allocator, "Scan ");
             try writeTableRef(allocator, out, s.table);
+            if (s.alias) |a| {
+                try out.appendSlice(allocator, " AS ");
+                try out.appendSlice(allocator, a);
+            }
             try out.append(allocator, '\n');
         },
         .limit => |l| {

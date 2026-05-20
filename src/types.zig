@@ -357,6 +357,41 @@ pub const TableSchema = struct {
     }
 };
 
+/// Resolve a column reference (possibly qualified `alias.col`) against a
+/// flat column slice. Used by every user-facing lookup site so the
+/// parser can leave qualifiers intact without each operator carrying
+/// its own match logic.
+///
+/// Match order:
+///   1. Exact match on the full string.
+///   2. If `name` contains a `.`, retry exact match against the suffix
+///      after the last dot. Lets bare-table users keep writing `t.col`
+///      against an unaliased scan whose schema only has `col`.
+///   3. Else (no dot in `name`) search for any column whose name ends
+///      in `.name` — accepted only when exactly one column matches.
+///      Lets bare `col` resolve against an aliased schema (`a.col`).
+pub fn findColumn(columns: []const Column, name: []const u8) ?usize {
+    for (columns, 0..) |c, i| {
+        if (std.mem.eql(u8, c.name, name)) return i;
+    }
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+        const tail = name[dot + 1 ..];
+        for (columns, 0..) |c, i| {
+            if (std.mem.eql(u8, c.name, tail)) return i;
+        }
+        return null;
+    }
+    var match: ?usize = null;
+    for (columns, 0..) |c, i| {
+        const d = std.mem.lastIndexOfScalar(u8, c.name, '.') orelse continue;
+        if (std.mem.eql(u8, c.name[d + 1 ..], name)) {
+            if (match != null) return null; // ambiguous
+            match = i;
+        }
+    }
+    return match;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

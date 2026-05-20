@@ -338,6 +338,8 @@ pub const Derived = compute_op.Derived;
 
 pub const SetUnion = @import("set_union.zig").SetUnion;
 
+pub const AliasRename = @import("alias_rename.zig").AliasRename;
+
 pub const join_op = @import("join.zig");
 pub const Join = join_op.Join;
 pub const JoinSpec = join_op.Spec;

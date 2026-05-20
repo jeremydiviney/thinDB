@@ -288,12 +288,7 @@ fn cloneValue(out_arena: std.mem.Allocator, v: Value) std.mem.Allocator.Error!Va
 pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
     switch (expr.*) {
         .leaf => |*p| {
-            const col_idx = blk: {
-                for (schema, 0..) |c, i| {
-                    if (std.mem.eql(u8, c.name, p.col)) break :blk i;
-                }
-                return Error.ColumnNotFound;
-            };
+            const col_idx = types.findColumn(schema, p.col) orelse return Error.ColumnNotFound;
             const col_type = schema[col_idx].type;
             const col_tag = ValueTag.fromType(col_type);
             const val_tag = std.meta.activeTag(p.val);
@@ -305,14 +300,8 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             }
         },
         .leaf_col_col => |lc| {
-            const li = blk: {
-                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.left)) break :blk i;
-                return Error.ColumnNotFound;
-            };
-            const ri = blk: {
-                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.right)) break :blk i;
-                return Error.ColumnNotFound;
-            };
+            const li = types.findColumn(schema, lc.left) orelse return Error.ColumnNotFound;
+            const ri = types.findColumn(schema, lc.right) orelse return Error.ColumnNotFound;
             const lt = schema[li].type;
             const rt = schema[ri].type;
             // String columns only support eq / neq (same as col-vs-literal).
@@ -323,18 +312,11 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             if (std.meta.activeTag(lt) != std.meta.activeTag(rt)) return Error.PredicateTypeMismatch;
         },
         .is_null, .is_not_null => |col_name| {
-            for (schema) |c| {
-                if (std.mem.eql(u8, c.name, col_name)) return;
-            }
-            return Error.ColumnNotFound;
+            _ = types.findColumn(schema, col_name) orelse return Error.ColumnNotFound;
         },
         .like => |lp| {
-            for (schema) |c| {
-                if (!std.mem.eql(u8, c.name, lp.col)) continue;
-                if (!c.type.isString()) return Error.UnsupportedOperatorForType;
-                return;
-            }
-            return Error.ColumnNotFound;
+            const idx = types.findColumn(schema, lp.col) orelse return Error.ColumnNotFound;
+            if (!schema[idx].type.isString()) return Error.UnsupportedOperatorForType;
         },
         .@"and" => |children| {
             for (children) |*c| try validateExpr(@constCast(c), schema);
@@ -354,10 +336,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // pre-compile pass already type-checked at resolution; this
         // is a safety net.
         .in_set => |s| {
-            const col_idx = blk: {
-                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, s.col)) break :blk i;
-                return Error.ColumnNotFound;
-            };
+            const col_idx = types.findColumn(schema, s.col) orelse return Error.ColumnNotFound;
             const col_tag = ValueTag.fromType(schema[col_idx].type);
             for (s.values) |v| {
                 if (std.meta.activeTag(v) != col_tag) return Error.PredicateTypeMismatch;
@@ -390,8 +369,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
 }
 
 fn findCol(schema: []const Column, name: []const u8) ?usize {
-    for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return i;
-    return null;
+    return types.findColumn(schema, name);
 }
 
 /// Lossless widening for an integer / float literal to match a wider
@@ -489,12 +467,7 @@ pub fn evaluatePredicate(
 ) anyerror!void {
     switch (expr) {
         .leaf => |p| {
-            const col_idx = blk: {
-                for (schema, 0..) |c, i| {
-                    if (std.mem.eql(u8, c.name, p.col)) break :blk i;
-                }
-                return Error.ColumnNotFound;
-            };
+            const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
             try evaluateMaskWithPred(batch.values[col_idx], p, batch.row_count, out);
             // Two-valued logic: NULL never matches a comparison.
             const view = batch.values[col_idx];
@@ -505,43 +478,22 @@ pub fn evaluatePredicate(
             }
         },
         .leaf_col_col => |lc| {
-            const li = blk: {
-                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.left)) break :blk i;
-                return Error.ColumnNotFound;
-            };
-            const ri = blk: {
-                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.right)) break :blk i;
-                return Error.ColumnNotFound;
-            };
+            const li = findCol(schema, lc.left) orelse return Error.ColumnNotFound;
+            const ri = findCol(schema, lc.right) orelse return Error.ColumnNotFound;
             try evaluateColColMask(batch.values[li], batch.values[ri], lc.op, batch.row_count, out);
         },
         .is_null => |col_name| {
-            const col_idx = blk: {
-                for (schema, 0..) |c, i| {
-                    if (std.mem.eql(u8, c.name, col_name)) break :blk i;
-                }
-                return Error.ColumnNotFound;
-            };
+            const col_idx = findCol(schema, col_name) orelse return Error.ColumnNotFound;
             const view = batch.values[col_idx];
             for (0..batch.row_count) |i| out[i] = !view.isValid(i);
         },
         .is_not_null => |col_name| {
-            const col_idx = blk: {
-                for (schema, 0..) |c, i| {
-                    if (std.mem.eql(u8, c.name, col_name)) break :blk i;
-                }
-                return Error.ColumnNotFound;
-            };
+            const col_idx = findCol(schema, col_name) orelse return Error.ColumnNotFound;
             const view = batch.values[col_idx];
             for (0..batch.row_count) |i| out[i] = view.isValid(i);
         },
         .like => |lp| {
-            const col_idx = blk: {
-                for (schema, 0..) |c, i| {
-                    if (std.mem.eql(u8, c.name, lp.col)) break :blk i;
-                }
-                return Error.ColumnNotFound;
-            };
+            const col_idx = findCol(schema, lp.col) orelse return Error.ColumnNotFound;
             const view = batch.values[col_idx];
             try evaluateLikeMask(view, lp.pattern, batch.row_count, out);
         },
@@ -581,10 +533,7 @@ pub fn evaluatePredicate(
         .scalar_subquery, .exists_subquery, .in_subquery => return Error.PredicateTypeMismatch,
         .always => |b| @memset(out, b),
         .in_set => |s| {
-            const col_idx = blk: {
-                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, s.col)) break :blk i;
-                return Error.ColumnNotFound;
-            };
+            const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
             try evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
         },
         .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out),

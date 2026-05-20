@@ -694,17 +694,23 @@ pub const Parser = struct {
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
 
-        // Qualified column? `table.col` — for the parser's v1 we accept
-        // the dotted form but use only the last segment (the engine
-        // doesn't track per-table column qualification yet).
-        var col_name = first;
-        if (self.cur.tag == .dot) {
-            try self.advance();
-            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-            col_name = self.cur.text;
-            try self.advance();
-        }
-        const dup_col = try self.arena.dupe(u8, col_name);
+        // Qualified column? `table.col` — preserved as the dotted
+        // string `qualifier.col` so a downstream lookup against a
+        // scan renamed by `FROM t AS alias` finds the right column.
+        const dup_col = blk: {
+            if (self.cur.tag == .dot) {
+                try self.advance();
+                if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+                const second = self.cur.text;
+                try self.advance();
+                const buf = try self.arena.alloc(u8, first.len + 1 + second.len);
+                @memcpy(buf[0..first.len], first);
+                buf[first.len] = '.';
+                @memcpy(buf[first.len + 1 ..], second);
+                break :blk @as([]const u8, buf);
+            }
+            break :blk try self.arena.dupe(u8, first);
+        };
 
         // If a binary operator follows the column ref, lift it into a
         // binary expression (e.g., `qty + 1`, `price * 1.05`).
@@ -1041,14 +1047,8 @@ pub const Parser = struct {
                     const nested_args = try self.parseCallArgList();
                     return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = nested_args } };
                 }
-                var col_name = name;
-                if (self.cur.tag == .dot) {
-                    try self.advance();
-                    if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-                    col_name = self.cur.text;
-                    try self.advance();
-                }
-                return ir.Expr{ .col_ref = try self.arena.dupe(u8, col_name) };
+                const col_dup = try self.dupQualifiedColRef(name);
+                return ir.Expr{ .col_ref = col_dup };
             },
             .integer, .floating, .string, .kw_true, .kw_false => {
                 const v = try self.parseValue();
@@ -1088,14 +1088,26 @@ pub const Parser = struct {
         const name = self.cur.text;
         try self.advance();
         if (self.cur.tag == .lparen) return ParseError.SqlInvalidProjection;
-        var col_name = name;
-        if (self.cur.tag == .dot) {
-            try self.advance();
-            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-            col_name = self.cur.text;
-            try self.advance();
-        }
-        return ir.Expr{ .col_ref = try self.arena.dupe(u8, col_name) };
+        const col_dup = try self.dupQualifiedColRef(name);
+        return ir.Expr{ .col_ref = col_dup };
+    }
+
+    /// Helper for the `identifier (. identifier)?` shape. The two-part
+    /// form is preserved as the dotted string `qualifier.col` so the
+    /// reference survives long enough for a renamed scan (`FROM t AS
+    /// alias`) to resolve it. Caller has already consumed the first
+    /// identifier and passes its text as `first`.
+    fn dupQualifiedColRef(self: *Parser, first: []const u8) ParseError![]const u8 {
+        if (self.cur.tag != .dot) return try self.arena.dupe(u8, first);
+        try self.advance();
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const second = self.cur.text;
+        try self.advance();
+        const buf = try self.arena.alloc(u8, first.len + 1 + second.len);
+        @memcpy(buf[0..first.len], first);
+        buf[first.len] = '.';
+        @memcpy(buf[first.len + 1 ..], second);
+        return buf;
     }
 
     /// Default name when a scalar expression has no AS alias — use the
@@ -1242,7 +1254,7 @@ pub const Parser = struct {
                 3 => .{ .database = parts_buf[0], .schema = parts_buf[1], .name = parts_buf[2] },
                 else => unreachable,
             };
-            op = try self.allocOp(.{ .scan = .{ .table = ref } });
+            op = try self.allocOp(.{ .scan = .{ .table = ref, .alias = null } });
             resolved_name = parts_buf[parts_len - 1];
         }
 
@@ -1251,12 +1263,18 @@ pub const Parser = struct {
             try self.advance();
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
             resolved_name = try self.arena.dupe(u8, self.cur.text);
+            if (op.* == .scan) {
+                op.scan.alias = resolved_name;
+            }
             try self.advance();
         } else if (self.cur.tag == .identifier) {
             // Implicit alias: bare identifier after the FROM target.
             // SQL clause keywords (JOIN/WHERE/ON/...) aren't .identifier
             // tokens so they don't trigger this.
             resolved_name = try self.arena.dupe(u8, self.cur.text);
+            if (op.* == .scan) {
+                op.scan.alias = resolved_name;
+            }
             try self.advance();
         }
         return .{ .name = resolved_name, .op = op };
@@ -1389,8 +1407,9 @@ pub const Parser = struct {
         defer items.deinit(self.arena);
         while (true) {
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-            const col = try self.arena.dupe(u8, self.cur.text);
+            const first = self.cur.text;
             try self.advance();
+            const col = try self.dupQualifiedColRef(first);
             var desc = false;
             if (self.cur.tag == .kw_asc) {
                 try self.advance();

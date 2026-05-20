@@ -431,6 +431,12 @@ pub const Op = union(OpTag) {
         /// Strings borrowed from the encoded buffer on decode; owned by
         /// the client on encode.
         table: TableRef,
+        /// Optional FROM-clause alias (`FROM lineitem AS l1`). When
+        /// set, the compile path wraps this scan in a column-renaming
+        /// projection so the scan's output columns are exposed as
+        /// `alias.colname` — enabling self-joins and disambiguating
+        /// multi-table FROM clauses.
+        alias: ?[]const u8 = null,
     };
 
     pub const Limit = struct {
@@ -636,7 +642,10 @@ const EncodeError = Allocator.Error;
 fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!void {
     try out.append(allocator, @intFromEnum(@as(OpTag, op)));
     switch (op) {
-        .scan => |s| try encodeTableRef(allocator, out, s.table),
+        .scan => |s| {
+            try encodeTableRef(allocator, out, s.table);
+            try encodeOptString(allocator, out, s.alias);
+        },
         .limit => |l| {
             try appendU64(allocator, out, l.n);
             try encodeOp(allocator, out, l.upstream.*);
@@ -1320,7 +1329,8 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     return switch (tag) {
         .scan => blk: {
             const ref = try decodeTableRef(bytes, cursor);
-            break :blk Op{ .scan = .{ .table = ref } };
+            const alias = try decodeOptString(bytes, cursor);
+            break :blk Op{ .scan = .{ .table = ref, .alias = alias } };
         },
         .limit => blk: {
             if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;

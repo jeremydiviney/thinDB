@@ -1011,8 +1011,7 @@ fn exprIntLiteral(e: ir.Expr) !i64 {
 }
 
 fn lookupCol(schema: []const Column, name: []const u8) ?usize {
-    for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return i;
-    return null;
+    return types.findColumn(schema, name);
 }
 
 fn freeSpecIndices(allocator: Allocator, specs: []Window.SpecIndices, n: usize) void {

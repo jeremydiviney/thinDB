@@ -1172,10 +1172,7 @@ pub fn joinKeysCovered(state: exec.SortState, on: []const KeyPair, side: KeySide
 }
 
 fn columnIndex(schema: []const Column, name: []const u8) ?usize {
-    for (schema, 0..) |c, i| {
-        if (std.mem.eql(u8, c.name, name)) return i;
-    }
-    return null;
+    return types.findColumn(schema, name);
 }
 
 fn isStringTag(t: TypeTag) bool {

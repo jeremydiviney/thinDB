@@ -38,10 +38,7 @@ pub const Project = struct {
         errdefer allocator.free(views);
 
         for (names, 0..) |name, i| {
-            const idx = blk: {
-                for (up_schema, 0..) |c, j| if (std.mem.eql(u8, c.name, name)) break :blk j;
-                return Error.ColumnNotFound;
-            };
+            const idx = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
             column_map[i] = idx;
             out_schema[i] = up_schema[idx];
         }
