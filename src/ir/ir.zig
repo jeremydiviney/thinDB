@@ -1083,6 +1083,7 @@ const PredTag = enum(u8) {
     p_and = 3,
     p_or = 4,
     p_not = 5,
+    like = 6,
 };
 
 pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: PredicateExpr) EncodeError!void {
@@ -1103,6 +1104,13 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
             try out.append(allocator, @intFromEnum(PredTag.is_not_null));
             try appendU32(allocator, out, @intCast(col.len));
             try out.appendSlice(allocator, col);
+        },
+        .like => |lp| {
+            try out.append(allocator, @intFromEnum(PredTag.like));
+            try appendU32(allocator, out, @intCast(lp.col.len));
+            try out.appendSlice(allocator, lp.col);
+            try appendU32(allocator, out, @intCast(lp.pattern.len));
+            try out.appendSlice(allocator, lp.pattern);
         },
         .@"and" => |children| {
             try out.append(allocator, @intFromEnum(PredTag.p_and));
@@ -1782,7 +1790,7 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(PredTag.p_not)) return Error.IrCorrupt;
+    if (tag_byte > @intFromEnum(PredTag.like)) return Error.IrCorrupt;
     const tag: PredTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1828,6 +1836,11 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
             errdefer allocator.destroy(child);
             child.* = try decodePredicate(allocator, bytes, cursor);
             break :blk PredicateExpr{ .not = child };
+        },
+        .like => blk: {
+            const col = try readString(bytes, cursor);
+            const pat = try readString(bytes, cursor);
+            break :blk PredicateExpr{ .like = .{ .col = col, .pattern = pat } };
         },
     };
 }
@@ -1928,7 +1941,7 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
 
 pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     switch (expr) {
-        .leaf, .is_null, .is_not_null => {},
+        .leaf, .is_null, .is_not_null, .like => {},
         .@"and", .@"or" => |children| {
             for (children) |c| freeDecodedPredicate(c, allocator);
             allocator.free(children);
@@ -2321,6 +2334,12 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
         },
         .is_null => |col| try writeAll(allocator, out, col, " IS NULL", ""),
         .is_not_null => |col| try writeAll(allocator, out, col, " IS NOT NULL", ""),
+        .like => |lp| {
+            try out.appendSlice(allocator, lp.col);
+            try out.appendSlice(allocator, " LIKE '");
+            try out.appendSlice(allocator, lp.pattern);
+            try out.append(allocator, '\'');
+        },
         .@"and" => |children| try joinPredicates(allocator, out, children, " AND "),
         .@"or" => |children| try joinPredicates(allocator, out, children, " OR "),
         .not => |child| {

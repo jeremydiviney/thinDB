@@ -743,6 +743,10 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
         } },
         .is_null => |col| PredicateExpr{ .is_null = try aa.dupe(u8, col) },
         .is_not_null => |col| PredicateExpr{ .is_not_null = try aa.dupe(u8, col) },
+        .like => |lp| PredicateExpr{ .like = .{
+            .col = try aa.dupe(u8, lp.col),
+            .pattern = try aa.dupe(u8, lp.pattern),
+        } },
         .@"and" => |children| PredicateExpr{ .@"and" = try cloneChildren(aa, children) },
         .@"or" => |children| PredicateExpr{ .@"or" = try cloneChildren(aa, children) },
         .not => |child| blk: {

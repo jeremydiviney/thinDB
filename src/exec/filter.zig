@@ -162,6 +162,15 @@ pub const Filter = struct {
                 const view = batch.values[col_idx];
                 for (0..batch.row_count) |i| out[i] = view.isValid(i);
             },
+            .like => |lp| {
+                const col_idx = blk: {
+                    for (self.schema, 0..) |c, i| {
+                        if (std.mem.eql(u8, c.name, lp.col)) break :blk i;
+                    }
+                    return Error.ColumnNotFound;
+                };
+                try predicate.evaluateLikeMask(batch.values[col_idx], lp.pattern, batch.row_count, out);
+            },
             .@"and" => |children| {
                 if (children.len == 0) {
                     @memset(out, true);

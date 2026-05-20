@@ -39,10 +39,24 @@ pub const PredicateExpr = union(enum) {
     leaf: Predicate,
     is_null: []const u8,
     is_not_null: []const u8,
+    /// SQL LIKE pattern match. `pattern` is a SQL pattern with two
+    /// wildcards: `%` (zero-or-more chars) and `_` (exactly one char).
+    /// Other bytes are literal. NOT LIKE lowers to `.not` wrapping a
+    /// `.like` — no separate variant.
+    like: LikePred,
     @"and": []const PredicateExpr,
     @"or": []const PredicateExpr,
     not: *const PredicateExpr,
 };
+
+pub const LikePred = struct {
+    col: []const u8,
+    pattern: []const u8,
+};
+
+pub fn likeExpr(col: []const u8, pattern: []const u8) PredicateExpr {
+    return .{ .like = .{ .col = col, .pattern = pattern } };
+}
 
 /// Build a leaf predicate expression. Shorthand for `.{ .leaf = ... }`.
 pub fn leafExpr(col: []const u8, op: PredicateOp, val: Value) PredicateExpr {
@@ -69,6 +83,10 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
         } },
         .is_null => |c| .{ .is_null = try out_arena.dupe(u8, c) },
         .is_not_null => |c| .{ .is_not_null = try out_arena.dupe(u8, c) },
+        .like => |lp| .{ .like = .{
+            .col = try out_arena.dupe(u8, lp.col),
+            .pattern = try out_arena.dupe(u8, lp.pattern),
+        } },
         .@"and" => |kids| blk: {
             const dup = try out_arena.alloc(PredicateExpr, kids.len);
             for (kids, 0..) |k, i| dup[i] = try deepClonePredicate(out_arena, k);
@@ -124,6 +142,14 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         .is_null, .is_not_null => |col_name| {
             for (schema) |c| {
                 if (std.mem.eql(u8, c.name, col_name)) return;
+            }
+            return Error.ColumnNotFound;
+        },
+        .like => |lp| {
+            for (schema) |c| {
+                if (!std.mem.eql(u8, c.name, lp.col)) continue;
+                if (!c.type.isString()) return Error.UnsupportedOperatorForType;
+                return;
             }
             return Error.ColumnNotFound;
         },
@@ -191,6 +217,33 @@ pub fn pushExprDown(upstream: *exec.Query, expr: PredicateExpr) !void {
     }
 }
 
+/// SQL LIKE matcher. `pattern` uses `%` (zero-or-more) and `_` (one).
+/// Recursive backtracking matcher — acceptable for v1's modest pattern
+/// lengths. No escape syntax in v1 (`\%` / `\_` not supported).
+pub fn likeMatch(text: []const u8, pattern: []const u8) bool {
+    var ti: usize = 0;
+    var pi: usize = 0;
+    var star_ti: ?usize = null;
+    var star_pi: usize = 0;
+    while (ti < text.len) {
+        if (pi < pattern.len and pattern[pi] == '%') {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if (pi < pattern.len and (pattern[pi] == '_' or pattern[pi] == text[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if (star_ti) |sti| {
+            // Backtrack to last %, consume one more char from text.
+            pi = star_pi + 1;
+            ti = sti + 1;
+            star_ti = sti + 1;
+        } else return false;
+    }
+    while (pi < pattern.len and pattern[pi] == '%') pi += 1;
+    return pi == pattern.len;
+}
+
 /// Evaluate a full boolean predicate over a Batch (typed columns +
 /// nulls + AND/OR/NOT). Writes per-row match bits into `out`. The
 /// caller supplies an allocator for AND/OR scratch (one per recursive
@@ -240,6 +293,16 @@ pub fn evaluatePredicate(
             const view = batch.values[col_idx];
             for (0..batch.row_count) |i| out[i] = view.isValid(i);
         },
+        .like => |lp| {
+            const col_idx = blk: {
+                for (schema, 0..) |c, i| {
+                    if (std.mem.eql(u8, c.name, lp.col)) break :blk i;
+                }
+                return Error.ColumnNotFound;
+            };
+            const view = batch.values[col_idx];
+            try evaluateLikeMask(view, lp.pattern, batch.row_count, out);
+        },
         .@"and" => |children| {
             if (children.len == 0) {
                 @memset(out, true);
@@ -272,6 +335,41 @@ pub fn evaluatePredicate(
             try evaluatePredicate(allocator, child.*, schema, batch, out);
             for (out) |*o| o.* = !o.*;
         },
+    }
+}
+
+/// Per-row LIKE evaluation: matches NULL → false (two-valued logic).
+/// Only valid against string-typed columns (validateExpr enforces).
+pub fn evaluateLikeMask(view: ColumnView, pattern: []const u8, n: usize, mask: []bool) !void {
+    switch (view.data) {
+        .varchar => |sv| {
+            for (0..n) |i| {
+                if (!view.isValid(i)) {
+                    mask[i] = false;
+                    continue;
+                }
+                mask[i] = likeMatch(sv.rowBytes(i), pattern);
+            }
+        },
+        .string => |sv| {
+            for (0..n) |i| {
+                if (!view.isValid(i)) {
+                    mask[i] = false;
+                    continue;
+                }
+                mask[i] = likeMatch(sv.rowBytes(i), pattern);
+            }
+        },
+        .char => |sv| {
+            for (0..n) |i| {
+                if (!view.isValid(i)) {
+                    mask[i] = false;
+                    continue;
+                }
+                mask[i] = likeMatch(sv.rowBytes(i), pattern);
+            }
+        },
+        else => return Error.UnsupportedOperatorForType,
     }
 }
 

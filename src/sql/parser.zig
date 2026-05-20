@@ -1281,6 +1281,21 @@ pub const Parser = struct {
             return try self.makeBetween(col_dup, lo, hi, negate_predicate);
         }
 
+        // LIKE 'pattern'  /  NOT LIKE 'pattern'
+        if (self.cur.tag == .kw_like) {
+            try self.advance();
+            if (self.cur.tag != .string) return ParseError.SqlExpectedValue;
+            const pattern = try self.arena.dupe(u8, self.cur.value.string);
+            try self.advance();
+            var pe: PredicateExpr = .{ .like = .{ .col = col_dup, .pattern = pattern } };
+            if (negate_predicate) {
+                const child = try self.arena.create(PredicateExpr);
+                child.* = pe;
+                pe = .{ .not = child };
+            }
+            return pe;
+        }
+
         // Any other use of bare NOT inside parseAtom is a parse error —
         // boolean-level NOT was already consumed by parseNot.
         if (negate_predicate) return ParseError.SqlExpectedKeyword;
