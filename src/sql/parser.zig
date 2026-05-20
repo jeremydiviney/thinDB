@@ -511,6 +511,16 @@ pub const Parser = struct {
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
 
+        // CASE expression at projection start. Same routing — parseCallArg
+        // would also handle it (parseCallAtom dispatches on CASE), but
+        // taking it here lets the projection alias the result.
+        if (self.cur.tag == .kw_case) {
+            const expr = try self.parseCaseExpr();
+            const default_name = try self.exprDefaultName(expr);
+            const alias = try self.maybeAlias(default_name);
+            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+        }
+
         // Identifier or function call. Look ahead: `(` after an identifier
         // means a call.
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
@@ -748,11 +758,48 @@ pub const Parser = struct {
         return lhs;
     }
 
+    /// Parse a searched CASE expression:
+    ///   CASE WHEN bool THEN expr (WHEN bool THEN expr)* [ELSE expr] END
+    /// Cursor enters on `CASE`, exits past `END`. Simple-form CASE
+    /// (`CASE col WHEN v THEN ...`) is not supported in v1; users should
+    /// rewrite to searched form (`CASE WHEN col = v THEN ...`).
+    fn parseCaseExpr(self: *Parser) ParseError!ir.Expr {
+        try self.expect(.kw_case);
+        if (self.cur.tag != .kw_when) return ParseError.SqlExpectedKeyword;
+
+        var branches: std.ArrayList(ir.Expr.Branch) = .empty;
+        defer branches.deinit(self.arena);
+
+        while (self.cur.tag == .kw_when) {
+            try self.advance();
+            const cond = try self.parseBoolExpr();
+            if (self.cur.tag != .kw_then) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            const then_expr = try self.parseCallArg();
+            try branches.append(self.arena, .{ .cond = cond, .then = then_expr });
+        }
+
+        var else_branch: ?*const ir.Expr = null;
+        if (self.cur.tag == .kw_else) {
+            try self.advance();
+            const eb = try self.arena.create(ir.Expr);
+            eb.* = try self.parseCallArg();
+            else_branch = eb;
+        }
+
+        if (self.cur.tag != .kw_end) return ParseError.SqlExpectedKeyword;
+        try self.advance();
+
+        const branches_owned = try branches.toOwnedSlice(self.arena);
+        return ir.Expr{ .case = .{ .branches = branches_owned, .else_branch = else_branch } };
+    }
+
     /// Leaf of the expr sub-language. Same shape as the original
     /// `parseCallArg`: column ref (possibly qualified), literal, or
     /// nested scalar call. Aggregates and window functions are
     /// rejected — they belong at the top level of the SELECT list.
     fn parseCallAtom(self: *Parser) ParseError!ir.Expr {
+        if (self.cur.tag == .kw_case) return try self.parseCaseExpr();
         switch (self.cur.tag) {
             .identifier => {
                 const name = self.cur.text;
@@ -837,6 +884,7 @@ pub const Parser = struct {
                 try buf.append(self.arena, ')');
                 return try buf.toOwnedSlice(self.arena);
             },
+            .case => return try self.arena.dupe(u8, "case"),
         }
     }
 

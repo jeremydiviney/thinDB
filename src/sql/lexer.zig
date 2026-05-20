@@ -88,6 +88,13 @@ pub const TokenTag = enum {
     /// identifier scan, so `auto_increment` parses as one ident and we
     /// promote it to a keyword in `keywordFor`.
     kw_auto_increment,
+    // CASE / WHEN / THEN / ELSE / END — searched CASE expression in
+    // projections and any expr position.
+    kw_case,
+    kw_when,
+    kw_then,
+    kw_else,
+    kw_end,
 
     // Operators / punctuation.
     eq, // =
@@ -458,6 +465,11 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "qualify", .tag = .kw_qualify },
         .{ .name = "default", .tag = .kw_default },
         .{ .name = "auto_increment", .tag = .kw_auto_increment },
+        .{ .name = "case", .tag = .kw_case },
+        .{ .name = "when", .tag = .kw_when },
+        .{ .name = "then", .tag = .kw_then },
+        .{ .name = "else", .tag = .kw_else },
+        .{ .name = "end", .tag = .kw_end },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;

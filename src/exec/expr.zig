@@ -20,6 +20,9 @@ const types = @import("../types.zig");
 const Value = types.Value;
 const Type = types.Type;
 
+const predicate_mod = @import("predicate.zig");
+const PredicateExpr = predicate_mod.PredicateExpr;
+
 pub const Expr = union(enum) {
     /// Reference to an upstream column by name.
     col_ref: []const u8,
@@ -28,10 +31,26 @@ pub const Expr = union(enum) {
     /// Function invocation. `fn_name` is matched against the registry
     /// at plan time. `args` may be empty (for nullary functions).
     call: Call,
+    /// SQL searched CASE expression. Branches evaluated in order;
+    /// first branch whose `cond` is true contributes its `then`
+    /// expression to the row. When no branch matches the optional
+    /// `else_branch` wins (NULL if absent). All branch `then` results
+    /// must resolve to the same type.
+    case: Case,
 
     pub const Call = struct {
         fn_name: []const u8,
         args: []const Expr,
+    };
+
+    pub const Branch = struct {
+        cond: PredicateExpr,
+        then: Expr,
+    };
+
+    pub const Case = struct {
+        branches: []const Branch,
+        else_branch: ?*const Expr,
     };
 };
 
@@ -77,6 +96,20 @@ pub fn deepClone(out_arena: Allocator, e: Expr) Allocator.Error!Expr {
             const args_dup = try out_arena.alloc(Expr, c.args.len);
             for (c.args, 0..) |child, i| args_dup[i] = try deepClone(out_arena, child);
             break :blk .{ .call = .{ .fn_name = name_dup, .args = args_dup } };
+        },
+        .case => |cs| blk: {
+            const branches_dup = try out_arena.alloc(Expr.Branch, cs.branches.len);
+            for (cs.branches, 0..) |br, i| branches_dup[i] = .{
+                .cond = try predicate_mod.deepClonePredicate(out_arena, br.cond),
+                .then = try deepClone(out_arena, br.then),
+            };
+            var else_dup: ?*const Expr = null;
+            if (cs.else_branch) |eb| {
+                const eb_owned = try out_arena.create(Expr);
+                eb_owned.* = try deepClone(out_arena, eb.*);
+                else_dup = eb_owned;
+            }
+            break :blk .{ .case = .{ .branches = branches_dup, .else_branch = else_dup } };
         },
     };
 }

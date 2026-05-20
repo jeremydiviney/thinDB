@@ -1014,10 +1014,10 @@ fn encodeJoin(allocator: Allocator, out: *std.ArrayList(u8), j: Op.Join) EncodeE
     try encodeOp(allocator, out, j.right.*);
 }
 
-const ExprTag = enum(u8) { col_ref = 0, lit = 1, call = 2 };
+const ExprTag = enum(u8) { col_ref = 0, lit = 1, call = 2, case = 3 };
 
-/// Wire-encode an Expr tree (col_ref / lit / call). Recursive — mirrors
-/// the recursive Predicate encoding above.
+/// Wire-encode an Expr tree (col_ref / lit / call / case). Recursive
+/// — mirrors the recursive Predicate encoding above.
 pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) EncodeError!void {
     switch (e) {
         .col_ref => |name| {
@@ -1035,6 +1035,16 @@ pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) Encode
             try out.appendSlice(allocator, c.fn_name);
             try appendU32(allocator, out, @intCast(c.args.len));
             for (c.args) |child| try encodeExpr(allocator, out, child);
+        },
+        .case => |cs| {
+            try out.append(allocator, @intFromEnum(ExprTag.case));
+            try appendU32(allocator, out, @intCast(cs.branches.len));
+            for (cs.branches) |br| {
+                try encodePredicate(allocator, out, br.cond);
+                try encodeExpr(allocator, out, br.then);
+            }
+            try out.append(allocator, if (cs.else_branch != null) @as(u8, 1) else 0);
+            if (cs.else_branch) |eb| try encodeExpr(allocator, out, eb.*);
         },
     }
 }
@@ -1708,7 +1718,7 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(ExprTag.call)) return Error.IrCorrupt;
+    if (tag_byte > @intFromEnum(ExprTag.case)) return Error.IrCorrupt;
     const tag: ExprTag = @enumFromInt(tag_byte);
     return switch (tag) {
         .col_ref => Expr{ .col_ref = try readString(bytes, cursor) },
@@ -1723,6 +1733,27 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
             for (args) |*a| a.* = try decodeExpr(allocator, bytes, cursor);
             break :blk Expr{ .call = .{ .fn_name = name, .args = args } };
         },
+        .case => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const branches = try allocator.alloc(Expr.Branch, n);
+            errdefer allocator.free(branches);
+            for (branches) |*br| {
+                br.cond = try decodePredicate(allocator, bytes, cursor);
+                br.then = try decodeExpr(allocator, bytes, cursor);
+            }
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const has_else = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            var else_ptr: ?*const Expr = null;
+            if (has_else) {
+                const eb = try allocator.create(Expr);
+                eb.* = try decodeExpr(allocator, bytes, cursor);
+                else_ptr = eb;
+            }
+            break :blk Expr{ .case = .{ .branches = branches, .else_branch = else_ptr } };
+        },
     };
 }
 
@@ -1732,6 +1763,17 @@ pub fn freeDecodedExpr(e: Expr, allocator: Allocator) void {
         .call => |c| {
             for (c.args) |child| freeDecodedExpr(child, allocator);
             allocator.free(c.args);
+        },
+        .case => |cs| {
+            for (cs.branches) |br| {
+                freeDecodedPredicate(br.cond, allocator);
+                freeDecodedExpr(br.then, allocator);
+            }
+            allocator.free(cs.branches);
+            if (cs.else_branch) |eb| {
+                freeDecodedExpr(eb.*, allocator);
+                allocator.destroy(@constCast(eb));
+            }
         },
     }
 }
@@ -2250,6 +2292,20 @@ fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!
                 try explainExpr(allocator, out, arg);
             }
             try out.append(allocator, ')');
+        },
+        .case => |cs| {
+            try out.appendSlice(allocator, "CASE");
+            for (cs.branches) |br| {
+                try out.appendSlice(allocator, " WHEN ");
+                try explainPredicate(allocator, out, br.cond);
+                try out.appendSlice(allocator, " THEN ");
+                try explainExpr(allocator, out, br.then);
+            }
+            if (cs.else_branch) |eb| {
+                try out.appendSlice(allocator, " ELSE ");
+                try explainExpr(allocator, out, eb.*);
+            }
+            try out.appendSlice(allocator, " END");
         },
     }
 }

@@ -57,6 +57,43 @@ pub fn isNotNullExpr(col: []const u8) PredicateExpr {
     return .{ .is_not_null = col };
 }
 
+/// Deep-clone a PredicateExpr into `out_arena`. Mirrors
+/// `expr.deepClone` for the boolean side of a CASE/WHERE expression;
+/// used when an Expr.case needs to outlive its source arena.
+pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.mem.Allocator.Error!PredicateExpr {
+    return switch (p) {
+        .leaf => |lf| .{ .leaf = .{
+            .col = try out_arena.dupe(u8, lf.col),
+            .op = lf.op,
+            .val = try cloneValue(out_arena, lf.val),
+        } },
+        .is_null => |c| .{ .is_null = try out_arena.dupe(u8, c) },
+        .is_not_null => |c| .{ .is_not_null = try out_arena.dupe(u8, c) },
+        .@"and" => |kids| blk: {
+            const dup = try out_arena.alloc(PredicateExpr, kids.len);
+            for (kids, 0..) |k, i| dup[i] = try deepClonePredicate(out_arena, k);
+            break :blk .{ .@"and" = dup };
+        },
+        .@"or" => |kids| blk: {
+            const dup = try out_arena.alloc(PredicateExpr, kids.len);
+            for (kids, 0..) |k, i| dup[i] = try deepClonePredicate(out_arena, k);
+            break :blk .{ .@"or" = dup };
+        },
+        .not => |child| blk: {
+            const dup = try out_arena.create(PredicateExpr);
+            dup.* = try deepClonePredicate(out_arena, child.*);
+            break :blk .{ .not = dup };
+        },
+    };
+}
+
+fn cloneValue(out_arena: std.mem.Allocator, v: Value) std.mem.Allocator.Error!Value {
+    return switch (v) {
+        .text => |s| .{ .text = try out_arena.dupe(u8, s) },
+        else => v,
+    };
+}
+
 /// Type-check a PredicateExpr against a schema. Every leaf must reference an
 /// existing column with a value-tag matching that column's type. String
 /// columns only accept `.eq` and `.neq`.
@@ -151,6 +188,90 @@ pub fn pushExprDown(upstream: *exec.Query, expr: PredicateExpr) !void {
             for (children) |c| try pushExprDown(upstream, c);
         },
         else => {},
+    }
+}
+
+/// Evaluate a full boolean predicate over a Batch (typed columns +
+/// nulls + AND/OR/NOT). Writes per-row match bits into `out`. The
+/// caller supplies an allocator for AND/OR scratch (one per recursive
+/// level). NULL never matches a comparison; `IS NULL` / `IS NOT NULL`
+/// inspect the validity bitmap.
+pub fn evaluatePredicate(
+    allocator: std.mem.Allocator,
+    expr: PredicateExpr,
+    schema: []const Column,
+    batch: anytype,
+    out: []bool,
+) anyerror!void {
+    switch (expr) {
+        .leaf => |p| {
+            const col_idx = blk: {
+                for (schema, 0..) |c, i| {
+                    if (std.mem.eql(u8, c.name, p.col)) break :blk i;
+                }
+                return Error.ColumnNotFound;
+            };
+            try evaluateMaskWithPred(batch.values[col_idx], p, batch.row_count, out);
+            // Two-valued logic: NULL never matches a comparison.
+            const view = batch.values[col_idx];
+            if (view.nulls != null) {
+                for (0..batch.row_count) |i| {
+                    if (!view.isValid(i)) out[i] = false;
+                }
+            }
+        },
+        .is_null => |col_name| {
+            const col_idx = blk: {
+                for (schema, 0..) |c, i| {
+                    if (std.mem.eql(u8, c.name, col_name)) break :blk i;
+                }
+                return Error.ColumnNotFound;
+            };
+            const view = batch.values[col_idx];
+            for (0..batch.row_count) |i| out[i] = !view.isValid(i);
+        },
+        .is_not_null => |col_name| {
+            const col_idx = blk: {
+                for (schema, 0..) |c, i| {
+                    if (std.mem.eql(u8, c.name, col_name)) break :blk i;
+                }
+                return Error.ColumnNotFound;
+            };
+            const view = batch.values[col_idx];
+            for (0..batch.row_count) |i| out[i] = view.isValid(i);
+        },
+        .@"and" => |children| {
+            if (children.len == 0) {
+                @memset(out, true);
+                return;
+            }
+            try evaluatePredicate(allocator, children[0], schema, batch, out);
+            if (children.len == 1) return;
+            const scratch = try allocator.alloc(bool, out.len);
+            defer allocator.free(scratch);
+            for (children[1..]) |child| {
+                try evaluatePredicate(allocator, child, schema, batch, scratch);
+                for (out, scratch) |*o, s| o.* = o.* and s;
+            }
+        },
+        .@"or" => |children| {
+            if (children.len == 0) {
+                @memset(out, false);
+                return;
+            }
+            try evaluatePredicate(allocator, children[0], schema, batch, out);
+            if (children.len == 1) return;
+            const scratch = try allocator.alloc(bool, out.len);
+            defer allocator.free(scratch);
+            for (children[1..]) |child| {
+                try evaluatePredicate(allocator, child, schema, batch, scratch);
+                for (out, scratch) |*o, s| o.* = o.* or s;
+            }
+        },
+        .not => |child| {
+            try evaluatePredicate(allocator, child.*, schema, batch, out);
+            for (out) |*o| o.* = !o.*;
+        },
     }
 }
 

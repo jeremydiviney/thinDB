@@ -934,7 +934,7 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
                         plan.default_kind = .literal;
                         plan.default_literal = v;
                     },
-                    .call => return Error.WindowUnsupported,
+                    .call, .case => return Error.WindowUnsupported,
                 }
             }
         },

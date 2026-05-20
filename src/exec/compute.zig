@@ -32,6 +32,8 @@ const ColumnStore = store.ColumnStore;
 
 const expr_mod = @import("expr.zig");
 const Expr = expr_mod.Expr;
+const predicate_mod = @import("predicate.zig");
+const PredicateExpr = predicate_mod.PredicateExpr;
 const scalar_fn = @import("scalar_fn.zig");
 const ScalarFn = scalar_fn.ScalarFn;
 const NullStrategy = scalar_fn.NullStrategy;
@@ -87,7 +89,7 @@ const CallPlan = struct {
 };
 
 /// Resolved per-derived plan: rename, literal-only (constant column),
-/// or a function-call tree.
+/// a function-call tree, or a searched-CASE expression.
 const ResolvedDerived = struct {
     name: []const u8,
     output_type: Type,
@@ -95,7 +97,39 @@ const ResolvedDerived = struct {
         rename: struct { src_idx: usize },
         lit_only: *LitSlot,
         call: *CallPlan,
+        case: *CasePlan,
     },
+};
+
+/// One branch of a resolved CASE. `cond` is evaluated as a row mask;
+/// `then_src` produces the per-row value when this branch wins.
+const CaseBranch = struct {
+    cond: PredicateExpr,
+    then_src: BranchSrc,
+};
+
+/// Materialization source for a CASE branch's THEN (and ELSE) clause.
+/// CASE's branches don't support nested CASE in v1 — keeps the resolve
+/// + free trees finite without an extra dimension.
+const BranchSrc = union(enum) {
+    col: usize,
+    lit: *LitSlot,
+    call: *CallPlan,
+};
+
+const CasePlan = struct {
+    branches: []const CaseBranch,
+    else_src: ?BranchSrc,
+    output: *ColumnStore,
+    output_owned: bool,
+    output_type: Type,
+    /// Upstream schema captured at resolve so the per-batch predicate
+    /// evaluator can resolve column refs in branch conditions.
+    upstream_schema: []const Column,
+    /// True when any branch may produce a NULL (else-less form, or
+    /// any then_src is a nullable column). Used by Compute to decide
+    /// whether the output column needs a validity bitmap.
+    may_produce_null: bool,
 };
 
 pub const Compute = struct {
@@ -194,6 +228,7 @@ pub const Compute = struct {
             switch (r.kind) {
                 .call => |plan| freeCallPlan(self.allocator, plan),
                 .lit_only => |slot| slot.buf.deinit(self.allocator),
+                .case => |plan| freeCasePlan(self.allocator, plan),
                 .rename => {},
             }
         }
@@ -250,6 +285,10 @@ pub const Compute = struct {
                     try self.evalCall(plan, in.values, n);
                     // Root's owned output → derived_cols slot. Copies
                     // both data + validity (transform.appendAllColumn).
+                    try appendCopiedColumn(self.allocator, out_col, plan.output.view(), n);
+                },
+                .case => |plan| {
+                    try self.evalCase(plan, in.values, n);
                     try appendCopiedColumn(self.allocator, out_col, plan.output.view(), n);
                 },
             }
@@ -322,6 +361,80 @@ pub const Compute = struct {
             }
         }
     }
+
+    /// Evaluate a CASE expression over a single batch. Strategy:
+    ///   1. Materialize every branch's THEN (and the ELSE) into a
+    ///      per-batch ColumnView. Cheap for col_ref / lit; runs the
+    ///      sub-CallPlan for call-typed branches.
+    ///   2. Evaluate each branch's condition into a row mask. First
+    ///      true mask wins per row; record the winner in `winners`.
+    ///   3. Walk rows in order, copying the winner's cell into the
+    ///      output ColumnStore (or appending NULL when no branch
+    ///      matches and there's no ELSE).
+    fn evalCase(self: *Compute, plan: *CasePlan, in_values: []const ColumnView, n: usize) !void {
+        plan.output.clear();
+
+        var branch_views_buf: [16]ColumnView = undefined;
+        if (plan.branches.len > branch_views_buf.len) return Error.ComputeTooManyArgs;
+        const branch_views = branch_views_buf[0..plan.branches.len];
+        for (plan.branches, branch_views) |br, *bv| {
+            bv.* = try self.materializeBranchSrc(br.then_src, in_values, n);
+        }
+        var else_view: ?ColumnView = null;
+        if (plan.else_src) |es| else_view = try self.materializeBranchSrc(es, in_values, n);
+
+        const cond_buf = try self.allocator.alloc(bool, n);
+        defer self.allocator.free(cond_buf);
+        const winners = try self.allocator.alloc(i32, n);
+        defer self.allocator.free(winners);
+        @memset(winners, -1);
+
+        const fake_batch: Batch = .{
+            .schema = plan.upstream_schema,
+            .values = in_values,
+            .row_count = n,
+        };
+        for (plan.branches, 0..) |br, bi| {
+            @memset(cond_buf, false);
+            try predicate_mod.evaluatePredicate(self.allocator, br.cond, plan.upstream_schema, fake_batch, cond_buf);
+            for (cond_buf, winners) |c, *w| {
+                if (c and w.* == -1) w.* = @intCast(bi);
+            }
+        }
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const w = winners[i];
+            if (w == -1) {
+                if (else_view) |ev| {
+                    try appendCellFromView(self.allocator, plan.output, ev, i);
+                } else {
+                    try plan.output.data.appendNullPlaceholder(self.allocator);
+                    if (plan.output.nulls != null) {
+                        const row = plan.output.data.rowCount() - 1;
+                        try plan.output.appendValidBit(self.allocator, row, false);
+                    }
+                }
+            } else {
+                try appendCellFromView(self.allocator, plan.output, branch_views[@intCast(w)], i);
+            }
+        }
+    }
+
+    fn materializeBranchSrc(self: *Compute, s: BranchSrc, in_values: []const ColumnView, n: usize) !ColumnView {
+        return switch (s) {
+            .col => |idx| in_values[idx],
+            .lit => |slot| blk: {
+                slot.buf.clear();
+                try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
+                break :blk slot.buf.view();
+            },
+            .call => |sub| blk: {
+                try self.evalCall(sub, in_values, n);
+                break :blk sub.output.view();
+            },
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -363,6 +476,140 @@ fn resolveDerived(
                 .kind = .{ .call = plan },
             };
         },
+        .case => {
+            const plan = try buildCasePlan(runtime_allocator, aa, d.expr.case, up_schema);
+            return .{
+                .name = try aa.dupe(u8, d.name),
+                .output_type = plan.output_type,
+                .kind = .{ .case = plan },
+            };
+        },
+    }
+}
+
+/// Resolve a parsed CASE expression to a CasePlan. All branches' THEN
+/// (and ELSE) results must unify to a single output type — v1 picks
+/// the first branch's type and rejects mismatches. Nested CASE in a
+/// branch's THEN is also rejected.
+fn buildCasePlan(
+    runtime_allocator: Allocator,
+    aa: Allocator,
+    cs: Expr.Case,
+    up_schema: []const Column,
+) !*CasePlan {
+    if (cs.branches.len == 0) return Error.ComputeUnsupportedExpr;
+
+    const branches = try aa.alloc(CaseBranch, cs.branches.len);
+    var built: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < built) : (i += 1) freeBranchSrc(runtime_allocator, branches[i].then_src);
+    }
+
+    var inferred_type: ?Type = null;
+    var may_null = cs.else_branch == null;
+    for (cs.branches, branches) |src, *dst| {
+        const then_src = try buildBranchSrc(runtime_allocator, aa, src.then, up_schema);
+        const t = branchSrcType(then_src, up_schema);
+        if (inferred_type) |it| {
+            if (std.meta.activeTag(it) != std.meta.activeTag(t)) {
+                freeBranchSrc(runtime_allocator, then_src);
+                return Error.ComputeUnsupportedExpr;
+            }
+        } else inferred_type = t;
+        if (branchSrcNullable(then_src, up_schema)) may_null = true;
+        dst.* = .{ .cond = src.cond, .then_src = then_src };
+        built += 1;
+    }
+
+    var else_src: ?BranchSrc = null;
+    if (cs.else_branch) |eb| {
+        const es = try buildBranchSrc(runtime_allocator, aa, eb.*, up_schema);
+        errdefer freeBranchSrc(runtime_allocator, es);
+        const t = branchSrcType(es, up_schema);
+        if (inferred_type) |it| {
+            if (std.meta.activeTag(it) != std.meta.activeTag(t)) return Error.ComputeUnsupportedExpr;
+        }
+        if (branchSrcNullable(es, up_schema)) may_null = true;
+        else_src = es;
+    }
+
+    const out_type = inferred_type orelse return Error.ComputeUnsupportedExpr;
+
+    const out_buf = try runtime_allocator.create(ColumnStore);
+    errdefer runtime_allocator.destroy(out_buf);
+    out_buf.* = try ColumnStore.init(runtime_allocator, out_type, may_null);
+
+    const plan = try aa.create(CasePlan);
+    plan.* = .{
+        .branches = branches,
+        .else_src = else_src,
+        .output = out_buf,
+        .output_owned = true,
+        .output_type = out_type,
+        .upstream_schema = up_schema,
+        .may_produce_null = may_null,
+    };
+    return plan;
+}
+
+fn buildBranchSrc(
+    runtime_allocator: Allocator,
+    aa: Allocator,
+    e: Expr,
+    up_schema: []const Column,
+) !BranchSrc {
+    return switch (e) {
+        .col_ref => |name| blk: {
+            const idx = columnIndex(up_schema, name) orelse return Error.ColumnNotFound;
+            break :blk BranchSrc{ .col = idx };
+        },
+        .lit => |v| blk: {
+            const slot = try aa.create(LitSlot);
+            slot.* = .{
+                .value = v,
+                .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
+            };
+            break :blk BranchSrc{ .lit = slot };
+        },
+        .call => blk: {
+            const sub = try buildCallPlan(runtime_allocator, aa, e, up_schema);
+            break :blk BranchSrc{ .call = sub };
+        },
+        .case => return Error.ComputeUnsupportedExpr,
+    };
+}
+
+fn branchSrcType(s: BranchSrc, up_schema: []const Column) Type {
+    return switch (s) {
+        .col => |idx| up_schema[idx].type,
+        .lit => |slot| literalType(slot.value),
+        .call => |plan| plan.output_type,
+    };
+}
+
+fn branchSrcNullable(s: BranchSrc, up_schema: []const Column) bool {
+    return switch (s) {
+        .col => |idx| up_schema[idx].nullable,
+        .lit => false,
+        .call => |plan| callPlanNullable(plan, up_schema),
+    };
+}
+
+fn freeBranchSrc(allocator: Allocator, s: BranchSrc) void {
+    switch (s) {
+        .col => {},
+        .lit => |slot| slot.buf.deinit(allocator),
+        .call => |sub| freeCallPlan(allocator, sub),
+    }
+}
+
+fn freeCasePlan(allocator: Allocator, plan: *CasePlan) void {
+    for (plan.branches) |br| freeBranchSrc(allocator, br.then_src);
+    if (plan.else_src) |es| freeBranchSrc(allocator, es);
+    if (plan.output_owned) {
+        plan.output.deinit(allocator);
+        allocator.destroy(plan.output);
     }
 }
 
@@ -409,6 +656,7 @@ fn buildCallPlan(
                 arg_plans[i] = .{ .call = sub };
                 arg_types[i] = sub.output_type;
             },
+            .case => return Error.ComputeUnsupportedExpr,
         }
     }
 
@@ -509,6 +757,7 @@ fn derivedNullable(r: ResolvedDerived, up_schema: []const Column) bool {
         .rename => |rn| up_schema[rn.src_idx].nullable,
         .lit_only => false, // literal-only derived: constant column, never null
         .call => |plan| callPlanNullable(plan, up_schema),
+        .case => |plan| plan.may_produce_null,
     };
 }
 
@@ -589,6 +838,64 @@ fn appendCopiedColumn(
     // appendAllColumn used by Sort/Filter for output staging.
     try @import("../engine/transform.zig").appendAllColumn(allocator, src, out);
     _ = n;
+}
+
+/// Append the single cell at `src_idx` from `src` into `dst`. Used by
+/// the CASE evaluator to assemble the per-row winning value. `src`
+/// and `dst` must share the same primitive type (validated at resolve
+/// time for CASE branches).
+fn appendCellFromView(
+    allocator: Allocator,
+    dst: *ColumnStore,
+    src: ColumnView,
+    src_idx: usize,
+) !void {
+    switch (dst.data) {
+        .int => |*l| try l.append(allocator, src.data.int[src_idx]),
+        .bigint => |*l| try l.append(allocator, src.data.bigint[src_idx]),
+        .smallint => |*l| try l.append(allocator, src.data.smallint[src_idx]),
+        .tinyint => |*l| try l.append(allocator, src.data.tinyint[src_idx]),
+        .largeint => |*l| try l.append(allocator, src.data.largeint[src_idx]),
+        .float => |*l| try l.append(allocator, src.data.float[src_idx]),
+        .double => |*l| try l.append(allocator, src.data.double[src_idx]),
+        .boolean => |*l| try l.append(allocator, src.data.boolean[src_idx]),
+        .date => |*l| try l.append(allocator, src.data.date[src_idx]),
+        .datetime => |*l| try l.append(allocator, src.data.datetime[src_idx]),
+        .decimal64 => |*l| try l.append(allocator, src.data.decimal64[src_idx]),
+        .decimal128 => |*l| try l.append(allocator, src.data.decimal128[src_idx]),
+        .uuid => |*l| try l.append(allocator, src.data.uuid[src_idx]),
+        .varchar => |*s| {
+            const bytes = switch (src.data) {
+                .varchar => |sv| sv.rowBytes(src_idx),
+                .string => |sv| sv.rowBytes(src_idx),
+                .char => |sv| sv.rowBytes(src_idx),
+                else => unreachable,
+            };
+            try s.appendValue(allocator, bytes);
+        },
+        .string => |*s| {
+            const bytes = switch (src.data) {
+                .varchar => |sv| sv.rowBytes(src_idx),
+                .string => |sv| sv.rowBytes(src_idx),
+                .char => |sv| sv.rowBytes(src_idx),
+                else => unreachable,
+            };
+            try s.appendValue(allocator, bytes);
+        },
+        .char => |*s| {
+            const bytes = switch (src.data) {
+                .varchar => |sv| sv.rowBytes(src_idx),
+                .string => |sv| sv.rowBytes(src_idx),
+                .char => |sv| sv.rowBytes(src_idx),
+                else => unreachable,
+            };
+            try s.appendValue(allocator, bytes);
+        },
+    }
+    if (dst.nulls != null) {
+        const row = dst.data.rowCount() - 1;
+        try dst.appendValidBit(allocator, row, src.isValid(src_idx));
+    }
 }
 
 /// Append `n` copies of `v` into `buf`. Used by Compute's call path to
