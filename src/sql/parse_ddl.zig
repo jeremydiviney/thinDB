@@ -292,6 +292,7 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
     var nullable = true; // SQL standard default; flipped to false by NOT NULL or PRIMARY KEY
     var is_pk = false;
     var saw_not_null = false;
+    var default_value: ?types.Value = null;
     while (true) {
         switch (p.cur.tag) {
             .kw_not => {
@@ -313,11 +314,20 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
                 try p.advance();
                 nullable = true;
             },
+            // DEFAULT <literal> — column-level default for omitted-column
+            // INSERTs. v1 accepts only literal values (no expressions /
+            // function calls). The Value tag's type must match the
+            // column type; we don't enforce that here at the parse layer
+            // (the compile path validates it once the schema is known).
+            .kw_default => {
+                try p.advance();
+                default_value = try p.parseValue();
+            },
             else => break,
         }
     }
     return .{
-        .def = .{ .name = name, .column_type = ty, .nullable = nullable },
+        .def = .{ .name = name, .column_type = ty, .nullable = nullable, .default_value = default_value },
         .is_pk = is_pk,
     };
 }

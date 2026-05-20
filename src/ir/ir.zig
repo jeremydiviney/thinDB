@@ -86,6 +86,10 @@ pub const ColumnDef = struct {
     name: []const u8,
     column_type: @import("../types.zig").Type,
     nullable: bool,
+    /// Optional DEFAULT clause from CREATE TABLE. Today only literal
+    /// values are accepted. Threads into `types.Column.default_value`
+    /// at compile time; INSERT fills omitted columns from this.
+    default_value: ?@import("../types.zig").Value = null,
 };
 
 pub const CreateTable = struct {

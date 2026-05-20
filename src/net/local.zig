@@ -1173,7 +1173,19 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             const cols = try ctx.allocator.alloc(types.Column, ct.columns.len);
             defer ctx.allocator.free(cols);
             for (ct.columns, 0..) |c, ci| {
-                cols[ci] = .{ .name = c.name, .type = c.column_type, .nullable = c.nullable };
+                // Validate DEFAULT value-tag matches the column type so a
+                // mismatch errors at CREATE TABLE rather than first INSERT.
+                if (c.default_value) |dv| {
+                    if (types.ValueTag.fromType(c.column_type) != std.meta.activeTag(dv)) {
+                        return Error.TypeMismatch;
+                    }
+                }
+                cols[ci] = .{
+                    .name = c.name,
+                    .type = c.column_type,
+                    .nullable = c.nullable,
+                    .default_value = c.default_value,
+                };
             }
             const schema_def: TableSchema = .{
                 .columns = cols,
@@ -1264,7 +1276,11 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
     }
 
     for (schema_to_source, 0..) |maybe_src, si| {
-        if (maybe_src == null and !tbl_schema.columns[si].nullable) return Error.ColumnNotFound;
+        const col = tbl_schema.columns[si];
+        // Omitted column is OK if it's nullable OR has a DEFAULT — the
+        // INSERT row build below substitutes the default for missing
+        // values. NOT NULL columns without a default still error.
+        if (maybe_src == null and !col.nullable and col.default_value == null) return Error.ColumnNotFound;
     }
     for (op.rows) |row| {
         if (row.len != source_widths) return Error.BadRequest;
@@ -1288,7 +1304,18 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
     for (op.rows) |row| {
         for (tbl_schema.columns, 0..) |col, si| {
             const maybe_src = schema_to_source[si];
-            const cell: ?Value = if (maybe_src) |src| row[src] else null;
+            // Resolution order for the cell:
+            //   1. User-supplied value (incl. an explicit NULL on a
+            //      nullable column).
+            //   2. Column DEFAULT, when no source AND a default exists.
+            //   3. NULL (the column must be nullable to reach this
+            //      branch — validation above ensures it).
+            const cell: ?Value = if (maybe_src) |src|
+                row[src]
+            else if (col.default_value) |dv|
+                dv
+            else
+                null;
             try builder.appendCell(si, col, cell);
         }
     }

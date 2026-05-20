@@ -302,6 +302,12 @@ pub const Column = struct {
     /// blocks and memtable buffers carry a validity bitmap alongside the
     /// data. Default `false` (NOT NULL) matches the original v0.1 contract.
     nullable: bool = false,
+    /// Optional default-value expression for this column. Today only
+    /// literal values are accepted (`DEFAULT 0`, `DEFAULT 'unset'`,
+    /// `DEFAULT TRUE`). Used by the INSERT path when the user omits
+    /// this column from their column list. The value's tag must match
+    /// the column type (the parser + compile path enforce this).
+    default_value: ?Value = null,
 };
 
 pub const TableSchemaError = error{

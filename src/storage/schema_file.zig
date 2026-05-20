@@ -30,7 +30,11 @@ const TableSchema = types.TableSchema;
 const format = @import("format.zig");
 
 pub const schema_magic: [4]u8 = .{ 't', 'D', 'B', 'C' };
-pub const schema_version: u16 = 2;
+/// Version history:
+///   v1 → original layout
+///   v2 → per-column nullable bit
+///   v3 → per-column DEFAULT value (optional, see encode/decodeDefault)
+pub const schema_version: u16 = 3;
 pub const schema_filename = "schema.bin";
 
 pub const Error = error{
@@ -77,6 +81,7 @@ pub const SchemaOwner = struct {
                 .name = try aa.dupe(u8, c.name),
                 .type = c.type,
                 .nullable = c.nullable,
+                .default_value = if (c.default_value) |dv| try cloneValue(aa, dv) else null,
             };
         }
 
@@ -117,6 +122,8 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator)
             else => 0,
         };
         try appendU32(scratch, &buf, extra);
+        // v3: column DEFAULT value. 0 = none, 1 = present (+ payload).
+        try encodeDefault(scratch, &buf, c.default_value);
     }
 
     try appendU32(scratch, &buf, @intCast(schema.order_key.len));
@@ -139,7 +146,9 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
     if (!std.mem.eql(u8, bytes[0..4], &schema_magic)) return Error.SchemaBadMagic;
 
     const version = format.readU16(bytes[4..6]);
-    if (version != schema_version) return Error.SchemaUnsupportedVersion;
+    // Accept v2 (no per-column DEFAULT) and v3 (DEFAULT bytes appended
+    // after each column's extra field). Older versions error.
+    if (version != schema_version and version != 2) return Error.SchemaUnsupportedVersion;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -189,7 +198,11 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .decimal128 => .{ .decimal128 = .{ .p = @intCast((extra >> 8) & 0xff), .s = @intCast(extra & 0xff) } },
             .uuid => .uuid,
         };
-        columns[i] = .{ .name = name, .type = t, .nullable = nullable };
+        var default_value: ?types.Value = null;
+        if (version >= 3) {
+            default_value = try decodeDefault(aa, bytes, &cursor);
+        }
+        columns[i] = .{ .name = name, .type = t, .nullable = nullable, .default_value = default_value };
     }
 
     if (cursor + 4 > bytes.len) return Error.SchemaCorrupt;
@@ -251,6 +264,179 @@ pub fn schemasEqual(a: TableSchema, b: TableSchema) bool {
 
 const appendU16 = format.appendU16;
 const appendU32 = format.appendU32;
+
+/// Encode an optional `DEFAULT` value into the schema buffer (v3+).
+/// Layout: 1 presence byte (0 = no default, 1 = present). When present:
+/// 1 byte ValueTag + the type's payload bytes (little-endian for ints,
+/// IEEE-754 little-endian for floats, length-prefixed bytes for text).
+fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), v: ?types.Value) !void {
+    const dv = v orelse {
+        try buf.append(scratch, 0);
+        return;
+    };
+    try buf.append(scratch, 1);
+    try buf.append(scratch, @intFromEnum(@as(types.ValueTag, dv)));
+    var tmp: [16]u8 = undefined;
+    switch (dv) {
+        .int => |x| {
+            std.mem.writeInt(i32, tmp[0..4], x, .little);
+            try buf.appendSlice(scratch, tmp[0..4]);
+        },
+        .bigint => |x| {
+            std.mem.writeInt(i64, tmp[0..8], x, .little);
+            try buf.appendSlice(scratch, tmp[0..8]);
+        },
+        .boolean => |x| try buf.append(scratch, if (x) @as(u8, 1) else 0),
+        .text => |s| {
+            try appendU32(scratch, buf, @intCast(s.len));
+            try buf.appendSlice(scratch, s);
+        },
+        .float => |x| {
+            std.mem.writeInt(u32, tmp[0..4], @bitCast(x), .little);
+            try buf.appendSlice(scratch, tmp[0..4]);
+        },
+        .double => |x| {
+            std.mem.writeInt(u64, tmp[0..8], @bitCast(x), .little);
+            try buf.appendSlice(scratch, tmp[0..8]);
+        },
+        .date => |x| {
+            std.mem.writeInt(i32, tmp[0..4], x, .little);
+            try buf.appendSlice(scratch, tmp[0..4]);
+        },
+        .datetime => |x| {
+            std.mem.writeInt(i64, tmp[0..8], x, .little);
+            try buf.appendSlice(scratch, tmp[0..8]);
+        },
+        .tinyint => |x| try buf.append(scratch, @bitCast(x)),
+        .smallint => |x| {
+            std.mem.writeInt(i16, tmp[0..2], x, .little);
+            try buf.appendSlice(scratch, tmp[0..2]);
+        },
+        .largeint => |x| {
+            std.mem.writeInt(i128, tmp[0..16], x, .little);
+            try buf.appendSlice(scratch, tmp[0..16]);
+        },
+        .decimal64 => |x| {
+            std.mem.writeInt(i64, tmp[0..8], x, .little);
+            try buf.appendSlice(scratch, tmp[0..8]);
+        },
+        .decimal128 => |x| {
+            std.mem.writeInt(i128, tmp[0..16], x, .little);
+            try buf.appendSlice(scratch, tmp[0..16]);
+        },
+        .uuid => |x| {
+            std.mem.writeInt(u128, tmp[0..16], x, .little);
+            try buf.appendSlice(scratch, tmp[0..16]);
+        },
+    }
+}
+
+fn decodeDefault(arena: Allocator, bytes: []const u8, cursor: *usize) !?types.Value {
+    if (cursor.* + 1 > bytes.len) return Error.SchemaCorrupt;
+    const present = bytes[cursor.*];
+    cursor.* += 1;
+    if (present == 0) return null;
+    if (cursor.* + 1 > bytes.len) return Error.SchemaCorrupt;
+    const tag_byte = bytes[cursor.*];
+    cursor.* += 1;
+    const tag: types.ValueTag = @enumFromInt(tag_byte);
+    return switch (tag) {
+        .int => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(i32, bytes[cursor.*..][0..4], .little);
+            cursor.* += 4;
+            break :blk types.Value{ .int = v };
+        },
+        .bigint => blk: {
+            if (cursor.* + 8 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(i64, bytes[cursor.*..][0..8], .little);
+            cursor.* += 8;
+            break :blk types.Value{ .bigint = v };
+        },
+        .boolean => blk: {
+            if (cursor.* + 1 > bytes.len) return Error.SchemaCorrupt;
+            const v = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            break :blk types.Value{ .boolean = v };
+        },
+        .text => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.SchemaCorrupt;
+            const n = format.readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            if (cursor.* + n > bytes.len) return Error.SchemaCorrupt;
+            const s = try arena.dupe(u8, bytes[cursor.* .. cursor.* + n]);
+            cursor.* += n;
+            break :blk types.Value{ .text = s };
+        },
+        .float => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.SchemaCorrupt;
+            const bits = std.mem.readInt(u32, bytes[cursor.*..][0..4], .little);
+            cursor.* += 4;
+            break :blk types.Value{ .float = @bitCast(bits) };
+        },
+        .double => blk: {
+            if (cursor.* + 8 > bytes.len) return Error.SchemaCorrupt;
+            const bits = std.mem.readInt(u64, bytes[cursor.*..][0..8], .little);
+            cursor.* += 8;
+            break :blk types.Value{ .double = @bitCast(bits) };
+        },
+        .date => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(i32, bytes[cursor.*..][0..4], .little);
+            cursor.* += 4;
+            break :blk types.Value{ .date = v };
+        },
+        .datetime => blk: {
+            if (cursor.* + 8 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(i64, bytes[cursor.*..][0..8], .little);
+            cursor.* += 8;
+            break :blk types.Value{ .datetime = v };
+        },
+        .tinyint => blk: {
+            if (cursor.* + 1 > bytes.len) return Error.SchemaCorrupt;
+            const v: i8 = @bitCast(bytes[cursor.*]);
+            cursor.* += 1;
+            break :blk types.Value{ .tinyint = v };
+        },
+        .smallint => blk: {
+            if (cursor.* + 2 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(i16, bytes[cursor.*..][0..2], .little);
+            cursor.* += 2;
+            break :blk types.Value{ .smallint = v };
+        },
+        .largeint => blk: {
+            if (cursor.* + 16 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(i128, bytes[cursor.*..][0..16], .little);
+            cursor.* += 16;
+            break :blk types.Value{ .largeint = v };
+        },
+        .decimal64 => blk: {
+            if (cursor.* + 8 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(i64, bytes[cursor.*..][0..8], .little);
+            cursor.* += 8;
+            break :blk types.Value{ .decimal64 = v };
+        },
+        .decimal128 => blk: {
+            if (cursor.* + 16 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(i128, bytes[cursor.*..][0..16], .little);
+            cursor.* += 16;
+            break :blk types.Value{ .decimal128 = v };
+        },
+        .uuid => blk: {
+            if (cursor.* + 16 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(u128, bytes[cursor.*..][0..16], .little);
+            cursor.* += 16;
+            break :blk types.Value{ .uuid = v };
+        },
+    };
+}
+
+fn cloneValue(arena: Allocator, v: types.Value) !types.Value {
+    return switch (v) {
+        .text => |s| types.Value{ .text = try arena.dupe(u8, s) },
+        else => v,
+    };
+}
 
 // ---------- tests --------------------------------------------------------
 
