@@ -79,6 +79,17 @@ pub const PredicateExpr = union(enum) {
     /// linear scan. v1 set sizes are small (typical < 1k) — hash-set
     /// optimization is a follow-up.
     in_set: InSet,
+    /// Resolved form of a correlated subquery (EXISTS / NOT EXISTS /
+    /// IN / NOT IN). The pre-compile pass dropped the correlation
+    /// predicates from the inner, drained the rewritten inner, and
+    /// stored each result row's correlation-key tuple here (plus the
+    /// outer's IN-column value for IN-form, prefixed).
+    ///
+    /// Per outer row: assemble a tuple from `outer_cols`, linear-scan
+    /// `rows` for a match, apply `negate`. NULL in any outer col →
+    /// the tuple can't match (consistent with the NOT IN dialect:
+    /// see [[thindb-not-in-nonstandard]]).
+    correlated_set: CorrelatedSet,
 };
 
 pub const LikePred = struct {
@@ -108,6 +119,21 @@ pub const ColColPred = struct {
     left: []const u8,
     op: PredicateOp,
     right: []const u8,
+};
+
+pub const CorrelatedSet = struct {
+    /// The outer-side column names whose values, taken together,
+    /// form the lookup tuple per row. For EXISTS, these are the
+    /// outer correlation keys. For IN, the first element is the
+    /// outer's IN-column followed by the outer correlation keys.
+    outer_cols: []const []const u8,
+    /// Materialized rows. Each inner slice has length equal to
+    /// `outer_cols.len`; entries are the inner subquery's drained
+    /// values in the parallel order.
+    rows: []const []const Value,
+    /// `true` = NOT IN / NOT EXISTS; outer row passes iff its
+    /// tuple does NOT appear in `rows`.
+    negate: bool,
 };
 
 pub fn likeExpr(col: []const u8, pattern: []const u8) PredicateExpr {
@@ -166,6 +192,21 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
             break :blk .{ .in_set = .{
                 .col = try out_arena.dupe(u8, s.col),
                 .values = vals,
+                .negate = s.negate,
+            } };
+        },
+        .correlated_set => |s| blk: {
+            const outer_cols = try out_arena.alloc([]const u8, s.outer_cols.len);
+            for (s.outer_cols, outer_cols) |src, *dst| dst.* = try out_arena.dupe(u8, src);
+            const rows = try out_arena.alloc([]const Value, s.rows.len);
+            for (s.rows, rows) |src, *dst| {
+                const tuple = try out_arena.alloc(Value, src.len);
+                for (src, tuple) |v, *t| t.* = try cloneValue(out_arena, v);
+                dst.* = tuple;
+            }
+            break :blk .{ .correlated_set = .{
+                .outer_cols = outer_cols,
+                .rows = rows,
                 .negate = s.negate,
             } };
         },
@@ -280,7 +321,27 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                 if (std.meta.activeTag(v) != col_tag) return Error.PredicateTypeMismatch;
             }
         },
+        // `.correlated_set` — every outer_col must exist; per-row
+        // tuples must match each col's value tag. Same safety net.
+        .correlated_set => |s| {
+            for (s.outer_cols) |c_name| {
+                _ = findCol(schema, c_name) orelse return Error.ColumnNotFound;
+            }
+            for (s.rows) |row| {
+                if (row.len != s.outer_cols.len) return Error.PredicateTypeMismatch;
+                for (row, s.outer_cols) |v, c_name| {
+                    const col_idx = findCol(schema, c_name).?;
+                    const expected = ValueTag.fromType(schema[col_idx].type);
+                    if (std.meta.activeTag(v) != expected) return Error.PredicateTypeMismatch;
+                }
+            }
+        },
     }
+}
+
+fn findCol(schema: []const Column, name: []const u8) ?usize {
+    for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return i;
+    return null;
 }
 
 /// Lossless widening for an integer / float literal to match a wider
@@ -476,7 +537,78 @@ pub fn evaluatePredicate(
             };
             try evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
         },
+        .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out),
     }
+}
+
+/// Per-row tuple lookup against a materialized correlated set.
+/// Assembles each row's outer-side tuple, linear-scans `rows` for a
+/// match. NULL in any outer col → the tuple can't match.
+pub fn evaluateCorrelatedSetMask(s: CorrelatedSet, schema: []const Column, batch: anytype, out: []bool) !void {
+    const n_cols = s.outer_cols.len;
+    if (n_cols == 0) return Error.PredicateTypeMismatch;
+
+    var col_idx_buf: [16]usize = undefined;
+    if (n_cols > col_idx_buf.len) return Error.PredicateTypeMismatch;
+    const col_idxs = col_idx_buf[0..n_cols];
+    for (s.outer_cols, col_idxs) |c_name, *idx_out| {
+        idx_out.* = findCol(schema, c_name) orelse return Error.ColumnNotFound;
+    }
+
+    var i: usize = 0;
+    while (i < batch.row_count) : (i += 1) {
+        // NULL in any outer col → no match possible.
+        var any_null = false;
+        for (col_idxs) |idx| {
+            if (!batch.values[idx].isValid(i)) {
+                any_null = true;
+                break;
+            }
+        }
+        if (any_null) {
+            out[i] = s.negate; // NULL → can't match; NOT IN passes, IN fails.
+            continue;
+        }
+        // Scan rows for a tuple match.
+        var found = false;
+        for (s.rows) |row| {
+            var all_match = true;
+            for (col_idxs, row) |idx, ref_val| {
+                if (!cellMatchesValue(batch.values[idx], i, ref_val)) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) {
+                found = true;
+                break;
+            }
+        }
+        out[i] = if (s.negate) !found else found;
+    }
+}
+
+/// Equality check between a single cell of a ColumnView and a Value
+/// of the same type. Returns false on type mismatch (defensive).
+fn cellMatchesValue(view: ColumnView, idx: usize, ref: Value) bool {
+    return switch (view.data) {
+        .int => |s| ref == .int and s[idx] == ref.int,
+        .bigint => |s| ref == .bigint and s[idx] == ref.bigint,
+        .smallint => |s| ref == .smallint and s[idx] == ref.smallint,
+        .tinyint => |s| ref == .tinyint and s[idx] == ref.tinyint,
+        .largeint => |s| ref == .largeint and s[idx] == ref.largeint,
+        .float => |s| ref == .float and s[idx] == ref.float,
+        .double => |s| ref == .double and s[idx] == ref.double,
+        .boolean => |s| ref == .boolean and (s[idx] != 0) == ref.boolean,
+        .date => |s| ref == .date and s[idx] == ref.date,
+        .datetime => |s| ref == .datetime and s[idx] == ref.datetime,
+        .decimal64 => |s| ref == .decimal64 and s[idx] == ref.decimal64,
+        .decimal128 => |s| ref == .decimal128 and s[idx] == ref.decimal128,
+        .uuid => |s| ref == .uuid and s[idx] == ref.uuid,
+        .varchar => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
+        .string => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
+        .char => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
+    };
 }
 
 /// Per-row set-membership check. `negate=false` → IN, `true` → NOT IN.

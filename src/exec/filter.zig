@@ -230,6 +230,7 @@ pub const Filter = struct {
                 };
                 try predicate.evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
             },
+            .correlated_set => |s| try predicate.evaluateCorrelatedSetMask(s, self.schema, batch, out),
         }
     }
 };

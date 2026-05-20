@@ -457,6 +457,18 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
             }
             try out.append(allocator, ']');
         },
+        .correlated_set => |s| {
+            try out.append(allocator, '(');
+            for (s.outer_cols, 0..) |c, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, c);
+            }
+            try out.appendSlice(allocator, if (s.negate) ") NOT IN [" else ") IN [");
+            var buf: [16]u8 = undefined;
+            const s_count = try std.fmt.bufPrint(&buf, "{d} rows", .{s.rows.len});
+            try out.appendSlice(allocator, s_count);
+            try out.append(allocator, ']');
+        },
     }
 }
 
