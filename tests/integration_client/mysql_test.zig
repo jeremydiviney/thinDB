@@ -1935,7 +1935,7 @@ test "mysql wire: COM_STMT_PREPARE + EXECUTE for parameterized INSERT writes row
     var id_buf: [8]u8 = undefined;
     std.mem.writeInt(i64, &id_buf, 42, .little);
     var qty_buf: [4]u8 = undefined;
-    std.mem.writeInt(i32, &qty_buf, 99, .little);
+    std.mem.writeInt(i32, &qty_buf, -99, .little);
 
     // VAR_STRING value = lenenc length + bytes.
     var tag_payload: std.ArrayList(u8) = .empty;
@@ -1967,7 +1967,7 @@ test "mysql wire: COM_STMT_PREPARE + EXECUTE for parameterized INSERT writes row
         const tags = batch.values[2].data.string;
         var r: usize = 0;
         while (r < batch.row_count) : (r += 1) {
-            if (ids[r] == 42 and qtys[r] == 99 and std.mem.eql(u8, tags.rowBytes(r), "via-prepare")) {
+            if (ids[r] == 42 and qtys[r] == -99 and std.mem.eql(u8, tags.rowBytes(r), "via-prepare")) {
                 saw_match = true;
             }
         }

@@ -285,6 +285,31 @@ test "sql insert: int literal up-coerces to bigint" {
     try std.testing.expectEqual(@as(i64, 42), b.values[0].data.bigint[0]);
 }
 
+test "sql insert: negative numeric literals" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, score DOUBLE NOT NULL)");
+    defer q1.deinit();
+    _ = try q1.next();
+    var q2 = try runSql(allocator, db, "INSERT INTO t VALUES (1, -482021160, -3.5)");
+    defer q2.deinit();
+    _ = try q2.next();
+
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q3 = try runSql(allocator, db, "SELECT qty, score FROM t");
+    defer q3.deinit();
+    const b = (try q3.next()).?;
+    try std.testing.expectEqual(@as(i32, -482021160), b.values[0].data.int[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, -3.5), b.values[1].data.double[0], 1e-12);
+}
+
 test "sql insert: string literal coerces to uuid" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
