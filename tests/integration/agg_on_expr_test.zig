@@ -107,7 +107,80 @@ test "agg on expr: GROUP BY column with agg-on-expr" {
     try std.testing.expectEqual(@as(i64, 30), batch.values[1].data.bigint[1]);
 }
 
-// NOTE: SUM(CASE WHEN ...) currently crashes — the CASE branches
-// produce INT but SUM widens to BIGINT and the type-marshaling
-// between Compute and Aggregate has a gap. Captured as TODO; the
-// pure-arithmetic agg-on-expr forms above all work.
+test "agg on expr: SUM(CASE WHEN ...) — conditional sum" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, status VARCHAR(8) NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (id, status) VALUES (1, 'active'), (2, 'idle'), (3, 'active'), (4, 'idle'), (5, 'active')");
+    const tt = try db.openTable("t", .{});
+    try tt.flush();
+
+    var q = try runSql(allocator, db, "SELECT SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_count FROM t");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 3), batch.values[0].data.bigint[0]);
+}
+
+test "agg on expr: SUM(CASE WHEN ...) with GROUP BY" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db,
+        "CREATE TABLE sales (id BIGINT PRIMARY KEY, region VARCHAR(8) NOT NULL, amount INT NOT NULL)",
+    );
+    try exec(allocator, db,
+        "INSERT INTO sales (id, region, amount) VALUES " ++
+            "(1, 'east', 50), (2, 'east', 150), (3, 'east', 80), " ++
+            "(4, 'west', 200), (5, 'west', 90)",
+    );
+    const tt = try db.openTable("sales", .{});
+    try tt.flush();
+
+    // big_count: count of orders with amount > 100, per region.
+    var q = try runSql(allocator, db,
+        "SELECT region, SUM(CASE WHEN amount > 100 THEN 1 ELSE 0 END) AS big_count " ++
+            "FROM sales GROUP BY region ORDER BY region ASC",
+    );
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), batch.row_count);
+    // east: 1 amount > 100 (150). west: 1 amount > 100 (200).
+    try std.testing.expectEqualStrings("east", batch.values[0].data.varchar.rowBytes(0));
+    try std.testing.expectEqual(@as(i64, 1), batch.values[1].data.bigint[0]);
+    try std.testing.expectEqualStrings("west", batch.values[0].data.varchar.rowBytes(1));
+    try std.testing.expectEqual(@as(i64, 1), batch.values[1].data.bigint[1]);
+}
+
+test "agg on expr: SUM(CASE WHEN ...) — revenue when active" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db,
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, status VARCHAR(8) NOT NULL, amount INT NOT NULL)",
+    );
+    try exec(allocator, db,
+        "INSERT INTO orders (id, status, amount) VALUES " ++
+            "(1, 'active', 100), (2, 'cancel', 50), (3, 'active', 200), (4, 'active', 75)",
+    );
+    const tt = try db.openTable("orders", .{});
+    try tt.flush();
+
+    // SUM(CASE WHEN status='active' THEN amount ELSE 0) = sum of active amounts.
+    var q = try runSql(allocator, db,
+        "SELECT SUM(CASE WHEN status = 'active' THEN amount ELSE 0 END) AS active_rev FROM orders",
+    );
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    // active amounts: 100 + 200 + 75 = 375
+    try std.testing.expectEqual(@as(i64, 375), batch.values[0].data.bigint[0]);
+}
