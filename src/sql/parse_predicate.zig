@@ -87,6 +87,42 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         try p.expect(.rparen);
         return .{ .exists_subquery = @ptrCast(source) };
     }
+    // Literal-on-LHS comparison: `lit op X`. Two sub-cases handled:
+    //   - lit op col   → flipped to `col reverse_op lit` as a normal leaf
+    //   - lit op lit   → evaluated at parse time, emitted as `.always`
+    // Subquery on either side of a literal-LHS comparison is rejected
+    // — workaround is to write the column on the LHS.
+    if (isLiteralTokenStart(p.cur.tag, p.cur.text)) {
+        const lhs_val = try p.parseValue();
+        const op_lhs: PredicateOp = switch (p.cur.tag) {
+            .eq => .eq,
+            .neq => .neq,
+            .lt => .lt,
+            .lte => .lte,
+            .gt => .gt,
+            .gte => .gte,
+            else => return PE.SqlExpectedToken,
+        };
+        try p.advance();
+        if (p.cur.tag == .identifier and !isTypedLiteralKeyword(p.cur.text)) {
+            var rhs_col = p.cur.text;
+            try p.advance();
+            if (p.cur.tag == .dot) {
+                try p.advance();
+                if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
+                rhs_col = p.cur.text;
+                try p.advance();
+            }
+            const col_dup = try p.arena.dupe(u8, rhs_col);
+            return .{ .leaf = .{ .col = col_dup, .op = reverseOp(op_lhs), .val = lhs_val } };
+        }
+        if (isLiteralTokenStart(p.cur.tag, p.cur.text)) {
+            const rhs_val = try p.parseValue();
+            const result = compareLiterals(lhs_val, op_lhs, rhs_val) catch return PE.SqlExpectedValue;
+            return .{ .always = result };
+        }
+        return PE.SqlExpectedValue;
+    }
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
     var col_name = p.cur.text;
     try p.advance();
@@ -250,6 +286,41 @@ fn isTypedLiteralKeyword(s: []const u8) bool {
     return std.ascii.eqlIgnoreCase(s, "date") or
         std.ascii.eqlIgnoreCase(s, "datetime") or
         std.ascii.eqlIgnoreCase(s, "timestamp");
+}
+
+fn isLiteralTokenStart(tag: anytype, text: []const u8) bool {
+    return switch (tag) {
+        .integer, .floating, .string, .kw_true, .kw_false => true,
+        .identifier => isTypedLiteralKeyword(text),
+        else => false,
+    };
+}
+
+fn reverseOp(op: PredicateOp) PredicateOp {
+    return switch (op) {
+        .eq => .eq,
+        .neq => .neq,
+        .lt => .gt,
+        .lte => .gte,
+        .gt => .lt,
+        .gte => .lte,
+    };
+}
+
+/// Compile-time comparison of two literal Values. Both sides must
+/// share the same active tag (no widening). Returns error.Invalid on
+/// any mismatch — the caller surfaces it as a parse error.
+fn compareLiterals(a: Value, op: PredicateOp, b: Value) !bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.Invalid;
+    const order = a.compare(b);
+    return switch (op) {
+        .eq => order == .eq,
+        .neq => order != .eq,
+        .lt => order == .lt,
+        .lte => order != .gt,
+        .gt => order == .gt,
+        .gte => order != .lt,
+    };
 }
 
 fn makeBetween(p: anytype, col: []const u8, lo: Value, hi: Value, negate: bool) !PredicateExpr {
