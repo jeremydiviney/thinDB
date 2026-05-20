@@ -62,3 +62,36 @@ pub fn daysFromDatetime(micros: i64) i32 {
     const secs = @divFloor(micros, 1_000_000);
     return @intCast(@divFloor(secs, 86_400));
 }
+
+/// Days since 1970-01-01 for a (year, month, day) tuple. Inverse of
+/// `daysToYmd`. Uses Hinnant's civil_from_days algorithm — exact, handles
+/// BC dates, no leap-second nonsense. `month` is 1..12, `day` is 1..31.
+///
+/// Reference: Howard Hinnant, "chrono-Compatible Low-Level Date
+/// Algorithms" — civil_from_days.
+pub fn ymdToDays(year: i32, month: u32, day: u32) i32 {
+    var y = year;
+    if (month <= 2) y -= 1;
+    const era = @divFloor(y, 400);
+    const yoe: u32 = @intCast(y - era * 400);
+    const m_adj: i32 = if (month > 2) @as(i32, @intCast(month)) - 3 else @as(i32, @intCast(month)) + 9;
+    const doy: u32 = @intCast(@divTrunc(153 * m_adj + 2, 5) + @as(i32, @intCast(day)) - 1);
+    const doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return @as(i32, era * 146097) + @as(i32, @intCast(doe)) - 719468;
+}
+
+/// Days in month for a given (year, 1-indexed month). Handles Feb leap-year.
+pub fn lastDayOfMonth(year: i32, month: u32) u32 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) @as(u32, 29) else 28,
+        else => unreachable,
+    };
+}
+
+pub fn isLeapYear(year: i32) bool {
+    if (@rem(year, 4) != 0) return false;
+    if (@rem(year, 100) != 0) return true;
+    return @rem(year, 400) == 0;
+}

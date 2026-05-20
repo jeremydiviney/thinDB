@@ -687,12 +687,57 @@ pub const Parser = struct {
         }
         // Then extend into an AddSub-level expression.
         while (self.cur.tag == .plus or self.cur.tag == .minus) {
-            const fn_name: []const u8 = if (self.cur.tag == .plus) "add" else "sub";
+            const is_minus = self.cur.tag == .minus;
             try self.advance();
-            const rhs = try self.parseMulDiv();
-            lhs = try self.makeBinary(fn_name, lhs, rhs);
+            if (self.cur.tag == .kw_interval) {
+                lhs = try self.applyInterval(lhs, is_minus);
+            } else {
+                const fn_name: []const u8 = if (is_minus) "sub" else "add";
+                const rhs = try self.parseMulDiv();
+                lhs = try self.makeBinary(fn_name, lhs, rhs);
+            }
         }
         return lhs;
+    }
+
+    /// Cursor sits on the INTERVAL keyword. Consume the
+    /// `INTERVAL '<integer>' (DAY|MONTH|YEAR)` form and rewrite to a
+    /// calendar-aware scalar call on `lhs`. `negate` flips the sign
+    /// for the `lhs - INTERVAL ...` form.
+    fn applyInterval(self: *Parser, lhs: ir.Expr, negate: bool) ParseError!ir.Expr {
+        try self.expect(.kw_interval);
+        // Accept both `'90'` (string) and bare integer for the
+        // quantity — MySQL / DuckDB use string, PG uses bare integer.
+        var n: i64 = 0;
+        if (self.cur.tag == .string) {
+            const s = self.cur.value.string;
+            n = std.fmt.parseInt(i64, s, 10) catch return ParseError.SqlExpectedValue;
+            try self.advance();
+        } else if (self.cur.tag == .integer) {
+            n = self.cur.value.integer;
+            try self.advance();
+        } else return ParseError.SqlExpectedValue;
+        if (negate) n = -n;
+
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const unit_word = self.cur.text;
+        const fn_name: []const u8 = if (std.ascii.eqlIgnoreCase(unit_word, "day") or std.ascii.eqlIgnoreCase(unit_word, "days"))
+            "date_add"
+        else if (std.ascii.eqlIgnoreCase(unit_word, "month") or std.ascii.eqlIgnoreCase(unit_word, "months"))
+            "date_add_months"
+        else if (std.ascii.eqlIgnoreCase(unit_word, "year") or std.ascii.eqlIgnoreCase(unit_word, "years"))
+            "date_add_years"
+        else
+            return ParseError.SqlExpectedKeyword;
+        try self.advance();
+
+        // Build a 2-arg call: fn(date_expr, n).
+        const args = try self.arena.alloc(ir.Expr, 2);
+        args[0] = lhs;
+        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ParseError.SqlExpectedValue;
+        args[1] = ir.Expr{ .lit = .{ .int = @intCast(n) } };
+        const name_dup = try self.arena.dupe(u8, fn_name);
+        return ir.Expr{ .call = .{ .fn_name = name_dup, .args = args } };
     }
 
     /// Parse `(arg, arg, ...)`. Cursor is on `(` going in, on the token
@@ -771,10 +816,15 @@ pub const Parser = struct {
     fn parseAddSub(self: *Parser) ParseError!ir.Expr {
         var lhs = try self.parseMulDiv();
         while (self.cur.tag == .plus or self.cur.tag == .minus) {
-            const fn_name: []const u8 = if (self.cur.tag == .plus) "add" else "sub";
+            const is_minus = self.cur.tag == .minus;
             try self.advance();
-            const rhs = try self.parseMulDiv();
-            lhs = try self.makeBinary(fn_name, lhs, rhs);
+            if (self.cur.tag == .kw_interval) {
+                lhs = try self.applyInterval(lhs, is_minus);
+            } else {
+                const fn_name: []const u8 = if (is_minus) "sub" else "add";
+                const rhs = try self.parseMulDiv();
+                lhs = try self.makeBinary(fn_name, lhs, rhs);
+            }
         }
         return lhs;
     }

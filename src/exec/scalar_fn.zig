@@ -275,6 +275,11 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "datediff", .arg_types = &.{ .date, .date }, .return_type = .int, .kernel = date.datediffKernel },
     .{ .name = "date_add", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddKernel },
     .{ .name = "date_sub", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateSubKernel },
+    // Calendar-aware month/year addition; clamps day on short destination
+    // months (`2024-01-31 + 1 month → 2024-02-29`). Used by the parser
+    // when it lowers `date + INTERVAL '<N>' MONTH|YEAR`.
+    .{ .name = "date_add_months", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddMonthsKernel },
+    .{ .name = "date_add_years", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddYearsKernel },
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .kernel = date.fromUnixtimeKernel },
     // --- date (expanded MySQL-style helpers) ---

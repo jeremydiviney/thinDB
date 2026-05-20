@@ -127,6 +127,38 @@ pub fn dateSubKernel(allocator: Allocator, args: []const ColumnView, out: *Colum
     while (i < row_count) : (i += 1) try out.data.date.append(allocator, d[i] - n[i]);
 }
 
+/// Add `n` calendar months to a DATE, clamping the day component when the
+/// destination month is shorter (`2024-01-31 + 1 month → 2024-02-29`).
+/// Negative `n` works the same way in reverse.
+pub fn dateAddMonthsKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const d = args[0].data.date;
+    const n = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        try out.data.date.append(allocator, addMonths(d[i], n[i]));
+    }
+}
+
+pub fn dateAddYearsKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const d = args[0].data.date;
+    const n = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        try out.data.date.append(allocator, addMonths(d[i], n[i] * 12));
+    }
+}
+
+fn addMonths(days: i32, n_months: i32) i32 {
+    const ymd = daysToYmd(days) orelse return days;
+    // Compute (year, month_0_indexed) zero-based math, then re-bias.
+    const total_m0: i32 = @as(i32, @intCast(ymd.year)) * 12 + (@as(i32, ymd.month) - 1) + n_months;
+    const new_year: i32 = @divFloor(total_m0, 12);
+    const new_month: u32 = @intCast(@mod(total_m0, 12) + 1);
+    const last = common.lastDayOfMonth(new_year, new_month);
+    const clamped_day: u32 = @min(@as(u32, ymd.day), last);
+    return common.ymdToDays(new_year, new_month, clamped_day);
+}
+
 pub fn unixTimestampKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const s = args[0].data.datetime;
     var i: usize = 0;

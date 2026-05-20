@@ -32,6 +32,7 @@ test {
     _ = @import("in_list_test.zig");
     _ = @import("extract_test.zig");
     _ = @import("having_test.zig");
+    _ = @import("interval_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 
