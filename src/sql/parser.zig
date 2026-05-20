@@ -467,6 +467,23 @@ pub const Parser = struct {
             root = try self.allocOp(.{ .limit = .{ .n = n, .upstream = root } });
         }
 
+        // UNION / UNION ALL chains. SQL semantics: left-associative;
+        // every right-hand side is itself a full SELECT pipeline.
+        // v1 only ships UNION ALL — UNION (distinct) errors with
+        // SqlInvalidProjection until a dedup pass lands.
+        while (self.cur.tag == .kw_union) {
+            try self.advance();
+            const all = self.cur.tag == .kw_all;
+            if (all) try self.advance();
+            if (!all) return ParseError.SqlInvalidProjection;
+            const rhs = try self.parseStatement();
+            root = try self.allocOp(.{ .set_union = .{
+                .left = root,
+                .right = rhs,
+                .all = true,
+            } });
+        }
+
         return root;
     }
 
@@ -1596,6 +1613,10 @@ fn countRefs(
         .ddl, .show, .insert, .copy => {},
         .batch => |b| for (b.statements) |sub| try visitChild(arena, refs, sub),
         .window => |w| try visitChild(arena, refs, w.upstream),
+        .set_union => |u| {
+            try visitChild(arena, refs, u.left);
+            try visitChild(arena, refs, u.right);
+        },
     }
 }
 

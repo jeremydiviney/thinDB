@@ -352,10 +352,25 @@ pub const OpTag = enum(u8) {
     /// specs; the operator does one sort per spec and runs all of that
     /// spec's calls in a single sweep.
     window = 15,
+    /// UNION ALL — concatenate two upstreams with compatible schemas.
+    /// (UNION distinct deferred — needs a dedup pass on top of this.)
+    set_union = 16,
 };
 
 pub const BatchOp = struct {
     statements: []const *Op,
+};
+
+/// UNION ALL — concatenate the row streams from `left` and `right`.
+/// Schemas must be compatible (same column count + per-position type
+/// tags must match); output schema borrows the left side's names.
+/// UNION (distinct) lands on top of this as a dedup pass when needed.
+pub const SetUnion = struct {
+    left: *Op,
+    right: *Op,
+    /// `true` = UNION ALL (no dedup); `false` is reserved for the
+    /// future distinct variant. v1 only emits `all = true`.
+    all: bool,
 };
 
 /// In-memory operator tree, built by the client query-builder and decoded
@@ -378,6 +393,7 @@ pub const Op = union(OpTag) {
     batch: BatchOp,
     copy: CopyOp,
     window: WindowOp,
+    set_union: SetUnion,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -535,6 +551,12 @@ pub const Op = union(OpTag) {
                 w.upstream.deinitDecoded(allocator);
                 allocator.destroy(w.upstream);
             },
+            .set_union => |u| {
+                u.left.deinitDecoded(allocator);
+                allocator.destroy(u.left);
+                u.right.deinitDecoded(allocator);
+                allocator.destroy(u.right);
+            },
         }
     }
 };
@@ -597,6 +619,11 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         },
         .copy => |c| try encodeCopy(allocator, out, c),
         .window => |w| try encodeWindow(allocator, out, w),
+        .set_union => |u| {
+            try out.append(allocator, if (u.all) @as(u8, 1) else 0);
+            try encodeOp(allocator, out, u.left.*);
+            try encodeOp(allocator, out, u.right.*);
+        },
     }
 }
 
@@ -1209,7 +1236,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.window)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.set_union)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1440,6 +1467,19 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
         },
         .copy => Op{ .copy = try decodeCopy(allocator, bytes, cursor) },
         .window => try decodeWindow(allocator, bytes, cursor),
+        .set_union => blk: {
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const all = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            const left = try allocator.create(Op);
+            errdefer allocator.destroy(left);
+            left.* = try decodeOp(allocator, bytes, cursor);
+            errdefer left.deinitDecoded(allocator);
+            const right = try allocator.create(Op);
+            errdefer allocator.destroy(right);
+            right.* = try decodeOp(allocator, bytes, cursor);
+            break :blk Op{ .set_union = .{ .left = left, .right = right, .all = all } };
+        },
     };
 }
 
@@ -2141,6 +2181,11 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
                 try out.append(allocator, '\n');
             }
             try explainOp(allocator, out, w.upstream.*, depth + 1);
+        },
+        .set_union => |u| {
+            try out.appendSlice(allocator, if (u.all) "UnionAll\n" else "Union\n");
+            try explainOp(allocator, out, u.left.*, depth + 1);
+            try explainOp(allocator, out, u.right.*, depth + 1);
         },
     }
 }

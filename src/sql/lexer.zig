@@ -98,6 +98,8 @@ pub const TokenTag = enum {
     kw_like,
     kw_in,
     kw_interval,
+    kw_union,
+    kw_all,
 
     // Operators / punctuation.
     eq, // =
@@ -476,6 +478,8 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "like", .tag = .kw_like },
         .{ .name = "in", .tag = .kw_in },
         .{ .name = "interval", .tag = .kw_interval },
+        .{ .name = "union", .tag = .kw_union },
+        .{ .name = "all", .tag = .kw_all },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;

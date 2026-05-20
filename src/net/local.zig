@@ -930,6 +930,13 @@ pub fn buildServerQuerySession(
             errdefer upstream.deinit();
             break :blk try upstream.window(w.specs, w.calls);
         },
+        .set_union => |u| blk: {
+            const left_q = try buildServerQuerySession(allocator, db, session, u.left.*);
+            errdefer @constCast(&left_q).deinit();
+            const right_q = try buildServerQuerySession(allocator, db, session, u.right.*);
+            errdefer @constCast(&right_q).deinit();
+            break :blk try exec.SetUnion.create(allocator, left_q, right_q, u.all);
+        },
     };
 }
 
@@ -1139,6 +1146,13 @@ fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             var upstream = try compileOp(ctx, w.upstream);
             errdefer upstream.deinit();
             break :blk try upstream.window(w.specs, w.calls);
+        },
+        .set_union => |u| blk: {
+            const left_q = try compileOp(ctx, u.left);
+            errdefer @constCast(&left_q).deinit();
+            const right_q = try compileOp(ctx, u.right);
+            errdefer @constCast(&right_q).deinit();
+            break :blk try exec.SetUnion.create(ctx.allocator, left_q, right_q, u.all);
         },
     };
 }

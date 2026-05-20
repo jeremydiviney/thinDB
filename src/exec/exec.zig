@@ -336,6 +336,8 @@ pub const compute_op = @import("compute.zig");
 pub const Compute = compute_op.Compute;
 pub const Derived = compute_op.Derived;
 
+pub const SetUnion = @import("set_union.zig").SetUnion;
+
 pub const join_op = @import("join.zig");
 pub const Join = join_op.Join;
 pub const JoinSpec = join_op.Spec;
