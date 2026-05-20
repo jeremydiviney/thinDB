@@ -204,8 +204,15 @@ pub const Filter = struct {
                 for (out) |*o| o.* = !o.*;
             },
             // Resolved away by the pre-compile pass.
-            .scalar_subquery, .exists_subquery => return Error.PredicateTypeMismatch,
+            .scalar_subquery, .exists_subquery, .in_subquery => return Error.PredicateTypeMismatch,
             .always => |b| @memset(out, b),
+            .in_set => |s| {
+                const col_idx = blk: {
+                    for (self.schema, 0..) |c, i| if (std.mem.eql(u8, c.name, s.col)) break :blk i;
+                    return Error.ColumnNotFound;
+                };
+                try predicate.evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
+            },
         }
     }
 };

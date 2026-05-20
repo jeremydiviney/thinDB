@@ -754,6 +754,20 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
         } },
         .exists_subquery => |src| PredicateExpr{ .exists_subquery = src },
         .always => |b| PredicateExpr{ .always = b },
+        .in_subquery => |s| PredicateExpr{ .in_subquery = .{
+            .col = try aa.dupe(u8, s.col),
+            .source = s.source,
+            .negate = s.negate,
+        } },
+        .in_set => |s| blk: {
+            const vals = try aa.alloc(types.Value, s.values.len);
+            for (s.values, vals) |v, *out| out.* = try cloneValue(aa, v);
+            break :blk PredicateExpr{ .in_set = .{
+                .col = try aa.dupe(u8, s.col),
+                .values = vals,
+                .negate = s.negate,
+            } };
+        },
         .@"and" => |children| PredicateExpr{ .@"and" = try cloneChildren(aa, children) },
         .@"or" => |children| PredicateExpr{ .@"or" = try cloneChildren(aa, children) },
         .not => |child| blk: {
@@ -976,6 +990,11 @@ pub const CompileCtx = struct {
     /// Strings duplicated into `allocator` to back Session updates from
     /// `USE` statements. Freed at `deinit`.
     session_strings: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Per-query arena for Values produced by the subquery pre-compile
+    /// pass (scalar values, IN-set materializations, text dupes). The
+    /// IR tree borrows pointers into this arena; freed at `deinit`.
+    /// Lazily initialized so plans without subqueries pay nothing.
+    subquery_arena: ?std.heap.ArenaAllocator = null,
     /// Rows affected by a top-level side-effect statement (INSERT today).
     /// Wire layers (MySQL OK_Packet, PG CommandComplete) read this after
     /// running the CompiledQuery. Zero for ops that don't mutate data.
@@ -987,6 +1006,16 @@ pub const CompileCtx = struct {
         self.materialized.deinit(self.allocator);
         for (self.session_strings.items) |s| self.allocator.free(s);
         self.session_strings.deinit(self.allocator);
+        if (self.subquery_arena) |*ar| ar.deinit();
+    }
+
+    /// Get (or lazily create) the subquery arena. Resolution-time
+    /// allocations from the pre-compile pass live here.
+    pub fn subqueryArena(self: *CompileCtx) Allocator {
+        if (self.subquery_arena == null) {
+            self.subquery_arena = std.heap.ArenaAllocator.init(self.allocator);
+        }
+        return self.subquery_arena.?.allocator();
     }
 };
 
@@ -1116,7 +1145,7 @@ fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
     switch (pred.*) {
-        .leaf, .is_null, .is_not_null, .like, .always => {},
+        .leaf, .is_null, .is_not_null, .like, .always, .in_set => {},
         .scalar_subquery => |sq| {
             const val = try runScalarSubquery(ctx, sq.source);
             pred.* = .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = val } };
@@ -1124,6 +1153,10 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
         .exists_subquery => |src| {
             const has_rows = try runExistsSubquery(ctx, src);
             pred.* = .{ .always = has_rows };
+        },
+        .in_subquery => |s| {
+            const values = try runInSubquery(ctx, s.source);
+            pred.* = .{ .in_set = .{ .col = s.col, .values = values, .negate = s.negate } };
         },
         .@"and" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
         .@"or" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
@@ -1170,6 +1203,57 @@ fn runExistsSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !bool {
     return false;
 }
 
+/// Drain an IN-subquery's inner. Inner must produce exactly one column.
+/// Materializes every non-NULL cell into a Value slice owned by
+/// `ctx.allocator` (text values dup'd into the same allocator).
+/// NULL handling per thinDB dialect: NULLs are dropped from the set —
+/// see [[thindb-not-in-nonstandard]] memory for the rationale.
+fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Value {
+    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(source_opaque)));
+    try resolveSubqueriesInOp(ctx, inner);
+
+    var q = try compileOp(ctx, inner);
+    defer q.deinit();
+
+    const schema = q.outputSchema();
+    if (schema.len != 1) return Error.BadRequest;
+
+    const aa = ctx.subqueryArena();
+    var out: std.ArrayList(Value) = .empty;
+
+    while (try q.next()) |batch| {
+        const view = batch.values[0];
+        var i: usize = 0;
+        while (i < batch.row_count) : (i += 1) {
+            if (!view.isValid(i)) continue;
+            const v = try extractScalarValueAt(aa, view, i);
+            try out.append(aa, v);
+        }
+    }
+    return try out.toOwnedSlice(aa);
+}
+
+fn extractScalarValueAt(allocator: Allocator, view: storage.ColumnView, idx: usize) !Value {
+    return switch (view.data) {
+        .int => |s| .{ .int = s[idx] },
+        .bigint => |s| .{ .bigint = s[idx] },
+        .smallint => |s| .{ .smallint = s[idx] },
+        .tinyint => |s| .{ .tinyint = s[idx] },
+        .largeint => |s| .{ .largeint = s[idx] },
+        .float => |s| .{ .float = s[idx] },
+        .double => |s| .{ .double = s[idx] },
+        .boolean => |s| .{ .boolean = s[idx] != 0 },
+        .date => |s| .{ .date = s[idx] },
+        .datetime => |s| .{ .datetime = s[idx] },
+        .decimal64 => |s| .{ .decimal64 = s[idx] },
+        .decimal128 => |s| .{ .decimal128 = s[idx] },
+        .uuid => |s| .{ .uuid = s[idx] },
+        .varchar => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
+        .string => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
+        .char => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
+    };
+}
+
 /// Compile + drain an inner Op, expecting exactly one row × one
 /// column. Returns the extracted scalar. Multi-row → error,
 /// multi-col → error, zero rows in Tier 1 also errors (NULL handling
@@ -1191,7 +1275,7 @@ fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !Value {
     if (try q.next() != null) return Error.BadRequest; // multi-row
 
     const view = first_batch.values[0];
-    return try extractScalarValue(ctx.allocator, view);
+    return try extractScalarValue(ctx.subqueryArena(), view);
 }
 
 fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {

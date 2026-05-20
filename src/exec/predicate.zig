@@ -62,6 +62,17 @@ pub const PredicateExpr = union(enum) {
     /// none. Used as the resolved form of EXISTS / NOT EXISTS and
     /// (later) NOT IN against an empty subquery result.
     always: bool,
+    /// `col [NOT] IN (SELECT ...)` — pre-compile pass drains the inner,
+    /// materializes its single column into a Value slice, rewrites
+    /// this node to `.in_set`. NULL handling per thinDB dialect: see
+    /// [[thindb-not-in-nonstandard]] — NULLs are dropped from the set
+    /// in both IN and NOT IN.
+    in_subquery: InSubquery,
+    /// Materialized set-membership filter — `.in_set.values` is the
+    /// inner subquery's column reified into Values; evaluator does
+    /// linear scan. v1 set sizes are small (typical < 1k) — hash-set
+    /// optimization is a follow-up.
+    in_set: InSet,
 };
 
 pub const LikePred = struct {
@@ -73,6 +84,18 @@ pub const ScalarSubquery = struct {
     col: []const u8,
     op: PredicateOp,
     source: *const anyopaque,
+};
+
+pub const InSubquery = struct {
+    col: []const u8,
+    source: *const anyopaque,
+    negate: bool,
+};
+
+pub const InSet = struct {
+    col: []const u8,
+    values: []const Value,
+    negate: bool,
 };
 
 pub fn likeExpr(col: []const u8, pattern: []const u8) PredicateExpr {
@@ -115,6 +138,20 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
         } },
         .exists_subquery => |src| .{ .exists_subquery = src },
         .always => |b| .{ .always = b },
+        .in_subquery => |s| .{ .in_subquery = .{
+            .col = try out_arena.dupe(u8, s.col),
+            .source = s.source,
+            .negate = s.negate,
+        } },
+        .in_set => |s| blk: {
+            const vals = try out_arena.alloc(Value, s.values.len);
+            for (s.values, vals) |v, *out| out.* = try cloneValue(out_arena, v);
+            break :blk .{ .in_set = .{
+                .col = try out_arena.dupe(u8, s.col),
+                .values = vals,
+                .negate = s.negate,
+            } };
+        },
         .@"and" => |kids| blk: {
             const dup = try out_arena.alloc(PredicateExpr, kids.len);
             for (kids, 0..) |k, i| dup[i] = try deepClonePredicate(out_arena, k);
@@ -191,10 +228,23 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // Scalar subqueries must be resolved (rewritten to `.leaf`) by
         // the pre-compile pass before validation runs. Reaching this
         // branch means the resolver missed a node — surface loudly.
-        .scalar_subquery, .exists_subquery => return Error.PredicateTypeMismatch,
+        .scalar_subquery, .exists_subquery, .in_subquery => return Error.PredicateTypeMismatch,
         // `.always` is a constant-bool resolved form; nothing to
         // validate against schema.
         .always => {},
+        // `.in_set` — column must exist and types must agree. The
+        // pre-compile pass already type-checked at resolution; this
+        // is a safety net.
+        .in_set => |s| {
+            const col_idx = blk: {
+                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, s.col)) break :blk i;
+                return Error.ColumnNotFound;
+            };
+            const col_tag = ValueTag.fromType(schema[col_idx].type);
+            for (s.values) |v| {
+                if (std.meta.activeTag(v) != col_tag) return Error.PredicateTypeMismatch;
+            }
+        },
     }
 }
 
@@ -371,8 +421,79 @@ pub fn evaluatePredicate(
             for (out) |*o| o.* = !o.*;
         },
         // Resolved by the pre-compile pass.
-        .scalar_subquery, .exists_subquery => return Error.PredicateTypeMismatch,
+        .scalar_subquery, .exists_subquery, .in_subquery => return Error.PredicateTypeMismatch,
         .always => |b| @memset(out, b),
+        .in_set => |s| {
+            const col_idx = blk: {
+                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, s.col)) break :blk i;
+                return Error.ColumnNotFound;
+            };
+            try evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
+        },
+    }
+}
+
+/// Per-row set-membership check. `negate=false` → IN, `true` → NOT IN.
+/// Set is guaranteed NULL-free (the resolver drops NULLs at materialization).
+/// Two-valued logic: NULL in the column never matches → IN false, NOT IN
+/// also false (consistent with the IN side).
+pub fn evaluateInSetMask(view: ColumnView, values: []const Value, negate: bool, n: usize, mask: []bool) !void {
+    // Outer per-column-type dispatch keeps the inner loop type-mono.
+    switch (view.data) {
+        .int => |col| {
+            for (0..n) |i| {
+                if (!view.isValid(i)) {
+                    mask[i] = false;
+                    continue;
+                }
+                var found = false;
+                for (values) |v| {
+                    if (v == .int and v.int == col[i]) {
+                        found = true;
+                        break;
+                    }
+                }
+                mask[i] = if (negate) !found else found;
+            }
+        },
+        .bigint => |col| {
+            for (0..n) |i| {
+                if (!view.isValid(i)) {
+                    mask[i] = false;
+                    continue;
+                }
+                var found = false;
+                for (values) |v| {
+                    if (v == .bigint and v.bigint == col[i]) {
+                        found = true;
+                        break;
+                    }
+                }
+                mask[i] = if (negate) !found else found;
+            }
+        },
+        .varchar => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
+        .string => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
+        .char => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
+        else => return Error.UnsupportedOperatorForType,
+    }
+}
+
+fn evalInSetStringy(sv: anytype, values: []const Value, negate: bool, view: ColumnView, n: usize, mask: []bool) !void {
+    for (0..n) |i| {
+        if (!view.isValid(i)) {
+            mask[i] = false;
+            continue;
+        }
+        const cell = sv.rowBytes(i);
+        var found = false;
+        for (values) |v| {
+            if (v == .text and std.mem.eql(u8, v.text, cell)) {
+                found = true;
+                break;
+            }
+        }
+        mask[i] = if (negate) !found else found;
     }
 }
 

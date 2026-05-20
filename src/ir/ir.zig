@@ -1204,9 +1204,9 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
         },
         // Subqueries are parse-time only — resolved before any wire
         // round-trip. Surface loudly if we hit an unresolved one.
-        // `.always` resolves to a leaf-like boolean and shouldn't
-        // appear in wire IR either (callers re-emit via SQL).
-        .scalar_subquery, .exists_subquery, .always => return EncodeError.OutOfMemory,
+        // `.always` / `.in_set` are post-resolution forms that also
+        // shouldn't appear in wire IR (callers re-emit via SQL).
+        .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set => return EncodeError.OutOfMemory,
         .@"and" => |children| {
             try out.append(allocator, @intFromEnum(PredTag.p_and));
             try appendU32(allocator, out, @intCast(children.len));
@@ -2090,7 +2090,7 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
 
 pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     switch (expr) {
-        .leaf, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .always => {},
+        .leaf, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set => {},
         .@"and", .@"or" => |children| {
             for (children) |c| freeDecodedPredicate(c, allocator);
             allocator.free(children);

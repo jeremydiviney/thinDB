@@ -437,6 +437,19 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
         },
         .exists_subquery => try out.appendSlice(allocator, "EXISTS (SELECT …)"),
         .always => |b| try out.appendSlice(allocator, if (b) "TRUE" else "FALSE"),
+        .in_subquery => |s| {
+            try out.appendSlice(allocator, s.col);
+            try out.appendSlice(allocator, if (s.negate) " NOT IN (SELECT …)" else " IN (SELECT …)");
+        },
+        .in_set => |s| {
+            try out.appendSlice(allocator, s.col);
+            try out.appendSlice(allocator, if (s.negate) " NOT IN [" else " IN [");
+            for (s.values, 0..) |v, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try writeValue(allocator, out, v);
+            }
+            try out.append(allocator, ']');
+        },
     }
 }
 

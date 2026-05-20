@@ -145,11 +145,24 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         return pe;
     }
 
-    // IN (lit, lit, ...) — desugar to OR-chain of equality leaves.
-    // NOT IN wraps the OR-chain in .not.
+    // IN (...) — three forms:
+    //   - IN (SELECT ...)   → captured as .in_subquery, resolved later
+    //   - IN (WITH ... SELECT ...) → same
+    //   - IN (lit, lit, ...) → desugars to OR-chain of equality leaves
+    // NOT IN wraps either form via .not (literal-list form) or via
+    // the .in_subquery.negate flag (subquery form).
     if (p.cur.tag == .kw_in) {
         try p.advance();
         try p.expect(.lparen);
+        if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
+            const source = try p.parseStatement();
+            try p.expect(.rparen);
+            return .{ .in_subquery = .{
+                .col = col_dup,
+                .source = @ptrCast(source),
+                .negate = negate_predicate,
+            } };
+        }
         var values: std.ArrayList(Value) = .empty;
         defer values.deinit(p.arena);
         while (true) {
