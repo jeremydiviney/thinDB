@@ -256,6 +256,16 @@ pub const Parser = struct {
             group_cols = try self.parseIdentList();
         }
 
+        // Optional HAVING — post-aggregate filter. Predicate may
+        // reference grouped columns and aggregate aliases declared
+        // in the projection. Validation happens at compile time
+        // against the post-GroupBy output schema.
+        var pending_having: ?PredicateExpr = null;
+        if (self.cur.tag == .kw_having) {
+            try self.advance();
+            pending_having = try self.parseBoolExpr();
+        }
+
         // Optional WINDOW clause — named windows declared here resolve
         // OVER name references seen in the projection. Comes after GROUP
         // BY per the SQL standard.
@@ -382,6 +392,14 @@ pub const Parser = struct {
                 .upstream = root,
             } });
 
+            // HAVING after GroupBy, before ORDER BY. Filter operator
+            // sees the post-aggregate schema, so references to agg
+            // aliases (`COUNT(*) > 10`-style — but as `cnt > 10` since
+            // we already alias every agg) resolve cleanly.
+            if (pending_having) |pred| {
+                root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
+            }
+
             // Apply ORDER BY on the grouped schema.
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
@@ -396,6 +414,9 @@ pub const Parser = struct {
                 root = try self.allocOp(.{ .select = .{ .columns = out_names, .upstream = root } });
             }
         } else {
+            // HAVING without GROUP BY / aggregates is rejected — would
+            // be silently equivalent to WHERE, which masks user intent.
+            if (pending_having != null) return ParseError.SqlInvalidProjection;
             // Non-aggregated. Pipeline shape:
             //   Compute(scalars) → Window(windows) → OrderBy → Project → Limit
             // Compute first so window args can reference computed columns;
