@@ -788,6 +788,23 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
                 .negate = s.negate,
             } };
         },
+        .correlated_scalar => |s| blk: {
+            const PredMod = @import("../exec/predicate.zig");
+            const outer_keys = try aa.alloc([]const u8, s.outer_keys.len);
+            for (s.outer_keys, outer_keys) |src, *dst| dst.* = try aa.dupe(u8, src);
+            const rows = try aa.alloc(PredMod.CorrelatedScalarRow, s.rows.len);
+            for (s.rows, rows) |src, *dst| {
+                const key = try aa.alloc(types.Value, src.key.len);
+                for (src.key, key) |v, *k| k.* = try cloneValue(aa, v);
+                dst.* = .{ .key = key, .value = try cloneValue(aa, src.value) };
+            }
+            break :blk PredicateExpr{ .correlated_scalar = .{
+                .outer_compared = try aa.dupe(u8, s.outer_compared),
+                .op = s.op,
+                .outer_keys = outer_keys,
+                .rows = rows,
+            } };
+        },
         .@"and" => |children| PredicateExpr{ .@"and" = try cloneChildren(aa, children) },
         .@"or" => |children| PredicateExpr{ .@"or" = try cloneChildren(aa, children) },
         .not => |child| blk: {
@@ -1165,8 +1182,9 @@ fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
     switch (pred.*) {
-        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set => {},
+        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set, .correlated_scalar => {},
         .scalar_subquery => |sq| {
+            if (try maybeResolveCorrelatedScalar(ctx, pred, sq)) return;
             const val = try runScalarSubquery(ctx, sq.source);
             pred.* = .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = val } };
         },
@@ -1307,6 +1325,132 @@ fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) 
         .outer_cols = outer_cols_owned,
         .rows = rows_owned,
         .negate = s.negate,
+    } };
+    return true;
+}
+
+/// Detect + decorrelate a correlated scalar subquery. The inner must
+/// be `GroupBy([], [agg], Filter(preds, Scan(T)))` — i.e., a single
+/// global aggregate with optional filter. We rewrite by promoting
+/// the correlation keys into the GROUP BY, drop correlation
+/// predicates, and materialize key_tuple → agg_value. Returns true
+/// when correlated and pred.* was rewritten.
+fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anytype) !bool {
+    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(sq.source)));
+
+    // Walk through Select/Project layers to find a GroupBy.
+    var cur: *const ir.Op = inner;
+    while (true) {
+        switch (cur.*) {
+            .select, .exclude => |p| cur = p.upstream,
+            .group_by, .filter, .scan => break,
+            else => return false,
+        }
+    }
+    if (cur.* != .group_by) return false;
+
+    const gb = cur.group_by;
+    if (gb.aggs.len != 1) return false;
+    if (gb.group_cols.len != 0) return false; // already-grouped → unsupported v1
+
+    // Find the Filter + Scan beneath the GroupBy.
+    var filter_pred: ?PredicateExpr = null;
+    var scan_op: *const ir.Op.Scan = undefined;
+    switch (gb.upstream.*) {
+        .filter => |*f| {
+            filter_pred = f.predicate;
+            switch (f.upstream.*) {
+                .scan => |*s| scan_op = s,
+                else => return false,
+            }
+        },
+        .scan => |*s| scan_op = s,
+        else => return false,
+    }
+
+    const catalog = catalogFor(ctx.db) orelse return false;
+    const t = resolveTable(catalog, ctx.session.*, scan_op.table) catch return false;
+    const inner_schema = t.schema;
+
+    var info = CorrelationInfo.init();
+    defer info.deinit(ctx.allocator);
+    info.scan = scan_op;
+    if (filter_pred) |p| try collectConjuncts(ctx, p, inner_schema, &info);
+    if (info.outer_cols.items.len == 0) return false;
+
+    // Build rewritten inner:
+    //   Scan(T)
+    //   └ Filter(kept_predicates)        [if any]
+    //     └ GroupBy(group_cols = inner_cols, aggs = [original_agg])
+    //
+    // The result rows are (inner_correlation_keys..., agg_value).
+    const aa = ctx.subqueryArena();
+    const scan_clone = try aa.create(ir.Op);
+    scan_clone.* = .{ .scan = scan_op.* };
+
+    var upstream: *ir.Op = scan_clone;
+    if (info.kept_predicates.items.len > 0) {
+        const new_pred: PredicateExpr = if (info.kept_predicates.items.len == 1)
+            info.kept_predicates.items[0]
+        else blk: {
+            const kids = try aa.alloc(PredicateExpr, info.kept_predicates.items.len);
+            for (info.kept_predicates.items, kids) |src, *dst| dst.* = src;
+            break :blk PredicateExpr{ .@"and" = kids };
+        };
+        const f = try aa.create(ir.Op);
+        f.* = .{ .filter = .{ .predicate = new_pred, .upstream = upstream } };
+        upstream = f;
+    }
+    const group_cols = try aa.alloc([]const u8, info.inner_cols.items.len);
+    for (info.inner_cols.items, group_cols) |c, *dst| dst.* = c;
+    const aggs = try aa.alloc(ir.AggSpec, 1);
+    aggs[0] = gb.aggs[0];
+    const gb_new = try aa.create(ir.Op);
+    gb_new.* = .{ .group_by = .{
+        .group_cols = group_cols,
+        .aggs = aggs,
+        .upstream = upstream,
+    } };
+
+    // Drain. Output schema is [inner_correlation_keys..., agg_value].
+    var q = try compileOp(ctx, gb_new);
+    defer q.deinit();
+
+    const schema = q.outputSchema();
+    if (schema.len != info.inner_cols.items.len + 1) return false;
+    const agg_col_idx = schema.len - 1;
+
+    const outer_keys_owned = try aa.alloc([]const u8, info.outer_cols.items.len);
+    for (info.outer_cols.items, outer_keys_owned) |c, *dst| dst.* = try aa.dupe(u8, c);
+
+    var rows: std.ArrayList(@import("../exec/predicate.zig").CorrelatedScalarRow) = .empty;
+    while (try q.next()) |batch| {
+        var i: usize = 0;
+        while (i < batch.row_count) : (i += 1) {
+            const key = try aa.alloc(Value, info.inner_cols.items.len);
+            var any_null = false;
+            for (0..info.inner_cols.items.len) |j| {
+                const view = batch.values[j];
+                if (!view.isValid(i)) {
+                    any_null = true;
+                    break;
+                }
+                key[j] = try extractScalarValueAt(aa, view, i);
+            }
+            if (any_null) continue;
+            const agg_view = batch.values[agg_col_idx];
+            if (!agg_view.isValid(i)) continue;
+            const v = try extractScalarValueAt(aa, agg_view, i);
+            try rows.append(aa, .{ .key = key, .value = v });
+        }
+    }
+    const rows_owned = try rows.toOwnedSlice(aa);
+
+    pred.* = .{ .correlated_scalar = .{
+        .outer_compared = try aa.dupe(u8, sq.col),
+        .op = sq.op,
+        .outer_keys = outer_keys_owned,
+        .rows = rows_owned,
     } };
     return true;
 }

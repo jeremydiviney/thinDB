@@ -90,6 +90,15 @@ pub const PredicateExpr = union(enum) {
     /// the tuple can't match (consistent with the NOT IN dialect:
     /// see [[thindb-not-in-nonstandard]]).
     correlated_set: CorrelatedSet,
+    /// Resolved form of a correlated scalar subquery
+    /// (`outer.x op (SELECT agg(y) FROM B WHERE B.k = outer.k ...)`).
+    /// The pre-compile pass added the correlation keys to the inner's
+    /// GROUP BY and dropped the correlation predicates. Each result
+    /// row is `(key_tuple, agg_value)`. Per outer row: look up by
+    /// `outer_keys`, then compare `outer_compared op agg_value`. No
+    /// matching key → predicate fails (the standard SQL semantics
+    /// for a missing scalar-subquery result).
+    correlated_scalar: CorrelatedScalar,
 };
 
 pub const LikePred = struct {
@@ -119,6 +128,23 @@ pub const ColColPred = struct {
     left: []const u8,
     op: PredicateOp,
     right: []const u8,
+};
+
+pub const CorrelatedScalarRow = struct {
+    key: []const Value,
+    value: Value,
+};
+
+pub const CorrelatedScalar = struct {
+    /// The outer column being compared against the subquery result.
+    outer_compared: []const u8,
+    /// The comparison operator from the outer predicate.
+    op: PredicateOp,
+    /// Outer correlation keys, parallel to each row's `key` tuple.
+    outer_keys: []const []const u8,
+    /// Materialized rows. `key` tuples are unique (the inner's
+    /// GROUP BY on the correlation columns guarantees that).
+    rows: []const CorrelatedScalarRow,
 };
 
 pub const CorrelatedSet = struct {
@@ -208,6 +234,22 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
                 .outer_cols = outer_cols,
                 .rows = rows,
                 .negate = s.negate,
+            } };
+        },
+        .correlated_scalar => |s| blk: {
+            const outer_keys = try out_arena.alloc([]const u8, s.outer_keys.len);
+            for (s.outer_keys, outer_keys) |src, *dst| dst.* = try out_arena.dupe(u8, src);
+            const rows = try out_arena.alloc(CorrelatedScalarRow, s.rows.len);
+            for (s.rows, rows) |src, *dst| {
+                const key = try out_arena.alloc(Value, src.key.len);
+                for (src.key, key) |v, *k| k.* = try cloneValue(out_arena, v);
+                dst.* = .{ .key = key, .value = try cloneValue(out_arena, src.value) };
+            }
+            break :blk .{ .correlated_scalar = .{
+                .outer_compared = try out_arena.dupe(u8, s.outer_compared),
+                .op = s.op,
+                .outer_keys = outer_keys,
+                .rows = rows,
             } };
         },
         .@"and" => |kids| blk: {
@@ -334,6 +376,14 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                     const expected = ValueTag.fromType(schema[col_idx].type);
                     if (std.meta.activeTag(v) != expected) return Error.PredicateTypeMismatch;
                 }
+            }
+        },
+        // `.correlated_scalar` — outer_compared + outer_keys all
+        // exist; per-row keys + value type tags match.
+        .correlated_scalar => |s| {
+            _ = findCol(schema, s.outer_compared) orelse return Error.ColumnNotFound;
+            for (s.outer_keys) |c_name| {
+                _ = findCol(schema, c_name) orelse return Error.ColumnNotFound;
             }
         },
     }
@@ -538,7 +588,94 @@ pub fn evaluatePredicate(
             try evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
         },
         .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out),
+        .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out),
     }
+}
+
+/// Per-row: build key from outer_keys, look up matching CorrelatedScalarRow,
+/// then compare outer_compared op row.value. Missing key → row fails.
+pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column, batch: anytype, out: []bool) !void {
+    const n_keys = s.outer_keys.len;
+    var key_idx_buf: [16]usize = undefined;
+    if (n_keys > key_idx_buf.len) return Error.PredicateTypeMismatch;
+    const key_idxs = key_idx_buf[0..n_keys];
+    for (s.outer_keys, key_idxs) |c_name, *idx_out| {
+        idx_out.* = findCol(schema, c_name) orelse return Error.ColumnNotFound;
+    }
+    const cmp_idx = findCol(schema, s.outer_compared) orelse return Error.ColumnNotFound;
+    const cmp_view = batch.values[cmp_idx];
+
+    var i: usize = 0;
+    while (i < batch.row_count) : (i += 1) {
+        // NULL on outer comparison column or any outer key → fails.
+        if (!cmp_view.isValid(i)) {
+            out[i] = false;
+            continue;
+        }
+        var any_null = false;
+        for (key_idxs) |idx| {
+            if (!batch.values[idx].isValid(i)) {
+                any_null = true;
+                break;
+            }
+        }
+        if (any_null) {
+            out[i] = false;
+            continue;
+        }
+
+        // Linear-scan rows for matching key.
+        var found_value: ?Value = null;
+        for (s.rows) |row| {
+            var all_match = true;
+            for (key_idxs, row.key) |idx, ref_val| {
+                if (!cellMatchesValue(batch.values[idx], i, ref_val)) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) {
+                found_value = row.value;
+                break;
+            }
+        }
+        if (found_value) |v| {
+            out[i] = try compareCellToValue(cmp_view, i, s.op, v);
+        } else {
+            out[i] = false;
+        }
+    }
+}
+
+fn compareCellToValue(view: ColumnView, idx: usize, op: PredicateOp, ref: Value) !bool {
+    return switch (view.data) {
+        .int => |s| if (ref == .int) cmp(i32, s[idx], ref.int, op) else false,
+        .bigint => |s| if (ref == .bigint) cmp(i64, s[idx], ref.bigint, op) else false,
+        .smallint => |s| if (ref == .smallint) cmp(i16, s[idx], ref.smallint, op) else false,
+        .tinyint => |s| if (ref == .tinyint) cmp(i8, s[idx], ref.tinyint, op) else false,
+        .largeint => |s| if (ref == .largeint) cmp(i128, s[idx], ref.largeint, op) else false,
+        .float => |s| if (ref == .float) cmp(f32, s[idx], ref.float, op) else false,
+        .double => |s| if (ref == .double) cmp(f64, s[idx], ref.double, op) else false,
+        .boolean => |s| if (ref == .boolean) cmp(u8, s[idx], @intFromBool(ref.boolean), op) else false,
+        .date => |s| if (ref == .date) cmp(i32, s[idx], ref.date, op) else false,
+        .datetime => |s| if (ref == .datetime) cmp(i64, s[idx], ref.datetime, op) else false,
+        .decimal64 => |s| if (ref == .decimal64) cmp(i64, s[idx], ref.decimal64, op) else false,
+        .decimal128 => |s| if (ref == .decimal128) cmp(i128, s[idx], ref.decimal128, op) else false,
+        .uuid => |s| if (ref == .uuid) cmp(u128, s[idx], ref.uuid, op) else false,
+        // Strings: only eq/neq supported.
+        .varchar => |sv| if (ref == .text) blk: {
+            const eq = std.mem.eql(u8, sv.rowBytes(idx), ref.text);
+            break :blk if (op == .eq) eq else if (op == .neq) !eq else false;
+        } else false,
+        .string => |sv| if (ref == .text) blk: {
+            const eq = std.mem.eql(u8, sv.rowBytes(idx), ref.text);
+            break :blk if (op == .eq) eq else if (op == .neq) !eq else false;
+        } else false,
+        .char => |sv| if (ref == .text) blk: {
+            const eq = std.mem.eql(u8, sv.rowBytes(idx), ref.text);
+            break :blk if (op == .eq) eq else if (op == .neq) !eq else false;
+        } else false,
+    };
 }
 
 /// Per-row tuple lookup against a materialized correlated set.

@@ -469,6 +469,20 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
             try out.appendSlice(allocator, s_count);
             try out.append(allocator, ']');
         },
+        .correlated_scalar => |s| {
+            try out.appendSlice(allocator, s.outer_compared);
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, opSymbol(s.op));
+            try out.appendSlice(allocator, " agg(");
+            for (s.outer_keys, 0..) |c, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, c);
+            }
+            try out.appendSlice(allocator, ")");
+            var buf: [16]u8 = undefined;
+            const s_count = try std.fmt.bufPrint(&buf, " [{d} keys]", .{s.rows.len});
+            try out.appendSlice(allocator, s_count);
+        },
     }
 }
 
