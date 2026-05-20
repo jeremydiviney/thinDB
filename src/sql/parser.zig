@@ -1053,7 +1053,7 @@ pub const Parser = struct {
                 const col_dup = try self.dupQualifiedColRef(name);
                 return ir.Expr{ .col_ref = col_dup };
             },
-            .integer, .floating, .string, .kw_true, .kw_false => {
+            .plus, .minus, .integer, .floating, .string, .kw_true, .kw_false => {
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
             },
@@ -1539,6 +1539,30 @@ pub const Parser = struct {
     pub fn parseValue(self: *Parser) ParseError!Value {
         const tok = self.cur;
         switch (tok.tag) {
+            .plus, .minus => {
+                const negate = tok.tag == .minus;
+                try self.advance();
+                const signed_tok = self.cur;
+                switch (signed_tok.tag) {
+                    .integer => {
+                        try self.advance();
+                        const raw = signed_tok.value.integer;
+                        const v = if (negate) -raw else raw;
+                        // Default literal type: int (i32). Promote to bigint
+                        // if out of i32 range.
+                        if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) {
+                            return .{ .int = @intCast(v) };
+                        }
+                        return .{ .bigint = v };
+                    },
+                    .floating => {
+                        try self.advance();
+                        const v = if (negate) -signed_tok.value.floating else signed_tok.value.floating;
+                        return .{ .double = v };
+                    },
+                    else => return ParseError.SqlExpectedValue,
+                }
+            },
             .integer => {
                 try self.advance();
                 const v = tok.value.integer;
