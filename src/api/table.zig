@@ -545,6 +545,24 @@ pub const Table = struct {
         return deleted;
     }
 
+    /// SQL `DELETE FROM t [WHERE expr]` — generalized delete with the
+    /// rich PredicateExpr. Subqueries and `@vars` must already be
+    /// resolved by the pre-compile pass. `pred == null` deletes every
+    /// row. Returns the deleted row count. Streams per segment so
+    /// memory stays bounded by segment size.
+    ///
+    /// Note: WAL semantics for the rich predicate aren't implemented
+    /// yet (the existing appendDelete signature only carries the
+    /// simple `exec.Predicate`). For v1, durability comes from the
+    /// per-segment tombstone-file atomicity (tmp + rename) and the
+    /// memtable clone-and-swap. Crash recovery rebuilds segment
+    /// state from the persisted tombstone files.
+    pub fn deleteByExpr(self: *Table, pred: ?exec.PredicateExpr) !usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return try @import("delete.zig").execDeleteByExpr(self, pred);
+    }
+
     /// Merge all segments into a single new segment. Drops tombstoned rows.
     /// No-op if there's at most one segment.
     pub fn compact(self: *Table) !void {

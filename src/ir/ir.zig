@@ -366,6 +366,10 @@ pub const OpTag = enum(u8) {
     /// MySQL-style user-defined variable assignment: `SET @name = expr`.
     /// Side-effect — mutates the session's vars map. Produces no rows.
     set_var = 19,
+    /// `DELETE FROM t [WHERE ...]` — tombstone matching rows
+    /// (segments) and clone the memtable without them. Streaming;
+    /// memory bounded by per-segment tombstone list.
+    delete_op = 20,
 };
 
 pub const BatchOp = struct {
@@ -391,6 +395,15 @@ pub const SetUnion = struct {
 pub const SetVar = struct {
     name: []const u8,
     value: Expr,
+};
+
+/// `DELETE FROM t [WHERE ...]` — bulk row-deletion against an
+/// existing table. `predicate == null` means delete all rows. The
+/// predicate is the full `PredicateExpr` (so AND/OR/IN/subquery
+/// forms all work after the pre-compile resolver passes).
+pub const DeleteOp = struct {
+    table: TableRef,
+    predicate: ?@import("../exec/predicate.zig").PredicateExpr,
 };
 
 /// CREATE TABLE name AS SELECT ... — schema inferred from the
@@ -437,6 +450,7 @@ pub const Op = union(OpTag) {
     create_table_as: CreateTableAs,
     insert_select: InsertSelect,
     set_var: SetVar,
+    delete_op: DeleteOp,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -615,8 +629,8 @@ pub const Op = union(OpTag) {
                 i.source.deinitDecoded(allocator);
                 allocator.destroy(i.source);
             },
-            // Never reached: SET @var isn't wire-decoded.
-            .set_var => {},
+            // Never reached: SET @var / DELETE aren't wire-decoded.
+            .set_var, .delete_op => {},
         }
     }
 };
@@ -711,6 +725,10 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         // SQL path executes it without wire round-trip. Wire-encoding
         // it would require resolving the Expr to a literal first.
         .set_var => return EncodeError.OutOfMemory,
+        // DELETE is server-local in v1; wire encoding would need a
+        // predicate-encode path that handles every resolved variant.
+        // Add when a remote-client builder needs it.
+        .delete_op => return EncodeError.OutOfMemory,
     }
 }
 
@@ -1342,7 +1360,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.set_var)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.delete_op)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1630,7 +1648,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
         },
         // SET @var is never wire-encoded (encodeOp errors on it). If
         // a decoder somehow sees its tag, that's a corrupted stream.
-        .set_var => return Error.IrCorrupt,
+        .set_var, .delete_op => return Error.IrCorrupt,
     };
 }
 

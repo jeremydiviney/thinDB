@@ -104,6 +104,7 @@ pub const TokenTag = enum {
     /// Same `SET` keyword used for session config in PG; thinDB v1
     /// only accepts the MySQL form.
     kw_set,
+    kw_delete,
 
     /// MySQL-style user-defined variable: `@name`. The `text` field
     /// carries the name without the `@` prefix. Resolved to a literal
@@ -503,6 +504,7 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "union", .tag = .kw_union },
         .{ .name = "all", .tag = .kw_all },
         .{ .name = "set", .tag = .kw_set },
+        .{ .name = "delete", .tag = .kw_delete },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;

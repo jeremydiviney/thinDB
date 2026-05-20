@@ -3,9 +3,12 @@
 //! matching rows. Memtable rows are filtered in-place via retainRows.
 
 const std = @import("std");
-const ValueTag = @import("../types.zig").ValueTag;
+const types = @import("../types.zig");
+const ValueTag = types.ValueTag;
+const Column = types.Column;
 const storage = @import("../storage/storage.zig");
 const exec = @import("../exec/exec.zig");
+const predicate = exec.predicate;
 
 const api = @import("api.zig");
 const Table = api.Table;
@@ -79,6 +82,134 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
         defer t.allocator.free(keep);
         const view = t.memtable.columns[col_idx].view();
         for (0..n) |i| keep[i] = !comparison.evalRow(view, @intCast(i), pred);
+
+        if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
+            const old_mt = t.memtable;
+            t.memtable = new_mt;
+            old_mt.retire();
+            old_mt.release();
+            total += n - new_mt.row_count;
+        }
+    }
+
+    return total;
+}
+
+/// `DELETE FROM t [WHERE expr]` — generalized delete accepting the
+/// rich `PredicateExpr` (AND/OR/IN/etc). Same per-segment streaming
+/// shape as `execDelete` — tombstone offsets accumulate per segment
+/// (bounded by segment size, never by total table size), get merged
+/// into the segment's tombstone file, then the buffer is freed
+/// before moving to the next segment. Memtable rows are filtered
+/// via clone-and-swap, same as the simple `execDelete` path.
+///
+/// `pred_or_null == null` means delete every row.
+pub fn execDeleteByExpr(t: *Table, pred_or_null: ?predicate.PredicateExpr) !usize {
+    var total: usize = 0;
+
+    // Type-widen + schema-check the predicate once before walking
+    // segments. Same lossless widening Filter does at create-time
+    // (e.g. INT literal against a BIGINT column → mutated to bigint).
+    if (pred_or_null) |*p_const| {
+        // validateExpr mutates leaves in place; we need a mutable
+        // reference but the IR's predicate is by-value here. Cast
+        // is safe: we own the in-memory IR for the duration of
+        // this call.
+        const p_mut: *predicate.PredicateExpr = @constCast(p_const);
+        try predicate.validateExpr(p_mut, t.schema.columns);
+    }
+
+    // ---- Segments ----
+    for (t.manifest.segments.items) |entry| {
+        var name_buf: [32]u8 = undefined;
+        const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
+        var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);
+        defer seg.deinit();
+
+        var deleted: std.ArrayList(u32) = .empty;
+        defer deleted.deinit(t.allocator);
+
+        var row_offset: u32 = 0;
+        for (seg.info.row_groups, 0..) |rg, rg_idx| {
+            const n = rg.row_count;
+
+            if (pred_or_null == null) {
+                // No predicate → every row tombstoned. Skip decoding.
+                var i: u32 = 0;
+                while (i < n) : (i += 1) try deleted.append(t.allocator, row_offset + i);
+                row_offset += n;
+                continue;
+            }
+
+            // Decode all columns the predicate might touch — for v1
+            // simplicity, decode the whole row group. (A future
+            // optimization could pre-scan the predicate to learn
+            // which columns are referenced.)
+            const owned_cols = try t.allocator.alloc(storage.OwnedColumn, t.schema.columns.len);
+            defer {
+                for (owned_cols) |*oc| oc.deinit(t.allocator);
+                t.allocator.free(owned_cols);
+            }
+            for (t.schema.columns, 0..) |_, ci| {
+                owned_cols[ci] = try seg.decodeColumn(t.allocator, t.schema, rg_idx, ci);
+            }
+
+            const views = try t.allocator.alloc(storage.ColumnView, t.schema.columns.len);
+            defer t.allocator.free(views);
+            for (owned_cols, views) |oc, *v| v.* = oc.view();
+
+            const fake_batch: exec.Batch = .{
+                .schema = t.schema.columns,
+                .values = views,
+                .row_count = n,
+            };
+            const mask = try t.allocator.alloc(bool, n);
+            defer t.allocator.free(mask);
+            try predicate.evaluatePredicate(t.allocator, pred_or_null.?, t.schema.columns, fake_batch, mask);
+
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                if (mask[i]) try deleted.append(t.allocator, row_offset + i);
+            }
+            row_offset += n;
+        }
+
+        if (deleted.items.len > 0) {
+            try storage.tombstone.merge(
+                t.allocator,
+                t.io,
+                t.segments_dir,
+                entry.segment_id,
+                deleted.items,
+                t.syncEnabled(),
+            );
+            total += deleted.items.len;
+        }
+    }
+
+    // ---- Memtable ----
+    // Same snapshot-isolated clone-and-swap shape as `execDelete`.
+    if (t.memtable.row_count > 0) {
+        const n: usize = @intCast(t.memtable.row_count);
+        const keep = try t.allocator.alloc(bool, n);
+        defer t.allocator.free(keep);
+
+        if (pred_or_null == null) {
+            @memset(keep, false);
+        } else {
+            const views = try t.allocator.alloc(storage.ColumnView, t.schema.columns.len);
+            defer t.allocator.free(views);
+            for (t.memtable.columns, views) |*c, *v| v.* = c.view();
+            const fake_batch: exec.Batch = .{
+                .schema = t.schema.columns,
+                .values = views,
+                .row_count = n,
+            };
+            const mask = try t.allocator.alloc(bool, n);
+            defer t.allocator.free(mask);
+            try predicate.evaluatePredicate(t.allocator, pred_or_null.?, t.schema.columns, fake_batch, mask);
+            for (mask, keep) |m, *k| k.* = !m;
+        }
 
         if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
             const old_mt = t.memtable;

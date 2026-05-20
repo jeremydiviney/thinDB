@@ -62,6 +62,9 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
     switch (op.*) {
         .scan, .ddl, .show, .insert, .copy => {},
         .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value),
+        .delete_op => |*d| {
+            if (d.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
+        },
         .limit => |l| try resolveSubqueriesInOp(ctx, @constCast(l.upstream)),
         .select, .exclude => |p| try resolveSubqueriesInOp(ctx, @constCast(p.upstream)),
         .filter => |*f| {

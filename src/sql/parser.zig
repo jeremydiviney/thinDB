@@ -224,6 +224,7 @@ pub const Parser = struct {
             .kw_insert => return try parse_ddl.parseInsert(self),
             .kw_copy => return try parse_ddl.parseCopy(self),
             .kw_set => return try self.parseSetVar(),
+            .kw_delete => return try self.parseDelete(),
             else => {},
         }
         // Optional WITH clause: zero-or-more named CTEs precede the
@@ -1413,6 +1414,23 @@ pub const Parser = struct {
         return try pairs.toOwnedSlice(self.arena);
     }
 
+    /// Parse `DELETE FROM <table> [WHERE <bool_expr>]`. The
+    /// predicate uses the full PredicateExpr grammar so AND/OR/IN
+    /// (literal-list AND subquery) work — pre-compile resolution
+    /// handles subqueries and `@var` references before the per-row
+    /// evaluation runs.
+    pub fn parseDelete(self: *Parser) ParseError!*ir.Op {
+        try self.expect(.kw_delete);
+        try self.expect(.kw_from);
+        const tref = try self.parseTableRef();
+        var pred: ?PredicateExpr = null;
+        if (self.cur.tag == .kw_where) {
+            try self.advance();
+            pred = try self.parseBoolExpr();
+        }
+        return try self.allocOp(.{ .delete_op = .{ .table = tref, .predicate = pred } });
+    }
+
     /// Parse `SET @name = expr`. The RHS is a general Expr so users
     /// can write `SET @cutoff = (SELECT MAX(amount) FROM orders)` —
     /// the pre-compile pass resolves any scalar subquery into a
@@ -1638,7 +1656,7 @@ fn countRefs(
             try visitChild(arena, refs, j.right);
         },
         .materialize => |m| try visitChild(arena, refs, m.upstream),
-        .ddl, .show, .insert, .copy, .set_var => {},
+        .ddl, .show, .insert, .copy, .set_var, .delete_op => {},
         .batch => |b| for (b.statements) |sub| try visitChild(arena, refs, sub),
         .window => |w| try visitChild(arena, refs, w.upstream),
         .set_union => |u| {

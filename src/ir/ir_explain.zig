@@ -231,6 +231,15 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try out.appendSlice(allocator, sv.name);
             try out.append(allocator, '\n');
         },
+        .delete_op => |d| {
+            try out.appendSlice(allocator, "Delete ");
+            try writeTableRef(allocator, out, d.table);
+            if (d.predicate) |p| {
+                try out.appendSlice(allocator, " WHERE ");
+                try explainPredicate(allocator, out, p);
+            }
+            try out.append(allocator, '\n');
+        },
     }
 }
 

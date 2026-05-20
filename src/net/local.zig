@@ -1027,7 +1027,7 @@ pub fn buildServerQuerySession(
         // CTAS / INSERT-SELECT come from SQL parsing and only go
         // through the CompileCtx path. The plan-builder + wire path
         // doesn't construct these.
-        .create_table_as, .insert_select, .set_var => return Error.UnsupportedOp,
+        .create_table_as, .insert_select, .set_var, .delete_op => return Error.UnsupportedOp,
     };
 }
 
@@ -1290,7 +1290,19 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .create_table_as => |c| try compileCreateTableAs(ctx, c),
         .insert_select => |i| try compileInsertSelect(ctx, i),
         .set_var => |sv| try compileSetVar(ctx, sv),
+        .delete_op => |d| try compileDelete(ctx, d),
     };
+}
+
+/// `DELETE FROM t [WHERE ...]` — resolve the table, call
+/// `Table.deleteByExpr` (which streams per segment), and report
+/// the affected row count back through CompileCtx.
+fn compileDelete(ctx: *CompileCtx, d: ir.DeleteOp) !Query {
+    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const t = try resolveTable(catalog, ctx.session.*, d.table);
+    const deleted = try t.deleteByExpr(d.predicate);
+    ctx.affected_rows = @intCast(deleted);
+    return try EmptyOp.createWithCount(ctx.allocator, deleted);
 }
 
 /// `SET @name = expr` — evaluate the RHS Expr (which may contain a
