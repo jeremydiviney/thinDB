@@ -1172,7 +1172,20 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
         .create_table => |ct| {
             const cols = try ctx.allocator.alloc(types.Column, ct.columns.len);
             defer ctx.allocator.free(cols);
+            var saw_auto_increment = false;
             for (ct.columns, 0..) |c, ci| {
+                if (c.auto_increment) {
+                    // MySQL allows exactly one AI column per table. The
+                    // column must be integer-typed; DEFAULT alongside is
+                    // ambiguous (which one wins?) and forbidden. These
+                    // checks fire before the DEFAULT type-tag validation
+                    // below so AI+DEFAULT surfaces as UnsupportedOp rather
+                    // than getting filtered as a tag mismatch.
+                    if (saw_auto_increment) return Error.UnsupportedOp;
+                    if (c.default_value != null) return Error.UnsupportedOp;
+                    if (!c.column_type.isInteger()) return Error.TypeMismatch;
+                    saw_auto_increment = true;
+                }
                 // Validate DEFAULT value-tag matches the column type so a
                 // mismatch errors at CREATE TABLE rather than first INSERT.
                 if (c.default_value) |dv| {
@@ -1185,6 +1198,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                     .type = c.column_type,
                     .nullable = c.nullable,
                     .default_value = c.default_value,
+                    .auto_increment = c.auto_increment,
                 };
             }
             const schema_def: TableSchema = .{
@@ -1279,14 +1293,21 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
         const col = tbl_schema.columns[si];
         // Omitted column is OK if it's nullable OR has a DEFAULT — the
         // INSERT row build below substitutes the default for missing
-        // values. NOT NULL columns without a default still error.
-        if (maybe_src == null and !col.nullable and col.default_value == null) return Error.ColumnNotFound;
+        // values. AUTO_INCREMENT cols also auto-fill, so they don't
+        // require an explicit source. NOT NULL columns without any of
+        // these still error.
+        if (maybe_src == null and !col.nullable and col.default_value == null and !col.auto_increment) {
+            return Error.ColumnNotFound;
+        }
     }
     for (op.rows) |row| {
         if (row.len != source_widths) return Error.BadRequest;
         for (schema_to_source, 0..) |maybe_src, si| {
             if (maybe_src) |src| {
-                if (row[src] == null and !tbl_schema.columns[si].nullable) {
+                const col = tbl_schema.columns[si];
+                // Explicit NULL on an AI column is fine — the counter
+                // fills it. Otherwise NULL on NOT NULL is a type error.
+                if (row[src] == null and !col.nullable and !col.auto_increment) {
                     return Error.TypeMismatch;
                 }
             }
@@ -1298,32 +1319,104 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
         return try EmptyOp.createWithCount(ctx.allocator, 0);
     }
 
+    // AUTO_INCREMENT resolution must run under the Table mutex so the
+    // counter we reserve and the rows we hand to insertBatch stay in
+    // lock-step. We reserve a contiguous block up front, then fill each
+    // omitted/NULL AI cell with the next id while also bumping the
+    // counter past any explicit value the caller supplied.
+    const ai_idx_opt = @import("../api/table.zig").autoIncrementColumnIndex(tbl_schema);
+
     var builder = try InsertColumnBuilder.init(ctx.allocator, tbl_schema, row_count);
     defer builder.deinit();
 
-    for (op.rows) |row| {
-        for (tbl_schema.columns, 0..) |col, si| {
-            const maybe_src = schema_to_source[si];
-            // Resolution order for the cell:
-            //   1. User-supplied value (incl. an explicit NULL on a
-            //      nullable column).
-            //   2. Column DEFAULT, when no source AND a default exists.
-            //   3. NULL (the column must be nullable to reach this
-            //      branch — validation above ensures it).
-            const cell: ?Value = if (maybe_src) |src|
-                row[src]
-            else if (col.default_value) |dv|
-                dv
-            else
-                null;
-            try builder.appendCell(si, col, cell);
-        }
-    }
+    if (ai_idx_opt) |ai_idx| {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
 
-    try t.insertBatch(builder.schemaSlice(), builder.views(), row_count);
+        const ai_col = tbl_schema.columns[ai_idx];
+        const ai_src = schema_to_source[ai_idx];
+
+        var next_counter = t.reserveAutoIncrement(@intCast(row_count));
+        for (op.rows) |row| {
+            for (tbl_schema.columns, 0..) |col, si| {
+                const maybe_src = schema_to_source[si];
+                const cell: ?Value = if (si == ai_idx) blk: {
+                    const user_cell: ?Value = if (ai_src) |s| row[s] else null;
+                    if (user_cell) |uv| {
+                        // Explicit value; observe to push counter
+                        // past it. integer-only validated at create.
+                        t.observeAutoIncrement(integerValueAsI128(uv) catch return Error.TypeMismatch);
+                        break :blk uv;
+                    }
+                    // Omitted or explicit NULL → take the next id.
+                    const id = next_counter;
+                    next_counter += 1;
+                    break :blk integerLiteralForType(ai_col.type, id) catch return Error.TypeMismatch;
+                } else if (maybe_src) |src|
+                    row[src]
+                else if (col.default_value) |dv|
+                    dv
+                else
+                    null;
+                try builder.appendCell(si, col, cell);
+            }
+        }
+
+        try t.insertBatchLocked(builder.schemaSlice(), builder.views(), row_count);
+    } else {
+        for (op.rows) |row| {
+            for (tbl_schema.columns, 0..) |col, si| {
+                const maybe_src = schema_to_source[si];
+                // Resolution order for the cell:
+                //   1. User-supplied value (incl. an explicit NULL on a
+                //      nullable column).
+                //   2. Column DEFAULT, when no source AND a default exists.
+                //   3. NULL (the column must be nullable to reach this
+                //      branch — validation above ensures it).
+                const cell: ?Value = if (maybe_src) |src|
+                    row[src]
+                else if (col.default_value) |dv|
+                    dv
+                else
+                    null;
+                try builder.appendCell(si, col, cell);
+            }
+        }
+
+        try t.insertBatch(builder.schemaSlice(), builder.views(), row_count);
+    }
 
     ctx.affected_rows = @intCast(row_count);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(row_count));
+}
+
+/// Extract an integer Value as i128 for AUTO_INCREMENT counter
+/// observation. Rejects non-integer tags so a stray DEFAULT for a
+/// text/decimal column never bumps the counter.
+fn integerValueAsI128(v: Value) !i128 {
+    return switch (v) {
+        .tinyint => |x| @as(i128, x),
+        .smallint => |x| @as(i128, x),
+        .int => |x| @as(i128, x),
+        .bigint => |x| @as(i128, x),
+        .largeint => |x| x,
+        else => Error.TypeMismatch,
+    };
+}
+
+/// Build a typed integer literal for the AI column type, given a
+/// freshly reserved u64 counter value. Saturates at the column's
+/// representable max — beyond that, future inserts will keep getting
+/// the same value, which surfaces as a unique-key violation downstream.
+fn integerLiteralForType(t: types.Type, id: u64) !Value {
+    return switch (t) {
+        .tinyint => Value{ .tinyint = @intCast(@min(id, @as(u64, @intCast(std.math.maxInt(i8))))) },
+        .smallint => Value{ .smallint = @intCast(@min(id, @as(u64, @intCast(std.math.maxInt(i16))))) },
+        .int => Value{ .int = @intCast(@min(id, @as(u64, @intCast(std.math.maxInt(i32))))) },
+        .bigint => Value{ .bigint = @intCast(@min(id, @as(u64, @intCast(std.math.maxInt(i64))))) },
+        .largeint => Value{ .largeint = @as(i128, id) },
+        else => Error.TypeMismatch,
+    };
 }
 
 /// Per-column buffer used to bulk-collect literal Value rows for an

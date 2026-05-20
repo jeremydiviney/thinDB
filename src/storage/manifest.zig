@@ -2,15 +2,17 @@
 //! write-tmp-then-rename so readers either see the old or new state, never a
 //! partial state.
 //!
-//! Format (binary, little-endian):
+//! Format (v5, binary, little-endian):
 //!
-//!   [Header — 24 bytes]
+//!   [Header — 32 bytes]
 //!     magic "tDBM"            (4)
 //!     version u16             (2)
 //!     flags u16               (2 — reserved, written 0)
 //!     schema_fingerprint u64  (8)
 //!     segment_count u32       (4)
 //!     column_count u32        (4)
+//!     auto_inc_next u64       (8 — v5; MySQL-style table counter for the
+//!                              AUTO_INCREMENT column. 0 if no AI column.)
 //!
 //!   [Entries — 64 + 32*column_count bytes each]
 //!     For each segment:
@@ -38,10 +40,10 @@ const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
 
 pub const manifest_magic: [4]u8 = .{ 't', 'D', 'B', 'M' };
-pub const manifest_version: u16 = 4;
+pub const manifest_version: u16 = 5;
 pub const manifest_filename = "manifest";
 pub const manifest_tmp_filename = "manifest.tmp";
-pub const header_size: usize = 24;
+pub const header_size: usize = 32;
 /// Per-entry fixed prefix (excluding the per-column stats tail).
 pub const entry_prefix_size: usize = 64;
 pub const stats_slot_size: usize = 32; // i128 min + i128 max
@@ -86,6 +88,11 @@ pub const Manifest = struct {
     /// exactly `column_count` `Stats` slots in their `column_stats`
     /// field. Set at `empty()` time; immutable thereafter.
     column_count: u32,
+    /// Next AUTO_INCREMENT value the table will assign. Bumped on
+    /// insert (after both omitted-fill and explicit-supply paths).
+    /// Zero when the table has no AUTO_INCREMENT column. Persists
+    /// across reopens via the v5 manifest header.
+    auto_inc_next: u64 = 0,
     segments: std.ArrayList(ManifestEntry),
 
     pub fn empty(allocator: Allocator, schema_fingerprint: u64, column_count: u32) Manifest {
@@ -128,6 +135,7 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
     try appendU64(m.allocator, &buf, m.schema_fingerprint);
     try appendU32(m.allocator, &buf, @intCast(m.segments.items.len));
     try appendU32(m.allocator, &buf, m.column_count);
+    try appendU64(m.allocator, &buf, m.auto_inc_next);
 
     for (m.segments.items) |e| {
         try appendU64(m.allocator, &buf, e.segment_id);
@@ -194,6 +202,7 @@ pub fn readManifest(
 
     const count = format.readU32(bytes[16..20]);
     const column_count = format.readU32(bytes[20..24]);
+    const auto_inc_next = format.readU64(bytes[24..32]);
 
     const entry_size: usize = entry_prefix_size + @as(usize, column_count) * stats_slot_size;
     const expected_size: usize = header_size + @as(usize, count) * entry_size + trailer_size;
@@ -259,6 +268,7 @@ pub fn readManifest(
         .allocator = allocator,
         .schema_fingerprint = schema_fingerprint,
         .column_count = column_count,
+        .auto_inc_next = auto_inc_next,
         .segments = segments,
     };
 }

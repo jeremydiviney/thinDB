@@ -1,6 +1,6 @@
 //! Per-table schema persistence (<table>/schema.bin).
 //!
-//! Format (v2, binary, little-endian):
+//! Format (v4, binary, little-endian):
 //!
 //!   "tDBC" (4)
 //!   version u16
@@ -11,6 +11,8 @@
 //!     type_tag u8
 //!     nullable u8     (added v2; 0 = NOT NULL, 1 = nullable)
 //!     type_extra u32  (varchar N or 0)
+//!     default_value  (v3: 1 presence byte + optional payload)
+//!     auto_increment u8 (v4: 0 = none, 1 = AUTO_INCREMENT)
 //!   order_key_count u32
 //!   For each order_key name:
 //!     name_len u32, name bytes
@@ -34,7 +36,8 @@ pub const schema_magic: [4]u8 = .{ 't', 'D', 'B', 'C' };
 ///   v1 → original layout
 ///   v2 → per-column nullable bit
 ///   v3 → per-column DEFAULT value (optional, see encode/decodeDefault)
-pub const schema_version: u16 = 3;
+///   v4 → per-column AUTO_INCREMENT byte
+pub const schema_version: u16 = 4;
 pub const schema_filename = "schema.bin";
 
 pub const Error = error{
@@ -82,6 +85,7 @@ pub const SchemaOwner = struct {
                 .type = c.type,
                 .nullable = c.nullable,
                 .default_value = if (c.default_value) |dv| try cloneValue(aa, dv) else null,
+                .auto_increment = c.auto_increment,
             };
         }
 
@@ -124,6 +128,8 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator)
         try appendU32(scratch, &buf, extra);
         // v3: column DEFAULT value. 0 = none, 1 = present (+ payload).
         try encodeDefault(scratch, &buf, c.default_value);
+        // v4: AUTO_INCREMENT flag.
+        try buf.append(scratch, @intFromBool(c.auto_increment));
     }
 
     try appendU32(scratch, &buf, @intCast(schema.order_key.len));
@@ -146,9 +152,12 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
     if (!std.mem.eql(u8, bytes[0..4], &schema_magic)) return Error.SchemaBadMagic;
 
     const version = format.readU16(bytes[4..6]);
-    // Accept v2 (no per-column DEFAULT) and v3 (DEFAULT bytes appended
-    // after each column's extra field). Older versions error.
-    if (version != schema_version and version != 2) return Error.SchemaUnsupportedVersion;
+    // Accept v2 (no per-column DEFAULT), v3 (DEFAULT appended after
+    // each column's extra field), and v4 (AUTO_INCREMENT byte after
+    // the DEFAULT block). Older versions error.
+    if (version != schema_version and version != 3 and version != 2) {
+        return Error.SchemaUnsupportedVersion;
+    }
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -202,7 +211,19 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         if (version >= 3) {
             default_value = try decodeDefault(aa, bytes, &cursor);
         }
-        columns[i] = .{ .name = name, .type = t, .nullable = nullable, .default_value = default_value };
+        var auto_increment = false;
+        if (version >= 4) {
+            if (cursor + 1 > bytes.len) return Error.SchemaCorrupt;
+            auto_increment = bytes[cursor] != 0;
+            cursor += 1;
+        }
+        columns[i] = .{
+            .name = name,
+            .type = t,
+            .nullable = nullable,
+            .default_value = default_value,
+            .auto_increment = auto_increment,
+        };
     }
 
     if (cursor + 4 > bytes.len) return Error.SchemaCorrupt;
@@ -246,6 +267,7 @@ pub fn schemasEqual(a: TableSchema, b: TableSchema) bool {
         if (!std.mem.eql(u8, ac.name, bc.name)) return false;
         if (std.meta.activeTag(ac.type) != std.meta.activeTag(bc.type)) return false;
         if (ac.nullable != bc.nullable) return false;
+        if (ac.auto_increment != bc.auto_increment) return false;
         switch (ac.type) {
             .varchar => |n| if (n != bc.type.varchar) return false,
             .char => |n| if (n != bc.type.char) return false,

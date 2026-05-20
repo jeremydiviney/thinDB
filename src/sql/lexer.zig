@@ -83,6 +83,11 @@ pub const TokenTag = enum {
     kw_nulls,
     kw_qualify,
     kw_default,
+    /// MySQL-style `AUTO_INCREMENT` column attribute. Lexed as a single
+    /// token (matches MySQL's grammar) — the underscore is part of the
+    /// identifier scan, so `auto_increment` parses as one ident and we
+    /// promote it to a keyword in `keywordFor`.
+    kw_auto_increment,
 
     // Operators / punctuation.
     eq, // =
@@ -452,6 +457,7 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "nulls", .tag = .kw_nulls },
         .{ .name = "qualify", .tag = .kw_qualify },
         .{ .name = "default", .tag = .kw_default },
+        .{ .name = "auto_increment", .tag = .kw_auto_increment },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;

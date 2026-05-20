@@ -90,6 +90,11 @@ pub const ColumnDef = struct {
     /// values are accepted. Threads into `types.Column.default_value`
     /// at compile time; INSERT fills omitted columns from this.
     default_value: ?@import("../types.zig").Value = null,
+    /// MySQL-style AUTO_INCREMENT attribute. When set, the column is
+    /// integer-typed and the table maintains a per-table monotonic
+    /// counter that fills NULL/omitted inserts. Counter advances past
+    /// any explicit value the caller supplies (MySQL semantics).
+    auto_increment: bool = false,
 };
 
 pub const CreateTable = struct {

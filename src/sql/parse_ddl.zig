@@ -293,6 +293,7 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
     var is_pk = false;
     var saw_not_null = false;
     var default_value: ?types.Value = null;
+    var auto_increment = false;
     while (true) {
         switch (p.cur.tag) {
             .kw_not => {
@@ -323,11 +324,21 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
                 try p.advance();
                 default_value = try p.parseValue();
             },
+            .kw_auto_increment => {
+                try p.advance();
+                auto_increment = true;
+            },
             else => break,
         }
     }
     return .{
-        .def = .{ .name = name, .column_type = ty, .nullable = nullable, .default_value = default_value },
+        .def = .{
+            .name = name,
+            .column_type = ty,
+            .nullable = nullable,
+            .default_value = default_value,
+            .auto_increment = auto_increment,
+        },
         .is_pk = is_pk,
     };
 }

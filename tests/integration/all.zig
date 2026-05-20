@@ -25,6 +25,7 @@ test {
     _ = @import("window_matrix_test.zig");
     _ = @import("binary_arith_test.zig");
     _ = @import("column_defaults_test.zig");
+    _ = @import("auto_increment_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 

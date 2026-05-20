@@ -111,6 +111,17 @@ pub const Table = struct {
         // Fresh manifests (no file on disk) carry column_count=0; set
         // from the schema so future writes emit the right per-entry size.
         if (manifest.column_count == 0) manifest.column_count = @intCast(schema.columns.len);
+        // AUTO_INCREMENT reopen reconciliation: defensively bump the
+        // persisted counter past whatever max value already lives in
+        // segment stats. Cheap insurance against crash-between-insert-
+        // and-flush; without this we could re-issue an id already on
+        // disk. v1 counter starts at 1.
+        if (autoIncrementColumnIndex(schema)) |ai_idx| {
+            const observed = manifestMaxAutoIncrement(manifest, ai_idx);
+            const candidate: u64 = if (observed) |v| v +| 1 else 1;
+            if (candidate > manifest.auto_inc_next) manifest.auto_inc_next = candidate;
+            if (manifest.auto_inc_next == 0) manifest.auto_inc_next = 1;
+        }
 
         const memtable = try engine.Memtable.create(allocator, schema);
         errdefer memtable.release();
@@ -245,24 +256,50 @@ pub const Table = struct {
         var wal_target: ?u64 = null;
         {
             defer self.mutex.unlock(self.io);
-            try self.cloneMemtableIfPinnedLocked();
-            const was_empty = self.memtable.isEmpty();
-            const before_count: usize = @intCast(self.memtable.row_count);
-            try self.memtable.insertColumnarBatch(batch_schema, views, row_count);
-            const after_count: usize = @intCast(self.memtable.row_count);
-
-            if (self.wal) |*w| {
-                wal_target = try w.appendInsert(self.memtable, before_count, after_count);
-            }
-            if (was_empty and !self.memtable.isEmpty()) {
-                self.first_write_ts = Io.Clock.awake.now(self.io);
-            }
-            if (self.schema.unique) {
-                try @import("upsert.zig").applyUpsertResolution(self);
-            }
-            try self.maybeAutoFlushLocked();
+            wal_target = try self.insertBatchInner(batch_schema, views, row_count);
         }
         try self.awaitWalDurable(wal_target);
+    }
+
+    /// Same as `insertBatch` but assumes the caller already holds
+    /// `self.mutex`. Used by the SQL INSERT compile path when it needs
+    /// to reserve AUTO_INCREMENT ids under the same lock as the batch
+    /// insert. WAL durability await also happens here so the caller
+    /// can drop the lock immediately.
+    pub fn insertBatchLocked(
+        self: *Table,
+        batch_schema: []const types.Column,
+        views: []const storage.ColumnView,
+        row_count: usize,
+    ) !void {
+        const wal_target = try self.insertBatchInner(batch_schema, views, row_count);
+        try self.awaitWalDurable(wal_target);
+    }
+
+    fn insertBatchInner(
+        self: *Table,
+        batch_schema: []const types.Column,
+        views: []const storage.ColumnView,
+        row_count: usize,
+    ) !?u64 {
+        var wal_target: ?u64 = null;
+        try self.cloneMemtableIfPinnedLocked();
+        const was_empty = self.memtable.isEmpty();
+        const before_count: usize = @intCast(self.memtable.row_count);
+        try self.memtable.insertColumnarBatch(batch_schema, views, row_count);
+        const after_count: usize = @intCast(self.memtable.row_count);
+
+        if (self.wal) |*w| {
+            wal_target = try w.appendInsert(self.memtable, before_count, after_count);
+        }
+        if (was_empty and !self.memtable.isEmpty()) {
+            self.first_write_ts = Io.Clock.awake.now(self.io);
+        }
+        if (self.schema.unique) {
+            try @import("upsert.zig").applyUpsertResolution(self);
+        }
+        try self.maybeAutoFlushLocked();
+        return wal_target;
     }
 
     /// Mutates the memtable + appends bytes to the WAL (no fsync). The
@@ -443,6 +480,30 @@ pub const Table = struct {
         return self.manifest.segments.items.len;
     }
 
+    /// Reserve `count` consecutive AUTO_INCREMENT values starting at the
+    /// table's current counter, advance the counter past them, and return
+    /// the starting value. Caller must hold `self.mutex` (the INSERT
+    /// compile path runs under it). When the table has no AI column the
+    /// counter is zero — caller is expected to gate on
+    /// `autoIncrementColumnIndex` first.
+    pub fn reserveAutoIncrement(self: *Table, count: u64) u64 {
+        if (self.manifest.auto_inc_next == 0) self.manifest.auto_inc_next = 1;
+        const start = self.manifest.auto_inc_next;
+        self.manifest.auto_inc_next = start +| count;
+        return start;
+    }
+
+    /// Advance the counter so a future `reserveAutoIncrement` returns at
+    /// least `v + 1`. Used when the caller supplied an explicit value for
+    /// the AI column — MySQL bumps the counter past the largest such
+    /// value so future omitted-column inserts don't collide.
+    pub fn observeAutoIncrement(self: *Table, v: i128) void {
+        if (v < 0) return;
+        const u: u64 = if (v > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(v);
+        const next = u +| 1;
+        if (next > self.manifest.auto_inc_next) self.manifest.auto_inc_next = next;
+    }
+
     /// Build a `ManifestEntry` for a freshly-written segment under this
     /// table's schema. Populates byte_size, row_group_count,
     /// leading_key_stats, and the new v4 per-column_stats. Caller
@@ -557,6 +618,35 @@ pub fn buildColumnHasStats(allocator: Allocator, schema: TableSchema) ![]bool {
     return out;
 }
 
+/// Return the column index of the (at most one) AUTO_INCREMENT column,
+/// or null when none is declared.
+pub fn autoIncrementColumnIndex(schema: TableSchema) ?usize {
+    for (schema.columns, 0..) |c, i| {
+        if (c.auto_increment) return i;
+    }
+    return null;
+}
+
+/// Largest non-negative AI value observed across the manifest's
+/// per-column segment stats, or null when no segment carries usable
+/// stats for the AI column. Used at reopen to ensure the persisted
+/// counter never re-issues an id already on disk.
+fn manifestMaxAutoIncrement(m: storage.Manifest, ai_idx: usize) ?u64 {
+    var best: ?i128 = null;
+    for (m.segments.items) |e| {
+        if (ai_idx >= e.column_stats.len) continue;
+        const s = e.column_stats[ai_idx];
+        if (s.min == 0 and s.max == 0) continue;
+        if (best == null or s.max > best.?) best = s.max;
+    }
+    if (best) |v| {
+        if (v < 0) return 0;
+        if (v > std.math.maxInt(u64)) return std.math.maxInt(u64);
+        return @intCast(v);
+    }
+    return null;
+}
+
 /// Stable hash of a schema's column names, types, order key, and unique flag.
 /// Used to detect schema drift when reopening a table.
 pub fn schemaFingerprint(schema: TableSchema) u64 {
@@ -566,6 +656,7 @@ pub fn schemaFingerprint(schema: TableSchema) u64 {
         const tag: u8 = @intFromEnum(@as(TypeTag, c.type));
         hasher.update(&[_]u8{tag});
         hasher.update(&[_]u8{@intFromBool(c.nullable)});
+        hasher.update(&[_]u8{@intFromBool(c.auto_increment)});
         switch (c.type) {
             .varchar, .char => |n| {
                 var b: [4]u8 = undefined;

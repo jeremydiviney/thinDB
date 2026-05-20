@@ -308,6 +308,12 @@ pub const Column = struct {
     /// this column from their column list. The value's tag must match
     /// the column type (the parser + compile path enforce this).
     default_value: ?Value = null,
+    /// MySQL-style AUTO_INCREMENT attribute. At most one column per
+    /// table; type must be an integer width. The owning Table holds
+    /// a monotonic counter in its manifest; INSERT fills omitted /
+    /// NULL inserts with the counter, and bumps it past any explicit
+    /// caller-supplied value.
+    auto_increment: bool = false,
 };
 
 pub const TableSchemaError = error{
