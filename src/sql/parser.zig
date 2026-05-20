@@ -208,7 +208,7 @@ pub const Parser = struct {
         if (self.cur.tag != .eof) return ParseError.SqlTrailingTokens;
     }
 
-    fn parseStatement(self: *Parser) ParseError!*ir.Op {
+    pub fn parseStatement(self: *Parser) ParseError!*ir.Op {
         // DDL / SHOW / INSERT are leading-keyword forms that don't combine
         // with WITH. They have no projection / FROM / WHERE / etc.;
         // dispatch before the SELECT-only path.
@@ -1617,6 +1617,8 @@ fn countRefs(
             try visitChild(arena, refs, u.left);
             try visitChild(arena, refs, u.right);
         },
+        .create_table_as => |c| try visitChild(arena, refs, c.source),
+        .insert_select => |i| try visitChild(arena, refs, i.source),
     }
 }
 

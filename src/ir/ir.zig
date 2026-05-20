@@ -355,6 +355,14 @@ pub const OpTag = enum(u8) {
     /// UNION ALL — concatenate two upstreams with compatible schemas.
     /// (UNION distinct deferred — needs a dedup pass on top of this.)
     set_union = 16,
+    /// CREATE TABLE name AS SELECT ... — schema inferred from the
+    /// source query's output schema; rows materialized into the new
+    /// table on execute.
+    create_table_as = 17,
+    /// INSERT INTO name [(cols)] SELECT ... — inserts the source's
+    /// rows into an existing table. Compile-time validation of the
+    /// schema match against the target.
+    insert_select = 18,
 };
 
 pub const BatchOp = struct {
@@ -371,6 +379,26 @@ pub const SetUnion = struct {
     /// `true` = UNION ALL (no dedup); `false` is reserved for the
     /// future distinct variant. v1 only emits `all = true`.
     all: bool,
+};
+
+/// CREATE TABLE name AS SELECT ... — schema inferred from the
+/// source query's output schema. `if_not_exists` mirrors the v1
+/// DDL semantics: skip silently if the target already exists.
+pub const CreateTableAs = struct {
+    table: TableRef,
+    if_not_exists: bool,
+    is_temp: bool,
+    source: *Op,
+};
+
+/// INSERT INTO name [(cols)] SELECT ... — source query feeds rows
+/// into an existing table. `columns` is `null` for positional
+/// (every table column must be populated by the source in declared
+/// order); a non-null list narrows it to a subset.
+pub const InsertSelect = struct {
+    table: TableRef,
+    columns: ?[]const []const u8,
+    source: *Op,
 };
 
 /// In-memory operator tree, built by the client query-builder and decoded
@@ -394,6 +422,8 @@ pub const Op = union(OpTag) {
     copy: CopyOp,
     window: WindowOp,
     set_union: SetUnion,
+    create_table_as: CreateTableAs,
+    insert_select: InsertSelect,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -557,6 +587,15 @@ pub const Op = union(OpTag) {
                 u.right.deinitDecoded(allocator);
                 allocator.destroy(u.right);
             },
+            .create_table_as => |c| {
+                c.source.deinitDecoded(allocator);
+                allocator.destroy(c.source);
+            },
+            .insert_select => |i| {
+                if (i.columns) |cols| allocator.free(cols);
+                i.source.deinitDecoded(allocator);
+                allocator.destroy(i.source);
+            },
         }
     }
 };
@@ -623,6 +662,26 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             try out.append(allocator, if (u.all) @as(u8, 1) else 0);
             try encodeOp(allocator, out, u.left.*);
             try encodeOp(allocator, out, u.right.*);
+        },
+        .create_table_as => |c| {
+            try encodeTableRef(allocator, out, c.table);
+            try out.append(allocator, if (c.if_not_exists) @as(u8, 1) else 0);
+            try out.append(allocator, if (c.is_temp) @as(u8, 1) else 0);
+            try encodeOp(allocator, out, c.source.*);
+        },
+        .insert_select => |i| {
+            try encodeTableRef(allocator, out, i.table);
+            if (i.columns) |cols| {
+                try out.append(allocator, 1);
+                try appendU32(allocator, out, @intCast(cols.len));
+                for (cols) |c| {
+                    try appendU32(allocator, out, @intCast(c.len));
+                    try out.appendSlice(allocator, c);
+                }
+            } else {
+                try out.append(allocator, 0);
+            }
+            try encodeOp(allocator, out, i.source.*);
         },
     }
 }
@@ -1236,7 +1295,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.set_union)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.insert_select)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1479,6 +1538,47 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             errdefer allocator.destroy(right);
             right.* = try decodeOp(allocator, bytes, cursor);
             break :blk Op{ .set_union = .{ .left = left, .right = right, .all = all } };
+        },
+        .create_table_as => blk: {
+            const ref = try decodeTableRef(bytes, cursor);
+            if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
+            const if_not_exists = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            const is_temp = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            const source = try allocator.create(Op);
+            errdefer allocator.destroy(source);
+            source.* = try decodeOp(allocator, bytes, cursor);
+            break :blk Op{ .create_table_as = .{
+                .table = ref,
+                .if_not_exists = if_not_exists,
+                .is_temp = is_temp,
+                .source = source,
+            } };
+        },
+        .insert_select => blk: {
+            const ref = try decodeTableRef(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const has_cols = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            var cols_opt: ?[]const []const u8 = null;
+            if (has_cols) {
+                if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+                const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+                cursor.* += 4;
+                const cols = try allocator.alloc([]const u8, n);
+                errdefer allocator.free(cols);
+                for (cols) |*c| c.* = try readString(bytes, cursor);
+                cols_opt = cols;
+            }
+            const source = try allocator.create(Op);
+            errdefer allocator.destroy(source);
+            source.* = try decodeOp(allocator, bytes, cursor);
+            break :blk Op{ .insert_select = .{
+                .table = ref,
+                .columns = cols_opt,
+                .source = source,
+            } };
         },
     };
 }
@@ -2186,6 +2286,18 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try out.appendSlice(allocator, if (u.all) "UnionAll\n" else "Union\n");
             try explainOp(allocator, out, u.left.*, depth + 1);
             try explainOp(allocator, out, u.right.*, depth + 1);
+        },
+        .create_table_as => |c| {
+            try out.appendSlice(allocator, "CreateTableAs ");
+            try writeTableRef(allocator, out, c.table);
+            try out.append(allocator, '\n');
+            try explainOp(allocator, out, c.source.*, depth + 1);
+        },
+        .insert_select => |i| {
+            try out.appendSlice(allocator, "InsertSelect ");
+            try writeTableRef(allocator, out, i.table);
+            try out.append(allocator, '\n');
+            try explainOp(allocator, out, i.source.*, depth + 1);
         },
     }
 }

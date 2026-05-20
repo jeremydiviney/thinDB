@@ -937,6 +937,10 @@ pub fn buildServerQuerySession(
             errdefer @constCast(&right_q).deinit();
             break :blk try exec.SetUnion.create(allocator, left_q, right_q, u.all);
         },
+        // CTAS / INSERT-SELECT come from SQL parsing and only go
+        // through the CompileCtx path. The plan-builder + wire path
+        // doesn't construct these.
+        .create_table_as, .insert_select => return Error.UnsupportedOp,
     };
 }
 
@@ -1154,6 +1158,8 @@ fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             errdefer @constCast(&right_q).deinit();
             break :blk try exec.SetUnion.create(ctx.allocator, left_q, right_q, u.all);
         },
+        .create_table_as => |c| try compileCreateTableAs(ctx, c),
+        .insert_select => |i| try compileInsertSelect(ctx, i),
     };
 }
 
@@ -1277,6 +1283,114 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
         },
     }
     return try EmptyOp.create(ctx.allocator);
+}
+
+/// CREATE TABLE name AS SELECT ... — infer target schema from the
+/// source query's output schema, create the table, then drain the
+/// source and bulk-insert.
+fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
+    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+
+    var source = try compileOp(ctx, op.source);
+    defer source.deinit();
+
+    const src_schema = source.outputSchema();
+    if (src_schema.len == 0) return Error.BadRequest;
+
+    // Materialize the inferred table schema. v1: first column is the
+    // order key by default (matches what tests + bulk loaders expect);
+    // unique = false since CTAS doesn't declare a PK.
+    const cols = try ctx.allocator.alloc(types.Column, src_schema.len);
+    defer ctx.allocator.free(cols);
+    for (src_schema, cols) |s, *c| {
+        c.* = .{ .name = s.name, .type = s.type, .nullable = s.nullable };
+    }
+    const order_key = try ctx.allocator.alloc([]const u8, 1);
+    defer ctx.allocator.free(order_key);
+    order_key[0] = cols[0].name;
+    const target_schema: TableSchema = .{
+        .columns = cols,
+        .order_key = order_key,
+        .unique = false,
+    };
+    const opts: TableOptions = .{
+        .order_key = order_key,
+        .unique = false,
+        .row_group_size = null,
+    };
+
+    var t: *ApiTable = undefined;
+    if (op.is_temp) {
+        const ns = ctx.session.temp_namespace orelse return Error.UnsupportedOp;
+        if (ns.contains(op.table.name)) {
+            if (op.if_not_exists) return try EmptyOp.createWithCount(ctx.allocator, 0);
+            return Error.TableAlreadyExists;
+        }
+        t = ns.createTable(op.table.name, target_schema, opts) catch |e| return thindb_api.remapError(Error, e);
+    } else {
+        const db_name = op.table.database orelse ctx.session.current_db;
+        const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
+        const sc_name = op.table.schema orelse ctx.session.current_schema;
+        const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
+
+        sc.tables_mutex.lockUncancelable(sc.io);
+        const exists = sc.tables.get(op.table.name) != null;
+        sc.tables_mutex.unlock(sc.io);
+        if (exists) {
+            if (op.if_not_exists) return try EmptyOp.createWithCount(ctx.allocator, 0);
+            return Error.TableAlreadyExists;
+        }
+        t = sc.table(op.table.name, target_schema, opts) catch |e| return thindb_api.remapError(Error, e);
+    }
+
+    var total_rows: usize = 0;
+    while (try source.next()) |b| {
+        try t.insertBatch(b.schema, b.values, b.row_count);
+        total_rows += b.row_count;
+    }
+    ctx.affected_rows = @intCast(total_rows);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
+}
+
+/// INSERT INTO target [(cols)] SELECT ... — drain the source query
+/// and bulk-insert each batch into the target table. The source's
+/// output columns are renamed (per the column list, or positional
+/// against the target schema) so the memtable's name-based column
+/// matching finds them.
+fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
+    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const t = try resolveTable(catalog, ctx.session.*, op.table);
+    const tbl_schema = t.schema;
+
+    var source = try compileOp(ctx, op.source);
+    defer source.deinit();
+
+    const src_schema = source.outputSchema();
+    if (op.columns) |cols| {
+        if (cols.len != src_schema.len) return Error.BadRequest;
+        for (cols) |cname| {
+            _ = tbl_schema.columnIndex(cname) orelse return Error.ColumnNotFound;
+        }
+    } else {
+        if (src_schema.len != tbl_schema.columns.len) return Error.BadRequest;
+    }
+
+    // Synthesize a batch_schema where each source column carries the
+    // target column name expected by `Memtable.insertColumnarBatch`.
+    const renamed = try ctx.allocator.alloc(types.Column, src_schema.len);
+    defer ctx.allocator.free(renamed);
+    for (src_schema, renamed, 0..) |s, *r, i| {
+        const target_name = if (op.columns) |cols| cols[i] else tbl_schema.columns[i].name;
+        r.* = .{ .name = target_name, .type = s.type, .nullable = s.nullable };
+    }
+
+    var total_rows: usize = 0;
+    while (try source.next()) |b| {
+        try t.insertBatch(renamed, b.values, b.row_count);
+        total_rows += b.row_count;
+    }
+    ctx.affected_rows = @intCast(total_rows);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
 }
 
 fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {

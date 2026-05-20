@@ -76,7 +76,11 @@ pub fn parseDdl(p: anytype) !*ir.Op {
     }
 }
 
-/// CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] [db.][schema.]name ( column_def, ... [, PRIMARY KEY (..)] )
+/// CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] [db.][schema.]name
+///   ( column_def, ... [, PRIMARY KEY (..)] )
+///
+/// CTAS form: `CREATE TABLE name AS SELECT ...` — column list omitted;
+/// schema inferred from the source query at compile time.
 pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
     var if_not_exists = false;
@@ -89,6 +93,20 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
         if_not_exists = true;
     }
     const ref = try p.parseTableRef();
+
+    // CTAS path: `CREATE TABLE name AS SELECT ...`. No column list.
+    if (p.cur.tag == .kw_as) {
+        try p.advance();
+        if (p.cur.tag != .kw_select) return PE.SqlExpectedSelect;
+        const source = try p.parseStatement();
+        return try p.allocOp(.{ .create_table_as = .{
+            .table = ref,
+            .if_not_exists = if_not_exists,
+            .is_temp = is_temp,
+            .source = source,
+        } });
+    }
+
     try p.expect(.lparen);
 
     var cols: std.ArrayList(ir.ColumnDef) = .empty;
@@ -174,6 +192,18 @@ pub fn parseInsert(p: anytype) !*ir.Op {
         try p.advance();
         cols_opt = try p.parseIdentList();
         try p.expect(.rparen);
+    }
+
+    // INSERT INTO t (cols) SELECT ... — source rows from a query
+    // rather than a VALUES list. Parsed before the VALUES branch so
+    // SELECT/WITH show up in the same dispatch position.
+    if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
+        const source = try p.parseStatement();
+        return try p.allocOp(.{ .insert_select = .{
+            .table = ref,
+            .columns = cols_opt,
+            .source = source,
+        } });
     }
 
     if (p.cur.tag != .kw_values) return PE.SqlExpectedKeyword;

@@ -34,6 +34,7 @@ test {
     _ = @import("having_test.zig");
     _ = @import("interval_test.zig");
     _ = @import("union_test.zig");
+    _ = @import("ctas_insert_select_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 
