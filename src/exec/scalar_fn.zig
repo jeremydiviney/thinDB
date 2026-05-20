@@ -216,6 +216,22 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "sign", .arg_types = &.{.double}, .return_type = .int, .kernel = math.signKernel },
     .{ .name = "mod", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.modIntKernel },
     .{ .name = "mod", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.modBigintKernel },
+    // Binary arithmetic — backs the SQL infix operators (+ - * /) in the
+    // parser. Overloaded on (int,int), (bigint,bigint), (double,double);
+    // mixed-type combinations route through the existing scalar-fn
+    // coercion machinery (int→bigint→double promotion).
+    .{ .name = "add", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.addIntKernel },
+    .{ .name = "add", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.addBigintKernel },
+    .{ .name = "add", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.addDoubleKernel },
+    .{ .name = "sub", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.subIntKernel },
+    .{ .name = "sub", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.subBigintKernel },
+    .{ .name = "sub", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.subDoubleKernel },
+    .{ .name = "mul", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.mulIntKernel },
+    .{ .name = "mul", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.mulBigintKernel },
+    .{ .name = "mul", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.mulDoubleKernel },
+    .{ .name = "div", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.divIntKernel },
+    .{ .name = "div", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.divBigintKernel },
+    .{ .name = "div", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.divDoubleKernel },
     .{ .name = "pow", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.powKernel },
     .{ .name = "sqrt", .arg_types = &.{.double}, .return_type = .double, .kernel = math.sqrtKernel },
     .{ .name = "exp", .arg_types = &.{.double}, .return_type = .double, .kernel = math.expKernel },

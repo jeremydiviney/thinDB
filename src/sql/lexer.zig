@@ -91,6 +91,10 @@ pub const TokenTag = enum {
     gt, // >
     gte, // >=
     star, // *
+    plus, // +
+    minus, // -
+    slash, // /
+    percent, // %
     comma, // ,
     dot, // .
     lparen, // (
@@ -186,6 +190,26 @@ pub const Lexer = struct {
             '*' => {
                 self.pos += 1;
                 return Token{ .tag = .star, .text = self.src[start..self.pos] };
+            },
+            '+' => {
+                self.pos += 1;
+                return Token{ .tag = .plus, .text = self.src[start..self.pos] };
+            },
+            '%' => {
+                self.pos += 1;
+                return Token{ .tag = .percent, .text = self.src[start..self.pos] };
+            },
+            // `-` and `/` only land here after skipWhitespaceAndComments,
+            // which already consumed any `--` line comment or `/* */`
+            // block comment opener. A bare `-` or `/` is therefore an
+            // arithmetic operator.
+            '-' => {
+                self.pos += 1;
+                return Token{ .tag = .minus, .text = self.src[start..self.pos] };
+            },
+            '/' => {
+                self.pos += 1;
+                return Token{ .tag = .slash, .text = self.src[start..self.pos] };
             },
             '?' => {
                 self.pos += 1;

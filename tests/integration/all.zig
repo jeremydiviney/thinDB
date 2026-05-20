@@ -23,6 +23,7 @@ test {
     _ = @import("temp_tables_test.zig");
     _ = @import("window_test.zig");
     _ = @import("window_matrix_test.zig");
+    _ = @import("binary_arith_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 

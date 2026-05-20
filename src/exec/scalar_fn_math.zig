@@ -71,6 +71,104 @@ pub fn signKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
     }
 }
 
+// ---------------------------------------------------------------------------
+// Binary arithmetic (+, -, *, /) — kernel implementations.
+// All wrapping for integer types matches the column's declared width
+// (i32/i64). Division by zero on integer kernels returns 0 (same
+// convention as MOD above); on double-typed kernels Zig propagates
+// IEEE NaN/inf naturally.
+// ---------------------------------------------------------------------------
+
+pub fn addIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.int;
+    const b = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, a[i] +% b[i]);
+}
+
+pub fn addBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.bigint;
+    const b = args[1].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, a[i] +% b[i]);
+}
+
+pub fn addDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.double;
+    const b = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] + b[i]);
+}
+
+pub fn subIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.int;
+    const b = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, a[i] -% b[i]);
+}
+
+pub fn subBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.bigint;
+    const b = args[1].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, a[i] -% b[i]);
+}
+
+pub fn subDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.double;
+    const b = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] - b[i]);
+}
+
+pub fn mulIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.int;
+    const b = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, a[i] *% b[i]);
+}
+
+pub fn mulBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.bigint;
+    const b = args[1].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, a[i] *% b[i]);
+}
+
+pub fn mulDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.double;
+    const b = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] * b[i]);
+}
+
+pub fn divIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.int;
+    const b = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const r: i32 = if (b[i] == 0) 0 else @divTrunc(a[i], b[i]);
+        try out.data.int.append(allocator, r);
+    }
+}
+
+pub fn divBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.bigint;
+    const b = args[1].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const r: i64 = if (b[i] == 0) 0 else @divTrunc(a[i], b[i]);
+        try out.data.bigint.append(allocator, r);
+    }
+}
+
+pub fn divDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.double;
+    const b = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] / b[i]);
+}
+
 pub fn modIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const a = args[0].data.int;
     const b = args[1].data.int;

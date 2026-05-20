@@ -501,6 +501,16 @@ pub const Parser = struct {
     }
 
     fn parseProjItem(self: *Parser) ParseError!ProjItem {
+        // Parenthesized expression at projection start: `(expr) [AS name]`.
+        // Routes through the expression parser (which handles binary
+        // operators) without going through the identifier path.
+        if (self.cur.tag == .lparen) {
+            const expr = try self.parseCallArg();
+            const default_name = try self.exprDefaultName(expr);
+            const alias = try self.maybeAlias(default_name);
+            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+        }
+
         // Identifier or function call. Look ahead: `(` after an identifier
         // means a call.
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
@@ -560,9 +570,12 @@ pub const Parser = struct {
                 return try self.aggCallFromArgs(first, func, args);
             }
 
-            // Scalar function call → record as an Expr; lowered to a
-            // Compute step later.
-            const expr = ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args } };
+            // Scalar function call. If a binary operator follows, the
+            // whole thing is a binary expression with the call as the
+            // leftmost operand — lift into a .expr ProjItem. Otherwise
+            // stay as a bare scalar call.
+            const scalar_atom = ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args } };
+            const expr = try self.continueBinaryFrom(scalar_atom);
             const default_name = try self.exprDefaultName(expr);
             const alias = try self.maybeAlias(default_name);
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
@@ -579,8 +592,58 @@ pub const Parser = struct {
             try self.advance();
         }
         const dup_col = try self.arena.dupe(u8, col_name);
+
+        // If a binary operator follows the column ref, lift it into a
+        // binary expression (e.g., `qty + 1`, `price * 1.05`).
+        if (isBinaryOpToken(self.cur.tag)) {
+            const col_atom = ir.Expr{ .col_ref = dup_col };
+            const expr = try self.continueBinaryFrom(col_atom);
+            const default_name = try self.exprDefaultName(expr);
+            const alias = try self.maybeAlias(default_name);
+            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+        }
+
         const alias = try self.maybeAlias(dup_col);
         return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
+    }
+
+    /// True when `tag` is one of the binary arithmetic operators we
+    /// recognize in expression position (+ - * / %).
+    fn isBinaryOpToken(tag: TokenTag) bool {
+        return switch (tag) {
+            .plus, .minus, .star, .slash, .percent => true,
+            else => false,
+        };
+    }
+
+    /// Given an already-parsed left operand `atom`, continue parsing a
+    /// binary chain at the precedence-climbing levels. Used by
+    /// `parseProjItem` (which has already consumed the leading
+    /// identifier/call/dotted-col but not yet checked for an
+    /// operator). Returns `atom` unchanged if no operator follows.
+    fn continueBinaryFrom(self: *Parser, atom: ir.Expr) ParseError!ir.Expr {
+        // First, extend the atom into a MulDiv-level expression
+        // (same precedence the inner parseMulDiv would have produced).
+        var lhs = atom;
+        while (self.cur.tag == .star or self.cur.tag == .slash or self.cur.tag == .percent) {
+            const fn_name: []const u8 = switch (self.cur.tag) {
+                .star => "mul",
+                .slash => "div",
+                .percent => "mod",
+                else => unreachable,
+            };
+            try self.advance();
+            const rhs = try self.parseCallAtom();
+            lhs = try self.makeBinary(fn_name, lhs, rhs);
+        }
+        // Then extend into an AddSub-level expression.
+        while (self.cur.tag == .plus or self.cur.tag == .minus) {
+            const fn_name: []const u8 = if (self.cur.tag == .plus) "add" else "sub";
+            try self.advance();
+            const rhs = try self.parseMulDiv();
+            lhs = try self.makeBinary(fn_name, lhs, rhs);
+        }
+        return lhs;
     }
 
     /// Parse `(arg, arg, ...)`. Cursor is on `(` going in, on the token
@@ -642,24 +705,65 @@ pub const Parser = struct {
     }
 
 
-    /// One argument to a scalar function call — column ref, literal,
-    /// or nested scalar call. Aggregates can't nest inside any call.
+    /// One argument to a scalar function call. Entry point for the
+    /// expression sub-language used inside call args / projections.
+    /// Precedence layers:
+    ///   parseCallArg → parseAddSub  (lowest: + -)
+    ///                → parseMulDiv  (next:   * / %)
+    ///                → parseCallAtom (leaf: ident / call / literal)
+    /// Aggregates and window functions are rejected inside this
+    /// sub-language (atom layer enforces it).
     fn parseCallArg(self: *Parser) ParseError!ir.Expr {
+        return try self.parseAddSub();
+    }
+
+    /// `+` / `-` binary operators, lowest precedence in the expr
+    /// sub-language. Left-associative.
+    fn parseAddSub(self: *Parser) ParseError!ir.Expr {
+        var lhs = try self.parseMulDiv();
+        while (self.cur.tag == .plus or self.cur.tag == .minus) {
+            const fn_name: []const u8 = if (self.cur.tag == .plus) "add" else "sub";
+            try self.advance();
+            const rhs = try self.parseMulDiv();
+            lhs = try self.makeBinary(fn_name, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// `*` / `/` / `%` binary operators, higher precedence than + / -.
+    /// Left-associative.
+    fn parseMulDiv(self: *Parser) ParseError!ir.Expr {
+        var lhs = try self.parseCallAtom();
+        while (self.cur.tag == .star or self.cur.tag == .slash or self.cur.tag == .percent) {
+            const fn_name: []const u8 = switch (self.cur.tag) {
+                .star => "mul",
+                .slash => "div",
+                .percent => "mod",
+                else => unreachable,
+            };
+            try self.advance();
+            const rhs = try self.parseCallAtom();
+            lhs = try self.makeBinary(fn_name, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    /// Leaf of the expr sub-language. Same shape as the original
+    /// `parseCallArg`: column ref (possibly qualified), literal, or
+    /// nested scalar call. Aggregates and window functions are
+    /// rejected — they belong at the top level of the SELECT list.
+    fn parseCallAtom(self: *Parser) ParseError!ir.Expr {
         switch (self.cur.tag) {
             .identifier => {
                 const name = self.cur.text;
                 try self.advance();
                 if (self.cur.tag == .lparen) {
-                    // Nested call. Aggregates and window functions
-                    // aren't allowed here per standard SQL — they
-                    // belong at the top level of the SELECT list.
                     if (aggForName(name)) |_| return ParseError.SqlInvalidProjection;
                     if (ir.windowFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
                     const fname_dup = try self.arena.dupe(u8, name);
                     const nested_args = try self.parseCallArgList();
                     return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = nested_args } };
                 }
-                // Qualified column? use last segment.
                 var col_name = name;
                 if (self.cur.tag == .dot) {
                     try self.advance();
@@ -673,8 +777,24 @@ pub const Parser = struct {
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
             },
+            .lparen => {
+                // Parenthesized sub-expression. `(expr)` — parens
+                // override precedence; recurse on parseAddSub.
+                try self.advance();
+                const inner = try self.parseAddSub();
+                try self.expect(.rparen);
+                return inner;
+            },
             else => return ParseError.SqlExpectedValue,
         }
+    }
+
+    fn makeBinary(self: *Parser, fn_name: []const u8, lhs: ir.Expr, rhs: ir.Expr) ParseError!ir.Expr {
+        const args = try self.arena.alloc(ir.Expr, 2);
+        args[0] = lhs;
+        args[1] = rhs;
+        const fname_dup = try self.arena.dupe(u8, fn_name);
+        return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args } };
     }
 
     /// Parse a bare column reference (possibly qualified). Used inside
