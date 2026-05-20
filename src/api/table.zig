@@ -558,9 +558,46 @@ pub const Table = struct {
     /// memtable clone-and-swap. Crash recovery rebuilds segment
     /// state from the persisted tombstone files.
     pub fn deleteByExpr(self: *Table, pred: ?exec.PredicateExpr) !usize {
+        // Widen literals in the predicate up front so both the WAL-
+        // logged form and the executor see the same shape (BIGINT
+        // column + INT literal etc.). The mutation is local to this
+        // function but propagates because both calls take the
+        // widened value.
+        var pred_local: ?exec.PredicateExpr = pred;
+        if (pred_local) |*p| try exec.predicate.validateExpr(p, self.schema.columns);
+
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return try @import("delete.zig").execDeleteByExpr(self, pred);
+        var wal_target: ?u64 = null;
+        var deleted: usize = 0;
+        {
+            defer self.mutex.unlock(self.io);
+            wal_target = try self.logDeleteExprLocked(pred_local);
+            deleted = try @import("delete.zig").execDeleteByExpr(self, pred_local);
+        }
+        try self.awaitWalDurable(wal_target);
+        return deleted;
+    }
+
+    /// WAL-log a rich `DELETE FROM t WHERE ...` predicate. Mutex must
+    /// be held. Returns the WAL write_offset to await for durability,
+    /// or null when there's no WAL writer or the predicate shape
+    /// isn't loggable (caller should still proceed with the delete —
+    /// segment tombstones are durable independently).
+    pub fn logDeleteExprLocked(self: *Table, pred_opt: ?exec.PredicateExpr) !?u64 {
+        if (self.wal == null) return null;
+        if (pred_opt) |pred| {
+            return self.wal.?.appendDeleteExpr(pred) catch |err| switch (err) {
+                // Predicate variant the WAL can't encode (subquery /
+                // var_ref / correlated). Skip logging — delete still
+                // succeeds; documented gap.
+                error.WalPredicateUnsupported => null,
+                else => err,
+            };
+        }
+        // DELETE without WHERE — log as `.always = true` so replay
+        // wipes the memtable too.
+        const wal_pred: exec.PredicateExpr = .{ .always = true };
+        return try self.wal.?.appendDeleteExpr(wal_pred);
     }
 
     /// SQL `UPDATE t SET ... [WHERE expr]` — atomic DELETE-old +
@@ -574,17 +611,36 @@ pub const Table = struct {
     /// Both steps run while holding the table mutex so concurrent
     /// SELECT readers either see the all-old or the all-new state.
     pub fn applyUpdate(self: *Table, pred: ?exec.PredicateExpr, sink: *@import("../engine/engine.zig").Memtable) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        _ = try @import("delete.zig").execDeleteByExpr(self, pred);
+        // Widen the predicate up front so the WAL-logged form matches
+        // what execDeleteByExpr will run.
+        var pred_local: ?exec.PredicateExpr = pred;
+        if (pred_local) |*p| try exec.predicate.validateExpr(p, self.schema.columns);
 
-        // Append sink's rows into the table memtable via insertColumnarBatch.
-        const n = @as(usize, @intCast(sink.row_count));
-        if (n == 0) return;
-        const views_buf = try self.allocator.alloc(@import("../storage/storage.zig").ColumnView, sink.columns.len);
-        defer self.allocator.free(views_buf);
-        for (sink.columns, views_buf) |*c, *v| v.* = c.view();
-        try self.memtable.insertColumnarBatch(sink.schema.columns, views_buf, n);
+        self.mutex.lockUncancelable(self.io);
+        var wal_target: ?u64 = null;
+        {
+            defer self.mutex.unlock(self.io);
+
+            // DELETE leg — WAL-log the predicate, then tombstone +
+            // memtable-filter rows that match it.
+            const del_target = try self.logDeleteExprLocked(pred_local);
+            _ = del_target; // The insert WAL append below supersedes this.
+            _ = try @import("delete.zig").execDeleteByExpr(self, pred_local);
+
+            // INSERT leg — append sink rows into the table memtable.
+            // Goes through insertBatchInner which also WAL-logs and
+            // returns the offset we await on for durability.
+            const n = @as(usize, @intCast(sink.row_count));
+            if (n > 0) {
+                const views_buf = try self.allocator.alloc(@import("../storage/storage.zig").ColumnView, sink.columns.len);
+                defer self.allocator.free(views_buf);
+                for (sink.columns, views_buf) |*c, *v| v.* = c.view();
+                wal_target = try self.insertBatchInner(sink.schema.columns, views_buf, n);
+            }
+        }
+        // Await the later of the two WAL writes — insert's offset is
+        // higher than delete's so waiting on insert covers both.
+        try self.awaitWalDurable(wal_target);
     }
 
     /// Merge all segments into a single new segment. Drops tombstoned rows.

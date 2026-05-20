@@ -443,6 +443,10 @@ pub fn encodeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) !voi
     }
 }
 
+pub fn decodeValuePub(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
+    return decodeValue(tag, payload, cursor);
+}
+
 fn decodeValue(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
     const c = cursor.*;
     return switch (tag) {
@@ -531,6 +535,466 @@ fn decodeValue(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
             break :blk Value{ .text = payload[c + 4 .. c + 4 + len] };
         },
     };
+}
+
+// ---------------------------------------------------------------------------
+// Rich-predicate (PredicateExpr) encode / decode for delete_expr WAL records.
+//
+// Mirrors the IR's `encodePredicate` tag numbering so the byte layout is
+// stable across the codebase; the engine layer can't import IR (would
+// cycle), so we duplicate the small encoder/decoder here.
+//
+// Tag (u8):
+//   0  = leaf            [op u8][col_len u32][col bytes][value_tag u8][value bytes]
+//   1  = is_null         [col_len u32][col bytes]
+//   2  = is_not_null     [col_len u32][col bytes]
+//   3  = and             [n u32][child0][child1]...
+//   4  = or              [n u32][child0][child1]...
+//   5  = not             [child]
+//   6  = like            [col_len u32][col bytes][pat_len u32][pat bytes]
+//   7  = leaf_col_col    [op u8][left_len u32][left bytes][right_len u32][right bytes]
+//   8  = always          [b u8]   (0 = false, non-zero = true)
+//   9  = in_set          [col_len u32][col bytes][negate u8][value_tag u8][n_values u32][values...]
+//
+// Unresolved or runtime-only variants (scalar_subquery / exists_subquery /
+// in_subquery / correlated_* / leaf_var / var_ref) error out with
+// WalPredicateUnsupported — caller can choose to skip WAL logging and
+// proceed with the mutation.
+// ---------------------------------------------------------------------------
+
+const PredTagWal = enum(u8) {
+    leaf = 0,
+    is_null = 1,
+    is_not_null = 2,
+    p_and = 3,
+    p_or = 4,
+    p_not = 5,
+    like = 6,
+    leaf_col_col = 7,
+    always = 8,
+    in_set = 9,
+};
+
+pub fn encodePredicateExpr(allocator: Allocator, out: *std.ArrayList(u8), expr: anytype) !void {
+    var b4: [4]u8 = undefined;
+    switch (expr) {
+        .leaf => |lf| {
+            try out.append(allocator, @intFromEnum(PredTagWal.leaf));
+            try out.append(allocator, @intFromEnum(lf.op));
+            format.writeU32(&b4, @intCast(lf.col.len));
+            try out.appendSlice(allocator, &b4);
+            try out.appendSlice(allocator, lf.col);
+            try out.append(allocator, @intFromEnum(@as(ValueTag, lf.val)));
+            try encodeValue(allocator, out, lf.val);
+        },
+        .leaf_col_col => |lc| {
+            try out.append(allocator, @intFromEnum(PredTagWal.leaf_col_col));
+            try out.append(allocator, @intFromEnum(lc.op));
+            format.writeU32(&b4, @intCast(lc.left.len));
+            try out.appendSlice(allocator, &b4);
+            try out.appendSlice(allocator, lc.left);
+            format.writeU32(&b4, @intCast(lc.right.len));
+            try out.appendSlice(allocator, &b4);
+            try out.appendSlice(allocator, lc.right);
+        },
+        .is_null => |col| {
+            try out.append(allocator, @intFromEnum(PredTagWal.is_null));
+            format.writeU32(&b4, @intCast(col.len));
+            try out.appendSlice(allocator, &b4);
+            try out.appendSlice(allocator, col);
+        },
+        .is_not_null => |col| {
+            try out.append(allocator, @intFromEnum(PredTagWal.is_not_null));
+            format.writeU32(&b4, @intCast(col.len));
+            try out.appendSlice(allocator, &b4);
+            try out.appendSlice(allocator, col);
+        },
+        .like => |lp| {
+            try out.append(allocator, @intFromEnum(PredTagWal.like));
+            format.writeU32(&b4, @intCast(lp.col.len));
+            try out.appendSlice(allocator, &b4);
+            try out.appendSlice(allocator, lp.col);
+            format.writeU32(&b4, @intCast(lp.pattern.len));
+            try out.appendSlice(allocator, &b4);
+            try out.appendSlice(allocator, lp.pattern);
+        },
+        .@"and" => |kids| {
+            try out.append(allocator, @intFromEnum(PredTagWal.p_and));
+            format.writeU32(&b4, @intCast(kids.len));
+            try out.appendSlice(allocator, &b4);
+            for (kids) |k| try encodePredicateExpr(allocator, out, k);
+        },
+        .@"or" => |kids| {
+            try out.append(allocator, @intFromEnum(PredTagWal.p_or));
+            format.writeU32(&b4, @intCast(kids.len));
+            try out.appendSlice(allocator, &b4);
+            for (kids) |k| try encodePredicateExpr(allocator, out, k);
+        },
+        .not => |child| {
+            try out.append(allocator, @intFromEnum(PredTagWal.p_not));
+            try encodePredicateExpr(allocator, out, child.*);
+        },
+        .always => |b| {
+            try out.append(allocator, @intFromEnum(PredTagWal.always));
+            try out.append(allocator, if (b) @as(u8, 1) else 0);
+        },
+        .in_set => |s| {
+            try out.append(allocator, @intFromEnum(PredTagWal.in_set));
+            format.writeU32(&b4, @intCast(s.col.len));
+            try out.appendSlice(allocator, &b4);
+            try out.appendSlice(allocator, s.col);
+            try out.append(allocator, if (s.negate) @as(u8, 1) else 0);
+            // All set values share the same type tag — use [0]'s.
+            // The set is guaranteed non-empty at this point (parser
+            // requires at least one value).
+            if (s.values.len == 0) return Error.WalPredicateUnsupported;
+            const tag: ValueTag = std.meta.activeTag(s.values[0]);
+            try out.append(allocator, @intFromEnum(tag));
+            format.writeU32(&b4, @intCast(s.values.len));
+            try out.appendSlice(allocator, &b4);
+            for (s.values) |v| try encodeValue(allocator, out, v);
+        },
+        // Resolving / runtime forms can't be WAL-logged. Skip.
+        .scalar_subquery,
+        .exists_subquery,
+        .in_subquery,
+        .correlated_set,
+        .correlated_scalar,
+        .correlated_range,
+        .leaf_var,
+        => return Error.WalPredicateUnsupported,
+    }
+}
+
+/// Apply a `delete_expr` WAL record to the recovered memtable. Decodes
+/// the predicate then runs `evaluatePredicateOnMemtable` to drop the
+/// matching rows. Segments are durable independently via per-segment
+/// tombstone files — replay only fixes up the memtable side.
+pub fn applyDeleteExprRecord(allocator: Allocator, payload: []const u8, mt: *Memtable) !void {
+    _ = allocator;
+    var cursor: usize = 0;
+    const expr = try decodeOwnedPredicate(payload, &cursor, mt.allocator);
+    defer freeOwnedPredicate(mt.allocator, expr);
+
+    const n: usize = @intCast(mt.row_count);
+    if (n == 0) return;
+    const keep = try mt.allocator.alloc(bool, n);
+    defer mt.allocator.free(keep);
+    for (0..n) |i| keep[i] = !evaluatePredicateOnRow(mt, @intCast(i), expr);
+    _ = try mt.retainRows(keep);
+}
+
+/// Memtable-replay-only predicate node. Owned by the caller's
+/// allocator — strings + child arrays are dup'd / heap-alloc'd.
+/// Distinct from `exec.predicate.PredicateExpr` because engine
+/// can't import exec.
+const OwnedPredicate = union(PredTagWal) {
+    leaf: OwnedLeaf,
+    is_null: []u8,
+    is_not_null: []u8,
+    p_and: []OwnedPredicate,
+    p_or: []OwnedPredicate,
+    p_not: *OwnedPredicate,
+    like: OwnedLike,
+    leaf_col_col: OwnedColCol,
+    always: bool,
+    in_set: OwnedInSet,
+};
+
+const OwnedLeaf = struct {
+    col: []u8,
+    op: u8,
+    val: Value, // .text values borrow into the payload — see decoder note
+};
+
+const OwnedLike = struct {
+    col: []u8,
+    pattern: []u8,
+};
+
+const OwnedColCol = struct {
+    left: []u8,
+    op: u8,
+    right: []u8,
+};
+
+const OwnedInSet = struct {
+    col: []u8,
+    negate: bool,
+    values: []Value,
+};
+
+fn decodeOwnedPredicate(payload: []const u8, cursor: *usize, alloc: Allocator) !OwnedPredicate {
+    if (cursor.* + 1 > payload.len) return Error.WalCorrupt;
+    const tag_byte = payload[cursor.*];
+    cursor.* += 1;
+    if (tag_byte > @intFromEnum(PredTagWal.in_set)) return Error.WalUnknownRecord;
+    const tag: PredTagWal = @enumFromInt(tag_byte);
+    return switch (tag) {
+        .leaf => blk: {
+            if (cursor.* + 1 > payload.len) return Error.WalCorrupt;
+            const op_byte = payload[cursor.*];
+            cursor.* += 1;
+            const col = try readOwnedBytes(payload, cursor, alloc);
+            if (cursor.* + 1 > payload.len) return Error.WalCorrupt;
+            const val_tag_byte = payload[cursor.*];
+            cursor.* += 1;
+            const val = try decodeValue(@enumFromInt(val_tag_byte), payload, cursor);
+            break :blk OwnedPredicate{ .leaf = .{ .col = col, .op = op_byte, .val = val } };
+        },
+        .leaf_col_col => blk: {
+            if (cursor.* + 1 > payload.len) return Error.WalCorrupt;
+            const op_byte = payload[cursor.*];
+            cursor.* += 1;
+            const left = try readOwnedBytes(payload, cursor, alloc);
+            const right = try readOwnedBytes(payload, cursor, alloc);
+            break :blk OwnedPredicate{ .leaf_col_col = .{ .left = left, .op = op_byte, .right = right } };
+        },
+        .is_null => OwnedPredicate{ .is_null = try readOwnedBytes(payload, cursor, alloc) },
+        .is_not_null => OwnedPredicate{ .is_not_null = try readOwnedBytes(payload, cursor, alloc) },
+        .like => blk: {
+            const col = try readOwnedBytes(payload, cursor, alloc);
+            const pat = try readOwnedBytes(payload, cursor, alloc);
+            break :blk OwnedPredicate{ .like = .{ .col = col, .pattern = pat } };
+        },
+        .p_and, .p_or => blk: {
+            if (cursor.* + 4 > payload.len) return Error.WalCorrupt;
+            const n = format.readU32(payload[cursor.*..][0..4]);
+            cursor.* += 4;
+            const kids = try alloc.alloc(OwnedPredicate, n);
+            for (kids) |*k| k.* = try decodeOwnedPredicate(payload, cursor, alloc);
+            break :blk if (tag == .p_and) OwnedPredicate{ .p_and = kids } else OwnedPredicate{ .p_or = kids };
+        },
+        .p_not => blk: {
+            const child = try alloc.create(OwnedPredicate);
+            child.* = try decodeOwnedPredicate(payload, cursor, alloc);
+            break :blk OwnedPredicate{ .p_not = child };
+        },
+        .always => blk: {
+            if (cursor.* + 1 > payload.len) return Error.WalCorrupt;
+            const b = payload[cursor.*] != 0;
+            cursor.* += 1;
+            break :blk OwnedPredicate{ .always = b };
+        },
+        .in_set => blk: {
+            const col = try readOwnedBytes(payload, cursor, alloc);
+            if (cursor.* + 1 + 1 + 4 > payload.len) return Error.WalCorrupt;
+            const negate = payload[cursor.*] != 0;
+            cursor.* += 1;
+            const val_tag_byte = payload[cursor.*];
+            cursor.* += 1;
+            const n = format.readU32(payload[cursor.*..][0..4]);
+            cursor.* += 4;
+            const vals = try alloc.alloc(Value, n);
+            for (vals) |*v| v.* = try decodeValue(@enumFromInt(val_tag_byte), payload, cursor);
+            break :blk OwnedPredicate{ .in_set = .{ .col = col, .negate = negate, .values = vals } };
+        },
+    };
+}
+
+fn freeOwnedPredicate(alloc: Allocator, p: OwnedPredicate) void {
+    switch (p) {
+        .leaf => |lf| alloc.free(lf.col),
+        .leaf_col_col => |lc| {
+            alloc.free(lc.left);
+            alloc.free(lc.right);
+        },
+        .is_null, .is_not_null => |col| alloc.free(col),
+        .like => |lp| {
+            alloc.free(lp.col);
+            alloc.free(lp.pattern);
+        },
+        .p_and, .p_or => |kids| {
+            for (kids) |k| freeOwnedPredicate(alloc, k);
+            alloc.free(kids);
+        },
+        .p_not => |child| {
+            freeOwnedPredicate(alloc, child.*);
+            alloc.destroy(child);
+        },
+        .always => {},
+        .in_set => |s| {
+            alloc.free(s.col);
+            alloc.free(s.values);
+        },
+    }
+}
+
+fn readOwnedBytes(payload: []const u8, cursor: *usize, alloc: Allocator) ![]u8 {
+    if (cursor.* + 4 > payload.len) return Error.WalCorrupt;
+    const len = format.readU32(payload[cursor.*..][0..4]);
+    cursor.* += 4;
+    if (cursor.* + len > payload.len) return Error.WalCorrupt;
+    const dup = try alloc.alloc(u8, len);
+    @memcpy(dup, payload[cursor.* .. cursor.* + len]);
+    cursor.* += len;
+    return dup;
+}
+
+fn evaluatePredicateOnRow(mt: *Memtable, row: u32, p: OwnedPredicate) bool {
+    return switch (p) {
+        .leaf => |lf| blk: {
+            const idx = mt.schema.columnIndex(lf.col) orelse break :blk false;
+            const view = mt.columns[idx].view();
+            if (!view.isValid(row)) break :blk false;
+            break :blk predicateMatches(view, row, lf.op, lf.val);
+        },
+        .leaf_col_col => |lc| blk: {
+            const li = mt.schema.columnIndex(lc.left) orelse break :blk false;
+            const ri = mt.schema.columnIndex(lc.right) orelse break :blk false;
+            const lv = mt.columns[li].view();
+            const rv = mt.columns[ri].view();
+            if (!lv.isValid(row) or !rv.isValid(row)) break :blk false;
+            break :blk colColMatches(lv, rv, row, lc.op);
+        },
+        .is_null => |col| blk: {
+            const idx = mt.schema.columnIndex(col) orelse break :blk false;
+            break :blk !mt.columns[idx].view().isValid(row);
+        },
+        .is_not_null => |col| blk: {
+            const idx = mt.schema.columnIndex(col) orelse break :blk false;
+            break :blk mt.columns[idx].view().isValid(row);
+        },
+        .like => |lp| blk: {
+            const idx = mt.schema.columnIndex(lp.col) orelse break :blk false;
+            const view = mt.columns[idx].view();
+            if (!view.isValid(row)) break :blk false;
+            const cell = switch (view.data) {
+                .varchar => |sv| sv.rowBytes(row),
+                .string => |sv| sv.rowBytes(row),
+                .char => |sv| sv.rowBytes(row),
+                else => break :blk false,
+            };
+            break :blk likeMatch(cell, lp.pattern);
+        },
+        .p_and => |kids| {
+            for (kids) |k| {
+                if (!evaluatePredicateOnRow(mt, row, k)) return false;
+            }
+            return true;
+        },
+        .p_or => |kids| {
+            for (kids) |k| {
+                if (evaluatePredicateOnRow(mt, row, k)) return true;
+            }
+            return false;
+        },
+        .p_not => |child| !evaluatePredicateOnRow(mt, row, child.*),
+        .always => |b| b,
+        .in_set => |s| blk: {
+            const idx = mt.schema.columnIndex(s.col) orelse break :blk false;
+            const view = mt.columns[idx].view();
+            if (!view.isValid(row)) {
+                // NULL never matches; for IN false, for NOT IN false (dialect).
+                break :blk false;
+            }
+            var found = false;
+            for (s.values) |v| {
+                if (predicateMatches(view, row, 0, v)) { // op=0 → eq
+                    found = true;
+                    break;
+                }
+            }
+            break :blk if (s.negate) !found else found;
+        },
+    };
+}
+
+fn colColMatches(lv: ColumnView, rv: ColumnView, row: u32, op: u8) bool {
+    return switch (lv.data) {
+        .int => switch (rv.data) {
+            .int => cmpI(i32, lv.data.int[row], rv.data.int[row], op),
+            else => false,
+        },
+        .bigint => switch (rv.data) {
+            .bigint => cmpI(i64, lv.data.bigint[row], rv.data.bigint[row], op),
+            else => false,
+        },
+        .smallint => switch (rv.data) {
+            .smallint => cmpI(i16, lv.data.smallint[row], rv.data.smallint[row], op),
+            else => false,
+        },
+        .tinyint => switch (rv.data) {
+            .tinyint => cmpI(i8, lv.data.tinyint[row], rv.data.tinyint[row], op),
+            else => false,
+        },
+        .largeint => switch (rv.data) {
+            .largeint => cmpI(i128, lv.data.largeint[row], rv.data.largeint[row], op),
+            else => false,
+        },
+        .float => switch (rv.data) {
+            .float => cmpF(f32, lv.data.float[row], rv.data.float[row], op),
+            else => false,
+        },
+        .double => switch (rv.data) {
+            .double => cmpF(f64, lv.data.double[row], rv.data.double[row], op),
+            else => false,
+        },
+        .date => switch (rv.data) {
+            .date => cmpI(i32, lv.data.date[row], rv.data.date[row], op),
+            else => false,
+        },
+        .datetime => switch (rv.data) {
+            .datetime => cmpI(i64, lv.data.datetime[row], rv.data.datetime[row], op),
+            else => false,
+        },
+        .decimal64 => switch (rv.data) {
+            .decimal64 => cmpI(i64, lv.data.decimal64[row], rv.data.decimal64[row], op),
+            else => false,
+        },
+        .decimal128 => switch (rv.data) {
+            .decimal128 => cmpI(i128, lv.data.decimal128[row], rv.data.decimal128[row], op),
+            else => false,
+        },
+        .uuid => switch (rv.data) {
+            .uuid => cmpI(u128, lv.data.uuid[row], rv.data.uuid[row], op),
+            else => false,
+        },
+        .boolean => switch (rv.data) {
+            .boolean => cmpI(u8, lv.data.boolean[row], rv.data.boolean[row], op),
+            else => false,
+        },
+        .varchar, .string, .char => switch (rv.data) {
+            .varchar => |sv| cmpStr(rowStringBytes(lv, row), sv.rowBytes(row), op),
+            .string => |sv| cmpStr(rowStringBytes(lv, row), sv.rowBytes(row), op),
+            .char => |sv| cmpStr(rowStringBytes(lv, row), sv.rowBytes(row), op),
+            else => false,
+        },
+    };
+}
+
+fn rowStringBytes(view: ColumnView, row: u32) []const u8 {
+    return switch (view.data) {
+        .varchar => |sv| sv.rowBytes(row),
+        .string => |sv| sv.rowBytes(row),
+        .char => |sv| sv.rowBytes(row),
+        else => &[_]u8{},
+    };
+}
+
+/// Recursive LIKE matcher — `%` matches any run, `_` matches one byte.
+/// Local copy to avoid the engine→exec import.
+fn likeMatch(text: []const u8, pattern: []const u8) bool {
+    var ti: usize = 0;
+    var pi: usize = 0;
+    var star_ti: ?usize = null;
+    var star_pi: usize = 0;
+    while (ti < text.len) {
+        if (pi < pattern.len and pattern[pi] == '%') {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if (pi < pattern.len and (pattern[pi] == '_' or pattern[pi] == text[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if (star_ti) |sti| {
+            pi = star_pi + 1;
+            ti = sti + 1;
+            star_ti = sti + 1;
+        } else return false;
+    }
+    while (pi < pattern.len and pattern[pi] == '%') pi += 1;
+    return pi == pattern.len;
 }
 
 test {

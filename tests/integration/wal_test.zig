@@ -363,3 +363,127 @@ test "wal: concurrent writers survive close + reopen" {
     try std.testing.expectEqual(@as(u64, num_threads * per_thread), t.memtable.row_count);
 }
 
+// =============================================================================
+// SQL DELETE / UPDATE WAL replay — the rich-predicate path.
+// =============================================================================
+
+const sql_helpers = @import("sql_helpers.zig");
+
+test "wal: SQL DELETE FROM survives close-without-flush + reopen" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Session 1: CREATE + INSERT + DELETE via SQL with WAL on, no flush.
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+            .wal_enabled = true,
+            .auto_flush_secs = 0,
+            .auto_flush_rows = 1_000_000,
+            .auto_flush_bytes = 64 * 1024 * 1024,
+        });
+        defer db.close();
+        try sql_helpers.exec(allocator, db,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
+        );
+        try sql_helpers.exec(allocator, db,
+            "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+        );
+        try sql_helpers.exec(allocator, db, "DELETE FROM t WHERE qty > 20");
+        // No flush.
+    }
+
+    // Session 2: replay rebuilds the memtable + applies the delete.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+    defer db.close();
+    const ids = try sql_helpers.collectBigints(allocator, db, "SELECT id FROM t ORDER BY id ASC");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, ids);
+}
+
+test "wal: SQL DELETE with AND/OR predicate replays correctly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+        defer db.close();
+        try sql_helpers.exec(allocator, db,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, region VARCHAR(8) NOT NULL)",
+        );
+        try sql_helpers.exec(allocator, db,
+            "INSERT INTO t (id, qty, region) VALUES " ++
+                "(1, 10, 'east'), (2, 20, 'east'), (3, 30, 'west'), (4, 100, 'west')",
+        );
+        // (region = 'east' AND qty > 15) OR id = 4 → ids 2 + 4.
+        try sql_helpers.exec(allocator, db,
+            "DELETE FROM t WHERE (region = 'east' AND qty > 15) OR id = 4",
+        );
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+    defer db.close();
+    const ids = try sql_helpers.collectBigints(allocator, db, "SELECT id FROM t ORDER BY id ASC");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, ids);
+}
+
+test "wal: SQL UPDATE replays via DELETE + INSERT entries" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+        defer db.close();
+        try sql_helpers.exec(allocator, db,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
+        );
+        try sql_helpers.exec(allocator, db,
+            "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30)",
+        );
+        try sql_helpers.exec(allocator, db, "UPDATE t SET qty = 999 WHERE id = 2");
+        // No flush — replay should rebuild via WAL: insert all 3, delete
+        // matching the UPDATE's predicate, re-insert with new qty.
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+    defer db.close();
+    var q = try sql_helpers.runSql(allocator, db, "SELECT id, qty FROM t ORDER BY id ASC");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), batch.row_count);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, batch.values[0].data.bigint[0..3]);
+    try std.testing.expectEqualSlices(i32, &.{ 10, 999, 30 }, batch.values[1].data.int[0..3]);
+}
+
+test "wal: DELETE FROM t (no WHERE) wipes the memtable on replay" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+        defer db.close();
+        try sql_helpers.exec(allocator, db,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
+        );
+        try sql_helpers.exec(allocator, db,
+            "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20)",
+        );
+        try sql_helpers.exec(allocator, db, "DELETE FROM t");
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+    defer db.close();
+    const ids = try sql_helpers.collectBigints(allocator, db, "SELECT id FROM t");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{}, ids);
+}
+

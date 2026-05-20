@@ -91,6 +91,13 @@ pub const RecordType = enum(u8) {
     insert = 1,
     delete = 2,
     flush_marker = 3,
+    /// Rich-predicate delete — `DELETE FROM t WHERE <bool_expr>`. The
+    /// payload encodes a `PredicateExpr` tree (AND/OR/NOT/leaf/etc).
+    /// On replay, the memtable is filtered by evaluating the predicate
+    /// over its rows. Segment-side tombstones are durable independently
+    /// (per-segment atomic tmp+rename writes) — replay only fixes up
+    /// the memtable.
+    delete_expr = 4,
 };
 
 pub const Error = error{
@@ -100,6 +107,10 @@ pub const Error = error{
     WalCorrupt,
     WalUnknownRecord,
     WalTooSmall,
+    /// PredicateExpr contained a variant the WAL codec doesn't
+    /// support (subqueries, var_refs, correlated forms). Caller can
+    /// choose to skip WAL logging and proceed with the delete.
+    WalPredicateUnsupported,
 };
 
 /// Owns the open file handle for the current WAL and accumulates writes.
@@ -225,6 +236,24 @@ pub const WalWriter = struct {
         try codec.encodeValue(self.allocator, &payload, pred.val);
 
         return self.writeRecord(.delete, payload.items);
+    }
+
+    /// Encode a rich `PredicateExpr` tree (the SQL `DELETE FROM t WHERE
+    /// ...` form). Supported variants: leaf / leaf_col_col / is_null /
+    /// is_not_null / like / and / or / not / always / in_set. Predicates
+    /// containing unresolved subqueries (scalar/exists/in) or var_refs
+    /// surface as `error.WalPredicateUnsupported` — caller may proceed
+    /// without WAL logging (the delete still executes; durability for
+    /// memtable-only state is lost across crash, but segment tombstones
+    /// remain durable via their tmp+rename writes).
+    ///
+    /// `pred` is `anytype` to avoid an engine→exec import cycle —
+    /// callers pass an `exec.PredicateExpr`.
+    pub fn appendDeleteExpr(self: *WalWriter, pred: anytype) !u64 {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try codec.encodePredicateExpr(self.allocator, &payload, pred);
+        return self.writeRecord(.delete_expr, payload.items);
     }
 
     pub fn appendFlushMarker(self: *WalWriter, max_segment_id: u64) !u64 {
@@ -427,6 +456,7 @@ pub fn replay(
         switch (rec.type) {
             .insert => try codec.applyInsertRecord(allocator, rec.payload, mt),
             .delete => try codec.applyDeleteRecord(allocator, rec.payload, mt),
+            .delete_expr => try codec.applyDeleteExprRecord(allocator, rec.payload, mt),
             .flush_marker => {},
         }
         did_replay = true;
@@ -445,7 +475,7 @@ const ReadRecord = struct {
 fn readRecord(bytes: []const u8, off: usize) !ReadRecord {
     if (off + record_header_size > bytes.len) return Error.WalTooSmall;
     const tag_byte = bytes[off];
-    if (tag_byte < 1 or tag_byte > 3) return Error.WalUnknownRecord;
+    if (tag_byte < 1 or tag_byte > 4) return Error.WalUnknownRecord;
     const t: RecordType = @enumFromInt(tag_byte);
     const payload_len = format.readU32(bytes[off + 1 .. off + 5]);
     const payload_end = off + record_header_size + payload_len;
