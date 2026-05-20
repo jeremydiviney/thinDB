@@ -143,9 +143,14 @@ const ProjItem = struct {
     kind: union(enum) {
         /// Plain column reference. `column` is the column name.
         col: []const u8,
-        /// Aggregate call. `agg_func` is the function; `agg_col` is the
-        /// argument column name (null for COUNT(*)).
-        agg: struct { func: ir.AggFunc, col: ?[]const u8 },
+        /// Aggregate call. `agg_func` is the function; `agg_col` is
+        /// the argument column name (null for COUNT(*) — or null
+        /// when `arg_expr` is set and the actual argument is a
+        /// computed expression). `arg_expr` is the source Expr when
+        /// the user wrote `SUM(a * b)` or similar — the parser
+        /// hoists it into a synthetic Compute column whose name then
+        /// fills in `col` before the GroupBy is built.
+        agg: struct { func: ir.AggFunc, col: ?[]const u8, arg_expr: ?ir.Expr = null },
         /// Scalar function call expression. Lowered to a Compute step
         /// before the final projection.
         expr: ir.Expr,
@@ -376,14 +381,45 @@ pub const Parser = struct {
                 .expr, .window => unreachable,
             };
 
+            // Aggregate-on-expression hoist: any agg whose argument is
+            // an Expr (e.g. SUM(a * b)) gets a synthetic Compute
+            // column inserted before the GroupBy, and the AggSpec
+            // references that synthetic name. Aggs whose arg is a
+            // plain column ref pass through unchanged.
+            var derived_buf: std.ArrayList(ir.Derived) = .empty;
+            var synth_counter: usize = 0;
+            var agg_cols: std.ArrayList(?[]const u8) = .empty;
+            defer agg_cols.deinit(self.arena);
+            for (proj) |p| switch (p.kind) {
+                .agg => |a| {
+                    if (a.arg_expr) |e| {
+                        const owned_name = std.fmt.allocPrint(self.arena, "__agg_arg_{d}", .{synth_counter}) catch return ParseError.OutOfMemory;
+                        synth_counter += 1;
+                        try derived_buf.append(self.arena, .{ .name = owned_name, .expr = e });
+                        try agg_cols.append(self.arena, owned_name);
+                    } else {
+                        try agg_cols.append(self.arena, a.col);
+                    }
+                },
+                else => {},
+            };
+            if (derived_buf.items.len > 0) {
+                const derived_slice = try derived_buf.toOwnedSlice(self.arena);
+                root = try self.allocOp(.{ .compute = .{ .derived = derived_slice, .upstream = root } });
+            }
+
             // Build agg specs from the projection.
             var aggs_buf: std.ArrayList(ir.AggSpec) = .empty;
+            var agg_i: usize = 0;
             for (proj) |p| switch (p.kind) {
-                .agg => |a| try aggs_buf.append(self.arena, .{
-                    .func = a.func,
-                    .col = a.col,
-                    .as = p.name,
-                }),
+                .agg => |a| {
+                    try aggs_buf.append(self.arena, .{
+                        .func = a.func,
+                        .col = agg_cols.items[agg_i],
+                        .as = p.name,
+                    });
+                    agg_i += 1;
+                },
                 else => {},
             };
             const aggs_slice = try aggs_buf.toOwnedSlice(self.arena);
@@ -802,6 +838,7 @@ pub const Parser = struct {
     ) ParseError!ProjItem {
         if (args.len != 1) return ParseError.SqlInvalidProjection;
         var arg_col: ?[]const u8 = null;
+        var arg_expr: ?ir.Expr = null;
         switch (args[0]) {
             .col_ref => |c| {
                 if (std.mem.eql(u8, c, "*")) {
@@ -811,6 +848,12 @@ pub const Parser = struct {
                     arg_col = try self.arena.dupe(u8, c);
                 }
             },
+            // Expression arg — e.g. SUM(a * b) or COUNT(upper(name)).
+            // Hoisted into a synthetic Compute column before the
+            // GroupBy step; see parseStatement's pre-aggregate pass.
+            .call, .case, .lit => arg_expr = args[0],
+            // Subqueries / EXISTS as aggregate args are out of scope
+            // for v1; users can pre-aggregate via a CTE.
             else => return ParseError.SqlInvalidProjection,
         }
         const default_name = blk: {
@@ -818,12 +861,20 @@ pub const Parser = struct {
             defer buf.deinit(self.arena);
             try buf.appendSlice(self.arena, func_name);
             try buf.append(self.arena, '(');
-            try buf.appendSlice(self.arena, arg_col orelse "*");
+            if (arg_expr != null) {
+                try buf.appendSlice(self.arena, "expr");
+            } else {
+                try buf.appendSlice(self.arena, arg_col orelse "*");
+            }
             try buf.append(self.arena, ')');
             break :blk try buf.toOwnedSlice(self.arena);
         };
         const alias = try self.maybeAlias(default_name);
-        return ProjItem{ .name = alias, .kind = .{ .agg = .{ .func = func, .col = arg_col } } };
+        return ProjItem{ .name = alias, .kind = .{ .agg = .{
+            .func = func,
+            .col = arg_col,
+            .arg_expr = arg_expr,
+        } } };
     }
 
 
