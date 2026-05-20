@@ -814,9 +814,12 @@ pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*Api
     const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
     const schema_name = ref.schema orelse session.current_schema;
     const sc = db.schema(schema_name) orelse return Error.SchemaNotFound;
-    sc.tables_mutex.lockUncancelable(sc.io);
-    defer sc.tables_mutex.unlock(sc.io);
-    return sc.tables.get(ref.name) orelse return Error.TableNotFound;
+    {
+        sc.tables_mutex.lockUncancelable(sc.io);
+        defer sc.tables_mutex.unlock(sc.io);
+        if (sc.tables.get(ref.name)) |t| return t;
+    }
+    return sc.openTable(ref.name, .{});
 }
 
 /// Server-side IR dispatcher. Recursively walks the decoded IR tree and

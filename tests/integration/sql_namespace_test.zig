@@ -286,6 +286,34 @@ test "sql namespace: SHOW TABLES lists the current schema's tables" {
     try std.testing.expect(containsString(names, "beta"));
 }
 
+test "sql namespace: reopened database lists and scans persisted tables" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        _ = try seed(db, "persisted");
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var show_q = try runSql(allocator, db, "SHOW TABLES");
+    defer show_q.deinit();
+    var names = try collectStrings(allocator, &show_q);
+    defer freeStrings(allocator, &names);
+    try std.testing.expect(containsString(names, "persisted"));
+
+    var scan_q = try runSql(allocator, db, "SELECT id FROM persisted ORDER BY id");
+    defer scan_q.deinit();
+    const ids = try collectIds(allocator, &scan_q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids);
+}
+
 test "sql namespace: SHOW TABLES FROM db.schema cross-references" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -25,6 +25,8 @@ pub const Outcome = union(enum) {
     variable_row: struct { name: []const u8, value: []const u8 },
     /// Reply with an empty two-column result set (Variable_name, Value).
     empty_variables,
+    /// Reply with an empty Workbench/driver metadata result set.
+    empty_result: EmptyResultKind,
     /// `KILL [QUERY|CONNECTION] <id>` — wire layer looks up the
     /// target in the connection registry, sets its cancel flag, and
     /// replies OK (or ERR 1094 if no such id). We don't distinguish
@@ -36,6 +38,21 @@ pub const Outcome = union(enum) {
     /// namespace (if any), clears the txn flag, reverts the current
     /// schema to defaults, then replies OK.
     reset_connection,
+};
+
+pub const EmptyResultKind = enum {
+    warnings,
+    engines,
+    plugins,
+    collations,
+    character_sets,
+    full_tables,
+    table_status,
+    columns,
+    indexes,
+    grants,
+    processlist,
+    generic_status,
 };
 
 /// Returns null if `sql` is not a probe query we recognize.
@@ -116,6 +133,18 @@ pub fn match(
     if (std.mem.eql(u8, lc, "select user()") or std.mem.eql(u8, lc, "select current_user()"))
         return Outcome{ .single_value = .{ .col = "USER()", .val = "thindb@localhost" } };
 
+    if (isShowVariables(lc)) {
+        if (std.mem.indexOf(u8, lc, "sql_mode") != null)
+            return Outcome{ .variable_row = .{ .name = "sql_mode", .value = "STRICT_TRANS_TABLES" } };
+        if (std.mem.indexOf(u8, lc, "character_set_results") != null)
+            return Outcome{ .variable_row = .{ .name = "character_set_results", .value = "utf8mb4" } };
+        if (std.mem.indexOf(u8, lc, "lower_case_table_names") != null)
+            return Outcome{ .variable_row = .{ .name = "lower_case_table_names", .value = "1" } };
+        if (std.mem.indexOf(u8, lc, "version") != null)
+            return Outcome{ .variable_row = .{ .name = "version", .value = handshake.server_version } };
+        return Outcome{ .empty_variables = {} };
+    }
+
     if (std.mem.eql(u8, lc, "show variables like 'sql_mode'"))
         return Outcome{ .variable_row = .{ .name = "sql_mode", .value = "STRICT_TRANS_TABLES" } };
     if (std.mem.eql(u8, lc, "show variables like 'character_set_results'"))
@@ -123,11 +152,61 @@ pub fn match(
     if (std.mem.eql(u8, lc, "show variables like 'lower_case_table_names'"))
         return Outcome{ .variable_row = .{ .name = "lower_case_table_names", .value = "1" } };
 
-    if (std.mem.startsWith(u8, lc, "show variables")) {
-        return Outcome{ .empty_variables = {} };
-    }
+    if (isShowStatus(lc)) return Outcome{ .empty_variables = {} };
+    if (std.mem.startsWith(u8, lc, "show warnings") or
+        std.mem.startsWith(u8, lc, "show errors"))
+        return Outcome{ .empty_result = .warnings };
+    if (std.mem.startsWith(u8, lc, "show engines"))
+        return Outcome{ .empty_result = .engines };
+    if (std.mem.startsWith(u8, lc, "show plugins"))
+        return Outcome{ .empty_result = .plugins };
+    if (std.mem.startsWith(u8, lc, "show collation") or
+        std.mem.startsWith(u8, lc, "show collations"))
+        return Outcome{ .empty_result = .collations };
+    if (std.mem.startsWith(u8, lc, "show character set") or
+        std.mem.startsWith(u8, lc, "show charset"))
+        return Outcome{ .empty_result = .character_sets };
+    if (std.mem.startsWith(u8, lc, "show full tables"))
+        return Outcome{ .empty_result = .full_tables };
+    if (std.mem.startsWith(u8, lc, "show table status"))
+        return Outcome{ .empty_result = .table_status };
+    if (std.mem.startsWith(u8, lc, "show full columns") or
+        std.mem.startsWith(u8, lc, "show columns") or
+        std.mem.startsWith(u8, lc, "show fields") or
+        std.mem.startsWith(u8, lc, "desc ") or
+        std.mem.startsWith(u8, lc, "describe "))
+        return Outcome{ .empty_result = .columns };
+    if (std.mem.startsWith(u8, lc, "show index") or
+        std.mem.startsWith(u8, lc, "show indexes") or
+        std.mem.startsWith(u8, lc, "show keys"))
+        return Outcome{ .empty_result = .indexes };
+    if (std.mem.startsWith(u8, lc, "show grants"))
+        return Outcome{ .empty_result = .grants };
+    if (std.mem.startsWith(u8, lc, "show processlist") or
+        std.mem.startsWith(u8, lc, "show full processlist"))
+        return Outcome{ .empty_result = .processlist };
+    if (std.mem.startsWith(u8, lc, "show procedure status") or
+        std.mem.startsWith(u8, lc, "show function status") or
+        std.mem.startsWith(u8, lc, "show triggers") or
+        std.mem.startsWith(u8, lc, "show events") or
+        std.mem.startsWith(u8, lc, "show master status") or
+        std.mem.startsWith(u8, lc, "show slave status") or
+        std.mem.startsWith(u8, lc, "show replica status"))
+        return Outcome{ .empty_result = .generic_status };
 
     return null;
+}
+
+fn isShowVariables(lc: []const u8) bool {
+    return std.mem.startsWith(u8, lc, "show variables") or
+        std.mem.startsWith(u8, lc, "show session variables") or
+        std.mem.startsWith(u8, lc, "show global variables");
+}
+
+fn isShowStatus(lc: []const u8) bool {
+    return std.mem.startsWith(u8, lc, "show status") or
+        std.mem.startsWith(u8, lc, "show session status") or
+        std.mem.startsWith(u8, lc, "show global status");
 }
 
 fn osLabel() []const u8 {
@@ -153,6 +232,23 @@ test "canned accepts arbitrary SET as OK" {
     const m = try match(allocator, "SET autocommit=1", "");
     try std.testing.expect(m != null);
     try std.testing.expectEqual(@as(std.meta.Tag(Outcome), .ok_packet), std.meta.activeTag(m.?));
+}
+
+test "canned accepts Workbench SHOW SESSION VARIABLES probe" {
+    const allocator = std.testing.allocator;
+    const m = try match(allocator, "SHOW SESSION VARIABLES LIKE 'lower_case_table_names'", "");
+    try std.testing.expect(m != null);
+    switch (m.?) {
+        .variable_row => |vr| try std.testing.expectEqualStrings("lower_case_table_names", vr.name),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "canned accepts Workbench SHOW FULL TABLES probe" {
+    const allocator = std.testing.allocator;
+    const m = try match(allocator, "SHOW FULL TABLES FROM `main__public`", "");
+    try std.testing.expect(m != null);
+    try std.testing.expectEqual(@as(std.meta.Tag(Outcome), .empty_result), std.meta.activeTag(m.?));
 }
 
 test "canned database() with empty schema yields NULL" {

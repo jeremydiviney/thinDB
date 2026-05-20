@@ -8,7 +8,7 @@
 //!                     ['WHERE' bool_expr]
 //!                     ['GROUP' 'BY' ident (',' ident)*]
 //!                     ['ORDER' 'BY' order_item (',' order_item)*]
-//!                     ['LIMIT' integer]
+//!                     ['LIMIT' integer | 'LIMIT' 0 ',' integer]
 //!   proj_list     ::= '*' | proj_item (',' proj_item)*
 //!   proj_item     ::= ident ('.' ident)? [AS ident]
 //!                   | agg_call [AS ident]
@@ -332,7 +332,20 @@ pub const Parser = struct {
             const n = self.cur.value.integer;
             try self.advance();
             if (n < 0) return ParseError.SqlExpectedValue;
-            pending_limit = @intCast(n);
+            if (self.cur.tag == .comma) {
+                // MySQL-style LIMIT offset,count. thinDB has no Offset
+                // operator yet, but Workbench emits LIMIT 0,N for result
+                // browsing; zero offset is exactly equivalent to LIMIT N.
+                if (n != 0) return ParseError.SqlExpectedValue;
+                try self.advance();
+                if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+                const count = self.cur.value.integer;
+                try self.advance();
+                if (count < 0) return ParseError.SqlExpectedValue;
+                pending_limit = @intCast(count);
+            } else {
+                pending_limit = @intCast(n);
+            }
         }
 
         if (has_agg or group_cols.len > 0) {

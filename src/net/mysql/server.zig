@@ -19,6 +19,8 @@ const Catalog = thindb_api.Catalog;
 const Session = thindb_api.Session;
 const TempNamespace = thindb_api.TempNamespace;
 const ApiError = thindb_api.Error;
+const Schema = thindb_api.Schema;
+const Table = thindb_api.Table;
 
 const local = @import("../local.zig");
 const ir = @import("../../ir/ir.zig");
@@ -32,6 +34,7 @@ const canned = @import("canned.zig");
 const errors = @import("errors.zig");
 const auth = @import("auth.zig");
 const prepared = @import("prepared.zig");
+const sql_text_mod = @import("../sql_text.zig");
 const conn_registry = @import("../conn_registry.zig");
 const ConnectionState = conn_registry.ConnectionState;
 const ConnectionRegistry = conn_registry.Registry;
@@ -648,6 +651,7 @@ fn handleQuery(
             .single_null => |col| try result.sendSingleValueResult(allocator, w, col, null, &seq_id, caps),
             .variable_row => |vr| try result.sendVariableRow(allocator, w, vr.name, vr.value, &seq_id, caps),
             .empty_variables => try result.sendEmptyVariables(allocator, w, &seq_id, caps),
+            .empty_result => |kind| try sendMetadataResult(allocator, w, catalog, session, payload, kind, &seq_id, caps),
             .kill => |target_id| {
                 // No registry → KILL is a no-op success. With a
                 // registry, look up the target and set its cancel
@@ -676,7 +680,1559 @@ fn handleQuery(
         return;
     }
 
+    if (try sendSyntheticWorkbenchSelect(allocator, w, catalog, session, payload, &seq_id, caps)) return;
+
     try runEngineQuery(allocator, w, catalog, session, payload, &seq_id);
+}
+
+fn sendSyntheticWorkbenchSelect(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+    seq_id: *u8,
+    client_caps: u32,
+) !bool {
+    const lc = try sql_text_mod.normalizeForCannedMatch(allocator, payload);
+    defer allocator.free(lc);
+
+    if (!std.mem.startsWith(u8, lc, "select ")) return false;
+
+    const from_idx = topLevelKeyword(lc, "from");
+    if (from_idx) |idx| {
+        const tail = lc[idx..];
+        if (std.mem.indexOf(u8, tail, "information_schema") == null and
+            std.mem.indexOf(u8, tail, "`information_schema`") == null)
+            return false;
+
+        if (try sendInformationSchemaSelect(
+            allocator,
+            w,
+            catalog,
+            lc["select ".len..idx],
+            tail,
+            seq_id,
+            client_caps,
+        )) return true;
+
+        var cols = std.ArrayList(types.Column).empty;
+        defer cols.deinit(allocator);
+        try appendSelectColumns(allocator, &cols, lc["select ".len..idx]);
+        if (cols.items.len == 0) try cols.append(allocator, .{ .name = "Name", .type = .string });
+        try sendEmptyColumns(allocator, w, cols.items, seq_id, client_caps);
+        return true;
+    }
+
+    var select_list: []const u8 = lc["select ".len..];
+    if (topLevelKeyword(select_list, "limit")) |limit_idx| {
+        select_list = std.mem.trim(u8, select_list[0..limit_idx], " \t\r\n");
+    }
+    if (std.mem.startsWith(u8, select_list, "sql_no_cache ")) {
+        select_list = std.mem.trim(u8, select_list["sql_no_cache ".len..], " \t\r\n");
+    }
+
+    var cols = std.ArrayList(types.Column).empty;
+    defer cols.deinit(allocator);
+    var cells = std.ArrayList(?[]const u8).empty;
+    defer cells.deinit(allocator);
+
+    var start: usize = 0;
+    while (start < select_list.len) {
+        const end = nextTopLevelComma(select_list, start) orelse select_list.len;
+        const raw_expr = std.mem.trim(u8, select_list[start..end], " \t\r\n");
+        if (raw_expr.len > 0) {
+            const expr = stripAlias(raw_expr).expr;
+            const col_name = stripIdentifierQuotes(stripAlias(raw_expr).alias orelse raw_expr);
+            const value = syntheticSelectValue(expr, session.current_schema);
+            try cols.append(allocator, .{ .name = col_name, .type = .string, .nullable = value == null });
+            try cells.append(allocator, value);
+        }
+        start = end + 1;
+    }
+
+    if (cols.items.len == 0) return false;
+    try result.sendResultHeader(allocator, w, cols.items, "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+    try result.sendTextRow(allocator, w, cells.items, seq_id);
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
+    return true;
+}
+
+fn appendSelectColumns(
+    allocator: Allocator,
+    cols: *std.ArrayList(types.Column),
+    select_list: []const u8,
+) !void {
+    var start: usize = 0;
+    while (start < select_list.len) {
+        const end = nextTopLevelComma(select_list, start) orelse select_list.len;
+        const raw_expr = std.mem.trim(u8, select_list[start..end], " \t\r\n");
+        if (raw_expr.len > 0 and !std.mem.eql(u8, raw_expr, "*")) {
+            const alias = stripAlias(raw_expr).alias orelse raw_expr;
+            try cols.append(allocator, .{ .name = stripIdentifierQuotes(alias), .type = .string, .nullable = true });
+        }
+        start = end + 1;
+    }
+}
+
+fn StripAliasResult(comptime T: type) type {
+    return struct {
+        expr: T,
+        alias: ?T,
+    };
+}
+
+fn stripAlias(raw_expr: []const u8) StripAliasResult([]const u8) {
+    const expr = std.mem.trim(u8, raw_expr, " \t\r\n");
+    if (std.mem.lastIndexOf(u8, expr, " as ")) |idx| {
+        return .{
+            .expr = std.mem.trim(u8, expr[0..idx], " \t\r\n"),
+            .alias = std.mem.trim(u8, expr[idx + 4 ..], " \t\r\n"),
+        };
+    }
+    return .{ .expr = expr, .alias = null };
+}
+
+fn stripIdentifierQuotes(s_in: []const u8) []const u8 {
+    const s = std.mem.trim(u8, s_in, " \t\r\n");
+    if (s.len >= 2 and ((s[0] == '`' and s[s.len - 1] == '`') or
+        (s[0] == '"' and s[s.len - 1] == '"') or
+        (s[0] == '\'' and s[s.len - 1] == '\'')))
+        return s[1 .. s.len - 1];
+    return s;
+}
+
+fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8) ?[]const u8 {
+    const expr = std.mem.trim(u8, expr_in, " \t\r\n");
+    if (expr.len == 0) return "";
+    if (std.mem.eql(u8, expr, "null")) return null;
+    if (std.mem.eql(u8, expr, "1") or std.mem.eql(u8, expr, "0")) return expr;
+    if (expr.len >= 2 and expr[0] == '\'' and expr[expr.len - 1] == '\'') return expr[1 .. expr.len - 1];
+
+    if (std.mem.startsWith(u8, expr, "@@")) {
+        return syntheticVariableValue(expr[2..], current_schema);
+    }
+
+    if (std.mem.eql(u8, expr, "version()")) return handshake.server_version;
+    if (std.mem.eql(u8, expr, "database()") or std.mem.eql(u8, expr, "schema()")) return current_schema;
+    if (std.mem.eql(u8, expr, "user()") or
+        std.mem.eql(u8, expr, "current_user()") or
+        std.mem.eql(u8, expr, "session_user()") or
+        std.mem.eql(u8, expr, "system_user()"))
+        return "thindb@localhost";
+    if (std.mem.eql(u8, expr, "connection_id()")) return "1";
+    if (std.mem.eql(u8, expr, "connection_id")) return "1";
+    if (std.mem.eql(u8, expr, "current_timestamp()") or
+        std.mem.eql(u8, expr, "current_timestamp") or
+        std.mem.eql(u8, expr, "now()"))
+        return "1970-01-01 00:00:00";
+
+    // Workbench and drivers occasionally probe scalar expressions
+    // during connection setup. Returning a benign string result keeps
+    // those probes out of thinDB's FROM-requiring SQL parser.
+    return "";
+}
+
+fn syntheticVariableValue(var_in: []const u8, current_schema: []const u8) []const u8 {
+    var v = std.mem.trim(u8, var_in, " \t\r\n");
+    if (std.mem.startsWith(u8, v, "global.")) v = v["global.".len..];
+    if (std.mem.startsWith(u8, v, "session.")) v = v["session.".len..];
+    if (std.mem.startsWith(u8, v, "local.")) v = v["local.".len..];
+
+    if (std.mem.eql(u8, v, "version")) return handshake.server_version;
+    if (std.mem.eql(u8, v, "version_comment")) return "thinDB";
+    if (std.mem.eql(u8, v, "version_compile_os")) return osLabel();
+    if (std.mem.eql(u8, v, "version_compile_machine")) return "x86_64";
+    if (std.mem.eql(u8, v, "protocol_version")) return "10";
+    if (std.mem.eql(u8, v, "license")) return "thinDB";
+    if (std.mem.eql(u8, v, "hostname")) return "localhost";
+    if (std.mem.eql(u8, v, "port")) return "3307";
+    if (std.mem.eql(u8, v, "server_id")) return "1";
+
+    if (std.mem.eql(u8, v, "database") or std.mem.eql(u8, v, "schema")) return current_schema;
+    if (std.mem.eql(u8, v, "max_allowed_packet")) return "16777216";
+    if (std.mem.eql(u8, v, "net_buffer_length")) return "16384";
+    if (std.mem.eql(u8, v, "wait_timeout")) return "28800";
+    if (std.mem.eql(u8, v, "interactive_timeout")) return "28800";
+    if (std.mem.eql(u8, v, "max_connections")) return "256";
+    if (std.mem.eql(u8, v, "group_concat_max_len")) return "1024";
+    if (std.mem.eql(u8, v, "sql_select_limit")) return "18446744073709551615";
+
+    if (std.mem.eql(u8, v, "tx_isolation") or std.mem.eql(u8, v, "transaction_isolation"))
+        return "REPEATABLE-READ";
+    if (std.mem.eql(u8, v, "sql_mode")) return "STRICT_TRANS_TABLES";
+    if (std.mem.eql(u8, v, "autocommit")) return "1";
+    if (std.mem.eql(u8, v, "lower_case_table_names")) return "1";
+    if (std.mem.eql(u8, v, "auto_increment_increment")) return "1";
+    if (std.mem.eql(u8, v, "default_storage_engine") or std.mem.eql(u8, v, "storage_engine")) return "thinDB";
+
+    if (std.mem.eql(u8, v, "character_set_client") or
+        std.mem.eql(u8, v, "character_set_connection") or
+        std.mem.eql(u8, v, "character_set_results") or
+        std.mem.eql(u8, v, "character_set_server") or
+        std.mem.eql(u8, v, "character_set_database"))
+        return "utf8mb4";
+    if (std.mem.eql(u8, v, "collation_connection") or
+        std.mem.eql(u8, v, "collation_server") or
+        std.mem.eql(u8, v, "collation_database"))
+        return "utf8mb4_general_ci";
+    if (std.mem.eql(u8, v, "time_zone")) return "SYSTEM";
+    if (std.mem.eql(u8, v, "system_time_zone")) return "UTC";
+
+    if (std.mem.startsWith(u8, v, "have_")) return "NO";
+    return "";
+}
+
+fn osLabel() []const u8 {
+    return switch (@import("builtin").os.tag) {
+        .windows => "Windows",
+        .macos => "macOS",
+        else => "Linux",
+    };
+}
+
+fn topLevelKeyword(text: []const u8, keyword: []const u8) ?usize {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == '\'' or c == '"' or c == '`') {
+            i = skipQuoted(text, i, c);
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')' and depth > 0) {
+            depth -= 1;
+            continue;
+        }
+        if (depth == 0 and tokenAt(text, i, keyword)) return i;
+    }
+    return null;
+}
+
+fn tokenAt(text: []const u8, i: usize, token: []const u8) bool {
+    if (i + token.len > text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + token.len], token)) return false;
+    if (i > 0 and isIdentByte(text[i - 1])) return false;
+    if (i + token.len < text.len and isIdentByte(text[i + token.len])) return false;
+    return true;
+}
+
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$' or c == '@';
+}
+
+fn nextTopLevelComma(text: []const u8, start: usize) ?usize {
+    var depth: usize = 0;
+    var i = start;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == '\'' or c == '"' or c == '`') {
+            i = skipQuoted(text, i, c);
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')' and depth > 0) {
+            depth -= 1;
+            continue;
+        }
+        if (c == ',' and depth == 0) return i;
+    }
+    return null;
+}
+
+fn skipQuoted(text: []const u8, start: usize, quote: u8) usize {
+    var i = start + 1;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == quote) {
+            if (quote == '\'' and i + 1 < text.len and text[i + 1] == '\'') {
+                i += 1;
+                continue;
+            }
+            return i;
+        }
+    }
+    return text.len;
+}
+
+fn sendMetadataResult(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+    kind: canned.EmptyResultKind,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    return switch (kind) {
+        .full_tables => sendFullTablesResult(allocator, w, catalog, session, payload, seq_id, client_caps),
+        .table_status => sendTableStatusResult(allocator, w, catalog, session, payload, seq_id, client_caps),
+        .columns => sendColumnsResult(allocator, w, catalog, session, payload, seq_id, client_caps),
+        .indexes => sendIndexesResult(allocator, w, catalog, session, payload, seq_id, client_caps),
+        else => sendEmptyMetadataResult(allocator, w, kind, seq_id, client_caps),
+    };
+}
+
+const ResolvedSchema = struct {
+    db_name: []const u8,
+    schema_name: []const u8,
+    schema: *Schema,
+};
+
+const ShowTableTarget = struct {
+    schema_name: ?[]const u8,
+    table_name: []const u8,
+};
+
+const IdentSegment = struct {
+    text: []const u8,
+    next: usize,
+};
+
+const IdentPath = struct {
+    first: []const u8,
+    last: []const u8,
+    count: usize,
+    next: usize,
+};
+
+fn sendFullTablesResult(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    const schema_name = parseShowSchemaName(payload);
+    const resolved = resolveMetadataSchema(catalog, session, schema_name) orelse {
+        return sendEmptyMetadataResult(allocator, w, .full_tables, seq_id, client_caps);
+    };
+
+    const client_schema = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ resolved.db_name, resolved.schema_name });
+    defer allocator.free(client_schema);
+    const tables_col = try std.fmt.allocPrint(allocator, "Tables_in_{s}", .{client_schema});
+    defer allocator.free(tables_col);
+
+    const cols = [_]types.Column{
+        .{ .name = tables_col, .type = .string },
+        .{ .name = "Table_type", .type = .string },
+    };
+    try result.sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+
+    const table_names = try resolved.schema.listTables(allocator);
+    defer freeNameList(allocator, table_names);
+    for (table_names) |name| {
+        const cells = [_]?[]const u8{ name, "BASE TABLE" };
+        try result.sendTextRow(allocator, w, cells[0..], seq_id);
+    }
+
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
+}
+
+fn sendTableStatusResult(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    const cols = [_]types.Column{
+        .{ .name = "Name", .type = .string },
+        .{ .name = "Engine", .type = .string },
+        .{ .name = "Version", .type = .int },
+        .{ .name = "Row_format", .type = .string },
+        .{ .name = "Rows", .type = .bigint },
+        .{ .name = "Avg_row_length", .type = .bigint },
+        .{ .name = "Data_length", .type = .bigint },
+        .{ .name = "Max_data_length", .type = .bigint },
+        .{ .name = "Index_length", .type = .bigint },
+        .{ .name = "Data_free", .type = .bigint },
+        .{ .name = "Auto_increment", .type = .bigint, .nullable = true },
+        .{ .name = "Create_time", .type = .string, .nullable = true },
+        .{ .name = "Update_time", .type = .string, .nullable = true },
+        .{ .name = "Check_time", .type = .string, .nullable = true },
+        .{ .name = "Collation", .type = .string, .nullable = true },
+        .{ .name = "Checksum", .type = .bigint, .nullable = true },
+        .{ .name = "Create_options", .type = .string },
+        .{ .name = "Comment", .type = .string },
+    };
+    try result.sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+
+    const schema_name = parseShowSchemaName(payload);
+    if (resolveMetadataSchema(catalog, session, schema_name)) |resolved| {
+        const table_names = try resolved.schema.listTables(allocator);
+        defer freeNameList(allocator, table_names);
+        for (table_names) |name| {
+            const table = schemaTable(resolved.schema, name) orelse continue;
+            const row_count = tableRowCount(table);
+            var row_count_buf: [32]u8 = undefined;
+            const row_count_text = try std.fmt.bufPrint(&row_count_buf, "{d}", .{row_count});
+            const cells = [_]?[]const u8{
+                name,
+                "thinDB",
+                "10",
+                "Columnar",
+                row_count_text,
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                null,
+                null,
+                null,
+                null,
+                "utf8mb4_general_ci",
+                null,
+                "",
+                "",
+            };
+            try result.sendTextRow(allocator, w, cells[0..], seq_id);
+        }
+    }
+
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
+}
+
+fn sendColumnsResult(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    const lc = try sql_text_mod.normalizeForCannedMatch(allocator, payload);
+    defer allocator.free(lc);
+    const full = std.mem.startsWith(u8, lc, "show full columns") or
+        std.mem.startsWith(u8, lc, "show full fields");
+
+    const simple_cols = [_]types.Column{
+        .{ .name = "Field", .type = .string },
+        .{ .name = "Type", .type = .string },
+        .{ .name = "Null", .type = .string },
+        .{ .name = "Key", .type = .string },
+        .{ .name = "Default", .type = .string, .nullable = true },
+        .{ .name = "Extra", .type = .string },
+    };
+    const full_cols = [_]types.Column{
+        .{ .name = "Field", .type = .string },
+        .{ .name = "Type", .type = .string },
+        .{ .name = "Collation", .type = .string, .nullable = true },
+        .{ .name = "Null", .type = .string },
+        .{ .name = "Key", .type = .string },
+        .{ .name = "Default", .type = .string, .nullable = true },
+        .{ .name = "Extra", .type = .string },
+        .{ .name = "Privileges", .type = .string },
+        .{ .name = "Comment", .type = .string },
+    };
+    const cols = if (full) full_cols[0..] else simple_cols[0..];
+    try result.sendResultHeader(allocator, w, cols, "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+
+    if (parseShowTableTarget(payload)) |target| {
+        if (resolveMetadataTable(catalog, session, target)) |resolved| {
+            const table = resolved.table;
+            for (table.schema.columns) |col| {
+                const type_text = try allocMysqlColumnType(allocator, col.type);
+                defer allocator.free(type_text);
+                const key = columnKey(table, col.name);
+                const nullable = if (col.nullable) "YES" else "NO";
+                if (full) {
+                    const cells = [_]?[]const u8{
+                        col.name,
+                        type_text,
+                        columnCollation(col),
+                        nullable,
+                        key,
+                        null,
+                        "",
+                        "select,insert,update,references",
+                        "",
+                    };
+                    try result.sendTextRow(allocator, w, cells[0..], seq_id);
+                } else {
+                    const cells = [_]?[]const u8{
+                        col.name,
+                        type_text,
+                        nullable,
+                        key,
+                        null,
+                        "",
+                    };
+                    try result.sendTextRow(allocator, w, cells[0..], seq_id);
+                }
+            }
+        }
+    }
+
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
+}
+
+fn sendIndexesResult(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    const cols = [_]types.Column{
+        .{ .name = "Table", .type = .string },
+        .{ .name = "Non_unique", .type = .int },
+        .{ .name = "Key_name", .type = .string },
+        .{ .name = "Seq_in_index", .type = .int },
+        .{ .name = "Column_name", .type = .string },
+        .{ .name = "Collation", .type = .string, .nullable = true },
+        .{ .name = "Cardinality", .type = .bigint, .nullable = true },
+        .{ .name = "Sub_part", .type = .bigint, .nullable = true },
+        .{ .name = "Packed", .type = .string, .nullable = true },
+        .{ .name = "Null", .type = .string },
+        .{ .name = "Index_type", .type = .string },
+        .{ .name = "Comment", .type = .string },
+        .{ .name = "Index_comment", .type = .string },
+        .{ .name = "Visible", .type = .string },
+        .{ .name = "Expression", .type = .string, .nullable = true },
+    };
+    try result.sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+
+    if (parseShowTableTarget(payload)) |target| {
+        if (resolveMetadataTable(catalog, session, target)) |resolved| {
+            const table = resolved.table;
+            const non_unique = if (table.schema.unique) "0" else "1";
+            const key_name = if (table.schema.unique) "PRIMARY" else "order_key";
+            const row_count = tableRowCount(table);
+            var cardinality_buf: [32]u8 = undefined;
+            const cardinality_text = try std.fmt.bufPrint(&cardinality_buf, "{d}", .{row_count});
+            for (table.schema.order_key, 0..) |col_name, i| {
+                var seq_buf: [24]u8 = undefined;
+                const seq_text = try std.fmt.bufPrint(&seq_buf, "{d}", .{i + 1});
+                const col = table.schema.column(col_name);
+                const null_text = if (col != null and col.?.nullable) "YES" else "";
+                const cells = [_]?[]const u8{
+                    table.name,
+                    non_unique,
+                    key_name,
+                    seq_text,
+                    col_name,
+                    "A",
+                    cardinality_text,
+                    null,
+                    null,
+                    null_text,
+                    "BTREE",
+                    "",
+                    "",
+                    "YES",
+                    null,
+                };
+                try result.sendTextRow(allocator, w, cells[0..], seq_id);
+            }
+        }
+    }
+
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
+}
+
+const MetadataTable = struct {
+    resolved: ResolvedSchema,
+    table: *Table,
+};
+
+fn resolveMetadataTable(
+    catalog: *Catalog,
+    session: *SessionState,
+    target: ShowTableTarget,
+) ?MetadataTable {
+    const resolved = resolveMetadataSchema(catalog, session, target.schema_name) orelse return null;
+    const table = schemaTable(resolved.schema, target.table_name) orelse return null;
+    return .{ .resolved = resolved, .table = table };
+}
+
+fn resolveMetadataSchema(
+    catalog: *Catalog,
+    session: *SessionState,
+    maybe_name: ?[]const u8,
+) ?ResolvedSchema {
+    if (maybe_name) |raw_name| {
+        const name = stripIdentifierQuotes(std.mem.trim(u8, raw_name, " \t\r\n"));
+        if (name.len == 0) return null;
+        if (std.mem.indexOf(u8, name, "__")) |sep| {
+            const db_name = name[0..sep];
+            const schema_name = name[sep + 2 ..];
+            const db = catalog.database(db_name) orelse return null;
+            const sc = db.schema(schema_name) orelse return null;
+            return .{ .db_name = db.name, .schema_name = sc.name, .schema = sc };
+        }
+
+        if (catalog.database(session.current_db)) |cur_db| {
+            if (cur_db.schema(name)) |sc| {
+                return .{ .db_name = cur_db.name, .schema_name = sc.name, .schema = sc };
+            }
+        }
+        if (catalog.database(name)) |db| {
+            if (db.schema("public")) |sc| {
+                return .{ .db_name = db.name, .schema_name = sc.name, .schema = sc };
+            }
+        }
+        return null;
+    }
+
+    const db = catalog.database(session.current_db) orelse return null;
+    const sc = db.schema(session.current_schema) orelse return null;
+    return .{ .db_name = db.name, .schema_name = sc.name, .schema = sc };
+}
+
+fn schemaTable(sc: *Schema, name: []const u8) ?*Table {
+    {
+        sc.tables_mutex.lockUncancelable(sc.io);
+        defer sc.tables_mutex.unlock(sc.io);
+        if (sc.tables.get(name)) |t| return t;
+    }
+    return sc.openTable(name, .{}) catch null;
+}
+
+fn tableRowCount(t: *Table) u64 {
+    t.mutex.lockUncancelable(t.io);
+    defer t.mutex.unlock(t.io);
+    var rows = t.memtable.row_count;
+    for (t.manifest.segments.items) |entry| rows += entry.row_count;
+    return rows;
+}
+
+fn parseShowSchemaName(sql_text: []const u8) ?[]const u8 {
+    const s = trimSqlForMetadata(sql_text);
+    const idx = topLevelKeywordIgnoreCase(s, "from") orelse topLevelKeywordIgnoreCase(s, "in") orelse return null;
+    const path = readIdentifierPath(s, idx + 4) orelse return null;
+    return path.last;
+}
+
+fn parseShowTableTarget(sql_text: []const u8) ?ShowTableTarget {
+    const s = trimSqlForMetadata(sql_text);
+    if (startsWithIgnoreCase(s, "desc ")) {
+        const path = readIdentifierPath(s, "desc ".len) orelse return null;
+        return .{ .schema_name = if (path.count >= 2) path.first else null, .table_name = path.last };
+    }
+    if (startsWithIgnoreCase(s, "describe ")) {
+        const path = readIdentifierPath(s, "describe ".len) orelse return null;
+        return .{ .schema_name = if (path.count >= 2) path.first else null, .table_name = path.last };
+    }
+
+    const idx = topLevelKeywordIgnoreCase(s, "from") orelse topLevelKeywordIgnoreCase(s, "in") orelse return null;
+    const path = readIdentifierPath(s, idx + 4) orelse return null;
+    var schema_name: ?[]const u8 = if (path.count >= 2) path.first else null;
+    if (schema_name == null) {
+        const rest = s[path.next..];
+        if (topLevelKeywordIgnoreCase(rest, "from")) |schema_idx| {
+            if (readIdentifierPath(rest, schema_idx + 4)) |schema_path| schema_name = schema_path.last;
+        } else if (topLevelKeywordIgnoreCase(rest, "in")) |schema_idx| {
+            if (readIdentifierPath(rest, schema_idx + 2)) |schema_path| schema_name = schema_path.last;
+        }
+    }
+    return .{ .schema_name = schema_name, .table_name = path.last };
+}
+
+fn trimSqlForMetadata(sql_text: []const u8) []const u8 {
+    var s = stripLeadingCommentsForMetadata(std.mem.trim(u8, sql_text, " \t\r\n"));
+    while (s.len > 0 and s[s.len - 1] == ';') s = std.mem.trim(u8, s[0 .. s.len - 1], " \t\r\n");
+    return s;
+}
+
+fn stripLeadingCommentsForMetadata(sql_text: []const u8) []const u8 {
+    var s = sql_text;
+    while (true) {
+        s = std.mem.trim(u8, s, " \t\r\n");
+        if (std.mem.startsWith(u8, s, "/*")) {
+            const end = std.mem.indexOf(u8, s[2..], "*/") orelse return s;
+            s = s[end + 4 ..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, s, "--")) {
+            const end = std.mem.indexOfScalar(u8, s, '\n') orelse return "";
+            s = s[end + 1 ..];
+            continue;
+        }
+        return s;
+    }
+}
+
+fn readIdentifierPath(text: []const u8, start: usize) ?IdentPath {
+    var i = skipMetadataWhitespace(text, start);
+    var first: []const u8 = "";
+    var last: []const u8 = "";
+    var count: usize = 0;
+    while (true) {
+        const seg = readIdentifierSegment(text, i) orelse break;
+        const clean = stripIdentifierQuotes(seg.text);
+        if (count == 0) first = clean;
+        last = clean;
+        count += 1;
+        i = skipMetadataWhitespace(text, seg.next);
+        if (i < text.len and text[i] == '.') {
+            i += 1;
+            i = skipMetadataWhitespace(text, i);
+            continue;
+        }
+        break;
+    }
+    if (count == 0) return null;
+    return .{ .first = first, .last = last, .count = count, .next = i };
+}
+
+fn readIdentifierSegment(text: []const u8, start: usize) ?IdentSegment {
+    var i = skipMetadataWhitespace(text, start);
+    if (i >= text.len) return null;
+    const begin = i;
+    const c = text[i];
+    if (c == '`' or c == '"' or c == '\'') {
+        i += 1;
+        while (i < text.len) : (i += 1) {
+            if (text[i] == c) {
+                if (i + 1 < text.len and text[i + 1] == c) {
+                    i += 1;
+                    continue;
+                }
+                return .{ .text = text[begin .. i + 1], .next = i + 1 };
+            }
+        }
+        return .{ .text = text[begin..], .next = text.len };
+    }
+
+    while (i < text.len) : (i += 1) {
+        switch (text[i]) {
+            ' ', '\t', '\r', '\n', '.', ',', ';', '(', ')' => break,
+            else => {},
+        }
+    }
+    if (i == begin) return null;
+    return .{ .text = text[begin..i], .next = i };
+}
+
+fn skipMetadataWhitespace(text: []const u8, start: usize) usize {
+    var i = start;
+    while (i < text.len and std.ascii.isWhitespace(text[i])) : (i += 1) {}
+    return i;
+}
+
+fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    return text.len >= prefix.len and std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix);
+}
+
+fn topLevelKeywordIgnoreCase(text: []const u8, keyword: []const u8) ?usize {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == '\'' or c == '"' or c == '`') {
+            i = skipQuoted(text, i, c);
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')' and depth > 0) {
+            depth -= 1;
+            continue;
+        }
+        if (depth == 0 and tokenAtIgnoreCase(text, i, keyword)) return i;
+    }
+    return null;
+}
+
+fn tokenAtIgnoreCase(text: []const u8, i: usize, token: []const u8) bool {
+    if (i + token.len > text.len) return false;
+    if (!std.ascii.eqlIgnoreCase(text[i .. i + token.len], token)) return false;
+    if (i > 0 and isIdentByte(text[i - 1])) return false;
+    if (i + token.len < text.len and isIdentByte(text[i + token.len])) return false;
+    return true;
+}
+
+fn allocMysqlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
+    return switch (t) {
+        .tinyint => allocator.dupe(u8, "tinyint"),
+        .smallint => allocator.dupe(u8, "smallint"),
+        .int => allocator.dupe(u8, "int"),
+        .bigint => allocator.dupe(u8, "bigint"),
+        .largeint => allocator.dupe(u8, "decimal(38,0)"),
+        .boolean => allocator.dupe(u8, "tinyint(1)"),
+        .float => allocator.dupe(u8, "float"),
+        .double => allocator.dupe(u8, "double"),
+        .date => allocator.dupe(u8, "date"),
+        .datetime => allocator.dupe(u8, "datetime(6)"),
+        .decimal64 => |spec| std.fmt.allocPrint(allocator, "decimal({d},{d})", .{ spec.p, spec.s }),
+        .decimal128 => |spec| std.fmt.allocPrint(allocator, "decimal({d},{d})", .{ spec.p, spec.s }),
+        .uuid => allocator.dupe(u8, "char(36)"),
+        .varchar => |n| std.fmt.allocPrint(allocator, "varchar({d})", .{n}),
+        .char => |n| std.fmt.allocPrint(allocator, "char({d})", .{n}),
+        .string => allocator.dupe(u8, "text"),
+    };
+}
+
+fn allocInfoDataType(allocator: Allocator, t: types.Type) ![]u8 {
+    return switch (t) {
+        .tinyint => allocator.dupe(u8, "tinyint"),
+        .smallint => allocator.dupe(u8, "smallint"),
+        .int => allocator.dupe(u8, "int"),
+        .bigint => allocator.dupe(u8, "bigint"),
+        .largeint, .decimal64, .decimal128 => allocator.dupe(u8, "decimal"),
+        .boolean => allocator.dupe(u8, "tinyint"),
+        .float => allocator.dupe(u8, "float"),
+        .double => allocator.dupe(u8, "double"),
+        .date => allocator.dupe(u8, "date"),
+        .datetime => allocator.dupe(u8, "datetime"),
+        .uuid => allocator.dupe(u8, "char"),
+        .varchar => allocator.dupe(u8, "varchar"),
+        .char => allocator.dupe(u8, "char"),
+        .string => allocator.dupe(u8, "text"),
+    };
+}
+
+fn columnCollation(col: types.Column) ?[]const u8 {
+    return if (col.type.isString()) "utf8mb4_general_ci" else null;
+}
+
+fn columnKey(t: *Table, col_name: []const u8) []const u8 {
+    if (!isOrderKeyColumn(t, col_name)) return "";
+    return if (t.schema.unique) "PRI" else "MUL";
+}
+
+fn isOrderKeyColumn(t: *Table, col_name: []const u8) bool {
+    for (t.schema.order_key) |key| {
+        if (std.mem.eql(u8, key, col_name)) return true;
+    }
+    return false;
+}
+
+const InfoSchemaKind = enum { schemata, tables, columns, statistics };
+
+const InfoProjection = struct {
+    column: types.Column,
+    key: []const u8,
+};
+
+const InfoFilters = struct {
+    schema_name: ?[]const u8 = null,
+    table_name: ?[]const u8 = null,
+};
+
+const InfoRow = struct {
+    db_name: []const u8,
+    schema_name: []const u8,
+    table_name: ?[]const u8 = null,
+    table: ?*Table = null,
+    column: ?types.Column = null,
+    ordinal: usize = 0,
+    key_seq: usize = 0,
+};
+
+fn sendInformationSchemaSelect(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    select_list: []const u8,
+    tail: []const u8,
+    seq_id: *u8,
+    client_caps: u32,
+) !bool {
+    const kind = informationSchemaKind(tail) orelse return false;
+    const filters = parseInfoFilters(tail);
+
+    var projections = std.ArrayList(InfoProjection).empty;
+    defer projections.deinit(allocator);
+    try appendInfoProjections(allocator, &projections, select_list, kind);
+
+    var cols = std.ArrayList(types.Column).empty;
+    defer cols.deinit(allocator);
+    for (projections.items) |p| try cols.append(allocator, p.column);
+
+    try result.sendResultHeader(allocator, w, cols.items, "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+
+    switch (kind) {
+        .schemata => try emitInfoSchemataRows(allocator, w, catalog, projections.items, filters, seq_id),
+        .tables => try emitInfoTablesRows(allocator, w, catalog, projections.items, filters, seq_id),
+        .columns => try emitInfoColumnsRows(allocator, w, catalog, projections.items, filters, seq_id),
+        .statistics => try emitInfoStatisticsRows(allocator, w, catalog, projections.items, filters, seq_id),
+    }
+
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
+    return true;
+}
+
+fn informationSchemaKind(tail: []const u8) ?InfoSchemaKind {
+    if (std.mem.indexOf(u8, tail, "schemata") != null) return .schemata;
+    if (std.mem.indexOf(u8, tail, "statistics") != null) return .statistics;
+    if (std.mem.indexOf(u8, tail, "columns") != null) return .columns;
+    if (std.mem.indexOf(u8, tail, "tables") != null) return .tables;
+    return null;
+}
+
+fn parseInfoFilters(tail: []const u8) InfoFilters {
+    return .{
+        .schema_name = parseInfoStringFilter(tail, "table_schema") orelse parseInfoStringFilter(tail, "schema_name"),
+        .table_name = parseInfoStringFilter(tail, "table_name"),
+    };
+}
+
+fn parseInfoStringFilter(tail: []const u8, column_name: []const u8) ?[]const u8 {
+    var search_start: usize = 0;
+    while (search_start < tail.len) {
+        const rel = std.mem.indexOf(u8, tail[search_start..], column_name) orelse return null;
+        const idx = search_start + rel;
+        if ((idx > 0 and isIdentByte(tail[idx - 1])) or
+            (idx + column_name.len < tail.len and isIdentByte(tail[idx + column_name.len])))
+        {
+            search_start = idx + column_name.len;
+            continue;
+        }
+        const eq_rel = std.mem.indexOfScalar(u8, tail[idx + column_name.len ..], '=') orelse return null;
+        var value_start = skipMetadataWhitespace(tail, idx + column_name.len + eq_rel + 1);
+        if (value_start >= tail.len) return null;
+        const quote = tail[value_start];
+        if (quote == '\'' or quote == '"' or quote == '`') {
+            value_start += 1;
+            var value_end = value_start;
+            while (value_end < tail.len) : (value_end += 1) {
+                if (tail[value_end] == quote) return tail[value_start..value_end];
+            }
+            return tail[value_start..];
+        }
+        const seg = readIdentifierSegment(tail, value_start) orelse return null;
+        return stripIdentifierQuotes(seg.text);
+    }
+    return null;
+}
+
+fn rowMatchesInfoFilters(row: InfoRow, filters: InfoFilters) bool {
+    if (filters.schema_name) |schema_filter| {
+        if (!schemaFilterMatches(schema_filter, row.db_name, row.schema_name)) return false;
+    }
+    if (filters.table_name) |table_filter| {
+        const table_name = row.table_name orelse return false;
+        if (!std.ascii.eqlIgnoreCase(table_name, table_filter)) return false;
+    }
+    return true;
+}
+
+fn schemaFilterMatches(filter_in: []const u8, db_name: []const u8, schema_name: []const u8) bool {
+    const filter = stripIdentifierQuotes(std.mem.trim(u8, filter_in, " \t\r\n"));
+    if (std.mem.indexOf(u8, filter, "__")) |sep| {
+        return std.ascii.eqlIgnoreCase(filter[0..sep], db_name) and
+            std.ascii.eqlIgnoreCase(filter[sep + 2 ..], schema_name);
+    }
+    return std.ascii.eqlIgnoreCase(filter, schema_name) or std.ascii.eqlIgnoreCase(filter, db_name);
+}
+
+fn appendInfoProjections(
+    allocator: Allocator,
+    projections: *std.ArrayList(InfoProjection),
+    select_list: []const u8,
+    kind: InfoSchemaKind,
+) !void {
+    var saw_star = false;
+    var start: usize = 0;
+    while (start < select_list.len) {
+        const end = nextTopLevelComma(select_list, start) orelse select_list.len;
+        const raw_expr = std.mem.trim(u8, select_list[start..end], " \t\r\n");
+        if (raw_expr.len > 0) {
+            if (std.mem.eql(u8, raw_expr, "*") or std.mem.endsWith(u8, raw_expr, ".*")) {
+                saw_star = true;
+            } else {
+                const stripped = stripAlias(raw_expr);
+                const key = infoColumnKey(stripped.expr);
+                const name = stripIdentifierQuotes(stripped.alias orelse key);
+                try projections.append(allocator, .{
+                    .column = .{ .name = name, .type = .string, .nullable = true },
+                    .key = key,
+                });
+            }
+        }
+        start = end + 1;
+    }
+    if (projections.items.len == 0 or saw_star) {
+        projections.clearRetainingCapacity();
+        try appendDefaultInfoProjections(allocator, projections, kind);
+    }
+}
+
+fn appendInfoProjectionLiteral(
+    allocator: Allocator,
+    projections: *std.ArrayList(InfoProjection),
+    name: []const u8,
+    key: []const u8,
+) !void {
+    try projections.append(allocator, .{
+        .column = .{ .name = name, .type = .string, .nullable = true },
+        .key = key,
+    });
+}
+
+fn appendDefaultInfoProjections(
+    allocator: Allocator,
+    projections: *std.ArrayList(InfoProjection),
+    kind: InfoSchemaKind,
+) !void {
+    switch (kind) {
+        .schemata => {
+            try appendInfoProjectionLiteral(allocator, projections, "CATALOG_NAME", "catalog_name");
+            try appendInfoProjectionLiteral(allocator, projections, "SCHEMA_NAME", "schema_name");
+            try appendInfoProjectionLiteral(allocator, projections, "DEFAULT_CHARACTER_SET_NAME", "default_character_set_name");
+            try appendInfoProjectionLiteral(allocator, projections, "DEFAULT_COLLATION_NAME", "default_collation_name");
+            try appendInfoProjectionLiteral(allocator, projections, "SQL_PATH", "sql_path");
+        },
+        .tables => {
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_CATALOG", "table_catalog");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_SCHEMA", "table_schema");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_NAME", "table_name");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_TYPE", "table_type");
+            try appendInfoProjectionLiteral(allocator, projections, "ENGINE", "engine");
+            try appendInfoProjectionLiteral(allocator, projections, "VERSION", "version");
+            try appendInfoProjectionLiteral(allocator, projections, "ROW_FORMAT", "row_format");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_ROWS", "table_rows");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_COLLATION", "table_collation");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_COMMENT", "table_comment");
+        },
+        .columns => {
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_CATALOG", "table_catalog");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_SCHEMA", "table_schema");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_NAME", "table_name");
+            try appendInfoProjectionLiteral(allocator, projections, "COLUMN_NAME", "column_name");
+            try appendInfoProjectionLiteral(allocator, projections, "ORDINAL_POSITION", "ordinal_position");
+            try appendInfoProjectionLiteral(allocator, projections, "COLUMN_DEFAULT", "column_default");
+            try appendInfoProjectionLiteral(allocator, projections, "IS_NULLABLE", "is_nullable");
+            try appendInfoProjectionLiteral(allocator, projections, "DATA_TYPE", "data_type");
+            try appendInfoProjectionLiteral(allocator, projections, "COLUMN_TYPE", "column_type");
+            try appendInfoProjectionLiteral(allocator, projections, "COLUMN_KEY", "column_key");
+            try appendInfoProjectionLiteral(allocator, projections, "EXTRA", "extra");
+            try appendInfoProjectionLiteral(allocator, projections, "COLUMN_COMMENT", "column_comment");
+        },
+        .statistics => {
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_CATALOG", "table_catalog");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_SCHEMA", "table_schema");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_NAME", "table_name");
+            try appendInfoProjectionLiteral(allocator, projections, "NON_UNIQUE", "non_unique");
+            try appendInfoProjectionLiteral(allocator, projections, "INDEX_SCHEMA", "index_schema");
+            try appendInfoProjectionLiteral(allocator, projections, "INDEX_NAME", "index_name");
+            try appendInfoProjectionLiteral(allocator, projections, "SEQ_IN_INDEX", "seq_in_index");
+            try appendInfoProjectionLiteral(allocator, projections, "COLUMN_NAME", "column_name");
+            try appendInfoProjectionLiteral(allocator, projections, "COLLATION", "collation");
+            try appendInfoProjectionLiteral(allocator, projections, "CARDINALITY", "cardinality");
+            try appendInfoProjectionLiteral(allocator, projections, "NULLABLE", "nullable");
+            try appendInfoProjectionLiteral(allocator, projections, "INDEX_TYPE", "index_type");
+            try appendInfoProjectionLiteral(allocator, projections, "IS_VISIBLE", "is_visible");
+        },
+    }
+}
+
+fn infoColumnKey(expr_in: []const u8) []const u8 {
+    var expr = std.mem.trim(u8, expr_in, " \t\r\n");
+    if (std.mem.lastIndexOfScalar(u8, expr, '.')) |dot| {
+        expr = expr[dot + 1 ..];
+    }
+    return stripIdentifierQuotes(std.mem.trim(u8, expr, " \t\r\n"));
+}
+
+fn emitInfoSchemataRows(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    projections: []const InfoProjection,
+    filters: InfoFilters,
+    seq_id: *u8,
+) !void {
+    const db_names = try catalog.listDatabases(allocator);
+    defer freeNameList(allocator, db_names);
+    for (db_names) |db_name| {
+        const db = catalog.database(db_name) orelse continue;
+        const schema_names = try db.listSchemas(allocator);
+        defer freeNameList(allocator, schema_names);
+        for (schema_names) |schema_name| {
+            const row: InfoRow = .{ .db_name = db_name, .schema_name = schema_name };
+            if (!rowMatchesInfoFilters(row, filters)) continue;
+            try sendInfoRow(allocator, w, projections, row, seq_id);
+        }
+    }
+}
+
+fn emitInfoTablesRows(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    projections: []const InfoProjection,
+    filters: InfoFilters,
+    seq_id: *u8,
+) !void {
+    const db_names = try catalog.listDatabases(allocator);
+    defer freeNameList(allocator, db_names);
+    for (db_names) |db_name| {
+        const db = catalog.database(db_name) orelse continue;
+        const schema_names = try db.listSchemas(allocator);
+        defer freeNameList(allocator, schema_names);
+        for (schema_names) |schema_name| {
+            const sc = db.schema(schema_name) orelse continue;
+            const table_names = try sc.listTables(allocator);
+            defer freeNameList(allocator, table_names);
+            for (table_names) |table_name| {
+                const table = schemaTable(sc, table_name) orelse continue;
+                const row: InfoRow = .{
+                    .db_name = db_name,
+                    .schema_name = schema_name,
+                    .table_name = table_name,
+                    .table = table,
+                };
+                if (!rowMatchesInfoFilters(row, filters)) continue;
+                try sendInfoRow(allocator, w, projections, row, seq_id);
+            }
+        }
+    }
+}
+
+fn emitInfoColumnsRows(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    projections: []const InfoProjection,
+    filters: InfoFilters,
+    seq_id: *u8,
+) !void {
+    const db_names = try catalog.listDatabases(allocator);
+    defer freeNameList(allocator, db_names);
+    for (db_names) |db_name| {
+        const db = catalog.database(db_name) orelse continue;
+        const schema_names = try db.listSchemas(allocator);
+        defer freeNameList(allocator, schema_names);
+        for (schema_names) |schema_name| {
+            const sc = db.schema(schema_name) orelse continue;
+            const table_names = try sc.listTables(allocator);
+            defer freeNameList(allocator, table_names);
+            for (table_names) |table_name| {
+                const table = schemaTable(sc, table_name) orelse continue;
+                for (table.schema.columns, 0..) |col, i| {
+                    const row: InfoRow = .{
+                        .db_name = db_name,
+                        .schema_name = schema_name,
+                        .table_name = table_name,
+                        .table = table,
+                        .column = col,
+                        .ordinal = i + 1,
+                    };
+                    if (!rowMatchesInfoFilters(row, filters)) continue;
+                    try sendInfoRow(allocator, w, projections, row, seq_id);
+                }
+            }
+        }
+    }
+}
+
+fn emitInfoStatisticsRows(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    projections: []const InfoProjection,
+    filters: InfoFilters,
+    seq_id: *u8,
+) !void {
+    const db_names = try catalog.listDatabases(allocator);
+    defer freeNameList(allocator, db_names);
+    for (db_names) |db_name| {
+        const db = catalog.database(db_name) orelse continue;
+        const schema_names = try db.listSchemas(allocator);
+        defer freeNameList(allocator, schema_names);
+        for (schema_names) |schema_name| {
+            const sc = db.schema(schema_name) orelse continue;
+            const table_names = try sc.listTables(allocator);
+            defer freeNameList(allocator, table_names);
+            for (table_names) |table_name| {
+                const table = schemaTable(sc, table_name) orelse continue;
+                for (table.schema.order_key, 0..) |col_name, i| {
+                    const col = table.schema.column(col_name) orelse continue;
+                    const row: InfoRow = .{
+                        .db_name = db_name,
+                        .schema_name = schema_name,
+                        .table_name = table_name,
+                        .table = table,
+                        .column = col,
+                        .ordinal = i + 1,
+                        .key_seq = i + 1,
+                    };
+                    if (!rowMatchesInfoFilters(row, filters)) continue;
+                    try sendInfoRow(allocator, w, projections, row, seq_id);
+                }
+            }
+        }
+    }
+}
+
+fn sendInfoRow(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    projections: []const InfoProjection,
+    row: InfoRow,
+    seq_id: *u8,
+) !void {
+    const cells = try allocator.alloc(?[]const u8, projections.len);
+    defer allocator.free(cells);
+    var owned = std.ArrayList([]u8).empty;
+    defer {
+        for (owned.items) |s| allocator.free(s);
+        owned.deinit(allocator);
+    }
+
+    for (projections, 0..) |projection, i| {
+        cells[i] = try infoCell(allocator, &owned, projection.key, row);
+    }
+    try result.sendTextRow(allocator, w, cells, seq_id);
+}
+
+fn infoCell(
+    allocator: Allocator,
+    owned: *std.ArrayList([]u8),
+    key: []const u8,
+    row: InfoRow,
+) !?[]const u8 {
+    if (keyContains(key, "catalog")) return try cellDup(allocator, owned, "def");
+    if (keyContains(key, "table_schema") or keyContains(key, "schema_name") or keyContains(key, "index_schema"))
+        return try cellSchemaName(allocator, owned, row.db_name, row.schema_name);
+    if (keyContains(key, "default_character_set_name") or keyContains(key, "character_set_name"))
+        return try cellDup(allocator, owned, "utf8mb4");
+    if (keyContains(key, "default_collation_name") or keyContains(key, "collation_name") or keyContains(key, "table_collation"))
+        return try cellDup(allocator, owned, "utf8mb4_general_ci");
+    if (keyContains(key, "sql_path")) return null;
+
+    if (keyContains(key, "table_name")) return try cellDup(allocator, owned, row.table_name orelse "");
+    if (keyContains(key, "table_type")) return try cellDup(allocator, owned, "BASE TABLE");
+    if (keyContains(key, "engine")) return try cellDup(allocator, owned, "thinDB");
+    if (keyContains(key, "version")) return try cellDup(allocator, owned, "10");
+    if (keyContains(key, "row_format")) return try cellDup(allocator, owned, "Columnar");
+    if (keyContains(key, "table_rows") or keyContains(key, "cardinality")) {
+        const t = row.table orelse return try cellDup(allocator, owned, "0");
+        return try cellFmt(allocator, owned, "{d}", .{tableRowCount(t)});
+    }
+    if (keyContains(key, "avg_row_length") or
+        keyContains(key, "data_length") or
+        keyContains(key, "max_data_length") or
+        keyContains(key, "index_length") or
+        keyContains(key, "data_free") or
+        keyContains(key, "checksum"))
+        return try cellDup(allocator, owned, "0");
+    if (keyContains(key, "auto_increment") or keyContains(key, "create_time") or keyContains(key, "update_time") or keyContains(key, "check_time"))
+        return null;
+    if (keyContains(key, "create_options") or keyContains(key, "table_comment"))
+        return try cellDup(allocator, owned, "");
+
+    if (keyContains(key, "column_name")) return try cellDup(allocator, owned, if (row.column) |c| c.name else "");
+    if (keyContains(key, "ordinal_position") or keyContains(key, "seq_in_index"))
+        return try cellFmt(allocator, owned, "{d}", .{row.ordinal});
+    if (keyContains(key, "column_default")) return null;
+    if (keyContains(key, "is_nullable")) return try cellDup(allocator, owned, if (row.column != null and row.column.?.nullable) "YES" else "NO");
+    if (keyContains(key, "data_type")) {
+        const col = row.column orelse return try cellDup(allocator, owned, "");
+        const text = try allocInfoDataType(allocator, col.type);
+        try owned.append(allocator, text);
+        return text;
+    }
+    if (keyContains(key, "column_type")) {
+        const col = row.column orelse return try cellDup(allocator, owned, "");
+        const text = try allocMysqlColumnType(allocator, col.type);
+        try owned.append(allocator, text);
+        return text;
+    }
+    if (keyContains(key, "character_maximum_length")) return try columnCharLengthCell(allocator, owned, row.column, false);
+    if (keyContains(key, "character_octet_length")) return try columnCharLengthCell(allocator, owned, row.column, true);
+    if (keyContains(key, "numeric_precision")) return try numericPrecisionCell(allocator, owned, row.column);
+    if (keyContains(key, "numeric_scale")) return try numericScaleCell(allocator, owned, row.column);
+    if (keyContains(key, "datetime_precision")) {
+        if (row.column) |col| {
+            if (col.type == .datetime) return try cellDup(allocator, owned, "6");
+        }
+        return null;
+    }
+    if (keyContains(key, "column_key")) {
+        const t = row.table orelse return try cellDup(allocator, owned, "");
+        const col = row.column orelse return try cellDup(allocator, owned, "");
+        return try cellDup(allocator, owned, columnKey(t, col.name));
+    }
+    if (keyContains(key, "extra") or keyContains(key, "column_comment") or keyContains(key, "generation_expression"))
+        return try cellDup(allocator, owned, "");
+    if (keyContains(key, "privileges")) return try cellDup(allocator, owned, "select,insert,update,references");
+    if (keyContains(key, "srs_id")) return null;
+
+    if (keyContains(key, "non_unique")) {
+        const t = row.table orelse return try cellDup(allocator, owned, "1");
+        return try cellDup(allocator, owned, if (t.schema.unique) "0" else "1");
+    }
+    if (keyContains(key, "index_name")) {
+        const t = row.table orelse return try cellDup(allocator, owned, "order_key");
+        return try cellDup(allocator, owned, if (t.schema.unique) "PRIMARY" else "order_key");
+    }
+    if (keyContains(key, "collation")) return try cellDup(allocator, owned, "A");
+    if (keyContains(key, "sub_part") or keyContains(key, "packed") or keyContains(key, "expression"))
+        return null;
+    if (keyContains(key, "nullable")) return try cellDup(allocator, owned, if (row.column != null and row.column.?.nullable) "YES" else "");
+    if (keyContains(key, "index_type")) return try cellDup(allocator, owned, "BTREE");
+    if (keyContains(key, "comment") or keyContains(key, "index_comment")) return try cellDup(allocator, owned, "");
+    if (keyContains(key, "is_visible")) return try cellDup(allocator, owned, "YES");
+
+    return try cellDup(allocator, owned, "");
+}
+
+fn keyContains(key: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, key, needle) != null;
+}
+
+fn cellDup(allocator: Allocator, owned: *std.ArrayList([]u8), text: []const u8) ![]const u8 {
+    const copy = try allocator.dupe(u8, text);
+    try owned.append(allocator, copy);
+    return copy;
+}
+
+fn cellFmt(
+    allocator: Allocator,
+    owned: *std.ArrayList([]u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) ![]const u8 {
+    const text = try std.fmt.allocPrint(allocator, fmt, args);
+    try owned.append(allocator, text);
+    return text;
+}
+
+fn cellSchemaName(
+    allocator: Allocator,
+    owned: *std.ArrayList([]u8),
+    db_name: []const u8,
+    schema_name: []const u8,
+) ![]const u8 {
+    return cellFmt(allocator, owned, "{s}__{s}", .{ db_name, schema_name });
+}
+
+fn columnCharLengthCell(
+    allocator: Allocator,
+    owned: *std.ArrayList([]u8),
+    maybe_col: ?types.Column,
+    octets: bool,
+) !?[]const u8 {
+    const col = maybe_col orelse return null;
+    const chars: ?u64 = switch (col.type) {
+        .varchar => |n| n,
+        .char => |n| n,
+        .string => 65535,
+        .uuid => 36,
+        else => null,
+    };
+    const n = chars orelse return null;
+    return try cellFmt(allocator, owned, "{d}", .{if (octets) n * 4 else n});
+}
+
+fn numericPrecisionCell(
+    allocator: Allocator,
+    owned: *std.ArrayList([]u8),
+    maybe_col: ?types.Column,
+) !?[]const u8 {
+    const col = maybe_col orelse return null;
+    return switch (col.type) {
+        .tinyint => try cellDup(allocator, owned, "3"),
+        .smallint => try cellDup(allocator, owned, "5"),
+        .int => try cellDup(allocator, owned, "10"),
+        .bigint => try cellDup(allocator, owned, "19"),
+        .largeint => try cellDup(allocator, owned, "38"),
+        .float => try cellDup(allocator, owned, "12"),
+        .double => try cellDup(allocator, owned, "22"),
+        .decimal64 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.p}),
+        .decimal128 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.p}),
+        else => null,
+    };
+}
+
+fn numericScaleCell(
+    allocator: Allocator,
+    owned: *std.ArrayList([]u8),
+    maybe_col: ?types.Column,
+) !?[]const u8 {
+    const col = maybe_col orelse return null;
+    return switch (col.type) {
+        .tinyint, .smallint, .int, .bigint, .largeint => try cellDup(allocator, owned, "0"),
+        .decimal64 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.s}),
+        .decimal128 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.s}),
+        else => null,
+    };
+}
+
+fn freeNameList(allocator: Allocator, names: [][]u8) void {
+    for (names) |n| allocator.free(n);
+    allocator.free(names);
+}
+
+fn sendEmptyMetadataResult(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    kind: canned.EmptyResultKind,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    switch (kind) {
+        .warnings => {
+            const cols = [_]types.Column{
+                .{ .name = "Level", .type = .string },
+                .{ .name = "Code", .type = .int },
+                .{ .name = "Message", .type = .string },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .engines => {
+            const cols = [_]types.Column{
+                .{ .name = "Engine", .type = .string },
+                .{ .name = "Support", .type = .string },
+                .{ .name = "Comment", .type = .string },
+                .{ .name = "Transactions", .type = .string },
+                .{ .name = "XA", .type = .string },
+                .{ .name = "Savepoints", .type = .string },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .plugins => {
+            const cols = [_]types.Column{
+                .{ .name = "Name", .type = .string },
+                .{ .name = "Status", .type = .string },
+                .{ .name = "Type", .type = .string },
+                .{ .name = "Library", .type = .string },
+                .{ .name = "License", .type = .string },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .collations => {
+            const cols = [_]types.Column{
+                .{ .name = "Collation", .type = .string },
+                .{ .name = "Charset", .type = .string },
+                .{ .name = "Id", .type = .int },
+                .{ .name = "Default", .type = .string },
+                .{ .name = "Compiled", .type = .string },
+                .{ .name = "Sortlen", .type = .int },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .character_sets => {
+            const cols = [_]types.Column{
+                .{ .name = "Charset", .type = .string },
+                .{ .name = "Description", .type = .string },
+                .{ .name = "Default collation", .type = .string },
+                .{ .name = "Maxlen", .type = .int },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .full_tables => {
+            const cols = [_]types.Column{
+                .{ .name = "Tables_in_public", .type = .string },
+                .{ .name = "Table_type", .type = .string },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .table_status => {
+            const cols = [_]types.Column{
+                .{ .name = "Name", .type = .string },
+                .{ .name = "Engine", .type = .string },
+                .{ .name = "Version", .type = .int },
+                .{ .name = "Row_format", .type = .string },
+                .{ .name = "Rows", .type = .bigint },
+                .{ .name = "Avg_row_length", .type = .bigint },
+                .{ .name = "Data_length", .type = .bigint },
+                .{ .name = "Max_data_length", .type = .bigint },
+                .{ .name = "Index_length", .type = .bigint },
+                .{ .name = "Data_free", .type = .bigint },
+                .{ .name = "Auto_increment", .type = .bigint, .nullable = true },
+                .{ .name = "Create_time", .type = .string, .nullable = true },
+                .{ .name = "Update_time", .type = .string, .nullable = true },
+                .{ .name = "Check_time", .type = .string, .nullable = true },
+                .{ .name = "Collation", .type = .string, .nullable = true },
+                .{ .name = "Checksum", .type = .bigint, .nullable = true },
+                .{ .name = "Create_options", .type = .string },
+                .{ .name = "Comment", .type = .string },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .columns => {
+            const cols = [_]types.Column{
+                .{ .name = "Field", .type = .string },
+                .{ .name = "Type", .type = .string },
+                .{ .name = "Null", .type = .string },
+                .{ .name = "Key", .type = .string },
+                .{ .name = "Default", .type = .string, .nullable = true },
+                .{ .name = "Extra", .type = .string },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .indexes => {
+            const cols = [_]types.Column{
+                .{ .name = "Table", .type = .string },
+                .{ .name = "Non_unique", .type = .int },
+                .{ .name = "Key_name", .type = .string },
+                .{ .name = "Seq_in_index", .type = .int },
+                .{ .name = "Column_name", .type = .string },
+                .{ .name = "Collation", .type = .string, .nullable = true },
+                .{ .name = "Cardinality", .type = .bigint, .nullable = true },
+                .{ .name = "Sub_part", .type = .bigint, .nullable = true },
+                .{ .name = "Packed", .type = .string, .nullable = true },
+                .{ .name = "Null", .type = .string },
+                .{ .name = "Index_type", .type = .string },
+                .{ .name = "Comment", .type = .string },
+                .{ .name = "Index_comment", .type = .string },
+                .{ .name = "Visible", .type = .string },
+                .{ .name = "Expression", .type = .string, .nullable = true },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .grants => {
+            const cols = [_]types.Column{.{ .name = "Grants for thindb@localhost", .type = .string }};
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .processlist => {
+            const cols = [_]types.Column{
+                .{ .name = "Id", .type = .bigint },
+                .{ .name = "User", .type = .string },
+                .{ .name = "Host", .type = .string },
+                .{ .name = "db", .type = .string, .nullable = true },
+                .{ .name = "Command", .type = .string },
+                .{ .name = "Time", .type = .int },
+                .{ .name = "State", .type = .string, .nullable = true },
+                .{ .name = "Info", .type = .string, .nullable = true },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .generic_status => {
+            const cols = [_]types.Column{.{ .name = "Name", .type = .string }};
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+    }
+}
+
+fn sendEmptyColumns(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    cols: []const types.Column,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    try result.sendResultHeader(allocator, w, cols, "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
 }
 
 const TxnVerb = enum { begin, commit, rollback };
