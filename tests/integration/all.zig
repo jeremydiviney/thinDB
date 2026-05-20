@@ -27,6 +27,7 @@ test {
     _ = @import("column_defaults_test.zig");
     _ = @import("auto_increment_test.zig");
     _ = @import("case_when_test.zig");
+    _ = @import("between_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 

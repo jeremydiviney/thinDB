@@ -1262,6 +1262,29 @@ pub const Parser = struct {
             return if (negated) .{ .is_not_null = col_dup } else .{ .is_null = col_dup };
         }
 
+        // Optional NOT — turns BETWEEN into NOT BETWEEN (and reserves
+        // the same slot for future LIKE / IN follow-ups).
+        var negate_predicate = false;
+        if (self.cur.tag == .kw_not) {
+            try self.advance();
+            negate_predicate = true;
+        }
+
+        // BETWEEN lo AND hi  →  (col >= lo) AND (col <= hi)
+        // NOT BETWEEN        →  (col <  lo) OR  (col >  hi)
+        if (self.cur.tag == .kw_between) {
+            try self.advance();
+            const lo = try self.parseValue();
+            if (self.cur.tag != .kw_and) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            const hi = try self.parseValue();
+            return try self.makeBetween(col_dup, lo, hi, negate_predicate);
+        }
+
+        // Any other use of bare NOT inside parseAtom is a parse error —
+        // boolean-level NOT was already consumed by parseNot.
+        if (negate_predicate) return ParseError.SqlExpectedKeyword;
+
         // Comparison.
         const op: PredicateOp = switch (self.cur.tag) {
             .eq => .eq,
@@ -1275,6 +1298,18 @@ pub const Parser = struct {
         try self.advance();
         const val = try self.parseValue();
         return .{ .leaf = .{ .col = col_dup, .op = op, .val = val } };
+    }
+
+    fn makeBetween(self: *Parser, col: []const u8, lo: Value, hi: Value, negate: bool) ParseError!PredicateExpr {
+        const kids = try self.arena.alloc(PredicateExpr, 2);
+        if (negate) {
+            kids[0] = .{ .leaf = .{ .col = col, .op = .lt, .val = lo } };
+            kids[1] = .{ .leaf = .{ .col = col, .op = .gt, .val = hi } };
+            return .{ .@"or" = kids };
+        }
+        kids[0] = .{ .leaf = .{ .col = col, .op = .gte, .val = lo } };
+        kids[1] = .{ .leaf = .{ .col = col, .op = .lte, .val = hi } };
+        return .{ .@"and" = kids };
     }
 
     pub fn parseValue(self: *Parser) ParseError!Value {
