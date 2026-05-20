@@ -203,6 +203,23 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     };
     try p.advance();
 
+    // Column-vs-column comparison: `col1 op col2`. Detected when the
+    // RHS starts with an identifier rather than a literal. Supports
+    // optional `qualifier.col` on the RHS too — qualifier dropped,
+    // matches the LHS behavior.
+    if (p.cur.tag == .identifier) {
+        var rhs_col = p.cur.text;
+        try p.advance();
+        if (p.cur.tag == .dot) {
+            try p.advance();
+            if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
+            rhs_col = p.cur.text;
+            try p.advance();
+        }
+        const rhs_dup = try p.arena.dupe(u8, rhs_col);
+        return .{ .leaf_col_col = .{ .left = col_dup, .op = op, .right = rhs_dup } };
+    }
+
     // Scalar subquery on the RHS: `col cmp (SELECT ...)`. The parser
     // captures the inner Op; a pre-compile pass runs it once and
     // rewrites this predicate node into a `.leaf` literal.

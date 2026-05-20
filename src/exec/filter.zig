@@ -141,6 +141,23 @@ pub const Filter = struct {
                     return Error.ColumnNotFound;
                 };
                 try predicate.evaluateMaskWithPred(batch.values[col_idx], p, batch.row_count, out);
+                const view = batch.values[col_idx];
+                if (view.nulls != null) {
+                    for (0..batch.row_count) |i| if (!view.isValid(i)) {
+                        out[i] = false;
+                    };
+                }
+            },
+            .leaf_col_col => |lc| {
+                const li = blk: {
+                    for (self.schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.left)) break :blk i;
+                    return Error.ColumnNotFound;
+                };
+                const ri = blk: {
+                    for (self.schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.right)) break :blk i;
+                    return Error.ColumnNotFound;
+                };
+                try predicate.evaluateColColMask(batch.values[li], batch.values[ri], lc.op, batch.row_count, out);
             },
             .is_null => |col_name| {
                 const col_idx = blk: {

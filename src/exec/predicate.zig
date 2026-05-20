@@ -37,6 +37,12 @@ pub const Predicate = struct {
 ///   - `.not`        — child must NOT match
 pub const PredicateExpr = union(enum) {
     leaf: Predicate,
+    /// `col1 op col2` — both sides are column refs. Required for
+    /// TPC-H queries (Q12's `l_commitdate < l_receiptdate`) and for
+    /// detecting correlated subqueries (`l_orderkey = o_orderkey`
+    /// inside an EXISTS inner). NULL on either side → row fails the
+    /// predicate (two-valued logic).
+    leaf_col_col: ColColPred,
     is_null: []const u8,
     is_not_null: []const u8,
     /// SQL LIKE pattern match. `pattern` is a SQL pattern with two
@@ -98,6 +104,12 @@ pub const InSet = struct {
     negate: bool,
 };
 
+pub const ColColPred = struct {
+    left: []const u8,
+    op: PredicateOp,
+    right: []const u8,
+};
+
 pub fn likeExpr(col: []const u8, pattern: []const u8) PredicateExpr {
     return .{ .like = .{ .col = col, .pattern = pattern } };
 }
@@ -124,6 +136,11 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
             .col = try out_arena.dupe(u8, lf.col),
             .op = lf.op,
             .val = try cloneValue(out_arena, lf.val),
+        } },
+        .leaf_col_col => |lc| .{ .leaf_col_col = .{
+            .left = try out_arena.dupe(u8, lc.left),
+            .op = lc.op,
+            .right = try out_arena.dupe(u8, lc.right),
         } },
         .is_null => |c| .{ .is_null = try out_arena.dupe(u8, c) },
         .is_not_null => |c| .{ .is_not_null = try out_arena.dupe(u8, c) },
@@ -203,6 +220,24 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             if (col_type.isString() and p.op != .eq and p.op != .neq) {
                 return Error.UnsupportedOperatorForType;
             }
+        },
+        .leaf_col_col => |lc| {
+            const li = blk: {
+                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.left)) break :blk i;
+                return Error.ColumnNotFound;
+            };
+            const ri = blk: {
+                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.right)) break :blk i;
+                return Error.ColumnNotFound;
+            };
+            const lt = schema[li].type;
+            const rt = schema[ri].type;
+            // String columns only support eq / neq (same as col-vs-literal).
+            if (lt.isString() != rt.isString()) return Error.PredicateTypeMismatch;
+            if (lt.isString() and lc.op != .eq and lc.op != .neq) return Error.UnsupportedOperatorForType;
+            // Numeric / temporal: both sides must share the same tag.
+            // No widening for col-vs-col in v1.
+            if (std.meta.activeTag(lt) != std.meta.activeTag(rt)) return Error.PredicateTypeMismatch;
         },
         .is_null, .is_not_null => |col_name| {
             for (schema) |c| {
@@ -358,6 +393,17 @@ pub fn evaluatePredicate(
                 }
             }
         },
+        .leaf_col_col => |lc| {
+            const li = blk: {
+                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.left)) break :blk i;
+                return Error.ColumnNotFound;
+            };
+            const ri = blk: {
+                for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, lc.right)) break :blk i;
+                return Error.ColumnNotFound;
+            };
+            try evaluateColColMask(batch.values[li], batch.values[ri], lc.op, batch.row_count, out);
+        },
         .is_null => |col_name| {
             const col_idx = blk: {
                 for (schema, 0..) |c, i| {
@@ -494,6 +540,102 @@ fn evalInSetStringy(sv: anytype, values: []const Value, negate: bool, view: Colu
             }
         }
         mask[i] = if (negate) !found else found;
+    }
+}
+
+/// Per-row col-vs-col comparison. Both views must share the same
+/// primitive type tag (validateExpr enforces). NULL on either side
+/// → mask[i] = false (two-valued logic).
+pub fn evaluateColColMask(left: ColumnView, right: ColumnView, op: PredicateOp, n: usize, mask: []bool) !void {
+    switch (left.data) {
+        .int => |l| {
+            const r = right.data.int;
+            for (0..n) |i| mask[i] = cmp(i32, l[i], r[i], op);
+        },
+        .bigint => |l| {
+            const r = right.data.bigint;
+            for (0..n) |i| mask[i] = cmp(i64, l[i], r[i], op);
+        },
+        .smallint => |l| {
+            const r = right.data.smallint;
+            for (0..n) |i| mask[i] = cmp(i16, l[i], r[i], op);
+        },
+        .tinyint => |l| {
+            const r = right.data.tinyint;
+            for (0..n) |i| mask[i] = cmp(i8, l[i], r[i], op);
+        },
+        .largeint => |l| {
+            const r = right.data.largeint;
+            for (0..n) |i| mask[i] = cmp(i128, l[i], r[i], op);
+        },
+        .float => |l| {
+            const r = right.data.float;
+            for (0..n) |i| mask[i] = cmp(f32, l[i], r[i], op);
+        },
+        .double => |l| {
+            const r = right.data.double;
+            for (0..n) |i| mask[i] = cmp(f64, l[i], r[i], op);
+        },
+        .boolean => |l| {
+            const r = right.data.boolean;
+            for (0..n) |i| mask[i] = cmp(u8, l[i], r[i], op);
+        },
+        .date => |l| {
+            const r = right.data.date;
+            for (0..n) |i| mask[i] = cmp(i32, l[i], r[i], op);
+        },
+        .datetime => |l| {
+            const r = right.data.datetime;
+            for (0..n) |i| mask[i] = cmp(i64, l[i], r[i], op);
+        },
+        .decimal64 => |l| {
+            const r = right.data.decimal64;
+            for (0..n) |i| mask[i] = cmp(i64, l[i], r[i], op);
+        },
+        .decimal128 => |l| {
+            const r = right.data.decimal128;
+            for (0..n) |i| mask[i] = cmp(i128, l[i], r[i], op);
+        },
+        .uuid => |l| {
+            const r = right.data.uuid;
+            for (0..n) |i| mask[i] = cmp(u128, l[i], r[i], op);
+        },
+        .varchar => |l| switch (right.data) {
+            .varchar => |r| stringCmpCol(l, r, op, n, mask),
+            .string => |r| stringCmpCol(l, r, op, n, mask),
+            .char => |r| stringCmpCol(l, r, op, n, mask),
+            else => unreachable,
+        },
+        .string => |l| switch (right.data) {
+            .varchar => |r| stringCmpCol(l, r, op, n, mask),
+            .string => |r| stringCmpCol(l, r, op, n, mask),
+            .char => |r| stringCmpCol(l, r, op, n, mask),
+            else => unreachable,
+        },
+        .char => |l| switch (right.data) {
+            .varchar => |r| stringCmpCol(l, r, op, n, mask),
+            .string => |r| stringCmpCol(l, r, op, n, mask),
+            .char => |r| stringCmpCol(l, r, op, n, mask),
+            else => unreachable,
+        },
+    }
+    // NULL on either side → false.
+    if (left.nulls != null) {
+        for (0..n) |i| if (!left.isValid(i)) {
+            mask[i] = false;
+        };
+    }
+    if (right.nulls != null) {
+        for (0..n) |i| if (!right.isValid(i)) {
+            mask[i] = false;
+        };
+    }
+}
+
+fn stringCmpCol(l: anytype, r: anytype, op: PredicateOp, n: usize, mask: []bool) void {
+    for (0..n) |i| {
+        const eq = std.mem.eql(u8, l.rowBytes(i), r.rowBytes(i));
+        mask[i] = if (op == .eq) eq else !eq;
     }
 }
 

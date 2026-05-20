@@ -38,6 +38,7 @@ test {
     _ = @import("scalar_subquery_test.zig");
     _ = @import("exists_test.zig");
     _ = @import("in_subquery_test.zig");
+    _ = @import("col_col_predicate_test.zig");
     _ = @import("bug_repro_test.zig");
 }
 

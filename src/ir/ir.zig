@@ -1174,6 +1174,7 @@ const PredTag = enum(u8) {
     p_or = 4,
     p_not = 5,
     like = 6,
+    leaf_col_col = 7,
 };
 
 pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: PredicateExpr) EncodeError!void {
@@ -1201,6 +1202,14 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
             try out.appendSlice(allocator, lp.col);
             try appendU32(allocator, out, @intCast(lp.pattern.len));
             try out.appendSlice(allocator, lp.pattern);
+        },
+        .leaf_col_col => |lc| {
+            try out.append(allocator, @intFromEnum(PredTag.leaf_col_col));
+            try out.append(allocator, @intFromEnum(lc.op));
+            try appendU32(allocator, out, @intCast(lc.left.len));
+            try out.appendSlice(allocator, lc.left);
+            try appendU32(allocator, out, @intCast(lc.right.len));
+            try out.appendSlice(allocator, lc.right);
         },
         // Subqueries are parse-time only — resolved before any wire
         // round-trip. Surface loudly if we hit an unresolved one.
@@ -1939,7 +1948,7 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(PredTag.like)) return Error.IrCorrupt;
+    if (tag_byte > @intFromEnum(PredTag.leaf_col_col)) return Error.IrCorrupt;
     const tag: PredTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1990,6 +1999,16 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
             const col = try readString(bytes, cursor);
             const pat = try readString(bytes, cursor);
             break :blk PredicateExpr{ .like = .{ .col = col, .pattern = pat } };
+        },
+        .leaf_col_col => blk: {
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const op_byte = bytes[cursor.*];
+            cursor.* += 1;
+            if (op_byte > @intFromEnum(PredicateOp.gte)) return Error.IrCorrupt;
+            const op: PredicateOp = @enumFromInt(op_byte);
+            const left = try readString(bytes, cursor);
+            const right = try readString(bytes, cursor);
+            break :blk PredicateExpr{ .leaf_col_col = .{ .left = left, .op = op, .right = right } };
         },
     };
 }
@@ -2090,7 +2109,7 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
 
 pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     switch (expr) {
-        .leaf, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set => {},
+        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set => {},
         .@"and", .@"or" => |children| {
             for (children) |c| freeDecodedPredicate(c, allocator);
             allocator.free(children);

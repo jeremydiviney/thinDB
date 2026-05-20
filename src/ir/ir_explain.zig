@@ -414,6 +414,13 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
             try out.append(allocator, ' ');
             try writeValue(allocator, out, l.val);
         },
+        .leaf_col_col => |lc| {
+            try out.appendSlice(allocator, lc.left);
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, opSymbol(lc.op));
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, lc.right);
+        },
         .is_null => |col| try writeAll(allocator, out, col, " IS NULL", ""),
         .is_not_null => |col| try writeAll(allocator, out, col, " IS NOT NULL", ""),
         .like => |lp| {

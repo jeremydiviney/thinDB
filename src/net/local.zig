@@ -741,6 +741,11 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             .op = p.op,
             .val = try cloneValue(aa, p.val),
         } },
+        .leaf_col_col => |lc| PredicateExpr{ .leaf_col_col = .{
+            .left = try aa.dupe(u8, lc.left),
+            .op = lc.op,
+            .right = try aa.dupe(u8, lc.right),
+        } },
         .is_null => |col| PredicateExpr{ .is_null = try aa.dupe(u8, col) },
         .is_not_null => |col| PredicateExpr{ .is_not_null = try aa.dupe(u8, col) },
         .like => |lp| PredicateExpr{ .like = .{
@@ -1145,7 +1150,7 @@ fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
     switch (pred.*) {
-        .leaf, .is_null, .is_not_null, .like, .always, .in_set => {},
+        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set => {},
         .scalar_subquery => |sq| {
             const val = try runScalarSubquery(ctx, sq.source);
             pred.* = .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = val } };
