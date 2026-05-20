@@ -66,6 +66,10 @@ pub const Error = error{
     /// materializing. Aborts mid-build with a clear error rather
     /// than letting the underlying allocator OOM the process.
     MemoryBudgetExceeded,
+    /// Window operator: shape unsupported in the current implementation
+    /// (string-typed window output, args other than column refs for
+    /// aggregates, etc.). Tier 1 ships a deliberately narrow subset.
+    WindowUnsupported,
 };
 
 // ---------------------------------------------------------------------------
@@ -212,6 +216,18 @@ pub const Query = struct {
     /// extends the upstream schema with these new columns appended.
     pub fn compute(self: Query, derived: []const @import("compute.zig").Derived) !Query {
         return @import("compute.zig").Compute.create(self.allocator, self, derived);
+    }
+
+    /// Window function step. `specs` is the list of unique window
+    /// specifications referenced by `calls`; `calls` carry a `spec_idx`
+    /// into `specs`. Operator sorts the input once per spec and
+    /// evaluates all calls sharing that spec in a single sweep.
+    pub fn window(
+        self: Query,
+        specs: []const @import("../ir/ir.zig").WindowSpec,
+        calls: []const @import("../ir/ir.zig").WindowCall,
+    ) !Query {
+        return @import("window.zig").Window.create(self.allocator, self, specs, calls);
     }
 
     /// Inner equi-join with `other`. Output schema is this side's

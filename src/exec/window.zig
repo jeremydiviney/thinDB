@@ -1,0 +1,1086 @@
+//! Window function operator. Blocking — drains all upstream rows into
+//! per-column buffers, then for each WindowSpec sorts a permutation by
+//! (partition_by ++ order_by), walks partitions, and evaluates each
+//! WindowCall associated with that spec. Output is emitted in the
+//! ORIGINAL input row order: input columns followed by one output
+//! column per WindowCall.
+//!
+//! Tier 1 scope:
+//!   - ROW_NUMBER, RANK, DENSE_RANK
+//!   - LAG, LEAD (offset + literal-or-col-ref default)
+//!   - FIRST_VALUE, LAST_VALUE
+//!   - SUM, COUNT, AVG, MIN, MAX (aggregate windows)
+//!   - PARTITION BY + ORDER BY
+//!   - Default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW when
+//!     ORDER BY present; ROWS UNBOUNDED PRECEDING TO UNBOUNDED
+//!     FOLLOWING otherwise)
+//!   - ROWS BETWEEN <preceding|current|following> AND <...>
+//!
+//! Out of scope (Tier 2+): RANGE framing with N PRECEDING, GROUPS
+//! framing, EXCLUDE clauses, NTH_VALUE, NTILE/PERCENT_RANK/CUME_DIST,
+//! IGNORE NULLS semantics in the operator (parsed but not honored),
+//! string outputs from window functions.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const types = @import("../types.zig");
+const Column = types.Column;
+const Type = types.Type;
+const TypeTag = types.TypeTag;
+const Value = types.Value;
+
+const ir = @import("../ir/ir.zig");
+
+const storage = @import("../storage/storage.zig");
+const ColumnView = storage.ColumnView;
+
+const engine = @import("../engine/engine.zig");
+const ColumnStore = engine.ColumnStore;
+const transform = @import("../engine/transform.zig");
+
+const exec = @import("exec.zig");
+const Query = exec.Query;
+const Batch = exec.Batch;
+const Error = exec.Error;
+const makeQuery = exec.makeQuery;
+
+const predicate = @import("predicate.zig");
+const Predicate = predicate.Predicate;
+
+pub const Window = struct {
+    allocator: Allocator,
+    upstream: Query,
+
+    /// Output schema = input columns + one column per WindowCall.
+    schema: []Column,
+    /// Borrowed view of the upstream's schema; used during evaluation.
+    input_schema: []const Column,
+
+    /// One entry per `ir.WindowSpec`, indexes resolved at create time.
+    spec_indices: []SpecIndices,
+    /// One entry per `ir.WindowCall`: how to evaluate it.
+    call_plans: []CallPlan,
+
+    /// IR pointers held for the lifetime of the operator (frame info etc.).
+    specs: []const ir.WindowSpec,
+    calls: []const ir.WindowCall,
+
+    // Materialized state, built lazily on first `next()`.
+    drained: bool = false,
+    accumulated: []ColumnStore,        // input columns
+    output_columns: []ColumnStore,     // window outputs, parallel to `calls`
+    accumulated_rows: u64 = 0,
+
+    // Batch emit state — emits input + output in original order.
+    emit_offset: usize = 0,
+    out_input_columns: []ColumnStore,  // staging for input cols per batch
+    out_output_columns: []ColumnStore, // staging for output cols per batch
+    views: []ColumnView,               // input + output views, parallel to schema
+
+    const batch_size: usize = 1024;
+
+    /// Resolved column indices for one window spec.
+    const SpecIndices = struct {
+        partition_cols: []usize,
+        order_cols: []usize,
+        order_desc: []bool,
+    };
+
+    /// Per-call evaluation plan: which spec it uses + how to drive it.
+    const CallPlan = struct {
+        spec_idx: usize,
+        func: ir.WindowFunc,
+        /// First-argument column index when the function takes one
+        /// (LAG/LEAD/FIRST_VALUE/LAST_VALUE/aggregate). undefined for
+        /// nullary functions (ROW_NUMBER/RANK/DENSE_RANK).
+        value_col: usize = std.math.maxInt(usize),
+        /// LAG/LEAD offset. 1 by default.
+        offset: i64 = 1,
+        /// LAG/LEAD default. Three forms:
+        ///   .none      — return NULL on out-of-bounds (SQL standard
+        ///                default).
+        ///   .literal   — a constant value.
+        ///   .col_ref   — return the current row's value of this column
+        ///                (StarRocks v4 extension).
+        default_kind: DefaultKind = .none,
+        default_literal: Value = .{ .bigint = 0 },
+        default_col: usize = std.math.maxInt(usize),
+        /// COUNT(*) accepts no arg-column; tracked via this flag.
+        count_star: bool = false,
+    };
+
+    const DefaultKind = enum { none, literal, col_ref };
+
+    pub fn create(
+        allocator: Allocator,
+        upstream: Query,
+        specs: []const ir.WindowSpec,
+        calls: []const ir.WindowCall,
+    ) !Query {
+        const input_schema = upstream.outputSchema();
+
+        // Resolve every WindowSpec's column refs to indices.
+        const spec_indices = try allocator.alloc(SpecIndices, specs.len);
+        errdefer freeSpecIndices(allocator, spec_indices, 0);
+        var sinit: usize = 0;
+        errdefer freeSpecIndices(allocator, spec_indices, sinit);
+        for (specs, 0..) |sp, si| {
+            const pcols = try allocator.alloc(usize, sp.partition_by.len);
+            errdefer allocator.free(pcols);
+            for (sp.partition_by, 0..) |name, i| {
+                pcols[i] = lookupCol(input_schema, name) orelse return Error.ColumnNotFound;
+            }
+            const ocols = try allocator.alloc(usize, sp.order_by.len);
+            errdefer allocator.free(ocols);
+            const odesc = try allocator.alloc(bool, sp.order_by.len);
+            errdefer allocator.free(odesc);
+            for (sp.order_by, 0..) |s, i| {
+                ocols[i] = lookupCol(input_schema, s.col) orelse return Error.ColumnNotFound;
+                odesc[i] = s.desc;
+            }
+            spec_indices[si] = .{
+                .partition_cols = pcols,
+                .order_cols = ocols,
+                .order_desc = odesc,
+            };
+            sinit = si + 1;
+        }
+
+        // Resolve every call's args + frame + default-kind into a plan.
+        const call_plans = try allocator.alloc(CallPlan, calls.len);
+        errdefer allocator.free(call_plans);
+        for (calls, 0..) |c, ci| call_plans[ci] = try buildCallPlan(c, input_schema);
+
+        // Build output schema = input + output-column-per-call.
+        const schema = try allocator.alloc(Column, input_schema.len + calls.len);
+        errdefer allocator.free(schema);
+        for (input_schema, 0..) |col, i| schema[i] = col;
+        for (calls, 0..) |c, ci| {
+            const out_type = try outputType(c, call_plans[ci], input_schema);
+            schema[input_schema.len + ci] = .{
+                .name = c.output_name,
+                .type = out_type,
+                .nullable = true, // window outputs may be NULL (out-of-bounds LAG, etc.)
+            };
+        }
+
+        // Allocate column buffers for input and output (one per schema col).
+        const accumulated = try allocator.alloc(ColumnStore, input_schema.len);
+        errdefer allocator.free(accumulated);
+        var ainit: usize = 0;
+        errdefer for (accumulated[0..ainit]) |*c| c.deinit(allocator);
+        for (input_schema, 0..) |col, i| {
+            accumulated[i] = try ColumnStore.init(allocator, col.type, col.nullable);
+            ainit = i + 1;
+        }
+
+        const output_columns = try allocator.alloc(ColumnStore, calls.len);
+        errdefer allocator.free(output_columns);
+        var oinit: usize = 0;
+        errdefer for (output_columns[0..oinit]) |*c| c.deinit(allocator);
+        for (calls, 0..) |_, ci| {
+            const col = schema[input_schema.len + ci];
+            output_columns[ci] = try ColumnStore.init(allocator, col.type, true);
+            oinit = ci + 1;
+        }
+
+        const out_input_columns = try allocator.alloc(ColumnStore, input_schema.len);
+        errdefer allocator.free(out_input_columns);
+        var iinit: usize = 0;
+        errdefer for (out_input_columns[0..iinit]) |*c| c.deinit(allocator);
+        for (input_schema, 0..) |col, i| {
+            out_input_columns[i] = try ColumnStore.init(allocator, col.type, col.nullable);
+            iinit = i + 1;
+        }
+
+        const out_output_columns = try allocator.alloc(ColumnStore, calls.len);
+        errdefer allocator.free(out_output_columns);
+        var ooinit: usize = 0;
+        errdefer for (out_output_columns[0..ooinit]) |*c| c.deinit(allocator);
+        for (calls, 0..) |_, ci| {
+            const col = schema[input_schema.len + ci];
+            out_output_columns[ci] = try ColumnStore.init(allocator, col.type, true);
+            ooinit = ci + 1;
+        }
+
+        const views = try allocator.alloc(ColumnView, schema.len);
+        errdefer allocator.free(views);
+
+        const self = try allocator.create(Window);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .allocator = allocator,
+            .upstream = upstream,
+            .schema = schema,
+            .input_schema = input_schema,
+            .spec_indices = spec_indices,
+            .call_plans = call_plans,
+            .specs = specs,
+            .calls = calls,
+            .accumulated = accumulated,
+            .output_columns = output_columns,
+            .out_input_columns = out_input_columns,
+            .out_output_columns = out_output_columns,
+            .views = views,
+        };
+        return makeQuery(allocator, self);
+    }
+
+    pub fn deinit(self: *Window) void {
+        var up = self.upstream;
+        up.deinit();
+        for (self.accumulated) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.accumulated);
+        for (self.output_columns) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.output_columns);
+        for (self.out_input_columns) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.out_input_columns);
+        for (self.out_output_columns) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.out_output_columns);
+        self.allocator.free(self.views);
+        freeSpecIndices(self.allocator, self.spec_indices, self.spec_indices.len);
+        self.allocator.free(self.call_plans);
+        self.allocator.free(self.schema);
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    pub fn outputSchema(self: *Window) []const Column {
+        return self.schema;
+    }
+
+    pub fn addPrune(self: *Window, pred: Predicate) !void {
+        return self.upstream.addPrune(pred);
+    }
+
+    pub fn stats(self: *Window) exec.PipelineStats {
+        const up = self.upstream.stats();
+        // Window doesn't change row count; it adds columns. Sort state
+        // not claimed — we emit in input order, not in any spec's order.
+        return .{ .upper_rows = up.upper_rows };
+    }
+
+    pub fn accountant(self: *Window) ?*exec.memory.MemoryAccountant {
+        return self.upstream.accountant();
+    }
+
+    pub fn next(self: *Window) !?Batch {
+        if (!self.drained) try self.drainAndEvaluate();
+
+        const remaining = self.accumulated_rows - self.emit_offset;
+        if (remaining == 0) return null;
+        const n: usize = @intCast(@min(@as(u64, batch_size), remaining));
+        const lo = self.emit_offset;
+        const hi = lo + n;
+
+        // Stage rows lo..hi from each input column into out_input_columns.
+        for (self.out_input_columns) |*c| c.clear();
+        for (self.out_input_columns, 0..) |*out, ci| {
+            try appendRangeFromStore(self.allocator, self.accumulated[ci], lo, hi, out);
+        }
+        // Same for output columns.
+        for (self.out_output_columns) |*c| c.clear();
+        for (self.out_output_columns, 0..) |*out, ci| {
+            try appendRangeFromStore(self.allocator, self.output_columns[ci], lo, hi, out);
+        }
+
+        for (self.out_input_columns, 0..) |c, i| self.views[i] = c.view();
+        const off = self.input_schema.len;
+        for (self.out_output_columns, 0..) |c, i| self.views[off + i] = c.view();
+
+        self.emit_offset = hi;
+        return Batch{ .schema = self.schema, .values = self.views, .row_count = n };
+    }
+
+    fn drainAndEvaluate(self: *Window) !void {
+        // Drain upstream into accumulated.
+        const row_bytes = exec.memory.estimateRowBytes(self.input_schema);
+        const acc = self.upstream.accountant();
+        while (try self.upstream.next()) |batch| {
+            if (acc) |a| try a.reserve(batch.row_count * row_bytes);
+            for (batch.values, 0..) |view, ci| {
+                try transform.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
+            }
+            self.accumulated_rows += batch.row_count;
+        }
+        const n: usize = @intCast(self.accumulated_rows);
+        if (n == 0) {
+            self.drained = true;
+            return;
+        }
+
+        // Pre-size every output column to N rows, all-null. Evaluators
+        // overwrite specific positions; rows they don't touch stay null
+        // (correct semantics for OOB LAG/LEAD when default = .none).
+        for (self.output_columns, 0..) |*out, ci| {
+            const out_type = self.schema[self.input_schema.len + ci].type;
+            try preSizeColumn(self.allocator, out, out_type, n);
+        }
+
+        // For each spec, build a permutation and evaluate all its calls.
+        for (self.spec_indices, 0..) |si, spec_i| {
+            const perm = try self.buildPermutation(si);
+            defer self.allocator.free(perm);
+            for (self.call_plans, 0..) |plan, ci| {
+                if (plan.spec_idx != spec_i) continue;
+                try self.evaluateCall(plan, ci, perm, si);
+            }
+        }
+
+        self.drained = true;
+    }
+
+    fn buildPermutation(self: *Window, si: SpecIndices) ![]u32 {
+        const n: usize = @intCast(self.accumulated_rows);
+        const perm = try self.allocator.alloc(u32, n);
+        errdefer self.allocator.free(perm);
+        for (perm, 0..) |*p, i| p.* = @intCast(i);
+
+        const Ctx = struct {
+            cols: []const ColumnStore,
+            part: []const usize,
+            order: []const usize,
+            desc: []const bool,
+
+            pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                for (ctx.part) |ci| {
+                    const ord = transform.compareInColumn(ctx.cols[ci], a, b);
+                    if (ord == .lt) return true;
+                    if (ord == .gt) return false;
+                }
+                for (ctx.order, 0..) |ci, i| {
+                    const ord = transform.compareInColumn(ctx.cols[ci], a, b);
+                    if (ord == .lt) return !ctx.desc[i];
+                    if (ord == .gt) return ctx.desc[i];
+                }
+                return false;
+            }
+        };
+
+        std.sort.pdq(u32, perm, Ctx{
+            .cols = self.accumulated,
+            .part = si.partition_cols,
+            .order = si.order_cols,
+            .desc = si.order_desc,
+        }, Ctx.lessThan);
+        return perm;
+    }
+
+    fn evaluateCall(
+        self: *Window,
+        plan: CallPlan,
+        out_idx: usize,
+        perm: []const u32,
+        si: SpecIndices,
+    ) !void {
+        const spec = self.specs[plan.spec_idx];
+        const out = &self.output_columns[out_idx];
+
+        // Walk partitions (runs of equal partition_by values in perm).
+        var p_start: usize = 0;
+        while (p_start < perm.len) {
+            const p_end = partitionEnd(self.accumulated, si.partition_cols, perm, p_start);
+            try self.evaluateOnePartition(plan, spec, si, perm, p_start, p_end, out);
+            p_start = p_end;
+        }
+    }
+
+    fn evaluateOnePartition(
+        self: *Window,
+        plan: CallPlan,
+        spec: ir.WindowSpec,
+        si: SpecIndices,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+    ) !void {
+        switch (plan.func) {
+            .row_number => try fillRowNumber(perm, p_start, p_end, out),
+            .rank => try fillRank(self.accumulated, si.order_cols, perm, p_start, p_end, out, false),
+            .dense_rank => try fillRank(self.accumulated, si.order_cols, perm, p_start, p_end, out, true),
+            .lag => try self.fillLagLead(plan, perm, p_start, p_end, out, true),
+            .lead => try self.fillLagLead(plan, perm, p_start, p_end, out, false),
+            .first_value => try fillFirstValue(self.accumulated[plan.value_col], perm, p_start, p_end, out),
+            .last_value => try self.fillLastValue(plan, spec, perm, p_start, p_end, out),
+            .sum, .avg, .count, .min, .max => try self.fillAggregate(plan, spec, perm, p_start, p_end, out),
+            else => return Error.WindowUnsupported,
+        }
+    }
+
+    fn fillLagLead(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+        is_lag: bool,
+    ) !void {
+        const offset: i64 = plan.offset;
+        const value_col = self.accumulated[plan.value_col];
+        var i: usize = p_start;
+        while (i < p_end) : (i += 1) {
+            const orig = perm[i];
+            const target_signed: i64 = if (is_lag)
+                @as(i64, @intCast(i)) - offset
+            else
+                @as(i64, @intCast(i)) + offset;
+            if (target_signed >= @as(i64, @intCast(p_start)) and target_signed < @as(i64, @intCast(p_end))) {
+                const src_idx = perm[@intCast(target_signed)];
+                try copyCell(value_col, src_idx, out, orig);
+            } else {
+                switch (plan.default_kind) {
+                    .none => setNull(out, orig),
+                    .literal => try writeLiteral(out, orig, plan.default_literal),
+                    .col_ref => {
+                        const def_col = self.accumulated[plan.default_col];
+                        try copyCell(def_col, orig, out, orig);
+                    },
+                }
+            }
+        }
+    }
+
+    fn fillLastValue(
+        self: *Window,
+        plan: CallPlan,
+        spec: ir.WindowSpec,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+    ) !void {
+        const value_col = self.accumulated[plan.value_col];
+        var i: usize = p_start;
+        while (i < p_end) : (i += 1) {
+            const orig = perm[i];
+            const fb = computeFrameBounds(spec.frame, i, p_start, p_end);
+            // LAST_VALUE = value at frame end (inclusive).
+            if (fb.end_inclusive < @as(i64, @intCast(p_start))) {
+                setNull(out, orig);
+            } else {
+                const idx_in_perm = @as(usize, @intCast(@min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)))));
+                const src = perm[idx_in_perm];
+                try copyCell(value_col, src, out, orig);
+            }
+        }
+    }
+
+    fn fillAggregate(
+        self: *Window,
+        plan: CallPlan,
+        spec: ir.WindowSpec,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+    ) !void {
+        var i: usize = p_start;
+        while (i < p_end) : (i += 1) {
+            const orig = perm[i];
+            const fb = computeFrameBounds(spec.frame, i, p_start, p_end);
+            // Clamp to partition bounds.
+            const lo_i: i64 = @max(fb.start, @as(i64, @intCast(p_start)));
+            const hi_i: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
+            if (lo_i > hi_i) {
+                // Empty frame.
+                switch (plan.func) {
+                    .count => try writeBigint(out, orig, 0),
+                    else => setNull(out, orig),
+                }
+                continue;
+            }
+            const lo: usize = @intCast(lo_i);
+            const hi: usize = @intCast(hi_i);
+            try self.evalAggOverFrame(plan, perm, lo, hi, out, orig);
+        }
+    }
+
+    /// Naive per-row scan over the frame [lo, hi] inclusive.
+    /// Tier 1 — O(N * frame_width). Sliding-window state is a Tier-2
+    /// optimization (#145 SIMD pass or its own task).
+    fn evalAggOverFrame(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        lo: usize,
+        hi: usize,
+        out: *ColumnStore,
+        out_idx: u32,
+    ) !void {
+        switch (plan.func) {
+            .count => {
+                var n: i64 = 0;
+                if (plan.count_star) {
+                    n = @intCast(hi + 1 - lo);
+                } else {
+                    const view = self.accumulated[plan.value_col].view();
+                    var k: usize = lo;
+                    while (k <= hi) : (k += 1) {
+                        if (isValid(view, perm[k])) n += 1;
+                    }
+                }
+                try writeBigint(out, out_idx, n);
+            },
+            .sum => try self.frameSum(plan, perm, lo, hi, out, out_idx),
+            .avg => try self.frameAvg(plan, perm, lo, hi, out, out_idx),
+            .min => try self.frameMinMax(plan, perm, lo, hi, out, out_idx, true),
+            .max => try self.frameMinMax(plan, perm, lo, hi, out, out_idx, false),
+            else => return Error.WindowUnsupported,
+        }
+    }
+
+    fn frameSum(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        lo: usize,
+        hi: usize,
+        out: *ColumnStore,
+        out_idx: u32,
+    ) !void {
+        const col = self.accumulated[plan.value_col];
+        const view = col.view();
+        var saw_value = false;
+        switch (col.data) {
+            .int, .bigint, .tinyint, .smallint, .largeint => {
+                var sum: i128 = 0;
+                var k: usize = lo;
+                while (k <= hi) : (k += 1) {
+                    const r = perm[k];
+                    if (!isValid(view, r)) continue;
+                    saw_value = true;
+                    sum += readIntAsI128(col, r);
+                }
+                if (!saw_value) {
+                    setNull(out, out_idx);
+                } else {
+                    // SUM widens to bigint by default in this v1; for
+                    // largeint inputs we widen to largeint.
+                    switch (out.data) {
+                        .bigint => try writeBigint(out, out_idx, @intCast(sum)),
+                        .largeint => try writeLargeint(out, out_idx, sum),
+                        else => return Error.WindowUnsupported,
+                    }
+                }
+            },
+            .float, .double => {
+                var sum: f64 = 0;
+                var k: usize = lo;
+                while (k <= hi) : (k += 1) {
+                    const r = perm[k];
+                    if (!isValid(view, r)) continue;
+                    saw_value = true;
+                    sum += readFloatAsF64(col, r);
+                }
+                if (!saw_value) setNull(out, out_idx) else try writeDouble(out, out_idx, sum);
+            },
+            else => return Error.WindowUnsupported,
+        }
+    }
+
+    fn frameAvg(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        lo: usize,
+        hi: usize,
+        out: *ColumnStore,
+        out_idx: u32,
+    ) !void {
+        const col = self.accumulated[plan.value_col];
+        const view = col.view();
+        var sum: f64 = 0;
+        var n: i64 = 0;
+        switch (col.data) {
+            .int, .bigint, .tinyint, .smallint, .largeint, .float, .double => {
+                var k: usize = lo;
+                while (k <= hi) : (k += 1) {
+                    const r = perm[k];
+                    if (!isValid(view, r)) continue;
+                    sum += readNumericAsF64(col, r);
+                    n += 1;
+                }
+            },
+            else => return Error.WindowUnsupported,
+        }
+        if (n == 0) setNull(out, out_idx) else try writeDouble(out, out_idx, sum / @as(f64, @floatFromInt(n)));
+    }
+
+    fn frameMinMax(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        lo: usize,
+        hi: usize,
+        out: *ColumnStore,
+        out_idx: u32,
+        is_min: bool,
+    ) !void {
+        const col = self.accumulated[plan.value_col];
+        const view = col.view();
+        var best_idx: i64 = -1;
+        var k: usize = lo;
+        while (k <= hi) : (k += 1) {
+            const r = perm[k];
+            if (!isValid(view, r)) continue;
+            if (best_idx < 0) {
+                best_idx = @intCast(r);
+                continue;
+            }
+            const ord = transform.compareInColumn(col, @intCast(best_idx), r);
+            const replace = if (is_min) (ord == .gt) else (ord == .lt);
+            if (replace) best_idx = @intCast(r);
+        }
+        if (best_idx < 0) {
+            setNull(out, out_idx);
+        } else {
+            try copyCell(col, @intCast(best_idx), out, out_idx);
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Free helpers — no Window methods, used internally.
+// ---------------------------------------------------------------------------
+
+fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
+    var plan: Window.CallPlan = .{
+        .spec_idx = c.spec_idx,
+        .func = c.func,
+    };
+    switch (c.func) {
+        .row_number, .rank, .dense_rank => {},
+        .lag, .lead => {
+            // args: expr, [offset], [default]
+            if (c.args.len < 1) return Error.WindowUnsupported;
+            plan.value_col = try exprColIdx(c.args[0], schema);
+            if (c.args.len >= 2) {
+                plan.offset = try exprIntLiteral(c.args[1]);
+                if (plan.offset < 0) return Error.WindowUnsupported;
+            }
+            if (c.args.len >= 3) {
+                switch (c.args[2]) {
+                    .col_ref => |name| {
+                        plan.default_kind = .col_ref;
+                        plan.default_col = lookupCol(schema, name) orelse return Error.ColumnNotFound;
+                    },
+                    .lit => |v| {
+                        plan.default_kind = .literal;
+                        plan.default_literal = v;
+                    },
+                    .call => return Error.WindowUnsupported,
+                }
+            }
+        },
+        .first_value, .last_value => {
+            plan.value_col = try exprColIdx(c.args[0], schema);
+        },
+        .sum, .avg, .count, .min, .max => {
+            switch (c.args[0]) {
+                .col_ref => |name| {
+                    if (std.mem.eql(u8, name, "*")) {
+                        if (c.func != .count) return Error.WindowUnsupported;
+                        plan.count_star = true;
+                    } else {
+                        plan.value_col = lookupCol(schema, name) orelse return Error.ColumnNotFound;
+                    }
+                },
+                else => return Error.WindowUnsupported,
+            }
+        },
+        else => return Error.WindowUnsupported,
+    }
+    return plan;
+}
+
+fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !Type {
+    return switch (c.func) {
+        .row_number, .rank, .dense_rank => .bigint,
+        .count => .bigint,
+        .sum => blk: {
+            const t = schema[plan.value_col].type;
+            switch (t) {
+                .int, .bigint, .tinyint, .smallint => break :blk Type{ .bigint = {} },
+                .largeint => break :blk Type{ .largeint = {} },
+                .float, .double => break :blk Type{ .double = {} },
+                else => return Error.WindowUnsupported,
+            }
+        },
+        .avg => Type{ .double = {} },
+        .min, .max, .lag, .lead, .first_value, .last_value => schema[plan.value_col].type,
+        else => Error.WindowUnsupported,
+    };
+}
+
+fn exprColIdx(e: ir.Expr, schema: []const Column) !usize {
+    return switch (e) {
+        .col_ref => |name| lookupCol(schema, name) orelse return Error.ColumnNotFound,
+        else => Error.WindowUnsupported,
+    };
+}
+
+fn exprIntLiteral(e: ir.Expr) !i64 {
+    return switch (e) {
+        .lit => |v| switch (v) {
+            .int => |x| x,
+            .bigint => |x| x,
+            .smallint => |x| x,
+            .tinyint => |x| x,
+            else => Error.WindowUnsupported,
+        },
+        else => Error.WindowUnsupported,
+    };
+}
+
+fn lookupCol(schema: []const Column, name: []const u8) ?usize {
+    for (schema, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return i;
+    return null;
+}
+
+fn freeSpecIndices(allocator: Allocator, specs: []Window.SpecIndices, n: usize) void {
+    for (specs[0..n]) |si| {
+        allocator.free(si.partition_cols);
+        allocator.free(si.order_cols);
+        allocator.free(si.order_desc);
+    }
+    allocator.free(specs);
+}
+
+/// Pre-size an output ColumnStore to `n` rows, initial state = all NULL
+/// (zero data + zero-valid validity bitmap). Evaluators overwrite the
+/// data + flip validity bits per row they fill.
+fn preSizeColumn(allocator: Allocator, out: *ColumnStore, t: Type, n: usize) !void {
+    out.clear();
+    switch (out.data) {
+        .int => |*l| try l.appendNTimes(allocator, 0, n),
+        .bigint => |*l| try l.appendNTimes(allocator, 0, n),
+        .boolean => |*l| try l.appendNTimes(allocator, 0, n),
+        .tinyint => |*l| try l.appendNTimes(allocator, 0, n),
+        .smallint => |*l| try l.appendNTimes(allocator, 0, n),
+        .largeint => |*l| try l.appendNTimes(allocator, 0, n),
+        .float => |*l| try l.appendNTimes(allocator, 0, n),
+        .double => |*l| try l.appendNTimes(allocator, 0, n),
+        .date => |*l| try l.appendNTimes(allocator, 0, n),
+        .datetime => |*l| try l.appendNTimes(allocator, 0, n),
+        .decimal64 => |*l| try l.appendNTimes(allocator, 0, n),
+        .decimal128 => |*l| try l.appendNTimes(allocator, 0, n),
+        .uuid => |*l| try l.appendNTimes(allocator, 0, n),
+        .varchar, .string, .char => return Error.WindowUnsupported,
+    }
+    _ = t;
+    if (out.nulls) |*nb| {
+        const bytes_needed = (n + 7) / 8;
+        try nb.appendNTimes(allocator, 0, bytes_needed); // 0 = NULL
+    }
+}
+
+fn appendRangeFromStore(
+    allocator: Allocator,
+    src: ColumnStore,
+    lo: usize,
+    hi: usize,
+    out: *ColumnStore,
+) !void {
+    const indices_buf = try allocator.alloc(u32, hi - lo);
+    defer allocator.free(indices_buf);
+    for (indices_buf, 0..) |*p, i| p.* = @intCast(lo + i);
+    try transform.appendByIndices(allocator, src.view(), indices_buf, out);
+}
+
+/// `perm` is sorted by (partition_by, order_by). Find the end of the
+/// current partition starting at `start` — the smallest index `e` >
+/// `start` such that the partition-key tuple at `perm[e]` differs from
+/// `perm[start]` (or `perm.len` if the partition runs to the end).
+fn partitionEnd(
+    cols: []const ColumnStore,
+    part_cols: []const usize,
+    perm: []const u32,
+    start: usize,
+) usize {
+    if (part_cols.len == 0) return perm.len;
+    var e: usize = start + 1;
+    const ref = perm[start];
+    while (e < perm.len) : (e += 1) {
+        for (part_cols) |ci| {
+            if (transform.compareInColumn(cols[ci], ref, perm[e]) != .eq) return e;
+        }
+    }
+    return e;
+}
+
+fn fillRowNumber(perm: []const u32, p_start: usize, p_end: usize, out: *ColumnStore) !void {
+    var i: usize = p_start;
+    var rn: i64 = 1;
+    while (i < p_end) : (i += 1) {
+        try writeBigint(out, perm[i], rn);
+        rn += 1;
+    }
+}
+
+fn fillRank(
+    cols: []const ColumnStore,
+    order_cols: []const usize,
+    perm: []const u32,
+    p_start: usize,
+    p_end: usize,
+    out: *ColumnStore,
+    dense: bool,
+) !void {
+    var i: usize = p_start;
+    var prev_rank: i64 = 1;
+    while (i < p_end) : (i += 1) {
+        const cur_rank = if (i == p_start) blk: {
+            prev_rank = 1;
+            break :blk 1;
+        } else if (orderEquals(cols, order_cols, perm[i - 1], perm[i])) blk: {
+            break :blk prev_rank;
+        } else blk: {
+            if (dense) {
+                prev_rank += 1;
+                break :blk prev_rank;
+            } else {
+                // RANK uses position-in-partition for the new group.
+                break :blk @as(i64, @intCast(i - p_start)) + 1;
+            }
+        };
+        try writeBigint(out, perm[i], cur_rank);
+        prev_rank = cur_rank;
+    }
+}
+
+fn orderEquals(
+    cols: []const ColumnStore,
+    order_cols: []const usize,
+    a: u32,
+    b: u32,
+) bool {
+    for (order_cols) |ci| {
+        if (transform.compareInColumn(cols[ci], a, b) != .eq) return false;
+    }
+    return true;
+}
+
+fn fillFirstValue(
+    value_col: ColumnStore,
+    perm: []const u32,
+    p_start: usize,
+    p_end: usize,
+    out: *ColumnStore,
+) !void {
+    if (p_start >= p_end) return;
+    const first_src = perm[p_start];
+    var i: usize = p_start;
+    while (i < p_end) : (i += 1) {
+        try copyCell(value_col, first_src, out, perm[i]);
+    }
+}
+
+/// Compute the [start, end_inclusive] frame indices (in PERMUTATION
+/// space) for the current row at perm[cur]. Indices are relative to
+/// the whole perm array; callers clamp to partition bounds.
+const FrameBounds = struct {
+    start: i64,
+    end_inclusive: i64,
+};
+
+fn computeFrameBounds(frame: ir.Frame, cur: usize, p_start: usize, p_end: usize) FrameBounds {
+    const c: i64 = @intCast(cur);
+    const ps: i64 = @intCast(p_start);
+    const pe_inclusive: i64 = @as(i64, @intCast(p_end)) - 1;
+
+    const start = boundToIndex(frame.start, c, ps, pe_inclusive, true);
+    const end = boundToIndex(frame.end, c, ps, pe_inclusive, false);
+    return .{ .start = start, .end_inclusive = end };
+}
+
+fn boundToIndex(b: ir.FrameBound, cur: i64, p_start: i64, p_end_inclusive: i64, is_start: bool) i64 {
+    _ = is_start;
+    return switch (b) {
+        .unbounded_preceding => p_start,
+        .preceding => |n| cur - @as(i64, @intCast(n)),
+        .current_row => cur,
+        .following => |n| cur + @as(i64, @intCast(n)),
+        .unbounded_following => p_end_inclusive,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Cell-level read/write helpers
+// ---------------------------------------------------------------------------
+
+fn isValid(view: ColumnView, row: u32) bool {
+    if (view.nulls) |nb| {
+        const byte_idx = row >> 3;
+        const bit: u3 = @intCast(row & 7);
+        return (nb[byte_idx] & (@as(u8, 1) << bit)) != 0;
+    }
+    return true;
+}
+
+fn setNull(out: *ColumnStore, row: u32) void {
+    const nb = if (out.nulls) |*n| n else return;
+    const byte_idx = row >> 3;
+    const bit: u3 = @intCast(row & 7);
+    nb.items[byte_idx] &= ~(@as(u8, 1) << bit);
+}
+
+fn setValid(out: *ColumnStore, row: u32) void {
+    const nb = if (out.nulls) |*n| n else return;
+    const byte_idx = row >> 3;
+    const bit: u3 = @intCast(row & 7);
+    nb.items[byte_idx] |= (@as(u8, 1) << bit);
+}
+
+fn writeBigint(out: *ColumnStore, row: u32, v: i64) !void {
+    switch (out.data) {
+        .bigint => |*l| l.items[row] = v,
+        else => return Error.WindowUnsupported,
+    }
+    setValid(out, row);
+}
+
+fn writeLargeint(out: *ColumnStore, row: u32, v: i128) !void {
+    switch (out.data) {
+        .largeint => |*l| l.items[row] = v,
+        else => return Error.WindowUnsupported,
+    }
+    setValid(out, row);
+}
+
+fn writeDouble(out: *ColumnStore, row: u32, v: f64) !void {
+    switch (out.data) {
+        .double => |*l| l.items[row] = v,
+        else => return Error.WindowUnsupported,
+    }
+    setValid(out, row);
+}
+
+fn writeLiteral(out: *ColumnStore, row: u32, lit: Value) !void {
+    switch (out.data) {
+        .int => |*l| l.items[row] = switch (lit) {
+            .int => |x| x,
+            .bigint => |x| @intCast(x),
+            else => return Error.WindowUnsupported,
+        },
+        .bigint => |*l| l.items[row] = switch (lit) {
+            .int => |x| x,
+            .bigint => |x| x,
+            else => return Error.WindowUnsupported,
+        },
+        .boolean => |*l| l.items[row] = switch (lit) {
+            .boolean => |x| if (x) @as(u8, 1) else @as(u8, 0),
+            else => return Error.WindowUnsupported,
+        },
+        .double => |*l| l.items[row] = switch (lit) {
+            .double => |x| x,
+            .float => |x| x,
+            else => return Error.WindowUnsupported,
+        },
+        .float => |*l| l.items[row] = switch (lit) {
+            .float => |x| x,
+            else => return Error.WindowUnsupported,
+        },
+        else => return Error.WindowUnsupported,
+    }
+    setValid(out, row);
+}
+
+fn copyCell(src: ColumnStore, src_row: u32, out: *ColumnStore, out_row: u32) !void {
+    const view = src.view();
+    if (!isValid(view, src_row)) {
+        setNull(out, out_row);
+        return;
+    }
+    switch (src.data) {
+        .int => |l| switch (out.data) {
+            .int => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .bigint => |l| switch (out.data) {
+            .bigint => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .tinyint => |l| switch (out.data) {
+            .tinyint => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .smallint => |l| switch (out.data) {
+            .smallint => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .largeint => |l| switch (out.data) {
+            .largeint => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .float => |l| switch (out.data) {
+            .float => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .double => |l| switch (out.data) {
+            .double => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .boolean => |l| switch (out.data) {
+            .boolean => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .date => |l| switch (out.data) {
+            .date => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .datetime => |l| switch (out.data) {
+            .datetime => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .decimal64 => |l| switch (out.data) {
+            .decimal64 => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .decimal128 => |l| switch (out.data) {
+            .decimal128 => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .uuid => |l| switch (out.data) {
+            .uuid => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .varchar, .string, .char => return Error.WindowUnsupported,
+    }
+    setValid(out, out_row);
+}
+
+fn readIntAsI128(col: ColumnStore, row: u32) i128 {
+    return switch (col.data) {
+        .int => |l| @intCast(l.items[row]),
+        .bigint => |l| @intCast(l.items[row]),
+        .tinyint => |l| @intCast(l.items[row]),
+        .smallint => |l| @intCast(l.items[row]),
+        .largeint => |l| l.items[row],
+        else => 0,
+    };
+}
+
+fn readFloatAsF64(col: ColumnStore, row: u32) f64 {
+    return switch (col.data) {
+        .float => |l| @floatCast(l.items[row]),
+        .double => |l| l.items[row],
+        else => 0,
+    };
+}
+
+fn readNumericAsF64(col: ColumnStore, row: u32) f64 {
+    return switch (col.data) {
+        .int => |l| @floatFromInt(l.items[row]),
+        .bigint => |l| @floatFromInt(l.items[row]),
+        .tinyint => |l| @floatFromInt(l.items[row]),
+        .smallint => |l| @floatFromInt(l.items[row]),
+        .largeint => |l| @floatFromInt(l.items[row]),
+        .float => |l| @floatCast(l.items[row]),
+        .double => |l| l.items[row],
+        else => 0,
+    };
+}
