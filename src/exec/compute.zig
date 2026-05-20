@@ -484,9 +484,9 @@ fn resolveDerived(
                 .kind = .{ .case = plan },
             };
         },
-        // Scalar subqueries must be resolved (rewritten to `.lit`) by
-        // the pre-compile pass before this resolver runs.
-        .scalar_subquery => return Error.ComputeUnsupportedExpr,
+        // Subqueries must be resolved (rewritten to `.lit`) by the
+        // pre-compile pass before this resolver runs.
+        .scalar_subquery, .exists_subquery => return Error.ComputeUnsupportedExpr,
     }
 }
 
@@ -580,7 +580,7 @@ fn buildBranchSrc(
             break :blk BranchSrc{ .call = sub };
         },
         .case => return Error.ComputeUnsupportedExpr,
-        .scalar_subquery => return Error.ComputeUnsupportedExpr,
+        .scalar_subquery, .exists_subquery => return Error.ComputeUnsupportedExpr,
     };
 }
 
@@ -661,7 +661,7 @@ fn buildCallPlan(
                 arg_types[i] = sub.output_type;
             },
             .case => return Error.ComputeUnsupportedExpr,
-            .scalar_subquery => return Error.ComputeUnsupportedExpr,
+            .scalar_subquery, .exists_subquery => return Error.ComputeUnsupportedExpr,
         }
     }
 

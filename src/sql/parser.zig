@@ -560,6 +560,16 @@ pub const Parser = struct {
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
 
+        // EXISTS (SELECT ...) at projection start. Routed via the
+        // shared expr-atom parser; we just lift the resulting Expr
+        // into an aliased .expr ProjItem.
+        if (self.cur.tag == .kw_exists) {
+            const expr = try self.parseCallAtom();
+            const default_name = try self.exprDefaultName(expr);
+            const alias = try self.maybeAlias(default_name);
+            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+        }
+
         // EXTRACT(field FROM expr) — special function form. Detected
         // here before the identifier-then-`(` branch below misparses
         // the field name as a regular call arg.
@@ -940,6 +950,16 @@ pub const Parser = struct {
     /// rejected — they belong at the top level of the SELECT list.
     fn parseCallAtom(self: *Parser) ParseError!ir.Expr {
         if (self.cur.tag == .kw_case) return try self.parseCaseExpr();
+        // EXISTS (SELECT ...) in expression position — projects a
+        // boolean. Resolved by the pre-compile pass into `.lit`.
+        if (self.cur.tag == .kw_exists) {
+            try self.advance();
+            try self.expect(.lparen);
+            if (self.cur.tag != .kw_select and self.cur.tag != .kw_with) return ParseError.SqlExpectedSelect;
+            const source = try self.parseStatement();
+            try self.expect(.rparen);
+            return ir.Expr{ .exists_subquery = @ptrCast(source) };
+        }
         // EXTRACT(field FROM expr) — SQL-standard. Lowers to a regular
         // scalar call (year/month/day/hour/minute/second). `field` is
         // an identifier (not a reserved keyword) so check the *next*
@@ -1052,6 +1072,7 @@ pub const Parser = struct {
             },
             .case => return try self.arena.dupe(u8, "case"),
             .scalar_subquery => return try self.arena.dupe(u8, "subquery"),
+            .exists_subquery => return try self.arena.dupe(u8, "exists"),
         }
     }
 

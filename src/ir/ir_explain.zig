@@ -401,6 +401,7 @@ fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!
             try out.appendSlice(allocator, " END");
         },
         .scalar_subquery => try out.appendSlice(allocator, "(SELECT …)"),
+        .exists_subquery => try out.appendSlice(allocator, "EXISTS(SELECT …)"),
     }
 }
 
@@ -434,6 +435,8 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
             try out.appendSlice(allocator, opSymbol(sq.op));
             try out.appendSlice(allocator, " (SELECT …)");
         },
+        .exists_subquery => try out.appendSlice(allocator, "EXISTS (SELECT …)"),
+        .always => |b| try out.appendSlice(allocator, if (b) "TRUE" else "FALSE"),
     }
 }
 

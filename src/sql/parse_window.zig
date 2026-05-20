@@ -327,6 +327,7 @@ pub fn defaultName(arena: Allocator, func_name: []const u8, args: []const ir.Exp
             },
             .case => try buf.appendSlice(arena, "case"),
             .scalar_subquery => try buf.appendSlice(arena, "subquery"),
+            .exists_subquery => try buf.appendSlice(arena, "exists"),
         }
     }
     try buf.append(arena, ')');

@@ -44,6 +44,11 @@ pub const Expr = union(enum) {
     /// substitutes a `.lit` node before any operator is built —
     /// operators never see this variant.
     scalar_subquery: *const anyopaque,
+    /// `EXISTS (SELECT ...)` in projection / expression position.
+    /// Pre-compile pass runs the inner once and rewrites this into
+    /// a `.lit = .{ .boolean = true|false }`. Opaque pointer for
+    /// the same cycle reason.
+    exists_subquery: *const anyopaque,
 
     pub const Call = struct {
         fn_name: []const u8,
@@ -120,6 +125,7 @@ pub fn deepClone(out_arena: Allocator, e: Expr) Allocator.Error!Expr {
         },
         // Opaque pointer aliased — the IR arena owns the pointee.
         .scalar_subquery => |p| .{ .scalar_subquery = p },
+        .exists_subquery => |p| .{ .exists_subquery = p },
     };
 }
 

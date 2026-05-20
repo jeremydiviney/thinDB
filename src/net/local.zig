@@ -752,6 +752,8 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             .op = sq.op,
             .source = sq.source,
         } },
+        .exists_subquery => |src| PredicateExpr{ .exists_subquery = src },
+        .always => |b| PredicateExpr{ .always = b },
         .@"and" => |children| PredicateExpr{ .@"and" = try cloneChildren(aa, children) },
         .@"or" => |children| PredicateExpr{ .@"or" = try cloneChildren(aa, children) },
         .not => |child| blk: {
@@ -1114,10 +1116,14 @@ fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
     switch (pred.*) {
-        .leaf, .is_null, .is_not_null, .like => {},
+        .leaf, .is_null, .is_not_null, .like, .always => {},
         .scalar_subquery => |sq| {
             const val = try runScalarSubquery(ctx, sq.source);
             pred.* = .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = val } };
+        },
+        .exists_subquery => |src| {
+            const has_rows = try runExistsSubquery(ctx, src);
+            pred.* = .{ .always = has_rows };
         },
         .@"and" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
         .@"or" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
@@ -1140,7 +1146,28 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
             const val = try runScalarSubquery(ctx, opaque_ptr);
             e.* = .{ .lit = val };
         },
+        .exists_subquery => |opaque_ptr| {
+            const has_rows = try runExistsSubquery(ctx, opaque_ptr);
+            e.* = .{ .lit = .{ .boolean = has_rows } };
+        },
     }
+}
+
+/// Compile + drain an inner Op enough to answer "are there any rows?"
+/// Pulls the first batch; if its row_count > 0 the answer is TRUE.
+/// Otherwise tries one more `next()` to handle batched-empty-then-data
+/// from upstream operators that emit a heading empty batch.
+fn runExistsSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !bool {
+    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(source_opaque)));
+    try resolveSubqueriesInOp(ctx, inner);
+
+    var q = try compileOp(ctx, inner);
+    defer q.deinit();
+
+    while (try q.next()) |batch| {
+        if (batch.row_count > 0) return true;
+    }
+    return false;
 }
 
 /// Compile + drain an inner Op, expecting exactly one row × one

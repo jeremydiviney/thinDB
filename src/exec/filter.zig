@@ -204,7 +204,8 @@ pub const Filter = struct {
                 for (out) |*o| o.* = !o.*;
             },
             // Resolved away by the pre-compile pass.
-            .scalar_subquery => return Error.PredicateTypeMismatch,
+            .scalar_subquery, .exists_subquery => return Error.PredicateTypeMismatch,
+            .always => |b| @memset(out, b),
         }
     }
 };

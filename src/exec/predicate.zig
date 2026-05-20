@@ -53,6 +53,15 @@ pub const PredicateExpr = union(enum) {
     /// pointer is `*const ir.Op` opaqued to dodge the cycle with the
     /// IR module. Operators never see this variant.
     scalar_subquery: ScalarSubquery,
+    /// `EXISTS (SELECT ...)` — pre-compile pass runs the inner once,
+    /// checks row_count > 0, replaces with `.always`. NOT EXISTS is
+    /// produced by wrapping in `.not` at parse time. Source is an
+    /// opaque `*const ir.Op` (same cycle dodge as scalar_subquery).
+    exists_subquery: *const anyopaque,
+    /// Constant per-row predicate — TRUE matches every row, FALSE
+    /// none. Used as the resolved form of EXISTS / NOT EXISTS and
+    /// (later) NOT IN against an empty subquery result.
+    always: bool,
 };
 
 pub const LikePred = struct {
@@ -104,6 +113,8 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
             .op = sq.op,
             .source = sq.source,
         } },
+        .exists_subquery => |src| .{ .exists_subquery = src },
+        .always => |b| .{ .always = b },
         .@"and" => |kids| blk: {
             const dup = try out_arena.alloc(PredicateExpr, kids.len);
             for (kids, 0..) |k, i| dup[i] = try deepClonePredicate(out_arena, k);
@@ -180,7 +191,10 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // Scalar subqueries must be resolved (rewritten to `.leaf`) by
         // the pre-compile pass before validation runs. Reaching this
         // branch means the resolver missed a node — surface loudly.
-        .scalar_subquery => return Error.PredicateTypeMismatch,
+        .scalar_subquery, .exists_subquery => return Error.PredicateTypeMismatch,
+        // `.always` is a constant-bool resolved form; nothing to
+        // validate against schema.
+        .always => {},
     }
 }
 
@@ -357,7 +371,8 @@ pub fn evaluatePredicate(
             for (out) |*o| o.* = !o.*;
         },
         // Resolved by the pre-compile pass.
-        .scalar_subquery => return Error.PredicateTypeMismatch,
+        .scalar_subquery, .exists_subquery => return Error.PredicateTypeMismatch,
+        .always => |b| @memset(out, b),
     }
 }
 

@@ -76,6 +76,17 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         try p.expect(.rparen);
         return inner;
     }
+    // EXISTS (SELECT ...) — produces a constant-bool predicate after
+    // the pre-compile pass runs the inner. NOT EXISTS is parsed via
+    // parseNot wrapping this atom.
+    if (p.cur.tag == .kw_exists) {
+        try p.advance();
+        try p.expect(.lparen);
+        if (p.cur.tag != .kw_select and p.cur.tag != .kw_with) return PE.SqlExpectedSelect;
+        const source = try p.parseStatement();
+        try p.expect(.rparen);
+        return .{ .exists_subquery = @ptrCast(source) };
+    }
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
     var col_name = p.cur.text;
     try p.advance();
