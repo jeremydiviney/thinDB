@@ -118,13 +118,13 @@ test "UPDATE: WHERE using session var" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    try exec(allocator, db, "SET @cutoff = 25; UPDATE t SET qty = 7 WHERE qty > @cutoff");
+    try exec(allocator, db, "SET @cutoff = 25; UPDATE t SET qty = -1 WHERE qty > @cutoff");
 
-    // qty > 25 → ids 3 (30) and 4 (40) set to 7.
+    // qty > 25 → ids 3 (30) and 4 (40) set to -1.
     var q = try runSql(allocator, db, "SELECT id, qty FROM t ORDER BY id ASC");
     defer q.deinit();
     const batch = (try q.next()).?;
-    try std.testing.expectEqualSlices(i32, &.{ 10, 20, 7, 7 }, batch.values[1].data.int[0..batch.row_count]);
+    try std.testing.expectEqualSlices(i32, &.{ 10, 20, -1, -1 }, batch.values[1].data.int[0..batch.row_count]);
 }
 
 test "UPDATE: affected_rows reported" {
