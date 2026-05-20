@@ -48,6 +48,10 @@ const exec_predicate = @import("../exec/predicate.zig");
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 
+const parse_window = @import("parse_window.zig");
+pub const ParsedWindowCall = parse_window.ParsedWindowCall;
+const parse_ddl = @import("parse_ddl.zig");
+
 pub const ParseError = error{
     SqlExpectedSelect,
     SqlExpectedFrom,
@@ -144,8 +148,15 @@ const ProjItem = struct {
         /// Scalar function call expression. Lowered to a Compute step
         /// before the final projection.
         expr: ir.Expr,
+        /// Window function call. Lowered to a Window step + the
+        /// projection picks up `name` from its output. The spec is
+        /// stored inline at parse time; `applyWindowOps` deduplicates
+        /// equivalent specs across all window calls in the SELECT and
+        /// assigns each call a spec_idx.
+        window: ParsedWindowCall,
     },
 };
+
 
 /// Per-CTE materialization hint from the SQL surface.
 ///   .auto  — refcount-driven: wrap when references ≥ 2.
@@ -158,7 +169,12 @@ const CteEntry = struct {
     hint: MaterializeHint,
 };
 
-const Parser = struct {
+pub const Parser = struct {
+    /// Exported so `parse_window.zig` (which takes the parser via `anytype`
+    /// to avoid a circular import) can name our error set via
+    /// `@TypeOf(p.*).Err`.
+    pub const Err = ParseError;
+
     arena: Allocator,
     lex: *Lexer,
     cur: Token,
@@ -170,12 +186,19 @@ const Parser = struct {
     /// Ordered list of CTE root *Op for the post-parse auto-detect
     /// refcount pass. Order matches declaration in the WITH clause.
     cte_roots: std.ArrayListUnmanaged(*ir.Op) = .empty,
+    /// Named windows declared in the trailing `WINDOW name AS (...)`
+    /// clause of the current SELECT. Populated by `parseWindowClause`
+    /// before projection lowering; consumed by `parseWindowSpecOrRef`
+    /// when a function uses `OVER name`. Cleared at the end of each
+    /// SELECT so different statements in a batch don't bleed into
+    /// each other.
+    named_windows: std.StringHashMapUnmanaged(ir.WindowSpec) = .empty,
 
-    fn advance(self: *Parser) ParseError!void {
+    pub fn advance(self: *Parser) ParseError!void {
         self.cur = try self.lex.next();
     }
 
-    fn expect(self: *Parser, tag: TokenTag) ParseError!void {
+    pub fn expect(self: *Parser, tag: TokenTag) ParseError!void {
         if (self.cur.tag != tag) return ParseError.SqlExpectedToken;
         try self.advance();
     }
@@ -190,10 +213,10 @@ const Parser = struct {
         // with WITH. They have no projection / FROM / WHERE / etc.;
         // dispatch before the SELECT-only path.
         switch (self.cur.tag) {
-            .kw_create, .kw_drop, .kw_use => return try self.parseDdl(),
-            .kw_show => return try self.parseShow(),
-            .kw_insert => return try self.parseInsert(),
-            .kw_copy => return try self.parseCopy(),
+            .kw_create, .kw_drop, .kw_use => return try parse_ddl.parseDdl(self),
+            .kw_show => return try parse_ddl.parseShow(self),
+            .kw_insert => return try parse_ddl.parseInsert(self),
+            .kw_copy => return try parse_ddl.parseCopy(self),
             else => {},
         }
         // Optional WITH clause: zero-or-more named CTEs precede the
@@ -233,6 +256,13 @@ const Parser = struct {
             group_cols = try self.parseIdentList();
         }
 
+        // Optional WINDOW clause — named windows declared here resolve
+        // OVER name references seen in the projection. Comes after GROUP
+        // BY per the SQL standard.
+        if (self.cur.tag == .kw_window) {
+            try parse_window.parseWindowClause(self);
+        }
+
         // Decide between a Project, a Group-by, or a Group-by + Project
         // based on the projection list shape.
         const has_agg = blk: {
@@ -249,10 +279,22 @@ const Parser = struct {
             };
             break :blk false;
         };
+        const has_window = blk: {
+            for (proj) |p| switch (p.kind) {
+                .window => break :blk true,
+                else => {},
+            };
+            break :blk false;
+        };
         if (has_expr and (has_agg or group_cols.len > 0)) {
             // v1 keeps these mutually exclusive — scalar expressions
             // combined with aggregation needs a clear pre-vs-post
             // aggregate decision the parser doesn't yet make.
+            return ParseError.SqlMixedAggAndPlainProjection;
+        }
+        if (has_window and (has_agg or group_cols.len > 0)) {
+            // Window functions on top of GROUP BY need an inner-subquery
+            // shape that the parser doesn't yet emit. Reject explicitly.
             return ParseError.SqlMixedAggAndPlainProjection;
         }
 
@@ -293,7 +335,9 @@ const Parser = struct {
                     if (!found) return ParseError.SqlMixedAggAndPlainProjection;
                 },
                 .agg => {},
-                .expr => unreachable, // gated above (has_expr & has_agg/group_cols rejected)
+                // .expr and .window gated above (mixed with aggregation
+                // is rejected) — reaching them here is a bug.
+                .expr, .window => unreachable,
             };
 
             // Build agg specs from the projection.
@@ -327,11 +371,11 @@ const Parser = struct {
                 root = try self.allocOp(.{ .select = .{ .columns = out_names, .upstream = root } });
             }
         } else {
-            // Non-aggregated. ORDER BY applies BEFORE the Project so it
-            // can reference any column from the input schema. If we have
-            // scalar expressions, materialize them via a Compute step
-            // BEFORE the OrderBy (so OrderBy can reference computed
-            // column aliases too).
+            // Non-aggregated. Pipeline shape:
+            //   Compute(scalars) → Window(windows) → OrderBy → Project → Limit
+            // Compute first so window args can reference computed columns;
+            // Window before OrderBy so ORDER BY can reference window outputs;
+            // Project last so it selects from the union of input + derived.
             if (has_expr) {
                 var derived_buf: std.ArrayList(ir.Derived) = .empty;
                 for (proj) |p| switch (p.kind) {
@@ -340,6 +384,11 @@ const Parser = struct {
                 };
                 const derived_slice = try derived_buf.toOwnedSlice(self.arena);
                 root = try self.allocOp(.{ .compute = .{ .derived = derived_slice, .upstream = root } });
+            }
+            if (has_window) {
+                if (try buildWindowOp(self.arena, proj, root, &self.named_windows)) |win| {
+                    root = win;
+                }
             }
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
@@ -351,8 +400,9 @@ const Parser = struct {
                 for (proj, cols) |p, *out| {
                     switch (p.kind) {
                         .col => |c| out.* = c,
-                        // Computed exprs surface under their derived name (alias).
-                        .expr => out.* = p.name,
+                        // Computed exprs and window outputs surface under
+                        // their derived name (the alias).
+                        .expr, .window => out.* = p.name,
                         .agg => unreachable, // already handled by the agg branch
                     }
                 }
@@ -367,273 +417,8 @@ const Parser = struct {
         return root;
     }
 
-    fn parseDdl(self: *Parser) ParseError!*ir.Op {
-        const head = self.cur.tag;
-        try self.advance();
-        switch (head) {
-            .kw_create => {
-                if (self.cur.tag == .kw_database) {
-                    try self.advance();
-                    const name = try self.dupedIdent();
-                    return try self.allocOp(.{ .ddl = .{ .create_database = name } });
-                }
-                if (self.cur.tag == .kw_schema) {
-                    try self.advance();
-                    const name = try self.dupedIdent();
-                    return try self.allocOp(.{ .ddl = .{ .create_schema = name } });
-                }
-                var is_temp = false;
-                if (self.cur.tag == .kw_temp or self.cur.tag == .kw_temporary) {
-                    is_temp = true;
-                    try self.advance();
-                }
-                if (self.cur.tag == .kw_table) {
-                    try self.advance();
-                    return try self.parseCreateTableBody(is_temp);
-                }
-                return ParseError.SqlExpectedKeyword;
-            },
-            .kw_drop => {
-                if (self.cur.tag == .kw_database) {
-                    try self.advance();
-                    const name = try self.dupedIdent();
-                    return try self.allocOp(.{ .ddl = .{ .drop_database = name } });
-                }
-                if (self.cur.tag == .kw_schema) {
-                    try self.advance();
-                    const name = try self.dupedIdent();
-                    return try self.allocOp(.{ .ddl = .{ .drop_schema = name } });
-                }
-                if (self.cur.tag == .kw_temp or self.cur.tag == .kw_temporary) {
-                    try self.advance();
-                }
-                if (self.cur.tag == .kw_table) {
-                    try self.advance();
-                    return try self.parseDropTableBody();
-                }
-                return ParseError.SqlExpectedKeyword;
-            },
-            .kw_use => {
-                const first = try self.dupedIdent();
-                if (self.cur.tag == .dot) {
-                    try self.advance();
-                    const second = try self.dupedIdent();
-                    return try self.allocOp(.{ .ddl = .{ .use_database_schema = .{
-                        .database = first,
-                        .schema = second,
-                    } } });
-                }
-                return try self.allocOp(.{ .ddl = .{ .use_schema = first } });
-            },
-            else => unreachable,
-        }
-    }
 
-    /// CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] [db.][schema.]name ( column_def, ... [, PRIMARY KEY (..)] )
-    fn parseCreateTableBody(self: *Parser, is_temp: bool) ParseError!*ir.Op {
-        var if_not_exists = false;
-        if (self.cur.tag == .kw_if) {
-            try self.advance();
-            if (self.cur.tag != .kw_not) return ParseError.SqlExpectedKeyword;
-            try self.advance();
-            if (self.cur.tag != .kw_exists) return ParseError.SqlExpectedKeyword;
-            try self.advance();
-            if_not_exists = true;
-        }
-        const ref = try self.parseTableRef();
-        try self.expect(.lparen);
-
-        var cols: std.ArrayList(ir.ColumnDef) = .empty;
-        defer cols.deinit(self.arena);
-        var inline_pk: ?[]const u8 = null;
-        var table_pk: ?[]const []const u8 = null;
-
-        while (true) {
-            if (self.cur.tag == .kw_primary) {
-                try self.advance();
-                if (self.cur.tag != .kw_key) return ParseError.SqlExpectedKeyword;
-                try self.advance();
-                try self.expect(.lparen);
-                table_pk = try self.parseIdentList();
-                try self.expect(.rparen);
-            } else {
-                const col = try self.parseColumnDef();
-                try cols.append(self.arena, col.def);
-                if (col.is_pk) {
-                    if (inline_pk != null) return ParseError.SqlInvalidProjection;
-                    inline_pk = col.def.name;
-                }
-            }
-            if (self.cur.tag != .comma) break;
-            try self.advance();
-        }
-        try self.expect(.rparen);
-
-        // Tolerate trailing engine-options noise like `ENGINE=...` / `CHARSET=...`
-        // by eating any tokens up to EOF or semicolon. Keeps MySQL clients happy.
-        while (self.cur.tag != .eof and self.cur.tag != .semicolon) {
-            try self.advance();
-        }
-
-        if (inline_pk != null and table_pk != null) {
-            return ParseError.SqlInvalidProjection;
-        }
-        const order_key: []const []const u8 = if (table_pk) |tpk|
-            tpk
-        else if (inline_pk) |ipk| blk: {
-            const one = try self.arena.alloc([]const u8, 1);
-            one[0] = ipk;
-            break :blk one;
-        } else return ParseError.SqlInvalidProjection;
-
-        const owned_cols = try self.arena.alloc(ir.ColumnDef, cols.items.len);
-        for (cols.items, 0..) |c, i| owned_cols[i] = c;
-
-        return try self.allocOp(.{ .ddl = .{ .create_table = .{
-            .table = ref,
-            .if_not_exists = if_not_exists,
-            .is_temp = is_temp,
-            .columns = owned_cols,
-            .order_key = order_key,
-        } } });
-    }
-
-    fn parseDropTableBody(self: *Parser) ParseError!*ir.Op {
-        var if_exists = false;
-        if (self.cur.tag == .kw_if) {
-            try self.advance();
-            if (self.cur.tag != .kw_exists) return ParseError.SqlExpectedKeyword;
-            try self.advance();
-            if_exists = true;
-        }
-        const ref = try self.parseTableRef();
-        return try self.allocOp(.{ .ddl = .{ .drop_table = .{
-            .table = ref,
-            .if_exists = if_exists,
-        } } });
-    }
-
-    fn parseInsert(self: *Parser) ParseError!*ir.Op {
-        try self.advance(); // consume INSERT
-        if (self.cur.tag != .kw_into) return ParseError.SqlExpectedKeyword;
-        try self.advance();
-        const ref = try self.parseTableRef();
-
-        var cols_opt: ?[]const []const u8 = null;
-        if (self.cur.tag == .lparen) {
-            try self.advance();
-            cols_opt = try self.parseIdentList();
-            try self.expect(.rparen);
-        }
-
-        if (self.cur.tag != .kw_values) return ParseError.SqlExpectedKeyword;
-        try self.advance();
-
-        var rows: std.ArrayList([]const ?Value) = .empty;
-        defer rows.deinit(self.arena);
-        while (true) {
-            try self.expect(.lparen);
-            var row_vals: std.ArrayList(?Value) = .empty;
-            defer row_vals.deinit(self.arena);
-            while (true) {
-                const v = try self.parseInsertValue();
-                try row_vals.append(self.arena, v);
-                if (self.cur.tag != .comma) break;
-                try self.advance();
-            }
-            try self.expect(.rparen);
-            const row_owned = try self.arena.alloc(?Value, row_vals.items.len);
-            for (row_vals.items, 0..) |v, i| row_owned[i] = v;
-            try rows.append(self.arena, row_owned);
-            if (self.cur.tag != .comma) break;
-            try self.advance();
-        }
-        const rows_owned = try self.arena.alloc([]const ?Value, rows.items.len);
-        for (rows.items, 0..) |r, i| rows_owned[i] = r;
-
-        return try self.allocOp(.{ .insert = .{
-            .table = ref,
-            .columns = cols_opt,
-            .rows = rows_owned,
-        } });
-    }
-
-    /// COPY [db.][schema.]table [(col, ...)] FROM STDIN [WITH (...)]
-    /// COPY [db.][schema.]table [(col, ...)] TO STDOUT [WITH (...)]
-    /// File-path forms (`FROM 'path'` / `TO 'path'`) are rejected.
-    ///
-    /// `TO`, `STDIN`, `STDOUT`, `FORMAT`, `TEXT` are NOT lexer keywords
-    /// (they collide with column-type names like `TEXT`). We accept
-    /// them as identifiers and match case-insensitively here.
-    fn parseCopy(self: *Parser) ParseError!*ir.Op {
-        try self.advance(); // consume COPY
-        const ref = try self.parseTableRef();
-
-        var cols_opt: ?[]const []const u8 = null;
-        if (self.cur.tag == .lparen) {
-            try self.advance();
-            cols_opt = try self.parseIdentList();
-            try self.expect(.rparen);
-        }
-
-        // Direction: FROM is a real keyword; TO is an identifier whose
-        // text we compare ASCII-case-insensitively.
-        const direction: ir.CopyOp.Direction = switch (self.cur.tag) {
-            .kw_from => .from_stdin,
-            .identifier => blk: {
-                if (std.ascii.eqlIgnoreCase(self.cur.text, "to")) break :blk .to_stdout;
-                return ParseError.SqlExpectedKeyword;
-            },
-            else => return ParseError.SqlExpectedKeyword,
-        };
-        try self.advance();
-
-        switch (self.cur.tag) {
-            .identifier => {
-                const text = self.cur.text;
-                if (std.ascii.eqlIgnoreCase(text, "stdin")) {
-                    if (direction != .from_stdin) return ParseError.SqlExpectedKeyword;
-                } else if (std.ascii.eqlIgnoreCase(text, "stdout")) {
-                    if (direction != .to_stdout) return ParseError.SqlExpectedKeyword;
-                } else return ParseError.SqlExpectedKeyword;
-                try self.advance();
-            },
-            .string => return ParseError.SqlCopyFileNotSupported,
-            else => return ParseError.SqlExpectedKeyword,
-        }
-
-        // Optional WITH (...) options. Recognized: `FORMAT TEXT`. Any
-        // other option is rejected — we only do text-format COPY.
-        if (self.cur.tag == .kw_with) {
-            try self.advance();
-            try self.expect(.lparen);
-            while (true) {
-                try self.parseCopyOption();
-                if (self.cur.tag != .comma) break;
-                try self.advance();
-            }
-            try self.expect(.rparen);
-        }
-
-        return try self.allocOp(.{ .copy = .{
-            .direction = direction,
-            .table = ref,
-            .columns = cols_opt,
-        } });
-    }
-
-    fn parseCopyOption(self: *Parser) ParseError!void {
-        if (self.cur.tag != .identifier or
-            !std.ascii.eqlIgnoreCase(self.cur.text, "format"))
-            return ParseError.SqlCopyUnsupportedFormat;
-        try self.advance();
-        if (self.cur.tag != .identifier or
-            !std.ascii.eqlIgnoreCase(self.cur.text, "text"))
-            return ParseError.SqlCopyUnsupportedFormat;
-        try self.advance();
-    }
-
-    fn parseTableRef(self: *Parser) ParseError!ir.TableRef {
+    pub fn parseTableRef(self: *Parser) ParseError!ir.TableRef {
         var parts_buf: [3][]const u8 = undefined;
         var n: usize = 0;
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
@@ -656,146 +441,8 @@ const Parser = struct {
         };
     }
 
-    const ColDefResult = struct { def: ir.ColumnDef, is_pk: bool };
 
-    fn parseColumnDef(self: *Parser) ParseError!ColDefResult {
-        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-        const name = try self.arena.dupe(u8, self.cur.text);
-        try self.advance();
-
-        const ty = try self.parseColumnType();
-
-        var nullable = true; // SQL standard default; flipped to false by NOT NULL or PRIMARY KEY
-        var is_pk = false;
-        var saw_not_null = false;
-        while (true) {
-            switch (self.cur.tag) {
-                .kw_not => {
-                    try self.advance();
-                    if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
-                    try self.advance();
-                    nullable = false;
-                    saw_not_null = true;
-                },
-                .kw_primary => {
-                    try self.advance();
-                    if (self.cur.tag != .kw_key) return ParseError.SqlExpectedKeyword;
-                    try self.advance();
-                    is_pk = true;
-                    nullable = false;
-                },
-                .kw_null => {
-                    if (saw_not_null) return ParseError.SqlExpectedKeyword;
-                    try self.advance();
-                    nullable = true;
-                },
-                else => break,
-            }
-        }
-        return .{
-            .def = .{ .name = name, .column_type = ty, .nullable = nullable },
-            .is_pk = is_pk,
-        };
-    }
-
-    fn parseColumnType(self: *Parser) ParseError!types.Type {
-        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-        const name = self.cur.text;
-        try self.advance();
-
-        // BIGINT / INT / INTEGER / SMALLINT / TINYINT
-        if (asciiEqlAny(name, &.{"bigint"})) return .bigint;
-        if (asciiEqlAny(name, &.{ "int", "integer" })) return .int;
-        if (asciiEqlAny(name, &.{"smallint"})) return .smallint;
-        if (asciiEqlAny(name, &.{"tinyint"})) return .smallint;
-        if (asciiEqlAny(name, &.{ "float", "real" })) return .float;
-        if (asciiEqlAny(name, &.{"double"})) {
-            // Optional PRECISION trailing keyword.
-            if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "precision")) {
-                try self.advance();
-            }
-            return .double;
-        }
-        if (asciiEqlAny(name, &.{ "decimal", "numeric" })) {
-            try self.expect(.lparen);
-            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
-            const p_raw = self.cur.value.integer;
-            try self.advance();
-            try self.expect(.comma);
-            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
-            const s_raw = self.cur.value.integer;
-            try self.advance();
-            try self.expect(.rparen);
-            if (p_raw < 1 or p_raw > 38 or s_raw < 0 or s_raw > p_raw) return ParseError.SqlExpectedValue;
-            const p_u: u8 = @intCast(p_raw);
-            const s_u: u8 = @intCast(s_raw);
-            return if (p_u <= 18)
-                types.Type{ .decimal64 = .{ .p = p_u, .s = s_u } }
-            else
-                types.Type{ .decimal128 = .{ .p = p_u, .s = s_u } };
-        }
-        if (asciiEqlAny(name, &.{"varchar"})) {
-            try self.expect(.lparen);
-            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
-            const n_raw = self.cur.value.integer;
-            try self.advance();
-            try self.expect(.rparen);
-            if (n_raw < 1) return ParseError.SqlExpectedValue;
-            return types.Type{ .varchar = @intCast(n_raw) };
-        }
-        if (asciiEqlAny(name, &.{ "text", "string" })) return .string;
-        if (asciiEqlAny(name, &.{ "boolean", "bool" })) return .boolean;
-        if (asciiEqlAny(name, &.{"date"})) return .date;
-        if (asciiEqlAny(name, &.{ "datetime", "timestamp" })) return .datetime;
-        if (asciiEqlAny(name, &.{"uuid"})) return .uuid;
-        return ParseError.SqlExpectedKeyword;
-    }
-
-    fn parseInsertValue(self: *Parser) ParseError!?Value {
-        if (self.cur.tag == .kw_null) {
-            try self.advance();
-            return null;
-        }
-        return try self.parseValue();
-    }
-
-    fn parseShow(self: *Parser) ParseError!*ir.Op {
-        try self.advance(); // consume SHOW
-        switch (self.cur.tag) {
-            .kw_databases => {
-                try self.advance();
-                return try self.allocOp(.{ .show = .databases });
-            },
-            .kw_schemas => {
-                try self.advance();
-                var db: ?[]const u8 = null;
-                if (self.cur.tag == .kw_from) {
-                    try self.advance();
-                    db = try self.dupedIdent();
-                }
-                return try self.allocOp(.{ .show = .{ .schemas = db } });
-            },
-            .kw_tables => {
-                try self.advance();
-                var ref: ir.TableRef = .{ .name = "" };
-                if (self.cur.tag == .kw_from) {
-                    try self.advance();
-                    const first = try self.dupedIdent();
-                    if (self.cur.tag == .dot) {
-                        try self.advance();
-                        const second = try self.dupedIdent();
-                        ref = .{ .database = first, .schema = second, .name = "" };
-                    } else {
-                        ref = .{ .schema = first, .name = "" };
-                    }
-                }
-                return try self.allocOp(.{ .show = .{ .tables = ref } });
-            },
-            else => return ParseError.SqlExpectedKeyword,
-        }
-    }
-
-    fn dupedIdent(self: *Parser) ParseError![]const u8 {
+    pub fn dupedIdent(self: *Parser) ParseError![]const u8 {
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const out = try self.arena.dupe(u8, self.cur.text);
         try self.advance();
@@ -830,13 +477,60 @@ const Parser = struct {
 
         // Function call?
         if (self.cur.tag == .lparen) {
-            // Try aggregate first; fall through to scalar otherwise.
-            if (aggForName(first)) |func| {
-                return try self.finishAggCall(first, func);
+            // Parse the call shape (name + paren-wrapped args) once. Then
+            // decide between aggregate / scalar / window based on what
+            // follows.
+            const args = try self.parseCallArgList();
+            const fname_dup = try self.arena.dupe(u8, first);
+
+            // Optional [IGNORE | RESPECT] NULLS between `)` and `OVER`.
+            const ignore_nulls = try parse_window.parseIgnoreNulls(self);
+
+            // OVER (...) makes this a window call regardless of which
+            // function name was used. SUM / AVG / etc. become aggregate-
+            // window flavors; ROW_NUMBER / LAG / FIRST_VALUE / etc.
+            // require OVER and reject everywhere else.
+            if (self.cur.tag == .kw_over) {
+                try self.advance();
+                const spec_kind = try parse_window.parseWindowSpecOrRef(self);
+                const wfunc = ir.windowFuncForName(first) orelse
+                    return ParseError.SqlInvalidProjection;
+                parse_window.validateWindowCall(wfunc, args, ignore_nulls) catch
+                    return ParseError.SqlInvalidProjection;
+                const call: ParsedWindowCall = .{
+                    .func = wfunc,
+                    .args = args,
+                    .ignore_nulls = ignore_nulls,
+                    .spec_kind = spec_kind,
+                };
+                const default_name = try parse_window.defaultName(self.arena, first, args);
+                const alias = try self.maybeAlias(default_name);
+                return ProjItem{ .name = alias, .kind = .{ .window = call } };
             }
+
+            // IGNORE NULLS without OVER is a parse error per SQL standard.
+            if (ignore_nulls) return ParseError.SqlInvalidProjection;
+
+            // Window-only functions (row_number, rank, lag, first_value,
+            // etc.) require OVER. Reject them when used as a non-window
+            // call so the error is clear at the call site instead of
+            // surfacing as "unknown function" later.
+            if (ir.windowFuncForName(first)) |wfunc| {
+                if (!parse_window.isAggregateAlsoFunc(wfunc)) return ParseError.SqlInvalidProjection;
+                // Aggregate-named functions (sum/avg/count/min/max) fall
+                // through to the aggregate path below.
+            }
+
+            // Aggregate path: rebuild the (func, col) shape the existing
+            // aggregate lowering expects. Aggregates only accept a single
+            // column-ref arg (or `*` for COUNT(*)); reject anything else.
+            if (aggForName(first)) |func| {
+                return try self.aggCallFromArgs(first, func, args);
+            }
+
             // Scalar function call → record as an Expr; lowered to a
             // Compute step later.
-            const expr = try self.finishScalarCall(first);
+            const expr = ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args } };
             const default_name = try self.exprDefaultName(expr);
             const alias = try self.maybeAlias(default_name);
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
@@ -857,18 +551,51 @@ const Parser = struct {
         return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
     }
 
-    /// Finish parsing an aggregate call after seeing `funcname (`. Cursor
-    /// is positioned on whatever follows the open paren.
-    fn finishAggCall(self: *Parser, func_name: []const u8, func: ir.AggFunc) ParseError!ProjItem {
-        try self.advance(); // consume '('
-        var arg_col: ?[]const u8 = null;
+    /// Parse `(arg, arg, ...)`. Cursor is on `(` going in, on the token
+    /// after `)` coming out. Returns the args slice. `*` is encoded as
+    /// `Expr.col_ref = "*"` (downstream callers — aggregates — recognize
+    /// the sentinel; everyone else rejects it).
+    fn parseCallArgList(self: *Parser) ParseError![]const ir.Expr {
+        try self.expect(.lparen);
+        var args: std.ArrayList(ir.Expr) = .empty;
         if (self.cur.tag == .star) {
             try self.advance();
-        } else if (self.cur.tag == .identifier) {
-            arg_col = try self.arena.dupe(u8, self.cur.text);
-            try self.advance();
-        } else return ParseError.SqlExpectedIdent;
+            try args.append(self.arena, ir.Expr{ .col_ref = "*" });
+        } else if (self.cur.tag != .rparen) {
+            while (true) {
+                const a = try self.parseCallArg();
+                try args.append(self.arena, a);
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+        }
         try self.expect(.rparen);
+        return try args.toOwnedSlice(self.arena);
+    }
+
+    /// Build a ProjItem.agg from a pre-parsed args slice. Aggregates
+    /// accept either a single column-ref arg or `*` (COUNT only). The
+    /// args have already been parsed via the generic call-args path
+    /// (which leaves *-as-col_ref `"*"`).
+    fn aggCallFromArgs(
+        self: *Parser,
+        func_name: []const u8,
+        func: ir.AggFunc,
+        args: []const ir.Expr,
+    ) ParseError!ProjItem {
+        if (args.len != 1) return ParseError.SqlInvalidProjection;
+        var arg_col: ?[]const u8 = null;
+        switch (args[0]) {
+            .col_ref => |c| {
+                if (std.mem.eql(u8, c, "*")) {
+                    // *-form is COUNT-only.
+                    if (func != .count) return ParseError.SqlInvalidProjection;
+                } else {
+                    arg_col = try self.arena.dupe(u8, c);
+                }
+            },
+            else => return ParseError.SqlInvalidProjection,
+        }
         const default_name = blk: {
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(self.arena);
@@ -882,28 +609,6 @@ const Parser = struct {
         return ProjItem{ .name = alias, .kind = .{ .agg = .{ .func = func, .col = arg_col } } };
     }
 
-    /// Finish parsing a scalar function call (`funcname (args...)`) after
-    /// the lookahead determines it isn't an aggregate. Each arg may be a
-    /// column reference (optionally qualified) or a literal — Compute
-    /// materializes literals into a per-batch constant column. Nested
-    /// scalar calls are rejected (task #154 covers the recursive
-    /// evaluator).
-    fn finishScalarCall(self: *Parser, func_name: []const u8) ParseError!ir.Expr {
-        try self.advance(); // consume '('
-        const fname_dup = try self.arena.dupe(u8, func_name);
-        var args: std.ArrayList(ir.Expr) = .empty;
-        if (self.cur.tag != .rparen) {
-            while (true) {
-                const a = try self.parseCallArg();
-                try args.append(self.arena, a);
-                if (self.cur.tag != .comma) break;
-                try self.advance();
-            }
-        }
-        try self.expect(.rparen);
-        const args_slice = try args.toOwnedSlice(self.arena);
-        return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args_slice } };
-    }
 
     /// One argument to a scalar function call — column ref, literal,
     /// or nested scalar call. Aggregates can't nest inside any call.
@@ -913,11 +618,14 @@ const Parser = struct {
                 const name = self.cur.text;
                 try self.advance();
                 if (self.cur.tag == .lparen) {
-                    // Nested call. Aggregates aren't allowed here per
-                    // standard SQL — they belong at the top level of
-                    // the SELECT list.
+                    // Nested call. Aggregates and window functions
+                    // aren't allowed here per standard SQL — they
+                    // belong at the top level of the SELECT list.
                     if (aggForName(name)) |_| return ParseError.SqlInvalidProjection;
-                    return try self.finishScalarCall(name);
+                    if (ir.windowFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
+                    const fname_dup = try self.arena.dupe(u8, name);
+                    const nested_args = try self.parseCallArgList();
+                    return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = nested_args } };
                 }
                 // Qualified column? use last segment.
                 var col_name = name;
@@ -1236,7 +944,7 @@ const Parser = struct {
         return try pairs.toOwnedSlice(self.arena);
     }
 
-    fn parseOrderBy(self: *Parser) ParseError![]const @import("../exec/sort.zig").SortSpec {
+    pub fn parseOrderBy(self: *Parser) ParseError![]const @import("../exec/sort.zig").SortSpec {
         const SortSpec = @import("../exec/sort.zig").SortSpec;
         var items: std.ArrayList(SortSpec) = .empty;
         defer items.deinit(self.arena);
@@ -1258,7 +966,7 @@ const Parser = struct {
         return try items.toOwnedSlice(self.arena);
     }
 
-    fn parseIdentList(self: *Parser) ParseError![]const []const u8 {
+    pub fn parseIdentList(self: *Parser) ParseError![]const []const u8 {
         var items: std.ArrayList([]const u8) = .empty;
         defer items.deinit(self.arena);
         while (true) {
@@ -1270,7 +978,7 @@ const Parser = struct {
         return try items.toOwnedSlice(self.arena);
     }
 
-    fn expectIdent(self: *Parser) ParseError![]const u8 {
+    pub fn expectIdent(self: *Parser) ParseError![]const u8 {
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const name = self.cur.text;
         try self.advance();
@@ -1369,7 +1077,7 @@ const Parser = struct {
         return .{ .leaf = .{ .col = col_dup, .op = op, .val = val } };
     }
 
-    fn parseValue(self: *Parser) ParseError!Value {
+    pub fn parseValue(self: *Parser) ParseError!Value {
         const tok = self.cur;
         switch (tok.tag) {
             .integer => {
@@ -1402,7 +1110,7 @@ const Parser = struct {
         }
     }
 
-    fn allocOp(self: *Parser, op: ir.Op) ParseError!*ir.Op {
+    pub fn allocOp(self: *Parser, op: ir.Op) ParseError!*ir.Op {
         const out = try self.arena.create(ir.Op);
         out.* = op;
         return out;
@@ -1519,14 +1227,76 @@ fn countAggs(proj: []const ProjItem) usize {
     return n;
 }
 
+/// Lower the window ProjItems collected from a SELECT into a single
+/// `ir.WindowOp`. Walks all ProjItems, resolves named-window references
+/// against `named_windows`, deduplicates equivalent specs by structural
+/// equality, builds the spec table and the WindowCall list, and wraps
+/// `upstream` in an `Op{ .window = ... }`. The returned op is the new
+/// pipeline root; the caller chains OrderBy / Project / Limit
+/// downstream of it.
+///
+/// `null` returned when no projection item is a window call — caller
+/// keeps `upstream` as-is.
+fn buildWindowOp(
+    arena: Allocator,
+    proj: []const ProjItem,
+    upstream: *ir.Op,
+    named_windows: *const std.StringHashMapUnmanaged(ir.WindowSpec),
+) ParseError!?*ir.Op {
+    var count: usize = 0;
+    for (proj) |p| switch (p.kind) {
+        .window => count += 1,
+        else => {},
+    };
+    if (count == 0) return null;
+
+    var specs_buf: std.ArrayList(ir.WindowSpec) = .empty;
+    defer specs_buf.deinit(arena);
+    var calls_buf: std.ArrayList(ir.WindowCall) = .empty;
+    defer calls_buf.deinit(arena);
+
+    for (proj) |p| switch (p.kind) {
+        .window => |w| {
+            const resolved_spec: ir.WindowSpec = switch (w.spec_kind) {
+                .inline_spec => |s| s,
+                .named => |name| blk: {
+                    const stored = named_windows.get(name) orelse
+                        return ParseError.SqlInvalidProjection;
+                    break :blk parse_window.cloneWindowSpec(arena, stored) catch
+                        return ParseError.OutOfMemory;
+                },
+            };
+            const spec_idx = blk: {
+                for (specs_buf.items, 0..) |existing, i| {
+                    if (parse_window.windowSpecsEqual(existing, resolved_spec)) break :blk i;
+                }
+                try specs_buf.append(arena, resolved_spec);
+                break :blk specs_buf.items.len - 1;
+            };
+            try calls_buf.append(arena, .{
+                .spec_idx = @intCast(spec_idx),
+                .func = w.func,
+                .args = w.args,
+                .ignore_nulls = w.ignore_nulls,
+                .output_name = p.name,
+            });
+        },
+        else => {},
+    };
+
+    const specs_slice = try specs_buf.toOwnedSlice(arena);
+    const calls_slice = try calls_buf.toOwnedSlice(arena);
+    const op = try arena.create(ir.Op);
+    op.* = .{ .window = .{
+        .specs = specs_slice,
+        .calls = calls_slice,
+        .upstream = upstream,
+    } };
+    return op;
+}
+
 fn nameIn(needle: []const u8, names: []const []const u8) bool {
     for (names) |n| if (std.mem.eql(u8, n, needle)) return true;
     return false;
 }
 
-fn asciiEqlAny(s: []const u8, candidates: []const []const u8) bool {
-    for (candidates) |c| {
-        if (std.ascii.eqlIgnoreCase(s, c)) return true;
-    }
-    return false;
-}
