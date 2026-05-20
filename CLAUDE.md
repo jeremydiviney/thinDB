@@ -226,6 +226,7 @@ test "decimal addition propagates precision correctly" {
 - **Don't add features beyond what the task requires.** Three similar lines are better than a premature abstraction.
 - **For UI/CLI changes (none in v1, but later)**: actually run the change end-to-end before declaring done. Tests verify code correctness, not feature correctness.
 - **Commit messages**: short, in the imperative ("Add dictionary encoder", not "Added dictionary encoder"). Body explains WHY if the diff doesn't already.
+- **Git integration: merge, don't rebase.** When the remote is ahead, use `git pull` (creating a merge commit) rather than `git pull --rebase`. The owner prefers a merge history over rebased history — fewer surprises across collaborators, simpler conflict resolution in one pass, and the merge commit is a useful anchor for "here's where the two threads of work joined." Never force-push unless explicitly asked.
 
 ---
 
