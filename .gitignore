@@ -10,6 +10,9 @@ vendor/zstd-upstream/
 
 # Bench scratch directories — recreated each run
 .bench-data/
+.clickbench-db/
+# ClickBench TSV dataset — multi-GB, regenerated on demand
+bench/clickbench/data/
 
 # Local IDE / editor files
 .vscode/

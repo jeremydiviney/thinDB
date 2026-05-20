@@ -99,6 +99,26 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks (recommended: -Doptimize=ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
+    // ---- ClickBench loader: bench/clickbench/main.zig ----------------------
+    const clickbench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/clickbench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    clickbench_mod.addImport("thindb", thindb_mod);
+
+    const clickbench_exe = b.addExecutable(.{
+        .name = "thindb_clickbench",
+        .root_module = clickbench_mod,
+    });
+    b.installArtifact(clickbench_exe);
+
+    const run_clickbench = b.addRunArtifact(clickbench_exe);
+    run_clickbench.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_clickbench.addArgs(args);
+    const clickbench_step = b.step("clickbench", "Load ClickBench TSV into a fresh DB (recommended: -Doptimize=ReleaseFast). First arg = TSV path, second arg = max rows.");
+    clickbench_step.dependOn(&run_clickbench.step);
+
     // ---- thindb-server executable: standalone multi-wire server -------------
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/cmd/server.zig"),
