@@ -6,51 +6,9 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
-
-const RunResult = struct {
-    arena: std.heap.ArenaAllocator,
-    cq: thindb.net.CompiledQuery,
-
-    pub fn deinit(self: *RunResult) void {
-        self.cq.deinit();
-        self.arena.deinit();
-    }
-
-    pub fn next(self: *RunResult) !?thindb.Batch {
-        return self.cq.next();
-    }
-
-    pub fn affectedRows(self: *const RunResult) u64 {
-        return self.cq.affectedRows();
-    }
-};
-
-fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(), sql);
-    const cq = try thindb.net.compile(allocator, db, root);
-    return .{ .arena = arena, .cq = cq };
-}
-
-fn expectRunError(allocator: std.mem.Allocator, db: anytype, sql: []const u8, expected: anyerror) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const parsed = thindb.sql.parse(arena.allocator(), sql);
-    if (parsed) |root| {
-        const cq_result = thindb.net.compile(allocator, db, root);
-        if (cq_result) |cq_ok| {
-            var cq = cq_ok;
-            cq.deinit();
-            return error.TestUnexpectedSuccess;
-        } else |err| {
-            try std.testing.expectEqual(expected, err);
-            return;
-        }
-    } else |err| {
-        try std.testing.expectEqual(expected, err);
-    }
-}
+const helpers = @import("sql_helpers.zig");
+const runSql = helpers.runSql;
+const expectRunError = helpers.expectRunError;
 
 test "sql ddl: CREATE TABLE with inline PRIMARY KEY" {
     const allocator = std.testing.allocator;

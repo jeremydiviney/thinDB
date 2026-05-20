@@ -4,6 +4,9 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
+const helpers = @import("sql_helpers.zig");
+const RunResult = helpers.RunResult;
+const runSql = helpers.runSql;
 
 const schema_t = thindb.TableSchema{
     .columns = &.{
@@ -25,28 +28,6 @@ fn seed(db: anytype, name: []const u8) !*thindb.Table {
     });
     try t.flush();
     return t;
-}
-
-const RunResult = struct {
-    arena: std.heap.ArenaAllocator,
-    cq: thindb.net.CompiledQuery,
-
-    pub fn deinit(self: *RunResult) void {
-        self.cq.deinit();
-        self.arena.deinit();
-    }
-
-    pub fn next(self: *RunResult) !?thindb.Batch {
-        return self.cq.next();
-    }
-};
-
-fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(), sql);
-    const cq = try thindb.net.compile(allocator, db, root);
-    return .{ .arena = arena, .cq = cq };
 }
 
 fn runSqlSession(

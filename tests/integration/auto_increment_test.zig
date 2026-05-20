@@ -7,70 +7,11 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
-
-const RunResult = struct {
-    arena: std.heap.ArenaAllocator,
-    cq: thindb.net.CompiledQuery,
-
-    pub fn deinit(self: *RunResult) void {
-        self.cq.deinit();
-        self.arena.deinit();
-    }
-
-    pub fn next(self: *RunResult) !?thindb.Batch {
-        return self.cq.next();
-    }
-};
-
-fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(), sql);
-    const cq = try thindb.net.compile(allocator, db, root);
-    return .{ .arena = arena, .cq = cq };
-}
-
-fn exec(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !void {
-    var q = try runSql(allocator, db, sql);
-    defer q.deinit();
-    while (try q.next()) |_| {}
-}
-
-fn expectRunError(
-    allocator: std.mem.Allocator,
-    db: anytype,
-    sql: []const u8,
-    expected: anyerror,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const parsed = thindb.sql.parse(arena.allocator(), sql);
-    if (parsed) |root| {
-        const cq_result = thindb.net.compile(allocator, db, root);
-        if (cq_result) |cq_ok| {
-            var cq = cq_ok;
-            cq.deinit();
-            return error.TestUnexpectedSuccess;
-        } else |err| {
-            try std.testing.expectEqual(expected, err);
-        }
-    } else |err| {
-        try std.testing.expectEqual(expected, err);
-    }
-}
-
-fn collectBigints(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i64 {
-    var q = try runSql(allocator, db, sql);
-    defer q.deinit();
-    var out: std.ArrayList(i64) = .empty;
-    errdefer out.deinit(allocator);
-    while (try q.next()) |batch| {
-        for (batch.values[0].data.bigint[0..batch.row_count]) |v| {
-            try out.append(allocator, v);
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
+const helpers = @import("sql_helpers.zig");
+const runSql = helpers.runSql;
+const exec = helpers.exec;
+const collectBigints = helpers.collectBigints;
+const expectRunError = helpers.expectRunError;
 
 test "AUTO_INCREMENT: fills omitted column with monotonic counter" {
     const allocator = std.testing.allocator;

@@ -6,24 +6,8 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
-
-const RunResult = struct {
-    arena: std.heap.ArenaAllocator,
-    cq: thindb.net.CompiledQuery,
-
-    pub fn deinit(self: *RunResult) void {
-        self.cq.deinit();
-        self.arena.deinit();
-    }
-
-    pub fn next(self: *RunResult) !?thindb.Batch {
-        return self.cq.next();
-    }
-
-    pub fn affectedRows(self: *const RunResult) u64 {
-        return self.cq.affectedRows();
-    }
-};
+const helpers = @import("sql_helpers.zig");
+const RunResult = helpers.RunResult;
 
 fn runSqlSession(
     allocator: std.mem.Allocator,

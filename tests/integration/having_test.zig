@@ -3,33 +3,9 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
-
-const RunResult = struct {
-    arena: std.heap.ArenaAllocator,
-    cq: thindb.net.CompiledQuery,
-
-    pub fn deinit(self: *RunResult) void {
-        self.cq.deinit();
-        self.arena.deinit();
-    }
-    pub fn next(self: *RunResult) !?thindb.Batch {
-        return self.cq.next();
-    }
-};
-
-fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(), sql);
-    const cq = try thindb.net.compile(allocator, db, root);
-    return .{ .arena = arena, .cq = cq };
-}
-
-fn exec(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !void {
-    var q = try runSql(allocator, db, sql);
-    defer q.deinit();
-    while (try q.next()) |_| {}
-}
+const helpers = @import("sql_helpers.zig");
+const runSql = helpers.runSql;
+const exec = helpers.exec;
 
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});

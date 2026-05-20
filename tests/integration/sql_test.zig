@@ -8,6 +8,8 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
+const helpers = @import("sql_helpers.zig");
+const runSql = helpers.runSql;
 
 const schema_t = thindb.TableSchema{
     .columns = &.{
@@ -33,38 +35,6 @@ fn seedT(db: anytype) !*thindb.Table {
     });
     try t.flush();
     return t;
-}
-
-/// Parse + compile in one go. The IR arena's lifetime is tied to the
-/// returned CompiledQuery — operators borrow slices (column names,
-/// predicates, agg specs) directly from the IR tree, so the arena must
-/// outlive the query. The query itself is built via `net.compile`, which
-/// threads a CompileCtx so multi-referenced `.materialize` nodes share
-/// one drained buffer instead of redraining per reference.
-const RunResult = struct {
-    arena: std.heap.ArenaAllocator,
-    cq: thindb.net.CompiledQuery,
-
-    pub fn deinit(self: *RunResult) void {
-        self.cq.deinit();
-        self.arena.deinit();
-    }
-
-    pub fn next(self: *RunResult) !?thindb.Batch {
-        return self.cq.next();
-    }
-
-    pub fn outputSchema(self: *RunResult) []const thindb.Column {
-        return self.cq.outputSchema();
-    }
-};
-
-fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(), sql);
-    const cq = try thindb.net.compile(allocator, db, root);
-    return .{ .arena = arena, .cq = cq };
 }
 
 test "sql: SELECT * FROM t returns all rows" {
