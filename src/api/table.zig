@@ -276,7 +276,7 @@ pub const Table = struct {
         try self.awaitWalDurable(wal_target);
     }
 
-    fn insertBatchInner(
+    pub fn insertBatchInner(
         self: *Table,
         batch_schema: []const types.Column,
         views: []const storage.ColumnView,
@@ -349,7 +349,7 @@ pub const Table = struct {
     /// sync_mode is `.none`, or when an in-call flush already truncated past
     /// the target (in which case `WalWriter.truncate` has bumped synced past
     /// our offset and `awaitDurable` returns immediately).
-    fn awaitWalDurable(self: *Table, target: ?u64) !void {
+    pub fn awaitWalDurable(self: *Table, target: ?u64) !void {
         if (!self.syncEnabled()) return;
         const o = target orelse return;
         if (self.wal) |*w| try w.awaitDurable(self.io, o);
@@ -610,6 +610,19 @@ pub const Table = struct {
     ///      as a single columnar batch.
     /// Both steps run while holding the table mutex so concurrent
     /// SELECT readers either see the all-old or the all-new state.
+    /// Streaming UPDATE — replaces the older buffer-then-apply path
+    /// with per-segment delete+insert pairs so memory stays bounded
+    /// regardless of how many rows the UPDATE touches. Each segment's
+    /// tombstone-merge + new-row inserts happen together under the
+    /// table mutex.
+    pub fn updateStreaming(
+        self: *Table,
+        pred: ?exec.PredicateExpr,
+        assignments: []const @import("update.zig").Assignment,
+    ) !usize {
+        return try @import("update.zig").execUpdateStreaming(self, pred, assignments);
+    }
+
     pub fn applyUpdate(self: *Table, pred: ?exec.PredicateExpr, sink: *@import("../engine/engine.zig").Memtable) !void {
         // Widen the predicate up front so the WAL-logged form matches
         // what execDeleteByExpr will run.

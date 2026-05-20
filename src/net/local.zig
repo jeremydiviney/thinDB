@@ -1306,136 +1306,27 @@ fn compileDelete(ctx: *CompileCtx, d: ir.DeleteOp) !Query {
     return try EmptyOp.createWithCount(ctx.allocator, deleted);
 }
 
-/// `UPDATE t SET col = expr [, ...] [WHERE ...]` — implemented as
-/// DELETE-old + INSERT-new.
+/// `UPDATE t SET col = expr [, ...] [WHERE ...]` — streaming
+/// implementation. Each segment is processed as a self-contained
+/// "delete-old + insert-new" batch under the table mutex, so memory
+/// peak is bounded by row-group size + memtable budget regardless
+/// of how many rows the UPDATE touches.
 ///
-/// Phase 1 (still under the caller's flow, no mutex held yet):
-/// Build a Scan → [Filter] → Compute(assignments) → Select(final
-/// shape) sub-plan and drain it into a transient buffer. The
-/// source Scan snapshots the table state at scan-create, so it
-/// reads pre-update rows even if there's a concurrent insert
-/// elsewhere.
-///
-/// Phase 2 (`Table.applyUpdate`, mutex held):
-/// Tombstone originals matching the predicate, then bulk-insert
-/// the buffered new rows. Concurrent SELECT readers either see
-/// the all-old state (their snapshot predates the mutex window)
-/// or the all-new state (they grab the snapshot after release).
-///
-/// Memory: O(matching rows × row width). For huge UPDATEs the
-/// caller should phase the update or use DELETE + INSERT-SELECT
-/// against a staging table. v2 can switch to a per-segment
-/// streaming path that holds segment-sized buffers only.
+/// Subqueries / @var refs in the predicate and assignment exprs are
+/// already resolved by the pre-compile pass before this runs.
 fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     const t = try resolveTable(catalog, ctx.session.*, u.table);
 
-    // Verify every assigned column actually exists on the table.
-    for (u.assignments) |asn| {
-        _ = types.findColumn(t.schema.columns, asn.col) orelse return Error.ColumnNotFound;
+    const update_mod = @import("../api/update.zig");
+    const assigns_buf = try ctx.allocator.alloc(update_mod.Assignment, u.assignments.len);
+    defer ctx.allocator.free(assigns_buf);
+    for (u.assignments, assigns_buf) |src, *dst| {
+        dst.* = .{ .col = src.col, .value = src.value };
     }
 
-    const aa = ctx.allocator;
-    const schema = t.schema;
-
-    // Build derived columns under synthetic names so they don't
-    // collide with the upstream column we're about to replace.
-    var derived_buf: std.ArrayList(exec.Derived) = .empty;
-    defer derived_buf.deinit(aa);
-    var synth_names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (synth_names.items) |s| aa.free(s);
-        synth_names.deinit(aa);
-    }
-
-    for (u.assignments, 0..) |asn, i| {
-        const synth = try std.fmt.allocPrint(aa, "__upd_{d}__{s}", .{ i, asn.col });
-        try synth_names.append(aa, synth);
-        try derived_buf.append(aa, .{ .name = synth, .expr = asn.value });
-    }
-    const derived_slice = try derived_buf.toOwnedSlice(aa);
-    defer aa.free(derived_slice);
-
-    // IR shape: Scan(t) → [Filter(pred)] → Compute(synth derived)
-    //   → Select(final shape: synth where assigned, original
-    //     otherwise)
-    const scan_node = try aa.create(ir.Op);
-    defer aa.destroy(scan_node);
-    scan_node.* = .{ .scan = .{ .table = u.table, .alias = null } };
-
-    var upstream: *ir.Op = scan_node;
-    var filter_holder: ?*ir.Op = null;
-    defer if (filter_holder) |f| aa.destroy(f);
-    if (u.predicate) |p| {
-        const f = try aa.create(ir.Op);
-        f.* = .{ .filter = .{ .predicate = p, .upstream = upstream } };
-        filter_holder = f;
-        upstream = f;
-    }
-
-    var compute_holder: ?*ir.Op = null;
-    defer if (compute_holder) |c| aa.destroy(c);
-    if (derived_slice.len > 0) {
-        const c = try aa.create(ir.Op);
-        c.* = .{ .compute = .{ .derived = derived_slice, .upstream = upstream } };
-        compute_holder = c;
-        upstream = c;
-    }
-
-    const final_cols = try aa.alloc([]const u8, schema.columns.len);
-    defer aa.free(final_cols);
-    for (schema.columns, final_cols) |c, *out| {
-        var picked: []const u8 = c.name;
-        for (u.assignments, synth_names.items) |asn, syn| {
-            if (std.mem.eql(u8, asn.col, c.name)) {
-                picked = syn;
-                break;
-            }
-        }
-        out.* = picked;
-    }
-    const select_node = try aa.create(ir.Op);
-    defer aa.destroy(select_node);
-    select_node.* = .{ .select = .{ .columns = final_cols, .upstream = upstream } };
-
-    // Drain source into a row-buffer keyed by Schema column type.
-    var src_q = try compileOp(ctx, select_node);
-    defer src_q.deinit();
-
-    // Buffer matching rows in a fresh sink Memtable. The sink is
-    // handed to `Table.applyUpdate` which, under the table mutex,
-    // tombstones rows matching the original predicate, then bulk-
-    // inserts the sink's rows.
-    var sink = try @import("../engine/engine.zig").Memtable.init(aa, schema);
-    defer sink.deinit();
-
-    // The source pipeline's columns are named in upstream-space
-    // (synthetic for assigned cols, original for others). The
-    // sink wants table-schema names. Build a per-batch view of
-    // the source's columns under the table-schema names so the
-    // sink's column-by-name matcher sees what it expects.
-    const translated_schema = try aa.alloc(types.Column, schema.columns.len);
-    defer aa.free(translated_schema);
-
-    while (try src_q.next()) |batch| {
-        if (batch.row_count == 0) continue;
-        // batch.schema's column NAMES match the upstream of our
-        // Select — i.e., the synthetic name (for assigned cols) or
-        // the original name (for others). Rewrite the schema's
-        // names so column lookup in insertColumnarBatch finds them
-        // under the table's column names.
-        for (batch.schema, translated_schema, schema.columns) |bs, *out, sc| {
-            _ = bs;
-            out.* = .{ .name = sc.name, .type = sc.type, .nullable = sc.nullable };
-        }
-        try sink.insertColumnarBatch(translated_schema, batch.values, batch.row_count);
-    }
-
-    const affected = sink.row_count;
-    if (affected > 0) {
-        try t.applyUpdate(u.predicate, &sink);
-    }
-    ctx.affected_rows = affected;
+    const affected = try t.updateStreaming(u.predicate, assigns_buf);
+    ctx.affected_rows = @intCast(affected);
     return try EmptyOp.createWithCount(ctx.allocator, affected);
 }
 

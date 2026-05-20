@@ -280,18 +280,13 @@ pub fn appendMaskedColumn(
             },
             else => unreachable,
         },
-        .varchar => |sv| switch (out.data) {
-            .varchar => |*ss| for (mask, 0..) |m, row| {
-                if (m) try ss.appendValue(allocator, sv.rowBytes(row));
-            },
-            else => unreachable,
-        },
-        .string => |sv| switch (out.data) {
-            .string => |*ss| for (mask, 0..) |m, row| {
-                if (m) try ss.appendValue(allocator, sv.rowBytes(row));
-            },
-            else => unreachable,
-        },
+        // String family: any source (varchar/string/char) can land
+        // in any string-family destination — the wire / Compute paths
+        // may produce a `.string`-tagged column even when the table's
+        // schema column is declared as `varchar(N)` or `char(N)`.
+        .varchar => |sv| try appendMaskedStringy(allocator, sv, mask, out),
+        .string => |sv| try appendMaskedStringy(allocator, sv, mask, out),
+        .char => |sv| try appendMaskedStringy(allocator, sv, mask, out),
         .float => |s| switch (out.data) {
             .float => |*list| for (s, mask) |v, m| {
                 if (m) try list.append(allocator, v);
@@ -334,12 +329,6 @@ pub fn appendMaskedColumn(
             },
             else => unreachable,
         },
-        .char => |sv| switch (out.data) {
-            .char => |*ss| for (mask, 0..) |m, row| {
-                if (m) try ss.appendValue(allocator, sv.rowBytes(row));
-            },
-            else => unreachable,
-        },
         .decimal64 => |s| switch (out.data) {
             .decimal64 => |*list| for (s, mask) |v, m| {
                 if (m) try list.append(allocator, v);
@@ -367,6 +356,27 @@ pub fn appendMaskedColumn(
             try out.appendValidBit(allocator, dst_start + j, valid);
             j += 1;
         }
+    }
+}
+
+/// Copy mask-selected rows from any string-family source view
+/// (varchar/string/char) into any string-family destination
+/// ColumnStore. Used by appendMaskedColumn to bridge the case where
+/// the source's tag doesn't match the destination's declared type
+/// (e.g. Compute emits a `.string` column but the table schema
+/// declares it as `varchar(N)`).
+fn appendMaskedStringy(allocator: Allocator, sv: anytype, mask: []const bool, out: *ColumnStore) !void {
+    switch (out.data) {
+        .varchar => |*ss| for (mask, 0..) |m, row| {
+            if (m) try ss.appendValue(allocator, sv.rowBytes(row));
+        },
+        .string => |*ss| for (mask, 0..) |m, row| {
+            if (m) try ss.appendValue(allocator, sv.rowBytes(row));
+        },
+        .char => |*ss| for (mask, 0..) |m, row| {
+            if (m) try ss.appendValue(allocator, sv.rowBytes(row));
+        },
+        else => unreachable,
     }
 }
 
