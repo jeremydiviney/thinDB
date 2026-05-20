@@ -116,6 +116,125 @@ test "range EXISTS: mixed equi + range correlation" {
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, ids);
 }
 
+test "range EXISTS: BETWEEN-against-outer (closed range)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // Customers with subscription windows; events have timestamps.
+    // Question: which customers had any event during their subscription window?
+    try exec(allocator, db,
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY, sub_start INT NOT NULL, sub_end INT NOT NULL)",
+    );
+    try exec(allocator, db,
+        "INSERT INTO customers (id, sub_start, sub_end) VALUES " ++
+            "(1, 100, 200), (2, 300, 400), (3, 500, 600)",
+    );
+    try exec(allocator, db,
+        "CREATE TABLE events (id BIGINT PRIMARY KEY, ts INT NOT NULL)",
+    );
+    try exec(allocator, db,
+        "INSERT INTO events (id, ts) VALUES (1, 150), (2, 350), (3, 700)",
+    );
+    const t1 = try db.openTable("customers", .{});
+    try t1.flush();
+    const t2 = try db.openTable("events", .{});
+    try t2.flush();
+
+    // EXISTS event with ts between c.sub_start and c.sub_end.
+    // c1 (100-200) → event at 150 matches.
+    // c2 (300-400) → event at 350 matches.
+    // c3 (500-600) → no event in window.
+    const ids = try collectBigints(allocator, db,
+        "SELECT c.id FROM customers AS c " ++
+            "WHERE EXISTS (SELECT e.id FROM events AS e WHERE e.ts >= c.sub_start AND e.ts <= c.sub_end) " ++
+            "ORDER BY c.id ASC",
+    );
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, ids);
+}
+
+test "range NOT EXISTS: BETWEEN-against-outer (closed range)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db,
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY, sub_start INT NOT NULL, sub_end INT NOT NULL)",
+    );
+    try exec(allocator, db,
+        "INSERT INTO customers (id, sub_start, sub_end) VALUES " ++
+            "(1, 100, 200), (2, 300, 400), (3, 500, 600)",
+    );
+    try exec(allocator, db,
+        "CREATE TABLE events (id BIGINT PRIMARY KEY, ts INT NOT NULL)",
+    );
+    try exec(allocator, db,
+        "INSERT INTO events (id, ts) VALUES (1, 150), (2, 350), (3, 700)",
+    );
+    const t1 = try db.openTable("customers", .{});
+    try t1.flush();
+    const t2 = try db.openTable("events", .{});
+    try t2.flush();
+
+    // Customers with NO event in their window: only c3.
+    const ids = try collectBigints(allocator, db,
+        "SELECT c.id FROM customers AS c " ++
+            "WHERE NOT EXISTS (SELECT e.id FROM events AS e WHERE e.ts >= c.sub_start AND e.ts <= c.sub_end) " ++
+            "ORDER BY c.id ASC",
+    );
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{3}, ids);
+}
+
+test "range EXISTS: equi + closed range (per-user date window)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db,
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY, sub_start INT NOT NULL, sub_end INT NOT NULL)",
+    );
+    try exec(allocator, db,
+        "INSERT INTO customers (id, sub_start, sub_end) VALUES " ++
+            "(1, 100, 200), (2, 300, 400), (3, 500, 600)",
+    );
+    try exec(allocator, db,
+        "CREATE TABLE events (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL, ts INT NOT NULL)",
+    );
+    // c1 has an event at 150 (in window). c2 has an event at 500 (NOT in c2's
+    // window 300-400; it's in c3's window but the user_id is 2). c3 has none.
+    try exec(allocator, db,
+        "INSERT INTO events (id, user_id, ts) VALUES (1, 1, 150), (2, 2, 500), (3, 1, 350)",
+    );
+    const t1 = try db.openTable("customers", .{});
+    try t1.flush();
+    const t2 = try db.openTable("events", .{});
+    try t2.flush();
+
+    // For each customer, EXISTS an event whose user_id matches AND ts is in window.
+    // c1: event (id=1, user_id=1, ts=150) in window [100,200] → match.
+    // c2: event (id=2, user_id=2, ts=500) NOT in window [300,400] → no.
+    // c3: no events for user_id=3 → no.
+    const ids = try collectBigints(allocator, db,
+        "SELECT c.id FROM customers AS c " ++
+            "WHERE EXISTS (SELECT e.id FROM events AS e WHERE e.user_id = c.id " ++
+            "AND e.ts >= c.sub_start AND e.ts <= c.sub_end) " ++
+            "ORDER BY c.id ASC",
+    );
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{1}, ids);
+}
+
 test "range EXISTS: with inner-local filter applied before materialization" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

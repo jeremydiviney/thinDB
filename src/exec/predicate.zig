@@ -172,11 +172,20 @@ pub const CorrelatedRange = struct {
     /// to each group's `key` tuple. Empty when no equi keys.
     outer_keys: []const []const u8,
     /// Outer-side range column (the `y` in `inner.x op outer.y`).
+    /// For closed ranges this is the lower-bound outer column.
     outer_range_col: []const u8,
     /// Op in canonical "inner op outer" form. So `outer.y < inner.x`
     /// becomes op = `.gt` (inner > outer). Limited to {lt, lte, gt, gte}
     /// — `.eq` is captured as equi correlation, `.neq` isn't useful.
+    /// For closed ranges this is the lower-bound op (≥ or >).
     op: PredicateOp,
+    /// Upper-bound outer column for closed (BETWEEN-style) ranges.
+    /// Null for open-ended ranges (e.g. plain `inner.x > outer.lo`).
+    /// When set, `op_upper` must also be set and `op` is the
+    /// lower-bound op.
+    outer_range_col_upper: ?[]const u8 = null,
+    /// Upper-bound op for closed ranges. Either `.lt` or `.lte`.
+    op_upper: ?PredicateOp = null,
     /// One group per distinct equi-key tuple. Linear scan per outer
     /// row in v1 — group count is expected to be small.
     groups: []const CorrelatedRangeGroup,
@@ -301,10 +310,13 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
                 for (src.values, values) |v, *o| o.* = try cloneValue(out_arena, v);
                 dst.* = .{ .key = key, .values = values };
             }
+            const upper_col_dup: ?[]const u8 = if (s.outer_range_col_upper) |c| try out_arena.dupe(u8, c) else null;
             break :blk .{ .correlated_range = .{
                 .outer_keys = outer_keys,
                 .outer_range_col = try out_arena.dupe(u8, s.outer_range_col),
                 .op = s.op,
+                .outer_range_col_upper = upper_col_dup,
+                .op_upper = s.op_upper,
                 .groups = groups,
                 .negate = s.negate,
             } };
@@ -714,6 +726,11 @@ pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, b
     }
     const range_idx = findCol(schema, s.outer_range_col) orelse return Error.ColumnNotFound;
     const range_view = batch.values[range_idx];
+    const range_upper_idx: ?usize = if (s.outer_range_col_upper) |c|
+        findCol(schema, c) orelse return Error.ColumnNotFound
+    else
+        null;
+    const closed_range = range_upper_idx != null;
 
     var i: usize = 0;
     while (i < batch.row_count) : (i += 1) {
@@ -722,6 +739,12 @@ pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, b
         if (!range_view.isValid(i)) {
             out[i] = s.negate;
             continue;
+        }
+        if (range_upper_idx) |ui| {
+            if (!batch.values[ui].isValid(i)) {
+                out[i] = s.negate;
+                continue;
+            }
         }
         var any_null = false;
         for (key_idxs) |idx| {
@@ -756,22 +779,100 @@ pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, b
                 out[i] = s.negate;
                 continue;
             }
-            // Open-ended range collapses to a min/max compare.
-            //   inner.x >  outer.y  → exists iff max > y  (i.e., y < max)
-            //   inner.x >= outer.y  → exists iff max >= y
-            //   inner.x <  outer.y  → exists iff min < y
-            //   inner.x <= outer.y  → exists iff min <= y
-            const probe: Value = switch (s.op) {
-                .gt, .gte => g.values[g.values.len - 1], // max
-                .lt, .lte => g.values[0], // min
-                else => return Error.PredicateTypeMismatch,
+            const exists = if (closed_range)
+                try evaluateClosedRange(g.values, range_view, batch.values[range_upper_idx.?], i, s.op, s.op_upper.?)
+            else blk: {
+                // Open-ended range collapses to a min/max compare.
+                //   inner.x >  outer.y  → exists iff max > y
+                //   inner.x >= outer.y  → exists iff max >= y
+                //   inner.x <  outer.y  → exists iff min < y
+                //   inner.x <= outer.y  → exists iff min <= y
+                const probe: Value = switch (s.op) {
+                    .gt, .gte => g.values[g.values.len - 1], // max
+                    .lt, .lte => g.values[0], // min
+                    else => return Error.PredicateTypeMismatch,
+                };
+                break :blk try compareCellToValue(range_view, i, reverseRangeOp(s.op), probe);
             };
-            const exists = try compareCellToValue(range_view, i, reverseRangeOp(s.op), probe);
             out[i] = if (s.negate) !exists else exists;
         } else {
             out[i] = s.negate;
         }
     }
+}
+
+/// Closed-range existence check. Given a bucket's sorted ascending
+/// `values` and an outer row's lower/upper bound cells, return whether
+/// any value satisfies `lower_op outer.lower` AND `upper_op outer.upper`.
+///
+/// Strategy: bsearch for the first value ≥ the effective lower bound.
+/// If found and ≤ the effective upper bound, EXISTS; else no.
+///
+///   lower_op = .gt   →  value >  lo  → first value strictly greater
+///   lower_op = .gte  →  value >= lo  → first value >=
+///   upper_op = .lt   →  value <  hi
+///   upper_op = .lte  →  value <= hi
+fn evaluateClosedRange(
+    values: []const Value,
+    lower_view: anytype,
+    upper_view: anytype,
+    row_idx: usize,
+    lower_op: PredicateOp,
+    upper_op: PredicateOp,
+) !bool {
+    // Materialize lo/hi as Values so we can use Value.compare.
+    const lo = try extractValueFromView(lower_view, row_idx);
+    const hi = try extractValueFromView(upper_view, row_idx);
+
+    // Binary search for first value that satisfies the lower bound.
+    // For .gte: first value with value >= lo  → lower_bound(lo)
+    // For .gt:  first value with value >  lo  → upper_bound(lo)
+    var lo_idx: usize = 0;
+    var hi_idx: usize = values.len;
+    while (lo_idx < hi_idx) {
+        const mid = lo_idx + (hi_idx - lo_idx) / 2;
+        const cmp_res = values[mid].compare(lo);
+        const before_target = switch (lower_op) {
+            .gte => cmp_res == .lt, // need value >= lo
+            .gt => cmp_res != .gt, // need value > lo
+            else => return Error.PredicateTypeMismatch,
+        };
+        if (before_target) lo_idx = mid + 1 else hi_idx = mid;
+    }
+
+    if (lo_idx >= values.len) return false;
+
+    // Check the first candidate against the upper bound.
+    const candidate = values[lo_idx];
+    const upper_cmp = candidate.compare(hi);
+    return switch (upper_op) {
+        .lte => upper_cmp != .gt, // value <= hi
+        .lt => upper_cmp == .lt, // value < hi
+        else => Error.PredicateTypeMismatch,
+    };
+}
+
+/// Pull a typed Value out of a single cell of a ColumnView. Mirrors
+/// the existing extractScalarValueAt helper in subquery_resolve but
+/// inline here so the evaluator stays self-contained.
+fn extractValueFromView(view: anytype, idx: usize) !Value {
+    return switch (view.data) {
+        .int => |s| .{ .int = s[idx] },
+        .bigint => |s| .{ .bigint = s[idx] },
+        .smallint => |s| .{ .smallint = s[idx] },
+        .tinyint => |s| .{ .tinyint = s[idx] },
+        .largeint => |s| .{ .largeint = s[idx] },
+        .float => |s| .{ .float = s[idx] },
+        .double => |s| .{ .double = s[idx] },
+        .boolean => |s| .{ .boolean = s[idx] != 0 },
+        .date => |s| .{ .date = s[idx] },
+        .datetime => |s| .{ .datetime = s[idx] },
+        .decimal64 => |s| .{ .decimal64 = s[idx] },
+        .decimal128 => |s| .{ .decimal128 = s[idx] },
+        .uuid => |s| .{ .uuid = s[idx] },
+        // Strings aren't supported in range comparisons.
+        .varchar, .string, .char => Error.UnsupportedOperatorForType,
+    };
 }
 
 /// Flip a range op so `inner op outer` becomes the equivalent

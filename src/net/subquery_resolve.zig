@@ -509,10 +509,14 @@ fn maybeResolveCorrelatedExists(
     var info = (try analyzeCorrelation(ctx, inner)) orelse return false;
     defer info.deinit(ctx.allocator);
 
-    // Range-correlation path (single range conjunct, optionally with
-    // equi keys). Multi-range correlation falls back to the bail
-    // path — caller surfaces it as unsupported.
+    // Range-correlation path: single open-ended op, or a pair of
+    // ops that form a closed BETWEEN-style range on the same inner
+    // column. Larger or mixed-shape multi-range conjuncts fall back
+    // to the bail path — caller surfaces them as unsupported.
     if (info.range_corrs.items.len == 1) {
+        return try resolveCorrelatedExistsRange(ctx, pred, info, negate);
+    }
+    if (info.range_corrs.items.len == 2 and isClosedRange(info.range_corrs.items)) {
         return try resolveCorrelatedExistsRange(ctx, pred, info, negate);
     }
     if (info.range_corrs.items.len > 1) return false;
@@ -560,17 +564,46 @@ fn maybeResolveCorrelatedExists(
     return true;
 }
 
+/// Two range conjuncts form a closed BETWEEN-style range when they
+/// target the SAME inner column and have one lower-bound op (`>` /
+/// `>=`) and one upper-bound op (`<` / `<=`). Caller passes the
+/// raw `info.range_corrs.items` slice — must already be length 2.
+fn isClosedRange(corrs: []const RangeCorr) bool {
+    std.debug.assert(corrs.len == 2);
+    if (!std.mem.eql(u8, corrs[0].inner_col, corrs[1].inner_col)) return false;
+    const is_lower_0 = corrs[0].op == .gt or corrs[0].op == .gte;
+    const is_lower_1 = corrs[1].op == .gt or corrs[1].op == .gte;
+    // Exactly one of the two must be the lower-bound side.
+    return is_lower_0 != is_lower_1;
+}
+
 /// Materialize a range-correlated EXISTS inner. Projects
 /// `(equi_inner_cols..., range_inner_col)`, drains, buckets rows by
 /// the equi-key tuple, sorts each bucket's range values ascending.
-/// Per outer row the eval is then a single min/max compare.
+/// Per outer row the eval is then a single min/max compare for the
+/// open-ended case, or a bsearch for the closed BETWEEN case.
 fn resolveCorrelatedExistsRange(
     ctx: *CompileCtx,
     pred: *PredicateExpr,
     info: CorrelationInfo,
     negate: bool,
 ) !bool {
-    const range = info.range_corrs.items[0];
+    // Pick the lower-bound conjunct (for `range`) and, when present,
+    // the upper-bound conjunct. Open-ended ranges have only one.
+    var range = info.range_corrs.items[0];
+    var upper: ?RangeCorr = null;
+    if (info.range_corrs.items.len == 2) {
+        const a = info.range_corrs.items[0];
+        const b = info.range_corrs.items[1];
+        const a_is_lower = a.op == .gt or a.op == .gte;
+        if (a_is_lower) {
+            range = a;
+            upper = b;
+        } else {
+            range = b;
+            upper = a;
+        }
+    }
     const aa = ctx.subqueryArena();
 
     // Build rewritten inner. Reuse buildRewrittenInner by routing the
@@ -654,10 +687,19 @@ fn resolveCorrelatedExistsRange(
     const outer_keys_owned = try aa.alloc([]const u8, info.outer_cols.items.len);
     for (info.outer_cols.items, outer_keys_owned) |c, *dst| dst.* = try aa.dupe(u8, c);
 
+    var outer_upper_col: ?[]const u8 = null;
+    var op_upper: ?exec.PredicateOp = null;
+    if (upper) |u| {
+        outer_upper_col = try aa.dupe(u8, u.outer_col);
+        op_upper = u.op;
+    }
+
     pred.* = .{ .correlated_range = .{
         .outer_keys = outer_keys_owned,
         .outer_range_col = try aa.dupe(u8, range.outer_col),
         .op = range.op,
+        .outer_range_col_upper = outer_upper_col,
+        .op_upper = op_upper,
         .groups = groups_owned,
         .negate = negate,
     } };

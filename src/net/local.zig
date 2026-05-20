@@ -818,10 +818,13 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
                 for (src.values, values) |v, *o| o.* = try cloneValue(aa, v);
                 dst.* = .{ .key = key, .values = values };
             }
+            const upper_col_dup: ?[]const u8 = if (s.outer_range_col_upper) |c| try aa.dupe(u8, c) else null;
             break :blk PredicateExpr{ .correlated_range = .{
                 .outer_keys = outer_keys,
                 .outer_range_col = try aa.dupe(u8, s.outer_range_col),
                 .op = s.op,
+                .outer_range_col_upper = upper_col_dup,
+                .op_upper = s.op_upper,
                 .groups = groups,
                 .negate = s.negate,
             } };
