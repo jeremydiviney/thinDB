@@ -499,6 +499,77 @@ test "window: FIRST_VALUE IGNORE NULLS finds first non-null in partition" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 30, 30, 30, 30 }, vals);
 }
 
+test "window: LAG on string column round-trips bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    defer q1.deinit();
+    _ = try q1.next();
+    var q2 = try runSql(allocator, db,
+        "INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
+    );
+    defer q2.deinit();
+    _ = try q2.next();
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT id, lag(name) OVER (ORDER BY id ASC) AS prev FROM t ORDER BY id ASC",
+    );
+    defer q.deinit();
+    var batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), batch.row_count);
+    const nulls = batch.values[1].nulls.?;
+    // id=1 → NULL; id=2 → "alice"; id=3 → "bob"
+    try std.testing.expectEqual(false, (nulls[0] & 1) != 0);
+    try std.testing.expectEqual(true, (nulls[0] & 2) != 0);
+    try std.testing.expectEqual(true, (nulls[0] & 4) != 0);
+    try std.testing.expectEqualStrings("alice", batch.values[1].data.string.rowBytes(1));
+    try std.testing.expectEqualStrings("bob", batch.values[1].data.string.rowBytes(2));
+}
+
+test "window: MIN over string column finds lexicographically smallest" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, grp BIGINT, name TEXT NOT NULL)",
+    );
+    defer q1.deinit();
+    _ = try q1.next();
+    var q2 = try runSql(allocator, db,
+        "INSERT INTO t VALUES (1, 1, 'zeta'), (2, 1, 'alpha'), (3, 1, 'mu'), (4, 2, 'omega'), (5, 2, 'beta')",
+    );
+    defer q2.deinit();
+    _ = try q2.next();
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT id, min(name) OVER (PARTITION BY grp) AS smallest FROM t ORDER BY id ASC",
+    );
+    defer q.deinit();
+    var batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 5), batch.row_count);
+    // grp=1: min lex = "alpha". grp=2: "beta".
+    try std.testing.expectEqualStrings("alpha", batch.values[1].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("alpha", batch.values[1].data.string.rowBytes(1));
+    try std.testing.expectEqualStrings("alpha", batch.values[1].data.string.rowBytes(2));
+    try std.testing.expectEqualStrings("beta", batch.values[1].data.string.rowBytes(3));
+    try std.testing.expectEqualStrings("beta", batch.values[1].data.string.rowBytes(4));
+}
+
 test "window: named window via WINDOW clause" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

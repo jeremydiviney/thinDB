@@ -69,7 +69,14 @@ pub const Window = struct {
     // Materialized state, built lazily on first `next()`.
     drained: bool = false,
     accumulated: []ColumnStore,        // input columns
-    output_columns: []ColumnStore,     // window outputs, parallel to `calls`
+    output_columns: []ColumnStore,     // window outputs (fixed-width types)
+    /// Parallel scratch for string-typed outputs. `string_outputs[ci]`
+    /// is `&.{}` when the call's output isn't a string type; otherwise
+    /// it's a `[N]?[]const u8` indexed by original row position
+    /// (`null` = SQL NULL). String slices borrow into the input
+    /// column's StringStore (lifetime-safe because the input column
+    /// lives as long as the operator).
+    string_outputs: [][]?[]const u8,
     accumulated_rows: u64 = 0,
 
     // Batch emit state — emits input + output in original order.
@@ -188,6 +195,14 @@ pub const Window = struct {
             oinit = ci + 1;
         }
 
+        // Per-call string scratch — empty for non-string outputs;
+        // size-N `?[]const u8` slice for string outputs. Filled in
+        // `preSizeColumn` so that `create()` can keep this allocation
+        // path tidy.
+        const string_outputs = try allocator.alloc([]?[]const u8, calls.len);
+        errdefer allocator.free(string_outputs);
+        for (string_outputs) |*s| s.* = &.{};
+
         const out_input_columns = try allocator.alloc(ColumnStore, input_schema.len);
         errdefer allocator.free(out_input_columns);
         var iinit: usize = 0;
@@ -224,6 +239,7 @@ pub const Window = struct {
             .calls = calls,
             .accumulated = accumulated,
             .output_columns = output_columns,
+            .string_outputs = string_outputs,
             .out_input_columns = out_input_columns,
             .out_output_columns = out_output_columns,
             .views = views,
@@ -238,6 +254,8 @@ pub const Window = struct {
         self.allocator.free(self.accumulated);
         for (self.output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_columns);
+        for (self.string_outputs) |s| if (s.len > 0) self.allocator.free(s);
+        self.allocator.free(self.string_outputs);
         for (self.out_input_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.out_input_columns);
         for (self.out_output_columns) |*c| c.deinit(self.allocator);
@@ -283,10 +301,16 @@ pub const Window = struct {
         for (self.out_input_columns, 0..) |*out, ci| {
             try appendRangeFromStore(self.allocator, self.accumulated[ci], lo, hi, out);
         }
-        // Same for output columns.
+        // Same for output columns — but string outputs materialize from
+        // the `string_outputs[ci]` scratch instead of the (empty)
+        // ColumnStore.
         for (self.out_output_columns) |*c| c.clear();
         for (self.out_output_columns, 0..) |*out, ci| {
-            try appendRangeFromStore(self.allocator, self.output_columns[ci], lo, hi, out);
+            if (self.string_outputs[ci].len > 0) {
+                try appendStringScratchRange(self.allocator, self.string_outputs[ci], lo, hi, out);
+            } else {
+                try appendRangeFromStore(self.allocator, self.output_columns[ci], lo, hi, out);
+            }
         }
 
         for (self.out_input_columns, 0..) |c, i| self.views[i] = c.view();
@@ -317,9 +341,19 @@ pub const Window = struct {
         // Pre-size every output column to N rows, all-null. Evaluators
         // overwrite specific positions; rows they don't touch stay null
         // (correct semantics for OOB LAG/LEAD when default = .none).
+        // For string-typed outputs we leave the ColumnStore empty and
+        // allocate `string_outputs[ci]` instead — strings are written
+        // by row position into the scratch and materialized into a
+        // StringStore at emit time.
         for (self.output_columns, 0..) |*out, ci| {
             const out_type = self.schema[self.input_schema.len + ci].type;
-            try preSizeColumn(self.allocator, out, out_type, n);
+            if (isStringType(out_type)) {
+                const scratch = try self.allocator.alloc(?[]const u8, n);
+                for (scratch) |*e| e.* = null;
+                self.string_outputs[ci] = scratch;
+            } else {
+                try preSizeColumn(self.allocator, out, out_type, n);
+            }
         }
 
         // For each spec, build a permutation and evaluate all its calls.
@@ -379,13 +413,16 @@ pub const Window = struct {
         si: SpecIndices,
     ) !void {
         const spec = self.specs[plan.spec_idx];
-        const out = &self.output_columns[out_idx];
+        const cell: OutCell = .{
+            .column = &self.output_columns[out_idx],
+            .string_scratch = if (self.string_outputs[out_idx].len > 0) self.string_outputs[out_idx] else null,
+        };
 
         // Walk partitions (runs of equal partition_by values in perm).
         var p_start: usize = 0;
         while (p_start < perm.len) {
             const p_end = partitionEnd(self.accumulated, si.partition_cols, perm, p_start);
-            try self.evaluateOnePartition(plan, spec, si, perm, p_start, p_end, out);
+            try self.evaluateOnePartition(plan, spec, si, perm, p_start, p_end, cell);
             p_start = p_end;
         }
     }
@@ -398,17 +435,17 @@ pub const Window = struct {
         perm: []const u32,
         p_start: usize,
         p_end: usize,
-        out: *ColumnStore,
+        cell: OutCell,
     ) !void {
         switch (plan.func) {
-            .row_number => try fillRowNumber(perm, p_start, p_end, out),
-            .rank => try fillRank(self.accumulated, si.order_cols, perm, p_start, p_end, out, false),
-            .dense_rank => try fillRank(self.accumulated, si.order_cols, perm, p_start, p_end, out, true),
-            .lag => try self.fillLagLead(plan, perm, p_start, p_end, out, true),
-            .lead => try self.fillLagLead(plan, perm, p_start, p_end, out, false),
-            .first_value => try fillFirstValue(self.accumulated[plan.value_col], perm, p_start, p_end, out, plan.ignore_nulls),
-            .last_value => try self.fillLastValue(plan, spec, perm, p_start, p_end, out),
-            .sum, .avg, .count, .min, .max => try self.fillAggregate(plan, spec, perm, p_start, p_end, out),
+            .row_number => try fillRowNumber(perm, p_start, p_end, cell.column),
+            .rank => try fillRank(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column, false),
+            .dense_rank => try fillRank(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column, true),
+            .lag => try self.fillLagLead(plan, perm, p_start, p_end, cell, true),
+            .lead => try self.fillLagLead(plan, perm, p_start, p_end, cell, false),
+            .first_value => try fillFirstValue(self.accumulated[plan.value_col], perm, p_start, p_end, cell, plan.ignore_nulls),
+            .last_value => try self.fillLastValue(plan, spec, perm, p_start, p_end, cell),
+            .sum, .avg, .count, .min, .max => try self.fillAggregate(plan, spec, perm, p_start, p_end, cell),
             else => return Error.WindowUnsupported,
         }
     }
@@ -419,7 +456,7 @@ pub const Window = struct {
         perm: []const u32,
         p_start: usize,
         p_end: usize,
-        out: *ColumnStore,
+        cell: OutCell,
         is_lag: bool,
     ) !void {
         const offset: i64 = plan.offset;
@@ -433,14 +470,14 @@ pub const Window = struct {
             else
                 directOffset(i, p_start, p_end, offset, is_lag);
             if (target_idx) |t| {
-                try copyCell(value_col, perm[t], out, orig);
+                try copyCellTo(value_col, perm[t], cell, orig);
             } else {
                 switch (plan.default_kind) {
-                    .none => setNull(out, orig),
-                    .literal => try writeLiteral(out, orig, plan.default_literal),
+                    .none => setNullCell(cell, orig),
+                    .literal => try writeLiteralCell(cell, orig, plan.default_literal),
                     .col_ref => {
                         const def_col = self.accumulated[plan.default_col];
-                        try copyCell(def_col, orig, out, orig);
+                        try copyCellTo(def_col, orig, cell, orig);
                     },
                 }
             }
@@ -454,7 +491,7 @@ pub const Window = struct {
         perm: []const u32,
         p_start: usize,
         p_end: usize,
-        out: *ColumnStore,
+        cell: OutCell,
     ) !void {
         const value_col = self.accumulated[plan.value_col];
         const view = value_col.view();
@@ -465,7 +502,7 @@ pub const Window = struct {
             const frame_end_clamped: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
             const frame_start_clamped: i64 = @max(fb.start, @as(i64, @intCast(p_start)));
             if (frame_end_clamped < frame_start_clamped) {
-                setNull(out, orig);
+                setNullCell(cell, orig);
                 continue;
             }
             const src_idx: ?usize = if (plan.ignore_nulls)
@@ -473,9 +510,9 @@ pub const Window = struct {
             else
                 @as(usize, @intCast(frame_end_clamped));
             if (src_idx) |idx| {
-                try copyCell(value_col, perm[idx], out, orig);
+                try copyCellTo(value_col, perm[idx], cell, orig);
             } else {
-                setNull(out, orig);
+                setNullCell(cell, orig);
             }
         }
     }
@@ -487,19 +524,12 @@ pub const Window = struct {
         perm: []const u32,
         p_start: usize,
         p_end: usize,
-        out: *ColumnStore,
+        cell: OutCell,
     ) !void {
-        // Fast-path the two most common frame shapes:
-        //   - Whole-partition (UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING):
-        //     one aggregate, broadcast to every row in the partition.
-        //   - Prefix / running (UNBOUNDED PRECEDING TO CURRENT ROW):
-        //     single forward sweep maintaining a running accumulator.
-        // Other shapes (`N PRECEDING`, sliding) fall back to the naive
-        // per-row scan in `evalAggOverFrame`.
         const shape = classifyFrame(spec.frame);
         switch (shape) {
-            .whole_partition => return self.fillAggregateWholePartition(plan, perm, p_start, p_end, out),
-            .prefix_to_current => return self.fillAggregatePrefix(plan, perm, p_start, p_end, out),
+            .whole_partition => return self.fillAggregateWholePartition(plan, perm, p_start, p_end, cell),
+            .prefix_to_current => return self.fillAggregatePrefix(plan, perm, p_start, p_end, cell),
             .general => {},
         }
 
@@ -511,12 +541,12 @@ pub const Window = struct {
             const hi_i: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
             if (lo_i > hi_i) {
                 switch (plan.func) {
-                    .count => try writeBigint(out, orig, 0),
-                    else => setNull(out, orig),
+                    .count => try writeBigint(cell.column, orig, 0),
+                    else => setNullCell(cell, orig),
                 }
                 continue;
             }
-            try self.evalAggOverFrame(plan, perm, @intCast(lo_i), @intCast(hi_i), out, orig);
+            try self.evalAggOverFrame(plan, perm, @intCast(lo_i), @intCast(hi_i), cell, orig);
         }
     }
 
@@ -529,16 +559,13 @@ pub const Window = struct {
         perm: []const u32,
         p_start: usize,
         p_end: usize,
-        out: *ColumnStore,
+        cell: OutCell,
     ) !void {
         if (p_start >= p_end) return;
-        // Compute the aggregate over the entire partition once.
-        try self.evalAggOverFrame(plan, perm, p_start, p_end - 1, out, perm[p_start]);
-        // Mirror the value of perm[p_start] (row already written) into
-        // every other row in the partition.
+        try self.evalAggOverFrame(plan, perm, p_start, p_end - 1, cell, perm[p_start]);
         var i: usize = p_start + 1;
         while (i < p_end) : (i += 1) {
-            try copyCell(out.*, perm[p_start], out, perm[i]);
+            try broadcastOutputCell(cell, perm[p_start], perm[i]);
         }
     }
 
@@ -551,16 +578,14 @@ pub const Window = struct {
         perm: []const u32,
         p_start: usize,
         p_end: usize,
-        out: *ColumnStore,
+        cell: OutCell,
     ) !void {
         if (p_start >= p_end) return;
         switch (plan.func) {
-            .count => try self.prefixCount(plan, perm, p_start, p_end, out),
-            .sum => try self.prefixSum(plan, perm, p_start, p_end, out),
-            .avg => try self.prefixAvg(plan, perm, p_start, p_end, out),
-            // MIN/MAX prefix is O(N) too (one running comparison per row),
-            // implemented inline here.
-            .min, .max => try self.prefixMinMax(plan, perm, p_start, p_end, out, plan.func == .min),
+            .count => try self.prefixCount(plan, perm, p_start, p_end, cell.column),
+            .sum => try self.prefixSum(plan, perm, p_start, p_end, cell.column),
+            .avg => try self.prefixAvg(plan, perm, p_start, p_end, cell.column),
+            .min, .max => try self.prefixMinMax(plan, perm, p_start, p_end, cell, plan.func == .min),
             else => unreachable,
         }
     }
@@ -662,7 +687,7 @@ pub const Window = struct {
         perm: []const u32,
         p_start: usize,
         p_end: usize,
-        out: *ColumnStore,
+        cell: OutCell,
         is_min: bool,
     ) !void {
         const col = self.accumulated[plan.value_col];
@@ -681,9 +706,9 @@ pub const Window = struct {
                 }
             }
             if (best_idx < 0) {
-                setNull(out, r);
+                setNullCell(cell, r);
             } else {
-                try copyCell(col, @intCast(best_idx), out, r);
+                try copyCellTo(col, @intCast(best_idx), cell, r);
             }
         }
     }
@@ -697,7 +722,7 @@ pub const Window = struct {
         perm: []const u32,
         lo: usize,
         hi: usize,
-        out: *ColumnStore,
+        cell: OutCell,
         out_idx: u32,
     ) !void {
         switch (plan.func) {
@@ -712,12 +737,12 @@ pub const Window = struct {
                         if (isValid(view, perm[k])) n += 1;
                     }
                 }
-                try writeBigint(out, out_idx, n);
+                try writeBigint(cell.column, out_idx, n);
             },
-            .sum => try self.frameSum(plan, perm, lo, hi, out, out_idx),
-            .avg => try self.frameAvg(plan, perm, lo, hi, out, out_idx),
-            .min => try self.frameMinMax(plan, perm, lo, hi, out, out_idx, true),
-            .max => try self.frameMinMax(plan, perm, lo, hi, out, out_idx, false),
+            .sum => try self.frameSum(plan, perm, lo, hi, cell.column, out_idx),
+            .avg => try self.frameAvg(plan, perm, lo, hi, cell.column, out_idx),
+            .min => try self.frameMinMax(plan, perm, lo, hi, cell, out_idx, true),
+            .max => try self.frameMinMax(plan, perm, lo, hi, cell, out_idx, false),
             else => return Error.WindowUnsupported,
         }
     }
@@ -805,7 +830,7 @@ pub const Window = struct {
         perm: []const u32,
         lo: usize,
         hi: usize,
-        out: *ColumnStore,
+        cell: OutCell,
         out_idx: u32,
         is_min: bool,
     ) !void {
@@ -825,9 +850,9 @@ pub const Window = struct {
             if (replace) best_idx = @intCast(r);
         }
         if (best_idx < 0) {
-            setNull(out, out_idx);
+            setNullCell(cell, out_idx);
         } else {
-            try copyCell(col, @intCast(best_idx), out, out_idx);
+            try copyCellTo(col, @intCast(best_idx), cell, out_idx);
         }
     }
 };
@@ -901,6 +926,8 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
             }
         },
         .avg => Type{ .double = {} },
+        // String input is supported here — the operator writes into a
+        // separate `string_outputs` scratch (see Window.string_outputs).
         .min, .max, .lag, .lead, .first_value, .last_value => schema[plan.value_col].type,
         else => Error.WindowUnsupported,
     };
@@ -981,6 +1008,96 @@ fn appendRangeFromStore(
     try transform.appendByIndices(allocator, src.view(), indices_buf, out);
 }
 
+/// Build a row range of a staged string-output ColumnStore from the
+/// `[N]?[]const u8` scratch. Each scratch entry is either a slice into
+/// an input column's StringStore (lifetime-safe — input columns live
+/// as long as the operator) or `null` for SQL NULL.
+fn appendStringScratchRange(
+    allocator: Allocator,
+    scratch: []const ?[]const u8,
+    lo: usize,
+    hi: usize,
+    out: *ColumnStore,
+) !void {
+    var i: usize = lo;
+    while (i < hi) : (i += 1) {
+        const row: usize = i - lo;
+        const bytes = scratch[i] orelse "";
+        switch (out.data) {
+            .string => |*ss| try ss.appendValue(allocator, bytes),
+            .varchar => |*ss| try ss.appendValue(allocator, bytes),
+            .char => |*ss| try ss.appendValue(allocator, bytes),
+            else => return Error.WindowUnsupported,
+        }
+        try out.appendValidBit(allocator, row, scratch[i] != null);
+    }
+}
+
+fn isStringType(t: Type) bool {
+    return switch (t) {
+        .string, .varchar, .char => true,
+        else => false,
+    };
+}
+
+/// A destination cell for a window-function output row write.
+/// Either targets the pre-sized `ColumnStore` (fixed-width types) or
+/// the `string_scratch` slice (string-typed outputs). The two are
+/// mutually exclusive — exactly one of them is "live" for a given
+/// output call.
+const OutCell = struct {
+    column: *ColumnStore,
+    string_scratch: ?[]?[]const u8 = null,
+};
+
+fn setNullCell(cell: OutCell, row: u32) void {
+    if (cell.string_scratch) |s| {
+        s[row] = null;
+        return;
+    }
+    setNull(cell.column, row);
+}
+
+fn copyCellTo(src: ColumnStore, src_row: u32, cell: OutCell, out_row: u32) !void {
+    const view = src.view();
+    if (!isValid(view, src_row)) {
+        setNullCell(cell, out_row);
+        return;
+    }
+    if (cell.string_scratch) |s| {
+        s[out_row] = switch (src.data) {
+            .string => |ss| ss.view().rowBytes(src_row),
+            .varchar => |ss| ss.view().rowBytes(src_row),
+            .char => |ss| ss.view().rowBytes(src_row),
+            else => return Error.WindowUnsupported,
+        };
+        return;
+    }
+    try copyCell(src, src_row, cell.column, out_row);
+}
+
+/// Mirror an already-written output cell's value at `src_row` to
+/// another row `dst_row`. Used by the whole-partition aggregate
+/// broadcast path so we compute the aggregate once and copy across.
+fn broadcastOutputCell(cell: OutCell, src_row: u32, dst_row: u32) !void {
+    if (cell.string_scratch) |s| {
+        s[dst_row] = s[src_row];
+        return;
+    }
+    try copyCell(cell.column.*, src_row, cell.column, dst_row);
+}
+
+fn writeLiteralCell(cell: OutCell, row: u32, lit: Value) !void {
+    if (cell.string_scratch) |s| {
+        s[row] = switch (lit) {
+            .text => |t| t,
+            else => return Error.WindowUnsupported,
+        };
+        return;
+    }
+    try writeLiteral(cell.column, row, lit);
+}
+
 /// `perm` is sorted by (partition_by, order_by). Find the end of the
 /// current partition starting at `start` — the smallest index `e` >
 /// `start` such that the partition-key tuple at `perm[e]` differs from
@@ -1059,7 +1176,7 @@ fn fillFirstValue(
     perm: []const u32,
     p_start: usize,
     p_end: usize,
-    out: *ColumnStore,
+    cell: OutCell,
     ignore_nulls: bool,
 ) !void {
     if (p_start >= p_end) return;
@@ -1071,9 +1188,9 @@ fn fillFirstValue(
     var i: usize = p_start;
     while (i < p_end) : (i += 1) {
         if (first_src_idx) |idx| {
-            try copyCell(value_col, perm[idx], out, perm[i]);
+            try copyCellTo(value_col, perm[idx], cell, perm[i]);
         } else {
-            setNull(out, perm[i]);
+            setNullCell(cell, perm[i]);
         }
     }
 }
