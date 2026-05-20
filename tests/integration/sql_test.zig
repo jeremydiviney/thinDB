@@ -158,6 +158,25 @@ test "sql: ORDER BY DESC + LIMIT" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 4 }, ids.items);
 }
 
+test "sql: MySQL LIMIT offset,count with zero offset" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT id FROM t ORDER BY id ASC LIMIT 0, 2");
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, ids.items);
+}
+
 test "sql: GROUP BY with count(*) and sum(qty)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -39,11 +39,29 @@ const pg_quotes: QuoteRules = .{
 /// Both wires' canned-probe matchers normalize input identically; this
 /// is the shared helper. Caller owns the returned slice.
 pub fn normalizeForCannedMatch(allocator: Allocator, sql: []const u8) ![]u8 {
-    var s = std.mem.trim(u8, sql, " \t\r\n");
+    var s = stripLeadingComments(std.mem.trim(u8, sql, " \t\r\n"));
     while (s.len > 0 and s[s.len - 1] == ';') s = std.mem.trim(u8, s[0 .. s.len - 1], " \t\r\n");
     const out = try allocator.alloc(u8, s.len);
     for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
     return out;
+}
+
+fn stripLeadingComments(sql: []const u8) []const u8 {
+    var s = sql;
+    while (true) {
+        s = std.mem.trim(u8, s, " \t\r\n");
+        if (std.mem.startsWith(u8, s, "/*")) {
+            const end = std.mem.indexOf(u8, s[2..], "*/") orelse return s;
+            s = s[end + 4 ..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, s, "--")) {
+            const end = std.mem.indexOfScalar(u8, s, '\n') orelse return "";
+            s = s[end + 1 ..];
+            continue;
+        }
+        return s;
+    }
 }
 
 /// Render a byte slice as a SQL string literal: wrap in single quotes,
@@ -238,6 +256,13 @@ test "normalizeForCannedMatch strips trailing semicolons + lowercases" {
     const out = try normalizeForCannedMatch(allocator, "  SELECT VERSION() ;;  ");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("select version()", out);
+}
+
+test "normalizeForCannedMatch strips leading comments" {
+    const allocator = std.testing.allocator;
+    const out = try normalizeForCannedMatch(allocator, " /* wb */ SHOW VARIABLES;");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("show variables", out);
 }
 
 test "renderStringLiteral escapes embedded quotes" {

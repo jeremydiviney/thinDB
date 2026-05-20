@@ -42,7 +42,9 @@ pub const Schema = struct {
         name: []const u8,
         config: Config,
     ) !*Schema {
-        const schema_dir = try parent_dir.createDirPathOpen(io, name, .{});
+        const schema_dir = try parent_dir.createDirPathOpen(io, name, .{
+            .open_options = .{ .iterate = true },
+        });
         errdefer {
             var d = schema_dir;
             d.close(io);
@@ -200,6 +202,19 @@ pub const Schema = struct {
             if (self.tables.get(name)) |existing| return existing;
         }
 
+        var probe = self.schema_dir.openDir(self.io, name, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return Error.TableNotFound,
+            else => return err,
+        };
+        probe.access(self.io, "schema.bin", .{ .read = true }) catch |err| {
+            probe.close(self.io);
+            return switch (err) {
+                error.FileNotFound => Error.TableNotFound,
+                else => err,
+            };
+        };
+        probe.close(self.io);
+
         const t = try Table.open(
             self.allocator,
             self.io,
@@ -297,17 +312,44 @@ pub const Schema = struct {
     /// List the names of every table in this schema. Caller frees the
     /// returned slice and each name with `allocator`.
     pub fn listTables(self: *Schema, allocator: Allocator) ![][]u8 {
-        self.tables_mutex.lockUncancelable(self.io);
-        defer self.tables_mutex.unlock(self.io);
-
-        const out = try allocator.alloc([]u8, self.tables.count());
-        errdefer allocator.free(out);
-        var i: usize = 0;
-        errdefer for (out[0..i]) |s| allocator.free(s);
-        var it = self.tables.keyIterator();
-        while (it.next()) |k| : (i += 1) {
-            out[i] = try allocator.dupe(u8, k.*);
+        var out_list: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out_list.items) |s| allocator.free(s);
+            out_list.deinit(allocator);
         }
-        return out;
+
+        self.tables_mutex.lockUncancelable(self.io);
+        {
+            defer self.tables_mutex.unlock(self.io);
+
+            var it = self.tables.keyIterator();
+            while (it.next()) |k| {
+                try out_list.append(allocator, try allocator.dupe(u8, k.*));
+            }
+        }
+
+        var dir_it = self.schema_dir.iterate();
+        while (try dir_it.next(self.io)) |entry| {
+            if (entry.kind != .directory) continue;
+            if (ownedNameListContains(out_list.items, entry.name)) continue;
+            if (!self.diskTableExists(entry.name)) continue;
+            try out_list.append(allocator, try allocator.dupe(u8, entry.name));
+        }
+
+        return try out_list.toOwnedSlice(allocator);
+    }
+
+    fn diskTableExists(self: *Schema, name: []const u8) bool {
+        var table_dir = self.schema_dir.openDir(self.io, name, .{}) catch return false;
+        defer table_dir.close(self.io);
+        table_dir.access(self.io, "schema.bin", .{ .read = true }) catch return false;
+        return true;
+    }
+
+    fn ownedNameListContains(names: []const []u8, needle: []const u8) bool {
+        for (names) |name| {
+            if (std.mem.eql(u8, name, needle)) return true;
+        }
+        return false;
     }
 };

@@ -666,6 +666,85 @@ test "mysql wire: COM_QUERY against seeded table returns rows" {
     if (sctx.err) |e| return e;
 }
 
+test "mysql wire: Workbench metadata probes reflect catalog tables" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const t = try sc.table("orders", schema_orders, opts_orders);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .tag = "b" },
+    });
+
+    const port: u16 = test_port_base + 210;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const th = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer th.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("main__public");
+
+    try client.sendQuery("SHOW FULL TABLES FROM `main__public`");
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const rows = try client.readResultSet(arena.allocator());
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("orders", rows[0][0].?);
+        try std.testing.expectEqualStrings("BASE TABLE", rows[0][1].?);
+    }
+
+    try client.sendQuery("SHOW FULL COLUMNS FROM `orders`");
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const rows = try client.readResultSet(arena.allocator());
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
+        try std.testing.expectEqualStrings("id", rows[0][0].?);
+        try std.testing.expectEqualStrings("bigint", rows[0][1].?);
+        try std.testing.expectEqualStrings("PRI", rows[0][4].?);
+        try std.testing.expectEqualStrings("tag", rows[2][0].?);
+        try std.testing.expectEqualStrings("text", rows[2][1].?);
+    }
+
+    try client.sendQuery("SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'main__public'");
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const rows = try client.readResultSet(arena.allocator());
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("orders", rows[0][0].?);
+        try std.testing.expectEqualStrings("BASE TABLE", rows[0][1].?);
+    }
+
+    try client.sendQuery("SELECT COLUMN_NAME, DATA_TYPE, COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'main__public' AND TABLE_NAME = 'orders'");
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const rows = try client.readResultSet(arena.allocator());
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
+        try std.testing.expectEqualStrings("id", rows[0][0].?);
+        try std.testing.expectEqualStrings("bigint", rows[0][1].?);
+        try std.testing.expectEqualStrings("PRI", rows[0][2].?);
+    }
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
 test "mysql wire: SET / SHOW VARIABLES probes return canned OK / rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

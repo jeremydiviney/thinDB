@@ -155,6 +155,11 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     defer catalog.close();
+    _ = catalog.createOrOpenDatabase("main") catch |err| {
+        try err_w.print("thindb-server: failed to open default main/public namespace: {t}\n", .{err});
+        try err_w.flush();
+        return 1;
+    };
 
     var shared_limiter = thindb.ConnectionLimiter.init(max_connections);
 

@@ -716,7 +716,7 @@ test "delete removes matching rows from memtable" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, b.values[0].data.bigint);
 }
 
-test "openTable on missing table returns FileNotFound" {
+test "openTable on missing table returns TableNotFound" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -727,5 +727,5 @@ test "openTable on missing table returns FileNotFound" {
     defer db.close();
 
     const result = db.openTable("missing", .{});
-    try std.testing.expectError(storage.schema_file.Error.SchemaRequired, result);
+    try std.testing.expectError(Error.TableNotFound, result);
 }
