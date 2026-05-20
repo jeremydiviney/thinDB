@@ -487,6 +487,25 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
             const s_count = try std.fmt.bufPrint(&buf, " [{d} keys]", .{s.rows.len});
             try out.appendSlice(allocator, s_count);
         },
+        .correlated_range => |s| {
+            try out.appendSlice(allocator, if (s.negate) "NOT EXISTS range(" else "EXISTS range(");
+            try out.appendSlice(allocator, s.outer_range_col);
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, opSymbol(s.op));
+            try out.appendSlice(allocator, " inner");
+            if (s.outer_keys.len > 0) {
+                try out.appendSlice(allocator, " by [");
+                for (s.outer_keys, 0..) |c, i| {
+                    if (i > 0) try out.appendSlice(allocator, ", ");
+                    try out.appendSlice(allocator, c);
+                }
+                try out.append(allocator, ']');
+            }
+            try out.append(allocator, ')');
+            var buf: [24]u8 = undefined;
+            const s_count = try std.fmt.bufPrint(&buf, " [{d} groups]", .{s.groups.len});
+            try out.appendSlice(allocator, s_count);
+        },
     }
 }
 

@@ -99,6 +99,16 @@ pub const PredicateExpr = union(enum) {
     /// matching key → predicate fails (the standard SQL semantics
     /// for a missing scalar-subquery result).
     correlated_scalar: CorrelatedScalar,
+    /// Resolved form of a correlated EXISTS / NOT EXISTS whose inner
+    /// includes a single range conjunct of the form `inner.x op outer.y`
+    /// (op ∈ {<, <=, >, >=}). The inner-side `x` values for each
+    /// equi-correlation key are materialized, sorted ascending, with
+    /// min/max cached. Per outer row: look up by `outer_keys`, then
+    /// check whether any inner value satisfies `value op outer_y` —
+    /// for open-ended ops a single compare to min or max is enough.
+    /// Combined with optional equi-key correlation (`outer_keys`),
+    /// the lookup happens within the matching group only.
+    correlated_range: CorrelatedRange,
 };
 
 pub const LikePred = struct {
@@ -145,6 +155,34 @@ pub const CorrelatedScalar = struct {
     /// Materialized rows. `key` tuples are unique (the inner's
     /// GROUP BY on the correlation columns guarantees that).
     rows: []const CorrelatedScalarRow,
+};
+
+pub const CorrelatedRangeGroup = struct {
+    /// Equi-correlation key for this group (parallel to outer_keys
+    /// in the parent CorrelatedRange). Empty slice when there are
+    /// no equi keys — that case has exactly one group.
+    key: []const Value,
+    /// Inner-side range-column values for rows matching this key,
+    /// sorted ascending. NULLs were dropped at materialization.
+    values: []const Value,
+};
+
+pub const CorrelatedRange = struct {
+    /// Outer-side correlation key column names (equi part). Parallel
+    /// to each group's `key` tuple. Empty when no equi keys.
+    outer_keys: []const []const u8,
+    /// Outer-side range column (the `y` in `inner.x op outer.y`).
+    outer_range_col: []const u8,
+    /// Op in canonical "inner op outer" form. So `outer.y < inner.x`
+    /// becomes op = `.gt` (inner > outer). Limited to {lt, lte, gt, gte}
+    /// — `.eq` is captured as equi correlation, `.neq` isn't useful.
+    op: PredicateOp,
+    /// One group per distinct equi-key tuple. Linear scan per outer
+    /// row in v1 — group count is expected to be small.
+    groups: []const CorrelatedRangeGroup,
+    /// `true` = NOT EXISTS — outer row passes iff no inner value
+    /// satisfies the range op.
+    negate: bool,
 };
 
 pub const CorrelatedSet = struct {
@@ -250,6 +288,25 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
                 .op = s.op,
                 .outer_keys = outer_keys,
                 .rows = rows,
+            } };
+        },
+        .correlated_range => |s| blk: {
+            const outer_keys = try out_arena.alloc([]const u8, s.outer_keys.len);
+            for (s.outer_keys, outer_keys) |src, *dst| dst.* = try out_arena.dupe(u8, src);
+            const groups = try out_arena.alloc(CorrelatedRangeGroup, s.groups.len);
+            for (s.groups, groups) |src, *dst| {
+                const key = try out_arena.alloc(Value, src.key.len);
+                for (src.key, key) |v, *k| k.* = try cloneValue(out_arena, v);
+                const values = try out_arena.alloc(Value, src.values.len);
+                for (src.values, values) |v, *o| o.* = try cloneValue(out_arena, v);
+                dst.* = .{ .key = key, .values = values };
+            }
+            break :blk .{ .correlated_range = .{
+                .outer_keys = outer_keys,
+                .outer_range_col = try out_arena.dupe(u8, s.outer_range_col),
+                .op = s.op,
+                .groups = groups,
+                .negate = s.negate,
             } };
         },
         .@"and" => |kids| blk: {
@@ -361,6 +418,15 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // exist; per-row keys + value type tags match.
         .correlated_scalar => |s| {
             _ = findCol(schema, s.outer_compared) orelse return Error.ColumnNotFound;
+            for (s.outer_keys) |c_name| {
+                _ = findCol(schema, c_name) orelse return Error.ColumnNotFound;
+            }
+        },
+        // `.correlated_range` — outer_range_col + each outer_keys
+        // entry must exist on the outer schema. Group values are
+        // pre-sorted at materialization; trust their tags.
+        .correlated_range => |s| {
+            _ = findCol(schema, s.outer_range_col) orelse return Error.ColumnNotFound;
             for (s.outer_keys) |c_name| {
                 _ = findCol(schema, c_name) orelse return Error.ColumnNotFound;
             }
@@ -538,6 +604,7 @@ pub fn evaluatePredicate(
         },
         .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out),
         .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out),
+        .correlated_range => |s| try evaluateCorrelatedRangeMask(s, schema, batch, out),
     }
 }
 
@@ -624,6 +691,99 @@ fn compareCellToValue(view: ColumnView, idx: usize, op: PredicateOp, ref: Value)
             const eq = std.mem.eql(u8, sv.rowBytes(idx), ref.text);
             break :blk if (op == .eq) eq else if (op == .neq) !eq else false;
         } else false,
+    };
+}
+
+/// Per-row range-correlation check. For each outer row:
+///   1. Build the equi-key tuple from `outer_keys`. NULL in any key → no match.
+///   2. Linear-scan `groups` for the matching key tuple.
+///   3. Within that group, check whether any inner value satisfies
+///      `value op outer_range_value` using the cached min/max — a
+///      single compare for open-ended ops.
+///   4. Apply `negate` (NOT EXISTS).
+///
+/// Empty group / no matching group → no inner row matches → EXISTS
+/// false, NOT EXISTS true.
+pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, batch: anytype, out: []bool) !void {
+    const n_keys = s.outer_keys.len;
+    var key_idx_buf: [16]usize = undefined;
+    if (n_keys > key_idx_buf.len) return Error.PredicateTypeMismatch;
+    const key_idxs = key_idx_buf[0..n_keys];
+    for (s.outer_keys, key_idxs) |c_name, *idx_out| {
+        idx_out.* = findCol(schema, c_name) orelse return Error.ColumnNotFound;
+    }
+    const range_idx = findCol(schema, s.outer_range_col) orelse return Error.ColumnNotFound;
+    const range_view = batch.values[range_idx];
+
+    var i: usize = 0;
+    while (i < batch.row_count) : (i += 1) {
+        // NULL on outer range col or any equi key → predicate fails
+        // (no inner row can satisfy a NULL comparison).
+        if (!range_view.isValid(i)) {
+            out[i] = s.negate;
+            continue;
+        }
+        var any_null = false;
+        for (key_idxs) |idx| {
+            if (!batch.values[idx].isValid(i)) {
+                any_null = true;
+                break;
+            }
+        }
+        if (any_null) {
+            out[i] = s.negate;
+            continue;
+        }
+
+        // Locate the group whose key tuple matches this row.
+        var matched_group: ?CorrelatedRangeGroup = null;
+        for (s.groups) |g| {
+            var all_match = true;
+            for (key_idxs, g.key) |idx, ref_val| {
+                if (!cellMatchesValue(batch.values[idx], i, ref_val)) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) {
+                matched_group = g;
+                break;
+            }
+        }
+
+        if (matched_group) |g| {
+            if (g.values.len == 0) {
+                out[i] = s.negate;
+                continue;
+            }
+            // Open-ended range collapses to a min/max compare.
+            //   inner.x >  outer.y  → exists iff max > y  (i.e., y < max)
+            //   inner.x >= outer.y  → exists iff max >= y
+            //   inner.x <  outer.y  → exists iff min < y
+            //   inner.x <= outer.y  → exists iff min <= y
+            const probe: Value = switch (s.op) {
+                .gt, .gte => g.values[g.values.len - 1], // max
+                .lt, .lte => g.values[0], // min
+                else => return Error.PredicateTypeMismatch,
+            };
+            const exists = try compareCellToValue(range_view, i, reverseRangeOp(s.op), probe);
+            out[i] = if (s.negate) !exists else exists;
+        } else {
+            out[i] = s.negate;
+        }
+    }
+}
+
+/// Flip a range op so `inner op outer` becomes the equivalent
+/// `outer op' inner`. Used by the range evaluator to phrase the
+/// existence check as "outer compared-against probe(min|max)".
+fn reverseRangeOp(op: PredicateOp) PredicateOp {
+    return switch (op) {
+        .gt => .lt,
+        .gte => .lte,
+        .lt => .gt,
+        .lte => .gte,
+        else => unreachable,
     };
 }
 

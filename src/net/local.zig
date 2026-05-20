@@ -805,6 +805,26 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
                 .rows = rows,
             } };
         },
+        .correlated_range => |s| blk: {
+            const PredMod = @import("../exec/predicate.zig");
+            const outer_keys = try aa.alloc([]const u8, s.outer_keys.len);
+            for (s.outer_keys, outer_keys) |src, *dst| dst.* = try aa.dupe(u8, src);
+            const groups = try aa.alloc(PredMod.CorrelatedRangeGroup, s.groups.len);
+            for (s.groups, groups) |src, *dst| {
+                const key = try aa.alloc(types.Value, src.key.len);
+                for (src.key, key) |v, *k| k.* = try cloneValue(aa, v);
+                const values = try aa.alloc(types.Value, src.values.len);
+                for (src.values, values) |v, *o| o.* = try cloneValue(aa, v);
+                dst.* = .{ .key = key, .values = values };
+            }
+            break :blk PredicateExpr{ .correlated_range = .{
+                .outer_keys = outer_keys,
+                .outer_range_col = try aa.dupe(u8, s.outer_range_col),
+                .op = s.op,
+                .groups = groups,
+                .negate = s.negate,
+            } };
+        },
         .@"and" => |children| PredicateExpr{ .@"and" = try cloneChildren(aa, children) },
         .@"or" => |children| PredicateExpr{ .@"or" = try cloneChildren(aa, children) },
         .not => |child| blk: {
@@ -1182,7 +1202,7 @@ fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
     switch (pred.*) {
-        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set, .correlated_scalar => {},
+        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range => {},
         .scalar_subquery => |sq| {
             if (try maybeResolveCorrelatedScalar(ctx, pred, sq)) return;
             const val = try runScalarSubquery(ctx, sq.source);
@@ -1236,6 +1256,14 @@ fn maybeResolveCorrelatedExists(
     const inner: *ir.Op = @constCast(@ptrCast(@alignCast(source_opaque)));
     var info = (try analyzeCorrelation(ctx, inner)) orelse return false;
     defer info.deinit(ctx.allocator);
+
+    // Range-correlation path (single range conjunct, optionally with
+    // equi keys). Multi-range correlation falls back to the bail
+    // path — caller surfaces it as unsupported.
+    if (info.range_corrs.items.len == 1) {
+        return try resolveCorrelatedExistsRange(ctx, pred, info, negate);
+    }
+    if (info.range_corrs.items.len > 1) return false;
     if (info.outer_cols.items.len == 0) return false;
 
     // Build rewritten inner: drop correlation predicates; project the
@@ -1280,6 +1308,123 @@ fn maybeResolveCorrelatedExists(
     return true;
 }
 
+/// Materialize a range-correlated EXISTS inner. Projects
+/// `(equi_inner_cols..., range_inner_col)`, drains, buckets rows by
+/// the equi-key tuple, sorts each bucket's range values ascending.
+/// Per outer row the eval is then a single min/max compare.
+fn resolveCorrelatedExistsRange(
+    ctx: *CompileCtx,
+    pred: *PredicateExpr,
+    info: CorrelationInfo,
+    negate: bool,
+) !bool {
+    const range = info.range_corrs.items[0];
+    const aa = ctx.subqueryArena();
+
+    // Build rewritten inner. Reuse buildRewrittenInner by routing the
+    // range inner col through `extra_first_col` and the equi cols as
+    // info.inner_cols — that way Select projects (range_col,
+    // equi_inner_cols...). We'll un-permute on drain.
+    const rewritten = try buildRewrittenInner(ctx, undefined, info, range.inner_col);
+
+    var q = try compileOp(ctx, rewritten);
+    defer q.deinit();
+
+    const n_keys = info.inner_cols.items.len;
+
+    // First pass: drain into flat (key_tuple, range_value) rows.
+    const RowEntry = struct {
+        key: []Value,
+        value: Value,
+    };
+    var rows: std.ArrayList(RowEntry) = .empty;
+    defer rows.deinit(ctx.allocator);
+
+    while (try q.next()) |batch| {
+        var i: usize = 0;
+        while (i < batch.row_count) : (i += 1) {
+            const range_view = batch.values[0];
+            if (!range_view.isValid(i)) continue;
+            var any_null = false;
+            const key = try aa.alloc(Value, n_keys);
+            for (0..n_keys) |j| {
+                const view = batch.values[1 + j];
+                if (!view.isValid(i)) {
+                    any_null = true;
+                    break;
+                }
+                key[j] = try extractScalarValueAt(aa, view, i);
+            }
+            if (any_null) continue;
+            const v = try extractScalarValueAt(aa, range_view, i);
+            try rows.append(ctx.allocator, .{ .key = key, .value = v });
+        }
+    }
+
+    // Group rows by equi-key tuple. We materialize a parallel
+    // (keys, values_lists) pair: keys[i] is the i-th unique key
+    // tuple, values_lists[i] is its growing list of range values.
+    // The n_keys == 0 case (pure range, no equi correlation) collapses
+    // to a single group with an empty key.
+    var unique_keys: std.ArrayList([]Value) = .empty;
+    defer unique_keys.deinit(ctx.allocator);
+    var values_lists: std.ArrayList(std.ArrayList(Value)) = .empty;
+    defer {
+        for (values_lists.items) |*vl| vl.deinit(ctx.allocator);
+        values_lists.deinit(ctx.allocator);
+    }
+
+    for (rows.items) |row| {
+        var bucket_idx: ?usize = null;
+        for (unique_keys.items, 0..) |k, gi| {
+            if (keysEqual(k, row.key)) {
+                bucket_idx = gi;
+                break;
+            }
+        }
+        if (bucket_idx == null) {
+            try unique_keys.append(ctx.allocator, row.key);
+            try values_lists.append(ctx.allocator, .empty);
+            bucket_idx = unique_keys.items.len - 1;
+        }
+        try values_lists.items[bucket_idx.?].append(ctx.allocator, row.value);
+    }
+
+    // Snapshot each bucket into the subquery arena, sorting along the way.
+    const groups_owned = try aa.alloc(exec.predicate.CorrelatedRangeGroup, unique_keys.items.len);
+    for (unique_keys.items, values_lists.items, groups_owned) |k, *vl, *out| {
+        std.sort.pdq(Value, vl.items, {}, valueLessThan);
+        const arena_vals = try aa.alloc(Value, vl.items.len);
+        @memcpy(arena_vals, vl.items);
+        out.* = .{ .key = k, .values = arena_vals };
+    }
+
+    const outer_keys_owned = try aa.alloc([]const u8, info.outer_cols.items.len);
+    for (info.outer_cols.items, outer_keys_owned) |c, *dst| dst.* = try aa.dupe(u8, c);
+
+    pred.* = .{ .correlated_range = .{
+        .outer_keys = outer_keys_owned,
+        .outer_range_col = try aa.dupe(u8, range.outer_col),
+        .op = range.op,
+        .groups = groups_owned,
+        .negate = negate,
+    } };
+    return true;
+}
+
+fn keysEqual(a: []const Value, b: []const Value) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |av, bv| {
+        if (std.meta.activeTag(av) != std.meta.activeTag(bv)) return false;
+        if (av.compare(bv) != .eq) return false;
+    }
+    return true;
+}
+
+fn valueLessThan(_: void, a: Value, b: Value) bool {
+    return a.compare(b) == .lt;
+}
+
 /// Detect + decorrelate a correlated IN / NOT IN inner. Returns true
 /// when correlated; otherwise the caller does the uncorrelated path.
 fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) !bool {
@@ -1287,6 +1432,10 @@ fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) 
     var info = (try analyzeCorrelation(ctx, inner)) orelse return false;
     defer info.deinit(ctx.allocator);
     if (info.outer_cols.items.len == 0) return false;
+    // Range correlation in IN-subquery context isn't supported yet —
+    // the IN set depends on the outer range value, which can't be
+    // hash-keyed. Bail; caller surfaces as unsupported.
+    if (info.range_corrs.items.len > 0) return false;
 
     // Rewritten inner projects the IN column FIRST (so the outer's
     // `s.col` matches against it), then the correlation keys.
@@ -1375,8 +1524,12 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
     var info = CorrelationInfo.init();
     defer info.deinit(ctx.allocator);
     info.scan = scan_op;
-    if (filter_pred) |p| try collectConjuncts(ctx, p, inner_schema, &info);
+    if (filter_pred) |p| try collectConjuncts(ctx, p, inner_schema, scan_op.alias, &info);
     if (info.outer_cols.items.len == 0) return false;
+    // Range correlation in scalar subquery context isn't supported
+    // yet — the materialized agg can't be keyed by an open-ended
+    // range, so we'd need per-row eval. Bail.
+    if (info.range_corrs.items.len > 0) return false;
 
     // Build rewritten inner:
     //   Scan(T)
@@ -1460,9 +1613,33 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
 /// column name (what the rewritten inner projects) and
 /// `outer_cols[i]` is the outer-side column name (what the eventual
 /// per-row lookup keys against). All correlations are equi only.
+/// One non-equi correlation conjunct, canonicalized so the predicate
+/// always reads `inner_col op outer_col`. So `outer.y < inner.x`
+/// flips to `(inner_col=x, op=.gt, outer_col=y)`.
+const RangeCorr = struct {
+    inner_col: []const u8,
+    op: exec.PredicateOp,
+    outer_col: []const u8,
+};
+
+/// Flip a comparison op so swapping the operands yields the same
+/// truth value: `a op b` ↔ `b flip(op) a`.
+fn flipRangeOp(op: exec.PredicateOp) exec.PredicateOp {
+    return switch (op) {
+        .lt => .gt,
+        .lte => .gte,
+        .gt => .lt,
+        .gte => .lte,
+        .eq, .neq => op,
+    };
+}
+
 const CorrelationInfo = struct {
     inner_cols: std.ArrayList([]const u8),
     outer_cols: std.ArrayList([]const u8),
+    /// Range correlations — captured separately because they need
+    /// per-group sorting rather than tuple hashing.
+    range_corrs: std.ArrayList(RangeCorr),
     /// Non-correlation predicates that should stay in the inner's
     /// WHERE clause (col-vs-lit or col-vs-col where both sides are
     /// inner-local). Slice into the original IR — read-only.
@@ -1471,11 +1648,17 @@ const CorrelationInfo = struct {
     scan: ?*const ir.Op.Scan = null,
 
     fn init() CorrelationInfo {
-        return .{ .inner_cols = .empty, .outer_cols = .empty, .kept_predicates = .empty };
+        return .{
+            .inner_cols = .empty,
+            .outer_cols = .empty,
+            .range_corrs = .empty,
+            .kept_predicates = .empty,
+        };
     }
     fn deinit(self: *CorrelationInfo, allocator: Allocator) void {
         self.inner_cols.deinit(allocator);
         self.outer_cols.deinit(allocator);
+        self.range_corrs.deinit(allocator);
         self.kept_predicates.deinit(allocator);
     }
 };
@@ -1521,34 +1704,71 @@ fn analyzeCorrelation(ctx: *CompileCtx, inner: *ir.Op) !?CorrelationInfo {
     info.scan = scan_op;
 
     if (filter_pred) |pred| {
-        try collectConjuncts(ctx, pred, inner_schema, &info);
+        try collectConjuncts(ctx, pred, inner_schema, scan_op.alias, &info);
     }
 
     return info;
+}
+
+/// Strict "does this col-ref belong to the inner scan?" check. Unlike
+/// the generic `types.findColumn` smart matcher, this rejects refs
+/// whose qualifier doesn't match the scan's alias — otherwise the
+/// correlation analyzer would mistake `outer_alias.colname` for an
+/// inner col whenever the bare column name happens to exist in the
+/// inner table (very common: `region`, `id`, `created_at`, etc.).
+fn refIsInnerLocal(ref: []const u8, inner_schema: TableSchema, scan_alias: ?[]const u8) bool {
+    if (std.mem.lastIndexOfScalar(u8, ref, '.')) |dot| {
+        const qualifier = ref[0..dot];
+        const tail = ref[dot + 1 ..];
+        const alias = scan_alias orelse return false; // qualified ref against unaliased scan: not local
+        if (!std.mem.eql(u8, qualifier, alias)) return false;
+        return inner_schema.columnIndex(tail) != null;
+    }
+    return inner_schema.columnIndex(ref) != null;
 }
 
 fn collectConjuncts(
     ctx: *CompileCtx,
     pred: PredicateExpr,
     inner_schema: TableSchema,
+    scan_alias: ?[]const u8,
     info: *CorrelationInfo,
 ) !void {
     switch (pred) {
-        .@"and" => |children| for (children) |c| try collectConjuncts(ctx, c, inner_schema, info),
+        .@"and" => |children| for (children) |c| try collectConjuncts(ctx, c, inner_schema, scan_alias, info),
         .leaf_col_col => |lc| {
-            const left_local = inner_schema.columnIndex(lc.left) != null;
-            const right_local = inner_schema.columnIndex(lc.right) != null;
+            const left_local = refIsInnerLocal(lc.left, inner_schema, scan_alias);
+            const right_local = refIsInnerLocal(lc.right, inner_schema, scan_alias);
             if (left_local and right_local) {
                 // Pure inner predicate — keep in rewritten inner.
                 try info.kept_predicates.append(ctx.allocator, pred);
             } else if (left_local and !right_local) {
-                if (lc.op != .eq) return Error.UnsupportedOp; // range correlation
-                try info.inner_cols.append(ctx.allocator, lc.left);
-                try info.outer_cols.append(ctx.allocator, lc.right);
+                if (lc.op == .eq) {
+                    try info.inner_cols.append(ctx.allocator, lc.left);
+                    try info.outer_cols.append(ctx.allocator, lc.right);
+                } else if (lc.op == .lt or lc.op == .lte or lc.op == .gt or lc.op == .gte) {
+                    try info.range_corrs.append(ctx.allocator, .{
+                        .inner_col = lc.left,
+                        .op = lc.op,
+                        .outer_col = lc.right,
+                    });
+                } else {
+                    return Error.UnsupportedOp;
+                }
             } else if (!left_local and right_local) {
-                if (lc.op != .eq) return Error.UnsupportedOp;
-                try info.inner_cols.append(ctx.allocator, lc.right);
-                try info.outer_cols.append(ctx.allocator, lc.left);
+                if (lc.op == .eq) {
+                    try info.inner_cols.append(ctx.allocator, lc.right);
+                    try info.outer_cols.append(ctx.allocator, lc.left);
+                } else if (lc.op == .lt or lc.op == .lte or lc.op == .gt or lc.op == .gte) {
+                    // Flip so inner is always on the left of the op.
+                    try info.range_corrs.append(ctx.allocator, .{
+                        .inner_col = lc.right,
+                        .op = flipRangeOp(lc.op),
+                        .outer_col = lc.left,
+                    });
+                } else {
+                    return Error.UnsupportedOp;
+                }
             } else {
                 // Neither side in the inner table — can't possibly
                 // be a correlation we can handle.
