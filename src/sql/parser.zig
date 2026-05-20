@@ -521,6 +521,24 @@ pub const Parser = struct {
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
 
+        // EXTRACT(field FROM expr) — special function form. Detected
+        // here before the identifier-then-`(` branch below misparses
+        // the field name as a regular call arg.
+        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "extract")) {
+            const saved = self.cur;
+            try self.advance();
+            if (self.cur.tag == .lparen) {
+                const expr = try self.parseExtractCall(saved);
+                const default_name = try self.exprDefaultName(expr);
+                const alias = try self.maybeAlias(default_name);
+                return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            }
+            // Bare `extract` as a column name — treat as col_ref.
+            const dup_col = try self.arena.dupe(u8, saved.text);
+            const alias = try self.maybeAlias(dup_col);
+            return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
+        }
+
         // Identifier or function call. Look ahead: `(` after an identifier
         // means a call.
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
@@ -758,6 +776,39 @@ pub const Parser = struct {
         return lhs;
     }
 
+    /// Parse the contents of `EXTRACT(field FROM expr)` — cursor enters
+    /// on the `(`, exits past `)`. The field name is case-insensitive
+    /// and matched against year/month/day/hour/minute/second; the
+    /// resulting Expr is a regular scalar call to that function.
+    fn parseExtractCall(self: *Parser, _: Token) ParseError!ir.Expr {
+        try self.expect(.lparen);
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const field = self.cur.text;
+        const fn_name: []const u8 = if (std.ascii.eqlIgnoreCase(field, "year"))
+            "year"
+        else if (std.ascii.eqlIgnoreCase(field, "month"))
+            "month"
+        else if (std.ascii.eqlIgnoreCase(field, "day"))
+            "day"
+        else if (std.ascii.eqlIgnoreCase(field, "hour"))
+            "hour"
+        else if (std.ascii.eqlIgnoreCase(field, "minute"))
+            "minute"
+        else if (std.ascii.eqlIgnoreCase(field, "second"))
+            "second"
+        else
+            return ParseError.SqlExpectedKeyword;
+        try self.advance();
+        if (self.cur.tag != .kw_from) return ParseError.SqlExpectedFrom;
+        try self.advance();
+        const arg = try self.parseCallArg();
+        try self.expect(.rparen);
+        const args = try self.arena.alloc(ir.Expr, 1);
+        args[0] = arg;
+        const name_dup = try self.arena.dupe(u8, fn_name);
+        return ir.Expr{ .call = .{ .fn_name = name_dup, .args = args } };
+    }
+
     /// Parse a searched CASE expression:
     ///   CASE WHEN bool THEN expr (WHEN bool THEN expr)* [ELSE expr] END
     /// Cursor enters on `CASE`, exits past `END`. Simple-form CASE
@@ -800,6 +851,25 @@ pub const Parser = struct {
     /// rejected — they belong at the top level of the SELECT list.
     fn parseCallAtom(self: *Parser) ParseError!ir.Expr {
         if (self.cur.tag == .kw_case) return try self.parseCaseExpr();
+        // EXTRACT(field FROM expr) — SQL-standard. Lowers to a regular
+        // scalar call (year/month/day/hour/minute/second). `field` is
+        // an identifier (not a reserved keyword) so check the *next*
+        // token for `(`.
+        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "extract")) {
+            // Peek: the next two tokens must look like `( ident`. If
+            // they don't, fall through to the identifier branch (treats
+            // `extract` as a column name).
+            const saved = self.cur;
+            try self.advance();
+            if (self.cur.tag == .lparen) {
+                return try self.parseExtractCall(saved);
+            }
+            // Roll-back path: we already consumed `extract` and looked
+            // at the next token. Re-emit it as a col_ref since the
+            // grammar can't peek-then-backtrack arbitrarily.
+            const col = try self.arena.dupe(u8, saved.text);
+            return ir.Expr{ .col_ref = col };
+        }
         switch (self.cur.tag) {
             .identifier => {
                 const name = self.cur.text;
