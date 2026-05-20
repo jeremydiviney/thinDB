@@ -98,6 +98,39 @@ describe("pg window functions", () => {
     }
   });
 
+  test("QUALIFY keeps only the top-ranked row per partition", async () => {
+    const client = makeClient();
+    await client.connect();
+    try {
+      await seed(client);
+      const r = await client.query(
+        "SELECT id, rank() OVER (PARTITION BY grp ORDER BY qty DESC) AS rk FROM t QUALIFY rk = 1 ORDER BY id ASC",
+      );
+      const got = r.rows.map((row) => String(row.id));
+      // grp=1 top is id=3 (qty=30); grp=2 top is id=5 (qty=200).
+      expect(got).toEqual(["3", "5"]);
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  });
+
+  test("NTILE(2) splits a partition", async () => {
+    const client = makeClient();
+    await client.connect();
+    try {
+      await seed(client);
+      const r = await client.query(
+        "SELECT id, ntile(2) OVER (PARTITION BY grp ORDER BY id ASC) AS bucket FROM t ORDER BY id ASC",
+      );
+      const got = r.rows.map((row) => String(row.bucket));
+      // grp=1 has 3 rows (N=3, n=2): 2/1 = bucket sizes 2,1 → 1,1,2
+      // grp=2 has 2 rows (N=2, n=2): 1,1 → 1,2
+      expect(got).toEqual(["1", "1", "2", "1", "2"]);
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  });
+
   test("ROWS BETWEEN 1 PRECEDING AND CURRENT ROW (trailing sum)", async () => {
     const client = makeClient();
     await client.connect();

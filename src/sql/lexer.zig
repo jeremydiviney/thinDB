@@ -81,6 +81,7 @@ pub const TokenTag = enum {
     kw_ignore,
     kw_respect,
     kw_nulls,
+    kw_qualify,
 
     // Operators / punctuation.
     eq, // =
@@ -424,6 +425,7 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "ignore", .tag = .kw_ignore },
         .{ .name = "respect", .tag = .kw_respect },
         .{ .name = "nulls", .tag = .kw_nulls },
+        .{ .name = "qualify", .tag = .kw_qualify },
     };
     for (kws) |kw| {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;

@@ -81,8 +81,17 @@ pub fn validateWindowCall(
             if (args.len != 1) return error.InvalidShape;
             if (ignore_nulls) return error.InvalidShape;
         },
-        // Tier 2 — parser rejects until operator support lands.
-        .ntile, .cume_dist, .percent_rank => return error.InvalidShape,
+        // Tier 2 ranking-style — take one integer-literal arg (NTILE)
+        // or no args (PERCENT_RANK, CUME_DIST). IGNORE NULLS isn't
+        // meaningful for any of these.
+        .ntile => {
+            if (args.len != 1) return error.InvalidShape;
+            if (ignore_nulls) return error.InvalidShape;
+        },
+        .cume_dist, .percent_rank => {
+            if (args.len != 0) return error.InvalidShape;
+            if (ignore_nulls) return error.InvalidShape;
+        },
     }
 }
 

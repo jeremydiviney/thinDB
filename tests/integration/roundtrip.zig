@@ -1065,9 +1065,11 @@ test "error: filter predicate type mismatch on each new type" {
     try std.testing.expectError(error.PredicateTypeMismatch, q);
     base.deinit();
 
-    // LARGEINT column with a BIGINT literal — type mismatch.
+    // LARGEINT column with a TEXT literal — type mismatch. (BIGINT
+    // literal would widen losslessly to LARGEINT, so use a literal
+    // that genuinely can't be widened.)
     base = try thindb.scan(allocator, t);
-    q = base.filter(thindb.leafExpr("big", .eq, .{ .bigint = 1 }));
+    q = base.filter(thindb.leafExpr("big", .eq, .{ .text = "1" }));
     try std.testing.expectError(error.PredicateTypeMismatch, q);
     base.deinit();
 

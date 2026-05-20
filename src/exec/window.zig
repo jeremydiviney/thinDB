@@ -118,6 +118,12 @@ pub const Window = struct {
         /// Honor `IGNORE NULLS` on null-skipping functions (LAG, LEAD,
         /// FIRST_VALUE, LAST_VALUE). Forwarded from the IR.
         ignore_nulls: bool = false,
+        /// `NTILE(n)` bucket count. Stored as i64 because the user
+        /// supplies it as an integer literal and we want to reject
+        /// non-positive values cleanly.
+        ntile_buckets: i64 = 1,
+        /// `NTH_VALUE(expr, n)` 1-based offset within the frame.
+        nth_offset: i64 = 1,
     };
 
     const DefaultKind = enum { none, literal, col_ref };
@@ -445,8 +451,11 @@ pub const Window = struct {
             .lead => try self.fillLagLead(plan, perm, p_start, p_end, cell, false),
             .first_value => try fillFirstValue(self.accumulated[plan.value_col], perm, p_start, p_end, cell, plan.ignore_nulls),
             .last_value => try self.fillLastValue(plan, spec, perm, p_start, p_end, cell),
+            .nth_value => try self.fillNthValue(plan, spec, perm, p_start, p_end, cell),
+            .ntile => try fillNtile(plan, perm, p_start, p_end, cell.column),
+            .percent_rank => try fillPercentRank(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
+            .cume_dist => try fillCumeDist(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
             .sum, .avg, .count, .min, .max => try self.fillAggregate(plan, spec, perm, p_start, p_end, cell),
-            else => return Error.WindowUnsupported,
         }
     }
 
@@ -480,6 +489,44 @@ pub const Window = struct {
                         try copyCellTo(def_col, orig, cell, orig);
                     },
                 }
+            }
+        }
+    }
+
+    fn fillNthValue(
+        self: *Window,
+        plan: CallPlan,
+        spec: ir.WindowSpec,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        cell: OutCell,
+    ) !void {
+        const value_col = self.accumulated[plan.value_col];
+        const view = value_col.view();
+        const n: i64 = plan.nth_offset;
+        var i: usize = p_start;
+        while (i < p_end) : (i += 1) {
+            const orig = perm[i];
+            const fb = computeFrameBounds(spec.frame, i, p_start, p_end);
+            const fs: i64 = @max(fb.start, @as(i64, @intCast(p_start)));
+            const fe: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
+            if (fe < fs) {
+                setNullCell(cell, orig);
+                continue;
+            }
+            const src_idx: ?usize = if (plan.ignore_nulls)
+                nthNonNullInRange(view, perm, @intCast(fs), @intCast(fe), n)
+            else blk: {
+                // 1-based offset → absolute index in perm.
+                const target: i64 = fs + (n - 1);
+                if (target > fe) break :blk null;
+                break :blk @as(?usize, @intCast(target));
+            };
+            if (src_idx) |idx| {
+                try copyCellTo(value_col, perm[idx], cell, orig);
+            } else {
+                setNullCell(cell, orig);
             }
         }
     }
@@ -894,6 +941,16 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
         .first_value, .last_value => {
             plan.value_col = try exprColIdx(c.args[0], schema);
         },
+        .nth_value => {
+            plan.value_col = try exprColIdx(c.args[0], schema);
+            plan.nth_offset = try exprIntLiteral(c.args[1]);
+            if (plan.nth_offset < 1) return Error.WindowUnsupported;
+        },
+        .ntile => {
+            plan.ntile_buckets = try exprIntLiteral(c.args[0]);
+            if (plan.ntile_buckets < 1) return Error.WindowUnsupported;
+        },
+        .cume_dist, .percent_rank => {},
         .sum, .avg, .count, .min, .max => {
             switch (c.args[0]) {
                 .col_ref => |name| {
@@ -907,7 +964,6 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
                 else => return Error.WindowUnsupported,
             }
         },
-        else => return Error.WindowUnsupported,
     }
     return plan;
 }
@@ -926,10 +982,11 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
             }
         },
         .avg => Type{ .double = {} },
+        .ntile => .bigint,
+        .percent_rank, .cume_dist => Type{ .double = {} },
         // String input is supported here — the operator writes into a
         // separate `string_outputs` scratch (see Window.string_outputs).
-        .min, .max, .lag, .lead, .first_value, .last_value => schema[plan.value_col].type,
-        else => Error.WindowUnsupported,
+        .min, .max, .lag, .lead, .first_value, .last_value, .nth_value => schema[plan.value_col].type,
     };
 }
 
@@ -1251,6 +1308,107 @@ fn lastNonNullInRange(view: ColumnView, perm: []const u32, lo: usize, hi: usize)
         if (isValid(view, perm[@intCast(k)])) return @intCast(k);
     }
     return null;
+}
+
+/// Find the Nth (1-based) perm index in [lo, hi] whose value column
+/// is non-null. Used by NTH_VALUE IGNORE NULLS.
+fn nthNonNullInRange(view: ColumnView, perm: []const u32, lo: usize, hi: usize, n: i64) ?usize {
+    var seen: i64 = 0;
+    var k: usize = lo;
+    while (k <= hi) : (k += 1) {
+        if (isValid(view, perm[k])) {
+            seen += 1;
+            if (seen == n) return k;
+        }
+    }
+    return null;
+}
+
+/// NTILE(n) — distribute the ordered partition into `n` buckets that
+/// differ in size by at most one. The first `N % n` buckets are larger
+/// (ceil) and contain rows 0..larger_zone-1; the remaining buckets
+/// have floor(N/n) rows each.
+fn fillNtile(
+    plan: anytype,
+    perm: []const u32,
+    p_start: usize,
+    p_end: usize,
+    out: *ColumnStore,
+) !void {
+    const N: i64 = @intCast(p_end - p_start);
+    const n: i64 = plan.ntile_buckets;
+    if (N == 0) return;
+    const small_size: i64 = @divTrunc(N, n);
+    const large_count: i64 = @mod(N, n);
+    const large_size: i64 = small_size + 1;
+    const large_zone: i64 = large_count * large_size;
+    var i: usize = p_start;
+    while (i < p_end) : (i += 1) {
+        const pos: i64 = @intCast(i - p_start);
+        const bucket: i64 = if (pos < large_zone)
+            @divTrunc(pos, large_size) + 1
+        else
+            // After the large zone, advance through the smaller buckets.
+            large_count + @divTrunc(pos - large_zone, @max(small_size, 1)) + 1;
+        try writeBigint(out, perm[i], bucket);
+    }
+}
+
+/// PERCENT_RANK = (rank - 1) / (partition_size - 1) where `rank` is the
+/// RANK() value (with-gaps). For a partition of size 1, returns 0.
+fn fillPercentRank(
+    cols: []const ColumnStore,
+    order_cols: []const usize,
+    perm: []const u32,
+    p_start: usize,
+    p_end: usize,
+    out: *ColumnStore,
+) !void {
+    if (p_start >= p_end) return;
+    const N: i64 = @intCast(p_end - p_start);
+    if (N == 1) {
+        try writeDouble(out, perm[p_start], 0);
+        return;
+    }
+    const denom: f64 = @floatFromInt(N - 1);
+    var rank_in_partition: i64 = 1;
+    var i: usize = p_start;
+    while (i < p_end) : (i += 1) {
+        if (i != p_start and !orderEquals(cols, order_cols, perm[i - 1], perm[i])) {
+            rank_in_partition = @intCast(i - p_start + 1);
+        }
+        const v: f64 = @as(f64, @floatFromInt(rank_in_partition - 1)) / denom;
+        try writeDouble(out, perm[i], v);
+    }
+}
+
+/// CUME_DIST = (count of rows in partition with order_by ≤ current's
+/// order_by) / partition_size. Peer rows (equal order_by) share the
+/// same cume_dist value.
+fn fillCumeDist(
+    cols: []const ColumnStore,
+    order_cols: []const usize,
+    perm: []const u32,
+    p_start: usize,
+    p_end: usize,
+    out: *ColumnStore,
+) !void {
+    if (p_start >= p_end) return;
+    const N: i64 = @intCast(p_end - p_start);
+    const denom: f64 = @floatFromInt(N);
+    var i: usize = p_start;
+    while (i < p_end) {
+        // Find the run of rows that are peers (equal on order_by).
+        var j: usize = i + 1;
+        while (j < p_end and orderEquals(cols, order_cols, perm[i], perm[j])) : (j += 1) {}
+        // CUME_DIST counts rows-preceding-or-peer = j - p_start (the
+        // count of rows whose order_by ≤ current's).
+        const count: i64 = @intCast(j - p_start);
+        const v: f64 = @as(f64, @floatFromInt(count)) / denom;
+        var k: usize = i;
+        while (k < j) : (k += 1) try writeDouble(out, perm[k], v);
+        i = j;
+    }
 }
 
 /// Compute the [start, end_inclusive] frame indices (in PERMUTATION

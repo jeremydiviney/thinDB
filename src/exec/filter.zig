@@ -38,7 +38,6 @@ pub const Filter = struct {
 
     pub fn create(allocator: Allocator, upstream: Query, expr: PredicateExpr) !Query {
         const schema = upstream.outputSchema();
-        try predicate.validateExpr(expr, schema);
 
         const views = try allocator.alloc(ColumnView, schema.len);
         errdefer allocator.free(views);
@@ -64,9 +63,14 @@ pub const Filter = struct {
             .views = views,
         };
 
+        // Validate in place against the operator-owned predicate so any
+        // integer-literal widening mutations land in self.expr (and
+        // therefore in the eval path).
+        try predicate.validateExpr(&self.expr, schema);
+
         // Push leaves through top-level ANDs down to Scan for row-group prune.
         var up = self.upstream;
-        predicate.pushExprDown(&up, expr) catch |err| switch (err) {
+        predicate.pushExprDown(&up, self.expr) catch |err| switch (err) {
             error.ColumnNotFound => {},
             else => return err,
         };

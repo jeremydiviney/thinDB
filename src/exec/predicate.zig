@@ -60,9 +60,14 @@ pub fn isNotNullExpr(col: []const u8) PredicateExpr {
 /// Type-check a PredicateExpr against a schema. Every leaf must reference an
 /// existing column with a value-tag matching that column's type. String
 /// columns only accept `.eq` and `.neq`.
-pub fn validateExpr(expr: PredicateExpr, schema: []const Column) !void {
-    switch (expr) {
-        .leaf => |p| {
+///
+/// Performs lossless integer-literal widening when the column type is
+/// wider than the literal (e.g. column BIGINT, literal `.int` → mutate to
+/// `.bigint`). Pure narrowing isn't done — we don't want silent data
+/// loss in the predicate semantics.
+pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
+    switch (expr.*) {
+        .leaf => |*p| {
             const col_idx = blk: {
                 for (schema, 0..) |c, i| {
                     if (std.mem.eql(u8, c.name, p.col)) break :blk i;
@@ -70,8 +75,10 @@ pub fn validateExpr(expr: PredicateExpr, schema: []const Column) !void {
                 return Error.ColumnNotFound;
             };
             const col_type = schema[col_idx].type;
-            if (ValueTag.fromType(col_type) != std.meta.activeTag(p.val)) {
-                return Error.PredicateTypeMismatch;
+            const col_tag = ValueTag.fromType(col_type);
+            const val_tag = std.meta.activeTag(p.val);
+            if (col_tag != val_tag) {
+                tryWidenLiteral(&p.val, col_tag) catch return Error.PredicateTypeMismatch;
             }
             if (col_type.isString() and p.op != .eq and p.op != .neq) {
                 return Error.UnsupportedOperatorForType;
@@ -84,12 +91,48 @@ pub fn validateExpr(expr: PredicateExpr, schema: []const Column) !void {
             return Error.ColumnNotFound;
         },
         .@"and" => |children| {
-            for (children) |c| try validateExpr(c, schema);
+            for (children) |*c| try validateExpr(@constCast(c), schema);
         },
         .@"or" => |children| {
-            for (children) |c| try validateExpr(c, schema);
+            for (children) |*c| try validateExpr(@constCast(c), schema);
         },
-        .not => |child| try validateExpr(child.*, schema),
+        .not => |child| try validateExpr(@constCast(child), schema),
+    }
+}
+
+/// Lossless widening for an integer / float literal to match a wider
+/// column type. Errors when the source literal can't be losslessly
+/// represented in the target type (caller treats that as a type
+/// mismatch).
+fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
+    switch (val.*) {
+        .tinyint => |v| switch (target) {
+            .smallint => val.* = .{ .smallint = v },
+            .int => val.* = .{ .int = v },
+            .bigint => val.* = .{ .bigint = v },
+            .largeint => val.* = .{ .largeint = v },
+            else => return error.NoWidening,
+        },
+        .smallint => |v| switch (target) {
+            .int => val.* = .{ .int = v },
+            .bigint => val.* = .{ .bigint = v },
+            .largeint => val.* = .{ .largeint = v },
+            else => return error.NoWidening,
+        },
+        .int => |v| switch (target) {
+            .bigint => val.* = .{ .bigint = v },
+            .largeint => val.* = .{ .largeint = v },
+            else => return error.NoWidening,
+        },
+        .bigint => |v| switch (target) {
+            .largeint => val.* = .{ .largeint = v },
+            else => return error.NoWidening,
+        },
+        .float => |v| switch (target) {
+            .double => val.* = .{ .double = v },
+            else => return error.NoWidening,
+        },
+        else => return error.NoWidening,
     }
 }
 

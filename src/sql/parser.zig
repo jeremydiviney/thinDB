@@ -263,6 +263,18 @@ pub const Parser = struct {
             try parse_window.parseWindowClause(self);
         }
 
+        // Optional QUALIFY <bool_expr> — Snowflake/BigQuery/DuckDB-style
+        // post-window filter. Per the SQL extension, comes after WINDOW
+        // and before ORDER BY. The predicate may reference window-output
+        // aliases (since it's evaluated AFTER the Window step in the
+        // pipeline); the engine validates column refs at compile time
+        // against the post-window schema.
+        var pending_qualify: ?PredicateExpr = null;
+        if (self.cur.tag == .kw_qualify) {
+            try self.advance();
+            pending_qualify = try self.parseBoolExpr();
+        }
+
         // Decide between a Project, a Group-by, or a Group-by + Project
         // based on the projection list shape.
         const has_agg = blk: {
@@ -389,6 +401,13 @@ pub const Parser = struct {
                 if (try buildWindowOp(self.arena, proj, root, &self.named_windows)) |win| {
                     root = win;
                 }
+            }
+            if (pending_qualify) |pred| {
+                // QUALIFY without any window in the SELECT is allowed
+                // by most dialects (acts as a HAVING), but reject for
+                // now — encourage users to use WHERE instead.
+                if (!has_window) return ParseError.SqlInvalidProjection;
+                root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
             }
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });

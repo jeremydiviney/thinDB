@@ -499,6 +499,125 @@ test "window: FIRST_VALUE IGNORE NULLS finds first non-null in partition" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 30, 30, 30, 30 }, vals);
 }
 
+test "window: NTILE(4) divides 10 rows into 4 buckets of 3,3,2,2" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY)",
+    );
+    defer q1.deinit();
+    _ = try q1.next();
+    var q2 = try runSql(allocator, db,
+        "INSERT INTO t VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)",
+    );
+    defer q2.deinit();
+    _ = try q2.next();
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT id, ntile(4) OVER (ORDER BY id ASC) AS bucket FROM t ORDER BY id ASC",
+    );
+    defer q.deinit();
+    const buckets = try collectRows(i64, allocator, &q, 1);
+    defer allocator.free(buckets);
+    // 10 rows, 4 buckets. N=10, n=4 → 10/4 = 2 small, 10%4 = 2 large.
+    // Buckets sized: 3, 3, 2, 2.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 1, 1, 2, 2, 2, 3, 3, 4, 4 }, buckets);
+}
+
+test "window: PERCENT_RANK + CUME_DIST on ties" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT)",
+    );
+    defer q1.deinit();
+    _ = try q1.next();
+    var q2 = try runSql(allocator, db,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 20), (4, 30)",
+    );
+    defer q2.deinit();
+    _ = try q2.next();
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    // Sorted by score: 10, 20, 20, 30. Ranks (with-gaps): 1, 2, 2, 4.
+    // PERCENT_RANK = (rank - 1) / (N - 1):
+    //   id=1: 0/3 = 0.0
+    //   id=2: 1/3 ≈ 0.333
+    //   id=3: 1/3 ≈ 0.333  (peer)
+    //   id=4: 3/3 = 1.0
+    // CUME_DIST = rows_<=_current / N:
+    //   id=1: 1/4 = 0.25
+    //   id=2: 3/4 = 0.75 (peer)
+    //   id=3: 3/4 = 0.75
+    //   id=4: 4/4 = 1.0
+    var qa = try runSql(allocator, db,
+        "SELECT id, percent_rank() OVER (ORDER BY score ASC) AS pr FROM t ORDER BY id ASC",
+    );
+    defer qa.deinit();
+    const pr = try collectRows(f64, allocator, &qa, 1);
+    defer allocator.free(pr);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), pr[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0 / 3.0), pr[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0 / 3.0), pr[2], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), pr[3], 1e-9);
+
+    var qb = try runSql(allocator, db,
+        "SELECT id, cume_dist() OVER (ORDER BY score ASC) AS cd FROM t ORDER BY id ASC",
+    );
+    defer qb.deinit();
+    const cd = try collectRows(f64, allocator, &qb, 1);
+    defer allocator.free(cd);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), cd[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), cd[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), cd[2], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), cd[3], 1e-9);
+}
+
+test "window: NTH_VALUE returns NULL when n exceeds frame size, value otherwise" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    // NTH_VALUE(qty, 2) OVER (PARTITION BY grp ORDER BY id) with default
+    // frame (UNBOUNDED PRECEDING TO CURRENT ROW). Row 1 of each partition
+    // has only 1 row in its frame → NULL. Row 2+ sees the second value.
+    var q = try runSql(allocator, db,
+        "SELECT id, nth_value(qty, 2) OVER (PARTITION BY grp ORDER BY id ASC) AS second FROM t ORDER BY id ASC",
+    );
+    defer q.deinit();
+    var qv = try runSql(allocator, db,
+        "SELECT id, nth_value(qty, 2) OVER (PARTITION BY grp ORDER BY id ASC) AS second FROM t ORDER BY id ASC",
+    );
+    defer qv.deinit();
+    const valids = try collectValidity(allocator, &q, 1);
+    defer allocator.free(valids);
+    const vals = try collectRows(i64, allocator, &qv, 1);
+    defer allocator.free(vals);
+    // grp=1: id1 → NULL, id2 → 20 (second row's qty), id3 → 20
+    // grp=2: id4 → NULL, id5 → 200
+    try std.testing.expectEqualSlices(bool, &[_]bool{ false, true, true, false, true }, valids);
+    try std.testing.expectEqual(@as(i64, 20), vals[1]);
+    try std.testing.expectEqual(@as(i64, 20), vals[2]);
+    try std.testing.expectEqual(@as(i64, 200), vals[4]);
+}
+
 test "window: LAG on string column round-trips bytes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -568,6 +687,32 @@ test "window: MIN over string column finds lexicographically smallest" {
     try std.testing.expectEqualStrings("alpha", batch.values[1].data.string.rowBytes(2));
     try std.testing.expectEqualStrings("beta", batch.values[1].data.string.rowBytes(3));
     try std.testing.expectEqualStrings("beta", batch.values[1].data.string.rowBytes(4));
+}
+
+test "window: QUALIFY filters on window output alias" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    // Per-partition rank by qty DESC, keep only the top row of each.
+    var q = try runSql(allocator, db,
+        \\SELECT id, rank() OVER (PARTITION BY grp ORDER BY qty DESC) AS rk
+        \\FROM t
+        \\QUALIFY rk = 1
+        \\ORDER BY id ASC
+    );
+    defer q.deinit();
+    var rows: std.ArrayList(i64) = .empty;
+    defer rows.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try rows.append(allocator, v);
+    }
+    // grp=1: top qty is 30 → id=3.  grp=2: top is 200 → id=5.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 5 }, rows.items);
 }
 
 test "window: named window via WINDOW clause" {
