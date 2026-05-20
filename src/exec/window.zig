@@ -108,6 +108,9 @@ pub const Window = struct {
         default_col: usize = std.math.maxInt(usize),
         /// COUNT(*) accepts no arg-column; tracked via this flag.
         count_star: bool = false,
+        /// Honor `IGNORE NULLS` on null-skipping functions (LAG, LEAD,
+        /// FIRST_VALUE, LAST_VALUE). Forwarded from the IR.
+        ignore_nulls: bool = false,
     };
 
     const DefaultKind = enum { none, literal, col_ref };
@@ -403,7 +406,7 @@ pub const Window = struct {
             .dense_rank => try fillRank(self.accumulated, si.order_cols, perm, p_start, p_end, out, true),
             .lag => try self.fillLagLead(plan, perm, p_start, p_end, out, true),
             .lead => try self.fillLagLead(plan, perm, p_start, p_end, out, false),
-            .first_value => try fillFirstValue(self.accumulated[plan.value_col], perm, p_start, p_end, out),
+            .first_value => try fillFirstValue(self.accumulated[plan.value_col], perm, p_start, p_end, out, plan.ignore_nulls),
             .last_value => try self.fillLastValue(plan, spec, perm, p_start, p_end, out),
             .sum, .avg, .count, .min, .max => try self.fillAggregate(plan, spec, perm, p_start, p_end, out),
             else => return Error.WindowUnsupported,
@@ -421,16 +424,16 @@ pub const Window = struct {
     ) !void {
         const offset: i64 = plan.offset;
         const value_col = self.accumulated[plan.value_col];
+        const view = value_col.view();
         var i: usize = p_start;
         while (i < p_end) : (i += 1) {
             const orig = perm[i];
-            const target_signed: i64 = if (is_lag)
-                @as(i64, @intCast(i)) - offset
+            const target_idx: ?usize = if (plan.ignore_nulls)
+                findNthNonNull(view, perm, i, p_start, p_end, offset, is_lag)
             else
-                @as(i64, @intCast(i)) + offset;
-            if (target_signed >= @as(i64, @intCast(p_start)) and target_signed < @as(i64, @intCast(p_end))) {
-                const src_idx = perm[@intCast(target_signed)];
-                try copyCell(value_col, src_idx, out, orig);
+                directOffset(i, p_start, p_end, offset, is_lag);
+            if (target_idx) |t| {
+                try copyCell(value_col, perm[t], out, orig);
             } else {
                 switch (plan.default_kind) {
                     .none => setNull(out, orig),
@@ -454,17 +457,25 @@ pub const Window = struct {
         out: *ColumnStore,
     ) !void {
         const value_col = self.accumulated[plan.value_col];
+        const view = value_col.view();
         var i: usize = p_start;
         while (i < p_end) : (i += 1) {
             const orig = perm[i];
             const fb = computeFrameBounds(spec.frame, i, p_start, p_end);
-            // LAST_VALUE = value at frame end (inclusive).
-            if (fb.end_inclusive < @as(i64, @intCast(p_start))) {
+            const frame_end_clamped: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
+            const frame_start_clamped: i64 = @max(fb.start, @as(i64, @intCast(p_start)));
+            if (frame_end_clamped < frame_start_clamped) {
                 setNull(out, orig);
+                continue;
+            }
+            const src_idx: ?usize = if (plan.ignore_nulls)
+                lastNonNullInRange(view, perm, @intCast(frame_start_clamped), @intCast(frame_end_clamped))
+            else
+                @as(usize, @intCast(frame_end_clamped));
+            if (src_idx) |idx| {
+                try copyCell(value_col, perm[idx], out, orig);
             } else {
-                const idx_in_perm = @as(usize, @intCast(@min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)))));
-                const src = perm[idx_in_perm];
-                try copyCell(value_col, src, out, orig);
+                setNull(out, orig);
             }
         }
     }
@@ -478,24 +489,202 @@ pub const Window = struct {
         p_end: usize,
         out: *ColumnStore,
     ) !void {
+        // Fast-path the two most common frame shapes:
+        //   - Whole-partition (UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING):
+        //     one aggregate, broadcast to every row in the partition.
+        //   - Prefix / running (UNBOUNDED PRECEDING TO CURRENT ROW):
+        //     single forward sweep maintaining a running accumulator.
+        // Other shapes (`N PRECEDING`, sliding) fall back to the naive
+        // per-row scan in `evalAggOverFrame`.
+        const shape = classifyFrame(spec.frame);
+        switch (shape) {
+            .whole_partition => return self.fillAggregateWholePartition(plan, perm, p_start, p_end, out),
+            .prefix_to_current => return self.fillAggregatePrefix(plan, perm, p_start, p_end, out),
+            .general => {},
+        }
+
         var i: usize = p_start;
         while (i < p_end) : (i += 1) {
             const orig = perm[i];
             const fb = computeFrameBounds(spec.frame, i, p_start, p_end);
-            // Clamp to partition bounds.
             const lo_i: i64 = @max(fb.start, @as(i64, @intCast(p_start)));
             const hi_i: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
             if (lo_i > hi_i) {
-                // Empty frame.
                 switch (plan.func) {
                     .count => try writeBigint(out, orig, 0),
                     else => setNull(out, orig),
                 }
                 continue;
             }
-            const lo: usize = @intCast(lo_i);
-            const hi: usize = @intCast(hi_i);
-            try self.evalAggOverFrame(plan, perm, lo, hi, out, orig);
+            try self.evalAggOverFrame(plan, perm, @intCast(lo_i), @intCast(hi_i), out, orig);
+        }
+    }
+
+    /// Whole-partition aggregate fast path: compute once, broadcast to
+    /// every row's original position. Reduces aggregate cost from
+    /// O(N×N) to O(N) per partition.
+    fn fillAggregateWholePartition(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+    ) !void {
+        if (p_start >= p_end) return;
+        // Compute the aggregate over the entire partition once.
+        try self.evalAggOverFrame(plan, perm, p_start, p_end - 1, out, perm[p_start]);
+        // Mirror the value of perm[p_start] (row already written) into
+        // every other row in the partition.
+        var i: usize = p_start + 1;
+        while (i < p_end) : (i += 1) {
+            try copyCell(out.*, perm[p_start], out, perm[i]);
+        }
+    }
+
+    /// Prefix / running aggregate fast path: single forward sweep,
+    /// maintaining a running accumulator. Covers the SQL-default frame
+    /// with ORDER BY (`UNBOUNDED PRECEDING TO CURRENT ROW`).
+    fn fillAggregatePrefix(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+    ) !void {
+        if (p_start >= p_end) return;
+        switch (plan.func) {
+            .count => try self.prefixCount(plan, perm, p_start, p_end, out),
+            .sum => try self.prefixSum(plan, perm, p_start, p_end, out),
+            .avg => try self.prefixAvg(plan, perm, p_start, p_end, out),
+            // MIN/MAX prefix is O(N) too (one running comparison per row),
+            // implemented inline here.
+            .min, .max => try self.prefixMinMax(plan, perm, p_start, p_end, out, plan.func == .min),
+            else => unreachable,
+        }
+    }
+
+    fn prefixCount(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+    ) !void {
+        var running: i64 = 0;
+        var i: usize = p_start;
+        if (plan.count_star) {
+            while (i < p_end) : (i += 1) {
+                running += 1;
+                try writeBigint(out, perm[i], running);
+            }
+            return;
+        }
+        const view = self.accumulated[plan.value_col].view();
+        while (i < p_end) : (i += 1) {
+            if (isValid(view, perm[i])) running += 1;
+            try writeBigint(out, perm[i], running);
+        }
+    }
+
+    fn prefixSum(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+    ) !void {
+        const col = self.accumulated[plan.value_col];
+        const view = col.view();
+        switch (col.data) {
+            .int, .bigint, .tinyint, .smallint, .largeint => {
+                var sum: i128 = 0;
+                var saw_any = false;
+                var i: usize = p_start;
+                while (i < p_end) : (i += 1) {
+                    if (isValid(view, perm[i])) {
+                        sum += readIntAsI128(col, perm[i]);
+                        saw_any = true;
+                    }
+                    if (saw_any) {
+                        switch (out.data) {
+                            .bigint => try writeBigint(out, perm[i], @intCast(sum)),
+                            .largeint => try writeLargeint(out, perm[i], sum),
+                            else => return Error.WindowUnsupported,
+                        }
+                    } else setNull(out, perm[i]);
+                }
+            },
+            .float, .double => {
+                var sum: f64 = 0;
+                var saw_any = false;
+                var i: usize = p_start;
+                while (i < p_end) : (i += 1) {
+                    if (isValid(view, perm[i])) {
+                        sum += readFloatAsF64(col, perm[i]);
+                        saw_any = true;
+                    }
+                    if (saw_any) try writeDouble(out, perm[i], sum) else setNull(out, perm[i]);
+                }
+            },
+            else => return Error.WindowUnsupported,
+        }
+    }
+
+    fn prefixAvg(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+    ) !void {
+        const col = self.accumulated[plan.value_col];
+        const view = col.view();
+        var sum: f64 = 0;
+        var n: i64 = 0;
+        var i: usize = p_start;
+        while (i < p_end) : (i += 1) {
+            if (isValid(view, perm[i])) {
+                sum += readNumericAsF64(col, perm[i]);
+                n += 1;
+            }
+            if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], sum / @as(f64, @floatFromInt(n)));
+        }
+    }
+
+    fn prefixMinMax(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out: *ColumnStore,
+        is_min: bool,
+    ) !void {
+        const col = self.accumulated[plan.value_col];
+        const view = col.view();
+        var best_idx: i64 = -1;
+        var i: usize = p_start;
+        while (i < p_end) : (i += 1) {
+            const r = perm[i];
+            if (isValid(view, r)) {
+                if (best_idx < 0) {
+                    best_idx = @intCast(r);
+                } else {
+                    const ord = transform.compareInColumn(col, @intCast(best_idx), r);
+                    const replace = if (is_min) (ord == .gt) else (ord == .lt);
+                    if (replace) best_idx = @intCast(r);
+                }
+            }
+            if (best_idx < 0) {
+                setNull(out, r);
+            } else {
+                try copyCell(col, @intCast(best_idx), out, r);
+            }
         }
     }
 
@@ -651,6 +840,7 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
     var plan: Window.CallPlan = .{
         .spec_idx = c.spec_idx,
         .func = c.func,
+        .ignore_nulls = c.ignore_nulls,
     };
     switch (c.func) {
         .row_number, .rank, .dense_rank => {},
@@ -870,13 +1060,80 @@ fn fillFirstValue(
     p_start: usize,
     p_end: usize,
     out: *ColumnStore,
+    ignore_nulls: bool,
 ) !void {
     if (p_start >= p_end) return;
-    const first_src = perm[p_start];
+    const view = value_col.view();
+    const first_src_idx: ?usize = if (ignore_nulls)
+        firstNonNullInRange(view, perm, p_start, p_end - 1)
+    else
+        @as(?usize, p_start);
     var i: usize = p_start;
     while (i < p_end) : (i += 1) {
-        try copyCell(value_col, first_src, out, perm[i]);
+        if (first_src_idx) |idx| {
+            try copyCell(value_col, perm[idx], out, perm[i]);
+        } else {
+            setNull(out, perm[i]);
+        }
     }
+}
+
+/// Direct offset for non-IGNORE-NULLS LAG/LEAD: just `cur ± offset`,
+/// clamped to partition bounds (returns null if out of range).
+fn directOffset(cur: usize, p_start: usize, p_end: usize, offset: i64, is_lag: bool) ?usize {
+    const target: i64 = if (is_lag)
+        @as(i64, @intCast(cur)) - offset
+    else
+        @as(i64, @intCast(cur)) + offset;
+    if (target < @as(i64, @intCast(p_start))) return null;
+    if (target >= @as(i64, @intCast(p_end))) return null;
+    return @intCast(target);
+}
+
+/// LAG/LEAD with IGNORE NULLS: walk backward (LAG) or forward (LEAD)
+/// through the partition, counting only rows where the value column is
+/// non-null. Return the perm index of the Nth non-null hit, or null
+/// when the partition runs out before reaching it.
+fn findNthNonNull(
+    view: ColumnView,
+    perm: []const u32,
+    cur: usize,
+    p_start: usize,
+    p_end: usize,
+    offset: i64,
+    is_lag: bool,
+) ?usize {
+    var seen: i64 = 0;
+    var k: i64 = @intCast(cur);
+    while (true) {
+        k += if (is_lag) -1 else 1;
+        if (k < @as(i64, @intCast(p_start))) return null;
+        if (k >= @as(i64, @intCast(p_end))) return null;
+        if (isValid(view, perm[@intCast(k)])) {
+            seen += 1;
+            if (seen == offset) return @intCast(k);
+        }
+    }
+}
+
+/// First perm index in [lo, hi] (inclusive) whose value column is
+/// non-null. Used by FIRST_VALUE IGNORE NULLS.
+fn firstNonNullInRange(view: ColumnView, perm: []const u32, lo: usize, hi: usize) ?usize {
+    var k: usize = lo;
+    while (k <= hi) : (k += 1) {
+        if (isValid(view, perm[k])) return k;
+    }
+    return null;
+}
+
+/// Last perm index in [lo, hi] (inclusive) whose value column is
+/// non-null. Used by LAST_VALUE IGNORE NULLS.
+fn lastNonNullInRange(view: ColumnView, perm: []const u32, lo: usize, hi: usize) ?usize {
+    var k: i64 = @intCast(hi);
+    while (k >= @as(i64, @intCast(lo))) : (k -= 1) {
+        if (isValid(view, perm[@intCast(k)])) return @intCast(k);
+    }
+    return null;
 }
 
 /// Compute the [start, end_inclusive] frame indices (in PERMUTATION
@@ -895,6 +1152,29 @@ fn computeFrameBounds(frame: ir.Frame, cur: usize, p_start: usize, p_end: usize)
     const start = boundToIndex(frame.start, c, ps, pe_inclusive, true);
     const end = boundToIndex(frame.end, c, ps, pe_inclusive, false);
     return .{ .start = start, .end_inclusive = end };
+}
+
+/// Classify the frame for aggregate fast-path selection.
+const FrameShape = enum {
+    /// UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING — single value per
+    /// partition, broadcast to every row.
+    whole_partition,
+    /// UNBOUNDED PRECEDING TO CURRENT ROW — running aggregate, one
+    /// forward sweep.
+    prefix_to_current,
+    /// Anything else (N PRECEDING / N FOLLOWING / sliding) falls back
+    /// to the naive per-row scan.
+    general,
+};
+
+fn classifyFrame(frame: ir.Frame) FrameShape {
+    const start_is_unbounded = std.meta.activeTag(frame.start) == .unbounded_preceding;
+    if (!start_is_unbounded) return .general;
+    return switch (frame.end) {
+        .unbounded_following => .whole_partition,
+        .current_row => .prefix_to_current,
+        else => .general,
+    };
 }
 
 fn boundToIndex(b: ir.FrameBound, cur: i64, p_start: i64, p_end_inclusive: i64, is_start: bool) i64 {

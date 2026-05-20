@@ -422,6 +422,83 @@ test "window: two calls sharing the same spec collapse to one sort" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 30, 60, 100, 300 }, rss);
 }
 
+test "window: LAG IGNORE NULLS skips null source rows when computing offset" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, qty BIGINT)",
+    );
+    defer q1.deinit();
+    _ = try q1.next();
+    var q2 = try runSql(allocator, db,
+        "INSERT INTO t VALUES (1, 10), (2, NULL), (3, NULL), (4, 40), (5, 50)",
+    );
+    defer q2.deinit();
+    _ = try q2.next();
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT id, lag(qty) IGNORE NULLS OVER (ORDER BY id ASC) AS prev FROM t ORDER BY id ASC",
+    );
+    defer q.deinit();
+    var qv = try runSql(allocator, db,
+        "SELECT id, lag(qty) IGNORE NULLS OVER (ORDER BY id ASC) AS prev FROM t ORDER BY id ASC",
+    );
+    defer qv.deinit();
+    const valids = try collectValidity(allocator, &q, 1);
+    defer allocator.free(valids);
+    const vals = try collectRows(i64, allocator, &qv, 1);
+    defer allocator.free(vals);
+
+    // id=1: no prior → NULL
+    // id=2: prior non-null is id=1 → 10
+    // id=3: prior non-null is id=1 → 10 (NULL at id=2 skipped)
+    // id=4: prior non-null is id=1 → 10
+    // id=5: prior non-null is id=4 → 40
+    try std.testing.expectEqualSlices(bool, &[_]bool{ false, true, true, true, true }, valids);
+    try std.testing.expectEqual(@as(i64, 10), vals[1]);
+    try std.testing.expectEqual(@as(i64, 10), vals[2]);
+    try std.testing.expectEqual(@as(i64, 10), vals[3]);
+    try std.testing.expectEqual(@as(i64, 40), vals[4]);
+}
+
+test "window: FIRST_VALUE IGNORE NULLS finds first non-null in partition" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, qty BIGINT)",
+    );
+    defer q1.deinit();
+    _ = try q1.next();
+    var q2 = try runSql(allocator, db,
+        "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, 30), (4, 40)",
+    );
+    defer q2.deinit();
+    _ = try q2.next();
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT id, first_value(qty) IGNORE NULLS OVER (ORDER BY id ASC) AS fv FROM t ORDER BY id ASC",
+    );
+    defer q.deinit();
+    const vals = try collectRows(i64, allocator, &q, 1);
+    defer allocator.free(vals);
+    // All rows see the first non-null in the partition: 30.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 30, 30, 30, 30 }, vals);
+}
+
 test "window: named window via WINDOW clause" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

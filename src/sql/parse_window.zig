@@ -65,7 +65,8 @@ pub fn validateWindowCall(
             if (args.len != 0) return error.InvalidShape;
             if (ignore_nulls) return error.InvalidShape;
         },
-        // Value access.
+        // Value access. IGNORE NULLS is meaningful and honored by the
+        // operator.
         .lag, .lead => {
             if (args.len < 1 or args.len > 3) return error.InvalidShape;
         },
