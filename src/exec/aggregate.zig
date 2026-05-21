@@ -86,6 +86,10 @@ const AccState = union(enum) {
     /// Separate i128 min/max variants for LARGEINT inputs (don't fit in i64).
     min_large: ?i128,
     max_large: ?i128,
+    /// MIN/MAX over string-family columns. Holds the running extreme as
+    /// arena-dup'd bytes (the view's bytes are transient per batch).
+    min_str: ?[]const u8,
+    max_str: ?[]const u8,
     avg: AvgAcc,
     /// Welford's online algorithm: numerically stable variance/stddev.
     /// Covers stddev_pop, stddev_samp, var_pop, var_samp.
@@ -371,12 +375,16 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
             .{ .sum_int = 0 },
         .min => if (in != null and in.?.isFloat())
             .{ .min_float = null }
+        else if (in != null and in.?.isString())
+            .{ .min_str = null }
         else if (in != null and (in.? == .largeint or in.? == .decimal128))
             .{ .min_large = null }
         else
             .{ .min_int = null },
         .max => if (in != null and in.?.isFloat())
             .{ .max_float = null }
+        else if (in != null and in.?.isString())
+            .{ .max_str = null }
         else if (in != null and (in.? == .largeint or in.? == .decimal128))
             .{ .max_large = null }
         else
@@ -417,7 +425,7 @@ fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams) !void {
         },
         .min, .max => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double or t == .date or t == .datetime)) {
+            if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double or t == .date or t == .datetime or t.isString())) {
                 return Error.AggregateUnsupportedType;
             }
         },
@@ -569,6 +577,16 @@ fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.min_float == null or v < s.min_float.?) s.min_float = v;
                 },
+                .varchar, .string, .char => {
+                    var r: u32 = row_start;
+                    while (r < row_end) : (r += 1) {
+                        if (!view.isValid(r)) continue;
+                        const bytes = stringRowBytes(view, r);
+                        if (s.min_str == null or std.mem.order(u8, bytes, s.min_str.?) == .lt) {
+                            s.min_str = try aa.dupe(u8, bytes);
+                        }
+                    }
+                },
                 else => unreachable,
             }
         },
@@ -620,6 +638,16 @@ fn updateState(
                 .double => |s_d| for (s_d[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     if (s.max_float == null or v > s.max_float.?) s.max_float = v;
+                },
+                .varchar, .string, .char => {
+                    var r: u32 = row_start;
+                    while (r < row_end) : (r += 1) {
+                        if (!view.isValid(r)) continue;
+                        const bytes = stringRowBytes(view, r);
+                        if (s.max_str == null or std.mem.order(u8, bytes, s.max_str.?) == .gt) {
+                            s.max_str = try aa.dupe(u8, bytes);
+                        }
+                    }
                 },
                 else => unreachable,
             }
@@ -760,6 +788,17 @@ fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u
     }
 }
 
+/// Bytes of a string-family value at `row`. Caller must ensure the view
+/// is varchar/string/char.
+fn stringRowBytes(view: ColumnView, row: u32) []const u8 {
+    return switch (view.data) {
+        .varchar => |sv| sv.rowBytes(row),
+        .string => |sv| sv.rowBytes(row),
+        .char => |sv| sv.rowBytes(row),
+        else => unreachable,
+    };
+}
+
 /// Encode a single value as bytes for hashing (count_distinct). Mirrors
 /// the layout in buildCompoundGroupKey but for one row, one column.
 fn encodeOneValue(aa: Allocator, out: *std.ArrayList(u8), view: ColumnView, row: u32) !void {
@@ -877,6 +916,18 @@ fn appendAccToColumn(
                 switch (out_type) {
                     .float => try col.data.float.append(allocator, @floatCast(v)),
                     .double => try col.data.double.append(allocator, v),
+                    else => unreachable,
+                }
+            },
+            .min_str, .max_str => {
+                // Empty-set MIN/MAX over strings yields "" (we don't surface
+                // aggregate-result NULLs yet), matching the numeric path's
+                // 0-default.
+                const v: []const u8 = if (func == .min) (state.min_str orelse "") else (state.max_str orelse "");
+                switch (out_type) {
+                    .varchar => try col.data.varchar.appendValue(allocator, v),
+                    .string => try col.data.string.appendValue(allocator, v),
+                    .char => try col.data.char.appendValue(allocator, v),
                     else => unreachable,
                 }
             },

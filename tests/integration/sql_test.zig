@@ -268,6 +268,62 @@ test "sql: global aggregate (no GROUP BY) — count(*), avg, min, max" {
     try std.testing.expectEqual(@as(i32, 50), b.values[3].data.int[0]);
 }
 
+test "sql: MIN/MAX on string column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // tags are a,b,a,b,c → lexicographic min "a", max "c".
+    var q = try runSql(allocator, db, "SELECT min(tag) AS lo, max(tag) AS hi FROM t");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expectEqualStrings("a", b.values[0].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("c", b.values[1].data.string.rowBytes(0));
+}
+
+test "sql: MIN/MAX on string column grouped" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // GROUP BY k: k=100 → tags {a,b} → min a/max b; k=200 → {a,b}; k=300 → {c}.
+    var q = try runSql(allocator, db,
+        \\SELECT k, min(tag) AS lo, max(tag) AS hi FROM t GROUP BY k ORDER BY k ASC
+    );
+    defer q.deinit();
+    var los: std.ArrayList([]const u8) = .empty;
+    var his: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (los.items) |s| allocator.free(s);
+        for (his.items) |s| allocator.free(s);
+        los.deinit(allocator);
+        his.deinit(allocator);
+    }
+    while (try q.next()) |bb| {
+        var r: usize = 0;
+        while (r < bb.row_count) : (r += 1) {
+            try los.append(allocator, try allocator.dupe(u8, bb.values[1].data.string.rowBytes(@intCast(r))));
+            try his.append(allocator, try allocator.dupe(u8, bb.values[2].data.string.rowBytes(@intCast(r))));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), los.items.len);
+    try std.testing.expectEqualStrings("a", los.items[0]);
+    try std.testing.expectEqualStrings("b", his.items[0]);
+    try std.testing.expectEqualStrings("a", los.items[1]);
+    try std.testing.expectEqualStrings("b", his.items[1]);
+    try std.testing.expectEqualStrings("c", los.items[2]);
+    try std.testing.expectEqualStrings("c", his.items[2]);
+}
+
 test "sql: IS NULL / IS NOT NULL on nullable column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
