@@ -113,4 +113,5 @@ test {
     _ = @import("net/sql_text.zig");
     _ = @import("net/random_seed.zig");
     _ = @import("util/snapshot.zig");
+    _ = @import("util/cardinality.zig");
 }
