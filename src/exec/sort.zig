@@ -158,6 +158,9 @@ pub const Sort = struct {
                 .descs = self.sort_desc,
                 .global = true,
             },
+            // Sorting reorders rows but doesn't change any column's values,
+            // so per-column distinct bounds carry through unchanged.
+            .column_cards = up.column_cards,
         };
     }
 

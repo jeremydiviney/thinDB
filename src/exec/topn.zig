@@ -175,6 +175,9 @@ pub const TopN = struct {
                 .descs = self.sort_desc,
                 .global = true,
             },
+            // Keeping a subset of rows can only shrink distinct counts, so
+            // the input's per-column bounds stay valid.
+            .column_cards = up.column_cards,
         };
     }
 

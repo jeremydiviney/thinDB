@@ -27,6 +27,9 @@ pub const Project = struct {
     output_schema: []Column,
     column_map: []usize, // output_idx → upstream_idx
     views: []ColumnView,
+    /// Upstream per-column cardinality bounds remapped to the projected
+    /// columns. Empty when the upstream has none. Cached at create.
+    cached_cards: []const exec.ColCard = &.{},
 
     pub fn create(allocator: Allocator, upstream: Query, names: []const []const u8) !Query {
         const up_schema = upstream.outputSchema();
@@ -43,6 +46,15 @@ pub const Project = struct {
             out_schema[i] = up_schema[idx];
         }
 
+        // Remap per-column cardinality bounds to the projected columns.
+        const up_cards = upstream.stats().column_cards;
+        const cached_cards: []const exec.ColCard = if (up_cards.len == 0) &.{} else blk: {
+            const cc = try allocator.alloc(exec.ColCard, names.len);
+            for (column_map, cc) |src, *out| out.* = if (src < up_cards.len) up_cards[src] else .unknown;
+            break :blk cc;
+        };
+        errdefer if (cached_cards.len > 0) allocator.free(cached_cards);
+
         const self = try allocator.create(Project);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -51,6 +63,7 @@ pub const Project = struct {
             .output_schema = out_schema,
             .column_map = column_map,
             .views = views,
+            .cached_cards = cached_cards,
         };
         return makeQuery(allocator, self);
     }
@@ -61,6 +74,7 @@ pub const Project = struct {
         self.allocator.free(self.output_schema);
         self.allocator.free(self.column_map);
         self.allocator.free(self.views);
+        if (self.cached_cards.len > 0) self.allocator.free(@constCast(self.cached_cards));
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -97,6 +111,7 @@ pub const Project = struct {
                 .descs = if (up.sort_state.descs.len == 0) &.{} else up.sort_state.descs[0..kept_prefix_len],
                 .global = up.sort_state.global,
             },
+            .column_cards = self.cached_cards,
         };
     }
 
@@ -191,6 +206,7 @@ pub const Limit = struct {
         return .{
             .upper_rows = @min(@as(u64, self.remaining), up.upper_rows),
             .sort_state = up.sort_state,
+            .column_cards = up.column_cards,
         };
     }
 
