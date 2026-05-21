@@ -357,6 +357,28 @@ test "sql: GROUP BY multiple distinct arithmetic expressions" {
     try std.testing.expectEqual(@as(usize, 3), rows);
 }
 
+test "sql: GROUP BY an aliased plain column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // GROUP BY kk (alias of k) groups on the underlying column k.
+    var q = try runSql(allocator, db,
+        \\SELECT k AS kk, count(*) AS n FROM t GROUP BY kk ORDER BY k ASC
+    );
+    defer q.deinit();
+    var counts: std.ArrayList(i64) = .empty;
+    defer counts.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try counts.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2, 1 }, counts.items);
+}
+
 test "sql: non-grouped scalar expr alongside aggregate is still rejected" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

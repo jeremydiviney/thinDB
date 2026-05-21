@@ -473,7 +473,14 @@ pub const Parser = struct {
             // a Project on top reorders/keeps only the SELECT items.
             if (!projMatchesGroupByOrder(proj, group_cols)) {
                 const out_names = try self.arena.alloc([]const u8, proj.len);
-                for (proj, out_names) |p, *o| o.* = p.name;
+                for (proj, out_names) |p, *o| switch (p.kind) {
+                    // A plain column is present in the grouped output under
+                    // its real column name (group keys group on the column,
+                    // not any SELECT alias). Computed exprs and aggregates
+                    // surface under their derived/alias name.
+                    .col => |c| o.* = c,
+                    else => o.* = p.name,
+                };
                 root = try self.allocOp(.{ .select = .{ .columns = out_names, .upstream = root } });
             }
         } else {
@@ -1664,7 +1671,15 @@ pub const Parser = struct {
         cols: *std.ArrayList([]const u8),
     ) ParseError!void {
         switch (proj[idx].kind) {
-            .col, .expr => {
+            // A plain column groups on its underlying column name (the
+            // upstream schema has that, not any SELECT alias). A computed
+            // expression is hoisted into the pre-aggregate Compute under
+            // the projection's name, which the GroupBy then groups on.
+            .col => |c| {
+                gk[idx] = true;
+                try cols.append(self.arena, c);
+            },
+            .expr => {
                 gk[idx] = true;
                 try cols.append(self.arena, proj[idx].name);
             },
