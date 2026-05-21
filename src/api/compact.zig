@@ -229,11 +229,12 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
         };
         if (!is_input) {
             keep.appendAssumeCapacity(entry);
-        } else if (entry.column_stats.len > 0) {
-            // Dropped entry — Manifest no longer reaches its column_stats,
-            // so free it now (the kept entries keep their owned slices via
-            // pointer copy into `keep`).
-            t.allocator.free(entry.column_stats);
+        } else {
+            // Dropped entry — Manifest no longer reaches its owned slices,
+            // so free them now (the kept entries keep theirs via pointer
+            // copy into `keep`).
+            if (entry.column_stats.len > 0) t.allocator.free(entry.column_stats);
+            if (entry.column_cardinality.len > 0) t.allocator.free(entry.column_cardinality);
         }
     }
 

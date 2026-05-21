@@ -13,10 +13,52 @@ const TableSchema = types.TableSchema;
 const format = @import("format.zig");
 const column = @import("column.zig");
 const compression_mod = @import("compression.zig");
+const cardinality = @import("../util/cardinality.zig");
 const ColumnView = column.ColumnView;
 const StringView = column.StringView;
 const RowGroupMeta = format.RowGroupMeta;
 const SegmentInfo = format.SegmentInfo;
+
+/// Distinct key for a NULL cell — a 1-byte marker that can't collide with
+/// the 8-byte value hashes, so all NULLs count as one distinct value.
+const null_card_key = &[_]u8{0xFF};
+
+fn hashCell(view: ColumnView, row: usize) u64 {
+    switch (view.data) {
+        .varchar, .string, .char => |sv| return std.hash.Wyhash.hash(0, sv.rowBytes(row)),
+        // Full-value 64-bit hash (not a truncated prefix) so two distinct
+        // values never collapse — under-counting would wrongly make a
+        // high-cardinality field look hashable.
+        inline else => |s| return std.hash.Wyhash.hash(0, std.mem.asBytes(&s[row])),
+    }
+}
+
+/// Per-column distinct-value cardinality over all rows: exact below
+/// `format.cardinality_limit`, else `format.cardinality_big`. Caller owns
+/// the returned slice.
+fn computeCardinality(allocator: Allocator, columns: []const ColumnView, row_count: usize) ![]u64 {
+    const card = try allocator.alloc(u64, columns.len);
+    errdefer allocator.free(card);
+    for (columns, 0..) |view, ci| {
+        var counter = cardinality.CardinalityCounter.init(allocator, format.cardinality_limit);
+        defer counter.deinit();
+        var r: usize = 0;
+        while (r < row_count) : (r += 1) {
+            if (view.isValid(r)) {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, hashCell(view, r), .little);
+                try counter.add(&key);
+            } else {
+                try counter.add(null_card_key);
+            }
+        }
+        card[ci] = switch (counter.result()) {
+            .exact => |n| n,
+            .big => format.cardinality_big,
+        };
+    }
+    return card;
+}
 
 pub fn writeSegment(
     allocator: Allocator,
@@ -111,6 +153,10 @@ pub fn writeSegment(
     try appendU32(allocator, &buf, footer_size);
     try buf.appendSlice(allocator, &format.segment_magic);
 
+    // ---- Per-column cardinality (whole-segment distinct counts) ----
+    const column_cardinality = try computeCardinality(allocator, columns, row_count);
+    errdefer allocator.free(column_cardinality);
+
     // ---- Flush to disk ----
     const byte_size: u64 = @intCast(buf.items.len);
     try @import("storage.zig").writeFileSynced(io, dir, file_name, buf.items, sync_on_close);
@@ -121,6 +167,7 @@ pub fn writeSegment(
         .schema_fingerprint = schema_fingerprint,
         .byte_size = byte_size,
         .row_groups = try row_groups.toOwnedSlice(allocator),
+        .column_cardinality = column_cardinality,
     };
 }
 

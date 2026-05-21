@@ -40,13 +40,14 @@ const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
 
 pub const manifest_magic: [4]u8 = .{ 't', 'D', 'B', 'M' };
-pub const manifest_version: u16 = 5;
+pub const manifest_version: u16 = 6;
 pub const manifest_filename = "manifest";
 pub const manifest_tmp_filename = "manifest.tmp";
 pub const header_size: usize = 32;
 /// Per-entry fixed prefix (excluding the per-column stats tail).
 pub const entry_prefix_size: usize = 64;
 pub const stats_slot_size: usize = 32; // i128 min + i128 max
+pub const card_slot_size: usize = 8; // u64 distinct count (or cardinality_big)
 pub const trailer_size: usize = 4;
 
 /// Per-entry flag bits.
@@ -79,6 +80,10 @@ pub const ManifestEntry = struct {
     /// manifest (no per-column stats stored). For columns whose type
     /// has no stats (float/double), the slot is `{0, 0}`.
     column_stats: []format.Stats = &.{},
+    /// Per-column distinct-value cardinality — one slot per schema column.
+    /// Exact when `< format.cardinality_limit`, else `format.cardinality_big`.
+    /// Lifetime tied to the owning `Manifest`. Empty when not populated.
+    column_cardinality: []u64 = &.{},
 };
 
 pub const Manifest = struct {
@@ -107,6 +112,7 @@ pub const Manifest = struct {
     pub fn deinit(self: *Manifest) void {
         for (self.segments.items) |e| {
             if (e.column_stats.len > 0) self.allocator.free(e.column_stats);
+            if (e.column_cardinality.len > 0) self.allocator.free(e.column_cardinality);
         }
         self.segments.deinit(self.allocator);
         self.* = undefined;
@@ -168,6 +174,18 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
             try appendI128(m.allocator, &buf, cs.min);
             try appendI128(m.allocator, &buf, cs.max);
         }
+
+        // Per-column cardinality: one u64 slot per column. Missing slots
+        // (entry not populated) record `cardinality_big` — conservative
+        // (treated as "can't prove low" → sort).
+        var cci: u32 = 0;
+        while (cci < m.column_count) : (cci += 1) {
+            const v: u64 = if (cci < e.column_cardinality.len)
+                e.column_cardinality[cci]
+            else
+                format.cardinality_big;
+            try appendU64(m.allocator, &buf, v);
+        }
     }
 
     try buf.appendSlice(m.allocator, &manifest_magic);
@@ -204,7 +222,7 @@ pub fn readManifest(
     const column_count = format.readU32(bytes[20..24]);
     const auto_inc_next = format.readU64(bytes[24..32]);
 
-    const entry_size: usize = entry_prefix_size + @as(usize, column_count) * stats_slot_size;
+    const entry_size: usize = entry_prefix_size + @as(usize, column_count) * (stats_slot_size + card_slot_size);
     const expected_size: usize = header_size + @as(usize, count) * entry_size + trailer_size;
     if (bytes.len != expected_size) return Error.ManifestCorrupt;
 
@@ -216,6 +234,7 @@ pub fn readManifest(
     errdefer {
         for (segments.items) |e| {
             if (e.column_stats.len > 0) allocator.free(e.column_stats);
+            if (e.column_cardinality.len > 0) allocator.free(e.column_cardinality);
         }
         segments.deinit(allocator);
     }
@@ -259,6 +278,14 @@ pub fn readManifest(
                 off += 16;
             }
             entry.column_stats = stats;
+
+            const card = try allocator.alloc(u64, column_count);
+            errdefer allocator.free(card);
+            for (card) |*c| {
+                c.* = format.readU64(bytes[off .. off + 8]);
+                off += 8;
+            }
+            entry.column_cardinality = card;
         }
 
         segments.appendAssumeCapacity(entry);
@@ -297,10 +324,13 @@ pub fn entryFromSegmentInfo(
         .byte_size = info.byte_size,
         .row_group_count = @intCast(info.row_groups.len),
     };
+    errdefer {
+        if (entry.column_stats.len > 0) allocator.free(entry.column_stats);
+        if (entry.column_cardinality.len > 0) allocator.free(entry.column_cardinality);
+    }
 
     if (column_has_stats.len > 0 and info.row_groups.len > 0) {
         const stats = try allocator.alloc(format.Stats, column_has_stats.len);
-        errdefer allocator.free(stats);
         for (column_has_stats, 0..) |has, ci| {
             if (!has) {
                 stats[ci] = .{ .min = 0, .max = 0 };
@@ -316,6 +346,13 @@ pub fn entryFromSegmentInfo(
             stats[ci] = .{ .min = lo, .max = hi };
         }
         entry.column_stats = stats;
+    }
+
+    // Carry the writer's per-column cardinality into the manifest entry.
+    if (info.column_cardinality.len > 0) {
+        const card = try allocator.alloc(u64, info.column_cardinality.len);
+        @memcpy(card, info.column_cardinality);
+        entry.column_cardinality = card;
     }
 
     if (leading_key_idx) |idx| {
