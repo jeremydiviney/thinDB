@@ -234,7 +234,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
             // so free them now (the kept entries keep theirs via pointer
             // copy into `keep`).
             if (entry.column_stats.len > 0) t.allocator.free(entry.column_stats);
-            if (entry.column_cardinality.len > 0) t.allocator.free(entry.column_cardinality);
+            if (entry.column_sketches.len > 0) t.allocator.free(entry.column_sketches);
         }
     }
 

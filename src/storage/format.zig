@@ -131,17 +131,12 @@ pub const RowGroupMeta = struct {
     stats: []const Stats,
 };
 
-/// Distinct-value count above which a field is just marked "big" and we
-/// stop tracking the exact count (the ejection threshold). Doubles as the
-/// hash-vs-sort GROUP BY cutoff: a group key whose proven distinct count
-/// (or product, for compound keys) is below this fits the hash table, so
-/// we hash; otherwise we sort. Conservative on purpose.
+/// Hash-vs-sort GROUP BY cutoff: a group key whose estimated distinct
+/// count (or product, for compound keys) is below this fits the hash
+/// table, so we hash; otherwise we sort. Conservative on purpose. Not a
+/// memory cliff — 8000 groups fit trivially in the budget — so the HLL
+/// estimate's error near this value is harmless.
 pub const cardinality_limit: u32 = 8000;
-
-/// Sentinel stored per column when a segment's distinct count for that
-/// column reached `cardinality_limit` — i.e. "big" (≥ limit). Any other
-/// value is the exact distinct count (< limit).
-pub const cardinality_big: u64 = std.math.maxInt(u64);
 
 pub const SegmentInfo = struct {
     segment_id: u64,
@@ -152,15 +147,15 @@ pub const SegmentInfo = struct {
     /// `readSegment` (from the input slice length).
     byte_size: u64,
     row_groups: []const RowGroupMeta,
-    /// Per-column distinct-value count (exact when < `cardinality_limit`,
-    /// else `cardinality_big`). One slot per schema column. Empty when the
-    /// writer didn't compute it.
-    column_cardinality: []const u64 = &.{},
+    /// Per-column HyperLogLog sketches, concatenated: column `ci` occupies
+    /// bytes `[ci*hll.m .. (ci+1)*hll.m]`. Mergeable across segments. Empty
+    /// when the writer didn't compute it.
+    column_sketches: []const u8 = &.{},
 
     pub fn deinit(self: SegmentInfo, allocator: std.mem.Allocator) void {
         for (self.row_groups) |rg| allocator.free(rg.stats);
         allocator.free(self.row_groups);
-        if (self.column_cardinality.len > 0) allocator.free(self.column_cardinality);
+        if (self.column_sketches.len > 0) allocator.free(self.column_sketches);
     }
 };
 

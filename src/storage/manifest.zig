@@ -38,16 +38,17 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const format = @import("format.zig");
+const hll = @import("../util/hll.zig");
 
 pub const manifest_magic: [4]u8 = .{ 't', 'D', 'B', 'M' };
-pub const manifest_version: u16 = 6;
+pub const manifest_version: u16 = 7;
 pub const manifest_filename = "manifest";
 pub const manifest_tmp_filename = "manifest.tmp";
 pub const header_size: usize = 32;
 /// Per-entry fixed prefix (excluding the per-column stats tail).
 pub const entry_prefix_size: usize = 64;
 pub const stats_slot_size: usize = 32; // i128 min + i128 max
-pub const card_slot_size: usize = 8; // u64 distinct count (or cardinality_big)
+pub const sketch_slot_size: usize = hll.m; // one HyperLogLog sketch per column
 pub const trailer_size: usize = 4;
 
 /// Per-entry flag bits.
@@ -80,10 +81,11 @@ pub const ManifestEntry = struct {
     /// manifest (no per-column stats stored). For columns whose type
     /// has no stats (float/double), the slot is `{0, 0}`.
     column_stats: []format.Stats = &.{},
-    /// Per-column distinct-value cardinality — one slot per schema column.
-    /// Exact when `< format.cardinality_limit`, else `format.cardinality_big`.
-    /// Lifetime tied to the owning `Manifest`. Empty when not populated.
-    column_cardinality: []u64 = &.{},
+    /// Per-column HyperLogLog sketches, concatenated (`column_count * hll.m`
+    /// bytes; column `ci` at `[ci*hll.m ..]`). Mergeable across segments for
+    /// a distinct-value estimate. Lifetime tied to the owning `Manifest`.
+    /// Empty when not populated.
+    column_sketches: []u8 = &.{},
 };
 
 pub const Manifest = struct {
@@ -112,7 +114,7 @@ pub const Manifest = struct {
     pub fn deinit(self: *Manifest) void {
         for (self.segments.items) |e| {
             if (e.column_stats.len > 0) self.allocator.free(e.column_stats);
-            if (e.column_cardinality.len > 0) self.allocator.free(e.column_cardinality);
+            if (e.column_sketches.len > 0) self.allocator.free(e.column_sketches);
         }
         self.segments.deinit(self.allocator);
         self.* = undefined;
@@ -175,16 +177,15 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
             try appendI128(m.allocator, &buf, cs.max);
         }
 
-        // Per-column cardinality: one u64 slot per column. Missing slots
-        // (entry not populated) record `cardinality_big` — conservative
-        // (treated as "can't prove low" → sort).
-        var cci: u32 = 0;
-        while (cci < m.column_count) : (cci += 1) {
-            const v: u64 = if (cci < e.column_cardinality.len)
-                e.column_cardinality[cci]
-            else
-                format.cardinality_big;
-            try appendU64(m.allocator, &buf, v);
+        // Per-column HyperLogLog sketches: `column_count * hll.m` bytes.
+        // A missing/short entry is zero-filled — an all-zero sketch
+        // estimates 0, which the merge treats as "no info" (conservative).
+        const want = @as(usize, m.column_count) * hll.m;
+        if (e.column_sketches.len >= want) {
+            try buf.appendSlice(m.allocator, e.column_sketches[0..want]);
+        } else {
+            try buf.appendSlice(m.allocator, e.column_sketches);
+            try buf.appendNTimes(m.allocator, 0, want - e.column_sketches.len);
         }
     }
 
@@ -222,7 +223,7 @@ pub fn readManifest(
     const column_count = format.readU32(bytes[20..24]);
     const auto_inc_next = format.readU64(bytes[24..32]);
 
-    const entry_size: usize = entry_prefix_size + @as(usize, column_count) * (stats_slot_size + card_slot_size);
+    const entry_size: usize = entry_prefix_size + @as(usize, column_count) * (stats_slot_size + sketch_slot_size);
     const expected_size: usize = header_size + @as(usize, count) * entry_size + trailer_size;
     if (bytes.len != expected_size) return Error.ManifestCorrupt;
 
@@ -234,7 +235,7 @@ pub fn readManifest(
     errdefer {
         for (segments.items) |e| {
             if (e.column_stats.len > 0) allocator.free(e.column_stats);
-            if (e.column_cardinality.len > 0) allocator.free(e.column_cardinality);
+            if (e.column_sketches.len > 0) allocator.free(e.column_sketches);
         }
         segments.deinit(allocator);
     }
@@ -279,13 +280,12 @@ pub fn readManifest(
             }
             entry.column_stats = stats;
 
-            const card = try allocator.alloc(u64, column_count);
-            errdefer allocator.free(card);
-            for (card) |*c| {
-                c.* = format.readU64(bytes[off .. off + 8]);
-                off += 8;
-            }
-            entry.column_cardinality = card;
+            const sketch_bytes = @as(usize, column_count) * hll.m;
+            const sketches = try allocator.alloc(u8, sketch_bytes);
+            errdefer allocator.free(sketches);
+            @memcpy(sketches, bytes[off .. off + sketch_bytes]);
+            off += sketch_bytes;
+            entry.column_sketches = sketches;
         }
 
         segments.appendAssumeCapacity(entry);
@@ -326,7 +326,7 @@ pub fn entryFromSegmentInfo(
     };
     errdefer {
         if (entry.column_stats.len > 0) allocator.free(entry.column_stats);
-        if (entry.column_cardinality.len > 0) allocator.free(entry.column_cardinality);
+        if (entry.column_sketches.len > 0) allocator.free(entry.column_sketches);
     }
 
     if (column_has_stats.len > 0 and info.row_groups.len > 0) {
@@ -348,11 +348,11 @@ pub fn entryFromSegmentInfo(
         entry.column_stats = stats;
     }
 
-    // Carry the writer's per-column cardinality into the manifest entry.
-    if (info.column_cardinality.len > 0) {
-        const card = try allocator.alloc(u64, info.column_cardinality.len);
-        @memcpy(card, info.column_cardinality);
-        entry.column_cardinality = card;
+    // Carry the writer's per-column HLL sketches into the manifest entry.
+    if (info.column_sketches.len > 0) {
+        const sk = try allocator.alloc(u8, info.column_sketches.len);
+        @memcpy(sk, info.column_sketches);
+        entry.column_sketches = sk;
     }
 
     if (leading_key_idx) |idx| {

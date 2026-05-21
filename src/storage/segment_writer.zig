@@ -13,15 +13,15 @@ const TableSchema = types.TableSchema;
 const format = @import("format.zig");
 const column = @import("column.zig");
 const compression_mod = @import("compression.zig");
-const cardinality = @import("../util/cardinality.zig");
+const hll = @import("../util/hll.zig");
 const ColumnView = column.ColumnView;
 const StringView = column.StringView;
 const RowGroupMeta = format.RowGroupMeta;
 const SegmentInfo = format.SegmentInfo;
 
-/// Distinct key for a NULL cell — a 1-byte marker that can't collide with
-/// the 8-byte value hashes, so all NULLs count as one distinct value.
-const null_card_key = &[_]u8{0xFF};
+/// Fixed hash for NULL cells, so all NULLs count as one distinct value
+/// (matching GROUP BY treating NULL as a single group).
+const null_hash: u64 = 0x9E3779B97F4A7C15;
 
 fn hashCell(view: ColumnView, row: usize) u64 {
     switch (view.data) {
@@ -33,31 +33,20 @@ fn hashCell(view: ColumnView, row: usize) u64 {
     }
 }
 
-/// Per-column distinct-value cardinality over all rows: exact below
-/// `format.cardinality_limit`, else `format.cardinality_big`. Caller owns
-/// the returned slice.
-fn computeCardinality(allocator: Allocator, columns: []const ColumnView, row_count: usize) ![]u64 {
-    const card = try allocator.alloc(u64, columns.len);
-    errdefer allocator.free(card);
+/// Per-column HyperLogLog sketches over all rows, concatenated (column
+/// `ci` at `[ci*hll.m .. (ci+1)*hll.m]`). Caller owns the returned slice.
+fn computeSketches(allocator: Allocator, columns: []const ColumnView, row_count: usize) ![]u8 {
+    const buf = try allocator.alloc(u8, columns.len * hll.m);
+    errdefer allocator.free(buf);
     for (columns, 0..) |view, ci| {
-        var counter = cardinality.CardinalityCounter.init(allocator, format.cardinality_limit);
-        defer counter.deinit();
+        var sketch: hll.Hll = .{};
         var r: usize = 0;
         while (r < row_count) : (r += 1) {
-            if (view.isValid(r)) {
-                var key: [8]u8 = undefined;
-                std.mem.writeInt(u64, &key, hashCell(view, r), .little);
-                try counter.add(&key);
-            } else {
-                try counter.add(null_card_key);
-            }
+            sketch.add(if (view.isValid(r)) hashCell(view, r) else null_hash);
         }
-        card[ci] = switch (counter.result()) {
-            .exact => |n| n,
-            .big => format.cardinality_big,
-        };
+        @memcpy(buf[ci * hll.m .. ci * hll.m + hll.m], sketch.bytes());
     }
-    return card;
+    return buf;
 }
 
 pub fn writeSegment(
@@ -153,9 +142,9 @@ pub fn writeSegment(
     try appendU32(allocator, &buf, footer_size);
     try buf.appendSlice(allocator, &format.segment_magic);
 
-    // ---- Per-column cardinality (whole-segment distinct counts) ----
-    const column_cardinality = try computeCardinality(allocator, columns, row_count);
-    errdefer allocator.free(column_cardinality);
+    // ---- Per-column HyperLogLog sketches (whole-segment distinct est) ----
+    const column_sketches = try computeSketches(allocator, columns, row_count);
+    errdefer allocator.free(column_sketches);
 
     // ---- Flush to disk ----
     const byte_size: u64 = @intCast(buf.items.len);
@@ -167,7 +156,7 @@ pub fn writeSegment(
         .schema_fingerprint = schema_fingerprint,
         .byte_size = byte_size,
         .row_groups = try row_groups.toOwnedSlice(allocator),
-        .column_cardinality = column_cardinality,
+        .column_sketches = column_sketches,
     };
 }
 

@@ -13,6 +13,7 @@ const Value = types.Value;
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
 const sformat = @import("../storage/format.zig");
+const hll = @import("../util/hll.zig");
 
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
@@ -31,11 +32,12 @@ const Predicate = predicate.Predicate;
 const PredicateOp = predicate.PredicateOp;
 const statsOverlapPredicate = predicate.statsOverlapPredicate;
 
-/// Merge per-segment cardinality stats into a per-column bound for the
-/// whole scan. A column is `unknown` if any segment marked it "big" or if
-/// the summed distinct counts (+ memtable rows, which could each add a new
-/// distinct value) reach the limit; otherwise `exact` with that sum as a
-/// proven upper bound (true distinct ≤ sum across segments).
+/// Merge each column's per-segment HyperLogLog sketches (register-wise max)
+/// into a distinct-value estimate for the whole scan, plus a conservative
+/// allowance for un-flushed memtable rows. `unknown` when the estimate
+/// reaches the limit; otherwise `exact` with the estimate as the bound.
+/// Merging HLL avoids the over-counting that summing per-segment counts
+/// suffers as segment count grows.
 fn computeColumnCards(
     allocator: Allocator,
     segs: []const storage.ManifestEntry,
@@ -45,23 +47,27 @@ fn computeColumnCards(
     const cards = try allocator.alloc(exec.ColCard, n);
     errdefer allocator.free(cards);
     for (cards, 0..) |*card, ci| {
-        var any_big = false;
-        var sum: u64 = memtable_rows;
+        var merged: hll.Hll = .{};
+        var have_sketch = false;
         for (segs) |e| {
-            const v: u64 = if (ci < e.column_cardinality.len)
-                e.column_cardinality[ci]
-            else
-                sformat.cardinality_big;
-            if (v == sformat.cardinality_big) {
-                any_big = true;
-                break;
+            const off = ci * hll.m;
+            if (e.column_sketches.len >= off + hll.m) {
+                const seg_sketch = hll.Hll.fromBytes(e.column_sketches[off .. off + hll.m]);
+                merged.merge(&seg_sketch);
+                have_sketch = true;
             }
-            sum +|= v;
         }
-        card.* = if (any_big or sum >= sformat.cardinality_limit)
+        if (!have_sketch and memtable_rows == 0) {
+            card.* = .{ .exact = 0 };
+            continue;
+        }
+        // Memtable rows are un-sketched; each could be a new distinct value,
+        // so add the row count as a conservative upper bump.
+        const est = merged.estimate() +| memtable_rows;
+        card.* = if (est >= sformat.cardinality_limit)
             .unknown
         else
-            .{ .exact = @intCast(sum) };
+            .{ .exact = @intCast(est) };
     }
     return cards;
 }
