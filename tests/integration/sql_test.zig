@@ -268,6 +268,57 @@ test "sql: global aggregate (no GROUP BY) — count(*), avg, min, max" {
     try std.testing.expectEqual(@as(i32, 50), b.values[3].data.int[0]);
 }
 
+test "sql: ORDER BY aggregate (COUNT(*))" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // tags a(2), b(2), c(1). ORDER BY COUNT(*) DESC → a/b before c.
+    // tie between a,b broken by group order; assert the last row is c with 1.
+    var q = try runSql(allocator, db,
+        \\SELECT tag, count(*) FROM t GROUP BY tag ORDER BY count(*) DESC
+    );
+    defer q.deinit();
+    var counts: std.ArrayList(i64) = .empty;
+    defer counts.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try counts.append(allocator, v);
+    }
+    try std.testing.expectEqual(@as(usize, 3), counts.items.len);
+    try std.testing.expectEqual(@as(i64, 2), counts.items[0]);
+    try std.testing.expectEqual(@as(i64, 2), counts.items[1]);
+    try std.testing.expectEqual(@as(i64, 1), counts.items[2]);
+}
+
+test "sql: ORDER BY aggregate ASC on COUNT(col)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // ORDER BY count(qty) ASC: c has 1, a/b have 2 → c first. The
+    // aggregate is unaliased so its output column keeps the canonical
+    // name "count(qty)" that ORDER BY binds against.
+    var q = try runSql(allocator, db,
+        \\SELECT tag, count(qty) FROM t GROUP BY tag ORDER BY count(qty) ASC
+    );
+    defer q.deinit();
+    var counts: std.ArrayList(i64) = .empty;
+    defer counts.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try counts.append(allocator, v);
+    }
+    try std.testing.expectEqual(@as(usize, 3), counts.items.len);
+    try std.testing.expectEqual(@as(i64, 1), counts.items[0]);
+}
+
 test "sql: COUNT(DISTINCT col) global" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

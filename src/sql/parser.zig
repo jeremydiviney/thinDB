@@ -1524,7 +1524,15 @@ pub const Parser = struct {
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
             const first = self.cur.text;
             try self.advance();
-            const col = try self.dupQualifiedColRef(first);
+            // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC). The sort
+            // runs after the aggregate, so bind it to the aggregate's
+            // canonical output column name. Users who alias the aggregate
+            // (`COUNT(*) AS c ... ORDER BY c`) take the plain-ident path.
+            const col = if (self.cur.tag == .lparen) blk: {
+                var distinct = false;
+                const args = try self.parseCallArgList(&distinct);
+                break :blk try self.aggSortName(first, args);
+            } else try self.dupQualifiedColRef(first);
             var desc = false;
             if (self.cur.tag == .kw_asc) {
                 try self.advance();
@@ -1537,6 +1545,25 @@ pub const Parser = struct {
             try self.advance();
         }
         return try items.toOwnedSlice(self.arena);
+    }
+
+    /// Canonical output-column name for an aggregate referenced in ORDER
+    /// BY, matching `aggCallFromArgs`'s default-name format
+    /// (`func(arg)` / `func(*)`). Only single col-ref / `*` args are
+    /// bindable — anything else can't be matched to a projected column.
+    fn aggSortName(self: *Parser, func_name: []const u8, args: []const ir.Expr) ParseError![]const u8 {
+        if (args.len != 1) return ParseError.SqlInvalidProjection;
+        const argname: []const u8 = switch (args[0]) {
+            .col_ref => |c| c,
+            else => return ParseError.SqlInvalidProjection,
+        };
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.arena);
+        try buf.appendSlice(self.arena, func_name);
+        try buf.append(self.arena, '(');
+        try buf.appendSlice(self.arena, argname);
+        try buf.append(self.arena, ')');
+        return try buf.toOwnedSlice(self.arena);
     }
 
     pub fn parseIdentList(self: *Parser) ParseError![]const []const u8 {
