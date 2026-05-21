@@ -201,7 +201,9 @@ pub fn parseWindowSpec(p: anytype) !ir.WindowSpec {
     if (p.cur.tag == .kw_order) {
         try p.advance();
         try p.expect(.kw_by);
-        order_by = try p.parseOrderBy();
+        // Window ORDER BY references columns, not projection outputs, so
+        // no projection context is needed for scalar-expr binding.
+        order_by = try p.parseOrderBy(&.{});
     }
 
     var frame: ir.Frame = if (order_by.len == 0)

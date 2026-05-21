@@ -378,7 +378,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_order) {
             try self.advance();
             try self.expect(.kw_by);
-            pending_order_specs = try self.parseOrderBy();
+            pending_order_specs = try self.parseOrderBy(proj);
         }
 
         // Optional LIMIT, in either of MySQL's two forms:
@@ -1591,7 +1591,7 @@ pub const Parser = struct {
         return try self.allocOp(.{ .set_var = .{ .name = name, .value = value_expr } });
     }
 
-    pub fn parseOrderBy(self: *Parser) ParseError![]const @import("../exec/sort.zig").SortSpec {
+    pub fn parseOrderBy(self: *Parser, proj: []const ProjItem) ParseError![]const @import("../exec/sort.zig").SortSpec {
         const SortSpec = @import("../exec/sort.zig").SortSpec;
         var items: std.ArrayList(SortSpec) = .empty;
         defer items.deinit(self.arena);
@@ -1599,14 +1599,20 @@ pub const Parser = struct {
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
             const first = self.cur.text;
             try self.advance();
-            // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC). The sort
-            // runs after the aggregate, so bind it to the aggregate's
-            // canonical output column name. Users who alias the aggregate
-            // (`COUNT(*) AS c ... ORDER BY c`) take the plain-ident path.
             const col = if (self.cur.tag == .lparen) blk: {
                 var distinct = false;
                 const args = try self.parseCallArgList(&distinct);
-                break :blk try self.aggSortName(first, args);
+                // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC) binds
+                // to the aggregate's canonical output column name (the
+                // sort runs after the aggregate). Aliased aggregates are
+                // referenced by alias via the plain-ident path.
+                if (aggForName(first) != null) break :blk try self.aggSortName(first, args);
+                // `ORDER BY scalar_fn(args)` (e.g. ORDER BY DATE_TRUNC(...))
+                // binds to the matching SELECT expression's output column.
+                const fname = try self.arena.dupe(u8, first);
+                const call_expr = ir.Expr{ .call = .{ .fn_name = fname, .args = args } };
+                const idx = findGroupMatch(proj, call_expr) orelse return ParseError.SqlInvalidProjection;
+                break :blk proj[idx].name;
             } else try self.dupQualifiedColRef(first);
             var desc = false;
             if (self.cur.tag == .kw_asc) {

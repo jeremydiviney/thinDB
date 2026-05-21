@@ -171,6 +171,34 @@ pub fn fromUnixtimeKernel(allocator: Allocator, args: []const ColumnView, out: *
     while (i < row_count) : (i += 1) try out.data.datetime.append(allocator, s[i] * 1_000_000);
 }
 
+/// DATE_TRUNC(unit, datetime) → datetime truncated down to the unit
+/// boundary. `unit` is a constant string ('second'/'minute'/'hour'/
+/// 'day'/'month'/'year'); an unrecognized unit passes the value through.
+pub fn dateTruncKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const unit = stringViewOf(args[0]).rowBytes(0);
+    const s = args[1].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        try out.data.datetime.append(allocator, truncDatetime(s[i], unit));
+    }
+}
+
+fn truncDatetime(v: i64, unit: []const u8) i64 {
+    const us: i64 = 1_000_000;
+    if (std.ascii.eqlIgnoreCase(unit, "second")) return @divFloor(v, us) * us;
+    if (std.ascii.eqlIgnoreCase(unit, "minute")) return @divFloor(v, 60 * us) * (60 * us);
+    if (std.ascii.eqlIgnoreCase(unit, "hour")) return @divFloor(v, 3600 * us) * (3600 * us);
+    if (std.ascii.eqlIgnoreCase(unit, "day")) return @divFloor(v, 86_400 * us) * (86_400 * us);
+    if (std.ascii.eqlIgnoreCase(unit, "month") or std.ascii.eqlIgnoreCase(unit, "year")) {
+        const ymd = daysToYmd(daysFromDatetime(v)) orelse return v;
+        const month: u32 = if (std.ascii.eqlIgnoreCase(unit, "year")) 1 else @intCast(ymd.month);
+        const td = common.ymdToDays(@intCast(ymd.year), month, 1);
+        return @as(i64, td) * 86_400 * us;
+    }
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // MySQL-style calendar helpers (dayofweek / dayofyear / quarter / last_day),
 // plus internal helpers used by date_format too.

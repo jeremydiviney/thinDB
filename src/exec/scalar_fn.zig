@@ -282,6 +282,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "date_add_years", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddYearsKernel },
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .kernel = date.fromUnixtimeKernel },
+    .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
     // --- date (expanded MySQL-style helpers) ---
     .{ .name = "dayofweek", .arg_types = &.{.date}, .return_type = .int, .kernel = date.dayofweekFromDateKernel },
     .{ .name = "dayofweek", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.dayofweekFromDatetimeKernel },

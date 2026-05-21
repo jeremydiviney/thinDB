@@ -375,6 +375,49 @@ test "sql: HAVING with raw aggregate (unaliased)" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 200 }, ks.items);
 }
 
+test "sql: DATE_TRUNC + GROUP BY/ORDER BY on the expression (ClickBench Q42 shape)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "ts", .type = .datetime },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("ev", schema, .{ .order_key = &ok, .unique = false });
+    // ts in micros: 90s, 110s (both minute 60s), 130s (minute 120s).
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .ts = @as(i64, 90_000_000) },
+        .{ .id = @as(i64, 2), .ts = @as(i64, 110_000_000) },
+        .{ .id = @as(i64, 3), .ts = @as(i64, 130_000_000) },
+    });
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        \\SELECT date_trunc('minute', ts) AS m, count(*) AS c FROM ev
+        \\GROUP BY date_trunc('minute', ts) ORDER BY date_trunc('minute', ts) ASC
+    );
+    defer q.deinit();
+    var ms: std.ArrayList(i64) = .empty;
+    var cs: std.ArrayList(i64) = .empty;
+    defer ms.deinit(allocator);
+    defer cs.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.datetime[0..b.row_count]) |v| try ms.append(allocator, v);
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try cs.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 60_000_000, 120_000_000 }, ms.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 1 }, cs.items);
+}
+
 test "sql: literal in SELECT projection" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
