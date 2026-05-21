@@ -221,6 +221,14 @@ pub const Query = struct {
         return @import("aggregate.zig").Aggregate.create(self.allocator, self, group_cols, aggs);
     }
 
+    /// Streaming sort-based grouped aggregation. Requires the input to be
+    /// sorted such that equal group keys are adjacent. Holds only one
+    /// group's state at a time (O(1) in cardinality). Caller (planner)
+    /// must verify the sortedness precondition via `stats().sort_state`.
+    pub fn streamGroupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec) !Query {
+        return @import("aggregate.zig").SortedAggregate.create(self.allocator, self, group_cols, aggs);
+    }
+
     /// Sort upstream rows by `sort_specs` (multi-column, ASC/DESC per key).
     /// Blocking — materializes all upstream rows before emitting any output.
     pub fn orderBy(self: Query, sort_specs: []const SortSpec) !Query {

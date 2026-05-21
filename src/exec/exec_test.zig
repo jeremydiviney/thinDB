@@ -1091,3 +1091,59 @@ test "scan: string eq predicate prunes row groups via prefix stats" {
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{3}, ids.items);
 }
+
+test "streaming aggregate: sorted GROUP BY produces correct per-group results" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "grp", .type = .int },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("g", schema, .{ .order_key = &.{"id"}, .unique = true });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .grp = @as(i32, 2), .v = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .grp = @as(i32, 1), .v = @as(i32, 20) },
+        .{ .id = @as(i64, 3), .grp = @as(i32, 2), .v = @as(i32, 30) },
+        .{ .id = @as(i64, 4), .grp = @as(i32, 3), .v = @as(i32, 40) },
+        .{ .id = @as(i64, 5), .grp = @as(i32, 1), .v = @as(i32, 50) },
+        .{ .id = @as(i64, 6), .grp = @as(i32, 2), .v = @as(i32, 60) },
+    });
+    try t.flush();
+
+    // Sort by grp so equal keys are adjacent, then stream-aggregate.
+    var base = try scan(allocator, t);
+    var sorted = try base.orderBy(&.{.{ .col = "grp", .desc = false }});
+    var q = try sorted.streamGroupBy(&.{"grp"}, &.{
+        .{ .func = .count, .as = "n" },
+        .{ .func = .sum, .col = "v", .as = "total" },
+    });
+    defer q.deinit();
+
+    var grps: std.ArrayList(i32) = .empty;
+    defer grps.deinit(allocator);
+    var counts: std.ArrayList(i64) = .empty;
+    defer counts.deinit(allocator);
+    var totals: std.ArrayList(i64) = .empty;
+    defer totals.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            try grps.append(allocator, b.values[0].data.int[i]);
+            try counts.append(allocator, b.values[1].data.bigint[i]);
+            try totals.append(allocator, b.values[2].data.bigint[i]);
+        }
+    }
+    // Ascending grp order: 1, 2, 3.
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3 }, grps.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3, 1 }, counts.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 70, 100, 40 }, totals.items);
+}

@@ -388,6 +388,240 @@ pub const Aggregate = struct {
     }
 };
 
+/// Streaming GROUP BY for input already sorted such that equal group keys
+/// are adjacent (direction-agnostic). Holds only the *current* group's
+/// accumulator state — O(1) in cardinality, unlike the hash Aggregate
+/// which holds every group at once. When the key changes, the open group's
+/// result row is appended to the output batch and the per-group transient
+/// arena is reset. Emits in `batch_size` chunks so operator memory stays
+/// bounded regardless of how many groups there are.
+///
+/// Requires `group_cols.len > 0`. The router in net/local.zig selects this
+/// only when `sort_state` proves the group keys are a sorted prefix.
+pub const SortedAggregate = struct {
+    allocator: Allocator,
+    arena: std.heap.ArenaAllocator,
+    upstream: Query,
+
+    group_col_indices: []usize,
+    agg_col_indices: []?usize,
+    aggs: []const AggSpec,
+
+    output_schema: []Column,
+    output_columns: []ColumnStore,
+    views: []ColumnView,
+
+    /// The open group's key bytes + accumulators. `cur_state` is allocated
+    /// once and re-initialized per group; its transient sub-allocations
+    /// (string min/max, distinct sets, ...) live in `arena`, reset between
+    /// groups.
+    cur_key: std.ArrayList(u8),
+    cur_state: []AccState,
+    open: bool = false,
+    /// Scratch for building a candidate row's key to compare against
+    /// `cur_key`.
+    key_scratch: std.ArrayList(u8),
+
+    /// Resumable input cursor: we may stop mid-batch when the output batch
+    /// fills, and continue from here on the next `next()` call.
+    cur_batch: ?Batch = null,
+    cur_row: u32 = 0,
+    upstream_done: bool = false,
+
+    const batch_size: usize = 1024;
+
+    pub fn create(
+        allocator: Allocator,
+        upstream: Query,
+        group_cols: []const []const u8,
+        aggs: []const AggSpec,
+    ) !Query {
+        if (aggs.len == 0) return Error.AggregateNoSpecs;
+        // Streaming only makes sense with grouping keys; the no-group
+        // (global) case has no sortedness to exploit and stays on Aggregate.
+        if (group_cols.len == 0) return Error.AggregateNoSpecs;
+        const up_schema = upstream.outputSchema();
+
+        const group_col_indices = try allocator.alloc(usize, group_cols.len);
+        errdefer allocator.free(group_col_indices);
+        for (group_cols, 0..) |name, i| {
+            group_col_indices[i] = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
+        }
+
+        const agg_col_indices = try allocator.alloc(?usize, aggs.len);
+        errdefer allocator.free(agg_col_indices);
+
+        const output_schema = try allocator.alloc(Column, group_cols.len + aggs.len);
+        errdefer allocator.free(output_schema);
+        for (group_col_indices, 0..) |src_idx, i| output_schema[i] = up_schema[src_idx];
+        for (aggs, 0..) |a, i| {
+            agg_col_indices[i] = if (a.col) |name|
+                (types.findColumn(up_schema, name) orelse return Error.ColumnNotFound)
+            else
+                null;
+            output_schema[group_cols.len + i] = .{
+                .name = a.as,
+                .type = try aggOutputType(a.func, if (agg_col_indices[i]) |idx| up_schema[idx].type else null),
+            };
+        }
+        for (aggs, agg_col_indices) |a, maybe_idx| {
+            const t = if (maybe_idx) |idx| up_schema[idx].type else null;
+            try validateAggFn(a.func, t, a.params);
+        }
+
+        const output_columns = try allocator.alloc(ColumnStore, output_schema.len);
+        errdefer allocator.free(output_columns);
+        var inited: usize = 0;
+        errdefer for (output_columns[0..inited]) |*c| c.deinit(allocator);
+        for (output_schema, 0..) |col, i| {
+            output_columns[i] = try ColumnStore.init(allocator, col.type, col.nullable);
+            inited += 1;
+        }
+
+        const views = try allocator.alloc(ColumnView, output_schema.len);
+        errdefer allocator.free(views);
+
+        const cur_state = try allocator.alloc(AccState, aggs.len);
+        errdefer allocator.free(cur_state);
+
+        const self = try allocator.create(SortedAggregate);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .upstream = upstream,
+            .group_col_indices = group_col_indices,
+            .agg_col_indices = agg_col_indices,
+            .aggs = aggs,
+            .output_schema = output_schema,
+            .output_columns = output_columns,
+            .views = views,
+            .cur_state = cur_state,
+            .cur_key = .empty,
+            .key_scratch = .empty,
+        };
+        return makeQuery(allocator, self);
+    }
+
+    pub fn deinit(self: *SortedAggregate) void {
+        var up = self.upstream;
+        up.deinit();
+        for (self.output_columns) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.output_columns);
+        self.allocator.free(self.views);
+        self.allocator.free(self.output_schema);
+        self.allocator.free(self.group_col_indices);
+        self.allocator.free(self.agg_col_indices);
+        self.allocator.free(self.cur_state);
+        self.cur_key.deinit(self.allocator);
+        self.key_scratch.deinit(self.allocator);
+        self.arena.deinit();
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    pub fn outputSchema(self: *SortedAggregate) []const Column {
+        return self.output_schema;
+    }
+
+    pub fn addPrune(self: *SortedAggregate, pred: Predicate) !void {
+        return self.upstream.addPrune(pred);
+    }
+
+    pub fn stats(self: *SortedAggregate) exec.PipelineStats {
+        const up = self.upstream.stats();
+        return .{ .upper_rows = up.upper_rows };
+    }
+
+    pub fn accountant(self: *SortedAggregate) ?*exec.memory.MemoryAccountant {
+        // Bounded memory by construction — no budget reservation needed.
+        return self.upstream.accountant();
+    }
+
+    fn beginGroup(self: *SortedAggregate) !void {
+        // key_scratch already holds the new group's key bytes.
+        self.cur_key.clearRetainingCapacity();
+        try self.cur_key.appendSlice(self.allocator, self.key_scratch.items);
+        const up_schema = self.upstream.outputSchema();
+        for (self.aggs, self.agg_col_indices, self.cur_state) |a, maybe_idx, *s| {
+            const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
+            s.* = initialState(a.func, in_t);
+        }
+        self.open = true;
+    }
+
+    fn finalizeGroup(self: *SortedAggregate) !void {
+        try appendGroupKey(
+            self.allocator,
+            self.cur_key.items,
+            self.group_col_indices,
+            self.upstream.outputSchema(),
+            self.output_columns[0..self.group_col_indices.len],
+        );
+        for (self.aggs, 0..) |a, ai| {
+            const out_idx = self.group_col_indices.len + ai;
+            try appendAccToColumn(self.allocator, a, self.cur_state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type);
+        }
+        // Group done — drop its transient state, keep the buffer for reuse.
+        _ = self.arena.reset(.retain_capacity);
+        self.open = false;
+    }
+
+    pub fn next(self: *SortedAggregate) !?Batch {
+        for (self.output_columns) |*c| c.clear();
+        var out_rows: usize = 0;
+
+        outer: while (out_rows < batch_size) {
+            if (self.cur_batch == null) {
+                if (self.upstream_done) {
+                    if (self.open) {
+                        try self.finalizeGroup();
+                        out_rows += 1;
+                    }
+                    break;
+                }
+                self.cur_batch = try self.upstream.next();
+                if (self.cur_batch == null) {
+                    self.upstream_done = true;
+                    continue;
+                }
+                self.cur_row = 0;
+            }
+            const batch = self.cur_batch.?;
+            while (self.cur_row < batch.row_count) {
+                self.key_scratch.clearRetainingCapacity();
+                try buildCompoundGroupKey(self.allocator, &self.key_scratch, batch, self.group_col_indices, self.cur_row);
+
+                if (self.open and !std.mem.eql(u8, self.key_scratch.items, self.cur_key.items)) {
+                    try self.finalizeGroup();
+                    out_rows += 1;
+                    if (out_rows == batch_size) {
+                        // Output batch is full and the current row hasn't
+                        // started its group yet. Emit now; the next call
+                        // resumes at this same row (open == false).
+                        break :outer;
+                    }
+                }
+                if (!self.open) try self.beginGroup();
+                for (self.aggs, 0..) |a, ai| {
+                    try updateState(self.arena.allocator(), &self.cur_state[ai], a, batch, self.agg_col_indices[ai], self.cur_row, self.cur_row + 1);
+                }
+                self.cur_row += 1;
+            }
+            if (self.cur_row >= batch.row_count) self.cur_batch = null;
+        }
+
+        if (out_rows == 0) return null;
+        for (self.output_columns, 0..) |c, i| self.views[i] = c.view();
+        return Batch{
+            .schema = self.output_schema,
+            .values = self.views,
+            .row_count = @intCast(out_rows),
+        };
+    }
+};
+
 fn initialState(func: AggFunc, in: ?Type) AccState {
     return switch (func) {
         .count => .{ .count = 0 },
