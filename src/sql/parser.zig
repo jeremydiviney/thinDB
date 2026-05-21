@@ -121,8 +121,17 @@ fn explainFormatFromName(name: []const u8) ir.ExplainFormat {
     return .text;
 }
 
+/// Parse with no specific wire flavor (`.neutral`): permissive/ANSI-leaning.
+/// The embedded/native path and tests use this. Wire servers call
+/// `parseDialect` with their pinned dialect so flavor-specific syntax is
+/// enforced.
 pub fn parse(arena: Allocator, sql: []const u8) ParseError!*ir.Op {
+    return parseDialect(arena, sql, .neutral);
+}
+
+pub fn parseDialect(arena: Allocator, sql: []const u8, dialect: types.Dialect) ParseError!*ir.Op {
     var lex = Lexer.init(arena, sql);
+    lex.dialect = dialect;
     var parser = Parser{ .arena = arena, .lex = &lex, .cur = try lex.next() };
 
     // Skip leading empty statements (e.g. ";;SELECT ...").

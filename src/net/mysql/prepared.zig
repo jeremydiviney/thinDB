@@ -78,6 +78,7 @@ pub const PreparedStmt = struct {
 /// existing lexer so escape rules stay consistent with the parser.
 pub fn countPlaceholders(arena: Allocator, sql: []const u8) !u16 {
     var lex = lexer_mod.Lexer.init(arena, sql);
+    lex.dialect = .mysql;
     var count: u16 = 0;
     while (true) {
         const tok = lex.next() catch return count;

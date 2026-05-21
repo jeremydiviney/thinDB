@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const types = @import("../types.zig");
 
 pub const TokenTag = enum {
     // Literals.
@@ -180,6 +181,10 @@ pub const Lexer = struct {
     arena: Allocator,
     src: []const u8,
     pos: usize = 0,
+    /// SQL flavor being lexed. Governs the dialect-divergent tokens:
+    /// `"..."` is an identifier on PG/neutral but a string literal on
+    /// MySQL, and backtick identifiers are rejected on PG.
+    dialect: types.Dialect = .neutral,
 
     pub fn init(arena: Allocator, src: []const u8) Lexer {
         return .{ .arena = arena, .src = src };
@@ -276,6 +281,7 @@ pub const Lexer = struct {
                 return Token{ .tag = .gt, .text = self.src[start..self.pos] };
             },
             '\'' => return try self.lexString(),
+            '"' => return try self.lexDoubleQuoted(),
             '`' => return try self.lexBacktickIdent(),
             '0'...'9' => return try self.lexNumber(),
             'a'...'z', 'A'...'Z', '_' => return try self.lexIdent(),
@@ -412,7 +418,46 @@ pub const Lexer = struct {
         return Token{ .tag = .at_identifier, .text = name };
     }
 
+    /// `"..."`. On MySQL this is a string literal (same as `'...'`); on
+    /// PG/neutral it is a delimited, case-preserving identifier. `""`
+    /// escapes an embedded double-quote in both modes.
+    fn lexDoubleQuoted(self: *Lexer) LexError!Token {
+        const as_string = self.dialect == .mysql;
+        const start = self.pos;
+        self.pos += 1; // opening "
+        var contains_escape = false;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            if (self.src[self.pos] != '"') continue;
+            if (self.peekChar(1) == '"') {
+                contains_escape = true;
+                self.pos += 1; // skip first "; loop's += 1 skips the second
+                continue;
+            }
+            self.pos += 1; // closing "
+            const raw = self.src[start + 1 .. self.pos - 1];
+            const text = self.src[start..self.pos];
+            const content = if (!contains_escape) raw else blk: {
+                const buf = try self.arena.alloc(u8, raw.len);
+                var out: usize = 0;
+                var i: usize = 0;
+                while (i < raw.len) : (i += 1) {
+                    buf[out] = raw[i];
+                    out += 1;
+                    if (raw[i] == '"' and i + 1 < raw.len and raw[i + 1] == '"') i += 1;
+                }
+                break :blk buf[0..out];
+            };
+            if (as_string) return Token{ .tag = .string, .text = text, .value = .{ .string = content } };
+            if (content.len == 0) return LexError.LexUnexpectedChar;
+            return Token{ .tag = .identifier, .text = content };
+        }
+        return if (as_string) LexError.LexUnterminatedString else LexError.LexUnterminatedIdentifier;
+    }
+
     fn lexBacktickIdent(self: *Lexer) LexError!Token {
+        // Backtick identifiers are a MySQL extension; PG has no such
+        // quoting, so reject them on a PG connection.
+        if (self.dialect == .postgres) return LexError.LexUnexpectedChar;
         const start = self.pos;
         self.pos += 1;
         while (self.pos < self.src.len) : (self.pos += 1) {
@@ -559,6 +604,51 @@ test "lexer: backtick-quoted identifier preserves case + allows spaces" {
     try std.testing.expectEqual(@as(TokenTag, .identifier), id.tag);
     try std.testing.expectEqualStrings("Foo Bar", id.text);
     try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+}
+
+test "lexer: double-quote is an identifier on PG/neutral, string on MySQL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // PG: case-preserving delimited identifier, "" un-escaped.
+    {
+        var lx = Lexer.init(arena.allocator(), "\"Foo\"\"Bar\"");
+        lx.dialect = .postgres;
+        const id = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .identifier), id.tag);
+        try std.testing.expectEqualStrings("Foo\"Bar", id.text);
+    }
+    // neutral behaves like PG (ANSI): identifier.
+    {
+        var lx = Lexer.init(arena.allocator(), "\"col\"");
+        const id = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .identifier), id.tag);
+        try std.testing.expectEqualStrings("col", id.text);
+    }
+    // MySQL: string literal, "" un-escaped.
+    {
+        var lx = Lexer.init(arena.allocator(), "\"a\"\"b\"");
+        lx.dialect = .mysql;
+        const s = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .string), s.tag);
+        try std.testing.expectEqualStrings("a\"b", s.value.string);
+    }
+}
+
+test "lexer: backtick identifier rejected on PG, accepted on MySQL/neutral" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    {
+        var lx = Lexer.init(arena.allocator(), "`x`");
+        lx.dialect = .postgres;
+        try std.testing.expectError(LexError.LexUnexpectedChar, lx.next());
+    }
+    {
+        var lx = Lexer.init(arena.allocator(), "`x`");
+        lx.dialect = .mysql;
+        const id = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .identifier), id.tag);
+        try std.testing.expectEqualStrings("x", id.text);
+    }
 }
 
 test "lexer: unterminated backtick errors cleanly" {

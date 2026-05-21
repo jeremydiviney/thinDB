@@ -218,6 +218,7 @@ pub fn substituteDollarSql(
 /// spec lets the client lie, but most drivers send accurate hints.
 pub fn maxDollarIndex(arena: Allocator, sql: []const u8) !u32 {
     var lex = lexer_mod.Lexer.init(arena, sql);
+    lex.dialect = .postgres;
     var max_idx: u32 = 0;
     while (true) {
         const tok = lex.next() catch return max_idx;
@@ -574,7 +575,7 @@ pub fn dryCompileSchema(
         const dummies = try pa.alloc(?[]const u8, num_params);
         for (dummies) |*slot| slot.* = "0";
         const substituted = substituteDollarSql(pa, sql, dummies) catch return null;
-        const op = sql_mod.parse(pa, substituted) catch return null;
+        const op = sql_mod.parseDialect(pa, substituted, .postgres) catch return null;
         if (isSideEffect(op.*)) return null;
     }
 
@@ -603,7 +604,7 @@ fn tryDryCompile(
     for (dummies) |*slot| slot.* = dummy;
 
     const substituted = substituteDollarSql(aa, sql, dummies) catch return null;
-    const op = sql_mod.parse(aa, substituted) catch return null;
+    const op = sql_mod.parseDialect(aa, substituted, .postgres) catch return null;
     if (isSideEffect(op.*)) return null;
 
     const db = catalog.database(session.current_db) orelse return null;

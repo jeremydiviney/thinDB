@@ -216,6 +216,53 @@ test "sql: EXPLAIN result column name follows the wire dialect" {
     }
 }
 
+test "sql: double-quoted identifiers resolve columns (neutral/PG)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT \"id\", \"qty\" FROM t");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(@as(usize, 2), schema.len);
+    try std.testing.expectEqualStrings("id", schema[0].name);
+    try std.testing.expectEqualStrings("qty", schema[1].name);
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 5), rows);
+}
+
+test "sql: on MySQL a double-quoted token is a string literal, not a column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // "tag" under MySQL is the constant string 'tag', so every row's value
+    // is the 3-byte literal — not the contents of the tag column.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const root = try thindb.sql.parseDialect(arena.allocator(), "SELECT \"tag\" FROM t", .mysql);
+    var cq = try thindb.net.compileWithSession(allocator, db, .{ .dialect = .mysql }, root);
+    defer cq.deinit();
+    var rows: usize = 0;
+    while (try cq.next()) |b| {
+        const sv = b.values[0].data.string;
+        for (0..b.row_count) |i| {
+            try std.testing.expectEqualStrings("tag", sv.rowBytes(i));
+            rows += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), rows);
+}
+
 test "sql: SELECT * FROM t returns all rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

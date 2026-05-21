@@ -3,6 +3,13 @@
 
 const std = @import("std");
 
+/// Which client wire/SQL flavor a statement is being parsed and served for.
+/// `.neutral` is the embedded/native path (permissive, ANSI-leaning); the
+/// wire servers pin `.mysql` / `.postgres` so parsing can enforce per-flavor
+/// syntax. Lives here (leaf module) so the lexer/parser and the high-level
+/// api/Session can share one definition without an import cycle.
+pub const Dialect = enum { neutral, mysql, postgres };
+
 pub const TypeTag = enum(u8) {
     int = 1,
     bigint = 2,

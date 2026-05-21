@@ -22,6 +22,8 @@ pub const Lexer = lexer.Lexer;
 pub const LexError = lexer.LexError;
 
 pub const parse = parser.parse;
+pub const parseDialect = parser.parseDialect;
+pub const Dialect = @import("../types.zig").Dialect;
 pub const ParseError = parser.ParseError;
 pub const MaterializeHint = parser.MaterializeHint;
 

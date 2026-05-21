@@ -189,7 +189,7 @@ pub const sweepStaleTempDirs = @import("temp_namespace.zig").sweepStaleTempDirs;
 /// Which client wire a session is served over. Lets wire-neutral
 /// compilation tailor a few dialect-specific surfaces (e.g. the EXPLAIN
 /// result column name) without forking the parser or engine.
-pub const Dialect = enum { neutral, mysql, postgres };
+pub const Dialect = @import("../types.zig").Dialect;
 
 pub const Session = struct {
     current_db: []const u8 = "main",

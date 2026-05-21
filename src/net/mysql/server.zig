@@ -2308,7 +2308,7 @@ fn runEngineQuery(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const op = sql.parse(arena.allocator(), payload) catch |err| {
+    const op = sql.parseDialect(arena.allocator(), payload, .mysql) catch |err| {
         const mapped = errors.mapInternal(err, "Parse error");
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, @errorName(err));
         return;
@@ -2473,7 +2473,7 @@ fn handleStmtPrepare(
     // observable effect on the catalog or data.
     blk: {
         const dummy_sql = prepared.renderDummySubstitution(arena.allocator(), payload, num_params) catch break :blk;
-        const dummy_op = sql.parse(arena.allocator(), dummy_sql) catch break :blk;
+        const dummy_op = sql.parseDialect(arena.allocator(), dummy_sql, .mysql) catch break :blk;
         if (dummy_op.* == .batch) break :blk;
         if (isSideEffectOp(dummy_op.*)) break :blk;
         const main_db = catalog.database(session.current_db) orelse break :blk;
@@ -2592,7 +2592,7 @@ fn handleStmtExecute(
         }
     }
 
-    const op = sql.parse(arena_alloc, substituted) catch |err| {
+    const op = sql.parseDialect(arena_alloc, substituted, .mysql) catch |err| {
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
         return;
