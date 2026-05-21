@@ -659,6 +659,20 @@ pub const Parser = struct {
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
 
+        // Literal at projection start: `SELECT 1`, `SELECT 'x'`,
+        // `SELECT 1 + 2`. Route through the expression parser so binary
+        // operators and aliasing work. (`GROUP BY 1` then references it
+        // as ordinal 1.)
+        switch (self.cur.tag) {
+            .integer, .floating, .string, .kw_true, .kw_false => {
+                const expr = try self.parseAddSub();
+                const default_name = try self.exprDefaultName(expr);
+                const alias = try self.maybeAlias(default_name);
+                return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            },
+            else => {},
+        }
+
         // EXTRACT(field FROM expr) — special function form. Detected
         // here before the identifier-then-`(` branch below misparses
         // the field name as a regular call arg.

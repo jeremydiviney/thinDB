@@ -375,6 +375,53 @@ test "sql: HAVING with raw aggregate (unaliased)" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 200 }, ks.items);
 }
 
+test "sql: literal in SELECT projection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // Bare literal projected for every row.
+    var q = try runSql(allocator, db, "SELECT 1 AS one, id FROM t ORDER BY id ASC");
+    defer q.deinit();
+    var ones: usize = 0;
+    var rows: usize = 0;
+    while (try q.next()) |b| {
+        for (b.values[0].data.int[0..b.row_count]) |v| {
+            if (v == 1) ones += 1;
+        }
+        rows += b.row_count;
+    }
+    try std.testing.expectEqual(@as(usize, 5), rows);
+    try std.testing.expectEqual(@as(usize, 5), ones);
+}
+
+test "sql: SELECT literal with GROUP BY ordinal (ClickBench Q34 shape)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // SELECT 1, k, count(*) ... GROUP BY 1, k — the literal is ordinal 1.
+    // Grouping by a constant + k ≡ grouping by k: 100(2),200(2),300(1).
+    var q = try runSql(allocator, db,
+        \\SELECT 1, k, count(*) AS c FROM t GROUP BY 1, k ORDER BY k ASC
+    );
+    defer q.deinit();
+    var counts: std.ArrayList(i64) = .empty;
+    defer counts.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[2].data.bigint[0..b.row_count]) |v| try counts.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2, 1 }, counts.items);
+}
+
 test "sql: GROUP BY ordinal" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
