@@ -133,10 +133,13 @@ pub const Config = struct {
     /// every query either runs entirely within `query_memory_budget`
     /// or fails fast with a clear error — never silently degrades.
     ///
-    /// Default 256 MB: small enough that local dev/tests don't trip
-    /// it accidentally, large enough that typical 1-10 M row joins
-    /// fit easily. Production deployments override.
-    query_memory_budget: usize = 256 * 1024 * 1024,
+    /// Default 2 GB: high-cardinality GROUP BY / large sorts on
+    /// multi-million-row tables hold their whole hash table or buffer
+    /// at once (eviction can't shrink the single peak), so the budget
+    /// has to clear that peak. Comfortable on a 16 GB+ box; production
+    /// deployments override. A real fix for the GROUP BY ceiling
+    /// (spill-to-disk) is future work.
+    query_memory_budget: usize = 2 * 1024 * 1024 * 1024,
 
     /// Max concurrent client connections across all wire protocols.
     /// Server-wide cap; reject (close immediately) when exceeded.
