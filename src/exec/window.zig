@@ -291,8 +291,14 @@ pub const Window = struct {
     pub fn stats(self: *Window) exec.PipelineStats {
         const up = self.upstream.stats();
         // Window emits in input order and only appends columns, so the
-        // upstream's sort claim (keys + directions) carries through intact.
-        return .{ .upper_rows = up.upper_rows, .sort_state = up.sort_state };
+        // upstream's sort claim and per-column cardinality bounds carry
+        // through. The appended window-output columns sit past the input
+        // schema, so the cardinality lookup reads them as unknown.
+        return .{
+            .upper_rows = up.upper_rows,
+            .sort_state = up.sort_state,
+            .column_cards = up.column_cards,
+        };
     }
 
     pub fn accountant(self: *Window) ?*exec.memory.MemoryAccountant {

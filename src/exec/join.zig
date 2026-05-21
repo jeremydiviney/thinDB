@@ -248,6 +248,11 @@ pub const Join = struct {
     /// Per right-side column: true if it should be emitted (i.e., it
     /// isn't a join key). Sized to right_schema.len.
     right_kept_mask: []const bool,
+    /// Per-output-column cardinality bound (left columns, then kept right
+    /// columns). A join can't grow a column's distinct-value count, so each
+    /// side's upstream bound stays valid. Cached at create. Empty when
+    /// neither side carries cardinality info.
+    cached_cards: []const exec.ColCard = &.{},
 
     /// Materialized build side. One ColumnStore per build-side column.
     build_columns: []ColumnStore,
@@ -503,6 +508,24 @@ pub const Join = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
+        // Concatenate per-column cardinality bounds: left columns, then the
+        // kept right columns. Each side's bound carries through (a join only
+        // shrinks or repeats a column's distinct values, never adds new ones).
+        const lc = left.stats().column_cards;
+        const rc = right.stats().column_cards;
+        const cached_cards: []const exec.ColCard = if (lc.len == 0 and rc.len == 0) &.{} else blk: {
+            const cc = try allocator.alloc(exec.ColCard, output_schema.len);
+            for (cc[0..left_schema.len], 0..) |*out, i| out.* = if (i < lc.len) lc[i] else .unknown;
+            var oi: usize = left_schema.len;
+            for (right_kept_mask, 0..) |keep, ri| {
+                if (!keep) continue;
+                cc[oi] = if (ri < rc.len) rc[ri] else .unknown;
+                oi += 1;
+            }
+            break :blk cc;
+        };
+        errdefer if (cached_cards.len > 0) allocator.free(cached_cards);
+
         const self = try allocator.create(Join);
         errdefer allocator.destroy(self);
 
@@ -523,6 +546,7 @@ pub const Join = struct {
             .output_schema = output_schema,
             .left_col_count = left_schema.len,
             .right_kept_mask = right_kept_mask_owned,
+            .cached_cards = cached_cards,
             .build_columns = build_columns,
             .hash_table = .empty,
             .key_scratch = .empty,
@@ -568,6 +592,7 @@ pub const Join = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.output_schema);
         self.allocator.free(self.right_kept_mask);
+        if (self.cached_cards.len > 0) self.allocator.free(@constCast(self.cached_cards));
         self.key_scratch.deinit(self.allocator);
         if (self.matched_build) |*mb| mb.deinit(self.allocator);
         if (self.skew_detector) |det| det.deinit();
@@ -608,7 +633,7 @@ pub const Join = struct {
         const l = self.left.stats();
         const r = self.right.stats();
         const product = std.math.mul(u64, l.upper_rows, r.upper_rows) catch std.math.maxInt(u64);
-        return .{ .upper_rows = product };
+        return .{ .upper_rows = product, .column_cards = self.cached_cards };
     }
 
     pub fn next(self: *Join) !?Batch {
