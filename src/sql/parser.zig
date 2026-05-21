@@ -239,6 +239,11 @@ pub const Parser = struct {
         switch (self.cur.tag) {
             .kw_create, .kw_drop, .kw_use => return try parse_ddl.parseDdl(self),
             .kw_show => return try parse_ddl.parseShow(self),
+            .kw_explain => {
+                try self.advance(); // consume EXPLAIN
+                const inner = try self.parseStatement();
+                return try self.allocOp(.{ .explain = .{ .inner = inner } });
+            },
             .kw_insert => return try parse_ddl.parseInsert(self),
             .kw_copy => return try parse_ddl.parseCopy(self),
             .kw_set => return try self.parseSetVar(),
@@ -1985,6 +1990,7 @@ fn countRefs(
 ) ParseError!void {
     switch (op.*) {
         .scan => {},
+        .explain => |e| try visitChild(arena, refs, e.inner),
         .limit => |l| try visitChild(arena, refs, l.upstream),
         .select => |p| try visitChild(arena, refs, p.upstream),
         .exclude => |p| try visitChild(arena, refs, p.upstream),

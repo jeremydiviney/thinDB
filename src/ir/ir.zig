@@ -374,6 +374,8 @@ pub const OpTag = enum(u8) {
     /// DELETE-old + INSERT-new under the table mutex, streaming
     /// per row group so memory stays bounded.
     update_op = 21,
+    /// `EXPLAIN <statement>` — render the inner statement's physical plan.
+    explain = 22,
 };
 
 pub const BatchOp = struct {
@@ -427,6 +429,13 @@ pub const UpdateOp = struct {
     predicate: ?@import("../exec/predicate.zig").PredicateExpr,
 };
 
+/// EXPLAIN <statement> — wraps an inner statement. Compiling it builds the
+/// inner operator tree, renders its physical plan, and returns the plan as
+/// a one-column text result (instead of executing the inner statement).
+pub const ExplainOp = struct {
+    inner: *Op,
+};
+
 /// CREATE TABLE name AS SELECT ... — schema inferred from the
 /// source query's output schema. `if_not_exists` mirrors the v1
 /// DDL semantics: skip silently if the target already exists.
@@ -473,6 +482,7 @@ pub const Op = union(OpTag) {
     set_var: SetVar,
     delete_op: DeleteOp,
     update_op: UpdateOp,
+    explain: ExplainOp,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -566,6 +576,10 @@ pub const Op = union(OpTag) {
     pub fn deinitDecoded(self: *Op, allocator: Allocator) void {
         switch (self.*) {
             .scan => {},
+            .explain => |e| {
+                e.inner.deinitDecoded(allocator);
+                allocator.destroy(e.inner);
+            },
             .limit => |l| {
                 l.upstream.deinitDecoded(allocator);
                 allocator.destroy(l.upstream);
@@ -754,6 +768,9 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         // would need a predicate-encode path that handles every
         // resolved variant. Add when a remote-client builder needs it.
         .delete_op, .update_op => return EncodeError.OutOfMemory,
+        // EXPLAIN is a SQL-text-only statement; never sent over the binary
+        // IR protocol.
+        .explain => return EncodeError.OutOfMemory,
     }
 }
 
@@ -1675,7 +1692,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
         },
         // SET / DELETE / UPDATE are never wire-encoded. If decoder
         // somehow sees their tag, the stream is corrupt.
-        .set_var, .delete_op, .update_op => return Error.IrCorrupt,
+        .set_var, .delete_op, .update_op, .explain => return Error.IrCorrupt,
     };
 }
 

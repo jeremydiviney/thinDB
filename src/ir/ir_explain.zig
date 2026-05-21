@@ -35,6 +35,10 @@ pub fn explain(allocator: Allocator, out: *std.ArrayList(u8), root: Op) !void {
 fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize) !void {
     try writeIndent(allocator, out, depth);
     switch (op) {
+        .explain => |e| {
+            try out.appendSlice(allocator, "Explain\n");
+            try explainOp(allocator, out, e.inner.*, depth + 1);
+        },
         .scan => |s| {
             try out.appendSlice(allocator, "Scan ");
             try writeTableRef(allocator, out, s.table);

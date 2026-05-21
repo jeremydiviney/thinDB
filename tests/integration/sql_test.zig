@@ -109,6 +109,33 @@ test "sql: GROUP BY on the sorted order key streams and aggregates correctly" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 70, 100, 40 }, totals.items);
 }
 
+test "sql: EXPLAIN returns the physical plan as a QUERY PLAN result set" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "EXPLAIN SELECT k, count(*) AS n FROM t GROUP BY k");
+    defer q.deinit();
+    try std.testing.expectEqualStrings("QUERY PLAN", q.outputSchema()[0].name);
+
+    var plan: std.ArrayList(u8) = .empty;
+    defer plan.deinit(allocator);
+    while (try q.next()) |b| {
+        const sv = b.values[0].data.string;
+        for (0..b.row_count) |i| {
+            try plan.appendSlice(allocator, sv.rowBytes(i));
+            try plan.append(allocator, '\n');
+        }
+    }
+    // The physical plan names the chosen operators.
+    try std.testing.expect(std.mem.indexOf(u8, plan.items, "Aggregate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.items, "Scan t") != null);
+}
+
 test "sql: SELECT * FROM t returns all rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

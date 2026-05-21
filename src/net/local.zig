@@ -1095,7 +1095,7 @@ pub fn buildServerQuerySession(
         // CTAS / INSERT-SELECT come from SQL parsing and only go
         // through the CompileCtx path. The plan-builder + wire path
         // doesn't construct these.
-        .create_table_as, .insert_select, .set_var, .delete_op, .update_op => return Error.UnsupportedOp,
+        .create_table_as, .insert_select, .set_var, .delete_op, .update_op, .explain => return Error.UnsupportedOp,
     };
 }
 
@@ -1459,6 +1459,25 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .set_var => |sv| try compileSetVar(ctx, sv),
         .delete_op => |d| try compileDelete(ctx, d),
         .update_op => |u| try compileUpdate(ctx, u),
+        .explain => |e| blk: {
+            // Compile the inner statement, render its physical plan, and
+            // return the plan as a one-column text result (one row per line).
+            // The inner query is never executed.
+            var inner = try compileOp(ctx, e.inner);
+            const plan = inner.explainPlan(ctx.allocator) catch |err| {
+                inner.deinit();
+                return err;
+            };
+            inner.deinit();
+            defer ctx.allocator.free(plan);
+            var lines: std.ArrayList([]u8) = .empty;
+            defer lines.deinit(ctx.allocator);
+            var it = std.mem.splitScalar(u8, plan, '\n');
+            while (it.next()) |line| {
+                if (line.len > 0) try lines.append(ctx.allocator, @constCast(line));
+            }
+            break :blk try NamesOp.create(ctx.allocator, "QUERY PLAN", lines.items);
+        },
     };
 }
 
