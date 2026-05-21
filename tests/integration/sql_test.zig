@@ -268,6 +268,71 @@ test "sql: global aggregate (no GROUP BY) — count(*), avg, min, max" {
     try std.testing.expectEqual(@as(i32, 50), b.values[3].data.int[0]);
 }
 
+test "sql: predicate coercion — int literal narrows to smallint column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "engine", .type = .smallint },
+            .{ .name = "d", .type = .date },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("ev", schema, .{ .order_key = &ok, .unique = false });
+    // d: 2013-07-01 = 15887 days, 2013-08-01 = 15918 days since epoch.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .engine = @as(i16, 0), .d = @as(i32, 15887) },
+        .{ .id = @as(i64, 2), .engine = @as(i16, 3), .d = @as(i32, 15918) },
+        .{ .id = @as(i64, 3), .engine = @as(i16, 0), .d = @as(i32, 15887) },
+    });
+    try t.flush();
+
+    // engine <> 0 : int literal 0 must narrow to smallint.
+    var q = try runSql(allocator, db, "SELECT count(*) AS n FROM ev WHERE engine <> 0");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[0]);
+}
+
+test "sql: predicate coercion — string literal parses to DATE column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "d", .type = .date },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("ev2", schema, .{ .order_key = &ok, .unique = false });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .d = @as(i32, 15887) }, // 2013-07-01
+        .{ .id = @as(i64, 2), .d = @as(i32, 15918) }, // 2013-08-01
+    });
+    try t.flush();
+
+    // '2013-07-15' = 15901 days. Only row 1 (15887) is < that.
+    var q = try runSql(allocator, db, "SELECT count(*) AS n FROM ev2 WHERE d < '2013-07-15'");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[0]);
+}
+
 test "sql: ORDER BY aggregate (COUNT(*))" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

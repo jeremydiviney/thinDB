@@ -1059,9 +1059,11 @@ test "error: filter predicate type mismatch on each new type" {
     defer db.close();
     const t = try db.table("t", schema, opts);
 
-    // Filter SMALLINT column with an INT literal — type mismatch.
+    // Filter SMALLINT column with an out-of-range INT literal — can't
+    // narrow losslessly, so it's a type mismatch. (An in-range int
+    // literal like 1 now narrows to smallint; see the coercion test.)
     var base = try thindb.scan(allocator, t);
-    var q = base.filter(thindb.leafExpr("small", .eq, .{ .int = 1 }));
+    var q = base.filter(thindb.leafExpr("small", .eq, .{ .int = 100000 }));
     try std.testing.expectError(error.PredicateTypeMismatch, q);
     base.deinit();
 

@@ -473,36 +473,96 @@ fn findCol(schema: []const Column, name: []const u8) ?usize {
 /// column type. Errors when the source literal can't be losslessly
 /// represented in the target type (caller treats that as a type
 /// mismatch).
+/// Coerce a predicate literal to the column's value tag when it's safe:
+///   - lossless integer widening (tinyint → … → largeint)
+///   - integer narrowing when the literal's *value* fits the target range
+///     (safe: the literal is a compile-time-known constant, so an
+///     out-of-range value errors rather than silently truncating)
+///   - boolean ↔ 0/1 integer
+///   - float → double
+///   - 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' text → date / datetime
+/// Returns NoWidening when no safe coercion exists.
 fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
-    switch (val.*) {
-        .tinyint => |v| switch (target) {
-            .smallint => val.* = .{ .smallint = v },
-            .int => val.* = .{ .int = v },
-            .bigint => val.* = .{ .bigint = v },
-            .largeint => val.* = .{ .largeint = v },
+    // Text literal compared against a temporal column: parse it.
+    if (val.* == .text) {
+        switch (target) {
+            .date => {
+                const d = parseDateString(val.text) catch return error.NoWidening;
+                val.* = .{ .date = d };
+                return;
+            },
+            .datetime => {
+                const dt = parseDateTimeString(val.text) catch return error.NoWidening;
+                val.* = .{ .datetime = dt };
+                return;
+            },
             else => return error.NoWidening,
-        },
-        .smallint => |v| switch (target) {
-            .int => val.* = .{ .int = v },
-            .bigint => val.* = .{ .bigint = v },
-            .largeint => val.* = .{ .largeint = v },
-            else => return error.NoWidening,
-        },
-        .int => |v| switch (target) {
-            .bigint => val.* = .{ .bigint = v },
-            .largeint => val.* = .{ .largeint = v },
-            else => return error.NoWidening,
-        },
-        .bigint => |v| switch (target) {
-            .largeint => val.* = .{ .largeint = v },
-            else => return error.NoWidening,
-        },
-        .float => |v| switch (target) {
-            .double => val.* = .{ .double = v },
-            else => return error.NoWidening,
+        }
+    }
+
+    // Integer-family literal → integer-family / boolean column. Widening
+    // is always safe; narrowing is gated on the value fitting the target.
+    if (val.* == .float) {
+        if (target == .double) {
+            val.* = .{ .double = val.float };
+            return;
+        }
+        return error.NoWidening;
+    }
+    const iv: i128 = switch (val.*) {
+        .tinyint => |v| v,
+        .smallint => |v| v,
+        .int => |v| v,
+        .bigint => |v| v,
+        .largeint => |v| v,
+        .boolean => |v| @intFromBool(v),
+        else => return error.NoWidening,
+    };
+    switch (target) {
+        .tinyint => val.* = .{ .tinyint = fitInt(i8, iv) catch return error.NoWidening },
+        .smallint => val.* = .{ .smallint = fitInt(i16, iv) catch return error.NoWidening },
+        .int => val.* = .{ .int = fitInt(i32, iv) catch return error.NoWidening },
+        .bigint => val.* = .{ .bigint = fitInt(i64, iv) catch return error.NoWidening },
+        .largeint => val.* = .{ .largeint = iv },
+        .boolean => {
+            if (iv != 0 and iv != 1) return error.NoWidening;
+            val.* = .{ .boolean = iv == 1 };
         },
         else => return error.NoWidening,
     }
+}
+
+fn fitInt(comptime T: type, v: i128) error{OutOfRange}!T {
+    if (v < std.math.minInt(T) or v > std.math.maxInt(T)) return error.OutOfRange;
+    return @intCast(v);
+}
+
+fn parseDateString(s: []const u8) !i32 {
+    if (s.len < 10) return error.Invalid;
+    if (s[4] != '-' or s[7] != '-') return error.Invalid;
+    const year = try std.fmt.parseInt(i32, s[0..4], 10);
+    const month = try std.fmt.parseInt(u32, s[5..7], 10);
+    const day = try std.fmt.parseInt(u32, s[8..10], 10);
+    if (month < 1 or month > 12 or day < 1 or day > 31) return error.Invalid;
+    return @import("scalar_fn_common.zig").ymdToDays(year, month, day);
+}
+
+fn parseDateTimeString(s: []const u8) !i64 {
+    if (s.len < 19) return error.Invalid;
+    if (s[4] != '-' or s[7] != '-') return error.Invalid;
+    const sep = s[10];
+    if (sep != ' ' and sep != 'T') return error.Invalid;
+    if (s[13] != ':' or s[16] != ':') return error.Invalid;
+    const year = try std.fmt.parseInt(i32, s[0..4], 10);
+    const month = try std.fmt.parseInt(u32, s[5..7], 10);
+    const day = try std.fmt.parseInt(u32, s[8..10], 10);
+    const hour = try std.fmt.parseInt(u32, s[11..13], 10);
+    const minute = try std.fmt.parseInt(u32, s[14..16], 10);
+    const second = try std.fmt.parseInt(u32, s[17..19], 10);
+    if (hour > 23 or minute > 59 or second > 59) return error.Invalid;
+    const days = @import("scalar_fn_common.zig").ymdToDays(year, month, day);
+    const day_secs: i64 = @as(i64, days) * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+    return day_secs * 1_000_000;
 }
 
 /// Push every leaf reachable through top-level ANDs down to the upstream so
