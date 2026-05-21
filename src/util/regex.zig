@@ -704,4 +704,78 @@ test "regex: invalid patterns rejected" {
     try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "(abc"));
     try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "[abc"));
     try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "abc)"));
+    // Lookaround is explicitly unsupported (only `(?:` is allowed).
+    try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "a(?=b)"));
+}
+
+test "regex: dot does not match newline" {
+    try expectMatch("a.b", "axb", true);
+    try expectMatch("^a.b$", "a\nb", false);
+}
+
+test "regex: shorthand classes incl. negated" {
+    try expectMatch("^\\s+$", " \t \n", true);
+    try expectMatch("^\\S+$", "abc", true);
+    try expectMatch("^\\S+$", "a c", false);
+    try expectMatch("^\\D+$", "abc.", true);
+    try expectMatch("^\\D+$", "ab1", false);
+    try expectMatch("^\\W+$", "...", true);
+    try expectMatch("^\\W+$", "a.", false);
+}
+
+test "regex: bounded + unbounded repetition" {
+    try expectMatch("^a{3}$", "aaa", true);
+    try expectMatch("^a{3}$", "aa", false);
+    try expectMatch("^a{2,}$", "aa", true);
+    try expectMatch("^a{2,}$", "aaaaa", true);
+    try expectMatch("^a{2,}$", "a", false);
+    try expectMatch("^a{2,3}$", "aaaa", false);
+}
+
+test "regex: multi-way alternation + nested groups" {
+    try expectMatch("^(red|green|blue)$", "green", true);
+    try expectMatch("^(red|green|blue)$", "yellow", false);
+    // Nested capture indices: outer=1, inner=2.
+    try expectReplace("((ab)c)", "abc", "\\2-\\1", "ab-abc");
+}
+
+test "regex: word-boundary negation \\B" {
+    try expectMatch("\\Bcat\\B", "scatter", true); // 'cat' inside a word
+    try expectMatch("\\Bcat\\B", "the cat sat", false); // standalone word
+}
+
+test "regex: escaped metacharacters are literal" {
+    try expectMatch("^a\\.b$", "a.b", true);
+    try expectMatch("^a\\.b$", "axb", false);
+    try expectMatch("^\\(\\+\\)$", "(+)", true);
+}
+
+test "regex: class edge cases ([]a] literal ], ranges, trailing -)" {
+    try expectMatch("^[]a]+$", "]a]a", true); // leading ] is a literal member
+    try expectMatch("^[a-]+$", "a-a-", true); // trailing - is literal
+    try expectMatch("^[0-9A-Fa-f]+$", "1aF", true);
+    try expectMatch("^[0-9A-Fa-f]+$", "1aG", false);
+}
+
+test "regex: greedy vs lazy replace" {
+    try expectReplace("a+", "aaa bbb aaa", "X", "X bbb X"); // greedy: whole run
+    try expectReplace("a+?", "aaa", "X", "XXX"); // lazy: one at a time
+}
+
+test "regex: replacement \\0 is the whole match; $N also works" {
+    try expectReplace("\\d+", "x42y", "[\\0]", "x[42]y");
+    try expectReplace("(\\d)(\\d)", "ab12cd", "$2$1", "ab21cd");
+}
+
+test "regex: global replace + empty-match handling (no infinite loop)" {
+    try expectReplace("o", "foo boo", "0", "f00 b00");
+    // a* matches empty before 'b' and at end → leading/trailing inserts.
+    try expectReplace("a*", "b", "X", "XbX");
+}
+
+test "regex: anchors bind to whole-string boundaries" {
+    try expectMatch("^abc$", "abc", true);
+    try expectMatch("^abc$", "xabc", false);
+    try expectMatch("^abc$", "abcx", false);
+    try expectMatch("bc$", "aabc", true);
 }
