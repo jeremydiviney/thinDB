@@ -94,13 +94,19 @@ test "pipeline stats propagate through scan, filter, limit, project, sort" {
         try std.testing.expect(s.sort_state.global);
     }
 
-    // Sort descending: no usable sort claim (we only claim ascending)
+    // Sort descending: claims a global sort on the key, with direction
+    // recorded in descs (grouping is direction-agnostic; an ascending
+    // SMJ merge guards on direction separately).
     {
         var base = try scan(allocator, t);
         var q = try base.orderBy(&.{.{ .col = "qty", .desc = true }});
         defer q.deinit();
         const s = q.stats();
-        try std.testing.expectEqual(@as(usize, 0), s.sort_state.keys.len);
+        try std.testing.expectEqual(@as(usize, 1), s.sort_state.keys.len);
+        try std.testing.expectEqualStrings("qty", s.sort_state.keys[0]);
+        try std.testing.expectEqual(@as(usize, 1), s.sort_state.descs.len);
+        try std.testing.expect(s.sort_state.descs[0]);
+        try std.testing.expect(s.sort_state.global);
     }
 
     // Global aggregate: 1 row out

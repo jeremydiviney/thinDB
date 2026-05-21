@@ -125,12 +125,25 @@ pub const SortState = struct {
     /// slice = not sorted on any known prefix. A join planner can
     /// check whether its join key matches a leading prefix of these.
     keys: []const []const u8 = &.{},
+    /// Per-key sort direction. Either empty (⟺ every key ascending — the
+    /// common case) or the same length as `keys`, where `descs[i] == true`
+    /// means `keys[i]` is sorted descending. Grouping is direction-
+    /// agnostic (equal values are adjacent in either order), but a
+    /// sort-merge join's ascending merge must reject a descending prefix —
+    /// see `joinKeysCovered`.
+    descs: []const bool = &.{},
     /// `true` = sorted across the whole stream (globally). `false` =
     /// sorted only within each emitted batch (e.g., scan of an
     /// uncompacted table where each row group is sorted but segments
     /// can overlap). Joins exploit `global=true` for the SMJ-merge-only
     /// fast path.
     global: bool = false,
+
+    /// Whether key `i` is ascending (the empty-`descs` convention means
+    /// all ascending).
+    pub fn ascendingAt(self: SortState, i: usize) bool {
+        return self.descs.len == 0 or !self.descs[i];
+    }
 };
 
 /// Pre-execution statistics about an operator's output.

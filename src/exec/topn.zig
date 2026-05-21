@@ -42,6 +42,9 @@ pub const TopN = struct {
 
     sort_col_indices: []usize,
     sort_desc: []bool,
+    /// Sort-key column names for the output sort claim (direction in
+    /// `sort_desc`). Allocated once at create-time.
+    sort_state_keys: []const []const u8,
 
     /// Rows we might emit = limit + offset. The buffer is pruned back to
     /// this whenever it grows past `2 * keep`.
@@ -85,6 +88,9 @@ pub const TopN = struct {
             sort_col_indices[i] = types.findColumn(schema, spec.col) orelse return Error.ColumnNotFound;
             sort_desc[i] = spec.desc;
         }
+        const sort_state_keys = try allocator.alloc([]const u8, sort_specs.len);
+        errdefer allocator.free(sort_state_keys);
+        for (sort_col_indices, 0..) |idx, i| sort_state_keys[i] = schema[idx].name;
 
         const accumulated = try allocator.alloc(ColumnStore, schema.len);
         errdefer allocator.free(accumulated);
@@ -120,6 +126,7 @@ pub const TopN = struct {
             .schema = schema,
             .sort_col_indices = sort_col_indices,
             .sort_desc = sort_desc,
+            .sort_state_keys = sort_state_keys,
             .keep = keep,
             .limit = limit,
             .offset = offset,
@@ -144,6 +151,7 @@ pub const TopN = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.sort_col_indices);
         self.allocator.free(self.sort_desc);
+        self.allocator.free(self.sort_state_keys);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -156,12 +164,18 @@ pub const TopN = struct {
         return self.upstream.addPrune(pred);
     }
 
-    /// Top-N output is sorted on its keys (ascending keys only — same
-    /// rule as Sort), but conservatively we don't publish a sort_state
-    /// since a downstream consumer rarely depends on it after a LIMIT.
+    /// Top-N output is globally sorted on its keys (in `sort_desc`
+    /// directions) — it sorts the kept window before emitting.
     pub fn stats(self: *TopN) exec.PipelineStats {
         const up = self.upstream.stats();
-        return .{ .upper_rows = @min(@as(u64, self.limit), up.upper_rows) };
+        return .{
+            .upper_rows = @min(@as(u64, self.limit), up.upper_rows),
+            .sort_state = .{
+                .keys = self.sort_state_keys,
+                .descs = self.sort_desc,
+                .global = true,
+            },
+        };
     }
 
     pub fn accountant(self: *TopN) ?*exec.memory.MemoryAccountant {

@@ -94,6 +94,7 @@ pub const Project = struct {
             .upper_rows = up.upper_rows,
             .sort_state = .{
                 .keys = up.sort_state.keys[0..kept_prefix_len],
+                .descs = if (up.sort_state.descs.len == 0) &.{} else up.sort_state.descs[0..kept_prefix_len],
                 .global = up.sort_state.global,
             },
         };

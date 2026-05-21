@@ -35,9 +35,10 @@ pub const Sort = struct {
 
     sort_col_indices: []usize,
     sort_desc: []bool,
-    /// Sort-key column names. Populated at create-time iff every key
-    /// is ascending; empty otherwise. Used by `stats()` to publish
-    /// the operator's output sort claim without re-allocating per call.
+    /// Sort-key column names, allocated once at create-time so `stats()`
+    /// can publish the output sort claim without re-allocating. Always
+    /// populated (ascending or descending) — the per-key direction is
+    /// `sort_desc`, which doubles as `SortState.descs`.
     sort_state_keys: []const []const u8,
 
     /// All upstream rows, accumulated by column. Built lazily on first
@@ -68,20 +69,17 @@ pub const Sort = struct {
         const sort_desc = try allocator.alloc(bool, sort_specs.len);
         errdefer allocator.free(sort_desc);
 
-        var all_asc = true;
         for (sort_specs, 0..) |spec, i| {
             sort_col_indices[i] = types.findColumn(schema, spec.col) orelse return Error.ColumnNotFound;
             sort_desc[i] = spec.desc;
-            if (spec.desc) all_asc = false;
         }
-        // Pre-allocate sort_state.keys only when all-ascending (we can
-        // only claim a useful sort state in that case). Empty otherwise.
-        const sort_state_keys: []const []const u8 = if (all_asc) blk: {
-            const names = try allocator.alloc([]const u8, sort_specs.len);
-            for (sort_col_indices, 0..) |idx, i| names[i] = schema[idx].name;
-            break :blk names;
-        } else &.{};
-        errdefer if (sort_state_keys.len > 0) allocator.free(sort_state_keys);
+        // Publish the sort claim for every key, ascending or descending —
+        // direction lives in `sort_desc` (= SortState.descs). Grouping is
+        // direction-agnostic; an SMJ ascending-merge guards on direction
+        // in joinKeysCovered.
+        const sort_state_keys = try allocator.alloc([]const u8, sort_specs.len);
+        for (sort_col_indices, 0..) |idx, i| sort_state_keys[i] = schema[idx].name;
+        errdefer allocator.free(sort_state_keys);
 
         const accumulated = try allocator.alloc(ColumnStore, schema.len);
         errdefer allocator.free(accumulated);
@@ -134,7 +132,7 @@ pub const Sort = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.sort_col_indices);
         self.allocator.free(self.sort_desc);
-        if (self.sort_state_keys.len > 0) self.allocator.free(self.sort_state_keys);
+        self.allocator.free(self.sort_state_keys);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -147,19 +145,19 @@ pub const Sort = struct {
         return self.upstream.addPrune(pred);
     }
 
-    /// Sort makes the output globally sorted on its sort keys — but
-    /// only when every key is ascending (a descending key wouldn't
-    /// satisfy a downstream SMJ/INLJ that assumes ascending order).
-    /// The names slice is allocated once at create-time so this is
-    /// allocation-free.
+    /// Sort makes the output globally sorted on its sort keys, in the
+    /// requested per-key direction (`sort_desc`). Downstream grouping uses
+    /// this regardless of direction; an ascending-merge SMJ guards on
+    /// direction itself.
     pub fn stats(self: *Sort) exec.PipelineStats {
         const up = self.upstream.stats();
-        if (self.sort_state_keys.len == 0) {
-            return .{ .upper_rows = up.upper_rows };
-        }
         return .{
             .upper_rows = up.upper_rows,
-            .sort_state = .{ .keys = self.sort_state_keys, .global = true },
+            .sort_state = .{
+                .keys = self.sort_state_keys,
+                .descs = self.sort_desc,
+                .global = true,
+            },
         };
     }
 

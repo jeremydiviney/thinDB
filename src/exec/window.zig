@@ -290,9 +290,9 @@ pub const Window = struct {
 
     pub fn stats(self: *Window) exec.PipelineStats {
         const up = self.upstream.stats();
-        // Window doesn't change row count; it adds columns. Sort state
-        // not claimed — we emit in input order, not in any spec's order.
-        return .{ .upper_rows = up.upper_rows };
+        // Window emits in input order and only appends columns, so the
+        // upstream's sort claim (keys + directions) carries through intact.
+        return .{ .upper_rows = up.upper_rows, .sort_state = up.sort_state };
     }
 
     pub fn accountant(self: *Window) ?*exec.memory.MemoryAccountant {

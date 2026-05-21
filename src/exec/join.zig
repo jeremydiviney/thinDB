@@ -1167,6 +1167,9 @@ pub fn joinKeysCovered(state: exec.SortState, on: []const KeyPair, side: KeySide
             .right => pair.right,
         };
         if (!std.mem.eql(u8, state.keys[i], required)) return false;
+        // The merge advances both cursors assuming ascending order; a
+        // descending-sorted prefix can't drive it, so don't claim coverage.
+        if (!state.ascendingAt(i)) return false;
     }
     return true;
 }
