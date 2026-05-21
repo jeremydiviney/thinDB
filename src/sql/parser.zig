@@ -98,6 +98,24 @@ fn aggForName(name: []const u8) ?ir.AggFunc {
     return null;
 }
 
+/// Canonical lowercase function name for an aggregate, used to rebuild
+/// the `func(arg)` reference name a HAVING clause would produce. Returns
+/// null for functions not addressable as a bare `func(col)` HAVING ref.
+fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
+    return switch (f) {
+        .count, .count_distinct => "count",
+        .sum => "sum",
+        .min => "min",
+        .max => "max",
+        .avg => "avg",
+        .stddev_pop => "stddev_pop",
+        .stddev_samp => "stddev_samp",
+        .var_pop => "var_pop",
+        .var_samp => "var_samp",
+        .percentile, .group_concat => null,
+    };
+}
+
 pub fn parse(arena: Allocator, sql: []const u8) ParseError!*ir.Op {
     var lex = Lexer.init(arena, sql);
     var parser = Parser{ .arena = arena, .lex = &lex, .cur = try lex.next() };
@@ -455,12 +473,14 @@ pub const Parser = struct {
                 .upstream = root,
             } });
 
-            // HAVING after GroupBy, before ORDER BY. Filter operator
-            // sees the post-aggregate schema, so references to agg
-            // aliases (`COUNT(*) > 10`-style — but as `cnt > 10` since
-            // we already alias every agg) resolve cleanly.
-            if (pending_having) |pred| {
-                root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
+            // HAVING after GroupBy, before ORDER BY. The Filter sees the
+            // post-aggregate schema. A raw aggregate reference (e.g.
+            // `HAVING COUNT(*) > 100000`) arrives as the canonical name
+            // `count(*)`; rewrite it to the matching SELECT aggregate's
+            // alias so it binds to the grouped output column.
+            if (pending_having) |*pred| {
+                try self.rewriteHavingAggRefs(pred, proj);
+                root = try self.allocOp(.{ .filter = .{ .predicate = pred.*, .upstream = root } });
             }
 
             // Apply ORDER BY on the grouped schema.
@@ -863,7 +883,7 @@ pub const Parser = struct {
     /// consumed and reported via `distinct_out` (for aggregate calls like
     /// `COUNT(DISTINCT col)`). Passing `null` for `distinct_out` rejects
     /// DISTINCT — it's only valid inside an aggregate.
-    fn parseCallArgList(self: *Parser, distinct_out: ?*bool) ParseError![]const ir.Expr {
+    pub fn parseCallArgList(self: *Parser, distinct_out: ?*bool) ParseError![]const ir.Expr {
         try self.expect(.lparen);
         if (self.cur.tag == .kw_distinct) {
             try self.advance();
@@ -1592,7 +1612,7 @@ pub const Parser = struct {
     /// BY, matching `aggCallFromArgs`'s default-name format
     /// (`func(arg)` / `func(*)`). Only single col-ref / `*` args are
     /// bindable — anything else can't be matched to a projected column.
-    fn aggSortName(self: *Parser, func_name: []const u8, args: []const ir.Expr) ParseError![]const u8 {
+    pub fn aggSortName(self: *Parser, func_name: []const u8, args: []const ir.Expr) ParseError![]const u8 {
         if (args.len != 1) return ParseError.SqlInvalidProjection;
         const argname: []const u8 = switch (args[0]) {
             .col_ref => |c| c,
@@ -1605,6 +1625,40 @@ pub const Parser = struct {
         try buf.appendSlice(self.arena, argname);
         try buf.append(self.arena, ')');
         return try buf.toOwnedSlice(self.arena);
+    }
+
+    /// Rewrite raw aggregate references in a HAVING predicate (parsed as
+    /// the canonical name `func(arg)`) to the matching SELECT aggregate's
+    /// alias, so they bind to the grouped output column.
+    fn rewriteHavingAggRefs(self: *Parser, expr: *PredicateExpr, proj: []const ProjItem) ParseError!void {
+        switch (expr.*) {
+            .leaf => |*l| {
+                if (try self.aggAliasFor(proj, l.col)) |alias| l.col = alias;
+            },
+            .leaf_col_col => |*lc| {
+                if (try self.aggAliasFor(proj, lc.left)) |a| lc.left = a;
+                if (try self.aggAliasFor(proj, lc.right)) |a| lc.right = a;
+            },
+            .@"and", .@"or" => |children| for (children) |*c| try self.rewriteHavingAggRefs(@constCast(c), proj),
+            .not => |child| try self.rewriteHavingAggRefs(@constCast(child), proj),
+            else => {},
+        }
+    }
+
+    fn aggAliasFor(self: *Parser, proj: []const ProjItem, name: []const u8) ParseError!?[]const u8 {
+        for (proj) |p| switch (p.kind) {
+            .agg => |a| {
+                // count_distinct / expression-arg aggregates aren't
+                // expressible as a HAVING reference today; skip them.
+                if (a.arg_expr != null) continue;
+                const fname = aggFuncName(a.func) orelse continue;
+                const arg = a.col orelse "*";
+                const cname = std.fmt.allocPrint(self.arena, "{s}({s})", .{ fname, arg }) catch return ParseError.OutOfMemory;
+                if (std.ascii.eqlIgnoreCase(cname, name)) return p.name;
+            },
+            else => {},
+        };
+        return null;
     }
 
     pub fn parseIdentList(self: *Parser) ParseError![]const []const u8 {

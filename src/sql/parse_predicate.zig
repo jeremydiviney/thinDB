@@ -116,7 +116,16 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         return PE.SqlExpectedValue;
     }
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
-    const col_dup = try parseQualifiedColRef(p);
+    var col_dup = try parseQualifiedColRef(p);
+
+    // Aggregate reference inside a predicate — only meaningful in HAVING
+    // (e.g. `HAVING COUNT(*) > 100000`). Canonicalize to the aggregate's
+    // output-column name; a post-parse pass rewrites it to the matching
+    // SELECT aggregate's alias.
+    if (p.cur.tag == .lparen) {
+        const args = try p.parseCallArgList(null);
+        col_dup = try p.aggSortName(col_dup, args);
+    }
 
     // IS NULL / IS NOT NULL.
     if (p.cur.tag == .kw_is) {

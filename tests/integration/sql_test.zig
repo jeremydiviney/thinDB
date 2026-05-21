@@ -268,6 +268,50 @@ test "sql: global aggregate (no GROUP BY) — count(*), avg, min, max" {
     try std.testing.expectEqual(@as(i32, 50), b.values[3].data.int[0]);
 }
 
+test "sql: HAVING with raw aggregate (aliased)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // HAVING count(*) > 1 (raw aggregate) binds to the aliased c.
+    // Groups: 100(2),200(2),300(1) → keep 100,200.
+    var q = try runSql(allocator, db,
+        \\SELECT k, count(*) AS c FROM t GROUP BY k HAVING count(*) > 1 ORDER BY k ASC
+    );
+    defer q.deinit();
+    var ks: std.ArrayList(i64) = .empty;
+    defer ks.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.int[0..b.row_count]) |v| try ks.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 200 }, ks.items);
+}
+
+test "sql: HAVING with raw aggregate (unaliased)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 1 ORDER BY k ASC
+    );
+    defer q.deinit();
+    var ks: std.ArrayList(i64) = .empty;
+    defer ks.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.int[0..b.row_count]) |v| try ks.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 200 }, ks.items);
+}
+
 test "sql: GROUP BY ordinal" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
