@@ -201,6 +201,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "concat", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.concat3Kernel },
     .{ .name = "substring", .arg_types = &.{ .string, .int, .int }, .return_type = .string, .kernel = string.substringKernel },
     .{ .name = "replace", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.replaceKernel },
+    .{ .name = "regexp_replace", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.regexpReplaceKernel },
     // --- coalesce overloads ---
     .{ .name = "coalesce", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .absorbs, .kernel = cond.coalesceStringKernel },
     .{ .name = "coalesce", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .absorbs, .kernel = cond.coalesceIntKernel },

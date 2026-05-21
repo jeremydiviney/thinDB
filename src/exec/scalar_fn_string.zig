@@ -12,12 +12,35 @@ const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
 
 const store = @import("../engine/store.zig");
+const regex = @import("../util/regex.zig");
 
 // ---------------------------------------------------------------------------
 // Core string kernels (upper, lower, length, trims, reverse, concat,
 // substring, replace). The lengthKernel is also registered as octet_length
 // and char_length aliases — same kernel, different name in builtins[].
 // ---------------------------------------------------------------------------
+
+/// REGEXP_REPLACE(haystack, pattern, replacement). Pattern + replacement
+/// are read from row 0 and the regex compiled once per batch — i.e. they
+/// must be constant across the batch (the usual case: SQL literals). The
+/// replacement may use `\N` capture backrefs. Backed by the linear-time
+/// engine in util/regex.zig; unsupported regex features (lookaround,
+/// in-pattern backrefs) or malformed patterns surface as
+/// RegexInvalidPattern.
+pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const pattern = stringViewOf(args[1]).rowBytes(0);
+    const replacement = stringViewOf(args[2]).rowBytes(0);
+    var re = try regex.Regex.compile(allocator, pattern);
+    defer re.deinit();
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const replaced = try re.replaceAll(allocator, sv.rowBytes(i), replacement);
+        defer allocator.free(replaced);
+        try store.StringStore.appendValue(stringStoreOf(out), allocator, replaced);
+    }
+}
 
 pub fn upperKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);

@@ -418,6 +418,55 @@ test "sql: DATE_TRUNC + GROUP BY/ORDER BY on the expression (ClickBench Q42 shap
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 1 }, cs.items);
 }
 
+test "sql: REGEXP_REPLACE extracts hostname (ClickBench Q28 function)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "url", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("u", schema, .{ .order_key = &ok, .unique = false });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .url = "https://www.example.com/a/b" },
+        .{ .id = @as(i64, 2), .url = "http://sub.host.org/x" },
+        .{ .id = @as(i64, 3), .url = "https://plain.net/" },
+    });
+    try t.flush();
+
+    // Raw multiline string: backslashes are literal, so the SQL sees
+    // `\.` and `\1` exactly (the lexer doesn't process backslash escapes).
+    var q = try runSql(allocator, db,
+        \\SELECT regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS host FROM u ORDER BY id ASC
+    );
+    defer q.deinit();
+    var hosts: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (hosts.items) |s| allocator.free(s);
+        hosts.deinit(allocator);
+    }
+    while (try q.next()) |b| {
+        const sv = b.values[0].data.string;
+        var r: usize = 0;
+        while (r < b.row_count) : (r += 1) {
+            try hosts.append(allocator, try allocator.dupe(u8, sv.rowBytes(@intCast(r))));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), hosts.items.len);
+    try std.testing.expectEqualStrings("example.com", hosts.items[0]);
+    try std.testing.expectEqualStrings("sub.host.org", hosts.items[1]);
+    try std.testing.expectEqualStrings("plain.net", hosts.items[2]);
+}
+
 test "sql: literal in SELECT projection" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
