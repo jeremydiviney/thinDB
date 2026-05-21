@@ -17,6 +17,7 @@ const TypeTag = types.TypeTag;
 
 const packet = @import("packet.zig");
 const handshake = @import("handshake.zig");
+const errors = @import("errors.zig");
 const canned = @import("canned.zig");
 const wire_format = @import("../wire_format.zig");
 
@@ -234,7 +235,19 @@ pub fn sendQueryResultStatus(
     var row_payload: std.ArrayList(u8) = .empty;
     defer row_payload.deinit(allocator);
 
-    while (try query.next()) |batch| {
+    while (true) {
+        // A runtime error mid-stream (e.g. MemoryBudgetExceeded from a
+        // blocking sort / GROUP BY) terminates the result set with an ERR
+        // packet rather than dropping the connection — the column defs are
+        // already on the wire, and MySQL clients accept an ERR packet in
+        // place of the terminating EOF/OK.
+        const maybe_batch = query.next() catch |err| {
+            const mapped = errors.mapInternal(err, null);
+            try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
+            seq_id.* +%= 1;
+            return;
+        };
+        const batch = maybe_batch orelse break;
         var r: usize = 0;
         while (r < batch.row_count) : (r += 1) {
             row_payload.clearRetainingCapacity();

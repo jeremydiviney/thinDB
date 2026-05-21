@@ -2672,7 +2672,15 @@ fn handleStmtExecute(
     var row_payload: std.ArrayList(u8) = .empty;
     defer row_payload.deinit(allocator);
 
-    while (try compiled.next()) |batch| {
+    while (true) {
+        // A runtime error after column defs terminates the result set
+        // with an ERR packet rather than dropping the connection.
+        const maybe_batch = compiled.next() catch |err| {
+            const mapped = errors.mapInternal(err, null);
+            try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+            return;
+        };
+        const batch = maybe_batch orelse break;
         var r: usize = 0;
         while (r < batch.row_count) : (r += 1) {
             row_payload.clearRetainingCapacity();
