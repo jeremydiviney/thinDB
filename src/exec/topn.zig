@@ -185,6 +185,11 @@ pub const TopN = struct {
         return self.upstream.accountant();
     }
 
+    pub fn explain(self: *TopN, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "TopN (bounded sort)");
+        try self.upstream.explain(out, allocator, depth + 1);
+    }
+
     fn comparator(self: *TopN, accumulated: []const ColumnStore) Comparator {
         return .{ .accumulated = accumulated, .indices = self.sort_col_indices, .desc = self.sort_desc };
     }

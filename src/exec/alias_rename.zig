@@ -97,6 +97,11 @@ pub const AliasRename = struct {
         return self.upstream.accountant();
     }
 
+    pub fn explain(self: *AliasRename, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "AliasRename");
+        try self.upstream.explain(out, allocator, depth + 1);
+    }
+
     pub fn next(self: *AliasRename) !?Batch {
         const batch = (try self.upstream.next()) orelse return null;
         return Batch{

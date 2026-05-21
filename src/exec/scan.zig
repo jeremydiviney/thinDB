@@ -239,6 +239,13 @@ pub const Scan = struct {
         return self.owned_accountant;
     }
 
+    pub fn explain(self: *Scan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainIndent(out, allocator, depth);
+        try out.appendSlice(allocator, "Scan ");
+        try out.appendSlice(allocator, self.table.name);
+        try out.append(allocator, '\n');
+    }
+
     pub fn deinit(self: *Scan) void {
         self.releaseBatch();
         self.closeCurSegment();

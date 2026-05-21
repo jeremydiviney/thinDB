@@ -268,6 +268,11 @@ pub const Compute = struct {
         return self.upstream.accountant();
     }
 
+    pub fn explain(self: *Compute, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "Compute");
+        try self.upstream.explain(out, allocator, depth + 1);
+    }
+
     pub fn next(self: *Compute) !?Batch {
         const in = (try self.upstream.next()) orelse return null;
         const n = in.row_count;

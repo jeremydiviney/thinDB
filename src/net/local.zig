@@ -2520,6 +2520,10 @@ const EmptyOp = struct {
     pub fn accountant(_: *EmptyOp) ?*exec.memory.MemoryAccountant {
         return null;
     }
+
+    pub fn explain(_: *EmptyOp, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "Empty");
+    }
 };
 
 const NamesOp = struct {
@@ -2598,6 +2602,10 @@ const NamesOp = struct {
 
     pub fn accountant(_: *NamesOp) ?*exec.memory.MemoryAccountant {
         return null;
+    }
+
+    pub fn explain(_: *NamesOp, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "Names");
     }
 };
 

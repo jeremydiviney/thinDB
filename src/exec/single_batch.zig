@@ -61,6 +61,11 @@ pub const SingleBatchSource = struct {
         return null;
     }
 
+    pub fn explain(self: *SingleBatchSource, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        _ = self;
+        try exec.explainLine(out, allocator, depth, "Values");
+    }
+
     pub fn next(self: *SingleBatchSource) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;

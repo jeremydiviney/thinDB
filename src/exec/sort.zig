@@ -168,6 +168,11 @@ pub const Sort = struct {
         return self.upstream.accountant();
     }
 
+    pub fn explain(self: *Sort, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "Sort");
+        try self.upstream.explain(out, allocator, depth + 1);
+    }
+
     /// Free the accumulated buffer + permutation and hand their bytes back
     /// to the query budget. Called once all sorted rows have been emitted
     /// (or on an empty input). Idempotent.

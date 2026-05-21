@@ -305,6 +305,11 @@ pub const Window = struct {
         return self.upstream.accountant();
     }
 
+    pub fn explain(self: *Window, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "Window");
+        try self.upstream.explain(out, allocator, depth + 1);
+    }
+
     /// Free the accumulated input buffer and release its reserved bytes
     /// once every row has been emitted. Idempotent. The per-batch emit
     /// buffers (`out_input_columns` / `out_output_columns`) and the window

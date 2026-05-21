@@ -388,6 +388,17 @@ pub const SortMergeJoin = struct {
         return self.left.accountant();
     }
 
+    pub fn explain(self: *SortMergeJoin, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainIndent(out, allocator, depth);
+        try out.appendSlice(allocator, "SortMergeJoin (left: ");
+        try out.appendSlice(allocator, if (self.skip_left_sort) "pre-sorted" else "sorts");
+        try out.appendSlice(allocator, ", right: ");
+        try out.appendSlice(allocator, if (self.skip_right_sort) "pre-sorted" else "sorts");
+        try out.appendSlice(allocator, ")\n");
+        try self.left.explain(out, allocator, depth + 1);
+        try self.right.explain(out, allocator, depth + 1);
+    }
+
     pub fn stats(self: *SortMergeJoin) exec.PipelineStats {
         const l = self.left.stats();
         const r = self.right.stats();

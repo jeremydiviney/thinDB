@@ -97,6 +97,12 @@ pub const SetUnion = struct {
         return self.left.accountant() orelse self.right.accountant();
     }
 
+    pub fn explain(self: *SetUnion, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, if (self.all) "UnionAll" else "Union");
+        try self.left.explain(out, allocator, depth + 1);
+        try self.right.explain(out, allocator, depth + 1);
+    }
+
     pub fn next(self: *SetUnion) !?Batch {
         if (!self.left_exhausted) {
             if (try self.left.next()) |b| {

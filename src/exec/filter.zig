@@ -106,6 +106,11 @@ pub const Filter = struct {
         return self.upstream.accountant();
     }
 
+    pub fn explain(self: *Filter, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "Filter");
+        try self.upstream.explain(out, allocator, depth + 1);
+    }
+
     pub fn next(self: *Filter) !?Batch {
         while (true) {
             const upstream_batch = (try self.upstream.next()) orelse return null;

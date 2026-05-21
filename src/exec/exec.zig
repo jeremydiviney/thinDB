@@ -117,7 +117,27 @@ pub const VTable = struct {
     /// throughout the query pipeline (operators inherit from their
     /// upstream). Null = no budget tracking (default; common in tests).
     accountant: *const fn (ptr: *anyopaque) ?*memory.MemoryAccountant,
+    /// Render this operator's physical plan line(s) into `out` at the given
+    /// indentation `depth`, then recurse into upstream(s) at `depth + 1`.
+    /// Shows the chosen physical operator + decisions (hash vs sort group-by,
+    /// join algorithm, pre-sorted/sort-elided), so the tree shape reveals
+    /// what the compiler picked.
+    explain: *const fn (ptr: *anyopaque, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) anyerror!void,
 };
+
+/// Write `depth` levels of indentation then a complete label line.
+pub fn explainLine(out: *std.ArrayList(u8), allocator: Allocator, depth: usize, text: []const u8) !void {
+    try explainIndent(out, allocator, depth);
+    try out.appendSlice(allocator, text);
+    try out.append(allocator, '\n');
+}
+
+/// Write `depth` levels of indentation (no newline). For operators that
+/// build a dynamic label line (column lists, names) directly into `out`.
+pub fn explainIndent(out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+    var i: usize = 0;
+    while (i < depth) : (i += 1) try out.appendSlice(allocator, "  ");
+}
 
 /// Sort property of an operator's output stream.
 pub const SortState = struct {
@@ -204,6 +224,19 @@ pub const Query = struct {
     /// inherit by calling this method on their input.
     pub fn accountant(self: Query) ?*memory.MemoryAccountant {
         return self.vtable.accountant(self.ptr);
+    }
+
+    pub fn explain(self: Query, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        return self.vtable.explain(self.ptr, out, allocator, depth);
+    }
+
+    /// Render the whole compiled operator tree as an indented physical plan.
+    /// Caller owns the returned bytes.
+    pub fn explainPlan(self: Query, allocator: Allocator) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try self.explain(&out, allocator, 0);
+        return out.toOwnedSlice(allocator);
     }
 
     // ----- Combinators -----
@@ -327,6 +360,10 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.accountant();
         }
+        fn explainWrap(ptr: *anyopaque, out: *std.ArrayList(u8), alloc: Allocator, depth: usize) anyerror!void {
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.explain(out, alloc, depth);
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
@@ -335,6 +372,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .addPrune = addPruneWrap,
             .stats = statsWrap,
             .accountant = accountantWrap,
+            .explain = explainWrap,
         };
     };
 

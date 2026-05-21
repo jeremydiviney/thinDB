@@ -119,6 +119,11 @@ pub const Project = struct {
         return self.upstream.accountant();
     }
 
+    pub fn explain(self: *Project, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "Project");
+        try self.upstream.explain(out, allocator, depth + 1);
+    }
+
     pub fn next(self: *Project) !?Batch {
         const batch = (try self.upstream.next()) orelse return null;
         for (self.column_map, 0..) |src_idx, dst_idx| {
@@ -212,6 +217,11 @@ pub const Limit = struct {
 
     pub fn accountant(self: *Limit) ?*exec.memory.MemoryAccountant {
         return self.upstream.accountant();
+    }
+
+    pub fn explain(self: *Limit, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "Limit");
+        try self.upstream.explain(out, allocator, depth + 1);
     }
 
     pub fn next(self: *Limit) !?Batch {

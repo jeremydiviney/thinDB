@@ -244,4 +244,11 @@ pub const Reader = struct {
     pub fn accountant(self: *Reader) ?*exec.memory.MemoryAccountant {
         return self.buffer.acct;
     }
+
+    pub fn explain(self: *Reader, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "MaterializedScan");
+        // Before the buffer is drained the source pipeline is still
+        // attached — show it as the materialized subtree.
+        if (self.buffer.upstream) |*u| try u.explain(out, allocator, depth + 1);
+    }
 };

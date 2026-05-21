@@ -276,6 +276,11 @@ pub const Aggregate = struct {
         return self.upstream.accountant();
     }
 
+    pub fn explain(self: *Aggregate, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, if (self.group_col_indices.len == 0) "Aggregate (global)" else "HashAggregate");
+        try self.upstream.explain(out, allocator, depth + 1);
+    }
+
     pub fn next(self: *Aggregate) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;
@@ -537,6 +542,13 @@ pub const SortedAggregate = struct {
     pub fn accountant(self: *SortedAggregate) ?*exec.memory.MemoryAccountant {
         // Bounded memory by construction — no budget reservation needed.
         return self.upstream.accountant();
+    }
+
+    pub fn explain(self: *SortedAggregate, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        // A Sort child below means "sorted then streamed"; its absence means
+        // the input was already sorted on the group key (no sort needed).
+        try exec.explainLine(out, allocator, depth, "StreamAggregate (sorted input)");
+        try self.upstream.explain(out, allocator, depth + 1);
     }
 
     fn beginGroup(self: *SortedAggregate) !void {

@@ -1222,6 +1222,57 @@ test "cardinality: bounds propagate through filter, sort, and project" {
     }
 }
 
+test "explain: physical plan shows hash vs stream group-by and sort elision" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "grp", .type = .int },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("ep", schema, .{ .order_key = &.{"id"}, .unique = true });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .grp = @as(i32, 1), .v = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .grp = @as(i32, 2), .v = @as(i32, 20) },
+    });
+    try t.flush();
+
+    // Hash path: scan → filter → hash group-by.
+    {
+        var base = try scan(allocator, t);
+        var filtered = try base.filter(leafExpr("v", .gt, .{ .int = 0 }));
+        var q = try filtered.groupBy(&.{"grp"}, &.{.{ .func = .count, .as = "n" }});
+        defer q.deinit();
+        const plan = try q.explainPlan(allocator);
+        defer allocator.free(plan);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "HashAggregate") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "Filter") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "Scan ep") != null);
+        // No Sort node in the hash path.
+        try std.testing.expect(std.mem.indexOf(u8, plan, "Sort") == null);
+    }
+
+    // Streaming path: sort then stream-aggregate — the Sort node is visible.
+    {
+        var base = try scan(allocator, t);
+        var sorted = try base.orderBy(&.{.{ .col = "grp", .desc = false }});
+        var q = try sorted.streamGroupBy(&.{"grp"}, &.{.{ .func = .count, .as = "n" }});
+        defer q.deinit();
+        const plan = try q.explainPlan(allocator);
+        defer allocator.free(plan);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "StreamAggregate") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "Sort") != null);
+    }
+}
+
 test "cardinality: join concatenates left and right bounds" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

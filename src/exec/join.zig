@@ -614,6 +614,12 @@ pub const Join = struct {
         return self.left.accountant();
     }
 
+    pub fn explain(self: *Join, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "HashJoin");
+        try self.left.explain(out, allocator, depth + 1);
+        try self.right.explain(out, allocator, depth + 1);
+    }
+
     pub fn stats(self: *Join) exec.PipelineStats {
         const l = self.left.stats();
         const r = self.right.stats();
