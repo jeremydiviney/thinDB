@@ -357,6 +357,43 @@ pub fn scanWithAccountant(
     return @import("scan.zig").Scan.createWithAccountant(allocator, table, accountant_ptr);
 }
 
+/// Build a join's output `column_cards` by concatenating the left columns'
+/// bounds with the kept right columns' bounds (the join output schema is
+/// `left ⧺ right-where-kept`). A join can't grow a column's distinct count,
+/// so each side's bound stays a valid upper bound. Returns `&.{}` when
+/// neither side carries cardinality info. Shared by all join operators.
+/// `right_kept_mask` is null when every right column is kept (range joins
+/// that drop no equi key).
+pub fn concatJoinCards(
+    allocator: Allocator,
+    left: Query,
+    right: Query,
+    left_col_count: usize,
+    right_kept_mask: ?[]const bool,
+    output_len: usize,
+) ![]const ColCard {
+    const lc = left.stats().column_cards;
+    const rc = right.stats().column_cards;
+    if (lc.len == 0 and rc.len == 0) return &.{};
+    const cc = try allocator.alloc(ColCard, output_len);
+    for (cc[0..left_col_count], 0..) |*out, i| out.* = if (i < lc.len) lc[i] else .unknown;
+    var oi: usize = left_col_count;
+    if (right_kept_mask) |mask| {
+        for (mask, 0..) |keep, ri| {
+            if (!keep) continue;
+            cc[oi] = if (ri < rc.len) rc[ri] else .unknown;
+            oi += 1;
+        }
+    } else {
+        var ri: usize = 0;
+        while (oi < output_len) : (oi += 1) {
+            cc[oi] = if (ri < rc.len) rc[ri] else .unknown;
+            ri += 1;
+        }
+    }
+    return cc;
+}
+
 // ---------------------------------------------------------------------------
 // Re-exports — callers @import("exec.zig") for everything operator-related
 // ---------------------------------------------------------------------------

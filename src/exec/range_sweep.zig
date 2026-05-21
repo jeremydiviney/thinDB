@@ -65,6 +65,9 @@ pub const RangeSweepJoin = struct {
 
     output_schema: []Column,
     left_col_count: usize,
+    /// Per-output-column cardinality bounds (left ⧺ all right; range joins
+    /// drop no key). Cached at create. Empty when neither side has info.
+    cached_cards: []const exec.ColCard = &.{},
 
     // Materialized state.
     left_materialized: []ColumnStore,
@@ -176,6 +179,9 @@ pub const RangeSweepJoin = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
+        const cached_cards = try exec.concatJoinCards(allocator, left, right, left_schema.len, null, output_schema.len);
+        errdefer if (cached_cards.len > 0) allocator.free(cached_cards);
+
         const self = try allocator.create(RangeSweepJoin);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -186,6 +192,7 @@ pub const RangeSweepJoin = struct {
             .range = .{ .left_col = lidx, .right_col = ridx, .op = rp.op },
             .output_schema = output_schema,
             .left_col_count = left_schema.len,
+            .cached_cards = cached_cards,
             .left_materialized = left_mat,
             .right_materialized = right_mat,
             .output_columns = output_columns,
@@ -213,6 +220,7 @@ pub const RangeSweepJoin = struct {
         self.allocator.free(self.output_columns);
         self.allocator.free(self.views);
         self.allocator.free(self.output_schema);
+        if (self.cached_cards.len > 0) self.allocator.free(@constCast(self.cached_cards));
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -241,7 +249,7 @@ pub const RangeSweepJoin = struct {
         const l = self.left.stats();
         const r = self.right.stats();
         const product = std.math.mul(u64, l.upper_rows, r.upper_rows) catch std.math.maxInt(u64);
-        return .{ .upper_rows = product };
+        return .{ .upper_rows = product, .column_cards = self.cached_cards };
     }
 
     pub fn next(self: *RangeSweepJoin) !?Batch {

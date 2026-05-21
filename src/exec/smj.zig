@@ -66,6 +66,9 @@ pub const SortMergeJoin = struct {
     left_col_count: usize,
     /// Per right-side column: true if we emit it (false for join keys).
     right_kept_mask: []const bool,
+    /// Per-output-column cardinality bounds (left ⧺ kept right). Cached at
+    /// create. Empty when neither side carries cardinality info.
+    cached_cards: []const exec.ColCard = &.{},
 
     // Materialized + sorted state for both sides. Populated lazily on
     // first .next() call. We sort the row indices (perm), then index
@@ -272,6 +275,9 @@ pub const SortMergeJoin = struct {
         const skip_right = right_stats.sort_state.global and
             join_mod.joinKeysCovered(right_stats.sort_state, spec.on, .right);
 
+        const cached_cards = try exec.concatJoinCards(allocator, left, right, left_schema.len, right_kept_mask_owned, output_schema.len);
+        errdefer if (cached_cards.len > 0) allocator.free(cached_cards);
+
         const self = try allocator.create(SortMergeJoin);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -284,6 +290,7 @@ pub const SortMergeJoin = struct {
             .output_schema = output_schema,
             .left_col_count = left_schema.len,
             .right_kept_mask = right_kept_mask_owned,
+            .cached_cards = cached_cards,
             .left_materialized = left_mat,
             .right_materialized = right_mat,
             .skip_left_sort = skip_left,
@@ -356,6 +363,7 @@ pub const SortMergeJoin = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.output_schema);
         self.allocator.free(self.right_kept_mask);
+        if (self.cached_cards.len > 0) self.allocator.free(@constCast(self.cached_cards));
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -388,7 +396,7 @@ pub const SortMergeJoin = struct {
         // advantage we should publish (e.g., a downstream merge or
         // groupBy on join keys can skip its own sort).
         const key_names = self.allocator.alloc([]const u8, self.left_key_indices.len) catch {
-            return .{ .upper_rows = product };
+            return .{ .upper_rows = product, .column_cards = self.cached_cards };
         };
         defer self.allocator.free(key_names);
         // Use the LEFT-side column names — those are the ones that
@@ -405,7 +413,7 @@ pub const SortMergeJoin = struct {
         // for v1 the sort_state lifetime is "until next call." For
         // correctness, allocate keys statically at create-time like
         // Sort does. TODO when planner consumes this.
-        return .{ .upper_rows = product };
+        return .{ .upper_rows = product, .column_cards = self.cached_cards };
     }
 
     pub fn next(self: *SortMergeJoin) !?Batch {

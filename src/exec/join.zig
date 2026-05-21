@@ -508,22 +508,7 @@ pub const Join = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
-        // Concatenate per-column cardinality bounds: left columns, then the
-        // kept right columns. Each side's bound carries through (a join only
-        // shrinks or repeats a column's distinct values, never adds new ones).
-        const lc = left.stats().column_cards;
-        const rc = right.stats().column_cards;
-        const cached_cards: []const exec.ColCard = if (lc.len == 0 and rc.len == 0) &.{} else blk: {
-            const cc = try allocator.alloc(exec.ColCard, output_schema.len);
-            for (cc[0..left_schema.len], 0..) |*out, i| out.* = if (i < lc.len) lc[i] else .unknown;
-            var oi: usize = left_schema.len;
-            for (right_kept_mask, 0..) |keep, ri| {
-                if (!keep) continue;
-                cc[oi] = if (ri < rc.len) rc[ri] else .unknown;
-                oi += 1;
-            }
-            break :blk cc;
-        };
+        const cached_cards = try exec.concatJoinCards(allocator, left, right, left_schema.len, right_kept_mask, output_schema.len);
         errdefer if (cached_cards.len > 0) allocator.free(cached_cards);
 
         const self = try allocator.create(Join);

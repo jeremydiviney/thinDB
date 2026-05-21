@@ -1147,3 +1147,149 @@ test "streaming aggregate: sorted GROUP BY produces correct per-group results" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3, 1 }, counts.items);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 70, 100, 40 }, totals.items);
 }
+
+test "cardinality: bounds propagate through filter, sort, and project" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "a", .type = .int },
+            .{ .name = "b", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("cp", schema, .{ .order_key = &.{"id"}, .unique = true });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .a = @as(i32, 10), .b = @as(i32, 100) },
+        .{ .id = @as(i64, 2), .a = @as(i32, 20), .b = @as(i32, 200) },
+        .{ .id = @as(i64, 3), .a = @as(i32, 30), .b = @as(i32, 300) },
+        .{ .id = @as(i64, 4), .a = @as(i32, 10), .b = @as(i32, 400) },
+        .{ .id = @as(i64, 5), .a = @as(i32, 20), .b = @as(i32, 100) },
+        .{ .id = @as(i64, 6), .a = @as(i32, 30), .b = @as(i32, 200) },
+    });
+    try t.flush();
+
+    // Baseline: scan exposes a bound per column; capture them (a=3 distinct,
+    // b=4 distinct → both small → exact).
+    var a_c: exec.ColCard = undefined;
+    var b_c: exec.ColCard = undefined;
+    {
+        var q = try scan(allocator, t);
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(usize, 3), s.column_cards.len);
+        try std.testing.expect(std.meta.activeTag(s.column_cards[1]) == .exact);
+        try std.testing.expect(std.meta.activeTag(s.column_cards[2]) == .exact);
+        a_c = s.column_cards[1];
+        b_c = s.column_cards[2];
+    }
+
+    // Filter preserves the bounds (filtering only shrinks distinct counts).
+    {
+        var base = try scan(allocator, t);
+        var q = try base.filter(leafExpr("a", .gt, .{ .int = 5 }));
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(a_c, s.column_cards[1]);
+        try std.testing.expectEqual(b_c, s.column_cards[2]);
+    }
+
+    // Sort preserves the bounds (reorder only).
+    {
+        var base = try scan(allocator, t);
+        var q = try base.orderBy(&.{.{ .col = "a", .desc = false }});
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(a_c, s.column_cards[1]);
+        try std.testing.expectEqual(b_c, s.column_cards[2]);
+    }
+
+    // Project remaps the bounds to the projected column order: [b, a].
+    {
+        var base = try scan(allocator, t);
+        var q = try base.project(&.{ "b", "a" });
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(usize, 2), s.column_cards.len);
+        try std.testing.expectEqual(b_c, s.column_cards[0]);
+        try std.testing.expectEqual(a_c, s.column_cards[1]);
+    }
+}
+
+test "cardinality: join concatenates left and right bounds" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Distinct non-key column names so the join output has no collision.
+    const lschema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "lv", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const rschema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "rv", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const l = try db.table("jl", lschema, .{ .order_key = &.{"id"}, .unique = true });
+    try l.insert(&.{
+        .{ .id = @as(i64, 1), .lv = @as(i32, 7) },
+        .{ .id = @as(i64, 2), .lv = @as(i32, 8) },
+        .{ .id = @as(i64, 3), .lv = @as(i32, 9) },
+    });
+    try l.flush();
+    const r = try db.table("jr", rschema, .{ .order_key = &.{"id"}, .unique = true });
+    try r.insert(&.{
+        .{ .id = @as(i64, 1), .rv = @as(i32, 70) },
+        .{ .id = @as(i64, 2), .rv = @as(i32, 80) },
+    });
+    try r.flush();
+
+    // Capture each side's per-column bounds independently.
+    var lcards: [2]exec.ColCard = undefined;
+    var rcards: [2]exec.ColCard = undefined;
+    {
+        var q = try scan(allocator, l);
+        defer q.deinit();
+        const s = q.stats();
+        lcards = .{ s.column_cards[0], s.column_cards[1] };
+    }
+    {
+        var q = try scan(allocator, r);
+        defer q.deinit();
+        const s = q.stats();
+        rcards = .{ s.column_cards[0], s.column_cards[1] };
+    }
+
+    // Join on id → output schema is (l.id, l.v, r.v); the right join key is
+    // dropped. Bounds should be [l.id, l.v, r.v].
+    var left = try scan(allocator, l);
+    const right = try scan(allocator, r);
+    var q = try left.join(right, .{
+        .on = &.{.{ .left = "id", .right = "id" }},
+        .algorithm = .auto,
+    });
+    defer q.deinit();
+    const s = q.stats();
+    try std.testing.expectEqual(@as(usize, 3), s.column_cards.len);
+    try std.testing.expectEqual(lcards[0], s.column_cards[0]); // l.id
+    try std.testing.expectEqual(lcards[1], s.column_cards[1]); // l.v
+    try std.testing.expectEqual(rcards[1], s.column_cards[2]); // r.v (right key dropped)
+    // Drain so the join tears down via its executed path.
+    while (try q.next()) |_| {}
+}

@@ -74,6 +74,9 @@ pub const NestedLoopJoin = struct {
     left_col_count: usize,
     /// Per right-side column: true if we emit it (false for join keys).
     right_kept_mask: []const bool,
+    /// Per-output-column cardinality bounds (left ⧺ kept right). Cached at
+    /// create. Empty when neither side carries cardinality info.
+    cached_cards: []const exec.ColCard = &.{},
 
     // Materialized state for both sides. Populated lazily on first .next().
     left_materialized: []ColumnStore,
@@ -238,6 +241,9 @@ pub const NestedLoopJoin = struct {
         const rvb = try allocator.alloc(ColumnView, right_schema.len);
         errdefer allocator.free(rvb);
 
+        const cached_cards = try exec.concatJoinCards(allocator, left, right, left_schema.len, right_kept_mask_owned, output_schema.len);
+        errdefer if (cached_cards.len > 0) allocator.free(cached_cards);
+
         const self = try allocator.create(NestedLoopJoin);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -254,6 +260,7 @@ pub const NestedLoopJoin = struct {
             .output_schema = output_schema,
             .left_col_count = left_schema.len,
             .right_kept_mask = right_kept_mask_owned,
+            .cached_cards = cached_cards,
             .left_materialized = left_mat,
             .right_materialized = right_mat,
             .output_columns = output_columns,
@@ -281,6 +288,7 @@ pub const NestedLoopJoin = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.output_schema);
         self.allocator.free(self.right_kept_mask);
+        if (self.cached_cards.len > 0) self.allocator.free(@constCast(self.cached_cards));
         self.allocator.free(self.left_view_buf);
         self.allocator.free(self.right_view_buf);
         if (self.matched_right) |*mb| mb.deinit(self.allocator);
@@ -312,7 +320,7 @@ pub const NestedLoopJoin = struct {
         const l = self.left.stats();
         const r = self.right.stats();
         const product = std.math.mul(u64, l.upper_rows, r.upper_rows) catch std.math.maxInt(u64);
-        return .{ .upper_rows = product };
+        return .{ .upper_rows = product, .column_cards = self.cached_cards };
     }
 
     pub fn next(self: *NestedLoopJoin) !?Batch {
