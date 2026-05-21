@@ -57,6 +57,58 @@ fn seedBig(db: anytype, rows: i64) !void {
     try t.flush();
 }
 
+test "sql: GROUP BY on the sorted order key streams and aggregates correctly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // order_key = grp (non-unique) with duplicates; a single flush yields
+    // one segment globally sorted on grp, so GROUP BY grp routes to the
+    // streaming sort-based aggregate (which emits in grp order).
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "grp", .type = .int },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"grp"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"grp"};
+    const t = try db.table("gk", schema, .{ .order_key = &ok, .unique = false });
+    try t.insert(&.{
+        .{ .grp = @as(i32, 2), .v = @as(i32, 10) },
+        .{ .grp = @as(i32, 1), .v = @as(i32, 20) },
+        .{ .grp = @as(i32, 2), .v = @as(i32, 30) },
+        .{ .grp = @as(i32, 3), .v = @as(i32, 40) },
+        .{ .grp = @as(i32, 1), .v = @as(i32, 50) },
+        .{ .grp = @as(i32, 2), .v = @as(i32, 60) },
+    });
+    try t.flush();
+
+    var q = try runSql(allocator, db, "SELECT grp, count(*) AS n, sum(v) AS total FROM gk GROUP BY grp");
+    defer q.deinit();
+    var grps: std.ArrayList(i32) = .empty;
+    defer grps.deinit(allocator);
+    var counts: std.ArrayList(i64) = .empty;
+    defer counts.deinit(allocator);
+    var totals: std.ArrayList(i64) = .empty;
+    defer totals.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            try grps.append(allocator, b.values[0].data.int[i]);
+            try counts.append(allocator, b.values[1].data.bigint[i]);
+            try totals.append(allocator, b.values[2].data.bigint[i]);
+        }
+    }
+    // Streaming emits in ascending group order.
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3 }, grps.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3, 1 }, counts.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 70, 100, 40 }, totals.items);
+}
+
 test "sql: SELECT * FROM t returns all rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

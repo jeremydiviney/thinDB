@@ -1020,6 +1020,9 @@ pub fn buildServerQuerySession(
         .group_by => |g| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, g.upstream.*);
             errdefer upstream.deinit();
+            if (groupKeysSortedPrefix(upstream.stats().sort_state, g.group_cols)) {
+                break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+            }
             break :blk try upstream.groupBy(g.group_cols, g.aggs);
         },
         .compute => |c| blk: {
@@ -1262,6 +1265,29 @@ pub fn compileWithSession(
 }
 
 
+/// True when the group-by keys are already a globally-sorted prefix of the
+/// input stream, so a streaming sort-based aggregate can replace the hash
+/// aggregate (bounded memory, no sort needed). Grouping only needs equal
+/// keys to be adjacent — direction is irrelevant — which holds iff the
+/// stream is globally sorted and its leading `group_cols.len` keys are
+/// exactly the group-by set.
+fn groupKeysSortedPrefix(state: exec.SortState, group_cols: []const []const u8) bool {
+    if (!state.global) return false;
+    if (group_cols.len == 0 or state.keys.len < group_cols.len) return false;
+    const prefix = state.keys[0..group_cols.len];
+    for (group_cols) |gc| {
+        var found = false;
+        for (prefix) |pk| {
+            if (types.columnNameEql(pk, gc)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
@@ -1317,6 +1343,9 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .group_by => |g| blk: {
             var upstream = try compileOp(ctx, g.upstream);
             errdefer upstream.deinit();
+            if (groupKeysSortedPrefix(upstream.stats().sort_state, g.group_cols)) {
+                break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+            }
             break :blk try upstream.groupBy(g.group_cols, g.aggs);
         },
         .compute => |c| blk: {
