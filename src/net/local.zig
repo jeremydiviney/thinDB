@@ -1020,8 +1020,18 @@ pub fn buildServerQuerySession(
         .group_by => |g| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, g.upstream.*);
             errdefer upstream.deinit();
-            if (groupKeysSortedPrefix(upstream.stats().sort_state, g.group_cols)) {
-                break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+            if (g.group_cols.len > 0) {
+                const st = upstream.stats();
+                if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
+                    break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                }
+                if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols)) {
+                    const specs = try allocator.alloc(exec.SortSpec, g.group_cols.len);
+                    defer allocator.free(specs);
+                    for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+                    upstream = try upstream.orderBy(specs);
+                    break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                }
             }
             break :blk try upstream.groupBy(g.group_cols, g.aggs);
         },
@@ -1288,6 +1298,29 @@ fn groupKeysSortedPrefix(state: exec.SortState, group_cols: []const []const u8) 
     return true;
 }
 
+/// True when we can *prove* the group-by hash table fits: every group key
+/// has a known distinct-count bound and their product is under the limit.
+/// Any unknown key (no on-disk stat, or post-join/derived) ⇒ false ⇒ the
+/// caller falls back to a bounded sort. `schema` is the group-by input's
+/// output schema (column_cards is indexed by it).
+fn groupKeysCardUnderLimit(st: exec.PipelineStats, schema: []const types.Column, group_cols: []const []const u8) bool {
+    const limit = @import("../storage/format.zig").cardinality_limit;
+    if (st.column_cards.len == 0) return false;
+    var product: u64 = 1;
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse return false;
+        if (idx >= st.column_cards.len) return false;
+        switch (st.column_cards[idx]) {
+            .unknown => return false,
+            .exact => |nd| {
+                product *|= nd;
+                if (product >= limit) return false;
+            },
+        }
+    }
+    return true;
+}
+
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
@@ -1343,8 +1376,22 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .group_by => |g| blk: {
             var upstream = try compileOp(ctx, g.upstream);
             errdefer upstream.deinit();
-            if (groupKeysSortedPrefix(upstream.stats().sort_state, g.group_cols)) {
-                break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+            // Global aggregate (no group keys) is O(1) — always hash.
+            if (g.group_cols.len > 0) {
+                const st = upstream.stats();
+                if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
+                    break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                }
+                if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols)) {
+                    // Unknown or over the limit → sort the group keys, then
+                    // stream. Bounded memory regardless of cardinality.
+                    const specs = try ctx.allocator.alloc(exec.SortSpec, g.group_cols.len);
+                    defer ctx.allocator.free(specs);
+                    for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+                    upstream = try upstream.orderBy(specs);
+                    break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                }
+                // else: proven under the limit → hash fits.
             }
             break :blk try upstream.groupBy(g.group_cols, g.aggs);
         },

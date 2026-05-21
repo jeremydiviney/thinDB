@@ -12,6 +12,7 @@ const Value = types.Value;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
+const sformat = @import("../storage/format.zig");
 
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
@@ -29,6 +30,41 @@ const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 const PredicateOp = predicate.PredicateOp;
 const statsOverlapPredicate = predicate.statsOverlapPredicate;
+
+/// Merge per-segment cardinality stats into a per-column bound for the
+/// whole scan. A column is `unknown` if any segment marked it "big" or if
+/// the summed distinct counts (+ memtable rows, which could each add a new
+/// distinct value) reach the limit; otherwise `exact` with that sum as a
+/// proven upper bound (true distinct ≤ sum across segments).
+fn computeColumnCards(
+    allocator: Allocator,
+    segs: []const storage.ManifestEntry,
+    n: usize,
+    memtable_rows: u64,
+) ![]exec.ColCard {
+    const cards = try allocator.alloc(exec.ColCard, n);
+    errdefer allocator.free(cards);
+    for (cards, 0..) |*card, ci| {
+        var any_big = false;
+        var sum: u64 = memtable_rows;
+        for (segs) |e| {
+            const v: u64 = if (ci < e.column_cardinality.len)
+                e.column_cardinality[ci]
+            else
+                sformat.cardinality_big;
+            if (v == sformat.cardinality_big) {
+                any_big = true;
+                break;
+            }
+            sum +|= v;
+        }
+        card.* = if (any_big or sum >= sformat.cardinality_limit)
+            .unknown
+        else
+            .{ .exact = @intCast(sum) };
+    }
+    return cards;
+}
 
 pub const Scan = struct {
     allocator: Allocator,
@@ -74,6 +110,11 @@ pub const Scan = struct {
     /// accountant is injected and owned by the query root (`CompileCtx`).
     owned_accountant: ?*exec.memory.MemoryAccountant = null,
     owns_accountant: bool = false,
+
+    /// Per-column distinct-value bound, merged across this scan's segment
+    /// snapshot (+ memtable rows). Computed once at create; borrowed by
+    /// `stats()`. One slot per schema column.
+    cached_cards: []exec.ColCard = &.{},
 
     /// When non-null, `seg_skip[i] == true` means segment at manifest
     /// index `i` is excluded by a pushed-down predicate on the leading
@@ -162,6 +203,14 @@ pub const Scan = struct {
             if (owned_accountant) |a| allocator.destroy(a);
         };
 
+        const cached_cards = try computeColumnCards(
+            allocator,
+            table.manifest.segments.items[0..segment_count],
+            n,
+            memtable_row_count,
+        );
+        errdefer allocator.free(cached_cards);
+
         self.* = .{
             .allocator = allocator,
             .io = table.io,
@@ -174,6 +223,7 @@ pub const Scan = struct {
             .prunes = .empty,
             .owned_accountant = owned_accountant,
             .owns_accountant = owns_accountant,
+            .cached_cards = cached_cards,
         };
 
         return makeQuery(allocator, self);
@@ -186,6 +236,7 @@ pub const Scan = struct {
     pub fn deinit(self: *Scan) void {
         self.releaseBatch();
         self.closeCurSegment();
+        if (self.cached_cards.len > 0) self.allocator.free(self.cached_cards);
         self.prunes.deinit(self.allocator);
         if (self.owns_accountant) {
             if (self.owned_accountant) |a| self.allocator.destroy(a);
@@ -325,6 +376,7 @@ pub const Scan = struct {
                 .keys = self.table.schema.order_key,
                 .global = global,
             },
+            .column_cards = self.cached_cards,
         };
     }
 

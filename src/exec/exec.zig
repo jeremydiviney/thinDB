@@ -146,6 +146,17 @@ pub const SortState = struct {
     }
 };
 
+/// Per-column distinct-value cardinality as it flows through the pipeline.
+/// `exact: n` means a proven upper bound of `n` distinct values (filters
+/// only shrink distinct counts, so an upstream bound stays valid). `unknown`
+/// means no proven bound (also used for the on-disk "big" marker). The
+/// GROUP BY planner multiplies the group keys' bounds: all `exact` and the
+/// product under the limit ⇒ hash fits; any `unknown` ⇒ sort.
+pub const ColCard = union(enum) {
+    exact: u32,
+    unknown,
+};
+
 /// Pre-execution statistics about an operator's output.
 pub const PipelineStats = struct {
     /// Upper bound on the number of rows this operator will emit.
@@ -155,6 +166,9 @@ pub const PipelineStats = struct {
     upper_rows: u64,
     /// Sort property of the output stream. See `SortState`.
     sort_state: SortState = .{},
+    /// Per-output-column distinct-value bound, indexed by output schema
+    /// column. Empty ⇒ no information (all columns unknown).
+    column_cards: []const ColCard = &.{},
 };
 
 pub const Query = struct {
