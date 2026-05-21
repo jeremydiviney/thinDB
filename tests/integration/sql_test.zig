@@ -268,6 +268,63 @@ test "sql: global aggregate (no GROUP BY) — count(*), avg, min, max" {
     try std.testing.expectEqual(@as(i32, 50), b.values[3].data.int[0]);
 }
 
+test "sql: COUNT(DISTINCT col) global" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // tags a,b,a,b,c → 3 distinct. k values 100,100,200,200,300 → 3 distinct.
+    var q = try runSql(allocator, db,
+        \\SELECT count(DISTINCT tag) AS dt, count(DISTINCT k) AS dk FROM t
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expectEqual(@as(i64, 3), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 3), b.values[1].data.bigint[0]);
+}
+
+test "sql: COUNT(DISTINCT col) grouped" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // GROUP BY tag: a→{100,200} (2), b→{100,200} (2), c→{300} (1).
+    var q = try runSql(allocator, db,
+        \\SELECT tag, count(DISTINCT k) AS dk FROM t GROUP BY tag ORDER BY tag ASC
+    );
+    defer q.deinit();
+    var dks: std.ArrayList(i64) = .empty;
+    defer dks.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try dks.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2, 1 }, dks.items);
+}
+
+test "sql: DISTINCT in a scalar call is rejected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    try std.testing.expectError(
+        error.SqlInvalidProjection,
+        runSql(allocator, db, "SELECT upper(DISTINCT tag) FROM t"),
+    );
+}
+
 test "sql: MIN/MAX on string column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

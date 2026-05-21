@@ -648,7 +648,8 @@ pub const Parser = struct {
             // Parse the call shape (name + paren-wrapped args) once. Then
             // decide between aggregate / scalar / window based on what
             // follows.
-            const args = try self.parseCallArgList();
+            var saw_distinct = false;
+            const args = try self.parseCallArgList(&saw_distinct);
             const fname_dup = try self.arena.dupe(u8, first);
 
             // Optional [IGNORE | RESPECT] NULLS between `)` and `OVER`.
@@ -693,8 +694,19 @@ pub const Parser = struct {
             // aggregate lowering expects. Aggregates only accept a single
             // column-ref arg (or `*` for COUNT(*)); reject anything else.
             if (aggForName(first)) |func| {
+                if (saw_distinct) {
+                    // Only COUNT(DISTINCT col) is supported today (the
+                    // count_distinct kernel). SUM/AVG/etc. DISTINCT would
+                    // need their own dedup accumulators.
+                    if (func != .count) return ParseError.SqlInvalidProjection;
+                    return try self.aggCallFromArgs(first, .count_distinct, args);
+                }
                 return try self.aggCallFromArgs(first, func, args);
             }
+
+            // DISTINCT is only valid inside an aggregate; a scalar/window
+            // call with DISTINCT is a syntax error.
+            if (saw_distinct) return ParseError.SqlInvalidProjection;
 
             // Scalar function call. If a binary operator follows, the
             // whole thing is a binary expression with the call as the
@@ -827,8 +839,18 @@ pub const Parser = struct {
     /// after `)` coming out. Returns the args slice. `*` is encoded as
     /// `Expr.col_ref = "*"` (downstream callers — aggregates — recognize
     /// the sentinel; everyone else rejects it).
-    fn parseCallArgList(self: *Parser) ParseError![]const ir.Expr {
+    /// Parse `( arg, arg, ... )` or `( * )`. A leading `DISTINCT` is
+    /// consumed and reported via `distinct_out` (for aggregate calls like
+    /// `COUNT(DISTINCT col)`). Passing `null` for `distinct_out` rejects
+    /// DISTINCT — it's only valid inside an aggregate.
+    fn parseCallArgList(self: *Parser, distinct_out: ?*bool) ParseError![]const ir.Expr {
         try self.expect(.lparen);
+        if (self.cur.tag == .kw_distinct) {
+            try self.advance();
+            if (distinct_out) |p| p.* = true else return ParseError.SqlInvalidProjection;
+        } else if (distinct_out) |p| {
+            p.* = false;
+        }
         var args: std.ArrayList(ir.Expr) = .empty;
         if (self.cur.tag == .star) {
             try self.advance();
@@ -1057,7 +1079,7 @@ pub const Parser = struct {
                     if (aggForName(name)) |_| return ParseError.SqlInvalidProjection;
                     if (ir.windowFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
                     const fname_dup = try self.arena.dupe(u8, name);
-                    const nested_args = try self.parseCallArgList();
+                    const nested_args = try self.parseCallArgList(null);
                     return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = nested_args } };
                 }
                 const col_dup = try self.dupQualifiedColRef(name);
