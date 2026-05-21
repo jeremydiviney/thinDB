@@ -57,6 +57,7 @@ pub const TopN = struct {
     reserved_bytes: usize = 0,
 
     drained: bool = false,
+    evicted: bool = false,
     perm: []u32 = &.{},
     emit_cursor: usize = 0,
     emit_end: usize = 0,
@@ -133,9 +134,11 @@ pub const TopN = struct {
     pub fn deinit(self: *TopN) void {
         var up = self.upstream;
         up.deinit();
-        for (self.accumulated) |*c| c.deinit(self.allocator);
-        self.allocator.free(self.accumulated);
-        if (self.perm.len > 0) self.allocator.free(self.perm);
+        if (!self.evicted) {
+            for (self.accumulated) |*c| c.deinit(self.allocator);
+            self.allocator.free(self.accumulated);
+            if (self.perm.len > 0) self.allocator.free(self.perm);
+        }
         for (self.output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_columns);
         self.allocator.free(self.views);
@@ -184,10 +187,27 @@ pub const TopN = struct {
         }
     };
 
+    /// Free the bounded buffer + permutation and release the remaining
+    /// reserved bytes once all kept rows have been emitted. Idempotent.
+    fn evict(self: *TopN) void {
+        if (self.evicted) return;
+        for (self.accumulated) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.accumulated);
+        self.accumulated = &.{};
+        if (self.perm.len > 0) self.allocator.free(self.perm);
+        self.perm = &.{};
+        if (self.upstream.accountant()) |a| a.release(self.reserved_bytes);
+        self.reserved_bytes = 0;
+        self.evicted = true;
+    }
+
     pub fn next(self: *TopN) !?Batch {
         if (!self.drained) try self.drainAndSelect();
 
-        if (self.emit_cursor >= self.emit_end) return null;
+        if (self.emit_cursor >= self.emit_end) {
+            self.evict();
+            return null;
+        }
         const remaining = self.emit_end - self.emit_cursor;
         const n: usize = @min(batch_size, remaining);
 

@@ -44,6 +44,11 @@ pub const Sort = struct {
     /// `next()` call (Sort is a blocking operator).
     accumulated: []ColumnStore,
     accumulated_rows: u64 = 0,
+    /// Bytes charged against the query budget for `accumulated` + `perm`.
+    /// Released (and the buffers freed) once the last row is emitted —
+    /// the sorted input is no longer a downstream dependency.
+    reserved_bytes: usize = 0,
+    evicted: bool = false,
 
     drained: bool = false,
     perm: []u32 = &.{},
@@ -119,9 +124,11 @@ pub const Sort = struct {
     pub fn deinit(self: *Sort) void {
         var up = self.upstream;
         up.deinit();
-        for (self.accumulated) |*c| c.deinit(self.allocator);
-        self.allocator.free(self.accumulated);
-        if (self.perm.len > 0) self.allocator.free(self.perm);
+        if (!self.evicted) {
+            for (self.accumulated) |*c| c.deinit(self.allocator);
+            self.allocator.free(self.accumulated);
+            if (self.perm.len > 0) self.allocator.free(self.perm);
+        }
         for (self.output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_columns);
         self.allocator.free(self.views);
@@ -160,11 +167,29 @@ pub const Sort = struct {
         return self.upstream.accountant();
     }
 
+    /// Free the accumulated buffer + permutation and hand their bytes back
+    /// to the query budget. Called once all sorted rows have been emitted
+    /// (or on an empty input). Idempotent.
+    fn evict(self: *Sort) void {
+        if (self.evicted) return;
+        for (self.accumulated) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.accumulated);
+        self.accumulated = &.{};
+        if (self.perm.len > 0) self.allocator.free(self.perm);
+        self.perm = &.{};
+        if (self.upstream.accountant()) |a| a.release(self.reserved_bytes);
+        self.reserved_bytes = 0;
+        self.evicted = true;
+    }
+
     pub fn next(self: *Sort) !?Batch {
         if (!self.drained) try self.drainAndSort();
 
         const remaining = self.accumulated_rows - self.emit_offset;
-        if (remaining == 0) return null;
+        if (remaining == 0) {
+            self.evict();
+            return null;
+        }
         const n: usize = @intCast(@min(@as(u64, batch_size), remaining));
 
         for (self.output_columns) |*c| c.clear();
@@ -187,7 +212,9 @@ pub const Sort = struct {
         const row_bytes = exec.memory.estimateRowBytes(self.upstream.outputSchema());
 
         while (try self.upstream.next()) |batch| {
-            if (acc) |a| try a.reserve(batch.row_count * row_bytes);
+            const b = batch.row_count * row_bytes;
+            if (acc) |a| try a.reserve(b);
+            self.reserved_bytes += b;
             for (batch.values, 0..) |view, ci| {
                 try engine.memtable.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
             }
@@ -201,6 +228,7 @@ pub const Sort = struct {
         }
         // Account for the perm array (u32 per row).
         if (acc) |a| try a.reserve(n * @sizeOf(u32));
+        self.reserved_bytes += n * @sizeOf(u32);
         self.perm = try self.allocator.alloc(u32, n);
         for (self.perm, 0..) |*p, i| p.* = @intCast(i);
 

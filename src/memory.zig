@@ -7,10 +7,22 @@
 //! check before each allocation; if the budget would be exceeded, the
 //! query fails fast with `MemoryBudgetExceeded` instead.
 //!
-//! Scope: per-query. Each query gets its own MemoryAccountant. Operators
-//! within a single query share that accountant so the budget is a global
-//! limit across the whole pipeline. Spilling to disk is a future
-//! enhancement; v1 simply refuses the query.
+//! Scope: per-query. On the SQL compile path (`net/local.zig`'s
+//! `CompileCtx`) one accountant is owned by the query root and injected
+//! into every Scan, so the budget is a true whole-query limit shared
+//! across all operators, materialized buffers, and subquery drains.
+//! Blocking operators reserve as they accumulate and `release()` (and free
+//! the backing memory) the moment their result is no longer a downstream
+//! dependency — so `current_bytes` tracks the live concurrent peak, not
+//! the sum of sequential phases. Spilling to disk is a future enhancement;
+//! today an over-budget query simply fails with `MemoryBudgetExceeded`.
+//!
+//! Future: a process-global memory pool. Each query would acquire its
+//! per-query budget from the pool at admission (today the grant == the
+//! configured per-query max, always granted) and not start until the
+//! reservation is available. The single seam for that is where the query
+//! root creates the accountant (acquire) and frees it (release) — keep
+//! budget acquisition centralized there rather than scattered.
 //!
 //! Threading: single-threaded by construction (our pull-based execution
 //! drives one operator at a time within a query). No mutex.

@@ -210,11 +210,20 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
     const aa = ctx.subqueryArena();
     var out: std.ArrayList(Value) = .empty;
 
+    // The materialized IN-set is resident for the rest of the query
+    // (the Filter reads it), so charge it against the query budget. We
+    // never release it here — it lives until the CompileCtx tears the
+    // subquery arena down. The inner query's own transient buffers were
+    // already accounted (and evicted) while draining it above.
+    const acct = try ctx.queryAccountant();
+    const per_value = @sizeOf(Value) + 32;
+
     while (try q.next()) |batch| {
         const view = batch.values[0];
         var i: usize = 0;
         while (i < batch.row_count) : (i += 1) {
             if (!view.isValid(i)) continue;
+            if (acct) |a| try a.reserve(per_value);
             const v = try extractScalarValueAt(aa, view, i);
             try out.append(aa, v);
         }

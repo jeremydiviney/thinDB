@@ -46,10 +46,25 @@ pub const MaterializedBuffer = struct {
     /// Source query — non-null until drained, then released early to
     /// free its operator tree's memory.
     upstream: ?Query,
+    /// Query-scoped accountant (owned by the CompileCtx). The buffered
+    /// rows are charged against it in `fill()` and released when the last
+    /// Reader is exhausted (DAG-aware eviction). Null = no tracking.
+    acct: ?*exec.memory.MemoryAccountant,
+    /// Bytes charged for the buffered rows; released exactly once on
+    /// eviction.
+    reserved_bytes: usize = 0,
+    /// Number of Readers not yet exhausted. Incremented in `Reader.create`,
+    /// decremented when a Reader finishes draining. At zero the column data
+    /// is freed and the budget released — the buffer is no longer a
+    /// downstream dependency of anything in the DAG.
+    live_readers: u32 = 0,
+    /// True once the column data has been freed + budget released.
+    evicted: bool = false,
 
     pub fn init(
         allocator: Allocator,
         upstream: Query,
+        acct: ?*exec.memory.MemoryAccountant,
     ) !*MaterializedBuffer {
         const up_schema = upstream.outputSchema();
         const buf = try allocator.create(MaterializedBuffer);
@@ -75,16 +90,44 @@ pub const MaterializedBuffer = struct {
             .schema = schema_dup,
             .columns = columns,
             .upstream = upstream,
+            .acct = acct,
         };
         return buf;
     }
 
     pub fn deinit(self: *MaterializedBuffer) void {
         if (self.upstream) |*u| u.deinit();
-        for (self.columns) |*c| c.deinit(self.allocator);
-        self.allocator.free(self.columns);
+        // If the buffer was never fully drained by its Readers (e.g. a
+        // LIMIT above stopped pulling), the column data is still resident
+        // here. Free it. We do NOT release the budget on this teardown
+        // path — the query is ending and the accountant is about to be
+        // destroyed by the CompileCtx.
+        if (!self.evicted) {
+            for (self.columns) |*c| c.deinit(self.allocator);
+            self.allocator.free(self.columns);
+        }
         self.allocator.free(self.schema);
         self.allocator.destroy(self);
+    }
+
+    /// Free the buffered column data and hand its bytes back to the query
+    /// budget. Called when the last Reader is exhausted; idempotent.
+    fn evict(self: *MaterializedBuffer) void {
+        if (self.evicted) return;
+        for (self.columns) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.columns);
+        self.columns = &.{};
+        if (self.acct) |a| a.release(self.reserved_bytes);
+        self.reserved_bytes = 0;
+        self.evicted = true;
+    }
+
+    /// A Reader has finished draining. When the last one finishes the
+    /// buffer is no longer a downstream dependency, so evict it.
+    fn readerFinished(self: *MaterializedBuffer) void {
+        std.debug.assert(self.live_readers > 0);
+        self.live_readers -= 1;
+        if (self.live_readers == 0) self.evict();
     }
 
     /// Drain `upstream` once, appending each batch into the per-column
@@ -94,13 +137,31 @@ pub const MaterializedBuffer = struct {
     pub fn fill(self: *MaterializedBuffer) !void {
         if (self.filled) return;
         const upstream = &self.upstream.?;
+        // Charge the buffered rows against the query budget as we drain.
+        // This is a blocking, fully-materializing operator just like Sort
+        // / hash GroupBy, so an oversized CTE fails fast with
+        // MemoryBudgetExceeded instead of silently accumulating GBs. The
+        // accountant is the query-scoped one (owned by the CompileCtx, not
+        // the upstream Scan), so it stays valid after we release the
+        // upstream below and lets us release these bytes again when the
+        // last Reader is done.
+        const row_bytes = exec.memory.estimateRowBytes(self.schema);
+        errdefer if (self.acct) |a| {
+            a.release(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        };
         while (try upstream.next()) |batch| {
+            const b = batch.row_count * row_bytes;
+            if (self.acct) |a| try a.reserve(b);
+            self.reserved_bytes += b;
             for (batch.values, 0..) |view, i| {
                 try transform.appendAllColumn(self.allocator, view, &self.columns[i]);
             }
             self.row_count += @intCast(batch.row_count);
         }
-        // Release the upstream — drain is done, we hold the data now.
+        // Release the upstream — drain is done, we hold the data now. The
+        // upstream Scan does not own the query accountant, so this leaves
+        // our reservation intact.
         var u = self.upstream.?;
         u.deinit();
         self.upstream = null;
@@ -118,12 +179,16 @@ pub const Reader = struct {
     buffer: *MaterializedBuffer,
     views: []ColumnView,
     emitted: bool = false,
+    /// True once this Reader has reported itself finished to the buffer
+    /// (drained past its single data batch). Guards a double decrement.
+    done: bool = false,
 
     pub fn create(allocator: Allocator, buffer: *MaterializedBuffer) !Query {
         const views = try allocator.alloc(ColumnView, buffer.schema.len);
         errdefer allocator.free(views);
         const self = try allocator.create(Reader);
         self.* = .{ .allocator = allocator, .buffer = buffer, .views = views };
+        buffer.live_readers += 1;
         return makeQuery(allocator, self);
     }
 
@@ -149,9 +214,21 @@ pub const Reader = struct {
 
     pub fn next(self: *Reader) !?Batch {
         try self.buffer.fill();
-        if (self.emitted) return null;
+        if (self.done) return null;
+        if (self.emitted) {
+            // Our single data batch has been consumed; this Reader is
+            // finished. Report it so the buffer can evict once the last
+            // Reader is done.
+            self.done = true;
+            self.buffer.readerFinished();
+            return null;
+        }
         self.emitted = true;
-        if (self.buffer.row_count == 0) return null;
+        if (self.buffer.row_count == 0) {
+            self.done = true;
+            self.buffer.readerFinished();
+            return null;
+        }
         for (self.buffer.columns, self.views) |*c, *v| v.* = c.view();
         return Batch{
             .schema = self.buffer.schema,
@@ -165,7 +242,6 @@ pub const Reader = struct {
     }
 
     pub fn accountant(self: *Reader) ?*exec.memory.MemoryAccountant {
-        _ = self;
-        return null;
+        return self.buffer.acct;
     }
 };

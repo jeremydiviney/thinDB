@@ -67,10 +67,13 @@ pub const Scan = struct {
     /// Pushed-down predicates used to skip row groups via min/max stats.
     prunes: std.ArrayList(PruneHint),
 
-    /// Owned by this Scan when `Table.query_memory_budget > 0`. All
-    /// operators in this query inherit it via `Query.accountant()`.
-    /// Null = no tracking.
+    /// The query memory accountant shared by every operator above this
+    /// Scan (reached via `Query.accountant()`). Null = no tracking.
+    /// `owns_accountant` is true only when this Scan minted it (the
+    /// standalone / raw-builder path); on the SQL compile path the
+    /// accountant is injected and owned by the query root (`CompileCtx`).
     owned_accountant: ?*exec.memory.MemoryAccountant = null,
+    owns_accountant: bool = false,
 
     /// When non-null, `seg_skip[i] == true` means segment at manifest
     /// index `i` is excluded by a pushed-down predicate on the leading
@@ -93,7 +96,20 @@ pub const Scan = struct {
         val: Value,
     };
 
+    /// Standalone scan: mints + owns its own accountant from the table's
+    /// configured budget. Used by the raw builder API and tests.
     pub fn create(allocator: Allocator, table: *Table) !Query {
+        return createWithAccountant(allocator, table, null);
+    }
+
+    /// Compile-path scan: when `injected` is non-null it becomes the
+    /// query-scoped accountant (owned by the query root, not by this
+    /// Scan). When null, behaves like `create` (self-mint per budget).
+    pub fn createWithAccountant(
+        allocator: Allocator,
+        table: *Table,
+        injected: ?*exec.memory.MemoryAccountant,
+    ) !Query {
         const n = table.schema.columns.len;
 
         const decoded = try allocator.alloc(storage.OwnedColumn, n);
@@ -130,16 +146,21 @@ pub const Scan = struct {
         const memtable_row_count = memtable_snap.row_count;
         table.mutex.unlock(table.io);
 
-        // Allocate the per-query memory accountant if the Table's
-        // config sets a non-zero budget. Heap-allocated so all
-        // operators in the pipeline can share via a pointer.
-        var owned_accountant: ?*exec.memory.MemoryAccountant = null;
-        if (table.query_memory_budget > 0) {
+        // Use the injected query-scoped accountant when present. Otherwise
+        // mint our own from the table's configured budget (heap-allocated
+        // so all operators in the pipeline share it via a pointer) and own
+        // its lifetime.
+        var owned_accountant: ?*exec.memory.MemoryAccountant = injected;
+        var owns_accountant = false;
+        if (injected == null and table.query_memory_budget > 0) {
             const acc = try allocator.create(exec.memory.MemoryAccountant);
             acc.* = exec.memory.MemoryAccountant.init(table.query_memory_budget);
             owned_accountant = acc;
+            owns_accountant = true;
         }
-        errdefer if (owned_accountant) |a| allocator.destroy(a);
+        errdefer if (owns_accountant) {
+            if (owned_accountant) |a| allocator.destroy(a);
+        };
 
         self.* = .{
             .allocator = allocator,
@@ -152,6 +173,7 @@ pub const Scan = struct {
             .views = views,
             .prunes = .empty,
             .owned_accountant = owned_accountant,
+            .owns_accountant = owns_accountant,
         };
 
         return makeQuery(allocator, self);
@@ -165,7 +187,9 @@ pub const Scan = struct {
         self.releaseBatch();
         self.closeCurSegment();
         self.prunes.deinit(self.allocator);
-        if (self.owned_accountant) |a| self.allocator.destroy(a);
+        if (self.owns_accountant) {
+            if (self.owned_accountant) |a| self.allocator.destroy(a);
+        }
         if (self.seg_skip) |s| self.allocator.free(s);
         if (self.filtered) |arr| {
             for (arr) |*c| c.deinit(self.allocator);

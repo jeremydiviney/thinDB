@@ -1120,6 +1120,15 @@ pub const CompileCtx = struct {
     /// Wire layers (MySQL OK_Packet, PG CommandComplete) read this after
     /// running the CompiledQuery. Zero for ops that don't mutate data.
     affected_rows: u64 = 0,
+    /// Query-scoped memory accountant. Lazily created (via
+    /// `queryAccountant`) the first time a Scan is compiled, then
+    /// injected into every Scan / materialized buffer / subquery drain so
+    /// the budget is shared across the whole query DAG. Owned here and
+    /// freed LAST in `deinit` — after the operator tree and the
+    /// materialized buffers, both of which may release against it.
+    /// This is the single seam where a future global memory pool would
+    /// hand out (and reclaim) the per-query budget.
+    accountant: ?*exec.memory.MemoryAccountant = null,
 
     pub fn deinit(self: *CompileCtx) void {
         var it = self.materialized.iterator();
@@ -1128,6 +1137,20 @@ pub const CompileCtx = struct {
         for (self.session_strings.items) |s| self.allocator.free(s);
         self.session_strings.deinit(self.allocator);
         if (self.subquery_arena) |*ar| ar.deinit();
+        if (self.accountant) |a| self.allocator.destroy(a);
+    }
+
+    /// The query-scoped accountant, created on first use from the
+    /// Database's configured per-query budget. Returns null when the
+    /// budget is 0 (tracking disabled).
+    pub fn queryAccountant(self: *CompileCtx) !?*exec.memory.MemoryAccountant {
+        if (self.accountant) |a| return a;
+        const budget = self.db.config.query_memory_budget;
+        if (budget == 0) return null;
+        const acc = try self.allocator.create(exec.memory.MemoryAccountant);
+        acc.* = exec.memory.MemoryAccountant.init(budget);
+        self.accountant = acc;
+        return acc;
     }
 
     /// Get (or lazily create) the subquery arena. Resolution-time
@@ -1244,7 +1267,8 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .scan => |s| blk: {
             const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
             const t = try resolveTable(catalog, ctx.session.*, s.table);
-            const base = try exec.scan(ctx.allocator, t);
+            const acct = try ctx.queryAccountant();
+            const base = try exec.scanWithAccountant(ctx.allocator, t, acct);
             if (s.alias) |alias| {
                 errdefer @constCast(&base).deinit();
                 break :blk try exec.AliasRename.create(ctx.allocator, base, alias);
@@ -1327,7 +1351,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             // cache, hand back a Reader. The buffer drains lazily
             // when the first reader's next() is called.
             const upstream = try compileOp(ctx, m.upstream);
-            const buf = try mat.MaterializedBuffer.init(ctx.allocator, upstream);
+            const buf = try mat.MaterializedBuffer.init(ctx.allocator, upstream, try ctx.queryAccountant());
             errdefer buf.deinit();
             try ctx.materialized.put(ctx.allocator, op, buf);
             break :blk try mat.Reader.create(ctx.allocator, buf);

@@ -311,6 +311,17 @@ pub fn scan(allocator: Allocator, table: *Table) !Query {
     return @import("scan.zig").Scan.create(allocator, table);
 }
 
+/// Scan that uses a query-scoped accountant owned by the caller (the
+/// SQL compile path's `CompileCtx`). Pass `null` to fall back to the
+/// self-minting behaviour of `scan`.
+pub fn scanWithAccountant(
+    allocator: Allocator,
+    table: *Table,
+    accountant_ptr: ?*memory.MemoryAccountant,
+) !Query {
+    return @import("scan.zig").Scan.createWithAccountant(allocator, table, accountant_ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Re-exports — callers @import("exec.zig") for everything operator-related
 // ---------------------------------------------------------------------------

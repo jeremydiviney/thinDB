@@ -37,6 +37,26 @@ fn seedT(db: anytype) !*thindb.Table {
     return t;
 }
 
+const schema_big = thindb.TableSchema{
+    .columns = &.{.{ .name = "id", .type = .bigint }},
+    .order_key = &.{"id"},
+    .unique = false,
+};
+const ok_big = [_][]const u8{"id"};
+const opts_big = thindb.TableOptions{ .order_key = &ok_big, .unique = false, .row_group_size = 8 };
+
+/// Seed a single-column `big` table with `rows` distinct bigint ids,
+/// flushing every 8 rows so the scan yields many small segment batches.
+fn seedBig(db: anytype, rows: i64) !void {
+    const t = try db.table("big", schema_big, opts_big);
+    var i: i64 = 0;
+    while (i < rows) : (i += 1) {
+        try t.insert(&.{.{ .id = i }});
+        if (@mod(i + 1, 8) == 0) try t.flush();
+    }
+    try t.flush();
+}
+
 test "sql: SELECT * FROM t returns all rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1501,6 +1521,113 @@ test "sql: MATERIALIZED hint forces buffer even on single use" {
         for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4, 5 }, ids.items);
+}
+
+test "sql: a materialized CTE is charged against the memory budget" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Tiny budget: buffering 200 bigints (1600 B) must exceed 1024 B.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .query_memory_budget = 1024,
+        .row_group_size = 8,
+    });
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("big", schema, .{ .order_key = &ok, .unique = false, .row_group_size = 8 });
+    var i: i64 = 0;
+    while (i < 200) : (i += 1) {
+        try t.insert(&.{.{ .id = i }});
+        if (@mod(i + 1, 8) == 0) try t.flush();
+    }
+    try t.flush();
+
+    // The MATERIALIZED CTE buffers the whole 200-row result; that
+    // accumulation now reserves against the budget and must trip.
+    var q = try runSql(allocator, db,
+        \\WITH m AS MATERIALIZED (SELECT id FROM big)
+        \\SELECT id FROM m
+    );
+    defer q.deinit();
+    try std.testing.expectError(error.MemoryBudgetExceeded, q.next());
+}
+
+test "sql: ORDER BY releases its sort buffer budget once the result is drained" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .query_memory_budget = 1 << 20,
+        .row_group_size = 8,
+    });
+    defer db.close();
+    try seedBig(db, 200);
+
+    var q = try runSql(allocator, db, "SELECT id FROM big ORDER BY id");
+    defer q.deinit();
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 200), rows);
+    // DAG-aware eviction: the sort buffer is freed + its budget released
+    // on the final (null) batch, so the query-scoped accountant is back
+    // to zero once the result has been drained.
+    try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
+}
+
+test "sql: GROUP BY releases its hash table budget after emitting" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .query_memory_budget = 1 << 20,
+        .row_group_size = 8,
+    });
+    defer db.close();
+    try seedBig(db, 200);
+
+    var q = try runSql(allocator, db, "SELECT id, count(*) AS c FROM big GROUP BY id");
+    defer q.deinit();
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 200), rows);
+    // The group accumulator arena is dropped + its budget released as
+    // soon as the single result batch is built.
+    try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
+}
+
+test "sql: a materialized CTE releases its budget after the last reader drains" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .query_memory_budget = 1 << 20,
+        .row_group_size = 8,
+    });
+    defer db.close();
+    try seedBig(db, 200);
+
+    var q = try runSql(allocator, db,
+        \\WITH m AS MATERIALIZED (SELECT id FROM big)
+        \\SELECT id FROM m
+    );
+    defer q.deinit();
+    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count());
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 200), rows);
+    // Refcount eviction: with the single reader drained, the buffered
+    // columns are freed and the budget handed back.
+    try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
 }
 
 test "sql: NOT MATERIALIZED disables auto-materialization on multi-use CTE" {

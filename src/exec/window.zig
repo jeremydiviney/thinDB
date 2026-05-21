@@ -68,6 +68,10 @@ pub const Window = struct {
 
     // Materialized state, built lazily on first `next()`.
     drained: bool = false,
+    /// Bytes charged for the accumulated input; released + freed once all
+    /// rows have been emitted (the input is no longer a dependency).
+    reserved_bytes: usize = 0,
+    evicted: bool = false,
     accumulated: []ColumnStore,        // input columns
     output_columns: []ColumnStore,     // window outputs (fixed-width types)
     /// Parallel scratch for string-typed outputs. `string_outputs[ci]`
@@ -256,8 +260,10 @@ pub const Window = struct {
     pub fn deinit(self: *Window) void {
         var up = self.upstream;
         up.deinit();
-        for (self.accumulated) |*c| c.deinit(self.allocator);
-        self.allocator.free(self.accumulated);
+        if (!self.evicted) {
+            for (self.accumulated) |*c| c.deinit(self.allocator);
+            self.allocator.free(self.accumulated);
+        }
         for (self.output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_columns);
         for (self.string_outputs) |s| if (s.len > 0) self.allocator.free(s);
@@ -293,11 +299,28 @@ pub const Window = struct {
         return self.upstream.accountant();
     }
 
+    /// Free the accumulated input buffer and release its reserved bytes
+    /// once every row has been emitted. Idempotent. The per-batch emit
+    /// buffers (`out_input_columns` / `out_output_columns`) and the window
+    /// output columns are freed later in `deinit`.
+    fn evict(self: *Window) void {
+        if (self.evicted) return;
+        for (self.accumulated) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.accumulated);
+        self.accumulated = &.{};
+        if (self.upstream.accountant()) |a| a.release(self.reserved_bytes);
+        self.reserved_bytes = 0;
+        self.evicted = true;
+    }
+
     pub fn next(self: *Window) !?Batch {
         if (!self.drained) try self.drainAndEvaluate();
 
         const remaining = self.accumulated_rows - self.emit_offset;
-        if (remaining == 0) return null;
+        if (remaining == 0) {
+            self.evict();
+            return null;
+        }
         const n: usize = @intCast(@min(@as(u64, batch_size), remaining));
         const lo = self.emit_offset;
         const hi = lo + n;
@@ -332,7 +355,9 @@ pub const Window = struct {
         const row_bytes = exec.memory.estimateRowBytes(self.input_schema);
         const acc = self.upstream.accountant();
         while (try self.upstream.next()) |batch| {
-            if (acc) |a| try a.reserve(batch.row_count * row_bytes);
+            const b = batch.row_count * row_bytes;
+            if (acc) |a| try a.reserve(b);
+            self.reserved_bytes += b;
             for (batch.values, 0..) |view, ci| {
                 try transform.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
             }

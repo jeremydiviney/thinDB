@@ -146,6 +146,11 @@ pub const Aggregate = struct {
     key_scratch: std.ArrayList(u8),
 
     emitted: bool = false,
+    /// Bytes charged against the query budget for the group hash table /
+    /// accumulator state (held in `arena`). Released when the single
+    /// result batch has been built — the input is no longer needed.
+    reserved_bytes: usize = 0,
+    evicted: bool = false,
 
     pub fn create(
         allocator: Allocator,
@@ -285,12 +290,29 @@ pub const Aggregate = struct {
             try self.appendGroupedResults();
         }
 
+        // Results are now materialized into `output_columns` (allocator-
+        // owned, independent of the arena), so the group hash table /
+        // accumulator state is no longer a downstream dependency. Free it
+        // and hand its budget back before emitting.
+        self.evict();
+
         for (self.output_columns, 0..) |c, i| self.views[i] = c.view();
         return Batch{
             .schema = self.output_schema,
             .values = self.views,
             .row_count = self.output_columns[0].rowCount(),
         };
+    }
+
+    /// Drop the group accumulator arena and release its reserved budget.
+    /// Idempotent. The arena is left in a valid (empty) state so the
+    /// later `deinit` call remains safe.
+    fn evict(self: *Aggregate) void {
+        if (self.evicted) return;
+        _ = self.arena.reset(.free_all);
+        if (self.upstream.accountant()) |a| a.release(self.reserved_bytes);
+        self.reserved_bytes = 0;
+        self.evicted = true;
     }
 
     fn accumulateBatch(self: *Aggregate, batch: Batch) !void {
@@ -319,10 +341,11 @@ pub const Aggregate = struct {
                 // New group — reserve its memory against the query
                 // budget. Approximate: key bytes + per-agg state +
                 // ~32 bytes hashmap overhead.
+                const approx = self.key_scratch.items.len + self.aggs.len * @sizeOf(AccState) + 32;
                 if (self.upstream.accountant()) |acct| {
-                    const approx = self.key_scratch.items.len + self.aggs.len * @sizeOf(AccState) + 32;
                     try acct.reserve(approx);
                 }
+                self.reserved_bytes += approx;
                 // The hashmap kept a reference to our scratch slice — but
                 // we're about to reuse that buffer. Replace key_ptr with
                 // an arena-owned dup so it survives.
