@@ -116,6 +116,11 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
     };
 }
 
+fn explainFormatFromName(name: []const u8) ir.ExplainFormat {
+    if (std.ascii.eqlIgnoreCase(name, "json")) return .json;
+    return .text;
+}
+
 pub fn parse(arena: Allocator, sql: []const u8) ParseError!*ir.Op {
     var lex = Lexer.init(arena, sql);
     var parser = Parser{ .arena = arena, .lex = &lex, .cur = try lex.next() };
@@ -232,6 +237,48 @@ pub const Parser = struct {
         if (self.cur.tag != .eof) return ParseError.SqlTrailingTokens;
     }
 
+    /// Consume the optional clauses between `EXPLAIN` and the explained
+    /// statement, in both dialect spellings, returning the requested
+    /// output format. Accepts MySQL `[ANALYZE] [FORMAT [=] fmt]` and PG
+    /// `[ANALYZE] | ( option [, option]* )`. `ANALYZE` is consumed but
+    /// currently has no effect (aliases plain EXPLAIN); unknown options
+    /// inside parentheses are skipped. Only `FORMAT JSON` selects JSON;
+    /// every other format name (TEXT/TREE/TRADITIONAL/…) maps to text.
+    fn parseExplainOptions(self: *Parser) ParseError!ir.ExplainFormat {
+        if (self.cur.tag == .lparen) {
+            try self.advance(); // (
+            var format: ir.ExplainFormat = .text;
+            while (self.cur.tag != .rparen) {
+                if (self.cur.tag == .eof) return ParseError.SqlExpectedToken;
+                if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "format")) {
+                    try self.advance(); // FORMAT
+                    if (self.cur.tag == .identifier) {
+                        format = explainFormatFromName(self.cur.text);
+                        try self.advance();
+                    }
+                } else {
+                    try self.advance(); // skip an unrelated option token
+                }
+                if (self.cur.tag == .comma) try self.advance();
+            }
+            try self.advance(); // )
+            return format;
+        }
+        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "analyze")) {
+            try self.advance();
+        }
+        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "format")) {
+            try self.advance(); // FORMAT
+            if (self.cur.tag == .eq) try self.advance(); // optional =
+            if (self.cur.tag == .identifier) {
+                const fmt = explainFormatFromName(self.cur.text);
+                try self.advance();
+                return fmt;
+            }
+        }
+        return .text;
+    }
+
     pub fn parseStatement(self: *Parser) ParseError!*ir.Op {
         // DDL / SHOW / INSERT are leading-keyword forms that don't combine
         // with WITH. They have no projection / FROM / WHERE / etc.;
@@ -241,8 +288,9 @@ pub const Parser = struct {
             .kw_show => return try parse_ddl.parseShow(self),
             .kw_explain => {
                 try self.advance(); // consume EXPLAIN
+                const format = try self.parseExplainOptions();
                 const inner = try self.parseStatement();
-                return try self.allocOp(.{ .explain = .{ .inner = inner } });
+                return try self.allocOp(.{ .explain = .{ .inner = inner, .format = format } });
             },
             .kw_insert => return try parse_ddl.parseInsert(self),
             .kw_copy => return try parse_ddl.parseCopy(self),

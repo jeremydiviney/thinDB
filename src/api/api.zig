@@ -186,9 +186,15 @@ pub const sweepStaleTempDirs = @import("temp_namespace.zig").sweepStaleTempDirs;
 /// the per-session TempNamespace and threads a pointer through here so
 /// CREATE TEMP TABLE / unqualified resolution / DROP TABLE can consult
 /// it ahead of the persistent catalog.
+/// Which client wire a session is served over. Lets wire-neutral
+/// compilation tailor a few dialect-specific surfaces (e.g. the EXPLAIN
+/// result column name) without forking the parser or engine.
+pub const Dialect = enum { neutral, mysql, postgres };
+
 pub const Session = struct {
     current_db: []const u8 = "main",
     current_schema: []const u8 = "public",
+    dialect: Dialect = .neutral,
     temp_namespace: ?*TempNamespace = null,
     /// MySQL-style user-defined variables (`@name`). Lazily heap-
     /// allocated on first `SET @name = ...`. Owned by the Connection;

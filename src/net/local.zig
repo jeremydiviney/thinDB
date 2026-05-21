@@ -1461,8 +1461,9 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .update_op => |u| try compileUpdate(ctx, u),
         .explain => |e| blk: {
             // Compile the inner statement, render its physical plan, and
-            // return the plan as a one-column text result (one row per line).
-            // The inner query is never executed.
+            // return the plan as a one-column result. The inner query is
+            // never executed. Column name follows the connecting wire's
+            // convention; JSON renders the whole tree into a single row.
             var inner = try compileOp(ctx, e.inner);
             const plan = inner.explainPlan(ctx.allocator) catch |err| {
                 inner.deinit();
@@ -1470,13 +1471,23 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             };
             inner.deinit();
             defer ctx.allocator.free(plan);
+            const col_name: []const u8 = switch (ctx.session.dialect) {
+                .mysql => "EXPLAIN",
+                .neutral, .postgres => "QUERY PLAN",
+            };
+            if (e.format == .json) {
+                const json = try planTextToJson(ctx.allocator, plan);
+                defer ctx.allocator.free(json);
+                var rows = [_][]u8{@constCast(json)};
+                break :blk try NamesOp.create(ctx.allocator, col_name, rows[0..]);
+            }
             var lines: std.ArrayList([]u8) = .empty;
             defer lines.deinit(ctx.allocator);
             var it = std.mem.splitScalar(u8, plan, '\n');
             while (it.next()) |line| {
                 if (line.len > 0) try lines.append(ctx.allocator, @constCast(line));
             }
-            break :blk try NamesOp.create(ctx.allocator, "QUERY PLAN", lines.items);
+            break :blk try NamesOp.create(ctx.allocator, col_name, lines.items);
         },
     };
 }
@@ -2544,6 +2555,75 @@ const EmptyOp = struct {
         try exec.explainLine(out, allocator, depth, "Empty");
     }
 };
+
+/// Indent level of a plan-text line: each tree level is exactly two
+/// leading spaces (see `exec.explainIndent`).
+fn planLineDepth(line: []const u8) usize {
+    var n: usize = 0;
+    while (n + 2 <= line.len and line[n] == ' ' and line[n + 1] == ' ') n += 2;
+    return n / 2;
+}
+
+fn jsonEscapeInto(out: *std.ArrayList(u8), allocator: Allocator, s: []const u8) !void {
+    const hex = "0123456789abcdef";
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(allocator, "\\\""),
+        '\\' => try out.appendSlice(allocator, "\\\\"),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        '\t' => try out.appendSlice(allocator, "\\t"),
+        else => if (c < 0x20) {
+            try out.appendSlice(allocator, "\\u00");
+            try out.append(allocator, hex[(c >> 4) & 0xf]);
+            try out.append(allocator, hex[c & 0xf]);
+        } else try out.append(allocator, c),
+    };
+}
+
+/// Emit the node at `lines[idx.*]` (known to sit at `depth`) and recurse
+/// into its children (each at `depth + 1`), advancing `idx` past the
+/// whole subtree. Children always sit exactly one level deeper because
+/// the text renderer increments depth by one per nesting level.
+fn emitPlanNode(
+    out: *std.ArrayList(u8),
+    allocator: Allocator,
+    lines: []const []const u8,
+    idx: *usize,
+    depth: usize,
+) !void {
+    const label = lines[idx.*][depth * 2 ..];
+    idx.* += 1;
+    try out.appendSlice(allocator, "{\"node\":\"");
+    try jsonEscapeInto(out, allocator, label);
+    try out.appendSlice(allocator, "\",\"children\":[");
+    var first = true;
+    while (idx.* < lines.len and planLineDepth(lines[idx.*]) == depth + 1) {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try emitPlanNode(out, allocator, lines, idx, depth + 1);
+    }
+    try out.appendSlice(allocator, "]}");
+}
+
+/// Render the indented plan text into a JSON tree of
+/// `{"node": <label>, "children": [...]}`. Caller owns the result.
+fn planTextToJson(allocator: Allocator, plan: []const u8) ![]u8 {
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var it = std.mem.splitScalar(u8, plan, '\n');
+    while (it.next()) |l| {
+        if (std.mem.trim(u8, l, " ").len > 0) try lines.append(allocator, l);
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (lines.items.len == 0) {
+        try out.appendSlice(allocator, "{}");
+        return out.toOwnedSlice(allocator);
+    }
+    var idx: usize = 0;
+    try emitPlanNode(&out, allocator, lines.items, &idx, 0);
+    return out.toOwnedSlice(allocator);
+}
 
 const NamesOp = struct {
     allocator: Allocator,

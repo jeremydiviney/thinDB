@@ -432,8 +432,15 @@ pub const UpdateOp = struct {
 /// EXPLAIN <statement> — wraps an inner statement. Compiling it builds the
 /// inner operator tree, renders its physical plan, and returns the plan as
 /// a one-column text result (instead of executing the inner statement).
+pub const ExplainFormat = enum { text, json };
+
 pub const ExplainOp = struct {
     inner: *Op,
+    /// Output rendering. `.text` = indented tree (one result row per line);
+    /// `.json` = single result row holding the whole plan as a JSON tree.
+    /// MySQL `FORMAT=TREE` and PG `(FORMAT TEXT)` both map to `.text`.
+    /// `ANALYZE` is accepted but currently aliases plain EXPLAIN.
+    format: ExplainFormat = .text,
 };
 
 /// CREATE TABLE name AS SELECT ... — schema inferred from the

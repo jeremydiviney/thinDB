@@ -322,6 +322,7 @@ const SessionState = struct {
         return .{
             .current_db = self.current_db,
             .current_schema = self.current_schema,
+            .dialect = .mysql,
             .temp_namespace = self.temp_namespace,
         };
     }

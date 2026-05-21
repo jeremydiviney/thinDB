@@ -136,6 +136,86 @@ test "sql: EXPLAIN returns the physical plan as a QUERY PLAN result set" {
     try std.testing.expect(std.mem.indexOf(u8, plan.items, "Scan t") != null);
 }
 
+test "sql: EXPLAIN ANALYZE aliases EXPLAIN (same static plan)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "EXPLAIN ANALYZE SELECT k, count(*) AS n FROM t GROUP BY k");
+    defer q.deinit();
+    try std.testing.expectEqualStrings("QUERY PLAN", q.outputSchema()[0].name);
+    var plan: std.ArrayList(u8) = .empty;
+    defer plan.deinit(allocator);
+    while (try q.next()) |b| {
+        const sv = b.values[0].data.string;
+        for (0..b.row_count) |i| try plan.appendSlice(allocator, sv.rowBytes(i));
+    }
+    try std.testing.expect(std.mem.indexOf(u8, plan.items, "Aggregate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.items, "Scan t") != null);
+}
+
+test "sql: EXPLAIN FORMAT=JSON renders the plan as one JSON row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // MySQL spelling and PG parenthesized spelling must both select JSON.
+    for ([_][]const u8{
+        "EXPLAIN FORMAT=JSON SELECT k, count(*) AS n FROM t GROUP BY k",
+        "EXPLAIN (FORMAT JSON) SELECT k, count(*) AS n FROM t GROUP BY k",
+    }) |sql| {
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        var json: std.ArrayList(u8) = .empty;
+        defer json.deinit(allocator);
+        var rows: usize = 0;
+        while (try q.next()) |b| {
+            const sv = b.values[0].data.string;
+            for (0..b.row_count) |i| {
+                try json.appendSlice(allocator, sv.rowBytes(i));
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), rows);
+        try std.testing.expect(json.items[0] == '{');
+        try std.testing.expect(std.mem.indexOf(u8, json.items, "\"node\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json.items, "\"children\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json.items, "Scan t") != null);
+    }
+}
+
+test "sql: EXPLAIN result column name follows the wire dialect" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const cases = .{
+        .{ .dialect = thindb.Dialect.mysql, .name = "EXPLAIN" },
+        .{ .dialect = thindb.Dialect.postgres, .name = "QUERY PLAN" },
+        .{ .dialect = thindb.Dialect.neutral, .name = "QUERY PLAN" },
+    };
+    inline for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const root = try thindb.sql.parse(arena.allocator(), "EXPLAIN SELECT k, count(*) FROM t GROUP BY k");
+        var cq = try thindb.net.compileWithSession(allocator, db, .{ .dialect = c.dialect }, root);
+        defer cq.deinit();
+        try std.testing.expectEqualStrings(c.name, cq.outputSchema()[0].name);
+    }
+}
+
 test "sql: SELECT * FROM t returns all rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
