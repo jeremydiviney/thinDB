@@ -367,8 +367,10 @@ fn computeNewRows(
         // Was this column assigned? If so, replace src_view with the
         // synthetic column from Compute's output.
         for (assignments, synth_names) |asn, syn| {
-            if (std.mem.eql(u8, asn.col, sc.name)) {
-                // Find synthetic column in `out`'s schema.
+            if (@import("../types.zig").columnNameEql(asn.col, sc.name)) {
+                // Find synthetic column in `out`'s schema. The synthetic
+                // name is generated internally so it's an exact match;
+                // no case-folding needed.
                 for (out.schema, 0..) |out_col, oi| {
                     if (std.mem.eql(u8, out_col.name, syn)) {
                         src_view = out.values[oi];

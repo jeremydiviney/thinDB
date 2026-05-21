@@ -140,7 +140,7 @@ pub const RangeSweepJoin = struct {
         var out_idx: usize = left_schema.len;
         for (right_schema) |c| {
             for (output_schema[0..out_idx]) |prior| {
-                if (std.mem.eql(u8, prior.name, c.name)) return Error.JoinColumnNameCollision;
+                if (types.columnNameEql(prior.name, c.name)) return Error.JoinColumnNameCollision;
             }
             output_schema[out_idx] = c;
             out_idx += 1;

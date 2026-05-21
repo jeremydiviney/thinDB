@@ -190,7 +190,7 @@ pub const NestedLoopJoin = struct {
         for (right_schema, 0..) |c, i| {
             if (!right_kept_mask[i]) continue;
             for (output_schema[0..out_idx]) |prior| {
-                if (std.mem.eql(u8, prior.name, c.name)) return Error.JoinColumnNameCollision;
+                if (types.columnNameEql(prior.name, c.name)) return Error.JoinColumnNameCollision;
             }
             output_schema[out_idx] = c;
             if (right_nullable_in_output) output_schema[out_idx].nullable = true;

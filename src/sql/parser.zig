@@ -343,8 +343,12 @@ pub const Parser = struct {
             pending_order_specs = try self.parseOrderBy();
         }
 
-        // Optional LIMIT.
+        // Optional LIMIT, in either of MySQL's two forms:
+        //   LIMIT count
+        //   LIMIT offset, count        (offset first)
+        //   LIMIT count OFFSET offset  (OFFSET keyword)
         var pending_limit: ?u64 = null;
+        var pending_offset: u64 = 0;
         if (self.cur.tag == .kw_limit) {
             try self.advance();
             if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
@@ -352,18 +356,24 @@ pub const Parser = struct {
             try self.advance();
             if (n < 0) return ParseError.SqlExpectedValue;
             if (self.cur.tag == .comma) {
-                // MySQL-style LIMIT offset,count. thinDB has no Offset
-                // operator yet, but Workbench emits LIMIT 0,N for result
-                // browsing; zero offset is exactly equivalent to LIMIT N.
-                if (n != 0) return ParseError.SqlExpectedValue;
+                // LIMIT offset, count — first number is the offset.
                 try self.advance();
                 if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
                 const count = self.cur.value.integer;
                 try self.advance();
                 if (count < 0) return ParseError.SqlExpectedValue;
+                pending_offset = @intCast(n);
                 pending_limit = @intCast(count);
             } else {
                 pending_limit = @intCast(n);
+                if (self.cur.tag == .kw_offset) {
+                    try self.advance();
+                    if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+                    const off = self.cur.value.integer;
+                    try self.advance();
+                    if (off < 0) return ParseError.SqlExpectedValue;
+                    pending_offset = @intCast(off);
+                }
             }
         }
 
@@ -504,7 +514,7 @@ pub const Parser = struct {
         }
         // Optional LIMIT applies last.
         if (pending_limit) |n| {
-            root = try self.allocOp(.{ .limit = .{ .n = n, .upstream = root } });
+            root = try self.allocOp(.{ .limit = .{ .n = n, .offset = pending_offset, .upstream = root } });
         }
 
         // UNION / UNION ALL chains. SQL semantics: left-associative;

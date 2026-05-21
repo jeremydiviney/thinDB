@@ -104,7 +104,32 @@ pub const Database = struct {
         try self.schemas.put(public.name, public);
         self.tables = &public.tables;
 
+        try discoverSchemasOnDisk(allocator, io, db_dir, config, self);
+
         return self;
+    }
+
+    /// Adopt any non-`public` schema subdirs on disk into this Database.
+    /// Non-fatal on iteration error — the database still has `public` and
+    /// works for the back-compat case.
+    fn discoverSchemasOnDisk(
+        allocator: Allocator,
+        io: Io,
+        db_dir: Io.Dir,
+        config: Config,
+        self: *Database,
+    ) !void {
+        var iter_dir = db_dir.openDir(io, ".", .{ .iterate = true }) catch return;
+        defer iter_dir.close(io);
+        var dir_it = iter_dir.iterate();
+        while (try dir_it.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            if (std.mem.eql(u8, entry.name, default_schema_name)) continue;
+            if (self.schemas.get(entry.name) != null) continue;
+            const s = Schema.open(allocator, io, db_dir, entry.name, config) catch continue;
+            s.database = self;
+            try self.schemas.put(s.name, s);
+        }
     }
 
     pub fn close(self: *Database) void {

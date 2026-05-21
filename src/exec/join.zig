@@ -454,7 +454,7 @@ pub const Join = struct {
             if (!right_kept_mask[i]) continue;
             // Check against left columns + already-placed right columns.
             for (output_schema[0..out_idx]) |prior| {
-                if (std.mem.eql(u8, prior.name, c.name)) return Error.JoinColumnNameCollision;
+                if (types.columnNameEql(prior.name, c.name)) return Error.JoinColumnNameCollision;
             }
             output_schema[out_idx] = c;
             if (right_nullable_in_output) output_schema[out_idx].nullable = true;

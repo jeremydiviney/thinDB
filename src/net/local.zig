@@ -901,9 +901,18 @@ pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*Api
             if (ns.findTable(ref.name)) |t| return t;
         }
     }
-    const db_name = ref.database orelse session.current_db;
+    var db_name: []const u8 = ref.database orelse session.current_db;
+    var schema_name: []const u8 = ref.schema orelse session.current_schema;
+    // MySQL-style `db__schema.table` arrives here as ref.schema = "db__schema",
+    // ref.database = null. Flatten it back to (db, schema) so the resolver
+    // doesn't go hunting for a literal schema named "db__schema".
+    if (ref.database == null and ref.schema != null) {
+        if (splitDoubleUnderscore(ref.schema.?)) |parts| {
+            db_name = parts.db;
+            schema_name = parts.schema;
+        }
+    }
     const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
-    const schema_name = ref.schema orelse session.current_schema;
     const sc = db.schema(schema_name) orelse return Error.SchemaNotFound;
     {
         sc.tables_mutex.lockUncancelable(sc.io);
@@ -911,6 +920,17 @@ pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*Api
         if (sc.tables.get(ref.name)) |t| return t;
     }
     return sc.openTable(ref.name, .{});
+}
+
+const NameParts = struct { db: []const u8, schema: []const u8 };
+
+/// Split `db__schema` into `(db, schema)` for MySQL-style flattened
+/// names. Returns null if `__` is absent. Mirrors the rule in
+/// `mysql/server.zig::applyInitDb` so wire-side and SQL-side resolve
+/// the same way.
+fn splitDoubleUnderscore(name: []const u8) ?NameParts {
+    const sep = std.mem.indexOf(u8, name, "__") orelse return null;
+    return .{ .db = name[0..sep], .schema = name[sep + 2 ..] };
 }
 
 /// Server-side IR dispatcher. Recursively walks the decoded IR tree and
@@ -937,7 +957,7 @@ pub fn buildServerQuerySession(
         },
         .limit => |l| blk: {
             const upstream = try buildServerQuerySession(allocator, db, session, l.upstream.*);
-            break :blk try upstream.limit(@intCast(l.n));
+            break :blk try upstream.limitOffset(@intCast(l.n), @intCast(l.offset));
         },
         .select => |s| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, s.upstream.*);
@@ -1198,7 +1218,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         },
         .limit => |l| blk: {
             const upstream = try compileOp(ctx, l.upstream);
-            break :blk try upstream.limit(@intCast(l.n));
+            break :blk try upstream.limitOffset(@intCast(l.n), @intCast(l.offset));
         },
         .select => |s| blk: {
             var upstream = try compileOp(ctx, s.upstream);
@@ -1367,11 +1387,26 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             db.dropSchema(name) catch |e| return thindb_api.remapError(Error, e);
         },
         .use_schema => |name| {
-            const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
-            _ = db.schema(name) orelse return Error.SchemaNotFound;
-            const owned = try ctx.allocator.dupe(u8, name);
-            try ctx.session_strings.append(ctx.allocator, owned);
-            ctx.session.current_schema = owned;
+            // Accept MySQL-style `USE db__schema` by splitting on `__`.
+            // Without this the SQL `USE` path diverges from COM_INIT_DB
+            // and tools like MySQL Workbench (which always emit the
+            // flattened form) fail with "Schema not found".
+            if (splitDoubleUnderscore(name)) |parts| {
+                const db = catalog.database(parts.db) orelse return Error.DatabaseNotFound;
+                _ = db.schema(parts.schema) orelse return Error.SchemaNotFound;
+                const db_owned = try ctx.allocator.dupe(u8, parts.db);
+                try ctx.session_strings.append(ctx.allocator, db_owned);
+                const sc_owned = try ctx.allocator.dupe(u8, parts.schema);
+                try ctx.session_strings.append(ctx.allocator, sc_owned);
+                ctx.session.current_db = db_owned;
+                ctx.session.current_schema = sc_owned;
+            } else {
+                const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
+                _ = db.schema(name) orelse return Error.SchemaNotFound;
+                const owned = try ctx.allocator.dupe(u8, name);
+                try ctx.session_strings.append(ctx.allocator, owned);
+                ctx.session.current_schema = owned;
+            }
         },
         .use_database_schema => |p| {
             const db = catalog.database(p.database) orelse return Error.DatabaseNotFound;
@@ -2432,7 +2467,7 @@ fn complementColumns(
     for (upstream_cols) |c| {
         var dropped = false;
         for (excluded) |ex| {
-            if (std.mem.eql(u8, c.name, ex)) {
+            if (types.columnNameEql(c.name, ex)) {
                 dropped = true;
                 break;
             }

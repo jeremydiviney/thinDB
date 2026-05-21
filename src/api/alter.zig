@@ -154,7 +154,7 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
 
 fn findColumn(cols: []const Column, name: []const u8) ?usize {
     for (cols, 0..) |c, i| {
-        if (std.mem.eql(u8, c.name, name)) return i;
+        if (@import("../types.zig").columnNameEql(c.name, name)) return i;
     }
     return null;
 }

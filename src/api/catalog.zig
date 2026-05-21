@@ -59,7 +59,45 @@ pub const Catalog = struct {
             .config = config,
             .databases = .init(allocator),
         };
+        errdefer {
+            var it = self.databases.iterator();
+            while (it.next()) |entry| entry.value_ptr.*.closeInPlace();
+            self.databases.deinit();
+        }
+        try discoverDatabasesOnDisk(allocator, io, root_dir, config, &self.databases);
+        var it = self.databases.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.catalog = self;
         return self;
+    }
+
+    /// Scan `root_dir` for subdirectories and adopt each one as a Database
+    /// in `out_map`. Skips reserved names (currently just `_temp/`). Used
+    /// at Catalog open to surface previously-persisted databases.
+    fn discoverDatabasesOnDisk(
+        allocator: Allocator,
+        io: Io,
+        root_dir: Io.Dir,
+        config: Config,
+        out_map: *std.StringHashMap(*Database),
+    ) !void {
+        const temp_name = @import("temp_namespace.zig").temp_root_dir_name;
+        // The root_dir handle may not have iterate-access; try opening a
+        // sibling handle with iterate. If that fails (e.g. permissions),
+        // skip discovery — non-fatal, callers can still create databases
+        // by name.
+        var iter_dir = root_dir.openDir(io, ".", .{ .iterate = true }) catch return;
+        defer iter_dir.close(io);
+        var dir_it = iter_dir.iterate();
+        while (try dir_it.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            if (std.mem.eql(u8, entry.name, temp_name)) continue;
+            if (out_map.get(entry.name) != null) continue;
+            // Database.create is idempotent on existing on-disk state: it
+            // re-opens the dir, re-opens the `public` schema, and the
+            // catalog pointer is fixed up by the caller.
+            const db = Database.create(allocator, io, root_dir, entry.name, config, undefined) catch continue;
+            try out_map.put(db.name, db);
+        }
     }
 
     pub fn close(self: *Catalog) void {

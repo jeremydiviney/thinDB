@@ -147,6 +147,62 @@ test "sql: MySQL LIMIT offset,count with zero offset" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, ids.items);
 }
 
+test "sql: LIMIT count OFFSET off skips leading rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT id FROM t ORDER BY id ASC LIMIT 2 OFFSET 2");
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    // ids 1..5; skip 2 → start at id 3; take 2 → 3,4.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4 }, ids.items);
+}
+
+test "sql: MySQL LIMIT offset,count with non-zero offset" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT id FROM t ORDER BY id ASC LIMIT 1, 3");
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+    }
+    // offset 1, count 3 → ids 2,3,4.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3, 4 }, ids.items);
+}
+
+test "sql: OFFSET past the end yields no rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT id FROM t ORDER BY id ASC LIMIT 10 OFFSET 99");
+    defer q.deinit();
+    var n: usize = 0;
+    while (try q.next()) |b| n += b.row_count;
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
 test "sql: GROUP BY with count(*) and sum(qty)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -253,6 +309,35 @@ test "sql: IS NULL / IS NOT NULL on nullable column" {
         for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 3 }, ids.items);
+
+    // OFFSET over a nullable string column exercises the null-bitmap
+    // bit-shift in the boundary batch (skip 1 → drop the first row, whose
+    // validity bit must not bleed into the kept rows' validity).
+    var q3 = try runSql(allocator, db, "SELECT note FROM nt ORDER BY id ASC LIMIT 5 OFFSET 1");
+    defer q3.deinit();
+    var notes: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (notes.items) |s| allocator.free(s);
+        notes.deinit(allocator);
+    }
+    var saw_null = false;
+    while (try q3.next()) |b| {
+        const v = b.values[0];
+        var r: usize = 0;
+        while (r < b.row_count) : (r += 1) {
+            if (!thindb.storage.column.isValidBit(v.nulls, r)) {
+                saw_null = true;
+            } else {
+                const s = v.data.string;
+                const bytes = s.bytes[s.offsets[r]..s.offsets[r + 1]];
+                try notes.append(allocator, try allocator.dupe(u8, bytes));
+            }
+        }
+    }
+    // Rows after skipping id=1: id=2 (null), id=3 ("yo").
+    try std.testing.expect(saw_null);
+    try std.testing.expectEqual(@as(usize, 1), notes.items.len);
+    try std.testing.expectEqualStrings("yo", notes.items[0]);
 }
 
 // ---------------------------------------------------------------------------

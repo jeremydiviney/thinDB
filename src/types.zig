@@ -335,7 +335,7 @@ pub const TableSchema = struct {
 
         for (self.columns, 0..) |c, i| {
             for (self.columns[0..i]) |prior| {
-                if (std.mem.eql(u8, c.name, prior.name)) return TableSchemaError.DuplicateColumn;
+                if (columnNameEql(c.name, prior.name)) return TableSchemaError.DuplicateColumn;
             }
         }
 
@@ -346,7 +346,7 @@ pub const TableSchema = struct {
 
     pub fn columnIndex(self: TableSchema, name: []const u8) ?usize {
         for (self.columns, 0..) |c, i| {
-            if (std.mem.eql(u8, c.name, name)) return i;
+            if (columnNameEql(c.name, name)) return i;
         }
         return null;
     }
@@ -356,6 +356,15 @@ pub const TableSchema = struct {
         return self.columns[idx];
     }
 };
+
+/// Case-insensitive compare for user-facing identifier lookup. The SQL
+/// lexer already lowercases unquoted identifiers, but schemas created
+/// through the Zig API (or via quoted DDL) keep their original case —
+/// every lookup site needs to bridge that, or `WatchID` vs `watchid`
+/// silently 404s.
+pub fn columnNameEql(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
 
 /// Resolve a column reference (possibly qualified `alias.col`) against a
 /// flat column slice. Used by every user-facing lookup site so the
@@ -372,19 +381,19 @@ pub const TableSchema = struct {
 ///      Lets bare `col` resolve against an aliased schema (`a.col`).
 pub fn findColumn(columns: []const Column, name: []const u8) ?usize {
     for (columns, 0..) |c, i| {
-        if (std.mem.eql(u8, c.name, name)) return i;
+        if (columnNameEql(c.name, name)) return i;
     }
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
         const tail = name[dot + 1 ..];
         for (columns, 0..) |c, i| {
-            if (std.mem.eql(u8, c.name, tail)) return i;
+            if (columnNameEql(c.name, tail)) return i;
         }
         return null;
     }
     var match: ?usize = null;
     for (columns, 0..) |c, i| {
         const d = std.mem.lastIndexOfScalar(u8, c.name, '.') orelse continue;
-        if (std.mem.eql(u8, c.name[d + 1 ..], name)) {
+        if (columnNameEql(c.name[d + 1 ..], name)) {
             if (match != null) return null; // ambiguous
             match = i;
         }

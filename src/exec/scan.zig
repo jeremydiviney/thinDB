@@ -216,7 +216,7 @@ pub const Scan = struct {
     pub fn addPrune(self: *Scan, pred: Predicate) !void {
         const col_idx = blk: {
             for (self.table.schema.columns, 0..) |c, i| {
-                if (std.mem.eql(u8, c.name, pred.col)) break :blk i;
+                if (@import("../types.zig").columnNameEql(c.name, pred.col)) break :blk i;
             }
             return Error.ColumnNotFound;
         };

@@ -86,7 +86,7 @@ pub const Batch = struct {
 
     pub fn columnIndex(self: Batch, name: []const u8) ?usize {
         for (self.schema, 0..) |c, i| {
-            if (std.mem.eql(u8, c.name, name)) return i;
+            if (@import("../types.zig").columnNameEql(c.name, name)) return i;
         }
         return null;
     }
@@ -191,6 +191,10 @@ pub const Query = struct {
 
     pub fn limit(self: Query, n: usize) !Query {
         return @import("project_limit.zig").Limit.create(self.allocator, self, n);
+    }
+
+    pub fn limitOffset(self: Query, n: usize, offset: usize) !Query {
+        return @import("project_limit.zig").Limit.createOffset(self.allocator, self, n, offset);
     }
 
     /// Aggregate over the entire upstream (no grouping).

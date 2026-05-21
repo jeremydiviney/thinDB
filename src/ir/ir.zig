@@ -490,6 +490,8 @@ pub const Op = union(OpTag) {
 
     pub const Limit = struct {
         n: u64,
+        /// Rows to skip before yielding (SQL OFFSET). 0 = no skip.
+        offset: u64 = 0,
         upstream: *Op,
     };
 
@@ -699,6 +701,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         },
         .limit => |l| {
             try appendU64(allocator, out, l.n);
+            try appendU64(allocator, out, l.offset);
             try encodeOp(allocator, out, l.upstream.*);
         },
         .select => |p| try encodeProject(allocator, out, p),
@@ -1392,13 +1395,15 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             break :blk Op{ .scan = .{ .table = ref, .alias = alias } };
         },
         .limit => blk: {
-            if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;
+            if (cursor.* + 16 > bytes.len) return Error.IrCorrupt;
             const n = readU64(bytes[cursor.* .. cursor.* + 8]);
+            cursor.* += 8;
+            const offset = readU64(bytes[cursor.* .. cursor.* + 8]);
             cursor.* += 8;
             const upstream = try allocator.create(Op);
             errdefer allocator.destroy(upstream);
             upstream.* = try decodeOp(allocator, bytes, cursor);
-            break :blk Op{ .limit = .{ .n = n, .upstream = upstream } };
+            break :blk Op{ .limit = .{ .n = n, .offset = offset, .upstream = upstream } };
         },
         .select, .exclude => blk: {
             const project = try decodeProject(allocator, bytes, cursor);

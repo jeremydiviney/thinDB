@@ -19,36 +19,62 @@ pub fn main(init: std.process.Init) !u8 {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Default args: data/hits.tsv, no row cap, fresh DB at .clickbench-db/.
+    // Defaults. CLI: first positional = TSV path, second = max rows.
+    // Flags: --data-dir PATH, --database NAME, --wipe / --no-wipe.
     var tsv_path: []const u8 = "bench/clickbench/data/hits.tsv";
     var max_rows: usize = 0;
-    const db_dir_path: []const u8 = ".clickbench-db";
+    var data_dir_path: []const u8 = ".clickbench-db";
+    var database_name: []const u8 = "clickbench";
+    var wipe: bool = true;
 
-    // Trivial CLI parsing — first positional is TSV path, second is
-    // max rows. Both optional.
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();
     _ = args_iter.skip(); // program name
-    if (args_iter.next()) |p| tsv_path = p;
-    if (args_iter.next()) |s| {
-        max_rows = std.fmt.parseInt(usize, s, 10) catch 0;
+    var positional: usize = 0;
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--data-dir")) {
+            data_dir_path = args_iter.next() orelse return error.MissingFlagValue;
+        } else if (std.mem.eql(u8, arg, "--database")) {
+            database_name = args_iter.next() orelse return error.MissingFlagValue;
+        } else if (std.mem.eql(u8, arg, "--no-wipe")) {
+            wipe = false;
+        } else if (std.mem.eql(u8, arg, "--wipe")) {
+            wipe = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("clickbench: unknown flag '{s}'\n", .{arg});
+            return 1;
+        } else switch (positional) {
+            0 => {
+                tsv_path = arg;
+                positional += 1;
+            },
+            1 => {
+                max_rows = std.fmt.parseInt(usize, arg, 10) catch 0;
+                positional += 1;
+            },
+            else => {
+                std.debug.print("clickbench: unexpected positional '{s}'\n", .{arg});
+                return 1;
+            },
+        }
     }
 
     std.debug.print("\nthinDB ClickBench loader v{s}\n", .{thindb.version});
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
     std.debug.print("  TSV path     : {s}\n", .{tsv_path});
-    std.debug.print("  DB path      : {s}\n", .{db_dir_path});
+    std.debug.print("  Data dir     : {s}\n", .{data_dir_path});
+    std.debug.print("  Target       : {s}.public.hits\n", .{database_name});
+    std.debug.print("  Wipe data dir: {}\n", .{wipe});
     if (max_rows > 0) std.debug.print("  Max rows     : {d}\n", .{max_rows});
 
-    // Wipe the DB dir for a clean run. deleteTree is a no-op if the
-    // path doesn't exist already.
     const cwd = std.Io.Dir.cwd();
-    try cwd.deleteTree(io, db_dir_path);
-    var db_dir = try cwd.createDirPathOpen(io, db_dir_path, .{});
-    defer db_dir.close(io);
+    if (wipe) try cwd.deleteTree(io, data_dir_path);
+    var data_root = try cwd.createDirPathOpen(io, data_dir_path, .{});
+    defer data_root.close(io);
 
-    var db = try thindb.Database.open(allocator, io, db_dir, .{});
-    defer db.close();
+    const catalog = try thindb.Catalog.open(allocator, io, data_root, .{});
+    defer catalog.close();
+    const db = try catalog.createOrOpenDatabase(database_name);
     const t = try db.table("hits", schema_mod.table_schema, schema_mod.table_options);
 
     std.debug.print("\nSchema    : {d} columns, order key on ({s}, {s}, {s}, {s}, {s})\n", .{

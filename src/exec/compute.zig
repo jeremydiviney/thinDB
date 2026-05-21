@@ -169,10 +169,10 @@ pub const Compute = struct {
         // disambiguate).
         for (resolved, 0..) |r, i| {
             for (up_schema) |uc| {
-                if (std.mem.eql(u8, uc.name, r.name)) return Error.ComputeNameCollision;
+                if (@import("../types.zig").columnNameEql(uc.name, r.name)) return Error.ComputeNameCollision;
             }
             for (resolved[0..i]) |prior| {
-                if (std.mem.eql(u8, prior.name, r.name)) return Error.ComputeNameCollision;
+                if (@import("../types.zig").columnNameEql(prior.name, r.name)) return Error.ComputeNameCollision;
             }
         }
 
