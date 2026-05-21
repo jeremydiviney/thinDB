@@ -933,6 +933,27 @@ fn splitDoubleUnderscore(name: []const u8) ?NameParts {
     return .{ .db = name[0..sep], .schema = name[sep + 2 ..] };
 }
 
+const TopNFusion = struct {
+    order_by: ir.Op.OrderBy,
+    /// The Project that sits above OrderBy in the non-aggregate pipeline,
+    /// if any — re-applied on top of the Top-N.
+    project: ?ir.Op.Project,
+};
+
+/// Recognize `Limit{ [Project] OrderBy{X} }` so the compiler can fuse it
+/// into a bounded Top-N. The non-aggregate pipeline puts an optional
+/// Project directly above OrderBy (`OrderBy → Project → Limit`).
+fn topNFusion(limit_upstream: *ir.Op) ?TopNFusion {
+    return switch (limit_upstream.*) {
+        .order_by => |o| .{ .order_by = o, .project = null },
+        .select => |p| switch (p.upstream.*) {
+            .order_by => |o| .{ .order_by = o, .project = p },
+            else => null,
+        },
+        else => null,
+    };
+}
+
 /// Server-side IR dispatcher. Recursively walks the decoded IR tree and
 /// builds the corresponding exec.Query operator chain using existing
 /// in-process operators. Uses a default Session — call sites needing
@@ -956,6 +977,20 @@ pub fn buildServerQuerySession(
             break :blk try exec.scan(allocator, t);
         },
         .limit => |l| blk: {
+            // Fuse ORDER BY ... LIMIT into a bounded Top-N: keep only the
+            // limit+offset rows we might emit instead of materializing the
+            // whole sorted input. The non-aggregate pipeline is
+            // limit{ [select] order_by{X} } — peek through an optional
+            // Project (which sits above OrderBy) and re-apply it on top.
+            if (topNFusion(l.upstream)) |f| {
+                const inner = try buildServerQuerySession(allocator, db, session, f.order_by.upstream.*);
+                var topn = try inner.topN(f.order_by.specs, @intCast(l.n), @intCast(l.offset));
+                if (f.project) |p| {
+                    errdefer topn.deinit();
+                    topn = try topn.project(p.columns);
+                }
+                break :blk topn;
+            }
             const upstream = try buildServerQuerySession(allocator, db, session, l.upstream.*);
             break :blk try upstream.limitOffset(@intCast(l.n), @intCast(l.offset));
         },
@@ -1217,6 +1252,18 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             break :blk base;
         },
         .limit => |l| blk: {
+            // Fuse ORDER BY ... LIMIT into a bounded Top-N (see the other
+            // compile path for rationale).
+            if (topNFusion(l.upstream)) |f| {
+                var inner = try compileOp(ctx, f.order_by.upstream);
+                errdefer inner.deinit();
+                var topn = try inner.topN(f.order_by.specs, @intCast(l.n), @intCast(l.offset));
+                if (f.project) |p| {
+                    errdefer topn.deinit();
+                    topn = try topn.project(p.columns);
+                }
+                break :blk topn;
+            }
             const upstream = try compileOp(ctx, l.upstream);
             break :blk try upstream.limitOffset(@intCast(l.n), @intCast(l.offset));
         },

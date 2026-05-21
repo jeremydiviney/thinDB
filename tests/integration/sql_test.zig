@@ -268,6 +268,69 @@ test "sql: global aggregate (no GROUP BY) — count(*), avg, min, max" {
     try std.testing.expectEqual(@as(i32, 50), b.values[3].data.int[0]);
 }
 
+test "sql: ORDER BY ... LIMIT stays within a tight memory budget (Top-N)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Tiny budget + small row groups: a full sort of 200 rows can't fit,
+    // but a bounded Top-N keeping ~5 rows can.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .query_memory_budget = 1024,
+        .row_group_size = 8,
+    });
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("big", schema, .{ .order_key = &ok, .unique = false, .row_group_size = 8 });
+    // Flush every 8 rows so the data lands in many small segments — the
+    // scan then yields small per-row-group batches, which is what lets
+    // Top-N prune between batches (a single batch bigger than the budget
+    // can't be helped). 200 rows → 25 segments of 8.
+    var i: i64 = 0;
+    while (i < 200) : (i += 1) {
+        try t.insert(&.{.{ .id = i }});
+        if (@mod(i + 1, 8) == 0) try t.flush();
+    }
+    try t.flush();
+
+    // Top-N: bounded → succeeds under the tight budget, correct top 5.
+    {
+        var q = try runSql(allocator, db, "SELECT id FROM big ORDER BY id DESC LIMIT 5");
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |b| {
+            for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+        }
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 199, 198, 197, 196, 195 }, ids.items);
+    }
+
+    // With OFFSET: skip the top 2, take next 3.
+    {
+        var q = try runSql(allocator, db, "SELECT id FROM big ORDER BY id DESC LIMIT 3 OFFSET 2");
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |b| {
+            for (b.values[0].data.bigint[0..b.row_count]) |v| try ids.append(allocator, v);
+        }
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 197, 196, 195 }, ids.items);
+    }
+
+    // A full sort (no LIMIT) is unbounded → exceeds the same budget.
+    {
+        var q = try runSql(allocator, db, "SELECT id FROM big ORDER BY id DESC");
+        defer q.deinit();
+        try std.testing.expectError(error.MemoryBudgetExceeded, q.next());
+    }
+}
+
 test "sql: HAVING with raw aggregate (aliased)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

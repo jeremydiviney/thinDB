@@ -214,6 +214,13 @@ pub const Query = struct {
         return @import("sort.zig").Sort.create(self.allocator, self, sort_specs);
     }
 
+    /// Bounded `ORDER BY ... LIMIT limit OFFSET offset` — keeps only the
+    /// `limit + offset` rows it might emit instead of materializing the
+    /// whole input. The planner fuses `Limit(OrderBy(X))` into this.
+    pub fn topN(self: Query, sort_specs: []const SortSpec, n: usize, offset: usize) !Query {
+        return @import("topn.zig").TopN.create(self.allocator, self, sort_specs, n, offset);
+    }
+
     /// Add derived columns via scalar function calls. Each `Derived`
     /// names the new column and supplies an `Expr` that resolves to a
     /// function on upstream columns (v1: no nesting). Output schema
