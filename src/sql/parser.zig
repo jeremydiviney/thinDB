@@ -257,12 +257,16 @@ pub const Parser = struct {
             root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
         }
 
-        // Optional GROUP BY.
-        var group_cols: []const []const u8 = &.{};
+        // Optional GROUP BY. Each item is a general expression so we
+        // accept ordinals (`GROUP BY 1`), aliases (`GROUP BY m`), plain
+        // columns, and computed keys (`GROUP BY ClientIP - 1`,
+        // `GROUP BY date_trunc(...)`). Resolution against the projection
+        // happens once we know the SELECT shape.
+        var group_exprs: []const ir.Expr = &.{};
         if (self.cur.tag == .kw_group) {
             try self.advance();
             try self.expect(.kw_by);
-            group_cols = try self.parseIdentList();
+            group_exprs = try self.parseGroupByExprs();
         }
 
         // Optional HAVING — post-aggregate filter. Predicate may
@@ -317,13 +321,29 @@ pub const Parser = struct {
             };
             break :blk false;
         };
-        if (has_expr and (has_agg or group_cols.len > 0)) {
-            // v1 keeps these mutually exclusive — scalar expressions
-            // combined with aggregation needs a clear pre-vs-post
-            // aggregate decision the parser doesn't yet make.
-            return ParseError.SqlMixedAggAndPlainProjection;
+        const has_group = group_exprs.len > 0;
+        // Resolve GROUP BY items against the projection. Produces the
+        // grouping key column names and a per-projection flag marking
+        // which items are grouping keys (so a computed grouping key like
+        // `extract(...) AS m` is allowed alongside aggregates and gets
+        // hoisted into a pre-aggregate Compute). For non-grouped queries
+        // this is empty and the scalar-only path below runs unchanged.
+        var group_cols: []const []const u8 = &.{};
+        var grouping_key: []bool = &.{};
+        if (has_agg or has_group) {
+            const res = try self.resolveGroupBy(proj, group_exprs);
+            group_cols = res.cols;
+            grouping_key = res.gk;
+            // Every projection must be an aggregate or a grouping key —
+            // a plain column or scalar expression that isn't grouped is
+            // ambiguous under aggregation.
+            for (proj, 0..) |p, i| switch (p.kind) {
+                .agg => {},
+                .col, .expr => if (!grouping_key[i]) return ParseError.SqlMixedAggAndPlainProjection,
+                .window => return ParseError.SqlMixedAggAndPlainProjection,
+            };
         }
-        if (has_window and (has_agg or group_cols.len > 0)) {
+        if (has_window and (has_agg or has_group)) {
             // Window functions on top of GROUP BY need an inner-subquery
             // shape that the parser doesn't yet emit. Reject explicitly.
             return ParseError.SqlMixedAggAndPlainProjection;
@@ -377,29 +397,22 @@ pub const Parser = struct {
             }
         }
 
-        if (has_agg or group_cols.len > 0) {
-            // Validate: every plain-col projection must be in group_cols.
-            for (proj) |p| switch (p.kind) {
-                .col => |c| {
-                    var found = false;
-                    for (group_cols) |g| if (std.mem.eql(u8, g, c)) {
-                        found = true;
-                        break;
-                    };
-                    if (!found) return ParseError.SqlMixedAggAndPlainProjection;
-                },
-                .agg => {},
-                // .expr and .window gated above (mixed with aggregation
-                // is rejected) — reaching them here is a bug.
-                .expr, .window => unreachable,
-            };
-
-            // Aggregate-on-expression hoist: any agg whose argument is
-            // an Expr (e.g. SUM(a * b)) gets a synthetic Compute
-            // column inserted before the GroupBy, and the AggSpec
-            // references that synthetic name. Aggs whose arg is a
-            // plain column ref pass through unchanged.
+        if (has_agg or has_group) {
+            // Pre-aggregate Compute. Two kinds of synthetic columns land
+            // here, computed before the GroupBy:
+            //   1. computed grouping keys — a `.expr` projection that a
+            //      GROUP BY item resolves to (e.g. `extract(...) AS m`,
+            //      `ClientIP - 1`). Output name = the projection's name,
+            //      which the GroupBy then groups on.
+            //   2. aggregate-on-expression args (e.g. SUM(a * b)) — a
+            //      synthetic `__agg_arg_N` column the AggSpec references.
             var derived_buf: std.ArrayList(ir.Derived) = .empty;
+            for (proj, 0..) |p, i| switch (p.kind) {
+                .expr => |e| if (grouping_key[i]) {
+                    try derived_buf.append(self.arena, .{ .name = p.name, .expr = e });
+                },
+                else => {},
+            };
             var synth_counter: usize = 0;
             var agg_cols: std.ArrayList(?[]const u8) = .empty;
             defer agg_cols.deinit(self.arena);
@@ -1157,7 +1170,7 @@ pub const Parser = struct {
     fn exprDefaultName(self: *Parser, e: ir.Expr) ParseError![]const u8 {
         switch (e) {
             .col_ref => |c| return try self.arena.dupe(u8, c),
-            .lit => return try self.arena.dupe(u8, "literal"),
+            .lit => |v| return try self.renderLit(v),
             .call => |c| {
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(self.arena);
@@ -1165,10 +1178,11 @@ pub const Parser = struct {
                 try buf.append(self.arena, '(');
                 for (c.args, 0..) |arg, i| {
                     if (i > 0) try buf.appendSlice(self.arena, ", ");
-                    switch (arg) {
-                        .col_ref => |cn| try buf.appendSlice(self.arena, cn),
-                        else => try buf.appendSlice(self.arena, "..."),
-                    }
+                    // Recurse so distinct args yield distinct names — a
+                    // SELECT can have `ClientIP - 1, ClientIP - 2`, which
+                    // would otherwise collapse to one name and collide.
+                    const arg_name = try self.exprDefaultName(arg);
+                    try buf.appendSlice(self.arena, arg_name);
                 }
                 try buf.append(self.arena, ')');
                 return try buf.toOwnedSlice(self.arena);
@@ -1183,6 +1197,26 @@ pub const Parser = struct {
                 return buf;
             },
         }
+    }
+
+    fn renderLit(self: *Parser, v: @import("../types.zig").Value) ParseError![]const u8 {
+        const aa = self.arena;
+        return switch (v) {
+            .int => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .bigint => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .smallint => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .tinyint => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .largeint => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .boolean => |b| try aa.dupe(u8, if (b) "true" else "false"),
+            .float => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .double => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .text => |s| std.fmt.allocPrint(aa, "'{s}'", .{s}) catch return ParseError.OutOfMemory,
+            .date => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .datetime => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .decimal64 => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .decimal128 => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .uuid => try aa.dupe(u8, "uuid"),
+        };
     }
 
     fn maybeAlias(self: *Parser, fallback: []const u8) ParseError![]const u8 {
@@ -1578,6 +1612,103 @@ pub const Parser = struct {
         return try items.toOwnedSlice(self.arena);
     }
 
+    /// Parse the comma-separated GROUP BY item list as general
+    /// expressions (covers ordinals, aliases, columns, and computed keys).
+    pub fn parseGroupByExprs(self: *Parser) ParseError![]const ir.Expr {
+        var items: std.ArrayList(ir.Expr) = .empty;
+        defer items.deinit(self.arena);
+        while (true) {
+            const e = try self.parseAddSub();
+            try items.append(self.arena, e);
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        return try items.toOwnedSlice(self.arena);
+    }
+
+    const GroupByResolution = struct { cols: []const []const u8, gk: []bool };
+
+    /// Resolve GROUP BY items against the projection. Each item binds to
+    /// a projected column (by ordinal, by name/alias, or by structural
+    /// expression match), yielding the grouping-key column names and a
+    /// per-projection flag. A bare column not present in the SELECT list
+    /// is grouped directly.
+    fn resolveGroupBy(self: *Parser, proj: []const ProjItem, group_exprs: []const ir.Expr) ParseError!GroupByResolution {
+        const gk = try self.arena.alloc(bool, proj.len);
+        @memset(gk, false);
+        var cols: std.ArrayList([]const u8) = .empty;
+        defer cols.deinit(self.arena);
+        for (group_exprs) |ge| {
+            if (ordinalOf(ge)) |k| {
+                if (k < 1 or k > proj.len) return ParseError.SqlInvalidProjection;
+                try self.markGroupKey(proj, gk, k - 1, &cols);
+                continue;
+            }
+            if (findGroupMatch(proj, ge)) |idx| {
+                try self.markGroupKey(proj, gk, idx, &cols);
+                continue;
+            }
+            switch (ge) {
+                .col_ref => |c| try cols.append(self.arena, try self.arena.dupe(u8, c)),
+                else => return ParseError.SqlInvalidProjection,
+            }
+        }
+        return .{ .cols = try cols.toOwnedSlice(self.arena), .gk = gk };
+    }
+
+    fn markGroupKey(
+        self: *Parser,
+        proj: []const ProjItem,
+        gk: []bool,
+        idx: usize,
+        cols: *std.ArrayList([]const u8),
+    ) ParseError!void {
+        switch (proj[idx].kind) {
+            .col, .expr => {
+                gk[idx] = true;
+                try cols.append(self.arena, proj[idx].name);
+            },
+            // Can't group by an aggregate or window output.
+            .agg, .window => return ParseError.SqlInvalidProjection,
+        }
+    }
+
+    /// A bare positive integer literal in GROUP BY is a 1-based ordinal
+    /// reference into the SELECT list.
+    fn ordinalOf(e: ir.Expr) ?usize {
+        const v = switch (e) {
+            .lit => |val| val,
+            else => return null,
+        };
+        const n: i128 = switch (v) {
+            .int => |x| x,
+            .bigint => |x| x,
+            .smallint => |x| x,
+            .tinyint => |x| x,
+            else => return null,
+        };
+        if (n < 1) return null;
+        return @intCast(n);
+    }
+
+    fn findGroupMatch(proj: []const ProjItem, ge: ir.Expr) ?usize {
+        switch (ge) {
+            .col_ref => |name| {
+                for (proj, 0..) |p, i| {
+                    if (std.ascii.eqlIgnoreCase(p.name, name)) return i;
+                }
+                return null;
+            },
+            else => {
+                for (proj, 0..) |p, i| switch (p.kind) {
+                    .expr => |e| if (exprEqual(e, ge)) return i,
+                    else => {},
+                };
+                return null;
+            },
+        }
+    }
+
     pub fn expectIdent(self: *Parser) ParseError![]const u8 {
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const name = self.cur.text;
@@ -1835,6 +1966,47 @@ fn countAggs(proj: []const ProjItem) usize {
         else => {},
     };
     return n;
+}
+
+/// Structural equality of two expressions. Used to bind a GROUP BY
+/// expression to the matching SELECT projection (e.g. `GROUP BY
+/// date_trunc(...)` ↔ `SELECT date_trunc(...) AS M`). CASE / subquery /
+/// var_ref nodes are conservatively treated as unequal — grouping by
+/// those goes through alias references instead.
+fn exprEqual(a: ir.Expr, b: ir.Expr) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .col_ref => |x| std.ascii.eqlIgnoreCase(x, b.col_ref),
+        .lit => |x| valueEqual(x, b.lit),
+        .call => |x| blk: {
+            const y = b.call;
+            if (!std.mem.eql(u8, x.fn_name, y.fn_name)) break :blk false;
+            if (x.args.len != y.args.len) break :blk false;
+            for (x.args, y.args) |xa, ya| if (!exprEqual(xa, ya)) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn valueEqual(a: @import("../types.zig").Value, b: @import("../types.zig").Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .text => |s| std.mem.eql(u8, s, b.text),
+        .boolean => |x| x == b.boolean,
+        .float => |x| x == b.float,
+        .double => |x| x == b.double,
+        .uuid => |x| x == b.uuid,
+        .int => |x| x == b.int,
+        .bigint => |x| x == b.bigint,
+        .smallint => |x| x == b.smallint,
+        .tinyint => |x| x == b.tinyint,
+        .largeint => |x| x == b.largeint,
+        .date => |x| x == b.date,
+        .datetime => |x| x == b.datetime,
+        .decimal64 => |x| x == b.decimal64,
+        .decimal128 => |x| x == b.decimal128,
+    };
 }
 
 /// Lower the window ProjItems collected from a SELECT into a single

@@ -268,6 +268,111 @@ test "sql: global aggregate (no GROUP BY) — count(*), avg, min, max" {
     try std.testing.expectEqual(@as(i32, 50), b.values[3].data.int[0]);
 }
 
+test "sql: GROUP BY ordinal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // GROUP BY 1 → the first SELECT item (k). k = 100,100,200,200,300.
+    var q = try runSql(allocator, db, "SELECT k, count(*) AS n FROM t GROUP BY 1 ORDER BY k ASC");
+    defer q.deinit();
+    var counts: std.ArrayList(i64) = .empty;
+    defer counts.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try counts.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2, 1 }, counts.items);
+}
+
+test "sql: GROUP BY alias of a computed expression" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // k + 1 = 101,101,201,201,301 → groups 101(2),201(2),301(1).
+    var q = try runSql(allocator, db,
+        \\SELECT k + 1 AS kp, count(*) AS n FROM t GROUP BY kp ORDER BY kp ASC
+    );
+    defer q.deinit();
+    var kps: std.ArrayList(i64) = .empty;
+    var counts: std.ArrayList(i64) = .empty;
+    defer kps.deinit(allocator);
+    defer counts.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.int[0..b.row_count]) |v| try kps.append(allocator, v);
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try counts.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 101, 201, 301 }, kps.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2, 1 }, counts.items);
+}
+
+test "sql: GROUP BY raw expression matched to aliased SELECT expr" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // GROUP BY k - 1 (raw) binds structurally to SELECT k - 1 AS km.
+    var q = try runSql(allocator, db,
+        \\SELECT k - 1 AS km, count(*) AS n FROM t GROUP BY k - 1 ORDER BY km ASC
+    );
+    defer q.deinit();
+    var counts: std.ArrayList(i64) = .empty;
+    defer counts.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try counts.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2, 1 }, counts.items);
+}
+
+test "sql: GROUP BY multiple distinct arithmetic expressions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // k - 1 and k - 2 get distinct default names (no collision) and both
+    // resolve as grouping keys.
+    var q = try runSql(allocator, db,
+        \\SELECT k - 1, k - 2, count(*) AS n FROM t GROUP BY k - 1, k - 2
+    );
+    defer q.deinit();
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    // Three distinct k values → three groups.
+    try std.testing.expectEqual(@as(usize, 3), rows);
+}
+
+test "sql: non-grouped scalar expr alongside aggregate is still rejected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // k + 1 is neither aggregated nor grouped → ambiguous.
+    try std.testing.expectError(
+        error.SqlMixedAggAndPlainProjection,
+        runSql(allocator, db, "SELECT k + 1, count(*) FROM t GROUP BY k"),
+    );
+}
+
 test "sql: predicate coercion — int literal narrows to smallint column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
