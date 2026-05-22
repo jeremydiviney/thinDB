@@ -511,6 +511,33 @@ test "sql: || is string concat on neutral/PG, logical OR on MySQL" {
     }
 }
 
+test "sql: GENERATED ALWAYS AS IDENTITY is an auto-increment column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE gi (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v int)");
+    try helpers.exec(allocator, db, "INSERT INTO gi (v) VALUES (10)");
+    try helpers.exec(allocator, db, "INSERT INTO gi (v) VALUES (20)");
+
+    var q = try runSql(allocator, db, "SELECT id, v FROM gi ORDER BY id");
+    defer q.deinit();
+    var ids: [2]i64 = undefined;
+    var n: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            ids[n] = b.values[0].data.bigint[i];
+            n += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(i64, 1), ids[0]);
+    try std.testing.expectEqual(@as(i64, 2), ids[1]);
+}
+
 test "sql: PG type aliases + bigserial in CREATE TABLE" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

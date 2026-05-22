@@ -372,6 +372,41 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
                 try p.advance();
                 auto_increment = true;
             },
+            // GENERATED [ALWAYS | BY DEFAULT] AS IDENTITY [( ... )] — the
+            // SQL-standard auto-increment spelling. Mapped onto
+            // AUTO_INCREMENT + NOT NULL; any sequence-option parenthesis
+            // is consumed and ignored.
+            .identifier => {
+                if (!std.ascii.eqlIgnoreCase(p.cur.text, "generated")) break;
+                try p.advance();
+                if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "always")) {
+                    try p.advance();
+                } else if (p.cur.tag == .kw_by) {
+                    try p.advance();
+                    if (!(p.cur.tag == .kw_default)) return PE.SqlExpectedKeyword;
+                    try p.advance();
+                }
+                if (p.cur.tag != .kw_as) return PE.SqlExpectedKeyword;
+                try p.advance();
+                if (!(p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "identity"))) return PE.SqlExpectedKeyword;
+                try p.advance();
+                if (p.cur.tag == .lparen) {
+                    var depth: usize = 0;
+                    while (true) {
+                        if (p.cur.tag == .lparen) depth += 1
+                        else if (p.cur.tag == .rparen) {
+                            depth -= 1;
+                            if (depth == 0) {
+                                try p.advance();
+                                break;
+                            }
+                        } else if (p.cur.tag == .eof) return PE.SqlExpectedToken;
+                        try p.advance();
+                    }
+                }
+                auto_increment = true;
+                nullable = false;
+            },
             else => break,
         }
     }
