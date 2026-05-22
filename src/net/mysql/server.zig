@@ -1152,8 +1152,11 @@ fn sendColumnsResult(
             for (table.schema.columns) |col| {
                 const type_text = try allocMysqlColumnType(allocator, col.type);
                 defer allocator.free(type_text);
+                const default_text = try allocColumnDefaultText(allocator, col);
+                defer if (default_text) |d| allocator.free(d);
                 const key = columnKey(table, col.name);
                 const nullable = if (col.nullable) "YES" else "NO";
+                const extra: []const u8 = if (col.auto_increment) "auto_increment" else "";
                 if (full) {
                     const cells = [_]?[]const u8{
                         col.name,
@@ -1161,8 +1164,8 @@ fn sendColumnsResult(
                         columnCollation(col),
                         nullable,
                         key,
-                        null,
-                        "",
+                        default_text,
+                        extra,
                         "select,insert,update,references",
                         "",
                     };
@@ -1173,8 +1176,8 @@ fn sendColumnsResult(
                         type_text,
                         nullable,
                         key,
-                        null,
-                        "",
+                        default_text,
+                        extra,
                     };
                     try result.sendTextRow(allocator, w, cells[0..], seq_id);
                 }
@@ -1484,6 +1487,29 @@ fn allocMysqlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
         .varchar => |n| std.fmt.allocPrint(allocator, "varchar({d})", .{n}),
         .char => |n| std.fmt.allocPrint(allocator, "char({d})", .{n}),
         .string => allocator.dupe(u8, "text"),
+    };
+}
+
+/// Render a column's literal DEFAULT as MySQL would display it in
+/// SHOW COLUMNS / DESCRIBE, or null when there is no default. Caller owns
+/// the returned slice.
+fn allocColumnDefaultText(allocator: Allocator, col: types.Column) !?[]const u8 {
+    const v = col.default_value orelse return null;
+    return switch (v) {
+        .boolean => |b| try allocator.dupe(u8, if (b) "1" else "0"),
+        .text => |s| try allocator.dupe(u8, s),
+        .int => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .bigint => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .tinyint => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .smallint => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .largeint => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .decimal64 => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .decimal128 => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .float => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .double => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .date => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .datetime => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .uuid => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
     };
 }
 

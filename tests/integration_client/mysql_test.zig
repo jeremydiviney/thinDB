@@ -745,6 +745,59 @@ test "mysql wire: Workbench metadata probes reflect catalog tables" {
     if (sctx.err) |e| return e;
 }
 
+test "mysql wire: SHOW COLUMNS reports DEFAULT and auto_increment Extra" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const schema_items = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint, .auto_increment = true },
+            .{ .name = "qty", .type = .int, .default_value = .{ .int = 7 } },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok_items = [_][]const u8{"id"};
+    const opts_items = thindb.TableOptions{ .order_key = &ok_items, .unique = true };
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    _ = try sc.table("items", schema_items, opts_items);
+
+    const port: u16 = test_port_base + 211;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const th = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer th.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("main__public");
+
+    try client.sendQuery("SHOW COLUMNS FROM `items`");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try client.readResultSet(arena.allocator());
+    // simple SHOW COLUMNS layout: Field, Type, Null, Key, Default, Extra
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("id", rows[0][0].?);
+    try std.testing.expectEqualStrings("auto_increment", rows[0][5].?);
+    try std.testing.expectEqualStrings("qty", rows[1][0].?);
+    try std.testing.expectEqualStrings("7", rows[1][4].?);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
 test "mysql wire: SET / SHOW VARIABLES probes return canned OK / rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
