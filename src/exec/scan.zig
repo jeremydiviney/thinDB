@@ -41,12 +41,13 @@ const statsOverlapPredicate = predicate.statsOverlapPredicate;
 fn computeColumnCards(
     allocator: Allocator,
     segs: []const storage.ManifestEntry,
-    n: usize,
+    out_phys: []const usize,
     memtable_rows: u64,
 ) ![]exec.ColCard {
-    const cards = try allocator.alloc(exec.ColCard, n);
+    const cards = try allocator.alloc(exec.ColCard, out_phys.len);
     errdefer allocator.free(cards);
-    for (cards, 0..) |*card, ci| {
+    for (cards, 0..) |*card, j| {
+        const ci = out_phys[j];
         var merged: hll.Hll = .{};
         var have_sketch = false;
         for (segs) |e| {
@@ -70,6 +71,48 @@ fn computeColumnCards(
             .{ .exact = @intCast(est) };
     }
     return cards;
+}
+
+/// Resolve the projection-pushdown column set to physical (table-order)
+/// indices. `needed == null` keeps every column. Names may be qualified
+/// (`alias.col`); resolution defers to `types.findColumn`, which strips a
+/// matching table/alias prefix. Duplicates collapse and the result is in
+/// table order. An empty `needed` (e.g. `COUNT(*)` referencing no column)
+/// still keeps one column so batches carry a row count cheaply.
+fn resolveOutPhys(
+    allocator: Allocator,
+    columns: []const Column,
+    needed: ?[]const []const u8,
+) ![]usize {
+    const names = needed orelse {
+        const all = try allocator.alloc(usize, columns.len);
+        for (all, 0..) |*p, i| p.* = i;
+        return all;
+    };
+
+    const seen = try allocator.alloc(bool, columns.len);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var count: usize = 0;
+    for (names) |name| {
+        const idx = @import("../types.zig").findColumn(columns, name) orelse return Error.ColumnNotFound;
+        if (!seen[idx]) {
+            seen[idx] = true;
+            count += 1;
+        }
+    }
+    if (count == 0 and columns.len > 0) {
+        const one = try allocator.alloc(usize, 1);
+        one[0] = 0;
+        return one;
+    }
+    const out = try allocator.alloc(usize, count);
+    var j: usize = 0;
+    for (seen, 0..) |s, i| if (s) {
+        out[j] = i;
+        j += 1;
+    };
+    return out;
 }
 
 pub const Scan = struct {
@@ -101,6 +144,17 @@ pub const Scan = struct {
     decoded: []storage.OwnedColumn,
     decoded_valid: bool = false,
     views: []ColumnView,
+
+    /// Physical column index for each output column. Projection pushdown:
+    /// when the query references only a subset of the table's columns, the
+    /// Scan decodes and emits just those, so blocking operators upstream
+    /// buffer fewer columns. `out_phys[j]` is the table-schema index of
+    /// output column `j`. Defaults to all columns in table order.
+    out_phys: []usize,
+    /// Output schema = the table columns at `out_phys`, in that order.
+    /// Aliases `table.schema.columns` when no projection (not owned).
+    out_schema: []const Column,
+    out_schema_owned: bool = false,
 
     /// Lazily allocated when a row group has rows tombstoned and we need to
     /// materialize a filtered batch. Reused across batches.
@@ -157,11 +211,34 @@ pub const Scan = struct {
         table: *Table,
         injected: ?*exec.memory.MemoryAccountant,
     ) !Query {
-        const n = table.schema.columns.len;
+        return createWithProjection(allocator, table, injected, null);
+    }
 
-        const decoded = try allocator.alloc(storage.OwnedColumn, n);
+    /// Like `createWithAccountant`, but `needed` (when non-null) restricts
+    /// the scan's output to those columns by name — projection pushdown, so
+    /// upstream blocking operators buffer fewer columns. Unknown names
+    /// error; `null` reads every column.
+    pub fn createWithProjection(
+        allocator: Allocator,
+        table: *Table,
+        injected: ?*exec.memory.MemoryAccountant,
+        needed: ?[]const []const u8,
+    ) !Query {
+        const out_phys = try resolveOutPhys(allocator, table.schema.columns, needed);
+        errdefer allocator.free(out_phys);
+
+        const out_schema_owned = needed != null;
+        const out_schema: []const Column = if (out_schema_owned) blk: {
+            const s = try allocator.alloc(Column, out_phys.len);
+            for (s, out_phys) |*c, p| c.* = table.schema.columns[p];
+            break :blk s;
+        } else table.schema.columns;
+        errdefer if (out_schema_owned) allocator.free(@constCast(out_schema));
+
+        const k = out_phys.len;
+        const decoded = try allocator.alloc(storage.OwnedColumn, k);
         errdefer allocator.free(decoded);
-        const views = try allocator.alloc(ColumnView, n);
+        const views = try allocator.alloc(ColumnView, k);
         errdefer allocator.free(views);
 
         const self = try allocator.create(Scan);
@@ -212,7 +289,7 @@ pub const Scan = struct {
         const cached_cards = try computeColumnCards(
             allocator,
             table.manifest.segments.items[0..segment_count],
-            n,
+            out_phys,
             memtable_row_count,
         );
         errdefer allocator.free(cached_cards);
@@ -226,6 +303,9 @@ pub const Scan = struct {
             .memtable_row_count = memtable_row_count,
             .decoded = decoded,
             .views = views,
+            .out_phys = out_phys,
+            .out_schema = out_schema,
+            .out_schema_owned = out_schema_owned,
             .prunes = .empty,
             .owned_accountant = owned_accountant,
             .owns_accountant = owns_accountant,
@@ -261,6 +341,8 @@ pub const Scan = struct {
         }
         self.allocator.free(self.decoded);
         self.allocator.free(self.views);
+        self.allocator.free(self.out_phys);
+        if (self.out_schema_owned) self.allocator.free(@constCast(self.out_schema));
         // Drop our pinned memtable reference. If we held the last one and
         // the memtable was retired (a flush/delete swapped it out), it's
         // freed here.
@@ -289,11 +371,11 @@ pub const Scan = struct {
 
     fn ensureFilteredBuffers(self: *Scan) ![]ColumnStore {
         if (self.filtered) |arr| return arr;
-        const arr = try self.allocator.alloc(ColumnStore, self.table.schema.columns.len);
+        const arr = try self.allocator.alloc(ColumnStore, self.out_schema.len);
         errdefer self.allocator.free(arr);
         var inited: usize = 0;
         errdefer for (arr[0..inited]) |*c| c.deinit(self.allocator);
-        for (self.table.schema.columns, 0..) |col, i| {
+        for (self.out_schema, 0..) |col, i| {
             arr[i] = try ColumnStore.init(self.allocator, col.type, col.nullable);
             inited += 1;
         }
@@ -358,7 +440,7 @@ pub const Scan = struct {
     }
 
     pub fn outputSchema(self: *Scan) []const Column {
-        return self.table.schema.columns;
+        return self.out_schema;
     }
 
     /// Pre-execution stats: sum of segment row counts + the memtable
@@ -481,12 +563,12 @@ pub const Scan = struct {
                 continue;
             }
 
-            for (self.table.schema.columns, 0..) |_, i| {
-                self.decoded[i] = try seg.decodeColumn(
+            for (self.out_phys, 0..) |phys, j| {
+                self.decoded[j] = try seg.decodeColumn(
                     self.allocator,
                     self.table.schema,
                     self.cur_rg_idx,
-                    i,
+                    phys,
                 );
             }
             self.decoded_valid = true;
@@ -501,7 +583,7 @@ pub const Scan = struct {
 
             for (self.decoded, 0..) |c, i| self.views[i] = c.view();
             return Batch{
-                .schema = self.table.schema.columns,
+                .schema = self.out_schema,
                 .values = self.views,
                 .row_count = rg_count,
             };
@@ -514,11 +596,11 @@ pub const Scan = struct {
             self.phase = .done;
             if (self.memtable_row_count == 0) return null;
 
-            for (self.memtable_snap.columns, 0..) |c, i| {
-                self.views[i] = c.view();
+            for (self.out_phys, 0..) |phys, j| {
+                self.views[j] = self.memtable_snap.columns[phys].view();
             }
             return Batch{
-                .schema = self.table.schema.columns,
+                .schema = self.out_schema,
                 .values = self.views,
                 .row_count = @intCast(self.memtable_row_count),
             };
@@ -568,7 +650,7 @@ pub const Scan = struct {
         for (filtered_cols, 0..) |c, i| self.views[i] = c.view();
 
         return Batch{
-            .schema = self.table.schema.columns,
+            .schema = self.out_schema,
             .values = self.views,
             .row_count = kept,
         };

@@ -1450,6 +1450,54 @@ test "compactor: count-based tier trigger merges incrementally and preserves row
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, ids.items);
 }
 
+test "scan projection: narrows output to the requested columns" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" },
+    });
+    try t.flush();
+
+    // Request {tag, id} out of schema order — output is in table order
+    // (id, tag) and excludes qty/active entirely.
+    {
+        var q = try thindb.exec.scanWithProjection(allocator, t, null, &[_][]const u8{ "tag", "id" });
+        defer q.deinit();
+        const out = q.outputSchema();
+        try std.testing.expectEqual(@as(usize, 2), out.len);
+        try std.testing.expectEqualStrings("id", out[0].name);
+        try std.testing.expectEqualStrings("tag", out[1].name);
+
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| {
+            try std.testing.expectEqual(@as(usize, 2), batch.values.len);
+            try ids.appendSlice(allocator, batch.values[0].data.bigint);
+        }
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, ids.items);
+    }
+
+    // Empty projection (e.g. COUNT(*) references no column) still keeps one
+    // column so batches carry a row count.
+    {
+        var q = try thindb.exec.scanWithProjection(allocator, t, null, &[_][]const u8{});
+        defer q.deinit();
+        try std.testing.expectEqual(@as(usize, 1), q.outputSchema().len);
+        var rows: usize = 0;
+        while (try q.next()) |batch| rows += batch.row_count;
+        try std.testing.expectEqual(@as(usize, 2), rows);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Upserts
 // ---------------------------------------------------------------------------

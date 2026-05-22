@@ -395,6 +395,17 @@ pub fn scanWithAccountant(
     return @import("scan.zig").Scan.createWithAccountant(allocator, table, accountant_ptr);
 }
 
+/// Like `scanWithAccountant`, but `needed` (when non-null) restricts the
+/// scan to those columns by name — projection pushdown. `null` reads all.
+pub fn scanWithProjection(
+    allocator: Allocator,
+    table: *Table,
+    accountant_ptr: ?*memory.MemoryAccountant,
+    needed: ?[]const []const u8,
+) !Query {
+    return @import("scan.zig").Scan.createWithProjection(allocator, table, accountant_ptr, needed);
+}
+
 /// Build a join's output `column_cards` by concatenating the left columns'
 /// bounds with the kept right columns' bounds (the join output schema is
 /// `left ⧺ right-where-kept`). A join can't grow a column's distinct count,
