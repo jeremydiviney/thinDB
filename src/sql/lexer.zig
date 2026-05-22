@@ -128,6 +128,7 @@ pub const TokenTag = enum {
     slash, // /
     percent, // %
     pipe_pipe, // || (PG/ANSI string concat; MySQL logical OR)
+    coloncolon, // :: (PG cast operator)
     comma, // ,
     dot, // .
     lparen, // (
@@ -256,6 +257,13 @@ pub const Lexer = struct {
                 if (self.peekChar(1) == '|') {
                     self.pos += 2;
                     return Token{ .tag = .pipe_pipe, .text = self.src[start..self.pos] };
+                }
+                return LexError.LexUnexpectedChar;
+            },
+            ':' => {
+                if (self.peekChar(1) == ':') {
+                    self.pos += 2;
+                    return Token{ .tag = .coloncolon, .text = self.src[start..self.pos] };
                 }
                 return LexError.LexUnexpectedChar;
             },

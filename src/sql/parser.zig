@@ -796,6 +796,32 @@ pub const Parser = struct {
             return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
         }
 
+        // CAST(expr AS type) at projection top level. Detected before the
+        // identifier-then-`(` call branch (which would choke on `AS`).
+        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "cast")) {
+            const saved = self.cur;
+            try self.advance();
+            if (self.cur.tag == .lparen) {
+                try self.advance();
+                const inner = try self.parseCallArg();
+                if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
+                try self.advance();
+                var expr = try self.parseCastTarget(inner);
+                try self.expect(.rparen);
+                while (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
+                    try self.advance();
+                    expr = try self.parseCastTarget(expr);
+                }
+                expr = try self.continueBinaryFrom(expr);
+                const default_name = try self.exprDefaultName(expr);
+                const alias = try self.maybeAlias(default_name);
+                return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            }
+            const dup_col = try self.arena.dupe(u8, saved.text);
+            const alias = try self.maybeAlias(dup_col);
+            return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
+        }
+
         // Identifier or function call. Look ahead: `(` after an identifier
         // means a call.
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
@@ -896,11 +922,15 @@ pub const Parser = struct {
             break :blk try self.arena.dupe(u8, first);
         };
 
-        // If a binary operator follows the column ref, lift it into a
-        // binary expression (e.g., `qty + 1`, `price * 1.05`).
-        if (isBinaryOpToken(self.cur.tag)) {
-            const col_atom = ir.Expr{ .col_ref = dup_col };
-            const expr = try self.continueBinaryFrom(col_atom);
+        // A `col::type` postfix cast (PG) and/or a trailing binary
+        // operator (`qty + 1`) lift the column ref into an expression.
+        if ((self.cur.tag == .coloncolon and self.lex.dialect != .mysql) or isBinaryOpToken(self.cur.tag)) {
+            var expr = ir.Expr{ .col_ref = dup_col };
+            while (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
+                try self.advance();
+                expr = try self.parseCastTarget(expr);
+            }
+            expr = try self.continueBinaryFrom(expr);
             const default_name = try self.exprDefaultName(expr);
             const alias = try self.maybeAlias(default_name);
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
@@ -1236,7 +1266,61 @@ pub const Parser = struct {
     /// nested scalar call. Aggregates and window functions are
     /// rejected — they belong at the top level of the SELECT list.
     fn parseCallAtom(self: *Parser) ParseError!ir.Expr {
+        var atom = try self.parseCallAtomBase();
+        // `expr::type` postfix cast (PG). Binds tighter than binary ops;
+        // rejected on MySQL (where `::` is not a cast operator).
+        while (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
+            try self.advance();
+            atom = try self.parseCastTarget(atom);
+        }
+        return atom;
+    }
+
+    /// Map a CAST target type onto the existing conversion scalar-fn that
+    /// implements it (the registry's implicit-cast ranking then coerces
+    /// the source width, e.g. smallint→bigint before to_int). Returns null
+    /// for targets without a conversion kernel yet — those CASTs error.
+    fn castFnName(ty: types.Type) ?[]const u8 {
+        return switch (ty) {
+            .int => "to_int",
+            .bigint => "to_bigint",
+            .float, .double => "to_double",
+            .varchar, .char, .string => "to_string",
+            // No conversion kernel yet: smallint/tinyint/largeint, boolean,
+            // date/datetime, decimal, uuid. (smallint/tinyint widen to int
+            // via to_int if the user targets INT.)
+            .smallint, .tinyint, .largeint, .boolean, .date, .datetime, .decimal64, .decimal128, .uuid => null,
+        };
+    }
+
+    /// Parse the target type (cursor on the type name) and wrap `inner`
+    /// in a `cast_as_<T>(inner)` scalar call. Used by both CAST(... AS T)
+    /// and the `inner::T` postfix.
+    fn parseCastTarget(self: *Parser, inner: ir.Expr) ParseError!ir.Expr {
+        const ty = try parse_ddl.parseColumnType(self);
+        const fn_name = castFnName(ty) orelse return ParseError.SqlInvalidProjection;
+        const args = try self.arena.alloc(ir.Expr, 1);
+        args[0] = inner;
+        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
+    }
+
+    fn parseCallAtomBase(self: *Parser) ParseError!ir.Expr {
         if (self.cur.tag == .kw_case) return try self.parseCaseExpr();
+        // CAST(expr AS type) — SQL-standard explicit cast (both dialects).
+        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "cast")) {
+            const saved = self.cur;
+            try self.advance();
+            if (self.cur.tag == .lparen) {
+                try self.advance();
+                const inner = try self.parseCallArg();
+                if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
+                try self.advance();
+                const result = try self.parseCastTarget(inner);
+                try self.expect(.rparen);
+                return result;
+            }
+            return ir.Expr{ .col_ref = try self.arena.dupe(u8, saved.text) };
+        }
         // EXISTS (SELECT ...) in expression position — projects a
         // boolean. Resolved by the pre-compile pass into `.lit`.
         if (self.cur.tag == .kw_exists) {

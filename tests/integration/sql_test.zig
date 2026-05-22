@@ -357,6 +357,48 @@ test "sql: FETCH FIRST / OFFSET ROWS (ANSI/PG row limiting)" {
     }
 }
 
+test "sql: CAST(expr AS type) and PG expr::type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db); // id=1 has qty=10
+
+    // CAST(int AS bigint)
+    {
+        var q = try runSql(allocator, db, "SELECT CAST(qty AS bigint) AS b FROM t ORDER BY id LIMIT 1");
+        defer q.deinit();
+        const r = (try q.next()).?;
+        try std.testing.expect(std.meta.activeTag(q.outputSchema()[0].type) == .bigint);
+        try std.testing.expectEqual(@as(i64, 10), r.values[0].data.bigint[0]);
+    }
+    // PG postfix ::double
+    {
+        var q = try runSql(allocator, db, "SELECT qty::double AS d FROM t ORDER BY id LIMIT 1");
+        defer q.deinit();
+        const r = (try q.next()).?;
+        try std.testing.expectEqual(@as(f64, 10), r.values[0].data.double[0]);
+    }
+    // CAST(bigint AS text) and CAST('42' AS int)
+    {
+        var q = try runSql(allocator, db, "SELECT CAST(id AS text) AS s, CAST('42' AS int) AS n FROM t ORDER BY id LIMIT 1");
+        defer q.deinit();
+        const r = (try q.next()).?;
+        try std.testing.expectEqualStrings("1", r.values[0].data.string.rowBytes(0));
+        try std.testing.expectEqual(@as(i32, 42), r.values[1].data.int[0]);
+    }
+    // `::` is not a cast operator on MySQL — it must fail to parse there.
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        if (thindb.sql.parseDialect(arena.allocator(), "SELECT qty::int FROM t", .mysql)) |_| {
+            return error.TestUnexpectedSuccess;
+        } else |_| {}
+    }
+}
+
 test "sql: string escapes — PG E'...' and MySQL backslash" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
