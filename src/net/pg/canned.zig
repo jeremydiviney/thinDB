@@ -25,6 +25,11 @@ pub const Probe = union(enum) {
     /// Reply with a multi-row, multi-column SELECT result. Each row's
     /// cells must match `cols.len`. Built once at match time.
     static_rows: StaticRows,
+    /// `SET search_path TO <schema>[, ...]` — apply the first schema as the
+    /// session's current schema (thinDB tracks a single schema, not a list).
+    /// The payload is owned (allocator-dup'd in `match`); the dispatcher
+    /// frees it after applying.
+    set_search_path: []const u8,
     /// `pg_cancel_backend(<pid>)` — wire layer looks up the target in
     /// the connection registry, sets its cancel flag, and replies a
     /// single-row "t"/"f" boolean. `pg_terminate_backend` shares the
@@ -60,6 +65,24 @@ pub fn match(
 
     if (lc.len == 0) return Probe{ .accept = "" };
 
+    // `SET search_path TO/= x[, ...]` actually switches the session schema
+    // (the first listed schema); every other SET stays a silent no-op.
+    if (std.mem.startsWith(u8, lc, "set search_path")) {
+        var rest = std.mem.trim(u8, lc["set search_path".len..], " \t");
+        if (std.mem.startsWith(u8, rest, "to")) {
+            rest = std.mem.trim(u8, rest[2..], " \t");
+        } else if (std.mem.startsWith(u8, rest, "=")) {
+            rest = std.mem.trim(u8, rest[1..], " \t");
+        }
+        var end: usize = 0;
+        while (end < rest.len and rest[end] != ',' and rest[end] != ' ') end += 1;
+        var schema = rest[0..end];
+        if (schema.len >= 2 and schema[0] == '"' and schema[schema.len - 1] == '"')
+            schema = schema[1 .. schema.len - 1];
+        // Skip the PG `"$user"` placeholder if it leads the list.
+        if (schema.len > 0 and schema[0] != '$')
+            return Probe{ .set_search_path = try allocator.dupe(u8, schema) };
+    }
     if (std.mem.startsWith(u8, lc, "set ") or std.mem.eql(u8, lc, "set"))
         return Probe{ .accept = "SET" };
     if (std.mem.eql(u8, lc, "begin") or std.mem.startsWith(u8, lc, "begin "))
@@ -136,10 +159,23 @@ test "match recognizes version() probe" {
 
 test "match treats arbitrary SET as accept" {
     const allocator = std.testing.allocator;
-    const m = try match(allocator, "SET search_path = analytics", "main", "public");
+    const m = try match(allocator, "SET client_encoding = 'UTF8'", "main", "public");
     try std.testing.expect(m != null);
     switch (m.?) {
         .accept => |tag| try std.testing.expectEqualStrings("SET", tag),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "match applies SET search_path to the first listed schema" {
+    const allocator = std.testing.allocator;
+    const m = try match(allocator, "SET search_path TO analytics, public", "main", "public");
+    try std.testing.expect(m != null);
+    switch (m.?) {
+        .set_search_path => |sc| {
+            try std.testing.expectEqualStrings("analytics", sc);
+            allocator.free(sc);
+        },
         else => return error.TestUnexpectedResult,
     }
 }

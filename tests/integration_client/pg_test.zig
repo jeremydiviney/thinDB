@@ -711,7 +711,7 @@ test "pg wire: CREATE DATABASE round-trips" {
     if (sctx.err) |e| return e;
 }
 
-test "pg wire: SET search_path is silently accepted" {
+test "pg wire: SET search_path switches the session schema" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -740,6 +740,13 @@ test "pg wire: SET search_path is silently accepted" {
     const reply = try client.readQueryReply(arena.allocator());
     try std.testing.expect(reply.error_code == null);
     try std.testing.expectEqualStrings("SET", reply.command_tag);
+
+    // It actually applies: current_schema() now reflects the new schema.
+    try client.sendQuery("SELECT current_schema()");
+    const reply2 = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply2.error_code == null);
+    try std.testing.expect(reply2.rows.len == 1);
+    try std.testing.expectEqualStrings("analytics", reply2.rows[0][0].?);
 
     try client.sendTerminate();
     if (sctx.err) |e| return e;

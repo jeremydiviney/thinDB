@@ -932,6 +932,11 @@ fn dispatchProbe(
             session.dropTempNamespace();
             try result.sendCommandComplete(allocator, w, tag);
         },
+        .set_search_path => |schema| {
+            try session.replaceDbSchema(session.current_db, schema);
+            allocator.free(schema);
+            try result.sendCommandComplete(allocator, w, "SET");
+        },
         .single_value => |sv| {
             const cols = [_]@import("../../types.zig").Column{.{ .name = sv.col, .type = .string, .nullable = sv.val == null }};
             try result.sendRowDescription(allocator, w, cols[0..]);
