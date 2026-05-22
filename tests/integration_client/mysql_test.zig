@@ -798,6 +798,42 @@ test "mysql wire: SHOW COLUMNS reports DEFAULT and auto_increment Extra" {
     if (sctx.err) |e| return e;
 }
 
+test "mysql wire: SELECT NOW() returns real wall-clock, not 1970" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 212;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const th = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer th.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("main__public");
+
+    try client.sendQuery("SELECT NOW()");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    const v = rows[0][0].?;
+    try std.testing.expect(v.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, v, "1970-01-01 00:00:00"));
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
 test "mysql wire: SET / SHOW VARIABLES probes return canned OK / rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -744,6 +744,12 @@ fn sendSyntheticWorkbenchSelect(
         const raw_expr = std.mem.trim(u8, select_list[start..end], " \t\r\n");
         if (raw_expr.len > 0) {
             const expr = stripAlias(raw_expr).expr;
+            // Temporal nullary functions resolve to real wall-clock through
+            // the engine's FROM-less SELECT path — bail the whole query to
+            // the engine instead of returning a canned epoch value here.
+            if (std.mem.eql(u8, expr, "now()") or
+                std.mem.eql(u8, expr, "current_timestamp()") or
+                std.mem.eql(u8, expr, "current_date()")) return false;
             const col_name = stripIdentifierQuotes(stripAlias(raw_expr).alias orelse raw_expr);
             const value = syntheticSelectValue(expr, session.current_schema);
             try cols.append(allocator, .{ .name = col_name, .type = .string, .nullable = value == null });
@@ -824,9 +830,10 @@ fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8) ?[]cons
         return "thindb@localhost";
     if (std.mem.eql(u8, expr, "connection_id()")) return "1";
     if (std.mem.eql(u8, expr, "connection_id")) return "1";
-    if (std.mem.eql(u8, expr, "current_timestamp()") or
-        std.mem.eql(u8, expr, "current_timestamp") or
-        std.mem.eql(u8, expr, "now()"))
+    // now() / current_timestamp() (paren forms) are routed to the engine
+    // for real wall-clock; only the bare identifier remains canned here
+    // (the parser doesn't yet treat it as a nullary function).
+    if (std.mem.eql(u8, expr, "current_timestamp"))
         return "1970-01-01 00:00:00";
 
     // Workbench and drivers occasionally probe scalar expressions
