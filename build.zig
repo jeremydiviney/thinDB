@@ -79,13 +79,26 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_integration_client_tests.step);
 
+    // ---- ReleaseFast thinDB module for performance tooling -----------------
+    // Benchmarks (and the ClickBench loader) are only meaningful against
+    // production-optimized code, so they always build at ReleaseFast
+    // regardless of -Doptimize. A plain `zig build bench` in the default
+    // Debug mode would otherwise report ~7x-inflated numbers.
+    const fast_zstd = b.dependency("zstd", .{ .target = target, .optimize = .ReleaseFast });
+    const thindb_fast = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    thindb_fast.linkLibrary(fast_zstd.artifact("zstd"));
+
     // ---- Benchmarks: bench/main.zig ----------------------------------------
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     });
-    bench_mod.addImport("thindb", thindb_mod);
+    bench_mod.addImport("thindb", thindb_fast);
 
     const bench_exe = b.addExecutable(.{
         .name = "thindb_bench",
@@ -96,16 +109,16 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_bench.addArgs(args);
-    const bench_step = b.step("bench", "Run benchmarks (recommended: -Doptimize=ReleaseFast)");
+    const bench_step = b.step("bench", "Run benchmarks (always built ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
     // ---- ClickBench loader: bench/clickbench/main.zig ----------------------
     const clickbench_mod = b.createModule(.{
         .root_source_file = b.path("bench/clickbench/main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     });
-    clickbench_mod.addImport("thindb", thindb_mod);
+    clickbench_mod.addImport("thindb", thindb_fast);
 
     const clickbench_exe = b.addExecutable(.{
         .name = "thindb_clickbench",
@@ -116,7 +129,7 @@ pub fn build(b: *std.Build) void {
     const run_clickbench = b.addRunArtifact(clickbench_exe);
     run_clickbench.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_clickbench.addArgs(args);
-    const clickbench_step = b.step("clickbench", "Load ClickBench TSV into a fresh DB (recommended: -Doptimize=ReleaseFast). First arg = TSV path, second arg = max rows.");
+    const clickbench_step = b.step("clickbench", "Load ClickBench TSV into a fresh DB (always built ReleaseFast). First arg = TSV path, second arg = max rows.");
     clickbench_step.dependOn(&run_clickbench.step);
 
     // ---- ClickBench probe: bench/clickbench/probe.zig --------------------

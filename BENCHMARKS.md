@@ -3,9 +3,9 @@
 Snapshot of `zig build bench -Doptimize=ReleaseFast` results, captured for reference.
 
 **Hardware:** AMD Ryzen 9 9900X (12C / 24T), 64 GB RAM, NVMe SSD, Windows 11.
-**Zig:** 0.16. **Build:** ReleaseFast. **Workload:** 1,000,000 rows for the core benches unless noted.
+**Zig:** 0.16. **Build:** ReleaseFast (the `bench` / `clickbench` steps now force it — see `build.zig`). **Workload:** 1,000,000 rows for the core benches unless noted.
 
-To regenerate: `zig build bench -Doptimize=ReleaseFast`.
+To regenerate: `zig build bench` (always built ReleaseFast regardless of `-Doptimize`).
 
 ---
 
@@ -13,21 +13,21 @@ To regenerate: `zig build bench -Doptimize=ReleaseFast`.
 
 | Operation | Time | Throughput | ns/row |
 |---|---:|---:|---:|
-| insert memtable | 49 ms | 20 M rows/s | 49 |
-| insert + flush | 88 ms | 11 M rows/s | 88 |
-| sustained insert (1000 × 1k → 100 segs) | 179 ms | 5.6 M rows/s | 179 |
-| scan flushed | 16 ms | 62 M rows/s | 16 |
-| scan cold (cache populating) | 17 ms | 58 M rows/s | 17 |
-| scan warm (cache hits) | 15 ms | 68 M rows/s | 15 |
-| filter `qty > 50` (non-order-key, 49% match) | 23 ms | 44 M rows/s | 23 |
-| filter `id < 50k` (order-key, narrow, 5% match) | 6 ms | **177 M rows/s** | 6 |
-| filter `id >= N/2` (order-key, 50% match) | 17 ms | 60 M rows/s | 17 |
-| aggregate count + sum + min + max | 18 ms | 55 M rows/s | 18 |
-| aggregate stddev_pop + var_pop (Welford) | 28 ms | 36 M rows/s | 28 |
-| aggregate count_distinct (~8 unique) | 28 ms | 36 M rows/s | 28 |
-| aggregate percentile_cont(0.5) [exact] | 29 ms | 34 M rows/s | 29 |
-| aggregate group_concat (~8 groups) | 43 ms | 23 M rows/s | 43 |
-| groupBy tag (8 groups), count + sum | 40 ms | 25 M rows/s | 40 |
+| insert memtable | 42 ms | 24 M rows/s | 42 |
+| insert + flush | 90 ms | 11 M rows/s | 90 |
+| sustained insert (1000 × 1k → 100 segs) | 210 ms | 4.8 M rows/s | 210 |
+| scan flushed | 18 ms | 56 M rows/s | 18 |
+| scan cold (cache populating) | 18 ms | 55 M rows/s | 18 |
+| scan warm (cache hits) | 16 ms | 64 M rows/s | 16 |
+| filter `qty > 50` (non-order-key, 49% match) | 22 ms | 44 M rows/s | 22 |
+| filter `id < 50k` (order-key, narrow, 5% match) | 6 ms | **166 M rows/s** | 6 |
+| filter `id >= N/2` (order-key, 50% match) | 16 ms | 62 M rows/s | 16 |
+| aggregate count + sum + min + max | 19 ms | 53 M rows/s | 19 |
+| aggregate stddev_pop + var_pop (Welford) | 29 ms | 35 M rows/s | 29 |
+| aggregate count_distinct (~8 unique) | 28 ms | 35 M rows/s | 28 |
+| aggregate percentile_cont(0.5) [exact] | 31 ms | 33 M rows/s | 31 |
+| aggregate group_concat (~8 groups) | 45 ms | 22 M rows/s | 45 |
+| groupBy tag (8 groups), count + sum | 41 ms | 24 M rows/s | 41 |
 
 **Notes on the post-baseline aggregates:**
 - `stddev_pop` / `var_pop` use Welford's algorithm — numerically stable, ~1.5× the cost of plain sum.
@@ -78,11 +78,14 @@ Leader-follower coalescing amortizes fsync cost ~4–5× at 8 threads.
 
 | Scenario | Result |
 |---|---|
-| 200 segs, no compact | ingest 164 ms, scan 18 ms (11 M rows/s) |
-| 5 segs, with compact | ingest 532 ms, scan 3.6 ms (**55 M rows/s**) |
-| tombstone-pressure compact | delete 50k in 6 ms, compact in 10 ms |
+| 200 segs, no compact | ingest 226 ms, scan 17 ms (12 M rows/s) |
+| 5 segs, with compact | ingest 565 ms, scan 4.6 ms (**44 M rows/s**) |
+| tombstone-pressure compact | delete 50k in 8 ms, compact in 15 ms |
 
-Compaction reclaims **~5×** scan speed (11 → 55 M rows/s).
+Compaction reclaims **~3.6×** scan speed (12 → 44 M rows/s). Compaction is
+build-aside: the merge runs lock-free and only the manifest swap + old-file
+delete takes the table's exclusive lock, so it's safe to run against live
+scans (the server runs it as a background sweep).
 
 ---
 
