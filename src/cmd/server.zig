@@ -222,12 +222,21 @@ pub fn main(init: std.process.Init) !u8 {
     var flusher_ctx: FlusherCtx = .{ .catalog = catalog, .io = io };
     const flusher_thread = try std.Thread.spawn(.{}, FlusherCtx.run, .{&flusher_ctx});
 
+    // Always-on background compactor. Each sweep merges at most one tier
+    // group per table, so a burst of flushes (or a bulk load that lands as
+    // many small segments) gets consolidated incrementally rather than
+    // leaving the table fragmented. The heavy merge runs lock-free; only
+    // the manifest swap briefly excludes readers.
+    var compactor_ctx: CompactorCtx = .{ .catalog = catalog, .io = io };
+    const compactor_thread = try std.Thread.spawn(.{}, CompactorCtx.run, .{&compactor_ctx});
+
     waitForStop(io);
 
     for (listeners[0..n_listeners]) |*l| l.close();
     closed = true;
     for (threads[0..n_listeners]) |t| t.join();
     flusher_thread.join();
+    compactor_thread.join();
 
     try out_w.writeAll("thindb-server shutting down\n");
     try out_w.flush();
@@ -270,6 +279,15 @@ const FlusherCtx = struct {
 
     fn run(self: *FlusherCtx) void {
         self.catalog.runBackgroundFlusher(self.io, 1000, &stop_flag);
+    }
+};
+
+const CompactorCtx = struct {
+    catalog: *thindb.Catalog,
+    io: Io,
+
+    fn run(self: *CompactorCtx) void {
+        self.catalog.runBackgroundCompactor(self.io, 2000, &stop_flag);
     }
 };
 
