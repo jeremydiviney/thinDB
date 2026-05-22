@@ -1486,14 +1486,18 @@ test "scan projection: narrows output to the requested columns" {
         try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, ids.items);
     }
 
-    // Empty projection (e.g. COUNT(*) references no column) still keeps one
-    // column so batches carry a row count.
+    // Empty projection (e.g. COUNT(*) references no column) decodes nothing:
+    // the scan emits row-count-only batches (0 output columns) straight from
+    // the manifest, and the row counts still total correctly.
     {
         var q = try thindb.exec.scanWithProjection(allocator, t, null, &[_][]const u8{});
         defer q.deinit();
-        try std.testing.expectEqual(@as(usize, 1), q.outputSchema().len);
+        try std.testing.expectEqual(@as(usize, 0), q.outputSchema().len);
         var rows: usize = 0;
-        while (try q.next()) |batch| rows += batch.row_count;
+        while (try q.next()) |batch| {
+            try std.testing.expectEqual(@as(usize, 0), batch.values.len);
+            rows += batch.row_count;
+        }
         try std.testing.expectEqual(@as(usize, 2), rows);
     }
 }

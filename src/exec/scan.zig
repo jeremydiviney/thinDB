@@ -78,7 +78,8 @@ fn computeColumnCards(
 /// (`alias.col`); resolution defers to `types.findColumn`, which strips a
 /// matching table/alias prefix. Duplicates collapse and the result is in
 /// table order. An empty `needed` (e.g. `COUNT(*)` referencing no column)
-/// still keeps one column so batches carry a row count cheaply.
+/// yields an empty set — the scan then emits row-count-only batches and
+/// never decodes (or even opens) a segment.
 fn resolveOutPhys(
     allocator: Allocator,
     columns: []const Column,
@@ -100,11 +101,6 @@ fn resolveOutPhys(
             seen[idx] = true;
             count += 1;
         }
-    }
-    if (count == 0 and columns.len > 0) {
-        const one = try allocator.alloc(usize, 1);
-        one[0] = 0;
-        return one;
     }
     const out = try allocator.alloc(usize, count);
     var j: usize = 0;
@@ -508,6 +504,35 @@ pub const Scan = struct {
 
     pub fn next(self: *Scan) !?Batch {
         self.releaseBatch();
+
+        // Count-only fast path: nothing references a column (e.g. a
+        // WHERE-less COUNT(*)), so we never open or decode a segment. Emit
+        // one row-count-only batch per segment straight from the manifest
+        // (total rows minus tombstoned), then the memtable snapshot count.
+        // A 0-column predicate set means no segment can be pruned, so every
+        // segment contributes its full surviving count.
+        if (self.out_phys.len == 0) {
+            while (self.phase == .segments) {
+                if (self.cur_seg_idx >= self.segment_count) {
+                    self.phase = .memtable;
+                    break;
+                }
+                const entry = self.table.manifest.segments.items[self.cur_seg_idx];
+                self.cur_seg_idx += 1;
+                const tombs = try storage.tombstone.read(self.allocator, self.io, self.table.segments_dir, entry.segment_id);
+                defer if (tombs) |t| self.allocator.free(t);
+                const dead: u64 = if (tombs) |t| t.len else 0;
+                const surviving: u64 = if (entry.row_count > dead) entry.row_count - dead else 0;
+                if (surviving == 0) continue;
+                return Batch{ .schema = self.out_schema, .values = self.views, .row_count = @intCast(surviving) };
+            }
+            if (self.phase == .memtable) {
+                self.phase = .done;
+                if (self.memtable_row_count == 0) return null;
+                return Batch{ .schema = self.out_schema, .values = self.views, .row_count = @intCast(self.memtable_row_count) };
+            }
+            return null;
+        }
 
         // Segments phase
         while (self.phase == .segments) {
