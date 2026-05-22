@@ -309,6 +309,42 @@ test "sql: pg_attribute JOIN pg_class lists a table's columns" {
     try std.testing.expect(saw_id and saw_tag);
 }
 
+test "sql: string_agg and group_concat concatenate grouped strings" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // string_agg(value, delimiter) — PG. tags per k: 100->a,b 200->a,b 300->c.
+    {
+        var q = try runSql(allocator, db, "SELECT k, string_agg(tag, '-') AS s FROM t GROUP BY k ORDER BY 1");
+        defer q.deinit();
+        var rows: usize = 0;
+        var last: []const u8 = "";
+        while (try q.next()) |b| {
+            const sv = b.values[1].data.string;
+            for (0..b.row_count) |i| {
+                last = sv.rowBytes(i);
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 3), rows);
+        // Last group (k=300) has a single tag, so no delimiter.
+        try std.testing.expectEqualStrings("c", last);
+    }
+
+    // group_concat without a delimiter defaults to "," (MySQL).
+    {
+        var q = try runSql(allocator, db, "SELECT k, group_concat(tag) AS s FROM t GROUP BY k ORDER BY 1");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqualStrings("a,b", b.values[1].data.string.rowBytes(0));
+    }
+}
+
 test "sql: now()/current_timestamp()/current_date() resolve to real wall-clock" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

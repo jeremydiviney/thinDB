@@ -89,6 +89,8 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
     .{ .name = "var_pop", .func = .var_pop },
     .{ .name = "var_samp", .func = .var_samp },
     .{ .name = "count_distinct", .func = .count_distinct },
+    .{ .name = "group_concat", .func = .group_concat },
+    .{ .name = "string_agg", .func = .group_concat },
 };
 
 fn aggForName(name: []const u8) ?ir.AggFunc {
@@ -182,7 +184,7 @@ const ProjItem = struct {
         /// the user wrote `SUM(a * b)` or similar — the parser
         /// hoists it into a synthetic Compute column whose name then
         /// fills in `col` before the GroupBy is built.
-        agg: struct { func: ir.AggFunc, col: ?[]const u8, arg_expr: ?ir.Expr = null },
+        agg: struct { func: ir.AggFunc, col: ?[]const u8, arg_expr: ?ir.Expr = null, separator: ?[]const u8 = null },
         /// Scalar function call expression. Lowered to a Compute step
         /// before the final projection.
         expr: ir.Expr,
@@ -523,6 +525,10 @@ pub const Parser = struct {
                         .func = a.func,
                         .col = agg_cols.items[agg_i],
                         .as = p.name,
+                        .params = if (a.func == .group_concat)
+                            .{ .separator = a.separator orelse "," }
+                        else
+                            .none,
                     });
                     agg_i += 1;
                 },
@@ -993,10 +999,27 @@ pub const Parser = struct {
         func: ir.AggFunc,
         args: []const ir.Expr,
     ) ParseError!ProjItem {
-        if (args.len != 1) return ParseError.SqlInvalidProjection;
+        // GROUP_CONCAT / STRING_AGG take an optional second positional arg:
+        // the delimiter string literal (STRING_AGG requires it, MySQL's
+        // GROUP_CONCAT spells it `SEPARATOR x` and is not parsed here, so a
+        // bare GROUP_CONCAT(x) defaults to ","). The delimiter is a param,
+        // not an aggregated value, so it doesn't count toward the 1-arg rule.
+        var separator: ?[]const u8 = null;
+        var value_args = args;
+        if (func == .group_concat and args.len == 2) {
+            separator = switch (args[1]) {
+                .lit => |v| switch (v) {
+                    .text => |s| try self.arena.dupe(u8, s),
+                    else => return ParseError.SqlInvalidProjection,
+                },
+                else => return ParseError.SqlInvalidProjection,
+            };
+            value_args = args[0..1];
+        }
+        if (value_args.len != 1) return ParseError.SqlInvalidProjection;
         var arg_col: ?[]const u8 = null;
         var arg_expr: ?ir.Expr = null;
-        switch (args[0]) {
+        switch (value_args[0]) {
             .col_ref => |c| {
                 if (std.mem.eql(u8, c, "*")) {
                     // *-form is COUNT-only.
@@ -1008,7 +1031,7 @@ pub const Parser = struct {
             // Expression arg — e.g. SUM(a * b) or COUNT(upper(name)).
             // Hoisted into a synthetic Compute column before the
             // GroupBy step; see parseStatement's pre-aggregate pass.
-            .call, .case, .lit => arg_expr = args[0],
+            .call, .case, .lit => arg_expr = value_args[0],
             // Subqueries / EXISTS as aggregate args are out of scope
             // for v1; users can pre-aggregate via a CTE.
             else => return ParseError.SqlInvalidProjection,
@@ -1031,6 +1054,7 @@ pub const Parser = struct {
             .func = func,
             .col = arg_col,
             .arg_expr = arg_expr,
+            .separator = separator,
         } } };
     }
 
