@@ -28,6 +28,39 @@ pub const SortSpec = struct {
     desc: bool = false,
 };
 
+/// Sort `perm` by a single key column, with a comparator monomorphized to
+/// the column's concrete type. The typed slice / StringView is captured
+/// once, so each comparison avoids the tagged-union dispatch and view
+/// reconstruction the generic multi-key comparator pays per call.
+fn sortSingleKey(perm: []u32, col: ColumnStore, desc: bool) void {
+    switch (col.data) {
+        inline .varchar, .string, .char => |s| {
+            const view = s.view();
+            const Cmp = struct {
+                v: @TypeOf(view),
+                d: bool,
+                pub fn lessThan(c: @This(), a: u32, b: u32) bool {
+                    const ord = std.mem.order(u8, c.v.rowBytes(a), c.v.rowBytes(b));
+                    return if (c.d) ord == .gt else ord == .lt;
+                }
+            };
+            std.sort.pdq(u32, perm, Cmp{ .v = view, .d = desc }, Cmp.lessThan);
+        },
+        inline else => |list| {
+            const items = list.items;
+            const Cmp = struct {
+                it: @TypeOf(items),
+                d: bool,
+                pub fn lessThan(c: @This(), a: u32, b: u32) bool {
+                    const ord = std.math.order(c.it[a], c.it[b]);
+                    return if (c.d) ord == .gt else ord == .lt;
+                }
+            };
+            std.sort.pdq(u32, perm, Cmp{ .it = items, .d = desc }, Cmp.lessThan);
+        },
+    }
+}
+
 pub const Sort = struct {
     allocator: Allocator,
     upstream: Query,
@@ -237,6 +270,18 @@ pub const Sort = struct {
         self.reserved_bytes += n * @sizeOf(u32);
         self.perm = try self.allocator.alloc(u32, n);
         for (self.perm, 0..) |*p, i| p.* = @intCast(i);
+
+        // Single sort key (the common case: high-card GROUP BY sort, most
+        // ORDER BY) gets a comparator monomorphized to the key column's
+        // type — captured once, so the ~O(n log n) comparisons skip the
+        // per-call union dispatch, ColumnStore indexing, and StringView
+        // rebuild that the generic multi-key path pays. The typed string
+        // arm is also the natural seam for a future vectorized compare.
+        if (self.sort_col_indices.len == 1) {
+            sortSingleKey(self.perm, self.accumulated[self.sort_col_indices[0]], self.sort_desc[0]);
+            self.drained = true;
+            return;
+        }
 
         const Ctx = struct {
             accumulated: []const ColumnStore,

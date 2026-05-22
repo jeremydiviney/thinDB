@@ -32,6 +32,8 @@ const usage_text =
     \\  --bind ADDR             Interface to bind (default 0.0.0.0).
     \\  --max-connections N     Cap on concurrent client connections across all wires (default 256).
     \\  --idle-timeout-secs N   Close a connection after N seconds of read silence (default 0 = disabled).
+    \\  --query-memory-budget B Per-query memory budget in bytes (default 2 GiB; also gates the
+    \\                          hash-vs-sort GROUP BY decision). 0 disables tracking.
     \\  --mysql-password PW     Require this password on the MySQL wire (mysql_native_password).
     \\                          Without this flag the MySQL wire is in trust mode and accepts any
     \\                          password. Does not affect the PG or native wires.
@@ -65,6 +67,7 @@ pub fn main(init: std.process.Init) !u8 {
     var bind: []const u8 = default_bind;
     var max_connections: u32 = 256;
     var idle_timeout_secs: u32 = 0;
+    var query_memory_budget: ?usize = null;
     var mysql_password: ?[]const u8 = null;
     var pg_password: ?[]const u8 = null;
     const mysql_profile = envFlag(init.environ_map, "THINDB_MYSQL_PROFILE");
@@ -115,6 +118,14 @@ pub fn main(init: std.process.Init) !u8 {
             idle_timeout_secs = v;
             continue;
         }
+        if (try takeValue(arg, "--query-memory-budget", &args_iter, err_w)) |v| {
+            query_memory_budget = std.fmt.parseInt(usize, v, 10) catch {
+                try err_w.print("thindb-server: invalid --query-memory-budget: {s}\n", .{v});
+                try err_w.flush();
+                return 1;
+            };
+            continue;
+        }
         if (try takeValue(arg, "--mysql-password", &args_iter, err_w)) |v| {
             mysql_password = v;
             continue;
@@ -152,6 +163,7 @@ pub fn main(init: std.process.Init) !u8 {
     const cfg: thindb.Config = .{
         .max_connections = max_connections,
         .idle_timeout_secs = idle_timeout_secs,
+        .query_memory_budget = query_memory_budget orelse (thindb.Config{}).query_memory_budget,
     };
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
