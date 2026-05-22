@@ -153,7 +153,25 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
             const resolved = try lookupSessionVar(ctx, name);
             e.* = .{ .lit = resolved };
         },
-        .call => |c| for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg)),
+        .call => |c| {
+            // Nullary temporal functions resolve to a statement-stable
+            // literal from the wall clock captured at compile time, rather
+            // than a per-row scalar kernel (PG/MySQL evaluate now() once
+            // per statement).
+            if (c.args.len == 0) {
+                if (std.ascii.eqlIgnoreCase(c.fn_name, "now") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "current_timestamp"))
+                {
+                    e.* = .{ .lit = .{ .datetime = ctx.now_micros } };
+                    return;
+                }
+                if (std.ascii.eqlIgnoreCase(c.fn_name, "current_date")) {
+                    e.* = .{ .lit = .{ .date = @intCast(@divFloor(ctx.now_micros, std.time.us_per_day)) } };
+                    return;
+                }
+            }
+            for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg));
+        },
         .case => |cs| {
             for (cs.branches) |*br| {
                 try resolveSubqueriesInPredicate(ctx, @constCast(&br.cond));

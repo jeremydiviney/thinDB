@@ -1143,6 +1143,11 @@ pub const CompileCtx = struct {
     /// This is the single seam where a future global memory pool would
     /// hand out (and reclaim) the per-query budget.
     accountant: ?*exec.memory.MemoryAccountant = null,
+    /// Wall-clock microseconds since the Unix epoch, captured once when
+    /// the query is compiled. The subquery pre-compile pass substitutes
+    /// it for `now()` / `current_timestamp()` / `current_date()` so those
+    /// are stable across the whole statement (PG/MySQL semantics).
+    now_micros: i64 = 0,
 
     pub fn deinit(self: *CompileCtx) void {
         var it = self.materialized.iterator();
@@ -1264,7 +1269,12 @@ pub fn compileWithSession(
     session_cell.* = session;
     errdefer allocator.destroy(session_cell);
 
-    var ctx = CompileCtx{ .allocator = allocator, .db = db, .session = session_cell };
+    var ctx = CompileCtx{
+        .allocator = allocator,
+        .db = db,
+        .session = session_cell,
+        .now_micros = std.Io.Timestamp.now(db.io, .real).toMicroseconds(),
+    };
     errdefer ctx.deinit();
     // Pre-compile pass: walk the IR and run each uncorrelated scalar
     // subquery once, replacing the `.scalar_subquery` marker with a

@@ -309,6 +309,28 @@ test "sql: pg_attribute JOIN pg_class lists a table's columns" {
     try std.testing.expect(saw_id and saw_tag);
 }
 
+test "sql: now()/current_timestamp()/current_date() resolve to real wall-clock" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT now() AS n, current_timestamp() AS t, current_date() AS d FROM t LIMIT 1");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    const now_us = b.values[0].data.datetime[0];
+    const ts_us = b.values[1].data.datetime[0];
+    const day = b.values[2].data.date[0];
+    // Real wall-clock, not the old hardcoded 1970 epoch.
+    try std.testing.expect(now_us > 1_500_000_000_000_000);
+    // Statement-stable: all three share the one captured timestamp.
+    try std.testing.expectEqual(now_us, ts_us);
+    try std.testing.expectEqual(@as(i32, @intCast(@divFloor(now_us, std.time.us_per_day))), day);
+}
+
 test "sql: ORDER BY ordinal sorts by the Nth SELECT item" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
