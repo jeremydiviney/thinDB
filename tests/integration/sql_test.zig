@@ -473,6 +473,13 @@ test "sql: string escapes — PG E'...' and MySQL backslash" {
         const b = (try cq.next()).?;
         try std.testing.expectEqualStrings("a\tb", b.values[0].data.string.rowBytes(0));
     }
+    // PG dollar-quoted string literal (raw contents).
+    {
+        var q = try runSql(allocator, db, "SELECT $$he'llo$$ AS s FROM t LIMIT 1");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqualStrings("he'llo", b.values[0].data.string.rowBytes(0));
+    }
 }
 
 test "sql: || is string concat on neutral/PG, logical OR on MySQL" {

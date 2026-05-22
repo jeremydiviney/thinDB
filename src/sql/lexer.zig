@@ -267,7 +267,15 @@ pub const Lexer = struct {
                 }
                 return LexError.LexUnexpectedChar;
             },
-            '$' => return try self.lexDollarParam(),
+            '$' => {
+                // `$N` numbered placeholder vs PG dollar-quoted string
+                // (`$$...$$` / `$tag$...$tag$`). A digit after `$` means a
+                // placeholder; anything else is a dollar-quote on PG/neutral.
+                const c1 = self.peekChar(1);
+                if (c1 != null and std.ascii.isDigit(c1.?)) return try self.lexDollarParam();
+                if (self.dialect != .mysql) return try self.lexDollarQuote();
+                return try self.lexDollarParam();
+            },
             '@' => return try self.lexAtVar(),
             '!' => {
                 if (self.peekChar(1) == '=') {
@@ -461,6 +469,32 @@ pub const Lexer = struct {
         const lowered = try self.arena.alloc(u8, text.len);
         for (text, 0..) |c, i| lowered[i] = std.ascii.toLower(c);
         return Token{ .tag = .identifier, .text = lowered };
+    }
+
+    /// PG dollar-quoted string: `$tag$ ... $tag$` (tag may be empty:
+    /// `$$ ... $$`). Contents are raw — no escape processing. Cursor is on
+    /// the opening `$`.
+    fn lexDollarQuote(self: *Lexer) LexError!Token {
+        const start = self.pos;
+        self.pos += 1; // opening $
+        while (self.pos < self.src.len and self.src[self.pos] != '$') {
+            const c = self.src[self.pos];
+            if (!(std.ascii.isAlphanumeric(c) or c == '_')) return LexError.LexUnexpectedChar;
+            self.pos += 1;
+        }
+        if (self.pos >= self.src.len) return LexError.LexUnterminatedString;
+        self.pos += 1; // closing $ of the opening delimiter
+        const delim = self.src[start..self.pos]; // "$tag$"
+        const content_start = self.pos;
+        while (self.pos + delim.len <= self.src.len) {
+            if (std.mem.eql(u8, self.src[self.pos .. self.pos + delim.len], delim)) {
+                const content = self.src[content_start..self.pos];
+                self.pos += delim.len;
+                return Token{ .tag = .string, .text = self.src[start..self.pos], .value = .{ .string = content } };
+            }
+            self.pos += 1;
+        }
+        return LexError.LexUnterminatedString;
     }
 
     fn lexDollarParam(self: *Lexer) LexError!Token {
@@ -756,6 +790,28 @@ test "lexer: PG E'...' escape strings process backslashes" {
     try std.testing.expectEqualStrings("a\nb", s.value.string);
 }
 
+test "lexer: PG dollar-quoted strings; $N stays a placeholder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    {
+        var lx = Lexer.init(aa, "$$a'b\"c$$"); // neutral, raw contents
+        const s = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .string), s.tag);
+        try std.testing.expectEqualStrings("a'b\"c", s.value.string);
+    }
+    {
+        var lx = Lexer.init(aa, "$tag$ hi $tag$");
+        const s = try lx.next();
+        try std.testing.expectEqualStrings(" hi ", s.value.string);
+    }
+    {
+        var lx = Lexer.init(aa, "$1"); // numbered placeholder, not a quote
+        const t = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .dollar_param), t.tag);
+    }
+}
+
 test "lexer: # is a line comment on MySQL only" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -888,11 +944,20 @@ test "lexer: $N inside string literal is content, not a placeholder" {
     try std.testing.expectEqual(@as(u32, 2), param.value.dollar_param);
 }
 
-test "lexer: $ without trailing digits errors" {
+test "lexer: a bare $ errors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lx = Lexer.init(arena.allocator(), "$");
-    try std.testing.expectError(LexError.LexUnexpectedChar, lx.next());
+    // On MySQL `$` is a stray char; on PG/neutral it opens a dollar-quote
+    // that never closes. Both are errors.
+    {
+        var lx = Lexer.init(arena.allocator(), "$");
+        lx.dialect = .mysql;
+        try std.testing.expectError(LexError.LexUnexpectedChar, lx.next());
+    }
+    {
+        var lx = Lexer.init(arena.allocator(), "$");
+        try std.testing.expectError(LexError.LexUnterminatedString, lx.next());
+    }
 }
 
 test "lexer: unterminated string errors cleanly" {
