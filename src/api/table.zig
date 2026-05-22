@@ -80,6 +80,17 @@ pub const Table = struct {
     /// AccessExclusiveLock, MySQL MDL).
     ddl_lock: Io.RwLock = .init,
 
+    /// Serializes compaction against itself (background sweep vs. explicit
+    /// COMPACT). Held for a whole compaction; does NOT block scans/inserts.
+    compact_lock: Io.Mutex = .init,
+
+    /// Monotonic source of new segment IDs. Initialized to `max(id)+1` at
+    /// open and bumped atomically on every segment creation (flush AND
+    /// compaction). A counter rather than `manifest.nextSegmentId()` so a
+    /// build-aside compaction can write its new segment file before the
+    /// manifest swap without colliding with a concurrent flush's ID.
+    next_segment_id: std.atomic.Value(u64) = .init(0),
+
     pub fn open(
         allocator: Allocator,
         io: Io,
@@ -169,6 +180,7 @@ pub const Table = struct {
             .manifest = manifest,
             .memtable = memtable,
             .wal = null,
+            .next_segment_id = .init(manifest.nextSegmentId()),
         };
 
         // If we replayed WAL records into a unique-key table's memtable,
@@ -370,7 +382,7 @@ pub const Table = struct {
             return;
         }
 
-        const seg_id = self.manifest.nextSegmentId();
+        const seg_id = self.allocSegmentId();
 
         var name_buf: [32]u8 = undefined;
         const file_name = try std.fmt.bufPrint(&name_buf, "{d:0>20}.dat", .{seg_id});
@@ -524,6 +536,11 @@ pub const Table = struct {
 
     pub fn segmentFileName(buf: []u8, seg_id: u64) ![]u8 {
         return std.fmt.bufPrint(buf, "{d:0>20}.dat", .{seg_id});
+    }
+
+    /// Allocate a fresh, never-reused (within this run) segment ID.
+    pub fn allocSegmentId(self: *Table) u64 {
+        return self.next_segment_id.fetchAdd(1, .monotonic);
     }
 
     /// Delete every row matching `pred`. Scans all segments + the memtable,

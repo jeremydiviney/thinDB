@@ -250,7 +250,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
     }
 
     // Write merged output.
-    const new_seg_id = t.manifest.nextSegmentId();
+    const new_seg_id = t.allocSegmentId();
     var name_buf: [32]u8 = undefined;
     const file_name = try Table.segmentFileName(&name_buf, new_seg_id);
 
