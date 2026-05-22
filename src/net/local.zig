@@ -1096,6 +1096,7 @@ pub fn buildServerQuerySession(
         // CTAS / INSERT-SELECT come from SQL parsing and only go
         // through the CompileCtx path. The plan-builder + wire path
         // doesn't construct these.
+        .single_row => return SingleRowSource.create(allocator),
         .create_table_as, .insert_select, .set_var, .delete_op, .update_op, .explain => return Error.UnsupportedOp,
     };
 }
@@ -1482,6 +1483,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .set_var => |sv| try compileSetVar(ctx, sv),
         .delete_op => |d| try compileDelete(ctx, d),
         .update_op => |u| try compileUpdate(ctx, u),
+        .single_row => try SingleRowSource.create(ctx.allocator),
         .explain => |e| blk: {
             // Compile the inner statement, render its physical plan, and
             // return the plan as a one-column result. The inner query is
@@ -2526,6 +2528,48 @@ fn unionSchemaAndTempTables(
 // call). SHOW ops return `NamesOp`, which materializes a list of names
 // into one string column and emits a single Batch.
 // ---------------------------------------------------------------------------
+
+/// FROM-less SELECT source: emits exactly one row with zero columns.
+/// A Compute/Project on top turns the projected expressions into the
+/// result (`SELECT 1+1`, `SELECT now()`).
+const SingleRowSource = struct {
+    allocator: Allocator,
+    emitted: bool = false,
+
+    fn create(allocator: Allocator) !Query {
+        const self = try allocator.create(SingleRowSource);
+        self.* = .{ .allocator = allocator };
+        return exec.makeQuery(allocator, self);
+    }
+
+    pub fn next(self: *SingleRowSource) !?exec.Batch {
+        if (self.emitted) return null;
+        self.emitted = true;
+        return exec.Batch{ .schema = &.{}, .values = &.{}, .row_count = 1 };
+    }
+
+    pub fn deinit(self: *SingleRowSource) void {
+        self.allocator.destroy(self);
+    }
+
+    pub fn outputSchema(_: *SingleRowSource) []const types.Column {
+        return &.{};
+    }
+
+    pub fn addPrune(_: *SingleRowSource, _: exec.Predicate) !void {}
+
+    pub fn stats(_: *SingleRowSource) exec.PipelineStats {
+        return .{ .upper_rows = 1 };
+    }
+
+    pub fn accountant(_: *SingleRowSource) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+
+    pub fn explain(_: *SingleRowSource, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "SingleRow");
+    }
+};
 
 const EmptyOp = struct {
     allocator: Allocator,

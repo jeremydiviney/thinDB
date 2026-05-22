@@ -359,10 +359,16 @@ pub const Parser = struct {
         // Projection list.
         const proj = try self.parseProjection();
 
-        // FROM clause — supports a single table or chained JOINs.
-        if (self.cur.tag != .kw_from) return ParseError.SqlExpectedFrom;
-        try self.advance();
-        var root = try self.parseFromClause();
+        // FROM clause — supports a single table or chained JOINs. A
+        // missing FROM is a FROM-less SELECT (`SELECT 1+1`, `SELECT now()`):
+        // evaluate the projection over one synthetic row.
+        var root: *ir.Op = undefined;
+        if (self.cur.tag == .kw_from) {
+            try self.advance();
+            root = try self.parseFromClause();
+        } else {
+            root = try self.allocOp(.{ .single_row = {} });
+        }
 
         // Optional WHERE.
         if (self.cur.tag == .kw_where) {
@@ -2225,7 +2231,7 @@ fn countRefs(
     op: *ir.Op,
 ) ParseError!void {
     switch (op.*) {
-        .scan => {},
+        .scan, .single_row => {},
         .explain => |e| try visitChild(arena, refs, e.inner),
         .limit => |l| try visitChild(arena, refs, l.upstream),
         .select => |p| try visitChild(arena, refs, p.upstream),

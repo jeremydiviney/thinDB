@@ -357,6 +357,39 @@ test "sql: FETCH FIRST / OFFSET ROWS (ANSI/PG row limiting)" {
     }
 }
 
+test "sql: FROM-less SELECT evaluates expressions over one row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // SELECT 1 + 1 — one row, no FROM.
+    {
+        var q = try runSql(allocator, db, "SELECT 1 + 1 AS s");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 1), b.row_count);
+        try std.testing.expectEqual(@as(i32, 2), b.values[0].data.int[0]);
+        try std.testing.expect((try q.next()) == null);
+    }
+    // SELECT now() — real wall-clock, no FROM.
+    {
+        var q = try runSql(allocator, db, "SELECT now() AS n");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expect(b.values[0].data.datetime[0] > 1_500_000_000_000_000);
+    }
+    // SELECT with string concat.
+    {
+        var q = try runSql(allocator, db, "SELECT 'a' || 'b' AS c");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqualStrings("ab", b.values[0].data.string.rowBytes(0));
+    }
+}
+
 test "sql: CAST(expr AS type) and PG expr::type" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

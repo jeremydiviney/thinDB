@@ -376,6 +376,10 @@ pub const OpTag = enum(u8) {
     update_op = 21,
     /// `EXPLAIN <statement>` — render the inner statement's physical plan.
     explain = 22,
+    /// FROM-less SELECT source: one row, zero columns. A Compute/Project
+    /// on top evaluates the projected expressions (`SELECT 1+1`,
+    /// `SELECT now()`). The SQL standard's implicit single-row table.
+    single_row = 23,
 };
 
 pub const BatchOp = struct {
@@ -490,6 +494,7 @@ pub const Op = union(OpTag) {
     delete_op: DeleteOp,
     update_op: UpdateOp,
     explain: ExplainOp,
+    single_row: void,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -582,7 +587,7 @@ pub const Op = union(OpTag) {
     /// whose strings come from caller storage.
     pub fn deinitDecoded(self: *Op, allocator: Allocator) void {
         switch (self.*) {
-            .scan => {},
+            .scan, .single_row => {},
             .explain => |e| {
                 e.inner.deinitDecoded(allocator);
                 allocator.destroy(e.inner);
@@ -778,6 +783,8 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         // EXPLAIN is a SQL-text-only statement; never sent over the binary
         // IR protocol.
         .explain => return EncodeError.OutOfMemory,
+        // Void op — the tag byte above is the whole encoding.
+        .single_row => {},
     }
 }
 
@@ -1697,9 +1704,10 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 .source = source,
             } };
         },
-        // SET / DELETE / UPDATE are never wire-encoded. If decoder
-        // somehow sees their tag, the stream is corrupt.
-        .set_var, .delete_op, .update_op, .explain => return Error.IrCorrupt,
+        // SET / DELETE / UPDATE / EXPLAIN / single_row are never
+        // wire-encoded (the tag guard above already rejects them). If the
+        // decoder somehow sees their tag, the stream is corrupt.
+        .set_var, .delete_op, .update_op, .explain, .single_row => return Error.IrCorrupt,
     };
 }
 
