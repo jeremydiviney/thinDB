@@ -33,7 +33,9 @@ pub fn parseBoolExpr(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
 // Parser's concrete `Err` set explicitly.
 pub fn parseOr(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     var lhs = try parseAnd(p);
-    while (p.cur.tag == .kw_or) {
+    // On the MySQL wire `||` is a synonym for OR (PG/neutral reserve it for
+    // string concatenation, handled in the expression parser).
+    while (p.cur.tag == .kw_or or (p.cur.tag == .pipe_pipe and p.lex.dialect == .mysql)) {
         try p.advance();
         const rhs = try parseAnd(p);
         const children = try p.arena.alloc(PredicateExpr, 2);

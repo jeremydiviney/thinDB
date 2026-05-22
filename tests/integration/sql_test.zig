@@ -309,6 +309,42 @@ test "sql: pg_attribute JOIN pg_class lists a table's columns" {
     try std.testing.expect(saw_id and saw_tag);
 }
 
+test "sql: || is string concat on neutral/PG, logical OR on MySQL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // neutral: `tag || tag` concatenates (tag 'c' for the k=300 row -> "cc").
+    {
+        var q = try runSql(allocator, db, "SELECT tag || tag AS s FROM t");
+        defer q.deinit();
+        var saw_cc = false;
+        while (try q.next()) |b| {
+            const sv = b.values[0].data.string;
+            for (0..b.row_count) |i| {
+                if (std.mem.eql(u8, sv.rowBytes(i), "cc")) saw_cc = true;
+            }
+        }
+        try std.testing.expect(saw_cc);
+    }
+
+    // MySQL: `||` means OR — k=100 OR k=300 selects ids 1,2,5.
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const root = try thindb.sql.parseDialect(arena.allocator(), "SELECT id FROM t WHERE k = 100 || k = 300", .mysql);
+        var cq = try thindb.net.compileWithSession(allocator, db, .{ .dialect = .mysql }, root);
+        defer cq.deinit();
+        var rows: usize = 0;
+        while (try cq.next()) |b| rows += b.row_count;
+        try std.testing.expectEqual(@as(usize, 3), rows);
+    }
+}
+
 test "sql: PG type aliases + bigserial in CREATE TABLE" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

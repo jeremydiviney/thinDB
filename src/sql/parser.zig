@@ -877,9 +877,15 @@ pub const Parser = struct {
     /// recognize in expression position (+ - * / %).
     fn isBinaryOpToken(tag: TokenTag) bool {
         return switch (tag) {
-            .plus, .minus, .star, .slash, .percent => true,
+            .plus, .minus, .star, .slash, .percent, .pipe_pipe => true,
             else => false,
         };
+    }
+
+    /// `||` is string concatenation on PG/neutral but logical OR on MySQL;
+    /// only treat it as a concat expression operator off the MySQL wire.
+    fn concatOpHere(self: *Parser) bool {
+        return self.cur.tag == .pipe_pipe and self.lex.dialect != .mysql;
     }
 
     /// Given an already-parsed left operand `atom`, continue parsing a
@@ -903,7 +909,13 @@ pub const Parser = struct {
             lhs = try self.makeBinary(fn_name, lhs, rhs);
         }
         // Then extend into an AddSub-level expression.
-        while (self.cur.tag == .plus or self.cur.tag == .minus) {
+        while (self.cur.tag == .plus or self.cur.tag == .minus or self.concatOpHere()) {
+            if (self.concatOpHere()) {
+                try self.advance();
+                const rhs = try self.parseMulDiv();
+                lhs = try self.makeBinary("concat", lhs, rhs);
+                continue;
+            }
             const is_minus = self.cur.tag == .minus;
             try self.advance();
             if (self.cur.tag == .kw_interval) {
@@ -1075,7 +1087,13 @@ pub const Parser = struct {
     /// sub-language. Left-associative.
     fn parseAddSub(self: *Parser) ParseError!ir.Expr {
         var lhs = try self.parseMulDiv();
-        while (self.cur.tag == .plus or self.cur.tag == .minus) {
+        while (self.cur.tag == .plus or self.cur.tag == .minus or self.concatOpHere()) {
+            if (self.concatOpHere()) {
+                try self.advance();
+                const rhs = try self.parseMulDiv();
+                lhs = try self.makeBinary("concat", lhs, rhs);
+                continue;
+            }
             const is_minus = self.cur.tag == .minus;
             try self.advance();
             if (self.cur.tag == .kw_interval) {
