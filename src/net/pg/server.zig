@@ -892,7 +892,7 @@ fn handleQuery(
     const sql_text = payload[0..query_end];
 
     if (try canned.match(allocator, sql_text, session.current_db, session.current_schema)) |probe| {
-        try dispatchProbe(allocator, w, catalog, session, probe);
+        try dispatchProbe(allocator, w, session, probe);
         try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
         try w.flush();
         return;
@@ -910,7 +910,6 @@ fn handleQuery(
 fn dispatchProbe(
     allocator: Allocator,
     w: *std.Io.Writer,
-    catalog: *Catalog,
     session: *SessionState,
     probe: canned.Probe,
 ) !void {
@@ -940,7 +939,6 @@ fn dispatchProbe(
             try result.sendDataRow(allocator, w, cells[0..]);
             try sendSelectComplete(allocator, w, 1);
         },
-        .catalog_listing => |cl| try dispatchCatalogListing(allocator, w, catalog, session, cl.col, cl.kind),
         .static_rows => |sr| {
             var col_types: std.ArrayList(@import("../../types.zig").Column) = .empty;
             defer col_types.deinit(allocator);
@@ -959,68 +957,6 @@ fn dispatchProbe(
             try sendSelectComplete(allocator, w, 1);
         },
     }
-}
-
-fn dispatchCatalogListing(
-    allocator: Allocator,
-    w: *std.Io.Writer,
-    catalog: *Catalog,
-    session: *SessionState,
-    col_name: []const u8,
-    kind: canned.ListingKind,
-) !void {
-    var names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (names.items) |s| allocator.free(s);
-        names.deinit(allocator);
-    }
-
-    switch (kind) {
-        .databases => {
-            const db_names = try catalog.listDatabases(allocator);
-            defer allocator.free(db_names);
-            for (db_names) |n| try names.append(allocator, n);
-        },
-        .schemas => {
-            const db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
-            const schema_names = try db.listSchemas(allocator);
-            defer allocator.free(schema_names);
-            for (schema_names) |n| try names.append(allocator, n);
-        },
-        .tables => {
-            const db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
-            const sc = db.schema(session.current_schema) orelse return ApiError.SchemaNotFound;
-            const table_names = try sc.listTables(allocator);
-            defer allocator.free(table_names);
-            for (table_names) |n| try names.append(allocator, n);
-            if (session.temp_namespace) |ns| {
-                const temps = try ns.listTables(allocator);
-                defer allocator.free(temps);
-                for (temps) |n| {
-                    var clash = false;
-                    for (table_names) |p| {
-                        if (std.mem.eql(u8, p, n)) {
-                            clash = true;
-                            break;
-                        }
-                    }
-                    if (clash) {
-                        allocator.free(n);
-                        continue;
-                    }
-                    try names.append(allocator, n);
-                }
-            }
-        },
-    }
-
-    const cols = [_]@import("../../types.zig").Column{.{ .name = col_name, .type = .string }};
-    try result.sendRowDescription(allocator, w, cols[0..]);
-    for (names.items) |n| {
-        const cells = [_]?[]const u8{n};
-        try result.sendDataRow(allocator, w, cells[0..]);
-    }
-    try sendSelectComplete(allocator, w, names.items.len);
 }
 
 fn runEngineQuery(

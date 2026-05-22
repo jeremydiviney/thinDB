@@ -52,6 +52,7 @@ const ir = @import("../ir/ir.zig");
 const wire = @import("wire.zig");
 const wire_format = @import("wire_format.zig");
 const subquery_resolve = @import("subquery_resolve.zig");
+const pgcat = @import("pg_catalog.zig");
 
 pub const Error = error{
     TableNotFound,
@@ -1325,6 +1326,18 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
             const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+            // pg_catalog virtual tables — PG/neutral only (MySQL has no
+            // such schema; there a `pg_class` ref resolves as a real table).
+            if (ctx.session.dialect != .mysql) {
+                if (pgcat.match(s.table)) |vt| {
+                    const base = try pgcat.build(ctx.allocator, catalog, ctx.session.*, vt);
+                    if (s.alias) |alias| {
+                        errdefer @constCast(&base).deinit();
+                        break :blk try exec.AliasRename.create(ctx.allocator, base, alias);
+                    }
+                    break :blk base;
+                }
+            }
             const t = try resolveTable(catalog, ctx.session.*, s.table);
             const acct = try ctx.queryAccountant();
             const base = try exec.scanWithAccountant(ctx.allocator, t, acct);

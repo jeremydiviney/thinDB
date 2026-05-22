@@ -22,10 +22,6 @@ pub const Probe = union(enum) {
     /// Reply with a single-row, single-column SELECT result. Column
     /// header is `col`; value is `val` (NULL if `val` is null).
     single_value: struct { col: []const u8, val: ?[]const u8 },
-    /// Reply with a single-column SELECT result whose rows are taken
-    /// from the catalog at dispatch time (databases / schemas /
-    /// tables). `col` is the column header; `kind` selects the source.
-    catalog_listing: struct { col: []const u8, kind: ListingKind },
     /// Reply with a multi-row, multi-column SELECT result. Each row's
     /// cells must match `cols.len`. Built once at match time.
     static_rows: StaticRows,
@@ -36,8 +32,6 @@ pub const Probe = union(enum) {
     /// close the target's socket).
     cancel_backend: u32,
 };
-
-pub const ListingKind = enum { databases, schemas, tables };
 
 pub const StaticRows = struct {
     col_names: []const []const u8,
@@ -123,25 +117,10 @@ pub fn match(
     if (std.mem.eql(u8, lc, "select 1"))
         return Probe{ .single_value = .{ .col = "?column?", .val = "1" } };
 
-    if (std.mem.eql(u8, lc, "select datname from pg_catalog.pg_database order by 1") or
-        std.mem.eql(u8, lc, "select datname from pg_database order by 1") or
-        std.mem.eql(u8, lc, "select datname from pg_catalog.pg_database"))
-    {
-        return Probe{ .catalog_listing = .{ .col = "datname", .kind = .databases } };
-    }
-
-    if (std.mem.indexOf(u8, lc, "from pg_catalog.pg_namespace") != null or
-        std.mem.indexOf(u8, lc, "from pg_namespace") != null)
-    {
-        return Probe{ .catalog_listing = .{ .col = "nspname", .kind = .schemas } };
-    }
-
-    if (std.mem.indexOf(u8, lc, "from pg_catalog.pg_class") != null or
-        std.mem.indexOf(u8, lc, "from pg_class") != null)
-    {
-        return Probe{ .catalog_listing = .{ .col = "Name", .kind = .tables } };
-    }
-
+    // pg_catalog relations (pg_class / pg_namespace / pg_database / ...) are
+    // served by the engine's virtual tables (see net/pg_catalog.zig), so we
+    // deliberately do NOT intercept them here — letting the query compile
+    // gives real, JOIN-able results instead of a single-column listing.
     return null;
 }
 
@@ -165,14 +144,10 @@ test "match treats arbitrary SET as accept" {
     }
 }
 
-test "match returns catalog listing for pg_database probe" {
+test "match does not intercept pg_catalog relations (engine vtables serve them)" {
     const allocator = std.testing.allocator;
     const m = try match(allocator, "SELECT datname FROM pg_catalog.pg_database ORDER BY 1", "main", "public");
-    try std.testing.expect(m != null);
-    switch (m.?) {
-        .catalog_listing => |cl| try std.testing.expectEqual(ListingKind.databases, cl.kind),
-        else => return error.TestUnexpectedResult,
-    }
+    try std.testing.expect(m == null);
 }
 
 test "match recognizes BEGIN / COMMIT" {

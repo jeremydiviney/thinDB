@@ -1658,24 +1658,40 @@ pub const Parser = struct {
         var items: std.ArrayList(SortSpec) = .empty;
         defer items.deinit(self.arena);
         while (true) {
-            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-            const first = self.cur.text;
-            try self.advance();
-            const col = if (self.cur.tag == .lparen) blk: {
-                var distinct = false;
-                const args = try self.parseCallArgList(&distinct);
-                // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC) binds
-                // to the aggregate's canonical output column name (the
-                // sort runs after the aggregate). Aliased aggregates are
-                // referenced by alias via the plain-ident path.
-                if (aggForName(first) != null) break :blk try self.aggSortName(first, args);
-                // `ORDER BY scalar_fn(args)` (e.g. ORDER BY DATE_TRUNC(...))
-                // binds to the matching SELECT expression's output column.
-                const fname = try self.arena.dupe(u8, first);
-                const call_expr = ir.Expr{ .call = .{ .fn_name = fname, .args = args } };
-                const idx = findGroupMatch(proj, call_expr) orelse return ParseError.SqlInvalidProjection;
-                break :blk proj[idx].name;
-            } else try self.dupQualifiedColRef(first);
+            var col: []const u8 = undefined;
+            if (self.cur.tag == .integer) {
+                // `ORDER BY <n>` — 1-based ordinal into the SELECT list
+                // (PG/MySQL). A plain column sorts on its underlying name
+                // (the sort runs before the final projection); a computed /
+                // aggregate / window item sorts on its output alias.
+                const k = self.cur.value.integer;
+                try self.advance();
+                if (k < 1 or k > @as(i64, @intCast(proj.len))) return ParseError.SqlInvalidProjection;
+                const p = proj[@intCast(k - 1)];
+                col = switch (p.kind) {
+                    .col => |c| try self.arena.dupe(u8, c),
+                    else => try self.arena.dupe(u8, p.name),
+                };
+            } else {
+                if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+                const first = self.cur.text;
+                try self.advance();
+                col = if (self.cur.tag == .lparen) blk: {
+                    var distinct = false;
+                    const args = try self.parseCallArgList(&distinct);
+                    // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC) binds
+                    // to the aggregate's canonical output column name (the
+                    // sort runs after the aggregate). Aliased aggregates are
+                    // referenced by alias via the plain-ident path.
+                    if (aggForName(first) != null) break :blk try self.aggSortName(first, args);
+                    // `ORDER BY scalar_fn(args)` (e.g. ORDER BY DATE_TRUNC(...))
+                    // binds to the matching SELECT expression's output column.
+                    const fname = try self.arena.dupe(u8, first);
+                    const call_expr = ir.Expr{ .call = .{ .fn_name = fname, .args = args } };
+                    const idx = findGroupMatch(proj, call_expr) orelse return ParseError.SqlInvalidProjection;
+                    break :blk proj[idx].name;
+                } else try self.dupQualifiedColRef(first);
+            }
             var desc = false;
             if (self.cur.tag == .kw_asc) {
                 try self.advance();

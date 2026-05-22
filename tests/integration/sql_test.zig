@@ -236,6 +236,133 @@ test "sql: double-quoted identifiers resolve columns (neutral/PG)" {
     try std.testing.expectEqual(@as(usize, 5), rows);
 }
 
+test "sql: pg_catalog.pg_class lists user tables" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT relname FROM pg_class");
+    defer q.deinit();
+    var saw_t = false;
+    while (try q.next()) |b| {
+        const rn = b.values[0].data.string;
+        for (0..b.row_count) |i| {
+            if (std.mem.eql(u8, rn.rowBytes(i), "t")) saw_t = true;
+        }
+    }
+    try std.testing.expect(saw_t);
+}
+
+test "sql: pg_class JOIN pg_namespace resolves a table to its schema" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT c.relname, n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace");
+    defer q.deinit();
+    var found = false;
+    while (try q.next()) |b| {
+        const rn = b.values[0].data.string;
+        const ns = b.values[1].data.string;
+        for (0..b.row_count) |i| {
+            if (std.mem.eql(u8, rn.rowBytes(i), "t")) {
+                try std.testing.expectEqualStrings("public", ns.rowBytes(i));
+                found = true;
+            }
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "sql: pg_attribute JOIN pg_class lists a table's columns" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname = 't'");
+    defer q.deinit();
+    var n: usize = 0;
+    var saw_id = false;
+    var saw_tag = false;
+    while (try q.next()) |b| {
+        const an = b.values[0].data.string;
+        for (0..b.row_count) |i| {
+            const name = an.rowBytes(i);
+            if (std.mem.eql(u8, name, "id")) saw_id = true;
+            if (std.mem.eql(u8, name, "tag")) saw_tag = true;
+            n += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expect(saw_id and saw_tag);
+}
+
+test "sql: ORDER BY ordinal sorts by the Nth SELECT item" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // ORDER BY 1 DESC == ORDER BY qty DESC here; check descending order.
+    var q = try runSql(allocator, db, "SELECT qty, id FROM t ORDER BY 1 DESC");
+    defer q.deinit();
+    var prev: ?i32 = null;
+    var rows: usize = 0;
+    while (try q.next()) |b| {
+        const qv = b.values[0].data.int;
+        for (0..b.row_count) |i| {
+            if (prev) |p| try std.testing.expect(qv[i] <= p);
+            prev = qv[i];
+            rows += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), rows);
+
+    // Same syntax against a pg_catalog vtable (the query psql/libpq sends).
+    var q2 = try runSql(allocator, db, "SELECT datname FROM pg_catalog.pg_database ORDER BY 1");
+    defer q2.deinit();
+    var dbs: usize = 0;
+    while (try q2.next()) |b| dbs += b.row_count;
+    try std.testing.expect(dbs >= 1);
+}
+
+test "sql: pg_type maps a well-known OID to its type name" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT typname FROM pg_type WHERE oid = 23");
+    defer q.deinit();
+    var rows: usize = 0;
+    while (try q.next()) |b| {
+        const tn = b.values[0].data.string;
+        for (0..b.row_count) |i| {
+            try std.testing.expectEqualStrings("int4", tn.rowBytes(i));
+            rows += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows);
+}
+
 test "sql: on MySQL a double-quoted token is a string literal, not a column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
