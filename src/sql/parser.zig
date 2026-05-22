@@ -123,6 +123,16 @@ fn explainFormatFromName(name: []const u8) ir.ExplainFormat {
     return .text;
 }
 
+/// SQL-standard bare (no-paren) temporal functions. They lex as plain
+/// identifiers; the parser rewrites them to the nullary call form so the
+/// now()/current_date compile-time substitution resolves them to real
+/// wall-clock instead of treating them as column references.
+fn bareTemporalFn(name: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(name, "current_timestamp")) return "current_timestamp";
+    if (std.ascii.eqlIgnoreCase(name, "current_date")) return "current_date";
+    return null;
+}
+
 /// Parse with no specific wire flavor (`.neutral`): permissive/ANSI-leaning.
 /// The embedded/native path and tests use this. Wire servers call
 /// `parseDialect` with their pinned dialect so flavor-specific syntax is
@@ -910,6 +920,18 @@ pub const Parser = struct {
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
 
+        // Bare CURRENT_TIMESTAMP / CURRENT_DATE (no parens) — nullary
+        // temporal functions, not column refs.
+        if (self.cur.tag != .dot) {
+            if (bareTemporalFn(first)) |fn_name| {
+                var e = ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = &.{} } };
+                e = try self.continueBinaryFrom(e);
+                const default_name = try self.exprDefaultName(e);
+                const alias = try self.maybeAlias(default_name);
+                return ProjItem{ .name = alias, .kind = .{ .expr = e } };
+            }
+        }
+
         // Qualified column? `table.col` — preserved as the dotted
         // string `qualifier.col` so a downstream lookup against a
         // scan renamed by `FROM t AS alias` finds the right column.
@@ -1370,6 +1392,11 @@ pub const Parser = struct {
                     const fname_dup = try self.arena.dupe(u8, name);
                     const nested_args = try self.parseCallArgList(null);
                     return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = nested_args } };
+                }
+                // Bare CURRENT_TIMESTAMP / CURRENT_DATE → nullary call.
+                if (self.cur.tag != .dot) {
+                    if (bareTemporalFn(name)) |fn_name|
+                        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = &.{} } };
                 }
                 const col_dup = try self.dupQualifiedColRef(name);
                 return ir.Expr{ .col_ref = col_dup };

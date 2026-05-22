@@ -381,6 +381,14 @@ test "sql: FROM-less SELECT evaluates expressions over one row" {
         const b = (try q.next()).?;
         try std.testing.expect(b.values[0].data.datetime[0] > 1_500_000_000_000_000);
     }
+    // Bare CURRENT_TIMESTAMP / CURRENT_DATE (no parens) resolve too.
+    {
+        var q = try runSql(allocator, db, "SELECT current_timestamp AS t, current_date AS d");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expect(b.values[0].data.datetime[0] > 1_500_000_000_000_000);
+        try std.testing.expect(b.values[1].data.date[0] > 18262);
+    }
     // SELECT with string concat.
     {
         var q = try runSql(allocator, db, "SELECT 'a' || 'b' AS c");
