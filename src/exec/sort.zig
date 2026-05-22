@@ -28,23 +28,109 @@ pub const SortSpec = struct {
     desc: bool = false,
 };
 
+/// MSD radix sort of a row-index permutation by a string column, byte by
+/// byte. `tmp` is an n-sized scratch (same length as `perm`). All strings in
+/// `perm` share the first `depth` bytes; bucket 0 holds rows whose string has
+/// already ended (they sort first — a shorter prefix is lexicographically
+/// less), buckets 1..256 hold rows by their byte at `depth` (value+1). Small
+/// or deep slices fall back to comparison sort (correct because the shared
+/// prefix doesn't affect their relative order); the depth cap also bounds
+/// recursion for pathological long-common-prefix input.
+fn radixSortStringPerm(perm: []u32, tmp: []u32, view: storage.StringView, depth: usize) void {
+    if (perm.len <= 32 or depth >= 128) {
+        sortStringPermAsc(perm, view);
+        return;
+    }
+    const offsets = view.offsets;
+    const bytes = view.bytes;
+
+    var counts = [_]u32{0} ** 257;
+    for (perm) |idx| {
+        const start = offsets[idx];
+        const end = offsets[idx + 1];
+        const b: usize = if (depth >= end - start) 0 else @as(usize, bytes[start + depth]) + 1;
+        counts[b] += 1;
+    }
+
+    // Degenerate level — every row has the same byte here (e.g. the shared
+    // "http://" prefix of every URL). Skip the scatter + copy and just
+    // descend; bucket 0 means every string ended (all equal → done).
+    const total: u32 = @intCast(perm.len);
+    for (counts, 0..) |cnt, b| {
+        if (cnt == total) {
+            if (b != 0) radixSortStringPerm(perm, tmp, view, depth + 1);
+            return;
+        }
+        if (cnt != 0) break;
+    }
+
+    var bstart: [258]u32 = undefined;
+    bstart[0] = 0;
+    for (0..257) |i| bstart[i + 1] = bstart[i] + counts[i];
+
+    var cursor: [257]u32 = undefined;
+    for (0..257) |i| cursor[i] = bstart[i];
+    for (perm) |idx| {
+        const start = offsets[idx];
+        const end = offsets[idx + 1];
+        const b: usize = if (depth >= end - start) 0 else @as(usize, bytes[start + depth]) + 1;
+        tmp[cursor[b]] = idx;
+        cursor[b] += 1;
+    }
+    @memcpy(perm, tmp[0..perm.len]);
+
+    // Bucket 0 = strings that ended at `depth`; all equal, no recursion.
+    var b: usize = 1;
+    while (b <= 256) : (b += 1) {
+        const s = bstart[b];
+        const e = bstart[b + 1];
+        if (e - s > 1) radixSortStringPerm(perm[s..e], tmp[s..e], view, depth + 1);
+    }
+}
+
+fn sortStringPermAsc(perm: []u32, view: storage.StringView) void {
+    const Cmp = struct {
+        v: storage.StringView,
+        pub fn lessThan(c: @This(), a: u32, b: u32) bool {
+            return std.mem.order(u8, c.v.rowBytes(a), c.v.rowBytes(b)) == .lt;
+        }
+    };
+    std.sort.pdq(u32, perm, Cmp{ .v = view }, Cmp.lessThan);
+}
+
+fn sortStringPermCompare(perm: []u32, view: storage.StringView, desc: bool) void {
+    const Cmp = struct {
+        v: storage.StringView,
+        d: bool,
+        pub fn lessThan(c: @This(), a: u32, b: u32) bool {
+            const ord = std.mem.order(u8, c.v.rowBytes(a), c.v.rowBytes(b));
+            return if (c.d) ord == .gt else ord == .lt;
+        }
+    };
+    std.sort.pdq(u32, perm, Cmp{ .v = view, .d = desc }, Cmp.lessThan);
+}
+
 /// Sort `perm` by a single key column, with a comparator monomorphized to
 /// the column's concrete type. The typed slice / StringView is captured
 /// once, so each comparison avoids the tagged-union dispatch and view
 /// reconstruction the generic multi-key comparator pays per call.
-fn sortSingleKey(perm: []u32, col: ColumnStore, desc: bool) void {
+fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) void {
     switch (col.data) {
         inline .varchar, .string, .char => |s| {
             const view = s.view();
-            const Cmp = struct {
-                v: @TypeOf(view),
-                d: bool,
-                pub fn lessThan(c: @This(), a: u32, b: u32) bool {
-                    const ord = std.mem.order(u8, c.v.rowBytes(a), c.v.rowBytes(b));
-                    return if (c.d) ord == .gt else ord == .lt;
-                }
+            // MSD radix sort by string bytes — O(n · key-prefix) instead of
+            // the comparison sort's O(n log n · compare-length). Algorithmic
+            // (no SIMD). Needs an n-sized index scratch; if that alloc fails,
+            // fall back to a plain comparison sort.
+            const tmp = allocator.alloc(u32, perm.len) catch {
+                sortStringPermCompare(perm, view, desc);
+                return;
             };
-            std.sort.pdq(u32, perm, Cmp{ .v = view, .d = desc }, Cmp.lessThan);
+            defer allocator.free(tmp);
+            radixSortStringPerm(perm, tmp, view, 0);
+            // Radix produces ascending order; DESC just reverses (ties are
+            // unspecified in an unstable sort, so this is fine).
+            if (desc) std.mem.reverse(u32, perm);
         },
         inline else => |list| {
             const items = list.items;
@@ -278,7 +364,7 @@ pub const Sort = struct {
         // rebuild that the generic multi-key path pays. The typed string
         // arm is also the natural seam for a future vectorized compare.
         if (self.sort_col_indices.len == 1) {
-            sortSingleKey(self.perm, self.accumulated[self.sort_col_indices[0]], self.sort_desc[0]);
+            sortSingleKey(self.allocator, self.perm, self.accumulated[self.sort_col_indices[0]], self.sort_desc[0]);
             self.drained = true;
             return;
         }
@@ -307,3 +393,52 @@ pub const Sort = struct {
         self.drained = true;
     }
 };
+
+test "sort: radix string sort produces correct lexicographic order" {
+    const ta = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5A17C0DE);
+    const rnd = prng.random();
+    // Tiny alphabet (incl. empty strings) → heavy duplicates + long shared
+    // prefixes, exercising recursion, the ended-string bucket, and the
+    // comparison fallback for small slices.
+    const alpha = "ab/.";
+
+    for (0..120) |iter| {
+        const n = rnd.intRangeAtMost(usize, 0, 600);
+        const max_len: usize = if (iter % 3 == 0) 3 else 12;
+
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer bytes.deinit(ta);
+        const offsets = try ta.alloc(u32, n + 1);
+        defer ta.free(offsets);
+        offsets[0] = 0;
+        for (0..n) |i| {
+            const len = rnd.intRangeAtMost(usize, 0, max_len);
+            for (0..len) |_| try bytes.append(ta, alpha[rnd.intRangeLessThan(usize, 0, alpha.len)]);
+            offsets[i + 1] = @intCast(bytes.items.len);
+        }
+        const view = storage.StringView{ .offsets = offsets, .bytes = bytes.items };
+
+        const perm = try ta.alloc(u32, n);
+        defer ta.free(perm);
+        for (perm, 0..) |*p, i| p.* = @intCast(i);
+        const tmp = try ta.alloc(u32, n);
+        defer ta.free(tmp);
+
+        if (n > 0) radixSortStringPerm(perm, tmp, view, 0);
+
+        // Keys must be non-decreasing.
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            try std.testing.expect(std.mem.order(u8, view.rowBytes(perm[i - 1]), view.rowBytes(perm[i])) != .gt);
+        }
+        // And `perm` must remain a permutation of 0..n.
+        const seen = try ta.alloc(bool, n);
+        defer ta.free(seen);
+        @memset(seen, false);
+        for (perm) |p| {
+            try std.testing.expect(!seen[p]);
+            seen[p] = true;
+        }
+    }
+}
