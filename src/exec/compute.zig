@@ -528,6 +528,12 @@ fn buildCasePlan(
         if (branchSrcNullable(then_src, up_schema)) may_null = true;
         dst.* = .{ .cond = src.cond, .then_src = then_src };
         built += 1;
+        // Coerce the branch condition's leaf literals to their column types
+        // (e.g. `= 0` against a SMALLINT column). The Filter operator does
+        // this for WHERE predicates via validateExpr; a CASE condition is
+        // evaluated directly in evalCase and needs the same pass, or
+        // evaluateMaskWithPred reads the wrong Value union field and panics.
+        try predicate_mod.validateExpr(&dst.cond, up_schema);
     }
 
     var else_src: ?BranchSrc = null;

@@ -1353,6 +1353,41 @@ test "sql: predicate coercion — int literal narrows to smallint column" {
     try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[0]);
 }
 
+test "sql: predicate coercion — int literal narrows to smallint inside CASE WHEN" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "engine", .type = .smallint },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("ev", schema, .{ .order_key = &ok, .unique = false });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .engine = @as(i16, 0) },
+        .{ .id = @as(i64, 2), .engine = @as(i16, 3) },
+        .{ .id = @as(i64, 3), .engine = @as(i16, 0) },
+    });
+    try t.flush();
+
+    // The CASE condition `engine = 0` compares a SMALLINT column to an int
+    // literal. Without coercing the branch condition (as the Filter does
+    // for WHERE), evaluateMaskWithPred reads the wrong Value union field
+    // and panics. Expect 2 rows where engine = 0.
+    var q = try runSql(allocator, db, "SELECT SUM(CASE WHEN engine = 0 THEN 1 ELSE 0 END) AS n FROM ev");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 2), b.values[0].data.bigint[0]);
+}
+
 test "sql: predicate coercion — string literal parses to DATE column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
