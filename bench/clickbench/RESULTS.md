@@ -27,7 +27,7 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Median query | ~520 ms |
 | Total (all 43) | ~32 s |
 | Slowest | Q34 `GROUP BY 1, URL` — 3.6 s (high-cardinality string GROUP BY) |
-| Q28 `REGEXP_REPLACE` | 3.2 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
+| Q28 `REGEXP_REPLACE` | 2.7 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
 The high-cardinality `GROUP BY` queries (Q15-18, Q32-35) pass because of
 **column pruning** (projection pushdown): the 105-column table is scanned
@@ -68,7 +68,7 @@ manifest row-count with no segment decode at all.
 | Q25 | 415 ms | `SearchPhrase ORDER BY SearchPhrase LIMIT 10` |
 | Q26 | 386 ms | `SearchPhrase ORDER BY EventTime, SearchPhrase LIMIT 10` |
 | Q27 | 600 ms | `CounterID, AVG(length(URL)), COUNT(*) HAVING COUNT(*) > 100000` |
-| Q28 | 3193 ms | `REGEXP_REPLACE(Referer, ...) GROUP BY k HAVING COUNT(*) > 100000` |
+| Q28 | 2718 ms | `REGEXP_REPLACE(Referer, ...) GROUP BY k HAVING COUNT(*) > 100000` |
 | Q29 | 1795 ms | `90 × SUM(ResolutionWidth + k)` |
 | Q30 | 569 ms | `SearchEngineID, ClientIP, COUNT(*), SUM(IsRefresh), AVG(ResolutionWidth)` |
 | Q31 | 516 ms | `WatchID, ClientIP, COUNT(*), ... WHERE SearchPhrase <> ''` |
