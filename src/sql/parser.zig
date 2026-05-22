@@ -290,6 +290,38 @@ pub const Parser = struct {
         return .text;
     }
 
+    /// ANSI / PG row-limiting clause (the alternative to LIMIT), parsed
+    /// after ORDER BY:
+    ///   [OFFSET n {ROW|ROWS}] [FETCH {FIRST|NEXT} [count] {ROW|ROWS} ONLY]
+    /// `count` defaults to 1. Both clauses are optional (absent → no change).
+    fn parseFetchOffset(self: *Parser, limit_out: *?u64, offset_out: *u64) ParseError!void {
+        if (self.cur.tag == .kw_offset) {
+            try self.advance();
+            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+            const off = self.cur.value.integer;
+            try self.advance();
+            if (off < 0) return ParseError.SqlExpectedValue;
+            offset_out.* = @intCast(off);
+            if (self.cur.tag == .kw_row or self.cur.tag == .kw_rows) try self.advance();
+        }
+        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "fetch")) {
+            try self.advance();
+            if (!(self.cur.tag == .identifier and
+                (std.ascii.eqlIgnoreCase(self.cur.text, "first") or std.ascii.eqlIgnoreCase(self.cur.text, "next"))))
+                return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            var count: i64 = 1;
+            if (self.cur.tag == .integer) {
+                count = self.cur.value.integer;
+                try self.advance();
+                if (count < 0) return ParseError.SqlExpectedValue;
+            }
+            if (self.cur.tag == .kw_row or self.cur.tag == .kw_rows) try self.advance() else return ParseError.SqlExpectedKeyword;
+            if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "only")) try self.advance() else return ParseError.SqlExpectedKeyword;
+            limit_out.* = @intCast(count);
+        }
+    }
+
     pub fn parseStatement(self: *Parser) ParseError!*ir.Op {
         // DDL / SHOW / INSERT are leading-keyword forms that don't combine
         // with WITH. They have no projection / FROM / WHERE / etc.;
@@ -477,6 +509,8 @@ pub const Parser = struct {
                     pending_offset = @intCast(off);
                 }
             }
+        } else {
+            try self.parseFetchOffset(&pending_limit, &pending_offset);
         }
 
         if (has_agg or has_group) {
@@ -620,8 +654,11 @@ pub const Parser = struct {
                 root = try self.allocOp(.{ .select = .{ .columns = cols, .upstream = root } });
             }
         }
-        // Optional LIMIT applies last.
-        if (pending_limit) |n| {
+        // Optional LIMIT / OFFSET applies last. A bare OFFSET (no limit,
+        // e.g. ANSI `OFFSET n ROWS`) still needs the operator, with an
+        // effectively-unbounded count.
+        if (pending_limit != null or pending_offset > 0) {
+            const n = pending_limit orelse std.math.maxInt(u64);
             root = try self.allocOp(.{ .limit = .{ .n = n, .offset = pending_offset, .upstream = root } });
         }
 

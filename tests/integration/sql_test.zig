@@ -309,6 +309,39 @@ test "sql: pg_attribute JOIN pg_class lists a table's columns" {
     try std.testing.expect(saw_id and saw_tag);
 }
 
+test "sql: FETCH FIRST / OFFSET ROWS (ANSI/PG row limiting)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db); // ids 1..5
+
+    const Case = struct { sql: []const u8, rows: usize, first: i64 };
+    const cases = [_]Case{
+        .{ .sql = "SELECT id FROM t ORDER BY id FETCH FIRST 2 ROWS ONLY", .rows = 2, .first = 1 },
+        .{ .sql = "SELECT id FROM t ORDER BY id OFFSET 3 ROWS FETCH NEXT 2 ROWS ONLY", .rows = 2, .first = 4 },
+        .{ .sql = "SELECT id FROM t ORDER BY id OFFSET 4 ROWS", .rows = 1, .first = 5 },
+        .{ .sql = "SELECT id FROM t ORDER BY id FETCH FIRST ROW ONLY", .rows = 1, .first = 1 },
+    };
+    for (cases) |c| {
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        var rows: usize = 0;
+        var first: ?i64 = null;
+        while (try q.next()) |b| {
+            const idv = b.values[0].data.bigint;
+            for (0..b.row_count) |i| {
+                if (first == null) first = idv[i];
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(c.rows, rows);
+        try std.testing.expectEqual(c.first, first.?);
+    }
+}
+
 test "sql: || is string concat on neutral/PG, logical OR on MySQL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
