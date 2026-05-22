@@ -1358,7 +1358,6 @@ fn groupKeysCardUnderLimit(st: exec.PipelineStats, schema: []const types.Column,
 
 const ProjScan = struct {
     names: std.ArrayListUnmanaged([]const u8) = .empty,
-    scan_count: usize = 0,
     bail: bool = false,
     /// True once a `select` or `group_by` shapes the output. Without one,
     /// the raw scan rows ARE the result (`SELECT *`), so every column is
@@ -1423,7 +1422,7 @@ fn projWalkExpr(c: *ProjScan, allocator: Allocator, e: ir.Expr) void {
 fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
     if (c.bail) return;
     switch (op.*) {
-        .scan => c.scan_count += 1,
+        .scan => {},
         .single_row => {},
         .limit => |l| projWalkOp(c, allocator, l.upstream),
         .select => |p| {
@@ -1449,8 +1448,42 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
             for (cmp.derived) |d| projWalkExpr(c, allocator, d.expr);
             projWalkOp(c, allocator, cmp.upstream);
         },
-        // Any other shape (join, set_union, window, materialize, exclude,
-        // DML, explain, ...) disables pruning — keep every column.
+        .join => |j| {
+            // Per-scan filtering attributes each name to its own table via
+            // findColumn's prefix handling, so collecting every join-key /
+            // range / post-filter column into the flat set is enough — each
+            // input scan keeps the subset that resolves to it.
+            for (j.on) |kp| {
+                c.add(allocator, kp.left);
+                c.add(allocator, kp.right);
+            }
+            for (j.ranges) |rp| {
+                c.add(allocator, rp.left);
+                c.add(allocator, rp.right);
+            }
+            if (j.extra_predicate) |p| projWalkPredicate(c, allocator, p);
+            projWalkOp(c, allocator, j.left);
+            projWalkOp(c, allocator, j.right);
+        },
+        .set_union => |u| {
+            projWalkOp(c, allocator, u.left);
+            projWalkOp(c, allocator, u.right);
+        },
+        .window => |w| {
+            for (w.specs) |sp| {
+                for (sp.partition_by) |nm| c.add(allocator, nm);
+                for (sp.order_by) |so| c.add(allocator, so.col);
+            }
+            for (w.calls) |call| for (call.args) |a| projWalkExpr(c, allocator, a);
+            projWalkOp(c, allocator, w.upstream);
+        },
+        .materialize => |m| projWalkOp(c, allocator, m.upstream),
+        .create_table_as => |ct| projWalkOp(c, allocator, ct.source),
+        .insert_select => |i| projWalkOp(c, allocator, i.source),
+        .explain => |e| projWalkOp(c, allocator, e.inner),
+        // Anything else — `exclude` (anti-projection / SELECT * EXCEPT, whose
+        // output is "all but these"), DDL/DML, raw inserts, etc. — disables
+        // pruning. Keeping every column is always correct.
         else => c.bail = true,
     }
 }
@@ -1460,7 +1493,11 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
 fn analyzeProjection(allocator: Allocator, root: *const ir.Op) ?[][]const u8 {
     var c = ProjScan{};
     projWalkOp(&c, allocator, root);
-    if (c.bail or c.scan_count != 1 or !c.has_shaper) {
+    // No `scan_count` cap: with multiple scans (joins, CTEs, set ops) each
+    // scan independently keeps the collected names that resolve to its own
+    // table, so the flat set is a correct per-scan superset. Bail only when
+    // a shape wasn't fully accounted for, or nothing shapes the output.
+    if (c.bail or !c.has_shaper) {
         c.names.deinit(allocator);
         return null;
     }
