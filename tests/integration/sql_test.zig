@@ -430,6 +430,21 @@ test "sql: CAST(expr AS type) and PG expr::type" {
             return error.TestUnexpectedSuccess;
         } else |_| {}
     }
+    // Extended targets: smallint, boolean, datetime->date.
+    {
+        var q = try runSql(allocator, db, "SELECT CAST(qty AS smallint) AS s, CAST(1 AS boolean) AS b FROM t ORDER BY id LIMIT 1");
+        defer q.deinit();
+        const r = (try q.next()).?;
+        try std.testing.expect(std.meta.activeTag(q.outputSchema()[0].type) == .smallint);
+        try std.testing.expectEqual(@as(i16, 10), r.values[0].data.smallint[0]);
+        try std.testing.expectEqual(@as(u8, 1), r.values[1].data.boolean[0]);
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT CAST(now() AS date) AS d");
+        defer q.deinit();
+        const r = (try q.next()).?;
+        try std.testing.expect(r.values[0].data.date[0] > 18262); // after 2020-01-01
+    }
 }
 
 test "sql: string escapes — PG E'...' and MySQL backslash" {

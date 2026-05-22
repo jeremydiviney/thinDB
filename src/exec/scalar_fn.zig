@@ -309,6 +309,23 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_int", .arg_types = &.{.string}, .return_type = .int, .kernel = math.stringToIntKernel },
     .{ .name = "to_bigint", .arg_types = &.{.string}, .return_type = .bigint, .kernel = math.stringToBigintKernel },
     .{ .name = "to_double", .arg_types = &.{.string}, .return_type = .double, .kernel = math.stringToDoubleKernel },
+    // Narrowing-int / largeint / boolean conversions (back the extra CAST
+    // targets). Narrower int sources widen to bigint first via the
+    // resolver's implicit-cast ranking, so one bigint overload suffices.
+    .{ .name = "to_smallint", .arg_types = &.{.bigint}, .return_type = .smallint, .kernel = math.bigintToSmallintKernel },
+    .{ .name = "to_smallint", .arg_types = &.{.double}, .return_type = .smallint, .kernel = math.doubleToSmallintKernel },
+    .{ .name = "to_smallint", .arg_types = &.{.string}, .return_type = .smallint, .kernel = math.stringToSmallintKernel },
+    .{ .name = "to_tinyint", .arg_types = &.{.bigint}, .return_type = .tinyint, .kernel = math.bigintToTinyintKernel },
+    .{ .name = "to_tinyint", .arg_types = &.{.double}, .return_type = .tinyint, .kernel = math.doubleToTinyintKernel },
+    .{ .name = "to_tinyint", .arg_types = &.{.string}, .return_type = .tinyint, .kernel = math.stringToTinyintKernel },
+    .{ .name = "to_largeint", .arg_types = &.{.bigint}, .return_type = .largeint, .kernel = math.bigintToLargeintKernel },
+    .{ .name = "to_largeint", .arg_types = &.{.double}, .return_type = .largeint, .kernel = math.doubleToLargeintKernel },
+    .{ .name = "to_largeint", .arg_types = &.{.string}, .return_type = .largeint, .kernel = math.stringToLargeintKernel },
+    .{ .name = "to_boolean", .arg_types = &.{.bigint}, .return_type = .boolean, .kernel = math.bigintToBoolKernel },
+    .{ .name = "to_boolean", .arg_types = &.{.double}, .return_type = .boolean, .kernel = math.doubleToBoolKernel },
+    // date <-> datetime
+    .{ .name = "to_date", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.datetimeToDateKernel },
+    .{ .name = "to_datetime", .arg_types = &.{.date}, .return_type = .datetime, .kernel = date.dateToDatetimeKernel },
     // Stringify numerics.
     .{ .name = "to_string", .arg_types = &.{.int}, .return_type = .string, .kernel = math.intToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.bigintToStringKernel },

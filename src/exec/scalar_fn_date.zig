@@ -171,6 +171,20 @@ pub fn fromUnixtimeKernel(allocator: Allocator, args: []const ColumnView, out: *
     while (i < row_count) : (i += 1) try out.data.datetime.append(allocator, s[i] * 1_000_000);
 }
 
+/// CAST(datetime AS date) — drop the time-of-day (floor to the day).
+pub fn datetimeToDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.date.append(allocator, @intCast(@divFloor(s[i], std.time.us_per_day)));
+}
+
+/// CAST(date AS datetime) — midnight UTC of that day.
+pub fn dateToDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.datetime.append(allocator, @as(i64, s[i]) * std.time.us_per_day);
+}
+
 /// DATE_TRUNC(unit, datetime) → datetime truncated down to the unit
 /// boundary. `unit` is a constant string ('second'/'minute'/'hour'/
 /// 'day'/'month'/'year'); an unrecognized unit passes the value through.

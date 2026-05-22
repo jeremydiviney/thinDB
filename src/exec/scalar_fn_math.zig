@@ -410,6 +410,69 @@ pub fn boolToStringKernel(allocator: Allocator, args: []const ColumnView, out: *
     }
 }
 
+// --- narrowing / boolean / largeint conversions (back CAST targets) ---
+// Numeric→numeric uses saturating lossyCast; string parses (0 on failure,
+// matching the existing to_int/to_bigint string kernels).
+
+pub fn bigintToSmallintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.smallint.append(allocator, std.math.lossyCast(i16, s[i]));
+}
+pub fn doubleToSmallintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.smallint.append(allocator, std.math.lossyCast(i16, s[i]));
+}
+pub fn stringToSmallintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.smallint.append(allocator, std.fmt.parseInt(i16, sv.rowBytes(i), 10) catch 0);
+}
+
+pub fn bigintToTinyintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.tinyint.append(allocator, std.math.lossyCast(i8, s[i]));
+}
+pub fn doubleToTinyintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.tinyint.append(allocator, std.math.lossyCast(i8, s[i]));
+}
+pub fn stringToTinyintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.tinyint.append(allocator, std.fmt.parseInt(i8, sv.rowBytes(i), 10) catch 0);
+}
+
+pub fn bigintToLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.largeint.append(allocator, @as(i128, s[i]));
+}
+pub fn doubleToLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.largeint.append(allocator, std.math.lossyCast(i128, s[i]));
+}
+pub fn stringToLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.largeint.append(allocator, std.fmt.parseInt(i128, sv.rowBytes(i), 10) catch 0);
+}
+
+pub fn bigintToBoolKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.boolean.append(allocator, if (s[i] != 0) @as(u8, 1) else 0);
+}
+pub fn doubleToBoolKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.boolean.append(allocator, if (s[i] != 0) @as(u8, 1) else 0);
+}
+
 // ---------------------------------------------------------------------------
 // Expanded math: truncate(x, d) / degrees / radians / atan2.
 // ---------------------------------------------------------------------------

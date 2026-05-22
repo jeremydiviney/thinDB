@@ -1290,12 +1290,16 @@ pub const Parser = struct {
         return switch (ty) {
             .int => "to_int",
             .bigint => "to_bigint",
+            .smallint => "to_smallint",
+            .tinyint => "to_tinyint",
+            .largeint => "to_largeint",
             .float, .double => "to_double",
+            .boolean => "to_boolean",
+            .date => "to_date",
+            .datetime => "to_datetime",
             .varchar, .char, .string => "to_string",
-            // No conversion kernel yet: smallint/tinyint/largeint, boolean,
-            // date/datetime, decimal, uuid. (smallint/tinyint widen to int
-            // via to_int if the user targets INT.)
-            .smallint, .tinyint, .largeint, .boolean, .date, .datetime, .decimal64, .decimal128, .uuid => null,
+            // No conversion kernel yet: decimal, uuid.
+            .decimal64, .decimal128, .uuid => null,
         };
     }
 
