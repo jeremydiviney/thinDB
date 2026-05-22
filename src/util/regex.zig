@@ -581,13 +581,29 @@ pub const Regex = struct {
     /// reference capture groups with `\0`..`\9` (`\0` = whole match).
     /// Caller owns the returned slice.
     pub fn replaceAll(self: *const Regex, allocator: Allocator, input: []const u8, template: []const u8) Error![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(allocator);
-
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const slots = try allocator.alloc(?usize, self.n_slots);
         defer allocator.free(slots);
+        return self.replaceAllWith(allocator, input, template, &arena, slots);
+    }
+
+    /// Like `replaceAll`, but the caller supplies the matcher scratch
+    /// (`arena` for per-match capture arrays, `slots` of length `n_slots`).
+    /// Reusing them across many rows in a batch avoids a per-row arena
+    /// alloc/free + slots alloc — the dominant fixed cost when applying one
+    /// compiled pattern to millions of values. `out_alloc` owns the result.
+    pub fn replaceAllWith(
+        self: *const Regex,
+        out_alloc: Allocator,
+        input: []const u8,
+        template: []const u8,
+        arena: *std.heap.ArenaAllocator,
+        slots: []?usize,
+    ) Error![]u8 {
+        const allocator = out_alloc;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
 
         var pos: usize = 0;
         while (pos <= input.len) {

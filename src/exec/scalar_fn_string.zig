@@ -34,9 +34,15 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
     var re = try regex.Regex.compile(allocator, pattern);
     defer re.deinit();
     const sv = stringViewOf(args[0]);
+    // Matcher scratch reused across every row: avoids a per-row arena
+    // alloc/free + slots alloc when applying one pattern to a whole batch.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const slots = try allocator.alloc(?usize, re.n_slots);
+    defer allocator.free(slots);
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const replaced = try re.replaceAll(allocator, sv.rowBytes(i), replacement);
+        const replaced = try re.replaceAllWith(allocator, sv.rowBytes(i), replacement, &arena, slots);
         defer allocator.free(replaced);
         try store.StringStore.appendValue(stringStoreOf(out), allocator, replaced);
     }
