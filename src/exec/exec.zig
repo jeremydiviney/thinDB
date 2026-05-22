@@ -259,13 +259,28 @@ pub const Query = struct {
 
     /// Aggregate over the entire upstream (no grouping).
     pub fn aggregate(self: Query, aggs: []const AggSpec) !Query {
-        return @import("aggregate.zig").Aggregate.create(self.allocator, self, &.{}, aggs);
+        return @import("aggregate.zig").Aggregate.create(self.allocator, self, &.{}, aggs, null);
     }
 
     /// Hash-grouped aggregation. `group_cols` lists the upstream columns to
     /// group by; one output row is emitted per distinct group.
     pub fn groupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec) !Query {
-        return @import("aggregate.zig").Aggregate.create(self.allocator, self, group_cols, aggs);
+        return @import("aggregate.zig").Aggregate.create(self.allocator, self, group_cols, aggs, null);
+    }
+
+    /// Hash GROUP BY with an optional top-k hint (set when this aggregate is
+    /// directly under `ORDER BY <keys> LIMIT k`). When every order key resolves
+    /// to a numeric aggregate output, the aggregate emits only the top-k groups.
+    pub fn groupByTopK(self: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK) !Query {
+        const agg = @import("aggregate.zig");
+        const t = top_k orelse
+            return agg.Aggregate.create(self.allocator, self, group_cols, aggs, null);
+        // The hint's keys are resolved (to agg indices) synchronously inside
+        // create, so this temporary translation array need only outlive the call.
+        const keys = try self.allocator.alloc(agg.TopKKey, t.keys.len);
+        defer self.allocator.free(keys);
+        for (t.keys, keys) |src, *dst| dst.* = .{ .col = src.col, .desc = src.desc };
+        return agg.Aggregate.create(self.allocator, self, group_cols, aggs, agg.TopKHint{ .k = t.k, .keys = keys });
     }
 
     /// Streaming sort-based grouped aggregation. Requires the input to be

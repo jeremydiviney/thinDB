@@ -538,6 +538,18 @@ pub const Op = union(OpTag) {
         upstream: *Op,
     };
 
+    /// Compile-time top-k hint: set by the planner when a GROUP BY is
+    /// directly under `ORDER BY <keys> LIMIT k`, so the hash aggregate can
+    /// emit only the top (k) groups instead of materializing them all. `keys`
+    /// borrows the OrderBy node's specs (any number, mixed ASC/DESC); the
+    /// aggregate fuses only if every key binds to a numeric aggregate output.
+    /// Purely derived (never serialized on the wire); the downstream
+    /// OrderBy+Limit still finalize exact order + offset.
+    pub const TopK = struct {
+        k: u32,
+        keys: []const SortSpec,
+    };
+
     pub const GroupBy = struct {
         /// Group-by column names. Empty slice = global aggregate (one
         /// output row over the whole input).
@@ -545,6 +557,7 @@ pub const Op = union(OpTag) {
         /// Aggregate specs (func + col + output name).
         aggs: []const AggSpec,
         upstream: *Op,
+        top_k: ?TopK = null,
     };
 
     pub const Compute = struct {

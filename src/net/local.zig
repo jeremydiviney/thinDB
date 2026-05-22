@@ -955,6 +955,25 @@ fn topNFusion(limit_upstream: *ir.Op) ?TopNFusion {
     };
 }
 
+/// When a Top-N fusion sits directly over a GROUP BY, annotate the GroupBy IR
+/// node with the full ORDER BY key list so the hash aggregate emits only the
+/// top-k groups rather than materializing them all (the downstream Top-N still
+/// finalizes exact order + offset). Safe to set unconditionally: the exec side
+/// falls back to a full emit unless every order key binds to a numeric
+/// aggregate output.
+fn applyTopKFusion(f: TopNFusion, l: ir.Op.Limit) void {
+    switch (f.order_by.upstream.*) {
+        .group_by => |*g| {
+            if (g.group_cols.len == 0) return; // global aggregate is one row
+            g.top_k = .{
+                .k = std.math.cast(u32, l.n +| l.offset) orelse return,
+                .keys = f.order_by.specs,
+            };
+        },
+        else => {},
+    }
+}
+
 /// Server-side IR dispatcher. Recursively walks the decoded IR tree and
 /// builds the corresponding exec.Query operator chain using existing
 /// in-process operators. Uses a default Session — call sites needing
@@ -984,6 +1003,7 @@ pub fn buildServerQuerySession(
             // limit{ [select] order_by{X} } — peek through an optional
             // Project (which sits above OrderBy) and re-apply it on top.
             if (topNFusion(l.upstream)) |f| {
+                applyTopKFusion(f, l);
                 const inner = try buildServerQuerySession(allocator, db, session, f.order_by.upstream.*);
                 var topn = try inner.topN(f.order_by.specs, @intCast(l.n), @intCast(l.offset));
                 if (f.project) |p| {
@@ -1034,7 +1054,7 @@ pub fn buildServerQuerySession(
                     break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
                 }
             }
-            break :blk try upstream.groupBy(g.group_cols, g.aggs);
+            break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k);
         },
         .compute => |c| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, c.upstream.*);
@@ -1575,6 +1595,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             // Fuse ORDER BY ... LIMIT into a bounded Top-N (see the other
             // compile path for rationale).
             if (topNFusion(l.upstream)) |f| {
+                applyTopKFusion(f, l);
                 var inner = try compileOp(ctx, f.order_by.upstream);
                 errdefer inner.deinit();
                 var topn = try inner.topN(f.order_by.specs, @intCast(l.n), @intCast(l.offset));
@@ -1630,7 +1651,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 }
                 // else: proven under the limit → hash fits.
             }
-            break :blk try upstream.groupBy(g.group_cols, g.aggs);
+            break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k);
         },
         .compute => |c| blk: {
             var upstream = try compileOp(ctx, c.upstream);

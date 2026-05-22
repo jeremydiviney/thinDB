@@ -252,3 +252,173 @@ test "aggregate: invalid percentile param rejected" {
     try std.testing.expectError(thindb.exec.Error.AggregateInvalidParam, result);
     base.deinit();
 }
+
+/// Look up the bigint value the top-k result emitted for group `g`, or null
+/// if `g` wasn't among the returned rows. Validates the heap selected the
+/// right *set* of groups regardless of (non-deterministic) emit order.
+fn topkBigint(b: thindb.exec.Batch, g: []const u8) ?i64 {
+    for (0..b.row_count) |i| {
+        if (std.mem.eql(u8, b.values[0].data.string.rowBytes(i), g)) return b.values[1].data.bigint[i];
+    }
+    return null;
+}
+
+fn topkDouble(b: thindb.exec.Batch, g: []const u8) ?f64 {
+    for (0..b.row_count) |i| {
+        if (std.mem.eql(u8, b.values[0].data.string.rowBytes(i), g)) return b.values[1].data.double[i];
+    }
+    return null;
+}
+
+fn topkHas(b: thindb.exec.Batch, g: []const u8) bool {
+    for (0..b.row_count) |i| {
+        if (std.mem.eql(u8, b.values[0].data.string.rowBytes(i), g)) return true;
+    }
+    return false;
+}
+
+test "aggregate: top-k fusion selects the correct k groups" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema_nums, opts_nums);
+    // Five groups with strictly distinct counts AND distinct sums, but the
+    // two orderings disagree — so a correct heap must use the named column,
+    // not just row count. count: a5 b4 c3 d2 e1; sum: e100 d40 c9 b8 a5.
+    var id: i64 = 0;
+    inline for (.{
+        .{ .g = "a", .n = 5, .x = 1.0 },
+        .{ .g = "b", .n = 4, .x = 2.0 },
+        .{ .g = "c", .n = 3, .x = 3.0 },
+        .{ .g = "d", .n = 2, .x = 20.0 },
+        .{ .g = "e", .n = 1, .x = 100.0 },
+    }) |grp| {
+        for (0..grp.n) |_| {
+            id += 1;
+            try t.insert(&.{.{ .id = id, .x = @as(f64, grp.x), .g = grp.g }});
+        }
+    }
+    try t.flush();
+
+    // COUNT(*) DESC LIMIT 3 → {a:5, b:4, c:3}; d, e excluded.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.groupByTopK(&.{"g"}, &.{
+            .{ .func = .count, .as = "c" },
+        }, .{ .k = 3, .keys = &.{.{ .col = "c", .desc = true }} });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 3), b.row_count);
+        try std.testing.expectEqual(@as(?i64, 5), topkBigint(b, "a"));
+        try std.testing.expectEqual(@as(?i64, 4), topkBigint(b, "b"));
+        try std.testing.expectEqual(@as(?i64, 3), topkBigint(b, "c"));
+        try std.testing.expectEqual(@as(?i64, null), topkBigint(b, "d"));
+        try std.testing.expectEqual(@as(?i64, null), topkBigint(b, "e"));
+    }
+
+    // SUM(x) DESC LIMIT 3 → {e:100, d:40, c:9}; disjoint from the count top-3
+    // except for c, proving the order column drives selection.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.groupByTopK(&.{"g"}, &.{
+            .{ .func = .sum, .col = "x", .as = "s" },
+        }, .{ .k = 3, .keys = &.{.{ .col = "s", .desc = true }} });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 3), b.row_count);
+        try std.testing.expectApproxEqAbs(@as(f64, 100.0), topkDouble(b, "e").?, 1e-9);
+        try std.testing.expectApproxEqAbs(@as(f64, 40.0), topkDouble(b, "d").?, 1e-9);
+        try std.testing.expectApproxEqAbs(@as(f64, 9.0), topkDouble(b, "c").?, 1e-9);
+        try std.testing.expectEqual(@as(?f64, null), topkDouble(b, "a"));
+        try std.testing.expectEqual(@as(?f64, null), topkDouble(b, "b"));
+    }
+
+    // COUNT(*) ASC LIMIT 2 → the two smallest groups {e:1, d:2}.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.groupByTopK(&.{"g"}, &.{
+            .{ .func = .count, .as = "c" },
+        }, .{ .k = 2, .keys = &.{.{ .col = "c", .desc = false }} });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 2), b.row_count);
+        try std.testing.expectEqual(@as(?i64, 1), topkBigint(b, "e"));
+        try std.testing.expectEqual(@as(?i64, 2), topkBigint(b, "d"));
+    }
+
+    // Unresolvable order column (string MIN) → fall back to emitting every
+    // group; the downstream Limit would still trim. All five groups present.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.groupByTopK(&.{"g"}, &.{
+            .{ .func = .min, .col = "g", .as = "mg" },
+        }, .{ .k = 2, .keys = &.{.{ .col = "mg", .desc = true }} });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 5), b.row_count);
+    }
+}
+
+test "aggregate: top-k fusion honors multiple order keys (lexicographic + per-key direction)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema_nums, opts_nums);
+    // Groups b and c tie on SUM(x)=8 but differ on COUNT (b=9, c=3). With
+    // LIMIT 2 the cut falls *inside* that tie, so the secondary key decides
+    // which of b/c survives — and flipping its direction flips the winner.
+    // sums:  a=10, b=8, c=8, d=5;  counts: a=5, b=9, c=3, d=1.
+    var id: i64 = 0;
+    inline for (.{
+        .{ .g = "a", .xs = [_]f64{ 2, 2, 2, 2, 2 } }, // sum 10, count 5
+        .{ .g = "b", .xs = [_]f64{ 1, 1, 1, 1, 1, 1, 1, 1, 0 } }, // sum 8, count 9
+        .{ .g = "c", .xs = [_]f64{ 4, 2, 2 } }, // sum 8, count 3
+        .{ .g = "d", .xs = [_]f64{5} }, // sum 5, count 1
+    }) |grp| {
+        inline for (grp.xs) |xv| {
+            id += 1;
+            try t.insert(&.{.{ .id = id, .x = @as(f64, xv), .g = grp.g }});
+        }
+    }
+    try t.flush();
+
+    // SUM(x) DESC, COUNT DESC LIMIT 2 → a, then the SUM=8 tie breaks to b (9 > 3).
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.groupByTopK(&.{"g"}, &.{
+            .{ .func = .sum, .col = "x", .as = "s" },
+            .{ .func = .count, .as = "c" },
+        }, .{ .k = 2, .keys = &.{ .{ .col = "s", .desc = true }, .{ .col = "c", .desc = true } } });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 2), b.row_count);
+        try std.testing.expect(topkHas(b, "a"));
+        try std.testing.expect(topkHas(b, "b"));
+        try std.testing.expect(!topkHas(b, "c"));
+        try std.testing.expect(!topkHas(b, "d"));
+    }
+
+    // SUM(x) DESC, COUNT ASC LIMIT 2 → a, then the tie flips to c (3 < 9).
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.groupByTopK(&.{"g"}, &.{
+            .{ .func = .sum, .col = "x", .as = "s" },
+            .{ .func = .count, .as = "c" },
+        }, .{ .k = 2, .keys = &.{ .{ .col = "s", .desc = true }, .{ .col = "c", .desc = false } } });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 2), b.row_count);
+        try std.testing.expect(topkHas(b, "a"));
+        try std.testing.expect(topkHas(b, "c"));
+        try std.testing.expect(!topkHas(b, "b"));
+        try std.testing.expect(!topkHas(b, "d"));
+    }
+}

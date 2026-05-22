@@ -71,6 +71,66 @@ pub const AggSpec = struct {
     params: AggParams = .none,
 };
 
+/// One ORDER BY key in a top-k hint: an aggregate output column name + its
+/// sort direction. Mirrors `ir.SortSpec`; kept dependency-free so `aggregate`
+/// need not import `ir` (which already depends on this file's `AggSpec`).
+pub const TopKKey = struct {
+    col: []const u8,
+    desc: bool,
+};
+
+/// Planner hint: this hash aggregate sits directly under `ORDER BY <keys>
+/// LIMIT k`. When every key resolves to a numeric aggregate output, the
+/// operator emits only the top-k groups instead of every group (the downstream
+/// OrderBy+Limit then re-sort the small set).
+pub const TopKHint = struct {
+    k: u32,
+    keys: []const TopKKey,
+};
+
+/// A comparable order value pulled from a finalized accumulator. The active
+/// variant follows the accumulator (integer-family vs float), and every group
+/// shares the same variant for a given key — so comparisons only ever match
+/// `int`↔`int` or `float`↔`float`.
+const OrderVal = union(enum) {
+    int: i128,
+    float: f64,
+};
+
+/// One ORDER BY key after binding its column name to a concrete aggregate
+/// index. Direction is per-key (mixed ASC/DESC supported).
+const ResolvedKey = struct {
+    agg_idx: usize,
+    desc: bool,
+};
+
+/// `TopKHint` after binding every key. Owns `keys` (allocator-backed; freed in
+/// `deinit`). `null` (unresolved) means fall back to emitting all groups.
+const ResolvedTopK = struct {
+    k: usize,
+    keys: []ResolvedKey,
+};
+
+/// Maximum ORDER BY keys the fusion handles. Beyond this the hint is left
+/// unresolved (full emit) — analytic top-N almost never sorts on more keys, so
+/// a small inline value cache beats a per-entry allocation.
+const MAX_TOPK_KEYS: usize = 4;
+
+/// One group competing for a top-k slot. `key`/`state` borrow into the group
+/// hash table (valid only until the result batch is materialized); `vals`
+/// caches each ORDER BY key's order value so the heap comparator does no
+/// accumulator decoding in its inner loop. Only `vals[0..keys.len]` is live.
+const TopKEntry = struct {
+    key: []const u8,
+    state: []AccState,
+    vals: [MAX_TOPK_KEYS]OrderVal,
+};
+
+/// Heap path is used only when k is modest; beyond this we emit all groups
+/// and let the downstream Limit trim, avoiding a large heap allocation for a
+/// degenerate `LIMIT <huge>`.
+const TOPK_HEAP_CAP: usize = 1 << 16;
+
 /// Per-aggregate accumulator state. Integer types accumulate into i64
 /// (MIN/MAX) or i128 (SUM); float/double types accumulate into f64; LARGEINT
 /// gets dedicated i128 min/max variants. The final value is cast back to the
@@ -150,6 +210,9 @@ pub const Aggregate = struct {
     /// stored key needs no decoding on output.
     single_str_key: bool = false,
 
+    /// Resolved top-k hint, or null to emit every group (the default).
+    top_k: ?ResolvedTopK = null,
+
     emitted: bool = false,
     /// Bytes charged against the query budget for the group hash table /
     /// accumulator state (held in `arena`). Released when the single
@@ -162,6 +225,7 @@ pub const Aggregate = struct {
         upstream: Query,
         group_cols: []const []const u8,
         aggs: []const AggSpec,
+        top_k: ?TopKHint,
     ) !Query {
         if (aggs.len == 0) return Error.AggregateNoSpecs;
         const up_schema = upstream.outputSchema();
@@ -220,6 +284,14 @@ pub const Aggregate = struct {
             s.* = initialState(a.func, in_t);
         }
 
+        // Resolve the top-k hint against this aggregate's output. Fuses only
+        // when grouping and *every* order key binds to a numeric aggregate
+        // output (string MIN/MAX, stddev/variance, percentile, group_concat,
+        // and group-key columns have no `OrderVal` — any such key leaves the
+        // whole hint unresolved so the operator falls back to a full emit).
+        const resolved_top_k = try resolveTopK(allocator, top_k, aggs, group_cols.len, output_schema);
+        errdefer if (resolved_top_k) |r| allocator.free(r.keys);
+
         const self = try allocator.create(Aggregate);
         errdefer allocator.destroy(self);
 
@@ -240,6 +312,7 @@ pub const Aggregate = struct {
                 .string, .varchar, .char => true,
                 else => false,
             },
+            .top_k = resolved_top_k,
         };
 
         // Pre-size the group hash table from the upstream cardinality
@@ -283,6 +356,7 @@ pub const Aggregate = struct {
         self.allocator.free(self.group_col_indices);
         self.allocator.free(self.agg_col_indices);
         self.allocator.free(self.single_state);
+        if (self.top_k) |r| self.allocator.free(r.keys);
         self.key_scratch.deinit(self.allocator);
         self.arena.deinit();
         const allocator = self.allocator;
@@ -329,6 +403,16 @@ pub const Aggregate = struct {
 
         if (self.group_col_indices.len == 0) {
             try self.appendSingleResult();
+        } else if (self.top_k) |r| {
+            // Use the bounded-heap top-k path only when k is modest and
+            // actually smaller than the group count; otherwise emitting every
+            // group and letting the downstream Limit trim is cheaper than a
+            // large heap that would keep nearly all groups anyway.
+            if (r.k <= TOPK_HEAP_CAP and r.k < self.groups.count()) {
+                try self.appendTopKResults(r);
+            } else {
+                try self.appendGroupedResults();
+            }
         } else {
             try self.appendGroupedResults();
         }
@@ -431,23 +515,59 @@ pub const Aggregate = struct {
     fn appendGroupedResults(self: *Aggregate) !void {
         var it = self.groups.iterator();
         while (it.next()) |entry| {
-            const key_bytes = entry.key_ptr.*;
-            const state = entry.value_ptr.*;
+            try self.appendGroupRow(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
 
-            if (self.single_str_key) {
-                // Raw string bytes — no compound framing to decode.
-                switch (self.output_columns[0].data) {
-                    .string, .varchar, .char => |*ss| try ss.appendValue(self.allocator, key_bytes),
-                    else => unreachable,
-                }
-            } else {
-                try appendGroupKey(self.allocator, key_bytes, self.group_col_indices, self.upstream.outputSchema(), self.output_columns[0..self.group_col_indices.len]);
+    /// Materialize one group's key + aggregate values into `output_columns`.
+    /// Copies into allocator-owned storage, so the borrowed `key_bytes` /
+    /// `state` (which live in the group arena) need not outlive this call.
+    fn appendGroupRow(self: *Aggregate, key_bytes: []const u8, state: []AccState) !void {
+        if (self.single_str_key) {
+            // Raw string bytes — no compound framing to decode.
+            switch (self.output_columns[0].data) {
+                .string, .varchar, .char => |*ss| try ss.appendValue(self.allocator, key_bytes),
+                else => unreachable,
             }
+        } else {
+            try appendGroupKey(self.allocator, key_bytes, self.group_col_indices, self.upstream.outputSchema(), self.output_columns[0..self.group_col_indices.len]);
+        }
 
-            for (self.aggs, 0..) |a, ai| {
-                const out_idx = self.group_col_indices.len + ai;
-                try appendAccToColumn(self.allocator, a, state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type);
+        for (self.aggs, 0..) |a, ai| {
+            const out_idx = self.group_col_indices.len + ai;
+            try appendAccToColumn(self.allocator, a, state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type);
+        }
+    }
+
+    /// Top-k emit path: a single pass over the group hash table keeps only the
+    /// `k` most-preferred groups (by the resolved ORDER BY keys, lexicographic
+    /// with per-key direction) in a bounded heap, then materializes just those.
+    /// The downstream OrderBy+Limit re-sort the small surviving set, so the heap
+    /// need not produce sorted output — it only has to pick the correct k
+    /// groups. This avoids building (and string-copying) every group's row only
+    /// for TopN to discard them.
+    fn appendTopKResults(self: *Aggregate, r: ResolvedTopK) !void {
+        const k = r.k;
+        const heap = try self.arena.allocator().alloc(TopKEntry, k);
+        var len: usize = 0;
+
+        var it = self.groups.iterator();
+        while (it.next()) |entry| {
+            const cand = topkEntry(entry.key_ptr.*, entry.value_ptr.*, r.keys);
+            if (len < k) {
+                heap[len] = cand;
+                len += 1;
+                if (len == k) topkBuildHeap(heap, r.keys);
+            } else if (topkLessPreferred(heap[0], cand, r.keys)) {
+                // The current worst kept group (root) is less preferred than
+                // the candidate — evict it.
+                heap[0] = cand;
+                topkSiftDown(heap, 0, k, r.keys);
             }
+        }
+
+        for (heap[0..len]) |w| {
+            try self.appendGroupRow(w.key, w.state);
         }
     }
 };
@@ -692,6 +812,129 @@ pub const SortedAggregate = struct {
         };
     }
 };
+
+/// Bind a top-k hint to concrete aggregate indices. Returns `null` (fall back
+/// to a full emit) unless grouping and *every* order key names an aggregate
+/// whose output is orderable. On success the returned `keys` slice is
+/// allocator-owned (freed in `Aggregate.deinit`).
+fn resolveTopK(
+    allocator: Allocator,
+    hint: ?TopKHint,
+    aggs: []const AggSpec,
+    group_cols_len: usize,
+    output_schema: []const Column,
+) !?ResolvedTopK {
+    const h = hint orelse return null;
+    if (group_cols_len == 0 or h.keys.len == 0 or h.keys.len > MAX_TOPK_KEYS) return null;
+    const rkeys = try allocator.alloc(ResolvedKey, h.keys.len);
+    for (h.keys, rkeys) |hk, *rk| {
+        const idx = findAggByName(aggs, hk.col) orelse {
+            allocator.free(rkeys);
+            return null;
+        };
+        if (!topkOrderable(aggs[idx].func, output_schema[group_cols_len + idx].type)) {
+            allocator.free(rkeys);
+            return null;
+        }
+        rk.* = .{ .agg_idx = idx, .desc = hk.desc };
+    }
+    return ResolvedTopK{ .k = h.k, .keys = rkeys };
+}
+
+fn findAggByName(aggs: []const AggSpec, name: []const u8) ?usize {
+    for (aggs, 0..) |a, i| {
+        if (std.mem.eql(u8, a.as, name)) return i;
+    }
+    return null;
+}
+
+/// Whether `func` (producing output type `out_t`) yields a value the top-k heap
+/// can order. String MIN/MAX, stddev/variance, percentile and group_concat have
+/// no numeric `OrderVal`; everything else (count, sum, avg, numeric MIN/MAX)
+/// does. Aggregates never surface NULL — empty/all-null groups emit 0/0.0 — so
+/// `aggOrderValue` is always defined for an orderable key.
+fn topkOrderable(func: AggFunc, out_t: Type) bool {
+    return switch (func) {
+        .count, .count_distinct, .sum, .avg => true,
+        .min, .max => !out_t.isString(),
+        else => false,
+    };
+}
+
+/// Extract a comparable order value from a finalized accumulator, mirroring the
+/// value `appendAccToColumn` would emit — including the 0/0.0 defaults for
+/// empty MIN/MAX/AVG — so the heap orders groups identically to the downstream
+/// OrderBy. Only reached for variants `topkOrderable` accepts.
+fn aggOrderValue(s: AccState) OrderVal {
+    return switch (s) {
+        .count => |c| .{ .int = @intCast(c) },
+        .sum_int => |v| .{ .int = v },
+        .sum_float => |v| .{ .float = v },
+        .min_int, .max_int => |m| .{ .int = m orelse 0 },
+        .min_large, .max_large => |m| .{ .int = m orelse 0 },
+        .min_float, .max_float => |m| .{ .float = m orelse 0.0 },
+        .avg => |a| .{ .float = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count)) },
+        .distinct => |set| .{ .int = @intCast(set.count()) },
+        else => unreachable,
+    };
+}
+
+fn ovOrder(a: OrderVal, b: OrderVal) std.math.Order {
+    return switch (a) {
+        .int => |x| std.math.order(x, b.int),
+        .float => |x| std.math.order(x, b.float),
+    };
+}
+
+/// Build a heap entry, caching each ORDER BY key's order value up front so the
+/// comparator never touches the (large, scattered) accumulator union.
+fn topkEntry(key: []const u8, state: []AccState, keys: []const ResolvedKey) TopKEntry {
+    var e = TopKEntry{ .key = key, .state = state, .vals = undefined };
+    for (keys, 0..) |kk, i| e.vals[i] = aggOrderValue(state[kk.agg_idx]);
+    return e;
+}
+
+/// Lexicographic comparison of two groups under the resolved ORDER BY keys.
+/// `.lt` ⟺ `a` ranks before `b` in the final ordering (i.e. `a` is more
+/// preferred / closer to the kept set), honoring each key's direction.
+fn topkOrder(a: TopKEntry, b: TopKEntry, keys: []const ResolvedKey) std.math.Order {
+    for (keys, 0..) |key, i| {
+        const ord = ovOrder(a.vals[i], b.vals[i]);
+        if (ord != .eq) return if (key.desc) ord.invert() else ord;
+    }
+    return .eq;
+}
+
+/// True when `a` ranks after `b` (so `a` is the better eviction candidate).
+fn topkLessPreferred(a: TopKEntry, b: TopKEntry, keys: []const ResolvedKey) bool {
+    return topkOrder(a, b, keys) == .gt;
+}
+
+/// Min-heap on preference: the root is the least-preferred kept entry, so a new
+/// candidate need only beat the root to earn a slot.
+fn topkSiftDown(heap: []TopKEntry, start: usize, n: usize, keys: []const ResolvedKey) void {
+    var i = start;
+    while (true) {
+        const l = 2 * i + 1;
+        const r = 2 * i + 2;
+        var least = i;
+        if (l < n and topkLessPreferred(heap[l], heap[least], keys)) least = l;
+        if (r < n and topkLessPreferred(heap[r], heap[least], keys)) least = r;
+        if (least == i) break;
+        std.mem.swap(TopKEntry, &heap[i], &heap[least]);
+        i = least;
+    }
+}
+
+fn topkBuildHeap(heap: []TopKEntry, keys: []const ResolvedKey) void {
+    const n = heap.len;
+    if (n < 2) return;
+    var i = n / 2;
+    while (i > 0) {
+        i -= 1;
+        topkSiftDown(heap, i, n, keys);
+    }
+}
 
 fn initialState(func: AggFunc, in: ?Type) AccState {
     return switch (func) {
