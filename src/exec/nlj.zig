@@ -371,14 +371,14 @@ pub const NestedLoopJoin = struct {
         const right_row_bytes = exec.memory.estimateRowBytes(self.right.outputSchema());
 
         while (try self.left.next()) |batch| {
-            if (acc) |a| try a.reserve(batch.row_count * left_row_bytes);
+            if (acc) |a| try a.reserve(.nested_loop, batch.row_count * left_row_bytes);
             for (batch.values, 0..) |v, i| {
                 try transform.appendAllColumn(self.allocator, v, &self.left_materialized[i]);
             }
             self.left_rows += @intCast(batch.row_count);
         }
         while (try self.right.next()) |batch| {
-            if (acc) |a| try a.reserve(batch.row_count * right_row_bytes);
+            if (acc) |a| try a.reserve(.nested_loop, batch.row_count * right_row_bytes);
             for (batch.values, 0..) |v, i| {
                 try transform.appendAllColumn(self.allocator, v, &self.right_materialized[i]);
             }

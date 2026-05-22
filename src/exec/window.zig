@@ -319,7 +319,7 @@ pub const Window = struct {
         for (self.accumulated) |*c| c.deinit(self.allocator);
         self.allocator.free(self.accumulated);
         self.accumulated = &.{};
-        if (self.upstream.accountant()) |a| a.release(self.reserved_bytes);
+        if (self.upstream.accountant()) |a| a.release(.window, self.reserved_bytes);
         self.reserved_bytes = 0;
         self.evicted = true;
     }
@@ -367,7 +367,7 @@ pub const Window = struct {
         const acc = self.upstream.accountant();
         while (try self.upstream.next()) |batch| {
             const b = batch.row_count * row_bytes;
-            if (acc) |a| try a.reserve(b);
+            if (acc) |a| try a.reserve(.window, b);
             self.reserved_bytes += b;
             for (batch.values, 0..) |view, ci| {
                 try transform.appendAllColumn(self.allocator, view, &self.accumulated[ci]);

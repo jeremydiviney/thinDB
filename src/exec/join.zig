@@ -687,7 +687,7 @@ pub const Join = struct {
 
         while (try up.next()) |batch| {
             const n = batch.row_count;
-            if (acc) |a| try a.reserve(n * per_row_overhead);
+            if (acc) |a| try a.reserve(.join_build, n * per_row_overhead);
             // Append batch into build_columns.
             for (batch.values, 0..) |v, i| {
                 try transform.appendAllColumn(self.allocator, v, &self.build_columns[i]);

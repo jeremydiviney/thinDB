@@ -183,7 +183,7 @@ pub const Sort = struct {
         self.accumulated = &.{};
         if (self.perm.len > 0) self.allocator.free(self.perm);
         self.perm = &.{};
-        if (self.upstream.accountant()) |a| a.release(self.reserved_bytes);
+        if (self.upstream.accountant()) |a| a.release(.sort, self.reserved_bytes);
         self.reserved_bytes = 0;
         self.evicted = true;
     }
@@ -219,7 +219,7 @@ pub const Sort = struct {
 
         while (try self.upstream.next()) |batch| {
             const b = batch.row_count * row_bytes;
-            if (acc) |a| try a.reserve(b);
+            if (acc) |a| try a.reserve(.sort, b);
             self.reserved_bytes += b;
             for (batch.values, 0..) |view, ci| {
                 try engine.memtable.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
@@ -233,7 +233,7 @@ pub const Sort = struct {
             return;
         }
         // Account for the perm array (u32 per row).
-        if (acc) |a| try a.reserve(n * @sizeOf(u32));
+        if (acc) |a| try a.reserve(.sort, n * @sizeOf(u32));
         self.reserved_bytes += n * @sizeOf(u32);
         self.perm = try self.allocator.alloc(u32, n);
         for (self.perm, 0..) |*p, i| p.* = @intCast(i);

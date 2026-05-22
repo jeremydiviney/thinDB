@@ -242,7 +242,7 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
         var i: usize = 0;
         while (i < batch.row_count) : (i += 1) {
             if (!view.isValid(i)) continue;
-            if (acct) |a| try a.reserve(per_value);
+            if (acct) |a| try a.reserve(.subquery, per_value);
             const v = try extractScalarValueAt(aa, view, i);
             try out.append(aa, v);
         }

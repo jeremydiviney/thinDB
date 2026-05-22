@@ -457,7 +457,7 @@ pub const SortMergeJoin = struct {
         // Drain left into left_materialized (skip if pre-filled).
         if (!self.pre_left_materialized) {
             while (try self.left.next()) |batch| {
-                if (acc) |a| try a.reserve(batch.row_count * left_row_bytes);
+                if (acc) |a| try a.reserve(.sort_merge_join, batch.row_count * left_row_bytes);
                 for (batch.values, 0..) |v, i| {
                     try transform.appendAllColumn(self.allocator, v, &self.left_materialized[i]);
                 }
@@ -467,7 +467,7 @@ pub const SortMergeJoin = struct {
         // Drain right (skip if pre-filled).
         if (!self.pre_right_materialized) {
             while (try self.right.next()) |batch| {
-                if (acc) |a| try a.reserve(batch.row_count * right_row_bytes);
+                if (acc) |a| try a.reserve(.sort_merge_join, batch.row_count * right_row_bytes);
                 for (batch.values, 0..) |v, i| {
                     try transform.appendAllColumn(self.allocator, v, &self.right_materialized[i]);
                 }

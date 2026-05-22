@@ -218,7 +218,7 @@ pub const TopN = struct {
         self.accumulated = &.{};
         if (self.perm.len > 0) self.allocator.free(self.perm);
         self.perm = &.{};
-        if (self.upstream.accountant()) |a| a.release(self.reserved_bytes);
+        if (self.upstream.accountant()) |a| a.release(.topn, self.reserved_bytes);
         self.reserved_bytes = 0;
         self.evicted = true;
     }
@@ -253,7 +253,7 @@ pub const TopN = struct {
 
         while (try self.upstream.next()) |batch| {
             const b = batch.row_count * self.row_bytes;
-            if (acc) |a| try a.reserve(b);
+            if (acc) |a| try a.reserve(.topn, b);
             self.reserved_bytes += b;
             for (batch.values, 0..) |view, ci| {
                 try engine.memtable.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
@@ -306,7 +306,7 @@ pub const TopN = struct {
 
         const dropped = n - keep_n;
         const release_bytes = dropped * self.row_bytes;
-        if (acc) |a| a.release(release_bytes);
+        if (acc) |a| a.release(.topn, release_bytes);
         self.reserved_bytes -= release_bytes;
 
         for (self.accumulated) |*c| c.deinit(self.allocator);

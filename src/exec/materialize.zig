@@ -117,7 +117,7 @@ pub const MaterializedBuffer = struct {
         for (self.columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.columns);
         self.columns = &.{};
-        if (self.acct) |a| a.release(self.reserved_bytes);
+        if (self.acct) |a| a.release(.materialize, self.reserved_bytes);
         self.reserved_bytes = 0;
         self.evicted = true;
     }
@@ -147,12 +147,12 @@ pub const MaterializedBuffer = struct {
         // last Reader is done.
         const row_bytes = exec.memory.estimateRowBytes(self.schema);
         errdefer if (self.acct) |a| {
-            a.release(self.reserved_bytes);
+            a.release(.materialize, self.reserved_bytes);
             self.reserved_bytes = 0;
         };
         while (try upstream.next()) |batch| {
             const b = batch.row_count * row_bytes;
-            if (self.acct) |a| try a.reserve(b);
+            if (self.acct) |a| try a.reserve(.materialize, b);
             self.reserved_bytes += b;
             for (batch.values, 0..) |view, i| {
                 try transform.appendAllColumn(self.allocator, view, &self.columns[i]);

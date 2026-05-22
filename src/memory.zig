@@ -36,34 +36,75 @@ pub const Error = error{
     MemoryBudgetExceeded,
 };
 
+/// Which blocking operator a reservation belongs to. Used only for the
+/// failure-time breakdown — every operator passes its own tag so an
+/// over-budget query can report where the memory went.
+pub const Source = enum {
+    sort,
+    topn,
+    hash_aggregate,
+    materialize,
+    join_build,
+    nested_loop,
+    range_sweep,
+    sort_merge_join,
+    window,
+    subquery,
+};
+
+const source_count = std.meta.fields(Source).len;
+
 pub const MemoryAccountant = struct {
     budget: usize,
     current_bytes: usize = 0,
+    /// Live bytes attributed to each `Source`, indexed by `@intFromEnum`.
+    by_source: [source_count]usize = [_]usize{0} ** source_count,
 
     pub fn init(budget: usize) MemoryAccountant {
         return .{ .budget = budget };
     }
 
-    /// Reserve `bytes` from the budget. Returns `MemoryBudgetExceeded`
-    /// when the reservation would exceed the budget; does NOT update
-    /// `current_bytes` in that case (no partial state).
-    pub fn reserve(self: *MemoryAccountant, bytes: usize) Error!void {
+    /// Reserve `bytes` from the budget, attributing them to `source`.
+    /// Returns `MemoryBudgetExceeded` when the reservation would exceed
+    /// the budget; does NOT update state in that case (no partial state),
+    /// but dumps a per-source breakdown to stderr first so the failure is
+    /// auditable. A failed reservation propagates terminally (no operator
+    /// retries it), so this fires at most once per over-budget query.
+    pub fn reserve(self: *MemoryAccountant, source: Source, bytes: usize) Error!void {
         const new_total = self.current_bytes + bytes;
-        if (new_total > self.budget) return Error.MemoryBudgetExceeded;
+        if (new_total > self.budget) {
+            self.dumpBreakdown(source, bytes);
+            return Error.MemoryBudgetExceeded;
+        }
         self.current_bytes = new_total;
+        self.by_source[@intFromEnum(source)] += bytes;
     }
 
-    /// Release `bytes` previously reserved. Asserts the balance never
-    /// goes negative — operators must call `release` exactly once per
-    /// matching `reserve` on their deinit path.
-    pub fn release(self: *MemoryAccountant, bytes: usize) void {
+    /// Release `bytes` previously reserved under `source`. Asserts the
+    /// balance never goes negative — operators must call `release` exactly
+    /// once per matching `reserve` on their deinit/eviction path.
+    pub fn release(self: *MemoryAccountant, source: Source, bytes: usize) void {
         std.debug.assert(self.current_bytes >= bytes);
+        std.debug.assert(self.by_source[@intFromEnum(source)] >= bytes);
         self.current_bytes -= bytes;
+        self.by_source[@intFromEnum(source)] -= bytes;
     }
 
     /// Bytes still available for additional reservations.
     pub fn available(self: MemoryAccountant) usize {
         return self.budget - self.current_bytes;
+    }
+
+    fn dumpBreakdown(self: *const MemoryAccountant, failing: Source, want: usize) void {
+        const mib = 1024 * 1024;
+        std.debug.print(
+            "[mem-audit] MemoryBudgetExceeded: +{d} MiB for '{s}' would exceed budget {d} MiB (in use {d} MiB)\n",
+            .{ want / mib, @tagName(failing), self.budget / mib, self.current_bytes / mib },
+        );
+        inline for (std.meta.fields(Source)) |f| {
+            const v = self.by_source[@intFromEnum(@field(Source, f.name))];
+            if (v > 0) std.debug.print("[mem-audit]   {s:<16} {d:>6} MiB\n", .{ f.name, v / mib });
+        }
     }
 };
 
@@ -96,33 +137,36 @@ pub fn estimateColumnBytes(t: types.Type) usize {
 
 test "memory: reserve then release returns budget" {
     var a = MemoryAccountant.init(1024);
-    try a.reserve(512);
+    try a.reserve(.sort, 512);
     try std.testing.expectEqual(@as(usize, 512), a.current_bytes);
     try std.testing.expectEqual(@as(usize, 512), a.available());
-    a.release(512);
+    a.release(.sort, 512);
     try std.testing.expectEqual(@as(usize, 0), a.current_bytes);
     try std.testing.expectEqual(@as(usize, 1024), a.available());
 }
 
 test "memory: reserve fails when budget would be exceeded" {
     var a = MemoryAccountant.init(1024);
-    try a.reserve(1024);
-    try std.testing.expectError(Error.MemoryBudgetExceeded, a.reserve(1));
+    try a.reserve(.sort, 1024);
+    try std.testing.expectError(Error.MemoryBudgetExceeded, a.reserve(.sort, 1));
     // The failed reservation does not consume any budget.
     try std.testing.expectEqual(@as(usize, 1024), a.current_bytes);
 }
 
 test "memory: multiple operators sharing one accountant" {
     var a = MemoryAccountant.init(1024);
-    // Operator A reserves 400
-    try a.reserve(400);
-    // Operator B reserves 500
-    try a.reserve(500);
+    // Operator A (sort) reserves 400
+    try a.reserve(.sort, 400);
+    // Operator B (hash aggregate) reserves 500
+    try a.reserve(.hash_aggregate, 500);
     try std.testing.expectEqual(@as(usize, 900), a.current_bytes);
     // Operator C would push us over
-    try std.testing.expectError(Error.MemoryBudgetExceeded, a.reserve(200));
+    try std.testing.expectError(Error.MemoryBudgetExceeded, a.reserve(.materialize, 200));
     // Operator A releases — now operator C can fit
-    a.release(400);
-    try a.reserve(200);
+    a.release(.sort, 400);
+    try a.reserve(.materialize, 200);
     try std.testing.expectEqual(@as(usize, 700), a.current_bytes);
+    // Per-source attribution is tracked independently.
+    try std.testing.expectEqual(@as(usize, 500), a.by_source[@intFromEnum(Source.hash_aggregate)]);
+    try std.testing.expectEqual(@as(usize, 200), a.by_source[@intFromEnum(Source.materialize)]);
 }

@@ -315,7 +315,7 @@ pub const Aggregate = struct {
     fn evict(self: *Aggregate) void {
         if (self.evicted) return;
         _ = self.arena.reset(.free_all);
-        if (self.upstream.accountant()) |a| a.release(self.reserved_bytes);
+        if (self.upstream.accountant()) |a| a.release(.hash_aggregate, self.reserved_bytes);
         self.reserved_bytes = 0;
         self.evicted = true;
     }
@@ -348,7 +348,7 @@ pub const Aggregate = struct {
                 // ~32 bytes hashmap overhead.
                 const approx = self.key_scratch.items.len + self.aggs.len * @sizeOf(AccState) + 32;
                 if (self.upstream.accountant()) |acct| {
-                    try acct.reserve(approx);
+                    try acct.reserve(.hash_aggregate, approx);
                 }
                 self.reserved_bytes += approx;
                 // The hashmap kept a reference to our scratch slice — but
