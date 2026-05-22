@@ -25,9 +25,9 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **3 ms** (metadata-only, 0-column scan) |
 | Median query | ~520 ms |
-| Total (all 43) | ~51 s |
-| Slowest | Q28 `REGEXP_REPLACE` — 22 s (regex-bound, CPU not memory) |
-| Slowest excluding Q28 | Q34 `GROUP BY URL` — 3.5 s |
+| Total (all 43) | ~32 s |
+| Slowest | Q34 `GROUP BY 1, URL` — 3.6 s (high-cardinality string GROUP BY) |
+| Q28 `REGEXP_REPLACE` | 3.2 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
 The high-cardinality `GROUP BY` queries (Q15-18, Q32-35) pass because of
 **column pruning** (projection pushdown): the 105-column table is scanned
@@ -68,7 +68,7 @@ manifest row-count with no segment decode at all.
 | Q25 | 415 ms | `SearchPhrase ORDER BY SearchPhrase LIMIT 10` |
 | Q26 | 386 ms | `SearchPhrase ORDER BY EventTime, SearchPhrase LIMIT 10` |
 | Q27 | 600 ms | `CounterID, AVG(length(URL)), COUNT(*) HAVING COUNT(*) > 100000` |
-| Q28 | 21956 ms | `REGEXP_REPLACE(Referer, ...) GROUP BY k HAVING COUNT(*) > 100000` |
+| Q28 | 3193 ms | `REGEXP_REPLACE(Referer, ...) GROUP BY k HAVING COUNT(*) > 100000` |
 | Q29 | 1795 ms | `90 × SUM(ResolutionWidth + k)` |
 | Q30 | 569 ms | `SearchEngineID, ClientIP, COUNT(*), SUM(IsRefresh), AVG(ResolutionWidth)` |
 | Q31 | 516 ms | `WatchID, ClientIP, COUNT(*), ... WHERE SearchPhrase <> ''` |
@@ -85,9 +85,13 @@ manifest row-count with no segment decode at all.
 | Q42 | 115 ms | `DATE_TRUNC('minute', EventTime), COUNT(*) GROUP BY ...` |
 
 **Notes**
-- **Q28** is the lone slow query: `REGEXP_REPLACE` over 5M `Referer` values is
-  CPU-bound in the Pike-VM regex engine. A Debug build exceeds the 120 s
-  client timeout; ReleaseFast brings it to ~22 s. Optimizing the regex hot
-  loop is the obvious next target for this query.
+- **Q28** (`REGEXP_REPLACE` host-extract over 5M `Referer` values) was the
+  lone slow query at ~22 s, CPU-bound in the Pike-VM regex engine. A
+  *stationary-run bulk-skip* (collapsing `[^/]+` / `.*$` loops into one
+  forward scan instead of one Pike step per character) plus seed reuse,
+  per-batch scratch reuse, and a loop-class probe gate brought it to **3.2 s**
+  — now below DuckDB's single-thread time for the same query (4.3 s) and
+  no longer regex-bound. The residual cost is the high-cardinality string
+  `GROUP BY` over the extracted hosts (compare Q33 `GROUP BY URL`, 3.2 s).
 - The full ClickBench dataset is 100M rows; this run uses the 5M-row subset
   for fast iteration. The data file (`data/hits_5m.tsv`) is not checked in.
