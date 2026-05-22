@@ -317,13 +317,27 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
     const name = try p.arena.dupe(u8, p.cur.text);
     try p.advance();
 
-    const ty = try parseColumnType(p);
-
     var nullable = true; // SQL standard default; flipped to false by NOT NULL or PRIMARY KEY
+    var auto_increment = false;
+    // PG SERIAL family is shorthand for an integer column that
+    // auto-increments and is NOT NULL — map it onto AUTO_INCREMENT.
+    const ty: types.Type = blk: {
+        if (p.cur.tag == .identifier) {
+            const serial_ty: ?types.Type =
+                if (asciiEqlAny(p.cur.text, &.{ "serial", "serial4" })) .int else if (asciiEqlAny(p.cur.text, &.{ "bigserial", "serial8" })) .bigint else if (asciiEqlAny(p.cur.text, &.{ "smallserial", "serial2" })) .smallint else null;
+            if (serial_ty) |st| {
+                try p.advance();
+                auto_increment = true;
+                nullable = false;
+                break :blk st;
+            }
+        }
+        break :blk try parseColumnType(p);
+    };
+
     var is_pk = false;
     var saw_not_null = false;
     var default_value: ?types.Value = null;
-    var auto_increment = false;
     while (true) {
         switch (p.cur.tag) {
             .kw_not => {
@@ -379,11 +393,14 @@ pub fn parseColumnType(p: anytype) !types.Type {
     const name = p.cur.text;
     try p.advance();
 
-    if (asciiEqlAny(name, &.{"bigint"})) return .bigint;
-    if (asciiEqlAny(name, &.{ "int", "integer" })) return .int;
-    if (asciiEqlAny(name, &.{"smallint"})) return .smallint;
+    // PG type-name aliases (int4/int8/...) sit alongside the standard
+    // names so DDL and casts emitted by PG clients/ORMs parse unchanged.
+    if (asciiEqlAny(name, &.{ "bigint", "int8" })) return .bigint;
+    if (asciiEqlAny(name, &.{ "int", "integer", "int4" })) return .int;
+    if (asciiEqlAny(name, &.{ "smallint", "int2" })) return .smallint;
     if (asciiEqlAny(name, &.{"tinyint"})) return .smallint;
-    if (asciiEqlAny(name, &.{ "float", "real" })) return .float;
+    if (asciiEqlAny(name, &.{ "float", "real", "float4" })) return .float;
+    if (asciiEqlAny(name, &.{"float8"})) return .double;
     if (asciiEqlAny(name, &.{"double"})) {
         if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "precision")) {
             try p.advance();
@@ -420,7 +437,8 @@ pub fn parseColumnType(p: anytype) !types.Type {
     if (asciiEqlAny(name, &.{ "text", "string" })) return .string;
     if (asciiEqlAny(name, &.{ "boolean", "bool" })) return .boolean;
     if (asciiEqlAny(name, &.{"date"})) return .date;
-    if (asciiEqlAny(name, &.{ "datetime", "timestamp" })) return .datetime;
+    // timestamptz is accepted as a synonym; thinDB datetimes are UTC-naive.
+    if (asciiEqlAny(name, &.{ "datetime", "timestamp", "timestamptz" })) return .datetime;
     if (asciiEqlAny(name, &.{"uuid"})) return .uuid;
     return PE.SqlExpectedKeyword;
 }

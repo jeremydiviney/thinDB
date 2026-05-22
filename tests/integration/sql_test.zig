@@ -309,6 +309,29 @@ test "sql: pg_attribute JOIN pg_class lists a table's columns" {
     try std.testing.expect(saw_id and saw_tag);
 }
 
+test "sql: PG type aliases + bigserial in CREATE TABLE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE pgt (id bigserial PRIMARY KEY, n int4, big int8, small int2, label text)");
+    try helpers.exec(allocator, db, "INSERT INTO pgt (n, big, small, label) VALUES (7, 99, 3, 'x')");
+
+    var q = try runSql(allocator, db, "SELECT id, n, big, small FROM pgt");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expect(std.meta.activeTag(schema[0].type) == .bigint); // bigserial
+    try std.testing.expect(std.meta.activeTag(schema[1].type) == .int); // int4
+    try std.testing.expect(std.meta.activeTag(schema[2].type) == .bigint); // int8
+    try std.testing.expect(std.meta.activeTag(schema[3].type) == .smallint); // int2
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[0]); // auto-increment
+    try std.testing.expectEqual(@as(i32, 7), b.values[1].data.int[0]);
+}
+
 test "sql: string_agg and group_concat concatenate grouped strings" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
