@@ -74,6 +74,9 @@ pub const Server = struct {
     /// the PG wire so a KILL from one wire can target connections
     /// on either. Caller-owned; must outlive the Server.
     registry: ?*ConnectionRegistry = null,
+    /// Opt-in per-connection profiling for the MySQL wire path. Set by
+    /// the server binary from THINDB_MYSQL_PROFILE.
+    profile: bool = false,
 
     pub fn close(self: *Server) void {
         self.listener.socket.close(self.io);
@@ -99,7 +102,7 @@ pub const Server = struct {
         defer self.limiter.release();
 
         const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
-        handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_password, self.registry) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_password, self.registry, self.profile) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -137,6 +140,7 @@ pub const Server = struct {
                 .limiter = self.limiter,
                 .auth_password = self.auth_password,
                 .registry = self.registry,
+                .profile = self.profile,
             };
             const thread = std.Thread.spawn(.{}, ConnJob.run, .{job}) catch {
                 self.limiter.release();
@@ -158,12 +162,13 @@ const ConnJob = struct {
     limiter: *ConnectionLimiter,
     auth_password: ?[]const u8,
     registry: ?*ConnectionRegistry,
+    profile: bool,
 
     fn run(self: *ConnJob) void {
         defer self.allocator.destroy(self);
         defer self.limiter.release();
         defer self.stream.close(self.io);
-        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id, self.auth_password, self.registry) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.connection_id, self.auth_password, self.registry, self.profile) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -248,7 +253,7 @@ const SessionState = struct {
     /// Salt sent in the HandshakeV10 greeting. Retained on the
     /// SessionState so COM_CHANGE_USER can re-verify the client's
     /// hash against the same challenge.
-    auth_salt: [auth.SALT_LEN]u8 = .{0} ** auth.SALT_LEN,
+    auth_salt: [auth.SALT_LEN]u8 = std.mem.zeroes([auth.SALT_LEN]u8),
     /// Pointer into the shared registry entry for this connection.
     /// Used by handleQuery to wire the cancel_flag into the
     /// in-flight CompiledQuery so a peer KILL aborts at the next
@@ -335,6 +340,244 @@ const SessionState = struct {
     }
 };
 
+const profile_report_every_commands: u64 = 50;
+const max_prepare_param_defs_to_emit: u16 = 256;
+var profile_print_mutex: ProfileSpinLock = .{};
+
+const ProfileSpinLock = struct {
+    state: std.atomic.Value(bool) = .{ .raw = false },
+
+    fn lock(self: *ProfileSpinLock) void {
+        while (self.state.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *ProfileSpinLock) void {
+        self.state.store(false, .release);
+    }
+};
+
+const ProfilePhase = enum(u8) {
+    packet_read,
+    command_total,
+    response_flush,
+    query_parse,
+    query_compile,
+    query_execute,
+    query_write,
+    query_execute_write,
+    stmt_prepare_count,
+    stmt_prepare_infer,
+    stmt_prepare_write,
+    stmt_execute_decode,
+    stmt_execute_substitute,
+    stmt_execute_parse,
+    stmt_execute_compile,
+    stmt_execute_engine,
+    stmt_execute_write,
+    stmt_long_data,
+    stmt_close,
+    stmt_reset,
+};
+
+const profile_phases = [_]ProfilePhase{
+    .packet_read,
+    .command_total,
+    .response_flush,
+    .query_parse,
+    .query_compile,
+    .query_execute,
+    .query_write,
+    .query_execute_write,
+    .stmt_prepare_count,
+    .stmt_prepare_infer,
+    .stmt_prepare_write,
+    .stmt_execute_decode,
+    .stmt_execute_substitute,
+    .stmt_execute_parse,
+    .stmt_execute_compile,
+    .stmt_execute_engine,
+    .stmt_execute_write,
+    .stmt_long_data,
+    .stmt_close,
+    .stmt_reset,
+};
+
+const profile_phase_count = profile_phases.len;
+
+const SqlKind = enum(u8) {
+    select,
+    insert,
+    ddl,
+    other,
+};
+
+const sql_kind_count = @typeInfo(SqlKind).@"enum".fields.len;
+
+const ProfileStats = struct {
+    count: u64 = 0,
+    total_ns: u64 = 0,
+    max_ns: u64 = 0,
+
+    fn add(self: *ProfileStats, ns: u64) void {
+        self.count += 1;
+        self.total_ns += ns;
+        if (ns > self.max_ns) self.max_ns = ns;
+    }
+};
+
+const MysqlProfiler = struct {
+    enabled: bool,
+    io: Io,
+    connection_id: u32,
+    total_commands: u64 = 0,
+    commands_since_report: u64 = 0,
+    rows_affected: u64 = 0,
+    rows_returned: u64 = 0,
+    phases: [profile_phase_count]ProfileStats,
+    sql_kinds: [sql_kind_count]u64,
+
+    fn init(io: Io, connection_id: u32, enabled: bool) MysqlProfiler {
+        return .{
+            .enabled = enabled,
+            .io = io,
+            .connection_id = connection_id,
+            .phases = std.mem.zeroes([profile_phase_count]ProfileStats),
+            .sql_kinds = std.mem.zeroes([sql_kind_count]u64),
+        };
+    }
+
+    fn start(self: *const MysqlProfiler) ?Io.Timestamp {
+        if (!self.enabled) return null;
+        return Io.Clock.awake.now(self.io);
+    }
+
+    fn recordSince(self: *MysqlProfiler, phase: ProfilePhase, start_ts: ?Io.Timestamp) void {
+        if (!self.enabled) return;
+        const t0 = start_ts orelse return;
+        const elapsed = t0.durationTo(Io.Clock.awake.now(self.io));
+        self.phases[@intFromEnum(phase)].add(@intCast(elapsed.toNanoseconds()));
+    }
+
+    fn recordSqlKind(self: *MysqlProfiler, kind: SqlKind) void {
+        if (!self.enabled) return;
+        self.sql_kinds[@intFromEnum(kind)] += 1;
+    }
+
+    fn addRowsAffected(self: *MysqlProfiler, rows: u64) void {
+        if (!self.enabled) return;
+        self.rows_affected += rows;
+    }
+
+    fn addRowsReturned(self: *MysqlProfiler, rows: u64) void {
+        if (!self.enabled) return;
+        self.rows_returned += rows;
+    }
+
+    fn finishCommand(self: *MysqlProfiler) void {
+        if (!self.enabled) return;
+        self.total_commands += 1;
+        self.commands_since_report += 1;
+        if (self.commands_since_report >= profile_report_every_commands) {
+            self.report(false);
+            self.commands_since_report = 0;
+        }
+    }
+
+    fn finish(self: *MysqlProfiler) void {
+        if (!self.enabled) return;
+        if (self.total_commands == 0 and !self.hasPhaseData()) return;
+        self.report(true);
+    }
+
+    fn hasPhaseData(self: *const MysqlProfiler) bool {
+        for (self.phases) |stats| {
+            if (stats.count > 0) return true;
+        }
+        return false;
+    }
+
+    fn report(self: *const MysqlProfiler, final: bool) void {
+        profile_print_mutex.lock();
+        defer profile_print_mutex.unlock();
+
+        const label = if (final) "final" else "periodic";
+        std.debug.print(
+            "mysql profile cid={d} {s}: commands={d} rows_affected={d} rows_returned={d} sql(select={d}, insert={d}, ddl={d}, other={d})\n",
+            .{
+                self.connection_id,
+                label,
+                self.total_commands,
+                self.rows_affected,
+                self.rows_returned,
+                self.sql_kinds[@intFromEnum(SqlKind.select)],
+                self.sql_kinds[@intFromEnum(SqlKind.insert)],
+                self.sql_kinds[@intFromEnum(SqlKind.ddl)],
+                self.sql_kinds[@intFromEnum(SqlKind.other)],
+            },
+        );
+        for (profile_phases) |phase| {
+            const stats = self.phases[@intFromEnum(phase)];
+            if (stats.count == 0) continue;
+            const total_ms = @as(f64, @floatFromInt(stats.total_ns)) / 1e6;
+            const mean_ms = total_ms / @as(f64, @floatFromInt(stats.count));
+            const max_ms = @as(f64, @floatFromInt(stats.max_ns)) / 1e6;
+            std.debug.print(
+                "  {s:<24} count={d:<8} total={d:>10.3}ms mean={d:>9.3}ms max={d:>9.3}ms\n",
+                .{ profilePhaseName(phase), stats.count, total_ms, mean_ms, max_ms },
+            );
+        }
+    }
+};
+
+fn profilePhaseName(phase: ProfilePhase) []const u8 {
+    return switch (phase) {
+        .packet_read => "packet_read",
+        .command_total => "command_total",
+        .response_flush => "response_flush",
+        .query_parse => "query_parse",
+        .query_compile => "query_compile",
+        .query_execute => "query_execute",
+        .query_write => "query_write",
+        .query_execute_write => "query_execute_write",
+        .stmt_prepare_count => "stmt_prepare_count",
+        .stmt_prepare_infer => "stmt_prepare_infer",
+        .stmt_prepare_write => "stmt_prepare_write",
+        .stmt_execute_decode => "stmt_execute_decode",
+        .stmt_execute_substitute => "stmt_execute_substitute",
+        .stmt_execute_parse => "stmt_execute_parse",
+        .stmt_execute_compile => "stmt_execute_compile",
+        .stmt_execute_engine => "stmt_execute_engine",
+        .stmt_execute_write => "stmt_execute_write",
+        .stmt_long_data => "stmt_long_data",
+        .stmt_close => "stmt_close",
+        .stmt_reset => "stmt_reset",
+    };
+}
+
+fn classifySqlKind(op: ir.Op) SqlKind {
+    return switch (std.meta.activeTag(op)) {
+        .scan,
+        .limit,
+        .select,
+        .exclude,
+        .filter,
+        .order_by,
+        .group_by,
+        .compute,
+        .join,
+        .materialize,
+        .show,
+        .window,
+        .set_union,
+        => .select,
+        .insert, .insert_select => .insert,
+        .ddl, .create_table_as => .ddl,
+        else => .other,
+    };
+}
+
 fn handleConnection(
     allocator: Allocator,
     io: Io,
@@ -343,6 +586,7 @@ fn handleConnection(
     connection_id: u32,
     auth_password: ?[]const u8,
     registry: ?*ConnectionRegistry,
+    profile_enabled: bool,
 ) !void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
@@ -353,6 +597,8 @@ fn handleConnection(
 
     var session = try SessionState.init(allocator, catalog, connection_id);
     defer session.deinit();
+    var profiler = MysqlProfiler.init(io, connection_id, profile_enabled);
+    defer profiler.finish();
 
     // Register in the shared registry so peer connections can KILL
     // this one's in-flight query. The connection state must outlive
@@ -430,31 +676,50 @@ fn handleConnection(
     try w.flush();
 
     while (true) {
+        const read_start = profiler.start();
         const pkt = packet.readPacket(allocator, r) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
+        profiler.recordSince(.packet_read, read_start);
         defer allocator.free(pkt.payload);
         if (pkt.payload.len == 0) continue;
 
         const cmd = pkt.payload[0];
         const body = pkt.payload[1..];
+        const command_start = profiler.start();
         switch (cmd) {
-            0x01 => return, // COM_QUIT
+            0x01 => {
+                profiler.recordSince(.command_total, command_start);
+                profiler.finishCommand();
+                return;
+            }, // COM_QUIT
             0x02 => try handleInitDb(allocator, w, catalog, &session, body),
-            0x03 => try handleQuery(allocator, w, catalog, &session, body),
+            0x03 => try handleQuery(allocator, w, catalog, &session, body, &profiler),
             // COM_STMT_PREPARE (0x16) — parse SQL, count `?` placeholders,
             // register a per-connection statement id, return prepare-ok.
-            0x16 => try handleStmtPrepare(allocator, w, catalog, &session, body),
+            0x16 => try handleStmtPrepare(allocator, w, catalog, &session, body, &profiler),
             // COM_STMT_EXECUTE (0x17) — bind parameters + run.
-            0x17 => try handleStmtExecute(allocator, w, catalog, &session, body),
+            0x17 => try handleStmtExecute(allocator, w, catalog, &session, body, &profiler),
             // COM_STMT_SEND_LONG_DATA (0x18) — accumulate long-data
             // bytes into a per-stmt per-param buffer. No response.
-            0x18 => try handleStmtSendLongData(&session, body),
+            0x18 => {
+                const phase_start = profiler.start();
+                try handleStmtSendLongData(&session, body);
+                profiler.recordSince(.stmt_long_data, phase_start);
+            },
             // COM_STMT_CLOSE (0x19) — free the stmt entry. No response.
-            0x19 => try handleStmtClose(&session, body),
+            0x19 => {
+                const phase_start = profiler.start();
+                try handleStmtClose(&session, body);
+                profiler.recordSince(.stmt_close, phase_start);
+            },
             // COM_STMT_RESET (0x1A) — clear long-data buffers; reply OK.
-            0x1A => try handleStmtReset(allocator, w, &session, body),
+            0x1A => {
+                const phase_start = profiler.start();
+                try handleStmtReset(allocator, w, &session, body);
+                profiler.recordSince(.stmt_reset, phase_start);
+            },
             0x0E => try handshake.sendOkPacket(allocator, w, 1, 0, 0), // COM_PING
             // COM_RESET_CONNECTION — wipes per-connection state without
             // closing the socket. Connection poolers (e.g. ProxySQL,
@@ -476,7 +741,11 @@ fn handleConnection(
             0x11 => try handleChangeUser(allocator, w, catalog, &session, body, auth_password),
             else => try handshake.sendErrPacket(allocator, w, 1, 1047, "HY000".*, "Unknown command"),
         }
+        const flush_start = profiler.start();
         try w.flush();
+        profiler.recordSince(.response_flush, flush_start);
+        profiler.recordSince(.command_total, command_start);
+        profiler.finishCommand();
     }
 }
 
@@ -603,6 +872,7 @@ fn handleQuery(
     catalog: *Catalog,
     session: *SessionState,
     payload: []const u8,
+    profiler: *MysqlProfiler,
 ) !void {
     var seq_id: u8 = 1;
     const caps = session.client_caps;
@@ -683,7 +953,7 @@ fn handleQuery(
 
     if (try sendSyntheticWorkbenchSelect(allocator, w, catalog, session, payload, &seq_id, caps)) return;
 
-    try runEngineQuery(allocator, w, catalog, session, payload, &seq_id);
+    try runEngineQuery(allocator, w, catalog, session, payload, &seq_id, profiler);
 }
 
 fn sendSyntheticWorkbenchSelect(
@@ -2334,15 +2604,19 @@ fn runEngineQuery(
     session: *SessionState,
     payload: []const u8,
     seq_id: *u8,
+    profiler: *MysqlProfiler,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
+    const parse_start = profiler.start();
     const op = sql.parseDialect(arena.allocator(), payload, .mysql) catch |err| {
+        profiler.recordSince(.query_parse, parse_start);
         const mapped = errors.mapInternal(err, "Parse error");
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, @errorName(err));
         return;
     };
+    profiler.recordSince(.query_parse, parse_start);
 
     if (op.* == .batch) {
         if ((session.client_caps & handshake.CLIENT_MULTI_STATEMENTS) == 0) {
@@ -2361,12 +2635,12 @@ fn runEngineQuery(
             const is_last = i + 1 == stmts.len;
             const base: u16 = session.transactionStatus();
             const extra: u16 = if (is_last) base else base | handshake.SERVER_MORE_RESULTS_EXISTS;
-            try runSingleStatement(allocator, w, catalog, session, stmt, seq_id, extra);
+            try runSingleStatement(allocator, w, catalog, session, stmt, seq_id, extra, profiler);
         }
         return;
     }
 
-    try runSingleStatement(allocator, w, catalog, session, op, seq_id, session.transactionStatus());
+    try runSingleStatement(allocator, w, catalog, session, op, seq_id, session.transactionStatus(), profiler);
 }
 
 /// Compile + emit ONE statement's packets. `extra_status` is OR'd into
@@ -2381,7 +2655,9 @@ fn runSingleStatement(
     op: *const ir.Op,
     seq_id: *u8,
     extra_status: u16,
+    profiler: *MysqlProfiler,
 ) !void {
+    profiler.recordSqlKind(classifySqlKind(op.*));
     const main_db = catalog.database(session.current_db) orelse {
         try handshake.sendErrPacket(allocator, w, seq_id.*, 1049, "42000".*, "Unknown database");
         return;
@@ -2395,11 +2671,14 @@ fn runSingleStatement(
         };
     }
 
+    const compile_start = profiler.start();
     var compiled = local.compileWithSession(allocator, main_db, session.asSession(), op) catch |err| {
+        profiler.recordSince(.query_compile, compile_start);
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
         return;
     };
+    profiler.recordSince(.query_compile, compile_start);
     defer compiled.deinit();
 
     // Clear any stale cancel flag from a previous statement on this
@@ -2412,25 +2691,33 @@ fn runSingleStatement(
     }
 
     if (isSideEffectOp(op.*)) {
+        const exec_start = profiler.start();
         _ = compiled.next() catch |err| {
+            profiler.recordSince(.query_execute, exec_start);
             const mapped = errors.mapInternal(err, null);
             try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
             return;
         };
+        profiler.recordSince(.query_execute, exec_start);
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
+        const affected_rows = compiled.affectedRows();
+        profiler.addRowsAffected(affected_rows);
+        const write_start = profiler.start();
         try handshake.sendOkPacketStatus(
             allocator,
             w,
             seq_id.*,
-            compiled.affectedRows(),
+            affected_rows,
             0,
             extra_status,
         );
+        profiler.recordSince(.query_write, write_start);
         seq_id.* +%= 1;
         return;
     }
 
+    const write_start = profiler.start();
     try result.sendQueryResultStatus(
         allocator,
         w,
@@ -2441,6 +2728,7 @@ fn runSingleStatement(
         session.client_caps,
         extra_status,
     );
+    profiler.recordSince(.query_execute_write, write_start);
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
@@ -2483,6 +2771,7 @@ fn handleStmtPrepare(
     catalog: *Catalog,
     session: *SessionState,
     payload: []const u8,
+    profiler: *MysqlProfiler,
 ) !void {
     var seq_id: u8 = 1;
     const caps = session.client_caps;
@@ -2490,7 +2779,9 @@ fn handleStmtPrepare(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
+    const count_start = profiler.start();
     const num_params = prepared.countPlaceholders(arena.allocator(), payload) catch 0;
+    profiler.recordSince(.stmt_prepare_count, count_start);
 
     const stmt_id = session.next_stmt_id;
     session.next_stmt_id +%= 1;
@@ -2501,48 +2792,63 @@ fn handleStmtPrepare(
     // here fall back to num_columns=0. Side-effect ops (DDL, INSERT)
     // are skipped before compile so the prepare-time pass has no
     // observable effect on the catalog or data.
-    blk: {
-        const dummy_sql = prepared.renderDummySubstitution(arena.allocator(), payload, num_params) catch break :blk;
-        const dummy_op = sql.parseDialect(arena.allocator(), dummy_sql, .mysql) catch break :blk;
-        if (dummy_op.* == .batch) break :blk;
-        if (isSideEffectOp(dummy_op.*)) break :blk;
-        const main_db = catalog.database(session.current_db) orelse break :blk;
-        var compiled = local.compileWithSession(arena.allocator(), main_db, session.asSession(), dummy_op) catch break :blk;
-        defer compiled.deinit();
-        const schema = compiled.outputSchema();
+    if (num_params <= max_prepare_param_defs_to_emit) {
+        const infer_start = profiler.start();
+        blk: {
+            const dummy_sql = prepared.renderDummySubstitution(arena.allocator(), payload, num_params) catch break :blk;
+            const dummy_op = sql.parseDialect(arena.allocator(), dummy_sql, .mysql) catch break :blk;
+            if (dummy_op.* == .batch) break :blk;
+            if (isSideEffectOp(dummy_op.*)) break :blk;
+            const main_db = catalog.database(session.current_db) orelse break :blk;
+            var compiled = local.compileWithSession(arena.allocator(), main_db, session.asSession(), dummy_op) catch break :blk;
+            defer compiled.deinit();
+            const schema = compiled.outputSchema();
 
-        const names = allocator.alloc([]u8, schema.len) catch break :blk;
-        var names_inited: usize = 0;
-        errdefer {
-            for (names[0..names_inited]) |n| allocator.free(n);
-            allocator.free(names);
+            const names = allocator.alloc([]u8, schema.len) catch break :blk;
+            var names_inited: usize = 0;
+            errdefer {
+                for (names[0..names_inited]) |n| allocator.free(n);
+                allocator.free(names);
+            }
+            for (schema) |col| {
+                names[names_inited] = allocator.dupe(u8, col.name) catch break :blk;
+                names_inited += 1;
+            }
+            const cols = allocator.alloc(types.Column, schema.len) catch break :blk;
+            for (schema, 0..) |col, i| {
+                cols[i] = .{ .name = names[i], .type = col.type, .nullable = col.nullable };
+            }
+            stmt.column_schema = cols;
+            stmt.column_names = names;
+            stmt.num_columns = @intCast(schema.len);
         }
-        for (schema) |col| {
-            names[names_inited] = allocator.dupe(u8, col.name) catch break :blk;
-            names_inited += 1;
-        }
-        const cols = allocator.alloc(types.Column, schema.len) catch break :blk;
-        for (schema, 0..) |col, i| {
-            cols[i] = .{ .name = names[i], .type = col.type, .nullable = col.nullable };
-        }
-        stmt.column_schema = cols;
-        stmt.column_names = names;
-        stmt.num_columns = @intCast(schema.len);
+        profiler.recordSince(.stmt_prepare_infer, infer_start);
     }
 
     try session.prepared_statements.put(allocator, stmt_id, stmt);
 
+    const write_start = profiler.start();
     try prepared.sendPrepareOkHeader(allocator, w, &seq_id, stmt_id, stmt.num_columns, num_params);
 
-    // Param column-defs. Real MySQL emits one per `?` with empty
-    // table/name and type=VAR_STRING. Mirror that.
-    var pi: u16 = 0;
-    while (pi < num_params) : (pi += 1) {
-        try prepared.sendParamColumnDef(allocator, w, &seq_id);
+    // Param column-defs. Real MySQL emits one per `?`, but mysql2 and
+    // other clients accept an EOF terminator before all definitions are
+    // sent. Large multi-row INSERT prepares can otherwise spend seconds
+    // writing metadata that clients do not use when binding parameters.
+    const emitted_all_param_defs = num_params <= max_prepare_param_defs_to_emit;
+    if (emitted_all_param_defs) {
+        var pi: u16 = 0;
+        while (pi < num_params) : (pi += 1) {
+            try prepared.sendParamColumnDef(allocator, w, &seq_id);
+        }
     }
-    if (num_params > 0 and (caps & handshake.CLIENT_DEPRECATE_EOF) == 0) {
-        try handshake.sendLegacyEofPacket(allocator, w, seq_id);
-        seq_id +%= 1;
+    if (num_params > 0) {
+        if ((caps & handshake.CLIENT_DEPRECATE_EOF) == 0) {
+            try handshake.sendLegacyEofPacket(allocator, w, seq_id);
+            seq_id +%= 1;
+        } else if (!emitted_all_param_defs) {
+            try handshake.sendEofOkPacket(allocator, w, seq_id);
+            seq_id +%= 1;
+        }
     }
 
     // Column column-defs.
@@ -2561,6 +2867,7 @@ fn handleStmtPrepare(
             seq_id +%= 1;
         }
     }
+    profiler.recordSince(.stmt_prepare_write, write_start);
 }
 
 /// Execute a previously-prepared statement: bind parameters from the
@@ -2572,6 +2879,7 @@ fn handleStmtExecute(
     catalog: *Catalog,
     session: *SessionState,
     payload: []const u8,
+    profiler: *MysqlProfiler,
 ) !void {
     var seq_id: u8 = 1;
     const caps = session.client_caps;
@@ -2592,7 +2900,9 @@ fn handleStmtExecute(
     const arena_alloc = arena.allocator();
 
     const after_header: usize = 9;
+    const decode_start = profiler.start();
     const params = prepared.decodeExecuteParams(arena_alloc, stmt, payload, after_header) catch |err| {
+        profiler.recordSince(.stmt_execute_decode, decode_start);
         const msg = switch (err) {
             error.NoBoundParamTypes => "missing parameter types on first execute",
             error.LongDataAndValueBoth => "long-data and value both bound for same param",
@@ -2602,8 +2912,11 @@ fn handleStmtExecute(
         try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, msg);
         return;
     };
+    profiler.recordSince(.stmt_execute_decode, decode_start);
 
+    const substitute_start = profiler.start();
     const substituted = prepared.substituteSql(arena_alloc, stmt.sql, params) catch |err| {
+        profiler.recordSince(.stmt_execute_substitute, substitute_start);
         const msg = switch (err) {
             error.MissingParameter => "missing parameter for placeholder",
             else => "parameter substitution failure",
@@ -2611,6 +2924,7 @@ fn handleStmtExecute(
         try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, msg);
         return;
     };
+    profiler.recordSince(.stmt_execute_substitute, substitute_start);
 
     // Clear long-data buffers after consuming them — MySQL semantics:
     // long-data accumulates across SEND_LONG_DATA calls but is consumed
@@ -2622,11 +2936,15 @@ fn handleStmtExecute(
         }
     }
 
+    const parse_start = profiler.start();
     const op = sql.parseDialect(arena_alloc, substituted, .mysql) catch |err| {
+        profiler.recordSince(.stmt_execute_parse, parse_start);
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
         return;
     };
+    profiler.recordSince(.stmt_execute_parse, parse_start);
+    profiler.recordSqlKind(classifySqlKind(op.*));
 
     if (op.* == .batch) {
         try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, "Multi-statement not supported in prepared mode");
@@ -2646,11 +2964,14 @@ fn handleStmtExecute(
         };
     }
 
+    const compile_start = profiler.start();
     var compiled = local.compileWithSession(allocator, main_db, session.asSession(), op) catch |err| {
+        profiler.recordSince(.stmt_execute_compile, compile_start);
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
         return;
     };
+    profiler.recordSince(.stmt_execute_compile, compile_start);
     defer compiled.deinit();
 
     if (session.conn_state) |state| {
@@ -2659,27 +2980,35 @@ fn handleStmtExecute(
     }
 
     if (isSideEffectOp(op.*)) {
+        const exec_start = profiler.start();
         _ = compiled.next() catch |err| {
+            profiler.recordSince(.stmt_execute_engine, exec_start);
             const mapped = errors.mapInternal(err, null);
             try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
             return;
         };
+        profiler.recordSince(.stmt_execute_engine, exec_start);
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
+        const affected_rows = compiled.affectedRows();
+        profiler.addRowsAffected(affected_rows);
+        const write_start = profiler.start();
         try handshake.sendOkPacketStatus(
             allocator,
             w,
             seq_id,
-            compiled.affectedRows(),
+            affected_rows,
             0,
             session.transactionStatus(),
         );
+        profiler.recordSince(.stmt_execute_write, write_start);
         return;
     }
 
     // Binary result set.
     const schema = compiled.outputSchema();
 
+    const header_write_start = profiler.start();
     var col_count_buf: std.ArrayList(u8) = .empty;
     defer col_count_buf.deinit(allocator);
     try packet.appendLenEncInt(allocator, &col_count_buf, @intCast(schema.len));
@@ -2699,19 +3028,26 @@ fn handleStmtExecute(
         try handshake.sendLegacyEofPacket(allocator, w, seq_id);
         seq_id +%= 1;
     }
+    profiler.recordSince(.stmt_execute_write, header_write_start);
 
     var row_payload: std.ArrayList(u8) = .empty;
     defer row_payload.deinit(allocator);
 
+    var returned_rows: u64 = 0;
     while (true) {
         // A runtime error after column defs terminates the result set
         // with an ERR packet rather than dropping the connection.
+        const next_start = profiler.start();
         const maybe_batch = compiled.next() catch |err| {
+            profiler.recordSince(.stmt_execute_engine, next_start);
             const mapped = errors.mapInternal(err, null);
             try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
             return;
         };
+        profiler.recordSince(.stmt_execute_engine, next_start);
         const batch = maybe_batch orelse break;
+        returned_rows += @intCast(batch.row_count);
+        const row_write_start = profiler.start();
         var r: usize = 0;
         while (r < batch.row_count) : (r += 1) {
             row_payload.clearRetainingCapacity();
@@ -2719,9 +3055,13 @@ fn handleStmtExecute(
             try packet.writePacket(w, seq_id, row_payload.items);
             seq_id +%= 1;
         }
+        profiler.recordSince(.stmt_execute_write, row_write_start);
     }
+    profiler.addRowsReturned(returned_rows);
 
+    const terminator_write_start = profiler.start();
     try result.sendResultTerminatorStatus(allocator, w, &seq_id, caps, session.transactionStatus());
+    profiler.recordSince(.stmt_execute_write, terminator_write_start);
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);

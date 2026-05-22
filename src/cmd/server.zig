@@ -41,6 +41,9 @@ const usage_text =
     \\  --help                  Show this help and exit.
     \\  --version               Print version and exit.
     \\
+    \\Environment:
+    \\  THINDB_MYSQL_PROFILE=1  Log per-connection MySQL protocol phase timings.
+    \\
     \\Examples:
     \\  thindb-server --data-dir /var/lib/thindb
     \\  thindb-server --data-dir ./db --mysql-port 0 --pg-port 5433
@@ -64,6 +67,7 @@ pub fn main(init: std.process.Init) !u8 {
     var idle_timeout_secs: u32 = 0;
     var mysql_password: ?[]const u8 = null;
     var pg_password: ?[]const u8 = null;
+    const mysql_profile = envFlag(init.environ_map, "THINDB_MYSQL_PROFILE");
 
     var stderr_buf: [4096]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
@@ -195,6 +199,7 @@ pub fn main(init: std.process.Init) !u8 {
                 const s = try thindb.serveMysql(gpa, io, catalog, addr, &shared_limiter);
                 s.auth_password = mysql_password;
                 s.registry = &shared_registry;
+                s.profile = mysql_profile;
                 break :blk .{ .mysql = s };
             },
             .pg => blk: {
@@ -207,6 +212,9 @@ pub fn main(init: std.process.Init) !u8 {
         };
         n_listeners += 1;
         try out_w.print("  {s} listening on {s}:{d}\n", .{ spec.label, bind, spec.port });
+    }
+    if (mysql_profile and mysql_port != 0) {
+        try out_w.writeAll("  MySQL profiling enabled (THINDB_MYSQL_PROFILE)\n");
     }
     try out_w.flush();
 
@@ -271,6 +279,16 @@ const Listener = union(WireKind) {
 
 fn runListener(l: *Listener) void {
     l.run();
+}
+
+fn envFlag(map: *std.process.Environ.Map, key: []const u8) bool {
+    const value = map.get(key) orelse return false;
+    if (value.len == 0) return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+    return true;
 }
 
 const FlusherCtx = struct {
