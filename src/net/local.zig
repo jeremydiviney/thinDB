@@ -1150,6 +1150,12 @@ pub const CompileCtx = struct {
     /// are stable across the whole statement (PG/MySQL semantics).
     now_micros: i64 = 0,
 
+    /// Projection pushdown: base-column names the (single) scan must
+    /// produce, or null to read every column. Computed once after subquery
+    /// resolution. The name strings are borrowed from the IR; only the
+    /// outer slice is owned. See `analyzeProjection`.
+    prune_names: ?[][]const u8 = null,
+
     pub fn deinit(self: *CompileCtx) void {
         var it = self.materialized.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit();
@@ -1158,6 +1164,7 @@ pub const CompileCtx = struct {
         self.session_strings.deinit(self.allocator);
         if (self.subquery_arena) |*ar| ar.deinit();
         if (self.accountant) |a| self.allocator.destroy(a);
+        if (self.prune_names) |p| self.allocator.free(p);
     }
 
     /// The query-scoped accountant, created on first use from the
@@ -1282,6 +1289,9 @@ pub fn compileWithSession(
     // concrete `.leaf` / `.lit`. After this pass operators never see
     // subquery nodes — they're a parse-time-only construct.
     try subquery_resolve.resolveSubqueriesInOp(&ctx, @constCast(root));
+    // Projection pushdown: after subqueries are resolved to constants,
+    // figure out which base columns the (single) scan must produce.
+    ctx.prune_names = analyzeProjection(allocator, root);
     const q = try compileOp(&ctx, root);
     return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
 }
@@ -1333,6 +1343,130 @@ fn groupKeysCardUnderLimit(st: exec.PipelineStats, schema: []const types.Column,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Projection pushdown (column pruning) — compile-time analysis.
+//
+// Walk the resolved IR collecting every column NAME referenced anywhere
+// (SELECT, WHERE, GROUP BY / aggregates, ORDER BY, computed exprs,
+// correlated-subquery outer refs). The result feeds the scan's projection
+// so it decodes only those columns. Conservative by construction: any plan
+// shape we don't exhaustively account for (joins, set ops, windows,
+// materialized CTEs, anti-projection, > 1 scan) sets `bail` and pruning is
+// disabled (the scan reads every column). Keeping extra columns is always
+// correct; missing one would be a bug — so when unsure, keep all.
+// ---------------------------------------------------------------------------
+
+const ProjScan = struct {
+    names: std.ArrayListUnmanaged([]const u8) = .empty,
+    scan_count: usize = 0,
+    bail: bool = false,
+    /// True once a `select` or `group_by` shapes the output. Without one,
+    /// the raw scan rows ARE the result (`SELECT *`), so every column is
+    /// needed and pruning must be disabled — distinct from `COUNT(*)`,
+    /// where a group_by is present but references no column.
+    has_shaper: bool = false,
+
+    fn add(self: *ProjScan, allocator: Allocator, name: []const u8) void {
+        self.names.append(allocator, name) catch {
+            self.bail = true;
+        };
+    }
+};
+
+fn projWalkPredicate(c: *ProjScan, allocator: Allocator, p: exec.predicate.PredicateExpr) void {
+    if (c.bail) return;
+    switch (p) {
+        .leaf => |lf| c.add(allocator, lf.col),
+        .leaf_col_col => |lc| {
+            c.add(allocator, lc.left);
+            c.add(allocator, lc.right);
+        },
+        .is_null, .is_not_null => |col| c.add(allocator, col),
+        .like => |lp| c.add(allocator, lp.col),
+        .in_set => |s| c.add(allocator, s.col),
+        .@"and", .@"or" => |children| for (children) |ch| projWalkPredicate(c, allocator, ch),
+        .not => |child| projWalkPredicate(c, allocator, child.*),
+        .always => {},
+        .correlated_set => |s| for (s.outer_cols) |nm| c.add(allocator, nm),
+        .correlated_scalar => |s| {
+            c.add(allocator, s.outer_compared);
+            for (s.outer_keys) |nm| c.add(allocator, nm);
+        },
+        .correlated_range => |s| {
+            c.add(allocator, s.outer_range_col);
+            if (s.outer_range_col_upper) |upper| c.add(allocator, upper);
+            for (s.outer_keys) |nm| c.add(allocator, nm);
+        },
+        // Unresolved subquery markers must not survive the pre-compile
+        // pass; if one does, disable pruning rather than miss a column.
+        .scalar_subquery, .exists_subquery, .in_subquery, .leaf_var => c.bail = true,
+    }
+}
+
+fn projWalkExpr(c: *ProjScan, allocator: Allocator, e: ir.Expr) void {
+    if (c.bail) return;
+    switch (e) {
+        .col_ref => |nm| c.add(allocator, nm),
+        .lit => {},
+        .call => |call| for (call.args) |a| projWalkExpr(c, allocator, a),
+        .case => |cs| {
+            for (cs.branches) |br| {
+                projWalkPredicate(c, allocator, br.cond);
+                projWalkExpr(c, allocator, br.then);
+            }
+            if (cs.else_branch) |eb| projWalkExpr(c, allocator, eb.*);
+        },
+        .scalar_subquery, .exists_subquery, .var_ref => c.bail = true,
+    }
+}
+
+fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
+    if (c.bail) return;
+    switch (op.*) {
+        .scan => c.scan_count += 1,
+        .single_row => {},
+        .limit => |l| projWalkOp(c, allocator, l.upstream),
+        .select => |p| {
+            c.has_shaper = true;
+            for (p.columns) |nm| c.add(allocator, nm);
+            projWalkOp(c, allocator, p.upstream);
+        },
+        .filter => |f| {
+            projWalkPredicate(c, allocator, f.predicate);
+            projWalkOp(c, allocator, f.upstream);
+        },
+        .order_by => |o| {
+            for (o.specs) |sp| c.add(allocator, sp.col);
+            projWalkOp(c, allocator, o.upstream);
+        },
+        .group_by => |g| {
+            c.has_shaper = true;
+            for (g.group_cols) |nm| c.add(allocator, nm);
+            for (g.aggs) |a| if (a.col) |nm| c.add(allocator, nm);
+            projWalkOp(c, allocator, g.upstream);
+        },
+        .compute => |cmp| {
+            for (cmp.derived) |d| projWalkExpr(c, allocator, d.expr);
+            projWalkOp(c, allocator, cmp.upstream);
+        },
+        // Any other shape (join, set_union, window, materialize, exclude,
+        // DML, explain, ...) disables pruning — keep every column.
+        else => c.bail = true,
+    }
+}
+
+/// Names a single-scan query references, or null to keep all columns.
+/// The strings are borrowed from the IR; caller owns the outer slice.
+fn analyzeProjection(allocator: Allocator, root: *const ir.Op) ?[][]const u8 {
+    var c = ProjScan{};
+    projWalkOp(&c, allocator, root);
+    if (c.bail or c.scan_count != 1 or !c.has_shaper) {
+        c.names.deinit(allocator);
+        return null;
+    }
+    return c.names.toOwnedSlice(allocator) catch null;
+}
+
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
@@ -1351,7 +1485,20 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             }
             const t = try resolveTable(catalog, ctx.session.*, s.table);
             const acct = try ctx.queryAccountant();
-            const base = try exec.scanWithAccountant(ctx.allocator, t, acct);
+            // Projection pushdown: keep only analyzed names that resolve to
+            // a base column of this table (derived/aliased names drop out —
+            // their base inputs were collected separately). null = read all.
+            var needed: ?[]const []const u8 = null;
+            if (ctx.prune_names) |raw| {
+                var keep: std.ArrayListUnmanaged([]const u8) = .empty;
+                errdefer keep.deinit(ctx.allocator);
+                for (raw) |nm| {
+                    if (types.findColumn(t.schema.columns, nm) != null) try keep.append(ctx.allocator, nm);
+                }
+                needed = try keep.toOwnedSlice(ctx.allocator);
+            }
+            defer if (needed) |n| ctx.allocator.free(n);
+            const base = try exec.scanWithProjection(ctx.allocator, t, acct, needed);
             if (s.alias) |alias| {
                 errdefer @constCast(&base).deinit();
                 break :blk try exec.AliasRename.create(ctx.allocator, base, alias);
