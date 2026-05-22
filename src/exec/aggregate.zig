@@ -232,6 +232,35 @@ pub const Aggregate = struct {
             .groups = .empty,
             .key_scratch = .empty,
         };
+
+        // Pre-size the group hash table from the upstream cardinality
+        // estimate so it doesn't rehash repeatedly as it fills toward its
+        // final size (a high-card GROUP BY otherwise rehashes ~log2(N) times,
+        // re-moving every live entry each time). The router only sends us
+        // here when this count fits the budget, so the up-front allocation is
+        // safe. Skipped when the estimate is unknown or trivially small.
+        if (group_col_indices.len > 0) {
+            const st = self.upstream.stats();
+            var est: u64 = 1;
+            var known = true;
+            for (group_col_indices) |ci| {
+                if (ci >= st.column_cards.len) {
+                    known = false;
+                    break;
+                }
+                switch (st.column_cards[ci]) {
+                    .exact => |nd| est *|= nd,
+                    .unknown => {
+                        known = false;
+                        break;
+                    },
+                }
+            }
+            if (known and est > 1024) {
+                const cap: u32 = @intCast(@min(est, @max(st.upper_rows, 1)));
+                self.groups.ensureTotalCapacity(self.arena.allocator(), cap) catch {};
+            }
+        }
         return makeQuery(allocator, self);
     }
 
