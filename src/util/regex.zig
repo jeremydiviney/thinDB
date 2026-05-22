@@ -428,6 +428,72 @@ const Compiler = struct {
 // Compiled regex + Pike VM
 // ---------------------------------------------------------------------------
 
+/// One epsilon-closed NFA thread: a program counter plus the capture slots
+/// recorded so far. `caps` is never mutated in place — `.save` dups first —
+/// so threads can share a buffer until they diverge.
+const Thread = struct { pc: u32, caps: []?usize };
+
+/// Reusable matcher scratch. Construct one per batch and pass it to every
+/// `findWith` / `replaceAllScratch` call: the visited-stamp array, the two
+/// thread lists, the seed buffer, and the per-match capture arena are all
+/// retained across calls, so applying one compiled pattern to millions of
+/// rows allocates essentially nothing in steady state.
+pub const Scratch = struct {
+    backing: Allocator,
+    /// Per-match capture arrays. Reset (retain_capacity) at the start of
+    /// each `find`, so capture dups cost a bump-alloc into reused memory.
+    arena: std.heap.ArenaAllocator,
+    /// `visited[pc] == gen` means pc was already closed this step. `gen`
+    /// is monotonic across every step of every find sharing this scratch,
+    /// which is why `visited` never needs re-zeroing between finds.
+    visited: []u32 = &.{},
+    gen: u32 = 0,
+    clist: std.ArrayListUnmanaged(Thread) = .empty,
+    carried: std.ArrayListUnmanaged(Thread) = .empty,
+    /// Closure of `carried` at the next position, used once per run to test
+    /// whether a class loop is stationary (safe to bulk-skip).
+    probe: std.ArrayListUnmanaged(Thread) = .empty,
+    /// All-null start ("seed") capture buffer, read-only during a find.
+    seed: []?usize = &.{},
+    /// Result slot buffer for `replaceAllScratch`'s internal `find` calls.
+    slots: []?usize = &.{},
+
+    pub fn init(backing: Allocator) Scratch {
+        return .{ .backing = backing, .arena = std.heap.ArenaAllocator.init(backing) };
+    }
+
+    pub fn deinit(self: *Scratch) void {
+        self.arena.deinit();
+        if (self.visited.len > 0) self.backing.free(self.visited);
+        if (self.seed.len > 0) self.backing.free(self.seed);
+        if (self.slots.len > 0) self.backing.free(self.slots);
+        self.clist.deinit(self.backing);
+        self.carried.deinit(self.backing);
+        self.probe.deinit(self.backing);
+    }
+
+    /// Grow `visited`/`seed` to fit this program, and guard `gen` against
+    /// wrapping (re-zero `visited` and restart `gen` if it's about to).
+    fn prepare(self: *Scratch, prog_len: usize, n_slots: u32, input_len: usize) Error!void {
+        if (self.visited.len < prog_len) {
+            self.visited = try self.backing.realloc(self.visited, prog_len);
+            @memset(self.visited, 0);
+            self.gen = 0;
+        }
+        if (self.seed.len < n_slots) {
+            self.seed = try self.backing.realloc(self.seed, n_slots);
+        }
+        @memset(self.seed[0..n_slots], null);
+        // Up to two `gen` bumps per input position (one per step, one per
+        // stationary-run probe), plus closure headroom.
+        const headroom: u64 = 2 * @as(u64, input_len) + prog_len + 2;
+        if (@as(u64, self.gen) + headroom >= std.math.maxInt(u32)) {
+            @memset(self.visited, 0);
+            self.gen = 0;
+        }
+    }
+};
+
 pub const Regex = struct {
     prog: []Inst,
     n_slots: u32, // 2 * (n_groups + 1)
@@ -437,6 +503,11 @@ pub const Regex = struct {
     /// thread only at line boundaries instead of at every position, which
     /// is the dominant per-row cost for anchored patterns over many rows.
     anchored_start: bool,
+    /// True when the program contains a `\b`/`\B` assertion. These make a
+    /// thread's epsilon-closure depend on the surrounding bytes, which
+    /// would break the stationary-run bulk-skip's position-independence
+    /// assumption — so the bulk-skip is disabled when this is set.
+    has_wordbound: bool,
 
     pub fn compile(allocator: Allocator, pattern: []const u8) Error!Regex {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -454,11 +525,17 @@ pub const Regex = struct {
         _ = try comp.emit(.match);
 
         const prog = try comp.prog.toOwnedSlice(allocator);
+        var has_wordbound = false;
+        for (prog) |inst| switch (inst) {
+            .word_boundary, .not_word_boundary => has_wordbound = true,
+            else => {},
+        };
         return .{
             .prog = prog,
             .n_slots = 2 * parser.next_group,
             .allocator = allocator,
             .anchored_start = prog.len > 1 and prog[1] == .bol,
+            .has_wordbound = has_wordbound,
         };
     }
 
@@ -472,18 +549,37 @@ pub const Regex = struct {
     /// `run_alloc` backs per-thread capture arrays; caller should pass an
     /// arena it can reset.
     pub fn find(self: *const Regex, run_alloc: Allocator, input: []const u8, start: usize, out_slots: []?usize) Error!bool {
+        var scratch = Scratch.init(run_alloc);
+        defer scratch.deinit();
+        return self.findWith(&scratch, input, start, out_slots);
+    }
+
+    /// Like `find`, but using a caller-owned `Scratch` reused across calls.
+    /// This is the form the batch kernels use: the visited array, thread
+    /// lists, seed buffer, and capture arena all persist between rows.
+    pub fn findWith(self: *const Regex, scratch: *Scratch, input: []const u8, start: usize, out_slots: []?usize) Error!bool {
+        return self.findWithImpl(true, scratch, input, start, out_slots);
+    }
+
+    /// `enable_skip` toggles the stationary-run bulk-skip fast path. The
+    /// `false` instantiation is the reference matcher used by the
+    /// differential property test to validate the `true` one; it is dead
+    /// code in any non-test build.
+    fn findWithImpl(self: *const Regex, comptime enable_skip: bool, scratch: *Scratch, input: []const u8, start: usize, out_slots: []?usize) Error!bool {
+        try scratch.prepare(self.prog.len, self.n_slots, input.len);
+        _ = scratch.arena.reset(.retain_capacity);
+
         const VM = struct {
             prog: []const Inst,
-            n_slots: u32,
             input: []const u8,
-            alloc: Allocator,
+            caps_alloc: Allocator,
+            list_alloc: Allocator,
             visited: []u32,
-            gen: u32 = 0,
+            gen: u32,
 
-            const Thread = struct { pc: u32, caps: []?usize };
-            const ThreadList = std.ArrayList(Thread);
+            const List = std.ArrayListUnmanaged(Thread);
 
-            fn addThread(vm: *@This(), list: *ThreadList, pc: u32, pos: usize, caps: []?usize) Error!void {
+            fn addThread(vm: *@This(), list: *List, pc: u32, pos: usize, caps: []?usize) Error!void {
                 if (vm.visited[pc] == vm.gen) return;
                 vm.visited[pc] = vm.gen;
                 switch (vm.prog[pc]) {
@@ -493,7 +589,7 @@ pub const Regex = struct {
                         try vm.addThread(list, s.b, pos, caps);
                     },
                     .save => |slot| {
-                        const caps2 = try vm.alloc.dupe(?usize, caps);
+                        const caps2 = try vm.caps_alloc.dupe(?usize, caps);
                         caps2[slot] = pos;
                         try vm.addThread(list, pc + 1, pos, caps2);
                     },
@@ -506,45 +602,47 @@ pub const Regex = struct {
                         const want = vm.prog[pc] == .word_boundary;
                         if (at_boundary == want) try vm.addThread(list, pc + 1, pos, caps);
                     },
-                    .class, .match => try list.append(vm.alloc, .{ .pc = pc, .caps = caps }),
+                    .class, .match => try list.append(vm.list_alloc, .{ .pc = pc, .caps = caps }),
                 }
             }
         };
 
-        const visited = try run_alloc.alloc(u32, self.prog.len);
-        @memset(visited, 0);
-        var vm = VM{ .prog = self.prog, .n_slots = self.n_slots, .input = input, .alloc = run_alloc, .visited = visited };
+        var vm = VM{
+            .prog = self.prog,
+            .input = input,
+            .caps_alloc = scratch.arena.allocator(),
+            .list_alloc = scratch.backing,
+            .visited = scratch.visited,
+            .gen = scratch.gen,
+        };
 
         // `clist` = epsilon-closed threads ready to consume a byte (only
         // `.class`/`.match` instructions). `carried` = the raw `.class`
         // targets advanced from the previous step, closed into `clist` at
         // the top of each step under a fresh dedup generation. Both lists
-        // are reused across steps; per-thread capture arrays come from the
-        // caller's arena.
-        var clist: VM.ThreadList = .empty;
-        var carried: VM.ThreadList = .empty;
+        // live in the scratch and are reused across rows; per-thread capture
+        // arrays come from the scratch arena.
+        const clist = &scratch.clist;
+        const carried = &scratch.carried;
+        clist.clearRetainingCapacity();
+        carried.clearRetainingCapacity();
         var matched: ?[]?usize = null;
 
-        // One reusable all-null capture buffer for the start ("seed") thread.
-        // `addThread` never mutates the caps it's given (`.save` dups first),
-        // so a single read-only buffer serves every step instead of a fresh
-        // alloc+memset per position.
-        const seed = try run_alloc.alloc(?usize, self.n_slots);
-        @memset(seed, null);
+        const seed = scratch.seed[0..self.n_slots];
 
         var sp = start;
         while (true) : (sp += 1) {
             vm.gen += 1;
             clist.clearRetainingCapacity();
             // Carried threads (earlier-starting) get higher priority.
-            for (carried.items) |t| try vm.addThread(&clist, t.pc, sp, t.caps);
+            for (carried.items) |t| try vm.addThread(clist, t.pc, sp, t.caps);
             // Seed an unanchored start thread at the lowest priority until a
             // match begins, so an earlier-starting match wins (leftmost). For
             // a `^`-anchored program the seed can only survive at a line
             // boundary, so skip it everywhere else — this removes the
             // per-position seed work that otherwise dominates anchored scans.
             if (matched == null and (!self.anchored_start or sp == 0 or input[sp - 1] == '\n')) {
-                try vm.addThread(&clist, 0, sp, seed);
+                try vm.addThread(clist, 0, sp, seed);
             }
             carried.clearRetainingCapacity();
 
@@ -554,7 +652,7 @@ pub const Regex = struct {
                 const t = clist.items[i];
                 switch (self.prog[t.pc]) {
                     .class => |cc| if (c) |ch| {
-                        if (cc.contains(ch)) try carried.append(run_alloc, .{ .pc = t.pc + 1, .caps = t.caps });
+                        if (cc.contains(ch)) try carried.append(vm.list_alloc, .{ .pc = t.pc + 1, .caps = t.caps });
                     },
                     .match => {
                         // Highest-priority match wins; lower-priority
@@ -566,9 +664,69 @@ pub const Regex = struct {
                 }
             }
 
+            // ---- stationary class-loop bulk-skip ---------------------------
+            // The single step just taken consumed `ch` and produced `carried`.
+            // If re-closing `carried` reproduces the exact thread list we
+            // started this step with, the loop is stationary: every following
+            // byte that survives the same way is an identical step, so the run
+            // can be collapsed into one forward scan. This is what turns the
+            // `[^/]+` host and `.*$` tail of the ClickBench host-extract from
+            // O(len) Pike steps into a near-memchr scan.
+            //
+            // Guards keeping the collapse exact:
+            //   * `enable_skip` and no pending match (a match must be reported
+            //     at its true position, not skipped over);
+            //   * `^`-anchored program, so no start thread is seeded mid-line
+            //     (seeding would change clist between steps); the scan also
+            //     stops at any '\n', the only mid-string seed point;
+            //   * no `\b`/`\B` (their closure is position-dependent);
+            //   * `ch != '\n'` so the probe position (sp+1) sees the same
+            //     anchor state as the run interior;
+            //   * the probe (clist at sp+1) equals the current clist as an
+            //     ordered list, with survivors keeping their capture pointer
+            //     (a `.save` on the loop path changes it → not stationary),
+            //     and introduces no `.match`.
+            if (enable_skip and matched == null and self.anchored_start and
+                !self.has_wordbound and clist.items.len > 0 and
+                clist.items.len <= 64 and carried.items.len > 0)
+            {
+                const ch = c.?;
+                if (ch != '\n') skip: {
+                    var sig0: u64 = 0;
+                    for (clist.items, 0..) |t, k| {
+                        if (self.prog[t.pc].class.contains(ch)) sig0 |= (@as(u64, 1) << @intCast(k));
+                    }
+
+                    vm.gen += 1;
+                    scratch.probe.clearRetainingCapacity();
+                    for (carried.items) |t| try vm.addThread(&scratch.probe, t.pc, sp + 1, t.caps);
+                    if (scratch.probe.items.len != clist.items.len) break :skip;
+                    for (scratch.probe.items, 0..) |pt, k| {
+                        const ct = clist.items[k];
+                        if (pt.pc != ct.pc) break :skip;
+                        if (self.prog[pt.pc] == .match) break :skip;
+                        const survivor = (sig0 & (@as(u64, 1) << @intCast(k))) != 0;
+                        if (survivor and pt.caps.ptr != ct.caps.ptr) break :skip;
+                    }
+
+                    var j = sp + 1;
+                    while (j < input.len) : (j += 1) {
+                        const b = input[j];
+                        if (b == '\n') break;
+                        var sig: u64 = 0;
+                        for (clist.items, 0..) |t, k| {
+                            if (self.prog[t.pc].class.contains(b)) sig |= (@as(u64, 1) << @intCast(k));
+                        }
+                        if (sig != sig0) break;
+                    }
+                    sp = j - 1; // the outer `sp += 1` resumes at j
+                }
+            }
+
             if (c == null) break;
             if (matched != null and carried.items.len == 0) break;
         }
+        scratch.gen = vm.gen;
 
         if (matched) |m| {
             @memcpy(out_slots[0..self.n_slots], m);
@@ -581,34 +739,34 @@ pub const Regex = struct {
     /// reference capture groups with `\0`..`\9` (`\0` = whole match).
     /// Caller owns the returned slice.
     pub fn replaceAll(self: *const Regex, allocator: Allocator, input: []const u8, template: []const u8) Error![]u8 {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const slots = try allocator.alloc(?usize, self.n_slots);
-        defer allocator.free(slots);
-        return self.replaceAllWith(allocator, input, template, &arena, slots);
+        var scratch = Scratch.init(allocator);
+        defer scratch.deinit();
+        return self.replaceAllScratch(allocator, input, template, &scratch);
     }
 
-    /// Like `replaceAll`, but the caller supplies the matcher scratch
-    /// (`arena` for per-match capture arrays, `slots` of length `n_slots`).
-    /// Reusing them across many rows in a batch avoids a per-row arena
-    /// alloc/free + slots alloc — the dominant fixed cost when applying one
-    /// compiled pattern to millions of values. `out_alloc` owns the result.
-    pub fn replaceAllWith(
+    /// Like `replaceAll`, but the caller supplies a reusable `Scratch`.
+    /// Reusing it across the rows of a batch avoids per-row allocation —
+    /// the dominant fixed cost when applying one compiled pattern to
+    /// millions of values. `out_alloc` owns the returned slice.
+    pub fn replaceAllScratch(
         self: *const Regex,
         out_alloc: Allocator,
         input: []const u8,
         template: []const u8,
-        arena: *std.heap.ArenaAllocator,
-        slots: []?usize,
+        scratch: *Scratch,
     ) Error![]u8 {
         const allocator = out_alloc;
+        if (scratch.slots.len < self.n_slots) {
+            scratch.slots = try scratch.backing.realloc(scratch.slots, self.n_slots);
+        }
+        const slots = scratch.slots[0..self.n_slots];
+
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
 
         var pos: usize = 0;
         while (pos <= input.len) {
-            _ = arena.reset(.retain_capacity);
-            const found = try self.find(arena.allocator(), input, pos, slots);
+            const found = try self.findWith(scratch, input, pos, slots);
             if (!found) break;
             const m_start = slots[0].?;
             const m_end = slots[1].?;
@@ -809,4 +967,72 @@ test "regex: anchors bind to whole-string boundaries" {
     try expectMatch("^abc$", "xabc", false);
     try expectMatch("^abc$", "abcx", false);
     try expectMatch("bc$", "aabc", true);
+}
+
+// The stationary-run bulk-skip in `findWithImpl(true, ...)` must produce
+// byte-for-byte the same match + capture slots as the reference matcher
+// (`findWithImpl(false, ...)`) for every input and every start position.
+// This differential test is the correctness contract for that fast path:
+// it spans loops with one and multiple survivors, capturing vs
+// non-capturing loops (where survivor capture pointers do/don't change),
+// lazy quantifiers, `\b` (which disables the skip), embedded newlines
+// (mid-string `^` seed points), and unanchored patterns.
+test "regex: stationary bulk-skip equals reference matcher (fuzz)" {
+    const patterns = [_][]const u8{
+        "^https?://(?:www\\.)?([^/]+)/.*$",
+        "^[^/]+/.*$",
+        "^[^/]+$",
+        "^.*$",
+        "^.*?b$",
+        "^a+b+$",
+        "^[ab]+c$",
+        "^[^c]+c$",
+        "^[a-y]*z$",
+        "^(a)+$",
+        "^(?:ab)+$",
+        "^x[^/]+y$",
+        "^\\w+$",
+        "^\\d+\\.\\d+$",
+        "^a*a*b$",
+        "^[^x]*x[^y]*y$",
+        "\\bcat\\b",
+        "^\\bword\\b$",
+        "[^/]+",
+        "abc",
+        "^(cat|dog)+$",
+    };
+    const alphabet = "abc/xyz12. \nwd_";
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE_1234);
+    const rnd = prng.random();
+    var buf: [40]u8 = undefined;
+
+    for (patterns) |pat| {
+        var re = try Regex.compile(std.testing.allocator, pat);
+        defer re.deinit();
+        var s_fast = Scratch.init(std.testing.allocator);
+        defer s_fast.deinit();
+        var s_slow = Scratch.init(std.testing.allocator);
+        defer s_slow.deinit();
+        const slots_fast = try std.testing.allocator.alloc(?usize, re.n_slots);
+        defer std.testing.allocator.free(slots_fast);
+        const slots_slow = try std.testing.allocator.alloc(?usize, re.n_slots);
+        defer std.testing.allocator.free(slots_slow);
+
+        var iter: usize = 0;
+        while (iter < 600) : (iter += 1) {
+            const len = rnd.intRangeAtMost(usize, 0, buf.len);
+            for (buf[0..len]) |*b| b.* = alphabet[rnd.intRangeLessThan(usize, 0, alphabet.len)];
+            const input = buf[0..len];
+
+            var start: usize = 0;
+            while (start <= len) : (start += 1) {
+                @memset(slots_fast, null);
+                @memset(slots_slow, null);
+                const mf = try re.findWithImpl(true, &s_fast, input, start, slots_fast);
+                const ms = try re.findWithImpl(false, &s_slow, input, start, slots_slow);
+                try std.testing.expectEqual(ms, mf);
+                if (ms) try std.testing.expectEqualSlices(?usize, slots_slow, slots_fast);
+            }
+        }
+    }
 }
