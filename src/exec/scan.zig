@@ -63,9 +63,14 @@ fn computeColumnCards(
             continue;
         }
         // Memtable rows are un-sketched; each could be a new distinct value,
-        // so add the row count as a conservative upper bump.
+        // so add the row count as a conservative upper bump. Report the full
+        // merged HLL estimate (accurate to ~1% well into the billions on a
+        // fixed-size sketch) rather than clamping high cardinalities to
+        // `.unknown` — the GROUP BY router weighs this estimate against the
+        // memory budget to choose hash vs sort. Only fall back to `.unknown`
+        // if the estimate can't fit the u32 bound.
         const est = merged.estimate() +| memtable_rows;
-        card.* = if (est >= sformat.cardinality_limit)
+        card.* = if (est > std.math.maxInt(u32))
             .unknown
         else
             .{ .exact = @intCast(est) };

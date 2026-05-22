@@ -131,13 +131,6 @@ pub const RowGroupMeta = struct {
     stats: []const Stats,
 };
 
-/// Hash-vs-sort GROUP BY cutoff: a group key whose estimated distinct
-/// count (or product, for compound keys) is below this fits the hash
-/// table, so we hash; otherwise we sort. Conservative on purpose. Not a
-/// memory cliff — 8000 groups fit trivially in the budget — so the HLL
-/// estimate's error near this value is harmless.
-pub const cardinality_limit: u32 = 8000;
-
 pub const SegmentInfo = struct {
     segment_id: u64,
     row_count: u64,

@@ -1026,7 +1026,7 @@ pub fn buildServerQuerySession(
                 if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
                     break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
                 }
-                if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols)) {
+                if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols, g.aggs.len, db.config.query_memory_budget)) {
                     const specs = try allocator.alloc(exec.SortSpec, g.group_cols.len);
                     defer allocator.free(specs);
                     for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
@@ -1325,18 +1325,47 @@ fn groupKeysSortedPrefix(state: exec.SortState, group_cols: []const []const u8) 
 /// Any unknown key (no on-disk stat, or post-join/derived) ⇒ false ⇒ the
 /// caller falls back to a bounded sort. `schema` is the group-by input's
 /// output schema (column_cards is indexed by it).
-fn groupKeysCardUnderLimit(st: exec.PipelineStats, schema: []const types.Column, group_cols: []const []const u8) bool {
-    const limit = @import("../storage/format.zig").cardinality_limit;
+/// Does a hash GROUP BY on these keys fit the memory budget? The hash path
+/// is O(n) (one pass) vs the sort path's O(n log n) string comparisons, so
+/// it's preferred whenever the group hash table fits. The only thing the
+/// sort fallback protects is memory, so the breakpoint is budget-derived
+/// rather than a fixed count: hash is chosen when the estimated table
+/// (NDV(keys) × per-group footprint) stays under half the query budget.
+/// Unknown cardinality always falls back to sort (memory-safe).
+fn groupKeysCardUnderLimit(
+    st: exec.PipelineStats,
+    schema: []const types.Column,
+    group_cols: []const []const u8,
+    n_aggs: usize,
+    budget: usize,
+) bool {
     if (st.column_cards.len == 0) return false;
-    var product: u64 = 1;
+
+    // Per-group footprint: dup'd key bytes + one accumulator per aggregate
+    // + StringHashMap entry/load-factor overhead. Deliberately generous so
+    // an HLL under-estimate doesn't push the real table over budget.
+    var per_group: u64 = 96; // map entry + value slice + load-factor slack
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc) orelse return false;
         if (idx >= st.column_cards.len) return false;
+        per_group += exec.memory.estimateColumnBytes(schema[idx].type);
+    }
+    per_group += @as(u64, n_aggs) * 48; // accumulator state per aggregate
+
+    // Use up to half the budget for the group table; the rest covers input
+    // batches, the output, and any sibling operators. budget==0 means
+    // tracking is disabled — fall back to a fixed 1 GiB allowance.
+    const allowed: u64 = if (budget == 0) (1 << 30) else @as(u64, budget) / 2;
+    const max_groups = allowed / per_group;
+
+    var product: u64 = 1;
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc).?;
         switch (st.column_cards[idx]) {
             .unknown => return false,
             .exact => |nd| {
                 product *|= nd;
-                if (product >= limit) return false;
+                if (product >= max_groups) return false;
             },
         }
     }
@@ -1590,7 +1619,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
                     break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
                 }
-                if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols)) {
+                if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols, g.aggs.len, ctx.db.config.query_memory_budget)) {
                     // Unknown or over the limit → sort the group keys, then
                     // stream. Bounded memory regardless of cardinality.
                     const specs = try ctx.allocator.alloc(exec.SortSpec, g.group_cols.len);
