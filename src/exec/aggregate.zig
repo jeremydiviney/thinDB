@@ -144,6 +144,11 @@ pub const Aggregate = struct {
     /// Allocated once, grown to max-key-size, cleared+reused per row.
     /// Saves ~1 arena alloc per row in the inner loop.
     key_scratch: std.ArrayList(u8),
+    /// True when grouping by exactly one string-typed column. The group key
+    /// is then the row's raw string bytes (already decoded in the batch), so
+    /// the per-row key build skips the scratch copy + length prefix and the
+    /// stored key needs no decoding on output.
+    single_str_key: bool = false,
 
     emitted: bool = false,
     /// Bytes charged against the query budget for the group hash table /
@@ -231,6 +236,10 @@ pub const Aggregate = struct {
             .single_state = single_state,
             .groups = .empty,
             .key_scratch = .empty,
+            .single_str_key = group_col_indices.len == 1 and switch (up_schema[group_col_indices[0]].type) {
+                .string, .varchar, .char => true,
+                else => false,
+            },
         };
 
         // Pre-size the group hash table from the upstream cardinality
@@ -360,6 +369,15 @@ pub const Aggregate = struct {
         }
 
         const aa = self.arena.allocator();
+        // Single string key: the key is the row's raw string bytes, already
+        // sitting decoded in the batch — no scratch copy / length prefix.
+        const str_view: ?storage.StringView = if (self.single_str_key)
+            switch (batch.values[self.group_col_indices[0]].data) {
+                .string, .varchar, .char => |sv| sv,
+                else => unreachable,
+            }
+        else
+            null;
         var row: u32 = 0;
         while (row < n) : (row += 1) {
             // Build the key into a reusable scratch buffer instead of
@@ -367,23 +385,27 @@ pub const Aggregate = struct {
             // groups — the scratch bytes only need to outlive the lookup
             // itself, so we can wipe and reuse them next iteration. New
             // groups get an arena-owned copy.
-            self.key_scratch.clearRetainingCapacity();
-            try buildCompoundGroupKey(self.allocator, &self.key_scratch, batch, self.group_col_indices, row);
+            const key: []const u8 = if (str_view) |sv| sv.rowBytes(row) else blk: {
+                self.key_scratch.clearRetainingCapacity();
+                try buildCompoundGroupKey(self.allocator, &self.key_scratch, batch, self.group_col_indices, row);
+                break :blk self.key_scratch.items;
+            };
 
-            const gop = try self.groups.getOrPut(aa, self.key_scratch.items);
+            const gop = try self.groups.getOrPut(aa, key);
             if (!gop.found_existing) {
                 // New group — reserve its memory against the query
                 // budget. Approximate: key bytes + per-agg state +
                 // ~32 bytes hashmap overhead.
-                const approx = self.key_scratch.items.len + self.aggs.len * @sizeOf(AccState) + 32;
+                const approx = key.len + self.aggs.len * @sizeOf(AccState) + 32;
                 if (self.upstream.accountant()) |acct| {
                     try acct.reserve(.hash_aggregate, approx);
                 }
                 self.reserved_bytes += approx;
-                // The hashmap kept a reference to our scratch slice — but
-                // we're about to reuse that buffer. Replace key_ptr with
-                // an arena-owned dup so it survives.
-                gop.key_ptr.* = try aa.dupe(u8, self.key_scratch.items);
+                // The hashmap borrowed `key`, which points into either the
+                // reused scratch buffer or the batch's column bytes — both
+                // outlive only this iteration. Replace key_ptr with an
+                // arena-owned dup so it survives.
+                gop.key_ptr.* = try aa.dupe(u8, key);
 
                 const state = try aa.alloc(AccState, self.aggs.len);
                 const up_schema = self.upstream.outputSchema();
@@ -412,7 +434,15 @@ pub const Aggregate = struct {
             const key_bytes = entry.key_ptr.*;
             const state = entry.value_ptr.*;
 
-            try appendGroupKey(self.allocator, key_bytes, self.group_col_indices, self.upstream.outputSchema(), self.output_columns[0..self.group_col_indices.len]);
+            if (self.single_str_key) {
+                // Raw string bytes — no compound framing to decode.
+                switch (self.output_columns[0].data) {
+                    .string, .varchar, .char => |*ss| try ss.appendValue(self.allocator, key_bytes),
+                    else => unreachable,
+                }
+            } else {
+                try appendGroupKey(self.allocator, key_bytes, self.group_col_indices, self.upstream.outputSchema(), self.output_columns[0..self.group_col_indices.len]);
+            }
 
             for (self.aggs, 0..) |a, ai| {
                 const out_idx = self.group_col_indices.len + ai;
