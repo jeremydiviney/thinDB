@@ -179,10 +179,14 @@ fn valueTagMatchesType(v: Value, t: Type) bool {
     };
 }
 
-/// Shadow-rewrite the table. Holds `ddl_lock` exclusive AND `table.mutex`
+/// Shadow-rewrite the table. Holds `compact_lock` (so it waits out an
+/// in-flight compaction, which rewrites the same segment files under no
+/// ddl_lock during its merge), then `ddl_lock` exclusive AND `table.mutex`
 /// for the duration — blocks readers (waiting on in-flight scans),
 /// writers (via the existing mutex), and any other DDL.
 pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
+    t.compact_lock.lockUncancelable(t.io);
+    defer t.compact_lock.unlock(t.io);
     t.ddl_lock.lockUncancelable(t.io);
     defer t.ddl_lock.unlock(t.io);
     t.mutex.lockUncancelable(t.io);

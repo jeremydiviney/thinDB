@@ -1399,6 +1399,57 @@ test "execTieredCompact: no-op when no tier has enough segments" {
     try std.testing.expectEqual(@as(usize, 3), t.segmentCount());
 }
 
+test "compactor: count-based tier trigger merges incrementally and preserves rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        .compact_min_segments = 4,
+        // Disable the tombstone trigger; exercise the count-based path only.
+        .compact_tombstone_threshold = 2.0,
+        .auto_flush_secs = 0,
+        .auto_flush_rows = 1_000_000,
+        .auto_flush_bytes = 64 * 1024 * 1024,
+    });
+    defer db.close();
+
+    const t = try db.table("orders", schema_v1, opts_v1);
+
+    // 10 single-row segments, all tier 0.
+    var i: i64 = 1;
+    while (i <= 10) : (i += 1) {
+        try t.insert(&.{.{ .id = i, .qty = @as(i32, @intCast(i * 10)), .active = true, .tag = "x" }});
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 10), t.segmentCount());
+
+    // One sweep merges exactly one tier group (tier_target_count = 4):
+    // 10 - 4 + 1 = 7. Proves it's incremental, not "compact everything".
+    try db.backgroundCompactSweep();
+    try std.testing.expectEqual(@as(usize, 7), t.segmentCount());
+
+    // Keep sweeping until it converges (each pass merges at most one group).
+    var guard: usize = 0;
+    while (t.segmentCount() > 1 and guard < 20) : (guard += 1) {
+        const before = t.segmentCount();
+        try db.backgroundCompactSweep();
+        if (t.segmentCount() == before) break;
+    }
+
+    // Every row survives the merges, whatever order they happened in.
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+    std.mem.sort(i64, ids.items, {}, std.sort.asc(i64));
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, ids.items);
+}
+
 // ---------------------------------------------------------------------------
 // Upserts
 // ---------------------------------------------------------------------------

@@ -473,16 +473,17 @@ pub const Table = struct {
         try self.maybeAutoFlushLocked();
     }
 
-    /// Background-compactor entry point. Tries to acquire the mutex
-    /// non-blockingly; on success, runs one compaction step. Considers
-    /// both the tombstone-pressure trigger and (when at least
-    /// `min_segments` are live) the count-based tier trigger. No-op on
-    /// lock contention, no qualifying segment, or both gates disabled.
+    /// Background-compactor entry point. Caller (the background compact
+    /// sweep) already holds `compact_lock`. Runs one compaction step,
+    /// considering both the tombstone-pressure trigger and (when at least
+    /// `min_segments` are live) the count-based tier trigger. No-op when
+    /// no segment qualifies or both gates are disabled.
     pub fn tryBackgroundCompact(self: *Table, min_segments: u32, tomb_threshold: f32) !void {
-        if (!self.mutex.tryLock()) return;
-        defer self.mutex.unlock(self.io);
         // Cheap optimization: skip the work if neither trigger can fire.
-        const enough_for_tier = (min_segments != 0 and self.manifest.segments.items.len >= min_segments);
+        self.mutex.lockUncancelable(self.io);
+        const seg_count = self.manifest.segments.items.len;
+        self.mutex.unlock(self.io);
+        const enough_for_tier = (min_segments != 0 and seg_count >= min_segments);
         const tomb_enabled = (tomb_threshold <= 1.0);
         if (!enough_for_tier and !tomb_enabled) return;
         try @import("compact.zig").execTieredCompact(self, tomb_threshold);
@@ -676,9 +677,8 @@ pub const Table = struct {
     /// Merge all segments into a single new segment. Drops tombstoned rows.
     /// No-op if there's at most one segment.
     pub fn compact(self: *Table) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.manifest.segments.items.len <= 1) return;
+        self.compact_lock.lockUncancelable(self.io);
+        defer self.compact_lock.unlock(self.io);
         try @import("compact.zig").execCompact(self);
     }
 

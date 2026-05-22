@@ -105,6 +105,22 @@ pub const Schema = struct {
         return t;
     }
 
+    /// Re-resolve `name` under `tables_mutex` AND grab its `compact_lock`
+    /// (non-blocking) atomically. Returns `null` if the table was dropped
+    /// since the snapshot or a compaction/DDL already holds the lock.
+    /// `compact_lock` (not `ddl_lock` shared) is the compaction-liveness
+    /// guard: held for the whole compaction, it lets the commit phase take
+    /// `ddl_lock` exclusive without self-deadlocking, while still blocking
+    /// a concurrent drop/alter/rename from running mid-merge. Caller MUST
+    /// `t.compact_lock.unlock` when done.
+    fn acquireTableForCompact(self: *Schema, name: []const u8) ?*Table {
+        self.tables_mutex.lockUncancelable(self.io);
+        defer self.tables_mutex.unlock(self.io);
+        const t = self.tables.get(name) orelse return null;
+        if (!t.compact_lock.tryLock()) return null;
+        return t;
+    }
+
     pub fn runBackgroundFlusher(
         self: *Schema,
         sleeper_io: Io,
@@ -130,8 +146,8 @@ pub const Schema = struct {
         const min_segs = self.config.compact_min_segments;
         const tomb_thresh = self.config.compact_tombstone_threshold;
         for (names) |name| {
-            if (self.acquireTableShared(name)) |t| {
-                defer t.ddl_lock.unlockShared(t.io);
+            if (self.acquireTableForCompact(name)) |t| {
+                defer t.compact_lock.unlock(t.io);
                 t.tryBackgroundCompact(min_segs, tomb_thresh) catch {};
             }
         }
@@ -242,6 +258,9 @@ pub const Schema = struct {
 
         if (maybe_existing) |entry| {
             const t = entry.value;
+            // compact_lock before ddl_lock (global order) so we wait out an
+            // in-flight compaction that holds no ddl_lock during its merge.
+            t.compact_lock.lockUncancelable(t.io);
             t.ddl_lock.lockUncancelable(t.io);
             t.close();
         } else {
@@ -286,6 +305,8 @@ pub const Schema = struct {
 
         const t = self.tables.get(old_name) orelse return Error.TableNotFound;
 
+        t.compact_lock.lockUncancelable(t.io);
+        defer t.compact_lock.unlock(t.io);
         t.ddl_lock.lockUncancelable(t.io);
         defer t.ddl_lock.unlock(t.io);
         t.mutex.lockUncancelable(t.io);
