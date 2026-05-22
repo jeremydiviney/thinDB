@@ -104,10 +104,14 @@ pub fn build(b: *std.Build) void {
         .name = "thindb_bench",
         .root_module = bench_mod,
     });
-    b.installArtifact(bench_exe);
 
+    // The bench is in-process (it imports thindb_fast directly and spins up
+    // any server it needs on a thread). It must NOT depend on the global
+    // install step: doing so rebuilds + reinstalls `thindb-server` in the
+    // default (Debug) optimize mode, silently clobbering a ReleaseFast
+    // server binary in zig-out/bin — which then makes every subsequent
+    // wire benchmark ~6x slower. `addRunArtifact` already builds bench_exe.
     const run_bench = b.addRunArtifact(bench_exe);
-    run_bench.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Run benchmarks (always built ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
@@ -124,10 +128,10 @@ pub fn build(b: *std.Build) void {
         .name = "thindb_clickbench",
         .root_module = clickbench_mod,
     });
-    b.installArtifact(clickbench_exe);
 
+    // Same reasoning as `bench` above: don't pull in the global install step,
+    // which would reinstall a Debug `thindb-server` over a ReleaseFast one.
     const run_clickbench = b.addRunArtifact(clickbench_exe);
-    run_clickbench.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_clickbench.addArgs(args);
     const clickbench_step = b.step("clickbench", "Load ClickBench TSV into a fresh DB (always built ReleaseFast). First arg = TSV path, second arg = max rows.");
     clickbench_step.dependOn(&run_clickbench.step);
