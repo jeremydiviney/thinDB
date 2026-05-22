@@ -292,7 +292,12 @@ pub const Lexer = struct {
             '"' => return try self.lexDoubleQuoted(),
             '`' => return try self.lexBacktickIdent(),
             '0'...'9' => return try self.lexNumber(),
-            'a'...'z', 'A'...'Z', '_' => return try self.lexIdent(),
+            'a'...'z', 'A'...'Z', '_' => {
+                // PG escape-string prefix `E'...'` / `e'...'`.
+                if ((ch == 'E' or ch == 'e') and self.peekChar(1) == '\'' and self.dialect != .mysql)
+                    return try self.lexEscapeString();
+                return try self.lexIdent();
+            },
             else => return LexError.LexUnexpectedChar,
         }
     }
@@ -315,6 +320,11 @@ pub const Lexer = struct {
                 while (self.pos < self.src.len and self.src[self.pos] != '\n') : (self.pos += 1) {}
                 continue;
             }
+            // # line comment (MySQL only)
+            if (ch == '#' and self.dialect == .mysql) {
+                while (self.pos < self.src.len and self.src[self.pos] != '\n') : (self.pos += 1) {}
+                continue;
+            }
             // /* block comment */
             if (ch == '/' and self.peekChar(1) == '*') {
                 self.pos += 2;
@@ -331,37 +341,83 @@ pub const Lexer = struct {
     }
 
     fn lexString(self: *Lexer) LexError!Token {
+        // MySQL processes C-style backslash escapes in ordinary string
+        // literals; PG/neutral treat backslash literally (standard SQL,
+        // standard_conforming_strings on). `''` always escapes a quote.
         const start = self.pos;
+        const content = try self.scanStringContent(self.dialect == .mysql);
+        return Token{ .tag = .string, .text = self.src[start..self.pos], .value = .{ .string = content } };
+    }
+
+    /// PG escape-string `E'...'` — backslash escapes are always processed
+    /// regardless of dialect. Cursor is on the `E`/`e`.
+    fn lexEscapeString(self: *Lexer) LexError!Token {
+        const start = self.pos;
+        self.pos += 1; // skip the E prefix
+        const content = try self.scanStringContent(true);
+        return Token{ .tag = .string, .text = self.src[start..self.pos], .value = .{ .string = content } };
+    }
+
+    /// Cursor is on the opening `'`. Consume through the closing `'` and
+    /// return the (un-escaped) content. `''` is always a literal quote;
+    /// when `process_backslash` is set, `\x` C-style escapes are honored.
+    fn scanStringContent(self: *Lexer, process_backslash: bool) LexError![]const u8 {
         self.pos += 1; // opening quote
-        var contains_escape = false;
-        while (self.pos < self.src.len) : (self.pos += 1) {
-            if (self.src[self.pos] == '\'') {
+        const body_start = self.pos;
+        var needs_build = false;
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (c == '\\' and process_backslash) {
+                needs_build = true;
+                self.pos += if (self.pos + 1 < self.src.len) 2 else 1;
+                continue;
+            }
+            if (c == '\'') {
                 if (self.peekChar(1) == '\'') {
-                    // SQL '' escape — record + skip both quotes.
-                    contains_escape = true;
-                    self.pos += 1; // skip first quote; loop's += 1 skips the second
+                    needs_build = true;
+                    self.pos += 2;
                     continue;
                 }
-                // Closing quote.
-                self.pos += 1;
-                const raw = self.src[start + 1 .. self.pos - 1];
-                const text = self.src[start..self.pos];
-                if (!contains_escape) {
-                    return Token{ .tag = .string, .text = text, .value = .{ .string = raw } };
-                }
-                // Un-escape '' → '. Allocate fresh in arena.
-                var buf = try self.arena.alloc(u8, raw.len);
-                var out_len: usize = 0;
-                var i: usize = 0;
-                while (i < raw.len) : (i += 1) {
-                    buf[out_len] = raw[i];
-                    out_len += 1;
-                    if (raw[i] == '\'' and i + 1 < raw.len and raw[i + 1] == '\'') i += 1;
-                }
-                return Token{ .tag = .string, .text = text, .value = .{ .string = buf[0..out_len] } };
+                const raw = self.src[body_start..self.pos];
+                self.pos += 1; // closing quote
+                if (!needs_build) return raw;
+                return try self.buildUnescaped(raw, process_backslash);
             }
+            self.pos += 1;
         }
         return LexError.LexUnterminatedString;
+    }
+
+    fn buildUnescaped(self: *Lexer, raw: []const u8, process_backslash: bool) LexError![]const u8 {
+        const buf = try self.arena.alloc(u8, raw.len);
+        var out: usize = 0;
+        var i: usize = 0;
+        while (i < raw.len) : (i += 1) {
+            const c = raw[i];
+            if (c == '\'' and i + 1 < raw.len and raw[i + 1] == '\'') {
+                buf[out] = '\'';
+                out += 1;
+                i += 1;
+                continue;
+            }
+            if (c == '\\' and process_backslash and i + 1 < raw.len) {
+                i += 1;
+                buf[out] = switch (raw[i]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => 0,
+                    'b' => 8,
+                    'Z' => 26,
+                    else => raw[i], // \\, \', \", \<other> → the literal char
+                };
+                out += 1;
+                continue;
+            }
+            buf[out] = c;
+            out += 1;
+        }
+        return buf[0..out];
     }
 
     fn lexNumber(self: *Lexer) LexError!Token {
@@ -656,6 +712,55 @@ test "lexer: backtick identifier rejected on PG, accepted on MySQL/neutral" {
         const id = try lx.next();
         try std.testing.expectEqual(@as(TokenTag, .identifier), id.tag);
         try std.testing.expectEqualStrings("x", id.text);
+    }
+}
+
+test "lexer: MySQL processes backslash escapes, PG/neutral treat backslash literally" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    {
+        var lx = Lexer.init(aa, "'a\\tb'"); // SQL: 'a\tb'
+        lx.dialect = .mysql;
+        const s = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .string), s.tag);
+        try std.testing.expectEqualStrings("a\tb", s.value.string);
+    }
+    {
+        var lx = Lexer.init(aa, "'a\\tb'"); // neutral: backslash is literal
+        const s = try lx.next();
+        try std.testing.expectEqualStrings("a\\tb", s.value.string);
+    }
+    {
+        // '' escapes a quote in every dialect.
+        var lx = Lexer.init(aa, "'it''s'");
+        const s = try lx.next();
+        try std.testing.expectEqualStrings("it's", s.value.string);
+    }
+}
+
+test "lexer: PG E'...' escape strings process backslashes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "E'a\\nb'"); // neutral
+    const s = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .string), s.tag);
+    try std.testing.expectEqualStrings("a\nb", s.value.string);
+}
+
+test "lexer: # is a line comment on MySQL only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    {
+        var lx = Lexer.init(aa, "1 # cmt\n+ 2");
+        lx.dialect = .mysql;
+        try std.testing.expectEqual(@as(TokenTag, .integer), (try lx.next()).tag);
+        try std.testing.expectEqual(@as(TokenTag, .plus), (try lx.next()).tag);
+    }
+    {
+        var lx = Lexer.init(aa, "#x"); // neutral: # is not a comment
+        try std.testing.expectError(LexError.LexUnexpectedChar, lx.next());
     }
 }
 

@@ -357,6 +357,34 @@ test "sql: FETCH FIRST / OFFSET ROWS (ANSI/PG row limiting)" {
     }
 }
 
+test "sql: string escapes — PG E'...' and MySQL backslash" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // PG/neutral E'...' processes the \t escape into a tab.
+    {
+        var q = try runSql(allocator, db, "SELECT E'a\\tb' AS s FROM t LIMIT 1");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqualStrings("a\tb", b.values[0].data.string.rowBytes(0));
+    }
+    // MySQL: backslash escapes in ordinary '...'.
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const root = try thindb.sql.parseDialect(arena.allocator(), "SELECT 'a\\tb' AS s FROM t LIMIT 1", .mysql);
+        var cq = try thindb.net.compileWithSession(allocator, db, .{ .dialect = .mysql }, root);
+        defer cq.deinit();
+        const b = (try cq.next()).?;
+        try std.testing.expectEqualStrings("a\tb", b.values[0].data.string.rowBytes(0));
+    }
+}
+
 test "sql: || is string concat on neutral/PG, logical OR on MySQL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
