@@ -332,6 +332,58 @@ fn isWordByte(b: u8) bool {
     return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_';
 }
 
+/// Bytes a match can begin with, for the unanchored first-byte prefilter.
+/// Returns an owned slice of those bytes when the set is small and useful
+/// (1..=8 distinct bytes, no empty match, no leading assertion); otherwise
+/// an empty slice (prefilter disabled). Conservatively over-approximates:
+/// any byte returned is a *possible* start, never a missed one.
+fn computePrefilter(allocator: Allocator, prog: []const Inst) Error![]u8 {
+    const visited = try allocator.alloc(bool, prog.len);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
+    var stack: std.ArrayListUnmanaged(u32) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, 0);
+
+    var set: CharClass = .{};
+    var ok = true;
+    while (stack.pop()) |pc| {
+        if (visited[pc]) continue;
+        visited[pc] = true;
+        switch (prog[pc]) {
+            .jmp => |t| try stack.append(allocator, t),
+            .split => |s| {
+                try stack.append(allocator, s.a);
+                try stack.append(allocator, s.b);
+            },
+            .save => try stack.append(allocator, pc + 1),
+            .class => |cc| {
+                var b: usize = 0;
+                while (b < 256) : (b += 1) if (cc.contains(@intCast(b))) set.add(@intCast(b));
+            },
+            // A reachable match means the empty string matches (start byte is
+            // unconstrained); a reachable assertion makes the start
+            // position-dependent. Either way, don't prefilter.
+            .match, .bol, .eol, .word_boundary, .not_word_boundary => ok = false,
+        }
+    }
+    if (!ok) return allocator.alloc(u8, 0);
+
+    var count: usize = 0;
+    for (set.bits) |m| count += @popCount(m);
+    if (count == 0 or count > 8) return allocator.alloc(u8, 0);
+
+    const bytes = try allocator.alloc(u8, count);
+    var n: usize = 0;
+    var b: usize = 0;
+    while (b < 256) : (b += 1) if (set.contains(@intCast(b))) {
+        bytes[n] = @intCast(b);
+        n += 1;
+    };
+    return bytes;
+}
+
 // ---------------------------------------------------------------------------
 // Compiler: AST → flat instruction program
 // ---------------------------------------------------------------------------
@@ -519,6 +571,13 @@ pub const Regex = struct {
     /// surviving thread is one — which avoids paying the stationarity probe
     /// on every char of a non-repeating prefix like `https?://`.
     loopy: []const bool,
+    /// For an *unanchored* pattern whose match can only begin with one of a
+    /// small set of bytes (a literal/class prefix, e.g. `google`, `utm`),
+    /// these are those bytes. `find` then memchr-skips straight to the next
+    /// candidate start instead of seeding + stepping the NFA at every dead
+    /// position. Empty when no useful prefix exists (anchored, can match
+    /// empty, leading assertion, or too many distinct first bytes).
+    prefilter_bytes: []const u8,
 
     pub fn compile(allocator: Allocator, pattern: []const u8) Error!Regex {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -566,19 +625,28 @@ pub const Regex = struct {
             }
         }
 
+        const anchored_start = prog.len > 1 and prog[1] == .bol;
+        const prefilter_bytes = if (anchored_start)
+            try allocator.alloc(u8, 0)
+        else
+            try computePrefilter(allocator, prog);
+        errdefer allocator.free(prefilter_bytes);
+
         return .{
             .prog = prog,
             .n_slots = 2 * parser.next_group,
             .allocator = allocator,
-            .anchored_start = prog.len > 1 and prog[1] == .bol,
+            .anchored_start = anchored_start,
             .has_wordbound = has_wordbound,
             .loopy = loopy,
+            .prefilter_bytes = prefilter_bytes,
         };
     }
 
     pub fn deinit(self: *Regex) void {
         self.allocator.free(self.prog);
         self.allocator.free(self.loopy);
+        self.allocator.free(self.prefilter_bytes);
     }
 
     /// Leftmost match at or after `start`. Returns capture slots (slot
@@ -670,6 +738,16 @@ pub const Regex = struct {
 
         var sp = start;
         while (true) : (sp += 1) {
+            // Unanchored first-byte prefilter: with no match yet and no
+            // in-progress thread carried from the previous step, a match can
+            // only begin at a byte in `prefilter_bytes`, so memchr straight to
+            // the next candidate instead of seeding + stepping dead positions.
+            if (enable_skip and matched == null and carried.items.len == 0 and
+                self.prefilter_bytes.len > 0 and sp < input.len)
+            {
+                sp = self.nextCandidate(input, sp);
+            }
+
             vm.gen += 1;
             clist.clearRetainingCapacity();
             // Carried threads (earlier-starting) get higher priority.
@@ -817,6 +895,19 @@ pub const Regex = struct {
         }
         var best = input.len;
         for (breakers[0..nb]) |x| {
+            if (std.mem.indexOfScalarPos(u8, input, from, x)) |idx| {
+                if (idx < best) best = idx;
+            }
+        }
+        return best;
+    }
+
+    /// First index `>= from` whose byte is a possible match start (in
+    /// `prefilter_bytes`), or `input.len`. Each candidate byte is located
+    /// with a vectorized `indexOfScalar` and the earliest wins.
+    fn nextCandidate(self: *const Regex, input: []const u8, from: usize) usize {
+        var best = input.len;
+        for (self.prefilter_bytes) |x| {
             if (std.mem.indexOfScalarPos(u8, input, from, x)) |idx| {
                 if (idx < best) best = idx;
             }
@@ -1090,8 +1181,17 @@ test "regex: stationary bulk-skip equals reference matcher (fuzz)" {
         "[^/]+",
         "abc",
         "^(cat|dog)+$",
+        // Unanchored — exercise the first-byte prefilter.
+        "google",
+        "utm[a-z]*",
+        "a*b",
+        "(cat|dog)",
+        "[0-9]+",
+        "x[ab]+y",
+        "ab+c",
+        ".*",
     };
-    const alphabet = "abc/xyz12. \nwd_";
+    const alphabet = "abc/xyz12. \nwd_goletum";
     var prng = std.Random.DefaultPrng.init(0xC0FFEE_1234);
     const rnd = prng.random();
     var buf: [40]u8 = undefined;
