@@ -432,6 +432,11 @@ pub const Regex = struct {
     prog: []Inst,
     n_slots: u32, // 2 * (n_groups + 1)
     allocator: Allocator,
+    /// True when the program is `^`-anchored at the start (prog[1] is a
+    /// `.bol` — no top-level alternation). Lets `find` seed the start
+    /// thread only at line boundaries instead of at every position, which
+    /// is the dominant per-row cost for anchored patterns over many rows.
+    anchored_start: bool,
 
     pub fn compile(allocator: Allocator, pattern: []const u8) Error!Regex {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -448,10 +453,12 @@ pub const Regex = struct {
         _ = try comp.emit(.{ .save = 1 });
         _ = try comp.emit(.match);
 
+        const prog = try comp.prog.toOwnedSlice(allocator);
         return .{
-            .prog = try comp.prog.toOwnedSlice(allocator),
+            .prog = prog,
             .n_slots = 2 * parser.next_group,
             .allocator = allocator,
+            .anchored_start = prog.len > 1 and prog[1] == .bol,
         };
     }
 
@@ -518,17 +525,25 @@ pub const Regex = struct {
         var carried: VM.ThreadList = .empty;
         var matched: ?[]?usize = null;
 
+        // One reusable all-null capture buffer for the start ("seed") thread.
+        // `addThread` never mutates the caps it's given (`.save` dups first),
+        // so a single read-only buffer serves every step instead of a fresh
+        // alloc+memset per position.
+        const seed = try run_alloc.alloc(?usize, self.n_slots);
+        @memset(seed, null);
+
         var sp = start;
         while (true) : (sp += 1) {
             vm.gen += 1;
             clist.clearRetainingCapacity();
             // Carried threads (earlier-starting) get higher priority.
             for (carried.items) |t| try vm.addThread(&clist, t.pc, sp, t.caps);
-            // Seed an unanchored start thread at the lowest priority until
-            // a match begins, so an earlier-starting match wins (leftmost).
-            if (matched == null) {
-                const seed = try run_alloc.alloc(?usize, self.n_slots);
-                @memset(seed, null);
+            // Seed an unanchored start thread at the lowest priority until a
+            // match begins, so an earlier-starting match wins (leftmost). For
+            // a `^`-anchored program the seed can only survive at a line
+            // boundary, so skip it everywhere else — this removes the
+            // per-position seed work that otherwise dominates anchored scans.
+            if (matched == null and (!self.anchored_start or sp == 0 or input[sp - 1] == '\n')) {
                 try vm.addThread(&clist, 0, sp, seed);
             }
             carried.clearRetainingCapacity();
