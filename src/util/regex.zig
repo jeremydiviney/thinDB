@@ -754,17 +754,7 @@ pub const Regex = struct {
                         if (survivor and pt.caps.ptr != ct.caps.ptr) break :skip;
                     }
 
-                    var j = sp + 1;
-                    while (j < input.len) : (j += 1) {
-                        const b = input[j];
-                        if (b == '\n') break;
-                        var sig: u64 = 0;
-                        for (clist.items, 0..) |t, k| {
-                            if (self.prog[t.pc].class.contains(b)) sig |= (@as(u64, 1) << @intCast(k));
-                        }
-                        if (sig != sig0) break;
-                    }
-                    sp = j - 1; // the outer `sp += 1` resumes at j
+                    sp = self.runEnd(clist.items, sig0, input, sp + 1) - 1; // outer `sp += 1` resumes at the run end
                 }
             }
 
@@ -778,6 +768,60 @@ pub const Regex = struct {
             return true;
         }
         return false;
+    }
+
+    /// First index `>= from` at which a stationary class-loop run ends: the
+    /// first byte whose surviving-class signature differs from `sig0`, or a
+    /// '\n' (a mid-string `^` seed point), or end-of-input.
+    ///
+    /// The set of bytes that *continue* the run is, exactly,
+    /// `(∩ survivor classes) ∩ (∩ complement of non-survivor classes)` minus
+    /// '\n' — computed once here by bitwise ops over the `CharClass` masks
+    /// rather than re-deriving the per-thread signature for every byte. When
+    /// the run has only a few distinct breaker bytes (the usual case: `[^/]+`
+    /// breaks on '/', `.*` on '\n'), each is found with a vectorized
+    /// `indexOfScalar` (memchr) and the earliest wins.
+    fn runEnd(self: *const Regex, clist_items: []const Thread, sig0: u64, input: []const u8, from: usize) usize {
+        var cont: CharClass = .{ .bits = [_]u8{0xFF} ** 32 };
+        for (clist_items, 0..) |t, k| {
+            const cc = self.prog[t.pc].class;
+            if ((sig0 >> @intCast(k)) & 1 != 0) {
+                for (&cont.bits, cc.bits) |*x, y| x.* &= y;
+            } else {
+                for (&cont.bits, cc.bits) |*x, y| x.* &= ~y;
+            }
+        }
+        // '\n' ends the run even when a survivor class would accept it.
+        cont.bits['\n' >> 3] &= ~(@as(u8, 1) << ('\n' & 7));
+
+        // Breaker bytes = complement of the continue set. If there are only a
+        // handful, memchr to the first; otherwise fall back to a tight scan
+        // over the precomputed set.
+        var breakers: [4]u8 = undefined;
+        var nb: usize = 0;
+        for (cont.bits, 0..) |m, bi| {
+            const inv = ~m;
+            if (inv == 0) continue;
+            var bit: u8 = 0;
+            while (bit < 8) : (bit += 1) {
+                if ((inv >> @intCast(bit)) & 1 != 0) {
+                    if (nb == breakers.len) {
+                        var j = from;
+                        while (j < input.len and cont.contains(input[j])) : (j += 1) {}
+                        return j;
+                    }
+                    breakers[nb] = @intCast(bi * 8 + bit);
+                    nb += 1;
+                }
+            }
+        }
+        var best = input.len;
+        for (breakers[0..nb]) |x| {
+            if (std.mem.indexOfScalarPos(u8, input, from, x)) |idx| {
+                if (idx < best) best = idx;
+            }
+        }
+        return best;
     }
 
     /// Replace every non-overlapping match in `input`. `template` may
