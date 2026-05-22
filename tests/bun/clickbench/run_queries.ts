@@ -37,6 +37,16 @@ const QUERIES_PATH =
   resolve(here, "../../../bench/clickbench/queries.sql");
 const TIMEOUT_MS = Number(process.env.THINDB_TIMEOUT_MS ?? "120000");
 const JSON_OUT = process.env.THINDB_JSON_OUT;
+// THINDB_ONLY: comma-separated query indices to run in isolation (e.g. "33"
+// or "28,33,34"). Empty = run all 43.
+const ONLY = (process.env.THINDB_ONLY ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => s.length > 0)
+  .map(Number);
+// THINDB_REPEAT: run each selected query N times (prints each run + best),
+// for warm-cache timing of an isolated query.
+const REPEAT = Math.max(1, Number(process.env.THINDB_REPEAT ?? "1"));
 
 type Outcome = {
   idx: number;
@@ -126,8 +136,20 @@ async function main(): Promise<void> {
 
   const outcomes: Outcome[] = [];
   for (let i = 0; i < queries.length; i++) {
+    if (ONLY.length > 0 && !ONLY.includes(i)) continue;
     const sql = queries[i]!;
-    const out = await runOne(conn, i, sql);
+
+    // Run REPEAT times; keep the fastest as the recorded outcome (warm-cache
+    // timing for an isolated query). Print every run when REPEAT > 1.
+    let out = await runOne(conn, i, sql);
+    const runs: number[] = out.ok ? [out.ms] : [];
+    for (let r = 1; r < REPEAT && out.ok; r++) {
+      const next = await runOne(conn, i, sql);
+      if (next.ok) {
+        runs.push(next.ms);
+        if (next.ms < out.ms) out = next;
+      }
+    }
     outcomes.push(out);
 
     // A query that errors at the connection level (server closed the
@@ -148,8 +170,12 @@ async function main(): Promise<void> {
       }
     }
     if (out.ok) {
+      const detail =
+        REPEAT > 1
+          ? `best ${out.ms.toFixed(1)}ms of [${runs.map((m) => m.toFixed(0)).join(", ")}]`
+          : `${out.ms.toFixed(1).padStart(8)}ms`;
       console.log(
-        `Q${String(i).padStart(2, "0")}  OK    ${out.ms.toFixed(1).padStart(8)}ms  ` +
+        `Q${String(i).padStart(2, "0")}  OK    ${detail}  ` +
           `rows=${String(out.rows).padStart(6)}  ${truncate(sql, 46)}`,
       );
     } else {
