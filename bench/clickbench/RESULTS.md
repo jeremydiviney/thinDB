@@ -36,6 +36,51 @@ for only the 1–4 columns each query references, so blocking operators
 8 of these exceeded the 2 GiB budget. `COUNT(*)` short-circuits to a
 manifest row-count with no segment decode at all.
 
+## vs DuckDB (same machine, same 5M data, same queries)
+
+DuckDB run in-process via the CLI (`.timer on`); thinDB over the MySQL wire.
+
+| Engine | Mode | Total (43 queries) | vs thinDB |
+|---|---|---:|---:|
+| **thinDB** | 1 thread, MySQL wire | **31.8 s** | — |
+| DuckDB | 1 thread (`SET threads=1`) | 9.5 s | thinDB **3.3× slower** |
+| DuckDB | all cores | 3.5 s | thinDB **9.1× slower** |
+
+thinDB is single-threaded today, so the apples-to-apples engine comparison
+is vs DuckDB-1-thread (3.3×); the all-cores number just reflects DuckDB's
+parallelism (the gap that auto-partitioned parallel execution, #144, would
+close). Per-query, the gap is concentrated in high-cardinality **string**
+GROUP BY / ORDER BY:
+
+| Query | thinDB | DuckDB-1t | ratio |
+|---|---:|---:|---:|
+| Q34 `GROUP BY 1, URL` | 3455 ms | 500 ms | 6.9× |
+| Q33 `GROUP BY URL` | 3062 ms | 468 ms | 6.5× |
+| Q28 `REGEXP_REPLACE` | **2723 ms** | **3604 ms** | **0.76× (thinDB wins)** |
+| Q23 `SELECT * … ORDER BY LIMIT` | 2299 ms | 288 ms | 8.0× |
+| Q22 `MIN(URL), MIN(Title), COUNT DISTINCT` | 1377 ms | 289 ms | 4.8× |
+| Q32 `WatchID, ClientIP GROUP BY` | 1278 ms | 420 ms | 3.0× |
+
+thinDB **beats** DuckDB single-thread on the regex query (Q28 is DuckDB's
+own slowest single-thread query). Everything else slow is the string
+GROUP BY / sort path — the next optimization frontier (SIMD hashing #145,
+parallelism #144, spill sort #240), none of it regex.
+
+## Front-end overhead (wire + parser) — negligible
+
+Measured so the 31.8 s is attributed correctly: it is essentially all
+query execution, not protocol or parsing.
+
+- **MySQL wire**, warm pooled connection: `SELECT 1` round-trips in
+  **0.031 ms**, `COUNT(*)` in 0.095 ms. Result serialization is ~0.1 µs/row
+  (returning 9000 more rows, `LIMIT 1000`→`10000`, added ~1 ms). Across all
+  43 queries the wire adds ~1–2 ms total. (Loopback TCP; a real network
+  adds RTT per query but the protocol itself is cheap.)
+- **SQL parser** (text → IR, ReleaseFast): 0.31 µs for `COUNT(*)`, ~1 µs
+  for a filter+GROUP BY+ORDER BY, 1.93 µs for Q28 (the most complex). That
+  is 5–6 orders of magnitude below execution (170 ms–3.6 s) — effectively
+  free.
+
 ## Per-query (ReleaseFast, 5M rows)
 
 | Q | Time | Query |
@@ -89,9 +134,10 @@ manifest row-count with no segment decode at all.
   lone slow query at ~22 s, CPU-bound in the Pike-VM regex engine. A
   *stationary-run bulk-skip* (collapsing `[^/]+` / `.*$` loops into one
   forward scan instead of one Pike step per character) plus seed reuse,
-  per-batch scratch reuse, and a loop-class probe gate brought it to **3.2 s**
-  — now below DuckDB's single-thread time for the same query (4.3 s) and
-  no longer regex-bound. The residual cost is the high-cardinality string
-  `GROUP BY` over the extracted hosts (compare Q33 `GROUP BY URL`, 3.2 s).
+  per-batch scratch reuse, a loop-class probe gate, and an unanchored
+  first-byte prefilter brought it to **2.7 s** — below DuckDB's single-thread
+  time for the same query (3.6 s) and no longer regex-bound. The residual
+  cost is the high-cardinality string `GROUP BY` over the extracted hosts
+  (compare Q33 `GROUP BY URL`, 3.1 s).
 - The full ClickBench dataset is 100M rows; this run uses the 5M-row subset
   for fast iteration. The data file (`data/hits_5m.tsv`) is not checked in.
