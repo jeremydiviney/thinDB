@@ -309,6 +309,21 @@ test "sql: pg_attribute JOIN pg_class lists a table's columns" {
     try std.testing.expect(saw_id and saw_tag);
 }
 
+test "sql: a bare non-grouped column under aggregation is rejected (strict GROUP BY)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // qty is neither grouped nor aggregated.
+    try helpers.expectRunError(allocator, db, "SELECT k, qty FROM t GROUP BY k", thindb.sql.ParseError.SqlMixedAggAndPlainProjection);
+    // Implicit aggregation (an aggregate present, no GROUP BY) is just as strict.
+    try helpers.expectRunError(allocator, db, "SELECT tag, count(*) FROM t", thindb.sql.ParseError.SqlMixedAggAndPlainProjection);
+}
+
 test "sql: FETCH FIRST / OFFSET ROWS (ANSI/PG row limiting)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
