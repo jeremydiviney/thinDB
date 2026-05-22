@@ -884,6 +884,10 @@ pub const Regex = struct {
             while (bit < 8) : (bit += 1) {
                 if ((inv >> @intCast(bit)) & 1 != 0) {
                     if (nb == breakers.len) {
+                        // Dense breaker set: tight scalar membership scan. A
+                        // SIMD range scan was tried here and measured neutral —
+                        // the per-run range detection cancels its benefit at
+                        // typical run lengths.
                         var j = from;
                         while (j < input.len and cont.contains(input[j])) : (j += 1) {}
                         return j;
@@ -1190,6 +1194,11 @@ test "regex: stationary bulk-skip equals reference matcher (fuzz)" {
         "x[ab]+y",
         "ab+c",
         ".*",
+        // Dense continue-sets — exercise the bulk-skip's scalar fallback.
+        "^[a-z]+$",
+        "^[a-y]+z$",
+        "^[0-9]+x$",
+        "^[ -~]+$",
     };
     const alphabet = "abc/xyz12. \nwd_goletum";
     var prng = std.Random.DefaultPrng.init(0xC0FFEE_1234);
