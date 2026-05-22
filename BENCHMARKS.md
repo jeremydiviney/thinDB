@@ -196,6 +196,35 @@ Sort-based partitioning. Most benches use `PARTITION BY grp_lo` (100 partitions 
 
 ---
 
+## ClickBench (5M rows, 105 columns)
+
+End-to-end SQL over the MySQL wire (mysql2 driver) against the real
+ClickBench `hits` schema (105 columns), loaded at 5,000,000 rows and
+compacted to 6 segments. ReleaseFast server; times are wall-clock per
+query including wire round-trip + result formatting.
+
+**43 / 43 queries pass.** Headline numbers:
+
+| | Time |
+|---|---:|
+| `COUNT(*)` (Q0) | **3 ms** — metadata-only, 0-column scan |
+| median query | ~520 ms |
+| typical GROUP BY / aggregate | 0.2 – 1.5 s |
+| heaviest GROUP BY on URL (Q33/Q34) | 3.1 – 3.5 s |
+| `REGEXP_REPLACE` host-extract (Q28) | 22 s — regex-bound, the lone outlier |
+| all 43 queries | 51 s total |
+
+This is the payoff of **column pruning** (projection pushdown): `hits` is
+105 columns wide, but each query scans only the 1–4 columns it references,
+so the blocking operators (Sort, hash aggregate) buffer a fraction of the
+data. Without it the high-cardinality GROUP BY queries blew past the 2 GiB
+query budget (8 of 43 failed); with it they pass comfortably. `COUNT(*)`
+short-circuits to a manifest row-count with no segment decode at all.
+
+Q28 (`REGEXP_REPLACE` over 5M `Referer` values) is the one slow query —
+CPU-bound in the Pike-VM regex engine, not memory. (A Debug build exceeds
+the 120 s client timeout; ReleaseFast brings it to ~22 s.)
+
 ## How does this compare?
 
 Cross-system join/scan benchmarks vary wildly with hardware, schema, and methodology — these are **order-of-magnitude** comparisons drawn from public sources and my own past measurements, not apples-to-apples.
