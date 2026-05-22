@@ -457,6 +457,10 @@ pub const Scratch = struct {
     seed: []?usize = &.{},
     /// Result slot buffer for `replaceAllScratch`'s internal `find` calls.
     slots: []?usize = &.{},
+    /// Reused output buffer for `replaceAllScratch`: the result of each row
+    /// is built here and borrowed by the caller, so a whole batch needs no
+    /// per-row result allocation.
+    out_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(backing: Allocator) Scratch {
         return .{ .backing = backing, .arena = std.heap.ArenaAllocator.init(backing) };
@@ -470,6 +474,7 @@ pub const Scratch = struct {
         self.clist.deinit(self.backing);
         self.carried.deinit(self.backing);
         self.probe.deinit(self.backing);
+        self.out_buf.deinit(self.backing);
     }
 
     /// Grow `visited`/`seed` to fit this program, and guard `gen` against
@@ -508,6 +513,12 @@ pub const Regex = struct {
     /// would break the stationary-run bulk-skip's position-independence
     /// assumption — so the bulk-skip is disabled when this is set.
     has_wordbound: bool,
+    /// `loopy[pc]` is true for a `.class` instruction that sits inside a
+    /// `*`/`+` repetition (a back-edge spans it). Only such classes can
+    /// drive a stationary run, so the bulk-skip is only *attempted* when a
+    /// surviving thread is one — which avoids paying the stationarity probe
+    /// on every char of a non-repeating prefix like `https?://`.
+    loopy: []const bool,
 
     pub fn compile(allocator: Allocator, pattern: []const u8) Error!Regex {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -525,22 +536,49 @@ pub const Regex = struct {
         _ = try comp.emit(.match);
 
         const prog = try comp.prog.toOwnedSlice(allocator);
+        errdefer allocator.free(prog);
         var has_wordbound = false;
         for (prog) |inst| switch (inst) {
             .word_boundary, .not_word_boundary => has_wordbound = true,
             else => {},
         };
+
+        // A `.class` is "loopy" if some back-edge (a jmp/split at index i
+        // targeting t <= i) spans it — i.e. it lives in a `*`/`+` body.
+        const loopy = try allocator.alloc(bool, prog.len);
+        @memset(loopy, false);
+        for (prog, 0..) |inst, i| {
+            const back: ?u32 = switch (inst) {
+                .jmp => |t| if (t <= i) t else null,
+                .split => |s| blk: {
+                    var lo: ?u32 = null;
+                    if (s.a <= i) lo = s.a;
+                    if (s.b <= i and (lo == null or s.b < lo.?)) lo = s.b;
+                    break :blk lo;
+                },
+                else => null,
+            };
+            if (back) |t| {
+                var pc = t;
+                while (pc <= i) : (pc += 1) {
+                    if (prog[pc] == .class) loopy[pc] = true;
+                }
+            }
+        }
+
         return .{
             .prog = prog,
             .n_slots = 2 * parser.next_group,
             .allocator = allocator,
             .anchored_start = prog.len > 1 and prog[1] == .bol,
             .has_wordbound = has_wordbound,
+            .loopy = loopy,
         };
     }
 
     pub fn deinit(self: *Regex) void {
         self.allocator.free(self.prog);
+        self.allocator.free(self.loopy);
     }
 
     /// Leftmost match at or after `start`. Returns capture slots (slot
@@ -693,9 +731,16 @@ pub const Regex = struct {
                 const ch = c.?;
                 if (ch != '\n') skip: {
                     var sig0: u64 = 0;
+                    var any_loop = false;
                     for (clist.items, 0..) |t, k| {
-                        if (self.prog[t.pc].class.contains(ch)) sig0 |= (@as(u64, 1) << @intCast(k));
+                        if (self.prog[t.pc].class.contains(ch)) {
+                            sig0 |= (@as(u64, 1) << @intCast(k));
+                            if (self.loopy[t.pc]) any_loop = true;
+                        }
                     }
+                    // Only a class in a `*`/`+` body can sustain a stationary
+                    // run; bail before the probe otherwise (e.g. literal prefix).
+                    if (!any_loop) break :skip;
 
                     vm.gen += 1;
                     scratch.probe.clearRetainingCapacity();
@@ -741,28 +786,29 @@ pub const Regex = struct {
     pub fn replaceAll(self: *const Regex, allocator: Allocator, input: []const u8, template: []const u8) Error![]u8 {
         var scratch = Scratch.init(allocator);
         defer scratch.deinit();
-        return self.replaceAllScratch(allocator, input, template, &scratch);
+        const borrowed = try self.replaceAllScratch(input, template, &scratch);
+        return allocator.dupe(u8, borrowed);
     }
 
-    /// Like `replaceAll`, but the caller supplies a reusable `Scratch`.
-    /// Reusing it across the rows of a batch avoids per-row allocation —
-    /// the dominant fixed cost when applying one compiled pattern to
-    /// millions of values. `out_alloc` owns the returned slice.
+    /// Like `replaceAll`, but the caller supplies a reusable `Scratch` and
+    /// the result is *borrowed* from `scratch.out_buf` (valid only until the
+    /// next call sharing this scratch). Reusing the scratch across the rows
+    /// of a batch avoids per-row allocation — the dominant fixed cost when
+    /// applying one compiled pattern to millions of values.
     pub fn replaceAllScratch(
         self: *const Regex,
-        out_alloc: Allocator,
         input: []const u8,
         template: []const u8,
         scratch: *Scratch,
-    ) Error![]u8 {
-        const allocator = out_alloc;
+    ) Error![]const u8 {
+        const allocator = scratch.backing;
         if (scratch.slots.len < self.n_slots) {
             scratch.slots = try scratch.backing.realloc(scratch.slots, self.n_slots);
         }
         const slots = scratch.slots[0..self.n_slots];
 
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(allocator);
+        const out = &scratch.out_buf;
+        out.clearRetainingCapacity();
 
         var pos: usize = 0;
         while (pos <= input.len) {
@@ -773,7 +819,7 @@ pub const Regex = struct {
             // Copy the text before the match.
             try out.appendSlice(allocator, input[pos..m_start]);
             // Expand the template.
-            try expandTemplate(allocator, &out, template, input, slots);
+            try expandTemplate(allocator, out, template, input, slots);
             if (m_end > pos) {
                 pos = m_end;
             } else {
@@ -783,7 +829,7 @@ pub const Regex = struct {
             }
         }
         if (pos < input.len) try out.appendSlice(allocator, input[pos..]);
-        return out.toOwnedSlice(allocator);
+        return out.items;
     }
 };
 

@@ -41,8 +41,9 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
     defer scratch.deinit();
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const replaced = try re.replaceAllScratch(allocator, sv.rowBytes(i), replacement, &scratch);
-        defer allocator.free(replaced);
+        // `replaced` is borrowed from the scratch's reused output buffer;
+        // appendValue copies it into the column store, so no free per row.
+        const replaced = try re.replaceAllScratch(sv.rowBytes(i), replacement, &scratch);
         try store.StringStore.appendValue(stringStoreOf(out), allocator, replaced);
     }
 }
