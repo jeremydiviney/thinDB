@@ -27,6 +27,8 @@ const makeQuery = exec.makeQuery;
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 
+const simd = @import("../util/simd.zig");
+
 pub const AggFunc = enum {
     count,
     sum,
@@ -936,6 +938,27 @@ fn topkBuildHeap(heap: []TopKEntry, keys: []const ResolvedKey) void {
     }
 }
 
+// Fold a SIMD-reduced extreme into the running MIN/MAX accumulator. Used by
+// the no-null fast paths; `m` comes from `simd.minOf`/`maxOf` over the batch.
+fn foldMinInt(s: *AccState, m: i64) void {
+    if (s.min_int == null or m < s.min_int.?) s.min_int = m;
+}
+fn foldMaxInt(s: *AccState, m: i64) void {
+    if (s.max_int == null or m > s.max_int.?) s.max_int = m;
+}
+fn foldMinLarge(s: *AccState, m: i128) void {
+    if (s.min_large == null or m < s.min_large.?) s.min_large = m;
+}
+fn foldMaxLarge(s: *AccState, m: i128) void {
+    if (s.max_large == null or m > s.max_large.?) s.max_large = m;
+}
+fn foldMinFloat(s: *AccState, m: f64) void {
+    if (s.min_float == null or m < s.min_float.?) s.min_float = m;
+}
+fn foldMaxFloat(s: *AccState, m: f64) void {
+    if (s.max_float == null or m > s.max_float.?) s.max_float = m;
+}
+
 fn initialState(func: AggFunc, in: ?Type) AccState {
     return switch (func) {
         .count => .{ .count = 0 },
@@ -1055,44 +1078,69 @@ fn updateState(
         .sum => {
             const idx = col_idx.?;
             const view = batch.values[idx];
+            const lo = row_start;
+            const hi = row_end;
+            if (view.nulls == null) {
+                // No nulls in this column: reduce the contiguous range with a
+                // tight SIMD kernel (no per-row validity branch). Small ints
+                // widen through i64 lanes; 64-bit-plus inputs stay scalar
+                // (i64-lane overflow / i128 isn't a SIMD win) but lose the
+                // per-row branch.
+                switch (view.data) {
+                    .int => |sl| s.sum_int += simd.sumWiden(i32, sl[lo..hi]),
+                    .smallint => |sl| s.sum_int += simd.sumWiden(i16, sl[lo..hi]),
+                    .tinyint => |sl| s.sum_int += simd.sumWiden(i8, sl[lo..hi]),
+                    .boolean => |sl| s.sum_int += simd.sumWiden(u8, sl[lo..hi]),
+                    .float => |sl| s.sum_float += simd.sumFloat(f32, sl[lo..hi]),
+                    .double => |sl| s.sum_float += simd.sumFloat(f64, sl[lo..hi]),
+                    .bigint, .decimal64 => |sl| for (sl[lo..hi]) |v| {
+                        s.sum_int += v;
+                    },
+                    .largeint, .decimal128 => |sl| for (sl[lo..hi]) |v| {
+                        s.sum_int += v;
+                    },
+                    else => unreachable,
+                }
+                return;
+            }
             switch (view.data) {
-                .int => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
+                .int => |s_int| for (s_int[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .bigint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                .bigint => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .boolean => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                .boolean => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .tinyint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                .tinyint => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .smallint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                .smallint => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .largeint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                .largeint => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .decimal64 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                .decimal64 => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .decimal128 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
+                .decimal128 => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_int += v;
                 },
-                .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
+                .float => |s_f| for (s_f[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_float += v;
                 },
-                .double => |s_d| for (s_d[row_start..row_end], row_start..) |v, r| {
+                .double => |s_d| for (s_d[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.sum_float += v;
                 },
@@ -1102,6 +1150,24 @@ fn updateState(
         .min => {
             const idx = col_idx.?;
             const view = batch.values[idx];
+            const lo = row_start;
+            const hi = row_end;
+            // No-null numeric fast path: SIMD-reduce the range, fold the one
+            // extreme into the accumulator. Strings can't reduce numerically —
+            // they fall through to the scalar loop below.
+            if (view.nulls == null and hi > lo) switch (view.data) {
+                .int, .date => |sl| return foldMinInt(s, simd.minOf(i32, sl[lo..hi])),
+                .bigint, .datetime => |sl| return foldMinInt(s, simd.minOf(i64, sl[lo..hi])),
+                .boolean => |sl| return foldMinInt(s, simd.minOf(u8, sl[lo..hi])),
+                .tinyint => |sl| return foldMinInt(s, simd.minOf(i8, sl[lo..hi])),
+                .smallint => |sl| return foldMinInt(s, simd.minOf(i16, sl[lo..hi])),
+                .decimal64 => |sl| return foldMinInt(s, simd.minOf(i64, sl[lo..hi])),
+                .largeint, .decimal128 => |sl| return foldMinLarge(s, simd.minOf(i128, sl[lo..hi])),
+                .float => |sl| return foldMinFloat(s, simd.minOf(f32, sl[lo..hi])),
+                .double => |sl| return foldMinFloat(s, simd.minOf(f64, sl[lo..hi])),
+                .varchar, .string, .char => {},
+                else => unreachable,
+            };
             switch (view.data) {
                 .int, .date => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
@@ -1164,6 +1230,21 @@ fn updateState(
         .max => {
             const idx = col_idx.?;
             const view = batch.values[idx];
+            const lo = row_start;
+            const hi = row_end;
+            if (view.nulls == null and hi > lo) switch (view.data) {
+                .int, .date => |sl| return foldMaxInt(s, simd.maxOf(i32, sl[lo..hi])),
+                .bigint, .datetime => |sl| return foldMaxInt(s, simd.maxOf(i64, sl[lo..hi])),
+                .boolean => |sl| return foldMaxInt(s, simd.maxOf(u8, sl[lo..hi])),
+                .tinyint => |sl| return foldMaxInt(s, simd.maxOf(i8, sl[lo..hi])),
+                .smallint => |sl| return foldMaxInt(s, simd.maxOf(i16, sl[lo..hi])),
+                .decimal64 => |sl| return foldMaxInt(s, simd.maxOf(i64, sl[lo..hi])),
+                .largeint, .decimal128 => |sl| return foldMaxLarge(s, simd.maxOf(i128, sl[lo..hi])),
+                .float => |sl| return foldMaxFloat(s, simd.maxOf(f32, sl[lo..hi])),
+                .double => |sl| return foldMaxFloat(s, simd.maxOf(f64, sl[lo..hi])),
+                .varchar, .string, .char => {},
+                else => unreachable,
+            };
             switch (view.data) {
                 .int, .date => |s_int| for (s_int[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
@@ -1226,6 +1307,30 @@ fn updateState(
         .avg => {
             const idx = col_idx.?;
             const view = batch.values[idx];
+            const lo = row_start;
+            const hi = row_end;
+            // No-null fast path: SIMD-sum the range, count is the row count.
+            // Integers sum exactly in i128 then convert (more accurate than the
+            // per-row f64 accumulation it replaces); floats use f64 lanes.
+            if (view.nulls == null and hi > lo) {
+                switch (view.data) {
+                    .int => |sl| s.avg.sum += @floatFromInt(simd.sumWiden(i32, sl[lo..hi])),
+                    .smallint => |sl| s.avg.sum += @floatFromInt(simd.sumWiden(i16, sl[lo..hi])),
+                    .tinyint => |sl| s.avg.sum += @floatFromInt(simd.sumWiden(i8, sl[lo..hi])),
+                    .boolean => |sl| s.avg.sum += @floatFromInt(simd.sumWiden(u8, sl[lo..hi])),
+                    .bigint, .decimal64 => |sl| for (sl[lo..hi]) |v| {
+                        s.avg.sum += @floatFromInt(v);
+                    },
+                    .largeint, .decimal128 => |sl| for (sl[lo..hi]) |v| {
+                        s.avg.sum += @floatFromInt(v);
+                    },
+                    .float => |sl| s.avg.sum += simd.sumFloat(f32, sl[lo..hi]),
+                    .double => |sl| s.avg.sum += simd.sumFloat(f64, sl[lo..hi]),
+                    else => unreachable,
+                }
+                s.avg.count += hi - lo;
+                return;
+            }
             switch (view.data) {
                 .int, .bigint, .boolean, .tinyint, .smallint, .decimal64 => {
                     avgUpdateInt(s, view, row_start, row_end);

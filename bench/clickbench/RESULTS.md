@@ -95,6 +95,20 @@ back-to-back measurements, not diffs against these absolutes.
 | Q09 | 663 | Q20 | 738 | Q31 | 571 | Q42 | 110 |
 | Q10 | 220 | Q21 | 792 | Q32 | 1460 | **Total** | **28.3 s** |
 
+### SIMD pass progress (#145)
+
+**Step 1 — aggregate reductions (SUM/MIN/MAX/AVG, no-null fast paths).** Shared
+`util/simd.zig` `@Vector` kernels (sum widens through i64 lanes; min/max/float
+native), taken when a column has no nulls so the per-row validity branch is
+gone. Correct + complete across the compatible aggregates, but **~neutral on
+ClickBench**: only Q29 (90 sums) shows a clean gain (~1905→~1680 ms, ~12%); the
+MIN/MAX/AVG queries (Q02/Q06/Q27/Q31/Q32) stay within run-to-run noise because
+they're **decode/bandwidth-bound, not reduction-bound**. Suite total moved
+inside noise (~26–27 s). Kept anyway — it removes branches from the hot loops
+and seeds the window-SIMD refactor (#272). Lesson: thinDB's ClickBench cost is
+in string-GROUP-BY hashing, wide materialize, and decode — not numeric inner
+loops — so further SIMD should aim there (scan/LIKE) or we pivot to those levers.
+
 ## Front-end overhead (wire + parser) — negligible
 
 Measured so the 31.8 s is attributed correctly: it is essentially all
