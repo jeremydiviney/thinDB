@@ -145,9 +145,12 @@ const AccState = union(enum) {
     max_int: ?i64,
     min_float: ?f64,
     max_float: ?f64,
-    /// Separate i128 min/max variants for LARGEINT inputs (don't fit in i64).
-    min_large: ?i128,
-    max_large: ?i128,
+    /// MIN/MAX for LARGEINT/DECIMAL128 inputs (don't fit in i64). Held inline
+    /// as a presence-flagged struct rather than `?i128` so the i128 can sit at
+    /// 8-byte alignment — that keeps the whole `AccState` union at 32 bytes
+    /// instead of 48 (the `?i128`'s 16-byte alignment would dominate).
+    min_large: LargeAcc,
+    max_large: LargeAcc,
     /// MIN/MAX over string-family columns. Holds the running extreme as
     /// arena-dup'd bytes (the view's bytes are transient per batch).
     min_str: ?[]const u8,
@@ -160,11 +163,15 @@ const AccState = union(enum) {
     distinct: std.StringHashMapUnmanaged(void),
     /// Exact percentile: keep every observed value (as f64), sort + interpolate at finalize.
     percentile_values: std.ArrayListUnmanaged(f64),
-    /// group_concat buffer + a flag so an empty first value is still
-    /// distinguishable from "nothing appended yet" (the latter must
-    /// NOT prepend a separator on the next append).
-    concat: ConcatAcc,
+    /// group_concat buffer, lazily boxed (the `ConcatAcc` is 32 bytes — too
+    /// wide to sit inline without inflating every other group's state — so it
+    /// lives behind a pointer, null until the first value is appended).
+    concat: ?*ConcatAcc,
 };
+
+/// Inline MIN/MAX accumulator for 128-bit inputs. `align(8)` on the i128 keeps
+/// the enclosing `AccState` union 8-aligned (32 B) rather than 16-aligned.
+const LargeAcc = struct { v: i128 align(8) = 0, present: bool = false };
 
 const AvgAcc = struct {
     sum: f64,
@@ -873,7 +880,7 @@ fn aggOrderValue(s: AccState) OrderVal {
         .sum_int => |v| .{ .int = v },
         .sum_float => |v| .{ .float = v },
         .min_int, .max_int => |m| .{ .int = m orelse 0 },
-        .min_large, .max_large => |m| .{ .int = m orelse 0 },
+        .min_large, .max_large => |m| .{ .int = if (m.present) m.v else 0 },
         .min_float, .max_float => |m| .{ .float = m orelse 0.0 },
         .avg => |a| .{ .float = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count)) },
         .distinct => |set| .{ .int = @intCast(set.count()) },
@@ -947,10 +954,10 @@ fn foldMaxInt(s: *AccState, m: i64) void {
     if (s.max_int == null or m > s.max_int.?) s.max_int = m;
 }
 fn foldMinLarge(s: *AccState, m: i128) void {
-    if (s.min_large == null or m < s.min_large.?) s.min_large = m;
+    if (!s.min_large.present or m < s.min_large.v) s.min_large = .{ .v = m, .present = true };
 }
 fn foldMaxLarge(s: *AccState, m: i128) void {
-    if (s.max_large == null or m > s.max_large.?) s.max_large = m;
+    if (!s.max_large.present or m > s.max_large.v) s.max_large = .{ .v = m, .present = true };
 }
 fn foldMinFloat(s: *AccState, m: f64) void {
     if (s.min_float == null or m < s.min_float.?) s.min_float = m;
@@ -972,7 +979,7 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
         else if (in != null and in.?.isString())
             .{ .min_str = null }
         else if (in != null and (in.? == .largeint or in.? == .decimal128))
-            .{ .min_large = null }
+            .{ .min_large = .{} }
         else
             .{ .min_int = null },
         .max => if (in != null and in.?.isFloat())
@@ -980,14 +987,14 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
         else if (in != null and in.?.isString())
             .{ .max_str = null }
         else if (in != null and (in.? == .largeint or in.? == .decimal128))
-            .{ .max_large = null }
+            .{ .max_large = .{} }
         else
             .{ .max_int = null },
         .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
         .count_distinct => .{ .distinct = .empty },
         .percentile => .{ .percentile_values = .empty },
-        .group_concat => .{ .concat = .{} },
+        .group_concat => .{ .concat = null },
     };
 }
 
@@ -1195,7 +1202,7 @@ fn updateState(
                 },
                 .largeint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    if (s.min_large == null or v < s.min_large.?) s.min_large = v;
+                    if (!s.min_large.present or v < s.min_large.v) s.min_large = .{ .v = v, .present = true };
                 },
                 .decimal64 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
@@ -1203,7 +1210,7 @@ fn updateState(
                 },
                 .decimal128 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    if (s.min_large == null or v < s.min_large.?) s.min_large = v;
+                    if (!s.min_large.present or v < s.min_large.v) s.min_large = .{ .v = v, .present = true };
                 },
                 .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
@@ -1272,7 +1279,7 @@ fn updateState(
                 },
                 .largeint => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    if (s.max_large == null or v > s.max_large.?) s.max_large = v;
+                    if (!s.max_large.present or v > s.max_large.v) s.max_large = .{ .v = v, .present = true };
                 },
                 .decimal64 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
@@ -1280,7 +1287,7 @@ fn updateState(
                 },
                 .decimal128 => |s_b| for (s_b[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    if (s.max_large == null or v > s.max_large.?) s.max_large = v;
+                    if (!s.max_large.present or v > s.max_large.v) s.max_large = .{ .v = v, .present = true };
                 },
                 .float => |s_f| for (s_f[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
@@ -1458,9 +1465,15 @@ fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u
             .char => |sv| sv.rowBytes(r),
             else => unreachable,
         };
-        if (s.concat.nonempty) try s.concat.buf.appendSlice(aa, sep);
-        try s.concat.buf.appendSlice(aa, bytes);
-        s.concat.nonempty = true;
+        const c = s.concat orelse blk: {
+            const box = try aa.create(ConcatAcc);
+            box.* = .{};
+            s.concat = box;
+            break :blk box;
+        };
+        if (c.nonempty) try c.buf.appendSlice(aa, sep);
+        try c.buf.appendSlice(aa, bytes);
+        c.nonempty = true;
     }
 }
 
@@ -1580,7 +1593,10 @@ fn appendAccToColumn(
                 }
             },
             .min_large, .max_large => {
-                const v: i128 = if (func == .min) (state.min_large orelse 0) else (state.max_large orelse 0);
+                const v: i128 = if (func == .min)
+                    (if (state.min_large.present) state.min_large.v else 0)
+                else
+                    (if (state.max_large.present) state.max_large.v else 0);
                 switch (out_type) {
                     .largeint => try col.data.largeint.append(allocator, v),
                     .decimal128 => try col.data.decimal128.append(allocator, v),
@@ -1659,7 +1675,8 @@ fn appendAccToColumn(
             }
         },
         .group_concat => {
-            try col.data.string.appendValue(allocator, state.concat.buf.items);
+            const items: []const u8 = if (state.concat) |c| c.buf.items else "";
+            try col.data.string.appendValue(allocator, items);
         },
     }
 }

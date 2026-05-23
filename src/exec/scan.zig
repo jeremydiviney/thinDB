@@ -594,11 +594,12 @@ pub const Scan = struct {
             }
 
             for (self.out_phys, 0..) |phys, j| {
-                self.decoded[j] = try seg.decodeColumn(
+                self.decoded[j] = try seg.decodeColumnMaybeCached(
                     self.allocator,
                     self.table.schema,
                     self.cur_rg_idx,
                     phys,
+                    &self.table.cache,
                 );
             }
             self.decoded_valid = true;

@@ -372,122 +372,58 @@ fn writeRawColumnBlock(
 
 fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats {
     return switch (view.data) {
-        .int => |data| blk: {
-            const slice = data[row_start..row_end];
-            var lo: i32 = std.math.maxInt(i32);
-            var hi: i32 = std.math.minInt(i32);
-            for (slice) |v| {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
-        },
-        .bigint => |data| blk: {
-            const slice = data[row_start..row_end];
-            var lo: i64 = std.math.maxInt(i64);
-            var hi: i64 = std.math.minInt(i64);
-            for (slice) |v| {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            break :blk .{ .min = lo, .max = hi };
-        },
-        .boolean => |data| blk: {
-            const slice = data[row_start..row_end];
-            var lo: u8 = 1;
-            var hi: u8 = 0;
-            for (slice) |v| {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            break :blk .{ .min = lo, .max = hi };
-        },
-        .date => |data| blk: {
-            const slice = data[row_start..row_end];
-            var lo: i32 = std.math.maxInt(i32);
-            var hi: i32 = std.math.minInt(i32);
-            for (slice) |v| {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
-        },
-        .datetime => |data| blk: {
-            const slice = data[row_start..row_end];
-            var lo: i64 = std.math.maxInt(i64);
-            var hi: i64 = std.math.minInt(i64);
-            for (slice) |v| {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            break :blk .{ .min = lo, .max = hi };
-        },
-        .tinyint => |data| blk: {
-            const slice = data[row_start..row_end];
-            var lo: i8 = std.math.maxInt(i8);
-            var hi: i8 = std.math.minInt(i8);
-            for (slice) |v| {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
-        },
-        .smallint => |data| blk: {
-            const slice = data[row_start..row_end];
-            var lo: i16 = std.math.maxInt(i16);
-            var hi: i16 = std.math.minInt(i16);
-            for (slice) |v| {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            break :blk .{ .min = @intCast(lo), .max = @intCast(hi) };
-        },
-        .largeint, .decimal128 => |data| blk: {
-            const slice = data[row_start..row_end];
+        .int, .date => |d| extentInt(i32, view, d, row_start, row_end),
+        .bigint, .datetime, .decimal64 => |d| extentInt(i64, view, d, row_start, row_end),
+        .boolean => |d| extentInt(u8, view, d, row_start, row_end),
+        .tinyint => |d| extentInt(i8, view, d, row_start, row_end),
+        .smallint => |d| extentInt(i16, view, d, row_start, row_end),
+        .largeint, .decimal128 => |d| extentInt(i128, view, d, row_start, row_end),
+        .uuid => |d| blk: {
+            // u128 → i128 via top-bit XOR so signed compare preserves unsigned
+            // ordering. See `format.encodeUnsignedU128`.
             var lo: i128 = std.math.maxInt(i128);
             var hi: i128 = std.math.minInt(i128);
-            for (slice) |v| {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            break :blk .{ .min = lo, .max = hi };
-        },
-        .uuid => |data| blk: {
-            // u128 → i128 via top-bit XOR so signed compare preserves
-            // unsigned ordering. See `format.encodeUnsignedU128`.
-            const slice = data[row_start..row_end];
-            var lo: i128 = std.math.maxInt(i128);
-            var hi: i128 = std.math.minInt(i128);
-            for (slice) |v| {
+            for (d[row_start..row_end], row_start..) |v, r| {
+                if (!view.isValid(r)) continue;
                 const enc = format.encodeUnsignedU128(v);
                 if (enc < lo) lo = enc;
                 if (enc > hi) hi = enc;
             }
             break :blk .{ .min = lo, .max = hi };
         },
-        .decimal64 => |data| blk: {
-            const slice = data[row_start..row_end];
-            var lo: i64 = std.math.maxInt(i64);
-            var hi: i64 = std.math.minInt(i64);
-            for (slice) |v| {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            break :blk .{ .min = lo, .max = hi };
-        },
-        // Strings store the prefix-encoded i128 of the first 16 bytes
-        // of each row's value. See `format.encodeStringPrefix`.
-        .varchar, .string, .char => |sv| computeStringStats(sv, row_start, row_end),
+        // Strings store the prefix-encoded i128 of the first 16 bytes of each
+        // row's value. See `format.encodeStringPrefix`.
+        .varchar, .string, .char => |sv| computeStringStats(view, sv, row_start, row_end),
         // Floats carry no stats today (NaN/sign handling deferred).
         .float, .double => .{ .min = 0, .max = 0 },
     };
 }
 
-fn computeStringStats(sv: StringView, row_start: usize, row_end: usize) format.Stats {
+/// Min/max over the *non-null* values of an integer-family column, encoded to
+/// `i128`. NULL rows are skipped: the column's per-type data array still holds
+/// a placeholder at null slots, so including them would pollute the extreme
+/// (e.g. a 0 at a null slot becoming a spurious MIN). An all-null range leaves
+/// `min = maxInt(T), max = minInt(T)` — an inverted "no values" sentinel that
+/// composes correctly under min/max folding and that consumers detect via
+/// `min > max`. Non-nullable columns have `view.nulls == null`, so `isValid`
+/// is always true and behaviour is unchanged.
+fn extentInt(comptime T: type, view: ColumnView, data: []const T, row_start: usize, row_end: usize) format.Stats {
+    var lo: T = std.math.maxInt(T);
+    var hi: T = std.math.minInt(T);
+    for (data[row_start..row_end], row_start..) |v, r| {
+        if (!view.isValid(r)) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    return .{ .min = @intCast(lo), .max = @intCast(hi) };
+}
+
+fn computeStringStats(view: ColumnView, sv: StringView, row_start: usize, row_end: usize) format.Stats {
     var lo: i128 = std.math.maxInt(i128);
     var hi: i128 = std.math.minInt(i128);
     var i = row_start;
     while (i < row_end) : (i += 1) {
+        if (!view.isValid(i)) continue;
         const enc = format.encodeStringPrefix(sv.rowBytes(i));
         if (enc < lo) lo = enc;
         if (enc > hi) hi = enc;

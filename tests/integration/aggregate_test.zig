@@ -422,3 +422,59 @@ test "aggregate: top-k fusion honors multiple order keys (lexicographic + per-ke
         try std.testing.expect(!topkHas(b, "d"));
     }
 }
+
+test "agg_stats: metadata-only MIN/MAX skips NULLs on a nullable column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 4 };
+    const t = try db.table("t", schema, opts);
+    // Non-null values {10, 3, 7} interleaved with NULLs (and split across two
+    // row groups by the size-4 setting) → MIN 3, MAX 10; NULLs ignored.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .v = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .v = @as(?i32, null) },
+        .{ .id = @as(i64, 3), .v = @as(i32, 3) },
+        .{ .id = @as(i64, 4), .v = @as(?i32, null) },
+        .{ .id = @as(i64, 5), .v = @as(i32, 7) },
+        .{ .id = @as(i64, 6), .v = @as(?i32, null) },
+    });
+    try t.flush();
+
+    const specs = [_]thindb.exec.MinMaxStatsSpec{
+        .{ .col_idx = 1, .is_min = true, .out_name = "mn" },
+        .{ .col_idx = 1, .is_min = false, .out_name = "mx" },
+    };
+    const maybe_q = try thindb.exec.minMaxStats(allocator, t, &specs);
+    try std.testing.expect(maybe_q != null); // shortcut must fire for the nullable column
+    var q = maybe_q.?;
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i32, 3), b.values[0].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 10), b.values[1].data.int[0]);
+
+    // Ground truth: the null-aware scan path must agree.
+    var base = try thindb.scan(allocator, t);
+    var gq = try base.aggregate(&.{
+        .{ .func = .min, .col = "v", .as = "mn" },
+        .{ .func = .max, .col = "v", .as = "mx" },
+    });
+    defer gq.deinit();
+    const gb = (try gq.next()).?;
+    try std.testing.expectEqual(gb.values[0].data.int[0], b.values[0].data.int[0]);
+    try std.testing.expectEqual(gb.values[1].data.int[0], b.values[1].data.int[0]);
+}

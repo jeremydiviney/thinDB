@@ -25,6 +25,12 @@ pub const memory = @import("../memory.zig");
 
 pub const prof = @import("../util/prof.zig");
 
+/// Diagnostic override for the GROUP BY path selection (see net/local.zig).
+/// `.auto` is normal cardinality/budget-based routing; `.hash` and `.sort`
+/// force the hash table or the sort+stream path respectively, bypassing the
+/// cardinality check. For benchmarking hash-vs-sort on the same query only.
+pub var force_group_by: enum { auto, hash, sort } = .auto;
+
 pub const Error = error{
     ColumnNotFound,
     TypeMismatch,
@@ -404,6 +410,15 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
 /// Top-level entry point: build a scan query against a Table.
 pub fn scan(allocator: Allocator, table: *Table) !Query {
     return @import("scan.zig").Scan.create(allocator, table);
+}
+
+pub const MinMaxStatsSpec = @import("agg_stats.zig").Spec;
+
+/// Metadata-only MIN/MAX over a bare table: folds the manifest's per-segment
+/// column stats instead of scanning. Returns null when the shortcut can't
+/// apply (caller compiles the normal scan+aggregate). See `agg_stats.zig`.
+pub fn minMaxStats(allocator: Allocator, table: *Table, specs: []const MinMaxStatsSpec) !?Query {
+    return @import("agg_stats.zig").MinMaxStats.create(allocator, table, specs);
 }
 
 /// Scan that uses a query-scoped accountant owned by the caller (the

@@ -1,11 +1,34 @@
-//! LRU byte-cache for decompressed column blocks.
+//! Pinning LRU buffer pool for decompressed column blocks, shared across all
+//! queries against a `Table`.
 //!
 //! Keyed by `(segment_id, row_group_idx, column_idx)`. Value is the raw,
 //! decompressed (but not decoded) bytes of one column block. A cache hit
-//! still pays a cheap decode step but skips the expensive flate decompress.
+//! still pays a cheap decode step but skips the expensive zstd decompress.
 //!
-//! Bounded by total cached bytes (`capacity_bytes`). Single-threaded; no
-//! refcounting needed — entries are stable byte slices owned by the cache.
+//! Bounded by total cached bytes (`capacity_bytes`). The cache does NOT assume
+//! the dataset fits in memory: when over budget it evicts unpinned LRU entries,
+//! and if every entry down to budget is currently pinned it temporarily exceeds
+//! capacity rather than free a block someone is reading.
+//!
+//! ## Concurrency
+//! Thread-per-connection servers share one cache per table. All metadata
+//! mutations (map, LRU links, byte counter, pin counts) are guarded by `mutex`,
+//! held only for the O(1) bookkeeping — never across decompress or decode.
+//!
+//! ## Pinning (in-use accounting)
+//! `acquire`/`insertPinned` return an entry with its pin count incremented;
+//! eviction never frees a pinned entry. The caller decodes from `entry.bytes`
+//! and then calls `release`. Pins are meant to be held only for the duration of
+//! one block decode, so callers should `defer cache.release(entry)` immediately
+//! — that guarantees the pin drops on every return path, including a `try`
+//! error mid-decode, so a failed query can't leak a pin and wedge a block.
+//!
+//! ## Coherence
+//! Segments are immutable once written and segment IDs come from a monotonic,
+//! never-reused counter, so a cached block is valid for the entire life of its
+//! segment and keys never collide with a future segment. Retired segments (post
+//! compaction) are simply never looked up again and age out via LRU. There is
+//! no in-place mutation to invalidate, and the memtable is never cached here.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,6 +37,23 @@ pub const Key = struct {
     segment_id: u64,
     row_group_idx: u32,
     column_idx: u32,
+};
+
+/// CAS-based spinlock. Zig 0.16's stdlib `std.Thread.Mutex` is gone and
+/// `Io.Mutex` requires an `Io` the decode path doesn't carry. The cache's
+/// critical sections are O(1) bookkeeping, so spinning is the right tool.
+const SpinLock = struct {
+    state: std.atomic.Value(bool) = .{ .raw = false },
+
+    fn lock(self: *SpinLock) void {
+        while (self.state.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.state.store(false, .release);
+    }
 };
 
 pub const Cache = struct {
@@ -26,7 +66,11 @@ pub const Cache = struct {
     head: ?*Entry = null,
     tail: ?*Entry = null,
 
-    /// Stats (read-only, for benches and debugging).
+    /// Guards every field below the allocator/capacity. Held only for O(1)
+    /// bookkeeping; never across a decompress or decode.
+    mutex: SpinLock = .{},
+
+    /// Stats (read under `mutex`, for benches and debugging).
     hits: u64 = 0,
     misses: u64 = 0,
     evictions: u64 = 0,
@@ -36,6 +80,8 @@ pub const Cache = struct {
         bytes: []u8,
         prev: ?*Entry,
         next: ?*Entry,
+        /// In-use refcount. Nonzero entries are never evicted.
+        pins: u32 = 0,
     };
 
     pub fn init(allocator: Allocator, capacity_bytes: usize) Cache {
@@ -57,54 +103,79 @@ pub const Cache = struct {
         self.* = undefined;
     }
 
-    /// Returns a borrowed byte slice if `key` is present. The slice is valid
-    /// until the next call that may evict it (insert/get on a different key).
-    /// In thinDB's single-threaded use, callers consume hits inline.
-    pub fn get(self: *Cache, key: Key) ?[]const u8 {
+    /// Acquire a pinned reference to the block for `key`, or null on miss. On
+    /// hit the entry is pinned (eviction-proof until released) and moved to MRU.
+    /// The caller MUST `release` it when done — prefer `defer cache.release(e)`
+    /// so the pin drops on error paths too. Thread-safe.
+    pub fn acquire(self: *Cache, key: Key) ?*Entry {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.map.get(key)) |entry| {
+            entry.pins += 1;
             self.touch(entry);
             self.hits += 1;
-            return entry.bytes;
+            return entry;
         }
         self.misses += 1;
         return null;
     }
 
-    /// Insert `bytes` (caller transfers ownership). The cache may immediately
-    /// evict other entries to stay within the byte budget. If the new entry
-    /// itself is larger than the budget, it is freed and not stored.
-    pub fn put(self: *Cache, key: Key, bytes: []u8) !void {
-        if (self.map.get(key) != null) {
-            // Already present — free the new bytes; caller's responsibility.
+    /// Insert `bytes` for `key` (ownership transfers to the cache) and return a
+    /// pinned entry to decode from. If another thread inserted `key` between the
+    /// caller's miss and this call, `bytes` is freed and the existing entry is
+    /// returned pinned instead. On allocation failure the entry is not stored
+    /// and `bytes` is left for the caller to free. Caller MUST `release`.
+    pub fn insertPinned(self: *Cache, key: Key, bytes: []u8) !*Entry {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.map.get(key)) |existing| {
             self.allocator.free(bytes);
-            return;
-        }
-        if (bytes.len > self.capacity_bytes) {
-            self.allocator.free(bytes);
-            return;
+            existing.pins += 1;
+            self.touch(existing);
+            self.hits += 1;
+            return existing;
         }
 
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
-        entry.* = .{ .key = key, .bytes = bytes, .prev = null, .next = null };
+        entry.* = .{ .key = key, .bytes = bytes, .prev = null, .next = null, .pins = 1 };
 
         try self.map.put(self.allocator, key, entry);
-        errdefer _ = self.map.remove(key);
 
         self.linkHead(entry);
         self.current_bytes += bytes.len;
-        try self.evictUntilWithinBudget();
+        self.evictUnpinnedToCapacity();
+        return entry;
     }
 
-    fn evictUntilWithinBudget(self: *Cache) !void {
+    /// Drop one pin previously taken by `acquire`/`insertPinned`. Thread-safe.
+    pub fn release(self: *Cache, entry: *Entry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(entry.pins > 0);
+        entry.pins -= 1;
+    }
+
+    /// Evict unpinned entries from the LRU end until within budget. Pinned
+    /// entries are skipped, never freed — so a dataset larger than the cache
+    /// (or a moment where the whole tail is in use) temporarily exceeds
+    /// capacity rather than freeing a block a reader still holds. Caller holds
+    /// `mutex`.
+    fn evictUnpinnedToCapacity(self: *Cache) void {
+        var victim = self.tail;
         while (self.current_bytes > self.capacity_bytes) {
-            const victim = self.tail orelse break;
-            self.unlink(victim);
-            _ = self.map.remove(victim.key);
-            self.current_bytes -= victim.bytes.len;
-            self.allocator.free(victim.bytes);
-            self.allocator.destroy(victim);
-            self.evictions += 1;
+            const v = victim orelse break;
+            const prev = v.prev;
+            if (v.pins == 0) {
+                self.unlink(v);
+                _ = self.map.remove(v.key);
+                self.current_bytes -= v.bytes.len;
+                self.allocator.free(v.bytes);
+                self.allocator.destroy(v);
+                self.evictions += 1;
+            }
+            victim = prev;
         }
     }
 
@@ -132,82 +203,102 @@ pub const Cache = struct {
 
 // ---------- tests --------------------------------------------------------
 
-test "cache get/put round-trip + hit counter" {
+fn put(c: *Cache, key: Key, bytes: []u8) !void {
+    c.release(try c.insertPinned(key, bytes));
+}
+
+test "cache acquire/insert round-trip + hit/miss counters" {
     const allocator = std.testing.allocator;
     var c: Cache = .init(allocator, 1024);
     defer c.deinit();
 
     const k = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
-    try std.testing.expect(c.get(k) == null);
+    try std.testing.expect(c.acquire(k) == null);
     try std.testing.expectEqual(@as(u64, 1), c.misses);
 
-    const buf = try allocator.dupe(u8, "hello");
-    try c.put(k, buf);
+    const e1 = try c.insertPinned(k, try allocator.dupe(u8, "hello"));
+    try std.testing.expectEqualStrings("hello", e1.bytes);
+    c.release(e1);
 
-    const got = c.get(k).?;
-    try std.testing.expectEqualStrings("hello", got);
+    const e2 = c.acquire(k).?;
+    try std.testing.expectEqualStrings("hello", e2.bytes);
     try std.testing.expectEqual(@as(u64, 1), c.hits);
+    c.release(e2);
 }
 
-test "cache evicts oldest when over budget" {
+test "cache evicts unpinned LRU entries when over budget" {
     const allocator = std.testing.allocator;
     var c: Cache = .init(allocator, 30);
     defer c.deinit();
 
-    // Three 10-byte entries — third pushes us over 30, evicting the first.
-    const buf1 = try allocator.dupe(u8, "0123456789");
-    try c.put(.{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }, buf1);
+    // Four 10-byte entries, all released so they're evictable; the fourth
+    // pushes us to 40 > 30, evicting the LRU tail (rg 0).
+    inline for (0..4) |i| {
+        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try allocator.dupe(u8, "0123456789"));
+    }
 
-    const buf2 = try allocator.dupe(u8, "abcdefghij");
-    try c.put(.{ .segment_id = 1, .row_group_idx = 1, .column_idx = 0 }, buf2);
-
-    const buf3 = try allocator.dupe(u8, "ABCDEFGHIJ");
-    try c.put(.{ .segment_id = 1, .row_group_idx = 2, .column_idx = 0 }, buf3);
-
-    // First should still be present (we just put it last; let me re-think test logic).
-    // Actually buf1 was first. After 3 puts each 10 bytes, current_bytes = 30 which is
-    // within budget (30 <= 30). No eviction yet. Add one more.
-    const buf4 = try allocator.dupe(u8, "wxyz123456");
-    try c.put(.{ .segment_id = 1, .row_group_idx = 3, .column_idx = 0 }, buf4);
-
-    // Now 40 bytes; cap 30; evict from tail (LRU). buf1 was head most recently? No —
-    // after puts in order, head=buf4, then buf3, buf2, buf1=tail. So buf1 should be evicted.
-    try std.testing.expect(c.get(.{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }) == null);
-    try std.testing.expect(c.get(.{ .segment_id = 1, .row_group_idx = 3, .column_idx = 0 }) != null);
+    try std.testing.expect(c.acquire(.{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }) == null);
+    const last = c.acquire(.{ .segment_id = 1, .row_group_idx = 3, .column_idx = 0 }).?;
+    c.release(last);
     try std.testing.expectEqual(@as(u64, 1), c.evictions);
 }
 
-test "cache LRU order updated on get" {
+test "cache LRU order updated on acquire" {
     const allocator = std.testing.allocator;
     var c: Cache = .init(allocator, 20);
     defer c.deinit();
 
     const k1 = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
     const k2 = Key{ .segment_id = 1, .row_group_idx = 1, .column_idx = 0 };
-    try c.put(k1, try allocator.dupe(u8, "0123456789"));
-    try c.put(k2, try allocator.dupe(u8, "abcdefghij"));
+    try put(&c, k1, try allocator.dupe(u8, "0123456789"));
+    try put(&c, k2, try allocator.dupe(u8, "abcdefghij"));
 
-    // Access k1 → moves it to head.
-    _ = c.get(k1);
+    // Touch k1 → MRU; k2 becomes the LRU tail.
+    c.release(c.acquire(k1).?);
 
-    // Now inserting another 10-byte entry: cap is 20, putting another 10 = 30; evict tail.
-    // Tail should be k2 (because k1 was just touched).
+    // Inserting a third 10-byte entry over a cap of 20 evicts the tail (k2).
     const k3 = Key{ .segment_id = 1, .row_group_idx = 2, .column_idx = 0 };
-    try c.put(k3, try allocator.dupe(u8, "XXXXXXXXXX"));
+    try put(&c, k3, try allocator.dupe(u8, "XXXXXXXXXX"));
 
-    try std.testing.expect(c.get(k2) == null);
-    try std.testing.expect(c.get(k1) != null);
-    try std.testing.expect(c.get(k3) != null);
+    try std.testing.expect(c.acquire(k2) == null);
+    c.release(c.acquire(k1).?);
+    c.release(c.acquire(k3).?);
 }
 
-test "cache rejects entries larger than the whole budget" {
+test "cache never evicts a pinned entry, even over budget" {
     const allocator = std.testing.allocator;
-    var c: Cache = .init(allocator, 10);
+    var c: Cache = .init(allocator, 20);
     defer c.deinit();
 
-    const big = try allocator.dupe(u8, "0123456789ABCDEF"); // 16 bytes > 10
-    try c.put(.{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }, big);
+    // Hold k1 pinned (in-use) the whole time.
+    const k1 = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
+    const pinned = try c.insertPinned(k1, try allocator.dupe(u8, "0123456789"));
 
-    try std.testing.expectEqual(@as(usize, 0), c.current_bytes);
-    try std.testing.expect(c.get(.{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }) == null);
+    // Flood the cache well past budget while k1 — the oldest entry — stays pinned.
+    inline for (1..4) |i| {
+        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try allocator.dupe(u8, "XXXXXXXXXX"));
+    }
+
+    // k1 must still be resident despite being LRU and us being over budget.
+    const again = c.acquire(k1).?;
+    try std.testing.expectEqualStrings("0123456789", again.bytes);
+    c.release(again);
+    c.release(pinned);
+}
+
+test "cache insertPinned dedupes a racing duplicate key" {
+    const allocator = std.testing.allocator;
+    var c: Cache = .init(allocator, 1024);
+    defer c.deinit();
+
+    const k = Key{ .segment_id = 7, .row_group_idx = 2, .column_idx = 3 };
+    const first = try c.insertPinned(k, try allocator.dupe(u8, "AAAA"));
+    // Second insert of the same key (simulating a lost decompress race) must
+    // free the redundant bytes and hand back the existing entry.
+    const second = try c.insertPinned(k, try allocator.dupe(u8, "BBBB"));
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqualStrings("AAAA", second.bytes);
+    try std.testing.expectEqual(@as(usize, 4), c.current_bytes);
+    c.release(first);
+    c.release(second);
 }

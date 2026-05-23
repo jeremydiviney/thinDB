@@ -1039,19 +1039,43 @@ pub fn buildServerQuerySession(
             break :blk try upstream.orderBy(o.specs);
         },
         .group_by => |g| blk: {
+            // Metadata-only MIN/MAX over a bare table scan — answer from the
+            // manifest stats without building (or draining) a scan at all.
+            if (g.group_cols.len == 0) switch (g.upstream.*) {
+                .scan => |s| {
+                    if (catalogFor(db)) |catalog| {
+                        if (resolveTable(catalog, session, s.table)) |t| {
+                            if (try tryMinMaxStats(allocator, t, g.aggs)) |q| break :blk q;
+                        } else |_| {}
+                    }
+                },
+                else => {},
+            };
             var upstream = try buildServerQuerySession(allocator, db, session, g.upstream.*);
             errdefer upstream.deinit();
             if (g.group_cols.len > 0) {
                 const st = upstream.stats();
-                if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
-                    break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
-                }
-                if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols, g.aggs.len, db.config.query_memory_budget)) {
-                    const specs = try allocator.alloc(exec.SortSpec, g.group_cols.len);
-                    defer allocator.free(specs);
-                    for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
-                    upstream = try upstream.orderBy(specs);
-                    break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                switch (exec.force_group_by) {
+                    .hash => {},
+                    .sort => {
+                        const specs = try allocator.alloc(exec.SortSpec, g.group_cols.len);
+                        defer allocator.free(specs);
+                        for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+                        upstream = try upstream.orderBy(specs);
+                        break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                    },
+                    .auto => {
+                        if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
+                            break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                        }
+                        if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols, g.aggs.len, db.config.query_memory_budget)) {
+                            const specs = try allocator.alloc(exec.SortSpec, g.group_cols.len);
+                            defer allocator.free(specs);
+                            for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+                            upstream = try upstream.orderBy(specs);
+                            break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                        }
+                    },
                 }
             }
             break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k);
@@ -1340,18 +1364,49 @@ fn groupKeysSortedPrefix(state: exec.SortState, group_cols: []const []const u8) 
     return true;
 }
 
-/// True when we can *prove* the group-by hash table fits: every group key
-/// has a known distinct-count bound and their product is under the limit.
-/// Any unknown key (no on-disk stat, or post-join/derived) ⇒ false ⇒ the
-/// caller falls back to a bounded sort. `schema` is the group-by input's
-/// output schema (column_cards is indexed by it).
-/// Does a hash GROUP BY on these keys fit the memory budget? The hash path
-/// is O(n) (one pass) vs the sort path's O(n log n) string comparisons, so
-/// it's preferred whenever the group hash table fits. The only thing the
-/// sort fallback protects is memory, so the breakpoint is budget-derived
-/// rather than a fixed count: hash is chosen when the estimated table
-/// (NDV(keys) × per-group footprint) stays under half the query budget.
-/// Unknown cardinality always falls back to sort (memory-safe).
+/// Metadata-only MIN/MAX: `SELECT MIN(c)|MAX(c) [, ...] FROM t` with no GROUP
+/// BY over a bare table scan (no WHERE/projection between the aggregate and the
+/// scan) is answerable from the manifest's per-segment column stats — no scan,
+/// no decode. Returns null whenever it can't apply, so the caller compiles the
+/// normal scan+aggregate. `agg_stats.MinMaxStats.create` enforces the data-side
+/// preconditions (non-null/exact-stats columns, empty memtable, no tombstones).
+fn tryMinMaxStats(allocator: Allocator, table: *ApiTable, aggs: []const exec.AggSpec) !?Query {
+    if (aggs.len == 0) return null;
+    const specs = try allocator.alloc(exec.MinMaxStatsSpec, aggs.len);
+    defer allocator.free(specs);
+    for (aggs, specs) |a, *sp| {
+        const is_min = switch (a.func) {
+            .min => true,
+            .max => false,
+            else => return null,
+        };
+        const col_name = a.col orelse return null;
+        const idx = types.findColumn(table.schema.columns, col_name) orelse return null;
+        sp.* = .{ .col_idx = idx, .is_min = is_min, .out_name = a.as };
+    }
+    return exec.minMaxStats(allocator, table, specs);
+}
+
+/// Does a hash GROUP BY on these keys fit the memory budget? The hash path is
+/// O(n) (one pass) vs the sort path's O(n log n) comparisons, so it's preferred
+/// whenever the group hash table provably fits. The sort fallback only protects
+/// memory, so the breakpoint is budget-derived: hash is chosen when the
+/// estimated table (groups × per-group footprint) stays under half the budget.
+///
+/// Group-count estimate: the product of per-key NDVs assumes the keys are
+/// independent and *overestimates* badly when they're correlated (e.g. a unique
+/// key makes the product explode while the real combo count is just the row
+/// count). The true combined count can never exceed the number of input rows,
+/// so we clamp the product to `st.upper_rows`. A key with unknown cardinality
+/// (post-filter, derived/computed, or no on-disk stat) contributes no usable
+/// factor — but the row-count ceiling still bounds the whole combo, so we fall
+/// back to that ceiling rather than giving up and sorting. `schema` is the
+/// group-by input's output schema (column_cards is indexed by it).
+///
+/// TODO(FD): tighten further with functional-dependency detection — a key that
+/// is a deterministic function of another key (e.g. `ClientIP - 1`) adds zero
+/// groups and could drop out of the estimate. Not needed at current scale (the
+/// row-count clamp already routes the correlated cases correctly).
 fn groupKeysCardUnderLimit(
     st: exec.PipelineStats,
     schema: []const types.Column,
@@ -1359,18 +1414,15 @@ fn groupKeysCardUnderLimit(
     n_aggs: usize,
     budget: usize,
 ) bool {
-    if (st.column_cards.len == 0) return false;
-
     // Per-group footprint: dup'd key bytes + one accumulator per aggregate
     // + StringHashMap entry/load-factor overhead. Deliberately generous so
     // an HLL under-estimate doesn't push the real table over budget.
     var per_group: u64 = 96; // map entry + value slice + load-factor slack
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc) orelse return false;
-        if (idx >= st.column_cards.len) return false;
         per_group += exec.memory.estimateColumnBytes(schema[idx].type);
     }
-    per_group += @as(u64, n_aggs) * 48; // accumulator state per aggregate
+    per_group += @as(u64, n_aggs) * 32; // accumulator state per aggregate (AccState)
 
     // Use up to half the budget for the group table; the rest covers input
     // batches, the output, and any sibling operators. budget==0 means
@@ -1378,18 +1430,23 @@ fn groupKeysCardUnderLimit(
     const allowed: u64 = if (budget == 0) (1 << 30) else @as(u64, budget) / 2;
     const max_groups = allowed / per_group;
 
+    // Estimate the combined group count, clamped to the row-count ceiling.
+    const ceiling: u64 = st.upper_rows;
     var product: u64 = 1;
+    var any_unknown = false;
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc).?;
+        if (idx >= st.column_cards.len) {
+            any_unknown = true;
+            continue;
+        }
         switch (st.column_cards[idx]) {
-            .unknown => return false,
-            .exact => |nd| {
-                product *|= nd;
-                if (product >= max_groups) return false;
-            },
+            .unknown => any_unknown = true,
+            .exact => |nd| product *|= nd,
         }
     }
-    return true;
+    const est: u64 = if (any_unknown) ceiling else @min(product, ceiling);
+    return est < max_groups;
 }
 
 // ---------------------------------------------------------------------------
@@ -1632,24 +1689,48 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             break :blk try upstream.orderBy(o.specs);
         },
         .group_by => |g| blk: {
+            // Metadata-only MIN/MAX over a bare table scan — answer from the
+            // manifest stats without building (or draining) a scan at all.
+            if (g.group_cols.len == 0) switch (g.upstream.*) {
+                .scan => |s| {
+                    if (catalogFor(ctx.db)) |catalog| {
+                        if (resolveTable(catalog, ctx.session.*, s.table)) |t| {
+                            if (try tryMinMaxStats(ctx.allocator, t, g.aggs)) |q| break :blk q;
+                        } else |_| {}
+                    }
+                },
+                else => {},
+            };
             var upstream = try compileOp(ctx, g.upstream);
             errdefer upstream.deinit();
             // Global aggregate (no group keys) is O(1) — always hash.
             if (g.group_cols.len > 0) {
                 const st = upstream.stats();
-                if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
-                    break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                switch (exec.force_group_by) {
+                    .hash => {},
+                    .sort => {
+                        const specs = try ctx.allocator.alloc(exec.SortSpec, g.group_cols.len);
+                        defer ctx.allocator.free(specs);
+                        for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+                        upstream = try upstream.orderBy(specs);
+                        break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                    },
+                    .auto => {
+                        if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
+                            break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                        }
+                        if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols, g.aggs.len, ctx.db.config.query_memory_budget)) {
+                            // Unknown or over the limit → sort the group keys,
+                            // then stream. Bounded memory regardless of card.
+                            const specs = try ctx.allocator.alloc(exec.SortSpec, g.group_cols.len);
+                            defer ctx.allocator.free(specs);
+                            for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+                            upstream = try upstream.orderBy(specs);
+                            break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
+                        }
+                        // else: proven under the limit → hash fits.
+                    },
                 }
-                if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols, g.aggs.len, ctx.db.config.query_memory_budget)) {
-                    // Unknown or over the limit → sort the group keys, then
-                    // stream. Bounded memory regardless of cardinality.
-                    const specs = try ctx.allocator.alloc(exec.SortSpec, g.group_cols.len);
-                    defer ctx.allocator.free(specs);
-                    for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
-                    upstream = try upstream.orderBy(specs);
-                    break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
-                }
-                // else: proven under the limit → hash fits.
             }
             break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k);
         },

@@ -34,6 +34,11 @@ const usage_text =
     \\  --idle-timeout-secs N   Close a connection after N seconds of read silence (default 0 = disabled).
     \\  --query-memory-budget B Per-query memory budget in bytes (default 2 GiB; also gates the
     \\                          hash-vs-sort GROUP BY decision). 0 disables tracking.
+    \\  --cache-size B          Per-table decompressed-block buffer-pool budget (default 256 MiB).
+    \\                          Accepts raw bytes or a K/M/G suffix (e.g. 8G). Shared across all
+    \\                          queries against a table; blocks in use are pinned and never evicted.
+    \\  --force-group-by S      Diagnostic: force GROUP BY path — auto (default) | hash | sort.
+    \\                          Bypasses cardinality routing; for hash-vs-sort benchmarking only.
     \\  --profile-ops           Print a per-operator INCLUSIVE time breakdown to stderr after each
     \\                          query (diagnostic; ~zero overhead when off). Self time of an operator
     \\                          is its inclusive minus its upstream's in a linear pipeline.
@@ -71,6 +76,7 @@ pub fn main(init: std.process.Init) !u8 {
     var max_connections: u32 = 256;
     var idle_timeout_secs: u32 = 0;
     var query_memory_budget: ?usize = null;
+    var cache_size_bytes: ?usize = null;
     var mysql_password: ?[]const u8 = null;
     var pg_password: ?[]const u8 = null;
     const mysql_profile = envFlag(init.environ_map, "THINDB_MYSQL_PROFILE");
@@ -95,6 +101,20 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (std.mem.eql(u8, arg, "--profile-ops")) {
             thindb.exec.prof.enabled = true;
+            continue;
+        }
+        if (try takeValue(arg, "--force-group-by", &args_iter, err_w)) |v| {
+            if (std.mem.eql(u8, v, "hash")) {
+                thindb.exec.force_group_by = .hash;
+            } else if (std.mem.eql(u8, v, "sort")) {
+                thindb.exec.force_group_by = .sort;
+            } else if (std.mem.eql(u8, v, "auto")) {
+                thindb.exec.force_group_by = .auto;
+            } else {
+                try err_w.print("thindb-server: --force-group-by must be auto|hash|sort, got: {s}\n", .{v});
+                try err_w.flush();
+                return 1;
+            }
             continue;
         }
         if (try takeValue(arg, "--data-dir", &args_iter, err_w)) |v| {
@@ -128,6 +148,14 @@ pub fn main(init: std.process.Init) !u8 {
         if (try takeValue(arg, "--query-memory-budget", &args_iter, err_w)) |v| {
             query_memory_budget = std.fmt.parseInt(usize, v, 10) catch {
                 try err_w.print("thindb-server: invalid --query-memory-budget: {s}\n", .{v});
+                try err_w.flush();
+                return 1;
+            };
+            continue;
+        }
+        if (try takeValue(arg, "--cache-size", &args_iter, err_w)) |v| {
+            cache_size_bytes = parseSize(v) catch {
+                try err_w.print("thindb-server: invalid --cache-size: {s} (use bytes, or a K/M/G suffix)\n", .{v});
                 try err_w.flush();
                 return 1;
             };
@@ -171,6 +199,7 @@ pub fn main(init: std.process.Init) !u8 {
         .max_connections = max_connections,
         .idle_timeout_secs = idle_timeout_secs,
         .query_memory_budget = query_memory_budget orelse (thindb.Config{}).query_memory_budget,
+        .cache_size_bytes = cache_size_bytes orelse (thindb.Config{}).cache_size_bytes,
     };
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
@@ -380,6 +409,30 @@ fn takeU32(
 
 fn parseBind(bind: []const u8, port: u16) !std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parse(bind, port);
+}
+
+/// Parse a byte size: a plain integer, or an integer with a single binary
+/// suffix `K`/`M`/`G` (×1024, ×1024², ×1024³). Case-insensitive on the suffix.
+fn parseSize(s: []const u8) !usize {
+    if (s.len == 0) return error.Empty;
+    const last = s[s.len - 1];
+    const mult: usize = switch (last) {
+        'k', 'K' => 1024,
+        'm', 'M' => 1024 * 1024,
+        'g', 'G' => 1024 * 1024 * 1024,
+        else => 1,
+    };
+    const digits = if (mult == 1) s else s[0 .. s.len - 1];
+    const n = try std.fmt.parseInt(usize, digits, 10);
+    return std.math.mul(usize, n, mult);
+}
+
+test "parseSize handles plain bytes and K/M/G suffixes" {
+    try std.testing.expectEqual(@as(usize, 256), try parseSize("256"));
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), try parseSize("8G"));
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), try parseSize("512m"));
+    try std.testing.expectEqual(@as(usize, 64 * 1024), try parseSize("64K"));
+    try std.testing.expectError(error.InvalidCharacter, parseSize("8GB"));
 }
 
 // ---------------------------------------------------------------------------

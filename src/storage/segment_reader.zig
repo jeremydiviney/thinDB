@@ -73,23 +73,30 @@ pub const ReadSegment = struct {
 
         const flags = format.ColumnBlockFlags.fromByte(self.file_bytes[cursor + 1]);
 
-        // Try cache for the decompressed bytes.
+        // Consult the buffer pool for the decompressed bytes. The pin is held
+        // only across the decode below and dropped via `defer` so a failure
+        // mid-decode can't leak it and wedge the block.
         if (c) |cc| {
             const key = storage_cache.Key{
                 .segment_id = self.info.segment_id,
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
             };
-            if (cc.get(key)) |raw| {
-                return decodeRawColumn(allocator, col_type, raw, rg.row_count, flags);
+            if (cc.acquire(key)) |entry| {
+                defer cc.release(entry);
+                return decodeRawColumn(allocator, col_type, entry.bytes, rg.row_count, flags);
             }
-            // Miss: decompress fresh + cache.
-            const raw = try getDecompressedBytes(allocator, self.file_bytes, cursor);
-            errdefer allocator.free(raw);
-            try cc.put(key, raw);
-            // After put(), cache OWNS raw — re-fetch a borrowed slice to decode from.
-            const cached_raw = cc.get(key) orelse raw;
-            return decodeRawColumn(allocator, col_type, cached_raw, rg.row_count, flags);
+            // Miss: decompress fresh and hand the bytes to the cache. The
+            // errdefer is scoped to the block so it fires only if we fail
+            // before ownership transfers; once `insertPinned` returns, the
+            // cache owns the bytes and only the pin needs releasing.
+            const entry = blk: {
+                const raw = try getDecompressedBytes(allocator, self.file_bytes, cursor);
+                errdefer allocator.free(raw);
+                break :blk try cc.insertPinned(key, raw);
+            };
+            defer cc.release(entry);
+            return decodeRawColumn(allocator, col_type, entry.bytes, rg.row_count, flags);
         }
 
         // No cache: original path.

@@ -25,8 +25,8 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
 | Median query | ~440 ms |
-| Total (all 43, best-of-3) | **~24.8 s** (was 28.3 s pre-SIMD; Q29 1499→224 ms via fused col-op-const) |
-| Slowest | Q28 `REGEXP_REPLACE` — 2.9 s; Q23 `SELECT * … ORDER BY LIMIT` — 2.5 s |
+| Total (all 43, best-of-3) | **~18.0 s** (24.8 → 21.1 buffer pool → 18.6 hash-routing → 18.0 MIN/MAX-from-stats; 28.3 pre-SIMD) |
+| Slowest | Q28 `REGEXP_REPLACE` — 2.4 s (CPU-bound); Q23 `SELECT *` — 1.2 s; Q32 GROUP BY — 1.2 s |
 | Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
 Recent wins folded into this number: **top-k aggregation fusion** (`GROUP BY
@@ -126,6 +126,110 @@ hash-table probe latency, string handling — not numeric inner loops. SIMD paid
 off exactly where the work was compute-bound arithmetic (`col op const`); the
 remaining levers are algorithmic (late materialization, hash-table layout),
 not SIMD.
+
+## Buffer pool — cross-query decompressed-block cache (live)
+
+Until now the per-table LRU block cache existed but was **dead**: the scan
+called the null-cache decode path, so every query re-read and re-`zstd`-
+decompressed every column block it touched — even back-to-back runs of the
+same query. DuckDB, by contrast, runs ClickBench fully warm: with no
+`memory_limit` set it sizes its buffer pool to ~80% of RAM (~49 GB here),
+so after the first touch the entire 5M dataset is resident and every query
+is decompress-free. thinDB's "best-of-3" was therefore **warm-vs-cold**
+against DuckDB — re-decompressing on every rep.
+
+This pass wires the scan through the cache and turns it into a proper
+pinning buffer pool (`--cache-size`, default 256 MiB; run at **8 GiB**):
+
+- **Pin/unpin (in-use accounting).** `acquire`/`insertPinned` bump a refcount;
+  eviction walks the LRU tail and frees only **unpinned** blocks. A block a
+  reader still holds is never freed, so the pool is correct for datasets
+  **larger than the cache** — when the whole tail is pinned it temporarily
+  exceeds budget rather than free an in-use block. Pins are held only across
+  one block decode and dropped via `defer`, so a query that errors mid-decode
+  can't leak a pin and wedge a block.
+- **Concurrency.** A spinlock guards the O(1) metadata (map / LRU links / byte
+  counter / pin counts), never held across decompress or decode — fine for
+  the thread-per-connection server.
+- **Coherence is free.** Segments are immutable and segment IDs come from a
+  monotonic never-reused counter, so a cached block `(segment_id, rg, col)` is
+  valid for the life of its segment and keys never collide with a future
+  segment. Compaction's retired segments are simply never looked up again and
+  age out via LRU; the memtable is never cached. No invalidation logic.
+
+Effect is exactly where the cost is decompress-bound — the wide-projection /
+string-scan queries — and absent where it's CPU- or GROUP-BY-bound. Cold
+(rep 1, populates the pool) vs warm (reps 2-3, cache hit), same process:
+
+| Query | cold | warm | warm Δ |
+|---|---:|---:|---:|
+| Q23 `SELECT * … LIMIT 10` | 2176 ms | **1289 ms** | −41% |
+| Q20 `COUNT(*) WHERE URL LIKE` | 766 ms | **515 ms** | −33% |
+| Q22 `MIN(URL),MIN(Title),COUNT DISTINCT` | 1242 ms | **962 ms** | −23% |
+| Q24 `SearchPhrase ORDER BY … LIMIT` | 409 ms | **312 ms** | −24% |
+| Q28 `REGEXP_REPLACE` (CPU-bound) | 2823 ms | 2709 ms | ~flat |
+
+Suite total best-of-3 **24.8 s → ~21.1 s (−15%)**, 43/43, all of it in the
+decode-bound queries. The remaining levers stay algorithmic: late
+materialization for Q23 (#273), spill sort (#240), parallelism (#144).
+
+## High-cardinality GROUP BY — hash routing (live)
+
+A hash GROUP BY is one O(n) pass; the sort path is O(n log n). Hash wins on
+every high-card query we measured — by 2× when the keys actually compress:
+
+| Query | groups | sort | hash | |
+|---|--:|--:|--:|---|
+| Q35 `ClientIP, −1, −2, −3` | 730 K | 874 ms | **400 ms** | 2.2× (6.8:1 compression) |
+| Q39 `… CASE …, URL GROUP BY` | — | 798 ms | **242 ms** | 3.3× |
+| Q18 `UserID, minute, SearchPhrase` | 2.85 M | 997 ms | **894 ms** | |
+| Q32 `WatchID, ClientIP` | 5.0 M | 1290 ms | **1128 ms** | near-unique, only log-factor |
+
+These were routing to **sort** for two avoidable reasons, both fixed:
+
+1. **State compaction.** The per-group accumulator `AccState` was 48 B (sized
+   by its widest *rare* variant). Moving `min/max_large` to an inline `align(8)`
+   struct and lazily boxing `group_concat` shrank it to **32 B** with no hot-path
+   change (`count`/`sum`/`avg`/`min`/`max`/`distinct` all stay inline). That
+   raised the routing threshold from 4.26M → 5.26M groups — enough that Q32's 5M
+   now fits.
+2. **Estimate fix (clamp + unknown-as-ceiling).** The router estimated groups as
+   the *product of per-key NDVs* and bailed to sort on any `unknown` key. The
+   product assumes independence and explodes when keys are correlated
+   (`WatchID × ClientIP = 5M × 730K = 3.6e12` vs the real 5M); and computed keys
+   (`minute(…)`, `ClientIP−k`, `CASE …`) are always `unknown`. Fix: the combined
+   group count can never exceed the input row count, so clamp the estimate to
+   `upper_rows`, and treat `unknown` keys as that same ceiling instead of giving
+   up. Provably memory-safe (the ceiling is a true upper bound, so if the
+   estimate fits, the real table fits). This is what unlocked Q18/Q35/Q39 — their
+   computed keys no longer force a sort.
+
+Deferred: functional-dependency tightening (a key that's a function of another
+key adds no groups) — gives a tighter estimate but changes no routing decision
+at this scale, since the row-count clamp already routes every case correctly.
+
+## Metadata-only MIN/MAX (live)
+
+`MIN(c)`/`MAX(c)` over a bare table (no GROUP BY, no WHERE) is answered by
+folding the manifest's per-segment column min/max — no scan, no decode:
+
+| Query | before | after | |
+|---|--:|--:|---|
+| Q06 `MIN/MAX(EventDate)` | 162 ms | **0.4 ms** | ~400×; **beats** DuckDB's 1 ms |
+
+A new `MinMaxStats` leaf operator (src/exec/agg_stats.zig) is substituted at
+plan time when the pattern matches and the columns carry exact stats. It falls
+back to the normal scan+aggregate for: float/double (no stats) and string
+(16-byte-prefix, approximate) columns; a populated memtable (unflushed rows);
+or any tombstone (a deleted row could have been the extreme).
+
+**Nullable columns supported.** The segment writer's `computeStats` now skips
+NULL slots (previously it folded the placeholder value at null positions,
+polluting the extreme), and an all-null row group stores an inverted
+`min > max` "no values" sentinel that the fold ignores. So `MIN/MAX` over a
+nullable column is both correct (NULLs excluded, per SQL semantics) and
+served from stats. Verified end-to-end by re-importing the 5M dataset under
+the null-aware writer (43/43, Q06 value unchanged).
 
 ## Front-end overhead (wire + parser) — negligible
 
