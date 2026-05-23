@@ -118,7 +118,7 @@ pub const Filter = struct {
             const n = upstream_batch.row_count;
             const mask = try self.allocator.alloc(bool, n);
             defer self.allocator.free(mask);
-            try self.evaluateExpr(self.expr, upstream_batch, mask);
+            try self.evaluateExpr(self.expr, upstream_batch, mask, null);
 
             var matched: usize = 0;
             for (mask) |m| if (m) {
@@ -136,7 +136,11 @@ pub const Filter = struct {
         }
     }
 
-    fn evaluateExpr(self: *Filter, expr: PredicateExpr, batch: Batch, out: []bool) anyerror!void {
+    /// Evaluate `expr` into `out`. `active`, when non-null, marks rows still
+    /// worth testing — an earlier conjunct already eliminated the rest, so
+    /// expensive leaves (LIKE) skip them. Inactive rows in `out` are
+    /// don't-care: the caller's conjunction AND masks them off.
+    fn evaluateExpr(self: *Filter, expr: PredicateExpr, batch: Batch, out: []bool, active: ?[]const bool) anyerror!void {
         switch (expr) {
             .leaf => |p| {
                 const col_idx = types.findColumn(self.schema, p.col) orelse return Error.ColumnNotFound;
@@ -165,19 +169,23 @@ pub const Filter = struct {
             },
             .like => |lp| {
                 const col_idx = types.findColumn(self.schema, lp.col) orelse return Error.ColumnNotFound;
-                try predicate.evaluateLikeMask(batch.values[col_idx], lp.pattern, batch.row_count, out);
+                try predicate.evaluateLikeMask(batch.values[col_idx], lp.pattern, batch.row_count, out, active);
             },
             .@"and" => |children| {
                 if (children.len == 0) {
                     @memset(out, true);
                     return;
                 }
-                try self.evaluateExpr(children[0], batch, out);
+                // Conjunction is mask-guided: each conjunct after the first is
+                // evaluated only on rows still alive in the running mask, so an
+                // expensive predicate (LIKE) runs on the few survivors of the
+                // selective ones rather than every row.
+                try self.evaluateExpr(children[0], batch, out, active);
                 if (children.len == 1) return;
                 const scratch = try self.allocator.alloc(bool, out.len);
                 defer self.allocator.free(scratch);
                 for (children[1..]) |child| {
-                    try self.evaluateExpr(child, batch, scratch);
+                    try self.evaluateExpr(child, batch, scratch, out);
                     for (out, scratch) |*o, s| o.* = o.* and s;
                 }
             },
@@ -186,17 +194,20 @@ pub const Filter = struct {
                     @memset(out, false);
                     return;
                 }
-                try self.evaluateExpr(children[0], batch, out);
+                // Disjunction widens, so it can't narrow the active set; it just
+                // forwards the incoming `active` (rows eliminated upstream stay
+                // eliminated) to every child.
+                try self.evaluateExpr(children[0], batch, out, active);
                 if (children.len == 1) return;
                 const scratch = try self.allocator.alloc(bool, out.len);
                 defer self.allocator.free(scratch);
                 for (children[1..]) |child| {
-                    try self.evaluateExpr(child, batch, scratch);
+                    try self.evaluateExpr(child, batch, scratch, active);
                     for (out, scratch) |*o, s| o.* = o.* or s;
                 }
             },
             .not => |child| {
-                try self.evaluateExpr(child.*, batch, out);
+                try self.evaluateExpr(child.*, batch, out, active);
                 for (out) |*o| o.* = !o.*;
             },
             // Resolved away by the pre-compile pass.

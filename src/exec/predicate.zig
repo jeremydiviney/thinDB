@@ -747,7 +747,7 @@ pub fn evaluatePredicate(
         .like => |lp| {
             const col_idx = findCol(schema, lp.col) orelse return Error.ColumnNotFound;
             const view = batch.values[col_idx];
-            try evaluateLikeMask(view, lp.pattern, batch.row_count, out);
+            try evaluateLikeMask(view, lp.pattern, batch.row_count, out, null);
         },
         .@"and" => |children| {
             if (children.len == 0) {
@@ -1295,13 +1295,19 @@ fn stringCmpCol(l: anytype, r: anytype, op: PredicateOp, n: usize, mask: []bool)
 
 /// Per-row LIKE evaluation: matches NULL → false (two-valued logic).
 /// Only valid against string-typed columns (validateExpr enforces).
-pub fn evaluateLikeMask(view: ColumnView, pattern: []const u8, n: usize, mask: []bool) !void {
+/// `active`, when non-null, marks the rows still worth testing — a row whose
+/// `active[i]` is false is already eliminated by an earlier conjunct, so the
+/// (expensive) substring match is skipped via `and` short-circuit. Inactive
+/// rows are written false; the conjunction AND masks them anyway.
+pub fn evaluateLikeMask(view: ColumnView, pattern: []const u8, n: usize, mask: []bool, active: ?[]const bool) !void {
     // Compile the pattern once per batch, then match each row against the plan.
     const plan = compileLike(pattern);
     switch (view.data) {
         .varchar, .string, .char => |sv| {
-            for (0..n) |i| {
-                mask[i] = view.isValid(i) and plan.match(sv.rowBytes(i));
+            if (active) |act| {
+                for (0..n) |i| mask[i] = act[i] and view.isValid(i) and plan.match(sv.rowBytes(i));
+            } else {
+                for (0..n) |i| mask[i] = view.isValid(i) and plan.match(sv.rowBytes(i));
             }
         },
         else => return Error.UnsupportedOperatorForType,

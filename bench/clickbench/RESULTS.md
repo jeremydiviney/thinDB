@@ -25,7 +25,7 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
 | Median query | ~440 ms |
-| Total (all 43, best-of-3) | **~11.4 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE → 11.4 flat agg state) |
+| Total (all 43, best-of-3) | **~11.3 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE → 11.4 flat agg state → 11.3 mask-guided AND) |
 | Slowest | Q28 `REGEXP_REPLACE` — 2.4 s (CPU-bound); Q23 `SELECT *` — 1.2 s; Q32 GROUP BY — 1.2 s |
 | Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
@@ -308,6 +308,28 @@ Suite **12.1 → 11.4 s**, 43/43. (An integer-packed-key variant was tried first
 and measured *neutral* — using Q17/Q18 as no-change controls, Q32's apparent
 move was entirely machine noise — so it was reverted. The cost was the slice
 indirection, not key serialization.)
+
+## Mask-guided conjunction (live) — short-circuit AND across rows
+
+The Filter evaluated every conjunct of an `AND` over **all** rows, then ANDed the
+masks. For Q22 (`Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND
+SearchPhrase <> ''`) that meant *two* full 5M-row LIKE scans even though the
+first conjunct already eliminates almost everything. The `AND` is now
+mask-guided: each conjunct after the first is evaluated only on rows still alive
+in the running mask (the active set is threaded into the leaf evaluators, and
+the LIKE matcher skips inactive rows via `and` short-circuit). General — any
+`AND` of a selective predicate with an expensive one benefits; no per-query
+casing. (Cost-based reordering of the conjuncts is a further refinement; the
+mask-guided evaluation already captures the win when the selective predicate is
+written first, as ClickBench writes it.)
+
+Best-of-5, vs full-mask AND:
+
+| Query | full-mask | mask-guided | DuckDB-1t | |
+|---|--:|--:|--:|--:|
+| Q22 `Title LIKE … AND URL NOT LIKE …` | 412 ms | **218 ms** | 289 ms | **win** |
+
+Suite **11.4 → 11.3 s**, 43/43.
 
 ## Front-end overhead (wire + parser) — negligible
 
