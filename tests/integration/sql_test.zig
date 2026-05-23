@@ -136,6 +136,57 @@ test "sql: EXPLAIN returns the physical plan as a QUERY PLAN result set" {
     try std.testing.expect(std.mem.indexOf(u8, plan.items, "Scan t") != null);
 }
 
+test "sql: GROUP BY with a constant key routes to hash, not sort fallback" {
+    // Regression guard for the constant-key routing gap (ClickBench Q34):
+    // `GROUP BY 1, tag` materializes the literal `1` via Compute. That derived
+    // column must report NDV 1 so the router products it as 1 x NDV(tag) and
+    // picks HashAggregate; before the fix it read as unknown cardinality and
+    // forced the sort fallback (StreamAggregate over a full Sort) even though
+    // tag alone trivially fits the budget. Independent of data size.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    {
+        var q = try runSql(allocator, db, "EXPLAIN SELECT 1, tag, count(*) AS c FROM t GROUP BY 1, tag ORDER BY c DESC LIMIT 2");
+        defer q.deinit();
+        var plan: std.ArrayList(u8) = .empty;
+        defer plan.deinit(allocator);
+        while (try q.next()) |b| {
+            const sv = b.values[0].data.string;
+            for (0..b.row_count) |i| try plan.appendSlice(allocator, sv.rowBytes(i));
+        }
+        try std.testing.expect(std.mem.indexOf(u8, plan.items, "HashAggregate") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan.items, "StreamAggregate") == null);
+    }
+
+    // And the results are correct: tags a (2) and b (2) outrank c (1).
+    {
+        var q = try runSql(allocator, db, "SELECT 1, tag, count(*) AS c FROM t GROUP BY 1, tag ORDER BY c DESC LIMIT 2");
+        defer q.deinit();
+        var rows: usize = 0;
+        var saw_a = false;
+        var saw_b = false;
+        while (try q.next()) |b| {
+            const tags = b.values[1].data.string;
+            for (0..b.row_count) |i| {
+                rows += 1;
+                const tag = tags.rowBytes(i);
+                const c = b.values[2].data.bigint[i];
+                try std.testing.expectEqual(@as(i64, 2), c);
+                if (std.mem.eql(u8, tag, "a")) saw_a = true;
+                if (std.mem.eql(u8, tag, "b")) saw_b = true;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), rows);
+        try std.testing.expect(saw_a and saw_b);
+    }
+}
+
 test "sql: EXPLAIN ANALYZE aliases EXPLAIN (same static plan)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -23,11 +23,18 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Metric | Value |
 |---|---:|
 | Queries passing | **43 / 43** |
-| `COUNT(*)` (Q0) | **3 ms** (metadata-only, 0-column scan) |
-| Median query | ~520 ms |
-| Total (all 43) | ~32 s |
-| Slowest | Q34 `GROUP BY 1, URL` — 3.6 s (high-cardinality string GROUP BY) |
-| Q28 `REGEXP_REPLACE` | 2.7 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
+| `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
+| Median query | ~440 ms |
+| Total (all 43, best-of-3) | **~28.3 s** |
+| Slowest | Q28 `REGEXP_REPLACE` — 2.9 s; Q23 `SELECT * … ORDER BY LIMIT` — 2.5 s |
+| Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
+
+Recent wins folded into this number: **top-k aggregation fusion** (`GROUP BY
+<key> ORDER BY <agg> LIMIT k` emits only the k groups — Q33 3.1 s → 0.9 s) and
+the **constant-key routing fix** (`GROUP BY 1, URL` no longer reads the literal
+key as unknown-cardinality and falls to the sort path — Q34 3.6 s → 1.1 s).
+This is the **pre-SIMD baseline** (see the full table below); the SIMD pass
+(#145) targets the numeric/scan inner loops next.
 
 The high-cardinality `GROUP BY` queries (Q15-18, Q32-35) pass because of
 **column pruning** (projection pushdown): the 105-column table is scanned
@@ -42,9 +49,9 @@ DuckDB run in-process via the CLI (`.timer on`); thinDB over the MySQL wire.
 
 | Engine | Mode | Total (43 queries) | vs thinDB |
 |---|---|---:|---:|
-| **thinDB** | 1 thread, MySQL wire | **31.8 s** | — |
-| DuckDB | 1 thread (`SET threads=1`) | 9.5 s | thinDB **3.3× slower** |
-| DuckDB | all cores | 3.5 s | thinDB **9.1× slower** |
+| **thinDB** | 1 thread, MySQL wire | **28.3 s** | — |
+| DuckDB | 1 thread (`SET threads=1`) | 9.5 s | thinDB **3.0× slower** |
+| DuckDB | all cores | 3.5 s | thinDB **8.1× slower** |
 
 thinDB is single-threaded today, so the apples-to-apples engine comparison
 is vs DuckDB-1-thread (3.3×); the all-cores number just reflects DuckDB's
@@ -54,17 +61,39 @@ GROUP BY / ORDER BY:
 
 | Query | thinDB | DuckDB-1t | ratio |
 |---|---:|---:|---:|
-| Q34 `GROUP BY 1, URL` | 3455 ms | 500 ms | 6.9× |
-| Q33 `GROUP BY URL` | 3062 ms | 468 ms | 6.5× |
-| Q28 `REGEXP_REPLACE` | **2723 ms** | **3604 ms** | **0.76× (thinDB wins)** |
-| Q23 `SELECT * … ORDER BY LIMIT` | 2299 ms | 288 ms | 8.0× |
-| Q22 `MIN(URL), MIN(Title), COUNT DISTINCT` | 1377 ms | 289 ms | 4.8× |
-| Q32 `WatchID, ClientIP GROUP BY` | 1278 ms | 420 ms | 3.0× |
+| Q28 `REGEXP_REPLACE` | **2866 ms** | **3604 ms** | **0.80× (thinDB wins)** |
+| Q23 `SELECT * … ORDER BY LIMIT` | 2541 ms | 288 ms | 8.8× |
+| Q29 `SUM(...)×~90` | 1905 ms | — | (compute/reduction-bound) |
+| Q22 `MIN(URL), MIN(Title), COUNT DISTINCT` | 1530 ms | 289 ms | 5.3× |
+| Q32 `WatchID, ClientIP GROUP BY` | 1460 ms | 420 ms | 3.5× |
+| Q34 `GROUP BY 1, URL` | 1075 ms | 500 ms | 2.1× (was 3455 ms) |
+| Q33 `GROUP BY URL` | 944 ms | 468 ms | 2.0× (was 3062 ms) |
 
 thinDB **beats** DuckDB single-thread on the regex query (Q28 is DuckDB's
-own slowest single-thread query). Everything else slow is the string
-GROUP BY / sort path — the next optimization frontier (SIMD hashing #145,
-parallelism #144, spill sort #240), none of it regex.
+own slowest single-thread query). With the string-GROUP-BY queries now
+fused/hash-routed, the remaining gap is spread across the scan + numeric
+inner loops (Q29 reductions, Q23 wide materialize, filter/LIKE scans) — the
+SIMD pass (#145) target — plus parallelism (#144) and spill sort (#240).
+
+## Pre-SIMD baseline — full per-query (best of 3, 2 GiB)
+
+Snapshot taken before the SIMD pass so before/after is attributable. ~5%
+run-to-run variance on this machine; treat per-query SIMD deltas as
+back-to-back measurements, not diffs against these absolutes.
+
+| Q | ms | Q | ms | Q | ms | Q | ms |
+|---|--:|---|--:|---|--:|---|--:|
+| Q00 | 0 | Q11 | 222 | Q22 | 1530 | Q33 | 944 |
+| Q01 | 256 | Q12 | 379 | Q23 | 2541 | Q34 | 1075 |
+| Q02 | 211 | Q13 | 502 | Q24 | 390 | Q35 | 997 |
+| Q03 | 208 | Q14 | 812 | Q25 | 443 | Q36 | 231 |
+| Q04 | 391 | Q15 | 414 | Q26 | 395 | Q37 | 136 |
+| Q05 | 435 | Q16 | 926 | Q27 | 614 | Q38 | 152 |
+| Q06 | 187 | Q17 | 708 | Q28 | 2866 | Q39 | 1011 |
+| Q07 | 186 | Q18 | 1180 | Q29 | 1905 | Q40 | 88 |
+| Q08 | 604 | Q19 | 170 | Q30 | 575 | Q41 | 103 |
+| Q09 | 663 | Q20 | 738 | Q31 | 571 | Q42 | 110 |
+| Q10 | 220 | Q21 | 792 | Q32 | 1460 | **Total** | **28.3 s** |
 
 ## Front-end overhead (wire + parser) — negligible
 

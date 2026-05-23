@@ -260,8 +260,30 @@ pub const Compute = struct {
     /// derived (derived columns can't be in upstream's sort_state, so
     /// they can't appear in it; thus the upstream's claim is still
     /// fully valid in our output schema).
+    ///
+    /// Extends `column_cards` to cover the derived columns so downstream
+    /// routing (notably GROUP BY hash-vs-sort, which products per-key NDV)
+    /// can reason about them: a literal-only column has NDV 1, a rename
+    /// inherits its source's card, anything computed is unknown. Without
+    /// this, `GROUP BY <const>, key` reads the const column as unknown and
+    /// is forced onto the sort path even when `key` alone fits the budget.
     pub fn stats(self: *Compute) exec.PipelineStats {
-        return self.upstream.stats();
+        var up = self.upstream.stats();
+        const up_n = self.upstream.outputSchema().len;
+        // Only extend when upstream reports a full per-column card array;
+        // otherwise the indices wouldn't line up and fabricating is unsafe.
+        if (up.column_cards.len != up_n) return up;
+        const cards = self.arena.allocator().alloc(exec.ColCard, up_n + self.derived.len) catch return up;
+        @memcpy(cards[0..up_n], up.column_cards);
+        for (self.derived, 0..) |d, i| {
+            cards[up_n + i] = switch (d.kind) {
+                .lit_only => .{ .exact = 1 },
+                .rename => |rn| if (rn.src_idx < up_n) up.column_cards[rn.src_idx] else .unknown,
+                .call, .case => .unknown,
+            };
+        }
+        up.column_cards = cards;
+        return up;
     }
 
     pub fn accountant(self: *Compute) ?*exec.memory.MemoryAccountant {
