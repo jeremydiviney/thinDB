@@ -81,8 +81,12 @@ pub const Config = struct {
     auto_flush_min_rows: u64 = 1,
     auto_flush_min_bytes: usize = 0,
 
-    /// LRU cache budget for decompressed column blocks. 0 disables caching.
-    cache_size_bytes: usize = 256 * 1024 * 1024,
+    /// LRU cache budget for decompressed column blocks. The special value
+    /// `0` means "auto" — resolved at open time to ~20% of physical RAM
+    /// (floored at 256 MiB) by `autoCacheSizeBytes`. Set an explicit non-zero
+    /// value to pin the budget; there is no separate "disable cache" — a tiny
+    /// explicit value (e.g. 1) is the way to effectively turn it off.
+    cache_size_bytes: usize = 0,
 
     /// Background-compactor threshold. When a table has at least this many
     /// live segments and the background compactor sweep runs, it triggers
@@ -154,6 +158,19 @@ pub const Config = struct {
     /// values: 1800 (30 min), 3600 (1 hour).
     idle_timeout_secs: u32 = 0,
 };
+
+/// Resolve the decompressed-block cache budget. A non-zero `configured` is
+/// honored verbatim; `0` means "auto" — ~20% of physical RAM, floored at
+/// 256 MiB so small machines still get a usable pool. The LRU fills lazily and
+/// evicts to this bound, so a large auto budget on a big box costs nothing
+/// until the workload's hot set actually grows into it. Falls back to the
+/// floor if the OS can't report total memory.
+pub fn autoCacheSizeBytes(configured: usize) usize {
+    if (configured != 0) return configured;
+    const floor: u64 = 256 * 1024 * 1024;
+    const total = std.process.totalSystemMemory() catch return @intCast(floor);
+    return @intCast(@max(total / 5, floor));
+}
 
 pub const TableOptions = struct {
     /// Required for create. On reopen via `db.table(...)`, must match the

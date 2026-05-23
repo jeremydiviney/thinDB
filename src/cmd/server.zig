@@ -34,9 +34,10 @@ const usage_text =
     \\  --idle-timeout-secs N   Close a connection after N seconds of read silence (default 0 = disabled).
     \\  --query-memory-budget B Per-query memory budget in bytes (default 2 GiB; also gates the
     \\                          hash-vs-sort GROUP BY decision). 0 disables tracking.
-    \\  --cache-size B          Per-table decompressed-block buffer-pool budget (default 256 MiB).
-    \\                          Accepts raw bytes or a K/M/G suffix (e.g. 8G). Shared across all
-    \\                          queries against a table; blocks in use are pinned and never evicted.
+    \\  --cache-size B          Per-table decompressed-block buffer-pool budget (default: auto,
+    \\                          ~20% of physical RAM, floored at 256 MiB). Accepts raw bytes or a
+    \\                          K/M/G suffix (e.g. 8G). Shared across all queries against a table;
+    \\                          blocks in use are pinned and never evicted.
     \\  --force-group-by S      Diagnostic: force GROUP BY path — auto (default) | hash | sort.
     \\                          Bypasses cardinality routing; for hash-vs-sort benchmarking only.
     \\  --profile-ops           Print a per-operator INCLUSIVE time breakdown to stderr after each
