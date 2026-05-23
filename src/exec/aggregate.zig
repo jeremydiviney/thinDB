@@ -164,6 +164,10 @@ const AccState = union(enum) {
     welford: WelfordAcc,
     /// Exact distinct count: set of arena-dup'd value bytes.
     distinct: std.StringHashMapUnmanaged(void),
+    /// Exact distinct count over a fixed-width integer-family column: the raw
+    /// value bits are hashed directly (no per-value byte serialization or key
+    /// arena-dup). Selected by `initialState` when the input type is int-family.
+    distinct_int: std.AutoHashMapUnmanaged(u128, void),
     /// Exact percentile: keep every observed value (as f64), sort + interpolate at finalize.
     percentile_values: std.ArrayListUnmanaged(f64),
     /// group_concat buffer, lazily boxed (the `ConcatAcc` is 32 bytes — too
@@ -1075,6 +1079,7 @@ fn aggOrderValue(s: AccState) OrderVal {
         .min_float, .max_float => |m| .{ .float = m orelse 0.0 },
         .avg => |a| .{ .float = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count)) },
         .distinct => |set| .{ .int = @intCast(set.count()) },
+        .distinct_int => |set| .{ .int = @intCast(set.count()) },
         else => unreachable,
     };
 }
@@ -1183,7 +1188,10 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
             .{ .max_int = null },
         .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
-        .count_distinct => .{ .distinct = .empty },
+        .count_distinct => if (in != null and intKeyBits(in.?) != null)
+            .{ .distinct_int = .empty }
+        else
+            .{ .distinct = .empty },
         .percentile => .{ .percentile_values = .empty },
         .group_concat => .{ .concat = null },
     };
@@ -1643,18 +1651,46 @@ fn welfordStep(w: *WelfordAcc, x: f64) void {
 /// arena-dups the key for storage. Validation rejects NULL — SQL
 /// semantics say NULL is excluded from DISTINCT counts.
 fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
-    var scratch: std.ArrayList(u8) = .empty;
-    defer scratch.deinit(aa);
-    var r: u32 = row_start;
-    while (r < row_end) : (r += 1) {
-        if (!view.isValid(r)) continue;
-        scratch.clearRetainingCapacity();
-        try encodeOneValue(aa, &scratch, view, r);
-        const gop = try s.distinct.getOrPut(aa, scratch.items);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try aa.dupe(u8, scratch.items);
-        }
+    switch (s.*) {
+        .distinct_int => |*set| {
+            var r: u32 = row_start;
+            while (r < row_end) : (r += 1) {
+                if (!view.isValid(r)) continue;
+                try set.put(aa, distinctIntKey(view, r), {});
+            }
+        },
+        .distinct => |*set| {
+            var scratch: std.ArrayList(u8) = .empty;
+            defer scratch.deinit(aa);
+            var r: u32 = row_start;
+            while (r < row_end) : (r += 1) {
+                if (!view.isValid(r)) continue;
+                scratch.clearRetainingCapacity();
+                try encodeOneValue(aa, &scratch, view, r);
+                const gop = try set.getOrPut(aa, scratch.items);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = try aa.dupe(u8, scratch.items);
+                }
+            }
+        },
+        else => unreachable,
     }
+}
+
+/// Raw value bits of a fixed-width integer-family column at `row`, packed into a
+/// u128 for direct hashing in the count_distinct int fast path. The per-type
+/// `fieldBits` cast is bijective, so distinct stored values map to distinct keys.
+fn distinctIntKey(view: ColumnView, row: u32) u128 {
+    return switch (view.data) {
+        .boolean => |s| fieldBits(u8, s[row], 8),
+        .tinyint => |s| fieldBits(i8, s[row], 8),
+        .smallint => |s| fieldBits(i16, s[row], 16),
+        .int, .date => |s| fieldBits(i32, s[row], 32),
+        .bigint, .datetime, .decimal64 => |s| fieldBits(i64, s[row], 64),
+        .largeint, .decimal128 => |s| fieldBits(i128, s[row], 128),
+        .uuid => |s| fieldBits(u128, s[row], 128),
+        else => unreachable,
+    };
 }
 
 /// PERCENTILE_CONT(p): collect every valid value as f64, sort at
@@ -1873,7 +1909,12 @@ fn appendAccToColumn(
             try col.data.double.append(allocator, out);
         },
         .count_distinct => {
-            try col.data.bigint.append(allocator, @intCast(state.distinct.count()));
+            const n: u32 = switch (state) {
+                .distinct => |set| set.count(),
+                .distinct_int => |set| set.count(),
+                else => unreachable,
+            };
+            try col.data.bigint.append(allocator, @intCast(n));
         },
         .percentile => {
             const p: f64 = switch (spec.params) {

@@ -429,6 +429,43 @@ Best-of-5 vs the re-sort buffer:
 
 Suite **7.8 → 7.4 s**, 43/43.
 
+## COUNT(DISTINCT) integer fast path (live) — raw-bits hash set
+
+`COUNT(DISTINCT col)` serialized every value into a scratch byte buffer
+(`encodeOneValue`) and inserted it into a `StringHashMapUnmanaged(void)`,
+arena-dup'ing each first sighting. For a `BIGINT` column like `UserID` (~1M
+distinct over 5M rows) that is 5M byte-serializations + 5M string-hash probes +
+~1M key dups — the same byte-blob machinery the GROUP BY key path already showed
+is the cost, not the hashing.
+
+When the distinct column is a **fixed-width integer-family** type (the
+`intKeyBits` set: bool/tinyint/smallint/int/date/bigint/datetime/decimal64/
+largeint/decimal128/uuid) the accumulator now uses an
+`AutoHashMapUnmanaged(u128, void)` keyed on the **raw value bits** (`fieldBits`,
+the same bijective two's-complement cast the integer group-key path uses): no
+per-value serialization, no scratch buffer, no key dup, integer hashing. The
+count is identical — the cast is bijective, so distinct stored values map 1:1 to
+distinct u128 keys. String/float-family distinct stays on the byte-blob path,
+selected in `initialState` purely by input type — no per-query casing.
+
+Controlled best-of-5, same session, vs the byte-blob set:
+
+| Query | byte set | int set | DuckDB-1t | |
+|---|--:|--:|--:|--:|
+| Q04 `COUNT(DISTINCT UserID)` | 128 ms | **75 ms** | 56 | −41% |
+| Q08 `RegionID, COUNT(DISTINCT UserID)` | 283 ms | **136 ms** | 73 | −52% |
+| Q09 `Region, SUM/COUNT/AVG/DISTINCT` | 362 ms | **202 ms** | 105 | −44% |
+| Q10 `MobilePhoneModel, …DISTINCT` | 25 ms | **20 ms** | 40 | win |
+| Q11 `MobilePhone, …DISTINCT` | 30 ms | **25 ms** | 39 | win |
+| Q13 `SearchPhrase, COUNT(DISTINCT UserID)` | 155 ms | **124 ms** | 163 | win (was tie) |
+
+Controls confirm it is surgical: Q05 `COUNT(DISTINCT SearchPhrase)` (string →
+byte path) is flat 145↔148 ms, and Q22 (distinct over a tiny LIKE-filtered set,
+so scan-bound) is flat 830 ms. Q13 flips from a tie to a win; Q08/Q09 roughly
+halve. ~0.4 s off the six int-distinct queries. 43/43, `zig build test` green.
+(Suite-total anchor unchanged: this session's box runs warmer than the 7.4 s
+run; the controlled per-query A/B is the comparable measurement.)
+
 ## Front-end overhead (wire + parser) — negligible
 
 Measured so the 31.8 s is attributed correctly: it is essentially all
