@@ -25,7 +25,7 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
 | Median query | ~440 ms |
-| Total (all 43, best-of-3) | **~13.6 s** (24.8 → 21.1 buffer pool → 18.6 hash-routing → 18.0 MIN/MAX-stats → 13.6 per-column reads) |
+| Total (all 43, best-of-3) | **~12.1 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE) |
 | Slowest | Q28 `REGEXP_REPLACE` — 2.4 s (CPU-bound); Q23 `SELECT *` — 1.2 s; Q32 GROUP BY — 1.2 s |
 | Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
@@ -258,6 +258,28 @@ These now match or beat DuckDB-1t. The win generalizes (Q10 190→29, Q29 215→
 Q08 462→305), dropping the suite **18.0 → 13.6 s**. Only `SELECT *` (Q23) is
 unchanged — it reads every column, so there's nothing to prune (its lever is
 late materialization, #273).
+
+## LIKE fast path (live) — compiled segments + memchr-seeded substring
+
+`LIKE` was a per-row recursive-backtracking matcher. It's now compiled once per
+batch into literal segments split on `%` (the common `%lit%` / `lit%` / `%lit` /
+exact / `%a%b%` shapes), matched via a SIMD memchr-seeded substring scan
+(`indexOfScalarPos` on the first byte + `eql` for the rest) — no per-call
+skip-table setup. Patterns with `_` keep the backtracker. General, no
+query-specific casing. (A first cut using `std.mem.indexOfPos` *regressed* —
+it builds a Boyer-Moore table per call; the memchr seed avoids that. Lesson
+re-confirmed: measure, A/B controlled, keep the winner.)
+
+Controlled best-of-5, same data, back-to-back vs the backtracker:
+
+| Query | backtracker | memchr | |
+|---|--:|--:|--:|
+| Q22 `Title LIKE … AND URL NOT LIKE …` | 718 ms | **412 ms** | −43% |
+| Q20 `COUNT WHERE URL LIKE` | 303 ms | **188 ms** | −38% |
+| Q21 `… MIN(URL) WHERE URL LIKE` | 324 ms | **204 ms** | −37% |
+| Q23 `SELECT * WHERE URL LIKE` | 944 ms | **863 ms** | −9% |
+
+Suite **13.6 → 12.1 s**, 43/43.
 
 ## Front-end overhead (wire + parser) — negligible
 

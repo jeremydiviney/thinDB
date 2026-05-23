@@ -583,10 +583,105 @@ pub fn pushExprDown(upstream: *exec.Query, expr: PredicateExpr) !void {
     }
 }
 
-/// SQL LIKE matcher. `pattern` uses `%` (zero-or-more) and `_` (one).
-/// Recursive backtracking matcher — acceptable for v1's modest pattern
-/// lengths. No escape syntax in v1 (`\%` / `\_` not supported).
+/// SQL LIKE matcher. `pattern` uses `%` (zero-or-more) and `_` (one). No
+/// escape syntax in v1 (`\%` / `\_` not supported). Convenience wrapper that
+/// compiles + matches in one shot; loops over many rows should `compileLike`
+/// once and reuse the plan (see `evaluateLikeMask`).
 pub fn likeMatch(text: []const u8, pattern: []const u8) bool {
+    return compileLike(pattern).match(text);
+}
+
+const max_like_segments = 16;
+
+/// A LIKE pattern compiled once for fast per-row matching. With no `_`, the
+/// pattern is a sequence of literal segments separated by `%` (zero-or-more),
+/// so it matches via ordered substring search (`std.mem.indexOfPos`, an
+/// optimized scan) — anchored at an end only when the pattern doesn't start /
+/// end with `%`. This subsumes the common shapes (`lit`, `lit%`, `%lit`,
+/// `%lit%`, `%a%b%`). Patterns with `_`, or more than `max_like_segments`
+/// literal pieces, fall back to the recursive backtracking matcher.
+pub const LikePlan = struct {
+    general: bool,
+    pattern: []const u8,
+    empty: bool = false,
+    anchored_start: bool = false,
+    anchored_end: bool = false,
+    nseg: usize = 0,
+    segs: [max_like_segments][]const u8 = undefined,
+
+    pub fn match(self: *const LikePlan, text: []const u8) bool {
+        if (self.general) return likeMatchBacktrack(text, self.pattern);
+        if (self.empty) return text.len == 0;
+        if (self.nseg == 0) return true; // pattern is all `%` → matches anything
+        var pos: usize = 0;
+        var i: usize = 0;
+        while (i < self.nseg) : (i += 1) {
+            const seg = self.segs[i];
+            const is_first = i == 0;
+            const is_last = i == self.nseg - 1;
+            if (is_first and self.anchored_start) {
+                if (text.len < seg.len or !std.mem.eql(u8, text[0..seg.len], seg)) return false;
+                pos = seg.len;
+                if (is_last and self.anchored_end) return pos == text.len;
+            } else if (is_last and self.anchored_end) {
+                if (text.len < seg.len) return false;
+                const start = text.len - seg.len;
+                if (start < pos or !std.mem.eql(u8, text[start..], seg)) return false;
+                pos = text.len;
+            } else {
+                const found = findSubstring(text, pos, seg) orelse return false;
+                pos = found + seg.len;
+            }
+        }
+        return true;
+    }
+};
+
+/// Classify a LIKE pattern into a `LikePlan`. No allocation — segments are
+/// slices into `pattern`, which outlives the plan.
+pub fn compileLike(pattern: []const u8) LikePlan {
+    if (std.mem.indexOfScalar(u8, pattern, '_') != null) {
+        return .{ .general = true, .pattern = pattern };
+    }
+    if (pattern.len == 0) return .{ .general = false, .pattern = pattern, .empty = true };
+    var plan: LikePlan = .{
+        .general = false,
+        .pattern = pattern,
+        .anchored_start = pattern[0] != '%',
+        .anchored_end = pattern[pattern.len - 1] != '%',
+    };
+    var it = std.mem.splitScalar(u8, pattern, '%');
+    while (it.next()) |s| {
+        if (s.len == 0) continue;
+        if (plan.nseg == max_like_segments) return .{ .general = true, .pattern = pattern };
+        plan.segs[plan.nseg] = s;
+        plan.nseg += 1;
+    }
+    return plan;
+}
+
+/// Find `needle` in `haystack` at or after `start`. Seeds on the first byte
+/// via `indexOfScalarPos` (a vectorized memchr) and confirms the rest with
+/// `eql` — no per-call skip-table setup, which matters when this runs once per
+/// row over millions of rows. Returns the match offset, or null.
+fn findSubstring(haystack: []const u8, start: usize, needle: []const u8) ?usize {
+    if (needle.len == 0) return start;
+    if (needle.len > haystack.len) return null;
+    if (needle.len == 1) return std.mem.indexOfScalarPos(u8, haystack, start, needle[0]);
+    const last = haystack.len - needle.len;
+    var i = start;
+    while (i <= last) {
+        const p = std.mem.indexOfScalarPos(u8, haystack, i, needle[0]) orelse return null;
+        if (p > last) return null;
+        if (std.mem.eql(u8, haystack[p + 1 ..][0 .. needle.len - 1], needle[1..])) return p;
+        i = p + 1;
+    }
+    return null;
+}
+
+/// Recursive-backtracking LIKE matcher — fallback for patterns containing `_`.
+/// `%` = zero-or-more, `_` = exactly one; no escape syntax in v1.
+fn likeMatchBacktrack(text: []const u8, pattern: []const u8) bool {
     var ti: usize = 0;
     var pi: usize = 0;
     var star_ti: ?usize = null;
@@ -1201,32 +1296,12 @@ fn stringCmpCol(l: anytype, r: anytype, op: PredicateOp, n: usize, mask: []bool)
 /// Per-row LIKE evaluation: matches NULL → false (two-valued logic).
 /// Only valid against string-typed columns (validateExpr enforces).
 pub fn evaluateLikeMask(view: ColumnView, pattern: []const u8, n: usize, mask: []bool) !void {
+    // Compile the pattern once per batch, then match each row against the plan.
+    const plan = compileLike(pattern);
     switch (view.data) {
-        .varchar => |sv| {
+        .varchar, .string, .char => |sv| {
             for (0..n) |i| {
-                if (!view.isValid(i)) {
-                    mask[i] = false;
-                    continue;
-                }
-                mask[i] = likeMatch(sv.rowBytes(i), pattern);
-            }
-        },
-        .string => |sv| {
-            for (0..n) |i| {
-                if (!view.isValid(i)) {
-                    mask[i] = false;
-                    continue;
-                }
-                mask[i] = likeMatch(sv.rowBytes(i), pattern);
-            }
-        },
-        .char => |sv| {
-            for (0..n) |i| {
-                if (!view.isValid(i)) {
-                    mask[i] = false;
-                    continue;
-                }
-                mask[i] = likeMatch(sv.rowBytes(i), pattern);
+                mask[i] = view.isValid(i) and plan.match(sv.rowBytes(i));
             }
         },
         else => return Error.UnsupportedOperatorForType,
