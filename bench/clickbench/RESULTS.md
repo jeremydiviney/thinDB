@@ -25,7 +25,7 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
 | Median query | ~440 ms |
-| Total (all 43, best-of-3) | **~10.9 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE → 11.4 flat agg state → 11.3 mask-guided AND → 10.9 single-row accumulate) |
+| Total (all 43, best-of-3) | **~10.1 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE → 11.4 flat agg state → 11.3 mask-guided AND → 10.9 single-row accumulate → 10.1 late materialization) |
 | Slowest | Q28 `REGEXP_REPLACE` — 2.4 s (CPU-bound); Q23 `SELECT *` — 1.2 s; Q32 GROUP BY — 1.2 s |
 | Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
@@ -344,6 +344,27 @@ Controlled best-of-5 vs per-row `updateState`: Q32 919→864 ms (−6%, the SUM
 path). The suite total moved more (11.3→10.9 s) because Q30 issues **90 SUM
 aggregates** (≈450M per-value updates) — exactly the case this removes setup
 from. COUNT-only queries (Q17/Q18) are unchanged, as expected. 43/43.
+
+## Late materialization (live) — fetch wide columns only for survivors
+
+Q23 (`SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`)
+matches only **422 of 5M rows** and keeps **10**, yet the naive
+`TopN → Filter → Scan(all 105 cols)` plan decoded every column for every row
+(profile: Scan ~506 ms). The planner now recognizes
+`Limit{ [Project] [OrderBy] Filter{ Scan(single base table) } }` where the
+output is wider than the columns the filter + ORDER BY touch, and rewrites it to
+a `LateScan`: the inner `Scan(probe cols + a hidden __rowloc) → Filter → TopN`
+decodes only the probe columns plus each row's packed physical location; then
+the wide output columns are fetched for just the ≤k survivors (re-decoding the
+few row groups they live in — the row-group cache absorbs repeats — and reading
+memtable-resident survivors from the pinned snapshot). The `__rowloc` rides
+through tombstone compaction as a normal column, so locations stay correct after
+deletes. General to any `SELECT <wide> … WHERE <pred> [ORDER BY …] LIMIT n`;
+conservative shape match bails to the normal plan otherwise.
+
+Best-of-5: **Q23 806 → 231 ms (−71%), under DuckDB-1t's 290 ms.** Suite
+10.9 → 10.1 s, 43/43. (Q25/Q26/Q27 — `SELECT SearchPhrase … LIMIT` — correctly
+do *not* late-materialize: their output isn't wider than the probe set.)
 
 ## Front-end overhead (wire + parser) — negligible
 

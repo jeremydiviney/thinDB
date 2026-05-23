@@ -443,6 +443,44 @@ pub fn scanWithProjection(
     return @import("scan.zig").Scan.createWithProjection(allocator, table, accountant_ptr, needed);
 }
 
+/// Build a late-materialization plan for `SELECT <output_names> FROM table
+/// WHERE <pred> [ORDER BY <order_specs>] LIMIT n OFFSET offset`.
+///
+/// Inner pipeline: `Scan(probe_names + __rowloc) → Filter(pred) →
+/// TopN(order_specs, n, offset) | Limit(n, offset)`. The inner decodes only
+/// the probe columns (filter ∪ ORDER BY) plus the location; the wrapping
+/// `LateScan` fetches the wide `output_names` columns for the ≤ n survivors.
+/// `order_specs == null` means no ORDER BY (a plain bounded limit).
+pub fn lateScan(
+    allocator: Allocator,
+    table: *Table,
+    accountant_ptr: ?*memory.MemoryAccountant,
+    probe_names: []const []const u8,
+    pred: predicate.PredicateExpr,
+    order_specs: ?[]const SortSpec,
+    output_names: []const []const u8,
+    n: usize,
+    offset: usize,
+) !Query {
+    const scan_ptr = try @import("scan.zig").Scan.allocWithProjectionLoc(
+        allocator,
+        table,
+        accountant_ptr,
+        probe_names,
+        true,
+    );
+    var inner = makeQuery(allocator, scan_ptr);
+    errdefer inner.deinit();
+
+    inner = try inner.filter(pred);
+    inner = if (order_specs) |specs|
+        try inner.topN(specs, n, offset)
+    else
+        try inner.limitOffset(n, offset);
+
+    return @import("latescan.zig").LateScan.create(allocator, inner, scan_ptr, table, output_names);
+}
+
 /// Build a join's output `column_cards` by concatenating the left columns'
 /// bounds with the kept right columns' bounds (the join output schema is
 /// `left ⧺ right-where-kept`). A join can't grow a column's distinct count,
@@ -497,6 +535,8 @@ pub const Scan = @import("scan.zig").Scan;
 pub const Filter = @import("filter.zig").Filter;
 pub const Project = @import("project_limit.zig").Project;
 pub const Limit = @import("project_limit.zig").Limit;
+pub const LateScan = @import("latescan.zig").LateScan;
+pub const rowloc = @import("rowloc.zig");
 
 pub const sort_op = @import("sort.zig");
 pub const Sort = sort_op.Sort;
@@ -539,4 +579,6 @@ test {
     _ = @import("exec_test.zig");
     _ = @import("scalar_fn_test.zig");
     _ = @import("cast.zig");
+    _ = LateScan;
+    _ = rowloc;
 }

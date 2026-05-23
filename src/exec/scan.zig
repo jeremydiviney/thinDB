@@ -32,6 +32,8 @@ const Predicate = predicate.Predicate;
 const PredicateOp = predicate.PredicateOp;
 const statsOverlapPredicate = predicate.statsOverlapPredicate;
 
+const rowloc = @import("rowloc.zig");
+
 /// Merge each column's per-segment HyperLogLog sketches (register-wise max)
 /// into a distinct-value estimate for the whole scan, plus a conservative
 /// allowance for un-flushed memtable rows. `unknown` when the estimate
@@ -146,20 +148,34 @@ pub const Scan = struct {
     decoded_valid: bool = false,
     views: []ColumnView,
 
-    /// Physical column index for each output column. Projection pushdown:
+    /// Physical column index for each PROJECTED column. Projection pushdown:
     /// when the query references only a subset of the table's columns, the
     /// Scan decodes and emits just those, so blocking operators upstream
     /// buffer fewer columns. `out_phys[j]` is the table-schema index of
-    /// output column `j`. Defaults to all columns in table order.
+    /// projected column `j`. Defaults to all columns in table order. When
+    /// `emit_loc` is set, `out_phys.len` is one less than the output
+    /// width — the trailing output column is the synthesized `__rowloc`.
     out_phys: []usize,
-    /// Output schema = the table columns at `out_phys`, in that order.
-    /// Aliases `table.schema.columns` when no projection (not owned).
+    /// Output schema = the table columns at `out_phys`, in that order, plus
+    /// a trailing `__rowloc` BIGINT column when `emit_loc` is set. Aliases
+    /// `table.schema.columns` only when no projection AND not emitting loc.
     out_schema: []const Column,
     out_schema_owned: bool = false,
+
+    /// Late-materialization mode: append a trailing hidden `__rowloc` BIGINT
+    /// column carrying each row's physical location (see rowloc.zig). The
+    /// location is synthesized into the `decoded` array as just another
+    /// column so tombstone compaction carries it correctly. Off by default —
+    /// every existing call site is byte-for-byte unchanged.
+    emit_loc: bool = false,
 
     /// Lazily allocated when a row group has rows tombstoned and we need to
     /// materialize a filtered batch. Reused across batches.
     filtered: ?[]ColumnStore = null,
+
+    /// Late-mat (`emit_loc`) scratch holding the packed `__rowloc` values for
+    /// the memtable batch. Owned; freed in `deinit`.
+    memtable_loc_buf: []i64 = &.{},
 
     /// Pushed-down predicates used to skip row groups via min/max stats.
     prunes: std.ArrayList(PruneHint),
@@ -225,18 +241,54 @@ pub const Scan = struct {
         injected: ?*exec.memory.MemoryAccountant,
         needed: ?[]const []const u8,
     ) !Query {
+        return createWithProjectionLoc(allocator, table, injected, needed, false);
+    }
+
+    /// Like `createWithProjection`, but `emit_loc` (when true) appends a
+    /// trailing hidden `__rowloc` BIGINT column carrying each row's physical
+    /// location. Used by `LateScan` for late materialization. Every other
+    /// call site goes through `createWithProjection` with `emit_loc = false`,
+    /// leaving its output schema unchanged.
+    pub fn createWithProjectionLoc(
+        allocator: Allocator,
+        table: *Table,
+        injected: ?*exec.memory.MemoryAccountant,
+        needed: ?[]const []const u8,
+        emit_loc: bool,
+    ) !Query {
+        const self = try allocWithProjectionLoc(allocator, table, injected, needed, emit_loc);
+        return makeQuery(allocator, self);
+    }
+
+    /// Same as `createWithProjectionLoc` but returns the raw `*Scan` instead of
+    /// the type-erased `Query`. `LateScan` builds its inner Scan through this
+    /// so it can reach `memtableSnap()` directly, then wraps the pointer in a
+    /// `Query` via `exec.makeQuery`.
+    pub fn allocWithProjectionLoc(
+        allocator: Allocator,
+        table: *Table,
+        injected: ?*exec.memory.MemoryAccountant,
+        needed: ?[]const []const u8,
+        emit_loc: bool,
+    ) !*Scan {
         const out_phys = try resolveOutPhys(allocator, table.schema.columns, needed);
         errdefer allocator.free(out_phys);
 
-        const out_schema_owned = needed != null;
+        // The output schema owns its own buffer whenever it diverges from the
+        // table's column slice — i.e. on any projection OR when appending the
+        // synthesized `__rowloc` column.
+        const out_schema_owned = needed != null or emit_loc;
+        const proj_len = out_phys.len;
+        const out_len = proj_len + @intFromBool(emit_loc);
         const out_schema: []const Column = if (out_schema_owned) blk: {
-            const s = try allocator.alloc(Column, out_phys.len);
-            for (s, out_phys) |*c, p| c.* = table.schema.columns[p];
+            const s = try allocator.alloc(Column, out_len);
+            for (s[0..proj_len], out_phys) |*c, p| c.* = table.schema.columns[p];
+            if (emit_loc) s[proj_len] = .{ .name = rowloc.col_name, .type = .bigint };
             break :blk s;
         } else table.schema.columns;
         errdefer if (out_schema_owned) allocator.free(@constCast(out_schema));
 
-        const k = out_phys.len;
+        const k = out_len;
         const decoded = try allocator.alloc(storage.OwnedColumn, k);
         errdefer allocator.free(decoded);
         const views = try allocator.alloc(ColumnView, k);
@@ -307,17 +359,24 @@ pub const Scan = struct {
             .out_phys = out_phys,
             .out_schema = out_schema,
             .out_schema_owned = out_schema_owned,
+            .emit_loc = emit_loc,
             .prunes = .empty,
             .owned_accountant = owned_accountant,
             .owns_accountant = owns_accountant,
             .cached_cards = cached_cards,
         };
 
-        return makeQuery(allocator, self);
+        return self;
     }
 
     pub fn accountant(self: *Scan) ?*exec.memory.MemoryAccountant {
         return self.owned_accountant;
+    }
+
+    /// The pinned memtable snapshot this scan reads from. `LateScan` reaches
+    /// through it to materialize memtable-resident survivors by row index.
+    pub fn memtableSnap(self: *Scan) *engine.Memtable {
+        return self.memtable_snap;
     }
 
     pub fn explain(self: *Scan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
@@ -330,6 +389,7 @@ pub const Scan = struct {
     pub fn deinit(self: *Scan) void {
         self.releaseBatch();
         self.closeCurSegment();
+        if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_cards.len > 0) self.allocator.free(self.cached_cards);
         self.prunes.deinit(self.allocator);
         if (self.owns_accountant) {
@@ -515,8 +575,9 @@ pub const Scan = struct {
         // one row-count-only batch per segment straight from the manifest
         // (total rows minus tombstoned), then the memtable snapshot count.
         // A 0-column predicate set means no segment can be pruned, so every
-        // segment contributes its full surviving count.
-        if (self.out_phys.len == 0) {
+        // segment contributes its full surviving count. (Late-mat scans
+        // always project >=1 probe column, so `emit_loc` never reaches here.)
+        if (self.out_phys.len == 0 and !self.emit_loc) {
             while (self.phase == .segments) {
                 if (self.cur_seg_idx >= self.segment_count) {
                     self.phase = .memtable;
@@ -593,6 +654,16 @@ pub const Scan = struct {
                 continue;
             }
 
+            const rg_count = rg.row_count;
+
+            var decoded_cols: usize = 0;
+            errdefer {
+                for (self.decoded[0..decoded_cols]) |*c| c.deinit(self.allocator);
+                // A later step (e.g. tombstone application) can fail after
+                // `decoded_valid` is set; clear it so the deinit-time
+                // `releaseBatch` doesn't free these columns a second time.
+                self.decoded_valid = false;
+            }
             for (self.out_phys, 0..) |phys, j| {
                 self.decoded[j] = try seg.decodeColumnMaybeCached(
                     self.allocator,
@@ -601,11 +672,24 @@ pub const Scan = struct {
                     phys,
                     &self.table.cache,
                 );
+                decoded_cols += 1;
+            }
+
+            // Late-mat: synthesize the trailing `__rowloc` column as a normal
+            // decoded column. The local offset is the row's index within this
+            // row group, so a survivor can later be re-fetched via
+            // `decodeColumnMaybeCached(rg_idx, phys)[offset]`. Carrying it
+            // through `applyTombsIfAny` keeps each surviving row's physical
+            // location correct after tombstone compaction.
+            if (self.emit_loc) {
+                const locs = try self.allocator.alloc(i64, rg_count);
+                for (locs, 0..) |*v, i| v.* = rowloc.packSegment(self.cur_seg_idx, self.cur_rg_idx, i);
+                self.decoded[self.out_phys.len] = .{ .data = .{ .bigint = locs } };
+                decoded_cols += 1;
             }
             self.decoded_valid = true;
 
             const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
-            const rg_count = rg.row_count;
             self.cur_rg_idx += 1;
 
             // Apply tombstones if any fall within this row group.
@@ -629,6 +713,12 @@ pub const Scan = struct {
 
             for (self.out_phys, 0..) |phys, j| {
                 self.views[j] = self.memtable_snap.columns[phys].view();
+            }
+            if (self.emit_loc) {
+                const n: usize = @intCast(self.memtable_row_count);
+                self.memtable_loc_buf = try self.allocator.alloc(i64, n);
+                for (self.memtable_loc_buf, 0..) |*v, i| v.* = rowloc.packMemtable(i);
+                self.views[self.out_phys.len] = .{ .data = .{ .bigint = self.memtable_loc_buf } };
             }
             return Batch{
                 .schema = self.out_schema,

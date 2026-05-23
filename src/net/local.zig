@@ -974,6 +974,218 @@ fn applyTopKFusion(f: TopNFusion, l: ir.Op.Limit) void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Late materialization (ClickBench Q23).
+//
+// `SELECT <wide> FROM t WHERE <pred> [ORDER BY <keys>] LIMIT n [OFFSET m]`
+// over a single base table: the non-late plan (`TopN → Filter → Scan(all)`)
+// makes the Scan decode every output column for every row before the filter
+// runs. When the output is wider than the columns the filter + ORDER BY touch,
+// late materialization decodes only those probe columns (plus a hidden row
+// location) through the filter + bounded top-k, then fetches the wide columns
+// for just the surviving rows. See `exec.lateScan` / `latescan.zig`.
+//
+// Detection is deliberately conservative: only a bare single-table `.scan`
+// (no alias / join / CTE / aggregate / window / computed-or-aliased
+// projection) under the optional Project → (OrderBy) → Filter → Scan shape.
+// Any deviation bails to the existing plan, which is always correct.
+// ---------------------------------------------------------------------------
+
+/// The `Filter{ Scan }` core of a late-mat candidate, plus the optional
+/// ORDER BY and top Project peeled above it.
+const LateMatPeel = struct {
+    select: ?ir.Op.Project,
+    order_specs: ?[]const SortSpec,
+    filter: ir.Op.Filter,
+    scan: ir.Op.Scan,
+};
+
+/// Peel `Limit{ [Project] [OrderBy] Filter{ Scan } }`. Returns null unless the
+/// shape bottoms out in a bare, unaliased single-table scan under a filter.
+fn lateMatPeel(l: ir.Op.Limit) ?LateMatPeel {
+    var node = l.upstream;
+    var select: ?ir.Op.Project = null;
+    if (node.* == .select) {
+        select = node.select;
+        node = node.select.upstream;
+    }
+    var order_specs: ?[]const SortSpec = null;
+    if (node.* == .order_by) {
+        order_specs = node.order_by.specs;
+        node = node.order_by.upstream;
+    }
+    if (node.* != .filter) return null;
+    const filter = node.filter;
+    if (filter.upstream.* != .scan) return null;
+    const scan = filter.upstream.scan;
+    // Aliased scans expose `alias.col` names via an AliasRename wrapper —
+    // resolving the output back to base columns gets murky. Bail.
+    if (scan.alias != null) return null;
+    return .{ .select = select, .order_specs = order_specs, .filter = filter, .scan = scan };
+}
+
+const LateMatShape = struct {
+    /// Concrete output column names in output order. For `SELECT *` this is
+    /// every base column; for an explicit projection, the listed names.
+    output_names: []const []const u8,
+    /// Inner scan's projection = filter columns ∪ ORDER BY columns. Owned.
+    probe_names: []const []const u8,
+    predicate: PredicateExpr,
+    /// ORDER BY keys, or null when there's no ORDER BY (plain bounded limit).
+    order_specs: ?[]const SortSpec,
+    /// Owned: `output_names` for the `SELECT *` case (else borrowed from IR).
+    owns_output: bool,
+
+    fn deinit(self: *LateMatShape, allocator: Allocator) void {
+        allocator.free(@constCast(self.probe_names));
+        if (self.owns_output) allocator.free(@constCast(self.output_names));
+    }
+};
+
+/// Add `name` to `set` if not already present (case-insensitive).
+fn addNameUnique(allocator: Allocator, set: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
+    for (set.items) |existing| {
+        if (types.columnNameEql(existing, name)) return;
+    }
+    try set.append(allocator, name);
+}
+
+fn collectPredicateNames(allocator: Allocator, set: *std.ArrayListUnmanaged([]const u8), p: PredicateExpr) !void {
+    switch (p) {
+        .leaf => |lf| try addNameUnique(allocator, set, lf.col),
+        .leaf_col_col => |lc| {
+            try addNameUnique(allocator, set, lc.left);
+            try addNameUnique(allocator, set, lc.right);
+        },
+        .is_null, .is_not_null => |col| try addNameUnique(allocator, set, col),
+        .like => |lp| try addNameUnique(allocator, set, lp.col),
+        .in_set => |s| try addNameUnique(allocator, set, s.col),
+        .@"and", .@"or" => |children| for (children) |ch| try collectPredicateNames(allocator, set, ch),
+        .not => |child| try collectPredicateNames(allocator, set, child.*),
+        .always => {},
+        // Correlated / unresolved-subquery shapes never appear under a single
+        // base-table late-mat candidate; returning an error makes the caller
+        // bail out of late-mat rather than silently drop a referenced column.
+        else => return Error.UnsupportedOp,
+    }
+}
+
+/// Resolve the single base table under a possible late-mat `Limit` shape, or
+/// null when the shape doesn't match or the table can't be resolved. Never
+/// errors — a failed resolve just disables late-mat.
+fn lateMatBaseTable(catalog: *Catalog, session: Session, l: ir.Op.Limit) ?*ApiTable {
+    const peel = lateMatPeel(l) orelse return null;
+    return resolveTable(catalog, session, peel.scan.table) catch null;
+}
+
+/// Match `Limit{ [Project] [OrderBy] Filter{ Scan } }` and build the pieces a
+/// late-materialization plan needs, or null when the shape doesn't match or
+/// late-mat wouldn't save decoding (output not strictly wider than the probe
+/// set). `table` is the already-resolved base table (used to expand `SELECT
+/// *`). Caller frees the returned shape via `LateMatShape.deinit`.
+fn lateMatShape(allocator: Allocator, table: *ApiTable, l: ir.Op.Limit) !?LateMatShape {
+    const peel = lateMatPeel(l) orelse return null;
+
+    // Probe set = filter columns ∪ ORDER BY columns, all resolving to base
+    // columns. Any name that doesn't resolve means we can't account for it —
+    // bail rather than risk a wrong plan.
+    var probe: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer probe.deinit(allocator);
+    collectPredicateNames(allocator, &probe, peel.filter.predicate) catch {
+        probe.deinit(allocator);
+        return null;
+    };
+    if (peel.order_specs) |specs| {
+        for (specs) |sp| try addNameUnique(allocator, &probe, sp.col);
+    }
+    for (probe.items) |nm| {
+        if (types.findColumn(table.schema.columns, nm) == null) {
+            probe.deinit(allocator);
+            return null;
+        }
+    }
+
+    // Output projection. An explicit projection must be plain base-column
+    // names; `SELECT *` expands to every base column.
+    var owns_output = false;
+    const output_names: []const []const u8 = if (peel.select) |p| blk: {
+        for (p.columns) |nm| {
+            if (types.findColumn(table.schema.columns, nm) == null) {
+                probe.deinit(allocator);
+                return null;
+            }
+        }
+        break :blk p.columns;
+    } else blk: {
+        const all = try allocator.alloc([]const u8, table.schema.columns.len);
+        for (all, table.schema.columns) |*o, c| o.* = c.name;
+        owns_output = true;
+        break :blk all;
+    };
+    errdefer if (owns_output) allocator.free(@constCast(output_names));
+
+    // Only worth it when the output decodes strictly more columns than the
+    // probe set — otherwise the inner scan already reads everything.
+    if (!outputWiderThanProbe(table, output_names, probe.items)) {
+        if (owns_output) allocator.free(@constCast(output_names));
+        probe.deinit(allocator);
+        return null;
+    }
+
+    return .{
+        .output_names = output_names,
+        .probe_names = try probe.toOwnedSlice(allocator),
+        .predicate = peel.filter.predicate,
+        .order_specs = peel.order_specs,
+        .owns_output = owns_output,
+    };
+}
+
+/// True when the set of base columns the output references is strictly larger
+/// than the probe set — i.e. at least one output column isn't already decoded
+/// by the inner scan, so late-mat saves work.
+fn outputWiderThanProbe(
+    table: *ApiTable,
+    output_names: []const []const u8,
+    probe: []const []const u8,
+) bool {
+    var extra: usize = 0;
+    for (output_names) |on| {
+        const oi = types.findColumn(table.schema.columns, on) orelse return false;
+        var in_probe = false;
+        for (probe) |pn| {
+            if (types.findColumn(table.schema.columns, pn)) |pi| {
+                if (pi == oi) {
+                    in_probe = true;
+                    break;
+                }
+            }
+        }
+        if (!in_probe) extra += 1;
+    }
+    return extra > 0;
+}
+
+fn buildLateMat(
+    allocator: Allocator,
+    table: *ApiTable,
+    acct: ?*exec.memory.MemoryAccountant,
+    shape: LateMatShape,
+    l: ir.Op.Limit,
+) !Query {
+    return exec.lateScan(
+        allocator,
+        table,
+        acct,
+        shape.probe_names,
+        shape.predicate,
+        shape.order_specs,
+        shape.output_names,
+        @intCast(l.n),
+        @intCast(l.offset),
+    );
+}
+
 /// Server-side IR dispatcher. Recursively walks the decoded IR tree and
 /// builds the corresponding exec.Query operator chain using existing
 /// in-process operators. Uses a default Session — call sites needing
@@ -997,6 +1209,17 @@ pub fn buildServerQuerySession(
             break :blk try exec.scan(allocator, t);
         },
         .limit => |l| blk: {
+            // Late materialization (see compileOp for the rationale + the
+            // shape-detection helpers). Bails to Top-N / Limit otherwise.
+            if (catalogFor(db)) |catalog| {
+                if (lateMatBaseTable(catalog, session, l)) |t| {
+                    if (try lateMatShape(allocator, t, l)) |shape| {
+                        var sh = shape;
+                        defer sh.deinit(allocator);
+                        break :blk try buildLateMat(allocator, t, null, sh, l);
+                    }
+                }
+            }
             // Fuse ORDER BY ... LIMIT into a bounded Top-N: keep only the
             // limit+offset rows we might emit instead of materializing the
             // whole sorted input. The non-aggregate pipeline is
@@ -1649,6 +1872,21 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             break :blk base;
         },
         .limit => |l| blk: {
+            // Late materialization: a wide `SELECT` over a single base table
+            // with a selective WHERE [+ ORDER BY] LIMIT decodes only the probe
+            // columns through the filter + top-k, then fetches the wide
+            // columns for the survivors. Conservative shape match; bails to
+            // the Top-N / Limit plans below otherwise.
+            if (catalogFor(ctx.db)) |catalog| {
+                if (lateMatBaseTable(catalog, ctx.session.*, l)) |t| {
+                    if (try lateMatShape(ctx.allocator, t, l)) |shape| {
+                        var sh = shape;
+                        defer sh.deinit(ctx.allocator);
+                        const acct = try ctx.queryAccountant();
+                        break :blk try buildLateMat(ctx.allocator, t, acct, sh, l);
+                    }
+                }
+            }
             // Fuse ORDER BY ... LIMIT into a bounded Top-N (see the other
             // compile path for rationale).
             if (topNFusion(l.upstream)) |f| {
