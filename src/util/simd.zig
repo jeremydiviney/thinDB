@@ -76,6 +76,78 @@ pub fn maxOf(comptime T: type, data: []const T) T {
     return reduceExtreme(T, data, false);
 }
 
+pub const BinOp = enum { add, sub, mul };
+
+/// Elementwise `dst[i] = a[i] <op> b[i]` over equal-length slices, vectorized.
+/// Integer ops wrap (matching the scalar `+%`/`-%`/`*%` kernels); float ops are
+/// plain IEEE. `dst` must already be sized to `a.len`.
+pub fn binInto(comptime T: type, comptime op: BinOp, a: []const T, b: []const T, dst: []T) void {
+    std.debug.assert(a.len == b.len and a.len == dst.len);
+    const is_int = @typeInfo(T) == .int;
+    const N = comptime lanes(T);
+    var i: usize = 0;
+    if (N > 1) {
+        while (i + N <= dst.len) : (i += N) {
+            const va: @Vector(N, T) = a[i..][0..N].*;
+            const vb: @Vector(N, T) = b[i..][0..N].*;
+            const vr: @Vector(N, T) = if (is_int) switch (op) {
+                .add => va +% vb,
+                .sub => va -% vb,
+                .mul => va *% vb,
+            } else switch (op) {
+                .add => va + vb,
+                .sub => va - vb,
+                .mul => va * vb,
+            };
+            dst[i..][0..N].* = vr;
+        }
+    }
+    while (i < dst.len) : (i += 1) {
+        dst[i] = if (is_int) switch (op) {
+            .add => a[i] +% b[i],
+            .sub => a[i] -% b[i],
+            .mul => a[i] *% b[i],
+        } else switch (op) {
+            .add => a[i] + b[i],
+            .sub => a[i] - b[i],
+            .mul => a[i] * b[i],
+        };
+    }
+}
+
+test "simd: binInto matches scalar add/sub/mul" {
+    const lengths = [_]usize{ 0, 1, 9, 16, 33, 1000 };
+    inline for (.{ i32, i64, f64 }) |T| {
+        inline for (.{ BinOp.add, BinOp.sub, BinOp.mul }) |op| {
+            for (lengths) |len| {
+                const a = try std.testing.allocator.alloc(T, len);
+                defer std.testing.allocator.free(a);
+                const b = try std.testing.allocator.alloc(T, len);
+                defer std.testing.allocator.free(b);
+                const dst = try std.testing.allocator.alloc(T, len);
+                defer std.testing.allocator.free(dst);
+                for (a, b, 0..) |*av, *bv, idx| {
+                    av.* = if (@typeInfo(T) == .float) @floatFromInt(idx % 17) else @intCast(idx % 17);
+                    bv.* = if (@typeInfo(T) == .float) @floatFromInt((idx % 5) + 1) else @intCast((idx % 5) + 1);
+                }
+                binInto(T, op, a, b, dst);
+                for (a, b, dst) |av, bv, dv| {
+                    const want: T = if (@typeInfo(T) == .float) switch (op) {
+                        .add => av + bv,
+                        .sub => av - bv,
+                        .mul => av * bv,
+                    } else switch (op) {
+                        .add => av +% bv,
+                        .sub => av -% bv,
+                        .mul => av *% bv,
+                    };
+                    try std.testing.expectEqual(want, dv);
+                }
+            }
+        }
+    }
+}
+
 test "simd: minOf/maxOf match scalar over assorted lengths and types" {
     const lengths = [_]usize{ 1, 7, 16, 17, 64, 1000, 4097 };
     inline for (.{ i8, i16, i32, i64, i128, f32, f64 }) |T| {

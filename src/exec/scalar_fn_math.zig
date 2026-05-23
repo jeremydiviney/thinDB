@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const common = @import("scalar_fn_common.zig");
 const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
+const simd = @import("../util/simd.zig");
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
 
@@ -79,67 +80,62 @@ pub fn signKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
 // IEEE NaN/inf naturally.
 // ---------------------------------------------------------------------------
 
+// Reserve `n` elements of an unmanaged int/bigint/double list and return the
+// freshly-exposed tail slice for a vectorized write. The output list is
+// cleared before each kernel call, so this appends `n` new values.
+fn reserveInt(allocator: Allocator, out: *ColumnStore, n: usize) ![]i32 {
+    try out.data.int.ensureUnusedCapacity(allocator, n);
+    const base = out.data.int.items.len;
+    out.data.int.items.len = base + n;
+    return out.data.int.items[base..];
+}
+fn reserveBigint(allocator: Allocator, out: *ColumnStore, n: usize) ![]i64 {
+    try out.data.bigint.ensureUnusedCapacity(allocator, n);
+    const base = out.data.bigint.items.len;
+    out.data.bigint.items.len = base + n;
+    return out.data.bigint.items[base..];
+}
+fn reserveDouble(allocator: Allocator, out: *ColumnStore, n: usize) ![]f64 {
+    try out.data.double.ensureUnusedCapacity(allocator, n);
+    const base = out.data.double.items.len;
+    out.data.double.items.len = base + n;
+    return out.data.double.items[base..];
+}
+
 pub fn addIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.int;
-    const b = args[1].data.int;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.int.append(allocator, a[i] +% b[i]);
+    simd.binInto(i32, .add, args[0].data.int[0..row_count], args[1].data.int[0..row_count], try reserveInt(allocator, out, row_count));
 }
 
 pub fn addBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.bigint;
-    const b = args[1].data.bigint;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, a[i] +% b[i]);
+    simd.binInto(i64, .add, args[0].data.bigint[0..row_count], args[1].data.bigint[0..row_count], try reserveBigint(allocator, out, row_count));
 }
 
 pub fn addDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.double;
-    const b = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] + b[i]);
+    simd.binInto(f64, .add, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
 }
 
 pub fn subIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.int;
-    const b = args[1].data.int;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.int.append(allocator, a[i] -% b[i]);
+    simd.binInto(i32, .sub, args[0].data.int[0..row_count], args[1].data.int[0..row_count], try reserveInt(allocator, out, row_count));
 }
 
 pub fn subBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.bigint;
-    const b = args[1].data.bigint;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, a[i] -% b[i]);
+    simd.binInto(i64, .sub, args[0].data.bigint[0..row_count], args[1].data.bigint[0..row_count], try reserveBigint(allocator, out, row_count));
 }
 
 pub fn subDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.double;
-    const b = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] - b[i]);
+    simd.binInto(f64, .sub, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
 }
 
 pub fn mulIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.int;
-    const b = args[1].data.int;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.int.append(allocator, a[i] *% b[i]);
+    simd.binInto(i32, .mul, args[0].data.int[0..row_count], args[1].data.int[0..row_count], try reserveInt(allocator, out, row_count));
 }
 
 pub fn mulBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.bigint;
-    const b = args[1].data.bigint;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, a[i] *% b[i]);
+    simd.binInto(i64, .mul, args[0].data.bigint[0..row_count], args[1].data.bigint[0..row_count], try reserveBigint(allocator, out, row_count));
 }
 
 pub fn mulDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.double;
-    const b = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] * b[i]);
+    simd.binInto(f64, .mul, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
 }
 
 pub fn divIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
