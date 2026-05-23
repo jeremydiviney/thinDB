@@ -20,6 +20,7 @@ pub const DataStore = store.DataStore;
 const transform = @import("transform.zig");
 pub const appendAllColumn = transform.appendAllColumn;
 pub const appendByIndices = transform.appendByIndices;
+pub const appendOneRow = transform.appendOneRow;
 pub const appendMaskedColumn = transform.appendMaskedColumn;
 pub const compareInColumn = transform.compareInColumn;
 

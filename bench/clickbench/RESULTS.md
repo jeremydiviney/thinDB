@@ -25,7 +25,7 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
 | Median query | ~440 ms |
-| Total (all 43, best-of-3) | **~7.8 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE → 11.4 flat agg state → 11.3 mask-guided AND → 10.9 single-row accumulate → 10.1 late materialization → 7.8 prefetch+int-key group table) |
+| Total (all 43, best-of-3) | **~7.4 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE → 11.4 flat agg state → 11.3 mask-guided AND → 10.9 single-row accumulate → 10.1 late materialization → 7.8 prefetch+int-key group table → 7.4 bounded top-N) |
 | Slowest | Q28 `REGEXP_REPLACE` — 2.4 s (CPU-bound); Q23 `SELECT *` — 1.2 s; Q32 GROUP BY — 1.2 s |
 | Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
@@ -402,6 +402,32 @@ never freed until query end. Keys are now serialized into one reused per-batch
 blob (offsets in a spans list, slices resolved once it's built); only *new*
 groups copy their key into `gkeys`. Q17 249→227 ms, Q18 366→360 ms (now ≤
 DuckDB-1t's 361), and far less arena churn for every compound GROUP BY.
+
+## Bounded top-N (live) — skip rows that can't make the cut
+
+`ORDER BY <col> LIMIT n [OFFSET m]` (the non-aggregate `TopN`) buffered **every**
+upstream row into a columnar buffer and re-ran `pdqsort` over it whenever the
+buffer passed `2·keep` — so for `LIMIT 10` it re-sorted a ~1000-row buffer on
+*every* input batch (~900 times for Q25), copying all ~938K filtered rows in to
+keep 10. Profiling: the operator was ~180 ms (scan+filter only ~37 ms).
+
+Now once the buffer holds `keep = limit+offset` sorted rows, each incoming batch
+is **pre-filtered against the worst-kept row** (a cross-store lexicographic
+compare honoring per-key direction; ties at the threshold stay candidates) — a
+row strictly worse than the current k-th best can never be emitted, so it's
+skipped (no copy, no re-sort). Steady state collapses to ~one compare per row;
+re-sort only fires on batches that contributed a candidate. General to every
+`ORDER BY … LIMIT`; large-OFFSET (Q39–42, keep ~10010) is correct + unregressed.
+
+Best-of-5 vs the re-sort buffer:
+
+| Query | before | after | DuckDB-1t | |
+|---|--:|--:|--:|--:|
+| Q25 `ORDER BY SearchPhrase LIMIT 10` | 220 ms | **33 ms** | 19 | (was 11.6×) |
+| Q24 `ORDER BY EventTime LIMIT 10` | 133 ms | **38 ms** | 38 | tie |
+| Q26 `ORDER BY EventTime, SearchPhrase LIMIT 10` | 197 ms | **38 ms** | 38 | tie |
+
+Suite **7.8 → 7.4 s**, 43/43.
 
 ## Front-end overhead (wire + parser) — negligible
 

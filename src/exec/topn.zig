@@ -3,12 +3,21 @@
 //! A full Sort holds every input row before it can emit; for an
 //! `ORDER BY ... LIMIT k` that's wasteful and can blow the query memory
 //! budget on a large input. Top-N instead keeps only the `keep = limit +
-//! offset` rows it might emit: it accumulates upstream batches and, once
-//! the buffer grows past `2 * keep`, sorts and truncates back to the best
-//! `keep` rows (releasing the dropped rows' bytes back to the query
-//! accountant). Steady-state memory is O(keep), independent of input
-//! size. The upstream (scan → filter) streams batch-by-batch into this
-//! bounded buffer, so the whole pipeline stays bounded.
+//! offset` rows it might emit.
+//!
+//! Warm-up: accumulate upstream batches until the buffer first grows past
+//! `2 * keep`, then sort and truncate back to the best `keep` rows. The
+//! last (worst) kept row becomes the *threshold* — the cut line below which
+//! a row can never be emitted.
+//!
+//! Steady state: with a threshold in hand, each subsequent row is tested
+//! against the worst-kept row with one lexicographic comparison; rows
+//! strictly worse than it are skipped (no copy, no re-sort). Only genuine
+//! candidates are appended, and the buffer is re-sorted + truncated back to
+//! `keep` only on batches that actually contributed a candidate. So the
+//! per-row cost is ~one compare, not a full re-sort per batch, and only
+//! candidates consume the query budget. Dropped rows' bytes are released
+//! back to the accountant, so memory stays O(keep) regardless of input size.
 //!
 //! The planner fuses `Limit(OrderBy(X))` into a single `TopN(X)` — see
 //! the `.limit` compile path in net/local.zig.
@@ -47,7 +56,8 @@ pub const TopN = struct {
     sort_state_keys: []const []const u8,
 
     /// Rows we might emit = limit + offset. The buffer is pruned back to
-    /// this whenever it grows past `2 * keep`.
+    /// this on warm-up (past `2 * keep`) and thereafter whenever a candidate
+    /// batch arrives.
     keep: usize,
     limit: usize,
     offset: usize,
@@ -58,6 +68,16 @@ pub const TopN = struct {
     /// Row bytes currently reserved against the query accountant. Tracked
     /// so prune can release exactly the dropped rows' share.
     reserved_bytes: usize = 0,
+    /// Index into `accumulated` of the worst-kept row (the `keep`-th best),
+    /// valid only while `threshold_active`. A row strictly worse than this
+    /// can never be emitted, so it's skipped without a copy. Set by `prune`
+    /// (which leaves `accumulated` sorted, so the worst is the last row).
+    worst_idx: u32 = 0,
+    /// True once `accumulated` holds a full `keep` rows and has been sorted,
+    /// so `worst_idx` is a meaningful cut line. Cleared whenever a candidate
+    /// is appended (the buffer is dirty until the next prune re-establishes
+    /// the threshold).
+    threshold_active: bool = false,
 
     drained: bool = false,
     evicted: bool = false,
@@ -209,6 +229,58 @@ pub const TopN = struct {
         }
     };
 
+    /// Compare raw values at row `a` of `va` against row `b` of `vb`,
+    /// where both views address the *same* logical column type. Mirrors
+    /// `engine.memtable.compareInColumn`'s per-type ordering (numeric for
+    /// scalars, byte-lexicographic for strings) but works across two
+    /// independent views/stores rather than two indices into one. NULLs are
+    /// compared by their placeholder value, exactly as the in-store
+    /// comparator does — keeping the bounded path byte-identical to the
+    /// full-sort path, which also ignores the null bitmap.
+    fn compareAcrossViews(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.math.Order {
+        return switch (va.data) {
+            .int => |s| std.math.order(s[a], vb.data.int[b]),
+            .bigint => |s| std.math.order(s[a], vb.data.bigint[b]),
+            .boolean => |s| std.math.order(s[a], vb.data.boolean[b]),
+            .varchar => |s| std.mem.order(u8, s.rowBytes(a), vb.data.varchar.rowBytes(b)),
+            .string => |s| std.mem.order(u8, s.rowBytes(a), vb.data.string.rowBytes(b)),
+            .char => |s| std.mem.order(u8, s.rowBytes(a), vb.data.char.rowBytes(b)),
+            .tinyint => |s| std.math.order(s[a], vb.data.tinyint[b]),
+            .smallint => |s| std.math.order(s[a], vb.data.smallint[b]),
+            .largeint => |s| std.math.order(s[a], vb.data.largeint[b]),
+            .float => |s| std.math.order(s[a], vb.data.float[b]),
+            .double => |s| std.math.order(s[a], vb.data.double[b]),
+            .date => |s| std.math.order(s[a], vb.data.date[b]),
+            .datetime => |s| std.math.order(s[a], vb.data.datetime[b]),
+            .decimal64 => |s| std.math.order(s[a], vb.data.decimal64[b]),
+            .decimal128 => |s| std.math.order(s[a], vb.data.decimal128[b]),
+            .uuid => |s| std.math.order(s[a], vb.data.uuid[b]),
+        };
+    }
+
+    /// True when batch row `row` (addressed through `batch_views`) is a
+    /// candidate for the kept set — i.e. it is NOT strictly worse than the
+    /// current worst-kept row, which lives at `worst_idx` in `accumulated`.
+    /// "Worse" is the multi-key lexicographic order in the sorted buffer's
+    /// direction, so a row that is equal on every key still qualifies (a tie
+    /// can displace the incumbent). `lessThan(threshold, row)` being true is
+    /// exactly "row sorts strictly after the threshold" ⇒ reject.
+    fn isCandidate(self: *TopN, batch_views: []const ColumnView, row: usize, worst_idx: u32) bool {
+        for (self.sort_col_indices, 0..) |ci, i| {
+            const ord = compareAcrossViews(
+                self.accumulated[ci].view(),
+                worst_idx,
+                batch_views[ci],
+                row,
+            );
+            // ord = threshold-vs-row on this key. Translate to sort order:
+            // ascending — threshold < row means row sorts after ⇒ reject.
+            if (ord == .lt) return self.sort_desc[i];
+            if (ord == .gt) return !self.sort_desc[i];
+        }
+        return true;
+    }
+
     /// Free the bounded buffer + permutation and release the remaining
     /// reserved bytes once all kept rows have been emitted. Idempotent.
     fn evict(self: *TopN) void {
@@ -252,16 +324,40 @@ pub const TopN = struct {
         const prune_threshold = std.math.mul(usize, self.keep, 2) catch std.math.maxInt(usize);
 
         while (try self.upstream.next()) |batch| {
-            const b = batch.row_count * self.row_bytes;
-            if (acc) |a| try a.reserve(.topn, b);
-            self.reserved_bytes += b;
-            for (batch.values, 0..) |view, ci| {
-                try engine.memtable.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
+            // A pathologically huge LIMIT (keep == maxInt) never prunes —
+            // accumulate everything and fall back to a single final sort.
+            if (self.keep == 0 or !self.threshold_active) {
+                const b = batch.row_count * self.row_bytes;
+                if (acc) |a| try a.reserve(.topn, b);
+                self.reserved_bytes += b;
+                for (batch.values, 0..) |view, ci| {
+                    try engine.memtable.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
+                }
+                self.accumulated_rows += batch.row_count;
+                if (self.keep > 0 and self.accumulated_rows > prune_threshold) {
+                    try self.prune(acc);
+                }
+                continue;
             }
-            self.accumulated_rows += batch.row_count;
-            if (self.keep > 0 and self.accumulated_rows > prune_threshold) {
-                try self.prune(acc);
+
+            // Threshold active: only rows that aren't strictly worse than the
+            // current worst-kept can ever be emitted. Skip the rest — no copy,
+            // no per-batch re-sort — paying just one comparison per input row.
+            var added: usize = 0;
+            for (0..batch.row_count) |row| {
+                if (!self.isCandidate(batch.values, row, self.worst_idx)) continue;
+                if (acc) |a| try a.reserve(.topn, self.row_bytes);
+                self.reserved_bytes += self.row_bytes;
+                for (batch.values, 0..) |view, ci| {
+                    try engine.memtable.appendOneRow(self.allocator, view, row, &self.accumulated[ci]);
+                }
+                added += 1;
             }
+            self.accumulated_rows += added;
+            // Only re-sort when this batch actually contributed candidates;
+            // re-prune back to `keep` so the buffer stays O(keep) and a fresh
+            // `worst_idx` cut line is established for the next batch.
+            if (added > 0) try self.prune(acc);
         }
 
         const n: usize = @intCast(self.accumulated_rows);
@@ -313,5 +409,16 @@ pub const TopN = struct {
         self.allocator.free(self.accumulated);
         self.accumulated = fresh;
         self.accumulated_rows = keep_n;
+
+        // Whenever the buffer is full (`keep` rows) and freshly sorted, the
+        // last row is the worst we'd keep — the cut line for the pre-filter.
+        // If we couldn't fill `keep` (fewer rows seen so far), there's no
+        // cut line yet, so the next batches still accumulate unconditionally.
+        if (keep_n == self.keep) {
+            self.worst_idx = @intCast(keep_n - 1);
+            self.threshold_active = true;
+        } else {
+            self.threshold_active = false;
+        }
     }
 };

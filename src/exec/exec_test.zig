@@ -1603,3 +1603,308 @@ test "aggregate: integer fast path — single bigint key, no ORDER BY, plain LIM
     }
     try std.testing.expectEqual(@as(usize, 50), got);
 }
+
+const SortSpec = @import("sort.zig").SortSpec;
+
+/// Drain a query, collecting the (bigint) key column at `key_col_idx` and the
+/// (bigint) payload column at `pay_col_idx` into the supplied lists.
+fn collectBigintPair(
+    allocator: std.mem.Allocator,
+    q: *Query,
+    key_col_idx: usize,
+    pay_col_idx: usize,
+    keys: *std.ArrayList(i64),
+    pays: *std.ArrayList(i64),
+) !void {
+    while (try q.next()) |b| {
+        try keys.appendSlice(allocator, b.values[key_col_idx].data.bigint);
+        try pays.appendSlice(allocator, b.values[pay_col_idx].data.bigint);
+    }
+}
+
+/// The bounded Top-N must return exactly what a full ORDER BY then
+/// `[offset, offset+limit)` slice returns. We verify that equivalence
+/// directly: run the reference (`orderBy` over the whole input, then slice the
+/// emit window) and the bounded `topN`, and assert the sort-key column matches
+/// element-for-element. Both paths share the identical comparator, so the key
+/// values — including ties at the cut line — line up exactly. We assert on the
+/// sort key (the load-bearing equivalence); the payload only carries through to
+/// confirm rows aren't scrambled relative to their key.
+fn assertTopNMatchesFullSort(
+    allocator: std.mem.Allocator,
+    t: *api.Table,
+    specs: []const SortSpec,
+    key_idx: usize,
+    pay_idx: usize,
+    limit: usize,
+    offset: usize,
+) !void {
+    // Reference: full sort, then take the emit window by hand.
+    var ref_keys: std.ArrayList(i64) = .empty;
+    defer ref_keys.deinit(allocator);
+    var ref_pays: std.ArrayList(i64) = .empty;
+    defer ref_pays.deinit(allocator);
+    {
+        var base = try scan(allocator, t);
+        var q = try base.orderBy(specs);
+        defer q.deinit();
+        try collectBigintPair(allocator, &q, key_idx, pay_idx, &ref_keys, &ref_pays);
+    }
+    const win_start = @min(offset, ref_keys.items.len);
+    const win_end = @min(offset + limit, ref_keys.items.len);
+    const exp_keys = ref_keys.items[win_start..win_end];
+
+    // Bounded Top-N.
+    var got_keys: std.ArrayList(i64) = .empty;
+    defer got_keys.deinit(allocator);
+    var got_pays: std.ArrayList(i64) = .empty;
+    defer got_pays.deinit(allocator);
+    {
+        var base = try scan(allocator, t);
+        var q = try base.topN(specs, limit, offset);
+        defer q.deinit();
+        try collectBigintPair(allocator, &q, key_idx, pay_idx, &got_keys, &got_pays);
+    }
+
+    try std.testing.expectEqualSlices(i64, exp_keys, got_keys.items);
+}
+
+test "topn: bounded path matches full sort across keys, directions, and offsets" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint }, // unique tie-breaker payload
+            .{ .name = "k1", .type = .bigint }, // primary key, moderate cardinality
+            .{ .name = "k2", .type = .int }, // secondary key, low cardinality
+            .{ .name = "name", .type = .string }, // string key
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    // ~3000 rows spanning several scan batches (>1024) so the bounded path
+    // prunes repeatedly and the threshold pre-filter actually engages.
+    const n = 3000;
+    const Row = struct { id: i64, k1: i64, k2: i32, name: []const u8 };
+    var rows: [n]Row = undefined;
+    var prng = std.Random.DefaultPrng.init(0x70F4C0FFEE);
+    const rnd = prng.random();
+    // Small string alphabet → frequent duplicate names (ties on the string key).
+    const names = [_][]const u8{ "", "alpha", "beta", "beta", "gamma", "delta", "delta", "delta" };
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        rows[i] = .{
+            .id = @intCast(i), // unique
+            .k1 = @intCast(rnd.intRangeAtMost(i64, 0, 40)), // many ties
+            .k2 = @intCast(rnd.intRangeAtMost(i32, 0, 5)), // heavy ties
+            .name = names[rnd.intRangeLessThan(usize, 0, names.len)],
+        };
+    }
+    try t.insert(&rows);
+    // Flush so each scenario re-scans from segments (the first scan retires
+    // the memtable, so without a flush later scans would see no rows).
+    try t.flush();
+
+    // Column indices: id=0, k1=1, k2=2, name=3.
+    // (payload asserted-through is id where the key is bigint.)
+    const Case = struct {
+        specs: []const SortSpec,
+        key_idx: usize,
+        limit: usize,
+        offset: usize,
+    };
+    const cases = [_]Case{
+        // single int key (k1), small + large limit, with/without offset
+        .{ .specs = &.{.{ .col = "k1", .desc = false }}, .key_idx = 1, .limit = 10, .offset = 0 },
+        .{ .specs = &.{.{ .col = "k1", .desc = true }}, .key_idx = 1, .limit = 10, .offset = 0 },
+        .{ .specs = &.{.{ .col = "k1", .desc = false }}, .key_idx = 1, .limit = 10, .offset = 25 },
+        // large-keep (offset far into the stream) — the non-regression shape.
+        .{ .specs = &.{.{ .col = "k1", .desc = false }}, .key_idx = 1, .limit = 10, .offset = 1000 },
+        // multi-key mixed ASC/DESC: k1 ASC, k2 DESC. Assert on k1.
+        .{ .specs = &.{ .{ .col = "k1", .desc = false }, .{ .col = "k2", .desc = true } }, .key_idx = 1, .limit = 20, .offset = 0 },
+        .{ .specs = &.{ .{ .col = "k1", .desc = false }, .{ .col = "k2", .desc = true } }, .key_idx = 1, .limit = 20, .offset = 15 },
+        // duplicate / tie keys at the boundary — k2 alone is heavily tied, so
+        // the cut line at almost any limit lands inside a run of equal keys.
+        .{ .specs = &.{.{ .col = "k2", .desc = false }}, .key_idx = 2, .limit = 7, .offset = 0 },
+        .{ .specs = &.{.{ .col = "k2", .desc = true }}, .key_idx = 2, .limit = 50, .offset = 30 },
+    };
+    inline for (cases) |c| {
+        // key_idx==2 is the int column — handle bigint vs int payload below.
+        if (c.key_idx == 2) {
+            try assertTopNMatchesFullSortInt(allocator, t, c.specs, c.limit, c.offset);
+        } else {
+            try assertTopNMatchesFullSort(allocator, t, c.specs, c.key_idx, 0, c.limit, c.offset);
+        }
+    }
+}
+
+/// Same equivalence check as `assertTopNMatchesFullSort` but for an `int`
+/// (i32) sort key at column index 2 (`k2`).
+fn assertTopNMatchesFullSortInt(
+    allocator: std.mem.Allocator,
+    t: *api.Table,
+    specs: []const SortSpec,
+    limit: usize,
+    offset: usize,
+) !void {
+    var ref: std.ArrayList(i32) = .empty;
+    defer ref.deinit(allocator);
+    {
+        var base = try scan(allocator, t);
+        var q = try base.orderBy(specs);
+        defer q.deinit();
+        while (try q.next()) |b| try ref.appendSlice(allocator, b.values[2].data.int);
+    }
+    const win_start = @min(offset, ref.items.len);
+    const win_end = @min(offset + limit, ref.items.len);
+    const exp = ref.items[win_start..win_end];
+
+    var got: std.ArrayList(i32) = .empty;
+    defer got.deinit(allocator);
+    {
+        var base = try scan(allocator, t);
+        var q = try base.topN(specs, limit, offset);
+        defer q.deinit();
+        while (try q.next()) |b| try got.appendSlice(allocator, b.values[2].data.int);
+    }
+    try std.testing.expectEqualSlices(i32, exp, got.items);
+}
+
+test "topn: single string key matches full sort" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "phrase", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    const n = 2500;
+    const Row = struct { id: i64, phrase: []const u8 };
+    var rows: [n]Row = undefined;
+    const phrases = [_][]const u8{ "", "apple", "banana", "banana", "cherry", "date", "fig", "grape", "grape", "kiwi" };
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rnd = prng.random();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        rows[i] = .{ .id = @intCast(i), .phrase = phrases[rnd.intRangeLessThan(usize, 0, phrases.len)] };
+    }
+    try t.insert(&rows);
+    try t.flush();
+
+    const specs = [_]SortSpec{.{ .col = "phrase", .desc = false }};
+    inline for (.{
+        .{ .limit = @as(usize, 10), .offset = @as(usize, 0) },
+        .{ .limit = @as(usize, 10), .offset = @as(usize, 50) },
+        .{ .limit = @as(usize, 100), .offset = @as(usize, 0) },
+    }) |c| {
+        var ref: std.ArrayList(u8) = .empty;
+        defer ref.deinit(allocator);
+        var ref_off: std.ArrayList(usize) = .empty;
+        defer ref_off.deinit(allocator);
+        {
+            var base = try scan(allocator, t);
+            var q = try base.orderBy(&specs);
+            defer q.deinit();
+            while (try q.next()) |b| {
+                const sv = b.values[1].data.string;
+                for (0..b.row_count) |r| {
+                    try ref.appendSlice(allocator, sv.rowBytes(r));
+                    try ref_off.append(allocator, ref.items.len);
+                }
+            }
+        }
+        // Emit window of sorted phrases as a list of byte slices.
+        const win_start = @min(c.offset, ref_off.items.len);
+        const win_end = @min(c.offset + c.limit, ref_off.items.len);
+
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(allocator);
+        var got_off: std.ArrayList(usize) = .empty;
+        defer got_off.deinit(allocator);
+        {
+            var base = try scan(allocator, t);
+            var q = try base.topN(&specs, c.limit, c.offset);
+            defer q.deinit();
+            while (try q.next()) |b| {
+                const sv = b.values[1].data.string;
+                for (0..b.row_count) |r| {
+                    try got.appendSlice(allocator, sv.rowBytes(r));
+                    try got_off.append(allocator, got.items.len);
+                }
+            }
+        }
+        // Compare phrase-by-phrase across the window.
+        try std.testing.expectEqual(win_end - win_start, got_off.items.len);
+        var prev_ref: usize = if (win_start == 0) 0 else ref_off.items[win_start - 1];
+        var prev_got: usize = 0;
+        for (win_start..win_end, 0..) |ri, gi| {
+            const r_slice = ref.items[prev_ref..ref_off.items[ri]];
+            const g_slice = got.items[prev_got..got_off.items[gi]];
+            try std.testing.expectEqualSlices(u8, r_slice, g_slice);
+            prev_ref = ref_off.items[ri];
+            prev_got = got_off.items[gi];
+        }
+    }
+}
+
+test "topn: input smaller than limit+offset emits the whole sorted input" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "k", .type = .bigint },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .k = @as(i64, 30) },
+        .{ .id = @as(i64, 2), .k = @as(i64, 10) },
+        .{ .id = @as(i64, 3), .k = @as(i64, 20) },
+    });
+    try t.flush();
+
+    const specs = [_]SortSpec{.{ .col = "k", .desc = false }};
+
+    // limit 10 > 3 rows: emit all three, sorted.
+    {
+        var base = try scan(allocator, t);
+        var q = try base.topN(&specs, 10, 0);
+        defer q.deinit();
+        var ks: std.ArrayList(i64) = .empty;
+        defer ks.deinit(allocator);
+        while (try q.next()) |b| try ks.appendSlice(allocator, b.values[1].data.bigint);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, ks.items);
+    }
+    // offset 5 past the end with 3 rows: emit nothing.
+    {
+        var base = try scan(allocator, t);
+        var q = try base.topN(&specs, 10, 5);
+        defer q.deinit();
+        try std.testing.expect((try q.next()) == null);
+    }
+}

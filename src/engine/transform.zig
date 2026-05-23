@@ -125,6 +125,88 @@ pub fn appendAllColumn(
     }
 }
 
+/// Append a single row (`row`) from `view` to `out`, carrying its validity
+/// bit. Used by the bounded Top-N to copy in only the rows that survive its
+/// threshold pre-filter, one candidate at a time, rather than the whole batch.
+pub fn appendOneRow(
+    allocator: Allocator,
+    view: ColumnView,
+    row: usize,
+    out: *ColumnStore,
+) !void {
+    const dst_row = out.data.rowCount();
+    switch (view.data) {
+        .int => |s| switch (out.data) {
+            .int => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .bigint => |s| switch (out.data) {
+            .bigint => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .boolean => |s| switch (out.data) {
+            .boolean => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .varchar => |sv| switch (out.data) {
+            .varchar => |*ss| try ss.appendValue(allocator, sv.rowBytes(row)),
+            else => unreachable,
+        },
+        .string => |sv| switch (out.data) {
+            .string => |*ss| try ss.appendValue(allocator, sv.rowBytes(row)),
+            else => unreachable,
+        },
+        .float => |s| switch (out.data) {
+            .float => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .double => |s| switch (out.data) {
+            .double => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .date => |s| switch (out.data) {
+            .date => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .datetime => |s| switch (out.data) {
+            .datetime => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .tinyint => |s| switch (out.data) {
+            .tinyint => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .smallint => |s| switch (out.data) {
+            .smallint => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .largeint => |s| switch (out.data) {
+            .largeint => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .char => |sv| switch (out.data) {
+            .char => |*ss| try ss.appendValue(allocator, sv.rowBytes(row)),
+            else => unreachable,
+        },
+        .decimal64 => |s| switch (out.data) {
+            .decimal64 => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .decimal128 => |s| switch (out.data) {
+            .decimal128 => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .uuid => |s| switch (out.data) {
+            .uuid => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+    }
+    if (out.nulls != null) {
+        const valid = storage.column.isValidBit(view.nulls, row);
+        try out.appendValidBit(allocator, dst_row, valid);
+    }
+}
+
 /// Append rows from `view` to `out`, picking by the given indices into `view`.
 /// Used by Sort to materialize batches in permutation order. Validity bits
 /// are carried across via `view.nulls`.
