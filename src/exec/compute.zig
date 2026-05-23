@@ -36,6 +36,7 @@ const predicate_mod = @import("predicate.zig");
 const PredicateExpr = predicate_mod.PredicateExpr;
 const scalar_fn = @import("scalar_fn.zig");
 const ScalarFn = scalar_fn.ScalarFn;
+const simd = @import("../util/simd.zig");
 const NullStrategy = scalar_fn.NullStrategy;
 
 const cast = @import("cast.zig");
@@ -88,8 +89,23 @@ const CallPlan = struct {
     output_type: Type,
 };
 
+/// Fused `col <op> const` (or `const <op> col`) for +/-/* — evaluated in one
+/// SIMD pass that widens the source column straight to the output type, so we
+/// skip both the smallint→int cast column and the replicated-literal column the
+/// generic call path would materialize. Only built when the column is
+/// non-nullable and column+output are the same kind (int→int or float→float).
+const FusedScalar = struct {
+    src_idx: usize,
+    src_type: Type,
+    out_type: Type, // .int, .bigint, or .double
+    op: simd.BinOp,
+    col_left: bool,
+    scalar_i: i64,
+    scalar_f: f64,
+};
+
 /// Resolved per-derived plan: rename, literal-only (constant column),
-/// a function-call tree, or a searched-CASE expression.
+/// a function-call tree, a searched-CASE expression, or a fused col-op-scalar.
 const ResolvedDerived = struct {
     name: []const u8,
     output_type: Type,
@@ -98,6 +114,7 @@ const ResolvedDerived = struct {
         lit_only: *LitSlot,
         call: *CallPlan,
         case: *CasePlan,
+        fused_scalar: FusedScalar,
     },
 };
 
@@ -230,6 +247,7 @@ pub const Compute = struct {
                 .lit_only => |slot| slot.buf.deinit(self.allocator),
                 .case => |plan| freeCasePlan(self.allocator, plan),
                 .rename => {},
+                .fused_scalar => {},
             }
         }
         self.allocator.free(self.output_schema);
@@ -279,7 +297,7 @@ pub const Compute = struct {
             cards[up_n + i] = switch (d.kind) {
                 .lit_only => .{ .exact = 1 },
                 .rename => |rn| if (rn.src_idx < up_n) up.column_cards[rn.src_idx] else .unknown,
-                .call, .case => .unknown,
+                .call, .case, .fused_scalar => .unknown,
             };
         }
         up.column_cards = cards;
@@ -318,6 +336,7 @@ pub const Compute = struct {
                     try self.evalCase(plan, in.values, n);
                     try appendCopiedColumn(self.allocator, out_col, plan.output.view(), n);
                 },
+                .fused_scalar => |fs| try self.evalFusedScalar(fs, in.values, out_col, n),
             }
         }
 
@@ -462,7 +481,176 @@ pub const Compute = struct {
             },
         };
     }
+
+    /// Evaluate a fused `col <op> const` directly into `out_col` in one
+    /// widening SIMD pass — no cast column, no replicated-literal column.
+    /// Only built for non-nullable int/float source columns (see tryFuseScalar),
+    /// so there is no validity bitmap to propagate.
+    fn evalFusedScalar(self: *Compute, fs: FusedScalar, in_values: []const ColumnView, out_col: *ColumnStore, n: usize) !void {
+        const src = in_values[fs.src_idx];
+        switch (fs.out_type) {
+            .int => {
+                try out_col.data.int.ensureUnusedCapacity(self.allocator, n);
+                out_col.data.int.items.len = n;
+                const dst = out_col.data.int.items[0..n];
+                const s: i32 = @intCast(fs.scalar_i);
+                switch (fs.src_type) {
+                    .tinyint => runScalar(i8, i32, fs.op, fs.col_left, src.data.tinyint[0..n], s, dst),
+                    .smallint => runScalar(i16, i32, fs.op, fs.col_left, src.data.smallint[0..n], s, dst),
+                    .int => runScalar(i32, i32, fs.op, fs.col_left, src.data.int[0..n], s, dst),
+                    .boolean => runScalar(u8, i32, fs.op, fs.col_left, src.data.boolean[0..n], s, dst),
+                    else => unreachable,
+                }
+            },
+            .bigint => {
+                try out_col.data.bigint.ensureUnusedCapacity(self.allocator, n);
+                out_col.data.bigint.items.len = n;
+                const dst = out_col.data.bigint.items[0..n];
+                const s: i64 = fs.scalar_i;
+                switch (fs.src_type) {
+                    .tinyint => runScalar(i8, i64, fs.op, fs.col_left, src.data.tinyint[0..n], s, dst),
+                    .smallint => runScalar(i16, i64, fs.op, fs.col_left, src.data.smallint[0..n], s, dst),
+                    .int => runScalar(i32, i64, fs.op, fs.col_left, src.data.int[0..n], s, dst),
+                    .bigint => runScalar(i64, i64, fs.op, fs.col_left, src.data.bigint[0..n], s, dst),
+                    .boolean => runScalar(u8, i64, fs.op, fs.col_left, src.data.boolean[0..n], s, dst),
+                    else => unreachable,
+                }
+            },
+            .double => {
+                try out_col.data.double.ensureUnusedCapacity(self.allocator, n);
+                out_col.data.double.items.len = n;
+                const dst = out_col.data.double.items[0..n];
+                const s: f64 = fs.scalar_f;
+                switch (fs.src_type) {
+                    .float => runScalar(f32, f64, fs.op, fs.col_left, src.data.float[0..n], s, dst),
+                    .double => runScalar(f64, f64, fs.op, fs.col_left, src.data.double[0..n], s, dst),
+                    else => unreachable,
+                }
+            },
+            else => unreachable,
+        }
+    }
 };
+
+/// Bridge the runtime op/direction to the comptime-specialized SIMD kernel.
+fn runScalar(comptime Tsrc: type, comptime Tout: type, op: simd.BinOp, col_left: bool, src: []const Tsrc, scalar: Tout, dst: []Tout) void {
+    switch (op) {
+        inline else => |o| switch (col_left) {
+            inline else => |cl| simd.scalarOp(Tsrc, Tout, o, cl, src, scalar, dst),
+        },
+    }
+}
+
+fn fusableSrc(t: Type) bool {
+    return switch (t) {
+        .tinyint, .smallint, .int, .bigint, .boolean, .float, .double => true,
+        else => false,
+    };
+}
+
+fn isIntType(t: Type) bool {
+    return switch (t) {
+        .tinyint, .smallint, .int, .bigint, .boolean => true,
+        else => false,
+    };
+}
+
+fn valueToI64(v: types.Value) i64 {
+    return switch (v) {
+        .int => |x| x,
+        .bigint => |x| x,
+        .smallint => |x| x,
+        .tinyint => |x| x,
+        .boolean => |x| @intFromBool(x),
+        .date => |x| x,
+        .datetime => |x| x,
+        .decimal64 => |x| x,
+        else => 0,
+    };
+}
+
+fn valueToF64(v: types.Value) f64 {
+    return switch (v) {
+        .double => |x| x,
+        .float => |x| x,
+        .int => |x| @floatFromInt(x),
+        .bigint => |x| @floatFromInt(x),
+        .smallint => |x| @floatFromInt(x),
+        .tinyint => |x| @floatFromInt(x),
+        else => 0,
+    };
+}
+
+/// Recognize `col +/-/* const` (either operand order) where the column is a
+/// non-nullable int/float and column+result are the same kind, so it can be
+/// fused into one widening SIMD pass. Returns null to fall back to the generic
+/// call path.
+fn tryFuseScalar(aa: Allocator, expr: Expr, up_schema: []const Column) !?FusedScalar {
+    const c = switch (expr) {
+        .call => |x| x,
+        else => return null,
+    };
+    const op: simd.BinOp = if (std.mem.eql(u8, c.fn_name, "add"))
+        .add
+    else if (std.mem.eql(u8, c.fn_name, "sub"))
+        .sub
+    else if (std.mem.eql(u8, c.fn_name, "mul"))
+        .mul
+    else
+        return null;
+    if (c.args.len != 2) return null;
+
+    var col_idx: usize = undefined;
+    var lit_v: types.Value = undefined;
+    var col_left: bool = undefined;
+    switch (c.args[0]) {
+        .col_ref => |name| switch (c.args[1]) {
+            .lit => |v| {
+                col_idx = columnIndex(up_schema, name) orelse return null;
+                lit_v = v;
+                col_left = true;
+            },
+            else => return null,
+        },
+        .lit => |v| switch (c.args[1]) {
+            .col_ref => |name| {
+                col_idx = columnIndex(up_schema, name) orelse return null;
+                lit_v = v;
+                col_left = false;
+            },
+            else => return null,
+        },
+        else => return null,
+    }
+
+    const src_type = up_schema[col_idx].type;
+    if (up_schema[col_idx].nullable or !fusableSrc(src_type)) return null;
+
+    // Canonical output type from the real overload resolution, so the derived
+    // column's type matches what the rest of the plan expects.
+    var arg_types: [2]Type = undefined;
+    arg_types[0] = if (col_left) src_type else literalType(lit_v);
+    arg_types[1] = if (col_left) literalType(lit_v) else src_type;
+    const r = (try scalar_fn.resolve(aa, c.fn_name, &arg_types)) orelse return null;
+    const out_type = r.func.return_type;
+
+    const src_int = isIntType(src_type);
+    switch (out_type) {
+        .int, .bigint => if (!src_int) return null,
+        .double => if (src_int) return null,
+        else => return null,
+    }
+
+    return FusedScalar{
+        .src_idx = col_idx,
+        .src_type = src_type,
+        .out_type = out_type,
+        .op = op,
+        .col_left = col_left,
+        .scalar_i = valueToI64(lit_v),
+        .scalar_f = valueToF64(lit_v),
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Resolution
@@ -496,6 +684,14 @@ fn resolveDerived(
             };
         },
         .call => {
+            // Fast path: `col +/-/* const` collapses to one widening SIMD pass.
+            if (try tryFuseScalar(aa, d.expr, up_schema)) |fs| {
+                return .{
+                    .name = try aa.dupe(u8, d.name),
+                    .output_type = fs.out_type,
+                    .kind = .{ .fused_scalar = fs },
+                };
+            }
             const plan = try buildCallPlan(runtime_allocator, aa, d.expr, up_schema);
             return .{
                 .name = try aa.dupe(u8, d.name),
@@ -793,6 +989,7 @@ fn derivedNullable(r: ResolvedDerived, up_schema: []const Column) bool {
         .lit_only => false, // literal-only derived: constant column, never null
         .call => |plan| callPlanNullable(plan, up_schema),
         .case => |plan| plan.may_produce_null,
+        .fused_scalar => false, // only built for non-nullable col + const
     };
 }
 

@@ -115,6 +115,93 @@ pub fn binInto(comptime T: type, comptime op: BinOp, a: []const T, b: []const T,
     }
 }
 
+/// Fused `dst[i] = widen(src[i]) <op> scalar` (or `scalar <op> widen(src[i])`
+/// when `col_left` is false), in one vectorized pass. `Tsrc` widens to `Tout`
+/// (same kind: int→int or float→float); integer ops wrap. Lets `col + const`
+/// skip both the smallint→int cast column and the replicated-literal column.
+pub fn scalarOp(
+    comptime Tsrc: type,
+    comptime Tout: type,
+    comptime op: BinOp,
+    comptime col_left: bool,
+    src: []const Tsrc,
+    scalar: Tout,
+    dst: []Tout,
+) void {
+    std.debug.assert(src.len == dst.len);
+    const is_int = @typeInfo(Tout) == .int;
+    const N = comptime lanes(Tout);
+    var i: usize = 0;
+    if (N > 1) {
+        const sv: @Vector(N, Tout) = @splat(scalar);
+        while (i + N <= dst.len) : (i += N) {
+            const chunk: @Vector(N, Tsrc) = src[i..][0..N].*;
+            const w = @as(@Vector(N, Tout), chunk);
+            const a = if (col_left) w else sv;
+            const b = if (col_left) sv else w;
+            dst[i..][0..N].* = if (is_int) switch (op) {
+                .add => a +% b,
+                .sub => a -% b,
+                .mul => a *% b,
+            } else switch (op) {
+                .add => a + b,
+                .sub => a - b,
+                .mul => a * b,
+            };
+        }
+    }
+    while (i < dst.len) : (i += 1) {
+        const w: Tout = src[i];
+        const a = if (col_left) w else scalar;
+        const b = if (col_left) scalar else w;
+        dst[i] = if (is_int) switch (op) {
+            .add => a +% b,
+            .sub => a -% b,
+            .mul => a *% b,
+        } else switch (op) {
+            .add => a + b,
+            .sub => a - b,
+            .mul => a * b,
+        };
+    }
+}
+
+test "simd: scalarOp matches widen-then-scalar reference" {
+    const lengths = [_]usize{ 0, 1, 9, 16, 33, 777 };
+    inline for (.{ .{ i16, i32 }, .{ i32, i32 }, .{ i32, i64 }, .{ f32, f64 }, .{ f64, f64 } }) |pair| {
+        const Tsrc = pair[0];
+        const Tout = pair[1];
+        inline for (.{ BinOp.add, BinOp.sub, BinOp.mul }) |op| {
+            inline for (.{ true, false }) |col_left| {
+                for (lengths) |len| {
+                    const src = try std.testing.allocator.alloc(Tsrc, len);
+                    defer std.testing.allocator.free(src);
+                    const dst = try std.testing.allocator.alloc(Tout, len);
+                    defer std.testing.allocator.free(dst);
+                    for (src, 0..) |*s, idx| s.* = if (@typeInfo(Tsrc) == .float) @floatFromInt(idx % 11) else @intCast(idx % 11);
+                    const scalar: Tout = if (@typeInfo(Tout) == .float) 3.0 else 3;
+                    scalarOp(Tsrc, Tout, op, col_left, src, scalar, dst);
+                    for (src, dst) |s, d| {
+                        const w: Tout = if (@typeInfo(Tout) == .float and @typeInfo(Tsrc) == .float) @floatCast(s) else s;
+                        const a = if (col_left) w else scalar;
+                        const b = if (col_left) scalar else w;
+                        const want: Tout = if (@typeInfo(Tout) == .int) switch (op) {
+                            .add => a +% b,
+                            .sub => a -% b,
+                            .mul => a *% b,
+                        } else switch (op) {
+                            .add => a + b,
+                            .sub => a - b,
+                            .mul => a * b,
+                        };
+                        try std.testing.expectEqual(want, d);
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "simd: binInto matches scalar add/sub/mul" {
     const lengths = [_]usize{ 0, 1, 9, 16, 33, 1000 };
     inline for (.{ i32, i64, f64 }) |T| {
