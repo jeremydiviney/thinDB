@@ -23,6 +23,8 @@ const Table = api.Table;
 
 pub const memory = @import("../memory.zig");
 
+pub const prof = @import("../util/prof.zig");
+
 pub const Error = error{
     ColumnNotFound,
     TypeMismatch,
@@ -353,7 +355,12 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
     const Wrapper = struct {
         fn nextWrap(ptr: *anyopaque) anyerror!?Batch {
             const o: *Op = @ptrCast(@alignCast(ptr));
-            return o.next();
+            if (!prof.enabled) return o.next();
+            const t0 = prof.nowTicks();
+            const r = o.next();
+            const d = prof.nowTicks() - t0;
+            prof.add(@typeName(Op), if (d > 0) @intCast(d) else 0);
+            return r;
         }
         fn deinitWrap(ptr: *anyopaque) void {
             const o: *Op = @ptrCast(@alignCast(ptr));

@@ -36,6 +36,7 @@ const auth = @import("auth.zig");
 const prepared = @import("prepared.zig");
 const sql_text_mod = @import("../sql_text.zig");
 const conn_registry = @import("../conn_registry.zig");
+const oprof = @import("../../util/prof.zig");
 const ConnectionState = conn_registry.ConnectionState;
 const ConnectionRegistry = conn_registry.Registry;
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
@@ -2717,6 +2718,7 @@ fn runSingleStatement(
         return;
     }
 
+    oprof.reset();
     const write_start = profiler.start();
     try result.sendQueryResultStatus(
         allocator,
@@ -2729,6 +2731,7 @@ fn runSingleStatement(
         extra_status,
     );
     profiler.recordSince(.query_execute_write, write_start);
+    oprof.dump("query");
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
@@ -3033,6 +3036,7 @@ fn handleStmtExecute(
     var row_payload: std.ArrayList(u8) = .empty;
     defer row_payload.deinit(allocator);
 
+    oprof.reset();
     var returned_rows: u64 = 0;
     while (true) {
         // A runtime error after column defs terminates the result set
@@ -3058,6 +3062,7 @@ fn handleStmtExecute(
         profiler.recordSince(.stmt_execute_write, row_write_start);
     }
     profiler.addRowsReturned(returned_rows);
+    oprof.dump("stmt_execute");
 
     const terminator_write_start = profiler.start();
     try result.sendResultTerminatorStatus(allocator, w, &seq_id, caps, session.transactionStatus());

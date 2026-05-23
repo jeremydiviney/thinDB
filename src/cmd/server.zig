@@ -34,6 +34,9 @@ const usage_text =
     \\  --idle-timeout-secs N   Close a connection after N seconds of read silence (default 0 = disabled).
     \\  --query-memory-budget B Per-query memory budget in bytes (default 2 GiB; also gates the
     \\                          hash-vs-sort GROUP BY decision). 0 disables tracking.
+    \\  --profile-ops           Print a per-operator INCLUSIVE time breakdown to stderr after each
+    \\                          query (diagnostic; ~zero overhead when off). Self time of an operator
+    \\                          is its inclusive minus its upstream's in a linear pipeline.
     \\  --mysql-password PW     Require this password on the MySQL wire (mysql_native_password).
     \\                          Without this flag the MySQL wire is in trust mode and accepts any
     \\                          password. Does not affect the PG or native wires.
@@ -89,6 +92,10 @@ pub fn main(init: std.process.Init) !u8 {
             try out_w.print("thindb-server {s}\n", .{thindb.version});
             try out_w.flush();
             return 0;
+        }
+        if (std.mem.eql(u8, arg, "--profile-ops")) {
+            thindb.exec.prof.enabled = true;
+            continue;
         }
         if (try takeValue(arg, "--data-dir", &args_iter, err_w)) |v| {
             data_dir_opt = v;
