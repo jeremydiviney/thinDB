@@ -29,6 +29,10 @@ const Predicate = predicate.Predicate;
 
 const simd = @import("../util/simd.zig");
 
+const group_table = @import("group_table.zig");
+const ByteGroupTable = group_table.ByteGroupTable;
+const IntGroupTable = group_table.IntGroupTable;
+
 pub const AggFunc = enum {
     count,
     sum,
@@ -206,9 +210,17 @@ pub const Aggregate = struct {
 
     /// Used only when there are no group-by columns (single global group).
     single_state: []AccState,
-    /// Used only when grouping. Maps compound-key bytes → group id (an index
-    /// into `gstate` / `gkeys`).
-    groups: std.StringHashMapUnmanaged(u32),
+    /// Open-addressing key→gid table for the byte-key (string/mixed/compound
+    /// non-integer) path. `int_layout != null` ⟺ the integer path is active and
+    /// this table is unused.
+    byte_table: ByteGroupTable = undefined,
+    /// Open-addressing key→gid table for the integer fast path (packed u128
+    /// keys). Used iff `int_layout != null`.
+    int_table: IntGroupTable = undefined,
+    /// `null` ⟺ byte-key path; non-null ⟺ all group columns are fixed-width
+    /// integer family summing to ≤128 bits, so keys pack into a u128 (no
+    /// per-row byte serialization). Owns `fields` (freed in `deinit`).
+    int_layout: ?IntKeyLayout = null,
     /// Flat per-group accumulator storage: group `g`'s accumulators occupy
     /// `gstate.items[g * aggs.len ..][0..aggs.len]`. New groups append here in
     /// gid order, and emit walks it in gid order — both sequential, so the
@@ -216,11 +228,22 @@ pub const Aggregate = struct {
     /// value would scatter the state across the arena and force a random read
     /// per group on both the accumulate and emit passes).
     gstate: std.ArrayListUnmanaged(AccState) = .empty,
-    /// Per-group key bytes, indexed by gid (arena-owned). Lets emit reconstruct
-    /// each group's key columns in gid order without touching the hash map.
+    /// Per-group key bytes, indexed by gid (arena-owned). Byte-key path only.
+    /// Lets emit reconstruct each group's key columns in gid order without
+    /// touching the hash table.
     gkeys: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Per-group packed u128 key, indexed by gid. Integer fast path only — the
+    /// emit pass unpacks each back into the group output columns.
+    gkeys_int: std.ArrayListUnmanaged(u128) = .empty,
     /// Number of distinct groups seen = next gid to assign.
     n_groups: u32 = 0,
+    /// Prefetch-pipeline scratch (byte path): per-row hash + key-slice for the
+    /// current batch. Phase (a) fills these; phase (b) probes with look-ahead.
+    /// Grown lazily to the batch row count; arena-owned.
+    pf_hashes: std.ArrayListUnmanaged(u64) = .empty,
+    pf_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Prefetch-pipeline scratch (integer path): per-row hash + packed u128 key.
+    pf_int_keys: std.ArrayListUnmanaged(u128) = .empty,
     /// Reusable buffer for building per-row group keys during accumulate.
     /// Allocated once, grown to max-key-size, cleared+reused per row.
     /// Saves ~1 arena alloc per row in the inner loop.
@@ -313,6 +336,12 @@ pub const Aggregate = struct {
         const resolved_top_k = try resolveTopK(allocator, top_k, aggs, group_cols.len, output_schema);
         errdefer if (resolved_top_k) |r| allocator.free(r.keys);
 
+        // Integer fast path: every group column is a fixed-width integer family
+        // type whose widths sum to ≤128 bits ⇒ keys pack into a u128, skipping
+        // the per-row byte serialization that dominates high-card GROUP BY.
+        const int_layout = try planIntKey(allocator, group_col_indices, up_schema);
+        errdefer if (int_layout) |l| l.deinit(allocator);
+
         const self = try allocator.create(Aggregate);
         errdefer allocator.destroy(self);
 
@@ -327,7 +356,7 @@ pub const Aggregate = struct {
             .output_columns = output_columns,
             .views = views,
             .single_state = single_state,
-            .groups = .empty,
+            .int_layout = int_layout,
             .key_scratch = .empty,
             .single_str_key = group_col_indices.len == 1 and switch (up_schema[group_col_indices[0]].type) {
                 .string, .varchar, .char => true,
@@ -336,12 +365,12 @@ pub const Aggregate = struct {
             .top_k = resolved_top_k,
         };
 
-        // Pre-size the group hash table from the upstream cardinality
-        // estimate so it doesn't rehash repeatedly as it fills toward its
-        // final size (a high-card GROUP BY otherwise rehashes ~log2(N) times,
-        // re-moving every live entry each time). The router only sends us
-        // here when this count fits the budget, so the up-front allocation is
-        // safe. Skipped when the estimate is unknown or trivially small.
+        // Pre-size the group table + flat state from the upstream cardinality
+        // estimate so they don't grow+rehash repeatedly as they fill toward
+        // their final size (a high-card GROUP BY otherwise rehashes ~log2(N)
+        // times, re-moving every live entry each time). The router only sends
+        // us here when this count fits the budget, so the up-front allocation
+        // is safe. Below the threshold we still init a small table.
         if (group_col_indices.len > 0) {
             const st = self.upstream.stats();
             var est: u64 = 1;
@@ -359,12 +388,23 @@ pub const Aggregate = struct {
                     },
                 }
             }
-            if (known and est > 1024) {
-                const cap: u32 = @intCast(@min(est, @max(st.upper_rows, 1)));
-                const aa = self.arena.allocator();
-                self.groups.ensureTotalCapacity(aa, cap) catch {};
-                self.gstate.ensureTotalCapacity(aa, @as(usize, cap) * self.aggs.len) catch {};
-                self.gkeys.ensureTotalCapacity(aa, cap) catch {};
+            const aa = self.arena.allocator();
+            const cap: usize = if (known and est > 1024)
+                @intCast(@min(est, @max(st.upper_rows, 1)))
+            else
+                0;
+            if (self.int_layout != null) {
+                self.int_table = IntGroupTable.init(aa, cap) catch try IntGroupTable.init(aa, 0);
+                if (cap > 0) {
+                    self.gstate.ensureTotalCapacity(aa, cap * self.aggs.len) catch {};
+                    self.gkeys_int.ensureTotalCapacity(aa, cap) catch {};
+                }
+            } else {
+                self.byte_table = ByteGroupTable.init(aa, cap) catch try ByteGroupTable.init(aa, 0);
+                if (cap > 0) {
+                    self.gstate.ensureTotalCapacity(aa, cap * self.aggs.len) catch {};
+                    self.gkeys.ensureTotalCapacity(aa, cap) catch {};
+                }
             }
         }
         return makeQuery(allocator, self);
@@ -381,7 +421,10 @@ pub const Aggregate = struct {
         self.allocator.free(self.agg_col_indices);
         self.allocator.free(self.single_state);
         if (self.top_k) |r| self.allocator.free(r.keys);
+        if (self.int_layout) |l| l.deinit(self.allocator);
         self.key_scratch.deinit(self.allocator);
+        // The group tables, flat state, per-group key lists, and prefetch
+        // scratch all live in `arena` — freed wholesale here.
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -466,6 +509,14 @@ pub const Aggregate = struct {
         self.evicted = true;
     }
 
+    /// Look-ahead distance for the probe pipeline. Before probing row `i` we
+    /// `@prefetch` the slot row `i + PREFETCH_DIST` will land in, so the random
+    /// cache miss for that bucket is in flight by the time we reach it — the
+    /// outstanding misses overlap instead of serializing. ~8–16 is the usual
+    /// sweet spot; 12 balances enough in-flight misses against the scratch
+    /// footprint per batch (≤1024 rows).
+    const PREFETCH_DIST: usize = 12;
+
     fn accumulateBatch(self: *Aggregate, batch: Batch) !void {
         const n = batch.row_count;
         const aa_state = self.arena.allocator();
@@ -475,10 +526,95 @@ pub const Aggregate = struct {
             }
             return;
         }
+        if (n == 0) return;
+        if (self.int_layout != null) {
+            try self.accumulateBatchInt(batch);
+        } else {
+            try self.accumulateBatchBytes(batch);
+        }
+    }
 
+    /// Update one group's accumulators for `row`. Shared by both key paths.
+    inline fn updateGroup(self: *Aggregate, gid: u32, batch: Batch, row: u32) !void {
+        const aa_state = self.arena.allocator();
+        const base = @as(usize, gid) * self.aggs.len;
+        const state = self.gstate.items[base .. base + self.aggs.len];
+        for (self.aggs, 0..) |a, ai| {
+            try updateStateRow(aa_state, &state[ai], a, batch, self.agg_col_indices[ai], row);
+        }
+    }
+
+    /// Append the initial accumulator state for a freshly-assigned group.
+    fn appendInitialState(self: *Aggregate, aa: Allocator) !void {
+        const up_schema = self.upstream.outputSchema();
+        for (self.aggs, self.agg_col_indices) |a, maybe_idx| {
+            const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
+            try self.gstate.append(aa, initialState(a.func, in_t));
+        }
+    }
+
+    /// Integer fast path: pack each row's group columns into a u128 (phase a),
+    /// then probe `int_table` with a prefetch look-ahead (phase b). The table
+    /// is grown for the whole batch up front so slot addresses stay stable
+    /// across the look-ahead window.
+    fn accumulateBatchInt(self: *Aggregate, batch: Batch) !void {
+        const n = batch.row_count;
         const aa = self.arena.allocator();
+        const layout = self.int_layout.?;
+
+        if (self.int_table.needsGrow(n)) try self.int_table.grow(aa, n);
+
+        // Phase (a): pack every row's key.
+        self.pf_int_keys.clearRetainingCapacity();
+        try self.pf_int_keys.ensureTotalCapacity(aa, n);
+        var row: u32 = 0;
+        while (row < n) : (row += 1) {
+            self.pf_int_keys.appendAssumeCapacity(packIntKey(layout, batch, self.group_col_indices, row));
+        }
+        const keys = self.pf_int_keys.items;
+
+        // Phase (b): probe with look-ahead prefetch.
+        const acct = self.upstream.accountant();
+        const approx_per = self.aggs.len * @sizeOf(AccState) + @sizeOf(u128) + 32;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const pf = i + PREFETCH_DIST;
+            if (pf < n) {
+                const b = self.int_table.bucketOf(group_table.hashU128(keys[pf]));
+                @prefetch(self.int_table.slotAddr(b), .{ .rw = .write, .locality = 1 });
+            }
+            const key = keys[i];
+            const probe = self.int_table.getOrPut(group_table.hashU128(key), key);
+            const gid = if (probe.found) probe.gid else blk: {
+                if (acct) |a| try a.reserve(.hash_aggregate, approx_per);
+                self.reserved_bytes += approx_per;
+                const new_gid = self.n_groups;
+                self.n_groups += 1;
+                self.int_table.commit(probe.slot, key, new_gid);
+                try self.gkeys_int.append(aa, key);
+                try self.appendInitialState(aa);
+                break :blk new_gid;
+            };
+            try self.updateGroup(gid, batch, @intCast(i));
+        }
+    }
+
+    /// Byte-key path (string / mixed / wide compound keys): serialize each
+    /// row's key + hash (phase a), then probe `byte_table` with a prefetch
+    /// look-ahead (phase b). New groups dup their key bytes into the arena
+    /// (indexed by gid) so the stored key survives past the batch.
+    fn accumulateBatchBytes(self: *Aggregate, batch: Batch) !void {
+        const n = batch.row_count;
+        const aa = self.arena.allocator();
+
+        if (self.byte_table.needsGrow(n)) try self.byte_table.grow(aa, n);
+
         // Single string key: the key is the row's raw string bytes, already
-        // sitting decoded in the batch — no scratch copy / length prefix.
+        // sitting decoded in the batch — no scratch copy / length prefix. Its
+        // bytes live in the batch (valid for this whole call), so phase (a) can
+        // borrow them directly. Compound/mixed keys are serialized into a
+        // per-batch arena buffer (one dupe per row) so every key slice in
+        // `pf_keys` stays live through phase (b).
         const str_view: ?storage.StringView = if (self.single_str_key)
             switch (batch.values[self.group_col_indices[0]].data) {
                 .string, .varchar, .char => |sv| sv,
@@ -486,50 +622,53 @@ pub const Aggregate = struct {
             }
         else
             null;
+
+        // Phase (a): build per-row key slice + hash.
+        self.pf_keys.clearRetainingCapacity();
+        self.pf_hashes.clearRetainingCapacity();
+        try self.pf_keys.ensureTotalCapacity(aa, n);
+        try self.pf_hashes.ensureTotalCapacity(aa, n);
         var row: u32 = 0;
         while (row < n) : (row += 1) {
-            // Build the key into a reusable scratch buffer instead of
-            // allocating fresh storage every row. Most rows hit existing
-            // groups — the scratch bytes only need to outlive the lookup
-            // itself, so we can wipe and reuse them next iteration. New
-            // groups get an arena-owned copy.
             const key: []const u8 = if (str_view) |sv| sv.rowBytes(row) else blk: {
                 self.key_scratch.clearRetainingCapacity();
                 try buildCompoundGroupKey(self.allocator, &self.key_scratch, batch, self.group_col_indices, row);
-                break :blk self.key_scratch.items;
+                break :blk try aa.dupe(u8, self.key_scratch.items);
             };
+            self.pf_keys.appendAssumeCapacity(key);
+            self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, key));
+        }
+        const keys = self.pf_keys.items;
+        const hashes = self.pf_hashes.items;
 
-            const gop = try self.groups.getOrPut(aa, key);
-            if (!gop.found_existing) {
-                // New group — reserve its memory against the query
-                // budget. Approximate: key bytes + per-agg state +
-                // ~32 bytes hashmap overhead.
+        // Phase (b): probe with look-ahead prefetch.
+        const acct = self.upstream.accountant();
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const pf = i + PREFETCH_DIST;
+            if (pf < n) {
+                const b = self.byte_table.bucketOf(hashes[pf]);
+                @prefetch(self.byte_table.slotAddr(b), .{ .rw = .write, .locality = 1 });
+            }
+            const key = keys[i];
+            const h = hashes[i];
+            const probe = self.byte_table.getOrPut(h, key, self.gkeys.items);
+            const gid = if (probe.found) probe.gid else blk: {
                 const approx = key.len + self.aggs.len * @sizeOf(AccState) + 32;
-                if (self.upstream.accountant()) |acct| {
-                    try acct.reserve(.hash_aggregate, approx);
-                }
+                if (acct) |a| try a.reserve(.hash_aggregate, approx);
                 self.reserved_bytes += approx;
-                // The hashmap borrowed `key`, which points into either the
-                // reused scratch buffer or the batch's column bytes — both
-                // outlive only this iteration. Replace key_ptr with an
-                // arena-owned dup so it survives, and remember it by gid for
-                // the emit pass.
-                const dup = try aa.dupe(u8, key);
-                gop.key_ptr.* = dup;
-                gop.value_ptr.* = self.n_groups;
+                const new_gid = self.n_groups;
                 self.n_groups += 1;
-                try self.gkeys.append(aa, dup);
-                const up_schema = self.upstream.outputSchema();
-                for (self.aggs, self.agg_col_indices) |a, maybe_idx| {
-                    const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
-                    try self.gstate.append(aa, initialState(a.func, in_t));
-                }
-            }
-            const base = @as(usize, gop.value_ptr.*) * self.aggs.len;
-            const state = self.gstate.items[base .. base + self.aggs.len];
-            for (self.aggs, 0..) |a, ai| {
-                try updateStateRow(aa_state, &state[ai], a, batch, self.agg_col_indices[ai], row);
-            }
+                self.byte_table.commit(probe.slot, h, new_gid);
+                // For the single-string-key path `key` borrows the batch (freed
+                // after this call) — dup it into the arena; for compound keys it
+                // already lives in the per-batch arena (and outlives the batch).
+                const stored: []const u8 = if (str_view != null) try aa.dupe(u8, key) else key;
+                try self.gkeys.append(aa, stored);
+                try self.appendInitialState(aa);
+                break :blk new_gid;
+            };
+            try self.updateGroup(gid, batch, @intCast(i));
         }
     }
 
@@ -544,22 +683,26 @@ pub const Aggregate = struct {
         var gid: u32 = 0;
         while (gid < self.n_groups) : (gid += 1) {
             const base = @as(usize, gid) * na;
-            try self.appendGroupRow(self.gkeys.items[gid], self.gstate.items[base .. base + na]);
+            try self.appendGroupRow(gid, self.gstate.items[base .. base + na]);
         }
     }
 
     /// Materialize one group's key + aggregate values into `output_columns`.
-    /// Copies into allocator-owned storage, so the borrowed `key_bytes` /
-    /// `state` (which live in the group arena) need not outlive this call.
-    fn appendGroupRow(self: *Aggregate, key_bytes: []const u8, state: []AccState) !void {
-        if (self.single_str_key) {
+    /// Copies into allocator-owned storage, so the borrowed `state` (which
+    /// lives in the group arena) need not outlive this call. The group key is
+    /// reconstructed from `gkeys_int[gid]` (integer path) or `gkeys[gid]`
+    /// (byte path) — both produce identical output columns.
+    fn appendGroupRow(self: *Aggregate, gid: u32, state: []AccState) !void {
+        if (self.int_layout) |layout| {
+            try appendIntGroupKey(self.allocator, self.gkeys_int.items[gid], layout, self.output_columns[0..self.group_col_indices.len]);
+        } else if (self.single_str_key) {
             // Raw string bytes — no compound framing to decode.
             switch (self.output_columns[0].data) {
-                .string, .varchar, .char => |*ss| try ss.appendValue(self.allocator, key_bytes),
+                .string, .varchar, .char => |*ss| try ss.appendValue(self.allocator, self.gkeys.items[gid]),
                 else => unreachable,
             }
         } else {
-            try appendGroupKey(self.allocator, key_bytes, self.group_col_indices, self.upstream.outputSchema(), self.output_columns[0..self.group_col_indices.len]);
+            try appendGroupKey(self.allocator, self.gkeys.items[gid], self.group_col_indices, self.upstream.outputSchema(), self.output_columns[0..self.group_col_indices.len]);
         }
 
         for (self.aggs, 0..) |a, ai| {
@@ -599,7 +742,7 @@ pub const Aggregate = struct {
 
         for (heap[0..len]) |w| {
             const base = @as(usize, w.gid) * na;
-            try self.appendGroupRow(self.gkeys.items[w.gid], self.gstate.items[base .. base + na]);
+            try self.appendGroupRow(w.gid, self.gstate.items[base .. base + na]);
         }
     }
 };
@@ -1741,6 +1884,141 @@ fn appendAccToColumn(
 /// per type matches `comparison.appendColumnValueBytes`. `out` is owned
 /// by the caller and is cleared+reused across rows in the accumulate
 /// loop — only new groups get arena-owned copies.
+/// Bit-width of a fixed-width integer-family type when packed into the u128
+/// compound key. `null` for any type that can't participate (floats, strings),
+/// which keeps the key off the integer fast path.
+fn intKeyBits(t: Type) ?u8 {
+    return switch (t) {
+        .boolean => 8,
+        .tinyint => 8,
+        .smallint => 16,
+        .int, .date => 32,
+        .bigint, .datetime, .decimal64 => 64,
+        .largeint, .decimal128, .uuid => 128,
+        else => null,
+    };
+}
+
+/// One group column's slot within the packed u128 key: its bit offset (from
+/// the low end) and width. Layout is column-order, column 0 in the lowest bits.
+const IntKeyField = struct {
+    offset: u8,
+    bits: u8,
+    type_tag: types.TypeTag,
+};
+
+/// Decision + layout for the integer fast path. `fields` (column-order)
+/// reconstructs each group column on emit. Returned by `planIntKey`; `null`
+/// when any group column isn't a fixed-width integer family or the widths sum
+/// past 128 bits — the operator then uses the byte-serialized key path.
+const IntKeyLayout = struct {
+    fields: []IntKeyField,
+
+    fn deinit(self: IntKeyLayout, allocator: Allocator) void {
+        allocator.free(self.fields);
+    }
+};
+
+/// Build an `IntKeyLayout` when every group column is a fixed-width integer
+/// family type whose widths sum to ≤128 bits; otherwise `null`. Caller owns the
+/// returned `fields` (freed in `Aggregate.deinit`).
+fn planIntKey(
+    allocator: Allocator,
+    group_col_indices: []const usize,
+    up_schema: []const Column,
+) !?IntKeyLayout {
+    if (group_col_indices.len == 0) return null;
+    var total: u16 = 0;
+    for (group_col_indices) |ci| {
+        const b = intKeyBits(up_schema[ci].type) orelse return null;
+        total += b;
+    }
+    if (total > 128) return null;
+
+    const fields = try allocator.alloc(IntKeyField, group_col_indices.len);
+    var offset: u8 = 0;
+    for (group_col_indices, fields) |ci, *f| {
+        const t = up_schema[ci].type;
+        const b = intKeyBits(t).?;
+        f.* = .{ .offset = offset, .bits = b, .type_tag = std.meta.activeTag(t) };
+        offset += b;
+    }
+    return .{ .fields = fields };
+}
+
+/// Reinterpret a signed/unsigned value of `bits` width as the low `bits` of a
+/// u128, masked to the field width (two's-complement bit pattern, so packing is
+/// bijective with `unpackIntField`).
+inline fn fieldBits(comptime SignedT: type, v: SignedT, bits: u8) u128 {
+    const UnsignedT = std.meta.Int(.unsigned, @bitSizeOf(SignedT));
+    const u: UnsignedT = @bitCast(v);
+    const mask: u128 = if (bits >= 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(bits)) - 1;
+    return @as(u128, u) & mask;
+}
+
+/// Pack the group columns of `row` into a single u128 key per `layout`. The raw
+/// stored value is used (matching the byte path, which also ignores group-column
+/// validity), so the two paths group identically.
+fn packIntKey(layout: IntKeyLayout, batch: Batch, group_col_indices: []const usize, row: u32) u128 {
+    var key: u128 = 0;
+    for (group_col_indices, layout.fields) |ci, f| {
+        const view = batch.values[ci];
+        const fb: u128 = switch (view.data) {
+            .boolean => |s| fieldBits(u8, s[row], f.bits),
+            .tinyint => |s| fieldBits(i8, s[row], f.bits),
+            .smallint => |s| fieldBits(i16, s[row], f.bits),
+            .int => |s| fieldBits(i32, s[row], f.bits),
+            .date => |s| fieldBits(i32, s[row], f.bits),
+            .bigint => |s| fieldBits(i64, s[row], f.bits),
+            .datetime => |s| fieldBits(i64, s[row], f.bits),
+            .decimal64 => |s| fieldBits(i64, s[row], f.bits),
+            .largeint => |s| fieldBits(i128, s[row], f.bits),
+            .decimal128 => |s| fieldBits(i128, s[row], f.bits),
+            .uuid => |s| fieldBits(u128, s[row], f.bits),
+            else => unreachable,
+        };
+        key |= fb << @intCast(f.offset);
+    }
+    return key;
+}
+
+/// Extract one field's signed/unsigned value from the packed key (inverse of
+/// `fieldBits`): mask out the field, then sign-extend through the matching
+/// signed integer type.
+inline fn unpackField(comptime SignedT: type, key: u128, f: IntKeyField) SignedT {
+    const UnsignedT = std.meta.Int(.unsigned, @bitSizeOf(SignedT));
+    const mask: u128 = if (f.bits >= 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(f.bits)) - 1;
+    const raw: UnsignedT = @truncate((key >> @intCast(f.offset)) & mask);
+    return @bitCast(raw);
+}
+
+/// Decode a packed u128 key back into the group output columns — the integer
+/// path's mirror of `appendGroupKey`. Reconstructs values bit-identically to
+/// what the byte path would have stored.
+fn appendIntGroupKey(
+    allocator: Allocator,
+    key: u128,
+    layout: IntKeyLayout,
+    out_cols: []ColumnStore,
+) !void {
+    for (layout.fields, 0..) |f, i| {
+        switch (f.type_tag) {
+            .boolean => try out_cols[i].data.boolean.append(allocator, unpackField(u8, key, f)),
+            .tinyint => try out_cols[i].data.tinyint.append(allocator, unpackField(i8, key, f)),
+            .smallint => try out_cols[i].data.smallint.append(allocator, unpackField(i16, key, f)),
+            .int => try out_cols[i].data.int.append(allocator, unpackField(i32, key, f)),
+            .date => try out_cols[i].data.date.append(allocator, unpackField(i32, key, f)),
+            .bigint => try out_cols[i].data.bigint.append(allocator, unpackField(i64, key, f)),
+            .datetime => try out_cols[i].data.datetime.append(allocator, unpackField(i64, key, f)),
+            .decimal64 => try out_cols[i].data.decimal64.append(allocator, unpackField(i64, key, f)),
+            .largeint => try out_cols[i].data.largeint.append(allocator, unpackField(i128, key, f)),
+            .decimal128 => try out_cols[i].data.decimal128.append(allocator, unpackField(i128, key, f)),
+            .uuid => try out_cols[i].data.uuid.append(allocator, unpackField(u128, key, f)),
+            else => unreachable,
+        }
+    }
+}
+
 fn buildCompoundGroupKey(
     allocator: Allocator,
     out: *std.ArrayList(u8),

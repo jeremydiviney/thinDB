@@ -581,4 +581,5 @@ test {
     _ = @import("cast.zig");
     _ = LateScan;
     _ = rowloc;
+    _ = @import("group_table.zig");
 }

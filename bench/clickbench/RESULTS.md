@@ -25,7 +25,7 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
 | Median query | ~440 ms |
-| Total (all 43, best-of-3) | **~10.1 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE → 11.4 flat agg state → 11.3 mask-guided AND → 10.9 single-row accumulate → 10.1 late materialization) |
+| Total (all 43, best-of-3) | **~7.8 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE → 11.4 flat agg state → 11.3 mask-guided AND → 10.9 single-row accumulate → 10.1 late materialization → 7.8 prefetch+int-key group table) |
 | Slowest | Q28 `REGEXP_REPLACE` — 2.4 s (CPU-bound); Q23 `SELECT *` — 1.2 s; Q32 GROUP BY — 1.2 s |
 | Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
@@ -365,6 +365,36 @@ conservative shape match bails to the normal plan otherwise.
 Best-of-5: **Q23 806 → 231 ms (−71%), under DuckDB-1t's 290 ms.** Suite
 10.9 → 10.1 s, 43/43. (Q25/Q26/Q27 — `SELECT SearchPhrase … LIMIT` — correctly
 do *not* late-materialize: their output isn't wider than the probe set.)
+
+## Prefetch + integer-key group table (live) — cache-conscious GROUP BY
+
+Profiling the agg-bound queries showed the cost is **not** emit/traversal (35–48
+ms) or building the aggregates (small), but the **hash probe/insert — 60–75% of
+the aggregate**, i.e. ~5M *random cache-missing* writes into a multi-million-
+entry table. A faster table alone is neutral (it doesn't reduce the miss count;
+an integer-key `AutoHashMap` A/B'd as neutral earlier). Two levers fix it:
+
+1. **Software-prefetch probe pipeline** — `accumulateBatch` now runs in two
+   phases per batch: compute every row's hash (+ packed key), then probe with a
+   look-ahead `@prefetch` of the bucket `D=12` rows ahead. This overlaps the
+   outstanding misses instead of serializing them. (Custom open-addressing
+   tables in `group_table.zig`; the table is grown before a batch so slot
+   addresses stay stable across the look-ahead.)
+2. **Integer-key fast path** — when all group cols are fixed-width ints summing
+   to ≤128 bits, the compound key packs into a `u128` (inline in the slot,
+   single-compare hits, integer hash) — no per-row byte serialization (deletes
+   Q32's ~100 ms key-build) and no key dup.
+
+Both general (no per-query casing); the int path is chosen purely by column
+types. Best-of-5 vs the StringHashMap path:
+
+| Query | before | after | DuckDB-1t | |
+|---|--:|--:|--:|--:|
+| Q32 `GROUP BY WatchID, ClientIP` (5M groups) | 884 ms | **418 ms** | 370 | 1.13× |
+| Q18 `GROUP BY UserID, minute, SearchPhrase` | 646 ms | **372 ms** | 361 | ~tied |
+| Q17 `GROUP BY UserID, SearchPhrase` | 374 ms | **250 ms** | 201 | 1.24× |
+
+Every GROUP BY benefits: suite **10.1 → 7.8 s**, 43/43.
 
 ## Front-end overhead (wire + parser) — negligible
 

@@ -1344,3 +1344,262 @@ test "cardinality: join concatenates left and right bounds" {
     // Drain so the join tears down via its executed path.
     while (try q.next()) |_| {}
 }
+
+test "aggregate: integer fast path — compound int key with count/sum/avg/min/max + nulls" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            // Two-column compound key: smallint (16b) + int (32b) packs into u128.
+            .{ .name = "region", .type = .smallint },
+            .{ .name = "year", .type = .int },
+            // Nullable aggregated column to exercise null handling on the
+            // integer-key path (the agg update is shared with the byte path).
+            .{ .name = "qty", .type = .int, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .region = @as(i16, -3), .year = @as(i32, 2020), .qty = @as(?i32, 10) },
+        .{ .id = @as(i64, 2), .region = @as(i16, -3), .year = @as(i32, 2020), .qty = @as(?i32, null) },
+        .{ .id = @as(i64, 3), .region = @as(i16, -3), .year = @as(i32, 2020), .qty = @as(?i32, 30) },
+        .{ .id = @as(i64, 4), .region = @as(i16, 7), .year = @as(i32, 2021), .qty = @as(?i32, 5) },
+        .{ .id = @as(i64, 5), .region = @as(i16, 7), .year = @as(i32, 2021), .qty = @as(?i32, 9) },
+        // A third group sharing region=-3 but a different year — verifies the
+        // compound key distinguishes on the high field, not just the low one.
+        .{ .id = @as(i64, 6), .region = @as(i16, -3), .year = @as(i32, 2021), .qty = @as(?i32, 100) },
+    });
+
+    var base = try scan(allocator, t);
+    var q = try base.groupBy(&.{ "region", "year" }, &.{
+        .{ .func = .count, .as = "n" },
+        .{ .func = .sum, .col = "qty", .as = "s" },
+        .{ .func = .avg, .col = "qty", .as = "a" },
+        .{ .func = .min, .col = "qty", .as = "mn" },
+        .{ .func = .max, .col = "qty", .as = "mx" },
+    });
+    defer q.deinit();
+
+    const Row = struct { n: i64, s: i64, a: f64, mn: i32, mx: i32 };
+    var seen: std.AutoHashMap([2]i64, Row) = .init(allocator);
+    defer seen.deinit();
+
+    // Output schema: region(0), year(1), n(2), s(3), a(4), mn(5), mx(6).
+    var total_rows: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            const region: i64 = b.values[0].data.smallint[i];
+            const year: i64 = b.values[1].data.int[i];
+            try seen.put(.{ region, year }, .{
+                .n = b.values[2].data.bigint[i],
+                .s = b.values[3].data.bigint[i],
+                .a = b.values[4].data.double[i],
+                .mn = b.values[5].data.int[i],
+                .mx = b.values[6].data.int[i],
+            });
+            total_rows += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), total_rows);
+
+    // region=-3, year=2020: qty {10, null, 30} → count(*)=3, sum=40, avg=20,
+    // min=10, max=30. COUNT(*) counts the null row; sum/avg/min/max skip it.
+    const g1 = seen.get(.{ -3, 2020 }).?;
+    try std.testing.expectEqual(@as(i64, 3), g1.n);
+    try std.testing.expectEqual(@as(i64, 40), g1.s);
+    try std.testing.expectEqual(@as(f64, 20.0), g1.a);
+    try std.testing.expectEqual(@as(i32, 10), g1.mn);
+    try std.testing.expectEqual(@as(i32, 30), g1.mx);
+
+    const g2 = seen.get(.{ 7, 2021 }).?;
+    try std.testing.expectEqual(@as(i64, 2), g2.n);
+    try std.testing.expectEqual(@as(i64, 14), g2.s);
+    try std.testing.expectEqual(@as(f64, 7.0), g2.a);
+    try std.testing.expectEqual(@as(i32, 5), g2.mn);
+    try std.testing.expectEqual(@as(i32, 9), g2.mx);
+
+    const g3 = seen.get(.{ -3, 2021 }).?;
+    try std.testing.expectEqual(@as(i64, 1), g3.n);
+    try std.testing.expectEqual(@as(i64, 100), g3.s);
+    try std.testing.expectEqual(@as(i32, 100), g3.mn);
+}
+
+test "aggregate: mixed int+string GROUP BY uses the byte path correctly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "region", .type = .int },
+            .{ .name = "status", .type = .string },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .region = @as(i32, 1), .status = "paid", .qty = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .region = @as(i32, 1), .status = "paid", .qty = @as(i32, 5) },
+        .{ .id = @as(i64, 3), .region = @as(i32, 1), .status = "pending", .qty = @as(i32, 7) },
+        .{ .id = @as(i64, 4), .region = @as(i32, 2), .status = "paid", .qty = @as(i32, 3) },
+    });
+
+    var base = try scan(allocator, t);
+    var q = try base.groupBy(&.{ "region", "status" }, &.{
+        .{ .func = .count, .as = "n" },
+        .{ .func = .sum, .col = "qty", .as = "s" },
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var matched: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            const region = b.values[0].data.int[i];
+            const status = b.values[1].data.string.rowBytes(i);
+            const n = b.values[2].data.bigint[i];
+            const s = b.values[3].data.bigint[i];
+            rows += 1;
+            if (region == 1 and std.mem.eql(u8, status, "paid")) {
+                try std.testing.expectEqual(@as(i64, 2), n);
+                try std.testing.expectEqual(@as(i64, 15), s);
+                matched += 1;
+            } else if (region == 1 and std.mem.eql(u8, status, "pending")) {
+                try std.testing.expectEqual(@as(i64, 1), n);
+                try std.testing.expectEqual(@as(i64, 7), s);
+                matched += 1;
+            } else if (region == 2 and std.mem.eql(u8, status, "paid")) {
+                try std.testing.expectEqual(@as(i64, 1), n);
+                try std.testing.expectEqual(@as(i64, 3), s);
+                matched += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows);
+    try std.testing.expectEqual(@as(usize, 3), matched);
+}
+
+test "aggregate: integer fast path — ORDER BY agg LIMIT k top-k emit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "user", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .user = @as(i64, 10), .qty = @as(i32, 5) },
+        .{ .id = @as(i64, 2), .user = @as(i64, 20), .qty = @as(i32, 3) },
+        .{ .id = @as(i64, 3), .user = @as(i64, 10), .qty = @as(i32, 7) },
+        .{ .id = @as(i64, 4), .user = @as(i64, 30), .qty = @as(i32, 1) },
+        .{ .id = @as(i64, 5), .user = @as(i64, 20), .qty = @as(i32, 6) },
+        .{ .id = @as(i64, 6), .user = @as(i64, 40), .qty = @as(i32, 100) },
+    });
+
+    // Top-2 by total DESC. The fused hash aggregate keeps only k groups
+    // through the int-path `appendGroupRow`; the downstream OrderBy+Limit
+    // produce the exact final order.
+    const ir = @import("../ir/ir.zig");
+    var base = try scan(allocator, t);
+    var grouped = try base.groupByTopK(
+        &.{"user"},
+        &.{.{ .func = .sum, .col = "qty", .as = "total" }},
+        ir.Op.TopK{ .k = 2, .keys = &.{.{ .col = "total", .desc = true }} },
+    );
+    var q = try grouped.orderBy(&.{.{ .col = "total", .desc = true }});
+    q = try q.limit(2);
+    defer q.deinit();
+
+    var totals: std.ArrayList(i64) = .empty;
+    defer totals.deinit(allocator);
+    var users: std.ArrayList(i64) = .empty;
+    defer users.deinit(allocator);
+    while (try q.next()) |b| {
+        try users.appendSlice(allocator, b.values[0].data.bigint);
+        try totals.appendSlice(allocator, b.values[1].data.bigint);
+    }
+    // user=40 → 100, user=10 → 12 are the top two.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 12 }, totals.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 40, 10 }, users.items);
+}
+
+test "aggregate: integer fast path — single bigint key, no ORDER BY, plain LIMIT" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "user", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    // Enough rows + groups to span multiple batches (>1024) and exercise the
+    // prefetch look-ahead across batch boundaries.
+    var rows: [4000]struct { id: i64, user: i64, qty: i32 } = undefined;
+    var i: usize = 0;
+    while (i < rows.len) : (i += 1) {
+        rows[i] = .{ .id = @intCast(i + 1), .user = @intCast(i % 700), .qty = @intCast((i % 13) + 1) };
+    }
+    try t.insert(&rows);
+
+    var base = try scan(allocator, t);
+    var grouped = try base.groupBy(&.{"user"}, &.{
+        .{ .func = .count, .as = "n" },
+        .{ .func = .sum, .col = "qty", .as = "s" },
+    });
+    var q = try grouped.limit(50);
+    defer q.deinit();
+
+    // Recompute the expected per-group aggregates independently.
+    var exp_n: [700]i64 = [_]i64{0} ** 700;
+    var exp_s: [700]i64 = [_]i64{0} ** 700;
+    i = 0;
+    while (i < rows.len) : (i += 1) {
+        const u: usize = @intCast(rows[i].user);
+        exp_n[u] += 1;
+        exp_s[u] += rows[i].qty;
+    }
+
+    var got: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| {
+            const u: usize = @intCast(b.values[0].data.bigint[r]);
+            try std.testing.expectEqual(exp_n[u], b.values[1].data.bigint[r]);
+            try std.testing.expectEqual(exp_s[u], b.values[2].data.bigint[r]);
+            got += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 50), got);
+}
