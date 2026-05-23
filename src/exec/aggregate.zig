@@ -123,8 +123,7 @@ const MAX_TOPK_KEYS: usize = 4;
 /// caches each ORDER BY key's order value so the heap comparator does no
 /// accumulator decoding in its inner loop. Only `vals[0..keys.len]` is live.
 const TopKEntry = struct {
-    key: []const u8,
-    state: []AccState,
+    gid: u32,
     vals: [MAX_TOPK_KEYS]OrderVal,
 };
 
@@ -207,8 +206,21 @@ pub const Aggregate = struct {
 
     /// Used only when there are no group-by columns (single global group).
     single_state: []AccState,
-    /// Used only when grouping. Maps compound-key bytes → owned state array.
-    groups: std.StringHashMapUnmanaged([]AccState),
+    /// Used only when grouping. Maps compound-key bytes → group id (an index
+    /// into `gstate` / `gkeys`).
+    groups: std.StringHashMapUnmanaged(u32),
+    /// Flat per-group accumulator storage: group `g`'s accumulators occupy
+    /// `gstate.items[g * aggs.len ..][0..aggs.len]`. New groups append here in
+    /// gid order, and emit walks it in gid order — both sequential, so the
+    /// cost stays cache-friendly at millions of groups (a slice-per-group map
+    /// value would scatter the state across the arena and force a random read
+    /// per group on both the accumulate and emit passes).
+    gstate: std.ArrayListUnmanaged(AccState) = .empty,
+    /// Per-group key bytes, indexed by gid (arena-owned). Lets emit reconstruct
+    /// each group's key columns in gid order without touching the hash map.
+    gkeys: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Number of distinct groups seen = next gid to assign.
+    n_groups: u32 = 0,
     /// Reusable buffer for building per-row group keys during accumulate.
     /// Allocated once, grown to max-key-size, cleared+reused per row.
     /// Saves ~1 arena alloc per row in the inner loop.
@@ -349,7 +361,10 @@ pub const Aggregate = struct {
             }
             if (known and est > 1024) {
                 const cap: u32 = @intCast(@min(est, @max(st.upper_rows, 1)));
-                self.groups.ensureTotalCapacity(self.arena.allocator(), cap) catch {};
+                const aa = self.arena.allocator();
+                self.groups.ensureTotalCapacity(aa, cap) catch {};
+                self.gstate.ensureTotalCapacity(aa, @as(usize, cap) * self.aggs.len) catch {};
+                self.gkeys.ensureTotalCapacity(aa, cap) catch {};
             }
         }
         return makeQuery(allocator, self);
@@ -417,7 +432,7 @@ pub const Aggregate = struct {
             // actually smaller than the group count; otherwise emitting every
             // group and letting the downstream Limit trim is cheaper than a
             // large heap that would keep nearly all groups anyway.
-            if (r.k <= TOPK_HEAP_CAP and r.k < self.groups.count()) {
+            if (r.k <= TOPK_HEAP_CAP and r.k < self.n_groups) {
                 try self.appendTopKResults(r);
             } else {
                 try self.appendGroupedResults();
@@ -497,18 +512,21 @@ pub const Aggregate = struct {
                 // The hashmap borrowed `key`, which points into either the
                 // reused scratch buffer or the batch's column bytes — both
                 // outlive only this iteration. Replace key_ptr with an
-                // arena-owned dup so it survives.
-                gop.key_ptr.* = try aa.dupe(u8, key);
-
-                const state = try aa.alloc(AccState, self.aggs.len);
+                // arena-owned dup so it survives, and remember it by gid for
+                // the emit pass.
+                const dup = try aa.dupe(u8, key);
+                gop.key_ptr.* = dup;
+                gop.value_ptr.* = self.n_groups;
+                self.n_groups += 1;
+                try self.gkeys.append(aa, dup);
                 const up_schema = self.upstream.outputSchema();
-                for (self.aggs, self.agg_col_indices, state) |a, maybe_idx, *s| {
+                for (self.aggs, self.agg_col_indices) |a, maybe_idx| {
                     const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
-                    s.* = initialState(a.func, in_t);
+                    try self.gstate.append(aa, initialState(a.func, in_t));
                 }
-                gop.value_ptr.* = state;
             }
-            const state = gop.value_ptr.*;
+            const base = @as(usize, gop.value_ptr.*) * self.aggs.len;
+            const state = self.gstate.items[base .. base + self.aggs.len];
             for (self.aggs, 0..) |a, ai| {
                 try updateState(aa_state, &state[ai], a, batch, self.agg_col_indices[ai], row, row + 1);
             }
@@ -522,9 +540,11 @@ pub const Aggregate = struct {
     }
 
     fn appendGroupedResults(self: *Aggregate) !void {
-        var it = self.groups.iterator();
-        while (it.next()) |entry| {
-            try self.appendGroupRow(entry.key_ptr.*, entry.value_ptr.*);
+        const na = self.aggs.len;
+        var gid: u32 = 0;
+        while (gid < self.n_groups) : (gid += 1) {
+            const base = @as(usize, gid) * na;
+            try self.appendGroupRow(self.gkeys.items[gid], self.gstate.items[base .. base + na]);
         }
     }
 
@@ -557,12 +577,14 @@ pub const Aggregate = struct {
     /// for TopN to discard them.
     fn appendTopKResults(self: *Aggregate, r: ResolvedTopK) !void {
         const k = r.k;
+        const na = self.aggs.len;
         const heap = try self.arena.allocator().alloc(TopKEntry, k);
         var len: usize = 0;
 
-        var it = self.groups.iterator();
-        while (it.next()) |entry| {
-            const cand = topkEntry(entry.key_ptr.*, entry.value_ptr.*, r.keys);
+        var gid: u32 = 0;
+        while (gid < self.n_groups) : (gid += 1) {
+            const base = @as(usize, gid) * na;
+            const cand = topkEntry(gid, self.gstate.items[base .. base + na], r.keys);
             if (len < k) {
                 heap[len] = cand;
                 len += 1;
@@ -576,7 +598,8 @@ pub const Aggregate = struct {
         }
 
         for (heap[0..len]) |w| {
-            try self.appendGroupRow(w.key, w.state);
+            const base = @as(usize, w.gid) * na;
+            try self.appendGroupRow(self.gkeys.items[w.gid], self.gstate.items[base .. base + na]);
         }
     }
 };
@@ -897,8 +920,8 @@ fn ovOrder(a: OrderVal, b: OrderVal) std.math.Order {
 
 /// Build a heap entry, caching each ORDER BY key's order value up front so the
 /// comparator never touches the (large, scattered) accumulator union.
-fn topkEntry(key: []const u8, state: []AccState, keys: []const ResolvedKey) TopKEntry {
-    var e = TopKEntry{ .key = key, .state = state, .vals = undefined };
+fn topkEntry(gid: u32, state: []AccState, keys: []const ResolvedKey) TopKEntry {
+    var e = TopKEntry{ .gid = gid, .vals = undefined };
     for (keys, 0..) |kk, i| e.vals[i] = aggOrderValue(state[kk.agg_idx]);
     return e;
 }

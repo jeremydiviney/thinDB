@@ -25,7 +25,7 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
 | Median query | ~440 ms |
-| Total (all 43, best-of-3) | **~12.1 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE) |
+| Total (all 43, best-of-3) | **~11.4 s** (24.8 → 21.1 pool → 18.6 hash-route → 18.0 MIN/MAX → 13.6 per-column reads → 12.1 LIKE → 11.4 flat agg state) |
 | Slowest | Q28 `REGEXP_REPLACE` — 2.4 s (CPU-bound); Q23 `SELECT *` — 1.2 s; Q32 GROUP BY — 1.2 s |
 | Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
@@ -280,6 +280,34 @@ Controlled best-of-5, same data, back-to-back vs the backtracker:
 | Q23 `SELECT * WHERE URL LIKE` | 944 ms | **863 ms** | −9% |
 
 Suite **13.6 → 12.1 s**, 43/43.
+
+## Flat group-accumulator state (live) — cache-conscious hash aggregate
+
+Profiling Q32 (`GROUP BY WatchID, ClientIP` over the full 5M rows, no filter)
+showed the **scan at ~4 ms and the aggregate at ~1010 ms** — essentially all the
+time. WatchID is near-unique, so ~5M groups form: the new-group path runs ~5M
+times and the top-k emit pass then visits all ~5M of them.
+
+The hash map previously stored a **separate `[]AccState` slice per group**, so
+both the per-group accumulator init and every emit-pass read chased a pointer to
+a scattered arena allocation — a cache miss per group in hash order. The map now
+stores a **`u32` group id**, and all accumulators live in one contiguous
+`gstate` array indexed by `gid`. New groups append sequentially; emit walks
+`gid` 0..N sequentially (bypassing the map). General — every `GROUP BY`
+benefits, no per-query casing.
+
+Controlled best-of-5, same data, back-to-back vs slice-per-group:
+
+| Query | slice/group | flat state | |
+|---|--:|--:|--:|
+| Q17 `GROUP BY UserID, SearchPhrase` | 508 ms | **396 ms** | −22% |
+| Q32 `GROUP BY WatchID, ClientIP` (5M groups) | 1033 ms | **926 ms** | −10% |
+| Q18 `GROUP BY UserID, minute, SearchPhrase` | 763 ms | **736 ms** | −4% |
+
+Suite **12.1 → 11.4 s**, 43/43. (An integer-packed-key variant was tried first
+and measured *neutral* — using Q17/Q18 as no-change controls, Q32's apparent
+move was entirely machine noise — so it was reverted. The cost was the slice
+indirection, not key serialization.)
 
 ## Front-end overhead (wire + parser) — negligible
 
