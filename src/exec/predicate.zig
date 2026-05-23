@@ -17,6 +17,7 @@ const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
 
 const exec = @import("exec.zig");
+const simd = @import("../util/simd.zig");
 const Error = exec.Error;
 
 pub const PredicateOp = enum { eq, neq, lt, lte, gt, gte };
@@ -1319,19 +1320,10 @@ pub fn evaluateLikeMask(view: ColumnView, pattern: []const u8, n: usize, mask: [
 pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bool) !void {
     const op = p.op;
     switch (view.data) {
-        .int => |s| {
-            const want = p.val.int;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(i32, v, want, op);
-        },
-        .bigint => |s| {
-            const want = p.val.bigint;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(i64, v, want, op);
-        },
-        .boolean => |s| {
-            const want = @intFromBool(p.val.boolean);
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(u8, v, want, op);
-        },
-        .varchar => |sv| {
+        .int => |s| cmpInto(i32, s[0..n], p.val.int, mask[0..n], op),
+        .bigint => |s| cmpInto(i64, s[0..n], p.val.bigint, mask[0..n], op),
+        .boolean => |s| cmpInto(u8, s[0..n], @intFromBool(p.val.boolean), mask[0..n], op),
+        .varchar, .char => |sv| {
             if (op != .eq and op != .neq) return Error.UnsupportedOperatorForType;
             for (0..n) |i| {
                 const eq = std.mem.eql(u8, sv.rowBytes(i), p.val.text);
@@ -1345,53 +1337,16 @@ pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bo
                 mask[i] = if (op == .eq) eq else !eq;
             }
         },
-        .float => |s| {
-            const want = p.val.float;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(f32, v, want, op);
-        },
-        .double => |s| {
-            const want = p.val.double;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(f64, v, want, op);
-        },
-        .date => |s| {
-            const want = p.val.date;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(i32, v, want, op);
-        },
-        .datetime => |s| {
-            const want = p.val.datetime;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(i64, v, want, op);
-        },
-        .tinyint => |s| {
-            const want = p.val.tinyint;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(i8, v, want, op);
-        },
-        .smallint => |s| {
-            const want = p.val.smallint;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(i16, v, want, op);
-        },
-        .largeint => |s| {
-            const want = p.val.largeint;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(i128, v, want, op);
-        },
-        .char => |sv| {
-            if (op != .eq and op != .neq) return Error.UnsupportedOperatorForType;
-            for (0..n) |i| {
-                const eq = std.mem.eql(u8, sv.rowBytes(i), p.val.text);
-                mask[i] = if (op == .eq) eq else !eq;
-            }
-        },
-        .decimal64 => |s| {
-            const want = p.val.decimal64;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(i64, v, want, op);
-        },
-        .decimal128 => |s| {
-            const want = p.val.decimal128;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(i128, v, want, op);
-        },
-        .uuid => |s| {
-            const want = p.val.uuid;
-            for (s[0..n], 0..) |v, i| mask[i] = cmp(u128, v, want, op);
-        },
+        .float => |s| cmpInto(f32, s[0..n], p.val.float, mask[0..n], op),
+        .double => |s| cmpInto(f64, s[0..n], p.val.double, mask[0..n], op),
+        .date => |s| cmpInto(i32, s[0..n], p.val.date, mask[0..n], op),
+        .datetime => |s| cmpInto(i64, s[0..n], p.val.datetime, mask[0..n], op),
+        .tinyint => |s| cmpInto(i8, s[0..n], p.val.tinyint, mask[0..n], op),
+        .smallint => |s| cmpInto(i16, s[0..n], p.val.smallint, mask[0..n], op),
+        .largeint => |s| cmpInto(i128, s[0..n], p.val.largeint, mask[0..n], op),
+        .decimal64 => |s| cmpInto(i64, s[0..n], p.val.decimal64, mask[0..n], op),
+        .decimal128 => |s| cmpInto(i128, s[0..n], p.val.decimal128, mask[0..n], op),
+        .uuid => |s| cmpInto(u128, s[0..n], p.val.uuid, mask[0..n], op),
     }
     // Two-valued logic: a NULL value never matches a comparison.
     if (view.nulls != null) {
@@ -1410,6 +1365,19 @@ fn cmp(comptime T: type, a: T, b: T, op: PredicateOp) bool {
         .gt => a > b,
         .gte => a >= b,
     };
+}
+
+/// Vectorized leaf comparison: `mask[i] = (data[i] <op> want)`. The runtime
+/// `op` is resolved to a comptime `simd.CmpOp` so the vector compare in
+/// `simd.compareInto` monomorphizes (the scalar per-row `cmp` with a runtime op
+/// switch wouldn't auto-vectorize).
+fn cmpInto(comptime T: type, data: []const T, want: T, mask: []bool, op: PredicateOp) void {
+    switch (op) {
+        inline else => |o| {
+            const cop = comptime std.meta.stringToEnum(simd.CmpOp, @tagName(o)).?;
+            simd.compareInto(T, cop, data, want, mask);
+        },
+    }
 }
 
 /// Returns true if the row-group stats could contain rows matching `op val`.

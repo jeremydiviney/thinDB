@@ -76,6 +76,44 @@ pub fn maxOf(comptime T: type, data: []const T) T {
     return reduceExtreme(T, data, false);
 }
 
+pub const CmpOp = enum { eq, neq, lt, lte, gt, gte };
+
+/// Elementwise `mask[i] = (data[i] <op> want)`, vectorized. `mask` must be
+/// sized to `data.len`. `op` is comptime so the vector comparison monomorphizes
+/// to a single SIMD compare per chunk; 128-bit `T` (no wide vector) degenerates
+/// to the scalar tail. Used by the Filter's per-leaf comparison kernel.
+pub fn compareInto(comptime T: type, comptime op: CmpOp, data: []const T, want: T, mask: []bool) void {
+    std.debug.assert(data.len == mask.len);
+    const N = comptime lanes(T);
+    var i: usize = 0;
+    if (N > 1) {
+        const wv: @Vector(N, T) = @splat(want);
+        while (i + N <= data.len) : (i += N) {
+            const v: @Vector(N, T) = data[i..][0..N].*;
+            const m: @Vector(N, bool) = switch (op) {
+                .eq => v == wv,
+                .neq => v != wv,
+                .lt => v < wv,
+                .lte => v <= wv,
+                .gt => v > wv,
+                .gte => v >= wv,
+            };
+            mask[i..][0..N].* = m;
+        }
+    }
+    while (i < data.len) : (i += 1) {
+        const v = data[i];
+        mask[i] = switch (op) {
+            .eq => v == want,
+            .neq => v != want,
+            .lt => v < want,
+            .lte => v <= want,
+            .gt => v > want,
+            .gte => v >= want,
+        };
+    }
+}
+
 pub const BinOp = enum { add, sub, mul };
 
 /// Elementwise `dst[i] = a[i] <op> b[i]` over equal-length slices, vectorized.
@@ -196,6 +234,37 @@ test "simd: scalarOp matches widen-then-scalar reference" {
                         };
                         try std.testing.expectEqual(want, d);
                     }
+                }
+            }
+        }
+    }
+}
+
+test "simd: compareInto matches scalar for all ops/types/lengths" {
+    const lengths = [_]usize{ 0, 1, 7, 8, 16, 17, 64, 1000, 4097 };
+    inline for (.{ i8, i16, i32, i64, i128, u8, u128, f32, f64 }) |T| {
+        inline for (.{ CmpOp.eq, CmpOp.neq, CmpOp.lt, CmpOp.lte, CmpOp.gt, CmpOp.gte }) |op| {
+            for (lengths) |len| {
+                const data = try std.testing.allocator.alloc(T, len);
+                defer std.testing.allocator.free(data);
+                const mask = try std.testing.allocator.alloc(bool, len);
+                defer std.testing.allocator.free(mask);
+                for (data, 0..) |*d, idx| {
+                    const x: i64 = @intCast((idx *% 31 +% 7) % 13);
+                    d.* = if (@typeInfo(T) == .float) @floatFromInt(x) else @intCast(x);
+                }
+                const want: T = if (@typeInfo(T) == .float) 6.0 else 6;
+                compareInto(T, op, data, want, mask);
+                for (data, mask) |d, m| {
+                    const exp = switch (op) {
+                        .eq => d == want,
+                        .neq => d != want,
+                        .lt => d < want,
+                        .lte => d <= want,
+                        .gt => d > want,
+                        .gte => d >= want,
+                    };
+                    try std.testing.expectEqual(exp, m);
                 }
             }
         }
