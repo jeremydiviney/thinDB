@@ -25,7 +25,7 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
 | Median query | ~440 ms |
-| Total (all 43, best-of-3) | **~28.3 s** |
+| Total (all 43, best-of-3) | **~24.8 s** (was 28.3 s pre-SIMD; Q29 1499→224 ms via fused col-op-const) |
 | Slowest | Q28 `REGEXP_REPLACE` — 2.9 s; Q23 `SELECT * … ORDER BY LIMIT` — 2.5 s |
 | Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
@@ -105,9 +105,27 @@ ClickBench**: only Q29 (90 sums) shows a clean gain (~1905→~1680 ms, ~12%); th
 MIN/MAX/AVG queries (Q02/Q06/Q27/Q31/Q32) stay within run-to-run noise because
 they're **decode/bandwidth-bound, not reduction-bound**. Suite total moved
 inside noise (~26–27 s). Kept anyway — it removes branches from the hot loops
-and seeds the window-SIMD refactor (#272). Lesson: thinDB's ClickBench cost is
-in string-GROUP-BY hashing, wide materialize, and decode — not numeric inner
-loops — so further SIMD should aim there (scan/LIKE) or we pivot to those levers.
+and seeds the window-SIMD refactor (#272).
+
+**Step 2 — fuse `col op const` (the big win).** `--profile-ops` (a per-operator
+timing flag added this pass) showed Q29's bottleneck wasn't the SUM (~2%) but
+the **Compute** materializing 90 derived columns (~87%), via three per-element
+passes (smallint→int cast, replicate-literal, add). Recognizing `col +/-/* const`
+at resolve time and evaluating it as one fused widening SIMD pass collapsed it:
+**Q29 1499 → 224 ms (~6.7×)**, suite **~26 → 24.8 s**, 43/43.
+
+**What the profiler ruled out.** Late materialization for Q23 (`SELECT *` decodes
+all 105 cols ×5M to emit 10): real but ~40%, capped by row-group decode
+granularity + a Batch-struct-wide change — deferred (#273). SIMD string hashing
+for the GROUP-BY family: profiled at ~4% (Q33 is half URL-decode in Scan, half
+hash-aggregate; within the aggregate, hashing is ~7% — the rest is probe memcmp
++ cache misses, **memory-bound**). Built it, measured flat, reverted.
+
+**Lesson:** thinDB's ClickBench cost is memory-bound — wide-column decode,
+hash-table probe latency, string handling — not numeric inner loops. SIMD paid
+off exactly where the work was compute-bound arithmetic (`col op const`); the
+remaining levers are algorithmic (late materialization, hash-table layout),
+not SIMD.
 
 ## Front-end overhead (wire + parser) — negligible
 
