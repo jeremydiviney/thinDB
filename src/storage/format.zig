@@ -34,7 +34,7 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// largeint / decimal128 / uuid (whose full range needs 16 bytes per
 /// value) and extends the string prefix from 8 bytes to 16. All
 /// stats-bearing types now share a uniform i128-based representation.
-pub const segment_version: u16 = 7;
+pub const segment_version: u16 = 8;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -129,6 +129,13 @@ pub const RowGroupMeta = struct {
     /// One entry per schema column. For string columns the entry is
     /// `{ min: 0, max: 0 }` (ignored).
     stats: []const Stats,
+    /// Absolute file offset of each column's block within this row group, one
+    /// per schema column (column-index order). Lets the reader pread just the
+    /// columns a query needs instead of the whole segment file. A block's
+    /// length is the next column's offset minus this one (the last column ends
+    /// at `offset + length`). Empty on the writer-built `SegmentInfo` (only the
+    /// footer carries them); populated by `readSegment`.
+    col_offsets: []const u64 = &.{},
 };
 
 pub const SegmentInfo = struct {
@@ -146,7 +153,10 @@ pub const SegmentInfo = struct {
     column_sketches: []const u8 = &.{},
 
     pub fn deinit(self: SegmentInfo, allocator: std.mem.Allocator) void {
-        for (self.row_groups) |rg| allocator.free(rg.stats);
+        for (self.row_groups) |rg| {
+            allocator.free(rg.stats);
+            if (rg.col_offsets.len > 0) allocator.free(rg.col_offsets);
+        }
         allocator.free(self.row_groups);
         if (self.column_sketches.len > 0) allocator.free(self.column_sketches);
     }

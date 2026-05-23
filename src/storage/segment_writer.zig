@@ -92,7 +92,10 @@ pub fn writeSegment(
     // ---- Row groups ----
     var row_groups: std.ArrayList(RowGroupMeta) = .empty;
     errdefer {
-        for (row_groups.items) |rg| allocator.free(rg.stats);
+        for (row_groups.items) |rg| {
+            allocator.free(rg.stats);
+            allocator.free(@constCast(rg.col_offsets));
+        }
         row_groups.deinit(allocator);
     }
 
@@ -104,7 +107,12 @@ pub fn writeSegment(
         try appendU32(allocator, &buf, @intCast(rows_in_group));
         try appendU32(allocator, &buf, 0); // padding
 
-        for (columns, schema.columns) |view, schema_col| {
+        // Record each column block's absolute file offset so the reader can
+        // pread individual columns without loading the whole segment.
+        const col_offsets = try allocator.alloc(u64, columns.len);
+        errdefer allocator.free(col_offsets);
+        for (columns, schema.columns, 0..) |view, schema_col, ci| {
+            col_offsets[ci] = @intCast(buf.items.len);
             try writeColumnBlock(allocator, &compressor, &buf, view, schema_col.nullable, row_offset, row_offset + rows_in_group);
         }
 
@@ -121,6 +129,7 @@ pub fn writeSegment(
             .length = rg_length,
             .row_count = @intCast(rows_in_group),
             .stats = stats,
+            .col_offsets = col_offsets,
         });
 
         row_offset += rows_in_group;
@@ -136,6 +145,9 @@ pub fn writeSegment(
         for (rg.stats) |s| {
             try appendI128(allocator, &buf, s.min);
             try appendI128(allocator, &buf, s.max);
+        }
+        for (rg.col_offsets) |co| {
+            try appendU64(allocator, &buf, co);
         }
     }
     const footer_size: u32 = @intCast(buf.items.len - footer_start + format.footer_trailer_size);

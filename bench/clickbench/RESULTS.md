@@ -25,7 +25,7 @@ THINDB_MYSQL_PORT=7880 THINDB_DB=clickbench__public bun run clickbench/run_queri
 | Queries passing | **43 / 43** |
 | `COUNT(*)` (Q0) | **<1 ms** (metadata-only, 0-column scan) |
 | Median query | ~440 ms |
-| Total (all 43, best-of-3) | **~18.0 s** (24.8 → 21.1 buffer pool → 18.6 hash-routing → 18.0 MIN/MAX-from-stats; 28.3 pre-SIMD) |
+| Total (all 43, best-of-3) | **~13.6 s** (24.8 → 21.1 buffer pool → 18.6 hash-routing → 18.0 MIN/MAX-stats → 13.6 per-column reads) |
 | Slowest | Q28 `REGEXP_REPLACE` — 2.4 s (CPU-bound); Q23 `SELECT *` — 1.2 s; Q32 GROUP BY — 1.2 s |
 | Q28 `REGEXP_REPLACE` | 2.9 s — was 22 s before the regex bulk-skip; now GROUP-BY-bound, not regex-bound |
 
@@ -230,6 +230,34 @@ polluting the extreme), and an all-null row group stores an inverted
 nullable column is both correct (NULLs excluded, per SQL semantics) and
 served from stats. Verified end-to-end by re-importing the 5M dataset under
 the null-aware writer (43/43, Q06 value unchanged).
+
+## Per-column reads (live) — the ~160 ms scan floor, removed
+
+Profiling the worst-vs-DuckDB queries showed a **column-count-independent ~160 ms
+floor** on the cheap ones (Q01 1 col, Q02 2 cols, Q03 1 col — all ~165 ms). The
+cause: `readSegment` read the **entire segment file** (~647 MB across all 105
+columns) into memory per query; column pruning skipped *decoding* unused columns
+but their bytes were still *read*. (A bulk-`memcpy` decode rewrite was a no-op in
+ReleaseFast — LLVM already lowered the per-element `readInt` loop to a memcpy —
+which confirmed decode was never the bottleneck.)
+
+Fix (segment format v8): the footer now stores each column block's file offset
+per row group, so the reader `pread`s only the columns a query needs instead of
+the whole file. `has_nulls` is schema-derived, so a buffer-pool hit touches no
+I/O at all. Result on the scan-bound queries:
+
+| Query | before | after | |
+|---|--:|--:|--:|
+| Q19 `UserID = const` | 157 ms | **2.5 ms** | 63× |
+| Q02 `SUM/COUNT/AVG` | 163 ms | **2.7 ms** | 60× |
+| Q03 `AVG(UserID)` | 164 ms | **4.7 ms** | 35× |
+| Q01 `COUNT WHERE` | 165 ms | **6.6 ms** | 25× |
+| Q07 `… GROUP BY` | 169 ms | **9.5 ms** | 18× |
+
+These now match or beat DuckDB-1t. The win generalizes (Q10 190→29, Q29 215→63,
+Q08 462→305), dropping the suite **18.0 → 13.6 s**. Only `SELECT *` (Q23) is
+unchanged — it reads every column, so there's nothing to prune (its lever is
+late materialization, #273).
 
 ## Front-end overhead (wire + parser) — negligible
 
