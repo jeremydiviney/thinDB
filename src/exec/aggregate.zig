@@ -528,7 +528,7 @@ pub const Aggregate = struct {
             const base = @as(usize, gop.value_ptr.*) * self.aggs.len;
             const state = self.gstate.items[base .. base + self.aggs.len];
             for (self.aggs, 0..) |a, ai| {
-                try updateState(aa_state, &state[ai], a, batch, self.agg_col_indices[ai], row, row + 1);
+                try updateStateRow(aa_state, &state[ai], a, batch, self.agg_col_indices[ai], row);
             }
         }
     }
@@ -1075,6 +1075,39 @@ fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams) !void {
                 else => return Error.AggregateInvalidParam,
             }
         },
+    }
+}
+
+/// Single-row accumulator update for the hash-aggregate inner loop, where every
+/// call covers exactly one row. `updateState` is built around contiguous-range
+/// SIMD reductions; routing a one-element range through it pays a kernel
+/// call + setup per value (millions of times). COUNT and SUM — the common hot
+/// aggregates — get a direct scalar update here; everything else (MIN/MAX, AVG,
+/// stddev, distinct, percentile, group_concat) defers to `updateState` so there
+/// is exactly one definition of their semantics.
+fn updateStateRow(aa: Allocator, s: *AccState, spec: AggSpec, batch: Batch, col_idx: ?usize, row: u32) !void {
+    switch (spec.func) {
+        .count => {
+            if (col_idx) |idx| {
+                if (batch.values[idx].isValid(row)) s.count += 1;
+            } else s.count += 1;
+        },
+        .sum => {
+            const view = batch.values[col_idx.?];
+            if (!view.isValid(row)) return;
+            switch (view.data) {
+                .int => |sl| s.sum_int += sl[row],
+                .smallint => |sl| s.sum_int += sl[row],
+                .tinyint => |sl| s.sum_int += sl[row],
+                .boolean => |sl| s.sum_int += sl[row],
+                .bigint, .decimal64 => |sl| s.sum_int += sl[row],
+                .largeint, .decimal128 => |sl| s.sum_int += sl[row],
+                .float => |sl| s.sum_float += sl[row],
+                .double => |sl| s.sum_float += sl[row],
+                else => unreachable,
+            }
+        },
+        else => try updateState(aa, s, spec, batch, col_idx, row, row + 1),
     }
 }
 
