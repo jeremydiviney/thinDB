@@ -242,6 +242,14 @@ pub const Aggregate = struct {
     /// Grown lazily to the batch row count; arena-owned.
     pf_hashes: std.ArrayListUnmanaged(u64) = .empty,
     pf_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Compound byte-key phase-(a) scratch: all of a batch's serialized keys are
+    /// packed back-to-back into `pf_key_blob` (cleared per batch, not per row),
+    /// with each row's (offset,len) in `pf_key_spans`. `pf_keys` slices are
+    /// resolved into the blob once it's fully built. This replaces a per-row
+    /// arena dup (most of which were wasted on existing-group rows and never
+    /// freed until query end); only *new* groups now copy their key into `gkeys`.
+    pf_key_blob: std.ArrayList(u8) = .empty,
+    pf_key_spans: std.ArrayListUnmanaged([2]u32) = .empty,
     /// Prefetch-pipeline scratch (integer path): per-row hash + packed u128 key.
     pf_int_keys: std.ArrayListUnmanaged(u128) = .empty,
     /// Reusable buffer for building per-row group keys during accumulate.
@@ -423,6 +431,7 @@ pub const Aggregate = struct {
         if (self.top_k) |r| self.allocator.free(r.keys);
         if (self.int_layout) |l| l.deinit(self.allocator);
         self.key_scratch.deinit(self.allocator);
+        self.pf_key_blob.deinit(self.allocator);
         // The group tables, flat state, per-group key lists, and prefetch
         // scratch all live in `arena` — freed wholesale here.
         self.arena.deinit();
@@ -623,20 +632,36 @@ pub const Aggregate = struct {
         else
             null;
 
-        // Phase (a): build per-row key slice + hash.
+        // Phase (a): build per-row key slice + hash. Single-string keys borrow
+        // the batch's bytes directly; compound keys are serialized into the
+        // reused per-batch `pf_key_blob` (offsets recorded in `pf_key_spans`,
+        // then resolved to slices once the blob stops growing) — no per-row dup.
         self.pf_keys.clearRetainingCapacity();
         self.pf_hashes.clearRetainingCapacity();
         try self.pf_keys.ensureTotalCapacity(aa, n);
         try self.pf_hashes.ensureTotalCapacity(aa, n);
         var row: u32 = 0;
-        while (row < n) : (row += 1) {
-            const key: []const u8 = if (str_view) |sv| sv.rowBytes(row) else blk: {
-                self.key_scratch.clearRetainingCapacity();
-                try buildCompoundGroupKey(self.allocator, &self.key_scratch, batch, self.group_col_indices, row);
-                break :blk try aa.dupe(u8, self.key_scratch.items);
-            };
-            self.pf_keys.appendAssumeCapacity(key);
-            self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, key));
+        if (str_view) |sv| {
+            while (row < n) : (row += 1) {
+                const key = sv.rowBytes(row);
+                self.pf_keys.appendAssumeCapacity(key);
+                self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, key));
+            }
+        } else {
+            self.pf_key_blob.clearRetainingCapacity();
+            self.pf_key_spans.clearRetainingCapacity();
+            try self.pf_key_spans.ensureTotalCapacity(aa, n);
+            while (row < n) : (row += 1) {
+                const off: u32 = @intCast(self.pf_key_blob.items.len);
+                try buildCompoundGroupKey(self.allocator, &self.pf_key_blob, batch, self.group_col_indices, row);
+                const len: u32 = @intCast(self.pf_key_blob.items.len - off);
+                self.pf_key_spans.appendAssumeCapacity(.{ off, len });
+                self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, self.pf_key_blob.items[off..]));
+            }
+            // Blob is stable now → resolve each row's key slice into it.
+            for (self.pf_key_spans.items) |sp| {
+                self.pf_keys.appendAssumeCapacity(self.pf_key_blob.items[sp[0] .. sp[0] + sp[1]]);
+            }
         }
         const keys = self.pf_keys.items;
         const hashes = self.pf_hashes.items;
@@ -660,11 +685,11 @@ pub const Aggregate = struct {
                 const new_gid = self.n_groups;
                 self.n_groups += 1;
                 self.byte_table.commit(probe.slot, h, new_gid);
-                // For the single-string-key path `key` borrows the batch (freed
-                // after this call) — dup it into the arena; for compound keys it
-                // already lives in the per-batch arena (and outlives the batch).
-                const stored: []const u8 = if (str_view != null) try aa.dupe(u8, key) else key;
-                try self.gkeys.append(aa, stored);
+                // `key` borrows transient storage — the batch (single-string) or
+                // the reused per-batch blob (compound) — so a new group dups it
+                // into the arena to survive past this batch. Only new groups pay
+                // this copy now, not every row.
+                try self.gkeys.append(aa, try aa.dupe(u8, key));
                 try self.appendInitialState(aa);
                 break :blk new_gid;
             };

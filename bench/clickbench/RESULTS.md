@@ -396,6 +396,13 @@ types. Best-of-5 vs the StringHashMap path:
 
 Every GROUP BY benefits: suite **10.1 → 7.8 s**, 43/43.
 
+Follow-up: the byte path's phase (a) previously dup'd **every** row's compound key
+into the query arena — but ~71% of those (existing-group rows) were wasted and
+never freed until query end. Keys are now serialized into one reused per-batch
+blob (offsets in a spans list, slices resolved once it's built); only *new*
+groups copy their key into `gkeys`. Q17 249→227 ms, Q18 366→360 ms (now ≤
+DuckDB-1t's 361), and far less arena churn for every compound GROUP BY.
+
 ## Front-end overhead (wire + parser) — negligible
 
 Measured so the 31.8 s is attributed correctly: it is essentially all
