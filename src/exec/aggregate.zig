@@ -256,6 +256,11 @@ pub const Aggregate = struct {
     pf_key_spans: std.ArrayListUnmanaged([2]u32) = .empty,
     /// Prefetch-pipeline scratch (integer path): per-row hash + packed u128 key.
     pf_int_keys: std.ArrayListUnmanaged(u128) = .empty,
+    /// Per-row resolved group id for the current batch. Both key paths fill
+    /// this in their phase-(b) probe loop instead of updating accumulators
+    /// inline; the batched scatter-update kernels then consume it once per
+    /// aggregate. Arena-owned, cleared per batch.
+    pf_gids: std.ArrayListUnmanaged(u32) = .empty,
     /// Reusable buffer for building per-row group keys during accumulate.
     /// Allocated once, grown to max-key-size, cleared+reused per row.
     /// Saves ~1 arena alloc per row in the inner loop.
@@ -547,13 +552,195 @@ pub const Aggregate = struct {
         }
     }
 
-    /// Update one group's accumulators for `row`. Shared by both key paths.
-    inline fn updateGroup(self: *Aggregate, gid: u32, batch: Batch, row: u32) !void {
+    /// Batched accumulator update for a resolved batch of `gids` (one per row,
+    /// `gids.len == batch.row_count`). For each aggregate the (func, input
+    /// column type) decision is hoisted out of the row loop — taken once here —
+    /// so the per-row scatter into `gstate` is a single specialized operation
+    /// rather than a per-row, per-aggregate type switch. The simple scalar
+    /// aggregates (COUNT/SUM/MIN/MAX/AVG) run through the specialized kernels;
+    /// the complex ones (stddev/var/count_distinct/percentile/group_concat)
+    /// still take the per-row `updateStateRow` pass so their semantics live in
+    /// exactly one place. Results are byte-identical to the prior per-row path.
+    fn accumulateAggsBatched(self: *Aggregate, batch: Batch, gids: []const u32) !void {
         const aa_state = self.arena.allocator();
-        const base = @as(usize, gid) * self.aggs.len;
-        const state = self.gstate.items[base .. base + self.aggs.len];
+        const na = self.aggs.len;
         for (self.aggs, 0..) |a, ai| {
-            try updateStateRow(aa_state, &state[ai], a, batch, self.agg_col_indices[ai], row);
+            switch (a.func) {
+                .count => self.scatterCount(gids, na, ai, self.agg_col_indices[ai], batch),
+                .sum => self.scatterSum(gids, na, ai, batch.values[self.agg_col_indices[ai].?]),
+                .min => try self.scatterMinMax(gids, na, ai, batch.values[self.agg_col_indices[ai].?], aa_state, true),
+                .max => try self.scatterMinMax(gids, na, ai, batch.values[self.agg_col_indices[ai].?], aa_state, false),
+                .avg => self.scatterAvg(gids, na, ai, batch.values[self.agg_col_indices[ai].?]),
+                // Complex aggregates keep the per-row update so their (single)
+                // definition of semantics is untouched.
+                else => {
+                    var r: u32 = 0;
+                    while (r < gids.len) : (r += 1) {
+                        const s = &self.gstate.items[@as(usize, gids[r]) * na + ai];
+                        try updateStateRow(aa_state, s, a, batch, self.agg_col_indices[ai], r);
+                    }
+                },
+            }
+        }
+    }
+
+    /// COUNT scatter. COUNT(*) (`col_idx == null`) bumps every row's group;
+    /// COUNT(col) skips NULLs. Mirrors `updateStateRow`/`updateState` .count.
+    inline fn scatterCount(self: *Aggregate, gids: []const u32, na: usize, ai: usize, col_idx: ?usize, batch: Batch) void {
+        const items = self.gstate.items;
+        if (col_idx) |idx| {
+            const view = batch.values[idx];
+            if (view.nulls == null) {
+                for (gids) |g| items[@as(usize, g) * na + ai].count += 1;
+            } else {
+                for (gids, 0..) |g, r| {
+                    if (view.isValid(r)) items[@as(usize, g) * na + ai].count += 1;
+                }
+            }
+        } else {
+            for (gids) |g| items[@as(usize, g) * na + ai].count += 1;
+        }
+    }
+
+    /// SUM scatter. Int family widens into `sum_int` (i128); float/double into
+    /// `sum_float` (f64); NULLs skipped. Mirrors `updateStateRow`/`updateState`.
+    inline fn scatterSum(self: *Aggregate, gids: []const u32, na: usize, ai: usize, view: ColumnView) void {
+        const items = self.gstate.items;
+        const has_nulls = view.nulls != null;
+        switch (view.data) {
+            inline .int, .smallint, .tinyint, .boolean, .bigint, .decimal64, .largeint, .decimal128 => |sl| {
+                if (has_nulls) {
+                    for (gids, 0..) |g, r| {
+                        if (!view.isValid(r)) continue;
+                        items[@as(usize, g) * na + ai].sum_int += sl[r];
+                    }
+                } else {
+                    for (gids, 0..) |g, r| items[@as(usize, g) * na + ai].sum_int += sl[r];
+                }
+            },
+            inline .float, .double => |sl| {
+                if (has_nulls) {
+                    for (gids, 0..) |g, r| {
+                        if (!view.isValid(r)) continue;
+                        items[@as(usize, g) * na + ai].sum_float += sl[r];
+                    }
+                } else {
+                    for (gids, 0..) |g, r| items[@as(usize, g) * na + ai].sum_float += sl[r];
+                }
+            },
+            else => unreachable,
+        }
+    }
+
+    /// AVG scatter. f64 running sum + u64 count; NULLs skipped. Integer values
+    /// convert per-row (matching `updateStateRow`'s grouped path, which routed
+    /// AVG through `updateState`'s scalar branch — not the no-null i128 fast
+    /// path, which is single-group only). Mirrors that scalar accumulation.
+    inline fn scatterAvg(self: *Aggregate, gids: []const u32, na: usize, ai: usize, view: ColumnView) void {
+        const items = self.gstate.items;
+        const has_nulls = view.nulls != null;
+        switch (view.data) {
+            inline .int, .smallint, .tinyint, .boolean, .bigint, .decimal64, .largeint, .decimal128 => |sl| {
+                if (has_nulls) {
+                    for (gids, 0..) |g, r| {
+                        if (!view.isValid(r)) continue;
+                        const acc = &items[@as(usize, g) * na + ai].avg;
+                        acc.sum += @as(f64, @floatFromInt(sl[r]));
+                        acc.count += 1;
+                    }
+                } else {
+                    for (gids, 0..) |g, r| {
+                        const acc = &items[@as(usize, g) * na + ai].avg;
+                        acc.sum += @as(f64, @floatFromInt(sl[r]));
+                        acc.count += 1;
+                    }
+                }
+            },
+            inline .float, .double => |sl| {
+                if (has_nulls) {
+                    for (gids, 0..) |g, r| {
+                        if (!view.isValid(r)) continue;
+                        const acc = &items[@as(usize, g) * na + ai].avg;
+                        acc.sum += sl[r];
+                        acc.count += 1;
+                    }
+                } else {
+                    for (gids, 0..) |g, r| {
+                        const acc = &items[@as(usize, g) * na + ai].avg;
+                        acc.sum += sl[r];
+                        acc.count += 1;
+                    }
+                }
+            },
+            else => unreachable,
+        }
+    }
+
+    /// MIN (`is_min`) / MAX scatter. Numeric int/large/float use the present-
+    /// flagged accumulator forms; strings arena-dup the running extreme. NULLs
+    /// skipped. Mirrors `updateStateRow`/`updateState` per-row semantics: which
+    /// int widths fold into `min_int`/`max_int` (i64) vs `min_large`/`max_large`
+    /// (i128), `date`→i64, `datetime`→i64, `decimal64`→i64, etc.
+    fn scatterMinMax(self: *Aggregate, gids: []const u32, na: usize, ai: usize, view: ColumnView, aa: Allocator, comptime is_min: bool) !void {
+        const items = self.gstate.items;
+        const has_nulls = view.nulls != null;
+        switch (view.data) {
+            // i64-accumulator int families. `date`→i64, `datetime` already i64,
+            // booleans/small ints widen to i64 (matching the scalar path).
+            inline .int, .date, .bigint, .datetime, .boolean, .tinyint, .smallint, .decimal64 => |sl| {
+                for (gids, 0..) |g, r| {
+                    if (has_nulls and !view.isValid(r)) continue;
+                    const iv: i64 = sl[r];
+                    const s = &items[@as(usize, g) * na + ai];
+                    if (is_min) {
+                        if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
+                    } else {
+                        if (s.max_int == null or iv > s.max_int.?) s.max_int = iv;
+                    }
+                }
+            },
+            // i128-accumulator families (don't fit in i64).
+            inline .largeint, .decimal128 => |sl| {
+                for (gids, 0..) |g, r| {
+                    if (has_nulls and !view.isValid(r)) continue;
+                    const v: i128 = sl[r];
+                    const s = &items[@as(usize, g) * na + ai];
+                    if (is_min) {
+                        if (!s.min_large.present or v < s.min_large.v) s.min_large = .{ .v = v, .present = true };
+                    } else {
+                        if (!s.max_large.present or v > s.max_large.v) s.max_large = .{ .v = v, .present = true };
+                    }
+                }
+            },
+            inline .float, .double => |sl| {
+                for (gids, 0..) |g, r| {
+                    if (has_nulls and !view.isValid(r)) continue;
+                    const fv: f64 = sl[r];
+                    const s = &items[@as(usize, g) * na + ai];
+                    if (is_min) {
+                        if (s.min_float == null or fv < s.min_float.?) s.min_float = fv;
+                    } else {
+                        if (s.max_float == null or fv > s.max_float.?) s.max_float = fv;
+                    }
+                }
+            },
+            .varchar, .string, .char => |sv| {
+                for (gids, 0..) |g, r| {
+                    if (has_nulls and !view.isValid(r)) continue;
+                    const bytes = sv.rowBytes(r);
+                    const s = &items[@as(usize, g) * na + ai];
+                    if (is_min) {
+                        if (s.min_str == null or std.mem.order(u8, bytes, s.min_str.?) == .lt) {
+                            s.min_str = try aa.dupe(u8, bytes);
+                        }
+                    } else {
+                        if (s.max_str == null or std.mem.order(u8, bytes, s.max_str.?) == .gt) {
+                            s.max_str = try aa.dupe(u8, bytes);
+                        }
+                    }
+                }
+            },
+            else => unreachable,
         }
     }
 
@@ -586,7 +773,9 @@ pub const Aggregate = struct {
         }
         const keys = self.pf_int_keys.items;
 
-        // Phase (b): probe with look-ahead prefetch.
+        // Phase (b): probe with look-ahead prefetch, recording each row's gid.
+        self.pf_gids.clearRetainingCapacity();
+        try self.pf_gids.ensureTotalCapacity(aa, n);
         const acct = self.upstream.accountant();
         const approx_per = self.aggs.len * @sizeOf(AccState) + @sizeOf(u128) + 32;
         var i: usize = 0;
@@ -608,8 +797,12 @@ pub const Aggregate = struct {
                 try self.appendInitialState(aa);
                 break :blk new_gid;
             };
-            try self.updateGroup(gid, batch, @intCast(i));
+            self.pf_gids.appendAssumeCapacity(gid);
         }
+
+        // Phase (c): batched, type-specialized scatter-update over the resolved
+        // gids — one tight loop per aggregate instead of a per-row type switch.
+        try self.accumulateAggsBatched(batch, self.pf_gids.items);
     }
 
     /// Byte-key path (string / mixed / wide compound keys): serialize each
@@ -670,7 +863,9 @@ pub const Aggregate = struct {
         const keys = self.pf_keys.items;
         const hashes = self.pf_hashes.items;
 
-        // Phase (b): probe with look-ahead prefetch.
+        // Phase (b): probe with look-ahead prefetch, recording each row's gid.
+        self.pf_gids.clearRetainingCapacity();
+        try self.pf_gids.ensureTotalCapacity(aa, n);
         const acct = self.upstream.accountant();
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -697,8 +892,12 @@ pub const Aggregate = struct {
                 try self.appendInitialState(aa);
                 break :blk new_gid;
             };
-            try self.updateGroup(gid, batch, @intCast(i));
+            self.pf_gids.appendAssumeCapacity(gid);
         }
+
+        // Phase (c): batched, type-specialized scatter-update over the resolved
+        // gids — one tight loop per aggregate instead of a per-row type switch.
+        try self.accumulateAggsBatched(batch, self.pf_gids.items);
     }
 
     fn appendSingleResult(self: *Aggregate) !void {
