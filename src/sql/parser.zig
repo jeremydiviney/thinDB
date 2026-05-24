@@ -530,17 +530,54 @@ pub const Parser = struct {
         }
 
         if (has_agg or has_group) {
+            // Functional-dependency group-key collapse (pre-execution
+            // rewrite). A computed grouping key that is a pure, deterministic
+            // function of other *retained* group keys — or a constant — adds
+            // no grouping distinctions, so we drop it from the GroupBy and
+            // recompute it once per output group ABOVE the aggregate. This
+            // shrinks the group key and moves the per-row arithmetic from the
+            // full input to the (typically far smaller) group output. The
+            // anchor set is the plain-column group keys; a `.expr` key collapses
+            // iff every column it references is one of those anchors (or it
+            // references none, i.e. a constant). Soundness: anchors are always
+            // retained, so the collapsed key remains a deterministic function
+            // of surviving keys — grouping on the anchors alone yields the same
+            // partition (NULLs included: f(NULL) is computed per group).
+            const collapse = try self.arena.alloc(bool, proj.len);
+            @memset(collapse, false);
+            // Only collapse onto a non-empty anchor set: at least one
+            // plain-column grouping key must survive. Otherwise (a GROUP BY
+            // made entirely of constants / expressions) collapsing everything
+            // would turn the aggregate global, which differs on empty input
+            // (`GROUP BY 1` yields zero rows; a global aggregate yields one).
+            var has_anchor = false;
+            for (proj, 0..) |p, i| {
+                if (grouping_key[i] and p.kind == .col) has_anchor = true;
+            }
+            if (has_anchor) {
+                for (proj, 0..) |p, i| {
+                    if (!grouping_key[i]) continue;
+                    switch (p.kind) {
+                        .expr => |e| if (exprCollapsesOnto(proj, grouping_key, e)) {
+                            collapse[i] = true;
+                        },
+                        else => {},
+                    }
+                }
+            }
+
             // Pre-aggregate Compute. Two kinds of synthetic columns land
             // here, computed before the GroupBy:
             //   1. computed grouping keys — a `.expr` projection that a
             //      GROUP BY item resolves to (e.g. `extract(...) AS m`,
             //      `ClientIP - 1`). Output name = the projection's name,
-            //      which the GroupBy then groups on.
+            //      which the GroupBy then groups on. Collapsed keys are
+            //      omitted here and recomputed in the post-aggregate Compute.
             //   2. aggregate-on-expression args (e.g. SUM(a * b)) — a
             //      synthetic `__agg_arg_N` column the AggSpec references.
             var derived_buf: std.ArrayList(ir.Derived) = .empty;
             for (proj, 0..) |p, i| switch (p.kind) {
-                .expr => |e| if (grouping_key[i]) {
+                .expr => |e| if (grouping_key[i] and !collapse[i]) {
                     try derived_buf.append(self.arena, .{ .name = p.name, .expr = e });
                 },
                 else => {},
@@ -584,12 +621,56 @@ pub const Parser = struct {
                 },
                 else => {},
             };
+            // Drop collapsed keys from the grouping columns. Collapsed `.expr`
+            // keys live in `group_cols` under their projection name; build the
+            // reduced list (and remember the dropped names so we recompute
+            // them above the aggregate).
+            var collapsed_names: std.ArrayList([]const u8) = .empty;
+            defer collapsed_names.deinit(self.arena);
+            var collapsed_exprs: std.ArrayList(ir.Derived) = .empty;
+            defer collapsed_exprs.deinit(self.arena);
+            for (proj, 0..) |p, i| {
+                if (!collapse[i]) continue;
+                switch (p.kind) {
+                    .expr => |e| {
+                        try collapsed_names.append(self.arena, p.name);
+                        try collapsed_exprs.append(self.arena, .{ .name = p.name, .expr = e });
+                    },
+                    else => {},
+                }
+            }
+            const retained_group_cols = if (collapsed_names.items.len == 0)
+                group_cols
+            else blk: {
+                var kept: std.ArrayList([]const u8) = .empty;
+                for (group_cols) |gc| {
+                    var dropped = false;
+                    for (collapsed_names.items) |cn| {
+                        if (types.columnNameEql(gc, cn)) {
+                            dropped = true;
+                            break;
+                        }
+                    }
+                    if (!dropped) try kept.append(self.arena, gc);
+                }
+                break :blk try kept.toOwnedSlice(self.arena);
+            };
+
             const aggs_slice = try aggs_buf.toOwnedSlice(self.arena);
             root = try self.allocOp(.{ .group_by = .{
-                .group_cols = group_cols,
+                .group_cols = retained_group_cols,
                 .aggs = aggs_slice,
                 .upstream = root,
             } });
+
+            // Recompute the collapsed keys once per output group, directly
+            // above the GroupBy so HAVING / ORDER BY / the final Project all
+            // see them. Each derived expression now reads the retained group
+            // columns (one row per group instead of one row per input row).
+            if (collapsed_exprs.items.len > 0) {
+                const above = try collapsed_exprs.toOwnedSlice(self.arena);
+                root = try self.allocOp(.{ .compute = .{ .derived = above, .upstream = root } });
+            }
 
             // HAVING after GroupBy, before ORDER BY. The Filter sees the
             // post-aggregate schema. A raw aggregate reference (e.g.
@@ -2334,6 +2415,59 @@ fn countAggs(proj: []const ProjItem) usize {
         else => {},
     };
     return n;
+}
+
+/// Scalar functions whose result depends on more than their arguments
+/// (wall clock, RNG, ...). A group key built from one of these is NOT a
+/// pure function of the other keys, so it must never be collapsed. The
+/// registry doesn't expose these yet, but list them so the rewrite stays
+/// correct the moment they land.
+fn isNondeterministicFn(name: []const u8) bool {
+    const names = [_][]const u8{
+        "now",           "current_date",      "current_timestamp",
+        "current_time",  "localtime",         "localtimestamp",
+        "random",        "rand",              "uuid",
+        "uuid_short",    "sysdate",           "unix_timestamp",
+    };
+    for (names) |n| if (std.ascii.eqlIgnoreCase(n, name)) return true;
+    return false;
+}
+
+/// True when every column `e` references is the name of a *retained* group
+/// key (a plain-column grouping key), and `e` is deterministic. A constant
+/// expression (no column refs) trivially qualifies. CASE / subquery /
+/// var_ref are treated conservatively as non-collapsible. This is the
+/// detection scope for functional-dependency group-key collapse — kept
+/// deliberately narrow: `base_col OP literal`, nested arithmetic over
+/// anchors, and pure constants. The anchor set is the plain-column grouping
+/// keys (those are always retained, never collapsed onto each other).
+fn exprCollapsesOnto(proj: []const ProjItem, grouping_key: []const bool, e: ir.Expr) bool {
+    return switch (e) {
+        .lit => true,
+        .col_ref => |name| isPlainGroupKey(proj, grouping_key, name),
+        .call => |c| blk: {
+            if (isNondeterministicFn(c.fn_name)) break :blk false;
+            for (c.args) |arg| {
+                if (!exprCollapsesOnto(proj, grouping_key, arg)) break :blk false;
+            }
+            break :blk true;
+        },
+        // CASE branches carry predicate conditions whose column refs aren't
+        // walked here; subquery / var_ref are resolved elsewhere. Bail.
+        else => false,
+    };
+}
+
+/// Is `name` a plain-column grouping key (an FD-collapse anchor)?
+fn isPlainGroupKey(proj: []const ProjItem, grouping_key: []const bool, name: []const u8) bool {
+    for (proj, 0..) |p, i| {
+        if (!grouping_key[i]) continue;
+        switch (p.kind) {
+            .col => |c| if (types.columnNameEql(c, name)) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Structural equality of two expressions. Used to bind a GROUP BY

@@ -52,6 +52,7 @@ test {
     _ = @import("update_sql_test.zig");
     _ = @import("bug_repro_test.zig");
     _ = @import("late_mat_test.zig");
+    _ = @import("fd_collapse_test.zig");
 }
 
 test "integration entry exists" {

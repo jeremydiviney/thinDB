@@ -962,7 +962,14 @@ fn topNFusion(limit_upstream: *ir.Op) ?TopNFusion {
 /// falls back to a full emit unless every order key binds to a numeric
 /// aggregate output.
 fn applyTopKFusion(f: TopNFusion, l: ir.Op.Limit) void {
-    switch (f.order_by.upstream.*) {
+    // Functional-dependency group-key collapse inserts a Compute between the
+    // OrderBy and the GroupBy to recompute the dropped keys per output group.
+    // That Compute is row-count- and order-preserving and never references the
+    // top-k order keys' source (they bind to aggregate / retained-key outputs),
+    // so peer through it to keep the bounded top-k emit.
+    var below = f.order_by.upstream;
+    if (below.* == .compute) below = below.compute.upstream;
+    switch (below.*) {
         .group_by => |*g| {
             if (g.group_cols.len == 0) return; // global aggregate is one row
             g.top_k = .{
