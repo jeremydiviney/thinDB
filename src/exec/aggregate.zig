@@ -32,6 +32,11 @@ const simd = @import("../util/simd.zig");
 const group_table = @import("group_table.zig");
 const ByteGroupTable = group_table.ByteGroupTable;
 const IntGroupTable = group_table.IntGroupTable;
+/// Per-tier integer group tables. The active one is selected by
+/// `int_layout.?.tier`; the unused two stay `null`.
+const IntTable32 = group_table.IntKeyTable(32);
+const IntTable96 = group_table.IntKeyTable(96);
+const IntTable128 = group_table.IntKeyTable(128);
 
 pub const AggFunc = enum {
     count,
@@ -241,8 +246,13 @@ pub const Aggregate = struct {
     /// this table is unused.
     byte_table: ByteGroupTable = undefined,
     /// Open-addressing key→gid table for the integer fast path (packed u128
-    /// keys). Used iff `int_layout != null`.
-    int_table: IntGroupTable = undefined,
+    /// keys), one per slot-size tier. Exactly the tier `int_layout.?.tier`
+    /// selects is non-null; the other two stay null. Splitting by tier lets the
+    /// common narrow keys use an 8- or 16-byte slot instead of the 32-byte
+    /// u128 slot, so the memory-bound probe moves fewer bytes per row.
+    int_table_32: ?IntTable32 = null,
+    int_table_96: ?IntTable96 = null,
+    int_table_128: ?IntTable128 = null,
     /// `null` ⟺ byte-key path; non-null ⟺ all group columns are fixed-width
     /// integer family summing to ≤128 bits, so keys pack into a u128 (no
     /// per-row byte serialization). Owns `fields` (freed in `deinit`).
@@ -451,8 +461,12 @@ pub const Aggregate = struct {
                 @intCast(@min(est, @max(st.upper_rows, 1)))
             else
                 0;
-            if (self.int_layout != null) {
-                self.int_table = IntGroupTable.init(aa, cap) catch try IntGroupTable.init(aa, 0);
+            if (self.int_layout) |layout| {
+                switch (layout.tier) {
+                    .bits32 => self.int_table_32 = IntTable32.init(aa, cap) catch try IntTable32.init(aa, 0),
+                    .bits96 => self.int_table_96 = IntTable96.init(aa, cap) catch try IntTable96.init(aa, 0),
+                    .bits128 => self.int_table_128 = IntTable128.init(aa, cap) catch try IntTable128.init(aa, 0),
+                }
                 if (cap > 0) {
                     self.gstate.ensureTotalCapacity(aa, cap * self.aggs.len) catch {};
                     self.gkeys_int.ensureTotalCapacity(aa, cap) catch {};
@@ -630,8 +644,15 @@ pub const Aggregate = struct {
             return;
         }
         if (n == 0) return;
-        if (self.int_layout != null) {
-            try self.accumulateBatchInt(batch);
+        if (self.int_layout) |layout| {
+            // Dispatch on the tier once per batch, then run the comptime-
+            // specialized accumulate so the hot phase-a/phase-b loop has no
+            // per-row union/tier branch — the table type is fixed at comptime.
+            switch (layout.tier) {
+                .bits32 => try self.accumulateBatchIntT(batch, IntTable32, &self.int_table_32.?),
+                .bits96 => try self.accumulateBatchIntT(batch, IntTable96, &self.int_table_96.?),
+                .bits128 => try self.accumulateBatchIntT(batch, IntTable128, &self.int_table_128.?),
+            }
         } else {
             try self.accumulateBatchBytes(batch);
         }
@@ -847,7 +868,7 @@ pub const Aggregate = struct {
     /// single combined open-addressing set keyed on `pack(gid, value)`, plus a
     /// flat per-gid counter bumped on each first sighting — no per-row dispatch,
     /// no per-group scattered hash map. Mirrors the prefetch-pipelined shape of
-    /// `accumulateBatchInt`: the table is grown for the whole batch up front so
+    /// `accumulateBatchIntT`: the table is grown for the whole batch up front so
     /// slot addresses stay stable across the look-ahead window, then phase (a)
     /// packs key+hash for every valid row and phase (b) probes with a look-ahead
     /// `@prefetch`. NULL rows are skipped (SQL excludes them from DISTINCT).
@@ -917,15 +938,19 @@ pub const Aggregate = struct {
     }
 
     /// Integer fast path: pack each row's group columns into a u128 (phase a),
-    /// then probe `int_table` with a prefetch look-ahead (phase b). The table
-    /// is grown for the whole batch up front so slot addresses stay stable
-    /// across the look-ahead window.
-    fn accumulateBatchInt(self: *Aggregate, batch: Batch) !void {
+    /// then probe the tier-`Table` with a prefetch look-ahead (phase b). The
+    /// table is grown for the whole batch up front so slot addresses stay stable
+    /// across the look-ahead window. Generic over the slot-tier table type so
+    /// the per-row probe specializes (no tier branch in the inner loop); the one
+    /// runtime tier decision is hoisted to `accumulateBatch`'s switch. `packIntKey`
+    /// keeps producing the full u128 — the table truncates/splits it losslessly
+    /// to its tier on store (the layout guarantees the key fits).
+    fn accumulateBatchIntT(self: *Aggregate, batch: Batch, comptime Table: type, table: *Table) !void {
         const n = batch.row_count;
         const aa = self.arena.allocator();
         const layout = self.int_layout.?;
 
-        if (self.int_table.needsGrow(n)) try self.int_table.grow(aa, n);
+        if (table.needsGrow(n)) try table.grow(aa, n);
 
         // Phase (a): pack every row's key.
         self.pf_int_keys.clearRetainingCapacity();
@@ -945,17 +970,17 @@ pub const Aggregate = struct {
         while (i < n) : (i += 1) {
             const pf = i + PREFETCH_DIST;
             if (pf < n) {
-                const b = self.int_table.bucketOf(group_table.hashU128(keys[pf]));
-                @prefetch(self.int_table.slotAddr(b), .{ .rw = .write, .locality = 1 });
+                const b = table.bucketOf(Table.hashKey(keys[pf]));
+                @prefetch(table.slotAddr(b), .{ .rw = .write, .locality = 1 });
             }
             const key = keys[i];
-            const probe = self.int_table.getOrPut(group_table.hashU128(key), key);
+            const probe = table.getOrPut(Table.hashKey(key), key);
             const gid = if (probe.found) probe.gid else blk: {
                 if (acct) |a| try a.reserve(.hash_aggregate, approx_per);
                 self.reserved_bytes += approx_per;
                 const new_gid = self.n_groups;
                 self.n_groups += 1;
-                self.int_table.commit(probe.slot, key, new_gid);
+                table.commit(probe.slot, key, new_gid);
                 try self.gkeys_int.append(aa, key);
                 try self.appendInitialState(aa);
                 break :blk new_gid;
@@ -2354,12 +2379,21 @@ const IntKeyField = struct {
     type_tag: types.TypeTag,
 };
 
+/// Slot-size tier for the packed integer key, routed by the summed group-column
+/// bit width. A narrower slot fits more entries per cache line, so the
+/// memory-bound probe moves fewer bytes. The 32/96/128 cutoffs match
+/// `group_table.IntKeyTable`'s three slot layouts.
+const IntKeyTier = enum { bits32, bits96, bits128 };
+
 /// Decision + layout for the integer fast path. `fields` (column-order)
-/// reconstructs each group column on emit. Returned by `planIntKey`; `null`
-/// when any group column isn't a fixed-width integer family or the widths sum
-/// past 128 bits — the operator then uses the byte-serialized key path.
+/// reconstructs each group column on emit; `tier` selects the slot size of the
+/// `group_table.IntKeyTable` that holds the key→gid map. Returned by
+/// `planIntKey`; `null` when any group column isn't a fixed-width integer family
+/// or the widths sum past 128 bits — the operator then uses the byte-serialized
+/// key path.
 const IntKeyLayout = struct {
     fields: []IntKeyField,
+    tier: IntKeyTier,
 
     fn deinit(self: IntKeyLayout, allocator: Allocator) void {
         allocator.free(self.fields);
@@ -2367,8 +2401,9 @@ const IntKeyLayout = struct {
 };
 
 /// Build an `IntKeyLayout` when every group column is a fixed-width integer
-/// family type whose widths sum to ≤128 bits; otherwise `null`. Caller owns the
-/// returned `fields` (freed in `Aggregate.deinit`).
+/// family type whose widths sum to ≤128 bits; otherwise `null`. The summed width
+/// also picks the slot tier (≤32 / ≤96 / ≤128 bits). Caller owns the returned
+/// `fields` (freed in `Aggregate.deinit`).
 fn planIntKey(
     allocator: Allocator,
     group_col_indices: []const usize,
@@ -2390,7 +2425,8 @@ fn planIntKey(
         f.* = .{ .offset = offset, .bits = b, .type_tag = std.meta.activeTag(t) };
         offset += b;
     }
-    return .{ .fields = fields };
+    const tier: IntKeyTier = if (total <= 32) .bits32 else if (total <= 96) .bits96 else .bits128;
+    return .{ .fields = fields, .tier = tier };
 }
 
 /// Reinterpret a signed/unsigned value of `bits` width as the low `bits` of a
