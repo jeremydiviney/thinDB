@@ -666,3 +666,129 @@ test "aggregate: combined distinct under a string group (Q13 byte-group + int-di
     }
     try std.testing.expectEqual(@as(usize, 3), rows_seen);
 }
+
+// Adaptive group-table sizing: the presize is a provable *ceiling*, and the
+// table starts modest, jumping to that ceiling only on an actual overflow.
+const adaptive_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        // High-NDV group key (distinct per row) — yields a large ceiling estimate.
+        .{ .name = "k", .type = .int },
+        // Filter selector with few distinct values — a selective predicate on it
+        // leaves only a tiny subset of `k` groups behind (the Q40 shape).
+        .{ .name = "sel", .type = .int },
+        .{ .name = "v", .type = .bigint },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const adaptive_ok = [_][]const u8{"id"};
+const adaptive_opts = thindb.TableOptions{ .order_key = &adaptive_ok, .unique = true, .row_group_size = 1024 };
+
+const AdaptiveRow = struct { id: i64, k: i32, sel: i32, v: i64 };
+
+test "aggregate: high-NDV key behind a selective filter stays under the adaptive initial size" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", adaptive_schema, adaptive_opts);
+
+    // 20_000 rows with a per-row-distinct `k` (NDV ≈ 20_000 → a multi-thousand
+    // ceiling), but `sel` cycles 0..9. Filtering to a single `sel` bucket leaves
+    // only ~2_000 actual groups — far under ADAPTIVE_INITIAL (65_536), so the
+    // group table never overflows its modest initial size.
+    const n_rows = 20_000;
+    const rows = try allocator.alloc(AdaptiveRow, n_rows);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| {
+        const ii: i64 = @intCast(i);
+        r.* = .{ .id = ii, .k = @intCast(i), .sel = @intCast(@mod(i, 10)), .v = ii };
+    }
+    try t.insert(rows);
+    try t.flush();
+
+    // Reference: groups in `sel == 3` are k = 3, 13, 23, … ; each appears once,
+    // so its COUNT(*) is 1 and SUM(v) is the row's own id (== k here).
+    var expected_groups: usize = 0;
+    var i: usize = 3;
+    while (i < n_rows) : (i += 10) expected_groups += 1;
+
+    var base = try thindb.scan(allocator, t);
+    var filtered = try base.filter(thindb.leafExpr("sel", .eq, .{ .int = 3 }));
+    var q = try filtered.groupBy(&.{"k"}, &.{
+        .{ .func = .count, .as = "c" },
+        .{ .func = .sum, .col = "v", .as = "s" },
+    });
+    defer q.deinit();
+
+    var groups_seen: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |row| {
+            groups_seen += 1;
+            const k = b.values[0].data.int[row];
+            const c = b.values[1].data.bigint[row];
+            const s = b.values[2].data.bigint[row];
+            try std.testing.expectEqual(@as(i32, 3), @mod(k, 10)); // only sel==3 keys
+            try std.testing.expectEqual(@as(i64, 1), c);
+            try std.testing.expectEqual(@as(i64, k), s); // v == id == k
+        }
+    }
+    try std.testing.expectEqual(expected_groups, groups_seen);
+}
+
+test "aggregate: genuinely high-card group-by overflows the initial size and jumps to the ceiling" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", adaptive_schema, adaptive_opts);
+
+    // More distinct group keys than ADAPTIVE_INITIAL (65_536): the int group
+    // table fills its modest initial size and must grow once, straight to the
+    // ceiling. Each key appears exactly twice so COUNT(*) per group is 2 and the
+    // emitted group count equals the distinct-key count — a full-coverage check
+    // that the grow re-inserted every entry correctly.
+    const n_keys: usize = 66_000;
+    const rows = try allocator.alloc(AdaptiveRow, n_keys * 2);
+    defer allocator.free(rows);
+    for (0..n_keys) |key| {
+        const a = key * 2;
+        const b = a + 1;
+        rows[a] = .{ .id = @intCast(a), .k = @intCast(key), .sel = 0, .v = @intCast(key) };
+        rows[b] = .{ .id = @intCast(b), .k = @intCast(key), .sel = 0, .v = @intCast(key) };
+    }
+    try t.insert(rows);
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    // SUM(v) (not a bare COUNT) keeps this on the generic int-table path rather
+    // than the count-in-slot fast path, so the adaptive grow is exercised.
+    var q = try base.groupBy(&.{"k"}, &.{
+        .{ .func = .count, .as = "c" },
+        .{ .func = .sum, .col = "v", .as = "s" },
+    });
+    defer q.deinit();
+
+    var groups_seen: usize = 0;
+    var count_sum: u64 = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |row| {
+            groups_seen += 1;
+            const k = b.values[0].data.int[row];
+            const c = b.values[1].data.bigint[row];
+            const s = b.values[2].data.bigint[row];
+            count_sum += @intCast(c);
+            try std.testing.expectEqual(@as(i64, 2), c); // each key inserted twice
+            try std.testing.expectEqual(@as(i64, @as(i64, k) * 2), s); // v == k, summed twice
+        }
+    }
+    try std.testing.expectEqual(n_keys, groups_seen);
+    try std.testing.expectEqual(@as(u64, n_keys * 2), count_sum);
+}

@@ -65,6 +65,11 @@ pub const ByteGroupTable = struct {
     slots: []ByteSlot,
     mask: usize,
     len: usize,
+    /// When non-zero, the first `grow` jumps straight to (at least) this slot
+    /// capacity instead of doubling. The Aggregate sets it to `capacityFor` its
+    /// provable group-count ceiling, so one grow off the modest initial size
+    /// reaches a table that can hold every group without growing again.
+    grow_target: usize = 0,
 
     /// Build a table sized to hold `expected` groups under the load factor
     /// without growing. `expected == 0` yields a small initial table.
@@ -117,6 +122,7 @@ pub const ByteGroupTable = struct {
     pub fn grow(self: *ByteGroupTable, allocator: Allocator, additional: usize) !void {
         var new_cap = self.slots.len;
         while ((self.len + additional) * 4 >= new_cap * 3) new_cap *= 2;
+        new_cap = @max(new_cap, self.grow_target);
         const slots = try allocator.alloc(ByteSlot, new_cap);
         for (slots) |*s| s.gid = EMPTY;
         const new_mask = new_cap - 1;
@@ -174,6 +180,11 @@ pub fn IntKeyTable(comptime max_bits: u16) type {
         slots: []Slot,
         mask: usize,
         len: usize,
+        /// When non-zero, the first `grow` jumps straight to (at least) this slot
+        /// capacity instead of doubling. The Aggregate sets it to `capacityFor`
+        /// its provable group-count ceiling, so one grow off the modest initial
+        /// size reaches a table that can hold every group without growing again.
+        grow_target: usize = 0,
 
         /// Hash a full-width `u128` key for this tier. Callers precompute it for
         /// the prefetch-pipelined probe; it must match `hashStored` (used by
@@ -264,6 +275,7 @@ pub fn IntKeyTable(comptime max_bits: u16) type {
         pub fn grow(self: *Self, allocator: Allocator, additional: usize) !void {
             var new_cap = self.slots.len;
             while ((self.len + additional) * 4 >= new_cap * 3) new_cap *= 2;
+            new_cap = @max(new_cap, self.grow_target);
             const slots = try allocator.alloc(Slot, new_cap);
             for (slots) |*s| s.gid = EMPTY;
             const new_mask = new_cap - 1;
@@ -495,7 +507,7 @@ pub const CountSlotTable = struct {
 /// Smallest power-of-two capacity that holds `expected` entries under the 0.75
 /// load factor, floored at 16. `expected * 4 / 3` is the minimum live-capacity;
 /// round it up to the next power of two.
-fn capacityFor(expected: usize) usize {
+pub fn capacityFor(expected: usize) usize {
     const need = (expected *| 4) / 3 + 1;
     var cap: usize = 16;
     while (cap < need) cap *= 2;
@@ -558,6 +570,40 @@ test "IntGroupTable grows and preserves all entries" {
         try std.testing.expectEqual(gid, p.gid);
         gid += 1;
     }
+}
+
+test "grow_target makes the first grow jump straight to the ceiling" {
+    const allocator = std.testing.allocator;
+
+    // Modest initial table; ceiling provably holds 10_000 entries. The first
+    // grow must reach `grow_target` in one shot — not the doubling that fitting
+    // the immediate `additional` alone would pick.
+    const ceiling = capacityFor(10_000);
+    var t = try IntGroupTable.init(allocator, 64);
+    t.grow_target = ceiling;
+    defer t.deinit(allocator);
+
+    const start = t.slots.len;
+    try std.testing.expect(start < ceiling);
+
+    try t.grow(allocator, 1);
+    try std.testing.expectEqual(ceiling, t.slots.len);
+
+    // ByteGroupTable honors the target identically.
+    var b = try ByteGroupTable.init(allocator, 64);
+    b.grow_target = ceiling;
+    defer b.deinit(allocator);
+    try std.testing.expect(b.slots.len < ceiling);
+    try b.grow(allocator, 1);
+    try std.testing.expectEqual(ceiling, b.slots.len);
+
+    // A grow whose immediate fit already exceeds the target keeps the larger
+    // size (the target is a floor, never a cap that would lose entries).
+    var t2 = try IntGroupTable.init(allocator, 64);
+    t2.grow_target = capacityFor(100);
+    defer t2.deinit(allocator);
+    try t2.grow(allocator, 50_000);
+    try std.testing.expect(t2.slots.len >= capacityFor(50_000));
 }
 
 test "IntKeyTable tiers store key 0 and the all-ones value within their width" {

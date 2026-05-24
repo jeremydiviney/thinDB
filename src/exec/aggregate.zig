@@ -278,6 +278,12 @@ pub const Aggregate = struct {
     /// integer family summing to ≤128 bits, so keys pack into a u128 (no
     /// per-row byte serialization). Owns `fields` (freed in `deinit`).
     int_layout: ?IntKeyLayout = null,
+    /// Provable ceiling on the group count (product of group-key NDVs, capped at
+    /// `upper_rows`). The group table presizes to a modest `ADAPTIVE_INITIAL`
+    /// and, on its first overflow, jumps straight to this ceiling — one grow
+    /// suffices because the actual group count can never exceed it. 0 ⟺ no
+    /// known estimate, so the table just doubles from its small initial size.
+    group_cap: usize = 0,
     /// Count-in-slot fast path for `GROUP BY <single non-nullable int col> …
     /// COUNT(*)`. Non-null ⟺ the gate in `create` fired: a single ≤64-bit int
     /// group column and a single `COUNT(*)` aggregate. The table holds the
@@ -550,23 +556,42 @@ pub const Aggregate = struct {
                 !up_schema[group_col_indices[0]].nullable and
                 (intKeyBits(up_schema[group_col_indices[0]].type) orelse 128) <= 64 and
                 aggs.len == 1 and aggs[0].func == .count and agg_col_indices[0] == null;
+            // `cap` is the provable group-count ceiling. The group table starts
+            // at the modest `ADAPTIVE_INITIAL` (not the ceiling) and, on its
+            // first overflow, grows straight to the ceiling — `grow_target`
+            // carries that jump into `group_table.grow`. `gstate`/`gkeys`
+            // follow the table's capacity (coupled in the accumulate paths after
+            // each grow), so they don't repeatedly double-copy as groups append.
+            // The count-table fast path (Q15) stays on the ceiling presize.
+            self.group_cap = cap;
+            const init_cap: usize = if (cap > 0) @min(cap, ADAPTIVE_INITIAL) else 0;
             if (count_slot_ok) {
                 self.count_table = CountSlotTable.init(aa, cap) catch CountSlotTable.empty;
             } else if (self.int_layout) |layout| {
                 switch (layout.tier) {
-                    .bits32 => self.int_table_32 = IntTable32.init(aa, cap) catch try IntTable32.init(aa, 0),
-                    .bits96 => self.int_table_96 = IntTable96.init(aa, cap) catch try IntTable96.init(aa, 0),
-                    .bits128 => self.int_table_128 = IntTable128.init(aa, cap) catch try IntTable128.init(aa, 0),
+                    .bits32 => {
+                        self.int_table_32 = IntTable32.init(aa, init_cap) catch try IntTable32.init(aa, 0);
+                        if (cap > 0) self.int_table_32.?.grow_target = group_table.capacityFor(cap);
+                    },
+                    .bits96 => {
+                        self.int_table_96 = IntTable96.init(aa, init_cap) catch try IntTable96.init(aa, 0);
+                        if (cap > 0) self.int_table_96.?.grow_target = group_table.capacityFor(cap);
+                    },
+                    .bits128 => {
+                        self.int_table_128 = IntTable128.init(aa, init_cap) catch try IntTable128.init(aa, 0);
+                        if (cap > 0) self.int_table_128.?.grow_target = group_table.capacityFor(cap);
+                    },
                 }
-                if (cap > 0) {
-                    self.gstate.ensureTotalCapacity(aa, cap * self.aggs.len) catch {};
-                    self.gkeys_int.ensureTotalCapacity(aa, cap) catch {};
+                if (init_cap > 0) {
+                    self.gstate.ensureTotalCapacity(aa, init_cap * self.aggs.len) catch {};
+                    self.gkeys_int.ensureTotalCapacity(aa, init_cap) catch {};
                 }
             } else {
-                self.byte_table = ByteGroupTable.init(aa, cap) catch try ByteGroupTable.init(aa, 0);
-                if (cap > 0) {
-                    self.gstate.ensureTotalCapacity(aa, cap * self.aggs.len) catch {};
-                    self.gkeys.ensureTotalCapacity(aa, cap) catch {};
+                self.byte_table = ByteGroupTable.init(aa, init_cap) catch try ByteGroupTable.init(aa, 0);
+                if (cap > 0) self.byte_table.grow_target = group_table.capacityFor(cap);
+                if (init_cap > 0) {
+                    self.gstate.ensureTotalCapacity(aa, init_cap * self.aggs.len) catch {};
+                    self.gkeys.ensureTotalCapacity(aa, init_cap) catch {};
                 }
             }
 
@@ -789,6 +814,18 @@ pub const Aggregate = struct {
     /// couple of (amortized) times, small enough that a selective query's
     /// zero-fill stays off the cache cliff. See the presize site in `create`.
     const PRESIZE_CAP: usize = 1 << 18;
+
+    /// Initial group-table size when a cardinality estimate is known. The
+    /// estimate (`group_cap`) is a provable *ceiling*, not a forecast — a
+    /// high-NDV group key behind a super-selective filter (ClickBench Q40)
+    /// produces a ceiling in the millions but only tens of thousands of actual
+    /// groups, so presizing to the ceiling page-faults a ~80 MB table for a
+    /// query that fills <1 MB. Instead start here and, on the first overflow,
+    /// jump straight to `group_cap` (a single grow — the ceiling always fits).
+    /// A genuinely-high-card group-by fills this immediately and pays exactly
+    /// that one jump (≈ today's presize), so this is never slower than before
+    /// for overflowing queries and free for queries that stay under it.
+    const ADAPTIVE_INITIAL: usize = 1 << 16;
 
     fn accumulateBatch(self: *Aggregate, batch: Batch) !void {
         const n = batch.row_count;
@@ -1173,7 +1210,14 @@ pub const Aggregate = struct {
         const aa = self.arena.allocator();
         const layout = self.int_layout.?;
 
-        if (table.needsGrow(n)) try table.grow(aa, n);
+        if (table.needsGrow(n)) {
+            try table.grow(aa, n);
+            // Couple the flat state + key arrays to the table's new capacity so
+            // appends below run amortized-free instead of double-copying as
+            // groups fill toward the (now-jumped) ceiling.
+            self.gstate.ensureTotalCapacity(aa, table.slots.len * self.aggs.len) catch {};
+            self.gkeys_int.ensureTotalCapacity(aa, table.slots.len) catch {};
+        }
 
         // Phase (a): pack every row's key.
         self.pf_int_keys.clearRetainingCapacity();
@@ -1224,7 +1268,14 @@ pub const Aggregate = struct {
         const n = batch.row_count;
         const aa = self.arena.allocator();
 
-        if (self.byte_table.needsGrow(n)) try self.byte_table.grow(aa, n);
+        if (self.byte_table.needsGrow(n)) {
+            try self.byte_table.grow(aa, n);
+            // Couple the flat state + key arrays to the table's new capacity so
+            // appends below run amortized-free instead of double-copying as
+            // groups fill toward the (now-jumped) ceiling.
+            self.gstate.ensureTotalCapacity(aa, self.byte_table.slots.len * self.aggs.len) catch {};
+            self.gkeys.ensureTotalCapacity(aa, self.byte_table.slots.len) catch {};
+        }
 
         // Single string key: the key is the row's raw string bytes, already
         // sitting decoded in the batch — no scratch copy / length prefix. Its
