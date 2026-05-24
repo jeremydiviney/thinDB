@@ -55,6 +55,7 @@ test {
     _ = @import("fd_collapse_test.zig");
     _ = @import("affine_agg_test.zig");
     _ = @import("group_by_limit_test.zig");
+    _ = @import("count_in_slot_test.zig");
 }
 
 test "integration entry exists" {

@@ -386,6 +386,112 @@ pub const DistinctU64Set = struct {
     }
 };
 
+/// Open-addressing table that holds the COUNT(*) *inside* the slot, for the
+/// `GROUP BY <single int col> … COUNT(*)` fast path. The classic two-array
+/// shape (a `{key,gid}` group table plus a separate per-gid count array) costs
+/// two random cache misses per row — one to resolve the gid, one to bump the
+/// count. Folding the count into a `{ key, count }` slot collapses that to a
+/// single miss per row: one probe finds (or creates) the slot and bumps its
+/// count in place. `SENTINEL` (all-ones u64) marks an empty slot; the one real
+/// key that collides with it (a 64-bit column's all-ones value, e.g. bigint -1)
+/// is counted separately via `has_sentinel` / `sentinel_count`. Built for the
+/// same software-prefetch insert pipeline as `DistinctU64Set`: `ensureFor` grows
+/// before a batch so slot addresses stay stable across the look-ahead window,
+/// then the caller interleaves `prefetch(look-ahead key)` with `insert(current
+/// key)`. The Aggregate later walks the occupied slots to lower each `{key,
+/// count}` into its `gkeys_int` / `gstate` arrays, so emit + top-k are untouched.
+pub const CountSlotTable = struct {
+    const Slot = struct { key: u64, count: u64 };
+
+    /// Power-of-two-sized open-addressing table; `&.{}` ⟺ not yet allocated.
+    /// The probe mask is derived as `slots.len - 1` rather than stored.
+    slots: []Slot,
+    /// Distinct non-sentinel keys (occupied slots).
+    len: u32,
+    has_sentinel: bool,
+    sentinel_count: u64,
+
+    pub const SENTINEL: u64 = std.math.maxInt(u64);
+
+    pub const empty: CountSlotTable = .{ .slots = &.{}, .len = 0, .has_sentinel = false, .sentinel_count = 0 };
+
+    pub fn init(allocator: Allocator, expected: usize) !CountSlotTable {
+        const cap = capacityFor(expected);
+        const slots = try allocator.alloc(Slot, cap);
+        for (slots) |*s| s.key = SENTINEL;
+        return .{ .slots = slots, .len = 0, .has_sentinel = false, .sentinel_count = 0 };
+    }
+
+    pub fn deinit(self: *CountSlotTable, allocator: Allocator) void {
+        if (self.slots.len != 0) allocator.free(self.slots);
+        self.* = undefined;
+    }
+
+    /// Reserve room for `additional` more distinct keys so no grow fires
+    /// mid-batch (slot addresses must stay stable across the caller's prefetch
+    /// look-ahead). Allocates lazily on first use from the `empty` state.
+    pub fn ensureFor(self: *CountSlotTable, allocator: Allocator, additional: usize) !void {
+        if (self.slots.len == 0) {
+            const cap = capacityFor(additional);
+            const slots = try allocator.alloc(Slot, cap);
+            for (slots) |*s| s.key = SENTINEL;
+            self.slots = slots;
+            return;
+        }
+        if ((@as(usize, self.len) + additional) * 4 >= self.slots.len * 3) try self.grow(allocator, additional);
+    }
+
+    fn grow(self: *CountSlotTable, allocator: Allocator, additional: usize) !void {
+        var new_cap = self.slots.len;
+        while ((@as(usize, self.len) + additional) * 4 >= new_cap * 3) new_cap *= 2;
+        const slots = try allocator.alloc(Slot, new_cap);
+        for (slots) |*s| s.key = SENTINEL;
+        const new_mask = new_cap - 1;
+        for (self.slots) |old| {
+            if (old.key == SENTINEL) continue;
+            var i = @as(usize, @truncate(mix64(old.key))) & new_mask;
+            while (slots[i].key != SENTINEL) : (i = (i + 1) & new_mask) {}
+            slots[i] = old;
+        }
+        allocator.free(self.slots);
+        self.slots = slots;
+    }
+
+    /// `@prefetch` the slot a future `insert(key)` will probe first.
+    pub inline fn prefetch(self: *CountSlotTable, key: u64) void {
+        @prefetch(&self.slots[@as(usize, @truncate(mix64(key))) & (self.slots.len - 1)], .{ .rw = .write, .locality = 1 });
+    }
+
+    /// Bump `key`'s count in place, creating its slot at count 1 on first
+    /// sighting. The caller must have reserved space via `ensureFor` for the
+    /// whole batch so no grow fires here.
+    pub inline fn insert(self: *CountSlotTable, key: u64) void {
+        if (key == SENTINEL) {
+            self.has_sentinel = true;
+            self.sentinel_count += 1;
+            return;
+        }
+        const mask = self.slots.len - 1;
+        var b = @as(usize, @truncate(mix64(key))) & mask;
+        while (true) : (b = (b + 1) & mask) {
+            const s = &self.slots[b];
+            if (s.key == SENTINEL) {
+                s.* = .{ .key = key, .count = 1 };
+                self.len += 1;
+                return;
+            }
+            if (s.key == key) {
+                s.count += 1;
+                return;
+            }
+        }
+    }
+
+    pub fn count(self: CountSlotTable) usize {
+        return @as(usize, self.len) + @intFromBool(self.has_sentinel);
+    }
+};
+
 /// Smallest power-of-two capacity that holds `expected` entries under the 0.75
 /// load factor, floored at 16. `expected * 4 / 3` is the minimum live-capacity;
 /// round it up to the next power of two.
@@ -541,6 +647,54 @@ test "DistinctU64Set counts distinct keys, handles the sentinel value, grows" {
     try set.ensureFor(allocator, 1);
     set.insert(0);
     try std.testing.expectEqual(@as(usize, n + 2), set.count());
+}
+
+test "CountSlotTable counts repeated keys, the sentinel value, and grows" {
+    const allocator = std.testing.allocator;
+    var t = CountSlotTable.empty;
+    defer t.deinit(allocator);
+
+    // 5000 distinct keys, key i inserted (i % 4) + 1 times. Spread the keys so
+    // the table grows several times across the batches.
+    const n: u64 = 5000;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        const reps: u64 = (i % 4) + 1;
+        try t.ensureFor(allocator, 1);
+        var r: u64 = 0;
+        while (r < reps) : (r += 1) t.insert((i +% 1) *% 0x9E3779B97F4A7C15);
+    }
+    try std.testing.expectEqual(@as(u32, n), t.len);
+    try std.testing.expectEqual(@as(usize, n), t.count());
+
+    // Each key's count matches its repeat schedule.
+    i = 0;
+    while (i < n) : (i += 1) {
+        const key = (i +% 1) *% 0x9E3779B97F4A7C15;
+        const mask = t.slots.len - 1;
+        var b = @as(usize, @truncate(mix64(key))) & mask;
+        const found = while (true) : (b = (b + 1) & mask) {
+            if (t.slots[b].key == key) break t.slots[b].count;
+            if (t.slots[b].key == CountSlotTable.SENTINEL) break @as(?u64, null);
+        };
+        try std.testing.expectEqual(@as(?u64, (i % 4) + 1), found);
+    }
+
+    // The sentinel value (all-ones) is tracked once via the flag, counted thrice.
+    try std.testing.expect(!t.has_sentinel);
+    try t.ensureFor(allocator, 1);
+    t.insert(CountSlotTable.SENTINEL);
+    t.insert(CountSlotTable.SENTINEL);
+    t.insert(CountSlotTable.SENTINEL);
+    try std.testing.expect(t.has_sentinel);
+    try std.testing.expectEqual(@as(u64, 3), t.sentinel_count);
+    try std.testing.expectEqual(@as(usize, n + 1), t.count());
+
+    // Key 0 is a normal storable key (distinct from empty slots).
+    try t.ensureFor(allocator, 1);
+    t.insert(0);
+    t.insert(0);
+    try std.testing.expectEqual(@as(usize, n + 2), t.count());
 }
 
 test "ByteGroupTable getOrPut + grow with external keys" {

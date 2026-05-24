@@ -38,6 +38,7 @@ const IntTable32 = group_table.IntKeyTable(32);
 const IntTable96 = group_table.IntKeyTable(96);
 const IntTable128 = group_table.IntKeyTable(128);
 const DistinctU64Set = group_table.DistinctU64Set;
+const CountSlotTable = group_table.CountSlotTable;
 
 pub const AggFunc = enum {
     count,
@@ -277,6 +278,15 @@ pub const Aggregate = struct {
     /// integer family summing to ≤128 bits, so keys pack into a u128 (no
     /// per-row byte serialization). Owns `fields` (freed in `deinit`).
     int_layout: ?IntKeyLayout = null,
+    /// Count-in-slot fast path for `GROUP BY <single non-nullable int col> …
+    /// COUNT(*)`. Non-null ⟺ the gate in `create` fired: a single ≤64-bit int
+    /// group column and a single `COUNT(*)` aggregate. The table holds the
+    /// running count *inside* each `{key,count}` slot, so accumulate is one
+    /// cache miss per row instead of two (probe + separate count bump). At emit
+    /// time `next()` lowers each occupied slot into `gkeys_int`/`gstate` in dense
+    /// gid order, after which the existing emit / top-k paths run unchanged.
+    /// Arena-owned (no explicit free), like the int tables.
+    count_table: ?CountSlotTable = null,
     /// Flat per-group accumulator storage: group `g`'s accumulators occupy
     /// `gstate.items[g * aggs.len ..][0..aggs.len]`. New groups append here in
     /// gid order, and emit walks it in gid order — both sequential, so the
@@ -514,7 +524,22 @@ pub const Aggregate = struct {
                 @intCast(@min(est, @max(st.upper_rows, 1)))
             else
                 0;
-            if (self.int_layout) |layout| {
+
+            // Count-in-slot fast path: one non-nullable ≤64-bit int group column
+            // and one `COUNT(*)`. The single group column being non-nullable means
+            // there is no NULL group to special-case, so the count can live inside
+            // the slot. `int_layout` is already non-null for a single ≤64-bit int
+            // column (it summed to ≤128 bits) — confirm the width here so the key
+            // injects into a u64 losslessly. When it fires, the generic int group
+            // table + flat-state presize below is skipped (the count table owns
+            // accumulate); `next()` lowers the slots into `gstate`/`gkeys_int`.
+            const count_slot_ok = group_col_indices.len == 1 and
+                !up_schema[group_col_indices[0]].nullable and
+                (intKeyBits(up_schema[group_col_indices[0]].type) orelse 128) <= 64 and
+                aggs.len == 1 and aggs[0].func == .count and agg_col_indices[0] == null;
+            if (count_slot_ok) {
+                self.count_table = CountSlotTable.init(aa, cap) catch CountSlotTable.empty;
+            } else if (self.int_layout) |layout| {
                 switch (layout.tier) {
                     .bits32 => self.int_table_32 = IntTable32.init(aa, cap) catch try IntTable32.init(aa, 0),
                     .bits96 => self.int_table_96 = IntTable96.init(aa, cap) catch try IntTable96.init(aa, 0),
@@ -637,6 +662,11 @@ pub const Aggregate = struct {
             try self.accumulateBatch(batch);
         }
 
+        // Count-in-slot is purely an accumulate optimization: lower its
+        // `{key,count}` slots into the standard `gkeys_int` / `gstate` arrays
+        // (dense gid order) so the emit / top-k dispatch below is untouched.
+        if (self.count_table != null) try self.lowerCountSlot(self.arena.allocator());
+
         if (self.group_col_indices.len == 0) {
             try self.appendSingleResult();
         } else if (self.top_k) |r| {
@@ -705,6 +735,10 @@ pub const Aggregate = struct {
             return;
         }
         if (n == 0) return;
+        if (self.count_table != null) {
+            try self.accumulateCountSlot(batch);
+            return;
+        }
         if (self.int_layout) |layout| {
             // Dispatch on the tier once per batch, then run the comptime-
             // specialized accumulate so the hot phase-a/phase-b loop has no
@@ -983,6 +1017,69 @@ pub const Aggregate = struct {
                 c.counts.items[@intCast(key >> vbits)] += 1;
             }
         }
+    }
+
+    /// Count-in-slot accumulate (gate-confirmed: one non-nullable ≤64-bit int
+    /// group column, one `COUNT(*)`). Type-switch once on the single group
+    /// column, then run the prefetch pipeline: grow the table for the whole
+    /// batch up front (so slot addresses stay stable across the look-ahead),
+    /// then interleave `prefetch(look-ahead key)` with `insert(current key)`.
+    /// `insert` bumps the count inside the slot — one cache miss per row. The
+    /// key is the value's unsigned bits zero-extended to u64 (same bijective
+    /// cast as `insertDistinctRange`). The group column is non-nullable, so no
+    /// validity branch.
+    fn accumulateCountSlot(self: *Aggregate, batch: Batch) !void {
+        const n = batch.row_count;
+        const aa = self.arena.allocator();
+        const view = batch.values[self.group_col_indices[0]];
+        switch (view.data) {
+            inline .int, .date => |sl| try self.insertCountRange(aa, i32, sl, n),
+            inline .bigint, .datetime, .decimal64 => |sl| try self.insertCountRange(aa, i64, sl, n),
+            .smallint => |sl| try self.insertCountRange(aa, i16, sl, n),
+            .tinyint => |sl| try self.insertCountRange(aa, i8, sl, n),
+            .boolean => |sl| try self.insertCountRange(aa, u8, sl, n),
+            else => unreachable,
+        }
+    }
+
+    /// Prefetch-pipelined count-in-slot insert over a non-nullable typed column
+    /// slice. Reserves the whole batch up front so no grow fires mid-loop. The
+    /// value's two's-complement bits zero-extend injectively into a u64, so
+    /// distinct stored values map to distinct keys.
+    inline fn insertCountRange(self: *Aggregate, aa: Allocator, comptime T: type, sl: []const T, n: usize) !void {
+        const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const t = &self.count_table.?;
+        try t.ensureFor(aa, n);
+        var r: usize = 0;
+        while (r < n) : (r += 1) {
+            if (r + PREFETCH_DIST < n) t.prefetch(@as(u64, @as(U, @bitCast(sl[r + PREFETCH_DIST]))));
+            t.insert(@as(u64, @as(U, @bitCast(sl[r]))));
+        }
+    }
+
+    /// Lower the count-in-slot table into the operator's `gkeys_int` / `gstate`
+    /// arrays so the existing emit / top-k dispatch runs unchanged. Walks the
+    /// occupied slots (plus the sentinel group, if present), assigning a dense
+    /// gid 0,1,2,…: `gkeys_int[gid] = key`, `gstate[gid] = .{ .count = c }` (the
+    /// single aggregate is COUNT, matching `initialState(.count, null)`).
+    fn lowerCountSlot(self: *Aggregate, aa: Allocator) !void {
+        const t = &self.count_table.?;
+        const total = t.count();
+        try self.gkeys_int.ensureTotalCapacity(aa, total);
+        try self.gstate.ensureTotalCapacity(aa, total);
+        var gid: u32 = 0;
+        for (t.slots) |s| {
+            if (s.key == CountSlotTable.SENTINEL) continue;
+            self.gkeys_int.appendAssumeCapacity(@as(u128, s.key));
+            self.gstate.appendAssumeCapacity(.{ .count = s.count });
+            gid += 1;
+        }
+        if (t.has_sentinel) {
+            self.gkeys_int.appendAssumeCapacity(@as(u128, CountSlotTable.SENTINEL));
+            self.gstate.appendAssumeCapacity(.{ .count = t.sentinel_count });
+            gid += 1;
+        }
+        self.n_groups = gid;
     }
 
     /// Append the initial accumulator state for a freshly-assigned group.
