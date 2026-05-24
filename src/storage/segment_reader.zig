@@ -121,6 +121,63 @@ pub const ReadSegment = struct {
         return decodeBlock(allocator, block, 0, col_type, rg.row_count, flags);
     }
 
+    /// A pinned, decompressed column block borrowed for the duration of one
+    /// scan `next()` call. `bytes` are the decompressed block bytes. Exactly
+    /// one of `entry` / `owned` is set: `entry` when the bytes live in the
+    /// shared cache (release the pin via `release`), `owned` when they were
+    /// decompressed without a cache (free via `release`). Callers MUST call
+    /// `release` to drop the pin / free the buffer.
+    pub const BorrowedBlock = struct {
+        bytes: []const u8,
+        entry: ?*storage_cache.Cache.Entry = null,
+        owned: ?[]u8 = null,
+
+        pub fn release(self: *BorrowedBlock, allocator: Allocator, c: ?*storage_cache.Cache) void {
+            if (self.entry) |e| {
+                if (c) |cc| cc.release(e);
+            }
+            if (self.owned) |b| allocator.free(b);
+            self.* = undefined;
+        }
+    };
+
+    /// Pin (and, on a miss, decompress + cache) one column's decompressed block
+    /// so the caller can build a BORROWED typed view over it. The returned
+    /// `BorrowedBlock` keeps the cache pin held until `release` — used by the
+    /// scan-side in-place filter, which evaluates the predicate and compacts
+    /// survivors out of the borrowed view, then releases, all within one
+    /// `next()`. When `c` is null the block is decompressed into an owned
+    /// buffer carried by the returned struct (still skips the decode-copy).
+    pub fn borrowColumnBlock(
+        self: ReadSegment,
+        allocator: Allocator,
+        row_group_idx: usize,
+        column_idx: usize,
+        c: ?*storage_cache.Cache,
+    ) !BorrowedBlock {
+        const rg = self.info.row_groups[row_group_idx];
+        if (c) |cc| {
+            const key = storage_cache.Key{
+                .segment_id = self.info.segment_id,
+                .row_group_idx = @intCast(row_group_idx),
+                .column_idx = @intCast(column_idx),
+            };
+            if (cc.acquire(key)) |entry| {
+                return .{ .bytes = entry.bytes, .entry = entry };
+            }
+            const block = try self.readColumnBlock(allocator, rg, column_idx);
+            defer allocator.free(block);
+            const raw = try getDecompressedBytes(allocator, block, 0);
+            errdefer allocator.free(raw);
+            const entry = try cc.insertPinned(key, raw);
+            return .{ .bytes = entry.bytes, .entry = entry };
+        }
+        const block = try self.readColumnBlock(allocator, rg, column_idx);
+        defer allocator.free(block);
+        const raw = try getDecompressedBytes(allocator, block, 0);
+        return .{ .bytes = raw, .owned = raw };
+    }
+
     /// Read the raw on-disk bytes (header + payload) of one column's block in a
     /// row group via a single positioned read. The block ends where the next
     /// column's begins (or at the row group's end for the last column).
@@ -352,6 +409,92 @@ fn decodeRawColumn(
         .decimal128 => return .{ .data = .{ .decimal128 = try decodeFixed(i128, allocator, values, row_count) }, .nulls = nulls },
         .uuid => return .{ .data = .{ .uuid = try decodeFixed(u128, allocator, values, row_count) }, .nulls = nulls },
     }
+}
+
+/// Build a BORROWED `ColumnView` over the raw decompressed block bytes —
+/// zero allocation, the view aliases `raw` directly. Used by the scan-side
+/// in-place filter fast path: the view is created over PINNED cache bytes,
+/// used for predicate evaluation + survivor compaction, and dropped within a
+/// single `next()` call. It must never be handed to a downstream operator.
+///
+/// Returns `null` when a typed view can't be formed safely:
+///   - a fixed-width element slice would be misaligned (`@alignCast` of
+///     misaligned bytes is UB, so we decline and the caller falls back to the
+///     owned-copy decode path),
+///   - on a big-endian host (the borrowed view assumes the on-disk
+///     little-endian layout is bit-identical to the in-memory `[]T`).
+///
+/// Only this `storage/` boundary performs the `@ptrCast`/`@alignCast`.
+pub fn viewRawColumn(
+    col_type: Type,
+    raw: []const u8,
+    row_count: u32,
+    flags: format.ColumnBlockFlags,
+) ?ColumnView {
+    if (native_endian != .little) return null;
+
+    var nulls: ?[]const u8 = null;
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        nulls = raw[0..bm_len];
+        values = raw[bm_len..];
+    }
+
+    switch (col_type) {
+        .int => return fixedView(i32, values, row_count, nulls, .int),
+        .bigint => return fixedView(i64, values, row_count, nulls, .bigint),
+        .boolean => return .{ .data = .{ .boolean = values[0..row_count] }, .nulls = nulls },
+        .float => return fixedView(f32, values, row_count, nulls, .float),
+        .double => return fixedView(f64, values, row_count, nulls, .double),
+        .date => return fixedView(i32, values, row_count, nulls, .date),
+        .datetime => return fixedView(i64, values, row_count, nulls, .datetime),
+        .tinyint => return .{ .data = .{ .tinyint = @ptrCast(values[0..row_count]) }, .nulls = nulls },
+        .smallint => return fixedView(i16, values, row_count, nulls, .smallint),
+        .largeint => return fixedView(i128, values, row_count, nulls, .largeint),
+        .decimal64 => return fixedView(i64, values, row_count, nulls, .decimal64),
+        .decimal128 => return fixedView(i128, values, row_count, nulls, .decimal128),
+        .uuid => return fixedView(u128, values, row_count, nulls, .uuid),
+        .varchar => return stringView(values, row_count, nulls, .varchar),
+        .string => return stringView(values, row_count, nulls, .string),
+        .char => return stringView(values, row_count, nulls, .char),
+    }
+}
+
+/// Reinterpret `values` as `[]const T` with a runtime alignment guard. Returns
+/// null when the byte slice isn't aligned for `T` (caller falls back to copy).
+fn fixedView(
+    comptime T: type,
+    values: []const u8,
+    row_count: u32,
+    nulls: ?[]const u8,
+    comptime tag: std.meta.Tag(column.ValueView),
+) ?ColumnView {
+    if (@intFromPtr(values.ptr) % @alignOf(T) != 0) return null;
+    const typed: []const T = @as([*]const T, @ptrCast(@alignCast(values.ptr)))[0..row_count];
+    return .{ .data = @unionInit(column.ValueView, @tagName(tag), typed), .nulls = nulls };
+}
+
+/// Build a borrowed `StringView` over `values` laid out as
+/// `[u32 byte_count][(n+1) u32 offsets][bytes]`. Returns null when the offset
+/// array isn't u32-aligned in place.
+fn stringView(
+    values: []const u8,
+    row_count: u32,
+    nulls: ?[]const u8,
+    comptime tag: std.meta.Tag(column.ValueView),
+) ?ColumnView {
+    const off_start = 4;
+    const off_count = @as(usize, row_count) + 1;
+    const off_bytes = off_count * 4;
+    const offsets_ptr = values.ptr + off_start;
+    if (@intFromPtr(offsets_ptr) % @alignOf(u32) != 0) return null;
+    const offsets: []const u32 = @as([*]const u32, @ptrCast(@alignCast(offsets_ptr)))[0..off_count];
+    const byte_count = offsets[row_count];
+    const data_start = off_start + off_bytes;
+    const bytes = values[data_start .. data_start + byte_count];
+    const sv = StringView{ .offsets = offsets, .bytes = bytes };
+    return .{ .data = @unionInit(column.ValueView, @tagName(tag), sv), .nulls = nulls };
 }
 
 fn decodeStringRaw(allocator: Allocator, raw: []const u8, row_count: u32) !OwnedStringColumn {

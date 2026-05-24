@@ -1953,3 +1953,238 @@ test "topn: input smaller than limit+offset emits the whole sorted input" {
         try std.testing.expect((try q.next()) == null);
     }
 }
+
+// --------------------------------------------------------------------------
+// Scan-side in-place (fused) filter — eliminates the decode-copy. These prove
+// the fused path emits byte-identical survivors to a known-good expected set,
+// across fixed-width + string columns, for selective / none / all selectivity,
+// and via a string LIKE filter. `base.filter(...)` fuses the predicate into the
+// Scan; we assert `Filter.fused` so a regression that silently drops fusion
+// fails loudly.
+// --------------------------------------------------------------------------
+
+const FuseRow = struct { id: i64, qty: i32, ratio: f64, tag: []const u8 };
+
+fn collectFused(
+    allocator: std.mem.Allocator,
+    q: *Query,
+    out_ids: *std.ArrayList(i64),
+    out_qty: *std.ArrayList(i32),
+    out_ratio: *std.ArrayList(f64),
+    out_tags: *std.ArrayList(u8),
+    out_tag_off: *std.ArrayList(usize),
+) !void {
+    while (try q.next()) |b| {
+        const ids = b.values[0].data.bigint;
+        const qtys = b.values[1].data.int;
+        const ratios = b.values[2].data.double;
+        const tags = b.values[3].data.string;
+        for (0..b.row_count) |i| {
+            try out_ids.append(allocator, ids[i]);
+            try out_qty.append(allocator, qtys[i]);
+            try out_ratio.append(allocator, ratios[i]);
+            try out_tags.appendSlice(allocator, tags.rowBytes(i));
+            try out_tag_off.append(allocator, out_tags.items.len);
+        }
+    }
+}
+
+test "fused filter: byte-identical survivors across selectivity (selective/none/all) + string LIKE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+            .{ .name = "ratio", .type = .double },
+            .{ .name = "tag", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    const rows = [_]FuseRow{
+        .{ .id = 1, .qty = 10, .ratio = 1.5, .tag = "apple" },
+        .{ .id = 2, .qty = 20, .ratio = 2.5, .tag = "apricot" },
+        .{ .id = 3, .qty = 30, .ratio = 3.5, .tag = "banana" },
+        .{ .id = 4, .qty = 40, .ratio = 4.5, .tag = "blueberry" },
+        .{ .id = 5, .qty = 50, .ratio = 5.5, .tag = "cherry" },
+        .{ .id = 6, .qty = 60, .ratio = 6.5, .tag = "apex" },
+    };
+    inline for (rows) |r| {
+        try t.insert(&.{.{ .id = r.id, .qty = r.qty, .ratio = r.ratio, .tag = r.tag }});
+    }
+    try t.flush();
+
+    // Build the expected survivor set in Zig for a given predicate-on-row test,
+    // then run it through the fused scan and compare column-by-column.
+    const Case = struct {
+        name: []const u8,
+        expr: PredicateExpr,
+        keep: *const fn (FuseRow) bool,
+    };
+    const cases = [_]Case{
+        // Selective: few survivors.
+        .{ .name = "selective", .expr = leafExpr("qty", .gte, .{ .int = 40 }), .keep = struct {
+            fn f(r: FuseRow) bool {
+                return r.qty >= 40;
+            }
+        }.f },
+        // None: matches nothing.
+        .{ .name = "none", .expr = leafExpr("qty", .gt, .{ .int = 1000 }), .keep = struct {
+            fn f(r: FuseRow) bool {
+                return r.qty > 1000;
+            }
+        }.f },
+        // All: matches everything.
+        .{ .name = "all", .expr = leafExpr("id", .gte, .{ .bigint = 0 }), .keep = struct {
+            fn f(r: FuseRow) bool {
+                _ = r;
+                return true;
+            }
+        }.f },
+        // String LIKE on the fast-path string column.
+        .{ .name = "like", .expr = .{ .like = .{ .col = "tag", .pattern = "ap%" } }, .keep = struct {
+            fn f(r: FuseRow) bool {
+                return std.mem.startsWith(u8, r.tag, "ap");
+            }
+        }.f },
+    };
+
+    inline for (cases) |c| {
+        var base = try scan(allocator, t);
+        var q = try base.filter(c.expr);
+        defer q.deinit();
+
+        // Confirm the predicate was actually fused into the Scan.
+        const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+        try std.testing.expect(filter_op.fused);
+
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        var qty: std.ArrayList(i32) = .empty;
+        defer qty.deinit(allocator);
+        var ratio: std.ArrayList(f64) = .empty;
+        defer ratio.deinit(allocator);
+        var tags: std.ArrayList(u8) = .empty;
+        defer tags.deinit(allocator);
+        var tag_off: std.ArrayList(usize) = .empty;
+        defer tag_off.deinit(allocator);
+        try collectFused(allocator, &q, &ids, &qty, &ratio, &tags, &tag_off);
+
+        // Expected.
+        var e_ids: std.ArrayList(i64) = .empty;
+        defer e_ids.deinit(allocator);
+        var e_qty: std.ArrayList(i32) = .empty;
+        defer e_qty.deinit(allocator);
+        var e_ratio: std.ArrayList(f64) = .empty;
+        defer e_ratio.deinit(allocator);
+        var e_tags: std.ArrayList(u8) = .empty;
+        defer e_tags.deinit(allocator);
+        inline for (rows) |r| {
+            if (c.keep(r)) {
+                try e_ids.append(allocator, r.id);
+                try e_qty.append(allocator, r.qty);
+                try e_ratio.append(allocator, r.ratio);
+                try e_tags.appendSlice(allocator, r.tag);
+            }
+        }
+
+        try std.testing.expectEqualSlices(i64, e_ids.items, ids.items);
+        try std.testing.expectEqualSlices(i32, e_qty.items, qty.items);
+        try std.testing.expectEqualSlices(f64, e_ratio.items, ratio.items);
+        try std.testing.expectEqualSlices(u8, e_tags.items, tags.items);
+    }
+}
+
+test "fused filter: applies to unflushed memtable rows too" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    // No flush: rows stay in the memtable. The fused Scan must still filter
+    // them (Filter is a pass-through once fused).
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 25) },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30) },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 5) },
+    });
+
+    var base = try scan(allocator, t);
+    var q = try base.filter(leafExpr("qty", .gte, .{ .int = 25 }));
+    defer q.deinit();
+
+    const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+    try std.testing.expect(filter_op.fused);
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, ids.items);
+
+    try t.flush();
+}
+
+test "fused filter: tombstoned rows removed before the predicate applies" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20) },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30) },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 40) },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 50) },
+    });
+    try t.flush();
+    // Delete id=3 → tombstone in the segment. The fused path ANDs the
+    // tombstone keep-mask into the predicate mask, so id=3 must not survive.
+    _ = try t.delete(.{ .col = "id", .op = .eq, .val = .{ .bigint = 3 } });
+
+    var base = try scan(allocator, t);
+    var q = try base.filter(leafExpr("qty", .gte, .{ .int = 20 }));
+    defer q.deinit();
+
+    const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+    try std.testing.expect(filter_op.fused);
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+    // qty>=20 → {2,3,4,5}; tombstone removes 3 → {2,4,5}.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 4, 5 }, ids.items);
+}

@@ -197,6 +197,74 @@ test "round-trip with multiple row groups" {
     try std.testing.expectEqualSlices(i64, &ids, collected.items);
 }
 
+test "borrowed view matches owned decode byte-for-byte (fixed + string)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+            .{ .name = "ratio", .type = .double },
+            .{ .name = "tag", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+
+    const ids = [_]i64{ 100, 101, 102, 103, 104 };
+    const qtys = [_]i32{ 1, 2, 3, 4, 5 };
+    const ratios = [_]f64{ 1.5, 2.5, 3.5, 4.5, 5.5 };
+    const tag_bytes = "AAA" ++ "BB" ++ "C" ++ "DDDD" ++ "EE";
+    const tag_offsets = [_]u32{ 0, 3, 5, 6, 10, 12 };
+
+    const columns = [_]ColumnView{
+        .{ .data = .{ .bigint = &ids } },
+        .{ .data = .{ .int = &qtys } },
+        .{ .data = .{ .double = &ratios } },
+        .{ .data = .{ .string = .{ .offsets = &tag_offsets, .bytes = tag_bytes } } },
+    };
+
+    var info = try writeSegment(allocator, io, tmp.dir, "seg.dat", schema, 7, 0, 16, &columns, false);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
+    defer seg.deinit();
+
+    var c = cache.Cache.init(allocator, 1 << 20);
+    defer c.deinit();
+
+    const rg_count = seg.info.row_groups[0].row_count;
+    inline for (.{ 0, 1, 2, 3 }) |col_idx| {
+        var owned = try seg.decodeColumn(allocator, schema, 0, col_idx);
+        defer owned.deinit(allocator);
+
+        var block = try seg.borrowColumnBlock(allocator, 0, col_idx, &c);
+        defer block.release(allocator, &c);
+
+        const col_type = schema.columns[col_idx].type;
+        const flags = format.ColumnBlockFlags{ .has_nulls = schema.columns[col_idx].nullable };
+        const view = segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags).?;
+
+        const ov = owned.view();
+        try std.testing.expectEqual(ov.data.rowCount(), view.data.rowCount());
+        switch (ov.data) {
+            .bigint => |s| try std.testing.expectEqualSlices(i64, s, view.data.bigint),
+            .int => |s| try std.testing.expectEqualSlices(i32, s, view.data.int),
+            .double => |s| try std.testing.expectEqualSlices(f64, s, view.data.double),
+            .string => |sv| {
+                for (0..sv.rowCount()) |r| {
+                    try std.testing.expectEqualStrings(sv.rowBytes(r), view.data.string.rowBytes(r));
+                }
+            },
+            else => unreachable,
+        }
+    }
+}
+
 test {
     _ = column;
     _ = format;

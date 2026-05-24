@@ -116,6 +116,13 @@ pub const VTable = struct {
     /// Operators that can act on hints (e.g. Scan) use them to skip row
     /// groups; others (Filter, Project, Limit) simply forward to upstream.
     addPrune: *const fn (ptr: *anyopaque, pred: predicate.Predicate) anyerror!void,
+    /// Offer a full predicate to this operator for in-place evaluation. The
+    /// Scan accepts (returns true) and applies the filter directly over its
+    /// borrowed cache bytes, emitting compacted owned survivors. Every other
+    /// operator declines (returns false), so the caller (Filter) keeps doing
+    /// its own masking. The borrowed view the Scan builds lives entirely
+    /// inside one `next()` call — no cross-operator lifetime contract.
+    tryFuseFilter: *const fn (ptr: *anyopaque, expr: predicate.PredicateExpr) anyerror!bool,
     /// Pre-execution statistics on this operator's OUTPUT: upper bound
     /// on rows, sort state. Cheap — computed from manifest + operator
     /// definitions, no data read required. Used by downstream planners
@@ -219,6 +226,13 @@ pub const Query = struct {
 
     pub fn addPrune(self: *Query, pred: predicate.Predicate) !void {
         return self.vtable.addPrune(self.ptr, pred);
+    }
+
+    /// Offer `expr` to this operator for in-place filtering. Returns true if
+    /// the operator took ownership of applying the predicate (the caller then
+    /// becomes a pass-through). See `VTable.tryFuseFilter`.
+    pub fn tryFuseFilter(self: *Query, expr: predicate.PredicateExpr) !bool {
+        return self.vtable.tryFuseFilter(self.ptr, expr);
     }
 
     /// Pre-execution stats on this operator's output. Cheap; no data
@@ -383,6 +397,11 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.addPrune(pred);
         }
+        fn tryFuseFilterWrap(ptr: *anyopaque, expr: predicate.PredicateExpr) anyerror!bool {
+            if (!@hasDecl(Op, "tryFuseFilter")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.tryFuseFilter(expr);
+        }
         fn statsWrap(ptr: *anyopaque) PipelineStats {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.stats();
@@ -401,6 +420,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .deinit = deinitWrap,
             .outputSchema = outputSchemaWrap,
             .addPrune = addPruneWrap,
+            .tryFuseFilter = tryFuseFilterWrap,
             .stats = statsWrap,
             .accountant = accountantWrap,
             .explain = explainWrap,

@@ -29,6 +29,7 @@ const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
+const PredicateExpr = predicate.PredicateExpr;
 const PredicateOp = predicate.PredicateOp;
 const statsOverlapPredicate = predicate.statsOverlapPredicate;
 
@@ -179,6 +180,24 @@ pub const Scan = struct {
 
     /// Pushed-down predicates used to skip row groups via min/max stats.
     prunes: std.ArrayList(PruneHint),
+
+    /// Fused WHERE predicate (set via `tryFuseFilter`). When non-null the Scan
+    /// evaluates it itself: for each row group it builds a BORROWED typed view
+    /// over the pinned/decompressed cache bytes, evaluates the predicate, and
+    /// compacts only the survivors into owned `filtered` buffers — eliminating
+    /// the full-column owned-copy that the old decode→Filter path made. The
+    /// borrowed view + cache pins live entirely within one `next()` call and
+    /// are released before returning; downstream only ever sees the owned,
+    /// compacted survivor batch. The expr's backing memory is owned by the
+    /// fusing Filter (which outlives this Scan), so the Scan never frees it.
+    fused_filter: ?PredicateExpr = null,
+    /// Scratch row-mask, grown on demand for the largest row group seen.
+    /// Reused across `next()` calls; freed in `deinit`.
+    mask_buf: []bool = &.{},
+    /// Scratch array of borrowed cache blocks for the fused-filter fast path,
+    /// one slot per projected column. Reused across `next()` calls; the pins
+    /// it holds are released within each call. Freed in `deinit`.
+    borrow_blocks: []storage.ReadSegment.BorrowedBlock = &.{},
 
     /// The query memory accountant shared by every operator above this
     /// Scan (reached via `Query.accountant()`). Null = no tracking.
@@ -389,6 +408,8 @@ pub const Scan = struct {
     pub fn deinit(self: *Scan) void {
         self.releaseBatch();
         self.closeCurSegment();
+        if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
+        if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_cards.len > 0) self.allocator.free(self.cached_cards);
         self.prunes.deinit(self.allocator);
@@ -442,6 +463,20 @@ pub const Scan = struct {
         }
         self.filtered = arr;
         return arr;
+    }
+
+    /// Accept a full predicate for scan-side in-place filtering. Declines
+    /// (returns false) for the count-only scan (no columns to filter) and the
+    /// late-materialization scan (`emit_loc`, which has its own pipeline). On
+    /// acceptance the predicate's leaves must reference only columns this scan
+    /// projects — guaranteed when the fusing Filter sits directly above and
+    /// shares this scan's output schema. The expr is stored by value; its
+    /// backing memory is owned by the caller and must outlive this scan.
+    pub fn tryFuseFilter(self: *Scan, expr: PredicateExpr) !bool {
+        if (self.out_phys.len == 0 or self.emit_loc) return false;
+        if (self.fused_filter != null) return false;
+        self.fused_filter = expr;
+        return true;
     }
 
     pub fn addPrune(self: *Scan, pred: Predicate) !void {
@@ -568,6 +603,8 @@ pub const Scan = struct {
     }
 
     pub fn next(self: *Scan) !?Batch {
+        if (self.fused_filter != null) return self.nextFiltered();
+
         self.releaseBatch();
 
         // Count-only fast path: nothing references a column (e.g. a
@@ -602,44 +639,7 @@ pub const Scan = struct {
 
         // Segments phase
         while (self.phase == .segments) {
-            if (self.cur_segment == null) {
-                // Advance past segments excluded by leading-key predicates.
-                while (self.cur_seg_idx < self.segment_count) : (self.cur_seg_idx += 1) {
-                    const skip = if (self.seg_skip) |s| s[self.cur_seg_idx] else false;
-                    if (!skip) break;
-                }
-                if (self.cur_seg_idx >= self.segment_count) {
-                    self.phase = .memtable;
-                    break;
-                }
-                const entry = self.table.manifest.segments.items[self.cur_seg_idx];
-                var name_buf: [32]u8 = undefined;
-                const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
-                self.cur_segment = try storage.readSegment(
-                    self.allocator,
-                    self.io,
-                    self.table.segments_dir,
-                    file_name,
-                    self.table.schema,
-                );
-                self.segments_opened += 1;
-
-                self.cur_segment_tomb = try storage.tombstone.read(
-                    self.allocator,
-                    self.io,
-                    self.table.segments_dir,
-                    entry.segment_id,
-                );
-
-                const rgs = self.cur_segment.?.info.row_groups;
-                self.cur_rg_first_row = try self.allocator.alloc(u32, rgs.len);
-                var running: u32 = 0;
-                for (rgs, 0..) |rg, i| {
-                    self.cur_rg_first_row[i] = running;
-                    running += rg.row_count;
-                }
-                self.cur_rg_idx = 0;
-            }
+            if (self.cur_segment == null and !try self.openCurSegment()) break;
 
             const seg = &self.cur_segment.?;
             if (self.cur_rg_idx >= seg.info.row_groups.len) {
@@ -728,6 +728,254 @@ pub const Scan = struct {
         }
 
         return null;
+    }
+
+    /// Advance past leading-key-excluded segments and open the next eligible
+    /// one into `cur_segment` (+ tombstones, row-group prefix sums, cursor).
+    /// Returns false (and transitions to the memtable phase) when no more
+    /// segments remain. Shared by `next()` and `nextFiltered()`.
+    fn openCurSegment(self: *Scan) !bool {
+        while (self.cur_seg_idx < self.segment_count) : (self.cur_seg_idx += 1) {
+            const skip = if (self.seg_skip) |s| s[self.cur_seg_idx] else false;
+            if (!skip) break;
+        }
+        if (self.cur_seg_idx >= self.segment_count) {
+            self.phase = .memtable;
+            return false;
+        }
+        const entry = self.table.manifest.segments.items[self.cur_seg_idx];
+        var name_buf: [32]u8 = undefined;
+        const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
+        self.cur_segment = try storage.readSegment(
+            self.allocator,
+            self.io,
+            self.table.segments_dir,
+            file_name,
+            self.table.schema,
+        );
+        self.segments_opened += 1;
+        self.cur_segment_tomb = try storage.tombstone.read(
+            self.allocator,
+            self.io,
+            self.table.segments_dir,
+            entry.segment_id,
+        );
+        const rgs = self.cur_segment.?.info.row_groups;
+        self.cur_rg_first_row = try self.allocator.alloc(u32, rgs.len);
+        var running: u32 = 0;
+        for (rgs, 0..) |rg, i| {
+            self.cur_rg_first_row[i] = running;
+            running += rg.row_count;
+        }
+        self.cur_rg_idx = 0;
+        return true;
+    }
+
+    /// Scan-side in-place filter path. Walks segment row groups then the
+    /// memtable, applying `fused_filter` directly to borrowed views over the
+    /// pinned/decompressed block bytes and compacting only survivors into the
+    /// owned `filtered` buffers. Returns one batch per row group that has at
+    /// least one survivor; null at end of stream.
+    ///
+    /// Lifetime: within ONE call, the borrow (cache pins + typed views) is
+    /// created in `tryBorrowViews`, used for predicate eval + compaction, and
+    /// released before `filterRowGroup` returns. The emitted batch aliases only
+    /// `self.filtered` / `self.views` (fully owned), exactly like the copy path
+    /// — so downstream sees no borrowed cache memory.
+    fn nextFiltered(self: *Scan) !?Batch {
+        const expr = self.fused_filter.?;
+
+        while (self.phase == .segments) {
+            if (self.cur_segment == null and !try self.openCurSegment()) break;
+
+            const seg = &self.cur_segment.?;
+            if (self.cur_rg_idx >= seg.info.row_groups.len) {
+                self.closeCurSegment();
+                self.cur_seg_idx += 1;
+                continue;
+            }
+
+            const rg = seg.info.row_groups[self.cur_rg_idx];
+            if (!self.rowGroupCanMatch(rg)) {
+                self.cur_rg_idx += 1;
+                continue;
+            }
+
+            const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
+            const rg_count = rg.row_count;
+            const this_rg = self.cur_rg_idx;
+            self.cur_rg_idx += 1;
+
+            const matched = try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
+            if (matched == 0) continue;
+            for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched };
+        }
+
+        if (self.phase == .memtable) {
+            self.phase = .done;
+            if (self.memtable_row_count == 0) return null;
+
+            const n: usize = @intCast(self.memtable_row_count);
+            const mem_views = try self.allocator.alloc(ColumnView, self.out_phys.len);
+            defer self.allocator.free(mem_views);
+            for (self.out_phys, 0..) |phys, j| mem_views[j] = self.memtable_snap.columns[phys].view();
+
+            const matched = try self.evalAndCompact(mem_views, n, null, expr);
+            if (matched == 0) return null;
+            for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched };
+        }
+
+        return null;
+    }
+
+    /// Filter one segment row group into `filtered`. Fast path: borrow typed
+    /// views directly over the pinned/decompressed cache blocks (no owned
+    /// decode) when every projected column's bytes are alignment-safe to view;
+    /// otherwise fall back to the owned-decode path. Both paths AND in the
+    /// optional tombstone keep-mask before applying the predicate, so deleted
+    /// rows never survive. All cache pins are released before returning.
+    fn filterRowGroup(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        rg_first: u32,
+        rg_count: u32,
+        expr: PredicateExpr,
+    ) !usize {
+        const tomb_mask = try self.tombstoneMask(rg_first, rg_count);
+        defer if (tomb_mask) |m| self.allocator.free(m);
+
+        // Fast path: borrow views over cache bytes. Bail to copy if any column
+        // can't be viewed (misalignment / big-endian).
+        if (try self.tryBorrowViews(seg, rg_idx, rg_count)) |borrow| {
+            defer for (borrow.blocks) |*b| b.release(self.allocator, &self.table.cache);
+            return self.evalAndCompact(borrow.views, rg_count, tomb_mask, expr);
+        }
+
+        // Fallback: owned decode (as the non-fused path), then evaluate +
+        // compact through the same kernel.
+        const owned_views = try self.decodeOwnedViews(seg, rg_idx, rg_count);
+        defer self.releaseDecoded();
+        return self.evalAndCompact(owned_views, rg_count, tomb_mask, expr);
+    }
+
+    const Borrow = struct {
+        blocks: []storage.ReadSegment.BorrowedBlock,
+        views: []ColumnView,
+    };
+
+    /// Try to build borrowed typed views over the cache blocks for every
+    /// projected column. Returns null (after releasing any pins taken) if any
+    /// column's bytes aren't safe to view in place. The returned `blocks` /
+    /// `views` alias `self`-owned scratch (`borrow_blocks` / `views`); the
+    /// caller must release the blocks within the same `next()` call.
+    fn tryBorrowViews(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32) !?Borrow {
+        const blocks = try self.ensureBorrowBlocks();
+
+        var got: usize = 0;
+        errdefer for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
+
+        for (self.out_phys, 0..) |phys, j| {
+            const col_type = self.table.schema.columns[phys].type;
+            const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+            const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags) orelse {
+                // Misaligned / unsupported: release this block and abandon the
+                // fast path for the whole row group (release the rest too).
+                block.release(self.allocator, &self.table.cache);
+                for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
+                return null;
+            };
+            blocks[j] = block;
+            self.views[j] = view;
+            got += 1;
+        }
+        return .{ .blocks = blocks[0..self.out_phys.len], .views = self.views[0..self.out_phys.len] };
+    }
+
+    /// Owned-decode the projected columns of one row group into `self.decoded`
+    /// and return their views. Sets `decoded_valid`; release via
+    /// `releaseDecoded`.
+    fn decodeOwnedViews(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, _: u32) ![]ColumnView {
+        var decoded_cols: usize = 0;
+        errdefer {
+            for (self.decoded[0..decoded_cols]) |*c| c.deinit(self.allocator);
+            self.decoded_valid = false;
+        }
+        for (self.out_phys, 0..) |phys, j| {
+            self.decoded[j] = try seg.decodeColumnMaybeCached(
+                self.allocator,
+                self.table.schema,
+                rg_idx,
+                phys,
+                &self.table.cache,
+            );
+            decoded_cols += 1;
+        }
+        self.decoded_valid = true;
+        for (self.decoded[0..self.out_phys.len], 0..) |c, i| self.views[i] = c.view();
+        return self.views[0..self.out_phys.len];
+    }
+
+    fn releaseDecoded(self: *Scan) void {
+        if (self.decoded_valid) {
+            for (self.decoded[0..self.out_phys.len]) |*c| c.deinit(self.allocator);
+            self.decoded_valid = false;
+        }
+    }
+
+    /// Evaluate `expr` over `views` (a batch of `n` rows), AND in the optional
+    /// `tomb_mask` (true = keep), and compact survivors into `filtered`.
+    /// Returns the survivor count.
+    fn evalAndCompact(self: *Scan, views: []const ColumnView, n: usize, tomb_mask: ?[]const bool, expr: PredicateExpr) !usize {
+        const mask = try self.ensureMask(n);
+        const batch = Batch{ .schema = self.out_schema, .values = views, .row_count = n };
+        try predicate.evaluateExprGuided(self.allocator, expr, self.out_schema, batch, mask, null);
+        if (tomb_mask) |tm| {
+            for (mask[0..n], tm) |*m, keep| m.* = m.* and keep;
+        }
+        var matched: usize = 0;
+        for (mask[0..n]) |m| matched += @intFromBool(m);
+        if (matched == 0) return 0;
+
+        const filtered_cols = try self.ensureFilteredBuffers();
+        for (filtered_cols) |*c| c.clear();
+        for (views, filtered_cols) |src, *dst| {
+            try engine.memtable.appendMaskedColumn(self.allocator, src, mask[0..n], dst);
+        }
+        return matched;
+    }
+
+    /// Build a keep-mask for tombstoned rows in `[rg_first, rg_first+rg_count)`,
+    /// or null when no tombstones fall in range. `true` = surviving row.
+    fn tombstoneMask(self: *Scan, rg_first: u32, rg_count: u32) !?[]bool {
+        const tombs = self.cur_segment_tomb orelse return null;
+        if (tombs.len == 0) return null;
+        const rg_end = rg_first + rg_count;
+        const lo = std.sort.lowerBound(u32, tombs, rg_first, cmpU32);
+        const hi = std.sort.lowerBound(u32, tombs, rg_end, cmpU32);
+        if (lo == hi) return null;
+        const mask = try self.allocator.alloc(bool, rg_count);
+        @memset(mask, true);
+        for (tombs[lo..hi]) |off| mask[off - rg_first] = false;
+        return mask;
+    }
+
+    fn ensureMask(self: *Scan, n: usize) ![]bool {
+        if (self.mask_buf.len < n) {
+            if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
+            self.mask_buf = try self.allocator.alloc(bool, n);
+        }
+        return self.mask_buf;
+    }
+
+    fn ensureBorrowBlocks(self: *Scan) ![]storage.ReadSegment.BorrowedBlock {
+        if (self.borrow_blocks.len >= self.out_phys.len) return self.borrow_blocks;
+        if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
+        self.borrow_blocks = try self.allocator.alloc(storage.ReadSegment.BorrowedBlock, self.out_phys.len);
+        return self.borrow_blocks;
     }
 
     fn releaseBatch(self: *Scan) void {

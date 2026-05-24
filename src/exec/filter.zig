@@ -18,7 +18,6 @@ const ColumnStore = engine.ColumnStore;
 const exec = @import("exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
-const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
@@ -35,6 +34,13 @@ pub const Filter = struct {
     /// same view() helper applies.
     filtered: []ColumnStore,
     views: []ColumnView,
+
+    /// When true, the upstream Scan accepted this predicate and applies it
+    /// itself (scan-side in-place filter), returning already-compacted owned
+    /// survivors. This Filter then forwards upstream batches verbatim — no
+    /// re-evaluation, no copy. The borrow over cache bytes lives entirely
+    /// inside the Scan's `next()`, never reaching here.
+    fused: bool = false,
 
     pub fn create(allocator: Allocator, upstream: Query, expr: PredicateExpr) !Query {
         const schema = upstream.outputSchema();
@@ -74,6 +80,13 @@ pub const Filter = struct {
             error.ColumnNotFound => {},
             else => return err,
         };
+
+        // Offer the full (validated) predicate to the upstream Scan for in-place
+        // filtering. If it accepts, it emits compacted owned survivors and this
+        // Filter degrades to a pass-through. The expr it borrows is `self.expr`,
+        // which outlives the query (owned by this Filter).
+        self.fused = self.upstream.tryFuseFilter(self.expr) catch false;
+
         return makeQuery(allocator, self);
     }
 
@@ -112,13 +125,17 @@ pub const Filter = struct {
     }
 
     pub fn next(self: *Filter) !?Batch {
+        // Fused: the Scan already applied the predicate and returns compacted
+        // owned survivors. Forward verbatim.
+        if (self.fused) return self.upstream.next();
+
         while (true) {
             const upstream_batch = (try self.upstream.next()) orelse return null;
 
             const n = upstream_batch.row_count;
             const mask = try self.allocator.alloc(bool, n);
             defer self.allocator.free(mask);
-            try self.evaluateExpr(self.expr, upstream_batch, mask, null);
+            try predicate.evaluateExprGuided(self.allocator, self.expr, self.schema, upstream_batch, mask, null);
 
             var matched: usize = 0;
             for (mask) |m| if (m) {
@@ -133,94 +150,6 @@ pub const Filter = struct {
             for (self.filtered, 0..) |c, ci| self.views[ci] = c.view();
 
             return Batch{ .schema = self.schema, .values = self.views, .row_count = matched };
-        }
-    }
-
-    /// Evaluate `expr` into `out`. `active`, when non-null, marks rows still
-    /// worth testing — an earlier conjunct already eliminated the rest, so
-    /// expensive leaves (LIKE) skip them. Inactive rows in `out` are
-    /// don't-care: the caller's conjunction AND masks them off.
-    fn evaluateExpr(self: *Filter, expr: PredicateExpr, batch: Batch, out: []bool, active: ?[]const bool) anyerror!void {
-        switch (expr) {
-            .leaf => |p| {
-                const col_idx = types.findColumn(self.schema, p.col) orelse return Error.ColumnNotFound;
-                try predicate.evaluateMaskWithPred(batch.values[col_idx], p, batch.row_count, out);
-                const view = batch.values[col_idx];
-                if (view.nulls != null) {
-                    for (0..batch.row_count) |i| if (!view.isValid(i)) {
-                        out[i] = false;
-                    };
-                }
-            },
-            .leaf_col_col => |lc| {
-                const li = types.findColumn(self.schema, lc.left) orelse return Error.ColumnNotFound;
-                const ri = types.findColumn(self.schema, lc.right) orelse return Error.ColumnNotFound;
-                try predicate.evaluateColColMask(batch.values[li], batch.values[ri], lc.op, batch.row_count, out);
-            },
-            .is_null => |col_name| {
-                const col_idx = types.findColumn(self.schema, col_name) orelse return Error.ColumnNotFound;
-                const view = batch.values[col_idx];
-                for (0..batch.row_count) |i| out[i] = !view.isValid(i);
-            },
-            .is_not_null => |col_name| {
-                const col_idx = types.findColumn(self.schema, col_name) orelse return Error.ColumnNotFound;
-                const view = batch.values[col_idx];
-                for (0..batch.row_count) |i| out[i] = view.isValid(i);
-            },
-            .like => |lp| {
-                const col_idx = types.findColumn(self.schema, lp.col) orelse return Error.ColumnNotFound;
-                try predicate.evaluateLikeMask(batch.values[col_idx], lp.pattern, batch.row_count, out, active);
-            },
-            .@"and" => |children| {
-                if (children.len == 0) {
-                    @memset(out, true);
-                    return;
-                }
-                // Conjunction is mask-guided: each conjunct after the first is
-                // evaluated only on rows still alive in the running mask, so an
-                // expensive predicate (LIKE) runs on the few survivors of the
-                // selective ones rather than every row.
-                try self.evaluateExpr(children[0], batch, out, active);
-                if (children.len == 1) return;
-                const scratch = try self.allocator.alloc(bool, out.len);
-                defer self.allocator.free(scratch);
-                for (children[1..]) |child| {
-                    try self.evaluateExpr(child, batch, scratch, out);
-                    for (out, scratch) |*o, s| o.* = o.* and s;
-                }
-            },
-            .@"or" => |children| {
-                if (children.len == 0) {
-                    @memset(out, false);
-                    return;
-                }
-                // Disjunction widens, so it can't narrow the active set; it just
-                // forwards the incoming `active` (rows eliminated upstream stay
-                // eliminated) to every child.
-                try self.evaluateExpr(children[0], batch, out, active);
-                if (children.len == 1) return;
-                const scratch = try self.allocator.alloc(bool, out.len);
-                defer self.allocator.free(scratch);
-                for (children[1..]) |child| {
-                    try self.evaluateExpr(child, batch, scratch, active);
-                    for (out, scratch) |*o, s| o.* = o.* or s;
-                }
-            },
-            .not => |child| {
-                try self.evaluateExpr(child.*, batch, out, active);
-                for (out) |*o| o.* = !o.*;
-            },
-            // Resolved away by the pre-compile pass.
-            .scalar_subquery, .exists_subquery, .in_subquery => return Error.PredicateTypeMismatch,
-            .always => |b| @memset(out, b),
-            .in_set => |s| {
-                const col_idx = types.findColumn(self.schema, s.col) orelse return Error.ColumnNotFound;
-                try predicate.evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
-            },
-            .correlated_set => |s| try predicate.evaluateCorrelatedSetMask(s, self.schema, batch, out),
-            .correlated_scalar => |s| try predicate.evaluateCorrelatedScalarMask(s, self.schema, batch, out),
-            .correlated_range => |s| try predicate.evaluateCorrelatedRangeMask(s, self.schema, batch, out),
-            .leaf_var => return Error.PredicateTypeMismatch,
         }
     }
 };
