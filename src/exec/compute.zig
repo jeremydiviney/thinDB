@@ -279,28 +279,32 @@ pub const Compute = struct {
     /// they can't appear in it; thus the upstream's claim is still
     /// fully valid in our output schema).
     ///
-    /// Extends `column_cards` to cover the derived columns so downstream
+    /// Extends `column_stats` to cover the derived columns so downstream
     /// routing (notably GROUP BY hash-vs-sort, which products per-key NDV)
     /// can reason about them: a literal-only column has NDV 1, a rename
-    /// inherits its source's card, anything computed is unknown. Without
-    /// this, `GROUP BY <const>, key` reads the const column as unknown and
-    /// is forced onto the sort path even when `key` alone fits the budget.
+    /// inherits its source's stat (values pass through unchanged, so its
+    /// min/max carry too), anything computed is unknown. Without this,
+    /// `GROUP BY <const>, key` reads the const column as unknown and is
+    /// forced onto the sort path even when `key` alone fits the budget.
+    /// Pass-through columns keep their stats; every ndv is capped at
+    /// `upper_rows` (unchanged by Compute).
     pub fn stats(self: *Compute) exec.PipelineStats {
         var up = self.upstream.stats();
         const up_n = self.upstream.outputSchema().len;
-        // Only extend when upstream reports a full per-column card array;
+        // Only extend when upstream reports a full per-column stat array;
         // otherwise the indices wouldn't line up and fabricating is unsafe.
-        if (up.column_cards.len != up_n) return up;
-        const cards = self.arena.allocator().alloc(exec.ColCard, up_n + self.derived.len) catch return up;
-        @memcpy(cards[0..up_n], up.column_cards);
+        if (up.column_stats.len != up_n) return up;
+        const out_stats = self.arena.allocator().alloc(exec.ColStat, up_n + self.derived.len) catch return up;
+        @memcpy(out_stats[0..up_n], up.column_stats);
         for (self.derived, 0..) |d, i| {
-            cards[up_n + i] = switch (d.kind) {
-                .lit_only => .{ .exact = 1 },
-                .rename => |rn| if (rn.src_idx < up_n) up.column_cards[rn.src_idx] else .unknown,
-                .call, .case, .fused_scalar => .unknown,
+            out_stats[up_n + i] = switch (d.kind) {
+                .lit_only => .{ .ndv = .{ .exact = 1 } },
+                .rename => |rn| if (rn.src_idx < up_n) up.column_stats[rn.src_idx] else .{ .ndv = .unknown },
+                .call, .case, .fused_scalar => .{ .ndv = .unknown },
             };
         }
-        up.column_cards = cards;
+        exec.capColStats(out_stats, up.upper_rows);
+        up.column_stats = out_stats;
         return up;
     }
 

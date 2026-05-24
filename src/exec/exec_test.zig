@@ -1175,7 +1175,7 @@ test "cardinality: bounds propagate through filter, sort, and project" {
     });
     try t.flush();
 
-    // Baseline: scan exposes a bound per column; capture them (a=3 distinct,
+    // Baseline: scan exposes a stat per column; capture them (a=3 distinct,
     // b=4 distinct → both small → exact).
     var a_c: exec.ColCard = undefined;
     var b_c: exec.ColCard = undefined;
@@ -1183,11 +1183,11 @@ test "cardinality: bounds propagate through filter, sort, and project" {
         var q = try scan(allocator, t);
         defer q.deinit();
         const s = q.stats();
-        try std.testing.expectEqual(@as(usize, 3), s.column_cards.len);
-        try std.testing.expect(std.meta.activeTag(s.column_cards[1]) == .exact);
-        try std.testing.expect(std.meta.activeTag(s.column_cards[2]) == .exact);
-        a_c = s.column_cards[1];
-        b_c = s.column_cards[2];
+        try std.testing.expectEqual(@as(usize, 3), s.column_stats.len);
+        try std.testing.expect(std.meta.activeTag(s.column_stats[1].ndv) == .exact);
+        try std.testing.expect(std.meta.activeTag(s.column_stats[2].ndv) == .exact);
+        a_c = s.column_stats[1].ndv;
+        b_c = s.column_stats[2].ndv;
     }
 
     // Filter preserves the bounds (filtering only shrinks distinct counts).
@@ -1196,8 +1196,8 @@ test "cardinality: bounds propagate through filter, sort, and project" {
         var q = try base.filter(leafExpr("a", .gt, .{ .int = 5 }));
         defer q.deinit();
         const s = q.stats();
-        try std.testing.expectEqual(a_c, s.column_cards[1]);
-        try std.testing.expectEqual(b_c, s.column_cards[2]);
+        try std.testing.expectEqual(a_c, s.column_stats[1].ndv);
+        try std.testing.expectEqual(b_c, s.column_stats[2].ndv);
     }
 
     // Sort preserves the bounds (reorder only).
@@ -1206,8 +1206,8 @@ test "cardinality: bounds propagate through filter, sort, and project" {
         var q = try base.orderBy(&.{.{ .col = "a", .desc = false }});
         defer q.deinit();
         const s = q.stats();
-        try std.testing.expectEqual(a_c, s.column_cards[1]);
-        try std.testing.expectEqual(b_c, s.column_cards[2]);
+        try std.testing.expectEqual(a_c, s.column_stats[1].ndv);
+        try std.testing.expectEqual(b_c, s.column_stats[2].ndv);
     }
 
     // Project remaps the bounds to the projected column order: [b, a].
@@ -1216,9 +1216,9 @@ test "cardinality: bounds propagate through filter, sort, and project" {
         var q = try base.project(&.{ "b", "a" });
         defer q.deinit();
         const s = q.stats();
-        try std.testing.expectEqual(@as(usize, 2), s.column_cards.len);
-        try std.testing.expectEqual(b_c, s.column_cards[0]);
-        try std.testing.expectEqual(a_c, s.column_cards[1]);
+        try std.testing.expectEqual(@as(usize, 2), s.column_stats.len);
+        try std.testing.expectEqual(b_c, s.column_stats[0].ndv);
+        try std.testing.expectEqual(a_c, s.column_stats[1].ndv);
     }
 }
 
@@ -1311,24 +1311,24 @@ test "cardinality: join concatenates left and right bounds" {
     });
     try r.flush();
 
-    // Capture each side's per-column bounds independently.
-    var lcards: [2]exec.ColCard = undefined;
-    var rcards: [2]exec.ColCard = undefined;
+    // Capture each side's per-column stats independently.
+    var lcards: [2]exec.ColStat = undefined;
+    var rcards: [2]exec.ColStat = undefined;
     {
         var q = try scan(allocator, l);
         defer q.deinit();
         const s = q.stats();
-        lcards = .{ s.column_cards[0], s.column_cards[1] };
+        lcards = .{ s.column_stats[0], s.column_stats[1] };
     }
     {
         var q = try scan(allocator, r);
         defer q.deinit();
         const s = q.stats();
-        rcards = .{ s.column_cards[0], s.column_cards[1] };
+        rcards = .{ s.column_stats[0], s.column_stats[1] };
     }
 
     // Join on id → output schema is (l.id, l.v, r.v); the right join key is
-    // dropped. Bounds should be [l.id, l.v, r.v].
+    // dropped. Stats should be [l.id, l.v, r.v].
     var left = try scan(allocator, l);
     const right = try scan(allocator, r);
     var q = try left.join(right, .{
@@ -1337,10 +1337,10 @@ test "cardinality: join concatenates left and right bounds" {
     });
     defer q.deinit();
     const s = q.stats();
-    try std.testing.expectEqual(@as(usize, 3), s.column_cards.len);
-    try std.testing.expectEqual(lcards[0], s.column_cards[0]); // l.id
-    try std.testing.expectEqual(lcards[1], s.column_cards[1]); // l.v
-    try std.testing.expectEqual(rcards[1], s.column_cards[2]); // r.v (right key dropped)
+    try std.testing.expectEqual(@as(usize, 3), s.column_stats.len);
+    try std.testing.expectEqual(lcards[0], s.column_stats[0]); // l.id
+    try std.testing.expectEqual(lcards[1], s.column_stats[1]); // l.v
+    try std.testing.expectEqual(rcards[1], s.column_stats[2]); // r.v (right key dropped)
     // Drain so the join tears down via its executed path.
     while (try q.next()) |_| {}
 }

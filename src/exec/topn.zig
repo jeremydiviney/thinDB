@@ -87,6 +87,10 @@ pub const TopN = struct {
 
     output_columns: []ColumnStore,
     views: []ColumnView,
+    /// Upstream per-column stats with each ndv re-capped at the bounded
+    /// `limit + offset` row count. Empty when the upstream carries no array.
+    /// Cached at create; borrowed by `stats()`.
+    cached_stats: []const exec.ColStat = &.{},
 
     const batch_size: usize = 1024;
 
@@ -140,6 +144,17 @@ pub const TopN = struct {
         // just degrades to a full sort — no pruning ever fires).
         const keep = std.math.add(usize, limit, offset) catch std.math.maxInt(usize);
 
+        // Re-cap per-column ndv at the bounded output row count.
+        const up = upstream.stats();
+        const upper = @min(@as(u64, limit), up.upper_rows);
+        const cached_stats: []const exec.ColStat = if (up.column_stats.len == 0) &.{} else blk: {
+            const cs = try allocator.alloc(exec.ColStat, up.column_stats.len);
+            @memcpy(cs, up.column_stats);
+            exec.capColStats(cs, upper);
+            break :blk cs;
+        };
+        errdefer if (cached_stats.len > 0) allocator.free(@constCast(cached_stats));
+
         self.* = .{
             .allocator = allocator,
             .upstream = upstream,
@@ -154,6 +169,7 @@ pub const TopN = struct {
             .accumulated = accumulated,
             .output_columns = output_columns,
             .views = views,
+            .cached_stats = cached_stats,
         };
         return makeQuery(allocator, self);
     }
@@ -161,6 +177,7 @@ pub const TopN = struct {
     pub fn deinit(self: *TopN) void {
         var up = self.upstream;
         up.deinit();
+        if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
         if (!self.evicted) {
             for (self.accumulated) |*c| c.deinit(self.allocator);
             self.allocator.free(self.accumulated);
@@ -196,8 +213,9 @@ pub const TopN = struct {
                 .global = true,
             },
             // Keeping a subset of rows can only shrink distinct counts, so
-            // the input's per-column bounds stay valid.
-            .column_cards = up.column_cards,
+            // the input's per-column stats stay valid; ndv re-capped at the
+            // bounded output row count (cached at create).
+            .column_stats = if (self.cached_stats.len > 0) self.cached_stats else up.column_stats,
         };
     }
 

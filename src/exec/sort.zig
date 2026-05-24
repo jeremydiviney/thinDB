@@ -278,8 +278,8 @@ pub const Sort = struct {
                 .global = true,
             },
             // Sorting reorders rows but doesn't change any column's values,
-            // so per-column distinct bounds carry through unchanged.
-            .column_cards = up.column_cards,
+            // so per-column stats (ndv + min/max) carry through unchanged.
+            .column_stats = up.column_stats,
         };
     }
 

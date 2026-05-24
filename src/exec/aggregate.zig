@@ -359,6 +359,17 @@ pub const Aggregate = struct {
     reserved_bytes: usize = 0,
     evicted: bool = false,
 
+    /// Propagated per-output-column stats: group-key columns carry their
+    /// input stats; aggregate-output columns are bounded by the group count
+    /// (≤ `upper_rows`) with unknown min/max. Computed at create from the
+    /// upstream stats; arena-owned, borrowed by `stats()`. Empty when the
+    /// upstream carries no per-column array.
+    cached_stats: []const exec.ColStat = &.{},
+    /// Provable upper bound on the output row (group) count, cached at create
+    /// so `stats()` doesn't recompute the product. For a global aggregate
+    /// (no group columns) this is 1.
+    cached_upper_rows: u64 = 1,
+
     pub fn create(
         allocator: Allocator,
         upstream: Query,
@@ -473,6 +484,8 @@ pub const Aggregate = struct {
             .emit_limit = if (group_col_indices.len > 0 and resolved_top_k == null) emit_limit else null,
         };
 
+        try self.computeOutputStats(up_schema);
+
         // No-GROUP-BY COUNT(DISTINCT int≤64): presize the membership set from
         // the value column's cardinality estimate (capped like the combined
         // path) so the 5M-row insert doesn't repeatedly grow+rehash on its way
@@ -487,7 +500,7 @@ pub const Aggregate = struct {
                 const vb = intKeyBits(up_schema[idx].type) orelse continue;
                 if (vb > 64) continue;
                 var set_cap: usize = 0;
-                if (idx < st.column_cards.len) switch (st.column_cards[idx]) {
+                if (idx < st.column_stats.len) switch (st.column_stats[idx].ndv) {
                     .exact => |nd| set_cap = @intCast(@min(nd, @max(st.upper_rows, 1))),
                     .unknown => {},
                 };
@@ -507,11 +520,11 @@ pub const Aggregate = struct {
             var est: u64 = 1;
             var known = true;
             for (group_col_indices) |ci| {
-                if (ci >= st.column_cards.len) {
+                if (ci >= st.column_stats.len) {
                     known = false;
                     break;
                 }
-                switch (st.column_cards[ci]) {
+                switch (st.column_stats[ci].ndv) {
                     .exact => |nd| est *|= nd,
                     .unknown => {
                         known = false;
@@ -577,8 +590,8 @@ pub const Aggregate = struct {
                 const vbits = intKeyBits(vt) orelse continue;
                 if (vbits > 64) continue;
                 var set_cap: usize = 0;
-                if (idx < st.column_cards.len) {
-                    switch (st.column_cards[idx]) {
+                if (idx < st.column_stats.len) {
+                    switch (st.column_stats[idx].ndv) {
                         .exact => |nd| set_cap = @intCast(@min(nd, @max(st.upper_rows, 1))),
                         .unknown => {},
                     }
@@ -625,16 +638,68 @@ pub const Aggregate = struct {
     }
 
     /// Global aggregate (no group_cols): always emits exactly 1 row.
-    /// Grouped aggregate: emits at most NDV(group_cols) rows, which is
-    /// bounded above by the upstream row count. We don't have NDV
-    /// without HLL, so for grouped agg the upper bound = upstream's.
-    /// Sort state: hash-based aggregate destroys any prior sort.
+    /// Grouped aggregate: emits at most `min(∏ NDV(group keys), input rows)`
+    /// rows — the provable group-count bound (cached at create). Output
+    /// columns: group-key columns carry their input stats, aggregate outputs
+    /// are bounded by the group count with unknown min/max. Sort state:
+    /// hash-based aggregate destroys any prior sort.
     pub fn stats(self: *Aggregate) exec.PipelineStats {
-        if (self.group_col_indices.len == 0) {
-            return .{ .upper_rows = 1 };
-        }
+        return .{
+            .upper_rows = self.cached_upper_rows,
+            .column_stats = self.cached_stats,
+        };
+    }
+
+    /// Build `cached_upper_rows` + `cached_stats` from the upstream stats.
+    /// Called once at create. The group-count bound is the saturating
+    /// product of the group keys' NDVs, clamped to the input row count; an
+    /// unknown key NDV (or a missing per-column array) leaves only the row
+    /// ceiling. Output stats are arena-owned.
+    fn computeOutputStats(self: *Aggregate, up_schema: []const Column) !void {
         const up = self.upstream.stats();
-        return .{ .upper_rows = up.upper_rows };
+
+        if (self.group_col_indices.len == 0) {
+            self.cached_upper_rows = 1;
+            // A global aggregate emits one row; each aggregate output is a
+            // single value (ndv ≤ 1), min/max unknown.
+            const aa = self.arena.allocator();
+            const out_stats = try aa.alloc(exec.ColStat, self.output_schema.len);
+            for (out_stats) |*s| s.* = .{ .ndv = .{ .exact = 1 } };
+            self.cached_stats = out_stats;
+            return;
+        }
+
+        var product: u64 = 1;
+        var known = up.column_stats.len == up_schema.len;
+        if (known) {
+            for (self.group_col_indices) |ci| {
+                switch (up.column_stats[ci].ndv) {
+                    .exact => |nd| product *|= nd,
+                    .unknown => {
+                        known = false;
+                        break;
+                    },
+                }
+            }
+        }
+        const upper: u64 = if (known) @min(product, up.upper_rows) else up.upper_rows;
+        self.cached_upper_rows = upper;
+
+        // Output column stats: group keys keep their input stats; aggregate
+        // outputs are bounded by the group count (ndv ≤ upper), min/max
+        // unknown. Skip when the upstream carries no full per-column array —
+        // fabricating one would change the "empty ⇒ no info" contract.
+        if (up.column_stats.len != up_schema.len) return;
+        const aa = self.arena.allocator();
+        const out_stats = try aa.alloc(exec.ColStat, self.output_schema.len);
+        for (self.group_col_indices, 0..) |ci, i| out_stats[i] = up.column_stats[ci];
+        const agg_ndv: exec.ColCard = if (upper > std.math.maxInt(u32))
+            .unknown
+        else
+            .{ .exact = @intCast(upper) };
+        for (out_stats[self.group_col_indices.len..]) |*s| s.* = .{ .ndv = agg_ndv };
+        exec.capColStats(out_stats, upper);
+        self.cached_stats = out_stats;
     }
 
     pub fn accountant(self: *Aggregate) ?*exec.memory.MemoryAccountant {

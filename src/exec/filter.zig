@@ -30,6 +30,11 @@ pub const Filter = struct {
     expr: PredicateExpr,
     schema: []const Column,
 
+    /// Upstream per-column stats tightened by this filter's predicate
+    /// (proven upper bounds only). Empty when the upstream carries no
+    /// full per-column array. Cached at create; borrowed by `stats()`.
+    cached_stats: []const exec.ColStat = &.{},
+
     /// Per-column accumulator. Mirrors the memtable's storage shape so the
     /// same view() helper applies.
     filtered: []ColumnStore,
@@ -81,6 +86,14 @@ pub const Filter = struct {
             else => return err,
         };
 
+        // Tighten the upstream per-column stats with this predicate's proven
+        // bounds (eq pins a column to one value, ranges clamp min/max, etc.).
+        // Computed after `validateExpr` so any integer-literal widening is
+        // reflected in `self.expr`. The Scan-fusion offer below doesn't change
+        // the OUTPUT this Filter represents, so the tightening holds either way.
+        self.cached_stats = try tightenStats(allocator, self.upstream.stats(), schema, self.expr);
+        errdefer if (self.cached_stats.len > 0) allocator.free(@constCast(self.cached_stats));
+
         // Offer the full (validated) predicate to the upstream Scan for in-place
         // filtering. If it accepts, it emits compacted owned survivors and this
         // Filter degrades to a pass-through. The expr it borrows is `self.expr`,
@@ -93,6 +106,7 @@ pub const Filter = struct {
     pub fn deinit(self: *Filter) void {
         var up = self.upstream;
         up.deinit();
+        if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
         for (self.filtered) |*c| c.deinit(self.allocator);
         self.allocator.free(self.filtered);
         self.allocator.free(self.views);
@@ -108,11 +122,18 @@ pub const Filter = struct {
         return self.upstream.addPrune(pred);
     }
 
-    /// Filter only restricts rows — upper bound is unchanged
-    /// (selectivity unknown without scanning). Sort state preserved
-    /// (Filter doesn't reorder).
+    /// Filter only restricts rows — `upper_rows` is unchanged (a filter is
+    /// only provably ≤ input; we don't estimate a reduction). Sort state
+    /// preserved (Filter doesn't reorder). Per-column stats are tightened by
+    /// the predicate's proven bounds (see `tightenStats`), then capped at
+    /// `upper_rows`.
     pub fn stats(self: *Filter) exec.PipelineStats {
-        return self.upstream.stats();
+        const up = self.upstream.stats();
+        return .{
+            .upper_rows = up.upper_rows,
+            .sort_state = up.sort_state,
+            .column_stats = if (self.cached_stats.len > 0) self.cached_stats else up.column_stats,
+        };
     }
 
     pub fn accountant(self: *Filter) ?*exec.memory.MemoryAccountant {
@@ -153,3 +174,94 @@ pub const Filter = struct {
         }
     }
 };
+
+/// Tighten the upstream per-column stats with the proven bounds a filter
+/// predicate guarantees. Only top-level AND conjuncts contribute (an OR/NOT
+/// branch proves nothing about any single column). For each contributing
+/// leaf the column's bound shrinks; `upper_rows` (the row ceiling) is left to
+/// the caller, then every column's ndv is capped at it.
+///
+/// Returns `&.{}` (caller falls back to upstream's array) when the upstream
+/// doesn't carry a full per-column array — fabricating one would change the
+/// "empty ⇒ no info" contract downstream consumers rely on. Caller owns the
+/// returned slice.
+fn tightenStats(
+    allocator: Allocator,
+    up: exec.PipelineStats,
+    schema: []const Column,
+    expr: PredicateExpr,
+) ![]const exec.ColStat {
+    if (up.column_stats.len != schema.len) return &.{};
+
+    const out = try allocator.alloc(exec.ColStat, schema.len);
+    errdefer allocator.free(out);
+    @memcpy(out, up.column_stats);
+
+    applyConjuncts(out, schema, expr);
+    exec.capColStats(out, up.upper_rows);
+    return out;
+}
+
+/// Walk top-level AND conjuncts, tightening `stats` for each `.leaf` /
+/// `.in_set` whose column resolves in `schema`.
+fn applyConjuncts(stats: []exec.ColStat, schema: []const Column, expr: PredicateExpr) void {
+    switch (expr) {
+        .@"and" => |children| for (children) |c| applyConjuncts(stats, schema, c),
+        .leaf => |p| applyLeaf(stats, schema, p),
+        .in_set => |s| applyInSet(stats, schema, s),
+        else => {},
+    }
+}
+
+fn applyLeaf(stats: []exec.ColStat, schema: []const Column, p: Predicate) void {
+    const idx = types.findColumn(schema, p.col) orelse return;
+    const has_range = predicate.typeHasRange(schema[idx].type);
+    const v: ?i128 = predicate.valueToRangeI128(p.val);
+    var s = &stats[idx];
+    switch (p.op) {
+        // `col = v`: exactly one surviving value.
+        .eq => {
+            s.ndv = .{ .exact = 1 };
+            if (has_range) if (v) |val| {
+                s.min = val;
+                s.max = val;
+            };
+        },
+        // `col <> v`: at most one distinct value is removed.
+        .neq => switch (s.ndv) {
+            .exact => |n| s.ndv = .{ .exact = @max(1, n) - 1 },
+            .unknown => {},
+        },
+        // `col < v` / `col <= v`: clamp the upper end.
+        .lt, .lte => if (has_range) if (v) |val| {
+            s.max = if (s.max) |m| @min(m, val) else val;
+        },
+        // `col > v` / `col >= v`: clamp the lower end.
+        .gt, .gte => if (has_range) if (v) |val| {
+            s.min = if (s.min) |m| @max(m, val) else val;
+        },
+    }
+}
+
+/// `col IN (k literals)`: ndv ≤ k; min/max clamp the prior range to the
+/// span of the literal set (intersection of bounds).
+fn applyInSet(stats: []exec.ColStat, schema: []const Column, in: predicate.InSet) void {
+    if (in.negate) return; // NOT IN proves no single-column bound
+    const idx = types.findColumn(schema, in.col) orelse return;
+    const k: u32 = if (in.values.len > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(in.values.len);
+    var s = &stats[idx];
+    switch (s.ndv) {
+        .exact => |n| s.ndv = .{ .exact = @min(n, k) },
+        .unknown => s.ndv = .{ .exact = k },
+    }
+    if (!predicate.typeHasRange(schema[idx].type)) return;
+    var set_min: ?i128 = null;
+    var set_max: ?i128 = null;
+    for (in.values) |val| {
+        const iv = predicate.valueToRangeI128(val) orelse continue;
+        set_min = if (set_min) |m| @min(m, iv) else iv;
+        set_max = if (set_max) |m| @max(m, iv) else iv;
+    }
+    if (set_min) |lo| s.min = if (s.min) |m| @max(m, lo) else lo;
+    if (set_max) |hi| s.max = if (s.max) |m| @min(m, hi) else hi;
+}

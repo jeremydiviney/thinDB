@@ -2195,7 +2195,7 @@ fn tryMinMaxStats(allocator: Allocator, table: *ApiTable, aggs: []const exec.Agg
 /// (post-filter, derived/computed, or no on-disk stat) contributes no usable
 /// factor — but the row-count ceiling still bounds the whole combo, so we fall
 /// back to that ceiling rather than giving up and sorting. `schema` is the
-/// group-by input's output schema (column_cards is indexed by it).
+/// group-by input's output schema (column_stats is indexed by it).
 ///
 /// TODO(FD): tighten further with functional-dependency detection — a key that
 /// is a deterministic function of another key (e.g. `ClientIP - 1`) adds zero
@@ -2230,11 +2230,11 @@ fn groupKeysCardUnderLimit(
     var any_unknown = false;
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc).?;
-        if (idx >= st.column_cards.len) {
+        if (idx >= st.column_stats.len) {
             any_unknown = true;
             continue;
         }
-        switch (st.column_cards[idx]) {
+        switch (st.column_stats[idx].ndv) {
             .unknown => any_unknown = true,
             .exact => |nd| product *|= nd,
         }

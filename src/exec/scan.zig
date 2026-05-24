@@ -35,21 +35,28 @@ const statsOverlapPredicate = predicate.statsOverlapPredicate;
 
 const rowloc = @import("rowloc.zig");
 
-/// Merge each column's per-segment HyperLogLog sketches (register-wise max)
-/// into a distinct-value estimate for the whole scan, plus a conservative
-/// allowance for un-flushed memtable rows. `unknown` when the estimate
-/// reaches the limit; otherwise `exact` with the estimate as the bound.
-/// Merging HLL avoids the over-counting that summing per-segment counts
-/// suffers as segment count grows.
-fn computeColumnCards(
+/// Build the per-projected-column propagated statistic for the whole scan:
+///   - `ndv`: merge each column's per-segment HyperLogLog sketches
+///     (register-wise max) into a distinct-value estimate, plus a
+///     conservative allowance for un-flushed memtable rows. Merging HLL
+///     avoids the over-counting that summing per-segment counts suffers as
+///     segment count grows. `unknown` only when the estimate can't fit the
+///     u32 bound; otherwise `exact`.
+///   - `min`/`max`: fold the manifest's per-segment per-column i128 min/max
+///     for int-family columns (see `predicate.typeHasRange`). A non-empty
+///     memtable holds un-summarized rows, so its presence forces min/max to
+///     `null` (we can't prove a bound over rows with no stored stats).
+///     Columns whose type carries no usable numeric range stay `null`.
+fn computeColumnStats(
     allocator: Allocator,
+    columns: []const Column,
     segs: []const storage.ManifestEntry,
     out_phys: []const usize,
     memtable_rows: u64,
-) ![]exec.ColCard {
-    const cards = try allocator.alloc(exec.ColCard, out_phys.len);
-    errdefer allocator.free(cards);
-    for (cards, 0..) |*card, j| {
+) ![]exec.ColStat {
+    const stats = try allocator.alloc(exec.ColStat, out_phys.len);
+    errdefer allocator.free(stats);
+    for (stats, 0..) |*stat, j| {
         const ci = out_phys[j];
         var merged: hll.Hll = .{};
         var have_sketch = false;
@@ -61,24 +68,32 @@ fn computeColumnCards(
                 have_sketch = true;
             }
         }
-        if (!have_sketch and memtable_rows == 0) {
-            card.* = .{ .exact = 0 };
-            continue;
+
+        const ndv: exec.ColCard = if (!have_sketch and memtable_rows == 0)
+            .{ .exact = 0 }
+        else blk: {
+            const est = merged.estimate() +| memtable_rows;
+            break :blk if (est > std.math.maxInt(u32)) .unknown else .{ .exact = @intCast(est) };
+        };
+
+        // Min/max only when the column type carries a usable numeric range
+        // AND every contributing row is summarized in the manifest (the
+        // memtable holds un-summarized rows, so any memtable row breaks the
+        // proof). Fold the per-segment column min/max.
+        var min: ?i128 = null;
+        var max: ?i128 = null;
+        if (predicate.typeHasRange(columns[ci].type) and memtable_rows == 0) {
+            for (segs) |e| {
+                if (e.column_stats.len <= ci) continue;
+                const cs = e.column_stats[ci];
+                min = if (min) |m| @min(m, cs.min) else cs.min;
+                max = if (max) |m| @max(m, cs.max) else cs.max;
+            }
         }
-        // Memtable rows are un-sketched; each could be a new distinct value,
-        // so add the row count as a conservative upper bump. Report the full
-        // merged HLL estimate (accurate to ~1% well into the billions on a
-        // fixed-size sketch) rather than clamping high cardinalities to
-        // `.unknown` — the GROUP BY router weighs this estimate against the
-        // memory budget to choose hash vs sort. Only fall back to `.unknown`
-        // if the estimate can't fit the u32 bound.
-        const est = merged.estimate() +| memtable_rows;
-        card.* = if (est > std.math.maxInt(u32))
-            .unknown
-        else
-            .{ .exact = @intCast(est) };
+
+        stat.* = .{ .ndv = ndv, .min = min, .max = max };
     }
-    return cards;
+    return stats;
 }
 
 /// Resolve the projection-pushdown column set to physical (table-order)
@@ -207,10 +222,11 @@ pub const Scan = struct {
     owned_accountant: ?*exec.memory.MemoryAccountant = null,
     owns_accountant: bool = false,
 
-    /// Per-column distinct-value bound, merged across this scan's segment
-    /// snapshot (+ memtable rows). Computed once at create; borrowed by
-    /// `stats()`. One slot per schema column.
-    cached_cards: []exec.ColCard = &.{},
+    /// Per-projected-column propagated statistic (distinct-value bound +
+    /// min/max range), merged across this scan's segment snapshot (+
+    /// memtable rows). Computed once at create; borrowed by `stats()`. One
+    /// slot per projected column.
+    cached_stats: []exec.ColStat = &.{},
 
     /// When non-null, `seg_skip[i] == true` means segment at manifest
     /// index `i` is excluded by a pushed-down predicate on the leading
@@ -358,13 +374,14 @@ pub const Scan = struct {
             if (owned_accountant) |a| allocator.destroy(a);
         };
 
-        const cached_cards = try computeColumnCards(
+        const cached_stats = try computeColumnStats(
             allocator,
+            table.schema.columns,
             table.manifest.segments.items[0..segment_count],
             out_phys,
             memtable_row_count,
         );
-        errdefer allocator.free(cached_cards);
+        errdefer allocator.free(cached_stats);
 
         self.* = .{
             .allocator = allocator,
@@ -382,7 +399,7 @@ pub const Scan = struct {
             .prunes = .empty,
             .owned_accountant = owned_accountant,
             .owns_accountant = owns_accountant,
-            .cached_cards = cached_cards,
+            .cached_stats = cached_stats,
         };
 
         return self;
@@ -411,7 +428,7 @@ pub const Scan = struct {
         if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
-        if (self.cached_cards.len > 0) self.allocator.free(self.cached_cards);
+        if (self.cached_stats.len > 0) self.allocator.free(self.cached_stats);
         self.prunes.deinit(self.allocator);
         if (self.owns_accountant) {
             if (self.owned_accountant) |a| self.allocator.destroy(a);
@@ -567,7 +584,7 @@ pub const Scan = struct {
                 .keys = self.table.schema.order_key,
                 .global = global,
             },
-            .column_cards = self.cached_cards,
+            .column_stats = self.cached_stats,
         };
     }
 

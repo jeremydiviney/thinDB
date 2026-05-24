@@ -27,9 +27,10 @@ pub const Project = struct {
     output_schema: []Column,
     column_map: []usize, // output_idx → upstream_idx
     views: []ColumnView,
-    /// Upstream per-column cardinality bounds remapped to the projected
-    /// columns. Empty when the upstream has none. Cached at create.
-    cached_cards: []const exec.ColCard = &.{},
+    /// Upstream per-column stats remapped to the projected columns (a
+    /// passed-through column keeps its ndv + min/max). Empty when the
+    /// upstream has none. Cached at create.
+    cached_stats: []const exec.ColStat = &.{},
 
     pub fn create(allocator: Allocator, upstream: Query, names: []const []const u8) !Query {
         const up_schema = upstream.outputSchema();
@@ -46,14 +47,15 @@ pub const Project = struct {
             out_schema[i] = up_schema[idx];
         }
 
-        // Remap per-column cardinality bounds to the projected columns.
-        const up_cards = upstream.stats().column_cards;
-        const cached_cards: []const exec.ColCard = if (up_cards.len == 0) &.{} else blk: {
-            const cc = try allocator.alloc(exec.ColCard, names.len);
-            for (column_map, cc) |src, *out| out.* = if (src < up_cards.len) up_cards[src] else .unknown;
+        // Remap per-column stats to the projected column order.
+        const up = upstream.stats();
+        const cached_stats: []const exec.ColStat = if (up.column_stats.len == 0) &.{} else blk: {
+            const cc = try allocator.alloc(exec.ColStat, names.len);
+            for (column_map, cc) |src, *out| out.* = if (src < up.column_stats.len) up.column_stats[src] else .{ .ndv = .unknown };
+            exec.capColStats(cc, up.upper_rows);
             break :blk cc;
         };
-        errdefer if (cached_cards.len > 0) allocator.free(cached_cards);
+        errdefer if (cached_stats.len > 0) allocator.free(@constCast(cached_stats));
 
         const self = try allocator.create(Project);
         errdefer allocator.destroy(self);
@@ -63,7 +65,7 @@ pub const Project = struct {
             .output_schema = out_schema,
             .column_map = column_map,
             .views = views,
-            .cached_cards = cached_cards,
+            .cached_stats = cached_stats,
         };
         return makeQuery(allocator, self);
     }
@@ -74,7 +76,7 @@ pub const Project = struct {
         self.allocator.free(self.output_schema);
         self.allocator.free(self.column_map);
         self.allocator.free(self.views);
-        if (self.cached_cards.len > 0) self.allocator.free(@constCast(self.cached_cards));
+        if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -111,7 +113,7 @@ pub const Project = struct {
                 .descs = if (up.sort_state.descs.len == 0) &.{} else up.sort_state.descs[0..kept_prefix_len],
                 .global = up.sort_state.global,
             },
-            .column_cards = self.cached_cards,
+            .column_stats = self.cached_stats,
         };
     }
 
@@ -156,6 +158,10 @@ pub const Limit = struct {
     /// batch. Each starts empty; allocated lazily only for nullable
     /// columns when the offset boundary is mid-batch.
     null_scratch: [][]u8,
+    /// Upstream per-column stats with each ndv re-capped at this Limit's
+    /// row bound. Empty when the upstream carries no array. Cached at
+    /// create; borrowed by `stats()`.
+    cached_stats: []const exec.ColStat = &.{},
 
     pub fn create(allocator: Allocator, upstream: Query, n: usize) !Query {
         return createOffset(allocator, upstream, n, 0);
@@ -171,6 +177,17 @@ pub const Limit = struct {
         errdefer allocator.free(null_scratch);
         for (null_scratch) |*s| s.* = &.{};
 
+        // Recompute the per-column ndv cap from the post-limit row bound.
+        const up = upstream.stats();
+        const upper = @min(@as(u64, n), up.upper_rows);
+        const cached_stats: []const exec.ColStat = if (up.column_stats.len == 0) &.{} else blk: {
+            const cs = try allocator.alloc(exec.ColStat, up.column_stats.len);
+            @memcpy(cs, up.column_stats);
+            exec.capColStats(cs, upper);
+            break :blk cs;
+        };
+        errdefer if (cached_stats.len > 0) allocator.free(@constCast(cached_stats));
+
         const self = try allocator.create(Limit);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -181,6 +198,7 @@ pub const Limit = struct {
             .views = views,
             .drop_views = drop_views,
             .null_scratch = null_scratch,
+            .cached_stats = cached_stats,
         };
         return makeQuery(allocator, self);
     }
@@ -188,6 +206,7 @@ pub const Limit = struct {
     pub fn deinit(self: *Limit) void {
         var up = self.upstream;
         up.deinit();
+        if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
         for (self.null_scratch) |s| if (s.len > 0) self.allocator.free(s);
         self.allocator.free(self.null_scratch);
         self.allocator.free(self.drop_views);
@@ -205,13 +224,15 @@ pub const Limit = struct {
     }
 
     /// Limit clamps row count to `min(n, upstream.upper)`. Sort state
-    /// preserved (Limit just truncates, doesn't reorder).
+    /// preserved (Limit just truncates, doesn't reorder). Per-column ndv
+    /// re-capped at the post-limit bound (cached at create); min/max
+    /// unchanged.
     pub fn stats(self: *Limit) exec.PipelineStats {
         const up = self.upstream.stats();
         return .{
             .upper_rows = @min(@as(u64, self.remaining), up.upper_rows),
             .sort_state = up.sort_state,
-            .column_cards = up.column_cards,
+            .column_stats = if (self.cached_stats.len > 0) self.cached_stats else up.column_stats,
         };
     }
 

@@ -1469,6 +1469,40 @@ fn cmpInto(comptime T: type, data: []const T, want: T, mask: []bool, op: Predica
     }
 }
 
+/// True iff a column of this type carries a usable numeric min/max range
+/// in the propagated `ColStat`. The int family, temporal, boolean, and
+/// decimal types store their literal value directly as the i128 range key
+/// (matching `valueToRangeI128`). Strings (prefix-encoded), uuid (top-bit
+/// XOR), and floats (no stats) are excluded — their manifest stats aren't a
+/// usable numeric range in the value's own domain.
+pub fn typeHasRange(t: types.Type) bool {
+    return switch (t) {
+        .int, .bigint, .smallint, .tinyint, .largeint => true,
+        .boolean, .date, .datetime => true,
+        .decimal64, .decimal128 => true,
+        .varchar, .string, .char, .uuid, .float, .double => false,
+    };
+}
+
+/// Map a predicate literal `Value` into the i128 range domain used by
+/// `ColStat.min`/`.max`. Returns null for types that carry no usable
+/// numeric range (strings, uuid, floats) — mirrors `typeHasRange`.
+pub fn valueToRangeI128(v: Value) ?i128 {
+    return switch (v) {
+        .int => |x| x,
+        .bigint => |x| x,
+        .boolean => |x| @intFromBool(x),
+        .date => |x| x,
+        .datetime => |x| x,
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        .largeint => |x| x,
+        .decimal64 => |x| x,
+        .decimal128 => |x| x,
+        .text, .uuid, .float, .double => null,
+    };
+}
+
 /// Returns true if the row-group stats could contain rows matching `op val`.
 /// Used by Scan and DELETE to decide whether to skip a row group entirely.
 ///

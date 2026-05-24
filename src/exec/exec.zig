@@ -192,6 +192,41 @@ pub const ColCard = union(enum) {
     unknown,
 };
 
+/// Per-column propagated statistic: a distinct-value bound plus an optional
+/// proven min/max range. `min`/`max` are i128 in the value's own domain
+/// (the same encoding `statsOverlapPredicate` compares against) and are only
+/// populated for fixed-width int-family columns (integers, temporal,
+/// boolean, decimal); they stay `null` for float, string, and uuid columns
+/// whose manifest stats aren't a usable numeric range. All three fields are
+/// PROVABLE UPPER/inclusive bounds — operators only ever tighten them, never
+/// estimate beyond what the data guarantees.
+pub const ColStat = struct {
+    ndv: ColCard = .unknown,
+    min: ?i128 = null,
+    max: ?i128 = null,
+};
+
+/// Cap a column statistic's distinct-value bound at `upper_rows`: a column
+/// can never hold more distinct values than there are rows. Leaves min/max
+/// untouched. An `.unknown` ndv stays `.unknown` — it signals "no usable
+/// finite bound" to the GROUP BY router, and turning it into a concrete
+/// `upper_rows` figure would change routing. Only an existing `.exact`
+/// bound is tightened. Applied at the end of every operator's transform.
+pub fn capColStat(stat: ColStat, upper_rows: u64) ColStat {
+    var out = stat;
+    const cap: u32 = if (upper_rows > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(upper_rows);
+    switch (out.ndv) {
+        .exact => |n| out.ndv = .{ .exact = @min(n, cap) },
+        .unknown => {},
+    }
+    return out;
+}
+
+/// Cap every column statistic in `stats` at `upper_rows` in place.
+pub fn capColStats(stats: []ColStat, upper_rows: u64) void {
+    for (stats) |*s| s.* = capColStat(s.*, upper_rows);
+}
+
 /// Pre-execution statistics about an operator's output.
 pub const PipelineStats = struct {
     /// Upper bound on the number of rows this operator will emit.
@@ -201,9 +236,10 @@ pub const PipelineStats = struct {
     upper_rows: u64,
     /// Sort property of the output stream. See `SortState`.
     sort_state: SortState = .{},
-    /// Per-output-column distinct-value bound, indexed by output schema
-    /// column. Empty ⇒ no information (all columns unknown).
-    column_cards: []const ColCard = &.{},
+    /// Per-output-column propagated statistic (distinct-value bound + min/max
+    /// range), indexed by output schema column. Empty ⇒ no information (all
+    /// columns unknown).
+    column_stats: []const ColStat = &.{},
 };
 
 pub const Query = struct {
@@ -504,37 +540,37 @@ pub fn lateScan(
     return @import("latescan.zig").LateScan.create(allocator, inner, scan_ptr, table, output_names);
 }
 
-/// Build a join's output `column_cards` by concatenating the left columns'
-/// bounds with the kept right columns' bounds (the join output schema is
+/// Build a join's output `column_stats` by concatenating the left columns'
+/// stats with the kept right columns' stats (the join output schema is
 /// `left ⧺ right-where-kept`). A join can't grow a column's distinct count,
-/// so each side's bound stays a valid upper bound. Returns `&.{}` when
-/// neither side carries cardinality info. Shared by all join operators.
-/// `right_kept_mask` is null when every right column is kept (range joins
-/// that drop no equi key).
-pub fn concatJoinCards(
+/// and an unchanged column keeps its min/max, so each side's stat stays a
+/// valid upper bound. Returns `&.{}` when neither side carries stats. Shared
+/// by all join operators. `right_kept_mask` is null when every right column
+/// is kept (range joins that drop no equi key).
+pub fn concatJoinStats(
     allocator: Allocator,
     left: Query,
     right: Query,
     left_col_count: usize,
     right_kept_mask: ?[]const bool,
     output_len: usize,
-) ![]const ColCard {
-    const lc = left.stats().column_cards;
-    const rc = right.stats().column_cards;
-    if (lc.len == 0 and rc.len == 0) return &.{};
-    const cc = try allocator.alloc(ColCard, output_len);
-    for (cc[0..left_col_count], 0..) |*out, i| out.* = if (i < lc.len) lc[i] else .unknown;
+) ![]const ColStat {
+    const ls = left.stats().column_stats;
+    const rs = right.stats().column_stats;
+    if (ls.len == 0 and rs.len == 0) return &.{};
+    const cc = try allocator.alloc(ColStat, output_len);
+    for (cc[0..left_col_count], 0..) |*out, i| out.* = if (i < ls.len) ls[i] else .{};
     var oi: usize = left_col_count;
     if (right_kept_mask) |mask| {
         for (mask, 0..) |keep, ri| {
             if (!keep) continue;
-            cc[oi] = if (ri < rc.len) rc[ri] else .unknown;
+            cc[oi] = if (ri < rs.len) rs[ri] else .{};
             oi += 1;
         }
     } else {
         var ri: usize = 0;
         while (oi < output_len) : (oi += 1) {
-            cc[oi] = if (ri < rc.len) rc[ri] else .unknown;
+            cc[oi] = if (ri < rs.len) rs[ri] else .{};
             ri += 1;
         }
     }
