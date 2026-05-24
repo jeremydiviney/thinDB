@@ -196,6 +196,28 @@ const ConcatAcc = struct {
     nonempty: bool = false,
 };
 
+/// Batched COUNT(DISTINCT <int col>) state for one aggregate under a GROUP BY.
+/// Replaces the per-row insert into each group's own `AccState.distinct_int`
+/// (which scatters one hash map per group across the arena) with a single
+/// combined open-addressing set keyed on `pack(gid, value)` plus a flat per-gid
+/// counter. One probe per row into one contiguous table — the DuckDB shape.
+/// Only built when the distinct value column is int-family ≤64 bits, so the
+/// `gid << vbits | value_bits` pack stays bijective inside the u128 key (gid <
+/// n_groups < 2^23, vbits ≤ 64 ⟹ never overflows 128 bits) and distinct
+/// (gid, value) pairs map 1:1 to distinct keys — an exact per-group count.
+const CombinedDistinct = struct {
+    /// Combined (gid, value) membership set. `IntGroupTable` is reused as a
+    /// pure set: the stored `gid` slot field is unused (`commit(slot, key, 0)`),
+    /// membership is the probe's `found` flag.
+    table: IntGroupTable,
+    /// Per-GROUP-gid distinct count, indexed by the aggregate's group gid.
+    /// `appendInitialState` appends a 0 for every new group.
+    counts: std.ArrayListUnmanaged(u64) = .empty,
+    /// Bit width of the value column (`intKeyBits(value_type)`, ≤64): the shift
+    /// amount that places gid above the value bits in the combined key.
+    vbits: u8,
+};
+
 pub const Aggregate = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -261,6 +283,16 @@ pub const Aggregate = struct {
     /// inline; the batched scatter-update kernels then consume it once per
     /// aggregate. Arena-owned, cleared per batch.
     pf_gids: std.ArrayListUnmanaged(u32) = .empty,
+    /// Per-aggregate combined COUNT(DISTINCT int) state, or `null` when the
+    /// aggregate stays on its existing path (not count_distinct, no GROUP BY,
+    /// or a non-int / >64-bit / float / string distinct column). Indexed by
+    /// aggregate index `ai`. Arena-owned (tables + counts), like `gstate`.
+    cd: []?CombinedDistinct,
+    /// Per-batch scratch for the combined-distinct kernel: each valid row's
+    /// packed `(gid, value)` key + its hash. Cleared per batch, reused across
+    /// the combined-distinct aggregates within a batch. Arena-owned.
+    pf_cd_keys: std.ArrayListUnmanaged(u128) = .empty,
+    pf_cd_hashes: std.ArrayListUnmanaged(u64) = .empty,
     /// Reusable buffer for building per-row group keys during accumulate.
     /// Allocated once, grown to max-key-size, cleared+reused per row.
     /// Saves ~1 arena alloc per row in the inner loop.
@@ -345,6 +377,14 @@ pub const Aggregate = struct {
             s.* = initialState(a.func, in_t);
         }
 
+        // Per-aggregate combined-distinct slot, populated below for those
+        // aggregates the gate selects. Start all-null; the arena-backed table /
+        // counts are filled once the arena exists (the `group_col_indices.len >
+        // 0` block), since the combined path requires a GROUP BY.
+        const cd = try allocator.alloc(?CombinedDistinct, aggs.len);
+        errdefer allocator.free(cd);
+        for (cd) |*c| c.* = null;
+
         // Resolve the top-k hint against this aggregate's output. Fuses only
         // when grouping and *every* order key binds to a numeric aggregate
         // output (string MIN/MAX, stddev/variance, percentile, group_concat,
@@ -373,6 +413,7 @@ pub const Aggregate = struct {
             .output_columns = output_columns,
             .views = views,
             .single_state = single_state,
+            .cd = cd,
             .int_layout = int_layout,
             .key_scratch = .empty,
             .single_str_key = group_col_indices.len == 1 and switch (up_schema[group_col_indices[0]].type) {
@@ -423,6 +464,40 @@ pub const Aggregate = struct {
                     self.gkeys.ensureTotalCapacity(aa, cap) catch {};
                 }
             }
+
+            // Gate the combined COUNT(DISTINCT int) kernel per aggregate. The
+            // combined set holds up to one entry per distinct (gid, value) pair,
+            // so presize from the value column's cardinality estimate (the
+            // dominant term) capped at the upstream row bound. The cap is the
+            // load-bearing part: `upper_rows` is the *scan's* estimate and a
+            // filter between scan and aggregate doesn't shrink it (Filter.stats
+            // passes through), so an unfiltered-but-selective query (e.g.
+            // ClickBench Q10/Q11, `WHERE MobilePhoneModel <> ''` keeps ~4% of
+            // rows) would otherwise presize the set to the full ~1M-distinct
+            // UserID estimate and pay a multi-MB zero-fill for a few-thousand-
+            // entry set. Capping at PRESIZE_CAP costs the genuinely-large
+            // unfiltered case (Q08/Q09) only a couple of cheap amortized
+            // re-grows while keeping the selective case off the cliff.
+            for (aggs, agg_col_indices, cd) |a, maybe_idx, *slot| {
+                if (a.func != .count_distinct) continue;
+                const idx = maybe_idx orelse continue;
+                const vt = up_schema[idx].type;
+                const vbits = intKeyBits(vt) orelse continue;
+                if (vbits > 64) continue;
+                var set_cap: usize = 0;
+                if (idx < st.column_cards.len) {
+                    switch (st.column_cards[idx]) {
+                        .exact => |nd| set_cap = @intCast(@min(nd, @max(st.upper_rows, 1))),
+                        .unknown => {},
+                    }
+                }
+                set_cap = @min(set_cap, PRESIZE_CAP);
+                slot.* = .{
+                    .table = IntGroupTable.init(aa, set_cap) catch try IntGroupTable.init(aa, 0),
+                    .vbits = vbits,
+                };
+                if (cap > 0) slot.*.?.counts.ensureTotalCapacity(aa, cap) catch {};
+            }
         }
         return makeQuery(allocator, self);
     }
@@ -437,6 +512,7 @@ pub const Aggregate = struct {
         self.allocator.free(self.group_col_indices);
         self.allocator.free(self.agg_col_indices);
         self.allocator.free(self.single_state);
+        self.allocator.free(self.cd);
         if (self.top_k) |r| self.allocator.free(r.keys);
         if (self.int_layout) |l| l.deinit(self.allocator);
         self.key_scratch.deinit(self.allocator);
@@ -535,6 +611,15 @@ pub const Aggregate = struct {
     /// footprint per batch (≤1024 rows).
     const PREFETCH_DIST: usize = 12;
 
+    /// Upper bound on the combined COUNT(DISTINCT int) set's presize (entries).
+    /// Bounds the per-query zero-fill of the set when the value-NDV / row-count
+    /// estimate is large but a selective filter (invisible to this operator's
+    /// stats) means few rows actually arrive. 2^18 ≈ a 4 MiB IntSlot table —
+    /// large enough that the genuinely-big unfiltered case only re-grows a
+    /// couple of (amortized) times, small enough that a selective query's
+    /// zero-fill stays off the cache cliff. See the presize site in `create`.
+    const PRESIZE_CAP: usize = 1 << 18;
+
     fn accumulateBatch(self: *Aggregate, batch: Batch) !void {
         const n = batch.row_count;
         const aa_state = self.arena.allocator();
@@ -571,8 +656,21 @@ pub const Aggregate = struct {
                 .min => try self.scatterMinMax(gids, na, ai, batch.values[self.agg_col_indices[ai].?], aa_state, true),
                 .max => try self.scatterMinMax(gids, na, ai, batch.values[self.agg_col_indices[ai].?], aa_state, false),
                 .avg => self.scatterAvg(gids, na, ai, batch.values[self.agg_col_indices[ai].?]),
-                // Complex aggregates keep the per-row update so their (single)
-                // definition of semantics is untouched.
+                // COUNT(DISTINCT int) under a GROUP BY runs the combined
+                // (gid, value) kernel; the gate left `cd[ai]` non-null only for
+                // those. Every other complex aggregate (stddev/var/percentile/
+                // group_concat, plus string/float/128-bit/no-group distinct)
+                // keeps the per-row update so its (single) definition of
+                // semantics is untouched.
+                .count_distinct => if (self.cd[ai] != null) {
+                    try self.accumulateCombinedDistinct(ai, batch.values[self.agg_col_indices[ai].?], gids);
+                } else {
+                    var r: u32 = 0;
+                    while (r < gids.len) : (r += 1) {
+                        const s = &self.gstate.items[@as(usize, gids[r]) * na + ai];
+                        try updateStateRow(aa_state, s, a, batch, self.agg_col_indices[ai], r);
+                    }
+                },
                 else => {
                     var r: u32 = 0;
                     while (r < gids.len) : (r += 1) {
@@ -744,12 +842,77 @@ pub const Aggregate = struct {
         }
     }
 
+    /// Batched COUNT(DISTINCT int) for aggregate `ai` (gate-confirmed: int
+    /// value column ≤64 bits, under a GROUP BY). One probe per valid row into a
+    /// single combined open-addressing set keyed on `pack(gid, value)`, plus a
+    /// flat per-gid counter bumped on each first sighting — no per-row dispatch,
+    /// no per-group scattered hash map. Mirrors the prefetch-pipelined shape of
+    /// `accumulateBatchInt`: the table is grown for the whole batch up front so
+    /// slot addresses stay stable across the look-ahead window, then phase (a)
+    /// packs key+hash for every valid row and phase (b) probes with a look-ahead
+    /// `@prefetch`. NULL rows are skipped (SQL excludes them from DISTINCT).
+    /// The combined key is bijective (gid < 2^23, vbits ≤ 64), so distinct
+    /// (gid, value) pairs map 1:1 to distinct keys ⇒ exact per-group count —
+    /// byte-identical to the per-group `distinct_int` path it replaces.
+    fn accumulateCombinedDistinct(self: *Aggregate, ai: usize, view: ColumnView, gids: []const u32) !void {
+        const c = &self.cd[ai].?;
+        const aa = self.arena.allocator();
+        const n: usize = gids.len;
+        const vbits: u7 = @intCast(c.vbits);
+        const has_nulls = view.nulls != null;
+
+        // Grow once up front for the worst case (every row a new pair), keeping
+        // slot addresses stable for the prefetch look-ahead below.
+        if (c.table.needsGrow(n)) try c.table.grow(aa, n);
+
+        // Phase (a): pack each valid row's combined key + its hash. NULL rows
+        // contribute nothing and are dropped here, so phase (b) needs no
+        // validity branch and the look-ahead indexes line up with the keys.
+        self.pf_cd_keys.clearRetainingCapacity();
+        self.pf_cd_hashes.clearRetainingCapacity();
+        try self.pf_cd_keys.ensureTotalCapacity(aa, n);
+        try self.pf_cd_hashes.ensureTotalCapacity(aa, n);
+        var r: usize = 0;
+        while (r < n) : (r += 1) {
+            if (has_nulls and !view.isValid(r)) continue;
+            const value_bits = distinctIntKey(view, @intCast(r));
+            const key = (@as(u128, gids[r]) << vbits) | value_bits;
+            self.pf_cd_keys.appendAssumeCapacity(key);
+            self.pf_cd_hashes.appendAssumeCapacity(group_table.hashU128(key));
+        }
+        const keys = self.pf_cd_keys.items;
+        const hashes = self.pf_cd_hashes.items;
+        const m = keys.len;
+
+        // Phase (b): probe with look-ahead prefetch; a first sighting commits
+        // the pair and bumps the owning group's counter. The owning gid is the
+        // key's high bits (`key >> vbits`) — no parallel gid array needed.
+        var i: usize = 0;
+        while (i < m) : (i += 1) {
+            const pf = i + PREFETCH_DIST;
+            if (pf < m) {
+                const b = c.table.bucketOf(hashes[pf]);
+                @prefetch(c.table.slotAddr(b), .{ .rw = .write, .locality = 1 });
+            }
+            const key = keys[i];
+            const probe = c.table.getOrPut(hashes[i], key);
+            if (!probe.found) {
+                c.table.commit(probe.slot, key, 0);
+                c.counts.items[@intCast(key >> vbits)] += 1;
+            }
+        }
+    }
+
     /// Append the initial accumulator state for a freshly-assigned group.
+    /// Runs once per new group; also seeds each combined-distinct aggregate's
+    /// gid-indexed counter with 0 so the count array stays in lockstep with the
+    /// group gids.
     fn appendInitialState(self: *Aggregate, aa: Allocator) !void {
         const up_schema = self.upstream.outputSchema();
-        for (self.aggs, self.agg_col_indices) |a, maybe_idx| {
+        for (self.aggs, self.agg_col_indices, 0..) |a, maybe_idx, ai| {
             const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
             try self.gstate.append(aa, initialState(a.func, in_t));
+            if (self.cd[ai]) |*c| try c.counts.append(aa, 0);
         }
     }
 
@@ -901,8 +1064,10 @@ pub const Aggregate = struct {
     }
 
     fn appendSingleResult(self: *Aggregate) !void {
+        // No GROUP BY ⇒ the combined-distinct gate never fires; every distinct
+        // aggregate stays on its AccState set, so `cd_count` is always null.
         for (self.aggs, 0..) |a, ai| {
-            try appendAccToColumn(self.allocator, a, self.single_state[ai], &self.output_columns[ai], self.output_schema[ai].type);
+            try appendAccToColumn(self.allocator, a, self.single_state[ai], &self.output_columns[ai], self.output_schema[ai].type, null);
         }
     }
 
@@ -935,7 +1100,8 @@ pub const Aggregate = struct {
 
         for (self.aggs, 0..) |a, ai| {
             const out_idx = self.group_col_indices.len + ai;
-            try appendAccToColumn(self.allocator, a, state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type);
+            const cd_count: ?u64 = if (self.cd[ai]) |c| c.counts.items[gid] else null;
+            try appendAccToColumn(self.allocator, a, state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type, cd_count);
         }
     }
 
@@ -955,7 +1121,7 @@ pub const Aggregate = struct {
         var gid: u32 = 0;
         while (gid < self.n_groups) : (gid += 1) {
             const base = @as(usize, gid) * na;
-            const cand = topkEntry(gid, self.gstate.items[base .. base + na], r.keys);
+            const cand = topkEntry(gid, self.gstate.items[base .. base + na], r.keys, self.cd);
             if (len < k) {
                 heap[len] = cand;
                 len += 1;
@@ -1155,7 +1321,10 @@ pub const SortedAggregate = struct {
         );
         for (self.aggs, 0..) |a, ai| {
             const out_idx = self.group_col_indices.len + ai;
-            try appendAccToColumn(self.allocator, a, self.cur_state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type);
+            // SortedAggregate keeps every distinct aggregate on its per-group
+            // AccState set (O(1)-in-cardinality streaming reset between groups),
+            // so it never uses the combined-distinct path.
+            try appendAccToColumn(self.allocator, a, self.cur_state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type, null);
         }
         // Group done — drop its transient state, keep the buffer for reuse.
         _ = self.arena.reset(.retain_capacity);
@@ -1291,10 +1460,18 @@ fn ovOrder(a: OrderVal, b: OrderVal) std.math.Order {
 }
 
 /// Build a heap entry, caching each ORDER BY key's order value up front so the
-/// comparator never touches the (large, scattered) accumulator union.
-fn topkEntry(gid: u32, state: []AccState, keys: []const ResolvedKey) TopKEntry {
+/// comparator never touches the (large, scattered) accumulator union. A key
+/// bound to a combined COUNT(DISTINCT int) aggregate reads its count from the
+/// gid-indexed `cd` counter (the AccState set is empty on that path); every
+/// other key decodes its `AccState`.
+fn topkEntry(gid: u32, state: []AccState, keys: []const ResolvedKey, cd: []const ?CombinedDistinct) TopKEntry {
     var e = TopKEntry{ .gid = gid, .vals = undefined };
-    for (keys, 0..) |kk, i| e.vals[i] = aggOrderValue(state[kk.agg_idx]);
+    for (keys, 0..) |kk, i| {
+        e.vals[i] = if (cd[kk.agg_idx]) |c|
+            .{ .int = @intCast(c.counts.items[gid]) }
+        else
+            aggOrderValue(state[kk.agg_idx]);
+    }
     return e;
 }
 
@@ -2013,6 +2190,11 @@ fn appendAccToColumn(
     state: AccState,
     col: *ColumnStore,
     out_type: Type,
+    /// For a combined COUNT(DISTINCT int) aggregate, the group's distinct count
+    /// from the gid-indexed `CombinedDistinct.counts` — overrides the
+    /// `AccState` set count (which the combined path never populates). `null`
+    /// for every other aggregate / call site.
+    cd_count: ?u64,
 ) !void {
     const func = spec.func;
     switch (func) {
@@ -2108,7 +2290,7 @@ fn appendAccToColumn(
             try col.data.double.append(allocator, out);
         },
         .count_distinct => {
-            const n: u32 = switch (state) {
+            const n: u64 = if (cd_count) |cnt| cnt else switch (state) {
                 .distinct => |set| set.count(),
                 .distinct_int => |set| set.count(),
                 else => unreachable,

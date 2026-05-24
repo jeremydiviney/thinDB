@@ -478,3 +478,191 @@ test "agg_stats: metadata-only MIN/MAX skips NULLs on a nullable column" {
     try std.testing.expectEqual(gb.values[0].data.int[0], b.values[0].data.int[0]);
     try std.testing.expectEqual(gb.values[1].data.int[0], b.values[1].data.int[0]);
 }
+
+/// `int RegionID-like group` + `nullable bigint UserID-like` distinct value:
+/// the exact shape that routes through the combined COUNT(DISTINCT int) kernel
+/// (int_layout group path + ≤64-bit int distinct value). Covers the cross-group
+/// collision (value 100 in two regions must count once *per region*), NULL
+/// exclusion, an all-NULL group (count 0), and multi-batch input (row_group=2).
+const cd_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "r", .type = .int },
+        .{ .name = "u", .type = .bigint, .nullable = true },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const cd_ok = [_][]const u8{"id"};
+const cd_opts = thindb.TableOptions{ .order_key = &cd_ok, .unique = true, .row_group_size = 2 };
+
+fn cdBigint(b: thindb.exec.Batch, r: i32) ?i64 {
+    for (0..b.row_count) |i| {
+        if (b.values[0].data.int[i] == r) return b.values[1].data.bigint[i];
+    }
+    return null;
+}
+
+test "aggregate: combined COUNT(DISTINCT int) by int group — exact per-group counts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", cd_schema, cd_opts);
+    // r=1: u={100,100,200,NULL} → distinct 2. r=2: u={100,300,300} → distinct 2
+    //   (the shared value 100 must NOT collapse across regions). r=3: u={NULL,
+    //   NULL} → distinct 0. r=4: u={500} → distinct 1.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .r = @as(i32, 1), .u = @as(i64, 100) },
+        .{ .id = @as(i64, 2), .r = @as(i32, 1), .u = @as(i64, 100) },
+        .{ .id = @as(i64, 3), .r = @as(i32, 1), .u = @as(i64, 200) },
+        .{ .id = @as(i64, 4), .r = @as(i32, 1), .u = @as(?i64, null) },
+        .{ .id = @as(i64, 5), .r = @as(i32, 2), .u = @as(i64, 100) },
+        .{ .id = @as(i64, 6), .r = @as(i32, 2), .u = @as(i64, 300) },
+        .{ .id = @as(i64, 7), .r = @as(i32, 2), .u = @as(i64, 300) },
+        .{ .id = @as(i64, 8), .r = @as(i32, 3), .u = @as(?i64, null) },
+        .{ .id = @as(i64, 9), .r = @as(i32, 3), .u = @as(?i64, null) },
+        .{ .id = @as(i64, 10), .r = @as(i32, 4), .u = @as(i64, 500) },
+    });
+    try t.flush();
+
+    // Full grouped emit: every per-group distinct count is exact.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.groupBy(&.{"r"}, &.{
+            .{ .func = .count_distinct, .col = "u", .as = "u" },
+        });
+        defer q.deinit();
+        var rows_seen: usize = 0;
+        while (try q.next()) |b| {
+            for (0..b.row_count) |_| rows_seen += 1;
+            try std.testing.expectEqual(@as(?i64, 2), cdBigint(b, 1));
+            try std.testing.expectEqual(@as(?i64, 2), cdBigint(b, 2));
+            try std.testing.expectEqual(@as(?i64, 0), cdBigint(b, 3));
+            try std.testing.expectEqual(@as(?i64, 1), cdBigint(b, 4));
+        }
+        try std.testing.expectEqual(@as(usize, 4), rows_seen);
+    }
+
+    // Q08 shape: ORDER BY u DESC LIMIT 2 → the two count-2 regions {1, 2}; the
+    // top-k heap must read the combined counter, not the (empty) AccState set.
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.groupByTopK(&.{"r"}, &.{
+            .{ .func = .count_distinct, .col = "u", .as = "u" },
+        }, .{ .k = 2, .keys = &.{.{ .col = "u", .desc = true }} });
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 2), b.row_count);
+        try std.testing.expectEqual(@as(?i64, 2), cdBigint(b, 1));
+        try std.testing.expectEqual(@as(?i64, 2), cdBigint(b, 2));
+        try std.testing.expectEqual(@as(?i64, null), cdBigint(b, 3));
+        try std.testing.expectEqual(@as(?i64, null), cdBigint(b, 4));
+    }
+}
+
+test "aggregate: combined distinct alongside other aggregates (Q09 shape)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", cd_schema, cd_opts);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .r = @as(i32, 1), .u = @as(i64, 7) },
+        .{ .id = @as(i64, 2), .r = @as(i32, 1), .u = @as(i64, 7) },
+        .{ .id = @as(i64, 3), .r = @as(i32, 1), .u = @as(i64, 9) },
+        .{ .id = @as(i64, 4), .r = @as(i32, 2), .u = @as(i64, 5) },
+    });
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.groupBy(&.{"r"}, &.{
+        .{ .func = .count, .as = "c" },
+        .{ .func = .sum, .col = "u", .as = "s" },
+        .{ .func = .count_distinct, .col = "u", .as = "nd" },
+    });
+    defer q.deinit();
+    var rows_seen: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            rows_seen += 1;
+            const r = b.values[0].data.int[i];
+            const c = b.values[1].data.bigint[i];
+            const s = b.values[2].data.bigint[i];
+            const nd = b.values[3].data.bigint[i];
+            if (r == 1) {
+                try std.testing.expectEqual(@as(i64, 3), c);
+                try std.testing.expectEqual(@as(i64, 23), s); // 7+7+9
+                try std.testing.expectEqual(@as(i64, 2), nd); // {7, 9}
+            } else if (r == 2) {
+                try std.testing.expectEqual(@as(i64, 1), c);
+                try std.testing.expectEqual(@as(i64, 5), s);
+                try std.testing.expectEqual(@as(i64, 1), nd);
+            } else return error.UnexpectedGroup;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows_seen);
+}
+
+const cd_str_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "s", .type = .string },
+        .{ .name = "u", .type = .bigint, .nullable = true },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const cd_str_ok = [_][]const u8{"id"};
+const cd_str_opts = thindb.TableOptions{ .order_key = &cd_str_ok, .unique = true, .row_group_size = 2 };
+
+test "aggregate: combined distinct under a string group (Q13 byte-group + int-distinct combo)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", cd_str_schema, cd_str_opts);
+    // String group keys (byte-table path) with the combined int-distinct kernel
+    // running on top — the same value reused across distinct string groups must
+    // stay separated by group gid.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .s = "alpha", .u = @as(i64, 1) },
+        .{ .id = @as(i64, 2), .s = "alpha", .u = @as(i64, 1) },
+        .{ .id = @as(i64, 3), .s = "alpha", .u = @as(i64, 2) },
+        .{ .id = @as(i64, 4), .s = "beta", .u = @as(i64, 1) },
+        .{ .id = @as(i64, 5), .s = "beta", .u = @as(?i64, null) },
+        .{ .id = @as(i64, 6), .s = "gamma", .u = @as(?i64, null) },
+    });
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.groupBy(&.{"s"}, &.{
+        .{ .func = .count_distinct, .col = "u", .as = "u" },
+    });
+    defer q.deinit();
+    var rows_seen: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            rows_seen += 1;
+            const s = b.values[0].data.string.rowBytes(i);
+            const nd = b.values[1].data.bigint[i];
+            if (std.mem.eql(u8, s, "alpha")) {
+                try std.testing.expectEqual(@as(i64, 2), nd); // {1, 2}
+            } else if (std.mem.eql(u8, s, "beta")) {
+                try std.testing.expectEqual(@as(i64, 1), nd); // {1}, NULL excluded
+            } else if (std.mem.eql(u8, s, "gamma")) {
+                try std.testing.expectEqual(@as(i64, 0), nd); // all NULL
+            } else return error.UnexpectedGroup;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows_seen);
+}
