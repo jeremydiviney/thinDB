@@ -222,14 +222,19 @@ const ConcatAcc = struct {
 /// combined open-addressing set keyed on `pack(gid, value)` plus a flat per-gid
 /// counter. One probe per row into one contiguous table — the DuckDB shape.
 /// Only built when the distinct value column is int-family ≤64 bits, so the
-/// `gid << vbits | value_bits` pack stays bijective inside the u128 key (gid <
-/// n_groups < 2^23, vbits ≤ 64 ⟹ never overflows 128 bits) and distinct
-/// (gid, value) pairs map 1:1 to distinct keys — an exact per-group count.
+/// `gid << vbits | value_bits` pack stays bijective and fits the 96-bit tier:
+/// gid is a u32 (≤32 bits) and vbits ≤ 64, so the packed key is ≤96 bits — it
+/// lands in `hi:u32 = gid`, `lo:u64 = value` with no loss, and distinct
+/// (gid, value) pairs map 1:1 to distinct keys (an exact per-group count). A
+/// >64-bit value (largeint/decimal128/uuid) can't combine (gid + 128 overflows
+/// 128) and stays on the per-group set.
 const CombinedDistinct = struct {
-    /// Combined (gid, value) membership set. `IntGroupTable` is reused as a
-    /// pure set: the stored `gid` slot field is unused (`commit(slot, key, 0)`),
-    /// membership is the probe's `found` flag.
-    table: IntGroupTable,
+    /// Combined (gid, value) membership set. `IntTable96` is reused as a pure
+    /// set: the stored `gid` slot field is unused (`commit(slot, key, 0)`),
+    /// membership is the probe's `found` flag. The 96-bit tier's 16-byte slot
+    /// (vs the 128-bit tier's 32-byte) halves the bytes moved per probe on this
+    /// memory-bound insert.
+    table: IntTable96,
     /// Per-GROUP-gid distinct count, indexed by the aggregate's group gid.
     /// `appendInitialState` appends a 0 for every new group.
     counts: std.ArrayListUnmanaged(u64) = .empty,
@@ -555,7 +560,7 @@ pub const Aggregate = struct {
                 }
                 set_cap = @min(set_cap, PRESIZE_CAP);
                 slot.* = .{
-                    .table = IntGroupTable.init(aa, set_cap) catch try IntGroupTable.init(aa, 0),
+                    .table = IntTable96.init(aa, set_cap) catch try IntTable96.init(aa, 0),
                     .vbits = vbits,
                 };
                 if (cap > 0) slot.*.?.counts.ensureTotalCapacity(aa, cap) catch {};
@@ -955,7 +960,7 @@ pub const Aggregate = struct {
             const value_bits = distinctIntKey(view, @intCast(r));
             const key = (@as(u128, gids[r]) << vbits) | value_bits;
             self.pf_cd_keys.appendAssumeCapacity(key);
-            self.pf_cd_hashes.appendAssumeCapacity(group_table.hashU128(key));
+            self.pf_cd_hashes.appendAssumeCapacity(IntTable96.hashKey(key));
         }
         const keys = self.pf_cd_keys.items;
         const hashes = self.pf_cd_hashes.items;
