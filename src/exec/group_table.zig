@@ -290,6 +290,102 @@ pub fn IntKeyTable(comptime max_bits: u16) type {
 /// takes this tier.
 pub const IntGroupTable = IntKeyTable(128);
 
+/// Open-addressing membership set over u64 keys, for exact COUNT(DISTINCT) on
+/// integer columns ≤64 bits (the value bits zero-extend injectively into a
+/// u64). Key-only 8-byte slots — no gid tax, so the slot is half (or a quarter)
+/// the width of the equivalent `IntKeyTable` tier and far fewer bytes move per
+/// probe, which dominates this memory-bound insert. `SENTINEL` marks an empty
+/// slot; the one real key that collides with it (a 64-bit column's all-ones
+/// value, e.g. `bigint` -1) is counted separately via `has_sentinel`. Built for
+/// a software-prefetch insert pipeline: `ensureFor` grows before a batch so slot
+/// addresses stay stable across the look-ahead window, then the caller
+/// interleaves `prefetch(look-ahead key)` with `insert(current key)`.
+pub const DistinctU64Set = struct {
+    /// Power-of-two-sized open-addressing table; `&.{}` ⟺ not yet allocated.
+    /// The probe mask is derived as `slots.len - 1` rather than stored, keeping
+    /// the struct at 24 bytes so it fits the Aggregate's `AccState` union
+    /// without widening it — a wider union would bloat the per-group `gstate`
+    /// array (5M entries for a high-card GROUP BY).
+    slots: []u64,
+    len: u32,
+    has_sentinel: bool,
+
+    pub const SENTINEL: u64 = std.math.maxInt(u64);
+
+    pub const empty: DistinctU64Set = .{ .slots = &.{}, .len = 0, .has_sentinel = false };
+
+    pub fn init(allocator: Allocator, expected: usize) !DistinctU64Set {
+        const cap = capacityFor(expected);
+        const slots = try allocator.alloc(u64, cap);
+        @memset(slots, SENTINEL);
+        return .{ .slots = slots, .len = 0, .has_sentinel = false };
+    }
+
+    pub fn deinit(self: *DistinctU64Set, allocator: Allocator) void {
+        if (self.slots.len != 0) allocator.free(self.slots);
+        self.* = undefined;
+    }
+
+    /// Reserve room for `additional` more keys so no grow fires mid-batch (slot
+    /// addresses must stay stable across the caller's prefetch look-ahead).
+    /// Allocates lazily on first use from the `empty` state.
+    pub fn ensureFor(self: *DistinctU64Set, allocator: Allocator, additional: usize) !void {
+        if (self.slots.len == 0) {
+            const cap = capacityFor(additional);
+            const slots = try allocator.alloc(u64, cap);
+            @memset(slots, SENTINEL);
+            self.slots = slots;
+            return;
+        }
+        if ((@as(usize, self.len) + additional) * 4 >= self.slots.len * 3) try self.grow(allocator, additional);
+    }
+
+    fn grow(self: *DistinctU64Set, allocator: Allocator, additional: usize) !void {
+        var new_cap = self.slots.len;
+        while ((@as(usize, self.len) + additional) * 4 >= new_cap * 3) new_cap *= 2;
+        const slots = try allocator.alloc(u64, new_cap);
+        @memset(slots, SENTINEL);
+        const new_mask = new_cap - 1;
+        for (self.slots) |k| {
+            if (k == SENTINEL) continue;
+            var i = @as(usize, @truncate(mix64(k))) & new_mask;
+            while (slots[i] != SENTINEL) : (i = (i + 1) & new_mask) {}
+            slots[i] = k;
+        }
+        allocator.free(self.slots);
+        self.slots = slots;
+    }
+
+    /// `@prefetch` the slot a future `insert(key)` will probe first.
+    pub inline fn prefetch(self: *DistinctU64Set, key: u64) void {
+        @prefetch(&self.slots[@as(usize, @truncate(mix64(key))) & (self.slots.len - 1)], .{ .rw = .write, .locality = 1 });
+    }
+
+    /// Insert `key`; no-op if already present. The caller must have reserved
+    /// space via `ensureFor` for the whole batch so no grow fires here.
+    pub inline fn insert(self: *DistinctU64Set, key: u64) void {
+        if (key == SENTINEL) {
+            self.has_sentinel = true;
+            return;
+        }
+        const mask = self.slots.len - 1;
+        var b = @as(usize, @truncate(mix64(key))) & mask;
+        while (true) : (b = (b + 1) & mask) {
+            const s = self.slots[b];
+            if (s == SENTINEL) {
+                self.slots[b] = key;
+                self.len += 1;
+                return;
+            }
+            if (s == key) return;
+        }
+    }
+
+    pub fn count(self: DistinctU64Set) usize {
+        return @as(usize, self.len) + @intFromBool(self.has_sentinel);
+    }
+};
+
 /// Smallest power-of-two capacity that holds `expected` entries under the 0.75
 /// load factor, floored at 16. `expected * 4 / 3` is the minimum live-capacity;
 /// round it up to the next power of two.
@@ -416,6 +512,35 @@ test "IntKeyTable tiers grow and preserve every gid" {
             try std.testing.expect(p.found);
         }
     }
+}
+
+test "DistinctU64Set counts distinct keys, handles the sentinel value, grows" {
+    const allocator = std.testing.allocator;
+    var set = DistinctU64Set.empty;
+    defer set.deinit(allocator);
+
+    // 5000 distinct values, each inserted 3× — count must be 5000.
+    const n: u64 = 5000;
+    var pass: usize = 0;
+    while (pass < 3) : (pass += 1) {
+        try set.ensureFor(allocator, n);
+        var i: u64 = 0;
+        while (i < n) : (i += 1) set.insert((i +% 1) *% 0x9E3779B97F4A7C15);
+    }
+    try std.testing.expectEqual(@as(usize, n), set.count());
+
+    // The sentinel value (all-ones) is counted exactly once via the flag.
+    try std.testing.expect(!set.has_sentinel);
+    try set.ensureFor(allocator, 2);
+    set.insert(DistinctU64Set.SENTINEL);
+    set.insert(DistinctU64Set.SENTINEL);
+    try std.testing.expect(set.has_sentinel);
+    try std.testing.expectEqual(@as(usize, n + 1), set.count());
+
+    // Key 0 is a normal storable key (distinct from empty slots).
+    try set.ensureFor(allocator, 1);
+    set.insert(0);
+    try std.testing.expectEqual(@as(usize, n + 2), set.count());
 }
 
 test "ByteGroupTable getOrPut + grow with external keys" {

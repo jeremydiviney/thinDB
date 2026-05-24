@@ -37,6 +37,7 @@ const IntGroupTable = group_table.IntGroupTable;
 const IntTable32 = group_table.IntKeyTable(32);
 const IntTable96 = group_table.IntKeyTable(96);
 const IntTable128 = group_table.IntKeyTable(128);
+const DistinctU64Set = group_table.DistinctU64Set;
 
 pub const AggFunc = enum {
     count,
@@ -176,10 +177,17 @@ const AccState = union(enum) {
     welford: WelfordAcc,
     /// Exact distinct count: set of arena-dup'd value bytes.
     distinct: std.StringHashMapUnmanaged(void),
-    /// Exact distinct count over a fixed-width integer-family column: the raw
-    /// value bits are hashed directly (no per-value byte serialization or key
-    /// arena-dup). Selected by `initialState` when the input type is int-family.
+    /// Exact distinct count over a >64-bit integer-family column (largeint /
+    /// decimal128 / uuid): the raw value bits are hashed directly (no per-value
+    /// byte serialization or key arena-dup). Columns ≤64 bits take the faster
+    /// `distinct_int64` set instead.
     distinct_int: std.AutoHashMapUnmanaged(u128, void),
+    /// Exact distinct count over an integer-family column ≤64 bits: a key-only
+    /// open-addressing set probed via a software-prefetch pipeline. The slot is
+    /// 8 bytes (no gid) and the global insert is pure-latency-bound (no group
+    /// probe to overlap it), so prefetch + the narrow slot win big over the
+    /// generic `AutoHashMap`. Selected by `initialState` for ≤64-bit int inputs.
+    distinct_int64: group_table.DistinctU64Set,
     /// Exact percentile: keep every observed value (as f64), sort + interpolate at finalize.
     percentile_values: std.ArrayListUnmanaged(f64),
     /// group_concat buffer, lazily boxed (the `ConcatAcc` is 32 bytes — too
@@ -449,6 +457,29 @@ pub const Aggregate = struct {
             // one row already, and the top-k path owns its own bounded emit.
             .emit_limit = if (group_col_indices.len > 0 and resolved_top_k == null) emit_limit else null,
         };
+
+        // No-GROUP-BY COUNT(DISTINCT int≤64): presize the membership set from
+        // the value column's cardinality estimate (capped like the combined
+        // path) so the 5M-row insert doesn't repeatedly grow+rehash on its way
+        // to ~1M entries. The cap protects a selective-filter case (Filter.stats
+        // pass `upper_rows` through) from a multi-MB zero-fill for a small set.
+        if (group_col_indices.len == 0) {
+            const st = self.upstream.stats();
+            const aa = self.arena.allocator();
+            for (aggs, agg_col_indices, single_state) |a, maybe_idx, *s| {
+                if (a.func != .count_distinct) continue;
+                const idx = maybe_idx orelse continue;
+                const vb = intKeyBits(up_schema[idx].type) orelse continue;
+                if (vb > 64) continue;
+                var set_cap: usize = 0;
+                if (idx < st.column_cards.len) switch (st.column_cards[idx]) {
+                    .exact => |nd| set_cap = @intCast(@min(nd, @max(st.upper_rows, 1))),
+                    .unknown => {},
+                };
+                set_cap = @min(set_cap, PRESIZE_CAP);
+                if (set_cap > 0) s.* = .{ .distinct_int64 = DistinctU64Set.init(aa, set_cap) catch DistinctU64Set.empty };
+            }
+        }
 
         // Pre-size the group table + flat state from the upstream cardinality
         // estimate so they don't grow+rehash repeatedly as they fill toward
@@ -1503,6 +1534,7 @@ fn aggOrderValue(s: AccState) OrderVal {
         .avg => |a| .{ .float = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count)) },
         .distinct => |set| .{ .int = @intCast(set.count()) },
         .distinct_int => |set| .{ .int = @intCast(set.count()) },
+        .distinct_int64 => |set| .{ .int = @intCast(set.count()) },
         else => unreachable,
     };
 }
@@ -1620,7 +1652,7 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
         .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
         .count_distinct => if (in != null and intKeyBits(in.?) != null)
-            .{ .distinct_int = .empty }
+            (if (intKeyBits(in.?).? <= 64) .{ .distinct_int64 = .empty } else .{ .distinct_int = .empty })
         else
             .{ .distinct = .empty },
         .percentile => .{ .percentile_values = .empty },
@@ -2092,6 +2124,17 @@ fn welfordStep(w: *WelfordAcc, x: f64) void {
 /// semantics say NULL is excluded from DISTINCT counts.
 fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
     switch (s.*) {
+        .distinct_int64 => |*set| {
+            try set.ensureFor(aa, row_end - row_start);
+            switch (view.data) {
+                .boolean => |sl| insertDistinctRange(set, view, u8, sl, row_start, row_end),
+                .tinyint => |sl| insertDistinctRange(set, view, i8, sl, row_start, row_end),
+                .smallint => |sl| insertDistinctRange(set, view, i16, sl, row_start, row_end),
+                .int, .date => |sl| insertDistinctRange(set, view, i32, sl, row_start, row_end),
+                .bigint, .datetime, .decimal64 => |sl| insertDistinctRange(set, view, i64, sl, row_start, row_end),
+                else => unreachable,
+            }
+        },
         .distinct_int => |*set| {
             var r: u32 = row_start;
             while (r < row_end) : (r += 1) {
@@ -2114,6 +2157,39 @@ fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32,
             }
         },
         else => unreachable,
+    }
+}
+
+/// Insert a contiguous row range's integer values into a `DistinctU64Set` via
+/// the software-prefetch pipeline. The (column type → u64 key) decision is the
+/// caller's one-time switch; the key is a zero-extension of the value's
+/// two's-complement bits — injective within the column's ≤64-bit domain, so the
+/// distinct count is exact. A look-ahead `@prefetch` hides the random slot miss;
+/// NULLs are skipped (excluded from DISTINCT). `ensureFor` must have reserved
+/// the range up front so no grow invalidates the look-ahead's slot addresses.
+fn insertDistinctRange(
+    set: *DistinctU64Set,
+    view: ColumnView,
+    comptime T: type,
+    sl: []const T,
+    row_start: u32,
+    row_end: u32,
+) void {
+    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const D: u32 = 12;
+    if (view.nulls == null) {
+        var r: u32 = row_start;
+        while (r < row_end) : (r += 1) {
+            if (r + D < row_end) set.prefetch(@as(u64, @as(U, @bitCast(sl[r + D]))));
+            set.insert(@as(u64, @as(U, @bitCast(sl[r]))));
+        }
+    } else {
+        var r: u32 = row_start;
+        while (r < row_end) : (r += 1) {
+            if (r + D < row_end) set.prefetch(@as(u64, @as(U, @bitCast(sl[r + D]))));
+            if (!view.isValid(r)) continue;
+            set.insert(@as(u64, @as(U, @bitCast(sl[r]))));
+        }
     }
 }
 
@@ -2357,6 +2433,7 @@ fn appendAccToColumn(
             const n: u64 = if (cd_count) |cnt| cnt else switch (state) {
                 .distinct => |set| set.count(),
                 .distinct_int => |set| set.count(),
+                .distinct_int64 => |set| set.count(),
                 else => unreachable,
             };
             try col.data.bigint.append(allocator, @intCast(n));
