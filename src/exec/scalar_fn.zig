@@ -223,13 +223,19 @@ pub const builtins = [_]ScalarFn{
     // coercion machinery (int→bigint→double promotion).
     .{ .name = "add", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.addIntKernel },
     .{ .name = "add", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.addBigintKernel },
+    .{ .name = "add", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.addLargeintKernel },
     .{ .name = "add", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.addDoubleKernel },
     .{ .name = "sub", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.subIntKernel },
     .{ .name = "sub", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.subBigintKernel },
+    .{ .name = "sub", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.subLargeintKernel },
     .{ .name = "sub", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.subDoubleKernel },
     .{ .name = "mul", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.mulIntKernel },
     .{ .name = "mul", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.mulBigintKernel },
+    .{ .name = "mul", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.mulLargeintKernel },
     .{ .name = "mul", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.mulDoubleKernel },
+    // Internal checked i128 → i64 narrow for the affine-aggregate reduction.
+    // Errors on out-of-i64-range exactly like the SUM finalize. Not user-facing.
+    .{ .name = "__narrow_bigint", .arg_types = &.{.largeint}, .return_type = .bigint, .kernel = math.narrowBigintKernel },
     .{ .name = "div", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.divIntKernel },
     .{ .name = "div", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.divBigintKernel },
     .{ .name = "div", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.divDoubleKernel },

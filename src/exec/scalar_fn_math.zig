@@ -114,6 +114,52 @@ pub fn addDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     simd.binInto(f64, .add, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
 }
 
+// i128 (LARGEINT) arithmetic. Wrapping like the narrower int kernels — the
+// affine-aggregate reduction (`local.zig`) is the only producer and proves
+// the affine transform stays in range, so the i128 result equals the direct
+// `SUM(a·col+b)` accumulator exactly. Scalar loops (no SIMD) since i128 lanes
+// aren't a vector win.
+pub fn addLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.largeint;
+    const b = args[1].data.largeint;
+    try out.data.largeint.ensureUnusedCapacity(allocator, row_count);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) out.data.largeint.appendAssumeCapacity(a[i] +% b[i]);
+}
+
+pub fn subLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.largeint;
+    const b = args[1].data.largeint;
+    try out.data.largeint.ensureUnusedCapacity(allocator, row_count);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) out.data.largeint.appendAssumeCapacity(a[i] -% b[i]);
+}
+
+pub fn mulLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.largeint;
+    const b = args[1].data.largeint;
+    try out.data.largeint.ensureUnusedCapacity(allocator, row_count);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) out.data.largeint.appendAssumeCapacity(a[i] *% b[i]);
+}
+
+/// Checked i128 → i64 narrow used by the affine-aggregate reduction to
+/// finalize a derived integer SUM. Errors on out-of-range EXACTLY as the
+/// SUM accumulator's finalize does (`appendAccToColumn`: `> maxInt(i64) or
+/// < minInt(i64)`), so a derived `SUM(col)+k·COUNT(col)` raises the same
+/// `ArithmeticOverflow` the direct `SUM(col+k)` would. Internal-only
+/// (`__` name), never reachable from user SQL.
+pub fn narrowBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.largeint;
+    try out.data.bigint.ensureUnusedCapacity(allocator, row_count);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const v = s[i];
+        if (v > std.math.maxInt(i64) or v < std.math.minInt(i64)) return error.ArithmeticOverflow;
+        out.data.bigint.appendAssumeCapacity(@intCast(v));
+    }
+}
+
 pub fn subIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     simd.binInto(i32, .sub, args[0].data.int[0..row_count], args[1].data.int[0..row_count], try reserveInt(allocator, out, row_count));
 }

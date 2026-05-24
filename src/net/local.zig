@@ -982,6 +982,532 @@ fn applyTopKFusion(f: TopNFusion, l: ir.Op.Limit) void {
 }
 
 // ---------------------------------------------------------------------------
+// Algebraic aggregate reduction (ClickBench Q29).
+//
+// `SELECT SUM(rw), SUM(rw+1), ..., SUM(rw+89) FROM hits` lowers to 90 SUM
+// aggregates each over a synthetic `__agg_arg_k = rw + k` column — 90 derived
+// columns materialized over every input row, then 90 SUM passes. But every
+// arg is an AFFINE transform `a·rw + b` of one base column, so:
+//
+//   SUM(a·col+b) = a·SUM(col) + b·COUNT(col)   (integer/decimal only)
+//   COUNT(a·col+b) = COUNT(col)
+//   MIN(a·col+b) = a·MIN(col)+b if a>0 else a·MAX(col)+b   (value selection)
+//   MAX(a·col+b) = mirror of MIN
+//
+// We compute a small BASE set once ({SUM,COUNT} per SUM-family base col;
+// {MIN}/{MAX} per MIN/MAX-family base col) and DERIVE each original output
+// with per-output-group arithmetic in a post-aggregate Compute — the same
+// machinery the FD-collapse rewrite uses. The final Project restores SELECT
+// order.
+//
+// SAFE set: integer/decimal SUM, COUNT, and MIN/MAX over affine args. SKIPPED
+// (left computing directly): float/double SUM (non-associative), AVG / VAR /
+// STDDEV (float rounding), non-affine args (col*col, col/c, function calls).
+//
+// Overflow fidelity: the direct `SUM(col+k)` accumulates `(col_i +% k)` (the
+// arg arithmetic type WRAPS, then) in i128, narrowing once at the i64 output.
+// The derivation must be bit-identical INCLUDING the same ArithmeticOverflow.
+// Two guards make it so:
+//   1. The SUM base output is pinned to LARGEINT (i128) via
+//      `out_type_override`, so the base never narrows mid-flight (no spurious
+//      base overflow that the direct per-output path wouldn't hit).
+//   2. We only reduce a SUM agg when `a·col+b` provably cannot wrap its arg
+//      arithmetic type for ANY value in the base column's declared range — so
+//      `Σ(a·col+b) = a·Σcol + b·n` holds exactly in i128. The derivation then
+//      runs in i128 (new largeint add/sub/mul kernels) and narrows to the
+//      output type with `__narrow_bigint`, whose range check is byte-identical
+//      to the SUM finalize. Any agg failing the guard is left direct.
+// ---------------------------------------------------------------------------
+
+/// One base column's affine decomposition: `value = a·col + b` over the named
+/// base column, where `family` is sum (needs SUM+COUNT base) or minmax. For a
+/// plain `col` reference a=1, b=0 and `arg_type` is null (no wrapping arg).
+const AffineArg = struct {
+    base_col: []const u8,
+    a: i128,
+    b: i128,
+    /// Declared type of the base column (for the overflow bound on SUM).
+    base_type: types.Type,
+    /// Arithmetic type the direct `a·col+b` would evaluate (and wrap) in;
+    /// null when the arg is a plain column (no intermediate arithmetic).
+    arg_type: ?types.Type,
+};
+
+fn typeMinI128(t: types.Type) ?i128 {
+    return switch (t) {
+        .tinyint => std.math.minInt(i8),
+        .smallint => std.math.minInt(i16),
+        .int => std.math.minInt(i32),
+        .bigint => std.math.minInt(i64),
+        .largeint => std.math.minInt(i128),
+        .boolean => 0,
+        .decimal64 => std.math.minInt(i64),
+        .decimal128 => std.math.minInt(i128),
+        else => null,
+    };
+}
+
+fn typeMaxI128(t: types.Type) ?i128 {
+    return switch (t) {
+        .tinyint => std.math.maxInt(i8),
+        .smallint => std.math.maxInt(i16),
+        .int => std.math.maxInt(i32),
+        .bigint => std.math.maxInt(i64),
+        .largeint => std.math.maxInt(i128),
+        .boolean => 1,
+        .decimal64 => std.math.maxInt(i64),
+        .decimal128 => std.math.maxInt(i128),
+        else => null,
+    };
+}
+
+/// Type of an integer-family literal — matches the parser's lowering so the
+/// arithmetic-type resolution sees the same overload the direct path picked.
+fn litValueType(v: types.Value) types.Type {
+    return switch (v) {
+        .tinyint => .tinyint,
+        .smallint => .smallint,
+        .int => .int,
+        .bigint => .bigint,
+        .largeint => .largeint,
+        .boolean => .boolean,
+        else => .double,
+    };
+}
+
+/// Extract the constant integer multiplier/offset from an affine arg literal.
+/// Only integer-valued literals qualify (a float literal would taint the
+/// arithmetic type / rounding). Returns null for anything else.
+fn affineLiteralI128(v: types.Value) ?i128 {
+    return switch (v) {
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        .int => |x| x,
+        .bigint => |x| x,
+        .largeint => |x| x,
+        .boolean => |x| @intFromBool(x),
+        else => null,
+    };
+}
+
+/// Decompose `e` into `a·base_col + b` if it is an affine transform of a
+/// single plain column: `col`, `col±c`, `c±col`, `c·col`, `col·c`. Otherwise
+/// null. `up_schema` resolves the base column's declared type; `arg_type` is
+/// the resolved arithmetic type of the (non-trivial) expression.
+fn affineDecompose(aa: Allocator, up_schema: []const types.Column, e: ir.Expr) !?AffineArg {
+    switch (e) {
+        .col_ref => |name| {
+            const idx = types.findColumn(up_schema, name) orelse return null;
+            return AffineArg{ .base_col = name, .a = 1, .b = 0, .base_type = up_schema[idx].type, .arg_type = null };
+        },
+        .call => |c| {
+            if (c.args.len != 2) return null;
+            const is_add = std.mem.eql(u8, c.fn_name, "add");
+            const is_sub = std.mem.eql(u8, c.fn_name, "sub");
+            const is_mul = std.mem.eql(u8, c.fn_name, "mul");
+            if (!(is_add or is_sub or is_mul)) return null;
+
+            // Identify the (col, literal) split and which side is the column.
+            const l = c.args[0];
+            const r = c.args[1];
+            var col_name: []const u8 = undefined;
+            var lit_v: types.Value = undefined;
+            var col_left: bool = undefined;
+            switch (l) {
+                .col_ref => |n| switch (r) {
+                    .lit => |v| {
+                        col_name = n;
+                        lit_v = v;
+                        col_left = true;
+                    },
+                    else => return null,
+                },
+                .lit => |v| switch (r) {
+                    .col_ref => |n| {
+                        col_name = n;
+                        lit_v = v;
+                        col_left = false;
+                    },
+                    else => return null,
+                },
+                else => return null,
+            }
+            const k = affineLiteralI128(lit_v) orelse return null;
+            const idx = types.findColumn(up_schema, col_name) orelse return null;
+            const base_type = up_schema[idx].type;
+
+            var a: i128 = undefined;
+            var b: i128 = undefined;
+            if (is_add) {
+                a = 1;
+                b = k;
+            } else if (is_sub) {
+                if (col_left) {
+                    a = 1;
+                    b = -k; // col - k
+                } else {
+                    a = -1;
+                    b = k; // k - col
+                }
+            } else { // mul
+                a = k;
+                b = 0; // c·col == col·c
+            }
+
+            // Resolve the arithmetic type the direct path computes in, so the
+            // overflow bound checks the right width.
+            var arg_types: [2]types.Type = undefined;
+            arg_types[0] = if (col_left) base_type else litValueType(lit_v);
+            arg_types[1] = if (col_left) litValueType(lit_v) else base_type;
+            const resolved = (try @import("../exec/scalar_fn.zig").resolve(aa, c.fn_name, &arg_types)) orelse return null;
+            return AffineArg{ .base_col = col_name, .a = a, .b = b, .base_type = base_type, .arg_type = resolved.func.return_type };
+        },
+        else => return null,
+    }
+}
+
+/// True when `a·col+b` provably stays inside `arg_type` for every `col` in
+/// `base_type`'s declared range — guaranteeing the direct path's wrapping
+/// arithmetic never fires, so `Σ(a·col+b) == a·Σcol + b·n` exactly in i128.
+fn affineNoWrap(arg: AffineArg) bool {
+    const at = arg.arg_type orelse return true; // plain col: no arithmetic
+    const lo_base = typeMinI128(arg.base_type) orelse return false;
+    const hi_base = typeMaxI128(arg.base_type) orelse return false;
+    const arg_lo = typeMinI128(at) orelse return false;
+    const arg_hi = typeMaxI128(at) orelse return false;
+    // a·col+b is monotonic; the extremes are at the base-type endpoints.
+    const e1 = std.math.mul(i128, arg.a, lo_base) catch return false;
+    const e2 = std.math.mul(i128, arg.a, hi_base) catch return false;
+    const v1 = std.math.add(i128, e1, arg.b) catch return false;
+    const v2 = std.math.add(i128, e2, arg.b) catch return false;
+    const lo = @min(v1, v2);
+    const hi = @max(v1, v2);
+    return lo >= arg_lo and hi <= arg_hi;
+}
+
+/// Aggregate family for base-set sharing. SUM-family bases need {SUM,COUNT};
+/// MIN / MAX each need just their own extreme over the base column.
+const AggFamily = enum { sum, min, max };
+
+fn familyOf(f: exec.AggFunc) ?AggFamily {
+    return switch (f) {
+        .sum => .sum,
+        .min => .min,
+        .max => .max,
+        else => null,
+    };
+}
+
+/// Per-original-aggregate reduction plan: which base column + affine
+/// decomposition + family it derives from, and its original output alias /
+/// canonical output type.
+const ReducedAgg = struct {
+    out_name: []const u8,
+    out_type: types.Type,
+    family: AggFamily,
+    arg: AffineArg,
+};
+
+/// A base aggregate to compute once (deduped across reductions sharing a
+/// `(family, base_col)`).
+const BaseAgg = struct {
+    family: AggFamily,
+    base_col: []const u8,
+    sum_name: []const u8,
+    count_name: []const u8,
+    min_name: []const u8,
+    max_name: []const u8,
+};
+
+/// Build the IR Expr deriving one original output from its base aggregate(s).
+/// SUM: `__narrow_bigint(__base_sum*a + __base_cnt*b)` in i128 (or stays
+/// largeint when the output is largeint — no narrow). MIN/MAX: `a·base+b`
+/// computed in the arg arithmetic type via the existing int/bigint kernels.
+fn buildDerivedExpr(arena: Allocator, r: ReducedAgg, base: BaseAgg) !ir.Expr {
+    switch (r.family) {
+        .sum => {
+            const a_lit = try arena.create(ir.Expr);
+            a_lit.* = .{ .lit = .{ .largeint = r.arg.a } };
+            const b_lit = try arena.create(ir.Expr);
+            b_lit.* = .{ .lit = .{ .largeint = r.arg.b } };
+            const sum_ref = try arena.create(ir.Expr);
+            sum_ref.* = .{ .col_ref = base.sum_name };
+            const cnt_ref = try arena.create(ir.Expr);
+            cnt_ref.* = .{ .col_ref = base.count_name };
+
+            const a_term = try arena.alloc(ir.Expr, 2);
+            a_term[0] = sum_ref.*;
+            a_term[1] = a_lit.*;
+            const b_term = try arena.alloc(ir.Expr, 2);
+            b_term[0] = cnt_ref.*;
+            b_term[1] = b_lit.*;
+
+            const sum_args = try arena.alloc(ir.Expr, 2);
+            sum_args[0] = .{ .call = .{ .fn_name = "mul", .args = a_term } };
+            sum_args[1] = .{ .call = .{ .fn_name = "mul", .args = b_term } };
+            const inner: ir.Expr = .{ .call = .{ .fn_name = "add", .args = sum_args } };
+
+            // Output largeint ⇒ the base SUM is already largeint, the i128
+            // derivation IS the output. Otherwise narrow to bigint with the
+            // SUM-finalize-identical range check.
+            if (r.out_type == .largeint) return inner;
+            const narrow_args = try arena.alloc(ir.Expr, 1);
+            narrow_args[0] = inner;
+            return .{ .call = .{ .fn_name = "__narrow_bigint", .args = narrow_args } };
+        },
+        .min, .max => {
+            // Value selection: derive over the base extreme (a>0 keeps min/max
+            // direction; a<0 flips, already encoded by which base we picked).
+            const base_name = if (r.family == .min) base.min_name else base.max_name;
+            const col_ref = try arena.create(ir.Expr);
+            col_ref.* = .{ .col_ref = base_name };
+            // a·base
+            var scaled: ir.Expr = col_ref.*;
+            if (r.arg.a != 1) {
+                const a_args = try arena.alloc(ir.Expr, 2);
+                a_args[0] = col_ref.*;
+                a_args[1] = .{ .lit = litForI128(r.arg.a) };
+                scaled = .{ .call = .{ .fn_name = "mul", .args = a_args } };
+            }
+            if (r.arg.b == 0) return scaled;
+            const b_args = try arena.alloc(ir.Expr, 2);
+            b_args[0] = scaled;
+            b_args[1] = .{ .lit = litForI128(r.arg.b) };
+            return .{ .call = .{ .fn_name = "add", .args = b_args } };
+        },
+    }
+}
+
+/// Smallest integer-family Value holding `v` — matches the parser's literal
+/// typing (int when it fits i32, else bigint, else largeint) so coercion in
+/// the derived Compute picks the same arithmetic width the direct path used.
+fn litForI128(v: i128) types.Value {
+    if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) return .{ .int = @intCast(v) };
+    if (v >= std.math.minInt(i64) and v <= std.math.maxInt(i64)) return .{ .bigint = @intCast(v) };
+    return .{ .largeint = v };
+}
+
+/// Algebraic aggregate reduction. `base` is the Query below the (optional)
+/// `__agg_arg` Compute; `agg_arg_derived` maps that Compute's synthetic
+/// column names to their exprs (empty when `g.upstream` isn't such a
+/// Compute). Returns a reduced `GroupBy → Compute → Project` Query, or null
+/// when nothing collapses. All synthesized specs are arena-allocated so the
+/// borrowing operators stay valid for the query's lifetime.
+fn tryAffineAggReduction(
+    arena: Allocator,
+    base: *Query,
+    consumed: *bool,
+    agg_arg_derived: []const ir.Derived,
+    g: ir.Op.GroupBy,
+) !?Query {
+    if (g.aggs.len == 0) return null;
+    const up_schema = base.outputSchema();
+
+    const reduced = try arena.alloc(?ReducedAgg, g.aggs.len);
+    var any_reduced = false;
+    for (g.aggs, 0..) |a, i| {
+        reduced[i] = null;
+        const family = familyOf(a.func) orelse continue;
+        const col_name = a.col orelse continue; // COUNT(*) — no arg
+        // Resolve the arg expr: a `__agg_arg_N` traces to its Compute expr;
+        // anything else is a direct column reference.
+        var arg_expr: ir.Expr = .{ .col_ref = col_name };
+        for (agg_arg_derived) |d| {
+            if (types.columnNameEql(d.name, col_name)) {
+                arg_expr = d.expr;
+                break;
+            }
+        }
+        const aff = (try affineDecompose(arena, up_schema, arg_expr)) orelse continue;
+
+        if (family == .sum) {
+            // Integer SUM only (decimal scale propagation in the derivation is
+            // deliberately left direct). Float SUM never reaches here — its
+            // arg base type isn't integer.
+            if (!aff.base_type.isInteger() and aff.base_type != .boolean) continue;
+            if (!affineNoWrap(aff)) continue;
+        } else {
+            // MIN/MAX value-selection is bit-identical for any orderable
+            // numeric (incl. float), but the affine arithmetic must not wrap.
+            if (!affineNoWrap(aff)) continue;
+        }
+
+        const base_idx = types.findColumn(up_schema, aff.base_col) orelse continue;
+        // Determine which base extreme MIN/MAX derives from: a>0 keeps the
+        // same extreme, a<0 flips (MIN(a·col+b)=a·MAX(col)+b for a<0).
+        var fam = family;
+        if (family == .min and aff.a < 0) fam = .max;
+        if (family == .max and aff.a < 0) fam = .min;
+
+        reduced[i] = .{
+            .out_name = a.as,
+            .out_type = try aggOutTypeForReduction(family, up_schema[base_idx].type, aff),
+            .family = fam,
+            .arg = aff,
+        };
+        any_reduced = true;
+    }
+    if (!any_reduced) return null;
+
+    // Build the deduped base set keyed by (effective family, base col).
+    var bases: std.ArrayListUnmanaged(BaseAgg) = .empty;
+    const base_idx_of = try arena.alloc(usize, g.aggs.len);
+    var counter: usize = 0;
+    for (reduced, 0..) |maybe, i| {
+        const r = maybe orelse continue;
+        var found: ?usize = null;
+        for (bases.items, 0..) |b, bi| {
+            if (b.family == r.family and types.columnNameEql(b.base_col, r.arg.base_col)) {
+                found = bi;
+                break;
+            }
+        }
+        if (found) |bi| {
+            base_idx_of[i] = bi;
+        } else {
+            const tag = std.fmt.allocPrint(arena, "{d}", .{counter}) catch return error.OutOfMemory;
+            counter += 1;
+            try bases.append(arena, .{
+                .family = r.family,
+                .base_col = r.arg.base_col,
+                .sum_name = try std.fmt.allocPrint(arena, "__base_sum_{s}", .{tag}),
+                .count_name = try std.fmt.allocPrint(arena, "__base_cnt_{s}", .{tag}),
+                .min_name = try std.fmt.allocPrint(arena, "__base_min_{s}", .{tag}),
+                .max_name = try std.fmt.allocPrint(arena, "__base_max_{s}", .{tag}),
+            });
+            base_idx_of[i] = bases.items.len - 1;
+        }
+    }
+
+    // Count how many base aggregates the base set needs (SUM-family = 2).
+    var base_agg_count: usize = 0;
+    for (bases.items) |b| base_agg_count += if (b.family == .sum) @as(usize, 2) else 1;
+    // Direct aggregates we leave unreduced (kept on their own arg).
+    var direct_count: usize = 0;
+    for (reduced) |m| {
+        if (m == null) direct_count += 1;
+    }
+    // Only fire when it strictly shrinks the aggregate set. Otherwise the
+    // rewrite just adds a Compute + Project for no gain.
+    if (base_agg_count + direct_count >= g.aggs.len) return null;
+
+    // Assemble the reduced GroupBy's agg specs: base set first, then the
+    // direct (unreduced) aggregates in their original order.
+    var aggs: std.ArrayListUnmanaged(exec.AggSpec) = .empty;
+    for (bases.items) |b| {
+        switch (b.family) {
+            .sum => {
+                try aggs.append(arena, .{ .func = .sum, .col = b.base_col, .as = b.sum_name, .out_type_override = .largeint });
+                try aggs.append(arena, .{ .func = .count, .col = b.base_col, .as = b.count_name });
+            },
+            .min => try aggs.append(arena, .{ .func = .min, .col = b.base_col, .as = b.min_name }),
+            .max => try aggs.append(arena, .{ .func = .max, .col = b.base_col, .as = b.max_name }),
+        }
+    }
+    // Map the original arg expr (for direct aggs) onto a synthetic Compute so
+    // the reduced GroupBy still has its `__agg_arg`; reuse the original names.
+    var keep_derived: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    for (g.aggs, 0..) |a, i| {
+        if (reduced[i] != null) continue;
+        try aggs.append(arena, a);
+        if (a.col) |cn| {
+            for (agg_arg_derived) |d| {
+                if (types.columnNameEql(d.name, cn)) {
+                    try keep_derived.append(arena, d);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Base pipeline: re-add the kept `__agg_arg` Computes (for direct aggs)
+    // plus any non-agg-arg derived from the original Compute (e.g. computed
+    // group keys) so the reduced GroupBy sees them.
+    var pre: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    for (agg_arg_derived) |d| {
+        // Computed group keys (referenced by g.group_cols) must survive.
+        var is_group_key = false;
+        for (g.group_cols) |gc| {
+            if (types.columnNameEql(gc, d.name)) is_group_key = true;
+        }
+        if (is_group_key) {
+            try pre.append(arena, d);
+            continue;
+        }
+        // Keep only the agg-arg derived still referenced by a direct agg.
+        for (keep_derived.items) |kd| {
+            if (types.columnNameEql(kd.name, d.name)) {
+                try pre.append(arena, d);
+                break;
+            }
+        }
+    }
+
+    // From here we commit to building on top of `base` — take ownership so
+    // the caller doesn't also free it. Any error past this point frees the
+    // whole chain (including base) exactly once via this errdefer.
+    consumed.* = true;
+    var cur = base.*;
+    errdefer cur.deinit();
+    if (pre.items.len > 0) cur = try cur.compute(pre.items);
+    cur = try cur.groupByTopK(g.group_cols, aggs.items, null);
+
+    // Post-aggregate Compute: derive each reduced output once per group. The
+    // Compute forbids duplicate derived names; reduced aggs keep their SELECT
+    // alias when it's unique across the whole output (so a downstream ORDER BY
+    // / HAVING still binds), and get a disambiguating suffix only when the
+    // parser labeled several identically (`sum(expr)` — Q29 has 89 of them,
+    // which are positionally ambiguous in the direct path too). The final
+    // Project selects group cols + outputs in SELECT order, dropping the base
+    // aggregate columns.
+    var post: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    const out_names = try arena.alloc([]const u8, g.group_cols.len + g.aggs.len);
+    for (g.group_cols, 0..) |gc, i| out_names[i] = gc;
+    for (reduced, 0..) |maybe, i| {
+        const out_slot = g.group_cols.len + i;
+        if (maybe) |r| {
+            const b = bases.items[base_idx_of[i]];
+            const name = try uniqueOutputName(arena, out_names[0..out_slot], r.out_name, i);
+            try post.append(arena, .{ .name = name, .expr = try buildDerivedExpr(arena, r, b) });
+            out_names[out_slot] = name;
+        } else {
+            // Direct (unreduced) agg — stays under its own alias on the GroupBy.
+            out_names[out_slot] = g.aggs[i].as;
+        }
+    }
+    cur = try cur.compute(post.items);
+
+    cur = try cur.project(out_names);
+    return cur;
+}
+
+/// `desired` if unused among `taken`, else a `desired__<idx>` suffix that is.
+/// Preserves the SELECT alias when it's unique (downstream ORDER BY / HAVING
+/// still binds); only collapsed identically-labeled aggregates get suffixed.
+fn uniqueOutputName(arena: Allocator, taken: []const []const u8, desired: []const u8, idx: usize) ![]const u8 {
+    var clash = false;
+    for (taken) |t| {
+        if (types.columnNameEql(t, desired)) {
+            clash = true;
+            break;
+        }
+    }
+    if (!clash) return desired;
+    return std.fmt.allocPrint(arena, "{s}__{d}", .{ desired, idx });
+}
+
+/// The canonical output type the direct `<func>(arg)` would produce, so the
+/// derived Compute output matches byte-for-byte. SUM(int-family) → bigint
+/// (or largeint when the base is largeint); MIN/MAX → the arg arithmetic
+/// type (or the base type for a plain column).
+fn aggOutTypeForReduction(family: AggFamily, base_type: types.Type, aff: AffineArg) !types.Type {
+    switch (family) {
+        .sum => return if (base_type == .largeint) .largeint else .bigint,
+        .min, .max => return aff.arg_type orelse base_type,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Late materialization (ClickBench Q23).
 //
 // `SELECT <wide> FROM t WHERE <pred> [ORDER BY <keys>] LIMIT n [OFFSET m]`
@@ -1946,8 +2472,22 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 },
                 else => {},
             };
-            var upstream = try compileOp(ctx, g.upstream);
-            errdefer upstream.deinit();
+            // Algebraic aggregate reduction (ClickBench Q29). Peel the
+            // `__agg_arg` Compute (if present) and build only the base below
+            // it, then try to collapse affine SUM/MIN/MAX over one column into
+            // a small base set + per-output-group derivation. `base` is reused
+            // by the normal path below when nothing collapses (no rebuild).
+            const base_op = if (g.upstream.* == .compute) g.upstream.compute.upstream else g.upstream;
+            const agg_args: []const ir.Derived = if (g.upstream.* == .compute) g.upstream.compute.derived else &.{};
+            var upstream = try compileOp(ctx, base_op);
+            var consumed_base = false;
+            errdefer if (!consumed_base) upstream.deinit();
+            if (try tryAffineAggReduction(ctx.subqueryArena(), &upstream, &consumed_base, agg_args, g)) |q| {
+                break :blk q;
+            }
+            std.debug.assert(!consumed_base);
+            // Not reduced: re-layer the peeled Compute onto the built base.
+            if (agg_args.len > 0) upstream = try upstream.compute(agg_args);
             // Global aggregate (no group keys) is O(1) — always hash.
             if (g.group_cols.len > 0) {
                 const st = upstream.stats();

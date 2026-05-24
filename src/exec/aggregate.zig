@@ -80,6 +80,13 @@ pub const AggSpec = struct {
     /// Per-function payload. Defaults to `.none` so existing call
     /// sites compile unchanged.
     params: AggParams = .none,
+    /// Forces the output column type, overriding `aggOutputType`. Set by
+    /// the affine-aggregate reduction (`local.zig`) to keep an integer SUM
+    /// base in i128 (`.largeint`) so the post-aggregate derivation
+    /// `a·SUM + b·COUNT` runs in i128 with no intermediate i64 narrowing —
+    /// matching the direct path's accumulate-in-i128-then-narrow-once
+    /// overflow behavior bit-for-bit. `null` ⇒ the canonical type.
+    out_type_override: ?Type = null,
 };
 
 /// One ORDER BY key in a top-k hint: an aggregate output column name + its
@@ -359,7 +366,7 @@ pub const Aggregate = struct {
 
             output_schema[group_cols.len + i] = .{
                 .name = a.as,
-                .type = try aggOutputType(a.func, if (agg_col_indices[i]) |idx| up_schema[idx].type else null),
+                .type = try aggOutputTypeFor(a, if (agg_col_indices[i]) |idx| up_schema[idx].type else null),
             };
         }
 
@@ -1239,7 +1246,7 @@ pub const SortedAggregate = struct {
                 null;
             output_schema[group_cols.len + i] = .{
                 .name = a.as,
-                .type = try aggOutputType(a.func, if (agg_col_indices[i]) |idx| up_schema[idx].type else null),
+                .type = try aggOutputTypeFor(a, if (agg_col_indices[i]) |idx| up_schema[idx].type else null),
             };
         }
         for (aggs, agg_col_indices) |a, maybe_idx| {
@@ -1596,6 +1603,15 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
         .percentile => .{ .percentile_values = .empty },
         .group_concat => .{ .concat = null },
     };
+}
+
+/// Output type for an AggSpec, honoring an explicit override (used by the
+/// affine-aggregate reduction to pin an int SUM base to i128). The override
+/// is only ever a wider-or-equal type than the canonical one, so finalize /
+/// append stay correct (`.largeint` appends the i128 accumulator directly).
+fn aggOutputTypeFor(a: AggSpec, in: ?Type) !Type {
+    if (a.out_type_override) |t| return t;
+    return aggOutputType(a.func, in);
 }
 
 fn aggOutputType(func: AggFunc, in: ?Type) !Type {
