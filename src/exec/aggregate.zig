@@ -323,6 +323,12 @@ pub const Aggregate = struct {
     /// Resolved top-k hint, or null to emit every group (the default).
     top_k: ?ResolvedTopK = null,
 
+    /// Emit cap from an unordered `GROUP BY … LIMIT n`: stop after this many
+    /// groups (in group-insertion order). null = emit every group. The build
+    /// still consumes all input, so emitted groups' counts are exact; only the
+    /// emit is bounded. Mutually exclusive with `top_k`.
+    emit_limit: ?u32 = null,
+
     emitted: bool = false,
     /// Bytes charged against the query budget for the group hash table /
     /// accumulator state (held in `arena`). Released when the single
@@ -336,6 +342,7 @@ pub const Aggregate = struct {
         group_cols: []const []const u8,
         aggs: []const AggSpec,
         top_k: ?TopKHint,
+        emit_limit: ?u32,
     ) !Query {
         if (aggs.len == 0) return Error.AggregateNoSpecs;
         const up_schema = upstream.outputSchema();
@@ -438,6 +445,9 @@ pub const Aggregate = struct {
                 else => false,
             },
             .top_k = resolved_top_k,
+            // Only the hash-grouped emit honors the cap; a global aggregate is
+            // one row already, and the top-k path owns its own bounded emit.
+            .emit_limit = if (group_col_indices.len > 0 and resolved_top_k == null) emit_limit else null,
         };
 
         // Pre-size the group table + flat state from the upstream cardinality
@@ -571,7 +581,15 @@ pub const Aggregate = struct {
     }
 
     pub fn explain(self: *Aggregate, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        try exec.explainLine(out, allocator, depth, if (self.group_col_indices.len == 0) "Aggregate (global)" else "HashAggregate");
+        if (self.group_col_indices.len == 0) {
+            try exec.explainLine(out, allocator, depth, "Aggregate (global)");
+        } else if (self.emit_limit) |cap| {
+            const label = try std.fmt.allocPrint(allocator, "HashAggregate (emit-cap {d})", .{cap});
+            defer allocator.free(label);
+            try exec.explainLine(out, allocator, depth, label);
+        } else {
+            try exec.explainLine(out, allocator, depth, "HashAggregate");
+        }
         try self.upstream.explain(out, allocator, depth + 1);
     }
 
@@ -1105,8 +1123,13 @@ pub const Aggregate = struct {
 
     fn appendGroupedResults(self: *Aggregate) !void {
         const na = self.aggs.len;
+        // An unordered `GROUP BY … LIMIT n` caps the emit at the first n groups
+        // (group-insertion order). The build already consumed all input, so the
+        // counts/aggregates of those groups are exact — only the emit stops
+        // early, skipping the (string-heavy) row reconstruction for the rest.
+        const stop: u32 = if (self.emit_limit) |cap| @min(cap, self.n_groups) else self.n_groups;
         var gid: u32 = 0;
-        while (gid < self.n_groups) : (gid += 1) {
+        while (gid < stop) : (gid += 1) {
             const base = @as(usize, gid) * na;
             try self.appendGroupRow(gid, self.gstate.items[base .. base + na]);
         }

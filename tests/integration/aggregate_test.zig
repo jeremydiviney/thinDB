@@ -309,7 +309,7 @@ test "aggregate: top-k fusion selects the correct k groups" {
         var base = try thindb.scan(allocator, t);
         var q = try base.groupByTopK(&.{"g"}, &.{
             .{ .func = .count, .as = "c" },
-        }, .{ .k = 3, .keys = &.{.{ .col = "c", .desc = true }} });
+        }, .{ .k = 3, .keys = &.{.{ .col = "c", .desc = true }} }, null);
         defer q.deinit();
         const b = (try q.next()).?;
         try std.testing.expectEqual(@as(usize, 3), b.row_count);
@@ -326,7 +326,7 @@ test "aggregate: top-k fusion selects the correct k groups" {
         var base = try thindb.scan(allocator, t);
         var q = try base.groupByTopK(&.{"g"}, &.{
             .{ .func = .sum, .col = "x", .as = "s" },
-        }, .{ .k = 3, .keys = &.{.{ .col = "s", .desc = true }} });
+        }, .{ .k = 3, .keys = &.{.{ .col = "s", .desc = true }} }, null);
         defer q.deinit();
         const b = (try q.next()).?;
         try std.testing.expectEqual(@as(usize, 3), b.row_count);
@@ -342,7 +342,7 @@ test "aggregate: top-k fusion selects the correct k groups" {
         var base = try thindb.scan(allocator, t);
         var q = try base.groupByTopK(&.{"g"}, &.{
             .{ .func = .count, .as = "c" },
-        }, .{ .k = 2, .keys = &.{.{ .col = "c", .desc = false }} });
+        }, .{ .k = 2, .keys = &.{.{ .col = "c", .desc = false }} }, null);
         defer q.deinit();
         const b = (try q.next()).?;
         try std.testing.expectEqual(@as(usize, 2), b.row_count);
@@ -356,7 +356,7 @@ test "aggregate: top-k fusion selects the correct k groups" {
         var base = try thindb.scan(allocator, t);
         var q = try base.groupByTopK(&.{"g"}, &.{
             .{ .func = .min, .col = "g", .as = "mg" },
-        }, .{ .k = 2, .keys = &.{.{ .col = "mg", .desc = true }} });
+        }, .{ .k = 2, .keys = &.{.{ .col = "mg", .desc = true }} }, null);
         defer q.deinit();
         const b = (try q.next()).?;
         try std.testing.expectEqual(@as(usize, 5), b.row_count);
@@ -396,7 +396,7 @@ test "aggregate: top-k fusion honors multiple order keys (lexicographic + per-ke
         var q = try base.groupByTopK(&.{"g"}, &.{
             .{ .func = .sum, .col = "x", .as = "s" },
             .{ .func = .count, .as = "c" },
-        }, .{ .k = 2, .keys = &.{ .{ .col = "s", .desc = true }, .{ .col = "c", .desc = true } } });
+        }, .{ .k = 2, .keys = &.{ .{ .col = "s", .desc = true }, .{ .col = "c", .desc = true } } }, null);
         defer q.deinit();
         const b = (try q.next()).?;
         try std.testing.expectEqual(@as(usize, 2), b.row_count);
@@ -412,7 +412,7 @@ test "aggregate: top-k fusion honors multiple order keys (lexicographic + per-ke
         var q = try base.groupByTopK(&.{"g"}, &.{
             .{ .func = .sum, .col = "x", .as = "s" },
             .{ .func = .count, .as = "c" },
-        }, .{ .k = 2, .keys = &.{ .{ .col = "s", .desc = true }, .{ .col = "c", .desc = false } } });
+        }, .{ .k = 2, .keys = &.{ .{ .col = "s", .desc = true }, .{ .col = "c", .desc = false } } }, null);
         defer q.deinit();
         const b = (try q.next()).?;
         try std.testing.expectEqual(@as(usize, 2), b.row_count);
@@ -553,7 +553,7 @@ test "aggregate: combined COUNT(DISTINCT int) by int group — exact per-group c
         var base = try thindb.scan(allocator, t);
         var q = try base.groupByTopK(&.{"r"}, &.{
             .{ .func = .count_distinct, .col = "u", .as = "u" },
-        }, .{ .k = 2, .keys = &.{.{ .col = "u", .desc = true }} });
+        }, .{ .k = 2, .keys = &.{.{ .col = "u", .desc = true }} }, null);
         defer q.deinit();
         const b = (try q.next()).?;
         try std.testing.expectEqual(@as(usize, 2), b.row_count);

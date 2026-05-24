@@ -981,6 +981,40 @@ fn applyTopKFusion(f: TopNFusion, l: ir.Op.Limit) void {
     }
 }
 
+/// Sibling of `applyTopKFusion` for `GROUP BY … LIMIT n` with NO ORDER BY.
+/// Without an ordering the result rows are unspecified, so the hash aggregate
+/// may emit any `n + offset` groups and stop — we cap its emit at the first
+/// groups in group-insertion order rather than materializing (and string-
+/// reconstructing) every group only for the downstream Limit to discard.
+///
+/// Only fires when the GroupBy output flows directly into the Limit, modulo
+/// the row-count- and order-preserving Select/Compute layers the planner
+/// inserts above a GroupBy (final Project, FD-collapse key recompute). A HAVING
+/// (Filter) between the Limit and the GroupBy changes which groups qualify, so
+/// an emit cap below it would be wrong — bail out if one intervenes. Caller
+/// must have already ruled out the ORDER BY shape (`topNFusion` returned null),
+/// but we reject `.order_by` defensively anyway.
+fn applyGroupByLimitFusion(l: ir.Op.Limit) void {
+    var below = l.upstream;
+    // Peer through the order-preserving, row-count-preserving Project/Compute
+    // the planner stacks above a GroupBy. Any other node (Filter/HAVING,
+    // OrderBy, Join, …) means the GroupBy output does not flow straight to the
+    // Limit — leave it uncapped.
+    while (true) {
+        switch (below.*) {
+            .select => below = below.select.upstream,
+            .compute => below = below.compute.upstream,
+            .group_by => |*g| {
+                if (g.group_cols.len == 0) return; // global aggregate is one row
+                if (g.top_k != null) return; // ORDER BY path owns this GroupBy
+                g.emit_limit = std.math.cast(u32, l.n +| l.offset) orelse return;
+                return;
+            },
+            else => return,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Algebraic aggregate reduction (ClickBench Q29).
 //
@@ -1450,7 +1484,7 @@ fn tryAffineAggReduction(
     var cur = base.*;
     errdefer cur.deinit();
     if (pre.items.len > 0) cur = try cur.compute(pre.items);
-    cur = try cur.groupByTopK(g.group_cols, aggs.items, null);
+    cur = try cur.groupByTopK(g.group_cols, aggs.items, null, null);
 
     // Post-aggregate Compute: derive each reduced output once per group. The
     // Compute forbids duplicate derived names; reduced aggs keep their SELECT
@@ -1768,6 +1802,10 @@ pub fn buildServerQuerySession(
                 }
                 break :blk topn;
             }
+            // No ORDER BY: cap a directly-underlying GROUP BY's emit at the
+            // limit so it stops after `n+offset` groups instead of building
+            // every group for the Limit to discard.
+            applyGroupByLimitFusion(l);
             const upstream = try buildServerQuerySession(allocator, db, session, l.upstream.*);
             break :blk try upstream.limitOffset(@intCast(l.n), @intCast(l.offset));
         },
@@ -1834,7 +1872,7 @@ pub fn buildServerQuerySession(
                     },
                 }
             }
-            break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k);
+            break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
         },
         .compute => |c| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, c.upstream.*);
@@ -2433,6 +2471,9 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 }
                 break :blk topn;
             }
+            // No ORDER BY: cap a directly-underlying GROUP BY's emit at the
+            // limit (see the other compile path for rationale).
+            applyGroupByLimitFusion(l);
             const upstream = try compileOp(ctx, l.upstream);
             break :blk try upstream.limitOffset(@intCast(l.n), @intCast(l.offset));
         },
@@ -2517,7 +2558,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                     },
                 }
             }
-            break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k);
+            break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
         },
         .compute => |c| blk: {
             var upstream = try compileOp(ctx, c.upstream);

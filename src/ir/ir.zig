@@ -558,6 +558,14 @@ pub const Op = union(OpTag) {
         aggs: []const AggSpec,
         upstream: *Op,
         top_k: ?TopK = null,
+        /// Set when this GROUP BY flows directly into `LIMIT n` with NO
+        /// ORDER BY (and no intervening HAVING). The hash aggregate then
+        /// emits only the first `emit_limit` groups (in group-insertion
+        /// order) instead of materializing every group for the downstream
+        /// Limit to discard — `GROUP BY … LIMIT n` leaves order unspecified,
+        /// so emitting any n groups is valid. A planner hint only: not
+        /// serialized (set post-decode during the Limit-fusion rewrite).
+        emit_limit: ?u32 = null,
     };
 
     pub const Compute = struct {

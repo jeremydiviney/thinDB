@@ -1529,6 +1529,7 @@ test "aggregate: integer fast path — ORDER BY agg LIMIT k top-k emit" {
         &.{"user"},
         &.{.{ .func = .sum, .col = "qty", .as = "total" }},
         ir.Op.TopK{ .k = 2, .keys = &.{.{ .col = "total", .desc = true }} },
+        null,
     );
     var q = try grouped.orderBy(&.{.{ .col = "total", .desc = true }});
     q = try q.limit(2);
@@ -1602,6 +1603,50 @@ test "aggregate: integer fast path — single bigint key, no ORDER BY, plain LIM
         }
     }
     try std.testing.expectEqual(@as(usize, 50), got);
+}
+
+test "aggregate: emit_limit caps the grouped emit at the planner hint" {
+    // The exec-level mechanism behind the unordered `GROUP BY … LIMIT n`
+    // fusion: with emit_limit set, the hash aggregate's *own* output batch is
+    // capped at the hint (group-insertion order), not just clipped downstream.
+    // We assert the aggregate emits exactly `emit_limit` rows even though far
+    // more groups exist, and that those rows carry exact counts (build is
+    // unchanged).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "user", .type = .bigint },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    var rows: [600]struct { id: i64, user: i64 } = undefined;
+    for (&rows, 0..) |*r, i| r.* = .{ .id = @intCast(i + 1), .user = @intCast(i % 200) };
+    try t.insert(&rows);
+
+    var base = try scan(allocator, t);
+    // No top_k, emit_limit = 7. The aggregate (200 groups) must emit only 7
+    // rows in one batch — no downstream Limit involved.
+    var q = try base.groupByTopK(&.{"user"}, &.{.{ .func = .count, .as = "n" }}, null, 7);
+    defer q.deinit();
+
+    var got: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| {
+            // 600 rows over 200 groups (user = i % 200) → each group has 3.
+            try std.testing.expectEqual(@as(i64, 3), b.values[1].data.bigint[r]);
+            got += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 7), got);
 }
 
 const SortSpec = @import("sort.zig").SortSpec;
