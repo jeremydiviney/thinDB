@@ -39,6 +39,16 @@ const IntTable96 = group_table.IntKeyTable(96);
 const IntTable128 = group_table.IntKeyTable(128);
 const DistinctU64Set = group_table.DistinctU64Set;
 const CountSlotTable = group_table.CountSlotTable;
+/// FOR-narrow inline-state group tables for the single-int-key + single
+/// inline aggregate fast path. The state is always `i64` (SUM over ≤32-bit
+/// int families stays inside i64 by the eligibility gate; MIN/MAX fold to
+/// i64), so only the key width tiers. The active one is selected by
+/// `inline_for.?.tier`; the others stay `null`.
+const InlineState = i64;
+const InlineTable8 = group_table.InlineSlotTable(u8, InlineState);
+const InlineTable16 = group_table.InlineSlotTable(u16, InlineState);
+const InlineTable32 = group_table.InlineSlotTable(u32, InlineState);
+const InlineTable64 = group_table.InlineSlotTable(u64, InlineState);
 
 pub const AggFunc = enum {
     count,
@@ -244,6 +254,34 @@ const CombinedDistinct = struct {
     vbits: u8,
 };
 
+/// FOR-narrow key width tier for the inline-state fast path. The summed slot
+/// (`{ KeyW, i64 }`) stays ≤16 bytes for every tier, so a probe touches one
+/// cache line. The tier is the smallest width whose `range = max − base`
+/// leaves the `maxInt(KeyW)` EMPTY sentinel free (`range < maxInt(KeyW)`).
+const InlineKeyTier = enum { w8, w16, w32, w64 };
+
+/// The single inline-able aggregate's fold, captured at plan time so the
+/// accumulate inner loop is a comptime-specialized scalar fold (no per-row
+/// func switch). The agg input column's stored slice type is carried by
+/// `read_tag` so the FOR-key read and the value read both specialize.
+const InlineAggKind = enum { sum, min, max };
+
+/// Decision + layout for the single-int-key + single-inline-aggregate fast
+/// path. The group column's value FOR-normalizes to `code = value − base`,
+/// stored in a `KeyW`-wide slot alongside an `i64` accumulator; emit lowers
+/// each occupied slot into `gkeys_int` / `gstate`, reconstructing
+/// `value = base + code`. `null` ⟺ ineligible (see `planInlineFor`).
+const InlineForPlan = struct {
+    /// FOR base = the group column's proven min. `value − base ∈ [0, range]`.
+    base: i64,
+    tier: InlineKeyTier,
+    kind: InlineAggKind,
+    /// Stored-slice tag of the group column (drives the FOR-key read).
+    key_tag: types.TypeTag,
+    /// Stored-slice tag of the aggregate's input column (drives the value read).
+    val_tag: types.TypeTag,
+};
+
 pub const Aggregate = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -293,6 +331,23 @@ pub const Aggregate = struct {
     /// gid order, after which the existing emit / top-k paths run unchanged.
     /// Arena-owned (no explicit free), like the int tables.
     count_table: ?CountSlotTable = null,
+    /// FOR-narrow inline-state fast path for `GROUP BY <single int col> …
+    /// {SUM|MIN|MAX}(<int col>)`. Non-null ⟺ `planInlineFor` accepted: a
+    /// single ≤64-bit int group column with a known FOR range and one
+    /// inline-able aggregate whose `{ KeyW, i64 }` slot stays ≤16 bytes. The
+    /// running accumulator lives *inside* each slot next to its FOR-narrowed
+    /// key (gid = slot position, no stored gid), so accumulate is one cache
+    /// miss per row. At emit `next()` lowers each occupied slot into
+    /// `gkeys_int` / `gstate` in dense gid order, after which the existing
+    /// emit / top-k paths run unchanged. Arena-owned, like the int tables.
+    inline_for: ?InlineForPlan = null,
+    /// The active FOR-narrow inline table, one per key-width tier
+    /// (`inline_for.?.tier` selects it); the other three stay `null`. Split
+    /// by tier so the common narrow keys use a 2/4-byte key slot.
+    inline_table_8: ?InlineTable8 = null,
+    inline_table_16: ?InlineTable16 = null,
+    inline_table_32: ?InlineTable32 = null,
+    inline_table_64: ?InlineTable64 = null,
     /// Flat per-group accumulator storage: group `g`'s accumulators occupy
     /// `gstate.items[g * aggs.len ..][0..aggs.len]`. New groups append here in
     /// gid order, and emit walks it in gid order — both sequential, so the
@@ -556,6 +611,14 @@ pub const Aggregate = struct {
                 !up_schema[group_col_indices[0]].nullable and
                 (intKeyBits(up_schema[group_col_indices[0]].type) orelse 128) <= 64 and
                 aggs.len == 1 and aggs[0].func == .count and agg_col_indices[0] == null;
+            // FOR-narrow inline-state fast path (additive to count-in-slot):
+            // single int key + one inline SUM/MIN/MAX. Only consulted when the
+            // COUNT path didn't fire. `null` ⟺ ineligible → generic int / byte
+            // path below.
+            self.inline_for = if (count_slot_ok)
+                null
+            else
+                planInlineFor(group_col_indices, agg_col_indices, aggs, up_schema, st);
             // `cap` is the provable group-count ceiling. The group table starts
             // at the modest `ADAPTIVE_INITIAL` (not the ceiling) and, on its
             // first overflow, grows straight to the ceiling — `grow_target`
@@ -567,6 +630,16 @@ pub const Aggregate = struct {
             const init_cap: usize = if (cap > 0) @min(cap, ADAPTIVE_INITIAL) else 0;
             if (count_slot_ok) {
                 self.count_table = CountSlotTable.init(aa, cap) catch CountSlotTable.empty;
+            } else if (self.inline_for) |plan| {
+                // Presize the inline table to the provable ceiling like the
+                // count table — its state rides with the slots through grow, so
+                // there is no separate `gstate` array to keep in lockstep.
+                switch (plan.tier) {
+                    .w8 => self.inline_table_8 = InlineTable8.init(aa, cap) catch InlineTable8.empty,
+                    .w16 => self.inline_table_16 = InlineTable16.init(aa, cap) catch InlineTable16.empty,
+                    .w32 => self.inline_table_32 = InlineTable32.init(aa, cap) catch InlineTable32.empty,
+                    .w64 => self.inline_table_64 = InlineTable64.init(aa, cap) catch InlineTable64.empty,
+                }
             } else if (self.int_layout) |layout| {
                 switch (layout.tier) {
                     .bits32 => {
@@ -771,6 +844,10 @@ pub const Aggregate = struct {
         // `{key,count}` slots into the standard `gkeys_int` / `gstate` arrays
         // (dense gid order) so the emit / top-k dispatch below is untouched.
         if (self.count_table != null) try self.lowerCountSlot(self.arena.allocator());
+        // Same shape for the FOR-narrow inline path: lower its `{key,state}`
+        // slots into `gkeys_int` / `gstate` (dense gid order) so emit / top-k
+        // run unchanged.
+        if (self.inline_for != null) try self.lowerInlineFor(self.arena.allocator());
 
         if (self.group_col_indices.len == 0) {
             try self.appendSingleResult();
@@ -854,6 +931,10 @@ pub const Aggregate = struct {
         if (n == 0) return;
         if (self.count_table != null) {
             try self.accumulateCountSlot(batch);
+            return;
+        }
+        if (self.inline_for) |plan| {
+            try self.accumulateInlineFor(batch, plan);
             return;
         }
         if (self.int_layout) |layout| {
@@ -1197,6 +1278,73 @@ pub const Aggregate = struct {
             gid += 1;
         }
         self.n_groups = gid;
+    }
+
+    /// FOR-narrow inline-state accumulate (gate-confirmed by `planInlineFor`):
+    /// one non-nullable ≤64-bit int group column, one inline SUM/MIN/MAX over a
+    /// ≤64-bit int column. Resolves the key width, the group/value stored types,
+    /// and the fold at comptime, then runs the prefetch-pipelined inner loop with
+    /// the table type fixed (no per-row union/tier/func branch). The group column
+    /// is non-nullable, so there is no key validity branch; the *value* column
+    /// may carry NULLs (SQL excludes them from SUM/MIN/MAX), so the fold skips
+    /// invalid rows.
+    fn accumulateInlineFor(self: *Aggregate, batch: Batch, plan: InlineForPlan) !void {
+        // The tier × kind × key-tag × val-tag inline fan-out exceeds the default
+        // comptime branch budget; raise it for this specialization tree.
+        @setEvalBranchQuota(10_000);
+        const aa = self.arena.allocator();
+        const key_view = batch.values[self.group_col_indices[0]];
+        const val_view = batch.values[self.agg_col_indices[0].?];
+        switch (plan.tier) {
+            .w8 => try inlineForTier(aa, plan, key_view, val_view, u8, &self.inline_table_8.?),
+            .w16 => try inlineForTier(aa, plan, key_view, val_view, u16, &self.inline_table_16.?),
+            .w32 => try inlineForTier(aa, plan, key_view, val_view, u32, &self.inline_table_32.?),
+            .w64 => try inlineForTier(aa, plan, key_view, val_view, u64, &self.inline_table_64.?),
+        }
+    }
+
+    /// Lower the FOR-narrow inline table into `gkeys_int` / `gstate` so the
+    /// existing emit / top-k dispatch runs unchanged. Walks the occupied slots,
+    /// assigning a dense gid 0,1,2,…: reconstructs `value = base + code`, packs
+    /// it into the single-column u128 key exactly as `packIntKey` would (so
+    /// `appendIntGroupKey` decodes it identically), and lowers the i64 state into
+    /// the matching `AccState` variant (`.sum_int` / `.min_int` / `.max_int`,
+    /// mirroring `initialState`). A group whose value column was all-NULL keeps
+    /// the fold identity, matching the canonical path's empty-set MIN/MAX/SUM.
+    fn lowerInlineFor(self: *Aggregate, aa: Allocator) !void {
+        const plan = self.inline_for.?;
+        const layout = self.int_layout.?;
+        const field = layout.fields[0];
+        switch (plan.tier) {
+            inline .w8, .w16, .w32, .w64 => |tier| {
+                const KeyW = inlineKeyWidth(tier);
+                const t: *group_table.InlineSlotTable(KeyW, InlineState) = switch (tier) {
+                    .w8 => &self.inline_table_8.?,
+                    .w16 => &self.inline_table_16.?,
+                    .w32 => &self.inline_table_32.?,
+                    .w64 => &self.inline_table_64.?,
+                };
+                const total = t.count();
+                try self.gkeys_int.ensureTotalCapacity(aa, total);
+                try self.gstate.ensureTotalCapacity(aa, total);
+                const SENTINEL = @TypeOf(t.*).SENTINEL;
+                var gid: u32 = 0;
+                for (t.slots) |s| {
+                    if (s.key == SENTINEL) continue;
+                    // `base + code` reconstructs the original value; the gate
+                    // proved it fits i64, so the i128 add narrows losslessly.
+                    const value: i64 = @intCast(@as(i128, plan.base) + @as(i128, s.key));
+                    self.gkeys_int.appendAssumeCapacity(packSingleIntField(field, value));
+                    self.gstate.appendAssumeCapacity(switch (plan.kind) {
+                        .sum => .{ .sum_int = @as(i128, s.state) },
+                        .min => .{ .min_int = s.state },
+                        .max => .{ .max_int = s.state },
+                    });
+                    gid += 1;
+                }
+                self.n_groups = gid;
+            },
+        }
     }
 
     /// Append the initial accumulator state for a freshly-assigned group.
@@ -2824,6 +2972,109 @@ fn planIntKey(
     return .{ .fields = fields, .tier = tier };
 }
 
+/// Decide the FOR-narrow inline-state fast path: exactly one integer-family
+/// group column, exactly one inline-able aggregate (`SUM`/`MIN`/`MAX` over an
+/// integer-family column), a proven group-column min/max range that leaves the
+/// `maxInt(KeyW)` EMPTY sentinel free, and a `{ KeyW, i64 }` slot ≤16 bytes.
+/// `null` ⟺ ineligible (the caller then uses the existing int / byte path).
+///
+/// NULL handling: a NULL group value would make `value − base` meaningless and
+/// SQL still groups NULLs together — so a *nullable* group column is a fallback
+/// condition (the existing int path handles its NULLs). The gate also requires
+/// the aggregate's input to be a non-128-bit int family so the i64 accumulator
+/// is the canonical SUM/MIN/MAX state, and (for SUM) that the proven sum bound
+/// fits i64 so the i64 accumulator never overflows where the canonical i128 one
+/// wouldn't — keeping results bit-identical to the fallback.
+fn planInlineFor(
+    group_col_indices: []const usize,
+    agg_col_indices: []const ?usize,
+    aggs: []const AggSpec,
+    up_schema: []const Column,
+    st: exec.PipelineStats,
+) ?InlineForPlan {
+    if (group_col_indices.len != 1 or aggs.len != 1) return null;
+
+    const gci = group_col_indices[0];
+    const gcol = up_schema[gci];
+    if (gcol.nullable) return null;
+    const gbits = intKeyBits(gcol.type) orelse return null;
+    if (gbits > 64) return null;
+
+    const a = aggs[0];
+    const kind: InlineAggKind = switch (a.func) {
+        .sum => .sum,
+        .min => .min,
+        .max => .max,
+        else => return null,
+    };
+    const aci = agg_col_indices[0] orelse return null;
+    const vt = up_schema[aci].type;
+    // i64 accumulator only: integer family ≤64 bits. 128-bit families
+    // (largeint/decimal128) and float/string take the canonical path.
+    const vbits = intKeyBits(vt) orelse return null;
+    if (vbits > 64) return null;
+
+    // FOR range from the group column's proven stats.
+    if (gci >= st.column_stats.len) return null;
+    const gs = st.column_stats[gci];
+    const min_i128 = gs.min orelse return null;
+    const max_i128 = gs.max orelse return null;
+    if (min_i128 > max_i128) return null;
+    if (min_i128 < std.math.minInt(i64) or max_i128 > std.math.maxInt(i64)) return null;
+    const base: i64 = @intCast(min_i128);
+    // range = max − base, computed in i128 then range-checked into u64.
+    const range_i128 = max_i128 - min_i128;
+    if (range_i128 < 0 or range_i128 > std.math.maxInt(u64)) return null;
+    const range: u64 = @intCast(range_i128);
+
+    // Smallest unsigned width whose `maxInt` strictly exceeds `range` (reserving
+    // the sentinel). A range needing the full u64 (`range == maxInt(u64)`) has no
+    // headroom for the sentinel ⇒ ineligible.
+    const tier: InlineKeyTier = if (range < std.math.maxInt(u8))
+        .w8
+    else if (range < std.math.maxInt(u16))
+        .w16
+    else if (range < std.math.maxInt(u32))
+        .w32
+    else if (range < std.math.maxInt(u64))
+        .w64
+    else
+        return null;
+
+    // SUM overflow guard: the proven sum bound (n·lo … n·hi) must fit i64 so the
+    // i64 accumulator can't wrap where the canonical i128 path wouldn't. MIN/MAX
+    // always fit i64 (a single value of a ≤64-bit family).
+    if (kind == .sum) {
+        const vs: ?exec.ColStat = if (aci < st.column_stats.len) st.column_stats[aci] else null;
+        const s = vs orelse return null;
+        const lo = s.min orelse return null;
+        const hi = s.max orelse return null;
+        const n: i128 = @intCast(@max(st.upper_rows, 1));
+        const lo_sum = std.math.mul(i128, n, lo) catch return null;
+        const hi_sum = std.math.mul(i128, n, hi) catch return null;
+        if (lo_sum < std.math.minInt(i64) or hi_sum > std.math.maxInt(i64)) return null;
+    }
+
+    // Slot-size gate: `{ KeyW, i64 }` ≤ 16 bytes. i64 state at 8-byte alignment
+    // keeps every tier at ≤16 bytes, but assert it so a future wider state can't
+    // silently slip past this contract.
+    const slot_size: usize = switch (tier) {
+        .w8 => @sizeOf(InlineTable8.Slot),
+        .w16 => @sizeOf(InlineTable16.Slot),
+        .w32 => @sizeOf(InlineTable32.Slot),
+        .w64 => @sizeOf(InlineTable64.Slot),
+    };
+    if (slot_size > 16) return null;
+
+    return .{
+        .base = base,
+        .tier = tier,
+        .kind = kind,
+        .key_tag = std.meta.activeTag(gcol.type),
+        .val_tag = std.meta.activeTag(vt),
+    };
+}
+
 /// Reinterpret a signed/unsigned value of `bits` width as the low `bits` of a
 /// u128, masked to the field width (two's-complement bit pattern, so packing is
 /// bijective with `unpackIntField`).
@@ -2858,6 +3109,109 @@ fn packIntKey(layout: IntKeyLayout, batch: Batch, group_col_indices: []const usi
         key |= fb << @intCast(f.offset);
     }
     return key;
+}
+
+/// Pack a single integer-family group column's `value` into the u128 key,
+/// matching `packIntKey` for the one-column case (`fieldBits` of the column's
+/// stored type at the field's offset). The inline-FOR lower produces keys
+/// `appendIntGroupKey` then decodes bit-identically to the canonical path.
+fn packSingleIntField(f: IntKeyField, value: i64) u128 {
+    const fb: u128 = switch (f.type_tag) {
+        .boolean => fieldBits(u8, @intCast(value), f.bits),
+        .tinyint => fieldBits(i8, @intCast(value), f.bits),
+        .smallint => fieldBits(i16, @intCast(value), f.bits),
+        .int, .date => fieldBits(i32, @intCast(value), f.bits),
+        .bigint, .datetime, .decimal64 => fieldBits(i64, value, f.bits),
+        else => unreachable,
+    };
+    return fb << @intCast(f.offset);
+}
+
+/// The unsigned key width type backing an `InlineKeyTier`.
+fn inlineKeyWidth(comptime tier: InlineKeyTier) type {
+    return switch (tier) {
+        .w8 => u8,
+        .w16 => u16,
+        .w32 => u32,
+        .w64 => u64,
+    };
+}
+
+/// One key-width tier of the inline-FOR accumulate. Dispatches the group
+/// column's stored slice type (the FOR-key read), then the (func × value stored
+/// slice type) fold, before entering the comptime-fixed inner loop — so the
+/// per-row probe carries no tier / func / type branch.
+inline fn inlineForTier(
+    aa: Allocator,
+    plan: InlineForPlan,
+    key_view: ColumnView,
+    val_view: ColumnView,
+    comptime KeyW: type,
+    table: *group_table.InlineSlotTable(KeyW, InlineState),
+) !void {
+    switch (plan.kind) {
+        inline .sum, .min, .max => |kind| switch (plan.key_tag) {
+            inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |kt| switch (plan.val_tag) {
+                inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vt| {
+                    const key_sl = @field(key_view.data, @tagName(kt));
+                    const val_sl = @field(val_view.data, @tagName(vt));
+                    try inlineForLoop(aa, plan.base, val_view, KeyW, key_sl, val_sl, table, kind);
+                },
+                else => unreachable,
+            },
+            else => unreachable,
+        },
+    }
+}
+
+/// Comptime-fixed inline-FOR inner loop. FOR-normalizes each row's key
+/// (`code = value − base`) into `KeyW`, then `getOrPut` either seeds the slot's
+/// state to the fold identity on first sighting or folds the value in place.
+/// Prefetch-pipelined: the table is grown for the whole batch up front so slot
+/// addresses stay stable across the look-ahead window. The group column is
+/// non-nullable (`planInlineFor` gate), so the key read needs no validity
+/// branch; the value column's NULLs are skipped (SQL excludes them).
+inline fn inlineForLoop(
+    aa: Allocator,
+    base: i64,
+    val_view: ColumnView,
+    comptime KeyW: type,
+    key_sl: anytype,
+    val_sl: anytype,
+    table: *group_table.InlineSlotTable(KeyW, InlineState),
+    comptime kind: InlineAggKind,
+) !void {
+    const n = key_sl.len;
+    try table.ensureFor(aa, n);
+    const val_has_nulls = val_view.nulls != null;
+    const base128: i128 = base;
+    var r: usize = 0;
+    while (r < n) : (r += 1) {
+        if (r + Aggregate.PREFETCH_DIST < n) {
+            // FOR code in i128 so a range exceeding i64 (a valid w64 tier) can't
+            // overflow the subtraction; the gate guarantees it fits `KeyW`.
+            const code_pf: KeyW = @intCast(@as(i128, key_sl[r + Aggregate.PREFETCH_DIST]) - base128);
+            table.prefetch(code_pf);
+        }
+        if (val_has_nulls and !val_view.isValid(r)) continue;
+        const code: KeyW = @intCast(@as(i128, key_sl[r]) - base128);
+        const v: i64 = val_sl[r];
+        const e = table.getOrPut(code);
+        switch (kind) {
+            .sum => {
+                if (!e.found) e.state.* = 0;
+                e.state.* += v;
+            },
+            .min => {
+                if (!e.found) e.state.* = std.math.maxInt(i64);
+                if (v < e.state.*) e.state.* = v;
+            },
+            .max => {
+                if (!e.found) e.state.* = std.math.minInt(i64);
+                if (v > e.state.*) e.state.* = v;
+            },
+        }
+    }
 }
 
 /// Extract one field's signed/unsigned value from the packed key (inverse of

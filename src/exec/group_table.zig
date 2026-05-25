@@ -526,7 +526,7 @@ pub const CountSlotTable = struct {
 pub fn InlineSlotTable(comptime KeyW: type, comptime StateT: type) type {
     return struct {
         const Self = @This();
-        const Slot = struct { key: KeyW, state: StateT };
+        pub const Slot = struct { key: KeyW, state: StateT };
 
         /// Power-of-two-sized open-addressing table; `&.{}` ⟺ not yet allocated.
         slots: []Slot,
