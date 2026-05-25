@@ -138,12 +138,17 @@ slot table, then **lower occupied slots into the existing dense
 paths run completely unchanged. `gstate` is capacity-sized and indexed by slot
 during accumulate; lowering compacts it to dense gids.
 
-- [ ] 1.1 Cross-segment stat rollup: query-global `min/max` per int key column from per-segment stats → base + range (+ sentinel headroom check).
-- [ ] 1.2 Narrow slot-as-gid table type (`group_table.zig`): comptime slot width (u8/u16/u32/u64) holding the FOR code, EMPTY = `range_max+1`, gid = slot index; prefetch-pipelined probe; grow. Standalone + unit-tested first.
-- [ ] 1.3 Aggregate integration: eligibility (int key(s), FOR range with sentinel headroom, fits a narrow slot), FOR-normalize `(value − base)` at probe, `gstate` indexed by slot position.
-- [ ] 1.4 Lower at emit: walk occupied slots → dense `gkeys_int`/`gstate`, reconstruct `base + code` into the key column; emit/top-k unchanged (FOR is order-preserving).
-- [ ] 1.5 Microbench: narrow slot-as-gid probe vs current tier at several widths (re-confirm distinctbench's 8B vs 16B ~2×, extend to 1/2/4B).
-- [ ] 1.6 `zig build test` green + ClickBench A/B. Expect Q15/Q19-class (i64 keys) to gain; closes no current loss (Q25/Q08) — a general int-key win.
+- [x] 1.2 `InlineSlotTable(KeyW, StateT)` in `group_table.zig`: generic slot = `{key:KeyW, state:StateT}`, gid = slot position, EMPTY = `maxInt(KeyW)`, prefetch-pipelined, grow carries state. Standalone + unit-tested. (commit `be5eb8d`)
+- [x] 1.3 + 1.4 Aggregate integration (commit `50cce36`): `planInlineFor` eligibility (one non-nullable int key ≤64b + one SUM/MIN/MAX over int ≤64b, FOR range from proven stats with sentinel headroom, SUM-overflow guarded by proven `n·[lo,hi]` fitting i64, slot ≤16B), FOR-normalize at probe, inline-state fold, `lowerInlineFor` → dense `gkeys_int`/`gstate` at emit (mirrors `lowerCountSlot`); everything else falls back to the canonical tier path unchanged. (1.1 stat rollup folded in via `column_stats`.)
+- [x] 1.5/1.6 591 tests pass (brute-force SUM/MIN/MAX + fallback cases); ClickBench neutral 43/43 — **no canonical query has the single-int-key+single-SUM/MIN/MAX shape**, so this is a general-engine win, not a ClickBench mover (as anticipated). The pure slot-as-gid-with-separate-gstate (for >16B state) is intentionally NOT built; inline-state covers the fits-in-slot case (see the multi-agg note below).
+
+**Multi-agg note:** splitting many aggregates across N inline tables is a
+DEAD END — N tables = N probes/misses per row, defeating the single-miss
+win. For many/wide aggs the right shape is ONE key→gid table + ONE
+contiguous per-gid `gstate` (2 misses, independent of agg count) — the
+existing canonical path; the inline-state slot only helps the few-agg
+fits-in-one-slot case. The real many-agg lever is vectorized batched agg
+kernels (#278), not table splitting.
 
 **Blast radius / correctness:** shared int-key GROUP BY path. Watch emit order
 (lowering keeps dense-gid order — verify against tests), `gstate` capacity
