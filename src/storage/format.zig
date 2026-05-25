@@ -29,17 +29,35 @@
 const std = @import("std");
 
 pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
-/// v7: per-column stats slot widens from 16 bytes (i64 min + i64 max)
-/// to 32 bytes (i128 min + i128 max). Unlocks usable stats for
-/// largeint / decimal128 / uuid (whose full range needs 16 bytes per
-/// value) and extends the string prefix from 8 bytes to 16. All
-/// stats-bearing types now share a uniform i128-based representation.
-pub const segment_version: u16 = 8;
+/// v9: per-column-block `encoding` byte (one of the two header reserved bytes)
+/// selects `raw` or `for_` (Frame-of-Reference). v8 segments wrote both reserved
+/// bytes as 0, which decodes as `.raw`, so v8 and v9 raw blocks are byte-identical
+/// on disk — the only on-disk difference is a `.for_` block, which only a v9
+/// writer emits. The header size is unchanged.
+///
+/// v7→v8: per-column stats slot widened from 16 bytes (i64 min + i64 max) to 32
+/// bytes (i128 min + i128 max). Unlocked usable stats for largeint / decimal128 /
+/// uuid and extended the string prefix from 8 to 16 bytes.
+pub const segment_version: u16 = 9;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
     none = 0,
     zstd = 1,
+};
+
+/// Per-column-block value encoding, stored in the first of the header's two
+/// reserved bytes. Orthogonal to `Compression`: a block is first encoded
+/// (raw vs FOR), then the encoded bytes are optionally zstd-compressed.
+///
+/// `.for_` (Frame-of-Reference) stores a fixed-width integer column as a single
+/// `base` plus per-row narrow unsigned deltas `value - base`, where `base` is the
+/// block's minimum non-null value and the delta width is the smallest of
+/// {1,2,4,8} bytes that holds `max - base`. Decoding reconstructs
+/// `value = base + delta`. See the FOR payload layout in `segment_writer.zig`.
+pub const Encoding = enum(u8) {
+    raw = 0,
+    for_ = 1,
 };
 
 /// Per-column-block flags (u8). Bit 0 = has_nulls (decompressed payload is
@@ -61,13 +79,18 @@ pub const ColumnBlockFlags = packed struct(u8) {
 pub const ColumnBlockHeader = struct {
     compression: Compression,
     flags: ColumnBlockFlags,
+    encoding: Encoding,
     uncompressed_size: u32,
     compressed_size: u32,
 };
 
 /// Size of the in-file column-block header:
-///   u8 compression + u8 flags + 2 reserved + u32 uncompressed_size + u32 compressed_size.
+///   u8 compression + u8 flags + u8 encoding + 1 reserved + u32 uncompressed_size + u32 compressed_size.
+/// (`encoding` occupies the first of v8's two reserved bytes; one reserved byte
+/// remains. The size is unchanged from v8, preserving on-disk back-compat.)
 pub const column_block_header_size: usize = 12;
+/// Byte offset of the `encoding` field within a column-block header.
+pub const column_block_encoding_offset: usize = 2;
 pub const header_size: usize = 32;
 pub const row_group_header_size: usize = 8;
 pub const footer_trailer_size: usize = 8; // u32 footer_size + 4-byte magic

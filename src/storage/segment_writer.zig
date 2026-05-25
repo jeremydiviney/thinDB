@@ -183,9 +183,15 @@ const appendU64 = format.appendU64;
 const appendI32 = format.appendI32;
 const appendI64 = format.appendI64;
 
-/// Build the raw (uncompressed) column-block payload, then try zstd-compress
+/// Build the encoded (uncompressed) column-block payload, then try zstd-compress
 /// it via the shared `Compressor`. Keep whichever is smaller. Prepend the
 /// on-disk header.
+///
+/// Encoding choice (raw vs Frame-of-Reference) is made once per block by
+/// `tryEncodeFor`: an eligible integer-family fixed-width column whose value
+/// range narrows is written FOR, everything else stays raw. The validity bitmap
+/// (when the column is nullable) is laid out identically in both encodings — it
+/// always prefixes the payload — so the reader's bitmap handling is shared.
 fn writeColumnBlock(
     allocator: Allocator,
     compressor: *compression_mod.Compressor,
@@ -205,7 +211,17 @@ fn writeColumnBlock(
     if (has_nulls) {
         try writeValidityBitmap(allocator, &scratch, view, row_start, row_end);
     }
-    try writeRawColumnBlock(allocator, &scratch, view, row_start, row_end);
+
+    // Try Frame-of-Reference first; fall back to raw when it doesn't narrow.
+    // `tryEncodeFor` appends the FOR body onto `scratch` (after the bitmap) and
+    // returns true iff it committed to FOR; on false `scratch` is untouched past
+    // the bitmap and we write the raw body.
+    const encoding: format.Encoding = if (try tryEncodeFor(allocator, &scratch, view, row_start, row_end))
+        .for_
+    else blk: {
+        try writeRawColumnBlock(allocator, &scratch, view, row_start, row_end);
+        break :blk .raw;
+    };
 
     const raw_size: u32 = @intCast(scratch.items.len);
 
@@ -222,11 +238,12 @@ fn writeColumnBlock(
 
     const flags = format.ColumnBlockFlags{ .has_nulls = has_nulls };
 
-    // Header: kind (u8) + flags (u8) + 2 reserved + uncompressed_size (u32) + compressed_size (u32)
+    // Header: kind (u8) + flags (u8) + encoding (u8) + 1 reserved + uncompressed_size (u32) + compressed_size (u32)
     try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + payload_size);
     buf.appendAssumeCapacity(@intFromEnum(kind));
     buf.appendAssumeCapacity(flags.toByte());
-    buf.appendSliceAssumeCapacity(&[_]u8{ 0, 0 });
+    buf.appendAssumeCapacity(@intFromEnum(encoding));
+    buf.appendAssumeCapacity(0); // remaining reserved byte
     var b4: [4]u8 = undefined;
     format.writeU32(&b4, raw_size);
     buf.appendSliceAssumeCapacity(&b4);
@@ -238,6 +255,119 @@ fn writeColumnBlock(
     } else {
         buf.appendSliceAssumeCapacity(scratch.items);
     }
+}
+
+/// Frame-of-Reference body, appended after the (already-written) validity
+/// bitmap. Layout of the FOR portion of the decompressed payload:
+///
+///   [base: i128 LE (16 bytes)] [width: u8 (1|2|4|8)] [3 pad bytes]
+///   [deltas: row_count × width, LE]
+///
+/// `base` is the minimum non-null value; each row stores the unsigned delta
+/// `value - base` truncated to `width` bytes (a NULL row still occupies a delta
+/// slot — its value is whatever placeholder the column array holds, masked off
+/// by the validity bitmap, so the slot's contents are irrelevant). The 3 pad
+/// bytes keep the deltas region from a width-misaligned start, mirroring the
+/// raw-block alignment that the borrowed-view fast path relies on; FOR blocks
+/// themselves bail out of the borrow path in 2A, but the padding keeps the
+/// layout self-consistent and aligned for the 2B narrow accessor.
+///
+/// Returns false (leaving `scratch` unchanged past the bitmap) when the column
+/// type is ineligible or the range can't narrow below the native width; the
+/// caller then writes a raw body.
+fn tryEncodeFor(
+    allocator: Allocator,
+    scratch: *std.ArrayList(u8),
+    view: ColumnView,
+    row_start: usize,
+    row_end: usize,
+) !bool {
+    return switch (view.data) {
+        .int, .date => |d| forEncode(i32, allocator, scratch, view, d, row_start, row_end),
+        .bigint, .datetime, .decimal64 => |d| forEncode(i64, allocator, scratch, view, d, row_start, row_end),
+        .smallint => |d| forEncode(i16, allocator, scratch, view, d, row_start, row_end),
+        .tinyint => |d| forEncode(i8, allocator, scratch, view, d, row_start, row_end),
+        .boolean => |d| forEncode(u8, allocator, scratch, view, d, row_start, row_end),
+        // largeint / decimal128 / uuid / float / double / strings are not FOR-eligible.
+        else => false,
+    };
+}
+
+/// Narrowest FOR delta width in bytes for a value span, or null when it can't
+/// beat (be strictly smaller than) the native element width `native`.
+fn forWidth(span: u128, native: usize) ?u8 {
+    const width: u8 = if (span <= std.math.maxInt(u8))
+        1
+    else if (span <= std.math.maxInt(u16))
+        2
+    else if (span <= std.math.maxInt(u32))
+        4
+    else
+        8;
+    return if (width < native) width else null;
+}
+
+fn forEncode(
+    comptime T: type,
+    allocator: Allocator,
+    scratch: *std.ArrayList(u8),
+    view: ColumnView,
+    data: []const T,
+    row_start: usize,
+    row_end: usize,
+) !bool {
+    const native = @sizeOf(T);
+    // Native-1-byte types (tinyint, boolean) can never narrow further.
+    if (native <= 1) return false;
+
+    // Min/max over non-null values, in i128 to make `max - base` overflow-proof.
+    var lo: i128 = std.math.maxInt(i128);
+    var hi: i128 = std.math.minInt(i128);
+    var any = false;
+    for (data[row_start..row_end], row_start..) |v, r| {
+        if (!view.isValid(r)) continue;
+        const iv: i128 = @intCast(v);
+        if (iv < lo) lo = iv;
+        if (iv > hi) hi = iv;
+        any = true;
+    }
+    // All-null block: no base to derive — stay raw (degenerate, rare).
+    if (!any) return false;
+
+    const span: u128 = @intCast(hi - lo);
+    const width = forWidth(span, native) orelse return false;
+
+    const n = row_end - row_start;
+    const for_body_size = 16 + 1 + 3 + n * width;
+    // Only commit to FOR when the encoded body is strictly smaller than the raw
+    // body (n * native). Conservative: a marginal case stays raw.
+    if (for_body_size >= n * native) return false;
+
+    try scratch.ensureUnusedCapacity(allocator, for_body_size);
+    var b16: [16]u8 = undefined;
+    format.writeI128(&b16, lo);
+    scratch.appendSliceAssumeCapacity(&b16);
+    scratch.appendSliceAssumeCapacity(&[_]u8{ width, 0, 0, 0 });
+
+    for (data[row_start..row_end], row_start..) |v, r| {
+        // A NULL slot's placeholder value can sit outside [lo, hi]; clamp its
+        // delta into [0, span] so it never under/overflows the narrow width.
+        // The validity bitmap masks these rows on read, so the exact stored code
+        // is irrelevant to correctness — clamping just keeps every code a real
+        // in-range delta (what the 2B narrow accessor assumes).
+        const iv: i128 = @intCast(v);
+        const delta_i: i128 = if (!view.isValid(r) or iv < lo)
+            0
+        else if (iv > hi)
+            @intCast(span)
+        else
+            iv - lo;
+        const delta: u128 = @intCast(delta_i);
+        var b8: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b8, @truncate(delta), .little);
+        scratch.appendSliceAssumeCapacity(b8[0..width]);
+    }
+    return true;
 }
 
 fn writeValidityBitmap(

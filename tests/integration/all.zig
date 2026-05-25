@@ -60,6 +60,7 @@ test {
     _ = @import("count_in_slot_test.zig");
     _ = @import("inline_for_agg_test.zig");
     _ = @import("stats_propagation_test.zig");
+    _ = @import("for_encoding_test.zig");
 }
 
 test "integration entry exists" {

@@ -898,9 +898,9 @@ pub const Scan = struct {
             const col_type = self.table.schema.columns[phys].type;
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
             var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
-            const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags) orelse {
-                // Misaligned / unsupported: release this block and abandon the
-                // fast path for the whole row group (release the rest too).
+            const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse {
+                // Misaligned / FOR-encoded / unsupported: release this block and
+                // abandon the fast path for the whole row group (release the rest too).
                 block.release(self.allocator, &self.table.cache);
                 for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
                 return null;

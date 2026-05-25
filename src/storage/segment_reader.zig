@@ -99,21 +99,23 @@ pub const ReadSegment = struct {
             };
             if (cc.acquire(key)) |entry| {
                 defer cc.release(entry);
-                return decodeRawColumn(allocator, col_type, entry.bytes, rg.row_count, flags);
+                return decodeColumnPayload(allocator, col_type, entry.bytes, rg.row_count, flags, entry.encoding);
             }
             // Miss: pread the block, decompress, hand the bytes to the cache.
             // The errdefer is scoped to the block so it fires only if we fail
             // before ownership transfers; once `insertPinned` returns the cache
             // owns the bytes and only the pin needs releasing.
+            var entry_encoding: format.Encoding = .raw;
             const entry = blk: {
                 const block = try self.readColumnBlock(allocator, rg, column_idx);
                 defer allocator.free(block);
+                entry_encoding = blockEncoding(block, 0);
                 const raw = try getDecompressedBytes(allocator, block, 0);
                 errdefer allocator.free(raw);
-                break :blk try cc.insertPinned(key, raw);
+                break :blk try cc.insertPinned(key, raw, entry_encoding);
             };
             defer cc.release(entry);
-            return decodeRawColumn(allocator, col_type, entry.bytes, rg.row_count, flags);
+            return decodeColumnPayload(allocator, col_type, entry.bytes, rg.row_count, flags, entry.encoding);
         }
 
         const block = try self.readColumnBlock(allocator, rg, column_idx);
@@ -129,6 +131,10 @@ pub const ReadSegment = struct {
     /// `release` to drop the pin / free the buffer.
     pub const BorrowedBlock = struct {
         bytes: []const u8,
+        /// Value encoding of `bytes`. A `.for_` block is not directly viewable
+        /// as native-width bytes, so `viewRawColumn` declines it and the caller
+        /// falls back to the owned-decode (expand) path. Raw blocks view in place.
+        encoding: format.Encoding = .raw,
         entry: ?*storage_cache.Cache.Entry = null,
         owned: ?[]u8 = null,
 
@@ -163,19 +169,21 @@ pub const ReadSegment = struct {
                 .column_idx = @intCast(column_idx),
             };
             if (cc.acquire(key)) |entry| {
-                return .{ .bytes = entry.bytes, .entry = entry };
+                return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
             }
             const block = try self.readColumnBlock(allocator, rg, column_idx);
             defer allocator.free(block);
+            const encoding = blockEncoding(block, 0);
             const raw = try getDecompressedBytes(allocator, block, 0);
             errdefer allocator.free(raw);
-            const entry = try cc.insertPinned(key, raw);
-            return .{ .bytes = entry.bytes, .entry = entry };
+            const entry = try cc.insertPinned(key, raw, encoding);
+            return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
         }
         const block = try self.readColumnBlock(allocator, rg, column_idx);
         defer allocator.free(block);
+        const encoding = blockEncoding(block, 0);
         const raw = try getDecompressedBytes(allocator, block, 0);
-        return .{ .bytes = raw, .owned = raw };
+        return .{ .bytes = raw, .encoding = encoding, .owned = raw };
     }
 
     /// Read the raw on-disk bytes (header + payload) of one column's block in a
@@ -301,6 +309,16 @@ pub fn readSegment(
 // Block decoding
 // ---------------------------------------------------------------------------
 
+/// Read the per-block `encoding` byte from a column-block header at `offset`.
+fn blockEncoding(bytes: []const u8, offset: usize) format.Encoding {
+    const b = bytes[offset + format.column_block_encoding_offset];
+    // Unknown encodings degrade to raw; the writer only ever emits raw/for_, and
+    // an unknown value would be caught by a downstream decode mismatch, but we
+    // keep the reader total here rather than introducing a new error path for a
+    // byte the writer fully controls.
+    return if (b <= @intFromEnum(format.Encoding.for_)) @enumFromInt(b) else .raw;
+}
+
 fn decodeBlock(
     allocator: Allocator,
     bytes: []const u8,
@@ -312,8 +330,9 @@ fn decodeBlock(
     var owned_raw: ?[]u8 = null;
     defer if (owned_raw) |r| allocator.free(r);
 
+    const encoding = blockEncoding(bytes, offset);
     const raw = try readBlockRaw(allocator, bytes, offset, &owned_raw);
-    return decodeRawColumn(allocator, col_type, raw, row_count, flags);
+    return decodeColumnPayload(allocator, col_type, raw, row_count, flags, encoding);
 }
 
 /// Reads the block at `offset`, returns its decompressed bytes. If the block
@@ -365,6 +384,25 @@ fn getDecompressedBytes(
     }
 }
 
+/// Decode a decompressed block payload into an OwnedColumn, dispatching on the
+/// block's value encoding. Both encodings share the validity-bitmap prefix
+/// convention (bitmap first when nullable); a `.for_` block's value region is
+/// expanded back to the native-width values so the produced column is the SAME
+/// native shape every consumer already expects.
+fn decodeColumnPayload(
+    allocator: Allocator,
+    col_type: Type,
+    raw: []const u8,
+    row_count: u32,
+    flags: format.ColumnBlockFlags,
+    encoding: format.Encoding,
+) !OwnedColumn {
+    return switch (encoding) {
+        .raw => decodeRawColumn(allocator, col_type, raw, row_count, flags),
+        .for_ => decodeForColumn(allocator, col_type, raw, row_count, flags),
+    };
+}
+
 fn decodeRawColumn(
     allocator: Allocator,
     col_type: Type,
@@ -411,6 +449,93 @@ fn decodeRawColumn(
     }
 }
 
+/// A FOR (Frame-of-Reference) block's value region, parsed in place over the
+/// decompressed payload (past any validity bitmap): the `base`, the delta
+/// `width` in bytes, and the `codes` (row_count × width narrow deltas). This is
+/// the hook Phase 2B's FOR-aware filter consumes — it lets a predicate compare
+/// against `const - base` over the narrow codes without expanding to native
+/// width. In 2A it is exercised only by a unit test.
+pub const ForBlock = struct {
+    base: i128,
+    width: u8,
+    codes: []const u8,
+};
+
+/// Parse the FOR header + codes out of a decompressed block payload. `values`
+/// is the payload past the validity bitmap (the caller strips the bitmap the
+/// same way the raw path does). Layout: `[base i128 LE][width u8][3 pad][codes]`.
+pub fn forBlockOf(values: []const u8, row_count: u32) ForBlock {
+    const base = format.readI128(values[0..16]);
+    const width = values[16];
+    const codes_start = 16 + 1 + 3;
+    const codes = values[codes_start .. codes_start + @as(usize, row_count) * width];
+    return .{ .base = base, .width = width, .codes = codes };
+}
+
+/// Expand a FOR-encoded block back to its native-width values so the produced
+/// OwnedColumn has the identical shape a raw block would. Reconstructs each row
+/// as `base + delta`. NULL rows (masked by the validity bitmap) still get a
+/// delta slot expanded into a placeholder value, which consumers ignore.
+fn decodeForColumn(
+    allocator: Allocator,
+    col_type: Type,
+    raw: []const u8,
+    row_count: u32,
+    flags: format.ColumnBlockFlags,
+) !OwnedColumn {
+    var nulls: ?[]u8 = null;
+    errdefer if (nulls) |n| allocator.free(n);
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        const bm_copy = try allocator.alloc(u8, bm_len);
+        @memcpy(bm_copy, raw[0..bm_len]);
+        nulls = bm_copy;
+        values = raw[bm_len..];
+    }
+
+    const fb = forBlockOf(values, row_count);
+
+    // The writer only ever FOR-encodes these integer-family fixed-width types.
+    return switch (col_type) {
+        .int => .{ .data = .{ .int = try expandFor(i32, allocator, fb, row_count) }, .nulls = nulls },
+        .date => .{ .data = .{ .date = try expandFor(i32, allocator, fb, row_count) }, .nulls = nulls },
+        .bigint => .{ .data = .{ .bigint = try expandFor(i64, allocator, fb, row_count) }, .nulls = nulls },
+        .datetime => .{ .data = .{ .datetime = try expandFor(i64, allocator, fb, row_count) }, .nulls = nulls },
+        .decimal64 => .{ .data = .{ .decimal64 = try expandFor(i64, allocator, fb, row_count) }, .nulls = nulls },
+        .smallint => .{ .data = .{ .smallint = try expandFor(i16, allocator, fb, row_count) }, .nulls = nulls },
+        .tinyint => .{ .data = .{ .tinyint = try expandFor(i8, allocator, fb, row_count) }, .nulls = nulls },
+        .boolean => blk: {
+            const data = try allocator.alloc(u8, row_count);
+            errdefer allocator.free(data);
+            for (data, 0..) |*slot, i| {
+                const delta = readForCode(fb.codes, fb.width, i);
+                slot.* = @intCast(fb.base + @as(i128, delta));
+            }
+            break :blk .{ .data = .{ .boolean = data }, .nulls = nulls };
+        },
+        else => unreachable,
+    };
+}
+
+/// One narrow delta from the codes region (little-endian, `width` bytes).
+fn readForCode(codes: []const u8, width: u8, row: usize) u64 {
+    var b8: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    const off = row * width;
+    @memcpy(b8[0..width], codes[off .. off + width]);
+    return std.mem.readInt(u64, &b8, .little);
+}
+
+fn expandFor(comptime T: type, allocator: Allocator, fb: ForBlock, row_count: u32) ![]T {
+    const data = try allocator.alloc(T, row_count);
+    errdefer allocator.free(data);
+    for (data, 0..) |*slot, i| {
+        const delta = readForCode(fb.codes, fb.width, i);
+        slot.* = @intCast(fb.base + @as(i128, delta));
+    }
+    return data;
+}
+
 /// Build a BORROWED `ColumnView` over the raw decompressed block bytes —
 /// zero allocation, the view aliases `raw` directly. Used by the scan-side
 /// in-place filter fast path: the view is created over PINNED cache bytes,
@@ -418,6 +543,9 @@ fn decodeRawColumn(
 /// single `next()` call. It must never be handed to a downstream operator.
 ///
 /// Returns `null` when a typed view can't be formed safely:
+///   - a `.for_` block: its bytes are narrow deltas, not native-width values,
+///     so it has no in-place native view — the caller falls back to the
+///     owned-decode (expand) path,
 ///   - a fixed-width element slice would be misaligned (`@alignCast` of
 ///     misaligned bytes is UB, so we decline and the caller falls back to the
 ///     owned-copy decode path),
@@ -430,8 +558,10 @@ pub fn viewRawColumn(
     raw: []const u8,
     row_count: u32,
     flags: format.ColumnBlockFlags,
+    encoding: format.Encoding,
 ) ?ColumnView {
     if (native_endian != .little) return null;
+    if (encoding != .raw) return null;
 
     var nulls: ?[]const u8 = null;
     var values = raw;

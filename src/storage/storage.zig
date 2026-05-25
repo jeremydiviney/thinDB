@@ -247,22 +247,99 @@ test "borrowed view matches owned decode byte-for-byte (fixed + string)" {
 
         const col_type = schema.columns[col_idx].type;
         const flags = format.ColumnBlockFlags{ .has_nulls = schema.columns[col_idx].nullable };
-        const view = segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags).?;
+        const maybe_view = segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding);
 
-        const ov = owned.view();
-        try std.testing.expectEqual(ov.data.rowCount(), view.data.rowCount());
-        switch (ov.data) {
-            .bigint => |s| try std.testing.expectEqualSlices(i64, s, view.data.bigint),
-            .int => |s| try std.testing.expectEqualSlices(i32, s, view.data.int),
-            .double => |s| try std.testing.expectEqualSlices(f64, s, view.data.double),
-            .string => |sv| {
-                for (0..sv.rowCount()) |r| {
-                    try std.testing.expectEqualStrings(sv.rowBytes(r), view.data.string.rowBytes(r));
-                }
-            },
-            else => unreachable,
+        // A FOR-encoded block (the narrow-range int/bigint columns here) has no
+        // in-place native view, so the borrow declines — the owned decode above
+        // is the correctness check for those. Raw blocks must match byte-for-byte.
+        if (block.encoding != .raw) {
+            try std.testing.expect(maybe_view == null);
+        } else {
+            const view = maybe_view.?;
+            const ov = owned.view();
+            try std.testing.expectEqual(ov.data.rowCount(), view.data.rowCount());
+            switch (ov.data) {
+                .bigint => |s| try std.testing.expectEqualSlices(i64, s, view.data.bigint),
+                .int => |s| try std.testing.expectEqualSlices(i32, s, view.data.int),
+                .double => |s| try std.testing.expectEqualSlices(f64, s, view.data.double),
+                .string => |sv| {
+                    for (0..sv.rowCount()) |r| {
+                        try std.testing.expectEqualStrings(sv.rowBytes(r), view.data.string.rowBytes(r));
+                    }
+                },
+                else => unreachable,
+            }
         }
     }
+}
+
+test "FOR encoding round-trips narrow-range int/bigint incl. negatives + nulls" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "k", .type = .int }, // narrow positive range → FOR
+            .{ .name = "n", .type = .bigint, .nullable = true }, // negatives + NULLs → FOR
+        },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+
+    const n_rows = 50;
+    var ks: [n_rows]i32 = undefined;
+    var ns: [n_rows]i64 = undefined;
+    var bm: [column.bitmapBytes(n_rows)]u8 = .{0} ** column.bitmapBytes(n_rows);
+    for (0..n_rows) |i| {
+        ks[i] = 1000 + @as(i32, @intCast(i % 7)); // [1000, 1006] → u8 deltas
+        ns[i] = -500 + @as(i64, @intCast(i)); // negative base, [-500, -451]
+        // Every 5th row of `n` is NULL.
+        if (i % 5 != 0) column.setValidBit(&bm, i, true);
+    }
+
+    const columns = [_]ColumnView{
+        .{ .data = .{ .int = &ks } },
+        .{ .data = .{ .bigint = &ns }, .nulls = &bm },
+    };
+
+    var info = try writeSegment(allocator, io, tmp.dir, "for.dat", schema, 9, 0, 64, &columns, false);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "for.dat", schema);
+    defer seg.deinit();
+
+    var c0 = try seg.decodeColumn(allocator, schema, 0, 0);
+    defer c0.deinit(allocator);
+    try std.testing.expectEqualSlices(i32, &ks, c0.data.int);
+
+    var c1 = try seg.decodeColumn(allocator, schema, 0, 1);
+    defer c1.deinit(allocator);
+    const v1 = c1.view();
+    for (0..n_rows) |i| {
+        const want_valid = (i % 5 != 0);
+        try std.testing.expectEqual(want_valid, v1.isValid(i));
+        if (want_valid) try std.testing.expectEqual(ns[i], c1.data.bigint[i]);
+    }
+}
+
+test "forBlockOf parses base/width/codes (2B narrow accessor)" {
+    // A FOR block over [10, 13]: base = 10, width = 1, deltas {0,3,1}.
+    const row_count: u32 = 3;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.testing.allocator);
+    var b16: [16]u8 = undefined;
+    format.writeI128(&b16, 10);
+    try payload.appendSlice(std.testing.allocator, &b16);
+    try payload.appendSlice(std.testing.allocator, &[_]u8{ 1, 0, 0, 0 }); // width=1 + 3 pad
+    try payload.appendSlice(std.testing.allocator, &[_]u8{ 0, 3, 1 });
+
+    const fb = segment_reader.forBlockOf(payload.items, row_count);
+    try std.testing.expectEqual(@as(i128, 10), fb.base);
+    try std.testing.expectEqual(@as(u8, 1), fb.width);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 3, 1 }, fb.codes);
 }
 
 test {

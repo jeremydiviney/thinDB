@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const format = @import("format.zig");
 
 pub const Key = struct {
     segment_id: u64,
@@ -82,6 +83,11 @@ pub const Cache = struct {
         next: ?*Entry,
         /// In-use refcount. Nonzero entries are never evicted.
         pins: u32 = 0,
+        /// Value encoding of the cached (decompressed) block. The block header
+        /// isn't cached, so the encoding rides alongside the payload bytes here;
+        /// the decode path needs it to interpret `bytes` (raw vs FOR). Defaults
+        /// to `.raw` so callers that don't set it (and tests) behave as before.
+        encoding: format.Encoding = .raw,
     };
 
     pub fn init(allocator: Allocator, capacity_bytes: usize) Cache {
@@ -121,11 +127,12 @@ pub const Cache = struct {
     }
 
     /// Insert `bytes` for `key` (ownership transfers to the cache) and return a
-    /// pinned entry to decode from. If another thread inserted `key` between the
-    /// caller's miss and this call, `bytes` is freed and the existing entry is
-    /// returned pinned instead. On allocation failure the entry is not stored
-    /// and `bytes` is left for the caller to free. Caller MUST `release`.
-    pub fn insertPinned(self: *Cache, key: Key, bytes: []u8) !*Entry {
+    /// pinned entry to decode from. `encoding` records how to interpret `bytes`
+    /// (raw vs FOR). If another thread inserted `key` between the caller's miss
+    /// and this call, `bytes` is freed and the existing entry is returned pinned
+    /// instead. On allocation failure the entry is not stored and `bytes` is left
+    /// for the caller to free. Caller MUST `release`.
+    pub fn insertPinned(self: *Cache, key: Key, bytes: []u8, encoding: format.Encoding) !*Entry {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -139,7 +146,7 @@ pub const Cache = struct {
 
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
-        entry.* = .{ .key = key, .bytes = bytes, .prev = null, .next = null, .pins = 1 };
+        entry.* = .{ .key = key, .bytes = bytes, .prev = null, .next = null, .pins = 1, .encoding = encoding };
 
         try self.map.put(self.allocator, key, entry);
 
@@ -204,7 +211,7 @@ pub const Cache = struct {
 // ---------- tests --------------------------------------------------------
 
 fn put(c: *Cache, key: Key, bytes: []u8) !void {
-    c.release(try c.insertPinned(key, bytes));
+    c.release(try c.insertPinned(key, bytes, .raw));
 }
 
 test "cache acquire/insert round-trip + hit/miss counters" {
@@ -216,7 +223,7 @@ test "cache acquire/insert round-trip + hit/miss counters" {
     try std.testing.expect(c.acquire(k) == null);
     try std.testing.expectEqual(@as(u64, 1), c.misses);
 
-    const e1 = try c.insertPinned(k, try allocator.dupe(u8, "hello"));
+    const e1 = try c.insertPinned(k, try allocator.dupe(u8, "hello"), .raw);
     try std.testing.expectEqualStrings("hello", e1.bytes);
     c.release(e1);
 
@@ -272,7 +279,7 @@ test "cache never evicts a pinned entry, even over budget" {
 
     // Hold k1 pinned (in-use) the whole time.
     const k1 = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
-    const pinned = try c.insertPinned(k1, try allocator.dupe(u8, "0123456789"));
+    const pinned = try c.insertPinned(k1, try allocator.dupe(u8, "0123456789"), .raw);
 
     // Flood the cache well past budget while k1 — the oldest entry — stays pinned.
     inline for (1..4) |i| {
@@ -292,10 +299,10 @@ test "cache insertPinned dedupes a racing duplicate key" {
     defer c.deinit();
 
     const k = Key{ .segment_id = 7, .row_group_idx = 2, .column_idx = 3 };
-    const first = try c.insertPinned(k, try allocator.dupe(u8, "AAAA"));
+    const first = try c.insertPinned(k, try allocator.dupe(u8, "AAAA"), .raw);
     // Second insert of the same key (simulating a lost decompress race) must
     // free the redundant bytes and hand back the existing entry.
-    const second = try c.insertPinned(k, try allocator.dupe(u8, "BBBB"));
+    const second = try c.insertPinned(k, try allocator.dupe(u8, "BBBB"), .raw);
     try std.testing.expectEqual(first, second);
     try std.testing.expectEqualStrings("AAAA", second.bytes);
     try std.testing.expectEqual(@as(usize, 4), c.current_bytes);
