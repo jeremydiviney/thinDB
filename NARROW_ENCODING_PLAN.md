@@ -181,16 +181,29 @@ absolute cross-run numbers (see [[feedback-incremental-bench]]).
   Recovered the URL-LIKE full-expansion (Q20). Comparison `<> ''` ~neutral (those
   cols are also grouped → projection expansion dominates). Plus string range
   comparisons enabled as a side correctness win (commit `19fbc11`).
-- [ ] 4.1 Query-time stitch: merged `string→global_code` map + per-segment
-  local→global LUTs; raw/memtable hash per-row in; global width floats.
-- [ ] 4.2 Group/distinct on global codes (feeds Phase 1 narrow keys). **This is
-  the biggest lever AND the most invasive change:** the aggregate consumes
-  MATERIALIZED columns from the scan (`single_str_key` hashes string bytes via
-  `gkeys: [][]const u8`); it never sees codes. To group on codes the scan must
-  EMIT a coded-string column (new `ValueView` variant carrying {dict, codes}),
-  the aggregate must group on the global code, and group-key strings materialize
-  only at emit. Touches the batch interface + scan emit + aggregate. Do as its
-  own focused effort.
+- [x] 4.1 Query-time stitch (commit `33e2f88`): `src/exec/global_dict.zig`
+  `GlobalDict` — intern→stable global code, `buildLut` per-segment local→global,
+  owns byte copies, `decode` for emit. Foundation only (no consumer yet).
+- [ ] 4.2 Group/distinct on global codes — **DECISION: Option A** (general
+  coded-column through the batch interface; the contained Option B fused path was
+  rejected — owner: "shooting for the moon"). The executor is built on
+  materialized columns, so this is a core-type change. Decompose, green + tested
+  + back-to-back-benched + **profiled** at each sub-step:
+  - **A1** coded-string column representation + a `materialize` shim. Add the
+    coded form (batch-slot wrapper preferred over a raw `ValueView` variant to
+    bound the switch blast radius) with a single choke point that materializes
+    for any non-code-aware consumer. No producer yet → behavior identical, green.
+  - **A2** scan emits coded columns for dict blocks (translate local→global via
+    the LUT, interning into a query-scoped `GlobalDict` in the CompileCtx);
+    every consumer still materializes → results identical, proves the plumbing.
+    Bench ~neutral; **profile the stitch-build + translate cost.**
+  - **A3** aggregate's single-string-key path groups on the u32 global code
+    (reuse the int-key group table), decode at emit. **This moves the bench**
+    (Q16/17/33/34). Profile group-probe + decode.
+  - **A4** DISTINCT on codes; ORDER BY via sorted codes; exact cardinality (4.5).
+  - **Profiling (owner ask):** attribute time to global-dict build / LUT /
+    translate / expand — extend `PipelineStats` or scoped timers; surface in
+    profile runs, not just suite totals.
 - [ ] 4.3 ORDER BY via sorted global codes; else decode.
 - [ ] 4.5 Exact-cardinality consumer: post-predicate dict-survivor count → sizing + predicate ordering.
 - [ ] 4.6 *(optional)* function memoization for pure scalar fns over coded columns (Q28 REGEXP_REPLACE; but its result is the GROUP BY key, so entangled with 4.2).
