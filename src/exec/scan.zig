@@ -1115,16 +1115,19 @@ pub const Scan = struct {
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
             var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
 
-            if (block.encoding == .for_) {
-                // Expand the FOR codes once into a native buffer owned by the
-                // block; the view aliases that buffer and the expansion is freed
-                // on `block.release`. The raw columns alongside stay zero-copy.
-                block.expanded = storage.segment_reader.decodeForColumn(
+            if (block.encoding != .raw) {
+                // Narrow-encoded (FOR or dict): expand the codes once into a
+                // native buffer owned by the block; the view aliases that buffer
+                // and the expansion is freed on `block.release`. The raw columns
+                // alongside stay zero-copy — one narrow column never forces the
+                // whole row group onto the owned-decode path.
+                block.expanded = storage.segment_reader.decodeColumnPayload(
                     self.allocator,
                     col_type,
                     block.bytes,
                     rg_count,
                     flags,
+                    block.encoding,
                 ) catch |e| {
                     block.release(self.allocator, &self.table.cache);
                     for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);

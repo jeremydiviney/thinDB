@@ -212,12 +212,15 @@ fn writeColumnBlock(
         try writeValidityBitmap(allocator, &scratch, view, row_start, row_end);
     }
 
-    // Try Frame-of-Reference first; fall back to raw when it doesn't narrow.
-    // `tryEncodeFor` appends the FOR body onto `scratch` (after the bitmap) and
-    // returns true iff it committed to FOR; on false `scratch` is untouched past
-    // the bitmap and we write the raw body.
+    // Try a narrow encoding first; fall back to raw. `tryEncodeFor` (int-family)
+    // and `tryEncodeDict` (low-card strings) each append their body onto
+    // `scratch` (after the bitmap) and return true iff they committed; on false
+    // `scratch` is untouched past the bitmap. The two are mutually exclusive by
+    // column type, so the order between them doesn't matter.
     const encoding: format.Encoding = if (try tryEncodeFor(allocator, &scratch, view, row_start, row_end))
         .for_
+    else if (try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
+        .dict
     else blk: {
         try writeRawColumnBlock(allocator, &scratch, view, row_start, row_end);
         break :blk .raw;
@@ -366,6 +369,128 @@ fn forEncode(
         var b8: [8]u8 = undefined;
         std.mem.writeInt(u64, &b8, @truncate(delta), .little);
         scratch.appendSliceAssumeCapacity(b8[0..width]);
+    }
+    return true;
+}
+
+/// Maximum distinct values a dict block may hold. The per-row code is then at
+/// most `u16`-wide; a column whose block exceeds this stays raw (mid-build
+/// abandon below avoids paying the full distinct scan for high-card columns).
+const dict_max_ndv: usize = 65536;
+/// Skip dict encoding for blob-like columns: a high average value length means
+/// the dict bytes dominate and per-row codes save little. Long-but-low-card
+/// values (URLs) still qualify because the dict stores each long value once.
+const dict_max_avg_len: usize = 256;
+
+/// Segment-local string dictionary body, appended after the (already-written)
+/// validity bitmap. Encodes a low-cardinality string block as the `k` distinct
+/// values once (sorted) plus a narrow per-row code. Layout documented on
+/// `format.Encoding.dict`. Returns false (leaving `scratch` untouched past the
+/// bitmap) when the column is not a string, is blob-like, exceeds the NDV cap,
+/// is too high-cardinality to pay off, or doesn't shrink the body — the caller
+/// then writes a raw string block.
+fn tryEncodeDict(
+    allocator: Allocator,
+    scratch: *std.ArrayList(u8),
+    view: ColumnView,
+    row_start: usize,
+    row_end: usize,
+) !bool {
+    const sv: StringView = switch (view.data) {
+        .varchar, .string, .char => |s| s,
+        else => return false,
+    };
+
+    const n = row_end - row_start;
+    if (n == 0) return false;
+
+    // Avg-len gate (cheap, upfront): total value bytes / rows. Uses the raw
+    // offset span, which includes any null-row bytes — a conservative bound.
+    const total_bytes: usize = sv.offsets[row_end] - sv.offsets[row_start];
+    if (total_bytes / n > dict_max_avg_len) return false;
+
+    // Distinct map (insertion order) over non-null rows, with mid-build abandon.
+    var map: std.StringHashMapUnmanaged(u32) = .empty;
+    defer map.deinit(allocator);
+    var distinct: std.ArrayList([]const u8) = .empty; // slices alias sv.bytes
+    defer distinct.deinit(allocator);
+
+    const row_codes = try allocator.alloc(u32, n); // insertion code per row
+    defer allocator.free(row_codes);
+
+    var r = row_start;
+    while (r < row_end) : (r += 1) {
+        const i = r - row_start;
+        if (!view.isValid(r)) {
+            row_codes[i] = 0; // placeholder; masked by validity on read
+            continue;
+        }
+        const s = sv.rowBytes(r);
+        const gop = try map.getOrPut(allocator, s);
+        if (!gop.found_existing) {
+            if (map.count() > dict_max_ndv) return false; // abandon: high-card
+            gop.value_ptr.* = @intCast(distinct.items.len);
+            try distinct.append(allocator, s);
+        }
+        row_codes[i] = gop.value_ptr.*;
+    }
+
+    const k = distinct.items.len;
+    if (k == 0) return false; // all-null block: stay raw (degenerate)
+    // NDV ≤ n/2: with more distinct values the codes + dict approach the raw
+    // body, so the encoding can't pay for its dict header.
+    if (k * 2 > n) return false;
+
+    // Sort distinct indices by value bytes; build insertion→sorted remap.
+    const order = try allocator.alloc(u32, k);
+    defer allocator.free(order);
+    for (order, 0..) |*o, idx| o.* = @intCast(idx);
+    const SortCtx = struct {
+        items: []const []const u8,
+        fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+            return std.mem.lessThan(u8, ctx.items[a], ctx.items[b]);
+        }
+    };
+    std.sort.pdq(u32, order, SortCtx{ .items = distinct.items }, SortCtx.lessThan);
+    const ins_to_sorted = try allocator.alloc(u32, k);
+    defer allocator.free(ins_to_sorted);
+    for (order, 0..) |ins_idx, p| ins_to_sorted[ins_idx] = @intCast(p);
+
+    var dict_byte_count: usize = 0;
+    for (distinct.items) |s| dict_byte_count += s.len;
+
+    const code_width: u8 = if (k <= 256) 1 else if (k <= 65536) 2 else 4;
+    const dict_body = 4 + 4 + (k + 1) * 4 + dict_byte_count + n * code_width;
+    // Raw string body, per `writeStringBlock`: [u32 byte_count][(n+1) u32][bytes].
+    const raw_body = 4 + (n + 1) * 4 + total_bytes;
+    if (dict_body >= raw_body) return false;
+
+    try scratch.ensureUnusedCapacity(allocator, dict_body);
+    var b4: [4]u8 = undefined;
+
+    format.writeU32(&b4, @intCast(k));
+    scratch.appendSliceAssumeCapacity(&b4);
+    scratch.appendSliceAssumeCapacity(&[_]u8{ code_width, 0, 0, 0 });
+
+    // dict_offsets in sorted order, rebased to 0 (k+1 entries).
+    format.writeU32(&b4, 0);
+    scratch.appendSliceAssumeCapacity(&b4);
+    var acc: u32 = 0;
+    for (order) |ins_idx| {
+        acc += @intCast(distinct.items[ins_idx].len);
+        format.writeU32(&b4, acc);
+        scratch.appendSliceAssumeCapacity(&b4);
+    }
+
+    // dict_bytes in sorted order.
+    for (order) |ins_idx| scratch.appendSliceAssumeCapacity(distinct.items[ins_idx]);
+
+    // codes: per-row sorted-dict index.
+    for (row_codes) |ic| {
+        const code = ins_to_sorted[ic];
+        var b8: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b8, code, .little);
+        scratch.appendSliceAssumeCapacity(b8[0..code_width]);
     }
     return true;
 }

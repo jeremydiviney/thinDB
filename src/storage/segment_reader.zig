@@ -324,7 +324,7 @@ fn blockEncoding(bytes: []const u8, offset: usize) format.Encoding {
     // an unknown value would be caught by a downstream decode mismatch, but we
     // keep the reader total here rather than introducing a new error path for a
     // byte the writer fully controls.
-    return if (b <= @intFromEnum(format.Encoding.for_)) @enumFromInt(b) else .raw;
+    return if (b <= @intFromEnum(format.Encoding.dict)) @enumFromInt(b) else .raw;
 }
 
 fn decodeBlock(
@@ -397,7 +397,7 @@ fn getDecompressedBytes(
 /// convention (bitmap first when nullable); a `.for_` block's value region is
 /// expanded back to the native-width values so the produced column is the SAME
 /// native shape every consumer already expects.
-fn decodeColumnPayload(
+pub fn decodeColumnPayload(
     allocator: Allocator,
     col_type: Type,
     raw: []const u8,
@@ -408,6 +408,7 @@ fn decodeColumnPayload(
     return switch (encoding) {
         .raw => decodeRawColumn(allocator, col_type, raw, row_count, flags),
         .for_ => decodeForColumn(allocator, col_type, raw, row_count, flags),
+        .dict => decodeDictColumn(allocator, col_type, raw, row_count, flags),
     };
 }
 
@@ -786,4 +787,118 @@ fn decodeStringRaw(allocator: Allocator, raw: []const u8, row_count: u32) !Owned
     @memcpy(data, raw[cursor .. cursor + byte_count]);
 
     return .{ .offsets = offsets, .bytes = data };
+}
+
+/// A segment-local string dictionary block's regions, parsed in place over the
+/// decompressed payload (past any validity bitmap). `dict_bytes` holds the `ndv`
+/// distinct values concatenated in sorted order; `offsets_region` is the
+/// `(ndv+1) × u32` rebased offset array (read via `format.readU32` so it tolerates
+/// the payload's arbitrary alignment); `codes` is `row_count × code_width`. This
+/// is the seam a later dictionary-aware execution layer consumes to operate on
+/// codes directly (global-code stitch, predicate-per-distinct); the Phase 3
+/// reader only uses it to rebuild the raw string shape.
+pub const DictBlock = struct {
+    ndv: u32,
+    code_width: u8,
+    offsets_region: []const u8,
+    dict_bytes: []const u8,
+    codes: []const u8,
+
+    /// Byte slice of distinct value at sorted index `code` (aliases `dict_bytes`).
+    pub fn dictValue(self: DictBlock, code: u32) []const u8 {
+        const a = format.readU32(self.offsets_region[@as(usize, code) * 4 ..][0..4]);
+        const b = format.readU32(self.offsets_region[(@as(usize, code) + 1) * 4 ..][0..4]);
+        return self.dict_bytes[a..b];
+    }
+
+    /// Per-row code (little-endian, `code_width` bytes).
+    pub fn rowCode(self: DictBlock, row: usize) u32 {
+        var b4: [4]u8 = .{ 0, 0, 0, 0 };
+        const off = row * self.code_width;
+        @memcpy(b4[0..self.code_width], self.codes[off .. off + self.code_width]);
+        return std.mem.readInt(u32, &b4, .little);
+    }
+};
+
+/// Parse the dict header + regions out of a decompressed block payload. `values`
+/// is the payload past the validity bitmap (the caller strips the bitmap the
+/// same way the raw/FOR paths do). Layout documented on `format.Encoding.dict`.
+pub fn dictBlockOf(values: []const u8, row_count: u32) DictBlock {
+    const ndv = format.readU32(values[0..4]);
+    const code_width = values[4];
+    const off_start = 8;
+    const off_bytes = (@as(usize, ndv) + 1) * 4;
+    const offsets_region = values[off_start .. off_start + off_bytes];
+    const dict_byte_count = format.readU32(values[off_start + @as(usize, ndv) * 4 ..][0..4]);
+    const dict_start = off_start + off_bytes;
+    const dict_bytes = values[dict_start .. dict_start + dict_byte_count];
+    const codes_start = dict_start + dict_byte_count;
+    const codes = values[codes_start .. codes_start + @as(usize, row_count) * code_width];
+    return .{
+        .ndv = ndv,
+        .code_width = code_width,
+        .offsets_region = offsets_region,
+        .dict_bytes = dict_bytes,
+        .codes = codes,
+    };
+}
+
+/// Decode a dict-encoded string block into an OwnedColumn whose shape is
+/// IDENTICAL to what a raw string block produces — every consumer is unchanged.
+/// Reconstructs each row by indexing the sorted dict with the row's code. NULL
+/// rows (masked by the validity bitmap) reconstruct their placeholder code's
+/// value, which consumers ignore (same convention as the FOR path).
+pub fn decodeDictColumn(
+    allocator: Allocator,
+    col_type: Type,
+    raw: []const u8,
+    row_count: u32,
+    flags: format.ColumnBlockFlags,
+) !OwnedColumn {
+    var nulls: ?[]u8 = null;
+    errdefer if (nulls) |n| allocator.free(n);
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        const bm_copy = try allocator.alloc(u8, bm_len);
+        @memcpy(bm_copy, raw[0..bm_len]);
+        nulls = bm_copy;
+        values = raw[bm_len..];
+    }
+
+    const db = dictBlockOf(values, row_count);
+    const sc = try expandDict(allocator, db, row_count);
+
+    // The writer only ever dict-encodes string-family columns.
+    return switch (col_type) {
+        .varchar => .{ .data = .{ .varchar = sc }, .nulls = nulls },
+        .string => .{ .data = .{ .string = sc }, .nulls = nulls },
+        .char => .{ .data = .{ .char = sc }, .nulls = nulls },
+        else => unreachable,
+    };
+}
+
+/// Rebuild the `[offsets][bytes]` owned string layout from dict codes. Two
+/// passes: size the per-row offsets, then copy each row's dict value in.
+fn expandDict(allocator: Allocator, db: DictBlock, row_count: u32) !OwnedStringColumn {
+    const offsets = try allocator.alloc(u32, @as(usize, row_count) + 1);
+    errdefer allocator.free(offsets);
+
+    var total: usize = 0;
+    offsets[0] = 0;
+    var row: usize = 0;
+    while (row < row_count) : (row += 1) {
+        total += db.dictValue(db.rowCode(row)).len;
+        offsets[row + 1] = @intCast(total);
+    }
+
+    const bytes = try allocator.alloc(u8, total);
+    errdefer allocator.free(bytes);
+    row = 0;
+    while (row < row_count) : (row += 1) {
+        const v = db.dictValue(db.rowCode(row));
+        @memcpy(bytes[offsets[row]..offsets[row + 1]], v);
+    }
+
+    return .{ .offsets = offsets, .bytes = bytes };
 }

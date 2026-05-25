@@ -55,9 +55,25 @@ pub const Compression = enum(u8) {
 /// block's minimum non-null value and the delta width is the smallest of
 /// {1,2,4,8} bytes that holds `max - base`. Decoding reconstructs
 /// `value = base + delta`. See the FOR payload layout in `segment_writer.zig`.
+///
+/// `.dict` (segment-local string dictionary) stores a low-cardinality string
+/// column as the `k` distinct values once (sorted) plus a narrow per-row `code`
+/// (index into the sorted dict). Decoding reconstructs each row by indexing the
+/// dict. The post-bitmap payload layout is:
+///
+///   [ndv: u32]                      number of distinct values `k`
+///   [code_width: u8][3 pad]         1 / 2 / 4 bytes, chosen by `k`
+///   [dict_offsets: (k+1) × u32]     byte offsets into `dict_bytes`, rebased to 0
+///   [dict_bytes: …]                 the `k` distinct values, concatenated, SORTED
+///   [codes: row_count × code_width] per-row index into the sorted dict
+///
+/// The dict is stored sorted so a later execution layer can binary-search it and
+/// derive ORDER BY from codes. NULL rows carry a placeholder code, masked by the
+/// validity bitmap (orthogonal, same convention as `.raw`/`.for_`).
 pub const Encoding = enum(u8) {
     raw = 0,
     for_ = 1,
+    dict = 2,
 };
 
 /// Per-column-block flags (u8). Bit 0 = has_nulls (decompressed payload is

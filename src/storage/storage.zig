@@ -342,6 +342,300 @@ test "forBlockOf parses base/width/codes (2B narrow accessor)" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 3, 1 }, fb.codes);
 }
 
+// ---------------------------------------------------------------------------
+// dict (segment-local string dictionary) encoding
+// ---------------------------------------------------------------------------
+
+const DictCols = struct {
+    offsets: []u32,
+    bytes: []u8,
+    fn deinit(self: *DictCols, a: Allocator) void {
+        a.free(self.offsets);
+        a.free(self.bytes);
+    }
+    fn view(self: DictCols, nulls: ?[]const u8) ColumnView {
+        return .{ .data = .{ .string = .{ .offsets = self.offsets, .bytes = self.bytes } }, .nulls = nulls };
+    }
+};
+
+fn buildStringCol(a: Allocator, vals: []const []const u8) !DictCols {
+    const offsets = try a.alloc(u32, vals.len + 1);
+    errdefer a.free(offsets);
+    var total: usize = 0;
+    offsets[0] = 0;
+    for (vals, 0..) |v, i| {
+        total += v.len;
+        offsets[i + 1] = @intCast(total);
+    }
+    const bytes = try a.alloc(u8, total);
+    errdefer a.free(bytes);
+    for (vals, 0..) |v, i| @memcpy(bytes[offsets[i]..offsets[i + 1]], v);
+    return .{ .offsets = offsets, .bytes = bytes };
+}
+
+/// A column of `n` distinct decimal strings "0".."n-1" — high-cardinality by
+/// construction, used to exercise the stays-raw + mid-build-abandon gates
+/// without a huge stack array of slices.
+fn buildSeqStringCol(a: Allocator, n: usize) !DictCols {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(a);
+    const offsets = try a.alloc(u32, n + 1);
+    errdefer a.free(offsets);
+    offsets[0] = 0;
+    var tmp: [24]u8 = undefined;
+    for (0..n) |i| {
+        const s = std.fmt.bufPrint(&tmp, "{d}", .{i}) catch unreachable;
+        try bytes.appendSlice(a, s);
+        offsets[i + 1] = @intCast(bytes.items.len);
+    }
+    return .{ .offsets = offsets, .bytes = try bytes.toOwnedSlice(a) };
+}
+
+fn blockEncodingOf(allocator: Allocator, seg: *ReadSegment, rg_idx: usize, col_idx: usize) !format.Encoding {
+    var c = cache.Cache.init(allocator, 1 << 20);
+    defer c.deinit();
+    var block = try seg.borrowColumnBlock(allocator, rg_idx, col_idx, &c);
+    defer block.release(allocator, &c);
+    return block.encoding;
+}
+
+test "dict encoding: low-card string → dict, high-card → raw, both round-trip" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "color", .type = .string }, // 4 distinct over 300 rows → dict
+            .{ .name = "uniq", .type = .string }, // 300 distinct → NDV > n/2 → raw
+        },
+        .order_key = &.{"color"},
+        .unique = false,
+    };
+
+    const n = 300;
+    const palette = [_][]const u8{ "red", "green", "blue", "magenta" };
+    var color_vals: [n][]const u8 = undefined;
+    for (0..n) |i| color_vals[i] = palette[i % palette.len];
+
+    var color = try buildStringCol(allocator, &color_vals);
+    defer color.deinit(allocator);
+    var uniq = try buildSeqStringCol(allocator, n);
+    defer uniq.deinit(allocator);
+
+    const columns = [_]ColumnView{ color.view(null), uniq.view(null) };
+
+    var info = try writeSegment(allocator, io, tmp.dir, "dict.dat", schema, 11, 0, n, &columns, false);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "dict.dat", schema);
+    defer seg.deinit();
+
+    try std.testing.expectEqual(format.Encoding.dict, try blockEncodingOf(allocator, &seg, 0, 0));
+    try std.testing.expectEqual(format.Encoding.raw, try blockEncodingOf(allocator, &seg, 0, 1));
+
+    var c0 = try seg.decodeColumn(allocator, schema, 0, 0);
+    defer c0.deinit(allocator);
+    var c1 = try seg.decodeColumn(allocator, schema, 0, 1);
+    defer c1.deinit(allocator);
+    const v0 = c0.view();
+    const v1 = c1.view();
+    var line: [24]u8 = undefined;
+    for (0..n) |i| {
+        try std.testing.expectEqualStrings(color_vals[i], v0.data.string.rowBytes(i));
+        const want = std.fmt.bufPrint(&line, "{d}", .{i}) catch unreachable;
+        try std.testing.expectEqualStrings(want, v1.data.string.rowBytes(i));
+    }
+}
+
+test "dict encoding: NULL and empty string are distinct under codes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{.{ .name = "s", .type = .string, .nullable = true }},
+        .order_key = &.{"s"},
+        .unique = false,
+    };
+
+    // Pattern of length 6: a NULL, an empty string, then low-card values. The
+    // empty string is a real distinct dict value; the NULL is masked.
+    const n = 120;
+    var vals: [n][]const u8 = undefined;
+    var bm: [column.bitmapBytes(n)]u8 = .{0} ** column.bitmapBytes(n);
+    for (0..n) |i| {
+        switch (i % 6) {
+            0 => vals[i] = "", // NULL row (bytes irrelevant; validity bit left clear)
+            1 => {
+                vals[i] = ""; // empty string, NOT null
+                column.setValidBit(&bm, i, true);
+            },
+            2, 3 => {
+                vals[i] = "alpha";
+                column.setValidBit(&bm, i, true);
+            },
+            else => {
+                vals[i] = "beta";
+                column.setValidBit(&bm, i, true);
+            },
+        }
+    }
+
+    var col = try buildStringCol(allocator, &vals);
+    defer col.deinit(allocator);
+    const columns = [_]ColumnView{col.view(&bm)};
+
+    var info = try writeSegment(allocator, io, tmp.dir, "dnull.dat", schema, 12, 0, n, &columns, false);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "dnull.dat", schema);
+    defer seg.deinit();
+
+    try std.testing.expectEqual(format.Encoding.dict, try blockEncodingOf(allocator, &seg, 0, 0));
+
+    var c0 = try seg.decodeColumn(allocator, schema, 0, 0);
+    defer c0.deinit(allocator);
+    const v = c0.view();
+    for (0..n) |i| {
+        const want_null = (i % 6 == 0);
+        try std.testing.expectEqual(!want_null, v.isValid(i));
+        if (!want_null) try std.testing.expectEqualStrings(vals[i], v.data.string.rowBytes(i));
+    }
+}
+
+test "dict encoding: blob-like (avg len > 256) stays raw" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{.{ .name = "blob", .type = .string }},
+        .order_key = &.{"blob"},
+        .unique = false,
+    };
+
+    // Only 3 distinct values (low card) but each ~300 bytes → avg-len gate trips.
+    const big_a = "A" ** 300;
+    const big_b = "B" ** 300;
+    const big_c = "C" ** 300;
+    const n = 60;
+    var vals: [n][]const u8 = undefined;
+    for (0..n) |i| vals[i] = switch (i % 3) {
+        0 => big_a,
+        1 => big_b,
+        else => big_c,
+    };
+
+    var col = try buildStringCol(allocator, &vals);
+    defer col.deinit(allocator);
+    const columns = [_]ColumnView{col.view(null)};
+
+    var info = try writeSegment(allocator, io, tmp.dir, "blob.dat", schema, 13, 0, n, &columns, false);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "blob.dat", schema);
+    defer seg.deinit();
+
+    try std.testing.expectEqual(format.Encoding.raw, try blockEncodingOf(allocator, &seg, 0, 0));
+
+    var c0 = try seg.decodeColumn(allocator, schema, 0, 0);
+    defer c0.deinit(allocator);
+    const v = c0.view();
+    for (0..n) |i| try std.testing.expectEqualStrings(vals[i], v.data.string.rowBytes(i));
+}
+
+test "dict encoding: NDV beyond the cap abandons mid-build → raw, round-trips" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{.{ .name = "s", .type = .string }},
+        .order_key = &.{"s"},
+        .unique = false,
+    };
+
+    // 70_000 distinct values in a single row group: the distinct map crosses the
+    // 65_536 cap mid-build, so the encoder abandons and the block stays raw.
+    const n = 70_000;
+    var col = try buildSeqStringCol(allocator, n);
+    defer col.deinit(allocator);
+    const columns = [_]ColumnView{col.view(null)};
+
+    var info = try writeSegment(allocator, io, tmp.dir, "abandon.dat", schema, 14, 0, n, &columns, false);
+    defer info.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), info.row_groups.len);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "abandon.dat", schema);
+    defer seg.deinit();
+
+    try std.testing.expectEqual(format.Encoding.raw, try blockEncodingOf(allocator, &seg, 0, 0));
+
+    var c0 = try seg.decodeColumn(allocator, schema, 0, 0);
+    defer c0.deinit(allocator);
+    const v = c0.view();
+    var line: [24]u8 = undefined;
+    for (0..n) |i| {
+        const want = std.fmt.bufPrint(&line, "{d}", .{i}) catch unreachable;
+        try std.testing.expectEqualStrings(want, v.data.string.rowBytes(i));
+    }
+}
+
+test "dict block stores a lexicographically sorted dictionary" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{.{ .name = "s", .type = .string }},
+        .order_key = &.{"s"},
+        .unique = false,
+    };
+
+    // Distinct values first SEEN in non-sorted order; the on-disk dict must be
+    // sorted, and per-row codes must still resolve to the original value.
+    const seen = [_][]const u8{ "delta", "alpha", "charlie", "bravo" };
+    const n = 40;
+    var vals: [n][]const u8 = undefined;
+    for (0..n) |i| vals[i] = seen[i % seen.len];
+
+    var col = try buildStringCol(allocator, &vals);
+    defer col.deinit(allocator);
+    const columns = [_]ColumnView{col.view(null)};
+
+    var info = try writeSegment(allocator, io, tmp.dir, "sorted.dat", schema, 15, 0, n, &columns, false);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "sorted.dat", schema);
+    defer seg.deinit();
+
+    var c = cache.Cache.init(allocator, 1 << 20);
+    defer c.deinit();
+    var block = try seg.borrowColumnBlock(allocator, 0, 0, &c);
+    defer block.release(allocator, &c);
+    try std.testing.expectEqual(format.Encoding.dict, block.encoding);
+
+    // Non-nullable column → no validity bitmap → the payload is the dict body.
+    const db = segment_reader.dictBlockOf(block.bytes, n);
+    try std.testing.expectEqual(@as(u32, 4), db.ndv);
+
+    // Dictionary entries are in non-decreasing lexicographic order.
+    var k: u32 = 1;
+    while (k < db.ndv) : (k += 1) {
+        try std.testing.expect(!std.mem.lessThan(u8, db.dictValue(k), db.dictValue(k - 1)));
+    }
+    // Each row's code resolves back to the original value.
+    for (0..n) |i| {
+        try std.testing.expectEqualStrings(vals[i], db.dictValue(db.rowCode(i)));
+    }
+}
+
 test {
     _ = column;
     _ = format;
