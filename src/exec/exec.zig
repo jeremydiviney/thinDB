@@ -91,6 +91,14 @@ pub const Batch = struct {
     /// only until the next `Query.next()` call.
     values: []const ColumnView,
     row_count: usize,
+    /// Optional per-column dictionary-code sidecar (Phase 4.2 Option A). When
+    /// `coded[j]` is set, column `j` is *also* available as global dict codes
+    /// (the `values[j]` view is still valid — a materialized placeholder/real
+    /// column — so non-code-aware consumers ignore the sidecar and work
+    /// unchanged). A code-aware consumer (the aggregate group key) reads the
+    /// narrow codes instead of hashing the strings. Same per-`next()` lifetime
+    /// as `values`. Null (the default) means no column is coded.
+    coded: ?[]const ?CodedColumn = null,
 
     pub fn columnIndex(self: Batch, name: []const u8) ?usize {
         for (self.schema, 0..) |c, i| {
