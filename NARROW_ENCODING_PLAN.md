@@ -189,21 +189,42 @@ absolute cross-run numbers (see [[feedback-incremental-bench]]).
   rejected — owner: "shooting for the moon"). The executor is built on
   materialized columns, so this is a core-type change. Decompose, green + tested
   + back-to-back-benched + **profiled** at each sub-step:
-  - **A1** coded-string column representation + a `materialize` shim. Add the
-    coded form (batch-slot wrapper preferred over a raw `ValueView` variant to
-    bound the switch blast radius) with a single choke point that materializes
-    for any non-code-aware consumer. No producer yet → behavior identical, green.
-  - **A2** scan emits coded columns for dict blocks (translate local→global via
-    the LUT, interning into a query-scoped `GlobalDict` in the CompileCtx);
-    every consumer still materializes → results identical, proves the plumbing.
-    Bench ~neutral; **profile the stitch-build + translate cost.**
-  - **A3** aggregate's single-string-key path groups on the u32 global code
-    (reuse the int-key group table), decode at emit. **This moves the bench**
-    (Q16/17/33/34). Profile group-probe + decode.
-  - **A4** DISTINCT on codes; ORDER BY via sorted codes; exact cardinality (4.5).
-  - **Profiling (owner ask):** attribute time to global-dict build / LUT /
-    translate / expand — extend `PipelineStats` or scoped timers; surface in
-    profile runs, not just suite totals.
+  **SEAMS DONE (all committed/pushed, 1017/1017 green) — fresh session implements the producer/consumer/gate against these:**
+  - [x] **A1** `CodedColumn{codes:[]u32, dict:*GlobalDict}` + `materialize`
+    choke point (`global_dict.zig`, commit `0c85a51`). NOT a `ValueView` variant
+    — `ValueView` is `union(TypeTag)`, a variant pollutes the core type enum.
+    Coded rides as a **batch sidecar**: `Batch.coded: ?[]const ?CodedColumn`
+    (`9c3fce4`). `CompileCtx.queryGlobalDict()` lifecycle (`3a8248b`).
+  - [x] **Profiling** (`3414935`): `dict-decode`/`for-decode`/`dict-filter` phase
+    timers in the `[oprof]` dump. **Diagnostic: dict-decode = 60–97% of Scan time
+    on string-heavy queries** — A2/A3 targets exactly this.
+  - [ ] **A2 producer** — scan emits codes for the gated key column. Hook in
+    `scan.zig next()` unfiltered decode loop (~L689): for `out_phys[code_col]`,
+    instead of `decodeColumnMaybeCached`, call a new `decodeColumnAsCodes(seg,
+    rg_idx, phys, rg_count, gdict)` → fills a scan-owned `code_buf: []u32` (dict
+    block → `buildLut` + per-row `lut[rowCode(r)]`; raw block → intern each row's
+    string per-row), set `self.decoded[code_col]` to a CHEAP empty-string
+    placeholder OwnedColumn, set `coded_slots[code_col] = .{codes, gdict}`, emit
+    `Batch{..., .coded = coded_slots}`. **HAZARDS found while scoping:**
+    (1) `applyTombsIfAny` (~L718) compacts `self.decoded` survivors — the codes
+    must compact in lockstep OR gate coding OFF when the rg has tombstones.
+    (2) memtable path (~L732) has no dict block → intern per-row (or gate off;
+    ClickBench memtable is empty post-flush). (3) the filtered path
+    (`nextFiltered`/`materializeSurvivors`) is a SEPARATE emit site — first cut
+    can gate to unfiltered only (no WHERE). (4) Scan fields: `code_col: ?usize`,
+    `gdict: ?*exec.GlobalDict`, `code_buf`, `coded_slots` — free in deinit.
+  - [ ] **A3 consumer** — `aggregate.zig accumulateBatch` (~L922): when
+    `batch.coded[key_idx]` set for the single group key, route to a code-accumulate
+    that feeds the **int-key table** (`IntTable32`, `accumulateBatchIntT` shape)
+    using the u32 codes as the key; at emit (`emitGroupKey` ~L1558) decode the
+    code via `GlobalDict.decode` instead of `gkeys[gid]`. **This moves the bench.**
+  - [ ] **Gate** (`local.zig` compile, the `.group_by` lowering ~L1835/L2363):
+    fire only when single string group key, key NOT referenced by WHERE/any agg
+    arg, child is a direct scan, no tombstones on the path. Set scan.code_col +
+    gdict (from `ctx.queryGlobalDict()`) and mark the aggregate key coded. Decline
+    → unchanged path. Covers Q33/34 first (single-key, no WHERE); SearchPhrase
+    (Q12-17/21/22) need the filtered-path producer + multi-key later.
+  - [ ] **A4** DISTINCT on codes; ORDER BY via sorted codes; exact cardinality (4.5).
 - [ ] 4.3 ORDER BY via sorted global codes; else decode.
 - [ ] 4.5 Exact-cardinality consumer: post-predicate dict-survivor count → sizing + predicate ordering.
 - [ ] 4.6 *(optional)* function memoization for pure scalar fns over coded columns (Q28 REGEXP_REPLACE; but its result is the GROUP BY key, so entangled with 4.2).
