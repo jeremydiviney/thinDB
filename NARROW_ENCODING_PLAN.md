@@ -169,12 +169,31 @@ gids). The runner doesn't validate values → `zig build test` is the gate.
 - [x] 3.4 Tests: `storage.zig` unit tests (gate fires dict for low-card / raw for high-card; NULL-vs-empty under codes; blob avg-len>256 → raw; NDV>65536 mid-build abandon → raw; sorted-dict invariant via `dictBlockOf`). `tests/integration/dict_encoding_test.zig` public-API round-trip (low+high-card+nullable/empty, GROUP BY over a dict column, single multi-row-group + multi-segment). **1011/1011 tests pass.**
 
 ### Phase 4 — Dictionary-aware execution *(the query wins)*
-- [ ] 4.1 Query-time stitch: merged `string→code` map + per-segment LUTs; raw/memtable hash per-row in; global width floats.
-- [ ] 4.2 Group/distinct on global codes (feeds Phase 1 narrow keys).
+**Context:** Phase 3 dict storage is query-NEUTRAL but in fact regressed ClickBench
+~2× (every dict string column re-expands to strings on each scan, where raw was
+zero-copy). Phase 4 converts that into a win by operating on codes. Building it
+incrementally, test+bench each step. **NOTE on benching:** this box's suite total
+drifts 15-20% with thermal/load — trust only old-vs-new back-to-back deltas, not
+absolute cross-run numbers (see [[feedback-incremental-bench]]).
+- [x] 4.4 Dict predicate pushdown (commit `4266bf4`): `=`/`<>`/`LIKE` on a dict
+  block → per-distinct eval into a matched-codes bitset → per-row code test, no
+  expansion; routes through the guided filter so only survivors materialize.
+  Recovered the URL-LIKE full-expansion (Q20). Comparison `<> ''` ~neutral (those
+  cols are also grouped → projection expansion dominates). Plus string range
+  comparisons enabled as a side correctness win (commit `19fbc11`).
+- [ ] 4.1 Query-time stitch: merged `string→global_code` map + per-segment
+  local→global LUTs; raw/memtable hash per-row in; global width floats.
+- [ ] 4.2 Group/distinct on global codes (feeds Phase 1 narrow keys). **This is
+  the biggest lever AND the most invasive change:** the aggregate consumes
+  MATERIALIZED columns from the scan (`single_str_key` hashes string bytes via
+  `gkeys: [][]const u8`); it never sees codes. To group on codes the scan must
+  EMIT a coded-string column (new `ValueView` variant carrying {dict, codes}),
+  the aggregate must group on the global code, and group-key strings materialize
+  only at emit. Touches the batch interface + scan emit + aggregate. Do as its
+  own focused effort.
 - [ ] 4.3 ORDER BY via sorted global codes; else decode.
-- [ ] 4.4 Dict predicate pushdown: per-segment dict eval → matches-bitset → per-row bit-test; raw fallback.
 - [ ] 4.5 Exact-cardinality consumer: post-predicate dict-survivor count → sizing + predicate ordering.
-- [ ] 4.6 *(optional)* function memoization for pure scalar fns over coded columns.
+- [ ] 4.6 *(optional)* function memoization for pure scalar fns over coded columns (Q28 REGEXP_REPLACE; but its result is the GROUP BY key, so entangled with 4.2).
 - [ ] 4.7 Tests + A/B: low-card categorical GROUP BYs benefit; high-card raw queries don't regress.
 
 ### Phase 5 — Compaction re-tiering + (optional) bit-packing
