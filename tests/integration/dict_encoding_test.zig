@@ -200,6 +200,49 @@ test "dict predicate pushdown returns correct rows (=, <>, range, LIKE)" {
     try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note LIKE 'y%'", quarter); // yes
 }
 
+fn checkStringRanges(allocator: std.mem.Allocator, db: anytype) !void {
+    // 400 rows, s cycles apple/banana/cherry/date (lexicographic order as listed),
+    // 100 of each.
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM r WHERE s = 'cherry'", 100);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM r WHERE s <> 'apple'", 300);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM r WHERE s < 'banana'", 100); // apple
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM r WHERE s <= 'banana'", 200); // apple, banana
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM r WHERE s > 'apple'", 300); // banana, cherry, date
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM r WHERE s >= 'cherry'", 200); // cherry, date
+}
+
+test "string range comparisons evaluate over raw (memtable) and dict (segment)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 256 });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE r (id BIGINT PRIMARY KEY, s VARCHAR(16) NOT NULL)");
+
+    const words = [_][]const u8{ "apple", "banana", "cherry", "date" };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "INSERT INTO r (id, s) VALUES ");
+    var line: [64]u8 = undefined;
+    var i: i64 = 0;
+    while (i < 400) : (i += 1) {
+        if (i != 0) try buf.appendSlice(allocator, ", ");
+        const s = try std.fmt.bufPrint(&line, "({d}, '{s}')", .{ i, words[@intCast(@mod(i, 4))] });
+        try buf.appendSlice(allocator, s);
+    }
+    try exec(allocator, db, buf.items);
+
+    // Memtable path: rows not yet flushed → raw per-row lexicographic compare.
+    try checkStringRanges(allocator, db);
+
+    // Dict path: flush → low-card `s` is dict-encoded; ranges evaluate on codes.
+    const t = try db.openTable("r", .{});
+    try t.flush();
+    try checkStringRanges(allocator, db);
+}
+
 test "dict-encoded string columns round-trip across multiple segments" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -1080,12 +1080,6 @@ test "error: filter predicate type mismatch on each new type" {
     q = base.filter(thindb.leafExpr("amt", .eq, .{ .bigint = 100 }));
     try std.testing.expectError(error.PredicateTypeMismatch, q);
     base.deinit();
-
-    // CHAR column with .lt (only eq/neq allowed on string-shaped types).
-    base = try thindb.scan(allocator, t);
-    q = base.filter(thindb.leafExpr("code", .lt, .{ .text = "AAAA" }));
-    try std.testing.expectError(error.UnsupportedOperatorForType, q);
-    base.deinit();
 }
 
 test "error: filter on unknown column" {

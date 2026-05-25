@@ -381,9 +381,6 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             if (col_tag != val_tag) {
                 tryWidenLiteral(&p.val, col_tag) catch return Error.PredicateTypeMismatch;
             }
-            if (col_type.isString() and p.op != .eq and p.op != .neq) {
-                return Error.UnsupportedOperatorForType;
-            }
         },
         .leaf_col_col => |lc| {
             const li = types.findColumn(schema, lc.left) orelse return Error.ColumnNotFound;
@@ -965,19 +962,21 @@ fn compareCellToValue(view: ColumnView, idx: usize, op: PredicateOp, ref: Value)
         .decimal64 => |s| if (ref == .decimal64) cmp(i64, s[idx], ref.decimal64, op) else false,
         .decimal128 => |s| if (ref == .decimal128) cmp(i128, s[idx], ref.decimal128, op) else false,
         .uuid => |s| if (ref == .uuid) cmp(u128, s[idx], ref.uuid, op) else false,
-        // Strings: only eq/neq supported.
-        .varchar => |sv| if (ref == .text) blk: {
-            const eq = std.mem.eql(u8, sv.rowBytes(idx), ref.text);
-            break :blk if (op == .eq) eq else if (op == .neq) !eq else false;
-        } else false,
-        .string => |sv| if (ref == .text) blk: {
-            const eq = std.mem.eql(u8, sv.rowBytes(idx), ref.text);
-            break :blk if (op == .eq) eq else if (op == .neq) !eq else false;
-        } else false,
-        .char => |sv| if (ref == .text) blk: {
-            const eq = std.mem.eql(u8, sv.rowBytes(idx), ref.text);
-            break :blk if (op == .eq) eq else if (op == .neq) !eq else false;
-        } else false,
+        // Strings: full lexicographic comparison (all six ops).
+        .varchar => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
+        .string => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
+        .char => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
+    };
+}
+
+/// Lexicographic byte comparison of `a` against `b` under `op` (used for string
+/// column-vs-literal predicates). NULL handling is the caller's; this is pure
+/// ordering of two present values.
+fn cmpStr(a: []const u8, b: []const u8, op: PredicateOp) bool {
+    return switch (std.mem.order(u8, a, b)) {
+        .lt => op == .lt or op == .lte or op == .neq,
+        .eq => op == .eq or op == .lte or op == .gte,
+        .gt => op == .gt or op == .gte or op == .neq,
     };
 }
 
@@ -1423,18 +1422,10 @@ pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bo
         .bigint => |s| cmpInto(i64, s[0..n], p.val.bigint, mask[0..n], op),
         .boolean => |s| cmpInto(u8, s[0..n], @intFromBool(p.val.boolean), mask[0..n], op),
         .varchar, .char => |sv| {
-            if (op != .eq and op != .neq) return Error.UnsupportedOperatorForType;
-            for (0..n) |i| {
-                const eq = std.mem.eql(u8, sv.rowBytes(i), p.val.text);
-                mask[i] = if (op == .eq) eq else !eq;
-            }
+            for (0..n) |i| mask[i] = cmpStr(sv.rowBytes(i), p.val.text, op);
         },
         .string => |sv| {
-            if (op != .eq and op != .neq) return Error.UnsupportedOperatorForType;
-            for (0..n) |i| {
-                const eq = std.mem.eql(u8, sv.rowBytes(i), p.val.text);
-                mask[i] = if (op == .eq) eq else !eq;
-            }
+            for (0..n) |i| mask[i] = cmpStr(sv.rowBytes(i), p.val.text, op);
         },
         .float => |s| cmpInto(f32, s[0..n], p.val.float, mask[0..n], op),
         .double => |s| cmpInto(f64, s[0..n], p.val.double, mask[0..n], op),
@@ -1568,11 +1559,11 @@ pub fn valueToRangeI128(v: Value) ?i128 {
 /// predicate value is encoded with the same scheme so signed i128
 /// comparison gives the right answer for every type.
 ///
-/// String predicates use the 16-byte prefix encoding; range ops are
-/// rejected by `validateExpr` so this only handles eq/neq for strings.
-/// Tied prefixes (`>16` byte strings sharing the same first 16 bytes)
-/// stay on the conservative side — eq keeps the row group, neq never
-/// prunes.
+/// String predicates use the 16-byte prefix encoding. `eq` prunes via the
+/// prefix range; `neq` and all range ops (lt/lte/gt/gte) stay conservative
+/// (return true, never prune) — prefix loss beyond 16 bytes makes a sound
+/// range decision impossible at tied prefixes, so the row group is kept and
+/// the per-row evaluator decides exactly.
 pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value) bool {
     const wanted: i128 = switch (v) {
         .int => |x| x,
