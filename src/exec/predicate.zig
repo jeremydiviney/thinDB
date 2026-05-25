@@ -863,8 +863,18 @@ pub fn evaluateExprGuided(
             if (children.len == 1) return;
             const scratch = try allocator.alloc(bool, out.len);
             defer allocator.free(scratch);
+            // Not-yet-true active mask: a row already TRUE in `out` needn't be
+            // evaluated by later disjuncts, so the expensive ones (LIKE/regex)
+            // skip it. Cheap kernels ignore `active` and recompute, but OR-ing a
+            // value into an already-true row leaves it true (idempotent) — so a
+            // row true after one disjunct stays true regardless of order.
+            const still_open = try allocator.alloc(bool, out.len);
+            defer allocator.free(still_open);
             for (children[1..]) |child| {
-                try evaluateExprGuided(allocator, child, schema, batch, scratch, active);
+                for (out, still_open, 0..) |o, *so, i| {
+                    so.* = (if (active) |act| act[i] else true) and !o;
+                }
+                try evaluateExprGuided(allocator, child, schema, batch, scratch, still_open);
                 for (out, scratch) |*o, s| o.* = o.* or s;
             }
         },

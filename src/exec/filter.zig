@@ -308,9 +308,13 @@ fn applyInSet(stats: []exec.ColStat, schema: []const Column, in: predicate.InSet
 ///     regardless of nullability: no row, null or not, passes.
 ///   - otherwise → the leaf is kept verbatim.
 ///
-/// `.@"or"` / `.not` children are left untouched (an always-true inside an OR
-/// flips the OR's truth — different logic, out of scope). `eq` in range, `neq`,
-/// LIKE, col-col, subquery forms, and is_null pass through. Returns the
+/// `.@"or"` recurses with the inverted rules: an always-FALSE disjunct drops
+/// (contributes nothing — safe regardless of nullability), an always-TRUE
+/// disjunct collapses the whole OR to `.always = true` (reached only via the
+/// non-nullable-gated path in `simplifyLeaf`, so admitting every row is safe),
+/// all-dropped → `.always = false`, and survivors are ordered cheapest +
+/// most-likely-true first. `.not` children are left untouched. `eq` in range,
+/// `neq`, LIKE, col-col, subquery forms, and is_null pass through. Returns the
 /// (possibly rebuilt) expr; `.always` carries a proven constant outcome.
 fn simplifyPredicate(
     allocator: Allocator,
@@ -354,6 +358,43 @@ fn simplifyPredicate(
             errdefer allocator.free(owned);
             try rewritten.append(allocator, owned);
             return .{ .@"and" = owned };
+        },
+        .@"or" => |children| {
+            var survivors: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+            errdefer survivors.deinit(allocator);
+            for (children) |child| {
+                const s = try simplifyPredicate(allocator, rewritten, child, schema, stats);
+                switch (s) {
+                    .always => |b| {
+                        if (b) {
+                            // An always-true disjunct satisfies the whole OR. Only
+                            // the #297 non-nullable-gated path produces always-true,
+                            // so admitting every row here is safe.
+                            survivors.deinit(allocator);
+                            return .{ .always = true };
+                        }
+                        // always-false disjunct contributes nothing — drop it.
+                    },
+                    else => try survivors.append(allocator, s),
+                }
+            }
+            if (survivors.items.len == 0) {
+                survivors.deinit(allocator);
+                return .{ .always = false };
+            }
+            if (survivors.items.len == 1) {
+                const only = survivors.items[0];
+                survivors.deinit(allocator);
+                return only;
+            }
+            // Order disjuncts cheapest first, and within a cost class the
+            // most-likely-TRUE first so the OR short-circuits early (the
+            // evaluator skips already-satisfied rows in later disjuncts).
+            std.mem.sort(PredicateExpr, survivors.items, DisjunctSortCtx{ .schema = schema, .stats = stats }, DisjunctSortCtx.lessThan);
+            const owned = try survivors.toOwnedSlice(allocator);
+            errdefer allocator.free(owned);
+            try rewritten.append(allocator, owned);
+            return .{ .@"or" = owned };
         },
         else => return expr,
     }
@@ -422,7 +463,29 @@ fn conjunctKey(expr: PredicateExpr, schema: []const Column, stats: []const exec.
         .in_set => |s| .{ .cost = 1, .sel = colSelectivity(s.col, schema, stats, @floatFromInt(@max(s.values.len, 1))) },
         .like => .{ .cost = 2, .sel = 0.10 },
         .not => .{ .cost = 2, .sel = 0.5 },
-        .@"and", .@"or" => .{ .cost = 2, .sel = 0.5 },
+        // Roll a nested group's children up so its real cost/selectivity orders
+        // it against its siblings: cost is the costliest child; an AND multiplies
+        // pass-fractions, an OR combines them as 1 - ∏(1 - childᵢ).
+        .@"and" => |kids| blk: {
+            var cost: u8 = 0;
+            var sel: f64 = 1.0;
+            for (kids) |k| {
+                const kk = conjunctKey(k, schema, stats);
+                cost = @max(cost, kk.cost);
+                sel *= kk.sel;
+            }
+            break :blk .{ .cost = cost, .sel = std.math.clamp(sel, 0.0, 1.0) };
+        },
+        .@"or" => |kids| blk: {
+            var cost: u8 = 0;
+            var none: f64 = 1.0;
+            for (kids) |k| {
+                const kk = conjunctKey(k, schema, stats);
+                cost = @max(cost, kk.cost);
+                none *= 1.0 - kk.sel;
+            }
+            break :blk .{ .cost = cost, .sel = std.math.clamp(1.0 - none, 0.0, 1.0) };
+        },
         .scalar_subquery, .exists_subquery, .in_subquery, .correlated_set, .correlated_scalar, .correlated_range => .{ .cost = 3, .sel = 0.5 },
         .always => |b| .{ .cost = 0, .sel = if (b) 1.0 else 0.0 },
         .leaf_var => .{ .cost = 0, .sel = 0.10 },
@@ -480,5 +543,20 @@ const ConjunctSortCtx = struct {
         const kb = conjunctKey(b, ctx.schema, ctx.stats);
         if (ka.cost != kb.cost) return ka.cost < kb.cost;
         return ka.sel < kb.sel;
+    }
+};
+
+/// Disjunct ordering: cheapest first, then within a cost class the
+/// most-likely-TRUE (highest pass-fraction) first, so the OR is satisfied
+/// early and the evaluator's short-circuit skips already-true rows in the
+/// costlier later disjuncts. OR is commutative, so order never changes results.
+const DisjunctSortCtx = struct {
+    schema: []const Column,
+    stats: []const exec.ColStat,
+    fn lessThan(ctx: DisjunctSortCtx, a: PredicateExpr, b: PredicateExpr) bool {
+        const ka = conjunctKey(a, ctx.schema, ctx.stats);
+        const kb = conjunctKey(b, ctx.schema, ctx.stats);
+        if (ka.cost != kb.cost) return ka.cost < kb.cost;
+        return ka.sel > kb.sel;
     }
 };

@@ -774,6 +774,155 @@ test "simplify: nullable column never drops a range conjunct, NULLs excluded" {
     try std.testing.expectEqual(@as(u64, 3), try drainCount(&q));
 }
 
+// ---------------------------------------------------------------------------
+// RECURSIVE predicate simplification + ordering + OR short-circuit. Each test
+// drains the surviving `id` set and compares it against a reference computed
+// directly from the seed data — proving order/short-circuit changes don't
+// alter results. (`seed`: id 1..6, a ∈ {10,20,10,20,30 layout below}, b 100..600.)
+//   id:1 a:10 b:100 | id:2 a:20 b:200 | id:3 a:30 b:300
+//   id:4 a:10 b:400 | id:5 a:20 b:500 | id:6 a:30 b:600
+// ---------------------------------------------------------------------------
+
+/// Drain `q` and collect the surviving `id` (bigint, col 0) values, sorted.
+fn collectIds(allocator: std.mem.Allocator, q: *thindb.Query) ![]i64 {
+    var ids: std.ArrayListUnmanaged(i64) = .empty;
+    errdefer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        const view = b.values[0];
+        for (0..b.row_count) |i| {
+            if (view.isValid(i)) try ids.append(allocator, view.data.bigint[i]);
+        }
+    }
+    const owned = try ids.toOwnedSlice(allocator);
+    std.mem.sort(i64, owned, {}, std.sort.asc(i64));
+    return owned;
+}
+
+test "recursive simplify: WHERE a < 15 OR a > 25 (OR of two ranges)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    // a ∈ {10,20,30}: a<15 → {10}=ids{1,4}; a>25 → {30}=ids{3,6}. Union {1,3,4,6}.
+    const ors = [_]thindb.exec.PredicateExpr{
+        thindb.leafExpr("a", .lt, .{ .int = 15 }),
+        thindb.leafExpr("a", .gt, .{ .int = 25 }),
+    };
+    var base = try thindb.scan(allocator, t);
+    var q = try base.filter(.{ .@"or" = &ors });
+    defer q.deinit();
+
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3, 4, 6 }, ids);
+}
+
+test "recursive simplify: WHERE (a < 15 OR b = 300) AND id <> 4 (nested OR in AND)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    // (a<15 → {1,4}) OR (b=300 → {3}) = {1,3,4}; AND id<>4 removes 4 → {1,3}.
+    const inner = [_]thindb.exec.PredicateExpr{
+        thindb.leafExpr("a", .lt, .{ .int = 15 }),
+        thindb.leafExpr("b", .eq, .{ .int = 300 }),
+    };
+    const outer = [_]thindb.exec.PredicateExpr{
+        .{ .@"or" = &inner },
+        thindb.leafExpr("id", .neq, .{ .bigint = 4 }),
+    };
+    var base = try thindb.scan(allocator, t);
+    var q = try base.filter(.{ .@"and" = &outer });
+    defer q.deinit();
+
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, ids);
+}
+
+test "recursive simplify: OR drops always-false disjunct, always-true disjunct admits all" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    // a < 5  → provably always-false (a min=10).
+    // id >= 0 → provably always-true on the NON-NULLABLE id (id min=1) ⇒ the
+    // whole OR collapses to always-true ⇒ every row survives.
+    const ors = [_]thindb.exec.PredicateExpr{
+        thindb.leafExpr("a", .lt, .{ .int = 5 }),
+        thindb.leafExpr("id", .gte, .{ .bigint = 0 }),
+    };
+    var base = try thindb.scan(allocator, t);
+    const scan_ptr = base.ptr;
+    var q = try base.filter(.{ .@"or" = &ors });
+    defer q.deinit();
+
+    // OR collapsed to always-true ⇒ the Filter is dropped (query IS the scan).
+    try std.testing.expectEqual(scan_ptr, q.ptr);
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4, 5, 6 }, ids);
+}
+
+const like_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "s", .type = .{ .varchar = 16 } },
+        .{ .name = "y", .type = .int },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+
+test "recursive simplify: WHERE s LIKE '%a%' OR y = 1 (cheap disjunct short-circuits the LIKE)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const lok = [_][]const u8{"id"};
+    const t = try db.table("lk", like_schema, .{ .order_key = &lok, .unique = true });
+    // s LIKE '%a%' true for ids {1(cat),3(bat)}; y=1 true for ids {2,3}.
+    // Union: {1,2,3}. id 4 (dog, y=9) and id 5 (fox, y=7) excluded.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .s = @as([]const u8, "cat"), .y = @as(i32, 0) },
+        .{ .id = @as(i64, 2), .s = @as([]const u8, "dog"), .y = @as(i32, 1) },
+        .{ .id = @as(i64, 3), .s = @as([]const u8, "bat"), .y = @as(i32, 1) },
+        .{ .id = @as(i64, 4), .s = @as([]const u8, "dog"), .y = @as(i32, 9) },
+        .{ .id = @as(i64, 5), .s = @as([]const u8, "fox"), .y = @as(i32, 7) },
+    });
+    try t.flush();
+
+    // The cheap int eq (y=1, cost 0) sorts before the LIKE (cost 2): rows already
+    // satisfied by y=1 are skipped by the LIKE via its `active` mask. Result must
+    // equal the reference union regardless of that short-circuit.
+    const ors = [_]thindb.exec.PredicateExpr{
+        .{ .like = .{ .col = "s", .pattern = "%a%" } },
+        thindb.leafExpr("y", .eq, .{ .int = 1 }),
+    };
+    var base = try thindb.scan(allocator, t);
+    var q = try base.filter(.{ .@"or" = &ors });
+    defer q.deinit();
+
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, ids);
+}
+
 test "stats: grouped SUM(b) carries provable bounds per output" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
