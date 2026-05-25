@@ -40,6 +40,15 @@ pub const Filter = struct {
     filtered: []ColumnStore,
     views: []ColumnView,
 
+    /// Second ping-pong materialization set for the compacting filter path: an
+    /// intermediate compaction writes survivors of the current (possibly
+    /// already-compacted) batch into a set distinct from the one it reads, so
+    /// successive compactions can alternate. Same shape as `filtered`/`views`,
+    /// but lazily allocated on the first compaction that needs it — fused and
+    /// non-compacting filters never pay for it.
+    filtered_b: []ColumnStore = &.{},
+    views_b: []ColumnView = &.{},
+
     /// When true, the upstream Scan accepted this predicate and applies it
     /// itself (scan-side in-place filter), returning already-compacted owned
     /// survivors. This Filter then forwards upstream batches verbatim — no
@@ -138,6 +147,11 @@ pub const Filter = struct {
         for (self.filtered) |*c| c.deinit(self.allocator);
         self.allocator.free(self.filtered);
         self.allocator.free(self.views);
+        if (self.filtered_b.len > 0) {
+            for (self.filtered_b) |*c| c.deinit(self.allocator);
+            self.allocator.free(self.filtered_b);
+            self.allocator.free(self.views_b);
+        }
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -178,6 +192,14 @@ pub const Filter = struct {
         // owned survivors. Forward verbatim.
         if (self.fused) return self.upstream.next();
 
+        // A top-level AND of ≥2 conjuncts can pay to compact survivors mid-way
+        // so the remaining conjuncts scan only the survivors. Anything else
+        // (single leaf, OR, NOT) has nothing to compact between.
+        switch (self.expr) {
+            .@"and" => |children| if (children.len >= 2) return self.nextCompacting(children),
+            else => {},
+        }
+
         while (true) {
             const upstream_batch = (try self.upstream.next()) orelse return null;
 
@@ -201,7 +223,124 @@ pub const Filter = struct {
             return Batch{ .schema = self.schema, .values = self.views, .row_count = matched };
         }
     }
+
+    /// Compacting evaluation of an ordered AND of conjuncts. Evaluates one
+    /// conjunct at a time against the current (possibly already-compacted)
+    /// batch; whenever `shouldCompact` fires it materializes the survivors of
+    /// every output column densely, so the remaining conjuncts scan only the
+    /// survivors. Identical results to the single-pass path (AND is
+    /// commutative; materialization only relocates rows, never changes them).
+    fn nextCompacting(self: *Filter, conjuncts: []const PredicateExpr) !?Batch {
+        const w = self.schema.len;
+        while (true) {
+            const upstream_batch = (try self.upstream.next()) orelse return null;
+            const n = upstream_batch.row_count;
+
+            // mask + scratch sized to the (largest) upstream batch; we operate
+            // on the [0..P] prefix as the working set shrinks on compaction.
+            const mask = try self.allocator.alloc(bool, n);
+            defer self.allocator.free(mask);
+            const scratch = try self.allocator.alloc(bool, n);
+            defer self.allocator.free(scratch);
+
+            var cur = Batch{ .schema = self.schema, .values = upstream_batch.values, .row_count = n };
+            // `which` names the buffer set free to receive the next compaction.
+            var which: u1 = 0;
+
+            try predicate.evaluateExprGuided(self.allocator, conjuncts[0], self.schema, cur, mask[0..n], null);
+            var m = popcount(mask[0..cur.row_count]);
+
+            var i: usize = 1;
+            while (m > 0 and i < conjuncts.len) : (i += 1) {
+                if (shouldCompact(cur.row_count, m, conjuncts.len - i, w)) {
+                    cur = try self.compactInto(which, cur, mask[0..cur.row_count], m);
+                    which ^= 1;
+                    @memset(mask[0..m], true);
+                }
+                const p = cur.row_count;
+                try predicate.evaluateExprGuided(self.allocator, conjuncts[i], self.schema, cur, scratch[0..p], mask[0..p]);
+                for (mask[0..p], scratch[0..p]) |*a, b| a.* = a.* and b;
+                m = popcount(mask[0..p]);
+            }
+            if (m == 0) continue;
+
+            const out = try self.compactInto(which, cur, mask[0..cur.row_count], m);
+            return out;
+        }
+    }
+
+    /// Materialize the `survivors` rows of `src` (those set in `mask`) into the
+    /// `which` ping-pong buffer set, returning a Batch over that set.
+    fn compactInto(self: *Filter, which: u1, src: Batch, mask: []const bool, survivors: usize) !Batch {
+        if (which == 1 and self.filtered_b.len == 0) try self.initBufferB();
+        const cols = if (which == 0) self.filtered else self.filtered_b;
+        const vs = if (which == 0) self.views else self.views_b;
+        for (cols) |*c| c.clear();
+        for (src.values, 0..) |view, ci| {
+            try engine.memtable.appendMaskedColumn(self.allocator, view, mask, &cols[ci]);
+        }
+        for (cols, 0..) |c, ci| vs[ci] = c.view();
+        return Batch{ .schema = self.schema, .values = vs, .row_count = survivors };
+    }
+
+    /// Allocate the second ping-pong buffer set on first use.
+    fn initBufferB(self: *Filter) !void {
+        const fb = try self.allocator.alloc(ColumnStore, self.schema.len);
+        errdefer self.allocator.free(fb);
+        var inited: usize = 0;
+        errdefer for (fb[0..inited]) |*c| c.deinit(self.allocator);
+        for (self.schema, 0..) |col, i| {
+            fb[i] = try ColumnStore.init(self.allocator, col.type, col.nullable);
+            inited += 1;
+        }
+        const vb = try self.allocator.alloc(ColumnView, self.schema.len);
+        self.filtered_b = fb;
+        self.views_b = vb;
+    }
 };
+
+fn popcount(mask: []const bool) usize {
+    var c: usize = 0;
+    for (mask) |m| c += @intFromBool(m);
+    return c;
+}
+
+// Compaction cost model (ns/row, relative — only ratios matter). Calibrated
+// from a microbench on Zen 5: a remaining conjunct costs ~`W_PRED` per row to
+// SIMD-scan + combine; materializing a survivor costs ~`G_COPY` per output
+// column; the survivor-count scan costs ~`G_SCAN`. Compaction at survival σ
+// over a P-row buffer pays when the rescans it saves on the eliminated rows
+// outweigh the extra full-width materialize:
+//   (1 − σ)·remaining·W_PRED  >  σ·W·G_COPY + G_SCAN.
+const W_PRED: f64 = 0.40;
+const G_COPY: f64 = 0.20;
+const G_SCAN: f64 = 0.18;
+// Below this many rows the per-batch fixed costs dominate any per-row saving —
+// never compact a trivially small working set.
+const COMPACT_MIN_ROWS: usize = 1024;
+
+fn shouldCompact(physical: usize, survivors: usize, remaining: usize, width: usize) bool {
+    if (physical < COMPACT_MIN_ROWS) return false;
+    const sigma = @as(f64, @floatFromInt(survivors)) / @as(f64, @floatFromInt(physical));
+    const saved = (1.0 - sigma) * @as(f64, @floatFromInt(remaining)) * W_PRED;
+    const cost = sigma * @as(f64, @floatFromInt(width)) * G_COPY + G_SCAN;
+    return saved > cost;
+}
+
+test "shouldCompact gate" {
+    // Below the row floor: never, regardless of how favourable the ratio.
+    try std.testing.expect(!shouldCompact(500, 1, 4, 2));
+    // High survival: the gather costs more than the rescans it saves.
+    try std.testing.expect(!shouldCompact(10000, 9500, 2, 4));
+    // Low survival + remaining work: pays.
+    try std.testing.expect(shouldCompact(10000, 200, 2, 4));
+    // More remaining conjuncts lowers the bar (monotone in `remaining`).
+    try std.testing.expect(!shouldCompact(10000, 4000, 1, 4));
+    try std.testing.expect(shouldCompact(10000, 4000, 4, 4));
+    // Wider output raises the bar (monotone in `width`).
+    try std.testing.expect(shouldCompact(10000, 2500, 2, 2));
+    try std.testing.expect(!shouldCompact(10000, 2500, 2, 16));
+}
 
 /// Tighten the upstream per-column stats with the proven bounds a filter
 /// predicate guarantees. Only top-level AND conjuncts contribute (an OR/NOT

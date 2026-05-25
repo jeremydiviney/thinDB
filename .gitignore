@@ -43,6 +43,7 @@ bench/clickbench/coverage*.json
 /keybench.zig
 /distinctbench.zig
 /lazybench.zig
+/compactbench.zig
 /aggbench.zig
 /computebench.zig
 /membench.zig

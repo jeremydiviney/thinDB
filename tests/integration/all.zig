@@ -40,6 +40,7 @@ test {
     _ = @import("in_subquery_test.zig");
     _ = @import("col_col_predicate_test.zig");
     _ = @import("predicate_precedence_test.zig");
+    _ = @import("filter_compaction_test.zig");
     _ = @import("correlated_subquery_test.zig");
     _ = @import("correlated_scalar_test.zig");
     _ = @import("typed_temporal_literal_test.zig");
