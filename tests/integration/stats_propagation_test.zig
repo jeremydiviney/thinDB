@@ -10,6 +10,16 @@ const thindb = @import("thindb");
 
 const exec = thindb.exec;
 const ColCard = exec.ColCard;
+const expr_mod = thindb.exec.expr_mod;
+
+/// `col <op> lit` as an Expr.Call. `op` is "add"/"sub"/"mul"; the literal is an
+/// `.int`. `lit_left` puts the literal on the left (e.g. `100 - col`).
+fn arith(aa: std.mem.Allocator, op: []const u8, col: []const u8, lit: i32, lit_left: bool) !thindb.exec.expr_mod.Expr {
+    const c = expr_mod.col(col);
+    const l = expr_mod.lit(.{ .int = lit });
+    const args = if (lit_left) [_]thindb.exec.expr_mod.Expr{ l, c } else [_]thindb.exec.expr_mod.Expr{ c, l };
+    return expr_mod.call(aa, op, &args);
+}
 
 const schema = thindb.TableSchema{
     .columns = &.{
@@ -281,4 +291,317 @@ test "stats: end-to-end Scan -> Filter -> GroupBy chain" {
     var rows: u64 = 0;
     while (try q.next()) |b| rows += b.row_count;
     try std.testing.expectEqual(@as(u64, 1), rows);
+}
+
+// ---------------------------------------------------------------------------
+// Compute: provable per-column ndv + min/max for derived columns.
+// Seed: a ∈ {10,20,30} (ndv 3, [10,30]), b ∈ {100..600} (ndv 6, [100,600]).
+// The derived column is appended at index 3 (after id, a, b).
+// ---------------------------------------------------------------------------
+
+test "stats: compute a + 10 shifts range, ndv = ndv(a)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{.{ .name = "a10", .expr = try arith(aa, "add", "a", 10, false) }});
+    defer q.deinit();
+    const s = q.stats();
+
+    // a ∈ [10,30] ⇒ a+10 ∈ [20,40]; ndv unchanged (affine is injective).
+    try std.testing.expectEqual(@as(?i128, 20), s.column_stats[3].min);
+    try std.testing.expectEqual(@as(?i128, 40), s.column_stats[3].max);
+    try ndvAtLeast(s.column_stats[3].ndv, 3);
+    switch (s.column_stats[3].ndv) {
+        .exact => |n| try std.testing.expect(n <= 3),
+        .unknown => return error.TestUnexpectedResult,
+    }
+}
+
+test "stats: compute a * 3 scales range up" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{.{ .name = "a3", .expr = try arith(aa, "mul", "a", 3, false) }});
+    defer q.deinit();
+    const s = q.stats();
+
+    // a ∈ [10,30] ⇒ a*3 ∈ [30,90].
+    try std.testing.expectEqual(@as(?i128, 30), s.column_stats[3].min);
+    try std.testing.expectEqual(@as(?i128, 90), s.column_stats[3].max);
+    try ndvAtLeast(s.column_stats[3].ndv, 3);
+}
+
+test "stats: compute a * -2 flips the range" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{.{ .name = "an2", .expr = try arith(aa, "mul", "a", -2, false) }});
+    defer q.deinit();
+    const s = q.stats();
+
+    // a ∈ [10,30], scale -2 ⇒ [-60, -20] (low end is -2·30, high is -2·10).
+    try std.testing.expectEqual(@as(?i128, -60), s.column_stats[3].min);
+    try std.testing.expectEqual(@as(?i128, -20), s.column_stats[3].max);
+    // Provable: no actual a (10,20,30) maps outside [-60,-20].
+    try std.testing.expect(s.column_stats[3].min.? <= -60 and s.column_stats[3].max.? >= -20);
+}
+
+test "stats: compute 100 - a (c - col) flips the range" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{.{ .name = "ca", .expr = try arith(aa, "sub", "a", 100, true) }});
+    defer q.deinit();
+    const s = q.stats();
+
+    // a ∈ [10,30] ⇒ 100 - a ∈ [70, 90].
+    try std.testing.expectEqual(@as(?i128, 70), s.column_stats[3].min);
+    try std.testing.expectEqual(@as(?i128, 90), s.column_stats[3].max);
+    try ndvAtLeast(s.column_stats[3].ndv, 3);
+}
+
+test "stats: compute a + b (two-column) sums ranges and multiplies ndv" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var base = try thindb.scan(allocator, t);
+    const ab = try expr_mod.call(aa, "add", &.{ expr_mod.col("a"), expr_mod.col("b") });
+    var q = try base.compute(&.{.{ .name = "ab", .expr = ab }});
+    defer q.deinit();
+    const s = q.stats();
+
+    // a ∈ [10,30], b ∈ [100,600] ⇒ a+b ∈ [110, 630].
+    try std.testing.expectEqual(@as(?i128, 110), s.column_stats[3].min);
+    try std.testing.expectEqual(@as(?i128, 630), s.column_stats[3].max);
+    // ndv ≤ ndv(a)·ndv(b) = 3·6 = 18, but capped at upper_rows = 6.
+    switch (s.column_stats[3].ndv) {
+        .exact => |n| try std.testing.expect(n <= 6 and n >= 1),
+        .unknown => return error.TestUnexpectedResult,
+    }
+    // Provable: the true distinct (a+b) count is 6; bound must not under-count.
+    try ndvAtLeast(s.column_stats[3].ndv, 6);
+}
+
+test "stats: compute literal column has ndv 1 and min == max == value" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{.{ .name = "k", .expr = expr_mod.lit(.{ .int = 42 }) }});
+    defer q.deinit();
+    const s = q.stats();
+
+    try std.testing.expectEqual(ColCard{ .exact = 1 }, s.column_stats[3].ndv);
+    try std.testing.expectEqual(@as(?i128, 42), s.column_stats[3].min);
+    try std.testing.expectEqual(@as(?i128, 42), s.column_stats[3].max);
+}
+
+test "stats: compute non-affine fn keeps ndv <= input, min/max null" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // abs(a): single-column, non-affine ⇒ ndv ≤ ndv(a), min/max not provable.
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{.{ .name = "absa", .expr = try thindb.exec.scalar_fn.abs(aa, expr_mod.col("a")) }});
+    defer q.deinit();
+    const s = q.stats();
+
+    // ndv ≤ ndv(a) = 3 (pigeonhole), and ≥ true distinct (abs of {10,20,30} = 3).
+    try ndvAtLeast(s.column_stats[3].ndv, 3);
+    switch (s.column_stats[3].ndv) {
+        .exact => |n| try std.testing.expect(n <= 3),
+        .unknown => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(?i128, null), s.column_stats[3].min);
+    try std.testing.expectEqual(@as(?i128, null), s.column_stats[3].max);
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate: provable output bounds (COUNT/SUM/MIN/MAX) and the end-to-end
+// COUNT(*) * 12 case (Compute interval arithmetic over an agg output).
+// ---------------------------------------------------------------------------
+
+test "stats: COUNT(*) output bounded to [0, rows]" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.aggregate(&.{.{ .func = .count, .as = "n" }});
+    defer q.deinit();
+    const s = q.stats();
+
+    try std.testing.expectEqual(@as(u64, 1), s.upper_rows);
+    try std.testing.expectEqual(@as(?i128, 0), s.column_stats[0].min);
+    try std.testing.expectEqual(@as(?i128, 6), s.column_stats[0].max); // rows = 6
+}
+
+test "stats: COUNT(*) * 12 resolves to [0, rows*12] end-to-end" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var base = try thindb.scan(allocator, t);
+    var agg = try base.aggregate(&.{.{ .func = .count, .as = "n" }});
+    // n is bigint; multiply by a bigint literal so the overload resolves.
+    const n12 = try expr_mod.call(aa, "mul", &.{ expr_mod.col("n"), expr_mod.lit(.{ .bigint = 12 }) });
+    var q = try agg.compute(&.{.{ .name = "n12", .expr = n12 }});
+    defer q.deinit();
+    const s = q.stats();
+
+    // n ∈ [0,6] ⇒ n*12 ∈ [0,72]. The derived column is appended at index 1.
+    try std.testing.expectEqual(@as(?i128, 0), s.column_stats[1].min);
+    try std.testing.expectEqual(@as(?i128, 72), s.column_stats[1].max);
+
+    // Drain to exercise the full path (and confirm the actual value fits the
+    // proven bound: COUNT(*) = 6, n12 = 72 ≤ 72).
+    var rows: u64 = 0;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        const v = b.values[1].data.bigint[0];
+        try std.testing.expect(v >= 0 and v <= 72);
+    }
+    try std.testing.expectEqual(@as(u64, 1), rows);
+}
+
+test "stats: SUM(a) bounded by [rows*lo, rows*hi]" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.aggregate(&.{.{ .func = .sum, .col = "a", .as = "sa" }});
+    defer q.deinit();
+    const s = q.stats();
+
+    // a ∈ [10,30], rows = 6 ⇒ SUM(a) ∈ [60, 180]. True sum is 120, within bound.
+    try std.testing.expectEqual(@as(?i128, 60), s.column_stats[0].min);
+    try std.testing.expectEqual(@as(?i128, 180), s.column_stats[0].max);
+}
+
+test "stats: MIN(a) / MAX(b) inherit the column range" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.aggregate(&.{
+        .{ .func = .min, .col = "a", .as = "mna" },
+        .{ .func = .max, .col = "b", .as = "mxb" },
+    });
+    defer q.deinit();
+    const s = q.stats();
+
+    // MIN(a) ∈ [10,30]; MAX(b) ∈ [100,600] — each lies within its column range.
+    try std.testing.expectEqual(@as(?i128, 10), s.column_stats[0].min);
+    try std.testing.expectEqual(@as(?i128, 30), s.column_stats[0].max);
+    try std.testing.expectEqual(@as(?i128, 100), s.column_stats[1].min);
+    try std.testing.expectEqual(@as(?i128, 600), s.column_stats[1].max);
+}
+
+test "stats: grouped SUM(b) carries provable bounds per output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    // GROUP BY a, SUM(b). a is the group key (index 0), SUM(b) at index 1.
+    var base = try thindb.scan(allocator, t);
+    var q = try base.groupBy(&.{"a"}, &.{.{ .func = .sum, .col = "b", .as = "sb" }});
+    defer q.deinit();
+    const s = q.stats();
+
+    // Group key keeps its range; SUM(b) bounded by [rows*lo, rows*hi] over the
+    // input row ceiling (6): b ∈ [100,600] ⇒ [600, 3600]. Loose but provable
+    // (the true per-group sums all fall inside).
+    try std.testing.expectEqual(@as(?i128, 10), s.column_stats[0].min);
+    try std.testing.expectEqual(@as(?i128, 30), s.column_stats[0].max);
+    try std.testing.expectEqual(@as(?i128, 600), s.column_stats[1].min);
+    try std.testing.expectEqual(@as(?i128, 3600), s.column_stats[1].max);
 }

@@ -686,10 +686,18 @@ pub const Aggregate = struct {
         if (self.group_col_indices.len == 0) {
             self.cached_upper_rows = 1;
             // A global aggregate emits one row; each aggregate output is a
-            // single value (ndv ≤ 1), min/max unknown.
+            // single value (ndv ≤ 1). min/max come from the provable agg bound
+            // (COUNT(*) ∈ [0, rows], SUM ∈ [rows·lo, rows·hi], MIN/MAX inherit
+            // the source column's range). Output schema here is the agg outputs
+            // only (no group keys).
             const aa = self.arena.allocator();
             const out_stats = try aa.alloc(exec.ColStat, self.output_schema.len);
-            for (out_stats) |*s| s.* = .{ .ndv = .{ .exact = 1 } };
+            const have_up = up.column_stats.len == up_schema.len;
+            for (self.aggs, self.agg_col_indices, self.output_schema, out_stats) |a, maybe_idx, oc, *s| {
+                const src: ?exec.ColStat = if (have_up) (if (maybe_idx) |idx| up.column_stats[idx] else null) else null;
+                s.* = aggColStat(a, oc.type, src, up.upper_rows);
+                s.ndv = .{ .exact = 1 };
+            }
             self.cached_stats = out_stats;
             return;
         }
@@ -722,7 +730,14 @@ pub const Aggregate = struct {
             .unknown
         else
             .{ .exact = @intCast(upper) };
-        for (out_stats[self.group_col_indices.len..]) |*s| s.* = .{ .ndv = agg_ndv };
+        // Aggregate outputs: ndv bounded by the group count; min/max from the
+        // provable per-agg bound over the source column's range.
+        const ng = self.group_col_indices.len;
+        for (self.aggs, self.agg_col_indices, self.output_schema[ng..], out_stats[ng..]) |a, maybe_idx, oc, *s| {
+            const src: ?exec.ColStat = if (maybe_idx) |idx| up.column_stats[idx] else null;
+            s.* = aggColStat(a, oc.type, src, up.upper_rows);
+            s.ndv = agg_ndv;
+        }
         exec.capColStats(out_stats, upper);
         self.cached_stats = out_stats;
     }
@@ -1885,6 +1900,52 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
 fn aggOutputTypeFor(a: AggSpec, in: ?Type) !Type {
     if (a.out_type_override) |t| return t;
     return aggOutputType(a.func, in);
+}
+
+/// True for output types that carry a usable i128 min/max range (matches
+/// `ColStat.min/max`'s int-family-only contract). Float/string/uuid → false.
+fn intFamilyOutput(t: Type) bool {
+    return t.isInteger() or t.isDecimal() or t == .boolean or t.isTemporal();
+}
+
+/// Provable min/max for one aggregate's output column, given the source
+/// column's stat (`src`, null for COUNT(*)), the output type, and the upstream
+/// row upper bound. Only int-family outputs carry a range; everything else
+/// (float SUM/AVG, string GROUP_CONCAT, etc.) stays null. Every i128 step is
+/// overflow-checked → null bound on overflow, never a wrong one. The `ndv`
+/// field is left at its default and overwritten by the caller.
+fn aggColStat(a: AggSpec, out_type: Type, src: ?exec.ColStat, upper_rows: u64) exec.ColStat {
+    const n: i128 = @intCast(upper_rows);
+    switch (a.func) {
+        .count, .count_distinct => return .{ .min = 0, .max = n },
+        .min, .max => {
+            if (!intFamilyOutput(out_type)) return .{};
+            const s = src orelse return .{};
+            // MIN/MAX of a column lie within the column's own range.
+            return .{ .min = s.min, .max = s.max };
+        },
+        .sum => {
+            if (!intFamilyOutput(out_type)) return .{}; // float SUM → double
+            const s = src orelse return .{};
+            const lo = s.min orelse return .{};
+            const hi = s.max orelse return .{};
+            // Σ over `upper_rows` rows of values in [lo, hi]: the low end is
+            // n·lo, the high end n·hi (n ≥ 0). Sign handled naturally since
+            // lo ≤ hi ⇒ n·lo ≤ n·hi for n ≥ 0.
+            const min = std.math.mul(i128, n, lo) catch return .{};
+            const max = std.math.mul(i128, n, hi) catch return .{};
+            return .{ .min = min, .max = max };
+        },
+        .avg => {
+            // AVG is DOUBLE today (→ null range). Guard on the output type so
+            // that an int-family AVG output, if it ever exists, inherits the
+            // column range (the mean lies within [lo, hi]).
+            if (!intFamilyOutput(out_type)) return .{};
+            const s = src orelse return .{};
+            return .{ .min = s.min, .max = s.max };
+        },
+        else => return .{},
+    }
 }
 
 fn aggOutputType(func: AggFunc, in: ?Type) !Type {

@@ -104,11 +104,39 @@ const FusedScalar = struct {
     scalar_f: f64,
 };
 
+/// Plan-time classification of a derived column's expression for PROVABLE
+/// stats propagation. Computed at resolve from the expression shape alone
+/// (no upstream stats needed); `stats()` combines it with the live upstream
+/// `ColStat` of the referenced source column(s). Every rule yields an
+/// UPPER/inclusive bound — never an estimate beyond what the algebra proves.
+const StatClass = union(enum) {
+    /// No provable bound (multi-arg non-arithmetic call, opaque fn, string
+    /// op, etc.): ndv unknown, min/max null.
+    none,
+    /// Literal constant column: ndv 1, and an integer-family value carries
+    /// min == max == value (null for non-int literals).
+    literal: ?i128,
+    /// Single-column function `f(src)`: ndv ≤ NDV(src) (pigeonhole). When
+    /// `affine` is set, `value = scale·src + offset` exactly — min/max flow
+    /// through the interval map. A null `affine` keeps min/max null.
+    unary: struct { src_idx: usize, affine: ?Affine },
+    /// Two-column arithmetic `src1 <op> src2`: ndv ≤ NDV(src1)·NDV(src2).
+    /// `op` is add/sub (min/max via interval); other ops leave min/max null.
+    binary: struct { src1: usize, src2: usize, op: ?simd.BinOp },
+};
+
+/// `value = scale·col + offset`, all i128. Captures the affine transforms the
+/// interval map can flow a range through: `col±c`, `c±col`, `c·col`, `col·c`.
+const Affine = struct { scale: i128, offset: i128 };
+
 /// Resolved per-derived plan: rename, literal-only (constant column),
 /// a function-call tree, a searched-CASE expression, or a fused col-op-scalar.
 const ResolvedDerived = struct {
     name: []const u8,
     output_type: Type,
+    /// Plan-time provable-stats descriptor (see `StatClass`). Read only by
+    /// `stats()`; has no effect on evaluation.
+    stat_class: StatClass,
     kind: union(enum) {
         rename: struct { src_idx: usize },
         lit_only: *LitSlot,
@@ -281,13 +309,19 @@ pub const Compute = struct {
     ///
     /// Extends `column_stats` to cover the derived columns so downstream
     /// routing (notably GROUP BY hash-vs-sort, which products per-key NDV)
-    /// can reason about them: a literal-only column has NDV 1, a rename
-    /// inherits its source's stat (values pass through unchanged, so its
-    /// min/max carry too), anything computed is unknown. Without this,
-    /// `GROUP BY <const>, key` reads the const column as unknown and is
-    /// forced onto the sort path even when `key` alone fits the budget.
-    /// Pass-through columns keep their stats; every ndv is capped at
-    /// `upper_rows` (unchanged by Compute).
+    /// can reason about them. Each derived column's bound is derived by
+    /// plan-time algebra (`StatClass`) over the source column's live stats:
+    ///   - rename → pass-through (values unchanged, so ndv + min/max carry).
+    ///   - literal → ndv 1, min == max == the integer value (null for non-int).
+    ///   - single-column `f(col)` → ndv ≤ NDV(col) (pigeonhole); min/max via
+    ///     interval arithmetic when `f` is affine, else null.
+    ///   - two-column `col1 <op> col2` → ndv ≤ NDV1·NDV2 (saturating); min/max
+    ///     for +/- via interval arithmetic.
+    /// Every i128 step is overflow-checked → null bound on overflow, never a
+    /// wrong one. Every ndv is finally capped at `upper_rows` (unchanged by
+    /// Compute). Without this, e.g. `GROUP BY <const>, key` reads the const
+    /// column as unknown and is forced onto the sort path even when `key`
+    /// alone fits the budget.
     pub fn stats(self: *Compute) exec.PipelineStats {
         var up = self.upstream.stats();
         const up_n = self.upstream.outputSchema().len;
@@ -297,11 +331,7 @@ pub const Compute = struct {
         const out_stats = self.arena.allocator().alloc(exec.ColStat, up_n + self.derived.len) catch return up;
         @memcpy(out_stats[0..up_n], up.column_stats);
         for (self.derived, 0..) |d, i| {
-            out_stats[up_n + i] = switch (d.kind) {
-                .lit_only => .{ .ndv = .{ .exact = 1 } },
-                .rename => |rn| if (rn.src_idx < up_n) up.column_stats[rn.src_idx] else .{ .ndv = .unknown },
-                .call, .case, .fused_scalar => .{ .ndv = .unknown },
-            };
+            out_stats[up_n + i] = derivedColStat(d, up.column_stats);
         }
         exec.capColStats(out_stats, up.upper_rows);
         up.column_stats = out_stats;
@@ -657,6 +687,202 @@ fn tryFuseScalar(aa: Allocator, expr: Expr, up_schema: []const Column) !?FusedSc
 }
 
 // ---------------------------------------------------------------------------
+// Provable-stats classification (plan-time; consumed by stats())
+// ---------------------------------------------------------------------------
+
+/// i128 value of an integer-family literal, else null (float/string/decimal:
+/// no usable i128 range, matching ColStat.min/max's int-only contract).
+fn intFamilyValueI128(v: types.Value) ?i128 {
+    return switch (v) {
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        .int => |x| x,
+        .bigint => |x| x,
+        .largeint => |x| x,
+        .boolean => |x| @intFromBool(x),
+        .date => |x| x,
+        .datetime => |x| x,
+        else => null,
+    };
+}
+
+/// Decompose `e` into `scale·col + offset` over a single column index, for the
+/// affine shapes the interval map flows ranges through (`col±c`, `c±col`,
+/// `c·col`, `col·c`, `-col` via `0-col`). Returns the src index plus Affine, or
+/// null if `e` isn't a single-column affine call. Integer-family literals only.
+fn affineUnary(e: Expr, up_schema: []const Column) ?struct { src_idx: usize, affine: Affine } {
+    const c = switch (e) {
+        .call => |x| x,
+        else => return null,
+    };
+    if (c.args.len != 2) return null;
+    const is_add = std.mem.eql(u8, c.fn_name, "add");
+    const is_sub = std.mem.eql(u8, c.fn_name, "sub");
+    const is_mul = std.mem.eql(u8, c.fn_name, "mul");
+    if (!(is_add or is_sub or is_mul)) return null;
+
+    var col_name: []const u8 = undefined;
+    var lit_v: types.Value = undefined;
+    var col_left: bool = undefined;
+    switch (c.args[0]) {
+        .col_ref => |n| switch (c.args[1]) {
+            .lit => |v| {
+                col_name = n;
+                lit_v = v;
+                col_left = true;
+            },
+            else => return null,
+        },
+        .lit => |v| switch (c.args[1]) {
+            .col_ref => |n| {
+                col_name = n;
+                lit_v = v;
+                col_left = false;
+            },
+            else => return null,
+        },
+        else => return null,
+    }
+    const k = intFamilyValueI128(lit_v) orelse return null;
+    const idx = columnIndex(up_schema, col_name) orelse return null;
+
+    var scale: i128 = undefined;
+    var offset: i128 = undefined;
+    if (is_add) {
+        scale = 1;
+        offset = k;
+    } else if (is_sub) {
+        if (col_left) {
+            scale = 1;
+            offset = -k; // col - k
+        } else {
+            scale = -1;
+            offset = k; // k - col
+        }
+    } else { // mul
+        scale = k;
+        offset = 0;
+    }
+    return .{ .src_idx = idx, .affine = .{ .scale = scale, .offset = offset } };
+}
+
+/// Classify a `.call` expression for provable stats. Single-column calls bound
+/// ndv ≤ NDV(src) (pigeonhole) and flow min/max when affine; two-column
+/// arithmetic bounds ndv ≤ NDV·NDV with min/max for add/sub. Anything else is
+/// `.none`.
+fn classifyExpr(e: Expr, up_schema: []const Column) StatClass {
+    const c = switch (e) {
+        .call => |x| x,
+        else => return .none,
+    };
+
+    // Two-column arithmetic `col1 <op> col2`.
+    if (c.args.len == 2 and c.args[0] == .col_ref and c.args[1] == .col_ref) {
+        const idx1 = columnIndex(up_schema, c.args[0].col_ref) orelse return .none;
+        const idx2 = columnIndex(up_schema, c.args[1].col_ref) orelse return .none;
+        const op: ?simd.BinOp = if (std.mem.eql(u8, c.fn_name, "add"))
+            .add
+        else if (std.mem.eql(u8, c.fn_name, "sub"))
+            .sub
+        else
+            null; // mul/div two-col: ndv bound still holds, min/max left null
+        return .{ .binary = .{ .src1 = idx1, .src2 = idx2, .op = op } };
+    }
+
+    // Single-column call. Affine shapes carry an interval map; any other
+    // single-column function still gets ndv ≤ NDV(src) by pigeonhole.
+    if (affineUnary(e, up_schema)) |aff| {
+        return .{ .unary = .{ .src_idx = aff.src_idx, .affine = aff.affine } };
+    }
+    if (singleColIndex(c, up_schema)) |idx| {
+        return .{ .unary = .{ .src_idx = idx, .affine = null } };
+    }
+    return .none;
+}
+
+/// If a call references exactly one distinct upstream column (and only column
+/// refs + literals as args), return its index; else null. A function over one
+/// column can't manufacture distinct outputs from equal inputs (pigeonhole),
+/// so ndv ≤ NDV(that column).
+fn singleColIndex(c: Expr.Call, up_schema: []const Column) ?usize {
+    var found: ?usize = null;
+    for (c.args) |arg| switch (arg) {
+        .col_ref => |name| {
+            const idx = columnIndex(up_schema, name) orelse return null;
+            if (found) |f| {
+                if (f != idx) return null; // two distinct columns
+            } else found = idx;
+        },
+        .lit => {},
+        else => return null, // nested call / case / subquery: can't prove single-col
+    };
+    return found;
+}
+
+/// Checked i128 add — null on overflow so a derived bound is never wrong.
+fn addChecked(a: i128, b: i128) ?i128 {
+    return std.math.add(i128, a, b) catch null;
+}
+
+/// Checked i128 subtract — null on overflow.
+fn subChecked(a: i128, b: i128) ?i128 {
+    return std.math.sub(i128, a, b) catch null;
+}
+
+/// Checked i128 mul — null on overflow.
+fn mulChecked(a: i128, b: i128) ?i128 {
+    return std.math.mul(i128, a, b) catch null;
+}
+
+/// Apply `scale·x + offset` to one interval endpoint, null on overflow.
+fn affineApply(aff: Affine, x: i128) ?i128 {
+    const s = mulChecked(aff.scale, x) orelse return null;
+    return addChecked(s, aff.offset);
+}
+
+/// Flow a `[lo, hi]` range through an affine map. `scale` direction sets which
+/// endpoint becomes the new min vs max; scale 0 collapses to `[offset, offset]`.
+/// Returns null min/max on any overflow.
+fn affineRange(aff: Affine, lo: ?i128, hi: ?i128) struct { min: ?i128, max: ?i128 } {
+    if (aff.scale == 0) return .{ .min = aff.offset, .max = aff.offset };
+    const l = lo orelse return .{ .min = null, .max = null };
+    const h = hi orelse return .{ .min = null, .max = null };
+    const a = affineApply(aff, l);
+    const b = affineApply(aff, h);
+    if (a == null or b == null) return .{ .min = null, .max = null };
+    return .{ .min = @min(a.?, b.?), .max = @max(a.?, b.?) };
+}
+
+/// Inclusive i128 range of an int-family type, or null for float/string/uuid.
+fn typeRangeI128(t: Type) ?struct { lo: i128, hi: i128 } {
+    return switch (t) {
+        .tinyint => .{ .lo = std.math.minInt(i8), .hi = std.math.maxInt(i8) },
+        .smallint => .{ .lo = std.math.minInt(i16), .hi = std.math.maxInt(i16) },
+        .int => .{ .lo = std.math.minInt(i32), .hi = std.math.maxInt(i32) },
+        .bigint => .{ .lo = std.math.minInt(i64), .hi = std.math.maxInt(i64) },
+        .largeint => .{ .lo = std.math.minInt(i128), .hi = std.math.maxInt(i128) },
+        .boolean => .{ .lo = 0, .hi = 1 },
+        .date => .{ .lo = std.math.minInt(i32), .hi = std.math.maxInt(i32) },
+        .datetime => .{ .lo = std.math.minInt(i64), .hi = std.math.maxInt(i64) },
+        .decimal64 => .{ .lo = std.math.minInt(i64), .hi = std.math.maxInt(i64) },
+        .decimal128 => .{ .lo = std.math.minInt(i128), .hi = std.math.maxInt(i128) },
+        else => null,
+    };
+}
+
+/// A derived [min,max] is only PROVABLE if the runtime arithmetic can't wrap:
+/// the integer kernels evaluate at the output type's width with wrapping
+/// (`+%`/`*%`), so a computed bound that escapes that width would be a lie.
+/// Returns the range only when both endpoints fit `out_type`; null otherwise.
+fn provableRange(out_type: Type, min: ?i128, max: ?i128) struct { min: ?i128, max: ?i128 } {
+    const lo = min orelse return .{ .min = null, .max = null };
+    const hi = max orelse return .{ .min = null, .max = null };
+    const rng = typeRangeI128(out_type) orelse return .{ .min = null, .max = null };
+    if (lo < rng.lo or hi > rng.hi) return .{ .min = null, .max = null };
+    return .{ .min = lo, .max = hi };
+}
+
+// ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
 
@@ -672,6 +898,7 @@ fn resolveDerived(
             return .{
                 .name = try aa.dupe(u8, d.name),
                 .output_type = up_schema[idx].type,
+                .stat_class = .none, // rename is handled directly by stats() (pass-through)
                 .kind = .{ .rename = .{ .src_idx = idx } },
             };
         },
@@ -684,15 +911,18 @@ fn resolveDerived(
             return .{
                 .name = try aa.dupe(u8, d.name),
                 .output_type = literalType(v),
+                .stat_class = .{ .literal = intFamilyValueI128(v) },
                 .kind = .{ .lit_only = slot },
             };
         },
         .call => {
+            const stat_class = classifyExpr(d.expr, up_schema);
             // Fast path: `col +/-/* const` collapses to one widening SIMD pass.
             if (try tryFuseScalar(aa, d.expr, up_schema)) |fs| {
                 return .{
                     .name = try aa.dupe(u8, d.name),
                     .output_type = fs.out_type,
+                    .stat_class = stat_class,
                     .kind = .{ .fused_scalar = fs },
                 };
             }
@@ -700,6 +930,7 @@ fn resolveDerived(
             return .{
                 .name = try aa.dupe(u8, d.name),
                 .output_type = plan.output_type,
+                .stat_class = stat_class,
                 .kind = .{ .call = plan },
             };
         },
@@ -708,6 +939,7 @@ fn resolveDerived(
             return .{
                 .name = try aa.dupe(u8, d.name),
                 .output_type = plan.output_type,
+                .stat_class = .none,
                 .kind = .{ .case = plan },
             };
         },
@@ -985,6 +1217,67 @@ fn literalType(v: types.Value) Type {
 
 fn columnIndex(schema: []const Column, name: []const u8) ?usize {
     return types.findColumn(schema, name);
+}
+
+/// Provable output stat for one derived column, combining its plan-time
+/// `StatClass` with the live upstream per-column stats. Renames pass the
+/// source stat through unchanged (the kind, not the class, carries the index).
+fn derivedColStat(d: ResolvedDerived, up_stats: []const exec.ColStat) exec.ColStat {
+    if (d.kind == .rename) {
+        const rn = d.kind.rename;
+        return if (rn.src_idx < up_stats.len) up_stats[rn.src_idx] else .{ .ndv = .unknown };
+    }
+    return switch (d.stat_class) {
+        .none => .{ .ndv = .unknown },
+        .literal => |v| .{ .ndv = .{ .exact = 1 }, .min = v, .max = v },
+        .unary => |u| blk: {
+            if (u.src_idx >= up_stats.len) break :blk .{ .ndv = .unknown };
+            const src = up_stats[u.src_idx];
+            // f(col): ndv ≤ NDV(col) (pigeonhole). Affine ⇒ flow the range,
+            // then clamp to the output width (wrapping kernels make an
+            // escaping bound unprovable).
+            if (u.affine) |aff| {
+                const r = affineRange(aff, src.min, src.max);
+                const p = provableRange(d.output_type, r.min, r.max);
+                break :blk .{ .ndv = src.ndv, .min = p.min, .max = p.max };
+            }
+            break :blk .{ .ndv = src.ndv };
+        },
+        .binary => |bn| blk: {
+            if (bn.src1 >= up_stats.len or bn.src2 >= up_stats.len) break :blk .{ .ndv = .unknown };
+            const s1 = up_stats[bn.src1];
+            const s2 = up_stats[bn.src2];
+            // ndv ≤ NDV1·NDV2 (saturating product; unknown if either is).
+            const ndv: exec.ColCard = switch (s1.ndv) {
+                .unknown => .unknown,
+                .exact => |n1| switch (s2.ndv) {
+                    .unknown => .unknown,
+                    .exact => |n2| .{ .exact = n1 *| n2 },
+                },
+            };
+            // min/max for + and - via interval arithmetic, clamped to the
+            // output width (same wrapping-kernel caveat as the affine case).
+            var min: ?i128 = null;
+            var max: ?i128 = null;
+            if (bn.op) |op| {
+                if (s1.min != null and s1.max != null and s2.min != null and s2.max != null) {
+                    switch (op) {
+                        .add => {
+                            min = addChecked(s1.min.?, s2.min.?);
+                            max = addChecked(s1.max.?, s2.max.?);
+                        },
+                        .sub => {
+                            min = subChecked(s1.min.?, s2.max.?);
+                            max = subChecked(s1.max.?, s2.min.?);
+                        },
+                        .mul => {},
+                    }
+                }
+            }
+            const p = provableRange(d.output_type, min, max);
+            break :blk .{ .ndv = ndv, .min = p.min, .max = p.max };
+        },
+    };
 }
 
 fn derivedNullable(r: ResolvedDerived, up_schema: []const Column) bool {
