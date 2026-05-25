@@ -156,13 +156,10 @@ sizing, and the combined-distinct gid coupling (its pack uses gid; if a query
 mixes slot-as-gid grouping with COUNT(DISTINCT), the lowering must hand it dense
 gids). The runner doesn't validate values → `zig build test` is the gate.
 
-### Phase 2 — On-disk FOR for numeric/temporal columns *(format change)*
-- [ ] 2.1 Segment format: per-column encoding header `{raw | FOR(base,width)}`; manifest/version bump.
-- [ ] 2.2 Writer: per-segment base/range at flush; byte-narrow when it saves width; gate; else raw.
-- [ ] 2.3 Reader: decode to a narrow view + base; cache holds the encoded(narrow) form.
-- [ ] 2.4 Predicate translation: numeric constant → `const − base` per segment; min/max skip in-domain.
-- [ ] 2.5 SUM base-correction: `SUM = N·base + SUM(delta)` (algebraic-reduction path); MIN/MAX/COUNT trivial.
-- [ ] 2.6 Tests + A/B: per-type round-trip, NULL orthogonality, edge ranges; segment-size + scan-bandwidth.
+### Phase 2 — On-disk FOR for numeric/temporal columns *(format change)* — DONE
+- [x] 2A (commit `107a90f`) format v8→v9: `Encoding {raw,for}` in a reserved block-header byte (old all-raw blocks byte-identical; strict v9 reader, v8 data re-imported — no back-compat read at this stage). FOR payload `[base:i128][width][deltas]` after the null bitmap. Writer FOR-encodes int-family columns when the delta width is strictly narrower AND the body shrinks (i128-safe gate; all-null/single-distinct/un-narrowable → raw). Reader expands base+delta to native (all consumers unchanged); borrow path bails FOR→owned-decode; `pub forBlockOf` exposes `{base,width,codes}`. Round-trip tests: negative base, min/max boundaries, single-distinct, NULLs, stays-raw, multi-segment.
+- [x] 2B (commit `ae1d46b`) FOR-aware fused-scan filter: `translateForLeaf` maps `col OP C` into the FOR domain once (per-op empty/all/narrow-compare boundaries), SIMD-compares the narrow codes from cache (`forCompareInto`), ANDs validity+tombstones, expands only survivors. Falls back for unhandled shapes / raw blocks. **Bench: FOR 36.2 vs raw 73.5 ms/pass = 2.03× at larger-than-cache scale** (16MB pinned cache, raw spills / FOR fits), identical match count. 1003 tests; all 6 ops × boundary constants × widths × nullable × multi-segment × stays-raw brute-forced.
+- [ ] 2.5 SUM base-correction (`SUM = N·base + SUM(delta)`) — deferred; the agg path reads native (FOR expands for non-filter consumers), so SUM is already correct, just not yet narrow-accumulated. Pick up with multi-agg / accumulator-narrowing work.
 
 ### Phase 3 — Segment-local string dictionary *(format change)*
 - [ ] 3.1 Format: per-column `dict` encoding — sorted dict block + FOR-narrowed code column.
