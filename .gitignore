@@ -44,6 +44,7 @@ bench/clickbench/coverage*.json
 /distinctbench.zig
 /lazybench.zig
 /compactbench.zig
+/formicro.zig
 /aggbench.zig
 /computebench.zig
 /membench.zig
@@ -55,6 +56,7 @@ bench/clickbench/coverage*.json
 # Bun bench scratch
 /tests/bun/ab_base.json
 /tests/bun/losing.json
+/tests/bun/rawv9.json
 /tests/bun/q15probe.ts
 /tests/bun/q40probe.ts
 # Stray build/server logs

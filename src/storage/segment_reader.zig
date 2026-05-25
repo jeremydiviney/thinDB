@@ -132,18 +132,25 @@ pub const ReadSegment = struct {
     /// `release` to drop the pin / free the buffer.
     pub const BorrowedBlock = struct {
         bytes: []const u8,
-        /// Value encoding of `bytes`. A `.for_` block is not directly viewable
-        /// as native-width bytes, so `viewRawColumn` declines it and the caller
-        /// falls back to the owned-decode (expand) path. Raw blocks view in place.
+        /// Value encoding of `bytes`. A `.for_` block's `bytes` are narrow
+        /// deltas, not native-width values, so `viewRawColumn` declines a direct
+        /// in-place view. The scan's borrow path instead expands the FOR codes
+        /// ONCE into `expanded` (native width) and views over that buffer —
+        /// keeping the rest of the projection zero-copy. Raw blocks view in place.
         encoding: format.Encoding = .raw,
         entry: ?*storage_cache.Cache.Entry = null,
         owned: ?[]u8 = null,
+        /// Native-width expansion of a FOR-encoded block, allocated by the
+        /// borrow path so a single FOR column doesn't force the whole row group
+        /// onto the owned-decode path. Freed on `release`. Null for raw blocks.
+        expanded: ?OwnedColumn = null,
 
         pub fn release(self: *BorrowedBlock, allocator: Allocator, c: ?*storage_cache.Cache) void {
             if (self.entry) |e| {
                 if (c) |cc| cc.release(e);
             }
             if (self.owned) |b| allocator.free(b);
+            if (self.expanded) |*col| col.deinit(allocator);
             self.* = undefined;
         }
     };
@@ -558,11 +565,25 @@ fn cmpScalar(comptime U: type, a: U, b: U, op: simd_mod.CmpOp) bool {
 /// count). Only survivors are expanded — the bandwidth win is that the full
 /// column was already filtered narrow; materialization touches survivors only.
 pub fn forExpandSurvivors(comptime T: type, fb: ForBlock, mask: []const bool, out: []T) void {
+    const base: T = @intCast(fb.base);
+    switch (fb.width) {
+        1 => expandSurvivorsW(T, u8, base, fb.codes, mask, out),
+        2 => expandSurvivorsW(T, u16, base, fb.codes, mask, out),
+        4 => expandSurvivorsW(T, u32, base, fb.codes, mask, out),
+        8 => expandSurvivorsW(T, u64, base, fb.codes, mask, out),
+        else => unreachable,
+    }
+}
+
+/// `out[j++] = base + codes[i]` for each set `mask[i]` — native add (no i128),
+/// reading the delta directly at its width instead of via a per-row temp copy.
+inline fn expandSurvivorsW(comptime T: type, comptime W: type, base: T, codes: []const u8, mask: []const bool, out: []T) void {
+    const wsz = @sizeOf(W);
     var j: usize = 0;
     for (mask, 0..) |m, i| {
         if (!m) continue;
-        const code = readForCode(fb.codes, fb.width, i);
-        out[j] = @intCast(fb.base + @as(i128, code));
+        const d = std.mem.readInt(W, codes[i * wsz ..][0..wsz], .little);
+        out[j] = base +% @as(T, @intCast(d));
         j += 1;
     }
 }
@@ -571,7 +592,7 @@ pub fn forExpandSurvivors(comptime T: type, fb: ForBlock, mask: []const bool, ou
 /// OwnedColumn has the identical shape a raw block would. Reconstructs each row
 /// as `base + delta`. NULL rows (masked by the validity bitmap) still get a
 /// delta slot expanded into a placeholder value, which consumers ignore.
-fn decodeForColumn(
+pub fn decodeForColumn(
     allocator: Allocator,
     col_type: Type,
     raw: []const u8,
@@ -600,15 +621,7 @@ fn decodeForColumn(
         .decimal64 => .{ .data = .{ .decimal64 = try expandFor(i64, allocator, fb, row_count) }, .nulls = nulls },
         .smallint => .{ .data = .{ .smallint = try expandFor(i16, allocator, fb, row_count) }, .nulls = nulls },
         .tinyint => .{ .data = .{ .tinyint = try expandFor(i8, allocator, fb, row_count) }, .nulls = nulls },
-        .boolean => blk: {
-            const data = try allocator.alloc(u8, row_count);
-            errdefer allocator.free(data);
-            for (data, 0..) |*slot, i| {
-                const delta = readForCode(fb.codes, fb.width, i);
-                slot.* = @intCast(fb.base + @as(i128, delta));
-            }
-            break :blk .{ .data = .{ .boolean = data }, .nulls = nulls };
-        },
+        .boolean => .{ .data = .{ .boolean = try expandFor(u8, allocator, fb, row_count) }, .nulls = nulls },
         else => unreachable,
     };
 }
@@ -624,11 +637,40 @@ fn readForCode(codes: []const u8, width: u8, row: usize) u64 {
 fn expandFor(comptime T: type, allocator: Allocator, fb: ForBlock, row_count: u32) ![]T {
     const data = try allocator.alloc(T, row_count);
     errdefer allocator.free(data);
-    for (data, 0..) |*slot, i| {
-        const delta = readForCode(fb.codes, fb.width, i);
-        slot.* = @intCast(fb.base + @as(i128, delta));
+    const base: T = @intCast(fb.base);
+    switch (fb.width) {
+        1 => expandWidth(T, u8, base, fb.codes, data),
+        2 => expandWidth(T, u16, base, fb.codes, data),
+        4 => expandWidth(T, u32, base, fb.codes, data),
+        8 => expandWidth(T, u64, base, fb.codes, data),
+        else => unreachable,
     }
     return data;
+}
+
+/// Reconstruct native values from the narrow unsigned deltas: `out[i] = base +
+/// codes[i]`. FOR is only applied when `value = base + delta` provably fits `T`
+/// (the writer narrows only when the span does), so the add runs in `T` — no
+/// per-row i128. Vectorized in chunks; the deltas are read unaligned (the codes
+/// region is not aligned in the decompressed buffer), then widened + added with
+/// `base` broadcast.
+inline fn expandWidth(comptime T: type, comptime W: type, base: T, codes: []const u8, out: []T) void {
+    const wsz = @sizeOf(W);
+    const N = std.simd.suggestVectorLength(T) orelse @max(1, 16 / @sizeOf(T));
+    var i: usize = 0;
+    if (N > 1) {
+        const base_vec: @Vector(N, T) = @splat(base);
+        const VecW = @Vector(N, W);
+        while (i + N <= out.len) : (i += N) {
+            const dv: VecW = @as(*align(1) const VecW, @ptrCast(codes.ptr + i * wsz)).*;
+            const wide: @Vector(N, T) = @intCast(dv);
+            out[i..][0..N].* = wide +% base_vec;
+        }
+    }
+    while (i < out.len) : (i += 1) {
+        const delta = std.mem.readInt(W, codes[i * wsz ..][0..wsz], .little);
+        out[i] = base +% @as(T, @intCast(delta));
+    }
 }
 
 /// Build a BORROWED `ColumnView` over the raw decompressed block bytes —

@@ -209,6 +209,10 @@ pub const Scan = struct {
     /// Scratch row-mask, grown on demand for the largest row group seen.
     /// Reused across `next()` calls; freed in `deinit`.
     mask_buf: []bool = &.{},
+    /// Second scratch row-mask, used by the FOR-aware AND filter to hold each
+    /// additional leaf's per-row result before ANDing it into `mask_buf`.
+    /// Grown on demand; reused across `next()` calls; freed in `deinit`.
+    mask_buf2: []bool = &.{},
     /// Scratch array of borrowed cache blocks for the fused-filter fast path,
     /// one slot per projected column. Reused across `next()` calls; the pins
     /// it holds are released within each call. Freed in `deinit`.
@@ -426,6 +430,7 @@ pub const Scan = struct {
         self.releaseBatch();
         self.closeCurSegment();
         if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
+        if (self.mask_buf2.len > 0) self.allocator.free(self.mask_buf2);
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_stats.len > 0) self.allocator.free(self.cached_stats);
@@ -864,13 +869,14 @@ pub const Scan = struct {
         const tomb_mask = try self.tombstoneMask(rg_first, rg_count);
         defer if (tomb_mask) |m| self.allocator.free(m);
 
-        // FOR-aware fast path: a single comparison leaf whose column is
-        // FOR-encoded compares the narrow codes directly (no native expand).
-        // Returns null when the shape doesn't apply (non-leaf, non-comparison
-        // op, non-FOR block) — then the borrow / owned-decode paths run
-        // unchanged (for a FOR block that means decode-expand then native
-        // filter: correct, just without the bandwidth win).
-        if (try self.tryFilterForLeaf(seg, rg_idx, rg_count, tomb_mask, expr)) |matched| {
+        // FOR-aware fast path: a single comparison leaf, or an AND of comparison
+        // leaves, evaluated column-by-column in the narrow code domain (FOR
+        // blocks) or over a borrowed native view (raw blocks) — no full-column
+        // expand, only survivors are materialized. Returns null when the shape
+        // doesn't apply (non-comparison op, string/LIKE/sub-query leaf, an
+        // un-projectable column), so the borrow / owned-decode paths below run
+        // unchanged (and the borrow path is itself per-column FOR-aware now).
+        if (try self.tryFilterForGuided(seg, rg_idx, rg_count, tomb_mask, expr)) |matched| {
             return matched;
         }
 
@@ -888,14 +894,17 @@ pub const Scan = struct {
         return self.evalAndCompact(owned_views, rg_count, tomb_mask, expr);
     }
 
-    /// FOR-aware leaf filter (Phase 2B). Applies when `expr` is a single
-    /// comparison `.leaf` whose projected column's block is FOR-encoded: the
-    /// constant is translated into the block's code domain once, the narrow
-    /// codes are compared directly to build the row mask (validity + tombstones
-    /// folded in exactly as the native path), and only survivors are expanded to
-    /// native during compaction. Returns null (taking no pins) when the shape
-    /// doesn't apply, so the caller's existing paths run unchanged.
-    fn tryFilterForLeaf(
+    /// FOR-aware fused filter (Phase 2B + per-leaf AND generalization). Handles a
+    /// single comparison `.leaf`, or an `.@"and"` whose children are ALL
+    /// comparison leaves on numeric/temporal columns: each leaf is evaluated in
+    /// the narrow FOR code domain when its block is FOR-encoded (no native
+    /// expand), or over a borrowed native view when raw, and the per-leaf masks
+    /// are ANDed into the survivor mask. Only survivors are then expanded
+    /// (`materializeSurvivors`). Returns null — taking and releasing no extra
+    /// state — when any leaf's shape doesn't fit (non-comparison op, string /
+    /// LIKE / sub-query leaf, un-projectable column), so the caller's per-column
+    /// borrow path (also FOR-aware) handles the row group instead.
+    fn tryFilterForGuided(
         self: *Scan,
         seg: *storage.ReadSegment,
         rg_idx: usize,
@@ -903,61 +912,29 @@ pub const Scan = struct {
         tomb_mask: ?[]const bool,
         expr: PredicateExpr,
     ) !?usize {
-        const leaf = switch (expr) {
-            .leaf => |p| p,
-            else => return null,
-        };
-        switch (leaf.op) {
-            .eq, .neq, .lt, .lte, .gt, .gte => {},
-        }
-        // The leaf column must be one this scan projects (true for every fused
-        // filter — the fusing Filter shares the scan's output schema).
-        const proj = blk: {
-            for (self.out_phys, 0..) |phys, j| {
-                if (@import("../types.zig").columnNameEql(self.table.schema.columns[phys].name, leaf.col)) {
-                    break :blk .{ .phys = phys, .j = j };
-                }
-            }
-            return null;
-        };
-        const col_type = self.table.schema.columns[proj.phys].type;
-        if (!predicate.typeHasRange(col_type)) return null;
-
-        // Borrow the predicate column's block. Decline (no FOR win) if it's not
-        // FOR-encoded; release the pin and let the caller's path handle it.
-        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[proj.phys].nullable };
-        var pred_block = try seg.borrowColumnBlock(self.allocator, rg_idx, proj.phys, &self.table.cache);
-        if (pred_block.encoding != .for_) {
-            pred_block.release(self.allocator, &self.table.cache);
-            return null;
-        }
-        defer pred_block.release(self.allocator, &self.table.cache);
-
-        const fv = storage.segment_reader.forViewOf(pred_block.bytes, rg_count, flags);
-
-        // span = max - base, from the row-group stats (base == stats.min for a
-        // FOR block). Used to resolve the boundary (.none/.all) cases precisely.
-        const col_stats = seg.info.row_groups[rg_idx].stats[proj.phys];
-        if (col_stats.max < fv.block.base) return null; // degenerate (all-null sentinel) — shouldn't reach FOR
-        const span: u128 = @intCast(col_stats.max - fv.block.base);
-
-        const plan = predicate.translateForLeaf(fv.block.base, span, leaf.op, leaf.val) orelse return null;
-
         const mask = try self.ensureMask(rg_count);
-        switch (plan) {
-            .none => @memset(mask[0..rg_count], false),
-            .all => @memset(mask[0..rg_count], true),
-            .compare => |cp| {
-                storage.segment_reader.forCompareInto(fv.block, cmpOpToSimd(cp.op), cp.code, rg_count, mask[0..rg_count]);
+        switch (expr) {
+            .leaf => |leaf| {
+                if (!try self.buildLeafMask(seg, rg_idx, rg_count, leaf, mask[0..rg_count])) return null;
             },
+            .@"and" => |children| {
+                if (children.len == 0) return null;
+                // Every child must be a comparison leaf we can evaluate narrow;
+                // otherwise decline the whole AND (mixed shapes fall back).
+                for (children) |c| if (c != .leaf) return null;
+
+                if (!try self.buildLeafMask(seg, rg_idx, rg_count, children[0].leaf, mask[0..rg_count])) return null;
+                if (children.len > 1) {
+                    const scratch = try self.ensureMask2(rg_count);
+                    for (children[1..]) |c| {
+                        if (!try self.buildLeafMask(seg, rg_idx, rg_count, c.leaf, scratch[0..rg_count])) return null;
+                        for (mask[0..rg_count], scratch[0..rg_count]) |*m, s| m.* = m.* and s;
+                    }
+                }
+            },
+            else => return null,
         }
-        // NULLs never match a comparison — clear them (skipped for `.none`,
-        // already all-false). The native leaf path does the same.
-        if (plan != .none and fv.nulls != null) {
-            for (0..rg_count) |i| {
-                if (!storage.column.isValidBit(fv.nulls, i)) mask[i] = false;
-            }
-        }
+
         if (tomb_mask) |tm| {
             for (mask[0..rg_count], tm) |*m, keep| m.* = m.* and keep;
         }
@@ -968,6 +945,66 @@ pub const Scan = struct {
 
         try self.materializeSurvivors(seg, rg_idx, rg_count, mask[0..rg_count]);
         return matched;
+    }
+
+    /// Evaluate one comparison `leaf` for the current row group into `out`
+    /// (sized `rg_count`), with NULLs cleared — tombstones are ANDed once by the
+    /// caller. A FOR-encoded block compares the narrow codes in place; a raw
+    /// block compares over a borrowed native view. Returns false (handling no
+    /// pins) when the leaf can't be evaluated this way (non-comparison op,
+    /// non-numeric column, an un-projectable column, or a block whose bytes
+    /// can't be viewed raw), so the caller declines the FOR-aware path entirely.
+    fn buildLeafMask(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        rg_count: u32,
+        leaf: Predicate,
+        out: []bool,
+    ) !bool {
+        switch (leaf.op) {
+            .eq, .neq, .lt, .lte, .gt, .gte => {},
+        }
+        const proj_phys = blk: {
+            for (self.out_phys) |phys| {
+                if (@import("../types.zig").columnNameEql(self.table.schema.columns[phys].name, leaf.col)) break :blk phys;
+            }
+            return false;
+        };
+        const col_type = self.table.schema.columns[proj_phys].type;
+        if (!predicate.typeHasRange(col_type)) return false;
+
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[proj_phys].nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, proj_phys, &self.table.cache);
+        defer block.release(self.allocator, &self.table.cache);
+
+        if (block.encoding == .for_) {
+            const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
+            // span = max - base (base == stats.min for a FOR block); resolves the
+            // boundary (.none/.all) cases precisely.
+            const col_stats = seg.info.row_groups[rg_idx].stats[proj_phys];
+            if (col_stats.max < fv.block.base) return false; // degenerate all-null sentinel — shouldn't reach FOR
+            const span: u128 = @intCast(col_stats.max - fv.block.base);
+            const plan = predicate.translateForLeaf(fv.block.base, span, leaf.op, leaf.val) orelse return false;
+            switch (plan) {
+                .none => @memset(out, false),
+                .all => @memset(out, true),
+                .compare => |cp| storage.segment_reader.forCompareInto(fv.block, cmpOpToSimd(cp.op), cp.code, rg_count, out),
+            }
+            if (plan != .none and fv.nulls != null) {
+                for (0..rg_count) |i| {
+                    if (!storage.column.isValidBit(fv.nulls, i)) out[i] = false;
+                }
+            }
+            return true;
+        }
+
+        // Raw block: compare over a borrowed native view (clears NULLs). Decline
+        // if the bytes can't be viewed in place (misaligned / big-endian) — the
+        // caller's owned-decode fallback handles it.
+        const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
+        try predicate.evaluateMaskWithPred(view, leaf, rg_count, out);
+        return true;
     }
 
     /// Compact the masked survivors of every projected column into `filtered`.
@@ -1059,10 +1096,14 @@ pub const Scan = struct {
     };
 
     /// Try to build borrowed typed views over the cache blocks for every
-    /// projected column. Returns null (after releasing any pins taken) if any
-    /// column's bytes aren't safe to view in place. The returned `blocks` /
-    /// `views` alias `self`-owned scratch (`borrow_blocks` / `views`); the
-    /// caller must release the blocks within the same `next()` call.
+    /// projected column. Per-column: a raw block views zero-copy in place; a
+    /// FOR-encoded block is expanded ONCE into an owned native buffer carried by
+    /// its `BorrowedBlock` (so one FOR column never forces the raw columns onto
+    /// the owned-decode path). Returns null (after releasing any pins taken)
+    /// only when a column's bytes are neither viewable raw nor FOR (misaligned /
+    /// big-endian raw). The returned `blocks` / `views` alias `self`-owned
+    /// scratch (`borrow_blocks` / `views`); the caller must release the blocks
+    /// within the same `next()` call (which frees any FOR expansion buffers).
     fn tryBorrowViews(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32) !?Borrow {
         const blocks = try self.ensureBorrowBlocks();
 
@@ -1073,9 +1114,31 @@ pub const Scan = struct {
             const col_type = self.table.schema.columns[phys].type;
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
             var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+
+            if (block.encoding == .for_) {
+                // Expand the FOR codes once into a native buffer owned by the
+                // block; the view aliases that buffer and the expansion is freed
+                // on `block.release`. The raw columns alongside stay zero-copy.
+                block.expanded = storage.segment_reader.decodeForColumn(
+                    self.allocator,
+                    col_type,
+                    block.bytes,
+                    rg_count,
+                    flags,
+                ) catch |e| {
+                    block.release(self.allocator, &self.table.cache);
+                    for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
+                    return e;
+                };
+                blocks[j] = block;
+                self.views[j] = block.expanded.?.view();
+                got += 1;
+                continue;
+            }
+
             const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse {
-                // Misaligned / FOR-encoded / unsupported: release this block and
-                // abandon the fast path for the whole row group (release the rest too).
+                // Misaligned / big-endian raw: release this block and abandon the
+                // fast path for the whole row group (release the rest too).
                 block.release(self.allocator, &self.table.cache);
                 for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
                 return null;
@@ -1161,6 +1224,14 @@ pub const Scan = struct {
             self.mask_buf = try self.allocator.alloc(bool, n);
         }
         return self.mask_buf;
+    }
+
+    fn ensureMask2(self: *Scan, n: usize) ![]bool {
+        if (self.mask_buf2.len < n) {
+            if (self.mask_buf2.len > 0) self.allocator.free(self.mask_buf2);
+            self.mask_buf2 = try self.allocator.alloc(bool, n);
+        }
+        return self.mask_buf2;
     }
 
     fn ensureBorrowBlocks(self: *Scan) ![]storage.ReadSegment.BorrowedBlock {

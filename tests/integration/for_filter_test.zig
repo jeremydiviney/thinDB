@@ -227,6 +227,85 @@ test "FOR-aware filter matches native filter across multiple segments" {
     try checkColumn(allocator, db, &segments, "nv", nvFor, nvValid, NV_MIN, NV_MAX);
 }
 
+test "FOR-aware AND over FOR + raw columns, projecting FOR + raw + string" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 256 });
+    defer db.close();
+
+    // `a`/`b` are bounded-range INTs → FOR-encoded; `r` is a full-spread BIGINT
+    // that stays raw; `s` is a low-card VARCHAR. The WHERE below is a 3-leaf AND
+    // mixing two FOR columns and the raw column, and the projection mixes a FOR
+    // column (`a`), the raw column (`r`), and the string column (`s`) — so the
+    // per-column borrow + the AND-of-leaves FOR path are both exercised, and the
+    // string column must come back byte-exact through the zero-copy borrow.
+    try exec(allocator, db,
+        \\CREATE TABLE t (
+        \\  id BIGINT PRIMARY KEY, a INT NOT NULL, b INT NOT NULL,
+        \\  r BIGINT NOT NULL, s VARCHAR(32)
+        \\)
+    );
+
+    const ROWS2: i64 = 2000;
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "INSERT INTO t (id, a, b, r, s) VALUES ");
+        var line: [128]u8 = undefined;
+        var i: i64 = 0;
+        while (i < ROWS2) : (i += 1) {
+            if (i != 0) try buf.appendSlice(allocator, ", ");
+            const a = 100 + @mod(i * 7, 200); // [100,299]
+            const b = 50 + @mod(i * 3, 100); //  [50,149]
+            const r = @mod(i * 2_400_000_000_007, std.math.maxInt(i64));
+            const s = try std.fmt.bufPrint(&line, "({d}, {d}, {d}, {d}, 'cat{d}')", .{ i + 1, a, b, r, @mod(i, 4) });
+            try buf.appendSlice(allocator, s);
+        }
+        try exec(allocator, db, buf.items);
+    }
+    const t = try db.openTable("t", .{});
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+    // a > 150 AND b <= 120 AND r >= 0 (r >= 0 is always-true on the raw column,
+    // exercising the raw leaf in the AND without changing the result set).
+    const sql = "SELECT id, a, r, s FROM t WHERE a > 150 AND b <= 120 AND r >= 0 ORDER BY id";
+
+    var got_ids: std.ArrayList(i64) = .empty;
+    defer got_ids.deinit(allocator);
+    {
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |row| {
+                const id = batch.values[0].data.bigint[row];
+                const a_val = batch.values[1].data.int[row];
+                const s_val = batch.values[3].data.varchar.rowBytes(row);
+                // The id encodes i = id - 1; recompute the expected derived values.
+                const i = id - 1;
+                try std.testing.expectEqual(@as(i32, @intCast(100 + @mod(i * 7, 200))), a_val);
+                var sbuf: [16]u8 = undefined;
+                const want_s = try std.fmt.bufPrint(&sbuf, "cat{d}", .{@mod(i, 4)});
+                try std.testing.expectEqualStrings(want_s, s_val);
+                try got_ids.append(allocator, id);
+            }
+        }
+    }
+
+    // Brute-force reference: same predicate computed in the test.
+    var want_count: usize = 0;
+    var i: i64 = 0;
+    while (i < ROWS2) : (i += 1) {
+        const a = 100 + @mod(i * 7, 200);
+        const b = 50 + @mod(i * 3, 100);
+        if (a > 150 and b <= 120) want_count += 1;
+    }
+    try std.testing.expectEqual(want_count, got_ids.items.len);
+}
+
 test "FOR-aware filter with a memtable tail (flushed segment + un-flushed rows)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
