@@ -864,6 +864,16 @@ pub const Scan = struct {
         const tomb_mask = try self.tombstoneMask(rg_first, rg_count);
         defer if (tomb_mask) |m| self.allocator.free(m);
 
+        // FOR-aware fast path: a single comparison leaf whose column is
+        // FOR-encoded compares the narrow codes directly (no native expand).
+        // Returns null when the shape doesn't apply (non-leaf, non-comparison
+        // op, non-FOR block) — then the borrow / owned-decode paths run
+        // unchanged (for a FOR block that means decode-expand then native
+        // filter: correct, just without the bandwidth win).
+        if (try self.tryFilterForLeaf(seg, rg_idx, rg_count, tomb_mask, expr)) |matched| {
+            return matched;
+        }
+
         // Fast path: borrow views over cache bytes. Bail to copy if any column
         // can't be viewed (misalignment / big-endian).
         if (try self.tryBorrowViews(seg, rg_idx, rg_count)) |borrow| {
@@ -876,6 +886,171 @@ pub const Scan = struct {
         const owned_views = try self.decodeOwnedViews(seg, rg_idx, rg_count);
         defer self.releaseDecoded();
         return self.evalAndCompact(owned_views, rg_count, tomb_mask, expr);
+    }
+
+    /// FOR-aware leaf filter (Phase 2B). Applies when `expr` is a single
+    /// comparison `.leaf` whose projected column's block is FOR-encoded: the
+    /// constant is translated into the block's code domain once, the narrow
+    /// codes are compared directly to build the row mask (validity + tombstones
+    /// folded in exactly as the native path), and only survivors are expanded to
+    /// native during compaction. Returns null (taking no pins) when the shape
+    /// doesn't apply, so the caller's existing paths run unchanged.
+    fn tryFilterForLeaf(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        rg_count: u32,
+        tomb_mask: ?[]const bool,
+        expr: PredicateExpr,
+    ) !?usize {
+        const leaf = switch (expr) {
+            .leaf => |p| p,
+            else => return null,
+        };
+        switch (leaf.op) {
+            .eq, .neq, .lt, .lte, .gt, .gte => {},
+        }
+        // The leaf column must be one this scan projects (true for every fused
+        // filter — the fusing Filter shares the scan's output schema).
+        const proj = blk: {
+            for (self.out_phys, 0..) |phys, j| {
+                if (@import("../types.zig").columnNameEql(self.table.schema.columns[phys].name, leaf.col)) {
+                    break :blk .{ .phys = phys, .j = j };
+                }
+            }
+            return null;
+        };
+        const col_type = self.table.schema.columns[proj.phys].type;
+        if (!predicate.typeHasRange(col_type)) return null;
+
+        // Borrow the predicate column's block. Decline (no FOR win) if it's not
+        // FOR-encoded; release the pin and let the caller's path handle it.
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[proj.phys].nullable };
+        var pred_block = try seg.borrowColumnBlock(self.allocator, rg_idx, proj.phys, &self.table.cache);
+        if (pred_block.encoding != .for_) {
+            pred_block.release(self.allocator, &self.table.cache);
+            return null;
+        }
+        defer pred_block.release(self.allocator, &self.table.cache);
+
+        const fv = storage.segment_reader.forViewOf(pred_block.bytes, rg_count, flags);
+
+        // span = max - base, from the row-group stats (base == stats.min for a
+        // FOR block). Used to resolve the boundary (.none/.all) cases precisely.
+        const col_stats = seg.info.row_groups[rg_idx].stats[proj.phys];
+        if (col_stats.max < fv.block.base) return null; // degenerate (all-null sentinel) — shouldn't reach FOR
+        const span: u128 = @intCast(col_stats.max - fv.block.base);
+
+        const plan = predicate.translateForLeaf(fv.block.base, span, leaf.op, leaf.val) orelse return null;
+
+        const mask = try self.ensureMask(rg_count);
+        switch (plan) {
+            .none => @memset(mask[0..rg_count], false),
+            .all => @memset(mask[0..rg_count], true),
+            .compare => |cp| {
+                storage.segment_reader.forCompareInto(fv.block, cmpOpToSimd(cp.op), cp.code, rg_count, mask[0..rg_count]);
+            },
+        }
+        // NULLs never match a comparison — clear them (skipped for `.none`,
+        // already all-false). The native leaf path does the same.
+        if (plan != .none and fv.nulls != null) {
+            for (0..rg_count) |i| {
+                if (!storage.column.isValidBit(fv.nulls, i)) mask[i] = false;
+            }
+        }
+        if (tomb_mask) |tm| {
+            for (mask[0..rg_count], tm) |*m, keep| m.* = m.* and keep;
+        }
+
+        var matched: usize = 0;
+        for (mask[0..rg_count]) |m| matched += @intFromBool(m);
+        if (matched == 0) return @as(usize, 0);
+
+        try self.materializeSurvivors(seg, rg_idx, rg_count, mask[0..rg_count]);
+        return matched;
+    }
+
+    /// Compact the masked survivors of every projected column into `filtered`.
+    /// Each column is borrowed from the cache; a FOR-encoded block expands only
+    /// its survivors to native (`forExpandSurvivors`), a raw block is viewed in
+    /// place and run through the shared masked-compaction. The borrow pins are
+    /// released before returning.
+    fn materializeSurvivors(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, mask: []const bool) !void {
+        const filtered_cols = try self.ensureFilteredBuffers();
+        for (filtered_cols) |*c| c.clear();
+
+        for (self.out_phys, 0..) |phys, j| {
+            const col_type = self.table.schema.columns[phys].type;
+            const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+            defer block.release(self.allocator, &self.table.cache);
+
+            if (block.encoding == .for_) {
+                const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
+                try self.appendForSurvivors(fv, mask, &filtered_cols[j]);
+                continue;
+            }
+
+            // Raw block: borrow a native view in place when possible, else fall
+            // back to an owned decode just for this column. Both feed the shared
+            // masked-compaction.
+            if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
+                try engine.memtable.appendMaskedColumn(self.allocator, view, mask, &filtered_cols[j]);
+            } else {
+                var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+                defer owned.deinit(self.allocator);
+                try engine.memtable.appendMaskedColumn(self.allocator, owned.view(), mask, &filtered_cols[j]);
+            }
+        }
+    }
+
+    /// Expand a FOR column's survivors (`base + code` for set mask bits) into a
+    /// `ColumnStore`. Only survivors are reconstructed — `forExpandSurvivors`
+    /// writes them compactly into a scratch native slice, which is appended to
+    /// the destination list. The per-survivor validity bit is carried so a NULL
+    /// row that happens to survive (not the current single-leaf shape, which
+    /// already cleared NULLs, but kept correct for any future composed mask)
+    /// materializes as NULL.
+    fn appendForSurvivors(self: *Scan, fv: storage.segment_reader.ForView, mask: []const bool, out: *ColumnStore) !void {
+        var matched: usize = 0;
+        for (mask) |m| matched += @intFromBool(m);
+
+        switch (out.data) {
+            .int => |*list| try self.expandForInto(i32, fv.block, mask, matched, list),
+            .date => |*list| try self.expandForInto(i32, fv.block, mask, matched, list),
+            .bigint => |*list| try self.expandForInto(i64, fv.block, mask, matched, list),
+            .datetime => |*list| try self.expandForInto(i64, fv.block, mask, matched, list),
+            .decimal64 => |*list| try self.expandForInto(i64, fv.block, mask, matched, list),
+            .smallint => |*list| try self.expandForInto(i16, fv.block, mask, matched, list),
+            .tinyint => |*list| try self.expandForInto(i8, fv.block, mask, matched, list),
+            .boolean => |*list| try self.expandForInto(u8, fv.block, mask, matched, list),
+            else => unreachable,
+        }
+
+        if (out.nulls != null) {
+            var j: usize = 0;
+            for (mask, 0..) |m, src_row| {
+                if (!m) continue;
+                const valid = storage.column.isValidBit(fv.nulls, src_row);
+                try out.appendValidBit(self.allocator, j, valid);
+                j += 1;
+            }
+        }
+    }
+
+    fn expandForInto(
+        self: *Scan,
+        comptime T: type,
+        fb: storage.segment_reader.ForBlock,
+        mask: []const bool,
+        matched: usize,
+        list: *std.ArrayList(T),
+    ) !void {
+        if (matched == 0) return;
+        try list.ensureUnusedCapacity(self.allocator, matched);
+        const start = list.items.len;
+        list.items.len = start + matched;
+        storage.segment_reader.forExpandSurvivors(T, fb, mask, list.items[start..]);
     }
 
     const Borrow = struct {
@@ -1045,4 +1220,17 @@ pub const Scan = struct {
 
 fn cmpU32(target: u32, item: u32) std.math.Order {
     return std.math.order(target, item);
+}
+
+/// Map a `PredicateOp` to the structurally-identical `simd.CmpOp` consumed by
+/// the FOR-code comparison kernel.
+fn cmpOpToSimd(op: PredicateOp) @import("../util/simd.zig").CmpOp {
+    return switch (op) {
+        .eq => .eq,
+        .neq => .neq,
+        .lt => .lt,
+        .lte => .lte,
+        .gt => .gt,
+        .gte => .gte,
+    };
 }

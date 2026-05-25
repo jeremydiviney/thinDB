@@ -37,6 +37,7 @@ const format = @import("format.zig");
 const column = @import("column.zig");
 const compression_mod = @import("compression.zig");
 const storage_cache = @import("cache.zig");
+const simd_mod = @import("../util/simd.zig");
 const ColumnView = column.ColumnView;
 const StringView = column.StringView;
 const OwnedColumn = column.OwnedColumn;
@@ -470,6 +471,100 @@ pub fn forBlockOf(values: []const u8, row_count: u32) ForBlock {
     const codes_start = 16 + 1 + 3;
     const codes = values[codes_start .. codes_start + @as(usize, row_count) * width];
     return .{ .base = base, .width = width, .codes = codes };
+}
+
+/// Split a decompressed FOR block payload into (validity bitmap, ForBlock).
+/// Mirrors the bitmap-stripping the raw/expand paths do, but keeps the codes
+/// narrow — the Phase 2B FOR-aware filter compares against these directly.
+pub const ForView = struct {
+    nulls: ?[]const u8,
+    block: ForBlock,
+};
+
+pub fn forViewOf(raw: []const u8, row_count: u32, flags: format.ColumnBlockFlags) ForView {
+    var nulls: ?[]const u8 = null;
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        nulls = raw[0..bm_len];
+        values = raw[bm_len..];
+    }
+    return .{ .nulls = nulls, .block = forBlockOf(values, row_count) };
+}
+
+/// Compare the narrow FOR codes against `want` under `op`, writing the result
+/// into `mask` — never expanding to native width. The width tiers a v9 FOR
+/// block can carry are u8/u16/u32 (8-byte deltas never beat the 8-byte native
+/// width, so the writer never emits width 8). `want` is the constant already
+/// translated into the code domain (`const - base`) by `translateForLeaf`,
+/// which guarantees it is in `[0, max_code]` for this width — so the unsigned
+/// comparison over codes is bit-for-bit identical to comparing the native
+/// values. NULLs are not handled here; the caller ANDs the validity bitmap.
+///
+/// SIMD over an aligned codes slice; an unaligned codes start (the FOR payload
+/// begins past a width-misaligned validity bitmap) falls back to a per-row
+/// narrow load + scalar compare — still narrow-width, no native expansion.
+/// The `@ptrCast`/`@alignCast` stays at this storage boundary.
+pub fn forCompareInto(fb: ForBlock, op: simd_mod.CmpOp, want: u64, row_count: u32, mask: []bool) void {
+    switch (fb.width) {
+        1 => forCompareWidth(u8, fb.codes, @truncate(want), row_count, op, mask),
+        2 => forCompareWidth(u16, fb.codes, @truncate(want), row_count, op, mask),
+        4 => forCompareWidth(u32, fb.codes, @truncate(want), row_count, op, mask),
+        // width 8 is never emitted by the writer; degrade safely by reading
+        // each code wide rather than reaching for an unreachable.
+        else => for (mask[0..row_count], 0..) |*m, i| {
+            const code = readForCode(fb.codes, fb.width, i);
+            m.* = cmpScalar(u64, code, want, op);
+        },
+    }
+}
+
+fn forCompareWidth(comptime U: type, codes: []const u8, want: U, row_count: u32, op: simd_mod.CmpOp, mask: []bool) void {
+    const n: usize = row_count;
+    if (@sizeOf(U) == 1) {
+        const typed: []const U = codes[0..n];
+        switch (op) {
+            inline else => |o| simd_mod.compareInto(U, o, typed, want, mask[0..n]),
+        }
+        return;
+    }
+    if (@intFromPtr(codes.ptr) % @alignOf(U) == 0) {
+        const typed: []const U = @as([*]const U, @ptrCast(@alignCast(codes.ptr)))[0..n];
+        switch (op) {
+            inline else => |o| simd_mod.compareInto(U, o, typed, want, mask[0..n]),
+        }
+        return;
+    }
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const code = std.mem.readInt(U, codes[i * @sizeOf(U) ..][0..@sizeOf(U)], .little);
+        mask[i] = cmpScalar(U, code, want, op);
+    }
+}
+
+fn cmpScalar(comptime U: type, a: U, b: U, op: simd_mod.CmpOp) bool {
+    return switch (op) {
+        .eq => a == b,
+        .neq => a != b,
+        .lt => a < b,
+        .lte => a <= b,
+        .gt => a > b,
+        .gte => a >= b,
+    };
+}
+
+/// Reconstruct the native value `base + code` for each row whose `mask` bit is
+/// set, appending the survivors in order into `out` (sized to the survivor
+/// count). Only survivors are expanded — the bandwidth win is that the full
+/// column was already filtered narrow; materialization touches survivors only.
+pub fn forExpandSurvivors(comptime T: type, fb: ForBlock, mask: []const bool, out: []T) void {
+    var j: usize = 0;
+    for (mask, 0..) |m, i| {
+        if (!m) continue;
+        const code = readForCode(fb.codes, fb.width, i);
+        out[j] = @intCast(fb.base + @as(i128, code));
+        j += 1;
+    }
 }
 
 /// Expand a FOR-encoded block back to its native-width values so the produced

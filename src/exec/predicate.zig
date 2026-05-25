@@ -1479,6 +1479,54 @@ fn cmpInto(comptime T: type, data: []const T, want: T, mask: []bool, op: Predica
     }
 }
 
+/// Outcome of translating a leaf comparison `col OP const` into the FOR
+/// (Frame-of-Reference) code domain of one block, where each row stores
+/// `code = value - base` with `code ∈ [0, span]`.
+///
+///   - `.none`             — no valid row can match (every survivor mask bit
+///                           is cleared); the caller skips the SIMD compare.
+///   - `.all`              — every valid (non-NULL) row matches; the caller
+///                           sets the mask true and just ANDs the validity bits.
+///   - `.compare`          — compare each code against `code` under `op` (the
+///                           code is guaranteed in `[0, span]`, so the unsigned
+///                           narrow-width comparison is identical to comparing
+///                           the native values).
+pub const ForLeafPlan = union(enum) {
+    none,
+    all,
+    compare: struct { op: PredicateOp, code: u64 },
+};
+
+/// Translate `col OP v` into the FOR code domain for a block with `base` and
+/// `span = max_value - base` (so valid codes occupy `[0, span]`). All math is
+/// in i128 so an out-of-range constant is handled without wraparound. Returns
+/// `null` when `v` carries no usable numeric domain (only the FOR-eligible
+/// integer-family / temporal / decimal64 / boolean types do — exactly the set
+/// the writer ever FOR-encodes), in which case the caller must not use the
+/// FOR-aware path.
+///
+/// The per-op boundary logic mirrors comparing the reconstructed native value
+/// `base + code` against the constant `C`, expressed on `D = C - base`:
+///   - eq : code == D when 0 ≤ D ≤ span, else none
+///   - neq: code != D when 0 ≤ D ≤ span, else all
+///   - lt : D ≤ 0 → none; D > span → all; else code < D
+///   - lte: D < 0 → none; D ≥ span → all; else code ≤ D
+///   - gt : D ≥ span → none; D < 0 → all; else code > D
+///   - gte: D > span → none; D ≤ 0 → all; else code ≥ D
+pub fn translateForLeaf(base: i128, span: u128, op: PredicateOp, v: Value) ?ForLeafPlan {
+    const c = valueToRangeI128(v) orelse return null;
+    const d: i128 = c - base;
+    const span_i: i128 = @intCast(span);
+    return switch (op) {
+        .eq => if (d < 0 or d > span_i) .none else .{ .compare = .{ .op = .eq, .code = @intCast(d) } },
+        .neq => if (d < 0 or d > span_i) .all else .{ .compare = .{ .op = .neq, .code = @intCast(d) } },
+        .lt => if (d <= 0) .none else if (d > span_i) .all else .{ .compare = .{ .op = .lt, .code = @intCast(d) } },
+        .lte => if (d < 0) .none else if (d >= span_i) .all else .{ .compare = .{ .op = .lte, .code = @intCast(d) } },
+        .gt => if (d >= span_i) .none else if (d < 0) .all else .{ .compare = .{ .op = .gt, .code = @intCast(d) } },
+        .gte => if (d > span_i) .none else if (d <= 0) .all else .{ .compare = .{ .op = .gte, .code = @intCast(d) } },
+    };
+}
+
 /// True iff a column of this type carries a usable numeric min/max range
 /// in the propagated `ColStat`. The int family, temporal, boolean, and
 /// decimal types store their literal value directly as the i128 range key

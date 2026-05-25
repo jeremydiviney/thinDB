@@ -22,6 +22,7 @@ const join_bench = @import("join_bench.zig");
 const materialize_bench = @import("materialize_bench.zig");
 const window_bench = @import("window_bench.zig");
 const mutation_bench = @import("mutation_bench.zig");
+const for_filter_bench = @import("for_filter_bench.zig");
 
 const Allocator = common.Allocator;
 const Io = common.Io;
@@ -48,6 +49,8 @@ pub fn main() !void {
 
     std.debug.print("\nthinDB v{s} bench  ({d} rows)\n", .{ thindb.version, n_rows });
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
+
+    try for_filter_bench.run(allocator, io);
 
     try benchInsertMemtable(allocator, io, n_rows);
     try benchInsertAndFlush(allocator, io, n_rows);
