@@ -213,11 +213,20 @@ absolute cross-run numbers (see [[feedback-incremental-bench]]).
     (`nextFiltered`/`materializeSurvivors`) is a SEPARATE emit site — first cut
     can gate to unfiltered only (no WHERE). (4) Scan fields: `code_col: ?usize`,
     `gdict: ?*exec.GlobalDict`, `code_buf`, `coded_slots` — free in deinit.
-  - [ ] **A3 consumer** — `aggregate.zig accumulateBatch` (~L922): when
-    `batch.coded[key_idx]` set for the single group key, route to a code-accumulate
-    that feeds the **int-key table** (`IntTable32`, `accumulateBatchIntT` shape)
-    using the u32 codes as the key; at emit (`emitGroupKey` ~L1558) decode the
-    code via `GlobalDict.decode` instead of `gkeys[gid]`. **This moves the bench.**
+  - [x] **A2 producer DONE** (commit `0c62cb0`, dormant): `scan.zig` `code_col`/
+    `gdict` fields + `fillKeyCodes` (dict→LUT translate / raw→intern) + empty
+    placeholder + `Batch.coded` sidecar, on the unfiltered no-tombstone segment
+    path. Gated off until the compile gate sets `code_col`.
+  - [ ] **A3 consumer** — REUSE the int-key table (confirmed the hook):
+    `accumulateBatchIntT` packs keys via `packIntKey(layout, batch, gci, row)`
+    (aggregate.zig ~L1390). Plan: at agg setup, when the gate marks the key coded,
+    FORCE `int_layout = bits32` (single u32 key) so `accumulateBatch` dispatch
+    (~L945) routes to `accumulateBatchIntT`; make `packIntKey` (and `needsGrow`
+    sizing) read `batch.coded[code_idx].codes[row]` as the u32 key instead of an
+    int column; `gkeys_int[gid]` then holds the global code. At emit
+    (`emitGroupKey` ~L1558, the `single_str_key`/int branch) decode the code via
+    `GlobalDict.decode(code)` into the output string column. **This moves the
+    bench.** Add an `agg.coded_key: ?struct{ col_idx, dict }` field set by the gate.
   - [ ] **Gate** (`local.zig` compile, the `.group_by` lowering ~L1835/L2363):
     fire only when single string group key, key NOT referenced by WHERE/any agg
     arg, child is a direct scan, no tombstones on the path. Set scan.code_col +
