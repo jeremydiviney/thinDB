@@ -168,6 +168,33 @@ fn expectCount(allocator: std.mem.Allocator, db: anytype, sql: []const u8, want:
     try std.testing.expectEqual(want, got);
 }
 
+test "GROUP BY on dict codes (forced hash) returns correct groups" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 256 });
+    defer db.close();
+    try exec(allocator, db,
+        \\CREATE TABLE t (
+        \\  id BIGINT PRIMARY KEY, color VARCHAR(16) NOT NULL,
+        \\  uniq VARCHAR(32) NOT NULL, note VARCHAR(16)
+        \\)
+    );
+    try setupTable(allocator, db, ROWS, 1);
+    const t = try db.openTable("t", .{});
+    try t.flush(); // color (4 distinct, NOT NULL) dict-encoded on disk
+
+    // Force the hash GROUP BY path so the Phase 4.2 gate fires (single
+    // dict-string key, no WHERE, COUNT(*) doesn't read the key, flushed).
+    const saved = thindb.exec.force_group_by;
+    thindb.exec.force_group_by = .hash;
+    defer thindb.exec.force_group_by = saved;
+
+    try verifyGroupBy(allocator, db, ROWS);
+}
+
 test "dict predicate pushdown returns correct rows (=, <>, range, LIKE)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

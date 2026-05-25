@@ -846,6 +846,15 @@ pub const Aggregate = struct {
         try self.upstream.explain(out, allocator, depth + 1);
     }
 
+    /// Phase 4.2 gate: accept a single string group key delivered as dict codes.
+    /// Only valid for the single-string-key shape (which takes the byte path,
+    /// where the code-byte keying + emit decode live). Returns false otherwise.
+    pub fn setCodedKey(self: *Aggregate, dict: *exec.GlobalDict) bool {
+        if (!self.single_str_key) return false;
+        self.coded_key = .{ .dict = dict };
+        return true;
+    }
+
     pub fn next(self: *Aggregate) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;

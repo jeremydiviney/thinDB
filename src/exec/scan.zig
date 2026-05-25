@@ -429,6 +429,29 @@ pub const Scan = struct {
         return self.owned_accountant;
     }
 
+    /// Phase 4.2 gate: accept emitting the projected column `name` as global
+    /// dict codes. Only an unfiltered scan over a flushed table (empty memtable,
+    /// no fused WHERE, not late-mat) with a non-nullable string column qualifies
+    /// — matching the producer (segment-only, no-tombstone, no-NULL-group)
+    /// implemented in `next()`. Returns false (leaving normal materialized emit)
+    /// otherwise.
+    pub fn setDictCodeColumn(self: *Scan, name: []const u8, dict: *exec.GlobalDict) bool {
+        if (self.fused_filter != null or self.emit_loc or self.memtable_row_count != 0) return false;
+        for (self.out_phys, 0..) |phys, j| {
+            const col = self.table.schema.columns[phys];
+            if (!@import("../types.zig").columnNameEql(col.name, name)) continue;
+            if (col.nullable) return false;
+            switch (col.type) {
+                .varchar, .string, .char => {},
+                else => return false,
+            }
+            self.code_col = j;
+            self.gdict = dict;
+            return true;
+        }
+        return false;
+    }
+
     /// The pinned memtable snapshot this scan reads from. `LateScan` reaches
     /// through it to materialize memtable-resident survivors by row index.
     pub fn memtableSnap(self: *Scan) *engine.Memtable {

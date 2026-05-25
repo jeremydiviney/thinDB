@@ -146,6 +146,15 @@ pub const VTable = struct {
     /// join algorithm, pre-sorted/sort-elided), so the tree shape reveals
     /// what the compiler picked.
     explain: *const fn (ptr: *anyopaque, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) anyerror!void,
+    /// Phase 4.2: ask a Scan to emit the named string column as global dict
+    /// codes (the `Batch.coded` sidecar) instead of materialized strings.
+    /// Returns true iff the operator is an eligible Scan that accepted. Every
+    /// other operator (via `makeQuery`'s `@hasDecl` guard) returns false.
+    setDictCodeColumn: *const fn (ptr: *anyopaque, name: []const u8, dict: *global_dict.GlobalDict) bool,
+    /// Phase 4.2: tell an Aggregate its single string group key arrives as dict
+    /// codes — it groups on the narrow code and decodes via `dict` at emit.
+    /// Returns true iff accepted (an Aggregate with a single string key).
+    setCodedKey: *const fn (ptr: *anyopaque, dict: *global_dict.GlobalDict) bool,
 };
 
 /// Write `depth` levels of indentation then a complete label line.
@@ -305,6 +314,18 @@ pub const Query = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    /// Phase 4.2: ask the underlying Scan to emit `name` as dict codes (sidecar).
+    /// Returns true iff an eligible Scan accepted; false for any other operator.
+    pub fn setDictCodeColumn(self: Query, name: []const u8, dict: *global_dict.GlobalDict) bool {
+        return self.vtable.setDictCodeColumn(self.ptr, name, dict);
+    }
+
+    /// Phase 4.2: tell the underlying Aggregate its single string key is coded.
+    /// Returns true iff an eligible Aggregate accepted.
+    pub fn setCodedKey(self: Query, dict: *global_dict.GlobalDict) bool {
+        return self.vtable.setCodedKey(self.ptr, dict);
+    }
+
     // ----- Combinators -----
 
     pub fn filter(self: Query, expr: predicate.PredicateExpr) !Query {
@@ -458,6 +479,16 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.explain(out, alloc, depth);
         }
+        fn setDictCodeColumnWrap(ptr: *anyopaque, name: []const u8, dict: *global_dict.GlobalDict) bool {
+            if (!@hasDecl(Op, "setDictCodeColumn")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.setDictCodeColumn(name, dict);
+        }
+        fn setCodedKeyWrap(ptr: *anyopaque, dict: *global_dict.GlobalDict) bool {
+            if (!@hasDecl(Op, "setCodedKey")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.setCodedKey(dict);
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
@@ -468,6 +499,8 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .stats = statsWrap,
             .accountant = accountantWrap,
             .explain = explainWrap,
+            .setDictCodeColumn = setDictCodeColumnWrap,
+            .setCodedKey = setCodedKeyWrap,
         };
     };
 

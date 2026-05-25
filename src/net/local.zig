@@ -2426,6 +2426,17 @@ fn analyzeProjection(allocator: Allocator, root: *const ir.Op) ?[][]const u8 {
     return c.names.toOwnedSlice(allocator) catch null;
 }
 
+/// True if any aggregate reads `name` as its argument — then the group key
+/// can't be dict-coded (the aggregate needs that column's materialized strings).
+fn aggUsesColumn(aggs: []const AggSpec, name: []const u8) bool {
+    for (aggs) |a| {
+        if (a.col) |c| {
+            if (@import("../types.zig").columnNameEql(c, name)) return true;
+        }
+    }
+    return false;
+}
+
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
@@ -2578,6 +2589,20 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                         }
                         // else: proven under the limit → hash fits.
                     },
+                }
+            }
+            // Phase 4.2: a single string group key over a bare scan (no WHERE /
+            // compute between — those wrap `upstream` so setDictCodeColumn
+            // declines), with the key not read by any aggregate, groups on global
+            // dict codes — the scan emits codes (skipping the dict→string expand,
+            // 60–97% of its time) and the aggregate keys on them + decodes at
+            // emit. The scan/aggregate setters enforce the rest; decline → normal.
+            if (g.group_cols.len == 1 and !aggUsesColumn(g.aggs, g.group_cols[0])) {
+                const gdict = try ctx.queryGlobalDict();
+                if (upstream.setDictCodeColumn(g.group_cols[0], gdict)) {
+                    var aq = try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
+                    _ = aq.setCodedKey(gdict);
+                    break :blk aq;
                 }
             }
             break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
