@@ -29,6 +29,13 @@ const Predicate = predicate.Predicate;
 
 const simd = @import("../util/simd.zig");
 
+const native_endian = @import("builtin").cpu.arch.endian();
+
+/// Phase 4.2 (Option A): a single string group key delivered as global dict
+/// codes (via `Batch.coded`) instead of materialized strings. `dict` decodes a
+/// code back to its string at emit.
+const CodedKey = struct { dict: *exec.GlobalDict };
+
 const group_table = @import("group_table.zig");
 const ByteGroupTable = group_table.ByteGroupTable;
 const IntGroupTable = group_table.IntGroupTable;
@@ -403,6 +410,13 @@ pub const Aggregate = struct {
     /// the per-row key build skips the scratch copy + length prefix and the
     /// stored key needs no decoding on output.
     single_str_key: bool = false,
+
+    /// Phase 4.2 (Option A): when set, the single string group key arrives as
+    /// global dict CODES via `Batch.coded[group_col_indices[0]]`. The byte path
+    /// keys on the 4 code-bytes (the scan already skipped the dict→string
+    /// expansion — the win); emit decodes the code back to a string via `dict`.
+    /// Set by the compile gate post-construction; null = normal string keys.
+    coded_key: ?CodedKey = null,
 
     /// Resolved top-k hint, or null to emit every group (the default).
     top_k: ?ResolvedTopK = null,
@@ -1446,7 +1460,15 @@ pub const Aggregate = struct {
         // borrow them directly. Compound/mixed keys are serialized into a
         // per-batch arena buffer (one dupe per row) so every key slice in
         // `pf_keys` stays live through phase (b).
-        const str_view: ?storage.StringView = if (self.single_str_key)
+        // Phase 4.2: the single string key may arrive as global dict CODES via
+        // the sidecar. Key on the 4 code-bytes (in place in the codes array,
+        // stable for the batch) — no string materialization.
+        const coded_cc: ?exec.CodedColumn = if (self.coded_key != null) blk: {
+            const cd = batch.coded orelse break :blk null;
+            break :blk cd[self.group_col_indices[0]];
+        } else null;
+
+        const str_view: ?storage.StringView = if (coded_cc == null and self.single_str_key)
             switch (batch.values[self.group_col_indices[0]].data) {
                 .string, .varchar, .char => |sv| sv,
                 else => unreachable,
@@ -1463,7 +1485,13 @@ pub const Aggregate = struct {
         try self.pf_keys.ensureTotalCapacity(aa, n);
         try self.pf_hashes.ensureTotalCapacity(aa, n);
         var row: u32 = 0;
-        if (str_view) |sv| {
+        if (coded_cc) |cc| {
+            while (row < n) : (row += 1) {
+                const kb = std.mem.asBytes(&cc.codes[row])[0..];
+                self.pf_keys.appendAssumeCapacity(kb);
+                self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, kb));
+            }
+        } else if (str_view) |sv| {
             while (row < n) : (row += 1) {
                 const key = sv.rowBytes(row);
                 self.pf_keys.appendAssumeCapacity(key);
@@ -1553,7 +1581,15 @@ pub const Aggregate = struct {
     /// reconstructed from `gkeys_int[gid]` (integer path) or `gkeys[gid]`
     /// (byte path) — both produce identical output columns.
     fn appendGroupRow(self: *Aggregate, gid: u32, state: []AccState) !void {
-        if (self.int_layout) |layout| {
+        if (self.coded_key) |ck| {
+            // Phase 4.2: the stored key is the 4 code-bytes; decode the global
+            // code back to its string via the query dictionary.
+            const code = std.mem.readInt(u32, self.gkeys.items[gid][0..4], native_endian);
+            switch (self.output_columns[0].data) {
+                .string, .varchar, .char => |*ss| try ss.appendValue(self.allocator, ck.dict.decode(code)),
+                else => unreachable,
+            }
+        } else if (self.int_layout) |layout| {
             try appendIntGroupKey(self.allocator, self.gkeys_int.items[gid], layout, self.output_columns[0..self.group_col_indices.len]);
         } else if (self.single_str_key) {
             // Raw string bytes — no compound framing to decode.
