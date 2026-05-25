@@ -185,6 +185,25 @@ gids). The runner doesn't validate values → `zig build test` is the gate.
 
 ---
 
+## 5b. Future directions (noted, not scheduled)
+
+- **Generic multi-key + multi-agg fast paths.** Push the inline-state /
+  slot-as-gid machinery to cover *multiple* group keys and *multiple*
+  aggregates, with the fastest specialized path selected per query shape
+  (the long-term goal: a fast path for every common scenario, generic
+  fallback only when nothing fits).
+- **Two-slot packing when aggs exceed 128 bits.** When the aggregate state
+  doesn't fit one ≤16-byte slot, instead of dropping to the generic
+  gid+gstate path, use TWO (or N) inline tables — pack the overflow
+  aggregates into a second 128-bit slot keyed on the same group key.
+  *Caveat to measure:* the earlier analysis suggests this is likely a
+  loss vs. the generic path (N tables = N probes/misses + N hashes/compares
+  per row + the gid-correlation problem, whereas generic is 1 probe +
+  1 contiguous `gstate` access = 2 misses regardless of agg count). But
+  it's worth a microbench at the 2-slot boundary specifically — if the
+  second probe is cheaper than a scattered `gstate` access in practice, it
+  could win for the just-over-one-slot case. Don't assume; measure.
+
 ## 6. Dependencies
 
 - Phase 1 is reversible and **gates** the rest.
