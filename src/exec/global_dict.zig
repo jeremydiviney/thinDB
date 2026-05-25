@@ -79,6 +79,50 @@ pub const GlobalDict = struct {
     }
 };
 
+/// A string column held as global codes instead of materialized bytes — the
+/// "coded" form that flows through the batch in Phase 4.2 Option A. Code-aware
+/// consumers (the aggregate's group key, DISTINCT, sorted-code ORDER BY) read
+/// the narrow `codes` directly; anyone else calls `materialize` to get the
+/// ordinary `[offsets][bytes]` string column. `codes[i]` indexes `dict`. NULL
+/// rows carry a placeholder code, masked by the column's validity bitmap (kept
+/// alongside, same split as `OwnedColumn.data` / `.nulls`).
+pub const CodedColumn = struct {
+    codes: []const u32,
+    dict: *const GlobalDict,
+
+    pub fn rowCount(self: CodedColumn) usize {
+        return self.codes.len;
+    }
+
+    /// Row `i`'s string, aliasing the dict's owned bytes (valid until the dict's
+    /// `deinit`). Caller checks validity separately.
+    pub fn rowBytes(self: CodedColumn, i: usize) []const u8 {
+        return self.dict.decode(self.codes[i]);
+    }
+
+    /// Decode every row into an `OwnedStringColumn` — the single materialize
+    /// choke point a non-code-aware consumer goes through. Two passes: size the
+    /// per-row offsets, then copy each row's decoded bytes.
+    pub fn materialize(self: CodedColumn, allocator: Allocator) !storage.OwnedStringColumn {
+        const n = self.codes.len;
+        const offsets = try allocator.alloc(u32, n + 1);
+        errdefer allocator.free(offsets);
+        var total: usize = 0;
+        offsets[0] = 0;
+        for (0..n) |i| {
+            total += self.dict.decode(self.codes[i]).len;
+            offsets[i + 1] = @intCast(total);
+        }
+        const bytes = try allocator.alloc(u8, total);
+        errdefer allocator.free(bytes);
+        for (0..n) |i| {
+            const s = self.dict.decode(self.codes[i]);
+            @memcpy(bytes[offsets[i]..offsets[i + 1]], s);
+        }
+        return .{ .offsets = offsets, .bytes = bytes };
+    }
+};
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -186,4 +230,26 @@ test "buildLut unifies overlapping per-segment dictionaries" {
         const g = lut_b[dbb.rowCode(r)];
         try testing.expectEqualStrings(want_b[r], gd.decode(g));
     }
+}
+
+test "CodedColumn materialize + rowBytes decode through the dict" {
+    var gd: GlobalDict = .{};
+    defer gd.deinit(testing.allocator);
+    const red = try gd.intern(testing.allocator, "red");
+    const green = try gd.intern(testing.allocator, "green");
+    const blue = try gd.intern(testing.allocator, "blue");
+
+    const codes = [_]u32{ red, green, blue, red, green };
+    const cc = CodedColumn{ .codes = &codes, .dict = &gd };
+    const want = [_][]const u8{ "red", "green", "blue", "red", "green" };
+
+    // Direct per-row access (the code-aware path).
+    for (0..cc.rowCount()) |i| try testing.expectEqualStrings(want[i], cc.rowBytes(i));
+
+    // Materialize (the non-code-aware choke point) → identical string column.
+    var sc = try cc.materialize(testing.allocator);
+    defer sc.deinit(testing.allocator);
+    const sv = sc.view();
+    try testing.expectEqual(@as(usize, want.len), sv.rowCount());
+    for (0..want.len) |i| try testing.expectEqualStrings(want[i], sv.rowBytes(i));
 }
