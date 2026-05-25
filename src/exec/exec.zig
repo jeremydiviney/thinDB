@@ -597,6 +597,10 @@ pub const Limit = @import("project_limit.zig").Limit;
 pub const LateScan = @import("latescan.zig").LateScan;
 pub const rowloc = @import("rowloc.zig");
 
+pub const global_dict = @import("global_dict.zig");
+pub const GlobalDict = global_dict.GlobalDict;
+pub const CodedColumn = global_dict.CodedColumn;
+
 pub const sort_op = @import("sort.zig");
 pub const Sort = sort_op.Sort;
 pub const SortSpec = sort_op.SortSpec;

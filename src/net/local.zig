@@ -1982,6 +1982,13 @@ pub const CompileCtx = struct {
     /// This is the single seam where a future global memory pool would
     /// hand out (and reclaim) the per-query budget.
     accountant: ?*exec.memory.MemoryAccountant = null,
+    /// Query-scoped global string dictionary (Phase 4.2 Option A). Lazily
+    /// created the first time a scan needs to emit a dict string column as
+    /// codes; the scan interns each segment's local dict into it (building a
+    /// local→global LUT) so GROUP BY / DISTINCT / ORDER BY operate on a single
+    /// code space across segments, and the codes decode back to strings at emit.
+    /// Owned here, freed in `deinit` after the operator tree (which borrows it).
+    global_dict: ?*exec.GlobalDict = null,
     /// Wall-clock microseconds since the Unix epoch, captured once when
     /// the query is compiled. The subquery pre-compile pass substitutes
     /// it for `now()` / `current_timestamp()` / `current_date()` so those
@@ -2002,7 +2009,22 @@ pub const CompileCtx = struct {
         self.session_strings.deinit(self.allocator);
         if (self.subquery_arena) |*ar| ar.deinit();
         if (self.accountant) |a| self.allocator.destroy(a);
+        if (self.global_dict) |g| {
+            g.deinit(self.allocator);
+            self.allocator.destroy(g);
+        }
         if (self.prune_names) |p| self.allocator.free(p);
+    }
+
+    /// The query-scoped global string dictionary, created on first use. Borrowed
+    /// by scans (to intern + translate dict codes) and by the aggregate / emit
+    /// (to decode codes back to strings); owned + freed by the CompileCtx.
+    pub fn queryGlobalDict(self: *CompileCtx) !*exec.GlobalDict {
+        if (self.global_dict) |g| return g;
+        const g = try self.allocator.create(exec.GlobalDict);
+        g.* = .{};
+        self.global_dict = g;
+        return g;
     }
 
     /// The query-scoped accountant, created on first use from the
