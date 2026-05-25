@@ -245,6 +245,22 @@ pub const Scan = struct {
     /// this to verify segment-level pruning fires.
     segments_opened: u32 = 0,
 
+    /// Phase 4.2 (Option A): when set, the projected column at `out_phys[code_col]`
+    /// is emitted as global dict CODES (via the `Batch.coded` sidecar) instead of
+    /// materialized strings — the consuming aggregate groups on the narrow code,
+    /// skipping the dict→string expansion (60–97% of scan time on string GROUP
+    /// BYs). `gdict` is the query-scoped GlobalDict the scan interns into. Set by
+    /// the compile gate after construction; null = normal materialized emit.
+    code_col: ?usize = null,
+    gdict: ?*exec.GlobalDict = null,
+    /// Per-batch global codes for `code_col` (reused across batches; freed in
+    /// deinit). The emitted `CodedColumn` aliases this — same per-`next()`
+    /// lifetime as `views`.
+    code_buf: std.ArrayListUnmanaged(u32) = .empty,
+    /// Sidecar slots (one per projected column), all null except `code_col` in a
+    /// coded batch. Lazily allocated; freed in deinit.
+    coded_slots: []?exec.CodedColumn = &.{},
+
     const Phase = enum { segments, memtable, done };
 
     pub const PruneHint = struct {
@@ -434,6 +450,8 @@ pub const Scan = struct {
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_stats.len > 0) self.allocator.free(self.cached_stats);
+        self.code_buf.deinit(self.allocator);
+        if (self.coded_slots.len > 0) self.allocator.free(self.coded_slots);
         self.prunes.deinit(self.allocator);
         if (self.owns_accountant) {
             if (self.owned_accountant) |a| self.allocator.destroy(a);
@@ -624,6 +642,67 @@ pub const Scan = struct {
         return true;
     }
 
+    /// Reset + return the per-projection sidecar slots (all null). Lazily sized.
+    fn ensureCodedSlots(self: *Scan) ![]?exec.CodedColumn {
+        if (self.coded_slots.len != self.out_phys.len) {
+            if (self.coded_slots.len > 0) self.allocator.free(self.coded_slots);
+            self.coded_slots = try self.allocator.alloc(?exec.CodedColumn, self.out_phys.len);
+        }
+        for (self.coded_slots) |*s| s.* = null;
+        return self.coded_slots;
+    }
+
+    /// Cheap empty-string placeholder for `values[code_col]` (a valid view for
+    /// any non-code-aware consumer; the real values flow as codes via the
+    /// sidecar). Offsets all-zero, no bytes.
+    fn emptyStringColumn(self: *Scan, col_type: types.Type, n: u32) !storage.OwnedColumn {
+        const offsets = try self.allocator.alloc(u32, @as(usize, n) + 1);
+        errdefer self.allocator.free(offsets);
+        @memset(offsets, 0);
+        const bytes = try self.allocator.alloc(u8, 0);
+        const sc = storage.OwnedStringColumn{ .offsets = offsets, .bytes = bytes };
+        return switch (col_type) {
+            .varchar => .{ .data = .{ .varchar = sc } },
+            .string => .{ .data = .{ .string = sc } },
+            .char => .{ .data = .{ .char = sc } },
+            else => unreachable,
+        };
+    }
+
+    /// Fill `code_buf` with global dict codes for the key column's current row
+    /// group, and return the placeholder `OwnedColumn` for `values[code_col]`.
+    /// Dict blocks translate local→global via a LUT (NO string expansion — the
+    /// Phase 4.2 win); raw blocks decode + intern per row (a high-card column
+    /// pays roughly what the group-table hash would have anyway).
+    fn fillKeyCodes(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, rg_count: u32) !storage.OwnedColumn {
+        const gdict = self.gdict.?;
+        const col_type = self.table.schema.columns[phys].type;
+        try self.code_buf.resize(self.allocator, rg_count);
+        const codes = self.code_buf.items[0..rg_count];
+
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+        defer block.release(self.allocator, &self.table.cache);
+
+        if (block.encoding == .dict) {
+            var values = block.bytes;
+            if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
+            const db = storage.segment_reader.dictBlockOf(values, rg_count);
+            const lut = try gdict.buildLut(self.allocator, db);
+            defer self.allocator.free(lut);
+            for (0..rg_count) |i| codes[i] = lut[db.rowCode(i)];
+        } else {
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+            defer owned.deinit(self.allocator);
+            const sv = switch (owned.data) {
+                .varchar, .string, .char => |s| s.view(),
+                else => unreachable,
+            };
+            for (0..rg_count) |i| codes[i] = try gdict.intern(self.allocator, sv.rowBytes(i));
+        }
+        return self.emptyStringColumn(col_type, rg_count);
+    }
+
     pub fn next(self: *Scan) !?Batch {
         if (self.fused_filter != null) return self.nextFiltered();
 
@@ -686,14 +765,22 @@ pub const Scan = struct {
                 // `releaseBatch` doesn't free these columns a second time.
                 self.decoded_valid = false;
             }
+            // Phase 4.2: emit the gated key column as codes (sidecar) instead of
+            // materialized strings. Disabled when the segment has tombstones (the
+            // survivor compaction would desync the codes) or in late-mat mode.
+            const coding = self.code_col != null and self.cur_segment_tomb == null and !self.emit_loc;
             for (self.out_phys, 0..) |phys, j| {
-                self.decoded[j] = try seg.decodeColumnMaybeCached(
-                    self.allocator,
-                    self.table.schema,
-                    self.cur_rg_idx,
-                    phys,
-                    &self.table.cache,
-                );
+                if (coding and j == self.code_col.?) {
+                    self.decoded[j] = try self.fillKeyCodes(seg, self.cur_rg_idx, phys, rg_count);
+                } else {
+                    self.decoded[j] = try seg.decodeColumnMaybeCached(
+                        self.allocator,
+                        self.table.schema,
+                        self.cur_rg_idx,
+                        phys,
+                        &self.table.cache,
+                    );
+                }
                 decoded_cols += 1;
             }
 
@@ -719,10 +806,17 @@ pub const Scan = struct {
             if (masked) |out| return out;
 
             for (self.decoded, 0..) |c, i| self.views[i] = c.view();
+            var sidecar: ?[]const ?exec.CodedColumn = null;
+            if (coding) {
+                const slots = try self.ensureCodedSlots();
+                slots[self.code_col.?] = .{ .codes = self.code_buf.items[0..rg_count], .dict = self.gdict.? };
+                sidecar = slots;
+            }
             return Batch{
                 .schema = self.out_schema,
                 .values = self.views,
                 .row_count = rg_count,
+                .coded = sidecar,
             };
         }
 
