@@ -54,6 +54,7 @@ bench/clickbench/coverage*.json
 /q33.json.gz
 # Bun bench scratch
 /tests/bun/ab_base.json
+/tests/bun/losing.json
 /tests/bun/q15probe.ts
 /tests/bun/q40probe.ts
 # Stray build/server logs
