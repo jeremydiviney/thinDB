@@ -121,13 +121,35 @@ Rules: reversible-first (in-memory before format changes); measure each
 (microbench + ClickBench A/B + `zig build test` green); commit clean wins,
 revert neutral/regressions.
 
-### Phase 1 — In-memory FOR narrow keys *(no format change, reversible — the proof)*
-- [ ] 1.1 Cross-segment stat rollup: query-global `min/max` (+ exact/upper NDV) from per-segment stats.
-- [ ] 1.2 Query base/width at plan start: `base = global_min`, `bits = ceil(log2(range+1))`, pick u8/u16/u32 slot.
-- [ ] 1.3 Narrow-key build in the group-table path: pack `(value − base)` into the narrowest slot (extend tiers with u8/u16; multi-col → bit-fields).
-- [ ] 1.4 Emit/order: reconstruct `base + code` at output; order-preserving so ORDER BY on the packed key holds.
-- [ ] 1.5 Microbench: narrow-key probe vs current at several ranges.
-- [ ] 1.6 ClickBench A/B. **Decision gate:** keep only on a real win; quantifies ClickBench benefit before any format work.
+### Phase 1 — slot-as-gid + FOR narrow group table *(in-memory, no format change)*
+**Why this shape (decided 2026-05-25):** the group-table slot floor is 8 bytes
+because the gid lives in the slot (`tier32 = {key32, gid32}`). Pure FOR can only
+shrink tier96/128→tier32, which ClickBench's keys don't benefit from (already
+tier32 i32, or un-shrinkable huge-range i64, or strings). The real lever is
+**slot-as-gid**: drop the gid from the slot (gid = slot position), so a u64 key
+is an 8-byte slot (vs tier96 16B → 2× on the i64-key GROUP BYs like Q15/Q19),
+and a FOR-narrowed key is a 1/2/4-byte slot. FOR is *coupled* to slot-as-gid:
+a gid-less slot needs an empty marker, and FOR provides it free by reserving
+`range_max+1` as the EMPTY sentinel.
+
+Mirrors the proven `CountSlotTable` pattern (#290): accumulate in the narrow
+slot table, then **lower occupied slots into the existing dense
+`gkeys_int`/`gstate` at emit** (`lowerCountSlot`), so the emit / top-k / ORDER BY
+paths run completely unchanged. `gstate` is capacity-sized and indexed by slot
+during accumulate; lowering compacts it to dense gids.
+
+- [ ] 1.1 Cross-segment stat rollup: query-global `min/max` per int key column from per-segment stats → base + range (+ sentinel headroom check).
+- [ ] 1.2 Narrow slot-as-gid table type (`group_table.zig`): comptime slot width (u8/u16/u32/u64) holding the FOR code, EMPTY = `range_max+1`, gid = slot index; prefetch-pipelined probe; grow. Standalone + unit-tested first.
+- [ ] 1.3 Aggregate integration: eligibility (int key(s), FOR range with sentinel headroom, fits a narrow slot), FOR-normalize `(value − base)` at probe, `gstate` indexed by slot position.
+- [ ] 1.4 Lower at emit: walk occupied slots → dense `gkeys_int`/`gstate`, reconstruct `base + code` into the key column; emit/top-k unchanged (FOR is order-preserving).
+- [ ] 1.5 Microbench: narrow slot-as-gid probe vs current tier at several widths (re-confirm distinctbench's 8B vs 16B ~2×, extend to 1/2/4B).
+- [ ] 1.6 `zig build test` green + ClickBench A/B. Expect Q15/Q19-class (i64 keys) to gain; closes no current loss (Q25/Q08) — a general int-key win.
+
+**Blast radius / correctness:** shared int-key GROUP BY path. Watch emit order
+(lowering keeps dense-gid order — verify against tests), `gstate` capacity
+sizing, and the combined-distinct gid coupling (its pack uses gid; if a query
+mixes slot-as-gid grouping with COUNT(DISTINCT), the lowering must hand it dense
+gids). The runner doesn't validate values → `zig build test` is the gate.
 
 ### Phase 2 — On-disk FOR for numeric/temporal columns *(format change)*
 - [ ] 2.1 Segment format: per-column encoding header `{raw | FOR(base,width)}`; manifest/version bump.
