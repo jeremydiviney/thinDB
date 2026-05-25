@@ -582,6 +582,198 @@ test "stats: MIN(a) / MAX(b) inherit the column range" {
     try std.testing.expectEqual(@as(?i128, 600), s.column_stats[1].max);
 }
 
+// ---------------------------------------------------------------------------
+// Plan-time predicate simplification against propagated min/max.
+//   - A range conjunct provably true over [cmin,cmax] on a NON-NULLABLE
+//     column drops out; an all-dropped Filter is removed (returns the scan).
+//   - A range/eq conjunct provably false yields zero rows (always-false).
+//   - BETWEEN half-drops: only the constraining half survives.
+//   - On a NULLABLE column the always-true case must NOT drop (a range
+//     predicate still excludes NULLs).
+// ---------------------------------------------------------------------------
+
+fn drainCount(q: *thindb.Query) !u64 {
+    var rows: u64 = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    return rows;
+}
+
+const pn_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "c", .type = .int },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const pn_ok = [_][]const u8{"id"};
+const pn_opts = thindb.TableOptions{ .order_key = &pn_ok, .unique = true };
+
+// c ∈ {100,200,300,400,500,600}: min 100, max 600, 6 rows.
+fn seedNonNull(db: *thindb.Database) !*thindb.Table {
+    const t = try db.table("pn", pn_schema, pn_opts);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .c = @as(i32, 100) },
+        .{ .id = @as(i64, 2), .c = @as(i32, 200) },
+        .{ .id = @as(i64, 3), .c = @as(i32, 300) },
+        .{ .id = @as(i64, 4), .c = @as(i32, 400) },
+        .{ .id = @as(i64, 5), .c = @as(i32, 500) },
+        .{ .id = @as(i64, 6), .c = @as(i32, 600) },
+    });
+    try t.flush();
+    return t;
+}
+
+test "simplify: WHERE c >= below-min drops the whole Filter, all rows survive" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seedNonNull(db);
+
+    var base = try thindb.scan(allocator, t);
+    const scan_ptr = base.ptr;
+    var q = try base.filter(thindb.leafExpr("c", .gte, .{ .int = 50 }));
+    defer q.deinit();
+
+    // The Filter is dropped: the query node IS the upstream scan.
+    try std.testing.expectEqual(scan_ptr, q.ptr);
+    try std.testing.expectEqual(@as(u64, 6), try drainCount(&q));
+}
+
+test "simplify: WHERE c <= above-max drops the whole Filter, all rows survive" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seedNonNull(db);
+
+    var base = try thindb.scan(allocator, t);
+    const scan_ptr = base.ptr;
+    var q = try base.filter(thindb.leafExpr("c", .lte, .{ .int = 700 }));
+    defer q.deinit();
+
+    try std.testing.expectEqual(scan_ptr, q.ptr);
+    try std.testing.expectEqual(@as(u64, 6), try drainCount(&q));
+}
+
+test "simplify: WHERE c > above-max is always-false, zero rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seedNonNull(db);
+
+    var base = try thindb.scan(allocator, t);
+    const scan_ptr = base.ptr;
+    var q = try base.filter(thindb.leafExpr("c", .gt, .{ .int = 700 }));
+    defer q.deinit();
+
+    // Always-false keeps a Filter (now an `.always = false` no-op) → 0 rows.
+    try std.testing.expect(scan_ptr != q.ptr);
+    try std.testing.expectEqual(@as(u64, 0), try drainCount(&q));
+}
+
+test "simplify: WHERE c = out-of-range is always-false, zero rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seedNonNull(db);
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.filter(thindb.leafExpr("c", .eq, .{ .int = 999 }));
+    defer q.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), try drainCount(&q));
+}
+
+test "simplify: BETWEEN half-drop equals the constraining half" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seedNonNull(db);
+
+    // `c BETWEEN 50 AND 350` = (c >= 50) AND (c <= 350). The lower half is
+    // always-true (50 <= min=100) and drops; only `c <= 350` constrains.
+    const between = [_]thindb.exec.PredicateExpr{
+        thindb.leafExpr("c", .gte, .{ .int = 50 }),
+        thindb.leafExpr("c", .lte, .{ .int = 350 }),
+    };
+    const between_expr: thindb.exec.PredicateExpr = .{ .@"and" = &between };
+
+    var n_between: u64 = 0;
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.filter(between_expr);
+        defer q.deinit();
+        n_between = try drainCount(&q);
+    }
+    var n_half: u64 = 0;
+    {
+        var base = try thindb.scan(allocator, t);
+        var q = try base.filter(thindb.leafExpr("c", .lte, .{ .int = 350 }));
+        defer q.deinit();
+        n_half = try drainCount(&q);
+    }
+
+    // {100,200,300} ⇒ 3 rows, and both forms agree.
+    try std.testing.expectEqual(@as(u64, 3), n_between);
+    try std.testing.expectEqual(n_half, n_between);
+}
+
+const pnull_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "c", .type = .int, .nullable = true },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const pnull_opts = thindb.TableOptions{ .order_key = &pn_ok, .unique = true };
+
+test "simplify: nullable column never drops a range conjunct, NULLs excluded" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // c ∈ {100, 200, NULL, 400, NULL}: non-null min 100, max 400; 3 non-null.
+    const t = try db.table("pnull", pnull_schema, pnull_opts);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .c = @as(?i32, 100) },
+        .{ .id = @as(i64, 2), .c = @as(?i32, 200) },
+        .{ .id = @as(i64, 3), .c = @as(?i32, null) },
+        .{ .id = @as(i64, 4), .c = @as(?i32, 400) },
+        .{ .id = @as(i64, 5), .c = @as(?i32, null) },
+    });
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    const scan_ptr = base.ptr;
+    // `c >= 50` is true for every non-null row, but a range predicate excludes
+    // NULLs — dropping it would wrongly admit the 2 NULL rows. Must be kept.
+    var q = try base.filter(thindb.leafExpr("c", .gte, .{ .int = 50 }));
+    defer q.deinit();
+
+    try std.testing.expect(scan_ptr != q.ptr);
+    // Exactly the 3 non-null rows survive — NOT all 5.
+    try std.testing.expectEqual(@as(u64, 3), try drainCount(&q));
+}
+
 test "stats: grouped SUM(b) carries provable bounds per output" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

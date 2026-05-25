@@ -1245,10 +1245,12 @@ test "explain: physical plan shows hash vs stream group-by and sort elision" {
     });
     try t.flush();
 
-    // Hash path: scan → filter → hash group-by.
+    // Hash path: scan → filter → hash group-by. `v > 15` is selective over
+    // v ∈ [10,20] (not provably constant), so the Filter node survives plan-
+    // time simplification and shows up in the plan.
     {
         var base = try scan(allocator, t);
-        var filtered = try base.filter(leafExpr("v", .gt, .{ .int = 0 }));
+        var filtered = try base.filter(leafExpr("v", .gt, .{ .int = 15 }));
         var q = try filtered.groupBy(&.{"grp"}, &.{.{ .func = .count, .as = "n" }});
         defer q.deinit();
         const plan = try q.explainPlan(allocator);
@@ -2036,17 +2038,18 @@ test "fused filter: byte-identical survivors across selectivity (selective/none/
                 return r.qty >= 40;
             }
         }.f },
-        // None: matches nothing.
-        .{ .name = "none", .expr = leafExpr("qty", .gt, .{ .int = 1000 }), .keep = struct {
+        // None: matches nothing. In-range value (qty ∈ [10,60]) absent from the
+        // data so plan-time simplification can't prove it false — still fuses.
+        .{ .name = "none", .expr = leafExpr("qty", .eq, .{ .int = 25 }), .keep = struct {
             fn f(r: FuseRow) bool {
-                return r.qty > 1000;
+                return r.qty == 25;
             }
         }.f },
-        // All: matches everything.
-        .{ .name = "all", .expr = leafExpr("id", .gte, .{ .bigint = 0 }), .keep = struct {
+        // All: matches everything. `<>` is never simplified from range alone,
+        // so the fused path is exercised rather than an always-true drop.
+        .{ .name = "all", .expr = leafExpr("qty", .neq, .{ .int = 999 }), .keep = struct {
             fn f(r: FuseRow) bool {
-                _ = r;
-                return true;
+                return r.qty != 999;
             }
         }.f },
         // String LIKE on the fast-path string column.
