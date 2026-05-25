@@ -38,6 +38,7 @@ const column = @import("column.zig");
 const compression_mod = @import("compression.zig");
 const storage_cache = @import("cache.zig");
 const simd_mod = @import("../util/simd.zig");
+const prof = @import("../util/prof.zig");
 const ColumnView = column.ColumnView;
 const StringView = column.StringView;
 const OwnedColumn = column.OwnedColumn;
@@ -600,6 +601,9 @@ pub fn decodeForColumn(
     row_count: u32,
     flags: format.ColumnBlockFlags,
 ) !OwnedColumn {
+    const _pt = if (prof.enabled) prof.nowTicks() else 0;
+    defer if (prof.enabled) prof.add("for-decode (expand→native)", @intCast(@max(0, prof.nowTicks() - _pt)));
+
     var nulls: ?[]u8 = null;
     errdefer if (nulls) |n| allocator.free(n);
     var values = raw;
@@ -855,6 +859,9 @@ pub fn decodeDictColumn(
     row_count: u32,
     flags: format.ColumnBlockFlags,
 ) !OwnedColumn {
+    const _pt = if (prof.enabled) prof.nowTicks() else 0;
+    defer if (prof.enabled) prof.add("dict-decode (expand→strings)", @intCast(@max(0, prof.nowTicks() - _pt)));
+
     var nulls: ?[]u8 = null;
     errdefer if (nulls) |n| allocator.free(n);
     var values = raw;

@@ -1037,6 +1037,9 @@ pub const Scan = struct {
         literal: []const u8,
         out: []bool,
     ) void {
+        const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        defer if (exec.prof.enabled) exec.prof.add("dict-filter (cmp per-distinct)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
+
         var nulls: ?[]const u8 = null;
         var values = block.bytes;
         if (flags.has_nulls) {
@@ -1134,6 +1137,9 @@ pub const Scan = struct {
         pattern: []const u8,
         out: []bool,
     ) void {
+        const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        defer if (exec.prof.enabled) exec.prof.add("dict-filter (LIKE per-distinct)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
+
         var nulls: ?[]const u8 = null;
         var values = block.bytes;
         if (flags.has_nulls) {
