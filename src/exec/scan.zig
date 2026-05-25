@@ -914,20 +914,20 @@ pub const Scan = struct {
     ) !?usize {
         const mask = try self.ensureMask(rg_count);
         switch (expr) {
-            .leaf => |leaf| {
-                if (!try self.buildLeafMask(seg, rg_idx, rg_count, leaf, mask[0..rg_count])) return null;
+            .leaf, .like => {
+                if (!try self.buildGuidedChild(seg, rg_idx, rg_count, expr, mask[0..rg_count])) return null;
             },
             .@"and" => |children| {
                 if (children.len == 0) return null;
-                // Every child must be a comparison leaf we can evaluate narrow;
-                // otherwise decline the whole AND (mixed shapes fall back).
-                for (children) |c| if (c != .leaf) return null;
+                // Every child must be a comparison leaf or a LIKE we can evaluate
+                // narrow; otherwise decline the whole AND (mixed shapes fall back).
+                for (children) |c| if (c != .leaf and c != .like) return null;
 
-                if (!try self.buildLeafMask(seg, rg_idx, rg_count, children[0].leaf, mask[0..rg_count])) return null;
+                if (!try self.buildGuidedChild(seg, rg_idx, rg_count, children[0], mask[0..rg_count])) return null;
                 if (children.len > 1) {
                     const scratch = try self.ensureMask2(rg_count);
                     for (children[1..]) |c| {
-                        if (!try self.buildLeafMask(seg, rg_idx, rg_count, c.leaf, scratch[0..rg_count])) return null;
+                        if (!try self.buildGuidedChild(seg, rg_idx, rg_count, c, scratch[0..rg_count])) return null;
                         for (mask[0..rg_count], scratch[0..rg_count]) |*m, s| m.* = m.* and s;
                     }
                 }
@@ -972,11 +972,26 @@ pub const Scan = struct {
             return false;
         };
         const col_type = self.table.schema.columns[proj_phys].type;
-        if (!predicate.typeHasRange(col_type)) return false;
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[proj_phys].nullable };
         var block = try seg.borrowColumnBlock(self.allocator, rg_idx, proj_phys, &self.table.cache);
         defer block.release(self.allocator, &self.table.cache);
+
+        // Dict-encoded string column: test the comparison against each distinct
+        // dict value once into a matched-codes bitset, then map per row via the
+        // narrow code — no expansion to strings. Only `col OP <text literal>`;
+        // anything else (e.g. a coerced non-text value) declines to the general
+        // path. (Phase 4.4 predicate pushdown.)
+        if (block.encoding == .dict) {
+            const lit: []const u8 = switch (leaf.val) {
+                .text => |t| t,
+                else => return false,
+            };
+            evalDictLeaf(block, rg_count, flags, leaf.op, lit, out);
+            return true;
+        }
+
+        if (!predicate.typeHasRange(col_type)) return false;
 
         if (block.encoding == .for_) {
             const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
@@ -1005,6 +1020,146 @@ pub const Scan = struct {
         const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
         try predicate.evaluateMaskWithPred(view, leaf, rg_count, out);
         return true;
+    }
+
+    /// Evaluate `col OP literal` against a DICT-encoded string block by testing
+    /// each distinct dict value once into a matched-codes bitset, then mapping
+    /// per row via the narrow code — no expansion to strings. NULL rows (and
+    /// rows whose code maps to a non-matching value) clear to false, matching
+    /// the 2-valued logic the FOR/raw leaf paths use. Bounded by ndv (≤ 65536),
+    /// so the bitset is at most 8 KiB and L1-resident; the dict is sorted, so a
+    /// later refinement could binary-search a code range instead of scanning.
+    fn evalDictLeaf(
+        block: storage.ReadSegment.BorrowedBlock,
+        rg_count: u32,
+        flags: storage.format.ColumnBlockFlags,
+        op: predicate.PredicateOp,
+        literal: []const u8,
+        out: []bool,
+    ) void {
+        var nulls: ?[]const u8 = null;
+        var values = block.bytes;
+        if (flags.has_nulls) {
+            const bm_len = storage.column.bitmapBytes(rg_count);
+            nulls = block.bytes[0..bm_len];
+            values = block.bytes[bm_len..];
+        }
+        const db = storage.segment_reader.dictBlockOf(values, rg_count);
+
+        var matched: [8192]u8 = undefined; // 65536 codes / 8
+        const nbytes = (db.ndv + 7) / 8;
+        @memset(matched[0..nbytes], 0);
+        var c: u32 = 0;
+        while (c < db.ndv) : (c += 1) {
+            const v = db.dictValue(c);
+            const hit = switch (op) {
+                .eq => std.mem.eql(u8, v, literal),
+                .neq => !std.mem.eql(u8, v, literal),
+                .lt => std.mem.order(u8, v, literal) == .lt,
+                .lte => std.mem.order(u8, v, literal) != .gt,
+                .gt => std.mem.order(u8, v, literal) == .gt,
+                .gte => std.mem.order(u8, v, literal) != .lt,
+            };
+            if (hit) matched[c >> 3] |= (@as(u8, 1) << @intCast(c & 7));
+        }
+
+        for (0..rg_count) |i| {
+            if (storage.column.isValidBit(nulls, i)) {
+                const code = db.rowCode(i);
+                out[i] = (matched[code >> 3] & (@as(u8, 1) << @intCast(code & 7))) != 0;
+            } else {
+                out[i] = false;
+            }
+        }
+    }
+
+    /// Dispatch one guided-filter child (a comparison `.leaf` or a `.like`) into
+    /// `out`. Returns false (declining the whole guided path) for any other shape
+    /// or any block the narrow path can't handle.
+    fn buildGuidedChild(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        rg_count: u32,
+        child: PredicateExpr,
+        out: []bool,
+    ) !bool {
+        return switch (child) {
+            .leaf => |leaf| self.buildLeafMask(seg, rg_idx, rg_count, leaf, out),
+            .like => |lp| self.buildLikeMask(seg, rg_idx, rg_count, lp, out),
+            else => false,
+        };
+    }
+
+    /// Evaluate a `col LIKE pattern` leaf for the current row group into `out`.
+    /// Pushed down ONLY when the block is dict-encoded: the pattern is matched
+    /// against each distinct dict value once, then mapped per row via the narrow
+    /// code (no expansion). Raw blocks decline (return false) so the general path
+    /// runs LIKE over the materialized strings as before. (Phase 4.4.)
+    fn buildLikeMask(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        rg_count: u32,
+        lp: predicate.LikePred,
+        out: []bool,
+    ) !bool {
+        const proj_phys = blk: {
+            for (self.out_phys) |phys| {
+                if (@import("../types.zig").columnNameEql(self.table.schema.columns[phys].name, lp.col)) break :blk phys;
+            }
+            return false;
+        };
+        switch (self.table.schema.columns[proj_phys].type) {
+            .varchar, .string, .char => {},
+            else => return false,
+        }
+
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[proj_phys].nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, proj_phys, &self.table.cache);
+        defer block.release(self.allocator, &self.table.cache);
+
+        if (block.encoding != .dict) return false; // raw → general path
+        evalDictLike(block, rg_count, flags, lp.pattern, out);
+        return true;
+    }
+
+    /// `col LIKE pattern` over a DICT-encoded block: compile the pattern once,
+    /// match each distinct dict value into a matched-codes bitset, then map per
+    /// row via the narrow code. NULL rows clear to false. Bounded by ndv.
+    fn evalDictLike(
+        block: storage.ReadSegment.BorrowedBlock,
+        rg_count: u32,
+        flags: storage.format.ColumnBlockFlags,
+        pattern: []const u8,
+        out: []bool,
+    ) void {
+        var nulls: ?[]const u8 = null;
+        var values = block.bytes;
+        if (flags.has_nulls) {
+            const bm_len = storage.column.bitmapBytes(rg_count);
+            nulls = block.bytes[0..bm_len];
+            values = block.bytes[bm_len..];
+        }
+        const db = storage.segment_reader.dictBlockOf(values, rg_count);
+
+        const plan = predicate.compileLike(pattern);
+        var matched: [8192]u8 = undefined;
+        const nbytes = (db.ndv + 7) / 8;
+        @memset(matched[0..nbytes], 0);
+        var c: u32 = 0;
+        while (c < db.ndv) : (c += 1) {
+            if (plan.match(db.dictValue(c))) matched[c >> 3] |= (@as(u8, 1) << @intCast(c & 7));
+        }
+
+        for (0..rg_count) |i| {
+            if (storage.column.isValidBit(nulls, i)) {
+                const code = db.rowCode(i);
+                out[i] = (matched[code >> 3] & (@as(u8, 1) << @intCast(code & 7))) != 0;
+            } else {
+                out[i] = false;
+            }
+        }
     }
 
     /// Compact the masked survivors of every projected column into `filtered`.

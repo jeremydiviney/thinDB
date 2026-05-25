@@ -158,6 +158,48 @@ test "dict-encoded string columns round-trip through flush (single segment, mult
     try verifyGroupBy(allocator, db, ROWS);
 }
 
+fn expectCount(allocator: std.mem.Allocator, db: anytype, sql: []const u8, want: i64) !void {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var got: i64 = 0;
+    while (try q.next()) |b| {
+        if (b.row_count > 0) got = b.values[0].data.bigint[0];
+    }
+    try std.testing.expectEqual(want, got);
+}
+
+test "dict predicate pushdown returns correct rows (=, <>, range, LIKE)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 256 });
+    defer db.close();
+    try exec(allocator, db,
+        \\CREATE TABLE t (
+        \\  id BIGINT PRIMARY KEY, color VARCHAR(16) NOT NULL,
+        \\  uniq VARCHAR(32) NOT NULL, note VARCHAR(16)
+        \\)
+    );
+    try setupTable(allocator, db, ROWS, 1);
+    const t = try db.openTable("t", .{});
+    try t.flush(); // low-card color/note now dict-encoded on disk
+
+    const quarter = @divExact(ROWS, 4);
+    // color cycles red(0)/green(1)/blue(2)/magenta(3). thinDB allows only =/<>
+    // on string columns (range ops rejected at validation), plus LIKE.
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE color = 'red'", quarter);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE color <> 'red'", ROWS - quarter);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE color LIKE 'g%'", quarter); // green
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE color LIKE '%re%'", quarter * 2); // red, green
+
+    // note: NULL (i%4==0), '' (1), 'yes' (2), 'no' (3). NULL/'' excluded by <>''.
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note = 'yes'", quarter);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note <> ''", quarter * 2); // yes + no
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note LIKE 'y%'", quarter); // yes
+}
+
 test "dict-encoded string columns round-trip across multiple segments" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
