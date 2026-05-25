@@ -504,6 +504,114 @@ pub const CountSlotTable = struct {
     }
 };
 
+/// Open-addressing group table that stores a small fixed accumulator INLINE in
+/// the slot next to a FOR-narrowed key, with the gid implied by slot position
+/// (no stored gid). Generalizes `CountSlotTable` (count-in-slot) to any fixed
+/// `StateT` and a narrow key width `KeyW` (an unsigned u8/u16/u32/u64): the slot
+/// is `{ key: KeyW, state: StateT }`, so a FOR-narrow key + small state packs
+/// into a few bytes and a probe touches one cache line — no gid tax, no second
+/// array to bump.
+///
+/// CONTRACT: keys are FOR-normalized codes in `[0, range]` with
+/// `range < maxInt(KeyW)`, so `maxInt(KeyW)` is the reserved EMPTY sentinel and
+/// never collides with a real key. (This is why there is no `has_sentinel`
+/// fallback like `CountSlotTable`, whose raw u64 key could itself be all-ones.)
+/// The caller guarantees it by subtracting the column min (the FOR base) and
+/// choosing `KeyW` wide enough to leave the top value free.
+///
+/// State rides with the slot through `grow` (the rehash copies the whole slot),
+/// so there is no gid-indexed state array to re-permute. At emit the caller
+/// walks the occupied slots, assigning dense gids in slot order — mirroring
+/// `lowerCountSlot`.
+pub fn InlineSlotTable(comptime KeyW: type, comptime StateT: type) type {
+    return struct {
+        const Self = @This();
+        const Slot = struct { key: KeyW, state: StateT };
+
+        /// Power-of-two-sized open-addressing table; `&.{}` ⟺ not yet allocated.
+        slots: []Slot,
+        len: u32,
+
+        pub const SENTINEL: KeyW = std.math.maxInt(KeyW);
+        pub const empty: Self = .{ .slots = &.{}, .len = 0 };
+
+        pub fn init(allocator: Allocator, expected: usize) !Self {
+            const cap = capacityFor(expected);
+            const slots = try allocator.alloc(Slot, cap);
+            for (slots) |*s| s.key = SENTINEL;
+            return .{ .slots = slots, .len = 0 };
+        }
+
+        pub fn deinit(self: *Self, allocator: Allocator) void {
+            if (self.slots.len != 0) allocator.free(self.slots);
+            self.* = undefined;
+        }
+
+        inline fn hashKey(key: KeyW) u64 {
+            return mix64(@as(u64, key));
+        }
+
+        /// Reserve room for `additional` more distinct keys so no grow fires
+        /// mid-batch (slot addresses must stay stable across the caller's
+        /// prefetch look-ahead). Allocates lazily on first use.
+        pub fn ensureFor(self: *Self, allocator: Allocator, additional: usize) !void {
+            if (self.slots.len == 0) {
+                const cap = capacityFor(additional);
+                const slots = try allocator.alloc(Slot, cap);
+                for (slots) |*s| s.key = SENTINEL;
+                self.slots = slots;
+                return;
+            }
+            if ((@as(usize, self.len) + additional) * 4 >= self.slots.len * 3) try self.grow(allocator, additional);
+        }
+
+        fn grow(self: *Self, allocator: Allocator, additional: usize) !void {
+            var new_cap = self.slots.len;
+            while ((@as(usize, self.len) + additional) * 4 >= new_cap * 3) new_cap *= 2;
+            const slots = try allocator.alloc(Slot, new_cap);
+            for (slots) |*s| s.key = SENTINEL;
+            const new_mask = new_cap - 1;
+            for (self.slots) |old| {
+                if (old.key == SENTINEL) continue;
+                var i = @as(usize, @truncate(hashKey(old.key))) & new_mask;
+                while (slots[i].key != SENTINEL) : (i = (i + 1) & new_mask) {}
+                slots[i] = old;
+            }
+            allocator.free(self.slots);
+            self.slots = slots;
+        }
+
+        pub inline fn prefetch(self: *Self, key: KeyW) void {
+            @prefetch(&self.slots[@as(usize, @truncate(hashKey(key))) & (self.slots.len - 1)], .{ .rw = .write, .locality = 1 });
+        }
+
+        pub const Entry = struct { state: *StateT, found: bool };
+
+        /// Locate `key`'s slot, returning a pointer to its inline state. On first
+        /// sighting (`found = false`) the slot is created with `key` and the
+        /// caller must initialize `state.*` (its contents are undefined). The
+        /// caller must have reserved space via `ensureFor` for the whole batch.
+        /// `key` must not equal `SENTINEL` (see the contract above).
+        pub inline fn getOrPut(self: *Self, key: KeyW) Entry {
+            const m = self.slots.len - 1;
+            var b = @as(usize, @truncate(hashKey(key))) & m;
+            while (true) : (b = (b + 1) & m) {
+                const s = &self.slots[b];
+                if (s.key == SENTINEL) {
+                    s.key = key;
+                    self.len += 1;
+                    return .{ .state = &s.state, .found = false };
+                }
+                if (s.key == key) return .{ .state = &s.state, .found = true };
+            }
+        }
+
+        pub fn count(self: Self) usize {
+            return self.len;
+        }
+    };
+}
+
 /// Smallest power-of-two capacity that holds `expected` entries under the 0.75
 /// load factor, floored at 16. `expected * 4 / 3` is the minimum live-capacity;
 /// round it up to the next power of two.
@@ -520,6 +628,55 @@ test "capacityFor rounds up to power of two above load factor" {
     try std.testing.expectEqual(@as(usize, 32), capacityFor(13));
     try std.testing.expect(capacityFor(1000) >= 1000 * 4 / 3);
     try std.testing.expect(std.math.isPowerOfTwo(capacityFor(1_000_000)));
+}
+
+test "InlineSlotTable: count-in-slot over a narrow u16 key" {
+    const allocator = std.testing.allocator;
+    const T = InlineSlotTable(u16, u64);
+    var t = try T.init(allocator, 8);
+    defer t.deinit(allocator);
+
+    const keys = [_]u16{ 3, 1, 3, 2, 1, 1, 0 };
+    for (keys) |k| {
+        const p = t.getOrPut(k);
+        if (!p.found) p.state.* = 0;
+        p.state.* += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), t.count()); // distinct {3,1,2,0}
+
+    var seen: [4]u64 = .{ 0, 0, 0, 0 }; // counts for keys 0..3
+    for (t.slots) |s| {
+        if (s.key == T.SENTINEL) continue;
+        seen[s.key] = s.state;
+    }
+    try std.testing.expectEqualSlices(u64, &.{ 1, 3, 1, 2 }, &seen);
+}
+
+test "InlineSlotTable: struct state survives grow" {
+    const allocator = std.testing.allocator;
+    const St = struct { sum: i64, n: u32 };
+    const T = InlineSlotTable(u32, St);
+    var t = T.empty;
+    defer t.deinit(allocator);
+
+    // Insert 1000 distinct keys, forcing several grows; state must follow slots.
+    const N: u32 = 1000;
+    var k: u32 = 0;
+    while (k < N) : (k += 1) {
+        try t.ensureFor(allocator, 1);
+        const p = t.getOrPut(k);
+        try std.testing.expect(!p.found);
+        p.state.* = .{ .sum = @as(i64, k) * 10, .n = 1 };
+    }
+    // Re-touch every key: all must be found with intact state.
+    k = 0;
+    while (k < N) : (k += 1) {
+        const p = t.getOrPut(k);
+        try std.testing.expect(p.found);
+        try std.testing.expectEqual(@as(i64, @as(i64, k) * 10), p.state.sum);
+        try std.testing.expectEqual(@as(u32, 1), p.state.n);
+    }
+    try std.testing.expectEqual(@as(usize, N), t.count());
 }
 
 test "IntGroupTable getOrPut handles key 0 and all-ones" {
