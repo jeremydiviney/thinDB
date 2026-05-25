@@ -641,4 +641,5 @@ test {
     _ = LateScan;
     _ = rowloc;
     _ = @import("group_table.zig");
+    _ = @import("global_dict.zig");
 }
