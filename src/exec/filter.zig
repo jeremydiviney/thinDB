@@ -341,16 +341,15 @@ fn simplifyPredicate(
                 survivors.deinit(allocator);
                 return .{ .always = true };
             }
-            if (survivors.items.len == children.len) {
-                // Nothing dropped — reuse the borrowed children slice.
-                survivors.deinit(allocator);
-                return expr;
-            }
             if (survivors.items.len == 1) {
                 const only = survivors.items[0];
                 survivors.deinit(allocator);
                 return only;
             }
+            // Order conjuncts cheap+selective first, expensive last (commutative,
+            // so results are unchanged) — owns the slice since the borrowed
+            // `children` can't be reordered in place.
+            std.mem.sort(PredicateExpr, survivors.items, ConjunctSortCtx{ .schema = schema, .stats = stats }, ConjunctSortCtx.lessThan);
             const owned = try survivors.toOwnedSlice(allocator);
             errdefer allocator.free(owned);
             try rewritten.append(allocator, owned);
@@ -404,3 +403,82 @@ fn simplifyLeaf(p: Predicate, schema: []const Column, stats: []const exec.ColSta
     }
     return leaf;
 }
+
+/// Plan-time ordering key for a top-level AND conjunct. We evaluate
+/// cheap+selective conjuncts first so the running alive-mask is tightest by the
+/// time the expensive ones (LIKE/regex/subquery) run — those alone skip dead
+/// rows (cheap int/range kernels SIMD-scan the whole batch regardless of order).
+/// Sort by `cost` ascending, then `sel` (pass-fraction) ascending. Selectivity
+/// is an NDV/min-max seed (a guess, not a histogram); it only affects order, so
+/// a wrong guess costs nothing but a suboptimal evaluation order.
+const ConjunctKey = struct { cost: u8, sel: f64 };
+
+fn conjunctKey(expr: PredicateExpr, schema: []const Column, stats: []const exec.ColStat) ConjunctKey {
+    return switch (expr) {
+        .leaf => |p| leafKey(p, schema, stats),
+        .is_null => .{ .cost = 0, .sel = 0.05 },
+        .is_not_null => .{ .cost = 0, .sel = 0.95 },
+        .leaf_col_col => .{ .cost = 1, .sel = 0.5 },
+        .in_set => |s| .{ .cost = 1, .sel = colSelectivity(s.col, schema, stats, @floatFromInt(@max(s.values.len, 1))) },
+        .like => .{ .cost = 2, .sel = 0.10 },
+        .not => .{ .cost = 2, .sel = 0.5 },
+        .@"and", .@"or" => .{ .cost = 2, .sel = 0.5 },
+        .scalar_subquery, .exists_subquery, .in_subquery, .correlated_set, .correlated_scalar, .correlated_range => .{ .cost = 3, .sel = 0.5 },
+        .always => |b| .{ .cost = 0, .sel = if (b) 1.0 else 0.0 },
+        .leaf_var => .{ .cost = 0, .sel = 0.10 },
+    };
+}
+
+fn leafKey(p: Predicate, schema: []const Column, stats: []const exec.ColStat) ConjunctKey {
+    const idx = types.findColumn(schema, p.col) orelse return .{ .cost = 1, .sel = 0.5 };
+    // int/date/bool/decimal compares are a cheap SIMD pass; string is memcmp.
+    const cost: u8 = if (predicate.typeHasRange(schema[idx].type)) 0 else 1;
+    const ndv: f64 = if (idx < stats.len) switch (stats[idx].ndv) {
+        .exact => |n| @floatFromInt(@max(n, 1)),
+        .unknown => 0,
+    } else 0;
+    const sel: f64 = switch (p.op) {
+        .eq => if (ndv > 0) 1.0 / ndv else 0.10,
+        .neq => if (ndv > 0) 1.0 - 1.0 / ndv else 0.90,
+        .lt, .lte, .gt, .gte => rangeSelectivity(p, stats, idx),
+    };
+    return .{ .cost = cost, .sel = sel };
+}
+
+/// Uniform-distribution interpolation of a range predicate's pass-fraction from
+/// the column's [min,max]. In f64 (lossy but overflow-free; this only orders).
+fn rangeSelectivity(p: Predicate, stats: []const exec.ColStat, idx: usize) f64 {
+    if (idx >= stats.len) return 0.33;
+    const cmin = stats[idx].min orelse return 0.33;
+    const cmax = stats[idx].max orelse return 0.33;
+    const v = predicate.valueToRangeI128(p.val) orelse return 0.33;
+    const fmin: f64 = @floatFromInt(cmin);
+    const fmax: f64 = @floatFromInt(cmax);
+    if (fmax <= fmin) return 0.5;
+    const frac = std.math.clamp((@as(f64, @floatFromInt(v)) - fmin) / (fmax - fmin), 0.0, 1.0);
+    return switch (p.op) {
+        .lt, .lte => frac,
+        .gt, .gte => 1.0 - frac,
+        else => 0.33,
+    };
+}
+
+fn colSelectivity(col: []const u8, schema: []const Column, stats: []const exec.ColStat, k: f64) f64 {
+    const idx = types.findColumn(schema, col) orelse return 0.5;
+    if (idx >= stats.len) return 0.5;
+    return switch (stats[idx].ndv) {
+        .exact => |n| std.math.clamp(k / @as(f64, @floatFromInt(@max(n, 1))), 0.0, 1.0),
+        .unknown => 0.30,
+    };
+}
+
+const ConjunctSortCtx = struct {
+    schema: []const Column,
+    stats: []const exec.ColStat,
+    fn lessThan(ctx: ConjunctSortCtx, a: PredicateExpr, b: PredicateExpr) bool {
+        const ka = conjunctKey(a, ctx.schema, ctx.stats);
+        const kb = conjunctKey(b, ctx.schema, ctx.stats);
+        if (ka.cost != kb.cost) return ka.cost < kb.cost;
+        return ka.sel < kb.sel;
+    }
+};
