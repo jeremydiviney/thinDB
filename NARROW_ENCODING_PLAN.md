@@ -233,6 +233,24 @@ absolute cross-run numbers (see [[feedback-incremental-bench]]).
     gdict (from `ctx.queryGlobalDict()`) and mark the aggregate key coded. Decline
     → unchanged path. Covers Q33/34 first (single-key, no WHERE); SearchPhrase
     (Q12-17/21/22) need the filtered-path producer + multi-key later.
+  - [x] **A3 consumer + gate DONE** (commit `13c6669`): two no-op-default VTable
+    methods (`setDictCodeColumn`/`setCodedKey`, `@hasDecl`-gated → no operator
+    ripple); compile gate in `compileOp .group_by` (hash path) fires for a single
+    string key over a bare scan, key unread by any agg. Byte path keys on the 4
+    code-bytes, emit decodes. **Correct: 1018 tests + 43/43 ClickBench under
+    forced-hash; profile confirms `dict-decode` GONE for the coded column.**
+  - **HONEST COVERAGE FINDING (2026-05-25):** the hash-path gate is **bench-neutral
+    on default ClickBench**. The only single-string-key, no-WHERE GROUP BY is
+    high-card URL (Q33/34) — which correctly routes to SORT (sort 392ms vs forced
+    hash 838ms: hashing millions of distinct URLs loses to the bounded sort). So
+    the gate doesn't fire by default, and forcing hash to fire it is a net loss
+    for high-card. The win is LATENT — coding kills dict-decode, but only pays off
+    for LOW-card dict-string keys (which hash well) or the WHERE'd/sort shapes.
+    **To convert latent→real:** (a) cardinality-based routing — use the dict NDV
+    (exact!) to route low-card dict-string GROUP BYs to hash+code (4.5 / #294);
+    and/or (b) code the sort path (streamGroupBy) + the filtered emit path so the
+    low-card SearchPhrase queries (Q12-17/21/22, which have WHERE / multi-key) get
+    it. (b) is where the real ClickBench string-GROUP-BY time lives.
   - [ ] **A4** DISTINCT on codes; ORDER BY via sorted codes; exact cardinality (4.5).
 - [ ] 4.3 ORDER BY via sorted global codes; else decode.
 - [ ] 4.5 Exact-cardinality consumer: post-predicate dict-survivor count → sizing + predicate ordering.
