@@ -536,7 +536,7 @@ pub const Aggregate = struct {
         // Integer fast path: every group column is a fixed-width integer family
         // type whose widths sum to ≤128 bits ⇒ keys pack into a u128, skipping
         // the per-row byte serialization that dominates high-card GROUP BY.
-        const int_layout = try planIntKey(allocator, group_col_indices, up_schema);
+        const int_layout = try planIntKey(allocator, group_col_indices, up_schema, null, &.{});
         errdefer if (int_layout) |l| l.deinit(allocator);
 
         const self = try allocator.create(Aggregate);
@@ -2989,6 +2989,11 @@ const IntKeyField = struct {
     offset: u8,
     bits: u8,
     type_tag: types.TypeTag,
+    /// When true the field's value is a dict CODE read from `batch.coded[ci]`
+    /// (a low-card string group column) rather than `batch.values[ci]`, packed
+    /// as a 32-bit unsigned code. `IntKeyLayout.coded_dicts[i]` decodes it back
+    /// to the string at emit. `type_tag` stays the string type for emit routing.
+    coded: bool = false,
 };
 
 /// Slot-size tier for the packed integer key, routed by the summed group-column
@@ -3006,9 +3011,13 @@ const IntKeyTier = enum { bits32, bits96, bits128 };
 const IntKeyLayout = struct {
     fields: []IntKeyField,
     tier: IntKeyTier,
+    /// Per-field GlobalDict for coded fields (null for non-coded), parallel to
+    /// `fields`. Owned; empty when no field is coded.
+    coded_dicts: []const ?*exec.GlobalDict = &.{},
 
     fn deinit(self: IntKeyLayout, allocator: Allocator) void {
         allocator.free(self.fields);
+        if (self.coded_dicts.len > 0) allocator.free(@constCast(self.coded_dicts));
     }
 };
 
@@ -3016,29 +3025,41 @@ const IntKeyLayout = struct {
 /// family type whose widths sum to ≤128 bits; otherwise `null`. The summed width
 /// also picks the slot tier (≤32 / ≤96 / ≤128 bits). Caller owns the returned
 /// `fields` (freed in `Aggregate.deinit`).
+/// `coded_mask[i]` (when non-null) marks group column `i` as a low-card dict
+/// string keyed on its 32-bit global code instead of its type's native width;
+/// `dicts[i]` is that column's GlobalDict (decoded back at emit). Passing a
+/// null mask reproduces the all-native behaviour. A coded field always fits a
+/// 32-bit slot, so a coded string counts as 32 bits toward the 128-bit budget.
 fn planIntKey(
     allocator: Allocator,
     group_col_indices: []const usize,
     up_schema: []const Column,
+    coded_mask: ?[]const bool,
+    dicts: []const ?*exec.GlobalDict,
 ) !?IntKeyLayout {
     if (group_col_indices.len == 0) return null;
     var total: u16 = 0;
-    for (group_col_indices) |ci| {
-        const b = intKeyBits(up_schema[ci].type) orelse return null;
+    for (group_col_indices, 0..) |ci, i| {
+        const coded = coded_mask != null and coded_mask.?[i];
+        const b: u16 = if (coded) 32 else (intKeyBits(up_schema[ci].type) orelse return null);
         total += b;
     }
     if (total > 128) return null;
 
     const fields = try allocator.alloc(IntKeyField, group_col_indices.len);
+    errdefer allocator.free(fields);
+    const cdicts = try allocator.alloc(?*exec.GlobalDict, group_col_indices.len);
+    errdefer allocator.free(cdicts);
     var offset: u8 = 0;
-    for (group_col_indices, fields) |ci, *f| {
-        const t = up_schema[ci].type;
-        const b = intKeyBits(t).?;
-        f.* = .{ .offset = offset, .bits = b, .type_tag = std.meta.activeTag(t) };
+    for (group_col_indices, fields, cdicts, 0..) |ci, *f, *cd, i| {
+        const coded = coded_mask != null and coded_mask.?[i];
+        const b: u8 = if (coded) 32 else intKeyBits(up_schema[ci].type).?;
+        f.* = .{ .offset = offset, .bits = b, .type_tag = std.meta.activeTag(up_schema[ci].type), .coded = coded };
+        cd.* = if (coded and i < dicts.len) dicts[i] else null;
         offset += b;
     }
     const tier: IntKeyTier = if (total <= 32) .bits32 else if (total <= 96) .bits96 else .bits128;
-    return .{ .fields = fields, .tier = tier };
+    return .{ .fields = fields, .tier = tier, .coded_dicts = cdicts };
 }
 
 /// Decide the FOR-narrow inline-state fast path: exactly one integer-family
@@ -3160,6 +3181,11 @@ inline fn fieldBits(comptime SignedT: type, v: SignedT, bits: u8) u128 {
 fn packIntKey(layout: IntKeyLayout, batch: Batch, group_col_indices: []const usize, row: u32) u128 {
     var key: u128 = 0;
     for (group_col_indices, layout.fields) |ci, f| {
+        if (f.coded) {
+            const code = batch.coded.?[ci].?.codes[row];
+            key |= fieldBits(u32, code, f.bits) << @intCast(f.offset);
+            continue;
+        }
         const view = batch.values[ci];
         const fb: u128 = switch (view.data) {
             .boolean => |s| fieldBits(u8, s[row], f.bits),
@@ -3303,6 +3329,15 @@ fn appendIntGroupKey(
     out_cols: []ColumnStore,
 ) !void {
     for (layout.fields, 0..) |f, i| {
+        if (f.coded) {
+            const code = unpackField(u32, key, f);
+            const bytes = layout.coded_dicts[i].?.decode(code);
+            switch (out_cols[i].data) {
+                .varchar, .string, .char => |*ss| try ss.appendValue(allocator, bytes),
+                else => unreachable,
+            }
+            continue;
+        }
         switch (f.type_tag) {
             .boolean => try out_cols[i].data.boolean.append(allocator, unpackField(u8, key, f)),
             .tinyint => try out_cols[i].data.tinyint.append(allocator, unpackField(i8, key, f)),

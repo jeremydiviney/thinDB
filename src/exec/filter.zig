@@ -164,6 +164,17 @@ pub const Filter = struct {
         return self.upstream.addPrune(pred);
     }
 
+    /// Forward coded-key setup to the upstream Scan — but only when this Filter
+    /// FUSED its predicate into the Scan. A fused Filter is a passthrough: the
+    /// Scan filters + emits coded survivors itself (its filtered path is
+    /// coding-aware). A non-fused Filter evaluates rows here and would have to
+    /// compact the code sidecar in lockstep (it can't), so it declines — the
+    /// GROUP BY gate then keeps the normal materialized-string path.
+    pub fn setDictCodeColumn(self: *Filter, name: []const u8, dict: *exec.GlobalDict) bool {
+        if (!self.fused) return false;
+        return self.upstream.setDictCodeColumn(name, dict);
+    }
+
     /// Filter only restricts rows — `upper_rows` is unchanged (a filter is
     /// only provably ≤ input; we don't estimate a reduction). Sort state
     /// preserved (Filter doesn't reorder). Per-column stats are tightened by

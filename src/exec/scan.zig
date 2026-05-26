@@ -257,15 +257,25 @@ pub const Scan = struct {
     /// skipping the dict→string expansion (60–97% of scan time on string GROUP
     /// BYs). `gdict` is the query-scoped GlobalDict the scan interns into. Set by
     /// the compile gate after construction; null = normal materialized emit.
-    code_col: ?usize = null,
-    gdict: ?*exec.GlobalDict = null,
-    /// Per-batch global codes for `code_col` (reused across batches; freed in
-    /// deinit). The emitted `CodedColumn` aliases this — same per-`next()`
-    /// lifetime as `views`.
-    code_buf: std.ArrayListUnmanaged(u32) = .empty,
-    /// Sidecar slots (one per projected column), all null except `code_col` in a
-    /// coded batch. Lazily allocated; freed in deinit.
+    /// Per-projected-column GlobalDict for coded key columns: non-null at each
+    /// position whose strings are emitted as global dict CODES (via the
+    /// `Batch.coded` sidecar) instead of materialized strings, so the aggregate
+    /// packs the narrow code into its group key and skips dict→string expansion.
+    /// Lazily allocated (sized `out_phys.len`) by `setDictCodeColumn`; an empty
+    /// slice means no coded columns. Freed in deinit.
+    coded_dicts_by_j: []?*exec.GlobalDict = &.{},
+    n_coded: usize = 0,
+    /// Per-projected-column global-code buffer (reused across batches); only the
+    /// coded positions are used. Each emitted `CodedColumn` aliases its buffer
+    /// (same per-`next()` lifetime as `views`). Freed in deinit.
+    code_bufs: []std.ArrayListUnmanaged(u32) = &.{},
+    /// Sidecar slots (one per projected column), null except coded positions in
+    /// a coded batch. Lazily allocated; freed in deinit.
     coded_slots: []?exec.CodedColumn = &.{},
+    /// Sidecar produced by the FILTERED path (`materializeSurvivors` /
+    /// `evalAndCompact`) when coding; `nextFiltered` attaches it to the emitted
+    /// batch. Aliases `coded_slots`; null on a non-coded row group.
+    filtered_coded: ?[]const ?exec.CodedColumn = null,
 
     const Phase = enum { segments, memtable, done };
 
@@ -442,7 +452,7 @@ pub const Scan = struct {
     /// implemented in `next()`. Returns false (leaving normal materialized emit)
     /// otherwise.
     pub fn setDictCodeColumn(self: *Scan, name: []const u8, dict: *exec.GlobalDict) bool {
-        if (self.fused_filter != null or self.emit_loc or self.memtable_row_count != 0) return false;
+        if (self.emit_loc or self.memtable_row_count != 0) return false;
         for (self.out_phys, 0..) |phys, j| {
             const col = self.table.schema.columns[phys];
             if (!@import("../types.zig").columnNameEql(col.name, name)) continue;
@@ -462,11 +472,25 @@ pub const Scan = struct {
                 .unknown => false,
             };
             if (!low_card) return false;
-            self.code_col = j;
-            self.gdict = dict;
+            self.ensureCodedArrays() catch return false;
+            self.coded_dicts_by_j[j] = dict;
+            self.n_coded += 1;
             return true;
         }
         return false;
+    }
+
+    /// Lazily allocate the per-projected-column coded arrays (dict map + code
+    /// buffers), sized to `out_phys.len`. Idempotent across repeated
+    /// `setDictCodeColumn` calls (one per coded group column).
+    fn ensureCodedArrays(self: *Scan) !void {
+        if (self.coded_dicts_by_j.len == self.out_phys.len) return;
+        const dicts = try self.allocator.alloc(?*exec.GlobalDict, self.out_phys.len);
+        for (dicts) |*d| d.* = null;
+        const bufs = try self.allocator.alloc(std.ArrayListUnmanaged(u32), self.out_phys.len);
+        for (bufs) |*b| b.* = .empty;
+        self.coded_dicts_by_j = dicts;
+        self.code_bufs = bufs;
     }
 
     /// The pinned memtable snapshot this scan reads from. `LateScan` reaches
@@ -490,7 +514,9 @@ pub const Scan = struct {
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_stats.len > 0) self.allocator.free(self.cached_stats);
-        self.code_buf.deinit(self.allocator);
+        for (self.code_bufs) |*b| b.deinit(self.allocator);
+        if (self.code_bufs.len > 0) self.allocator.free(self.code_bufs);
+        if (self.coded_dicts_by_j.len > 0) self.allocator.free(self.coded_dicts_by_j);
         if (self.coded_slots.len > 0) self.allocator.free(self.coded_slots);
         self.prunes.deinit(self.allocator);
         if (self.owns_accountant) {
@@ -714,11 +740,11 @@ pub const Scan = struct {
     /// Dict blocks translate local→global via a LUT (NO string expansion — the
     /// Phase 4.2 win); raw blocks decode + intern per row (a high-card column
     /// pays roughly what the group-table hash would have anyway).
-    fn fillKeyCodes(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, rg_count: u32) !storage.OwnedColumn {
-        const gdict = self.gdict.?;
+    fn fillKeyCodes(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, rg_count: u32, j: usize) !storage.OwnedColumn {
+        const gdict = self.coded_dicts_by_j[j].?;
         const col_type = self.table.schema.columns[phys].type;
-        try self.code_buf.resize(self.allocator, rg_count);
-        const codes = self.code_buf.items[0..rg_count];
+        try self.code_bufs[j].resize(self.allocator, rg_count);
+        const codes = self.code_bufs[j].items[0..rg_count];
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
         var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
@@ -812,10 +838,10 @@ pub const Scan = struct {
             // Phase 4.2: emit the gated key column as codes (sidecar) instead of
             // materialized strings. Disabled when the segment has tombstones (the
             // survivor compaction would desync the codes) or in late-mat mode.
-            const coding = self.code_col != null and self.cur_segment_tomb == null and !self.emit_loc;
+            const coding = self.n_coded > 0 and self.cur_segment_tomb == null and !self.emit_loc;
             for (self.out_phys, 0..) |phys, j| {
-                if (coding and j == self.code_col.?) {
-                    self.decoded[j] = try self.fillKeyCodes(seg, self.cur_rg_idx, phys, rg_count);
+                if (coding and self.coded_dicts_by_j[j] != null) {
+                    self.decoded[j] = try self.fillKeyCodes(seg, self.cur_rg_idx, phys, rg_count, j);
                 } else {
                     self.decoded[j] = try seg.decodeColumnMaybeCached(
                         self.allocator,
@@ -853,7 +879,11 @@ pub const Scan = struct {
             var sidecar: ?[]const ?exec.CodedColumn = null;
             if (coding) {
                 const slots = try self.ensureCodedSlots();
-                slots[self.code_col.?] = .{ .codes = self.code_buf.items[0..rg_count], .dict = self.gdict.? };
+                for (0..self.out_phys.len) |j| {
+                    if (self.coded_dicts_by_j[j]) |d| {
+                        slots[j] = .{ .codes = self.code_bufs[j].items[0..rg_count], .dict = d };
+                    }
+                }
                 sidecar = slots;
             }
             return Batch{
@@ -969,7 +999,7 @@ pub const Scan = struct {
             const matched = try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
             if (matched == 0) continue;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
-            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched };
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded };
         }
 
         if (self.phase == .memtable) {
@@ -984,7 +1014,7 @@ pub const Scan = struct {
             const matched = try self.evalAndCompact(mem_views, n, null, expr);
             if (matched == 0) return null;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
-            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched };
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded };
         }
 
         return null;
@@ -1315,9 +1345,28 @@ pub const Scan = struct {
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
 
+        const coding = self.n_coded > 0;
+        const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
+        var matched: usize = 0;
+        if (coding) {
+            for (mask) |m| matched += @intFromBool(m);
+        }
+
         for (self.out_phys, 0..) |phys, j| {
             const col_type = self.table.schema.columns[phys].type;
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+
+            // Coded group key: translate only the survivors' codes into the code
+            // buffer (dict block → LUT, raw block → intern), never expanding the
+            // full block to strings. `values[j]` gets an empty-string placeholder
+            // (the aggregate reads the sidecar codes, not the value column).
+            if (coding and self.coded_dicts_by_j[j] != null) {
+                try self.codeSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, mask, matched);
+                try self.fillEmptyStrings(&filtered_cols[j], matched);
+                slots.?[j] = .{ .codes = self.code_bufs[j].items[0..matched], .dict = self.coded_dicts_by_j[j].? };
+                continue;
+            }
+
             var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
             defer block.release(self.allocator, &self.table.cache);
 
@@ -1337,6 +1386,67 @@ pub const Scan = struct {
                 defer owned.deinit(self.allocator);
                 try engine.memtable.appendMaskedColumn(self.allocator, owned.view(), mask, &filtered_cols[j]);
             }
+        }
+        self.filtered_coded = slots;
+    }
+
+    /// Fill `code_bufs[j]` with the global dict codes of just the surviving rows
+    /// (`mask`) of one row group's column — dict blocks LUT-translate the local
+    /// codes, raw blocks decode + intern per survivor. No full-block string
+    /// expansion. `matched` is the survivor count.
+    fn codeSurvivorsFromBlock(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        phys: usize,
+        j: usize,
+        rg_count: u32,
+        flags: storage.format.ColumnBlockFlags,
+        mask: []const bool,
+        matched: usize,
+    ) !void {
+        const gdict = self.coded_dicts_by_j[j].?;
+        try self.code_bufs[j].resize(self.allocator, matched);
+        const codes = self.code_bufs[j].items[0..matched];
+
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+        defer block.release(self.allocator, &self.table.cache);
+
+        if (block.encoding == .dict) {
+            var values = block.bytes;
+            if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
+            const db = storage.segment_reader.dictBlockOf(values, rg_count);
+            const lut = try gdict.buildLut(self.allocator, db);
+            defer self.allocator.free(lut);
+            var k: usize = 0;
+            for (mask, 0..) |m, row| if (m) {
+                codes[k] = lut[db.rowCode(row)];
+                k += 1;
+            };
+        } else {
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+            defer owned.deinit(self.allocator);
+            const sv = switch (owned.data) {
+                .varchar, .string, .char => |s| s.view(),
+                else => unreachable,
+            };
+            var k: usize = 0;
+            for (mask, 0..) |m, row| if (m) {
+                codes[k] = try gdict.intern(self.allocator, sv.rowBytes(row));
+                k += 1;
+            };
+        }
+    }
+
+    /// Append `n` empty-string rows to `out` — the placeholder value column for a
+    /// coded group key (downstream reads the sidecar codes, not this column).
+    fn fillEmptyStrings(self: *Scan, out: *ColumnStore, n: usize) !void {
+        switch (out.data) {
+            .varchar, .string, .char => |*ss| {
+                var i: usize = 0;
+                while (i < n) : (i += 1) try ss.appendValue(self.allocator, "");
+            },
+            else => unreachable,
         }
     }
 
@@ -1495,13 +1605,40 @@ pub const Scan = struct {
         }
         var matched: usize = 0;
         for (mask[0..n]) |m| matched += @intFromBool(m);
-        if (matched == 0) return 0;
+        if (matched == 0) {
+            self.filtered_coded = null;
+            return 0;
+        }
+
+        const coding = self.n_coded > 0;
+        const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
 
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
-        for (views, filtered_cols) |src, *dst| {
+        for (views, filtered_cols, 0..) |src, *dst, j| {
+            // Coded group key: intern just the survivors' strings into the code
+            // buffer (the views are already decoded here); placeholder in the
+            // value column. The aggregate reads the sidecar codes.
+            if (coding and self.coded_dicts_by_j[j] != null) {
+                const gdict = self.coded_dicts_by_j[j].?;
+                try self.code_bufs[j].resize(self.allocator, matched);
+                const codes = self.code_bufs[j].items[0..matched];
+                const sv = switch (src.data) {
+                    .varchar, .string, .char => |s| s,
+                    else => unreachable,
+                };
+                var k: usize = 0;
+                for (mask[0..n], 0..) |m, row| if (m) {
+                    codes[k] = try gdict.intern(self.allocator, sv.rowBytes(row));
+                    k += 1;
+                };
+                try self.fillEmptyStrings(dst, matched);
+                slots.?[j] = .{ .codes = codes, .dict = gdict };
+                continue;
+            }
             try engine.memtable.appendMaskedColumn(self.allocator, src, mask[0..n], dst);
         }
+        self.filtered_coded = slots;
         return matched;
     }
 
