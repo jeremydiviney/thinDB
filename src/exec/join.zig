@@ -1012,12 +1012,6 @@ pub const Join = struct {
         };
     }
 
-    /// True iff the build side is preserved (only matters for FULL
-    /// in v1; LEFT/RIGHT force build to the NON-preserved side).
-    fn buildSidePreserved(self: Join) bool {
-        return self.join_type == .full;
-    }
-
     /// Emit one output row for an unmatched probe row: probe-side
     /// columns from `batch[probe_row]`, NULL for build-side columns.
     /// Special-cases the USING-dropped right-side join key columns:

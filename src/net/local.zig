@@ -1847,30 +1847,8 @@ pub fn buildServerQuerySession(
             };
             var upstream = try buildServerQuerySession(allocator, db, session, g.upstream.*);
             errdefer upstream.deinit();
-            if (g.group_cols.len > 0) {
-                const st = upstream.stats();
-                switch (exec.force_group_by) {
-                    .hash => {},
-                    .sort => {
-                        const specs = try allocator.alloc(exec.SortSpec, g.group_cols.len);
-                        defer allocator.free(specs);
-                        for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
-                        upstream = try upstream.orderBy(specs);
-                        break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
-                    },
-                    .auto => {
-                        if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
-                            break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
-                        }
-                        if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols, g.aggs.len, db.config.query_memory_budget)) {
-                            const specs = try allocator.alloc(exec.SortSpec, g.group_cols.len);
-                            defer allocator.free(specs);
-                            for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
-                            upstream = try upstream.orderBy(specs);
-                            break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
-                        }
-                    },
-                }
+            if (try routeStreamGroupBy(allocator, &upstream, g.group_cols, g.aggs, db.config.query_memory_budget)) |q| {
+                break :blk q;
             }
             break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
         },
@@ -2242,6 +2220,47 @@ fn tryMinMaxStats(allocator: Allocator, table: *ApiTable, aggs: []const exec.Agg
 /// is a deterministic function of another key (e.g. `ClientIP - 1`) adds zero
 /// groups and could drop out of the estimate. Not needed at current scale (the
 /// row-count clamp already routes the correlated cases correctly).
+/// Shared GROUP BY strategy routing for both compile dispatchers
+/// (`buildServerQuerySession` and `compileOp`). When a sort-based streaming
+/// aggregate is the right call — forced via `--force-group-by sort`, the keys
+/// are an already-sorted prefix, or the hash table is proven over the memory
+/// budget — order the keys and stream, returning the streamed Query. Returns
+/// null to fall through to the hash `groupByTopK`. `upstream` is reassigned in
+/// place when it orders the keys (the caller's errdefer then owns the wrapper).
+fn routeStreamGroupBy(
+    allocator: Allocator,
+    upstream: *Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    budget: usize,
+) !?Query {
+    if (group_cols.len == 0) return null;
+    const st = upstream.stats();
+    switch (exec.force_group_by) {
+        .hash => return null,
+        .sort => {
+            const specs = try allocator.alloc(exec.SortSpec, group_cols.len);
+            defer allocator.free(specs);
+            for (group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+            upstream.* = try upstream.orderBy(specs);
+            return try upstream.streamGroupBy(group_cols, aggs);
+        },
+        .auto => {
+            if (groupKeysSortedPrefix(st.sort_state, group_cols)) {
+                return try upstream.streamGroupBy(group_cols, aggs);
+            }
+            if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), group_cols, aggs.len, budget)) {
+                const specs = try allocator.alloc(exec.SortSpec, group_cols.len);
+                defer allocator.free(specs);
+                for (group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+                upstream.* = try upstream.orderBy(specs);
+                return try upstream.streamGroupBy(group_cols, aggs);
+            }
+            return null;
+        },
+    }
+}
+
 fn groupKeysCardUnderLimit(
     st: exec.PipelineStats,
     schema: []const types.Column,
@@ -2598,33 +2617,8 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             // Not reduced: re-layer the peeled Compute onto the built base.
             if (agg_args.len > 0) upstream = try upstream.compute(agg_args);
             // Global aggregate (no group keys) is O(1) — always hash.
-            if (g.group_cols.len > 0) {
-                const st = upstream.stats();
-                switch (exec.force_group_by) {
-                    .hash => {},
-                    .sort => {
-                        const specs = try ctx.allocator.alloc(exec.SortSpec, g.group_cols.len);
-                        defer ctx.allocator.free(specs);
-                        for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
-                        upstream = try upstream.orderBy(specs);
-                        break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
-                    },
-                    .auto => {
-                        if (groupKeysSortedPrefix(st.sort_state, g.group_cols)) {
-                            break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
-                        }
-                        if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), g.group_cols, g.aggs.len, ctx.db.config.query_memory_budget)) {
-                            // Unknown or over the limit → sort the group keys,
-                            // then stream. Bounded memory regardless of card.
-                            const specs = try ctx.allocator.alloc(exec.SortSpec, g.group_cols.len);
-                            defer ctx.allocator.free(specs);
-                            for (g.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
-                            upstream = try upstream.orderBy(specs);
-                            break :blk try upstream.streamGroupBy(g.group_cols, g.aggs);
-                        }
-                        // else: proven under the limit → hash fits.
-                    },
-                }
+            if (try routeStreamGroupBy(ctx.allocator, &upstream, g.group_cols, g.aggs, ctx.db.config.query_memory_budget)) |q| {
+                break :blk q;
             }
             // Phase 4.2: a single string group key over a bare scan (no WHERE /
             // compute between — those wrap `upstream` so setDictCodeColumn

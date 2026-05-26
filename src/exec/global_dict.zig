@@ -220,7 +220,6 @@ test "buildLut unifies overlapping per-segment dictionaries" {
     // Translating each segment's row codes yields globally-consistent codes,
     // and decoding recovers the original value.
     const want_a = [_][]const u8{ "apple", "cherry", "banana", "apple" };
-    for (0..dba.ndv) |_| {}
     for (0..seg_a.rows) |r| {
         const g = lut_a[dba.rowCode(r)];
         try testing.expectEqualStrings(want_a[r], gd.decode(g));

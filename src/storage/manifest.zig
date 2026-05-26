@@ -2,7 +2,7 @@
 //! write-tmp-then-rename so readers either see the old or new state, never a
 //! partial state.
 //!
-//! Format (v5, binary, little-endian):
+//! Format (v7, binary, little-endian):
 //!
 //!   [Header — 32 bytes]
 //!     magic "tDBM"            (4)
@@ -11,10 +11,11 @@
 //!     schema_fingerprint u64  (8)
 //!     segment_count u32       (4)
 //!     column_count u32        (4)
-//!     auto_inc_next u64       (8 — v5; MySQL-style table counter for the
+//!     auto_inc_next u64       (8 — MySQL-style table counter for the
 //!                              AUTO_INCREMENT column. 0 if no AI column.)
 //!
-//!   [Entries — 64 + 32*column_count bytes each]
+//!   [Entries — entry_prefix_size + column_count*(stats_slot_size +
+//!    sketch_slot_size) bytes each]
 //!     For each segment:
 //!       segment_id u64        (8)
 //!       row_count u64         (8)
@@ -23,9 +24,13 @@
 //!       flags u32             (4) — bit 0 = leading_key_stats valid
 //!       leading_key_min i128  (16)
 //!       leading_key_max i128  (16)
-//!       per_column_stats      (32 * column_count — i128 min + i128 max
-//!                              each, encoded per column type; {0,0}
+//!       per_column_stats      (stats_slot_size * column_count — i128 min +
+//!                              i128 max each, encoded per column type; {0,0}
 //!                              for columns whose type has no stats)
+//!       per_column_sketches   (sketch_slot_size * column_count — one
+//!                              HyperLogLog sketch per column, mergeable
+//!                              across segments for cardinality-based GROUP BY
+//!                              routing; all-zero ⟺ no sketch)
 //!
 //!   [Trailer]
 //!     magic "tDBM"            (4)

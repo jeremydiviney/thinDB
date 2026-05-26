@@ -221,10 +221,6 @@ pub const CorrelatedSet = struct {
     negate: bool,
 };
 
-pub fn likeExpr(col: []const u8, pattern: []const u8) PredicateExpr {
-    return .{ .like = .{ .col = col, .pattern = pattern } };
-}
-
 /// Build a leaf predicate expression. Shorthand for `.{ .leaf = ... }`.
 pub fn leafExpr(col: []const u8, op: PredicateOp, val: Value) PredicateExpr {
     return .{ .leaf = .{ .col = col, .op = op, .val = val } };

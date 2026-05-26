@@ -882,7 +882,7 @@ pub const Parser = struct {
             const saved = self.cur;
             try self.advance();
             if (self.cur.tag == .lparen) {
-                const expr = try self.parseExtractCall(saved);
+                const expr = try self.parseExtractCall();
                 const default_name = try self.exprDefaultName(expr);
                 const alias = try self.maybeAlias(default_name);
                 return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
@@ -1305,7 +1305,7 @@ pub const Parser = struct {
     /// on the `(`, exits past `)`. The field name is case-insensitive
     /// and matched against year/month/day/hour/minute/second; the
     /// resulting Expr is a regular scalar call to that function.
-    fn parseExtractCall(self: *Parser, _: Token) ParseError!ir.Expr {
+    fn parseExtractCall(self: *Parser) ParseError!ir.Expr {
         try self.expect(.lparen);
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const field = self.cur.text;
@@ -1455,7 +1455,7 @@ pub const Parser = struct {
             const saved = self.cur;
             try self.advance();
             if (self.cur.tag == .lparen) {
-                return try self.parseExtractCall(saved);
+                return try self.parseExtractCall();
             }
             // Roll-back path: we already consumed `extract` and looked
             // at the next token. Re-emit it as a col_ref since the
@@ -1518,16 +1518,6 @@ pub const Parser = struct {
         return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args } };
     }
 
-    /// Parse a bare column reference (possibly qualified). Used inside
-    /// contexts that don't accept full expressions.
-    fn parseColRefExpr(self: *Parser) ParseError!ir.Expr {
-        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-        const name = self.cur.text;
-        try self.advance();
-        if (self.cur.tag == .lparen) return ParseError.SqlInvalidProjection;
-        const col_dup = try self.dupQualifiedColRef(name);
-        return ir.Expr{ .col_ref = col_dup };
-    }
 
     /// Helper for the `identifier (. identifier)?` shape. The two-part
     /// form is preserved as the dotted string `qualifier.col` so the
@@ -1586,19 +1576,19 @@ pub const Parser = struct {
     fn renderLit(self: *Parser, v: @import("../types.zig").Value) ParseError![]const u8 {
         const aa = self.arena;
         return switch (v) {
-            .int => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
-            .bigint => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
-            .smallint => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
-            .tinyint => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
-            .largeint => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .int => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .bigint => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .smallint => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .tinyint => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .largeint => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
             .boolean => |b| try aa.dupe(u8, if (b) "true" else "false"),
-            .float => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
-            .double => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
-            .text => |s| std.fmt.allocPrint(aa, "'{s}'", .{s}) catch return ParseError.OutOfMemory,
-            .date => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
-            .datetime => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
-            .decimal64 => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
-            .decimal128 => |x| std.fmt.allocPrint(aa, "{d}", .{x}) catch return ParseError.OutOfMemory,
+            .float => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .double => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .text => |s| try std.fmt.allocPrint(aa, "'{s}'", .{s}),
+            .date => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .datetime => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .decimal64 => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .decimal128 => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
             .uuid => try aa.dupe(u8, "uuid"),
         };
     }

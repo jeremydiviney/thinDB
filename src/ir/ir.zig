@@ -2106,14 +2106,10 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
             const n = readU32(bytes[cursor.* .. cursor.* + 4]);
             cursor.* += 4;
             const children = try allocator.alloc(PredicateExpr, n);
-            errdefer {
-                // On failure mid-decode, free what we built.
-                var freed: u32 = 0;
-                while (freed < n) : (freed += 1) {
-                    // Only free initialized entries; rest are uninitialized.
-                }
-                allocator.free(children);
-            }
+            // `ir.decode` always runs against a per-query arena, so children
+            // decoded before a mid-list error are reclaimed with the arena;
+            // only the array itself needs an explicit errdefer.
+            errdefer allocator.free(children);
             var i: u32 = 0;
             while (i < n) : (i += 1) {
                 children[i] = try decodePredicate(allocator, bytes, cursor);

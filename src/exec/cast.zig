@@ -107,11 +107,6 @@ pub fn castCost(from: TypeTag, to: TypeTag) ?u32 {
     };
 }
 
-/// Returns true iff `from` can implicitly cast to `to`.
-pub fn canCast(from: TypeTag, to: TypeTag) bool {
-    return castCost(from, to) != null;
-}
-
 /// Returns the cast kernel for the (from, to) pair, or null if no
 /// implicit cast exists. The kernel writes both data AND validity bits
 /// when `out.nulls != null`; widening never introduces new nulls, so

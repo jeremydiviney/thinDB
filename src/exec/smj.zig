@@ -419,11 +419,8 @@ pub const SortMergeJoin = struct {
             break :blk self.output_schema[0..self.left_col_count];
         };
         for (self.left_key_indices, 0..) |idx, i| key_names[i] = left_schema[idx].name;
-        // NB: we allocate-then-free here — caller doesn't take the
-        // slice. The stats() caller reads .sort_state immediately;
-        // for v1 the sort_state lifetime is "until next call." For
-        // correctness, allocate keys statically at create-time like
-        // Sort does. TODO when planner consumes this.
+        // The sort_state lifetime is "until next call": the stats() caller
+        // reads it immediately and never retains the slice.
         return .{ .upper_rows = product, .column_stats = self.cached_stats };
     }
 
@@ -665,20 +662,6 @@ pub const SortMergeJoin = struct {
             self.right_kept_mask,
             self.left_col_count,
         );
-    }
-
-    // Helpers used by mid-run cursor save. v1's mergeStep always
-    // finishes a full run before checking output batch size, so these
-    // are placeholders for the future fine-grained-resume version.
-    fn lastRunStartRight(self: *SortMergeJoin, r_end: usize) usize {
-        _ = self;
-        return r_end;
-    }
-    fn firstOfRun(self: *SortMergeJoin, keys: [][]const u8, from: usize, key: []const u8) usize {
-        _ = self;
-        _ = keys;
-        _ = key;
-        return from;
     }
 
     fn emitOutputRow(self: *SortMergeJoin, left_row: u32, right_row: u32) !void {
