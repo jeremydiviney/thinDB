@@ -59,6 +59,11 @@ pub fn writeSegment(
     schema_fingerprint: u64,
     row_group_size: usize,
     columns: []const ColumnView,
+    /// Per-column HLL bytes of every segment that will coexist with this one
+    /// (same layout as `SegmentInfo.column_sketches`). Used only to compute the
+    /// global dict-eligibility cardinality; pass `&.{}` when no global view is
+    /// available (the gate then sees this segment's NDV alone).
+    prior_sketches: []const []const u8,
     sync_on_close: bool,
 ) !SegmentInfo {
     if (columns.len != schema.columns.len) return format.Error.SchemaMismatch;
@@ -70,6 +75,31 @@ pub fn writeSegment(
         if (std.meta.activeTag(view.data) != std.meta.activeTag(schema_col.type)) {
             return format.Error.SchemaMismatch;
         }
+    }
+
+    // Per-column HLL over this segment's rows, computed up front: the
+    // dict-eligibility gate below needs the segment-local NDV, and the same
+    // sketches are returned in SegmentInfo (so we compute them once).
+    const column_sketches = try computeSketches(allocator, columns, row_count);
+    errdefer allocator.free(column_sketches);
+
+    // Dict eligibility (per column): a string column is dictionary-encoded only
+    // when BOTH the segment-local NDV and the global NDV (this segment merged
+    // with every coexisting segment's sketch) are ≤ the cap. Above it the column
+    // stays raw — query-time coding would decline a high-card column anyway, and
+    // per-block dicts would only add decode cost. See NARROW_ENCODING_PLAN §2/§3.
+    const dict_eligible = try allocator.alloc(bool, columns.len);
+    defer allocator.free(dict_eligible);
+    for (dict_eligible, 0..) |*elig, ci| {
+        const seg_h = hll.Hll.fromBytes(column_sketches[ci * hll.m .. (ci + 1) * hll.m]);
+        var global = seg_h;
+        for (prior_sketches) |ps| {
+            if (ps.len >= (ci + 1) * hll.m) {
+                const ph = hll.Hll.fromBytes(ps[ci * hll.m .. (ci + 1) * hll.m]);
+                global.merge(&ph);
+            }
+        }
+        elig.* = seg_h.estimate() <= dict_max_global_ndv and global.estimate() <= dict_max_global_ndv;
     }
 
     var buf: std.ArrayList(u8) = .empty;
@@ -113,7 +143,7 @@ pub fn writeSegment(
         errdefer allocator.free(col_offsets);
         for (columns, schema.columns, 0..) |view, schema_col, ci| {
             col_offsets[ci] = @intCast(buf.items.len);
-            try writeColumnBlock(allocator, &compressor, &buf, view, schema_col.nullable, row_offset, row_offset + rows_in_group);
+            try writeColumnBlock(allocator, &compressor, &buf, view, schema_col.nullable, dict_eligible[ci], row_offset, row_offset + rows_in_group);
         }
 
         const rg_length: u32 = @intCast(buf.items.len - rg_file_offset);
@@ -153,10 +183,6 @@ pub fn writeSegment(
     const footer_size: u32 = @intCast(buf.items.len - footer_start + format.footer_trailer_size);
     try appendU32(allocator, &buf, footer_size);
     try buf.appendSlice(allocator, &format.segment_magic);
-
-    // ---- Per-column HyperLogLog sketches (whole-segment distinct est) ----
-    const column_sketches = try computeSketches(allocator, columns, row_count);
-    errdefer allocator.free(column_sketches);
 
     // ---- Flush to disk ----
     const byte_size: u64 = @intCast(buf.items.len);
@@ -198,6 +224,7 @@ fn writeColumnBlock(
     buf: *std.ArrayList(u8),
     view: ColumnView,
     nullable: bool,
+    dict_eligible: bool,
     row_start: usize,
     row_end: usize,
 ) !void {
@@ -219,7 +246,7 @@ fn writeColumnBlock(
     // column type, so the order between them doesn't matter.
     const encoding: format.Encoding = if (try tryEncodeFor(allocator, &scratch, view, row_start, row_end))
         .for_
-    else if (try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
+    else if (dict_eligible and try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
         .dict
     else blk: {
         try writeRawColumnBlock(allocator, &scratch, view, row_start, row_end);
@@ -377,6 +404,11 @@ fn forEncode(
 /// most `u16`-wide; a column whose block exceeds this stays raw (mid-build
 /// abandon below avoids paying the full distinct scan for high-card columns).
 const dict_max_ndv: usize = 65536;
+/// Whole-segment / global cardinality cap for dict *eligibility* (distinct from
+/// the per-block `dict_max_ndv` code-width cap). A string column is dict-encoded
+/// only when BOTH this segment's NDV and the global NDV (merged HLL across all
+/// coexisting segments) are at or below this. Above it the column stays raw.
+const dict_max_global_ndv: u64 = 65536;
 /// Skip dict encoding for blob-like columns: a high average value length means
 /// the dict bytes dominate and per-row codes save little. Long-but-low-card
 /// values (URLs) still qualify because the dict stores each long value once.

@@ -196,6 +196,26 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
     var work = try engine.Memtable.init(t.allocator, t.schema);
     defer work.deinit();
 
+    // Snapshot every current segment's per-column sketch for the global
+    // dict-eligibility gate. Brief lock so a concurrent flush can't realloc the
+    // manifest mid-read; the duped bytes outlive the lock. Passing the inputs'
+    // own sketches too is harmless — the merged output's sketch already covers
+    // their rows, so the HLL union is unchanged.
+    var prior_sketches: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (prior_sketches.items) |p| t.allocator.free(p);
+        prior_sketches.deinit(t.allocator);
+    }
+    {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        for (t.manifest.segments.items) |e| {
+            if (e.column_sketches.len > 0) {
+                try prior_sketches.append(t.allocator, try t.allocator.dupe(u8, e.column_sketches));
+            }
+        }
+    }
+
     for (seg_ids) |id| {
         var name_buf: [32]u8 = undefined;
         const file_name = try Table.segmentFileName(&name_buf, id);
@@ -277,6 +297,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
             t.schema_fingerprint,
             t.row_group_size,
             snapshot.views,
+            prior_sketches.items,
             sync,
         );
         defer info.deinit(t.allocator);

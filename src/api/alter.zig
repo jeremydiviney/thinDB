@@ -309,6 +309,10 @@ fn rewriteSegment(
         new_fp,
         t.row_group_size,
         new_views,
+        // No global view here: ALTER may add/drop columns, so old per-column
+        // sketches don't align with the new schema. Gate on segment-local NDV
+        // only (matches the prior per-block behaviour — no regression).
+        &.{},
         sync,
     );
 }

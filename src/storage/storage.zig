@@ -103,6 +103,7 @@ test "round-trip a single row group with all v0.1 types" {
         0xCAFEBABE_DEADBEEF, // fingerprint
         16, // row_group_size — small to force one row group of 5
         &columns,
+        &.{},
         false, // sync not needed for round-trip test
     );
     defer info.deinit(allocator);
@@ -175,7 +176,7 @@ test "round-trip with multiple row groups" {
         .{ .data = .{ .int = &qtys } },
     };
 
-    var info = try writeSegment(allocator, io, tmp.dir, "multi.dat", schema, 1, 0, 3, &columns, false);
+    var info = try writeSegment(allocator, io, tmp.dir, "multi.dat", schema, 1, 0, 3, &columns, &.{}, false);
     defer info.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 3), info.row_groups.len);
@@ -228,7 +229,7 @@ test "borrowed view matches owned decode byte-for-byte (fixed + string)" {
         .{ .data = .{ .string = .{ .offsets = &tag_offsets, .bytes = tag_bytes } } },
     };
 
-    var info = try writeSegment(allocator, io, tmp.dir, "seg.dat", schema, 7, 0, 16, &columns, false);
+    var info = try writeSegment(allocator, io, tmp.dir, "seg.dat", schema, 7, 0, 16, &columns, &.{}, false);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
@@ -305,7 +306,7 @@ test "FOR encoding round-trips narrow-range int/bigint incl. negatives + nulls" 
         .{ .data = .{ .bigint = &ns }, .nulls = &bm },
     };
 
-    var info = try writeSegment(allocator, io, tmp.dir, "for.dat", schema, 9, 0, 64, &columns, false);
+    var info = try writeSegment(allocator, io, tmp.dir, "for.dat", schema, 9, 0, 64, &columns, &.{}, false);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "for.dat", schema);
@@ -426,7 +427,7 @@ test "dict encoding: low-card string → dict, high-card → raw, both round-tri
 
     const columns = [_]ColumnView{ color.view(null), uniq.view(null) };
 
-    var info = try writeSegment(allocator, io, tmp.dir, "dict.dat", schema, 11, 0, n, &columns, false);
+    var info = try writeSegment(allocator, io, tmp.dir, "dict.dat", schema, 11, 0, n, &columns, &.{}, false);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "dict.dat", schema);
@@ -488,7 +489,7 @@ test "dict encoding: NULL and empty string are distinct under codes" {
     defer col.deinit(allocator);
     const columns = [_]ColumnView{col.view(&bm)};
 
-    var info = try writeSegment(allocator, io, tmp.dir, "dnull.dat", schema, 12, 0, n, &columns, false);
+    var info = try writeSegment(allocator, io, tmp.dir, "dnull.dat", schema, 12, 0, n, &columns, &.{}, false);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "dnull.dat", schema);
@@ -534,7 +535,7 @@ test "dict encoding: blob-like (avg len > 256) stays raw" {
     defer col.deinit(allocator);
     const columns = [_]ColumnView{col.view(null)};
 
-    var info = try writeSegment(allocator, io, tmp.dir, "blob.dat", schema, 13, 0, n, &columns, false);
+    var info = try writeSegment(allocator, io, tmp.dir, "blob.dat", schema, 13, 0, n, &columns, &.{}, false);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "blob.dat", schema);
@@ -567,7 +568,7 @@ test "dict encoding: NDV beyond the cap abandons mid-build → raw, round-trips"
     defer col.deinit(allocator);
     const columns = [_]ColumnView{col.view(null)};
 
-    var info = try writeSegment(allocator, io, tmp.dir, "abandon.dat", schema, 14, 0, n, &columns, false);
+    var info = try writeSegment(allocator, io, tmp.dir, "abandon.dat", schema, 14, 0, n, &columns, &.{}, false);
     defer info.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), info.row_groups.len);
 
@@ -609,7 +610,7 @@ test "dict block stores a lexicographically sorted dictionary" {
     defer col.deinit(allocator);
     const columns = [_]ColumnView{col.view(null)};
 
-    var info = try writeSegment(allocator, io, tmp.dir, "sorted.dat", schema, 15, 0, n, &columns, false);
+    var info = try writeSegment(allocator, io, tmp.dir, "sorted.dat", schema, 15, 0, n, &columns, &.{}, false);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "sorted.dat", schema);

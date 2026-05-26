@@ -82,7 +82,12 @@ segment's metadata (`raw | FOR(base,width) | dict(...)`). A query reads any mix:
 - **Crossing the cap is never an error.** A column that drifts high-card just
   produces newer **raw** segments; older **coded** segments stay valid forever
   (immutable + self-describing).
-- **Per-segment NDV cap (64K)** is enforced at flush (abandon→raw mid-build).
+- **Per-segment + global NDV cap (64K)** is enforced at every segment write
+  (flush *and* compaction): a string column is dict-eligible only when BOTH this
+  segment's NDV and the global NDV (HLL merged across all coexisting segments)
+  are ≤ 64K. The per-block `tryEncodeDict` then applies within eligible columns;
+  high-card columns stay fully raw. (Mid-build abandon remains as the
+  estimate-error safety net near the boundary.)
 - **Query-merged cardinality** can exceed 64K even if each segment is under it →
   the **query-global code width floats** (u8→u16→u32). On-disk codes stay ≤u16;
   the query-scoped global code is whatever the merge needs.
@@ -167,6 +172,18 @@ gids). The runner doesn't validate values → `zig build test` is the gate.
 - [x] 3.2 Writer `tryEncodeDict` (`segment_writer.zig`), tried after FOR (mutually exclusive by type), before raw. Gate: avg-len ≤ 256 (upfront), NDV ≤ 65536 with **mid-build abandon**, NDV ≤ n/2, body-shrinks vs the raw string block. Builds an insertion-order distinct map, sorts the distinct values, remaps codes to sorted order, emits the layout; else leaves scratch untouched → raw.
 - [x] 3.3 Reader `decodeDictColumn` (`segment_reader.zig`) rebuilds the IDENTICAL raw-string `OwnedColumn` (every consumer unchanged); wired into `decodeColumnPayload` (now `pub`). `dictBlockOf` + `DictBlock{dictValue,rowCode}` expose codes+dict (the seam Phase 4 consumes). Scan borrow path (`scan.zig tryBorrowViews`) generalized from `== .for_` to `!= .raw`: a dict (or FOR) column expands ONCE into `BorrowedBlock.expanded`, raw columns stay zero-copy — one narrow column never bails the whole row group.
 - [x] 3.4 Tests: `storage.zig` unit tests (gate fires dict for low-card / raw for high-card; NULL-vs-empty under codes; blob avg-len>256 → raw; NDV>65536 mid-build abandon → raw; sorted-dict invariant via `dictBlockOf`). `tests/integration/dict_encoding_test.zig` public-API round-trip (low+high-card+nullable/empty, GROUP BY over a dict column, single multi-row-group + multi-segment). **1011/1011 tests pass.**
+- [x] 3.5 **Segment+global eligibility gate** (the §2/§3 "per column, per segment"
+  decision, which the original per-block gate diverged from): `writeSegment` takes
+  `prior_sketches` (coexisting segments' HLL), computes its own sketch up front, and
+  marks a string column dict-eligible only when BOTH segment-local NDV and the merged
+  global NDV are ≤ 64K. Flush + compaction pass all current manifest sketches (the
+  merged output's sketch covers compaction inputs, so passing all is correct); ALTER
+  passes `&.{}` (schema may add/drop columns → old sketches misalign; segment-local
+  only, no regression). **Result on 5M ClickBench: high-card URL now fully raw on the
+  compacted layout — Q33 dict-decode 158ms→0, Scan 180→56ms, Q33 411→272ms
+  back-to-back. 1018 tests green.** *(Lesson: must rebuild `thindb-server` — not just
+  the loader — for compaction to use a writer change; a stale server's old-gate
+  compactor re-encoded URL.)*
 
 ### Phase 4 — Dictionary-aware execution *(the query wins)*
 **Context:** Phase 3 dict storage is query-NEUTRAL but in fact regressed ClickBench
