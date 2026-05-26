@@ -31,6 +31,37 @@ pub const prof = @import("../util/prof.zig");
 /// cardinality check. For benchmarking hash-vs-sort on the same query only.
 pub var force_group_by: enum { auto, hash, sort } = .auto;
 
+/// Benchmark override for the scan sub-batch size (rows). 0 = use the
+/// cache-aware auto size (`autoScanBatch`); >0 forces this many rows.
+pub var scan_sub_batch: usize = 0;
+
+/// Per-core L2 working-set budget for the auto scan sub-batch. 1 MiB matches
+/// modern x86 (Zen ~1 MiB/core; Intel ~1.25–2 MiB). The exact value is not
+/// load-bearing: the sub-batch win is robust across the 512 KiB–4 MiB L2 range
+/// (→ 4K–32K-row batches all beat the full 64K row group), so a default
+/// suffices and runtime probing would add little. Overridable per-deployment if
+/// it ever matters.
+const PER_CORE_L2_BYTES: usize = 1 << 20;
+
+/// Cache-aware scan sub-batch size (rows) for a projection whose summed per-row
+/// width is `row_bytes`. The scan emits a decoded row group in chunks of this
+/// many rows so a wide multi-column aggregate's column buffers stay resident in
+/// L2 instead of spilling — measured ~7% on the widest ClickBench GROUP BY (Q32)
+/// with no regression on narrow queries. Targets ≈⅛ of per-core L2 (headroom for
+/// the group table / accumulators that share the cache), clamped to [2048,
+/// 32768] and rounded to a multiple of 64 (a sub-batch's null-bitmap start must
+/// be byte-aligned). `row_bytes == 0` (count-only scan) ⇒ 0 ⇒ no sub-batching.
+/// `scan_sub_batch > 0` forces a fixed size (benchmark override).
+pub fn autoScanBatch(row_bytes: usize) usize {
+    const raw: usize = if (scan_sub_batch > 0)
+        scan_sub_batch
+    else if (row_bytes == 0)
+        return 0
+    else
+        @max(@as(usize, 2048), @min((PER_CORE_L2_BYTES / 8) / row_bytes, 32768));
+    return raw & ~@as(usize, 63);
+}
+
 pub const Error = error{
     ColumnNotFound,
     TypeMismatch,

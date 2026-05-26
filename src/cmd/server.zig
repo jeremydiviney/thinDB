@@ -104,6 +104,14 @@ pub fn main(init: std.process.Init) !u8 {
             thindb.exec.prof.enabled = true;
             continue;
         }
+        if (try takeValue(arg, "--scan-batch", &args_iter, err_w)) |v| {
+            thindb.exec.scan_sub_batch = std.fmt.parseInt(usize, v, 10) catch {
+                try err_w.print("thindb-server: --scan-batch must be an integer, got: {s}\n", .{v});
+                try err_w.flush();
+                return 1;
+            };
+            continue;
+        }
         if (try takeValue(arg, "--force-group-by", &args_iter, err_w)) |v| {
             if (std.mem.eql(u8, v, "hash")) {
                 thindb.exec.force_group_by = .hash;

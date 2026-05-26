@@ -27,6 +27,32 @@ const Batch = exec.Batch;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
+/// Slice a full-row-group `ColumnView` down to rows `[off, off+n)` for the scan
+/// sub-batch experiment. `off` is a multiple of 64 (the sub-batch stride), so a
+/// nullable column's bitmap slices on a byte boundary. Fixed-width slices the
+/// element slice; strings keep the shared bytes and slice the `n+1` offsets.
+fn subView(v: ColumnView, off: usize, n: usize) ColumnView {
+    const nulls: ?[]const u8 = if (v.nulls) |bm| bm[off / 8 ..] else null;
+    return switch (v.data) {
+        .int => |s| .{ .data = .{ .int = s[off..][0..n] }, .nulls = nulls },
+        .bigint => |s| .{ .data = .{ .bigint = s[off..][0..n] }, .nulls = nulls },
+        .boolean => |s| .{ .data = .{ .boolean = s[off..][0..n] }, .nulls = nulls },
+        .tinyint => |s| .{ .data = .{ .tinyint = s[off..][0..n] }, .nulls = nulls },
+        .smallint => |s| .{ .data = .{ .smallint = s[off..][0..n] }, .nulls = nulls },
+        .float => |s| .{ .data = .{ .float = s[off..][0..n] }, .nulls = nulls },
+        .double => |s| .{ .data = .{ .double = s[off..][0..n] }, .nulls = nulls },
+        .date => |s| .{ .data = .{ .date = s[off..][0..n] }, .nulls = nulls },
+        .datetime => |s| .{ .data = .{ .datetime = s[off..][0..n] }, .nulls = nulls },
+        .largeint => |s| .{ .data = .{ .largeint = s[off..][0..n] }, .nulls = nulls },
+        .decimal64 => |s| .{ .data = .{ .decimal64 = s[off..][0..n] }, .nulls = nulls },
+        .decimal128 => |s| .{ .data = .{ .decimal128 = s[off..][0..n] }, .nulls = nulls },
+        .uuid => |s| .{ .data = .{ .uuid = s[off..][0..n] }, .nulls = nulls },
+        .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+    };
+}
+
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 const PredicateExpr = predicate.PredicateExpr;
@@ -169,6 +195,17 @@ pub const Scan = struct {
     decoded: []storage.OwnedColumn,
     decoded_valid: bool = false,
     views: []ColumnView,
+
+    /// Scan sub-batch cursor (active only when `exec.scan_sub_batch > 0`). The
+    /// row group is decoded once; `sub_off`/`sub_count` walk it in sub-batches,
+    /// re-deriving sliced views into `views` from the still-live `decoded`
+    /// buffers each pull. `sub_off == sub_count` ⟺ row group exhausted.
+    sub_off: usize = 0,
+    sub_count: usize = 0,
+    /// Cache-aware rows-per-emit for the plain projection path (0 = emit the
+    /// full row group). Computed once at create from the projection width via
+    /// `exec.autoScanBatch`.
+    sub_batch_rows: usize = 0,
 
     /// Physical column index for each PROJECTED column. Projection pushdown:
     /// when the query references only a subset of the table's columns, the
@@ -437,6 +474,15 @@ pub const Scan = struct {
             .owns_accountant = owns_accountant,
             .cached_stats = cached_stats,
         };
+
+        // Cache-aware scan sub-batch: size the per-emit row count from the
+        // projection's per-row width so a wide multi-column batch stays
+        // L2-resident. Disabled for late-mat (its own narrow-probe path).
+        if (!emit_loc) {
+            var row_bytes: usize = 0;
+            for (out_schema) |col| row_bytes += exec.memory.estimateColumnBytes(col.type);
+            self.sub_batch_rows = exec.autoScanBatch(row_bytes);
+        }
 
         return self;
     }
@@ -787,8 +833,22 @@ pub const Scan = struct {
         return self.emptyStringColumn(col_type, rg_count);
     }
 
+    /// Emit the next sub-batch of the current (already-decoded) row group:
+    /// slice each live `decoded` column to `[sub_off, sub_off+n)` into `views`
+    /// and advance the cursor. Only the plain projection path uses this.
+    fn emitSub(self: *Scan) Batch {
+        const n = @min(self.sub_batch_rows, self.sub_count - self.sub_off);
+        for (self.decoded[0..self.views.len], 0..) |c, i| self.views[i] = subView(c.view(), self.sub_off, n);
+        self.sub_off += n;
+        return Batch{ .schema = self.out_schema, .values = self.views, .row_count = @intCast(n) };
+    }
+
     pub fn next(self: *Scan) !?Batch {
         if (self.fused_filter != null) return self.nextFiltered();
+
+        // Scan sub-batch experiment: serve the next slice of the already-decoded
+        // row group without releasing or re-decoding it.
+        if (self.sub_off < self.sub_count) return self.emitSub();
 
         self.releaseBatch();
 
@@ -899,6 +959,15 @@ pub const Scan = struct {
                     }
                 }
                 sidecar = slots;
+            }
+            // Sub-batch experiment: emit the row group in `scan_sub_batch`-row
+            // slices (plain projection only — not coded/late-mat, which keep
+            // the full batch). The decoded buffers stay live until the cursor
+            // exhausts and the next `next()` calls `releaseBatch`.
+            if (self.sub_batch_rows > 0 and !coding and !self.emit_loc and rg_count > self.sub_batch_rows) {
+                self.sub_off = 0;
+                self.sub_count = rg_count;
+                return self.emitSub();
             }
             return Batch{
                 .schema = self.out_schema,
@@ -1699,6 +1768,8 @@ pub const Scan = struct {
             for (self.decoded) |*c| c.deinit(self.allocator);
             self.decoded_valid = false;
         }
+        self.sub_off = 0;
+        self.sub_count = 0;
     }
 
     /// If any tombstone offsets fall within `[rg_first, rg_first + rg_count)`,
