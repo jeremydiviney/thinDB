@@ -134,6 +134,12 @@ fn resolveOutPhys(
     return out;
 }
 
+/// Max provable distinct-value bound for a string key to be dict-CODED for
+/// GROUP BY (Phase 4.2). Above this, interning the column into the global dict
+/// costs more than coding saves (profiled on high-card URL), so the key stays
+/// on the normal materialized path.
+const dict_code_max_ndv: u32 = 65536;
+
 pub const Scan = struct {
     allocator: Allocator,
     io: Io,
@@ -445,6 +451,17 @@ pub const Scan = struct {
                 .varchar, .string, .char => {},
                 else => return false,
             }
+            // Only code a PROVABLY low-cardinality key. Profiling Q33 (`GROUP BY
+            // URL`) showed coding a high-card column is a ~2x REGRESSION: building
+            // the global dict means interning millions of distinct strings
+            // (per-block buildLut + per-row for raw blocks) — far more than the
+            // narrow grouping saves. Require an exact NDV bound under the cap;
+            // unknown/high-card declines to the normal string path.
+            const low_card = j < self.cached_stats.len and switch (self.cached_stats[j].ndv) {
+                .exact => |ndv| ndv <= dict_code_max_ndv,
+                .unknown => false,
+            };
+            if (!low_card) return false;
             self.code_col = j;
             self.gdict = dict;
             return true;
@@ -708,6 +725,8 @@ pub const Scan = struct {
         defer block.release(self.allocator, &self.table.cache);
 
         if (block.encoding == .dict) {
+            const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+            defer if (exec.prof.enabled) exec.prof.add("dict-code (LUT+translate)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
             var values = block.bytes;
             if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
             const db = storage.segment_reader.dictBlockOf(values, rg_count);
@@ -715,6 +734,8 @@ pub const Scan = struct {
             defer self.allocator.free(lut);
             for (0..rg_count) |i| codes[i] = lut[db.rowCode(i)];
         } else {
+            const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+            defer if (exec.prof.enabled) exec.prof.add("dict-code (raw intern per-row)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {

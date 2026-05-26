@@ -417,6 +417,13 @@ pub const Aggregate = struct {
     /// expansion — the win); emit decodes the code back to a string via `dict`.
     /// Set by the compile gate post-construction; null = normal string keys.
     coded_key: ?CodedKey = null,
+    /// Per-batch scratch holding global codes interned from a NON-coded (string)
+    /// batch under `coded_key` — e.g. a tombstoned segment or the memtable, which
+    /// the scan emits as strings. Normalizing those to codes (same GlobalDict)
+    /// keeps a query that mixes coded and string batches grouping on ONE code
+    /// space (else the same value would split into a code-keyed and a
+    /// string-keyed group). Reused across batches; arena-backed.
+    coded_scratch: std.ArrayListUnmanaged(u32) = .empty,
 
     /// Resolved top-k hint, or null to emit every group (the default).
     top_k: ?ResolvedTopK = null,
@@ -1497,6 +1504,23 @@ pub const Aggregate = struct {
         if (coded_cc) |cc| {
             while (row < n) : (row += 1) {
                 const kb = std.mem.asBytes(&cc.codes[row])[0..];
+                self.pf_keys.appendAssumeCapacity(kb);
+                self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, kb));
+            }
+        } else if (self.coded_key) |ck| {
+            // Non-coded (string) batch under coding — a tombstoned segment or the
+            // memtable, which the scan emits as strings. Intern each key string
+            // into the SAME GlobalDict → global codes, so it groups consistently
+            // with the sidecar-coded batches (one code space, no split groups).
+            const sv = str_view.?;
+            self.coded_scratch.clearRetainingCapacity();
+            try self.coded_scratch.ensureTotalCapacity(aa, n);
+            while (row < n) : (row += 1) {
+                self.coded_scratch.appendAssumeCapacity(try ck.dict.intern(self.allocator, sv.rowBytes(row)));
+            }
+            row = 0;
+            while (row < n) : (row += 1) {
+                const kb = std.mem.asBytes(&self.coded_scratch.items[row])[0..];
                 self.pf_keys.appendAssumeCapacity(kb);
                 self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, kb));
             }
