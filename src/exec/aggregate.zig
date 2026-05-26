@@ -167,6 +167,14 @@ const TopKEntry = struct {
 /// degenerate `LIMIT <huge>`.
 const TOPK_HEAP_CAP: usize = 1 << 16;
 
+/// Backing state for a string COUNT(DISTINCT): the hash set of arena-dup'd
+/// value bytes, plus a flag for whether the (single, ≠ NULL) empty string was
+/// seen — counted via the flag rather than hashed + probed for every row.
+const DistinctStr = struct {
+    set: std.StringHashMapUnmanaged(void) = .empty,
+    seen_empty: bool = false,
+};
+
 /// Per-aggregate accumulator state. Integer types accumulate into i64
 /// (MIN/MAX) or i128 (SUM); float/double types accumulate into f64; LARGEINT
 /// gets dedicated i128 min/max variants. The final value is cast back to the
@@ -193,8 +201,11 @@ const AccState = union(enum) {
     /// Welford's online algorithm: numerically stable variance/stddev.
     /// Covers stddev_pop, stddev_samp, var_pop, var_samp.
     welford: WelfordAcc,
-    /// Exact distinct count: set of arena-dup'd value bytes.
-    distinct: std.StringHashMapUnmanaged(void),
+    /// Exact distinct count: set of arena-dup'd value bytes, plus a flag that
+    /// tracks the empty string. `""` is one distinct value (≠ NULL) but is
+    /// hugely common in optional text columns; the flag counts it once instead
+    /// of hashing + probing the map for every empty row.
+    distinct: DistinctStr,
     /// Exact distinct count over a >64-bit integer-family column (largeint /
     /// decimal128 / uuid): the raw value bits are hashed directly (no per-value
     /// byte serialization or key arena-dup). Columns ≤64 bits take the faster
@@ -2021,7 +2032,7 @@ fn aggOrderValue(s: AccState) OrderVal {
         .min_large, .max_large => |m| .{ .int = if (m.present) m.v else 0 },
         .min_float, .max_float => |m| .{ .float = m orelse 0.0 },
         .avg => |a| .{ .float = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count)) },
-        .distinct => |set| .{ .int = @intCast(set.count()) },
+        .distinct => |d| .{ .int = @intCast(d.set.count() + @as(u32, @intFromBool(d.seen_empty))) },
         .distinct_int => |set| .{ .int = @intCast(set.count()) },
         .distinct_int64 => |set| .{ .int = @intCast(set.count()) },
         else => unreachable,
@@ -2143,7 +2154,7 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
         .count_distinct => if (in != null and intKeyBits(in.?) != null)
             (if (intKeyBits(in.?).? <= 64) .{ .distinct_int64 = .empty } else .{ .distinct_int = .empty })
         else
-            .{ .distinct = .empty },
+            .{ .distinct = .{} },
         .percentile => .{ .percentile_values = .empty },
         .group_concat => .{ .concat = null },
     };
@@ -2677,15 +2688,28 @@ fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32,
                 try set.put(aa, distinctIntKey(view, r), {});
             }
         },
-        .distinct => |*set| {
+        .distinct => |*d| {
+            // The empty string is one distinct value (NULL is excluded above)
+            // but dominates optional text columns; count it via `seen_empty`
+            // rather than hashing + probing the map for every empty row. Only
+            // string-family columns have an empty form — the other types
+            // reaching this path are float/double, where `sv` stays null.
+            const sv: ?storage.StringView = switch (view.data) {
+                .string, .varchar, .char => |strv| strv,
+                else => null,
+            };
             var scratch: std.ArrayList(u8) = .empty;
             defer scratch.deinit(aa);
             var r: u32 = row_start;
             while (r < row_end) : (r += 1) {
                 if (!view.isValid(r)) continue;
+                if (sv) |strv| if (strv.rowBytes(r).len == 0) {
+                    d.seen_empty = true;
+                    continue;
+                };
                 scratch.clearRetainingCapacity();
                 try encodeOneValue(aa, &scratch, view, r);
-                const gop = try set.getOrPut(aa, scratch.items);
+                const gop = try d.set.getOrPut(aa, scratch.items);
                 if (!gop.found_existing) {
                     gop.key_ptr.* = try aa.dupe(u8, scratch.items);
                 }
@@ -2966,7 +2990,7 @@ fn appendAccToColumn(
         },
         .count_distinct => {
             const n: u64 = if (cd_count) |cnt| cnt else switch (state) {
-                .distinct => |set| set.count(),
+                .distinct => |d| d.set.count() + @as(u32, @intFromBool(d.seen_empty)),
                 .distinct_int => |set| set.count(),
                 .distinct_int64 => |set| set.count(),
                 else => unreachable,
