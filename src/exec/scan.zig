@@ -445,39 +445,53 @@ pub const Scan = struct {
         return self.owned_accountant;
     }
 
-    /// Phase 4.2 gate: accept emitting the projected column `name` as global
-    /// dict codes. Only an unfiltered scan over a flushed table (empty memtable,
-    /// no fused WHERE, not late-mat) with a non-nullable string column qualifies
-    /// — matching the producer (segment-only, no-tombstone, no-NULL-group)
-    /// implemented in `next()`. Returns false (leaving normal materialized emit)
-    /// otherwise.
-    pub fn setDictCodeColumn(self: *Scan, name: []const u8, dict: *exec.GlobalDict) bool {
-        if (self.emit_loc or self.memtable_row_count != 0) return false;
+    /// Projected-column position of `name` if it can be emitted as global dict
+    /// CODES, else null. Qualifies: a flushed table (empty memtable), not
+    /// late-mat, a non-nullable string column, PROVABLY low-cardinality (exact
+    /// NDV ≤ the cap). Coding a high-card column is a ~2× regression (Q33 `GROUP
+    /// BY URL`): building the global dict interns millions of distinct strings,
+    /// far more than the narrow grouping saves. (A fused WHERE is fine — the
+    /// filtered path codes survivors row-granularly.)
+    fn codeColIdx(self: *Scan, name: []const u8) ?usize {
+        if (self.emit_loc or self.memtable_row_count != 0) return null;
         for (self.out_phys, 0..) |phys, j| {
             const col = self.table.schema.columns[phys];
             if (!@import("../types.zig").columnNameEql(col.name, name)) continue;
-            if (col.nullable) return false;
+            if (col.nullable) return null;
             switch (col.type) {
                 .varchar, .string, .char => {},
-                else => return false,
+                else => return null,
             }
-            // Only code a PROVABLY low-cardinality key. Profiling Q33 (`GROUP BY
-            // URL`) showed coding a high-card column is a ~2x REGRESSION: building
-            // the global dict means interning millions of distinct strings
-            // (per-block buildLut + per-row for raw blocks) — far more than the
-            // narrow grouping saves. Require an exact NDV bound under the cap;
-            // unknown/high-card declines to the normal string path.
             const low_card = j < self.cached_stats.len and switch (self.cached_stats[j].ndv) {
                 .exact => |ndv| ndv <= dict_code_max_ndv,
                 .unknown => false,
             };
-            if (!low_card) return false;
-            self.ensureCodedArrays() catch return false;
-            self.coded_dicts_by_j[j] = dict;
-            self.n_coded += 1;
-            return true;
+            return if (low_card) j else null;
         }
-        return false;
+        return null;
+    }
+
+    /// Non-committing pre-check: can `name` be grouped as dict codes? The GROUP
+    /// BY gate validates EVERY key column before committing any (a partial
+    /// commit would desync the scan's coded emit from the aggregate's key).
+    pub fn canCodeColumn(self: *Scan, name: []const u8) bool {
+        return self.codeColIdx(name) != null;
+    }
+
+    /// Mark the projected column `name` for coded emit (see `codeColIdx`).
+    pub fn setDictCodeColumn(self: *Scan, name: []const u8, dict: *exec.GlobalDict) bool {
+        const j = self.codeColIdx(name) orelse return false;
+        self.ensureCodedArrays() catch return false;
+        self.coded_dicts_by_j[j] = dict;
+        self.n_coded += 1;
+        return true;
+    }
+
+    /// Undo all coded-column setup — used by the gate to roll back a partial
+    /// commit when the packed group key turns out not to fit the int budget.
+    pub fn clearDictCodeColumns(self: *Scan) void {
+        for (self.coded_dicts_by_j) |*d| d.* = null;
+        self.n_coded = 0;
     }
 
     /// Lazily allocate the per-projected-column coded arrays (dict map + code

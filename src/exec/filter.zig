@@ -175,6 +175,15 @@ pub const Filter = struct {
         return self.upstream.setDictCodeColumn(name, dict);
     }
 
+    pub fn canCodeColumn(self: *Filter, name: []const u8) bool {
+        if (!self.fused) return false;
+        return self.upstream.canCodeColumn(name);
+    }
+
+    pub fn clearDictCodeColumns(self: *Filter) void {
+        if (self.fused) self.upstream.clearDictCodeColumns();
+    }
+
     /// Filter only restricts rows — `upper_rows` is unchanged (a filter is
     /// only provably ≤ input; we don't estimate a reduction). Sort state
     /// preserved (Filter doesn't reorder). Per-column stats are tightened by

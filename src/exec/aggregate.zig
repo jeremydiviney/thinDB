@@ -862,6 +862,45 @@ pub const Aggregate = struct {
         return true;
     }
 
+    /// Reconfigure the group key onto the int-key path, packing the columns
+    /// marked in `coded_mask` as 32-bit dict CODES (a low-card string keyed on
+    /// its global code, decoded at emit) alongside any native int columns.
+    /// Called by the GROUP BY gate AFTER the scan is set to emit those columns
+    /// as codes; the gate pre-checks codeability + that the packed key fits the
+    /// 128-bit budget, so this normally succeeds. Returns false only if the
+    /// layout unexpectedly doesn't fit (caller then resets the scan + keeps the
+    /// string/byte path). Rebuilds `int_layout` and allocates the matching int
+    /// table (string keys have neither at construction — they default to the
+    /// byte path, whose now-unused table stays in the arena).
+    pub fn configureCodedKeys(self: *Aggregate, coded_mask: []const bool, dicts: []const ?*exec.GlobalDict) !bool {
+        const up_schema = self.upstream.outputSchema();
+        const layout = (try planIntKey(self.allocator, self.group_col_indices, up_schema, coded_mask, dicts)) orelse return false;
+        if (self.int_layout) |old| old.deinit(self.allocator);
+        self.int_layout = layout;
+
+        const aa = self.arena.allocator();
+        const init_cap: usize = if (self.group_cap > 0) @min(self.group_cap, ADAPTIVE_INITIAL) else 0;
+        switch (layout.tier) {
+            .bits32 => {
+                self.int_table_32 = try IntTable32.init(aa, init_cap);
+                if (self.group_cap > 0) self.int_table_32.?.grow_target = group_table.capacityFor(self.group_cap);
+            },
+            .bits96 => {
+                self.int_table_96 = try IntTable96.init(aa, init_cap);
+                if (self.group_cap > 0) self.int_table_96.?.grow_target = group_table.capacityFor(self.group_cap);
+            },
+            .bits128 => {
+                self.int_table_128 = try IntTable128.init(aa, init_cap);
+                if (self.group_cap > 0) self.int_table_128.?.grow_target = group_table.capacityFor(self.group_cap);
+            },
+        }
+        if (init_cap > 0) {
+            self.gstate.ensureTotalCapacity(aa, init_cap * self.aggs.len) catch {};
+            self.gkeys_int.ensureTotalCapacity(aa, init_cap) catch {};
+        }
+        return true;
+    }
+
     pub fn next(self: *Aggregate) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;

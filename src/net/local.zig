@@ -1989,6 +1989,9 @@ pub const CompileCtx = struct {
     /// code space across segments, and the codes decode back to strings at emit.
     /// Owned here, freed in `deinit` after the operator tree (which borrows it).
     global_dict: ?*exec.GlobalDict = null,
+    /// Additional per-column global dicts for the multi-key coded GROUP BY path
+    /// (one per coded key column). Owned; freed in `deinit`.
+    extra_dicts: std.ArrayListUnmanaged(*exec.GlobalDict) = .empty,
     /// Wall-clock microseconds since the Unix epoch, captured once when
     /// the query is compiled. The subquery pre-compile pass substitutes
     /// it for `now()` / `current_timestamp()` / `current_date()` so those
@@ -2013,6 +2016,11 @@ pub const CompileCtx = struct {
             g.deinit(self.allocator);
             self.allocator.destroy(g);
         }
+        for (self.extra_dicts.items) |g| {
+            g.deinit(self.allocator);
+            self.allocator.destroy(g);
+        }
+        self.extra_dicts.deinit(self.allocator);
         if (self.prune_names) |p| self.allocator.free(p);
     }
 
@@ -2024,6 +2032,17 @@ pub const CompileCtx = struct {
         const g = try self.allocator.create(exec.GlobalDict);
         g.* = .{};
         self.global_dict = g;
+        return g;
+    }
+
+    /// A fresh query-scoped global dict — one per coded column on the multi-key
+    /// coded GROUP BY path (each column has its own code space). Tracked + freed
+    /// by the CompileCtx, like `queryGlobalDict`'s.
+    pub fn newGlobalDict(self: *CompileCtx) !*exec.GlobalDict {
+        const g = try self.allocator.create(exec.GlobalDict);
+        errdefer self.allocator.destroy(g);
+        g.* = .{};
+        try self.extra_dicts.append(self.allocator, g);
         return g;
     }
 
@@ -2426,6 +2445,22 @@ fn analyzeProjection(allocator: Allocator, root: *const ir.Op) ?[][]const u8 {
     return c.names.toOwnedSlice(allocator) catch null;
 }
 
+/// Bits a group column contributes to a coded int key: a string keys on its
+/// 32-bit global code; an int-family column on its type width; anything else
+/// (float/double) can't pack (null). Mirrors aggregate.zig `intKeyBits` (+ the
+/// coded 32-bit field) so the gate's fit pre-check matches `planIntKey` exactly.
+fn codedKeyBits(t: types.Type) ?u16 {
+    return switch (t) {
+        .varchar, .string, .char => 32,
+        .boolean, .tinyint => 8,
+        .smallint => 16,
+        .int, .date => 32,
+        .bigint, .datetime, .decimal64 => 64,
+        .largeint, .decimal128, .uuid => 128,
+        else => null,
+    };
+}
+
 /// True if any aggregate reads `name` as its argument — then the group key
 /// can't be dict-coded (the aggregate needs that column's materialized strings).
 fn aggUsesColumn(aggs: []const AggSpec, name: []const u8) bool {
@@ -2604,6 +2639,55 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                     _ = aq.setCodedKey(gdict);
                     break :blk aq;
                 }
+            }
+            // Multi-key coded GROUP BY (int-path): each low-card string key → its
+            // 32-bit global code, packed with native int keys into the int group
+            // key (skipping dict→string expansion). Requires a fused WHERE
+            // (`g.upstream` is a Filter ⇒ the scan's filtered path always emits
+            // codes, so no mixed coded/string batches), a packed key ≤128 bits,
+            // and ≥1 codeable string key not read by an aggregate. The fit +
+            // codeability are pre-checked so the commit below always succeeds
+            // (the scan + aggregate must agree, and `groupByTopK` consumes
+            // `upstream`, so a post-commit undo isn't possible).
+            if (g.group_cols.len >= 2 and g.upstream.* == .filter) coded: {
+                const up_schema = upstream.outputSchema();
+                var total_bits: u16 = 0;
+                var n_str: usize = 0;
+                for (g.group_cols) |gc| {
+                    const idx = types.findColumn(up_schema, gc) orelse break :coded;
+                    const ct = up_schema[idx].type;
+                    total_bits += (codedKeyBits(ct) orelse break :coded);
+                    switch (ct) {
+                        .varchar, .string, .char => {
+                            if (aggUsesColumn(g.aggs, gc) or !upstream.canCodeColumn(gc)) break :coded;
+                            n_str += 1;
+                        },
+                        else => {},
+                    }
+                }
+                if (total_bits > 128 or n_str == 0) break :coded;
+
+                const n = g.group_cols.len;
+                const coded_mask = try ctx.allocator.alloc(bool, n);
+                defer ctx.allocator.free(coded_mask);
+                const dicts = try ctx.allocator.alloc(?*exec.GlobalDict, n);
+                defer ctx.allocator.free(dicts);
+                @memset(dicts, null);
+                for (g.group_cols, 0..) |gc, i| {
+                    const idx = types.findColumn(up_schema, gc).?;
+                    coded_mask[i] = switch (up_schema[idx].type) {
+                        .varchar, .string, .char => true,
+                        else => false,
+                    };
+                    if (coded_mask[i]) {
+                        const d = try ctx.newGlobalDict();
+                        dicts[i] = d;
+                        _ = upstream.setDictCodeColumn(gc, d);
+                    }
+                }
+                var aq = try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
+                _ = try aq.configureCodedKeys(coded_mask, dicts);
+                break :blk aq;
             }
             break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
         },

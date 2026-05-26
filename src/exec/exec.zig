@@ -155,6 +155,15 @@ pub const VTable = struct {
     /// codes — it groups on the narrow code and decodes via `dict` at emit.
     /// Returns true iff accepted (an Aggregate with a single string key).
     setCodedKey: *const fn (ptr: *anyopaque, dict: *global_dict.GlobalDict) bool,
+    /// Phase 4.2 multi-key: non-committing pre-check — can the underlying Scan
+    /// emit `name` as dict codes? The gate validates all keys before committing.
+    canCodeColumn: *const fn (ptr: *anyopaque, name: []const u8) bool,
+    /// Phase 4.2 multi-key: reconfigure an Aggregate's group key to pack the
+    /// columns marked in `coded_mask` as dict codes (+ native ints) into the
+    /// int-key path. Returns false if the packed key won't fit the 128-bit budget.
+    configureCodedKeys: *const fn (ptr: *anyopaque, coded_mask: []const bool, dicts: []const ?*global_dict.GlobalDict) anyerror!bool,
+    /// Phase 4.2 multi-key: roll back a Scan's coded-column setup (gate undo).
+    clearDictCodeColumns: *const fn (ptr: *anyopaque) void,
 };
 
 /// Write `depth` levels of indentation then a complete label line.
@@ -326,6 +335,21 @@ pub const Query = struct {
         return self.vtable.setCodedKey(self.ptr, dict);
     }
 
+    /// Phase 4.2 multi-key: can the underlying Scan emit `name` as codes?
+    pub fn canCodeColumn(self: Query, name: []const u8) bool {
+        return self.vtable.canCodeColumn(self.ptr, name);
+    }
+
+    /// Phase 4.2 multi-key: pack the coded columns into the Aggregate's int key.
+    pub fn configureCodedKeys(self: Query, coded_mask: []const bool, dicts: []const ?*global_dict.GlobalDict) !bool {
+        return self.vtable.configureCodedKeys(self.ptr, coded_mask, dicts);
+    }
+
+    /// Phase 4.2 multi-key: roll back the underlying Scan's coded-column setup.
+    pub fn clearDictCodeColumns(self: Query) void {
+        return self.vtable.clearDictCodeColumns(self.ptr);
+    }
+
     // ----- Combinators -----
 
     pub fn filter(self: Query, expr: predicate.PredicateExpr) !Query {
@@ -489,6 +513,21 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.setCodedKey(dict);
         }
+        fn canCodeColumnWrap(ptr: *anyopaque, name: []const u8) bool {
+            if (!@hasDecl(Op, "canCodeColumn")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.canCodeColumn(name);
+        }
+        fn configureCodedKeysWrap(ptr: *anyopaque, coded_mask: []const bool, dicts: []const ?*global_dict.GlobalDict) anyerror!bool {
+            if (!@hasDecl(Op, "configureCodedKeys")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.configureCodedKeys(coded_mask, dicts);
+        }
+        fn clearDictCodeColumnsWrap(ptr: *anyopaque) void {
+            if (!@hasDecl(Op, "clearDictCodeColumns")) return;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            o.clearDictCodeColumns();
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
@@ -501,6 +540,9 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .explain = explainWrap,
             .setDictCodeColumn = setDictCodeColumnWrap,
             .setCodedKey = setCodedKeyWrap,
+            .canCodeColumn = canCodeColumnWrap,
+            .configureCodedKeys = configureCodedKeysWrap,
+            .clearDictCodeColumns = clearDictCodeColumnsWrap,
         };
     };
 
