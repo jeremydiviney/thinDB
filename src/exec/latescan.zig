@@ -233,19 +233,45 @@ pub const LateScan = struct {
         }
     }
 
+    /// Fetch only the survivor `offsets` of each output column from one row
+    /// group — decode just those rows, never the full 65,536-row block. The
+    /// block is decompressed once (cached pin), then:
+    ///   - raw  : an in-place borrowed view; `appendByIndices` copies only the
+    ///            survivor offsets (zero full-block materialization),
+    ///   - dict : index each survivor's code into the dict directly (no expand),
+    ///   - FOR  : expand the block (cheap, vectorized) then gather the offsets.
     fn appendSegmentRows(self: *LateScan, seg: *storage.ReadSegment, rg_idx: usize, offsets: []const u32) !void {
+        const sr = storage.segment_reader;
+        const rc = seg.info.row_groups[rg_idx].row_count;
         for (self.out_phys, 0..) |phys, out_idx| {
-            var col = try seg.decodeColumnMaybeCached(
-                self.allocator,
-                self.table.schema,
-                rg_idx,
-                phys,
-                &self.table.cache,
-            );
-            defer col.deinit(self.allocator);
-            try engine.transform.appendByIndices(self.allocator, col.view(), offsets, &self.output_columns[out_idx]);
+            const col_type = self.table.schema.columns[phys].type;
+            const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+            const out = &self.output_columns[out_idx];
+
+            var bb = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+            defer bb.release(self.allocator, &self.table.cache);
+
+            switch (bb.encoding) {
+                .dict => try appendDictRows(self.allocator, bb.bytes, rc, flags, offsets, out),
+                .raw => {
+                    if (sr.viewRawColumn(col_type, bb.bytes, rc, flags, .raw)) |view| {
+                        try engine.transform.appendByIndices(self.allocator, view, offsets, out);
+                    } else {
+                        // Alignment / big-endian fallback: decode the block, gather.
+                        var col = try sr.decodeColumnPayload(self.allocator, col_type, bb.bytes, rc, flags, .raw);
+                        defer col.deinit(self.allocator);
+                        try engine.transform.appendByIndices(self.allocator, col.view(), offsets, out);
+                    }
+                },
+                .for_ => {
+                    var col = try sr.decodeColumnPayload(self.allocator, col_type, bb.bytes, rc, flags, .for_);
+                    defer col.deinit(self.allocator);
+                    try engine.transform.appendByIndices(self.allocator, col.view(), offsets, out);
+                },
+            }
         }
     }
+
 
     fn appendMemtableRow(self: *LateScan, row: usize) !void {
         const snap = self.inner_scan.memtableSnap();
@@ -260,3 +286,38 @@ pub const LateScan = struct {
         }
     }
 };
+
+/// Gather only `offsets`' rows of a dict-encoded string block into `out` by
+/// indexing each row's code into the sorted dict — never expanding the full
+/// block (the late-mat survivor fetch is ≤ k rows scattered across 65,536-row
+/// blocks). `raw` is the decompressed payload; the validity handling mirrors
+/// `transform.appendByIndices`.
+fn appendDictRows(
+    allocator: Allocator,
+    raw: []const u8,
+    row_count: u32,
+    flags: storage.format.ColumnBlockFlags,
+    offsets: []const u32,
+    out: *ColumnStore,
+) !void {
+    var values = raw;
+    var nulls: ?[]const u8 = null;
+    if (flags.has_nulls) {
+        const bm = storage.column.bitmapBytes(row_count);
+        nulls = raw[0..bm];
+        values = raw[bm..];
+    }
+    const db = storage.segment_reader.dictBlockOf(values, row_count);
+    const dst_start = out.data.rowCount();
+    switch (out.data) {
+        .varchar, .string, .char => |*ss| {
+            for (offsets) |off| try ss.appendValue(allocator, db.dictValue(db.rowCode(off)));
+        },
+        else => unreachable, // the writer only dict-encodes string-family columns
+    }
+    if (out.nulls != null) {
+        for (offsets, 0..) |off, j| {
+            try out.appendValidBit(allocator, dst_start + j, storage.column.isValidBit(nulls, off));
+        }
+    }
+}
