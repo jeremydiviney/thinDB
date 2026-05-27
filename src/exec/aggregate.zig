@@ -3102,7 +3102,7 @@ pub const IntKeyLayout = struct {
     /// `fields`. Owned; empty when no field is coded.
     coded_dicts: []const ?*exec.GlobalDict = &.{},
 
-    fn deinit(self: IntKeyLayout, allocator: Allocator) void {
+    pub fn deinit(self: IntKeyLayout, allocator: Allocator) void {
         allocator.free(self.fields);
         if (self.coded_dicts.len > 0) allocator.free(@constCast(self.coded_dicts));
     }
@@ -3268,7 +3268,7 @@ inline fn fieldBits(comptime SignedT: type, v: SignedT, bits: u8) u128 {
 /// (and letting the row loop vectorize). The raw stored value is used (matching
 /// the byte path, which also ignores group-column validity), so the two paths
 /// group identically. Same-payload variants share a prong via `inline`.
-fn orKeyColumn(keys: []u128, batch: Batch, ci: usize, f: IntKeyField) void {
+pub fn orKeyColumn(keys: []u128, batch: Batch, ci: usize, f: IntKeyField) void {
     const off: u7 = @intCast(f.offset);
     const bits = f.bits;
     if (f.coded) {

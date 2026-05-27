@@ -25,7 +25,21 @@ const ColumnView = storage.ColumnView;
 const agg = @import("aggregate.zig");
 const AggSpec = agg.AggSpec;
 const AggFunc = agg.AggFunc;
-const Batch = @import("exec.zig").Batch;
+
+const exec = @import("exec.zig");
+const Batch = exec.Batch;
+const Query = exec.Query;
+const makeQuery = exec.makeQuery;
+const Error = exec.Error;
+const predicate = exec.predicate;
+const PipelineStats = exec.PipelineStats;
+const memory = exec.memory;
+
+const engine = @import("../engine/engine.zig");
+const ColumnStore = engine.ColumnStore;
+const gt = @import("group_table.zig");
+
+const PREFETCH_DIST: usize = 12;
 
 /// How one aggregate's accumulator lives inside the compact per-group record.
 /// Each occupies a whole number of u64 words at `off` (word index), so the
@@ -353,6 +367,346 @@ pub fn finalize(layout: CompactLayout, state: []const u64, g: usize, ai: usize) 
             break :blk .{ .float = out };
         },
     };
+}
+
+/// Map a compact `Finalized` value to one output column, applying the output-
+/// type coercion — mirrors `aggregate.appendAccToColumn` for the fixed-state
+/// aggregates.
+fn appendFinalized(allocator: Allocator, f: Finalized, col: *ColumnStore, out_type: Type) !void {
+    switch (f) {
+        .int => |c| try col.data.bigint.append(allocator, @intCast(c)), // COUNT
+        .sum_int => |total| switch (out_type) {
+            .largeint => try col.data.largeint.append(allocator, total),
+            .decimal128 => try col.data.decimal128.append(allocator, total),
+            else => {
+                if (total > std.math.maxInt(i64) or total < std.math.minInt(i64)) return Error.ArithmeticOverflow;
+                try col.data.bigint.append(allocator, @intCast(total));
+            },
+        },
+        .signed => |v| switch (out_type) { // MIN/MAX over integers → input type
+            .int => try col.data.int.append(allocator, @intCast(v)),
+            .bigint => try col.data.bigint.append(allocator, v),
+            .boolean => try col.data.boolean.append(allocator, @intCast(v)),
+            .date => try col.data.date.append(allocator, @intCast(v)),
+            .datetime => try col.data.datetime.append(allocator, v),
+            .tinyint => try col.data.tinyint.append(allocator, @intCast(v)),
+            .smallint => try col.data.smallint.append(allocator, @intCast(v)),
+            .decimal64 => try col.data.decimal64.append(allocator, v),
+            else => unreachable,
+        },
+        .float => |v| switch (out_type) { // SUM(float), AVG, MIN/MAX(float), STDDEV/VAR
+            .double => try col.data.double.append(allocator, v),
+            .float => try col.data.float.append(allocator, @floatCast(v)),
+            else => unreachable,
+        },
+    }
+}
+
+/// Radix-partitioned aggregate operator (Phase 2b). Step (i): a single pre-sized
+/// compact-state table — no partitioning yet (added next). Drains the upstream,
+/// packs each row's int key, probes one group table, scatters via the compact
+/// core, and emits group columns (decoded from the packed key) + the finalized
+/// aggregates. Eligibility (int key ≤128 bits, fixed-state aggs) is the router's
+/// responsibility; `create` errors if the layouts don't apply.
+pub const RadixAggregate = struct {
+    allocator: Allocator,
+    arena: std.heap.ArenaAllocator,
+    upstream: Query,
+    group_col_indices: []usize,
+    agg_col_indices: []?usize,
+    aggs: []const AggSpec,
+    int_layout: agg.IntKeyLayout,
+    compact: CompactLayout,
+    output_schema: []types.Column,
+    output_columns: []ColumnStore,
+    views: []ColumnView,
+    cap_groups: usize,
+    done: bool = false,
+
+    pub fn create(allocator: Allocator, upstream: Query, group_cols: []const []const u8, aggs: []const AggSpec) !Query {
+        if (aggs.len == 0) return Error.AggregateNoSpecs;
+        const up_schema = upstream.outputSchema();
+
+        const gci = try allocator.alloc(usize, group_cols.len);
+        errdefer allocator.free(gci);
+        for (group_cols, gci) |name, *dst| dst.* = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
+
+        const aci = try allocator.alloc(?usize, aggs.len);
+        errdefer allocator.free(aci);
+        for (aggs, aci) |a, *dst| dst.* = if (a.col) |name| (types.findColumn(up_schema, name) orelse return Error.ColumnNotFound) else null;
+
+        const layout = (try agg.planIntKey(allocator, gci, up_schema, null, &.{})) orelse return Error.UnsupportedOperatorForType;
+        errdefer layout.deinit(allocator);
+
+        const compact = (try planCompact(allocator, aggs, aci, up_schema)) orelse return Error.AggregateUnsupportedType;
+        errdefer compact.deinit(allocator);
+
+        const out_schema = try allocator.alloc(types.Column, group_cols.len + aggs.len);
+        errdefer allocator.free(out_schema);
+        for (gci, 0..) |ci, i| out_schema[i] = up_schema[ci];
+        for (aggs, aci, 0..) |a, idx, i| {
+            const in_t: ?Type = if (idx) |x| up_schema[x].type else null;
+            out_schema[group_cols.len + i] = .{ .name = a.as, .type = try agg.aggOutputTypeFor(a, in_t) };
+        }
+
+        const out_cols = try allocator.alloc(ColumnStore, out_schema.len);
+        errdefer allocator.free(out_cols);
+        var inited: usize = 0;
+        errdefer for (out_cols[0..inited]) |*c| c.deinit(allocator);
+        for (out_schema, 0..) |col, i| {
+            out_cols[i] = try ColumnStore.init(allocator, col.type, col.nullable);
+            inited += 1;
+        }
+
+        const views = try allocator.alloc(ColumnView, out_schema.len);
+        errdefer allocator.free(views);
+
+        // Group-count estimate from upstream stats → presize (grow covers a miss).
+        const st = upstream.stats();
+        var est: u64 = 1;
+        var known = true;
+        for (gci) |ci| {
+            if (ci >= st.column_stats.len) {
+                known = false;
+                break;
+            }
+            switch (st.column_stats[ci].ndv) {
+                .exact => |nd| est *|= nd,
+                .unknown => {
+                    known = false;
+                    break;
+                },
+            }
+        }
+        const cap_groups: usize = if (known and est > 0) @intCast(@min(est, @max(st.upper_rows, 1))) else 4096;
+
+        const self = try allocator.create(RadixAggregate);
+        self.* = .{
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .upstream = upstream,
+            .group_col_indices = gci,
+            .agg_col_indices = aci,
+            .aggs = aggs,
+            .int_layout = layout,
+            .compact = compact,
+            .output_schema = out_schema,
+            .output_columns = out_cols,
+            .views = views,
+            .cap_groups = @max(cap_groups, 256),
+        };
+        return makeQuery(allocator, self);
+    }
+
+    fn drainTier(self: *RadixAggregate, comptime Table: type) !void {
+        const aa = self.arena.allocator();
+        const words = self.compact.words;
+        const layout = self.int_layout;
+        var table = try Table.init(aa, self.cap_groups);
+        var gstate: std.ArrayListUnmanaged(u64) = .empty;
+        var gkeys: std.ArrayListUnmanaged(u128) = .empty;
+        try gstate.ensureTotalCapacity(aa, self.cap_groups * words);
+        try gkeys.ensureTotalCapacity(aa, self.cap_groups);
+        var kb: std.ArrayListUnmanaged(u128) = .empty;
+        var hb: std.ArrayListUnmanaged(u64) = .empty;
+        var gidbuf: std.ArrayListUnmanaged(u32) = .empty;
+        var n_groups: u32 = 0;
+
+        while (try self.upstream.next()) |batch| {
+            const n = batch.row_count;
+            if (n == 0) continue;
+            if (table.needsGrow(n)) {
+                try table.grow(aa, n);
+                try gstate.ensureTotalCapacity(aa, table.slots.len * words);
+                try gkeys.ensureTotalCapacity(aa, table.slots.len);
+            }
+            try gstate.ensureUnusedCapacity(aa, n * words);
+            try gkeys.ensureUnusedCapacity(aa, n);
+            try kb.ensureTotalCapacity(aa, n);
+            try hb.ensureTotalCapacity(aa, n);
+            try gidbuf.ensureTotalCapacity(aa, n);
+
+            kb.clearRetainingCapacity();
+            kb.appendNTimesAssumeCapacity(0, n);
+            for (self.group_col_indices, layout.fields) |ci, f| agg.orKeyColumn(kb.items[0..n], batch, ci, f);
+
+            hb.clearRetainingCapacity();
+            for (0..n) |j| hb.appendAssumeCapacity(Table.hashKey(kb.items[j]));
+
+            gidbuf.clearRetainingCapacity();
+            for (0..n) |j| {
+                if (j + PREFETCH_DIST < n) @prefetch(table.slotAddr(table.bucketOf(hb.items[j + PREFETCH_DIST])), .{ .rw = .write, .locality = 1 });
+                const p = table.getOrPut(hb.items[j], kb.items[j]);
+                const g = if (p.found) p.gid else blk: {
+                    table.commit(p.slot, kb.items[j], n_groups);
+                    gkeys.appendAssumeCapacity(kb.items[j]);
+                    const base = @as(usize, n_groups) * words;
+                    gstate.items.len = base + words;
+                    @memset(gstate.items[base .. base + words], 0);
+                    const ng = n_groups;
+                    n_groups += 1;
+                    break :blk ng;
+                };
+                gidbuf.appendAssumeCapacity(g);
+            }
+            scatter(self.compact, gstate.items, gidbuf.items[0..n], batch);
+        }
+
+        // Emit: decode each group's key + finalize its aggregates into the
+        // allocator-owned output columns (independent of the arena).
+        for (0..n_groups) |g| {
+            try agg.appendIntGroupKey(self.allocator, gkeys.items[g], layout, self.output_columns[0..self.group_col_indices.len]);
+            for (self.compact.aggs, 0..) |_, ai| {
+                const oi = self.group_col_indices.len + ai;
+                try appendFinalized(self.allocator, finalize(self.compact, gstate.items, g, ai), &self.output_columns[oi], self.output_schema[oi].type);
+            }
+        }
+    }
+
+    pub fn next(self: *RadixAggregate) !?Batch {
+        if (self.done) return null;
+        self.done = true;
+        switch (self.int_layout.tier) {
+            .bits32 => try self.drainTier(gt.IntKeyTable(32)),
+            .bits96 => try self.drainTier(gt.IntKeyTable(96)),
+            .bits128 => try self.drainTier(gt.IntKeyTable(128)),
+        }
+        _ = self.arena.reset(.free_all); // group table/state no longer needed
+        for (self.output_columns, 0..) |c, i| self.views[i] = c.view();
+        return Batch{ .schema = self.output_schema, .values = self.views, .row_count = self.output_columns[0].rowCount() };
+    }
+
+    pub fn deinit(self: *RadixAggregate) void {
+        self.upstream.deinit();
+        self.arena.deinit();
+        for (self.output_columns) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.output_columns);
+        self.allocator.free(self.views);
+        self.allocator.free(self.output_schema);
+        self.compact.deinit(self.allocator);
+        self.int_layout.deinit(self.allocator);
+        self.allocator.free(self.agg_col_indices);
+        self.allocator.free(self.group_col_indices);
+        self.allocator.destroy(self);
+    }
+
+    pub fn outputSchema(self: *RadixAggregate) []const types.Column {
+        return self.output_schema;
+    }
+    pub fn addPrune(self: *RadixAggregate, pred: predicate.Predicate) !void {
+        return self.upstream.addPrune(pred);
+    }
+    pub fn stats(self: *RadixAggregate) PipelineStats {
+        return .{ .upper_rows = self.upstream.stats().upper_rows };
+    }
+    pub fn accountant(self: *RadixAggregate) ?*memory.MemoryAccountant {
+        return self.upstream.accountant();
+    }
+    pub fn explain(self: *RadixAggregate, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "RadixAggregate (compact, single-table)");
+        try self.upstream.explain(out, allocator, depth + 1);
+    }
+};
+
+// --- differential-test support: a tiny synthetic source over (k:int, v:smallint),
+// emitting in 4-row batches so the operator's multi-batch drain is exercised.
+const TestSource = struct {
+    schema: [2]types.Column,
+    k: []const i32,
+    v: []const i16,
+    views: [2]ColumnView = undefined,
+    pos: usize = 0,
+    allocator: Allocator,
+
+    fn create(a: Allocator, k: []const i32, v: []const i16) !*TestSource {
+        const s = try a.create(TestSource);
+        s.* = .{
+            .schema = .{ .{ .name = "k", .type = .int }, .{ .name = "v", .type = .smallint } },
+            .k = k,
+            .v = v,
+            .allocator = a,
+        };
+        return s;
+    }
+    pub fn next(self: *TestSource) !?Batch {
+        if (self.pos >= self.k.len) return null;
+        const lo = self.pos;
+        const hi = @min(lo + 4, self.k.len);
+        self.pos = hi;
+        self.views[0] = .{ .data = .{ .int = self.k[lo..hi] } };
+        self.views[1] = .{ .data = .{ .smallint = self.v[lo..hi] } };
+        return Batch{ .schema = self.schema[0..], .values = self.views[0..], .row_count = hi - lo };
+    }
+    pub fn deinit(self: *TestSource) void {
+        self.allocator.destroy(self);
+    }
+    pub fn outputSchema(self: *TestSource) []const types.Column {
+        return self.schema[0..];
+    }
+    pub fn addPrune(_: *TestSource, _: predicate.Predicate) !void {}
+    pub fn stats(self: *TestSource) PipelineStats {
+        return .{ .upper_rows = self.k.len };
+    }
+    pub fn accountant(_: *TestSource) ?*memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *TestSource, _: *std.ArrayList(u8), _: Allocator, _: usize) !void {}
+};
+
+const DiffRow = struct { k: i32, c: i64, s: i64, a: f64, mn: i16, mx: i16 };
+fn diffLessK(_: void, x: DiffRow, y: DiffRow) bool {
+    return x.k < y.k;
+}
+fn collectDiffRows(allocator: Allocator, q: *Query) ![]DiffRow {
+    var list: std.ArrayListUnmanaged(DiffRow) = .empty;
+    errdefer list.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| try list.append(allocator, .{
+            .k = b.values[0].data.int[r],
+            .c = b.values[1].data.bigint[r],
+            .s = b.values[2].data.bigint[r],
+            .a = b.values[3].data.double[r],
+            .mn = b.values[4].data.smallint[r],
+            .mx = b.values[5].data.smallint[r],
+        });
+    }
+    const rows = try list.toOwnedSlice(allocator);
+    std.mem.sort(DiffRow, rows, {}, diffLessK);
+    return rows;
+}
+
+test "RadixAggregate matches the generic Aggregate (count/sum/avg/min/max)" {
+    const ta = std.testing.allocator;
+    const k = [_]i32{ 1, 2, 1, 3, 2, 1, 3, 3 };
+    const v = [_]i16{ 10, 20, 30, 40, 5, 15, 25, 35 };
+    const group_cols = [_][]const u8{"k"};
+    const aggs = [_]AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .sum, .col = "v", .as = "s" },
+        .{ .func = .avg, .col = "v", .as = "a" },
+        .{ .func = .min, .col = "v", .as = "mn" },
+        .{ .func = .max, .col = "v", .as = "mx" },
+    };
+
+    var qr = try RadixAggregate.create(ta, makeQuery(ta, try TestSource.create(ta, &k, &v)), group_cols[0..], aggs[0..]);
+    defer qr.deinit();
+    const rr = try collectDiffRows(ta, &qr);
+    defer ta.free(rr);
+
+    var qa = try makeQuery(ta, try TestSource.create(ta, &k, &v)).groupBy(group_cols[0..], aggs[0..]);
+    defer qa.deinit();
+    const expected = try collectDiffRows(ta, &qa);
+    defer ta.free(expected);
+
+    try std.testing.expectEqual(expected.len, rr.len);
+    for (expected, rr) |e, g| {
+        try std.testing.expectEqual(e.k, g.k);
+        try std.testing.expectEqual(e.c, g.c);
+        try std.testing.expectEqual(e.s, g.s);
+        try std.testing.expectApproxEqAbs(e.a, g.a, 1e-9);
+        try std.testing.expectEqual(e.mn, g.mn);
+        try std.testing.expectEqual(e.mx, g.mx);
+    }
 }
 
 // ---------------------------------------------------------------------------
