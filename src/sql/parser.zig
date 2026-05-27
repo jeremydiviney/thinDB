@@ -337,7 +337,7 @@ pub const Parser = struct {
         // with WITH. They have no projection / FROM / WHERE / etc.;
         // dispatch before the SELECT-only path.
         switch (self.cur.tag) {
-            .kw_create, .kw_drop, .kw_use => return try parse_ddl.parseDdl(self),
+            .kw_create, .kw_drop, .kw_use, .kw_alter, .kw_rename, .kw_truncate => return try parse_ddl.parseDdl(self),
             .kw_show => return try parse_ddl.parseShow(self),
             .kw_explain => {
                 try self.advance(); // consume EXPLAIN

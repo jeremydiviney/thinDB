@@ -353,7 +353,7 @@ pub fn decodeSchema(allocator: Allocator, bytes: []const u8, cursor: *usize) !Ta
 
 /// Encode one AlterOp. Layout:
 ///   [op_tag u8]                          0=add, 1=drop, 2=rename
-///   add:     [name_len u32][name][type_tag u8][nullable u8][type_extra u32][value (tagged)]
+///   add:     [name_len u32][name][type_tag u8][nullable u8][type_extra u32][has_default u8][value?]
 ///   drop:    [name_len u32][name]
 ///   rename:  [from_len u32][from][to_len u32][to]
 pub fn encodeAlterOp(allocator: Allocator, out: *std.ArrayList(u8), op: AlterOp) !void {
@@ -364,7 +364,12 @@ pub fn encodeAlterOp(allocator: Allocator, out: *std.ArrayList(u8), op: AlterOp)
             try out.append(allocator, @intFromEnum(@as(TypeTag, a.type)));
             try out.append(allocator, @intFromBool(a.nullable));
             try appendU32(allocator, out, typeExtra(a.type));
-            try ir.encodeValue(allocator, out, a.default);
+            if (a.default) |default| {
+                try out.append(allocator, 1);
+                try ir.encodeValue(allocator, out, default);
+            } else {
+                try out.append(allocator, 0);
+            }
         },
         .drop => |name| {
             try out.append(allocator, 1);
@@ -395,12 +400,19 @@ pub fn decodeAlterOp(allocator: Allocator, bytes: []const u8, cursor: *usize) !A
             const extra = std.mem.readInt(u32, bytes[cursor.*..][0..4], .little);
             cursor.* += 4;
             const t = try typeFromTagAndExtra(tag_byte, extra);
-            const v = ir.decodeValue(bytes, cursor) catch return Error.WireCorrupt;
+            if (cursor.* + 1 > bytes.len) return Error.WireCorrupt;
+            const has_default = bytes[cursor.*];
+            cursor.* += 1;
+            const default: ?@import("../types.zig").Value = switch (has_default) {
+                0 => null,
+                1 => try dupeValue(allocator, ir.decodeValue(bytes, cursor) catch return Error.WireCorrupt),
+                else => return Error.WireCorrupt,
+            };
             break :blk AlterOp{ .add = .{
                 .name = try allocator.dupe(u8, name),
                 .type = t,
                 .nullable = nullable,
-                .default = try dupeValue(allocator, v),
+                .default = default,
             } };
         },
         1 => blk: {

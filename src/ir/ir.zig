@@ -80,6 +80,9 @@ pub const DdlOp = union(enum) {
     use_database_schema: struct { database: []const u8, schema: []const u8 },
     create_table: CreateTable,
     drop_table: DropTable,
+    rename_table: RenameTable,
+    alter_table_add_column: AlterTableAddColumn,
+    truncate_table: TableRef,
 };
 
 pub const ColumnDef = struct {
@@ -111,6 +114,16 @@ pub const CreateTable = struct {
 pub const DropTable = struct {
     table: TableRef,
     if_exists: bool,
+};
+
+pub const RenameTable = struct {
+    from: TableRef,
+    to: TableRef,
+};
+
+pub const AlterTableAddColumn = struct {
+    table: TableRef,
+    column: ColumnDef,
 };
 
 /// Side-effect: bulk insert literal rows. Lives outside DdlOp because
@@ -897,6 +910,9 @@ const DdlTag = enum(u8) {
     use_database_schema = 5,
     create_table = 6,
     drop_table = 7,
+    rename_table = 8,
+    alter_table_add_column = 9,
+    truncate_table = 10,
 };
 
 const TypeWireTag = enum(u8) {
@@ -1001,6 +1017,20 @@ fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
     };
 }
 
+fn encodeColumnDef(allocator: Allocator, out: *std.ArrayList(u8), c: ColumnDef) EncodeError!void {
+    try appendU32(allocator, out, @intCast(c.name.len));
+    try out.appendSlice(allocator, c.name);
+    try encodeType(allocator, out, c.column_type);
+    try out.append(allocator, @intFromBool(c.nullable));
+    if (c.default_value) |dv| {
+        try out.append(allocator, 1);
+        try encodeValue(allocator, out, dv);
+    } else {
+        try out.append(allocator, 0);
+    }
+    try out.append(allocator, @intFromBool(c.auto_increment));
+}
+
 fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeError!void {
     switch (d) {
         .create_database => |n| {
@@ -1041,12 +1071,7 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try out.append(allocator, @intFromBool(ct.if_not_exists));
             try out.append(allocator, @intFromBool(ct.is_temp));
             try appendU32(allocator, out, @intCast(ct.columns.len));
-            for (ct.columns) |c| {
-                try appendU32(allocator, out, @intCast(c.name.len));
-                try out.appendSlice(allocator, c.name);
-                try encodeType(allocator, out, c.column_type);
-                try out.append(allocator, @intFromBool(c.nullable));
-            }
+            for (ct.columns) |c| try encodeColumnDef(allocator, out, c);
             try appendU32(allocator, out, @intCast(ct.order_key.len));
             for (ct.order_key) |k| {
                 try appendU32(allocator, out, @intCast(k.len));
@@ -1057,6 +1082,20 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try out.append(allocator, @intFromEnum(DdlTag.drop_table));
             try encodeTableRef(allocator, out, dt.table);
             try out.append(allocator, @intFromBool(dt.if_exists));
+        },
+        .rename_table => |rt| {
+            try out.append(allocator, @intFromEnum(DdlTag.rename_table));
+            try encodeTableRef(allocator, out, rt.from);
+            try encodeTableRef(allocator, out, rt.to);
+        },
+        .alter_table_add_column => |at| {
+            try out.append(allocator, @intFromEnum(DdlTag.alter_table_add_column));
+            try encodeTableRef(allocator, out, at.table);
+            try encodeColumnDef(allocator, out, at.column);
+        },
+        .truncate_table => |ref| {
+            try out.append(allocator, @intFromEnum(DdlTag.truncate_table));
+            try encodeTableRef(allocator, out, ref);
         },
     }
 }
@@ -1892,11 +1931,37 @@ fn decodeOptString(bytes: []const u8, cursor: *usize) DecodeError!?[]const u8 {
     return try readString(bytes, cursor);
 }
 
+fn decodeColumnDef(bytes: []const u8, cursor: *usize) DecodeError!ColumnDef {
+    const name = try readString(bytes, cursor);
+    const ty = try decodeType(bytes, cursor);
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const nullable = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const has_default = bytes[cursor.*];
+    cursor.* += 1;
+    const default_value: ?Value = switch (has_default) {
+        0 => null,
+        1 => try decodeValue(bytes, cursor),
+        else => return Error.IrCorrupt,
+    };
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const auto_increment = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    return .{
+        .name = name,
+        .column_type = ty,
+        .nullable = nullable,
+        .default_value = default_value,
+        .auto_increment = auto_increment,
+    };
+}
+
 fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!DdlOp {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(DdlTag.drop_table)) return Error.IrCorrupt;
+    if (t > @intFromEnum(DdlTag.truncate_table)) return Error.IrCorrupt;
     const tag: DdlTag = @enumFromInt(t);
     return switch (tag) {
         .create_database => DdlOp{ .create_database = try readString(bytes, cursor) },
@@ -1922,14 +1987,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             cursor.* += 4;
             const cols = try allocator.alloc(ColumnDef, ncols);
             errdefer allocator.free(cols);
-            for (cols) |*c| {
-                const name = try readString(bytes, cursor);
-                const ty = try decodeType(bytes, cursor);
-                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
-                const nullable = bytes[cursor.*] != 0;
-                cursor.* += 1;
-                c.* = .{ .name = name, .column_type = ty, .nullable = nullable };
-            }
+            for (cols) |*c| c.* = try decodeColumnDef(bytes, cursor);
             if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
             const nkeys = readU32(bytes[cursor.* .. cursor.* + 4]);
             cursor.* += 4;
@@ -1951,6 +2009,17 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             cursor.* += 1;
             break :blk DdlOp{ .drop_table = .{ .table = ref, .if_exists = ie } };
         },
+        .rename_table => blk: {
+            const from = try decodeTableRef(bytes, cursor);
+            const to = try decodeTableRef(bytes, cursor);
+            break :blk DdlOp{ .rename_table = .{ .from = from, .to = to } };
+        },
+        .alter_table_add_column => blk: {
+            const ref = try decodeTableRef(bytes, cursor);
+            const column = try decodeColumnDef(bytes, cursor);
+            break :blk DdlOp{ .alter_table_add_column = .{ .table = ref, .column = column } };
+        },
+        .truncate_table => DdlOp{ .truncate_table = try decodeTableRef(bytes, cursor) },
     };
 }
 
@@ -2348,6 +2417,38 @@ test "ir: decode rejects truncated input" {
     const allocator = std.testing.allocator;
     const short = [_]u8{ 't', 'D', 'B' };
     try std.testing.expectError(Error.IrTooSmall, decode(allocator, &short));
+}
+
+test "ir: ddl rename alter-add and truncate round-trip" {
+    const allocator = std.testing.allocator;
+    const cases = [_]Op{
+        .{ .ddl = .{ .rename_table = .{
+            .from = .{ .name = "a" },
+            .to = .{ .name = "b" },
+        } } },
+        .{ .ddl = .{ .alter_table_add_column = .{
+            .table = .{ .name = "t" },
+            .column = .{
+                .name = "score",
+                .column_type = .int,
+                .nullable = false,
+                .default_value = .{ .int = 0 },
+            },
+        } } },
+        .{ .ddl = .{ .truncate_table = .{ .name = "t" } } },
+    };
+
+    for (cases) |root| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try encode(allocator, &buf, root);
+
+        var decoded = try decode(allocator, buf.items);
+        defer decoded.deinitDecoded(allocator);
+
+        try std.testing.expect(decoded == .ddl);
+        try std.testing.expectEqual(@as(std.meta.Tag(DdlOp), root.ddl), @as(std.meta.Tag(DdlOp), decoded.ddl));
+    }
 }
 
 test "ir: select round-trips with multiple columns" {

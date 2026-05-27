@@ -923,6 +923,36 @@ pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*Api
     return sc.openTable(ref.name, .{});
 }
 
+const PersistentTableTarget = struct {
+    db_name: []const u8,
+    schema_name: []const u8,
+    schema: *DbSchema,
+    table_name: []const u8,
+};
+
+fn resolvePersistentTableTarget(catalog: *Catalog, session: Session, ref: ir.TableRef) !PersistentTableTarget {
+    var db_name: []const u8 = ref.database orelse session.current_db;
+    var schema_name: []const u8 = ref.schema orelse session.current_schema;
+    if (ref.database == null and ref.schema != null) {
+        if (splitDoubleUnderscore(ref.schema.?)) |parts| {
+            db_name = parts.db;
+            schema_name = parts.schema;
+        }
+    }
+    const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
+    const sc = db.schema(schema_name) orelse return Error.SchemaNotFound;
+    return .{
+        .db_name = db_name,
+        .schema_name = schema_name,
+        .schema = sc,
+        .table_name = ref.name,
+    };
+}
+
+fn sameNamespace(a: PersistentTableTarget, b: PersistentTableTarget) bool {
+    return std.mem.eql(u8, a.db_name, b.db_name) and std.mem.eql(u8, a.schema_name, b.schema_name);
+}
+
 const NameParts = struct { db: []const u8, schema: []const u8 };
 
 /// Split `db__schema` into `(db, schema)` for MySQL-style flattened
@@ -3070,6 +3100,44 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                 ApiError.TableNotFound => if (!dt.if_exists) return Error.TableNotFound,
                 else => return thindb_api.remapError(Error, e),
             };
+        },
+        .rename_table => |rt| {
+            if (rt.from.database == null and rt.from.schema == null) {
+                if (ctx.session.temp_namespace) |ns| {
+                    if (ns.contains(rt.from.name)) return Error.UnsupportedOp;
+                }
+            }
+            const from = try resolvePersistentTableTarget(catalog, ctx.session.*, rt.from);
+            const to = try resolvePersistentTableTarget(catalog, ctx.session.*, rt.to);
+            if (!sameNamespace(from, to)) return Error.UnsupportedOp;
+            from.schema.renameTable(from.table_name, to.table_name) catch |e| return thindb_api.remapError(Error, e);
+        },
+        .alter_table_add_column => |at| {
+            if (at.table.database == null and at.table.schema == null) {
+                if (ctx.session.temp_namespace) |ns| {
+                    if (ns.contains(at.table.name)) return Error.UnsupportedOp;
+                }
+            }
+            const target = try resolvePersistentTableTarget(catalog, ctx.session.*, at.table);
+            const c = at.column;
+            if (c.auto_increment) return Error.UnsupportedOp;
+            if (c.default_value) |dv| {
+                if (types.ValueTag.fromType(c.column_type) != std.meta.activeTag(dv)) return Error.TypeMismatch;
+            } else if (!c.nullable) {
+                return Error.UnsupportedOp;
+            }
+            var ops = [_]AlterOp{.{ .add = .{
+                .name = c.name,
+                .type = c.column_type,
+                .nullable = c.nullable,
+                .default = c.default_value,
+            } }};
+            target.schema.alterTable(target.table_name, &ops) catch |e| return thindb_api.remapError(Error, e);
+        },
+        .truncate_table => |ref| {
+            const t = try resolveTable(catalog, ctx.session.*, ref);
+            try t.truncate();
+            ctx.affected_rows = 0;
         },
     }
     return try EmptyOp.create(ctx.allocator);
