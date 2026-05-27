@@ -116,6 +116,24 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks (always built ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
+    // ---- Isolated GROUP BY probe microbench: bench/groupby_micro.zig -------
+    // Standalone (imports group_table.zig directly — no thindb module), so it
+    // exercises only the high-card probe kernel with zero pipeline confounders.
+    const gbmicro_mod = b.createModule(.{
+        .root_source_file = b.path("bench/groupby_micro.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    // Import the whole thindb library: the bench reaches the probe kernels via
+    // `thindb.exec.group_table` and drives the REAL exec.Aggregate operator on
+    // synthetic in-memory batches (the faithful operator-machinery model).
+    gbmicro_mod.addImport("thindb", thindb_fast);
+    const gbmicro_exe = b.addExecutable(.{ .name = "gbmicro", .root_module = gbmicro_mod });
+    const run_gbmicro = b.addRunArtifact(gbmicro_exe);
+    if (b.args) |args| run_gbmicro.addArgs(args);
+    const gbmicro_step = b.step("gbmicro", "Run the isolated GROUP BY probe microbench (ReleaseFast)");
+    gbmicro_step.dependOn(&run_gbmicro.step);
+
     // ---- ClickBench loader: bench/clickbench/main.zig ----------------------
     const clickbench_mod = b.createModule(.{
         .root_source_file = b.path("bench/clickbench/main.zig"),

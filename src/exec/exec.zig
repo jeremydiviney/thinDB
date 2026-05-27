@@ -724,6 +724,8 @@ pub const Aggregate = aggregate_op.Aggregate;
 pub const AggFunc = aggregate_op.AggFunc;
 pub const AggSpec = aggregate_op.AggSpec;
 
+pub const group_table = @import("group_table.zig");
+
 pub const expr_mod = @import("expr.zig");
 pub const Expr = expr_mod.Expr;
 pub const scalar_fn = @import("scalar_fn.zig");
