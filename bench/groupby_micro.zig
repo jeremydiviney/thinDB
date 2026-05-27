@@ -1369,6 +1369,8 @@ const q32_experiments = [_]struct {
     .{ .name = "E0 full (probe+init+scatter+emit)", .run = q32_full },
     .{ .name = "REAL exec.Aggregate operator", .run = q32_real },
     .{ .name = "REAL op, COUNT(*) only (2 keys)", .run = q32_real_count_only },
+    .{ .name = "REAL Aggregate groupBy (full emit)", .run = q32_real_fullemit },
+    .{ .name = "REAL RadixAggregate op (full emit)", .run = q32_real_radix },
     .{ .name = "ER radix-partition P=32", .run = q32_radix32 },
     .{ .name = "ER radix-partition P=64", .run = q32_radix64 },
     .{ .name = "ER radix-partition P=128", .run = q32_radix128 },
@@ -1520,6 +1522,53 @@ fn q32_real_count_only(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
     return runRealAgg(a, d, &.{ "WatchID", "ClientIP" }, &.{
         .{ .func = .count, .col = null, .as = "c" },
     });
+}
+
+const q32_full_aggs = [_]texec.AggSpec{
+    .{ .func = .count, .col = null, .as = "c" },
+    .{ .func = .sum, .col = "IsRefresh", .as = "s" },
+    .{ .func = .avg, .col = "ResolutionWidth", .as = "avg" },
+};
+fn ckDrain(q: *texec.Query) !u64 {
+    var ck: u64 = 0;
+    while (try q.next()) |b| {
+        const wid = b.values[0].data.bigint;
+        const cip = b.values[1].data.int;
+        const cnt = b.values[2].data.bigint;
+        for (0..b.row_count) |r| ck ^= @as(u64, @bitCast(wid[r])) ^ @as(u64, @as(u32, @bitCast(cip[r]))) ^ @as(u64, @bitCast(cnt[r]));
+    }
+    return ck;
+}
+
+/// The REAL RadixAggregate operator (Phase 2b-i: single-table compact) over the
+/// synthetic Q32 source, full emit. Times create+drain+emit.
+fn q32_real_radix(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
+    const q0 = texec.makeQuery(a, try Q32Source.create(a, d));
+    const t0 = nowTicks();
+    var q = ra.RadixAggregate.create(a, q0, &.{ "WatchID", "ClientIP" }, q32_full_aggs[0..]) catch |e| {
+        var qq = q0;
+        qq.deinit();
+        return e;
+    };
+    defer q.deinit();
+    const ck = try ckDrain(&q);
+    return .{ .ticks = nowTicks() - t0, .cksum = ck };
+}
+
+/// The existing generic Aggregate via groupBy, FULL emit (no top-k) — the fair
+/// apples-to-apples baseline for q32_real_radix. Same checksum confirms identical
+/// results on the full 5M-group dataset.
+fn q32_real_fullemit(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
+    const q0 = texec.makeQuery(a, try Q32Source.create(a, d));
+    const t0 = nowTicks();
+    var q = q0.groupBy(&.{ "WatchID", "ClientIP" }, q32_full_aggs[0..]) catch |e| {
+        var qq = q0;
+        qq.deinit();
+        return e;
+    };
+    defer q.deinit();
+    const ck = try ckDrain(&q);
+    return .{ .ticks = nowTicks() - t0, .cksum = ck };
 }
 
 pub fn main() !void {
