@@ -30,6 +30,7 @@ const win = std.os.windows;
 const thindb = @import("thindb");
 const texec = thindb.exec;
 const gt = texec.group_table;
+const ra = texec.radix_aggregate;
 const IntTable96 = gt.IntKeyTable(96);
 const Column = thindb.types.Column;
 const ColumnView = thindb.storage.ColumnView;
@@ -1017,6 +1018,106 @@ fn q32_radix1p_acc4_128(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
     return q32Radix1PassAcc4(a, d, 7);
 }
 
+/// ER-compact — 2-pass radix P=128 driving the REAL radix_aggregate compact
+/// core (planCompact / scatter / finalize) for COUNT(*)/SUM/AVG. Validates the
+/// Phase-1 core inside the radix structure end-to-end and benches it against the
+/// hand-tuned acc4 kernels. Invariant checksum must match the other radix rows.
+fn q32_radix_compact(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
+    const schema = [_]Column{
+        .{ .name = "WatchID", .type = .bigint },
+        .{ .name = "ClientIP", .type = .int },
+        .{ .name = "IsRefresh", .type = .smallint },
+        .{ .name = "ResolutionWidth", .type = .smallint },
+    };
+    const aggs = [_]texec.AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .sum, .col = "IsRefresh", .as = "s" },
+        .{ .func = .avg, .col = "ResolutionWidth", .as = "avg" },
+    };
+    const agg_col_idx = [_]?usize{ null, 2, 3 };
+    const layout = (try ra.planCompact(a, &aggs, &agg_col_idx, &schema)).?;
+    defer layout.deinit(a);
+
+    const PBITS: u8 = 7;
+    const P: usize = @as(usize, 1) << @as(u6, @intCast(PBITS));
+    const SHIFT: u6 = @intCast(64 - @as(usize, PBITS));
+    const partcap = (N / P) * 7 / 5 + 64;
+    const maxpart = (N / P) * 2 + 64;
+
+    const srch = try a.alloc(u64, N);
+    defer a.free(srch);
+    const pkey = try a.alloc(u128, N);
+    defer a.free(pkey);
+    const phash = try a.alloc(u64, N);
+    defer a.free(phash);
+    const pref = try a.alloc(i16, N);
+    defer a.free(pref);
+    const pres = try a.alloc(i16, N);
+    defer a.free(pres);
+    const off = try a.alloc(usize, P + 1);
+    defer a.free(off);
+    const cur = try a.alloc(usize, P);
+    defer a.free(cur);
+    var t = try IntTable96.init(a, partcap);
+    defer t.deinit(a);
+    const gstate = try a.alloc(u64, (partcap + 1) * layout.words);
+    defer a.free(gstate);
+    const gidbuf = try a.alloc(u32, maxpart);
+    defer a.free(gidbuf);
+
+    const t0 = nowTicks();
+    @memset(off, 0);
+    for (0..N) |i| {
+        const h = IntTable96.hashKey(d.keyOf(i));
+        srch[i] = h;
+        off[(h >> SHIFT) + 1] += 1;
+    }
+    for (1..P + 1) |p| off[p] += off[p - 1];
+    @memcpy(cur, off[0..P]);
+    for (0..N) |i| {
+        const p = srch[i] >> SHIFT;
+        const j = cur[p];
+        cur[p] += 1;
+        pkey[j] = d.keyOf(i);
+        phash[j] = srch[i];
+        pref[j] = d.isref[i];
+        pres[j] = d.reswidth[i];
+    }
+    var total_groups: u64 = 0;
+    var total_count: u64 = 0;
+    for (0..P) |p| {
+        const lo = off[p];
+        const hi = off[p + 1];
+        const m = hi - lo;
+        for (t.slots) |*s| s.gid = gt.EMPTY;
+        var gid: u32 = 0;
+        for (0..m) |j| {
+            const idx = lo + j;
+            if (j + PF < m) @prefetch(t.slotAddr(t.bucketOf(phash[lo + j + PF])), .{ .rw = .write, .locality = 1 });
+            const probe = t.getOrPut(phash[idx], pkey[idx]);
+            if (probe.found) {
+                gidbuf[j] = probe.gid;
+            } else {
+                t.commit(probe.slot, pkey[idx], gid);
+                @memset(gstate[@as(usize, gid) * layout.words ..][0..layout.words], 0);
+                gidbuf[j] = gid;
+                gid += 1;
+            }
+        }
+        var vals = [_]ColumnView{
+            .{ .data = .{ .bigint = &[_]i64{} } },
+            .{ .data = .{ .int = &[_]i32{} } },
+            .{ .data = .{ .smallint = pref[lo..hi] } },
+            .{ .data = .{ .smallint = pres[lo..hi] } },
+        };
+        const pbatch = texec.Batch{ .schema = schema[0..], .values = vals[0..], .row_count = m };
+        ra.scatter(layout, gstate, gidbuf[0..m], pbatch);
+        total_groups += gid;
+        for (0..gid) |g| total_count += ra.finalize(layout, gstate, g, 0).int;
+    }
+    return .{ .ticks = nowTicks() - t0, .cksum = total_groups *% 0x100000001b3 ^ total_count };
+}
+
 fn q32_radix32(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
     return q32RadixImpl(a, d, 5);
 }
@@ -1282,6 +1383,7 @@ const q32_experiments = [_]struct {
     .{ .name = "ER-acc4 2-pass radix P=128 +4acc", .run = q32_radix_acc4_128 },
     .{ .name = "ER1-acc4 1-pass radix P=64 +4acc", .run = q32_radix1p_acc4_64 },
     .{ .name = "ER1-acc4 1-pass radix P=128 +4acc", .run = q32_radix1p_acc4_128 },
+    .{ .name = "ERC 2-pass radix P=128 REAL compact core", .run = q32_radix_compact },
     .{ .name = "ER2L 2-level radix 16x16=256 +4acc", .run = q32_radix2l_256 },
     .{ .name = "ER2L 2-level radix 16x32=512 +4acc", .run = q32_radix2l_512 },
     .{ .name = "ER2L 2-level radix 32x32=1024 +4acc", .run = q32_radix2l_1024 },
