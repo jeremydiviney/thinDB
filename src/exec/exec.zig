@@ -26,10 +26,13 @@ pub const memory = @import("../memory.zig");
 pub const prof = @import("../util/prof.zig");
 
 /// Diagnostic override for the GROUP BY path selection (see net/local.zig).
-/// `.auto` is normal cardinality/budget-based routing; `.hash` and `.sort`
-/// force the hash table or the sort+stream path respectively, bypassing the
-/// cardinality check. For benchmarking hash-vs-sort on the same query only.
-pub var force_group_by: enum { auto, hash, sort } = .auto;
+/// `.auto` is normal cardinality/budget-based routing; `.hash`, `.sort`, and
+/// `.radix` force the hash table, the sort+stream path, or the radix-partitioned
+/// aggregate respectively, bypassing the cardinality check (`.radix` still
+/// requires the query to qualify structurally: int key ≤128 bits, fixed-state
+/// aggregates). `.hash` also disables radix auto-routing. For benchmarking the
+/// paths on the same query only.
+pub var force_group_by: enum { auto, hash, sort, radix } = .auto;
 
 /// Benchmark override for the scan sub-batch size (rows). 0 = use the
 /// cache-aware auto size (`autoScanBatch`); >0 forces this many rows.
@@ -426,6 +429,15 @@ pub const Query = struct {
         defer self.allocator.free(keys);
         for (t.keys, keys) |src, *dst| dst.* = .{ .col = src.col, .desc = src.desc };
         return agg.Aggregate.create(self.allocator, self, group_cols, aggs, agg.TopKHint{ .k = t.k, .keys = keys }, emit_limit);
+    }
+
+    /// Radix-partitioned hash aggregation over a compact fixed-state core.
+    /// Standard high-cardinality path: int key ≤128 bits (native or dict-coded),
+    /// fixed-state aggregates only. A `top_k` hint (ORDER BY <agg> LIMIT k) emits
+    /// only the k most-preferred groups; the downstream OrderBy+Limit still
+    /// finalizes exact order. The router gates eligibility before calling.
+    pub fn radixGroupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("radix_aggregate.zig").TopK) !Query {
+        return @import("radix_aggregate.zig").RadixAggregate.create(self.allocator, self, group_cols, aggs, top_k);
     }
 
     /// Streaming sort-based grouped aggregation. Requires the input to be

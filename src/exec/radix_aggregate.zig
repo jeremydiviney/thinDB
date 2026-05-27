@@ -402,12 +402,45 @@ fn appendFinalized(allocator: Allocator, f: Finalized, col: *ColumnStore, out_ty
     }
 }
 
+/// A top-k hint for the operator: emit only the `k` groups most-preferred by a
+/// single ORDER BY key that resolves to an aggregate output (e.g. ORDER BY
+/// COUNT(*) DESC LIMIT k). The router passes this when the GROUP BY flows
+/// directly into `ORDER BY <agg> [DESC] LIMIT k`; otherwise the operator emits
+/// every group. Multi-key or group-column order keys fall back to full emit.
+pub const TopK = struct { k: u32, col: []const u8, desc: bool };
+
+const ResolvedTopK = struct { k: u32, agg_idx: usize, desc: bool };
+
+/// A comparable order value pulled from one group's finalized order aggregate.
+/// All groups share the active variant (set by the order aggregate's kind).
+const OrderVal = union(enum) {
+    i: i128,
+    f: f64,
+    /// True if `self` is preferred over `other` under direction `desc`.
+    fn preferred(self: OrderVal, other: OrderVal, desc: bool) bool {
+        return switch (self) {
+            .i => |v| if (desc) v > other.i else v < other.i,
+            .f => |v| if (desc) v > other.f else v < other.f,
+        };
+    }
+};
+
+fn orderValOf(layout: CompactLayout, state: []const u64, g: usize, ai: usize) OrderVal {
+    return switch (finalize(layout, state, g, ai)) {
+        .int => |c| .{ .i = @intCast(c) },
+        .sum_int => |v| .{ .i = v },
+        .signed => |v| .{ .i = v },
+        .float => |v| .{ .f = v },
+    };
+}
+
 /// Radix-partitioned aggregate operator (Phase 2b). Step (i): a single pre-sized
 /// compact-state table — no partitioning yet (added next). Drains the upstream,
 /// packs each row's int key, probes one group table, scatters via the compact
 /// core, and emits group columns (decoded from the packed key) + the finalized
-/// aggregates. Eligibility (int key ≤128 bits, fixed-state aggs) is the router's
-/// responsibility; `create` errors if the layouts don't apply.
+/// aggregates. With a `TopK` hint it emits only the k most-preferred groups
+/// (ORDER BY <agg> LIMIT k). Eligibility (int key ≤128 bits, fixed-state aggs)
+/// is the router's responsibility; `create` errors if the layouts don't apply.
 pub const RadixAggregate = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -421,9 +454,10 @@ pub const RadixAggregate = struct {
     output_columns: []ColumnStore,
     views: []ColumnView,
     cap_groups: usize,
+    top_k: ?ResolvedTopK,
     done: bool = false,
 
-    pub fn create(allocator: Allocator, upstream: Query, group_cols: []const []const u8, aggs: []const AggSpec) !Query {
+    pub fn create(allocator: Allocator, upstream: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?TopK) !Query {
         if (aggs.len == 0) return Error.AggregateNoSpecs;
         const up_schema = upstream.outputSchema();
 
@@ -480,6 +514,19 @@ pub const RadixAggregate = struct {
         }
         const cap_groups: usize = if (known and est > 0) @intCast(@min(est, @max(st.upper_rows, 1))) else 4096;
 
+        // Resolve the top-k hint: its order column must be one of the aggregate
+        // outputs (a fixed-state numeric value). A group-column or unknown order
+        // key leaves it unresolved → full emit (the router shouldn't route those).
+        var resolved_tk: ?ResolvedTopK = null;
+        if (top_k) |tk| {
+            for (aggs, 0..) |a, ai| {
+                if (types.columnNameEql(a.as, tk.col)) {
+                    resolved_tk = .{ .k = tk.k, .agg_idx = ai, .desc = tk.desc };
+                    break;
+                }
+            }
+        }
+
         const self = try allocator.create(RadixAggregate);
         self.* = .{
             .allocator = allocator,
@@ -494,6 +541,7 @@ pub const RadixAggregate = struct {
             .output_columns = out_cols,
             .views = views,
             .cap_groups = @max(cap_groups, 256),
+            .top_k = resolved_tk,
         };
         return makeQuery(allocator, self);
     }
@@ -502,11 +550,21 @@ pub const RadixAggregate = struct {
         const aa = self.arena.allocator();
         const words = self.compact.words;
         const layout = self.int_layout;
-        var table = try Table.init(aa, self.cap_groups);
+        // Adaptive sizing (mirrors aggregate.zig #295): start modest and grow
+        // straight to the provable ceiling on the first overflow. `cap_groups`
+        // is a min(∏NDV, upper_rows) UPPER bound — a selective filter over a
+        // high-table-wide-NDV key (Q40/Q41) over-estimates it wildly, so presizing
+        // to it would allocate+fault a multi-million-slot table for a few-K-group
+        // result. Starting small keeps those cache-resident; true high-card (Q32)
+        // overflows once and jumps to the ceiling.
+        const ADAPTIVE_INITIAL: usize = 1 << 16;
+        const init_cap = @min(self.cap_groups, ADAPTIVE_INITIAL);
+        var table = try Table.init(aa, init_cap);
+        if (self.cap_groups > init_cap) table.grow_target = gt.capacityFor(self.cap_groups);
         var gstate: std.ArrayListUnmanaged(u64) = .empty;
         var gkeys: std.ArrayListUnmanaged(u128) = .empty;
-        try gstate.ensureTotalCapacity(aa, self.cap_groups * words);
-        try gkeys.ensureTotalCapacity(aa, self.cap_groups);
+        try gstate.ensureTotalCapacity(aa, init_cap * words);
+        try gkeys.ensureTotalCapacity(aa, init_cap);
         var kb: std.ArrayListUnmanaged(u128) = .empty;
         var hb: std.ArrayListUnmanaged(u64) = .empty;
         var gidbuf: std.ArrayListUnmanaged(u32) = .empty;
@@ -552,15 +610,52 @@ pub const RadixAggregate = struct {
             scatter(self.compact, gstate.items, gidbuf.items[0..n], batch);
         }
 
-        // Emit: decode each group's key + finalize its aggregates into the
-        // allocator-owned output columns (independent of the arena).
-        for (0..n_groups) |g| {
-            try agg.appendIntGroupKey(self.allocator, gkeys.items[g], layout, self.output_columns[0..self.group_col_indices.len]);
-            for (self.compact.aggs, 0..) |_, ai| {
-                const oi = self.group_col_indices.len + ai;
-                try appendFinalized(self.allocator, finalize(self.compact, gstate.items, g, ai), &self.output_columns[oi], self.output_schema[oi].type);
+        try self.emitGroups(gstate.items, gkeys.items[0..n_groups]);
+    }
+
+    /// Emit group `g`'s row into the allocator-owned output columns: decode its
+    /// key into the group columns + finalize each aggregate.
+    fn emitOne(self: *RadixAggregate, gstate: []const u64, g: usize, key: u128) !void {
+        try agg.appendIntGroupKey(self.allocator, key, self.int_layout, self.output_columns[0..self.group_col_indices.len]);
+        for (self.compact.aggs, 0..) |_, ai| {
+            const oi = self.group_col_indices.len + ai;
+            try appendFinalized(self.allocator, finalize(self.compact, gstate, g, ai), &self.output_columns[oi], self.output_schema[oi].type);
+        }
+    }
+
+    /// Emit every group, or — with a resolved top-k hint — only the k most-
+    /// preferred by the order aggregate (linear k-slot selection; the downstream
+    /// ORDER BY re-sorts the small set, so emit order doesn't matter). `gkeys`
+    /// is indexed by gid 0..n_groups.
+    fn emitGroups(self: *RadixAggregate, gstate: []const u64, gkeys: []const u128) !void {
+        const tk = self.top_k orelse {
+            for (0..gkeys.len) |g| try self.emitOne(gstate, g, gkeys[g]);
+            return;
+        };
+        const k = @min(@as(usize, tk.k), gkeys.len);
+        if (k == 0) return;
+        const aa = self.arena.allocator();
+        const sel = try aa.alloc(usize, k);
+        const ov = try aa.alloc(OrderVal, k);
+        var len: usize = 0;
+        for (0..gkeys.len) |g| {
+            const v = orderValOf(self.compact, gstate, g, tk.agg_idx);
+            if (len < k) {
+                sel[len] = g;
+                ov[len] = v;
+                len += 1;
+                continue;
+            }
+            var worst: usize = 0;
+            for (1..k) |i| if (ov[worst].preferred(ov[i], tk.desc)) {
+                worst = i;
+            };
+            if (v.preferred(ov[worst], tk.desc)) {
+                sel[worst] = g;
+                ov[worst] = v;
             }
         }
+        for (0..len) |i| try self.emitOne(gstate, sel[i], gkeys[sel[i]]);
     }
 
     pub fn next(self: *RadixAggregate) !?Batch {
@@ -688,7 +783,7 @@ test "RadixAggregate matches the generic Aggregate (count/sum/avg/min/max)" {
         .{ .func = .max, .col = "v", .as = "mx" },
     };
 
-    var qr = try RadixAggregate.create(ta, makeQuery(ta, try TestSource.create(ta, &k, &v)), group_cols[0..], aggs[0..]);
+    var qr = try RadixAggregate.create(ta, makeQuery(ta, try TestSource.create(ta, &k, &v)), group_cols[0..], aggs[0..], null);
     defer qr.deinit();
     const rr = try collectDiffRows(ta, &qr);
     defer ta.free(rr);
@@ -707,6 +802,33 @@ test "RadixAggregate matches the generic Aggregate (count/sum/avg/min/max)" {
         try std.testing.expectEqual(e.mn, g.mn);
         try std.testing.expectEqual(e.mx, g.mx);
     }
+}
+
+test "RadixAggregate top-k emits only the k most-preferred groups" {
+    const ta = std.testing.allocator;
+    // Distinct SUM(v) per group so the top-k set is unambiguous (no ties).
+    // g1:sum100 g2:sum30 g3:sum5 g4:sum80 g5:sum1 → top-2 desc = {g1,g4}.
+    const k = [_]i32{ 1, 2, 2, 3, 4, 4, 5 };
+    const v = [_]i16{ 100, 10, 20, 5, 40, 40, 1 };
+    const group_cols = [_][]const u8{"k"};
+    const aggs = [_]AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .sum, .col = "v", .as = "s" },
+        .{ .func = .avg, .col = "v", .as = "a" },
+        .{ .func = .min, .col = "v", .as = "mn" },
+        .{ .func = .max, .col = "v", .as = "mx" },
+    };
+
+    var qr = try RadixAggregate.create(ta, makeQuery(ta, try TestSource.create(ta, &k, &v)), group_cols[0..], aggs[0..], .{ .k = 2, .col = "s", .desc = true });
+    defer qr.deinit();
+    const rr = try collectDiffRows(ta, &qr);
+    defer ta.free(rr);
+
+    try std.testing.expectEqual(@as(usize, 2), rr.len);
+    try std.testing.expectEqual(@as(i32, 1), rr[0].k); // g1, sum 100
+    try std.testing.expectEqual(@as(i64, 100), rr[0].s);
+    try std.testing.expectEqual(@as(i32, 4), rr[1].k); // g4, sum 80
+    try std.testing.expectEqual(@as(i64, 80), rr[1].s);
 }
 
 // ---------------------------------------------------------------------------

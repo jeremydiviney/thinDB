@@ -1850,6 +1850,9 @@ pub fn buildServerQuerySession(
             if (try routeStreamGroupBy(allocator, &upstream, g.group_cols, g.aggs, db.config.query_memory_budget)) |q| {
                 break :blk q;
             }
+            if (try routeRadixGroupBy(upstream, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| {
+                break :blk q;
+            }
             break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
         },
         .compute => |c| blk: {
@@ -2237,7 +2240,7 @@ fn routeStreamGroupBy(
     if (group_cols.len == 0) return null;
     const st = upstream.stats();
     switch (exec.force_group_by) {
-        .hash => return null,
+        .hash, .radix => return null,
         .sort => {
             const specs = try allocator.alloc(exec.SortSpec, group_cols.len);
             defer allocator.free(specs);
@@ -2259,6 +2262,89 @@ fn routeStreamGroupBy(
             return null;
         },
     }
+}
+
+/// Est. group-table size (groups × per-group state+key) above which `.auto`
+/// routes to the radix-partitioned aggregate. Below it, the table is cache-
+/// resident and the hash path's inline-state / count-slot fast paths win.
+const RADIX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Radix-partitioned aggregate routing — the standard high-cardinality path.
+/// Returns a RadixAggregate Query when the GROUP BY qualifies: a native integer
+/// key (string/dict-coded keys still take the coded paths the radix operator
+/// doesn't carry yet), fixed-state aggregates, and either no LIMIT or a single-
+/// key `ORDER BY <agg> LIMIT k` (the downstream OrderBy+Limit re-finalizes
+/// order). Under `.auto` a cache-model gate restricts it to high-cardinality
+/// cases; `--force-group-by radix` skips that gate (still requires the query to
+/// qualify structurally). Returns null to fall through to the hash
+/// `groupByTopK`; consumes `upstream` into the returned Query only on success.
+fn routeRadixGroupBy(
+    upstream: Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    top_k: ?ir.Op.TopK,
+    emit_limit: ?u32,
+) !?Query {
+    switch (exec.force_group_by) {
+        .hash, .sort => return null,
+        .auto, .radix => {},
+    }
+    if (group_cols.len == 0) return null;
+    // Top-k emit covers single-key `ORDER BY <agg> LIMIT k` only; a bare LIMIT
+    // (emit_limit) is better served by the hash path's insertion-order early-out.
+    if (emit_limit != null) return null;
+    if (top_k) |tk| {
+        if (tk.keys.len != 1) return null;
+    }
+
+    const schema = upstream.outputSchema();
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse return null;
+        switch (schema[idx].type) {
+            .varchar, .string, .char => return null,
+            else => {},
+        }
+    }
+
+    if (exec.force_group_by == .auto) {
+        // The single-int-key COUNT(*) shape has a specialized count-in-slot
+        // group table on the hash path that beats the generic compact core.
+        if (group_cols.len == 1 and aggs.len == 1 and aggs[0].func == .count and aggs[0].col == null) return null;
+
+        const st = upstream.stats();
+        var est: u64 = 1;
+        var known = true;
+        for (group_cols) |gc| {
+            const idx = types.findColumn(schema, gc).?;
+            if (idx >= st.column_stats.len) {
+                known = false;
+                break;
+            }
+            switch (st.column_stats[idx].ndv) {
+                .exact => |nd| est *|= nd,
+                .unknown => {
+                    known = false;
+                    break;
+                },
+            }
+        }
+        if (!known) return null;
+        est = @min(est, @max(st.upper_rows, 1));
+        const per_group_bytes: u64 = @as(u64, aggs.len) * 16 + 16; // ≈ state + key
+        if (est *| per_group_bytes <= RADIX_CACHE_BYTES) return null;
+    }
+
+    const rtk: ?exec.radix_aggregate.TopK = if (top_k) |tk|
+        .{ .k = tk.k, .col = tk.keys[0].col, .desc = tk.keys[0].desc }
+    else
+        null;
+
+    // create declines (cleanly, without consuming upstream) when the key won't
+    // pack into ≤128 bits or an aggregate isn't fixed-state — fall through.
+    return upstream.radixGroupBy(group_cols, aggs, rtk) catch |e| switch (e) {
+        error.UnsupportedOperatorForType, error.AggregateUnsupportedType => null,
+        else => e,
+    };
 }
 
 fn groupKeysCardUnderLimit(
@@ -2618,6 +2704,11 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             if (agg_args.len > 0) upstream = try upstream.compute(agg_args);
             // Global aggregate (no group keys) is O(1) — always hash.
             if (try routeStreamGroupBy(ctx.allocator, &upstream, g.group_cols, g.aggs, ctx.db.config.query_memory_budget)) |q| {
+                break :blk q;
+            }
+            // Native-int-key high-card GROUP BY → radix aggregate. Gated to
+            // non-string keys, so it never shadows the dict-coded paths below.
+            if (try routeRadixGroupBy(upstream, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| {
                 break :blk q;
             }
             // Phase 4.2: a single string group key over a bare scan (no WHERE /

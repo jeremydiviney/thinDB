@@ -1371,6 +1371,7 @@ const q32_experiments = [_]struct {
     .{ .name = "REAL op, COUNT(*) only (2 keys)", .run = q32_real_count_only },
     .{ .name = "REAL Aggregate groupBy (full emit)", .run = q32_real_fullemit },
     .{ .name = "REAL RadixAggregate op (full emit)", .run = q32_real_radix },
+    .{ .name = "REAL RadixAggregate op (top-10)", .run = q32_real_radix_topk },
     .{ .name = "ER radix-partition P=32", .run = q32_radix32 },
     .{ .name = "ER radix-partition P=64", .run = q32_radix64 },
     .{ .name = "ER radix-partition P=128", .run = q32_radix128 },
@@ -1545,7 +1546,23 @@ fn ckDrain(q: *texec.Query) !u64 {
 fn q32_real_radix(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
     const q0 = texec.makeQuery(a, try Q32Source.create(a, d));
     const t0 = nowTicks();
-    var q = ra.RadixAggregate.create(a, q0, &.{ "WatchID", "ClientIP" }, q32_full_aggs[0..]) catch |e| {
+    var q = ra.RadixAggregate.create(a, q0, &.{ "WatchID", "ClientIP" }, q32_full_aggs[0..], null) catch |e| {
+        var qq = q0;
+        qq.deinit();
+        return e;
+    };
+    defer q.deinit();
+    const ck = try ckDrain(&q);
+    return .{ .ticks = nowTicks() - t0, .cksum = ck };
+}
+
+/// The REAL RadixAggregate operator with the Q32 top-10 hint (ORDER BY c DESC
+/// LIMIT 10) — comparable to `q32_real` (generic top-10 at ~249 ms). Selection
+/// happens at emit, so only 10 rows leave the operator.
+fn q32_real_radix_topk(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
+    const q0 = texec.makeQuery(a, try Q32Source.create(a, d));
+    const t0 = nowTicks();
+    var q = ra.RadixAggregate.create(a, q0, &.{ "WatchID", "ClientIP" }, q32_full_aggs[0..], .{ .k = 10, .col = "c", .desc = true }) catch |e| {
         var qq = q0;
         qq.deinit();
         return e;
