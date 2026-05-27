@@ -1117,6 +1117,7 @@ pub const Scan = struct {
         rg_count: u32,
         expr: PredicateExpr,
     ) !usize {
+        if (try self.tryFusedLeafGather(seg, rg_idx, rg_count, expr)) |m| return m;
         const tomb_mask = try self.tombstoneMask(rg_first, rg_count);
         defer if (tomb_mask) |m| self.allocator.free(m);
 
@@ -1417,6 +1418,159 @@ pub const Scan = struct {
                 out[i] = false;
             }
         }
+    }
+
+    fn fcmpFor(comptime o: PredicateOp, v: i128, w: i128) bool {
+        return switch (o) { .eq => v == w, .neq => v != w, .lt => v < w, .lte => v <= w, .gt => v > w, .gte => v >= w };
+    }
+
+    /// Fused single-pass compare+gather: when the filter is a single comparison
+    /// leaf whose ONLY projected column is that same (non-nullable, FOR-encoded)
+    /// int column, decode + compare + branchlessly gather survivors in ONE pass —
+    /// instead of the general path's two O(rows) passes (SIMD compare → bool mask,
+    /// then a second borrow + gather re-reading the codes) plus the survivor count.
+    /// Returns the survivor count, or null when the shape doesn't fit (caller runs
+    /// the normal path). The common `WHERE k <op> c GROUP BY k` / `COUNT(*) WHERE
+    /// k <op> c` shape.
+    fn tryFusedLeafGather(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, expr: PredicateExpr) !?usize {
+        if (self.n_coded != 0) return null;
+        if (self.out_phys.len != 1) return null;
+        if (self.cur_segment_tomb) |t| {
+            if (t.len != 0) return null;
+        }
+        const leaf = switch (expr) {
+            .leaf => |l| l,
+            else => return null,
+        };
+        const phys = self.out_phys[0];
+        if (!@import("../types.zig").columnNameEql(self.table.schema.columns[phys].name, leaf.col)) return null;
+        const col = self.table.schema.columns[phys];
+        if (col.nullable) return null;
+        switch (col.type) {
+            .int, .date, .smallint, .tinyint, .bigint, .datetime, .decimal64 => {},
+            else => return null, // ≤64-bit int family only (largeint/decimal128/float/string decline)
+        }
+        const want = predicate.valueToRangeI128(leaf.val) orelse return null;
+
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = false };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+        defer block.release(self.allocator, &self.table.cache);
+        const filtered = try self.ensureFilteredBuffers();
+        const matched: usize = switch (block.encoding) {
+            .for_ => fr: {
+                const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
+                if (fv.block.width != 1 and fv.block.width != 2 and fv.block.width != 4) return null;
+                filtered[0].clear();
+                break :fr try fusedGatherFor(self.allocator, &filtered[0], fv, rg_count, leaf.op, want);
+            },
+            // Raw int32/int64 only (point/range lookups on a full-range key like
+            // UserID). Other raw types decline to the general path.
+            .raw => rw: {
+                if (col.type != .int and col.type != .bigint) return null;
+                const view = storage.segment_reader.viewRawColumn(col.type, block.bytes, rg_count, flags, block.encoding) orelse return null;
+                filtered[0].clear();
+                break :rw (try fusedGatherRaw(self.allocator, &filtered[0], view, rg_count, leaf.op, want)) orelse return null;
+            },
+            else => return null,
+        };
+        self.filtered_coded = null;
+        return matched;
+    }
+
+    /// Raw int32/int64 sibling of `fusedGatherFor`: one pass comparing the native
+    /// value + branchless gather (no mask array, no count pass). Switches on the
+    /// destination's active tag for safety; returns null for any other type.
+    fn fusedGatherRaw(allocator: Allocator, dst: *ColumnStore, view: ColumnView, rg_count: u32, op: PredicateOp, want: i128) !?usize {
+        switch (dst.data) {
+            .int => |*list| {
+                if (view.data != .int) return null;
+                return try fusedGatherSlice(i32, allocator, list, view.data.int, rg_count, op, want);
+            },
+            .bigint => |*list| {
+                if (view.data != .bigint) return null;
+                return try fusedGatherSlice(i64, allocator, list, view.data.bigint, rg_count, op, want);
+            },
+            else => return null,
+        }
+    }
+
+    fn fusedGatherSlice(comptime T: type, allocator: Allocator, list: *std.ArrayList(T), src: []const T, rg_count: u32, op: PredicateOp, want: i128) !usize {
+        try list.ensureUnusedCapacity(allocator, rg_count);
+        list.items.len = rg_count;
+        const out = list.items;
+        var j: usize = 0;
+        var i: usize = 0;
+        // SIMD-screen each chunk; only scalar-gather chunks that have a match.
+        // For a 0-survivor point lookup (e.g. UserID = const) this stays pure
+        // vector compare + reduce — no per-row gather work, no mask array.
+        const N = comptime (std.simd.suggestVectorLength(T) orelse 1);
+        if (N > 1 and want >= std.math.minInt(T) and want <= std.math.maxInt(T)) {
+            const V = @Vector(N, T);
+            const wv: V = @splat(@as(T, @intCast(want)));
+            switch (op) {
+                inline else => |o| {
+                    while (i + N <= rg_count) : (i += N) {
+                        const v: V = src[i..][0..N].*;
+                        const m: @Vector(N, bool) = switch (o) {
+                            .eq => v == wv,
+                            .neq => v != wv,
+                            .lt => v < wv,
+                            .lte => v <= wv,
+                            .gt => v > wv,
+                            .gte => v >= wv,
+                        };
+                        if (@reduce(.Or, m)) {
+                            inline for (0..N) |k| {
+                                out[j] = src[i + k];
+                                j += @intFromBool(m[k]);
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        switch (op) {
+            inline else => |o| {
+                while (i < rg_count) : (i += 1) {
+                    const x = src[i];
+                    out[j] = x;
+                    j += @intFromBool(fcmpFor(o, @as(i128, x), want));
+                }
+            },
+        }
+        list.items.len = j;
+        return j;
+    }
+
+    fn fusedGatherFor(allocator: Allocator, dst: *ColumnStore, fv: storage.segment_reader.ForView, rg_count: u32, op: PredicateOp, want: i128) !usize {
+        return switch (dst.data) {
+            inline .int, .date, .smallint, .tinyint, .bigint, .datetime, .decimal64 => |*list| {
+                try list.ensureUnusedCapacity(allocator, rg_count);
+                list.items.len = rg_count;
+                const out = list.items;
+                const base: i128 = fv.block.base;
+                const codes = fv.block.codes;
+                var j: usize = 0;
+                switch (op) {
+                    inline else => |o| switch (fv.block.width) {
+                        inline 1, 2, 4 => |W| {
+                            const CW = std.meta.Int(.unsigned, W * 8);
+                            var i: usize = 0;
+                            while (i < rg_count) : (i += 1) {
+                                const code = std.mem.readInt(CW, codes[i * W ..][0..W], .little);
+                                const v: i128 = base +% @as(i128, code);
+                                out[j] = @intCast(v);
+                                j += @intFromBool(fcmpFor(o, v, want));
+                            }
+                        },
+                        else => unreachable,
+                    },
+                }
+                list.items.len = j;
+                return j;
+            },
+            else => unreachable,
+        };
     }
 
     /// Compact the masked survivors of every projected column into `filtered`.
