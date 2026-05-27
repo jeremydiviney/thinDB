@@ -2188,7 +2188,7 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
 /// affine-aggregate reduction to pin an int SUM base to i128). The override
 /// is only ever a wider-or-equal type than the canonical one, so finalize /
 /// append stay correct (`.largeint` appends the i128 accumulator directly).
-fn aggOutputTypeFor(a: AggSpec, in: ?Type) !Type {
+pub fn aggOutputTypeFor(a: AggSpec, in: ?Type) !Type {
     if (a.out_type_override) |t| return t;
     return aggOutputType(a.func, in);
 }
@@ -3072,7 +3072,7 @@ fn intKeyBits(t: Type) ?u8 {
 
 /// One group column's slot within the packed u128 key: its bit offset (from
 /// the low end) and width. Layout is column-order, column 0 in the lowest bits.
-const IntKeyField = struct {
+pub const IntKeyField = struct {
     offset: u8,
     bits: u8,
     type_tag: types.TypeTag,
@@ -3095,7 +3095,7 @@ const IntKeyTier = enum { bits32, bits96, bits128 };
 /// `planIntKey`; `null` when any group column isn't a fixed-width integer family
 /// or the widths sum past 128 bits — the operator then uses the byte-serialized
 /// key path.
-const IntKeyLayout = struct {
+pub const IntKeyLayout = struct {
     fields: []IntKeyField,
     tier: IntKeyTier,
     /// Per-field GlobalDict for coded fields (null for non-coded), parallel to
@@ -3117,7 +3117,7 @@ const IntKeyLayout = struct {
 /// `dicts[i]` is that column's GlobalDict (decoded back at emit). Passing a
 /// null mask reproduces the all-native behaviour. A coded field always fits a
 /// 32-bit slot, so a coded string counts as 32 bits toward the 128-bit budget.
-fn planIntKey(
+pub fn planIntKey(
     allocator: Allocator,
     group_col_indices: []const usize,
     up_schema: []const Column,
@@ -3418,7 +3418,7 @@ inline fn unpackField(comptime SignedT: type, key: u128, f: IntKeyField) SignedT
 /// Decode a packed u128 key back into the group output columns — the integer
 /// path's mirror of `appendGroupKey`. Reconstructs values bit-identically to
 /// what the byte path would have stored.
-fn appendIntGroupKey(
+pub fn appendIntGroupKey(
     allocator: Allocator,
     key: u128,
     layout: IntKeyLayout,
