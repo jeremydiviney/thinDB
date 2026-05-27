@@ -221,10 +221,6 @@ pub const CorrelatedSet = struct {
     negate: bool,
 };
 
-pub fn likeExpr(col: []const u8, pattern: []const u8) PredicateExpr {
-    return .{ .like = .{ .col = col, .pattern = pattern } };
-}
-
 /// Build a leaf predicate expression. Shorthand for `.{ .leaf = ... }`.
 pub fn leafExpr(col: []const u8, op: PredicateOp, val: Value) PredicateExpr {
     return .{ .leaf = .{ .col = col, .op = op, .val = val } };
@@ -980,6 +976,15 @@ fn cmpStr(a: []const u8, b: []const u8, op: PredicateOp) bool {
     };
 }
 
+/// `col = ''` / `col <> ''` from the offset array alone — a row is empty iff its
+/// two adjacent offsets are equal, so the (very common) empty-string filter never
+/// constructs a byte slice or runs `mem.order` per row. The adjacent-offset
+/// compare auto-vectorizes; NULL clearing is the caller's, as for `cmpStr`.
+fn emptyStringMask(sv: anytype, want_empty: bool, n: usize, mask: []bool) void {
+    const offs = sv.offsets;
+    for (0..n) |i| mask[i] = (offs[i + 1] == offs[i]) == want_empty;
+}
+
 /// Per-row range-correlation check. For each outer row:
 ///   1. Build the equi-key tuple from `outer_keys`. NULL in any key → no match.
 ///   2. Linear-scan `groups` for the matching key tuple.
@@ -1422,10 +1427,18 @@ pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bo
         .bigint => |s| cmpInto(i64, s[0..n], p.val.bigint, mask[0..n], op),
         .boolean => |s| cmpInto(u8, s[0..n], @intFromBool(p.val.boolean), mask[0..n], op),
         .varchar, .char => |sv| {
-            for (0..n) |i| mask[i] = cmpStr(sv.rowBytes(i), p.val.text, op);
+            if (p.val.text.len == 0 and (op == .eq or op == .neq)) {
+                emptyStringMask(sv, op == .eq, n, mask[0..n]);
+            } else {
+                for (0..n) |i| mask[i] = cmpStr(sv.rowBytes(i), p.val.text, op);
+            }
         },
         .string => |sv| {
-            for (0..n) |i| mask[i] = cmpStr(sv.rowBytes(i), p.val.text, op);
+            if (p.val.text.len == 0 and (op == .eq or op == .neq)) {
+                emptyStringMask(sv, op == .eq, n, mask[0..n]);
+            } else {
+                for (0..n) |i| mask[i] = cmpStr(sv.rowBytes(i), p.val.text, op);
+            }
         },
         .float => |s| cmpInto(f32, s[0..n], p.val.float, mask[0..n], op),
         .double => |s| cmpInto(f64, s[0..n], p.val.double, mask[0..n], op),

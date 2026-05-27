@@ -443,10 +443,6 @@ pub fn encodeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) !voi
     }
 }
 
-pub fn decodeValuePub(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
-    return decodeValue(tag, payload, cursor);
-}
-
 fn decodeValue(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
     const c = cursor.*;
     return switch (tag) {

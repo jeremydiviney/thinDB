@@ -206,8 +206,6 @@ const appendU16 = format.appendU16;
 const appendU32 = format.appendU32;
 const appendI128 = format.appendI128;
 const appendU64 = format.appendU64;
-const appendI32 = format.appendI32;
-const appendI64 = format.appendI64;
 
 /// Build the encoded (uncompressed) column-block payload, then try zstd-compress
 /// it via the shared `Compressor`. Keep whichever is smaller. Prepend the

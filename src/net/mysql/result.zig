@@ -75,10 +75,6 @@ fn mysqlTypeOf(t: types.Type) struct { type_byte: u8, decimals: u8, len: u32, ch
     };
 }
 
-pub fn mysqlTypeInfo(t: types.Type) struct { type_byte: u8, decimals: u8, len: u32, charset: u16 } {
-    return mysqlTypeOf(t);
-}
-
 pub fn appendColumnDef(
     allocator: Allocator,
     out: *std.ArrayList(u8),

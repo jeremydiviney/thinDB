@@ -200,22 +200,6 @@ pub fn sendQueryResult(
     return row_count;
 }
 
-/// Send an inline single-column / one-or-more-row result set whose cells
-/// are pre-formatted text values. Used by canned probe responses.
-pub fn sendStringColumnResult(
-    allocator: Allocator,
-    w: *std.Io.Writer,
-    col_name: []const u8,
-    rows: []const []const u8,
-) !void {
-    const cols = [_]Column{.{ .name = col_name, .type = .string }};
-    try sendRowDescription(allocator, w, cols[0..]);
-    for (rows) |v| {
-        const cells = [_]?[]const u8{v};
-        try sendDataRow(allocator, w, cells[0..]);
-    }
-}
-
 test "pgTypeOf maps thinDB types to expected OIDs" {
     try std.testing.expectEqual(OID_INT4, pgTypeOf(.int).oid);
     try std.testing.expectEqual(OID_INT8, pgTypeOf(.bigint).oid);

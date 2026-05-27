@@ -50,6 +50,19 @@ pub const StringStore = struct {
         try self.offsets.append(allocator, @intCast(self.bytes.items.len));
     }
 
+    /// Reserve room for `rows` more values totaling `bytes_len` more bytes, so a
+    /// run of `appendValueAssumeCapacity` never reallocs or branches on capacity
+    /// — the bulk-materialize fast path (`appendMaskedStringy`).
+    pub fn ensureUnusedValueCapacity(self: *StringStore, allocator: Allocator, rows: usize, bytes_len: usize) Allocator.Error!void {
+        try self.offsets.ensureUnusedCapacity(allocator, rows);
+        try self.bytes.ensureUnusedCapacity(allocator, bytes_len);
+    }
+
+    pub fn appendValueAssumeCapacity(self: *StringStore, slice: []const u8) void {
+        self.bytes.appendSliceAssumeCapacity(slice);
+        self.offsets.appendAssumeCapacity(@intCast(self.bytes.items.len));
+    }
+
     pub fn rowCount(self: StringStore) usize {
         return self.offsets.items.len - 1;
     }

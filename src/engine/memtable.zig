@@ -406,9 +406,9 @@ pub const Memtable = struct {
         // failure — the only realistic failure is OOM, which is terminal
         // in practice. If that limitation matters later, swap in a snapshot/
         // restore of every column's ArrayList lengths.
-        for (self.schema.columns, 0..) |sch_col, si| {
+        for (0..self.schema.columns.len) |si| {
             const view = column_views[batch_idx_for_schema[si]];
-            try self.appendColumnFromView(si, sch_col, view, row_count);
+            try self.appendColumnFromView(si, view, row_count);
         }
         self.row_count += @intCast(row_count);
     }
@@ -416,7 +416,6 @@ pub const Memtable = struct {
     fn appendColumnFromView(
         self: *Memtable,
         col_idx: usize,
-        sch_col: types.Column,
         view: ColumnView,
         row_count: usize,
     ) !void {
@@ -490,7 +489,6 @@ pub const Memtable = struct {
                         try self.appendNullToColumn(col_idx);
                     }
                 }
-                _ = sch_col;
                 return;
             },
         }
@@ -508,7 +506,6 @@ pub const Memtable = struct {
                 try col.appendValidBit(self.allocator, row, valid);
             }
         }
-        _ = sch_col;
     }
 
     fn isStringTag(t: types.TypeTag) bool {

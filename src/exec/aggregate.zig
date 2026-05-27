@@ -580,10 +580,12 @@ pub const Aggregate = struct {
         try self.computeOutputStats(up_schema);
 
         // No-GROUP-BY COUNT(DISTINCT int≤64): presize the membership set from
-        // the value column's cardinality estimate (capped like the combined
-        // path) so the 5M-row insert doesn't repeatedly grow+rehash on its way
-        // to ~1M entries. The cap protects a selective-filter case (Filter.stats
-        // pass `upper_rows` through) from a multi-MB zero-fill for a small set.
+        // the value column's cardinality estimate (capped at PRESIZE_CAP) so the
+        // 5M-row insert grows+rehashes only a couple of times on its way to ~1M
+        // entries. (`DistinctU64Set` stays 24 bytes to fit `AccState`, so it has
+        // no grow_target — unlike the grouped combined set below, it can only cap
+        // + double.) The cap protects a selective-filter case (Filter.stats pass
+        // `upper_rows` through) from a multi-MB zero-fill for a small set.
         if (group_col_indices.len == 0) {
             const st = self.upstream.stats();
             const aa = self.arena.allocator();
@@ -719,18 +721,31 @@ pub const Aggregate = struct {
                 const vt = up_schema[idx].type;
                 const vbits = intKeyBits(vt) orelse continue;
                 if (vbits > 64) continue;
-                var set_cap: usize = 0;
+                // The set holds ≤ one entry per distinct (gid, value) pair, so its
+                // size is bounded by the value column's cardinality estimate (the
+                // dominant term) plus 10% headroom, and in all cases by the row
+                // count — there is never an *unbounded* case at this stage, only
+                // "no tighter estimate than the rows". Allocate a modest initial
+                // (ADAPTIVE_INITIAL); on first overflow grow straight to that
+                // bound in one rehash rather than doubling repeatedly (which cost
+                // Q08 ~8 ms). Growing to the *estimate*, not the row count, is
+                // load-bearing: a high-card-but-not-unique value (Q08: 5M rows,
+                // ~1M distinct UserIDs) would otherwise jump to a 5M-slot / 128 MB
+                // table and eat ~16 ms of sentinel-fill.
+                const row_ceiling = @max(st.upper_rows, 1);
+                var bound: usize = row_ceiling;
                 if (idx < st.column_stats.len) {
                     switch (st.column_stats[idx].ndv) {
-                        .exact => |nd| set_cap = @intCast(@min(nd, @max(st.upper_rows, 1))),
+                        .exact => |nd| bound = @intCast(@min(nd +| nd / 10, row_ceiling)),
                         .unknown => {},
                     }
                 }
-                set_cap = @min(set_cap, PRESIZE_CAP);
+                const presize = @min(bound, ADAPTIVE_INITIAL);
                 slot.* = .{
-                    .table = IntTable96.init(aa, set_cap) catch try IntTable96.init(aa, 0),
+                    .table = IntTable96.init(aa, presize) catch try IntTable96.init(aa, 0),
                     .vbits = vbits,
                 };
+                if (bound > presize) slot.*.?.table.grow_target = group_table.capacityFor(bound);
                 if (cap > 0) slot.*.?.counts.ensureTotalCapacity(aa, cap) catch {};
             }
         }
@@ -1266,13 +1281,23 @@ pub const Aggregate = struct {
         self.pf_cd_hashes.clearRetainingCapacity();
         try self.pf_cd_keys.ensureTotalCapacity(aa, n);
         try self.pf_cd_hashes.ensureTotalCapacity(aa, n);
-        var r: usize = 0;
-        while (r < n) : (r += 1) {
-            if (has_nulls and !view.isValid(r)) continue;
-            const value_bits = distinctIntKey(view, @intCast(r));
-            const key = (@as(u128, gids[r]) << vbits) | value_bits;
-            self.pf_cd_keys.appendAssumeCapacity(key);
-            self.pf_cd_hashes.appendAssumeCapacity(IntTable96.hashKey(key));
+        // Hoist the column-type dispatch out of the per-row loop: bind the typed
+        // value slice once (inline switch) so the pack is a single monomorphized
+        // read+pack+hash, no per-row `distinctIntKey` union branch over 5M rows.
+        // Only int-family ≤64-bit columns reach here (the CombinedDistinct gate).
+        switch (view.data) {
+            inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |sl| {
+                const Child = @typeInfo(@TypeOf(sl)).pointer.child;
+                const bits: u8 = @bitSizeOf(Child);
+                for (0..n) |r| {
+                    if (has_nulls and !view.isValid(r)) continue;
+                    const value_bits = fieldBits(Child, sl[r], bits);
+                    const key = (@as(u128, gids[r]) << vbits) | value_bits;
+                    self.pf_cd_keys.appendAssumeCapacity(key);
+                    self.pf_cd_hashes.appendAssumeCapacity(IntTable96.hashKey(key));
+                }
+            },
+            else => unreachable,
         }
         const keys = self.pf_cd_keys.items;
         const hashes = self.pf_cd_hashes.items;
@@ -1386,7 +1411,7 @@ pub const Aggregate = struct {
     /// Lower the FOR-narrow inline table into `gkeys_int` / `gstate` so the
     /// existing emit / top-k dispatch runs unchanged. Walks the occupied slots,
     /// assigning a dense gid 0,1,2,…: reconstructs `value = base + code`, packs
-    /// it into the single-column u128 key exactly as `packIntKey` would (so
+    /// it into the single-column u128 key exactly as `orKeyColumn` would (so
     /// `appendIntGroupKey` decodes it identically), and lowers the i64 state into
     /// the matching `AccState` variant (`.sum_int` / `.min_int` / `.max_int`,
     /// mirroring `initialState`). A group whose value column was all-NULL keeps
@@ -1431,12 +1456,29 @@ pub const Aggregate = struct {
     /// Runs once per new group; also seeds each combined-distinct aggregate's
     /// gid-indexed counter with 0 so the count array stays in lockstep with the
     /// group gids.
+    ///
+    /// The per-aggregate initial values are invariant across groups, so they are
+    /// copied in bulk (one `memcpy`) from the precomputed `single_state` template
+    /// — which holds exactly `initialState(func, in_t)` per aggregate and is never
+    /// mutated on the grouped path. The prior code recomputed `initialState` (a
+    /// func/type switch + an upstream-schema lookup) and ran a capacity-checked
+    /// append for every aggregate of every one of millions of groups.
     fn appendInitialState(self: *Aggregate, aa: Allocator) !void {
-        const up_schema = self.upstream.outputSchema();
-        for (self.aggs, self.agg_col_indices, 0..) |a, maybe_idx, ai| {
-            const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
-            try self.gstate.append(aa, initialState(a.func, in_t));
-            if (self.cd[ai]) |*c| try c.counts.append(aa, 0);
+        try self.gstate.appendSlice(aa, self.single_state);
+        for (self.cd) |*maybe| {
+            if (maybe.*) |*c| try c.counts.append(aa, 0);
+        }
+    }
+
+    /// Like `appendInitialState` but assumes the caller pre-reserved `gstate`
+    /// capacity for this group's aggregates (the int hot path ensures the whole
+    /// batch's worst case up front). The combined-distinct `counts` array — only
+    /// present for COUNT(DISTINCT) aggregates and absent on the hot Q32-shape
+    /// path — still grows on demand.
+    fn appendInitialStateAssumeCap(self: *Aggregate, aa: Allocator) !void {
+        self.gstate.appendSliceAssumeCapacity(self.single_state);
+        for (self.cd) |*maybe| {
+            if (maybe.*) |*c| try c.counts.append(aa, 0);
         }
     }
 
@@ -1445,7 +1487,7 @@ pub const Aggregate = struct {
     /// table is grown for the whole batch up front so slot addresses stay stable
     /// across the look-ahead window. Generic over the slot-tier table type so
     /// the per-row probe specializes (no tier branch in the inner loop); the one
-    /// runtime tier decision is hoisted to `accumulateBatch`'s switch. `packIntKey`
+    /// runtime tier decision is hoisted to `accumulateBatch`'s switch. `orKeyColumn`
     /// keeps producing the full u128 — the table truncates/splits it losslessly
     /// to its tier on store (the layout guarantees the key fits).
     fn accumulateBatchIntT(self: *Aggregate, batch: Batch, comptime Table: type, table: *Table) !void {
@@ -1461,15 +1503,22 @@ pub const Aggregate = struct {
             self.gstate.ensureTotalCapacity(aa, table.slots.len * self.aggs.len) catch {};
             self.gkeys_int.ensureTotalCapacity(aa, table.slots.len) catch {};
         }
+        // Every row could be a new group; reserve for the worst case up front so
+        // the per-row new-group appends below are bounds-free (assume-capacity).
+        // After the (rare) grow this is a no-op check; it also `try`-propagates a
+        // genuine OOM that the grow-coupling above swallowed.
+        try self.gstate.ensureUnusedCapacity(aa, n * self.aggs.len);
+        try self.gkeys_int.ensureUnusedCapacity(aa, n);
 
-        // Phase (a): pack every row's key.
+        // Phase (a): pack every row's key, column-major — the per-column ValueView
+        // type switch runs once per group column per batch (in `orKeyColumn`)
+        // instead of once per column per row. Keys start at 0; each column ORs in
+        // its bit-field contribution.
         self.pf_int_keys.clearRetainingCapacity();
         try self.pf_int_keys.ensureTotalCapacity(aa, n);
-        var row: u32 = 0;
-        while (row < n) : (row += 1) {
-            self.pf_int_keys.appendAssumeCapacity(packIntKey(layout, batch, self.group_col_indices, row));
-        }
+        self.pf_int_keys.appendNTimesAssumeCapacity(0, n);
         const keys = self.pf_int_keys.items;
+        for (self.group_col_indices, layout.fields) |ci, f| orKeyColumn(keys, batch, ci, f);
 
         // Phase (b): probe with look-ahead prefetch, recording each row's gid.
         self.pf_gids.clearRetainingCapacity();
@@ -1491,8 +1540,8 @@ pub const Aggregate = struct {
                 const new_gid = self.n_groups;
                 self.n_groups += 1;
                 table.commit(probe.slot, key, new_gid);
-                try self.gkeys_int.append(aa, key);
-                try self.appendInitialState(aa);
+                self.gkeys_int.appendAssumeCapacity(key);
+                try self.appendInitialStateAssumeCap(aa);
                 break :blk new_gid;
             };
             self.pf_gids.appendAssumeCapacity(gid);
@@ -2164,7 +2213,7 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
 /// affine-aggregate reduction to pin an int SUM base to i128). The override
 /// is only ever a wider-or-equal type than the canonical one, so finalize /
 /// append stay correct (`.largeint` appends the i128 accumulator directly).
-fn aggOutputTypeFor(a: AggSpec, in: ?Type) !Type {
+pub fn aggOutputTypeFor(a: AggSpec, in: ?Type) !Type {
     if (a.out_type_override) |t| return t;
     return aggOutputType(a.func, in);
 }
@@ -3048,7 +3097,7 @@ fn intKeyBits(t: Type) ?u8 {
 
 /// One group column's slot within the packed u128 key: its bit offset (from
 /// the low end) and width. Layout is column-order, column 0 in the lowest bits.
-const IntKeyField = struct {
+pub const IntKeyField = struct {
     offset: u8,
     bits: u8,
     type_tag: types.TypeTag,
@@ -3071,14 +3120,14 @@ const IntKeyTier = enum { bits32, bits96, bits128 };
 /// `planIntKey`; `null` when any group column isn't a fixed-width integer family
 /// or the widths sum past 128 bits — the operator then uses the byte-serialized
 /// key path.
-const IntKeyLayout = struct {
+pub const IntKeyLayout = struct {
     fields: []IntKeyField,
     tier: IntKeyTier,
     /// Per-field GlobalDict for coded fields (null for non-coded), parallel to
     /// `fields`. Owned; empty when no field is coded.
     coded_dicts: []const ?*exec.GlobalDict = &.{},
 
-    fn deinit(self: IntKeyLayout, allocator: Allocator) void {
+    pub fn deinit(self: IntKeyLayout, allocator: Allocator) void {
         allocator.free(self.fields);
         if (self.coded_dicts.len > 0) allocator.free(@constCast(self.coded_dicts));
     }
@@ -3093,7 +3142,7 @@ const IntKeyLayout = struct {
 /// `dicts[i]` is that column's GlobalDict (decoded back at emit). Passing a
 /// null mask reproduces the all-native behaviour. A coded field always fits a
 /// 32-bit slot, so a coded string counts as 32 bits toward the 128-bit budget.
-fn planIntKey(
+pub fn planIntKey(
     allocator: Allocator,
     group_col_indices: []const usize,
     up_schema: []const Column,
@@ -3238,39 +3287,48 @@ inline fn fieldBits(comptime SignedT: type, v: SignedT, bits: u8) u128 {
     return @as(u128, u) & mask;
 }
 
-/// Pack the group columns of `row` into a single u128 key per `layout`. The raw
-/// stored value is used (matching the byte path, which also ignores group-column
-/// validity), so the two paths group identically.
-fn packIntKey(layout: IntKeyLayout, batch: Batch, group_col_indices: []const usize, row: u32) u128 {
-    var key: u128 = 0;
-    for (group_col_indices, layout.fields) |ci, f| {
-        if (f.coded) {
-            const code = batch.coded.?[ci].?.codes[row];
-            key |= fieldBits(u32, code, f.bits) << @intCast(f.offset);
-            continue;
-        }
-        const view = batch.values[ci];
-        const fb: u128 = switch (view.data) {
-            .boolean => |s| fieldBits(u8, s[row], f.bits),
-            .tinyint => |s| fieldBits(i8, s[row], f.bits),
-            .smallint => |s| fieldBits(i16, s[row], f.bits),
-            .int => |s| fieldBits(i32, s[row], f.bits),
-            .date => |s| fieldBits(i32, s[row], f.bits),
-            .bigint => |s| fieldBits(i64, s[row], f.bits),
-            .datetime => |s| fieldBits(i64, s[row], f.bits),
-            .decimal64 => |s| fieldBits(i64, s[row], f.bits),
-            .largeint => |s| fieldBits(i128, s[row], f.bits),
-            .decimal128 => |s| fieldBits(i128, s[row], f.bits),
-            .uuid => |s| fieldBits(u128, s[row], f.bits),
-            else => unreachable,
-        };
-        key |= fb << @intCast(f.offset);
+/// OR group column `ci`'s bit-field contribution into every row's u128 `key`
+/// per field `f`. Column-major: the ValueView type switch runs once here, then a
+/// tight row loop — hoisting the dispatch out of the caller's per-row key build
+/// (and letting the row loop vectorize). The raw stored value is used (matching
+/// the byte path, which also ignores group-column validity), so the two paths
+/// group identically. Same-payload variants share a prong via `inline`.
+pub fn orKeyColumn(keys: []u128, batch: Batch, ci: usize, f: IntKeyField) void {
+    const off: u7 = @intCast(f.offset);
+    const bits = f.bits;
+    if (f.coded) {
+        const codes = batch.coded.?[ci].?.codes;
+        for (keys, codes) |*k, code| k.* |= fieldBits(u32, code, bits) << off;
+        return;
     }
-    return key;
+    switch (batch.values[ci].data) {
+        .boolean => |s| for (keys, s) |*k, v| {
+            k.* |= fieldBits(u8, v, bits) << off;
+        },
+        .tinyint => |s| for (keys, s) |*k, v| {
+            k.* |= fieldBits(i8, v, bits) << off;
+        },
+        .smallint => |s| for (keys, s) |*k, v| {
+            k.* |= fieldBits(i16, v, bits) << off;
+        },
+        inline .int, .date => |s| for (keys, s) |*k, v| {
+            k.* |= fieldBits(i32, v, bits) << off;
+        },
+        inline .bigint, .datetime, .decimal64 => |s| for (keys, s) |*k, v| {
+            k.* |= fieldBits(i64, v, bits) << off;
+        },
+        inline .largeint, .decimal128 => |s| for (keys, s) |*k, v| {
+            k.* |= fieldBits(i128, v, bits) << off;
+        },
+        .uuid => |s| for (keys, s) |*k, v| {
+            k.* |= fieldBits(u128, v, bits) << off;
+        },
+        else => unreachable,
+    }
 }
 
 /// Pack a single integer-family group column's `value` into the u128 key,
-/// matching `packIntKey` for the one-column case (`fieldBits` of the column's
+/// matching `orKeyColumn` for the one-column case (`fieldBits` of the column's
 /// stored type at the field's offset). The inline-FOR lower produces keys
 /// `appendIntGroupKey` then decodes bit-identically to the canonical path.
 fn packSingleIntField(f: IntKeyField, value: i64) u128 {
@@ -3385,7 +3443,7 @@ inline fn unpackField(comptime SignedT: type, key: u128, f: IntKeyField) SignedT
 /// Decode a packed u128 key back into the group output columns — the integer
 /// path's mirror of `appendGroupKey`. Reconstructs values bit-identically to
 /// what the byte path would have stored.
-fn appendIntGroupKey(
+pub fn appendIntGroupKey(
     allocator: Allocator,
     key: u128,
     layout: IntKeyLayout,

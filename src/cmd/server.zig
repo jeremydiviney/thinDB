@@ -38,7 +38,7 @@ const usage_text =
     \\                          ~20% of physical RAM, floored at 256 MiB). Accepts raw bytes or a
     \\                          K/M/G suffix (e.g. 8G). Shared across all queries against a table;
     \\                          blocks in use are pinned and never evicted.
-    \\  --force-group-by S      Diagnostic: force GROUP BY path — auto (default) | hash | sort.
+    \\  --force-group-by S      Diagnostic: force GROUP BY path — auto (default) | hash | sort | radix.
     \\                          Bypasses cardinality routing; for hash-vs-sort benchmarking only.
     \\  --profile-ops           Print a per-operator INCLUSIVE time breakdown to stderr after each
     \\                          query (diagnostic; ~zero overhead when off). Self time of an operator
@@ -104,15 +104,25 @@ pub fn main(init: std.process.Init) !u8 {
             thindb.exec.prof.enabled = true;
             continue;
         }
+        if (try takeValue(arg, "--scan-batch", &args_iter, err_w)) |v| {
+            thindb.exec.scan_sub_batch = std.fmt.parseInt(usize, v, 10) catch {
+                try err_w.print("thindb-server: --scan-batch must be an integer, got: {s}\n", .{v});
+                try err_w.flush();
+                return 1;
+            };
+            continue;
+        }
         if (try takeValue(arg, "--force-group-by", &args_iter, err_w)) |v| {
             if (std.mem.eql(u8, v, "hash")) {
                 thindb.exec.force_group_by = .hash;
             } else if (std.mem.eql(u8, v, "sort")) {
                 thindb.exec.force_group_by = .sort;
+            } else if (std.mem.eql(u8, v, "radix")) {
+                thindb.exec.force_group_by = .radix;
             } else if (std.mem.eql(u8, v, "auto")) {
                 thindb.exec.force_group_by = .auto;
             } else {
-                try err_w.print("thindb-server: --force-group-by must be auto|hash|sort, got: {s}\n", .{v});
+                try err_w.print("thindb-server: --force-group-by must be auto|hash|sort|radix, got: {s}\n", .{v});
                 try err_w.flush();
                 return 1;
             }
