@@ -762,4 +762,5 @@ test {
     _ = rowloc;
     _ = @import("group_table.zig");
     _ = @import("global_dict.zig");
+    _ = @import("radix_aggregate.zig");
 }
