@@ -434,6 +434,35 @@ fn orderValOf(layout: CompactLayout, state: []const u64, g: usize, ai: usize) Or
     };
 }
 
+/// Min-heap on *preference*: the root is the least-preferred kept group, so a
+/// new candidate need only beat the root to earn a slot. `sel`/`ov` are kept in
+/// lockstep (gid + its order value). Sifts the node at `start` down over `[0,n)`.
+fn topkSiftDown(sel: []usize, ov: []OrderVal, start: usize, n: usize, desc: bool) void {
+    var i = start;
+    while (true) {
+        const l = 2 * i + 1;
+        const r = 2 * i + 2;
+        var least = i;
+        // ov[least].preferred(ov[c]) ⟺ child c is *less* preferred ⟹ bubble it up.
+        if (l < n and ov[least].preferred(ov[l], desc)) least = l;
+        if (r < n and ov[least].preferred(ov[r], desc)) least = r;
+        if (least == i) break;
+        std.mem.swap(usize, &sel[i], &sel[least]);
+        std.mem.swap(OrderVal, &ov[i], &ov[least]);
+        i = least;
+    }
+}
+
+fn topkBuildHeap(sel: []usize, ov: []OrderVal, desc: bool) void {
+    const n = sel.len;
+    if (n < 2) return;
+    var i = n / 2;
+    while (i > 0) {
+        i -= 1;
+        topkSiftDown(sel, ov, i, n, desc);
+    }
+}
+
 /// Radix-partitioned aggregate operator (Phase 2b). Step (i): a single pre-sized
 /// compact-state table — no partitioning yet (added next). Drains the upstream,
 /// packs each row's int key, probes one group table, scatters via the compact
@@ -624,9 +653,10 @@ pub const RadixAggregate = struct {
     }
 
     /// Emit every group, or — with a resolved top-k hint — only the k most-
-    /// preferred by the order aggregate (linear k-slot selection; the downstream
-    /// ORDER BY re-sorts the small set, so emit order doesn't matter). `gkeys`
-    /// is indexed by gid 0..n_groups.
+    /// preferred by the order aggregate, selected with a bounded min-heap
+    /// (O(n_groups·log k), vs the naive O(n_groups·k) scan-for-worst). The
+    /// downstream ORDER BY re-sorts the small kept set, so emit order doesn't
+    /// matter. `gkeys` is indexed by gid 0..n_groups.
     fn emitGroups(self: *RadixAggregate, gstate: []const u64, gkeys: []const u128) !void {
         const tk = self.top_k orelse {
             for (0..gkeys.len) |g| try self.emitOne(gstate, g, gkeys[g]);
@@ -644,15 +674,12 @@ pub const RadixAggregate = struct {
                 sel[len] = g;
                 ov[len] = v;
                 len += 1;
-                continue;
-            }
-            var worst: usize = 0;
-            for (1..k) |i| if (ov[worst].preferred(ov[i], tk.desc)) {
-                worst = i;
-            };
-            if (v.preferred(ov[worst], tk.desc)) {
-                sel[worst] = g;
-                ov[worst] = v;
+                if (len == k) topkBuildHeap(sel, ov, tk.desc);
+            } else if (v.preferred(ov[0], tk.desc)) {
+                // More preferred than the worst kept (the heap root) — evict it.
+                sel[0] = g;
+                ov[0] = v;
+                topkSiftDown(sel, ov, 0, k, tk.desc);
             }
         }
         for (0..len) |i| try self.emitOne(gstate, sel[i], gkeys[sel[i]]);
