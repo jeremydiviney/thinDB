@@ -580,10 +580,12 @@ pub const Aggregate = struct {
         try self.computeOutputStats(up_schema);
 
         // No-GROUP-BY COUNT(DISTINCT int≤64): presize the membership set from
-        // the value column's cardinality estimate (capped like the combined
-        // path) so the 5M-row insert doesn't repeatedly grow+rehash on its way
-        // to ~1M entries. The cap protects a selective-filter case (Filter.stats
-        // pass `upper_rows` through) from a multi-MB zero-fill for a small set.
+        // the value column's cardinality estimate (capped at PRESIZE_CAP) so the
+        // 5M-row insert grows+rehashes only a couple of times on its way to ~1M
+        // entries. (`DistinctU64Set` stays 24 bytes to fit `AccState`, so it has
+        // no grow_target — unlike the grouped combined set below, it can only cap
+        // + double.) The cap protects a selective-filter case (Filter.stats pass
+        // `upper_rows` through) from a multi-MB zero-fill for a small set.
         if (group_col_indices.len == 0) {
             const st = self.upstream.stats();
             const aa = self.arena.allocator();
@@ -719,41 +721,31 @@ pub const Aggregate = struct {
                 const vt = up_schema[idx].type;
                 const vbits = intKeyBits(vt) orelse continue;
                 if (vbits > 64) continue;
-                // Size the set from the value column's cardinality estimate plus
-                // 10% headroom (the HLL NDV can run a touch low), bounded by the
-                // row count. `ndv_known == false` ⟺ no estimate.
-                var full_cap: usize = 0;
-                var ndv_known = false;
+                // The set holds ≤ one entry per distinct (gid, value) pair, so its
+                // size is bounded by the value column's cardinality estimate (the
+                // dominant term) plus 10% headroom, and in all cases by the row
+                // count — there is never an *unbounded* case at this stage, only
+                // "no tighter estimate than the rows". Allocate a modest initial
+                // (ADAPTIVE_INITIAL); on first overflow grow straight to that
+                // bound in one rehash rather than doubling repeatedly (which cost
+                // Q08 ~8 ms). Growing to the *estimate*, not the row count, is
+                // load-bearing: a high-card-but-not-unique value (Q08: 5M rows,
+                // ~1M distinct UserIDs) would otherwise jump to a 5M-slot / 128 MB
+                // table and eat ~16 ms of sentinel-fill.
+                const row_ceiling = @max(st.upper_rows, 1);
+                var bound: usize = row_ceiling;
                 if (idx < st.column_stats.len) {
                     switch (st.column_stats[idx].ndv) {
-                        .exact => |nd| {
-                            const buffered = nd +| nd / 10;
-                            full_cap = @intCast(@min(buffered, @max(st.upper_rows, 1)));
-                            ndv_known = true;
-                        },
+                        .exact => |nd| bound = @intCast(@min(nd +| nd / 10, row_ceiling)),
                         .unknown => {},
                     }
                 }
-                // Start modest, then grow straight to `full_cap` (the ceiling) on
-                // first overflow — one rehash, never the repeated doublings that
-                // cost Q08 ~8 ms. A KNOWN estimate starts at PRESIZE_CAP: big
-                // enough that a selective filter the operator can't see (Q10/Q11
-                // estimate ~1M, but the filter leaves ~60K distinct) stays put
-                // instead of jumping to a multi-MB table. UNKNOWN has no estimate
-                // so the ceiling is the provable row bound; start at the small
-                // ADAPTIVE_INITIAL to keep the zero-fill tiny for the common
-                // modest case, and jump to the row bound only if it overflows.
-                var init_entries: usize = PRESIZE_CAP;
-                if (!ndv_known) {
-                    full_cap = @max(st.upper_rows, 1);
-                    init_entries = ADAPTIVE_INITIAL;
-                }
-                const presize = @min(full_cap, init_entries);
+                const presize = @min(bound, ADAPTIVE_INITIAL);
                 slot.* = .{
                     .table = IntTable96.init(aa, presize) catch try IntTable96.init(aa, 0),
                     .vbits = vbits,
                 };
-                if (full_cap > presize) slot.*.?.table.grow_target = group_table.capacityFor(full_cap);
+                if (bound > presize) slot.*.?.table.grow_target = group_table.capacityFor(bound);
                 if (cap > 0) slot.*.?.counts.ensureTotalCapacity(aa, cap) catch {};
             }
         }
