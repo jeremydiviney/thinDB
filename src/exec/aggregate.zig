@@ -719,18 +719,35 @@ pub const Aggregate = struct {
                 const vt = up_schema[idx].type;
                 const vbits = intKeyBits(vt) orelse continue;
                 if (vbits > 64) continue;
-                var set_cap: usize = 0;
+                // Size the set from the value column's cardinality estimate plus
+                // 10% headroom (the HLL NDV can run a touch low), bounded by the
+                // row count. `ndv_known == false` ⟺ no estimate.
+                var full_cap: usize = 0;
+                var ndv_known = false;
                 if (idx < st.column_stats.len) {
                     switch (st.column_stats[idx].ndv) {
-                        .exact => |nd| set_cap = @intCast(@min(nd, @max(st.upper_rows, 1))),
+                        .exact => |nd| {
+                            const buffered = nd +| nd / 10;
+                            full_cap = @intCast(@min(buffered, @max(st.upper_rows, 1)));
+                            ndv_known = true;
+                        },
                         .unknown => {},
                     }
                 }
-                set_cap = @min(set_cap, PRESIZE_CAP);
+                // Allocate the full estimate up front only when it's modest. A
+                // large estimate (or an unknown one) starts at PRESIZE_CAP and
+                // jumps to `full_cap` on first overflow: a selective filter the
+                // operator can't see (Q10/Q11 estimate ~1M, but the filter leaves
+                // ~60K distinct) would otherwise eat a multi-MB zero-fill, while
+                // the genuinely-large unfiltered case (Q08/Q09) still skips the
+                // intermediate rehashes — ~8 ms — by growing straight to target.
+                if (!ndv_known) full_cap = @min(PRESIZE_CAP, @max(st.upper_rows, 1));
+                const presize = @min(full_cap, PRESIZE_CAP);
                 slot.* = .{
-                    .table = IntTable96.init(aa, set_cap) catch try IntTable96.init(aa, 0),
+                    .table = IntTable96.init(aa, presize) catch try IntTable96.init(aa, 0),
                     .vbits = vbits,
                 };
+                if (full_cap > presize) slot.*.?.table.grow_target = group_table.capacityFor(full_cap);
                 if (cap > 0) slot.*.?.counts.ensureTotalCapacity(aa, cap) catch {};
             }
         }
