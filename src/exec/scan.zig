@@ -1556,6 +1556,42 @@ pub const Scan = struct {
                         inline 1, 2, 4 => |W| {
                             const CW = std.meta.Int(.unsigned, W * 8);
                             var i: usize = 0;
+                            // Width-1 SIMD screen for low-cardinality FOR columns:
+                            // `base+code <op> want` is order-preserving, so it equals
+                            // the code-space compare `code <op> (want-base)`. Vector-
+                            // screen the bytes and only scalar-gather chunks with a
+                            // match, so a selective filter stays mostly pure vector
+                            // compare instead of 5M scalar decode+compare iterations.
+                            if (W == 1) {
+                                const wc: i128 = want - base;
+                                if (wc >= 0 and wc <= std.math.maxInt(u8)) {
+                                    const wantcode: u8 = @intCast(wc);
+                                    const N = comptime (std.simd.suggestVectorLength(u8) orelse 1);
+                                    if (N > 1) {
+                                        const V = @Vector(N, u8);
+                                        const wv: V = @splat(wantcode);
+                                        while (i + N <= rg_count) : (i += N) {
+                                            const cv: V = codes[i..][0..N].*;
+                                            const m: @Vector(N, bool) = switch (o) {
+                                                .eq => cv == wv,
+                                                .neq => cv != wv,
+                                                .lt => cv < wv,
+                                                .lte => cv <= wv,
+                                                .gt => cv > wv,
+                                                .gte => cv >= wv,
+                                            };
+                                            if (@reduce(.Or, m)) {
+                                                const ma: [N]bool = m;
+                                                var k: usize = 0;
+                                                while (k < N) : (k += 1) {
+                                                    out[j] = @intCast(base +% @as(i128, codes[i + k]));
+                                                    j += @intFromBool(ma[k]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             while (i < rg_count) : (i += 1) {
                                 const code = std.mem.readInt(CW, codes[i * W ..][0..W], .little);
                                 const v: i128 = base +% @as(i128, code);
