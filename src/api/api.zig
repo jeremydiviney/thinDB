@@ -31,11 +31,10 @@ pub const SyncMode = enum { none, per_flush };
 /// Not supported in v1: `change_type` (per-value conversion is a separate
 /// piece of work). Use drop+add as a workaround if you need it.
 pub const AlterOp = union(enum) {
-    /// Append a new column. Existing rows get `default` as their value.
-    /// `default`'s active tag must match `type` (e.g., type=.int requires
-    /// `.int = N`); nullable columns may pass anything (the default is
-    /// only used as the placeholder bytes — the validity bit is set true
-    /// either way for existing rows).
+    /// Append a new column. Existing rows get `default` as their value
+    /// when provided; nullable columns may omit it to backfill SQL NULL.
+    /// NOT NULL columns must provide a default whose active tag matches
+    /// `type` (e.g., type=.int requires `.int = N`).
     add: AddColumn,
     /// Remove a column by name. Errors if the column is part of the order
     /// key (would change row identity).
@@ -48,7 +47,7 @@ pub const AlterOp = union(enum) {
         name: []const u8,
         type: @import("../types.zig").Type,
         nullable: bool = false,
-        default: @import("../types.zig").Value,
+        default: ?@import("../types.zig").Value = null,
     };
 
     pub const RenameColumn = struct {

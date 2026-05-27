@@ -99,4 +99,52 @@ describe("mysql table", () => {
       await conn.end().catch(() => undefined);
     }
   });
+
+  test("RENAME, ALTER ADD COLUMN, and TRUNCATE", async () => {
+    const conn: Connection = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+    });
+    try {
+      await conn.query("CREATE TABLE ddl_src (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+      await conn.query("INSERT INTO ddl_src VALUES (1, 10), (2, 20)");
+      await conn.query("RENAME TABLE ddl_src TO ddl_dst");
+      await conn.query("ALTER TABLE ddl_dst ADD COLUMN note TEXT");
+      await conn.query("ALTER TABLE ddl_dst ADD COLUMN score INT NOT NULL DEFAULT 0");
+
+      const [altered] = (await conn.query(
+        "SELECT id, note, score FROM ddl_dst ORDER BY id ASC",
+      )) as [Array<Record<string, unknown>>, unknown];
+      expect(altered.length).toBe(2);
+      expect(altered[0]?.note).toBeNull();
+      expect(Number(altered[0]?.score)).toBe(0);
+      expect(altered[1]?.note).toBeNull();
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const [truncateRes] = (await conn.query("TRUNCATE TABLE ddl_dst")) as [any, unknown];
+      expect(truncateRes.affectedRows).toBe(0);
+
+      const [empty] = (await conn.query("SELECT id FROM ddl_dst")) as [
+        Array<Record<string, unknown>>,
+        unknown,
+      ];
+      expect(empty.length).toBe(0);
+
+      await conn.query("INSERT INTO ddl_dst (id, qty) VALUES (3, 30)");
+      const [after] = (await conn.query("SELECT id, score FROM ddl_dst")) as [
+        Array<Record<string, unknown>>,
+        unknown,
+      ];
+      expect(after.length).toBe(1);
+      expect(String(after[0]?.id)).toBe("3");
+      expect(Number(after[0]?.score)).toBe(0);
+
+      await conn.query("DROP TABLE ddl_dst");
+    } finally {
+      await conn.end().catch(() => undefined);
+    }
+  });
 });

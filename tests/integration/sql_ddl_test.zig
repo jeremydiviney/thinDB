@@ -8,6 +8,8 @@ const std = @import("std");
 const thindb = @import("thindb");
 const helpers = @import("sql_helpers.zig");
 const runSql = helpers.runSql;
+const exec = helpers.exec;
+const collectBigints = helpers.collectBigints;
 const expectRunError = helpers.expectRunError;
 
 test "sql ddl: CREATE TABLE with inline PRIMARY KEY" {
@@ -18,7 +20,9 @@ test "sql ddl: CREATE TABLE with inline PRIMARY KEY" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL, age INT)",
     );
     defer q.deinit();
@@ -40,7 +44,9 @@ test "sql ddl: CREATE TABLE with table-level compound PRIMARY KEY" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "CREATE TABLE events (org_id INT NOT NULL, ts BIGINT NOT NULL, payload TEXT, PRIMARY KEY (org_id, ts))",
     );
     defer q.deinit();
@@ -140,6 +146,114 @@ test "sql ddl: DROP TABLE on missing table errors without IF EXISTS" {
     try expectRunError(allocator, db, "DROP TABLE ghost", thindb.net.Error.TableNotFound);
 }
 
+test "sql ddl: parser recognizes rename, alter add column, and truncate" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    {
+        const root = try thindb.sql.parse(arena.allocator(), "RENAME TABLE a TO b");
+        try std.testing.expect(root.* == .ddl);
+        try std.testing.expect(root.ddl == .rename_table);
+        try std.testing.expectEqualStrings("a", root.ddl.rename_table.from.name);
+        try std.testing.expectEqualStrings("b", root.ddl.rename_table.to.name);
+    }
+    {
+        const root = try thindb.sql.parse(arena.allocator(), "ALTER TABLE t ADD COLUMN note TEXT");
+        try std.testing.expect(root.* == .ddl);
+        try std.testing.expect(root.ddl == .alter_table_add_column);
+        try std.testing.expectEqualStrings("note", root.ddl.alter_table_add_column.column.name);
+    }
+    {
+        const root = try thindb.sql.parse(arena.allocator(), "TRUNCATE TABLE t");
+        try std.testing.expect(root.* == .ddl);
+        try std.testing.expect(root.ddl == .truncate_table);
+        try std.testing.expectEqualStrings("t", root.ddl.truncate_table.name);
+    }
+}
+
+test "sql ddl: RENAME TABLE moves data to the new name" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, 10), (2, 20)");
+    try exec(allocator, db, "RENAME TABLE src TO dst");
+
+    try expectRunError(allocator, db, "SELECT id FROM src", thindb.net.Error.TableNotFound);
+    const ids = try collectBigints(allocator, db, "SELECT id FROM dst ORDER BY id ASC");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, ids);
+}
+
+test "sql ddl: ALTER TABLE ADD COLUMN backfills nullable NULL and default values" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    try exec(allocator, db, "ALTER TABLE t ADD COLUMN note TEXT");
+    try exec(allocator, db, "ALTER TABLE t ADD COLUMN score INT NOT NULL DEFAULT 0");
+
+    {
+        var q = try runSql(allocator, db, "SELECT note, score FROM t ORDER BY id ASC");
+        defer q.deinit();
+        const batch = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 2), batch.row_count);
+        try std.testing.expect(!batch.values[0].isValid(0));
+        try std.testing.expect(!batch.values[0].isValid(1));
+        try std.testing.expectEqual(@as(i32, 0), batch.values[1].data.int[0]);
+        try std.testing.expectEqual(@as(i32, 0), batch.values[1].data.int[1]);
+        try std.testing.expect((try q.next()) == null);
+    }
+
+    try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (3, 30)");
+    {
+        var q = try runSql(allocator, db, "SELECT score FROM t WHERE id = 3");
+        defer q.deinit();
+        const batch = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 1), batch.row_count);
+        try std.testing.expectEqual(@as(i32, 0), batch.values[0].data.int[0]);
+    }
+}
+
+test "sql ddl: TRUNCATE TABLE clears persisted rows and preserves schema" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+        try exec(allocator, db, "INSERT INTO t VALUES (1, 10), (2, 20)");
+        const t = try db.openTable("t", .{});
+        try t.flush();
+        try exec(allocator, db, "TRUNCATE TABLE t");
+    }
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const ids = try collectBigints(allocator, db, "SELECT id FROM t ORDER BY id ASC");
+        defer allocator.free(ids);
+        try std.testing.expectEqual(@as(usize, 0), ids.len);
+        try exec(allocator, db, "INSERT INTO t VALUES (3, 30)");
+        const after = try collectBigints(allocator, db, "SELECT id FROM t ORDER BY id ASC");
+        defer allocator.free(after);
+        try std.testing.expectEqualSlices(i64, &[_]i64{3}, after);
+    }
+}
+
 test "sql insert: positional values into all columns" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -177,7 +291,9 @@ test "sql insert: named column list reorders source values" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, tag TEXT NOT NULL)",
     );
     defer q1.deinit();
@@ -207,7 +323,9 @@ test "sql insert: NULL into a nullable column" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, nickname TEXT)",
     );
     defer q1.deinit();
@@ -239,7 +357,9 @@ test "sql insert: NULL into a NOT NULL column errors" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
     );
     defer q1.deinit();
@@ -393,7 +513,9 @@ test "sql roundtrip: DECIMAL column from string literal" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, amt DECIMAL(10,2) NOT NULL)",
     );
     defer q1.deinit();
@@ -419,7 +541,9 @@ test "sql roundtrip: FLOAT and DOUBLE columns" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, f FLOAT NOT NULL, d DOUBLE NOT NULL)",
     );
     defer q1.deinit();
@@ -446,7 +570,9 @@ test "sql roundtrip: BOOLEAN column with TRUE/FALSE literals" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, active BOOLEAN NOT NULL)",
     );
     defer q1.deinit();

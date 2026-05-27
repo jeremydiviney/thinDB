@@ -40,6 +40,8 @@ const ColumnSource = union(enum) {
     from_old: usize,
     /// Synthesize N rows of this default value (add case).
     add_with_default: Value,
+    /// Synthesize N SQL NULL rows for a newly-added nullable column.
+    add_null,
 };
 
 /// Resolved plan: the new column list + how each one is populated.
@@ -81,7 +83,13 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
     // Seed from the old schema: each column carries its data forward.
     for (old.columns, 0..) |c, idx| {
         const name_copy = try aa.dupe(u8, c.name);
-        try cols.append(aa, .{ .name = name_copy, .type = c.type, .nullable = c.nullable });
+        try cols.append(aa, .{
+            .name = name_copy,
+            .type = c.type,
+            .nullable = c.nullable,
+            .default_value = if (c.default_value) |v| try cloneValue(aa, v) else null,
+            .auto_increment = c.auto_increment,
+        });
         try sources.append(aa, .{ .from_old = idx });
     }
 
@@ -102,16 +110,20 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
         },
         .add => |add| {
             if (findColumn(cols.items, add.name) != null) return api.Error.ColumnAlreadyExists;
-            if (!valueTagMatchesType(add.default, add.type)) return api.Error.UnsupportedAlterOp;
+            if (add.default) |default| {
+                if (!valueTagMatchesType(default, add.type)) return api.Error.UnsupportedAlterOp;
+            } else if (!add.nullable) {
+                return api.Error.UnsupportedAlterOp;
+            }
             const name_copy = try aa.dupe(u8, add.name);
-            // If the default is a string-like, copy its bytes into the arena
-            // so the plan owns them.
-            const default_owned: Value = switch (add.default) {
-                .text => |s| Value{ .text = try aa.dupe(u8, s) },
-                else => add.default,
-            };
-            try cols.append(aa, .{ .name = name_copy, .type = add.type, .nullable = add.nullable });
-            try sources.append(aa, .{ .add_with_default = default_owned });
+            const default_owned = if (add.default) |v| try cloneValue(aa, v) else null;
+            try cols.append(aa, .{
+                .name = name_copy,
+                .type = add.type,
+                .nullable = add.nullable,
+                .default_value = default_owned,
+            });
+            try sources.append(aa, if (default_owned) |v| .{ .add_with_default = v } else .add_null);
         },
     };
 
@@ -176,6 +188,13 @@ fn valueTagMatchesType(v: Value, t: Type) bool {
         .decimal128 => vt == .decimal128,
         .uuid => vt == .uuid,
         .varchar, .string, .char => vt == .text,
+    };
+}
+
+fn cloneValue(allocator: Allocator, v: Value) !Value {
+    return switch (v) {
+        .text => |s| Value{ .text = try allocator.dupe(u8, s) },
+        else => v,
     };
 }
 
@@ -292,6 +311,9 @@ fn rewriteSegment(
             .add_with_default => |val| {
                 try fillDefault(t.allocator, &new_stores[new_idx], new_schema.columns[new_idx], val, rg.row_count);
             },
+            .add_null => {
+                try fillNull(t.allocator, &new_stores[new_idx], rg.row_count);
+            },
         };
     }
 
@@ -352,6 +374,18 @@ fn fillDefault(
     }
 }
 
+fn fillNull(
+    allocator: Allocator,
+    out: *ColumnStore,
+    n: u32,
+) !void {
+    const start_row = out.data.rowCount();
+    var i: u32 = 0;
+    while (i < n) : (i += 1) try out.data.appendNullPlaceholder(allocator);
+    var j: u32 = 0;
+    while (j < n) : (j += 1) try out.appendValidBit(allocator, start_row + j, false);
+}
+
 /// Re-initialize the Table after the on-disk swap. Reopens dir handles,
 /// reloads schema + manifest, replaces the memtable with a fresh one
 /// matching the new schema. Caller holds `table.mutex`.
@@ -371,6 +405,10 @@ fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64) !void {
     const new_manifest = try storage.readManifest(allocator, io, t.table_dir, new_fp);
     t.manifest.deinit();
     t.manifest = new_manifest;
+
+    const old_cache_capacity = t.cache.capacity_bytes;
+    t.cache.deinit();
+    t.cache = storage.cache.Cache.init(allocator, old_cache_capacity);
 
     const new_indices = try allocator.alloc(usize, t.schema.order_key.len);
     for (t.schema.order_key, 0..) |k, i| {

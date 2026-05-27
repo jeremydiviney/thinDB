@@ -683,6 +683,45 @@ pub const Table = struct {
         try self.awaitWalDurable(wal_target);
     }
 
+    /// Remove every row while preserving schema and table identity. This is a
+    /// DDL-style physical reset: segments, tombstones, memtable, WAL contents,
+    /// row-group cache, and AUTO_INCREMENT state are cleared together.
+    pub fn truncate(self: *Table) !void {
+        self.compact_lock.lockUncancelable(self.io);
+        defer self.compact_lock.unlock(self.io);
+        self.ddl_lock.lockUncancelable(self.io);
+        defer self.ddl_lock.unlock(self.io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.segments_dir.close(self.io);
+        try self.table_dir.deleteTree(self.io, "segments");
+        self.segments_dir = try self.table_dir.createDirPathOpen(self.io, "segments", .{});
+
+        var new_manifest = storage.Manifest.empty(self.allocator, self.schema_fingerprint, @intCast(self.schema.columns.len));
+        errdefer new_manifest.deinit();
+        if (autoIncrementColumnIndex(self.schema) != null) new_manifest.auto_inc_next = 1;
+        try storage.writeManifest(self.io, self.table_dir, new_manifest, self.syncEnabled());
+
+        if (self.wal) |*w| try w.truncate(self.schema_fingerprint);
+
+        const new_mt = try engine.Memtable.create(self.allocator, self.schema);
+        errdefer new_mt.release();
+        const old_mt = self.memtable;
+        self.memtable = new_mt;
+        old_mt.retire();
+        old_mt.release();
+
+        self.manifest.deinit();
+        self.manifest = new_manifest;
+        self.next_segment_id.store(self.manifest.nextSegmentId(), .monotonic);
+        self.first_write_ts = null;
+
+        const old_cache_capacity = self.cache.capacity_bytes;
+        self.cache.deinit();
+        self.cache = storage.cache.Cache.init(self.allocator, old_cache_capacity);
+    }
+
     /// Merge all segments into a single new segment. Drops tombstoned rows.
     /// No-op if there's at most one segment.
     pub fn compact(self: *Table) !void {
@@ -701,7 +740,6 @@ pub const Table = struct {
         self.segments_dir.deleteFile(self.io, tomb_name) catch {};
     }
 };
-
 
 /// Either loads the persisted schema, validates against the caller-provided
 /// one, or — when no schema.bin exists — clones the caller schema and

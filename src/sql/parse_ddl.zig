@@ -72,6 +72,34 @@ pub fn parseDdl(p: anytype) !*ir.Op {
             }
             return try p.allocOp(.{ .ddl = .{ .use_schema = first } });
         },
+        .kw_rename => {
+            if (p.cur.tag != .kw_table) return PE.SqlExpectedKeyword;
+            try p.advance();
+            const from = try p.parseTableRef();
+            if (p.cur.tag != .kw_to) return PE.SqlExpectedKeyword;
+            try p.advance();
+            const to = try p.parseTableRef();
+            return try p.allocOp(.{ .ddl = .{ .rename_table = .{ .from = from, .to = to } } });
+        },
+        .kw_alter => {
+            if (p.cur.tag != .kw_table) return PE.SqlExpectedKeyword;
+            try p.advance();
+            const table = try p.parseTableRef();
+            if (p.cur.tag != .kw_add) return PE.SqlExpectedKeyword;
+            try p.advance();
+            if (p.cur.tag == .kw_column) try p.advance();
+            const col = try parseColumnDef(p);
+            if (col.is_pk or col.def.auto_increment) return PE.SqlInvalidProjection;
+            return try p.allocOp(.{ .ddl = .{ .alter_table_add_column = .{
+                .table = table,
+                .column = col.def,
+            } } });
+        },
+        .kw_truncate => {
+            if (p.cur.tag == .kw_table) try p.advance();
+            const table = try p.parseTableRef();
+            return try p.allocOp(.{ .ddl = .{ .truncate_table = table } });
+        },
         else => unreachable,
     }
 }
@@ -259,6 +287,7 @@ pub fn parseCopy(p: anytype) !*ir.Op {
 
     const direction: ir.CopyOp.Direction = switch (p.cur.tag) {
         .kw_from => .from_stdin,
+        .kw_to => .to_stdout,
         .identifier => blk: {
             if (std.ascii.eqlIgnoreCase(p.cur.text, "to")) break :blk .to_stdout;
             return PE.SqlExpectedKeyword;

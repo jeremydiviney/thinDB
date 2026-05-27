@@ -361,6 +361,28 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
             if (dt.if_exists) try out.appendSlice(allocator, " if_exists");
             try out.append(allocator, '\n');
         },
+        .rename_table => |rt| {
+            try out.appendSlice(allocator, "RenameTable ");
+            try writeTableRef(allocator, out, rt.from);
+            try out.appendSlice(allocator, " to ");
+            try writeTableRef(allocator, out, rt.to);
+            try out.append(allocator, '\n');
+        },
+        .alter_table_add_column => |at| {
+            try out.appendSlice(allocator, "AlterTableAddColumn ");
+            try writeTableRef(allocator, out, at.table);
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, at.column.name);
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, @tagName(at.column.column_type));
+            if (at.column.nullable) try out.appendSlice(allocator, " NULL");
+            try out.append(allocator, '\n');
+        },
+        .truncate_table => |ref| {
+            try out.appendSlice(allocator, "TruncateTable ");
+            try writeTableRef(allocator, out, ref);
+            try out.append(allocator, '\n');
+        },
     }
 }
 
