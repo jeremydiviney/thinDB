@@ -2328,10 +2328,16 @@ fn routeRadixGroupBy(
                 },
             }
         }
-        if (!known) return null;
-        est = @min(est, @max(st.upper_rows, 1));
-        const per_group_bytes: u64 = @as(u64, aggs.len) * 16 + 16; // ≈ state + key
-        if (est *| per_group_bytes <= RADIX_CACHE_BYTES) return null;
+        // Known low-cardinality → the hash path's inline-state / count-slot fast
+        // paths win, so decline. UNKNOWN cardinality → take radix: its adaptive
+        // sizing bounds the worst case (an unexpectedly-huge group count would
+        // otherwise hit the generic 96B-state path), trading a few ms on
+        // unknown-but-low for bounded behaviour on unknown-but-high.
+        if (known) {
+            est = @min(est, @max(st.upper_rows, 1));
+            const per_group_bytes: u64 = @as(u64, aggs.len) * 16 + 16; // ≈ state + key
+            if (est *| per_group_bytes <= RADIX_CACHE_BYTES) return null;
+        }
     }
 
     const rtk: ?exec.radix_aggregate.TopK = if (top_k) |tk|
