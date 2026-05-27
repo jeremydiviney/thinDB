@@ -448,15 +448,19 @@ pub fn appendMaskedColumn(
 /// (e.g. Compute emits a `.string` column but the table schema
 /// declares it as `varchar(N)`).
 fn appendMaskedStringy(allocator: Allocator, sv: anytype, mask: []const bool, out: *ColumnStore) !void {
+    // Reserve once to upper bounds (every row a survivor; all source bytes) so
+    // the per-survivor copy never branches on capacity or reallocs — this gather
+    // is the filtered-scan materialize hot path. Bounds are one row group's
+    // worth and the buffer is reused across row groups, so the over-reserve is
+    // transient and cheap relative to eliminating the per-row growth checks.
+    const n = mask.len;
+    const src_span: usize = if (n == 0) 0 else sv.offsets[n] - sv.offsets[0];
     switch (out.data) {
-        .varchar => |*ss| for (mask, 0..) |m, row| {
-            if (m) try ss.appendValue(allocator, sv.rowBytes(row));
-        },
-        .string => |*ss| for (mask, 0..) |m, row| {
-            if (m) try ss.appendValue(allocator, sv.rowBytes(row));
-        },
-        .char => |*ss| for (mask, 0..) |m, row| {
-            if (m) try ss.appendValue(allocator, sv.rowBytes(row));
+        .varchar, .string, .char => |*ss| {
+            try ss.ensureUnusedValueCapacity(allocator, n, src_span);
+            for (mask, 0..) |m, row| {
+                if (m) ss.appendValueAssumeCapacity(sv.rowBytes(row));
+            }
         },
         else => unreachable,
     }
