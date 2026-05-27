@@ -734,15 +734,21 @@ pub const Aggregate = struct {
                         .unknown => {},
                     }
                 }
-                // Allocate the full estimate up front only when it's modest. A
-                // large estimate (or an unknown one) starts at PRESIZE_CAP and
-                // jumps to `full_cap` on first overflow: a selective filter the
-                // operator can't see (Q10/Q11 estimate ~1M, but the filter leaves
-                // ~60K distinct) would otherwise eat a multi-MB zero-fill, while
-                // the genuinely-large unfiltered case (Q08/Q09) still skips the
-                // intermediate rehashes — ~8 ms — by growing straight to target.
-                if (!ndv_known) full_cap = @min(PRESIZE_CAP, @max(st.upper_rows, 1));
-                const presize = @min(full_cap, PRESIZE_CAP);
+                // Start modest, then grow straight to `full_cap` (the ceiling) on
+                // first overflow — one rehash, never the repeated doublings that
+                // cost Q08 ~8 ms. A KNOWN estimate starts at PRESIZE_CAP: big
+                // enough that a selective filter the operator can't see (Q10/Q11
+                // estimate ~1M, but the filter leaves ~60K distinct) stays put
+                // instead of jumping to a multi-MB table. UNKNOWN has no estimate
+                // so the ceiling is the provable row bound; start at the small
+                // ADAPTIVE_INITIAL to keep the zero-fill tiny for the common
+                // modest case, and jump to the row bound only if it overflows.
+                var init_entries: usize = PRESIZE_CAP;
+                if (!ndv_known) {
+                    full_cap = @max(st.upper_rows, 1);
+                    init_entries = ADAPTIVE_INITIAL;
+                }
+                const presize = @min(full_cap, init_entries);
                 slot.* = .{
                     .table = IntTable96.init(aa, presize) catch try IntTable96.init(aa, 0),
                     .vbits = vbits,
