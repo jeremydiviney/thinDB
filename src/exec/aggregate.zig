@@ -1266,13 +1266,23 @@ pub const Aggregate = struct {
         self.pf_cd_hashes.clearRetainingCapacity();
         try self.pf_cd_keys.ensureTotalCapacity(aa, n);
         try self.pf_cd_hashes.ensureTotalCapacity(aa, n);
-        var r: usize = 0;
-        while (r < n) : (r += 1) {
-            if (has_nulls and !view.isValid(r)) continue;
-            const value_bits = distinctIntKey(view, @intCast(r));
-            const key = (@as(u128, gids[r]) << vbits) | value_bits;
-            self.pf_cd_keys.appendAssumeCapacity(key);
-            self.pf_cd_hashes.appendAssumeCapacity(IntTable96.hashKey(key));
+        // Hoist the column-type dispatch out of the per-row loop: bind the typed
+        // value slice once (inline switch) so the pack is a single monomorphized
+        // read+pack+hash, no per-row `distinctIntKey` union branch over 5M rows.
+        // Only int-family ≤64-bit columns reach here (the CombinedDistinct gate).
+        switch (view.data) {
+            inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |sl| {
+                const Child = @typeInfo(@TypeOf(sl)).pointer.child;
+                const bits: u8 = @bitSizeOf(Child);
+                for (0..n) |r| {
+                    if (has_nulls and !view.isValid(r)) continue;
+                    const value_bits = fieldBits(Child, sl[r], bits);
+                    const key = (@as(u128, gids[r]) << vbits) | value_bits;
+                    self.pf_cd_keys.appendAssumeCapacity(key);
+                    self.pf_cd_hashes.appendAssumeCapacity(IntTable96.hashKey(key));
+                }
+            },
+            else => unreachable,
         }
         const keys = self.pf_cd_keys.items;
         const hashes = self.pf_cd_hashes.items;
