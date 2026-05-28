@@ -780,7 +780,12 @@ test "zonemap memtable-only (no flushed segments)" {
 
 // --- Fall-back cases: zonemapTopN must return null; lateScan still correct. ---
 
-test "zonemap fallback: string leading key returns null" {
+// --- String leading key: prefix-stat pruning, ASC + DESC + prefix collision. ---
+
+/// Build a 3-string-column table (`s` order key, `w` payload, `tag`) over the
+/// given per-segment string lists (each list flushed as its own segment), run
+/// both paths for `ORDER BY s <dir> LIMIT n`, and assert identical output.
+fn runStringScenario(segs: []const []const []const u8, desc: bool, n: usize) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -790,29 +795,86 @@ test "zonemap fallback: string leading key returns null" {
         .columns = &.{
             .{ .name = "s", .type = .string },
             .{ .name = "w", .type = .bigint },
+            .{ .name = "tag", .type = .string },
         },
         .order_key = &.{"s"},
         .unique = false,
     };
-    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
     defer db.close();
     const t = try db.table("t", schema, .{ .order_key = &.{"s"}, .row_group_size = 4 });
-    try t.insert(&.{
-        .{ .s = @as([]const u8, "c"), .w = @as(i64, 3) },
-        .{ .s = @as([]const u8, "a"), .w = @as(i64, 1) },
-        .{ .s = @as([]const u8, "b"), .w = @as(i64, 2) },
-    });
-    try t.flush();
+
+    var w: i64 = 0;
+    for (segs) |seg| {
+        const cols = try allocator.alloc(ColumnStore, 3);
+        defer {
+            for (cols) |*c| c.deinit(allocator);
+            allocator.free(cols);
+        }
+        cols[0] = try ColumnStore.init(allocator, .string, false);
+        cols[1] = try ColumnStore.init(allocator, .bigint, false);
+        cols[2] = try ColumnStore.init(allocator, .string, false);
+        for (seg) |sv| {
+            try cols[0].data.string.appendValue(allocator, sv);
+            try cols[1].data.bigint.append(allocator, w);
+            w += 1;
+            try cols[2].data.string.appendValue(allocator, "t");
+        }
+        try insertGen(allocator, t, schema.columns, cols, seg.len);
+        try t.flush();
+    }
 
     const probe = &[_][]const u8{"s"};
-    const specs = &[_]SortSpec{.{ .col = "s", .desc = false }};
-    const out = &[_][]const u8{ "s", "w" };
+    const specs = &[_]SortSpec{.{ .col = "s", .desc = desc }};
+    const out = &[_][]const u8{ "s", "w", "tag" };
 
-    const z = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 2, 0);
-    try std.testing.expect(z == null);
+    var ref_q = try exec.lateScan(allocator, t, null, probe, .{ .always = true }, specs, out, n, 0);
+    defer ref_q.deinit();
+    var ref = try capture(allocator, &ref_q);
+    defer ref.deinit();
+
+    const z_opt = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, n, 0);
+    if (z_opt == null) return error.ZonemapShouldHaveApplied;
+    var z_q = z_opt.?;
+    defer z_q.deinit();
+    var got = try capture(allocator, &z_q);
+    defer got.deinit();
+
+    try expectSameRows(ref, got);
 }
 
-test "zonemap fallback: float leading key returns null" {
+test "zonemap string leading key ASC + DESC across disjoint segments" {
+    // Disjoint, increasing ranges so pruning engages in both directions.
+    const segs = &[_][]const []const u8{
+        &.{ "a1", "a2", "a3", "a4" },
+        &.{ "m1", "m2", "m3", "m4" },
+        &.{ "z1", "z2", "z3", "z4" },
+    };
+    try runStringScenario(segs, false, 3); // ASC → a1,a2,a3
+    try runStringScenario(segs, true, 3); // DESC → z4,z3,z2
+    try runStringScenario(segs, false, 100); // n beyond row count
+}
+
+test "zonemap string prefix collision (>16-byte shared prefix) stays correct" {
+    // All values share the same 16-byte prefix, so every row group's min/max
+    // prefix ties — the conservative-on-tie path must process them and the
+    // full-string heap comparator must settle order identically to lateScan.
+    const segs = &[_][]const []const u8{
+        &.{ "abcdefghijklmnop_03", "abcdefghijklmnop_07", "abcdefghijklmnop_01", "abcdefghijklmnop_05" },
+        &.{ "abcdefghijklmnop_08", "abcdefghijklmnop_02", "abcdefghijklmnop_06", "abcdefghijklmnop_04" },
+    };
+    try runStringScenario(segs, false, 4);
+    try runStringScenario(segs, true, 4);
+}
+
+test "zonemap double leading key (incl NaN) matches lateScan ASC + DESC" {
+    // Float ORDER BY now prunes via the NaN-last total order. Disjoint segment
+    // ranges + a NaN row (which sorts last) — both directions must match the
+    // lateScan reference exactly, since float ordering is now deterministic.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -820,27 +882,53 @@ test "zonemap fallback: float leading key returns null" {
 
     const schema = types.TableSchema{
         .columns = &.{
-            .{ .name = "f", .type = .float },
+            .{ .name = "f", .type = .double },
             .{ .name = "w", .type = .bigint },
         },
         .order_key = &.{"f"},
         .unique = false,
     };
-    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
     defer db.close();
     const t = try db.table("t", schema, .{ .order_key = &.{"f"}, .row_group_size = 4 });
+
+    const nan = std.math.nan(f64);
     try t.insert(&.{
-        .{ .f = @as(f32, 3.0), .w = @as(i64, 3) },
-        .{ .f = @as(f32, 1.0), .w = @as(i64, 1) },
+        .{ .f = @as(f64, -2.5), .w = @as(i64, 1) },
+        .{ .f = @as(f64, -1.0), .w = @as(i64, 2) },
+        .{ .f = @as(f64, 0.5), .w = @as(i64, 3) },
+        .{ .f = @as(f64, 3.25), .w = @as(i64, 4) },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .f = @as(f64, 4.0), .w = @as(i64, 5) },
+        .{ .f = @as(f64, 10.0), .w = @as(i64, 6) },
+        .{ .f = nan, .w = @as(i64, 7) }, // sorts last
+        .{ .f = @as(f64, 100.0), .w = @as(i64, 8) },
     });
     try t.flush();
 
     const probe = &[_][]const u8{"f"};
-    const specs = &[_]SortSpec{.{ .col = "f", .desc = false }};
     const out = &[_][]const u8{ "f", "w" };
+    inline for (.{ false, true }) |desc| {
+        const specs = &[_]SortSpec{.{ .col = "f", .desc = desc }};
+        var ref_q = try exec.lateScan(allocator, t, null, probe, .{ .always = true }, specs, out, 4, 0);
+        defer ref_q.deinit();
+        var ref = try capture(allocator, &ref_q);
+        defer ref.deinit();
 
-    const z = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 2, 0);
-    try std.testing.expect(z == null);
+        const z_opt = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 4, 0);
+        if (z_opt == null) return error.ZonemapShouldHaveApplied;
+        var z_q = z_opt.?;
+        defer z_q.deinit();
+        var got = try capture(allocator, &z_q);
+        defer got.deinit();
+        try expectSameRows(ref, got);
+    }
 }
 
 test "zonemap fallback: nullable leading key returns null" {

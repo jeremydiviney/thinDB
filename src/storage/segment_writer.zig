@@ -891,9 +891,28 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
         // Strings store the prefix-encoded i128 of the first 16 bytes of each
         // row's value. See `format.encodeStringPrefix`.
         .varchar, .string, .char => |sv| computeStringStats(view, sv, row_start, row_end),
-        // Floats carry no stats today (NaN/sign handling deferred).
-        .float, .double => .{ .min = 0, .max = 0 },
+        // Floats: order-preserving bit transform, NaN skipped. See
+        // `format.encodeFloatOrder`.
+        .float => |d| extentFloat(f32, view, d, row_start, row_end),
+        .double => |d| extentFloat(f64, view, d, row_start, row_end),
     };
+}
+
+/// Min/max over the non-null values of a float column, encoded to i128 via
+/// `format.encodeFloatOrder` (NaN sorts last, so a NaN row raises `max` to the
+/// NaN sentinel — never wrongly pruned under the NaN-last total order). NULL
+/// rows are skipped; an all-null range leaves the inverted `{maxInt, minInt}`
+/// sentinel that consumers detect via `min > max`.
+fn extentFloat(comptime T: type, view: ColumnView, data: []const T, row_start: usize, row_end: usize) format.Stats {
+    var lo: i128 = std.math.maxInt(i128);
+    var hi: i128 = std.math.minInt(i128);
+    for (data[row_start..row_end], row_start..) |v, r| {
+        if (!view.isValid(r)) continue;
+        const enc = format.encodeFloatOrder(@as(f64, v));
+        if (enc < lo) lo = enc;
+        if (enc > hi) hi = enc;
+    }
+    return .{ .min = lo, .max = hi };
 }
 
 /// Min/max over the *non-null* values of an integer-family column, encoded to

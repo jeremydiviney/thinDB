@@ -1092,6 +1092,51 @@ test "scan: string eq predicate prunes row groups via prefix stats" {
     try std.testing.expectEqualSlices(i64, &[_]i64{3}, ids.items);
 }
 
+test "scan: float range predicate prunes row groups via order-preserving stats" {
+    // Row groups with disjoint double ranges; `f > 4.5` must skip the groups
+    // whose max is below it and still return the matching rows — proving the
+    // float min/max (encodeFloatOrder) prune+decode is correct.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "f", .type = .double },
+        },
+        .order_key = &.{"f"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 2 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"f"}, .row_group_size = 2 });
+
+    // RGs by f: [-2.5,-1.5], [0.5,3.25], [4.0,6.5]. `f > 4.5` matches only the
+    // last group's 6.5 (id 6); the first two groups are pruned.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .f = @as(f64, -2.5) },
+        .{ .id = @as(i64, 2), .f = @as(f64, -1.5) },
+        .{ .id = @as(i64, 3), .f = @as(f64, 0.5) },
+        .{ .id = @as(i64, 4), .f = @as(f64, 3.25) },
+        .{ .id = @as(i64, 5), .f = @as(f64, 4.0) },
+        .{ .id = @as(i64, 6), .f = @as(f64, 6.5) },
+    });
+    try t.flush();
+
+    var base = try scan(allocator, t);
+    var q = try base.filter(leafExpr("f", .gt, .{ .double = 4.5 }));
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        try ids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{6}, ids.items);
+}
+
 test "streaming aggregate: sorted GROUP BY produces correct per-group results" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

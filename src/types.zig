@@ -163,6 +163,21 @@ pub const Type = union(TypeTag) {
     }
 };
 
+/// Total order for floats with NaN sorting LAST (greater than every finite value
+/// and ±inf), so float ORDER BY / MIN / MAX are deterministic — matching
+/// Postgres/DuckDB. `std.math.order` leaves NaN unordered (`.eq` to everything),
+/// which makes sorts nondeterministic; this replaces it at every float-compare
+/// site. Accepts f32 or f64.
+pub fn floatOrder(a: anytype, b: @TypeOf(a)) std.math.Order {
+    const an = std.math.isNan(a);
+    const bn = std.math.isNan(b);
+    if (an or bn) {
+        if (an and bn) return .eq;
+        return if (an) .gt else .lt; // NaN is the largest
+    }
+    return std.math.order(a, b);
+}
+
 /// Logical wrapper around a stored `u128` UUID. Mirrors `Date`/`DateTime`
 /// — gives `@as(Uuid, ...)` ergonomics for insert without colliding with
 /// LARGEINT columns. `.value` accesses the raw u128. UUIDs are
@@ -493,4 +508,21 @@ test "TableSchema.validate rejects empty columns" {
         .unique = false,
     };
     try std.testing.expectError(TableSchemaError.EmptyColumns, schema.validate());
+}
+
+test "floatOrder sorts NaN last and is otherwise numeric" {
+    const order = std.math.Order;
+    try std.testing.expectEqual(order.lt, floatOrder(@as(f64, 1.0), 2.0));
+    try std.testing.expectEqual(order.gt, floatOrder(@as(f64, 2.0), 1.0));
+    try std.testing.expectEqual(order.eq, floatOrder(@as(f64, 1.0), 1.0));
+    // ±inf order intact.
+    try std.testing.expectEqual(order.lt, floatOrder(-std.math.inf(f64), std.math.inf(f64)));
+    // NaN is greater than every finite value and ±inf, in either argument slot.
+    const nan = std.math.nan(f64);
+    try std.testing.expectEqual(order.gt, floatOrder(nan, std.math.inf(f64)));
+    try std.testing.expectEqual(order.lt, floatOrder(std.math.inf(f64), nan));
+    try std.testing.expectEqual(order.eq, floatOrder(nan, nan));
+    // Works for f32 too.
+    try std.testing.expectEqual(order.lt, floatOrder(@as(f32, 1.0), 2.0));
+    try std.testing.expectEqual(order.gt, floatOrder(std.math.nan(f32), @as(f32, 9.0)));
 }

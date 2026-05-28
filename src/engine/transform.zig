@@ -5,6 +5,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const types = @import("../types.zig");
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
 
@@ -26,8 +27,8 @@ pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
         .tinyint => |l| std.math.order(l.items[a], l.items[b]),
         .smallint => |l| std.math.order(l.items[a], l.items[b]),
         .largeint => |l| std.math.order(l.items[a], l.items[b]),
-        .float => |l| std.math.order(l.items[a], l.items[b]),
-        .double => |l| std.math.order(l.items[a], l.items[b]),
+        .float => |l| types.floatOrder(l.items[a], l.items[b]),
+        .double => |l| types.floatOrder(l.items[a], l.items[b]),
         .date => |l| std.math.order(l.items[a], l.items[b]),
         .datetime => |l| std.math.order(l.items[a], l.items[b]),
         .decimal64 => |l| std.math.order(l.items[a], l.items[b]),
@@ -52,8 +53,8 @@ pub fn compareViewRows(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.m
         .tinyint => |l| std.math.order(l[a], vb.data.tinyint[b]),
         .smallint => |l| std.math.order(l[a], vb.data.smallint[b]),
         .largeint => |l| std.math.order(l[a], vb.data.largeint[b]),
-        .float => |l| std.math.order(l[a], vb.data.float[b]),
-        .double => |l| std.math.order(l[a], vb.data.double[b]),
+        .float => |l| types.floatOrder(l[a], vb.data.float[b]),
+        .double => |l| types.floatOrder(l[a], vb.data.double[b]),
         .date => |l| std.math.order(l[a], vb.data.date[b]),
         .datetime => |l| std.math.order(l[a], vb.data.datetime[b]),
         .decimal64 => |l| std.math.order(l[a], vb.data.decimal64[b]),

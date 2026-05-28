@@ -138,7 +138,13 @@ fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool
                 it: @TypeOf(items),
                 d: bool,
                 pub fn lessThan(c: @This(), a: u32, b: u32) bool {
-                    const ord = std.math.order(c.it[a], c.it[b]);
+                    const Elem = @typeInfo(@TypeOf(c.it)).pointer.child;
+                    // Floats use the NaN-last total order so sorts are
+                    // deterministic; everything else is plain numeric order.
+                    const ord = switch (@typeInfo(Elem)) {
+                        .float => types.floatOrder(c.it[a], c.it[b]),
+                        else => std.math.order(c.it[a], c.it[b]),
+                    };
                     return if (c.d) ord == .gt else ord == .lt;
                 }
             };

@@ -10,13 +10,15 @@
 //! Algorithm (need top `K = n + m`):
 //!   1. Enumerate every (segment, row_group). For each, read the footer min/max
 //!      of every key in the prunable PREFIX — the longest leading run of order
-//!      keys that are non-nullable with usable numeric/temporal stats.
+//!      keys that are non-nullable with usable footer stats (any stat-bearing
+//!      type; strings prune at 16-byte-prefix granularity, floats use the
+//!      NaN-last total order).
 //!   2. best-corner = per prefix key, the most-preferred value the RG could
 //!      hold: ASC → min, DESC → max. This per-key-independent tuple is still a
 //!      valid lexicographic lower bound on every row's key tuple, because lex
 //!      compares left-to-right and each component is independently bounded.
-//!      Keys past the prefix (strings/floats/nullable) don't prune but still
-//!      order rows in the heap comparator.
+//!      Keys past the prefix (nullable) don't prune but still order rows in the
+//!      heap comparator.
 //!   3. Sort the RG list by best-corner, lexicographically over the prefix
 //!      (per-key direction).
 //!   4. Bounded max-heap of the K best rows (worst at root), keyed by the FULL
@@ -102,8 +104,9 @@ pub const ZonemapTopN = struct {
     /// Probe-batch index of each ORDER BY key column. Owned.
     key_probe_idx: []usize,
     /// Prunable prefix length: the longest leading run of ORDER BY keys with
-    /// non-nullable numeric/temporal footer stats (≥1). Only these keys drive
-    /// row-group pruning; the rest still order rows in the heap comparator.
+    /// non-nullable stat-bearing footer stats (≥1; see `leadingKeyTypeSupported`).
+    /// Only these keys drive row-group pruning; the rest still order rows in the
+    /// heap comparator.
     prefix_len: usize,
     /// Flat best-corner store, `prefix_len` i128s per row group. Scratch for one
     /// `collectTopK`; allocated in `enumerateRowGroups`, freed at its end.
@@ -168,8 +171,7 @@ pub const ZonemapTopN = struct {
 
         // Prunable prefix: the leading key is already validated as prunable;
         // extend while each subsequent key is also non-nullable with usable
-        // numeric/temporal footer stats. The first key that isn't (a string/
-        // float/nullable secondary key) caps the prefix.
+        // footer stats. The first nullable key caps the prefix.
         var prefix_len: usize = 1;
         while (prefix_len < order_specs.len) : (prefix_len += 1) {
             const c = table.schema.columns[key_phys[prefix_len]];
@@ -668,30 +670,37 @@ pub const ZonemapTopN = struct {
     }
 };
 
-/// Leading order-key types with a usable, order-preserving i128 footer min/max:
-/// non-nullable numeric/temporal. Excludes float/double (no stats), strings
-/// (`{0,0}`), uuid/largeint (the v1 gate keeps leading-key pruning to numeric/
-/// temporal whose i128 corner is a faithful bound).
+/// Leading/prefix order-key types that prune via the footer i128 min/max. Every
+/// stat-bearing type qualifies — `keyValueI128` mirrors the writer's per-type
+/// encoding so corners and heap rows live in the same i128 space. Strings prune
+/// at 16-byte-prefix granularity (sound: the writer's min/max are the true prefix
+/// classes, and `cornerWorseThanWorst` is conservative on ties, so a prefix
+/// collision just processes the row group). Floats use the NaN-last total order
+/// (`types.floatOrder` / `encodeFloatOrder`), so the corner bound and the heap
+/// comparator agree — a NaN row raises the row group's `max` to the NaN sentinel,
+/// keeping it from being wrongly pruned.
 fn leadingKeyTypeSupported(t: types.Type) bool {
-    return switch (t) {
-        .int, .smallint, .tinyint, .bigint, .date, .datetime, .decimal64, .decimal128 => true,
-        else => false,
-    };
+    return storage.format.typeHasStats(t);
 }
 
-/// Read stored row `r`'s key value as an i128 (same domain as the footer
-/// `Stats`), for the corner comparison. Only called on prefix keys, which are
-/// guaranteed to be supported numeric/temporal types.
+/// Read stored row `r`'s key value as an i128 in the same per-type encoding the
+/// footer `Stats` use, for the corner comparison. Only called on prefix keys,
+/// which `leadingKeyTypeSupported` guarantees are stat-bearing types.
 fn keyValueI128(col: ColumnStore, r: u32) i128 {
     return switch (col.data) {
         .int => |l| l.items[r],
         .smallint => |l| l.items[r],
         .tinyint => |l| l.items[r],
         .bigint => |l| l.items[r],
+        .boolean => |l| l.items[r],
         .date => |l| l.items[r],
         .datetime => |l| l.items[r],
         .decimal64 => |l| l.items[r],
         .decimal128 => |l| l.items[r],
-        else => unreachable,
+        .largeint => |l| l.items[r],
+        .uuid => |l| storage.format.encodeUnsignedU128(l.items[r]),
+        .string, .varchar, .char => |s| storage.format.encodeStringPrefix(s.view().rowBytes(r)),
+        .float => |l| storage.format.encodeFloatOrder(@as(f64, l.items[r])),
+        .double => |l| storage.format.encodeFloatOrder(l.items[r]),
     };
 }

@@ -1595,8 +1595,17 @@ pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value)
             const enc = storage.format.encodeStringPrefix(x);
             return enc >= s.min and enc <= s.max;
         },
-        // Floats still carry no stats — keep conservatively.
-        .float, .double => return true,
+        // Floats: encode the literal with the same order-preserving transform as
+        // the stats. A NaN literal can't match any range/eq, but the stats skip
+        // NaN, so stay conservative for it (never prune on a NaN literal).
+        .float => |x| blk: {
+            if (std.math.isNan(x)) return true;
+            break :blk storage.format.encodeFloatOrder(@as(f64, x));
+        },
+        .double => |x| blk: {
+            if (std.math.isNan(x)) return true;
+            break :blk storage.format.encodeFloatOrder(x);
+        },
     };
     return switch (op) {
         .eq => wanted >= s.min and wanted <= s.max,

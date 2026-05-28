@@ -119,7 +119,8 @@ pub const footer_trailer_size: usize = 8; // u32 footer_size + 4-byte magic
 ///   - uuid (u128): XOR top bit then cast to i128 — preserves unsigned
 ///     ordering under signed comparison
 ///   - varchar / string / char: prefix encoding (see `encodeStringPrefix`)
-///   - float / double: `{0, 0}` sentinel (NaN/sign handling deferred)
+///   - float / double: order-preserving bit transform (see `encodeFloatOrder`);
+///     NaN is skipped when computing the extent
 pub const Stats = struct {
     min: i128,
     max: i128,
@@ -147,6 +148,21 @@ pub fn encodeUnsignedU128(v: u128) i128 {
     return @bitCast(v ^ (@as(u128, 1) << 127));
 }
 
+/// Encode an f64 into an i128 such that signed i128 comparison preserves IEEE-754
+/// numeric order for every finite value and ±inf. The standard total-order trick:
+/// reinterpret the bits as u64, then if the sign bit is set (negative) flip all
+/// bits, else flip just the sign bit — making the result monotonic in float order.
+/// The u64 key lands in `[0, 2^64)`, so the i128 is always non-negative and signed
+/// comparison matches. NaN is never passed here — `computeStats` skips it.
+pub fn encodeFloatOrder(f: f64) i128 {
+    // NaN sorts last (max key) to match `types.floatOrder`: +inf maps to
+    // 0xFFF0… while maxInt(u64) is strictly above it, so NaN > every value.
+    if (std.math.isNan(f)) return @as(i128, std.math.maxInt(u64));
+    const bits: u64 = @bitCast(f);
+    const key: u64 = if (bits >> 63 != 0) ~bits else bits | (@as(u64, 1) << 63);
+    return @as(i128, key);
+}
+
 pub const Error = error{
     SchemaMismatch,
     UnevenColumns,
@@ -165,8 +181,8 @@ pub const RowGroupMeta = struct {
     offset: u64,
     length: u32,
     row_count: u32,
-    /// One entry per schema column. For string columns the entry is
-    /// `{ min: 0, max: 0 }` (ignored).
+    /// One entry per schema column, min/max in the per-type i128 encoding
+    /// (see `Stats`). Every column type carries usable stats.
     stats: []const Stats,
     /// Absolute file offset of each column's block within this row group, one
     /// per schema column (column-index order). Lets the reader pread just the
@@ -203,15 +219,15 @@ pub const SegmentInfo = struct {
 
 /// True iff a column of this type carries meaningful min/max in the
 /// per-row-group `Stats` slot (and in the manifest entry). Stats are
-/// always stored as i128 with a per-type encoding (see `Stats`).
-/// Types not listed here store `{0, 0}` and must be treated as "no
-/// stats" by pruning code.
+/// always stored as i128 with a per-type encoding (see `Stats`). Every
+/// column type carries stats now (float/double via `encodeFloatOrder`,
+/// NaN skipped at write time).
 pub fn typeHasStats(t: @import("../types.zig").Type) bool {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => true,
         .largeint, .decimal128, .uuid => true,
         .varchar, .string, .char => true,
-        .float, .double => false,
+        .float, .double => true,
     };
 }
 
@@ -327,6 +343,28 @@ test "encodeStringPrefix preserves lex byte order across signed i128" {
         encodeStringPrefix("abcdefghijklmnop_extra2"),
     );
     try std.testing.expectEqual(@as(i128, std.math.minInt(i128)), encodeStringPrefix(""));
+}
+
+test "encodeFloatOrder is monotonic across the f64 range" {
+    // Ascending by numeric value; encoded keys must be strictly increasing.
+    const ordered = [_]f64{
+        -std.math.inf(f64), -1e308, -1.5, -1.0, -0.5, -1e-308, -0.0,
+        0.0,               1e-308, 0.5,  1.0,  1.5,  1e308,    std.math.inf(f64),
+    };
+    var prev = encodeFloatOrder(ordered[0]);
+    for (ordered[1..]) |f| {
+        const cur = encodeFloatOrder(f);
+        // -0.0 and +0.0 are adjacent (encode to consecutive keys); every other
+        // step is a strict increase. `<=` covers the ±0 tie soundly for bounds.
+        try std.testing.expect(prev <= cur);
+        prev = cur;
+    }
+    // Distinct finite values are strictly ordered.
+    try std.testing.expect(encodeFloatOrder(1.0) < encodeFloatOrder(2.0));
+    try std.testing.expect(encodeFloatOrder(-2.0) < encodeFloatOrder(-1.0));
+    try std.testing.expect(encodeFloatOrder(-1.0) < encodeFloatOrder(1.0));
+    // NaN sorts strictly above every value, including +inf.
+    try std.testing.expect(encodeFloatOrder(std.math.nan(f64)) > encodeFloatOrder(std.math.inf(f64)));
 }
 
 test "byte helpers round-trip primitive types" {
