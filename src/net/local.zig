@@ -1845,6 +1845,14 @@ pub fn buildServerQuerySession(
             const t = try resolveTable(catalog, session, s.table);
             break :blk try exec.scan(allocator, t);
         },
+        .file_scan => |f| blk: {
+            const base = try exec.fileScan(allocator, db.io, db.config.file_scan_access, f, null);
+            if (f.alias) |alias| {
+                errdefer @constCast(&base).deinit();
+                break :blk try exec.AliasRename.create(allocator, base, alias);
+            }
+            break :blk base;
+        },
         .limit => |l| blk: {
             // Late materialization (see compileOp for the rationale + the
             // shape-detection helpers). Bails to Top-N / Limit otherwise.
@@ -2226,7 +2234,6 @@ pub fn compileWithSession(
     return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
 }
 
-
 /// True when the group-by keys are already a globally-sorted prefix of the
 /// input stream, so a streaming sort-based aggregate can replace the hash
 /// aggregate (bounded memory, no sort needed). Grouping only needs equal
@@ -2566,7 +2573,7 @@ fn projWalkExpr(c: *ProjScan, allocator: Allocator, e: ir.Expr) void {
 fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
     if (c.bail) return;
     switch (op.*) {
-        .scan => {},
+        .scan, .file_scan => {},
         .single_row => {},
         .limit => |l| projWalkOp(c, allocator, l.upstream),
         .select => |p| {
@@ -2675,6 +2682,12 @@ fn aggUsesColumn(aggs: []const AggSpec, name: []const u8) bool {
     return false;
 }
 
+fn stripAlias(alias: []const u8, name: []const u8) ?[]const u8 {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+    if (!types.columnNameEql(name[0..dot], alias)) return null;
+    return name[dot + 1 ..];
+}
+
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
@@ -2708,6 +2721,30 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             defer if (needed) |n| ctx.allocator.free(n);
             const base = try exec.scanWithProjection(ctx.allocator, t, acct, needed);
             if (s.alias) |alias| {
+                errdefer @constCast(&base).deinit();
+                break :blk try exec.AliasRename.create(ctx.allocator, base, alias);
+            }
+            break :blk base;
+        },
+        .file_scan => |f| blk: {
+            var needed: ?[]const []const u8 = null;
+            if (ctx.prune_names) |raw| {
+                var keep: std.ArrayListUnmanaged([]const u8) = .empty;
+                errdefer keep.deinit(ctx.allocator);
+                for (raw) |nm| {
+                    if (f.alias) |alias| {
+                        if (stripAlias(alias, nm)) |bare| {
+                            try keep.append(ctx.allocator, bare);
+                            continue;
+                        }
+                    }
+                    try keep.append(ctx.allocator, nm);
+                }
+                needed = try keep.toOwnedSlice(ctx.allocator);
+            }
+            defer if (needed) |n| ctx.allocator.free(n);
+            const base = try exec.fileScan(ctx.allocator, ctx.db.io, ctx.db.config.file_scan_access, f, needed);
+            if (f.alias) |alias| {
                 errdefer @constCast(&base).deinit();
                 break :blk try exec.AliasRename.create(ctx.allocator, base, alias);
             }
