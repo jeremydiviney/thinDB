@@ -359,6 +359,7 @@ pub const Parser = struct {
                 return try self.allocOp(.{ .explain = .{ .inner = inner, .format = format } });
             },
             .kw_insert => return try parse_ddl.parseInsert(self),
+            .kw_replace => return try parse_ddl.parseReplace(self),
             .kw_copy => return try parse_ddl.parseCopy(self),
             .kw_set => return try self.parseSetVar(),
             .kw_delete => return try self.parseDelete(),
@@ -932,6 +933,16 @@ pub const Parser = struct {
 
         // Identifier or function call. Look ahead: `(` after an identifier
         // means a call.
+        if (self.cur.tag == .kw_replace) {
+            const first = "replace";
+            try self.advance();
+            if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
+            const scalar_atom = try self.parseScalarCallAfterName(first);
+            const expr = try self.continueBinaryFrom(scalar_atom);
+            const default_name = try self.exprDefaultName(expr);
+            const alias = try self.maybeAlias(default_name);
+            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+        }
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const first = self.cur.text;
         try self.advance();
@@ -1058,6 +1069,12 @@ pub const Parser = struct {
 
         const alias = try self.maybeAlias(dup_col);
         return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
+    }
+
+    fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
+        const args = try self.parseCallArgList(null);
+        const fname_dup = try self.arena.dupe(u8, name);
+        return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args } };
     }
 
     /// True when `tag` is one of the binary arithmetic operators we
@@ -1474,6 +1491,12 @@ pub const Parser = struct {
             return ir.Expr{ .col_ref = col };
         }
         switch (self.cur.tag) {
+            .kw_replace => {
+                const name = "replace";
+                try self.advance();
+                if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
+                return try self.parseScalarCallAfterName(name);
+            },
             .identifier => {
                 const name = self.cur.text;
                 try self.advance();

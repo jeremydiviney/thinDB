@@ -639,7 +639,7 @@ fn runExtendedStatement(
         const new_session = compiled.sessionValue();
         try session.replaceDbSchema(new_session.current_db, new_session.current_schema);
         switch (op.*) {
-            .insert => {
+            .insert, .insert_select => {
                 var tag_buf: [48]u8 = undefined;
                 const tag = try std.fmt.bufPrint(&tag_buf, "INSERT 0 {d}", .{compiled.affectedRows()});
                 try result.sendCommandComplete(allocator, w, tag);
@@ -1036,7 +1036,7 @@ fn runSingleStatement(
         const new_session = compiled.sessionValue();
         try session.replaceDbSchema(new_session.current_db, new_session.current_schema);
         switch (op.*) {
-            .insert => {
+            .insert, .insert_select => {
                 var tag_buf: [48]u8 = undefined;
                 const tag = try std.fmt.bufPrint(&tag_buf, "INSERT 0 {d}", .{compiled.affectedRows()});
                 try result.sendCommandComplete(allocator, w, tag);
@@ -1057,7 +1057,7 @@ fn runSingleStatement(
 
 fn isSideEffectOp(op: ir.Op) bool {
     return switch (op) {
-        .ddl, .insert => true,
+        .ddl, .insert, .insert_select => true,
         else => false,
     };
 }

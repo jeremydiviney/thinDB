@@ -209,10 +209,21 @@ pub fn parseDropTableBody(p: anytype) !*ir.Op {
 }
 
 pub fn parseInsert(p: anytype) !*ir.Op {
+    return parseInsertLike(p, .insert);
+}
+
+pub fn parseReplace(p: anytype) !*ir.Op {
+    return parseInsertLike(p, .replace);
+}
+
+fn parseInsertLike(p: anytype, mode: ir.InsertMode) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
-    try p.advance(); // consume INSERT
-    if (p.cur.tag != .kw_into) return PE.SqlExpectedKeyword;
-    try p.advance();
+    try p.advance(); // consume INSERT / REPLACE
+    if (p.cur.tag == .kw_into) {
+        try p.advance();
+    } else if (mode != .replace) {
+        return PE.SqlExpectedKeyword;
+    }
     const ref = try p.parseTableRef();
 
     var cols_opt: ?[]const []const u8 = null;
@@ -228,6 +239,7 @@ pub fn parseInsert(p: anytype) !*ir.Op {
     if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
         const source = try p.parseStatement();
         return try p.allocOp(.{ .insert_select = .{
+            .mode = mode,
             .table = ref,
             .columns = cols_opt,
             .source = source,
@@ -260,6 +272,7 @@ pub fn parseInsert(p: anytype) !*ir.Op {
     for (rows.items, 0..) |r, i| rows_owned[i] = r;
 
     return try p.allocOp(.{ .insert = .{
+        .mode = mode,
         .table = ref,
         .columns = cols_opt,
         .rows = rows_owned,

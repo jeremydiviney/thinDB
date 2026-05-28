@@ -54,7 +54,7 @@ const exec_expr = @import("../exec/expr.zig");
 pub const Expr = exec_expr.Expr;
 
 pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
-pub const version: u16 = 1;
+pub const version: u16 = 2;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -164,7 +164,13 @@ pub const AlterTableAddColumn = struct {
 /// Side-effect: bulk insert literal rows. Lives outside DdlOp because
 /// INSERT isn't DDL (it mutates data, not metadata) and its execution
 /// path produces an affected-row count.
+pub const InsertMode = enum(u8) {
+    insert = 0,
+    replace = 1,
+};
+
 pub const InsertOp = struct {
+    mode: InsertMode = .insert,
     table: TableRef,
     /// `null` means positional against the resolved table's schema; a
     /// non-null slice names the target columns in declared order.
@@ -513,6 +519,7 @@ pub const CreateTableAs = struct {
 /// (every table column must be populated by the source in declared
 /// order); a non-null list narrows it to a subset.
 pub const InsertSelect = struct {
+    mode: InsertMode = .insert,
     table: TableRef,
     columns: ?[]const []const u8,
     source: *Op,
@@ -834,6 +841,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         },
         .insert_select => |i| {
             try encodeTableRef(allocator, out, i.table);
+            try out.append(allocator, @intFromEnum(i.mode));
             if (i.columns) |cols| {
                 try out.append(allocator, 1);
                 try appendU32(allocator, out, @intCast(cols.len));
@@ -1172,6 +1180,7 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
 
 fn encodeInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) EncodeError!void {
     try encodeTableRef(allocator, out, i.table);
+    try out.append(allocator, @intFromEnum(i.mode));
     if (i.columns) |cols| {
         try out.append(allocator, 1);
         try appendU32(allocator, out, @intCast(cols.len));
@@ -1813,6 +1822,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
         },
         .insert_select => blk: {
             const ref = try decodeTableRef(bytes, cursor);
+            const mode = try decodeInsertMode(bytes, cursor);
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const has_cols = bytes[cursor.*] != 0;
             cursor.* += 1;
@@ -1830,6 +1840,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             errdefer allocator.destroy(source);
             source.* = try decodeOp(allocator, bytes, cursor);
             break :blk Op{ .insert_select = .{
+                .mode = mode,
                 .table = ref,
                 .columns = cols_opt,
                 .source = source,
@@ -2158,6 +2169,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
 
 fn decodeInsert(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!InsertOp {
     const ref = try decodeTableRef(bytes, cursor);
+    const mode = try decodeInsertMode(bytes, cursor);
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const has_cols = bytes[cursor.*] != 0;
     cursor.* += 1;
@@ -2194,7 +2206,15 @@ fn decodeInsert(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
         r.* = cells;
         inited += 1;
     }
-    return .{ .table = ref, .columns = cols_opt, .rows = rows };
+    return .{ .mode = mode, .table = ref, .columns = cols_opt, .rows = rows };
+}
+
+fn decodeInsertMode(bytes: []const u8, cursor: *usize) DecodeError!InsertMode {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const tag = bytes[cursor.*];
+    cursor.* += 1;
+    if (tag > @intFromEnum(InsertMode.replace)) return Error.IrCorrupt;
+    return @enumFromInt(tag);
 }
 
 fn decodeShow(bytes: []const u8, cursor: *usize) DecodeError!ShowOp {
@@ -2580,6 +2600,57 @@ test "ir: ddl rename alter-add and truncate round-trip" {
 
         try std.testing.expect(decoded == .ddl);
         try std.testing.expectEqual(@as(std.meta.Tag(DdlOp), root.ddl), @as(std.meta.Tag(DdlOp), decoded.ddl));
+    }
+}
+
+test "ir: replace values and replace-select round-trip" {
+    const allocator = std.testing.allocator;
+
+    {
+        const cols = [_][]const u8{ "id", "v" };
+        const row = [_]?Value{ .{ .bigint = 1 }, .{ .text = "a" } };
+        const rows = [_][]const ?Value{&row};
+        const root: Op = .{ .insert = .{
+            .mode = .replace,
+            .table = .{ .name = "t" },
+            .columns = &cols,
+            .rows = &rows,
+        } };
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try encode(allocator, &buf, root);
+
+        var decoded = try decode(allocator, buf.items);
+        defer decoded.deinitDecoded(allocator);
+
+        try std.testing.expect(decoded == .insert);
+        try std.testing.expectEqual(InsertMode.replace, decoded.insert.mode);
+        try std.testing.expectEqualStrings("t", decoded.insert.table.name);
+        try std.testing.expectEqual(@as(usize, 1), decoded.insert.rows.len);
+    }
+
+    {
+        var source_storage: Op = .{ .scan = .{ .table = .{ .name = "src" } } };
+        const cols = [_][]const u8{ "id", "v" };
+        const root: Op = .{ .insert_select = .{
+            .mode = .replace,
+            .table = .{ .name = "dst" },
+            .columns = &cols,
+            .source = &source_storage,
+        } };
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try encode(allocator, &buf, root);
+
+        var decoded = try decode(allocator, buf.items);
+        defer decoded.deinitDecoded(allocator);
+
+        try std.testing.expect(decoded == .insert_select);
+        try std.testing.expectEqual(InsertMode.replace, decoded.insert_select.mode);
+        try std.testing.expectEqualStrings("dst", decoded.insert_select.table.name);
+        try std.testing.expect(decoded.insert_select.source.* == .scan);
     }
 }
 

@@ -238,7 +238,7 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try explainOp(allocator, out, c.source.*, depth + 1);
         },
         .insert_select => |i| {
-            try out.appendSlice(allocator, "InsertSelect ");
+            try out.appendSlice(allocator, if (i.mode == .replace) "ReplaceSelect " else "InsertSelect ");
             try writeTableRef(allocator, out, i.table);
             try out.append(allocator, '\n');
             try explainOp(allocator, out, i.source.*, depth + 1);
@@ -309,7 +309,7 @@ fn explainCopy(allocator: Allocator, out: *std.ArrayList(u8), c: CopyOp) !void {
 }
 
 fn explainInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) !void {
-    try out.appendSlice(allocator, "Insert ");
+    try out.appendSlice(allocator, if (i.mode == .replace) "Replace " else "Insert ");
     try writeTableRef(allocator, out, i.table);
     if (i.columns) |cols| {
         try out.appendSlice(allocator, " cols=[");
