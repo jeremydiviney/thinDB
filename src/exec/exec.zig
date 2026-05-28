@@ -676,6 +676,36 @@ pub fn lateScan(
     return @import("latescan.zig").LateScan.create(allocator, inner, scan_ptr, table, output_names);
 }
 
+/// Build a zonemap block-skipping top-N plan for the same shape `lateScan`
+/// handles (`SELECT <cols> FROM table WHERE <pred> ORDER BY <keys> LIMIT n
+/// OFFSET m`). Returns null when the shape's leading ORDER BY key isn't a
+/// non-nullable numeric/temporal column with usable footer stats — the caller
+/// then falls back to `lateScan` (correct, just unoptimized). `order_specs`
+/// must be non-empty. See `zonemap_topn.zig`.
+pub fn zonemapTopN(
+    allocator: Allocator,
+    table: *Table,
+    accountant_ptr: ?*memory.MemoryAccountant,
+    probe_names: []const []const u8,
+    pred: predicate.PredicateExpr,
+    order_specs: []const SortSpec,
+    output_names: []const []const u8,
+    n: usize,
+    offset: usize,
+) !?Query {
+    return @import("zonemap_topn.zig").ZonemapTopN.create(
+        allocator,
+        table,
+        accountant_ptr,
+        probe_names,
+        pred,
+        order_specs,
+        output_names,
+        n,
+        offset,
+    );
+}
+
 /// Build a join's output `column_stats` by concatenating the left columns'
 /// stats with the kept right columns' stats (the join output schema is
 /// `left ⧺ right-where-kept`). A join can't grow a column's distinct count,
@@ -732,6 +762,7 @@ pub const Filter = @import("filter.zig").Filter;
 pub const Project = @import("project_limit.zig").Project;
 pub const Limit = @import("project_limit.zig").Limit;
 pub const LateScan = @import("latescan.zig").LateScan;
+pub const ZonemapTopN = @import("zonemap_topn.zig").ZonemapTopN;
 pub const rowloc = @import("rowloc.zig");
 
 pub const global_dict = @import("global_dict.zig");
@@ -783,7 +814,9 @@ test {
     _ = @import("scalar_fn_test.zig");
     _ = @import("cast.zig");
     _ = LateScan;
+    _ = ZonemapTopN;
     _ = rowloc;
+    _ = @import("zonemap_topn_test.zig");
     _ = @import("group_table.zig");
     _ = @import("global_dict.zig");
     _ = @import("radix_aggregate.zig");

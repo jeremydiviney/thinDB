@@ -508,6 +508,254 @@ test "compact merges segments and absorbs tombstones" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 4, 5, 6 }, ids.items);
 }
 
+/// Decode the table's single (post-compaction) segment, concatenating the
+/// named column's values across every row-group in physical (= order-key) order.
+/// Caller frees the returned slice.
+fn collectMergedBigint(allocator: std.mem.Allocator, io: anytype, t: *Table, schema: TableSchema, col_idx: usize) ![]i64 {
+    const seg_id = t.manifest.segments.items[0].segment_id;
+    var name_buf: [32]u8 = undefined;
+    const file_name = try Table.segmentFileName(&name_buf, seg_id);
+    var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
+    defer seg.deinit();
+
+    var out: std.ArrayList(i64) = .empty;
+    errdefer out.deinit(allocator);
+    for (seg.info.row_groups, 0..) |_, rg_idx| {
+        var c = try seg.decodeColumn(allocator, schema, rg_idx, col_idx);
+        defer c.deinit(allocator);
+        try out.appendSlice(allocator, c.data.bigint);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "streaming merge: sorted union across many small segments (multi-row-group output)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    // row_group_size = 4 forces several output row-groups, exercising the flush
+    // boundary in the streaming writer.
+    var db = try Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    // Five segments whose key ranges interleave (each individually sorted, as
+    // flush guarantees). The merge must interleave them into one sorted run.
+    const segs = [_][]const i64{
+        &.{ 3, 9, 21 },
+        &.{ 1, 8, 30 },
+        &.{ 5, 6, 7, 22 },
+        &.{ 2, 4, 25 },
+        &.{ 10, 11, 12, 13, 14 },
+    };
+    for (segs) |s| {
+        for (s) |id| try t.insert(&.{.{ .id = id, .v = @as(i32, @intCast(id * 10)) }});
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 5), t.segmentCount());
+
+    try t.compact();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+    // Brute-force expected: sorted union of all ids.
+    var want: std.ArrayList(i64) = .empty;
+    defer want.deinit(allocator);
+    for (segs) |s| try want.appendSlice(allocator, s);
+    std.mem.sort(i64, want.items, {}, std.sort.asc(i64));
+
+    const ids = try collectMergedBigint(allocator, io, t, schema, 0);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, want.items, ids);
+
+    // The paired `v` column must travel with its row (v == id*10), proving the
+    // non-key columns are emitted in lockstep with the key.
+    const seg_id = t.manifest.segments.items[0].segment_id;
+    var name_buf: [32]u8 = undefined;
+    const file_name = try Table.segmentFileName(&name_buf, seg_id);
+    var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
+    defer seg.deinit();
+    var ri: usize = 0;
+    for (seg.info.row_groups, 0..) |_, rg_idx| {
+        var vcol = try seg.decodeColumn(allocator, schema, rg_idx, 1);
+        defer vcol.deinit(allocator);
+        for (vcol.data.int) |v| {
+            try std.testing.expectEqual(@as(i32, @intCast(ids[ri] * 10)), v);
+            ri += 1;
+        }
+    }
+}
+
+test "streaming merge: tombstoned rows are dropped" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try Database.open(allocator, io, tmp.dir, .{ .row_group_size = 3 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    // Three segments; we'll delete rows spread across all of them.
+    for ([_][]const i64{ &.{ 1, 2, 3, 4 }, &.{ 5, 6, 7, 8 }, &.{ 9, 10, 11, 12 } }) |s| {
+        for (s) |id| try t.insert(&.{.{ .id = id }});
+        try t.flush();
+    }
+    // Delete first-of-group, last-of-group, and an interior row across segments.
+    for ([_]i64{ 1, 4, 6, 8, 9, 12 }) |id| {
+        _ = try t.delete(.{ .col = "id", .op = .eq, .val = .{ .bigint = id } });
+    }
+
+    try t.compact();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+    const ids = try collectMergedBigint(allocator, io, t, schema, 0);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3, 5, 7, 10, 11 }, ids);
+}
+
+test "streaming merge: dict-eligible string column round-trips" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "color", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try Database.open(allocator, io, tmp.dir, .{ .row_group_size = 64 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    const palette = [_][]const u8{ "red", "green", "blue", "magenta" };
+    // Two segments, each ~150 rows of a 4-value palette → low global NDV → the
+    // merged block must be dict-encoded, and every value must round-trip.
+    var next_id: i64 = 0;
+    var expected_color = std.AutoHashMap(i64, []const u8).init(allocator);
+    defer expected_color.deinit();
+    for (0..2) |_| {
+        var k: usize = 0;
+        while (k < 150) : (k += 1) {
+            const color = palette[@as(usize, @intCast(next_id)) % palette.len];
+            try t.insert(&.{.{ .id = next_id, .color = color }});
+            try expected_color.put(next_id, color);
+            next_id += 1;
+        }
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 2), t.segmentCount());
+
+    try t.compact();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+    const seg_id = t.manifest.segments.items[0].segment_id;
+    var name_buf: [32]u8 = undefined;
+    const file_name = try Table.segmentFileName(&name_buf, seg_id);
+    var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
+    defer seg.deinit();
+
+    // The color column's first block is dict-encoded (low global NDV).
+    var cache = storage.cache.Cache.init(allocator, 1 << 20);
+    defer cache.deinit();
+    var block = try seg.borrowColumnBlock(allocator, 0, 1, &cache);
+    const enc = block.encoding;
+    block.release(allocator, &cache);
+    try std.testing.expectEqual(storage.format.Encoding.dict, enc);
+
+    // Every row's (id, color) survives the merge intact, in id order.
+    var prev_id: i64 = -1;
+    for (seg.info.row_groups, 0..) |_, rg_idx| {
+        var idc = try seg.decodeColumn(allocator, schema, rg_idx, 0);
+        defer idc.deinit(allocator);
+        var cc = try seg.decodeColumn(allocator, schema, rg_idx, 1);
+        defer cc.deinit(allocator);
+        const sv = cc.view().data.string;
+        for (idc.data.bigint, 0..) |id, i| {
+            try std.testing.expect(id > prev_id); // strictly ascending key
+            prev_id = id;
+            try std.testing.expectEqualStrings(expected_color.get(id).?, sv.rowBytes(i));
+        }
+    }
+}
+
+test "streaming merge: NULL ordering matches the single-flush sort path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint, .nullable = true },
+            .{ .name = "id", .type = .bigint },
+        },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+
+    // Same rows two ways: (1) inserted across several segments then merged,
+    // (2) inserted once and flushed (the buildSortedSnapshot path). The merged
+    // segment's row order — including where NULLs (stored as a 0 placeholder in
+    // the key column, so they sort with the zeros) land — must match the
+    // single-flush order exactly.
+    const Row = struct { k: ?i64, id: i64 };
+    const rows = [_]Row{
+        .{ .k = 5, .id = 1 },   .{ .k = null, .id = 2 }, .{ .k = -3, .id = 3 },
+        .{ .k = 0, .id = 4 },   .{ .k = 5, .id = 5 },    .{ .k = null, .id = 6 },
+        .{ .k = 100, .id = 7 }, .{ .k = -3, .id = 8 },   .{ .k = 2, .id = 9 },
+    };
+
+    // (2) reference: one flush.
+    var ref_ids: []i64 = undefined;
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try Database.open(allocator, io, tmp.dir, .{ .row_group_size = 64 });
+        defer db.close();
+        const t = try db.table("t", schema, .{ .order_key = &.{"k"} });
+        for (rows) |r| try t.insert(&.{.{ .k = r.k, .id = r.id }});
+        try t.flush();
+        ref_ids = try collectMergedBigint(allocator, io, t, schema, 1);
+    }
+    defer allocator.free(ref_ids);
+
+    // (1) merged: one row per segment, then compact.
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var db2 = try Database.open(allocator, io, tmp2.dir, .{ .row_group_size = 4 });
+    defer db2.close();
+    const t2 = try db2.table("t", schema, .{ .order_key = &.{"k"} });
+    for (rows) |r| {
+        try t2.insert(&.{.{ .k = r.k, .id = r.id }});
+        try t2.flush();
+    }
+    try t2.compact();
+    try std.testing.expectEqual(@as(usize, 1), t2.segmentCount());
+
+    const merged_ids = try collectMergedBigint(allocator, io, t2, schema, 1);
+    defer allocator.free(merged_ids);
+
+    // The merged row order (carried by the unique `id`) must equal the
+    // single-flush sort's order, NULL placement included.
+    try std.testing.expectEqualSlices(i64, ref_ids, merged_ids);
+}
+
 test "auto-flush fires when row count threshold is hit" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

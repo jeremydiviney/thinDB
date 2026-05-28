@@ -139,18 +139,29 @@ pub const Schema = struct {
     /// pattern as `backgroundFlushSweep`: name-snapshot + atomic shared
     /// lock acquisition so a concurrent drop can't free the Table out
     /// from under us.
-    pub fn backgroundCompactSweep(self: *Schema) !void {
-        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.tables_mutex, self.tables);
+    /// Returns true if any table merged a group this sweep (so the background
+    /// loop can keep draining without sleeping).
+    pub fn backgroundCompactSweep(self: *Schema) !bool {
+        // Discover every table on disk, not just those a query has already
+        // opened: the background compactor must monitor freshly-loaded tables
+        // (e.g. a bulk import done by another process, or any table on a
+        // just-started server) without needing client activity first.
+        // `listTables` returns opened + on-disk names; opening each adopts it
+        // into `self.tables` so it stays monitored from here on.
+        const names = try self.listTables(self.allocator);
         defer snapshot.freeNames(self.allocator, names);
 
         const min_segs = self.config.compact_min_segments;
         const tomb_thresh = self.config.compact_tombstone_threshold;
+        var worked = false;
         for (names) |name| {
+            _ = self.openTable(name, .{}) catch continue;
             if (self.acquireTableForCompact(name)) |t| {
                 defer t.compact_lock.unlock(t.io);
-                t.tryBackgroundCompact(min_segs, tomb_thresh) catch {};
+                if (t.tryBackgroundCompact(min_segs, tomb_thresh) catch false) worked = true;
             }
         }
+        return worked;
     }
 
     pub fn runBackgroundCompactor(
@@ -161,9 +172,11 @@ pub const Schema = struct {
     ) void {
         const duration: Io.Duration = .fromMilliseconds(@intCast(poll_ms));
         while (!should_stop.load(.acquire)) {
-            Io.sleep(sleeper_io, duration, .awake) catch return;
+            // Keep sweeping back-to-back while there's a backlog to drain; only
+            // sleep the poll interval once a sweep finds nothing to merge.
+            const worked = self.backgroundCompactSweep() catch false;
             if (should_stop.load(.acquire)) return;
-            self.backgroundCompactSweep() catch {};
+            if (!worked) Io.sleep(sleeper_io, duration, .awake) catch return;
         }
     }
 

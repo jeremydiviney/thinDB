@@ -198,6 +198,206 @@ pub fn writeSegment(
     };
 }
 
+/// Compute per-column dict-eligibility from a set of per-column HLL sketches
+/// (same layout as `SegmentInfo.column_sketches`). A column is eligible when
+/// the merged NDV across all `sketches` is at or below `dict_max_global_ndv`.
+/// Caller owns the returned slice.
+///
+/// Used by the streaming merge path, which derives the output's sketch from the
+/// union of the input segments' sketches rather than from a materialized column.
+pub fn dictEligibleFromSketches(
+    allocator: Allocator,
+    column_count: usize,
+    sketches: []const []const u8,
+) ![]bool {
+    const dict_eligible = try allocator.alloc(bool, column_count);
+    errdefer allocator.free(dict_eligible);
+    for (dict_eligible, 0..) |*elig, ci| {
+        var global: hll.Hll = .{};
+        for (sketches) |ps| {
+            if (ps.len >= (ci + 1) * hll.m) {
+                const ph = hll.Hll.fromBytes(ps[ci * hll.m .. (ci + 1) * hll.m]);
+                global.merge(&ph);
+            }
+        }
+        elig.* = global.estimate() <= dict_max_global_ndv;
+    }
+    return dict_eligible;
+}
+
+/// Streaming segment writer for compaction's k-way merge. Unlike `writeSegment`,
+/// which needs every column fully materialized, this accepts sorted row-groups
+/// one at a time so the merge holds at most ~(k input row-groups + one output
+/// row-group + the in-flight `buf`) in memory rather than the whole output.
+///
+/// `dict_eligible` and `column_sketches` are precomputed by the caller (from the
+/// union of the input segments' sketches — a correct upper bound for dict
+/// eligibility and an acceptable sketch for the merged output) and must outlive
+/// `begin`/`writeRowGroup`. Ownership of `column_sketches` transfers to the
+/// returned `SegmentInfo` at `finish`.
+///
+/// Usage: `begin`, then `writeRowGroup` per sorted row-group (≤ `row_group_size`
+/// rows), then `finish`. On any error before `finish`, call `deinit`.
+pub const MergedSegmentWriter = struct {
+    allocator: Allocator,
+    schema: TableSchema,
+    segment_id: u64,
+    schema_fingerprint: u64,
+    row_group_size: usize,
+    dict_eligible: []const bool,
+    column_sketches: []const u8,
+
+    buf: std.ArrayList(u8),
+    compressor: compression_mod.Compressor,
+    row_groups: std.ArrayList(RowGroupMeta),
+    row_count: u64,
+
+    pub fn begin(
+        allocator: Allocator,
+        schema: TableSchema,
+        segment_id: u64,
+        schema_fingerprint: u64,
+        row_group_size: usize,
+        dict_eligible: []const bool,
+        /// Per-column HLL bytes for the merged output (same layout as
+        /// `SegmentInfo.column_sketches`). Ownership transfers to `finish`'s
+        /// `SegmentInfo`; freed by `deinit` if the writer is torn down first.
+        column_sketches: []const u8,
+    ) !MergedSegmentWriter {
+        if (row_group_size == 0) return format.Error.InvalidRowGroupSize;
+        if (dict_eligible.len != schema.columns.len) return format.Error.SchemaMismatch;
+
+        var compressor = try compression_mod.Compressor.init();
+        errdefer compressor.deinit();
+
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, &format.segment_magic);
+        try appendU16(allocator, &buf, format.segment_version);
+        try appendU16(allocator, &buf, 0); // flags
+        try appendU64(allocator, &buf, schema_fingerprint);
+        try appendU64(allocator, &buf, segment_id);
+        try appendU64(allocator, &buf, 0); // row_count placeholder, patched at finish
+        std.debug.assert(buf.items.len == format.header_size);
+
+        return .{
+            .allocator = allocator,
+            .schema = schema,
+            .segment_id = segment_id,
+            .schema_fingerprint = schema_fingerprint,
+            .row_group_size = row_group_size,
+            .dict_eligible = dict_eligible,
+            .column_sketches = column_sketches,
+            .buf = buf,
+            .compressor = compressor,
+            .row_groups = .empty,
+            .row_count = 0,
+        };
+    }
+
+    /// Append one sorted row-group. `columns` is one view per schema column,
+    /// each holding the same `rows` (≤ `row_group_size`) rows. Encodes every
+    /// column block (raw / FOR / dict per `dict_eligible`) and records the
+    /// row-group's stats + offsets — the same per-block path `writeSegment` runs.
+    pub fn writeRowGroup(self: *MergedSegmentWriter, columns: []const ColumnView) !void {
+        if (columns.len != self.schema.columns.len) return format.Error.SchemaMismatch;
+        const rows: usize = if (columns.len == 0) 0 else columns[0].rowCount();
+        if (rows == 0) return;
+        for (columns) |view| {
+            if (view.rowCount() != rows) return format.Error.UnevenColumns;
+        }
+        if (rows > self.row_group_size) return format.Error.InvalidRowGroupSize;
+
+        const rg_file_offset: u64 = @intCast(self.buf.items.len);
+
+        try appendU32(self.allocator, &self.buf, @intCast(rows));
+        try appendU32(self.allocator, &self.buf, 0); // padding
+
+        const col_offsets = try self.allocator.alloc(u64, columns.len);
+        errdefer self.allocator.free(col_offsets);
+        for (columns, self.schema.columns, 0..) |view, schema_col, ci| {
+            col_offsets[ci] = @intCast(self.buf.items.len);
+            try writeColumnBlock(self.allocator, &self.compressor, &self.buf, view, schema_col.nullable, self.dict_eligible[ci], 0, rows);
+        }
+
+        const rg_length: u32 = @intCast(self.buf.items.len - rg_file_offset);
+
+        const stats = try self.allocator.alloc(format.Stats, columns.len);
+        errdefer self.allocator.free(stats);
+        for (columns, 0..) |view, ci| {
+            stats[ci] = computeStats(view, 0, rows);
+        }
+
+        try self.row_groups.append(self.allocator, .{
+            .offset = rg_file_offset,
+            .length = rg_length,
+            .row_count = @intCast(rows),
+            .stats = stats,
+            .col_offsets = col_offsets,
+        });
+        self.row_count += @intCast(rows);
+    }
+
+    /// Write the footer, patch the header's row_count, flush to disk, and return
+    /// the `SegmentInfo` (which takes ownership of `column_sketches` and the
+    /// row-group metadata). After a successful `finish` the writer's `buf` /
+    /// `compressor` are released; do not call `deinit` (it becomes a no-op).
+    pub fn finish(self: *MergedSegmentWriter, io: Io, dir: Io.Dir, file_name: []const u8, sync_on_close: bool) !SegmentInfo {
+        format.writeU64(self.buf.items[24..32], self.row_count);
+
+        const footer_start = self.buf.items.len;
+        try appendU32(self.allocator, &self.buf, @intCast(self.row_groups.items.len));
+        for (self.row_groups.items) |rg| {
+            try appendU64(self.allocator, &self.buf, rg.offset);
+            try appendU32(self.allocator, &self.buf, rg.length);
+            try appendU32(self.allocator, &self.buf, rg.row_count);
+            for (rg.stats) |s| {
+                try appendI128(self.allocator, &self.buf, s.min);
+                try appendI128(self.allocator, &self.buf, s.max);
+            }
+            for (rg.col_offsets) |co| {
+                try appendU64(self.allocator, &self.buf, co);
+            }
+        }
+        const footer_size: u32 = @intCast(self.buf.items.len - footer_start + format.footer_trailer_size);
+        try appendU32(self.allocator, &self.buf, footer_size);
+        try self.buf.appendSlice(self.allocator, &format.segment_magic);
+
+        const byte_size: u64 = @intCast(self.buf.items.len);
+        try @import("storage.zig").writeFileSynced(io, dir, file_name, self.buf.items, sync_on_close);
+
+        const info = SegmentInfo{
+            .segment_id = self.segment_id,
+            .row_count = self.row_count,
+            .schema_fingerprint = self.schema_fingerprint,
+            .byte_size = byte_size,
+            .row_groups = try self.row_groups.toOwnedSlice(self.allocator),
+            .column_sketches = self.column_sketches,
+        };
+
+        self.buf.deinit(self.allocator);
+        self.compressor.deinit();
+        self.* = undefined;
+        return info;
+    }
+
+    /// Release everything the writer owns. Frees `column_sketches` too —
+    /// ownership only leaves the writer on a successful `finish`. Safe to call
+    /// on a fresh `begin`-ed writer that never reached `finish`.
+    pub fn deinit(self: *MergedSegmentWriter) void {
+        for (self.row_groups.items) |rg| {
+            self.allocator.free(rg.stats);
+            self.allocator.free(@constCast(rg.col_offsets));
+        }
+        self.row_groups.deinit(self.allocator);
+        self.buf.deinit(self.allocator);
+        self.compressor.deinit();
+        if (self.column_sketches.len > 0) self.allocator.free(@constCast(self.column_sketches));
+        self.* = undefined;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------

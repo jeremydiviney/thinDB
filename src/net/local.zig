@@ -1588,17 +1588,21 @@ fn aggOutTypeForReduction(family: AggFamily, base_type: types.Type, aff: AffineA
 // Any deviation bails to the existing plan, which is always correct.
 // ---------------------------------------------------------------------------
 
-/// The `Filter{ Scan }` core of a late-mat candidate, plus the optional
-/// ORDER BY and top Project peeled above it.
+/// The `[Filter] Scan` core of a late-mat candidate, plus the optional ORDER BY
+/// and top Project peeled above it. `has_filter` is false for a bare scan with
+/// no WHERE (then `predicate` is the always-true constant).
 const LateMatPeel = struct {
     select: ?ir.Op.Project,
     order_specs: ?[]const SortSpec,
-    filter: ir.Op.Filter,
+    predicate: PredicateExpr,
+    has_filter: bool,
     scan: ir.Op.Scan,
 };
 
-/// Peel `Limit{ [Project] [OrderBy] Filter{ Scan } }`. Returns null unless the
-/// shape bottoms out in a bare, unaliased single-table scan under a filter.
+/// Peel `Limit{ [Project] [OrderBy] [Filter] Scan }`. Returns null unless the
+/// shape bottoms out in a bare, unaliased single-table scan. The Filter is
+/// optional: a no-WHERE `ORDER BY ... LIMIT` still qualifies (predicate ⇒
+/// always-true), which lets the zonemap top-N skip row groups for it too.
 fn lateMatPeel(l: ir.Op.Limit) ?LateMatPeel {
     var node = l.upstream;
     var select: ?ir.Op.Project = null;
@@ -1611,14 +1615,19 @@ fn lateMatPeel(l: ir.Op.Limit) ?LateMatPeel {
         order_specs = node.order_by.specs;
         node = node.order_by.upstream;
     }
-    if (node.* != .filter) return null;
-    const filter = node.filter;
-    if (filter.upstream.* != .scan) return null;
-    const scan = filter.upstream.scan;
+    var pred: PredicateExpr = .{ .always = true };
+    var has_filter = false;
+    if (node.* == .filter) {
+        pred = node.filter.predicate;
+        has_filter = true;
+        node = node.filter.upstream;
+    }
+    if (node.* != .scan) return null;
+    const scan = node.scan;
     // Aliased scans expose `alias.col` names via an AliasRename wrapper —
     // resolving the output back to base columns gets murky. Bail.
     if (scan.alias != null) return null;
-    return .{ .select = select, .order_specs = order_specs, .filter = filter, .scan = scan };
+    return .{ .select = select, .order_specs = order_specs, .predicate = pred, .has_filter = has_filter, .scan = scan };
 }
 
 const LateMatShape = struct {
@@ -1632,6 +1641,14 @@ const LateMatShape = struct {
     order_specs: ?[]const SortSpec,
     /// Owned: `output_names` for the `SELECT *` case (else borrowed from IR).
     owns_output: bool,
+    /// True when the output decodes strictly more columns than the probe set —
+    /// the precondition for late materialization to save work. (Zonemap top-N
+    /// benefits regardless, so it isn't gated on this.)
+    output_wider: bool,
+    /// True when a real WHERE was peeled (false ⇒ predicate is always-true).
+    /// LateScan is only used when there's a real filter; zonemap top-N handles
+    /// the no-filter case directly.
+    has_filter: bool,
 
     fn deinit(self: *LateMatShape, allocator: Allocator) void {
         allocator.free(@constCast(self.probe_names));
@@ -1688,7 +1705,7 @@ fn lateMatShape(allocator: Allocator, table: *ApiTable, l: ir.Op.Limit) !?LateMa
     // bail rather than risk a wrong plan.
     var probe: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer probe.deinit(allocator);
-    collectPredicateNames(allocator, &probe, peel.filter.predicate) catch {
+    collectPredicateNames(allocator, &probe, peel.predicate) catch {
         probe.deinit(allocator);
         return null;
     };
@@ -1721,20 +1738,19 @@ fn lateMatShape(allocator: Allocator, table: *ApiTable, l: ir.Op.Limit) !?LateMa
     };
     errdefer if (owns_output) allocator.free(@constCast(output_names));
 
-    // Only worth it when the output decodes strictly more columns than the
-    // probe set — otherwise the inner scan already reads everything.
-    if (!outputWiderThanProbe(table, output_names, probe.items)) {
-        if (owns_output) allocator.free(@constCast(output_names));
-        probe.deinit(allocator);
-        return null;
-    }
+    // LateScan only pays off when the output decodes strictly more columns
+    // than the probe set; zonemap top-N benefits either way. Record it and let
+    // `buildLateMat` decide — don't reject the shape here.
+    const output_wider = outputWiderThanProbe(table, output_names, probe.items);
 
     return .{
         .output_names = output_names,
         .probe_names = try probe.toOwnedSlice(allocator),
-        .predicate = peel.filter.predicate,
+        .predicate = peel.predicate,
         .order_specs = peel.order_specs,
         .owns_output = owns_output,
+        .output_wider = output_wider,
+        .has_filter = peel.has_filter,
     };
 }
 
@@ -1763,14 +1779,38 @@ fn outputWiderThanProbe(
     return extra > 0;
 }
 
+/// Build the zonemap top-N or late-materialization plan for a matched shape, or
+/// null when neither applies (caller falls through to its Top-N / Limit plan).
 fn buildLateMat(
     allocator: Allocator,
     table: *ApiTable,
     acct: ?*exec.memory.MemoryAccountant,
     shape: LateMatShape,
     l: ir.Op.Limit,
-) !Query {
-    return exec.lateScan(
+) !?Query {
+    // Prefer the zonemap block-skipping top-N path when there's an ORDER BY and
+    // its leading key qualifies (non-nullable numeric/temporal with footer
+    // stats). It prunes whole row groups via per-RG min/max and produces the
+    // byte-identical answer to the full-scan plan — regardless of projection
+    // width, and even with no WHERE. Returns null on any unsupported shape.
+    if (shape.order_specs) |specs| {
+        if (try exec.zonemapTopN(
+            allocator,
+            table,
+            acct,
+            shape.probe_names,
+            shape.predicate,
+            specs,
+            shape.output_names,
+            @intCast(l.n),
+            @intCast(l.offset),
+        )) |q| return q;
+    }
+    // LateScan is only worthwhile (and only validated) with a real WHERE that
+    // decodes fewer columns than the wide output. Otherwise signal the caller
+    // to use its plain Top-N / Limit plan.
+    if (!shape.output_wider or !shape.has_filter) return null;
+    return try exec.lateScan(
         allocator,
         table,
         acct,
@@ -1821,7 +1861,7 @@ pub fn buildServerQuerySession(
                     if (try lateMatShape(allocator, t, l)) |shape| {
                         var sh = shape;
                         defer sh.deinit(allocator);
-                        break :blk try buildLateMat(allocator, t, null, sh, l);
+                        if (try buildLateMat(allocator, t, null, sh, l)) |q| break :blk q;
                     }
                 }
             }
@@ -2289,7 +2329,7 @@ fn routeStreamGroupBy(
             if (groupKeysSortedPrefix(st.sort_state, group_cols)) {
                 return try upstream.streamGroupBy(group_cols, aggs);
             }
-            if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), group_cols, aggs.len, budget)) {
+            if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), group_cols, aggs, budget)) {
                 const specs = try allocator.alloc(exec.SortSpec, group_cols.len);
                 defer allocator.free(specs);
                 for (group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
@@ -2372,8 +2412,8 @@ fn routeRadixGroupBy(
         // unknown-but-low for bounded behaviour on unknown-but-high.
         if (known) {
             est = @min(est, @max(st.upper_rows, 1));
-            const per_group_bytes: u64 = @as(u64, aggs.len) * 16 + 16; // ≈ state + key
-            if (est *| per_group_bytes <= RADIX_CACHE_BYTES) return null;
+            const per_group_bytes = perGroupTableBytes(schema, group_cols, aggs);
+            if (per_group_bytes != 0 and est *| per_group_bytes <= RADIX_CACHE_BYTES) return null;
         }
     }
 
@@ -2390,22 +2430,44 @@ fn routeRadixGroupBy(
     };
 }
 
+/// Approximate allocated bytes per group in the hash / radix Aggregate table:
+/// the representative slot `{key/hash + gid}`, the per-group key copy
+/// (`gkeys_int` u128 / byte-key slice header), the group-key column bytes, and
+/// each aggregate's real SoA state-column width (`aggStateWidth`: count 8,
+/// sum 16, avg 16, numeric min/max 16, 48 for the wide `.other` column). Scaled
+/// by the 0.75 load-factor headroom, since the slot table, key array, and state
+/// columns are all sized to capacity ≈ groups / 0.75. Single source of truth for
+/// both the hash-vs-sort budget gate and the radix-vs-hash cache-residency gate
+/// so they size the table identically. Returns 0 iff a group column is missing.
+fn perGroupTableBytes(
+    schema: []const types.Column,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+) u64 {
+    var raw: u64 = 16 + 16; // slot {key/hash, gid} + per-group key copy
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse return 0;
+        raw += exec.memory.estimateColumnBytes(schema[idx].type);
+    }
+    for (aggs) |a| {
+        const in_t: ?types.Type = if (a.col) |name| blk: {
+            const idx = types.findColumn(schema, name) orelse break :blk null;
+            break :blk schema[idx].type;
+        } else null;
+        raw += exec.aggregate_op.aggStateWidth(a.func, in_t);
+    }
+    return raw * 4 / 3; // 0.75 load-factor headroom
+}
+
 fn groupKeysCardUnderLimit(
     st: exec.PipelineStats,
     schema: []const types.Column,
     group_cols: []const []const u8,
-    n_aggs: usize,
+    aggs: []const ir.AggSpec,
     budget: usize,
 ) bool {
-    // Per-group footprint: dup'd key bytes + one accumulator per aggregate
-    // + StringHashMap entry/load-factor overhead. Deliberately generous so
-    // an HLL under-estimate doesn't push the real table over budget.
-    var per_group: u64 = 96; // map entry + value slice + load-factor slack
-    for (group_cols) |gc| {
-        const idx = types.findColumn(schema, gc) orelse return false;
-        per_group += exec.memory.estimateColumnBytes(schema[idx].type);
-    }
-    per_group += @as(u64, n_aggs) * 32; // accumulator state per aggregate (AccState)
+    const per_group = perGroupTableBytes(schema, group_cols, aggs);
+    if (per_group == 0) return false; // missing group column → conservative: sort
 
     // Use up to half the budget for the group table; the rest covers input
     // batches, the output, and any sibling operators. budget==0 means
@@ -2700,7 +2762,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                         var sh = shape;
                         defer sh.deinit(ctx.allocator);
                         const acct = try ctx.queryAccountant();
-                        break :blk try buildLateMat(ctx.allocator, t, acct, sh, l);
+                        if (try buildLateMat(ctx.allocator, t, acct, sh, l)) |q| break :blk q;
                     }
                 }
             }

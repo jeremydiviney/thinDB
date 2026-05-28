@@ -33,6 +33,8 @@ pub const writeManifest = manifest.writeManifest;
 pub const readManifest = manifest.readManifest;
 
 pub const writeSegment = segment_writer.writeSegment;
+pub const MergedSegmentWriter = segment_writer.MergedSegmentWriter;
+pub const dictEligibleFromSketches = segment_writer.dictEligibleFromSketches;
 pub const readSegment = segment_reader.readSegment;
 
 /// Write `data` to `dir/sub_path`. When `sync_after_write` is true, also

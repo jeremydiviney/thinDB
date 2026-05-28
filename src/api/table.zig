@@ -487,15 +487,15 @@ pub const Table = struct {
     /// considering both the tombstone-pressure trigger and (when at least
     /// `min_segments` are live) the count-based tier trigger. No-op when
     /// no segment qualifies or both gates are disabled.
-    pub fn tryBackgroundCompact(self: *Table, min_segments: u32, tomb_threshold: f32) !void {
+    pub fn tryBackgroundCompact(self: *Table, min_segments: u32, tomb_threshold: f32) !bool {
         // Cheap optimization: skip the work if neither trigger can fire.
         self.mutex.lockUncancelable(self.io);
         const seg_count = self.manifest.segments.items.len;
         self.mutex.unlock(self.io);
         const enough_for_tier = (min_segments != 0 and seg_count >= min_segments);
         const tomb_enabled = (tomb_threshold <= 1.0);
-        if (!enough_for_tier and !tomb_enabled) return;
-        try @import("compact.zig").execTieredCompact(self, tomb_threshold);
+        if (!enough_for_tier and !tomb_enabled) return false;
+        return try @import("compact.zig").execTieredCompact(self, tomb_threshold);
     }
 
     pub fn segmentCount(self: Table) usize {
