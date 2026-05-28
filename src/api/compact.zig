@@ -84,8 +84,10 @@ pub fn execCompact(t: *Table) !void {
 /// segment, fall back to the count-based tier picker. No-op if no
 /// group qualifies. Caller holds `compact_lock`.
 ///
-/// Pass `tomb_threshold > 1.0` to disable the tombstone trigger.
-pub fn execTieredCompact(t: *Table, tomb_threshold: f32) !void {
+/// Pass `tomb_threshold > 1.0` to disable the tombstone trigger. Returns true
+/// if a merge was performed (so the background loop can keep draining without
+/// sleeping), false if no group qualified.
+pub fn execTieredCompact(t: *Table, tomb_threshold: f32) !bool {
     const metas = try snapshotSegMeta(t);
     defer t.allocator.free(metas);
 
@@ -95,7 +97,7 @@ pub fn execTieredCompact(t: *Table, tomb_threshold: f32) !void {
         if (tomb_pick) |ids| {
             defer t.allocator.free(ids);
             try mergeSegments(t, ids);
-            return;
+            return true;
         }
     }
     // 2. Tier-0 sweep: collapse a run of small staging segments into one
@@ -103,12 +105,13 @@ pub fn execTieredCompact(t: *Table, tomb_threshold: f32) !void {
     if (try pickTier0Group(t.allocator, metas)) |ids| {
         defer t.allocator.free(ids);
         try mergeSegments(t, ids);
-        return;
+        return true;
     }
     // 3. Tier-based count trigger (tier 1+).
-    const seg_ids = try pickCompactionGroup(t.allocator, metas) orelse return;
+    const seg_ids = try pickCompactionGroup(t.allocator, metas) orelse return false;
     defer t.allocator.free(seg_ids);
     try mergeSegments(t, seg_ids);
+    return true;
 }
 
 /// Find the first segment whose tombstone fraction exceeds `threshold`

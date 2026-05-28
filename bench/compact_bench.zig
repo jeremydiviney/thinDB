@@ -98,7 +98,7 @@ pub fn benchManySegmentsWithCompact(allocator: Allocator, io: Io) !void {
         for (batch, 0..) |*r, i| r.id = @intCast(done + i);
         try t.insert(batch);
         try t.flush();
-        try db.backgroundCompactSweep();
+        _ = try db.backgroundCompactSweep();
     }
     const ingest_ns = elapsedNs(io, t_ingest);
 
@@ -156,7 +156,7 @@ pub fn benchTombstonePressureCompact(allocator: Allocator, io: Io) !void {
 
     // Now run the tombstone-triggered compaction.
     const t_compact = Io.Clock.awake.now(io);
-    try db.backgroundCompactSweep();
+    _ = try db.backgroundCompactSweep();
     const compact_ns = elapsedNs(io, t_compact);
 
     std.debug.print(
@@ -208,7 +208,7 @@ pub fn benchTierFillUp(allocator: Allocator, io: Io) !void {
         const t_ingest = Io.Clock.awake.now(io);
         try t.insert(batch);
         try t.flush();
-        try db.backgroundCompactSweep();
+        _ = try db.backgroundCompactSweep();
         const ingest_ns = elapsedNs(io, t_ingest);
 
         if ((batch_idx + 1) % 100 == 0) {

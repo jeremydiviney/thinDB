@@ -1286,7 +1286,7 @@ test "backgroundCompactSweep: tiered merge when 4 same-tier segments accumulate"
     try std.testing.expectEqual(@as(usize, 4), t.segmentCount());
 
     // Sweep should pick all 4 (same tier, adjacent) and merge into one.
-    try db.backgroundCompactSweep();
+    _ = try db.backgroundCompactSweep();
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 
     // Three more flushes — only 3 segments, tiered policy needs 4 to fire.
@@ -1300,7 +1300,7 @@ test "backgroundCompactSweep: tiered merge when 4 same-tier segments accumulate"
         try t.flush();
     }
     try std.testing.expectEqual(@as(usize, 4), t.segmentCount()); // 1 merged + 3 new
-    try db.backgroundCompactSweep();
+    _ = try db.backgroundCompactSweep();
     // The 3 new ones are tier 0; the merged one is also tier 0 (still <65k rows).
     // So all 4 are at tier 0 and adjacent → merged again.
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
@@ -1347,7 +1347,7 @@ test "compactor: tombstone-pressure trigger reclaims a heavily-deleted segment" 
 
     // Tomb file now exists for the only segment.
     // Sweep should pick it (single-segment compact: rewrite without tombs).
-    try db.backgroundCompactSweep();
+    _ = try db.backgroundCompactSweep();
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 
     // After compaction the surviving rows should be the 5 with qty > 50.
@@ -1359,7 +1359,7 @@ test "compactor: tombstone-pressure trigger reclaims a heavily-deleted segment" 
     try std.testing.expectEqualSlices(i64, &[_]i64{ 6, 7, 8, 9, 10 }, ids.items);
 
     // Sweep again: no tombstones left, no tier trigger. No-op.
-    try db.backgroundCompactSweep();
+    _ = try db.backgroundCompactSweep();
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 }
 
@@ -1390,7 +1390,7 @@ test "tier-0 sweep: backgroundCompactSweep collapses adjacent small segments" {
     // The tier-0 sweep collapses the run of small segments into one in a single
     // merge (fires at >=2 segments, well under the 2M cap), rather than waiting
     // for a 4-wide tier group.
-    try db.backgroundCompactSweep();
+    _ = try db.backgroundCompactSweep();
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 }
 
@@ -1425,7 +1425,7 @@ test "compactor: tier-0 sweep collapses small segments and preserves rows" {
     // The tier-0 sweep collapses the whole run of small segments in a single
     // merge (>=2 segments triggers it; 10 rows are well under the 2M cap) —
     // not 4-at-a-time.
-    try db.backgroundCompactSweep();
+    _ = try db.backgroundCompactSweep();
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 
     // Every row survives the merge.

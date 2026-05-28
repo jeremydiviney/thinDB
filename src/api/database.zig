@@ -279,13 +279,16 @@ pub const Database = struct {
         }
     }
 
-    pub fn backgroundCompactSweep(self: *Database) !void {
+    /// Returns true if any schema merged a group this sweep.
+    pub fn backgroundCompactSweep(self: *Database) !bool {
         const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.schemas_mutex, self.schemas);
         defer snapshot.freeNames(self.allocator, names);
+        var worked = false;
         for (names) |name| {
             const s = self.schema(name) orelse continue;
-            try s.backgroundCompactSweep();
+            if (s.backgroundCompactSweep() catch false) worked = true;
         }
+        return worked;
     }
 
     pub fn runBackgroundCompactor(
@@ -296,9 +299,9 @@ pub const Database = struct {
     ) void {
         const duration: Io.Duration = .fromMilliseconds(@intCast(poll_ms));
         while (!should_stop.load(.acquire)) {
-            Io.sleep(sleeper_io, duration, .awake) catch return;
+            const worked = self.backgroundCompactSweep() catch false;
             if (should_stop.load(.acquire)) return;
-            self.backgroundCompactSweep() catch {};
+            if (!worked) Io.sleep(sleeper_io, duration, .awake) catch return;
         }
     }
 

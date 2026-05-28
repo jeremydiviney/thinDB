@@ -206,13 +206,16 @@ pub const Catalog = struct {
         }
     }
 
-    pub fn backgroundCompactSweep(self: *Catalog) !void {
+    /// Returns true if any database merged a group this sweep.
+    pub fn backgroundCompactSweep(self: *Catalog) !bool {
         const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.databases_mutex, self.databases);
         defer snapshot.freeNames(self.allocator, names);
+        var worked = false;
         for (names) |name| {
             const db = self.database(name) orelse continue;
-            db.backgroundCompactSweep() catch {};
+            if (db.backgroundCompactSweep() catch false) worked = true;
         }
+        return worked;
     }
 
     pub fn runBackgroundCompactor(
@@ -223,9 +226,9 @@ pub const Catalog = struct {
     ) void {
         const duration: Io.Duration = .fromMilliseconds(@intCast(poll_ms));
         while (!should_stop.load(.acquire)) {
-            Io.sleep(sleeper_io, duration, .awake) catch return;
+            const worked = self.backgroundCompactSweep() catch false;
             if (should_stop.load(.acquire)) return;
-            self.backgroundCompactSweep() catch {};
+            if (!worked) Io.sleep(sleeper_io, duration, .awake) catch return;
         }
     }
 
