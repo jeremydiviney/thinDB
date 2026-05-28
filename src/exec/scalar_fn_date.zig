@@ -190,27 +190,68 @@ pub fn dateToDatetimeKernel(allocator: Allocator, args: []const ColumnView, out:
 /// 'day'/'month'/'year'); an unrecognized unit passes the value through.
 pub fn dateTruncKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
-    const unit = stringViewOf(args[0]).rowBytes(0);
-    const s = args[1].data.datetime;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.datetime.append(allocator, truncDatetime(s[i], unit));
+    // The unit is the same for every row, so identify it ONCE — the per-row
+    // hot loop is then a branch-free arithmetic truncation, not six repeated
+    // case-insensitive string compares.
+    const unit = parseTruncUnit(stringViewOf(args[0]).rowBytes(0));
+    const s = args[1].data.datetime[0..row_count];
+
+    const base = out.data.datetime.items.len;
+    try out.data.datetime.resize(allocator, base + row_count);
+    const dst = out.data.datetime.items[base..][0..row_count];
+
+    const us: i64 = 1_000_000;
+    switch (unit) {
+        // Sub-day units are a floor to a fixed micro-quantum — a comptime
+        // divisor that lowers to a multiply-shift and vectorizes.
+        .second => truncToQuantum(us, s, dst),
+        .minute => truncToQuantum(60 * us, s, dst),
+        .hour => truncToQuantum(3600 * us, s, dst),
+        .day => truncToQuantum(86_400 * us, s, dst),
+        // Month/year boundaries aren't fixed-width — scalar calendar math.
+        .month, .year => for (dst, s) |*d, v| {
+            d.* = truncCalendar(v, unit == .year);
+        },
+        .other => @memcpy(dst, s),
     }
 }
 
-fn truncDatetime(v: i64, unit: []const u8) i64 {
-    const us: i64 = 1_000_000;
-    if (std.ascii.eqlIgnoreCase(unit, "second")) return @divFloor(v, us) * us;
-    if (std.ascii.eqlIgnoreCase(unit, "minute")) return @divFloor(v, 60 * us) * (60 * us);
-    if (std.ascii.eqlIgnoreCase(unit, "hour")) return @divFloor(v, 3600 * us) * (3600 * us);
-    if (std.ascii.eqlIgnoreCase(unit, "day")) return @divFloor(v, 86_400 * us) * (86_400 * us);
-    if (std.ascii.eqlIgnoreCase(unit, "month") or std.ascii.eqlIgnoreCase(unit, "year")) {
-        const ymd = daysToYmd(daysFromDatetime(v)) orelse return v;
-        const month: u32 = if (std.ascii.eqlIgnoreCase(unit, "year")) 1 else @intCast(ymd.month);
-        const td = common.ymdToDays(@intCast(ymd.year), month, 1);
-        return @as(i64, td) * 86_400 * us;
+const TruncUnit = enum { second, minute, hour, day, month, year, other };
+
+fn parseTruncUnit(unit: []const u8) TruncUnit {
+    const table = .{
+        .{ "second", TruncUnit.second }, .{ "minute", TruncUnit.minute },
+        .{ "hour", TruncUnit.hour },     .{ "day", TruncUnit.day },
+        .{ "month", TruncUnit.month },   .{ "year", TruncUnit.year },
+    };
+    inline for (table) |e| if (std.ascii.eqlIgnoreCase(unit, e[0])) return e[1];
+    return .other;
+}
+
+/// Vectorized floor-to-multiple: `dst[i] = s[i] - (s[i] mod q)`, the largest
+/// multiple of `q` not exceeding `s[i]` — identical to `@divFloor(s[i], q) * q`
+/// for every sign. `q` is comptime so `@mod` lowers to a multiply-shift.
+fn truncToQuantum(comptime q: i64, s: []const i64, dst: []i64) void {
+    const N = comptime (std.simd.suggestVectorLength(i64) orelse 1);
+    var i: usize = 0;
+    if (N > 1) {
+        const qv: @Vector(N, i64) = @splat(q);
+        while (i + N <= s.len) : (i += N) {
+            const v: @Vector(N, i64) = s[i..][0..N].*;
+            dst[i..][0..N].* = v - @mod(v, qv);
+        }
     }
-    return v;
+    while (i < s.len) : (i += 1) dst[i] = s[i] - @mod(s[i], q);
+}
+
+/// Truncate to the start of the month (or year) — calendar-relative, so it
+/// can't be expressed as a fixed micro-quantum. Unparseable values pass through.
+fn truncCalendar(v: i64, to_year: bool) i64 {
+    const us: i64 = 1_000_000;
+    const ymd = daysToYmd(daysFromDatetime(v)) orelse return v;
+    const month: u32 = if (to_year) 1 else @intCast(ymd.month);
+    const td = common.ymdToDays(@intCast(ymd.year), month, 1);
+    return @as(i64, td) * 86_400 * us;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,4 +447,44 @@ pub fn dateFormatDateKernel(allocator: Allocator, args: []const ColumnView, out:
     while (i < row_count) : (i += 1) {
         try dateFormatRow(allocator, out, fmt_sv.rowBytes(i), ds[i], 0);
     }
+}
+
+test "date_trunc: vectorized quantum truncation matches @divFloor reference" {
+    const us: i64 = 1_000_000;
+    // Lengths spanning the vector-tail boundary; sign-mixed inputs (pre-epoch
+    // negatives stress @mod's sign vs the @divFloor*q reference).
+    const lengths = [_]usize{ 0, 1, 3, 7, 8, 15, 16, 17, 64, 1000 };
+    inline for (.{ us, 60 * us, 3600 * us, 86_400 * us }) |q| {
+        for (lengths) |len| {
+            const s = try std.testing.allocator.alloc(i64, len);
+            defer std.testing.allocator.free(s);
+            const dst = try std.testing.allocator.alloc(i64, len);
+            defer std.testing.allocator.free(dst);
+            for (s, 0..) |*v, idx| {
+                const x: i64 = @intCast(idx);
+                v.* = (x *% 7919 -% 5000) *% 137; // varied, spans negatives
+            }
+            truncToQuantum(q, s, dst);
+            for (s, dst) |v, d| try std.testing.expectEqual(@divFloor(v, q) * q, d);
+        }
+    }
+}
+
+test "date_trunc: month/year land on the first of the unit" {
+    const us: i64 = 1_000_000;
+    const day = 86_400 * us;
+    // 2013-07-14 12:34:56 UTC = 15900 days since epoch + time-of-day.
+    const d_2013_07_14: i64 = 15900;
+    const v = d_2013_07_14 * day + (12 * 3600 + 34 * 60 + 56) * us + 789_000;
+    // month → 2013-07-01 00:00:00; year → 2013-01-01 00:00:00.
+    const d_2013_07_01 = common.ymdToDays(2013, 7, 1);
+    const d_2013_01_01 = common.ymdToDays(2013, 1, 1);
+    try std.testing.expectEqual(@as(i64, d_2013_07_01) * day, truncCalendar(v, false));
+    try std.testing.expectEqual(@as(i64, d_2013_01_01) * day, truncCalendar(v, true));
+}
+
+test "date_trunc: unit parse is case-insensitive, unknown → other" {
+    try std.testing.expectEqual(TruncUnit.minute, parseTruncUnit("MiNuTe"));
+    try std.testing.expectEqual(TruncUnit.year, parseTruncUnit("YEAR"));
+    try std.testing.expectEqual(TruncUnit.other, parseTruncUnit("fortnight"));
 }
