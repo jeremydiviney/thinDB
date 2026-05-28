@@ -38,6 +38,7 @@ const Error = exec.Error;
 
 const cast = @import("cast.zig");
 const CastKernel = cast.CastKernel;
+const udf_mod = @import("../udf.zig");
 
 // Kernel implementations are split into category files. Imported here for
 // the builtins[] registry; the rest of the codebase only sees ScalarFn /
@@ -47,21 +48,7 @@ const math = @import("scalar_fn_math.zig");
 const date = @import("scalar_fn_date.zig");
 const cond = @import("scalar_fn_cond.zig");
 
-pub const NullStrategy = enum {
-    /// Default: if any input row is null, output is null. The
-    /// Compute operator pre-builds a combined null mask before
-    /// invoking the kernel — kernels can assume non-null inputs.
-    /// Compute writes the bitmap as AND of input validities.
-    propagates,
-    /// Kernel handles nulls itself. Compute writes the bitmap as OR
-    /// of input validities (default: output non-null iff ANY input
-    /// non-null — matches coalesce / ifnull semantics).
-    absorbs,
-    /// Kernel writes both data AND validity bits. Compute does no
-    /// post-processing of the bitmap. Used by functions that can
-    /// produce null from non-null inputs (e.g. nullif).
-    kernel_managed,
-};
+pub const NullStrategy = udf_mod.NullStrategy;
 
 pub const Kernel = *const fn (
     allocator: Allocator,
@@ -75,7 +62,10 @@ pub const ScalarFn = struct {
     arg_types: []const Type,
     return_type: Type,
     null_strategy: NullStrategy = .propagates,
-    kernel: Kernel,
+    volatility: udf_mod.Volatility = .immutable,
+    kernel: ?Kernel = null,
+    udf_kernel: ?udf_mod.ScalarKernel = null,
+    user_data: ?*anyopaque = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -110,6 +100,15 @@ pub fn resolve(
     name: []const u8,
     arg_types: []const Type,
 ) !?ResolvedOverload {
+    return resolveWithRegistry(aa, null, name, arg_types);
+}
+
+pub fn resolveWithRegistry(
+    aa: Allocator,
+    registry: ?*const udf_mod.UdfRegistry,
+    name: []const u8,
+    arg_types: []const Type,
+) !?ResolvedOverload {
     // Fast path: exact TypeTag match. No allocation, no cost calc.
     for (builtins) |f| {
         if (!std.mem.eql(u8, f.name, name)) continue;
@@ -122,6 +121,13 @@ pub fn resolve(
             }
         }
         if (all_match) return ResolvedOverload{ .func = f, .arg_casts = null };
+    }
+    if (registry) |reg| {
+        for (reg.scalarEntries()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.name, name)) continue;
+            if (!udf_mod.sameTypeTags(entry.arg_types, arg_types)) continue;
+            return ResolvedOverload{ .func = scalarFromUdf(entry), .arg_casts = null };
+        }
     }
 
     // Slow path: rank by cumulative cast cost. Iterate name-matching
@@ -146,6 +152,26 @@ pub fn resolve(
             best = f;
         }
     }
+    if (registry) |reg| {
+        for (reg.scalarEntries()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.name, name)) continue;
+            if (entry.arg_types.len != arg_types.len) continue;
+            var total_cost: u64 = 0;
+            var castable = true;
+            for (entry.arg_types, arg_types) |declared, given| {
+                const c = cast.castCost(@as(TypeTag, given), @as(TypeTag, declared)) orelse {
+                    castable = false;
+                    break;
+                };
+                total_cost += c;
+            }
+            if (!castable) continue;
+            if (total_cost < best_cost) {
+                best_cost = total_cost;
+                best = scalarFromUdf(entry);
+            }
+        }
+    }
 
     const chosen = best orelse return null;
     // Build per-arg cast plan.
@@ -156,6 +182,18 @@ pub fn resolve(
         slot.* = if (ft == tt) null else cast.kernelFor(ft, tt);
     }
     return ResolvedOverload{ .func = chosen, .arg_casts = arg_casts };
+}
+
+fn scalarFromUdf(entry: udf_mod.ScalarEntry) ScalarFn {
+    return .{
+        .name = entry.name,
+        .arg_types = entry.arg_types,
+        .return_type = entry.return_type,
+        .null_strategy = entry.null_strategy,
+        .volatility = entry.volatility,
+        .udf_kernel = entry.kernel,
+        .user_data = entry.user_data,
+    };
 }
 
 /// Inverse lookup: return ALL registered overloads matching `name`.

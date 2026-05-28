@@ -38,6 +38,7 @@ const scalar_fn = @import("scalar_fn.zig");
 const ScalarFn = scalar_fn.ScalarFn;
 const simd = @import("../util/simd.zig");
 const NullStrategy = scalar_fn.NullStrategy;
+const udf_mod = @import("../udf.zig");
 
 const cast = @import("cast.zig");
 const CastKernel = cast.CastKernel;
@@ -199,6 +200,15 @@ pub const Compute = struct {
         upstream: Query,
         derived: []const Derived,
     ) !Query {
+        return createWithRegistry(allocator, upstream, derived, null);
+    }
+
+    pub fn createWithRegistry(
+        allocator: Allocator,
+        upstream: Query,
+        derived: []const Derived,
+        udf_registry: ?*const udf_mod.UdfRegistry,
+    ) !Query {
         if (derived.len == 0) return Error.ComputeNoColumns;
         const up_schema = upstream.outputSchema();
 
@@ -207,7 +217,7 @@ pub const Compute = struct {
         const aa = arena.allocator();
 
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
-        for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema);
+        for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema, udf_registry);
 
         // Validate no duplicate derived names AND no collision with
         // upstream column names (downstream wouldn't be able to
@@ -427,7 +437,14 @@ pub const Compute = struct {
         }
 
         // 3. Run the kernel.
-        try plan.func.kernel(self.allocator, arg_views, plan.output, n);
+        if (plan.func.kernel) |k| {
+            try k(self.allocator, arg_views, plan.output, n);
+        } else if (plan.func.udf_kernel) |k| {
+            const ctx: udf_mod.ScalarContext = .{ .allocator = self.allocator, .user_data = plan.func.user_data };
+            try k(&ctx, arg_views, plan.output, n);
+        } else {
+            return Error.ComputeNoSuchOverload;
+        }
 
         // 4. Null bookkeeping. Internal calls always have a nullable
         // output (we allocated it that way) so the parent's null-check
@@ -891,6 +908,7 @@ fn resolveDerived(
     aa: Allocator,
     d: Derived,
     up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
 ) !ResolvedDerived {
     switch (d.expr) {
         .col_ref => |name| {
@@ -926,7 +944,7 @@ fn resolveDerived(
                     .kind = .{ .fused_scalar = fs },
                 };
             }
-            const plan = try buildCallPlan(runtime_allocator, aa, d.expr, up_schema);
+            const plan = try buildCallPlan(runtime_allocator, aa, d.expr, up_schema, udf_registry);
             return .{
                 .name = try aa.dupe(u8, d.name),
                 .output_type = plan.output_type,
@@ -935,7 +953,7 @@ fn resolveDerived(
             };
         },
         .case => {
-            const plan = try buildCasePlan(runtime_allocator, aa, d.expr.case, up_schema);
+            const plan = try buildCasePlan(runtime_allocator, aa, d.expr.case, up_schema, udf_registry);
             return .{
                 .name = try aa.dupe(u8, d.name),
                 .output_type = plan.output_type,
@@ -958,6 +976,7 @@ fn buildCasePlan(
     aa: Allocator,
     cs: Expr.Case,
     up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
 ) !*CasePlan {
     if (cs.branches.len == 0) return Error.ComputeUnsupportedExpr;
 
@@ -971,7 +990,7 @@ fn buildCasePlan(
     var inferred_type: ?Type = null;
     var may_null = cs.else_branch == null;
     for (cs.branches, branches) |src, *dst| {
-        const then_src = try buildBranchSrc(runtime_allocator, aa, src.then, up_schema);
+        const then_src = try buildBranchSrc(runtime_allocator, aa, src.then, up_schema, udf_registry);
         const t = branchSrcType(then_src, up_schema);
         if (inferred_type) |it| {
             if (std.meta.activeTag(it) != std.meta.activeTag(t)) {
@@ -992,7 +1011,7 @@ fn buildCasePlan(
 
     var else_src: ?BranchSrc = null;
     if (cs.else_branch) |eb| {
-        const es = try buildBranchSrc(runtime_allocator, aa, eb.*, up_schema);
+        const es = try buildBranchSrc(runtime_allocator, aa, eb.*, up_schema, udf_registry);
         errdefer freeBranchSrc(runtime_allocator, es);
         const t = branchSrcType(es, up_schema);
         if (inferred_type) |it| {
@@ -1026,6 +1045,7 @@ fn buildBranchSrc(
     aa: Allocator,
     e: Expr,
     up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
 ) !BranchSrc {
     return switch (e) {
         .col_ref => |name| blk: {
@@ -1041,7 +1061,7 @@ fn buildBranchSrc(
             break :blk BranchSrc{ .lit = slot };
         },
         .call => blk: {
-            const sub = try buildCallPlan(runtime_allocator, aa, e, up_schema);
+            const sub = try buildCallPlan(runtime_allocator, aa, e, up_schema, udf_registry);
             break :blk BranchSrc{ .call = sub };
         },
         .case => return Error.ComputeUnsupportedExpr,
@@ -1096,6 +1116,7 @@ fn buildCallPlan(
     aa: Allocator,
     expr: Expr,
     up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
 ) !*CallPlan {
     const c = switch (expr) {
         .call => |x| x,
@@ -1121,7 +1142,7 @@ fn buildCallPlan(
                 arg_types[i] = literalType(v);
             },
             .call => {
-                const sub = try buildCallPlan(runtime_allocator, aa, arg, up_schema);
+                const sub = try buildCallPlan(runtime_allocator, aa, arg, up_schema, udf_registry);
                 arg_plans[i] = .{ .call = sub };
                 arg_types[i] = sub.output_type;
             },
@@ -1130,7 +1151,7 @@ fn buildCallPlan(
         }
     }
 
-    const r = (try scalar_fn.resolve(aa, c.fn_name, arg_types)) orelse return Error.ComputeNoSuchOverload;
+    const r = (try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types)) orelse return Error.ComputeNoSuchOverload;
 
     // Cast scratch buffers (one per coerced arg).
     var cast_buffers: ?[]?ColumnStore = null;

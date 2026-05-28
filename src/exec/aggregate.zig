@@ -79,6 +79,8 @@ pub const AggFunc = enum {
     /// Concatenate string values with a separator. params.separator
     /// is prepended before every value after the first. Output string.
     group_concat,
+    /// User-defined aggregate. `AggSpec.udf_name` carries the registry name.
+    udf,
 };
 
 /// Per-aggregate parameters not expressible via `col` / `as`. `.none`
@@ -92,6 +94,11 @@ pub const AggParams = union(enum) {
 
 pub const AggSpec = struct {
     func: AggFunc,
+    /// Registry name for `.func = .udf`.
+    udf_name: ?[]const u8 = null,
+    /// UDAF argument columns. Empty for built-ins and unary UDAFs that
+    /// use `.col` for backward-compatible client construction.
+    udf_arg_cols: []const []const u8 = &.{},
     /// Column to aggregate. `null` is only valid for `COUNT(*)`.
     col: ?[]const u8 = null,
     /// Output column name.
@@ -2450,6 +2457,7 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
             .{ .distinct = .{} },
         .percentile => .{ .percentile_values = .empty },
         .group_concat => .{ .concat = null },
+        .udf => unreachable,
     };
 }
 
@@ -2522,6 +2530,7 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         .min, .max => in orelse return Error.AggregateNoSpecs,
         .avg, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile => .double,
         .group_concat => .string,
+        .udf => Error.AggregateUnsupportedType,
     };
 }
 
@@ -2562,6 +2571,7 @@ fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams) !void {
                 else => return Error.AggregateInvalidParam,
             }
         },
+        .udf => return Error.AggregateUnsupportedType,
     }
 }
 
@@ -2594,6 +2604,7 @@ fn updateStateRow(aa: Allocator, s: *AccState, spec: AggSpec, batch: Batch, col_
                 else => unreachable,
             }
         },
+        .udf => return Error.AggregateUnsupportedType,
         else => try updateState(aa, s, spec, batch, col_idx, row, row + 1),
     }
 }
@@ -2924,6 +2935,7 @@ fn updateState(
             };
             try groupConcatUpdate(aa, s, batch.values[col_idx.?], row_start, row_end, sep);
         },
+        .udf => return Error.AggregateUnsupportedType,
     }
 }
 
@@ -3317,6 +3329,7 @@ fn appendAccToColumn(
             const items: []const u8 = if (state.concat) |c| c.buf.items else "";
             try col.data.string.appendValue(allocator, items);
         },
+        .udf => return Error.AggregateUnsupportedType,
     }
 }
 

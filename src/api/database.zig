@@ -245,6 +245,16 @@ pub const Database = struct {
         return s.renameTable(old_name, new_name);
     }
 
+    pub fn registerScalarUdf(self: *Database, desc: api.ScalarUdf) !void {
+        const catalog = self.catalog orelse self.owned_catalog orelse return Error.DatabaseNotFound;
+        return catalog.registerScalarUdf(desc);
+    }
+
+    pub fn registerAggregateUdf(self: *Database, desc: api.AggregateUdf) !void {
+        const catalog = self.catalog orelse self.owned_catalog orelse return Error.DatabaseNotFound;
+        return catalog.registerAggregateUdf(desc);
+    }
+
     /// Look up a table across schemas using the public schema first.
     /// Used by transports (`net/local.zig`, `net/tcp_server.zig`) that
     /// pre-v2 reached straight into `db.tables.get(name)`.

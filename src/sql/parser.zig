@@ -52,6 +52,7 @@ const parse_window = @import("parse_window.zig");
 pub const ParsedWindowCall = parse_window.ParsedWindowCall;
 const parse_ddl = @import("parse_ddl.zig");
 const parse_predicate = @import("parse_predicate.zig");
+const udf_mod = @import("../udf.zig");
 
 pub const ParseError = error{
     SqlExpectedSelect,
@@ -116,7 +117,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
         .var_samp => "var_samp",
-        .percentile, .group_concat => null,
+        .percentile, .group_concat, .udf => null,
     };
 }
 
@@ -151,9 +152,23 @@ pub fn parse(arena: Allocator, sql: []const u8) ParseError!*ir.Op {
 }
 
 pub fn parseDialect(arena: Allocator, sql: []const u8, dialect: types.Dialect) ParseError!*ir.Op {
+    return parseDialectWithUdfs(arena, sql, dialect, null);
+}
+
+pub fn parseDialectWithUdfs(
+    arena: Allocator,
+    sql: []const u8,
+    dialect: types.Dialect,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+) ParseError!*ir.Op {
     var lex = Lexer.init(arena, sql);
     lex.dialect = dialect;
-    var parser = Parser{ .arena = arena, .lex = &lex, .cur = try lex.next() };
+    var parser = Parser{
+        .arena = arena,
+        .lex = &lex,
+        .cur = try lex.next(),
+        .udf_registry = udf_registry,
+    };
 
     // Skip leading empty statements (e.g. ";;SELECT ...").
     while (parser.cur.tag == .semicolon) try parser.advance();
@@ -203,7 +218,14 @@ const ProjItem = struct {
         /// the user wrote `SUM(a * b)` or similar — the parser
         /// hoists it into a synthetic Compute column whose name then
         /// fills in `col` before the GroupBy is built.
-        agg: struct { func: ir.AggFunc, col: ?[]const u8, arg_expr: ?ir.Expr = null, separator: ?[]const u8 = null },
+        agg: struct {
+            func: ir.AggFunc,
+            udf_name: ?[]const u8 = null,
+            udf_arg_cols: []const []const u8 = &.{},
+            col: ?[]const u8,
+            arg_expr: ?ir.Expr = null,
+            separator: ?[]const u8 = null,
+        },
         /// Scalar function call expression. Lowered to a Compute step
         /// before the final projection.
         expr: ir.Expr,
@@ -256,9 +278,20 @@ pub const Parser = struct {
     /// SELECT so different statements in a batch don't bleed into
     /// each other.
     named_windows: std.StringHashMapUnmanaged(ir.WindowSpec) = .empty,
+    /// Optional catalog-owned registry used only to classify aggregate UDF
+    /// names during parse. Scalar UDFs stay normal Expr.call nodes.
+    udf_registry: ?*const udf_mod.UdfRegistry = null,
 
     pub fn advance(self: *Parser) ParseError!void {
         self.cur = try self.lex.next();
+    }
+
+    fn aggregateFuncForName(self: *const Parser, name: []const u8) ?ir.AggFunc {
+        if (aggForName(name)) |func| return func;
+        if (self.udf_registry) |registry| {
+            if (registry.hasAggregateName(name)) return .udf;
+        }
+        return null;
     }
 
     pub fn expect(self: *Parser, tag: TokenTag) ParseError!void {
@@ -624,6 +657,8 @@ pub const Parser = struct {
                 .agg => |a| {
                     try aggs_buf.append(self.arena, .{
                         .func = a.func,
+                        .udf_name = a.udf_name,
+                        .udf_arg_cols = a.udf_arg_cols,
                         .col = agg_cols.items[agg_i],
                         .as = p.name,
                         .params = if (a.func == .group_concat)
@@ -997,7 +1032,7 @@ pub const Parser = struct {
             // Aggregate path: rebuild the (func, col) shape the existing
             // aggregate lowering expects. Aggregates only accept a single
             // column-ref arg (or `*` for COUNT(*)); reject anything else.
-            if (aggForName(first)) |func| {
+            if (self.aggregateFuncForName(first)) |func| {
                 if (saw_distinct) {
                     // Only COUNT(DISTINCT col) is supported today (the
                     // count_distinct kernel). SUM/AVG/etc. DISTINCT would
@@ -1215,6 +1250,39 @@ pub const Parser = struct {
         func: ir.AggFunc,
         args: []const ir.Expr,
     ) ParseError!ProjItem {
+        if (func == .udf) {
+            if (args.len == 0) return ParseError.SqlInvalidProjection;
+            const arg_cols = try self.arena.alloc([]const u8, args.len);
+            for (args, arg_cols) |arg, *dst| {
+                dst.* = switch (arg) {
+                    .col_ref => |c| blk: {
+                        if (std.mem.eql(u8, c, "*")) return ParseError.SqlInvalidProjection;
+                        break :blk try self.arena.dupe(u8, c);
+                    },
+                    else => return ParseError.SqlInvalidProjection,
+                };
+            }
+            const default_name = blk: {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(self.arena);
+                try buf.appendSlice(self.arena, func_name);
+                try buf.append(self.arena, '(');
+                for (arg_cols, 0..) |c, i| {
+                    if (i > 0) try buf.append(self.arena, ',');
+                    try buf.appendSlice(self.arena, c);
+                }
+                try buf.append(self.arena, ')');
+                break :blk try buf.toOwnedSlice(self.arena);
+            };
+            const alias = try self.maybeAlias(default_name);
+            return ProjItem{ .name = alias, .kind = .{ .agg = .{
+                .func = .udf,
+                .udf_name = try self.arena.dupe(u8, func_name),
+                .udf_arg_cols = arg_cols,
+                .col = arg_cols[0],
+            } } };
+        }
+
         // GROUP_CONCAT / STRING_AGG take an optional second positional arg:
         // the delimiter string literal (STRING_AGG requires it, MySQL's
         // GROUP_CONCAT spells it `SEPARATOR x` and is not parsed here, so a
@@ -1268,6 +1336,7 @@ pub const Parser = struct {
         const alias = try self.maybeAlias(default_name);
         return ProjItem{ .name = alias, .kind = .{ .agg = .{
             .func = func,
+            .udf_name = if (func == .udf) try self.arena.dupe(u8, func_name) else null,
             .col = arg_col,
             .arg_expr = arg_expr,
             .separator = separator,
@@ -1501,7 +1570,7 @@ pub const Parser = struct {
                 const name = self.cur.text;
                 try self.advance();
                 if (self.cur.tag == .lparen) {
-                    if (aggForName(name)) |_| return ParseError.SqlInvalidProjection;
+                    if (self.aggregateFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
                     if (ir.windowFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
                     const fname_dup = try self.arena.dupe(u8, name);
                     const nested_args = try self.parseCallArgList(null);
@@ -2149,7 +2218,7 @@ pub const Parser = struct {
                     // to the aggregate's canonical output column name (the
                     // sort runs after the aggregate). Aliased aggregates are
                     // referenced by alias via the plain-ident path.
-                    if (aggForName(first) != null) break :blk try self.aggSortName(first, args);
+                    if (self.aggregateFuncForName(first) != null) break :blk try self.aggSortName(first, args);
                     // `ORDER BY scalar_fn(args)` (e.g. ORDER BY DATE_TRUNC(...))
                     // binds to the matching SELECT expression's output column.
                     const fname = try self.arena.dupe(u8, first);
@@ -2177,16 +2246,19 @@ pub const Parser = struct {
     /// (`func(arg)` / `func(*)`). Only single col-ref / `*` args are
     /// bindable — anything else can't be matched to a projected column.
     pub fn aggSortName(self: *Parser, func_name: []const u8, args: []const ir.Expr) ParseError![]const u8 {
-        if (args.len != 1) return ParseError.SqlInvalidProjection;
-        const argname: []const u8 = switch (args[0]) {
-            .col_ref => |c| c,
-            else => return ParseError.SqlInvalidProjection,
-        };
+        if (args.len != 1 and self.aggregateFuncForName(func_name) != .udf) return ParseError.SqlInvalidProjection;
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.arena);
         try buf.appendSlice(self.arena, func_name);
         try buf.append(self.arena, '(');
-        try buf.appendSlice(self.arena, argname);
+        for (args, 0..) |arg, i| {
+            if (i > 0) try buf.append(self.arena, ',');
+            const argname: []const u8 = switch (arg) {
+                .col_ref => |c| c,
+                else => return ParseError.SqlInvalidProjection,
+            };
+            try buf.appendSlice(self.arena, argname);
+        }
         try buf.append(self.arena, ')');
         return try buf.toOwnedSlice(self.arena);
     }
@@ -2215,7 +2287,10 @@ pub const Parser = struct {
                 // count_distinct / expression-arg aggregates aren't
                 // expressible as a HAVING reference today; skip them.
                 if (a.arg_expr != null) continue;
-                const fname = aggFuncName(a.func) orelse continue;
+                const fname = if (a.func == .udf)
+                    (a.udf_name orelse continue)
+                else
+                    (aggFuncName(a.func) orelse continue);
                 const arg = a.col orelse "*";
                 const cname = std.fmt.allocPrint(self.arena, "{s}({s})", .{ fname, arg }) catch return ParseError.OutOfMemory;
                 if (std.ascii.eqlIgnoreCase(cname, name)) return p.name;

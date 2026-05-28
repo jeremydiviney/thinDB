@@ -54,7 +54,7 @@ const exec_expr = @import("../exec/expr.zig");
 pub const Expr = exec_expr.Expr;
 
 pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
-pub const version: u16 = 2;
+pub const version: u16 = 3;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -690,6 +690,9 @@ pub const Op = union(OpTag) {
             },
             .group_by => |g| {
                 allocator.free(g.group_cols);
+                for (g.aggs) |a| {
+                    if (a.udf_arg_cols.len > 0) allocator.free(a.udf_arg_cols);
+                }
                 allocator.free(g.aggs);
                 g.upstream.deinitDecoded(allocator);
                 allocator.destroy(g.upstream);
@@ -1245,6 +1248,12 @@ fn encodeGroupBy(allocator: Allocator, out: *std.ArrayList(u8), g: Op.GroupBy) E
     for (g.aggs) |a| {
         // func (u8)
         try out.append(allocator, @intFromEnum(a.func));
+        try encodeOptString(allocator, out, a.udf_name);
+        try appendU32(allocator, out, @intCast(a.udf_arg_cols.len));
+        for (a.udf_arg_cols) |c| {
+            try appendU32(allocator, out, @intCast(c.len));
+            try out.appendSlice(allocator, c);
+        }
         // optional column: 0 = null (COUNT(*)), 1 = present
         if (a.col) |c| {
             try out.append(allocator, 1);
@@ -1625,8 +1634,15 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
                 const func_byte = bytes[cursor.*];
                 cursor.* += 1;
-                if (func_byte > @intFromEnum(AggFunc.group_concat)) return Error.IrCorrupt;
+                if (func_byte > @intFromEnum(AggFunc.udf)) return Error.IrCorrupt;
                 const func: AggFunc = @enumFromInt(func_byte);
+                const udf_name = try readOptString(bytes, cursor);
+                if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+                const n_udf_args = readU32(bytes[cursor.* .. cursor.* + 4]);
+                cursor.* += 4;
+                const udf_arg_cols = try allocator.alloc([]const u8, n_udf_args);
+                errdefer allocator.free(udf_arg_cols);
+                for (udf_arg_cols) |*c| c.* = try readString(bytes, cursor);
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
                 const has_col = bytes[cursor.*];
                 cursor.* += 1;
@@ -1650,7 +1666,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                     2 => .{ .separator = try readString(bytes, cursor) },
                     else => return Error.IrCorrupt,
                 };
-                a.* = .{ .func = func, .col = col, .as = as, .params = params };
+                a.* = .{ .func = func, .udf_name = udf_name, .udf_arg_cols = udf_arg_cols, .col = col, .as = as, .params = params };
             }
 
             const upstream = try allocator.create(Op);
@@ -2370,6 +2386,13 @@ fn readString(bytes: []const u8, cursor: *usize) DecodeError![]const u8 {
     const s = bytes[cursor.* .. cursor.* + len];
     cursor.* += len;
     return s;
+}
+
+fn readOptString(bytes: []const u8, cursor: *usize) DecodeError!?[]const u8 {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const present = bytes[cursor.*];
+    cursor.* += 1;
+    return if (present != 0) try readString(bytes, cursor) else null;
 }
 
 pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {

@@ -101,9 +101,19 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try out.appendSlice(allocator, "] aggs=[");
             for (g.aggs, 0..) |a, i| {
                 if (i > 0) try out.appendSlice(allocator, ", ");
-                try out.appendSlice(allocator, @tagName(a.func));
+                if (a.func == .udf and a.udf_name != null) {
+                    try out.appendSlice(allocator, a.udf_name.?);
+                } else {
+                    try out.appendSlice(allocator, @tagName(a.func));
+                }
                 try out.append(allocator, '(');
-                if (a.col) |c| try out.appendSlice(allocator, c) else try out.append(allocator, '*');
+                if (a.udf_arg_cols.len > 0) {
+                    try writeJoinedNames(allocator, out, a.udf_arg_cols);
+                } else if (a.col) |c| {
+                    try out.appendSlice(allocator, c);
+                } else {
+                    try out.append(allocator, '*');
+                }
                 try out.appendSlice(allocator, ") AS ");
                 try out.appendSlice(allocator, a.as);
             }

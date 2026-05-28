@@ -20,6 +20,8 @@ pub const Error = error{
     DatabaseAlreadyExists,
     SchemaNotFound,
     SchemaAlreadyExists,
+    FunctionAlreadyExists,
+    FunctionInvalidDefinition,
 };
 
 pub const SyncMode = enum { none, per_flush };
@@ -209,6 +211,12 @@ pub const Database = @import("database.zig").Database;
 pub const Catalog = @import("catalog.zig").Catalog;
 pub const TempNamespace = @import("temp_namespace.zig").TempNamespace;
 pub const sweepStaleTempDirs = @import("temp_namespace.zig").sweepStaleTempDirs;
+pub const udf = @import("../udf.zig");
+pub const UdfRegistry = udf.UdfRegistry;
+pub const ScalarUdf = udf.ScalarUdf;
+pub const AggregateUdf = udf.AggregateUdf;
+pub const UdfVolatility = udf.Volatility;
+pub const UdfNullStrategy = udf.NullStrategy;
 
 /// Per-connection resolution context. `compile()` consults this to fill
 /// in any null database/schema fields on a `TableRef`, and DDL `USE`
@@ -283,6 +291,8 @@ pub fn remapError(comptime DstError: type, e: anyerror) anyerror {
         Error.SchemaAlreadyExists => DstError.SchemaAlreadyExists,
         Error.TableNotFound => DstError.TableNotFound,
         Error.TableAlreadyExists => DstError.TableAlreadyExists,
+        Error.FunctionAlreadyExists => DstError.FunctionAlreadyExists,
+        Error.FunctionInvalidDefinition => DstError.FunctionInvalidDefinition,
         else => e,
     };
 }

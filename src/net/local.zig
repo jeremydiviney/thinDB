@@ -66,6 +66,8 @@ pub const Error = error{
     DatabaseAlreadyExists,
     SchemaNotFound,
     SchemaAlreadyExists,
+    FunctionAlreadyExists,
+    FunctionInvalidDefinition,
     /// In-flight query was cancelled by a peer (MySQL KILL or PG
     /// CancelRequest / pg_cancel_backend). Caller should map this to
     /// the protocol-specific abort code and continue serving the
@@ -582,11 +584,19 @@ pub const ClientQuery = struct {
         for (group_cols, 0..) |c, i| grp_dup[i] = try aa.dupe(u8, c);
 
         const aggs_dup = try aa.alloc(AggSpec, aggs.len);
-        for (aggs, 0..) |a, i| aggs_dup[i] = .{
-            .func = a.func,
-            .col = if (a.col) |c| try aa.dupe(u8, c) else null,
-            .as = try aa.dupe(u8, a.as),
-        };
+        for (aggs, 0..) |a, i| {
+            const udf_arg_cols = try aa.alloc([]const u8, a.udf_arg_cols.len);
+            for (a.udf_arg_cols, udf_arg_cols) |c, *dst| dst.* = try aa.dupe(u8, c);
+            aggs_dup[i] = .{
+                .func = a.func,
+                .udf_name = if (a.udf_name) |n| try aa.dupe(u8, n) else null,
+                .udf_arg_cols = udf_arg_cols,
+                .col = if (a.col) |c| try aa.dupe(u8, c) else null,
+                .as = try aa.dupe(u8, a.as),
+                .params = a.params,
+                .out_type_override = a.out_type_override,
+            };
+        }
 
         const upstream = try aa.create(ir.Op);
         upstream.* = prev_root;
@@ -1913,7 +1923,7 @@ pub fn buildServerQuerySession(
         .group_by => |g| blk: {
             // Metadata-only MIN/MAX over a bare table scan — answer from the
             // manifest stats without building (or draining) a scan at all.
-            if (g.group_cols.len == 0) switch (g.upstream.*) {
+            if (!hasUdfAgg(g.aggs) and g.group_cols.len == 0) switch (g.upstream.*) {
                 .scan => |s| {
                     if (catalogFor(db)) |catalog| {
                         if (resolveTable(catalog, session, s.table)) |t| {
@@ -1925,6 +1935,10 @@ pub fn buildServerQuerySession(
             };
             var upstream = try buildServerQuerySession(allocator, db, session, g.upstream.*);
             errdefer upstream.deinit();
+            if (hasUdfAgg(g.aggs)) {
+                const registry = if (catalogFor(db)) |catalog| &catalog.udfs else return Error.UnsupportedOp;
+                break :blk try upstream.udfGroupBy(g.group_cols, g.aggs, registry);
+            }
             if (try routeStreamGroupBy(allocator, &upstream, g.group_cols, g.aggs, db.config.query_memory_budget)) |q| {
                 break :blk q;
             }
@@ -1936,7 +1950,8 @@ pub fn buildServerQuerySession(
         .compute => |c| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, c.upstream.*);
             errdefer upstream.deinit();
-            break :blk try upstream.compute(c.derived);
+            const udfs = if (catalogFor(db)) |catalog| &catalog.udfs else null;
+            break :blk try upstream.computeWithRegistry(c.derived, udfs);
         },
         .join => |j| blk: {
             var left = try buildServerQuerySession(allocator, db, session, j.left.*);
@@ -2015,6 +2030,7 @@ pub fn buildServerQuerySession(
 pub const CompileCtx = struct {
     allocator: Allocator,
     db: *Database,
+    udf_registry: ?*const @import("../udf.zig").UdfRegistry = null,
     /// Mutable so DDL `USE` statements can update `current_db` /
     /// `current_schema` for subsequent statements that share the
     /// same Session. Borrowed; caller owns the value.
@@ -2218,6 +2234,7 @@ pub fn compileWithSession(
     var ctx = CompileCtx{
         .allocator = allocator,
         .db = db,
+        .udf_registry = if (catalogFor(db)) |catalog| &catalog.udfs else null,
         .session = session_cell,
         .now_micros = std.Io.Timestamp.now(db.io, .real).toMicroseconds(),
     };
@@ -2592,7 +2609,10 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
         .group_by => |g| {
             c.has_shaper = true;
             for (g.group_cols) |nm| c.add(allocator, nm);
-            for (g.aggs) |a| if (a.col) |nm| c.add(allocator, nm);
+            for (g.aggs) |a| {
+                if (a.col) |nm| c.add(allocator, nm);
+                for (a.udf_arg_cols) |nm| c.add(allocator, nm);
+            }
             projWalkOp(c, allocator, g.upstream);
         },
         .compute => |cmp| {
@@ -2678,6 +2698,16 @@ fn aggUsesColumn(aggs: []const AggSpec, name: []const u8) bool {
         if (a.col) |c| {
             if (@import("../types.zig").columnNameEql(c, name)) return true;
         }
+        for (a.udf_arg_cols) |c| {
+            if (@import("../types.zig").columnNameEql(c, name)) return true;
+        }
+    }
+    return false;
+}
+
+fn hasUdfAgg(aggs: []const AggSpec) bool {
+    for (aggs) |a| {
+        if (a.func == .udf) return true;
     }
     return false;
 }
@@ -2811,7 +2841,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .group_by => |g| blk: {
             // Metadata-only MIN/MAX over a bare table scan — answer from the
             // manifest stats without building (or draining) a scan at all.
-            if (g.group_cols.len == 0) switch (g.upstream.*) {
+            if (!hasUdfAgg(g.aggs) and g.group_cols.len == 0) switch (g.upstream.*) {
                 .scan => |s| {
                     if (catalogFor(ctx.db)) |catalog| {
                         if (resolveTable(catalog, ctx.session.*, s.table)) |t| {
@@ -2836,7 +2866,11 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             }
             std.debug.assert(!consumed_base);
             // Not reduced: re-layer the peeled Compute onto the built base.
-            if (agg_args.len > 0) upstream = try upstream.compute(agg_args);
+            if (agg_args.len > 0) upstream = try upstream.computeWithRegistry(agg_args, ctx.udf_registry);
+            if (hasUdfAgg(g.aggs)) {
+                const registry = ctx.udf_registry orelse return Error.UnsupportedOp;
+                break :blk try upstream.udfGroupBy(g.group_cols, g.aggs, registry);
+            }
             // Global aggregate (no group keys) is O(1) — always hash.
             if (try routeStreamGroupBy(ctx.allocator, &upstream, g.group_cols, g.aggs, ctx.db.config.query_memory_budget)) |q| {
                 break :blk q;
@@ -2914,7 +2948,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .compute => |c| blk: {
             var upstream = try compileOp(ctx, c.upstream);
             errdefer upstream.deinit();
-            break :blk try upstream.compute(c.derived);
+            break :blk try upstream.computeWithRegistry(c.derived, ctx.udf_registry);
         },
         .join => |j| blk: {
             var left = try compileOp(ctx, j.left);

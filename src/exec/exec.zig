@@ -448,6 +448,15 @@ pub const Query = struct {
         return @import("aggregate.zig").SortedAggregate.create(self.allocator, self, group_cols, aggs);
     }
 
+    pub fn udfGroupBy(
+        self: Query,
+        group_cols: []const []const u8,
+        aggs: []const AggSpec,
+        udf_registry: *const @import("../udf.zig").UdfRegistry,
+    ) !Query {
+        return @import("udf_aggregate.zig").UdfAggregate.create(self.allocator, self, group_cols, aggs, udf_registry);
+    }
+
     /// Sort upstream rows by `sort_specs` (multi-column, ASC/DESC per key).
     /// Blocking — materializes all upstream rows before emitting any output.
     pub fn orderBy(self: Query, sort_specs: []const SortSpec) !Query {
@@ -467,6 +476,14 @@ pub const Query = struct {
     /// extends the upstream schema with these new columns appended.
     pub fn compute(self: Query, derived: []const @import("compute.zig").Derived) !Query {
         return @import("compute.zig").Compute.create(self.allocator, self, derived);
+    }
+
+    pub fn computeWithRegistry(
+        self: Query,
+        derived: []const @import("compute.zig").Derived,
+        udf_registry: ?*const @import("../udf.zig").UdfRegistry,
+    ) !Query {
+        return @import("compute.zig").Compute.createWithRegistry(self.allocator, self, derived, udf_registry);
     }
 
     /// Window function step. `specs` is the list of unique window
@@ -775,6 +792,7 @@ pub const SortSpec = sort_op.SortSpec;
 
 pub const aggregate_op = @import("aggregate.zig");
 pub const Aggregate = aggregate_op.Aggregate;
+pub const UdfAggregate = @import("udf_aggregate.zig").UdfAggregate;
 pub const AggFunc = aggregate_op.AggFunc;
 pub const AggSpec = aggregate_op.AggSpec;
 
@@ -810,6 +828,7 @@ test {
     _ = Limit;
     _ = Sort;
     _ = Aggregate;
+    _ = UdfAggregate;
     _ = @import("exec_test.zig");
     _ = @import("scalar_fn_test.zig");
     _ = @import("cast.zig");
