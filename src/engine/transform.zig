@@ -36,6 +36,32 @@ pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
     };
 }
 
+/// Compare row `a` of `va` against row `b` of `vb`, where both are views over
+/// the SAME column type. Mirrors `compareInColumn` exactly (raw value order,
+/// including NULL-slot placeholders — validity is not consulted) so a streaming
+/// k-way merge across segments produces the same total order as the single-table
+/// `buildSortedSnapshot` sort. The two views' tags must match.
+pub fn compareViewRows(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.math.Order {
+    return switch (va.data) {
+        .int => |l| std.math.order(l[a], vb.data.int[b]),
+        .bigint => |l| std.math.order(l[a], vb.data.bigint[b]),
+        .boolean => |l| std.math.order(l[a], vb.data.boolean[b]),
+        .varchar => |s| std.mem.order(u8, s.rowBytes(a), vb.data.varchar.rowBytes(b)),
+        .string => |s| std.mem.order(u8, s.rowBytes(a), vb.data.string.rowBytes(b)),
+        .char => |s| std.mem.order(u8, s.rowBytes(a), vb.data.char.rowBytes(b)),
+        .tinyint => |l| std.math.order(l[a], vb.data.tinyint[b]),
+        .smallint => |l| std.math.order(l[a], vb.data.smallint[b]),
+        .largeint => |l| std.math.order(l[a], vb.data.largeint[b]),
+        .float => |l| std.math.order(l[a], vb.data.float[b]),
+        .double => |l| std.math.order(l[a], vb.data.double[b]),
+        .date => |l| std.math.order(l[a], vb.data.date[b]),
+        .datetime => |l| std.math.order(l[a], vb.data.datetime[b]),
+        .decimal64 => |l| std.math.order(l[a], vb.data.decimal64[b]),
+        .decimal128 => |l| std.math.order(l[a], vb.data.decimal128[b]),
+        .uuid => |l| std.math.order(l[a], vb.data.uuid[b]),
+    };
+}
+
 /// Append every row of `view` (including its validity bits if `view.nulls`
 /// is non-null) to `out`. Types must match.
 pub fn appendAllColumn(
