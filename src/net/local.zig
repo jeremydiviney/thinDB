@@ -1770,6 +1770,24 @@ fn buildLateMat(
     shape: LateMatShape,
     l: ir.Op.Limit,
 ) !Query {
+    // Prefer the zonemap block-skipping top-N path when there's an ORDER BY and
+    // its leading key qualifies (non-nullable numeric/temporal with footer
+    // stats). It prunes whole row groups via per-RG min/max and produces the
+    // byte-identical answer to lateScan. Returns null on any unsupported shape
+    // ⇒ fall back to the always-correct lateScan plan below.
+    if (shape.order_specs) |specs| {
+        if (try exec.zonemapTopN(
+            allocator,
+            table,
+            acct,
+            shape.probe_names,
+            shape.predicate,
+            specs,
+            shape.output_names,
+            @intCast(l.n),
+            @intCast(l.offset),
+        )) |q| return q;
+    }
     return exec.lateScan(
         allocator,
         table,

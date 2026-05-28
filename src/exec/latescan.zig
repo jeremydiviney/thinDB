@@ -66,6 +66,12 @@ pub const LateScan = struct {
 
     done: bool = false,
 
+    /// When non-null, `appendMemtableRow` resolves memtable survivors against
+    /// this snapshot instead of `inner_scan.memtableSnap()`. Set only by the
+    /// external `materializeInto` entry point (the zonemap top-N operator owns
+    /// its own pinned snapshot); the normal `fetch` path leaves it null.
+    materialize_snap_override: ?*engine.Memtable = null,
+
     pub fn create(
         allocator: Allocator,
         inner: Query,
@@ -180,6 +186,22 @@ pub const LateScan = struct {
         try self.materialize(locs.items);
     }
 
+    /// Public wide-column materializer for callers that collect survivor
+    /// `__rowloc`s themselves (e.g. the zonemap top-N operator). `locs` is in
+    /// the final emit order; memtable survivors resolve against `snap`. The
+    /// resolved output columns are read back via `outputColumns`. Kept here so
+    /// the late-mat fetch logic lives in exactly one place.
+    pub fn materializeInto(self: *LateScan, locs: []const i64, snap: *engine.Memtable) !void {
+        self.materialize_snap_override = snap;
+        try self.materialize(locs);
+    }
+
+    /// The materialized output columns + the resolved schema, for a caller
+    /// that drove `materializeInto`. Valid until the next materialize call.
+    pub fn outputColumns(self: *LateScan) struct { schema: []const Column, columns: []ColumnStore } {
+        return .{ .schema = self.out_schema, .columns = self.output_columns };
+    }
+
     /// Build the output columns for the survivors. Rows are processed in
     /// `locs` order (the inner already sorted them). Segment rows are batched
     /// per (segment, row group): we decode each needed column of that row
@@ -274,7 +296,7 @@ pub const LateScan = struct {
 
 
     fn appendMemtableRow(self: *LateScan, row: usize) !void {
-        const snap = self.inner_scan.memtableSnap();
+        const snap = self.materialize_snap_override orelse self.inner_scan.memtableSnap();
         const one = [_]u32{@intCast(row)};
         for (self.out_phys, 0..) |phys, out_idx| {
             try engine.transform.appendByIndices(
