@@ -76,6 +76,8 @@ pub const ParseError = error{
     SqlCopyFileNotSupported,
     /// COPY with an unsupported FORMAT option (we only do text).
     SqlCopyUnsupportedFormat,
+    SqlUnsupportedFileFunction,
+    SqlUnsupportedFileOption,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -130,6 +132,13 @@ fn explainFormatFromName(name: []const u8) ir.ExplainFormat {
 fn bareTemporalFn(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "current_timestamp")) return "current_timestamp";
     if (std.ascii.eqlIgnoreCase(name, "current_date")) return "current_date";
+    return null;
+}
+
+fn fileFormatForFunction(name: []const u8) ?ir.FileFormat {
+    if (std.ascii.eqlIgnoreCase(name, "read_csv")) return .csv;
+    if (std.ascii.eqlIgnoreCase(name, "read_json")) return .json;
+    if (std.ascii.eqlIgnoreCase(name, "read_parquet")) return .parquet;
     return null;
 }
 
@@ -207,7 +216,6 @@ const ProjItem = struct {
     },
 };
 
-
 /// Per-CTE materialization hint from the SQL surface.
 ///   .auto  — refcount-driven: wrap when references ≥ 2.
 ///   .force — `MATERIALIZED` keyword: always wrap.
@@ -217,6 +225,11 @@ pub const MaterializeHint = enum { auto, force, never };
 const CteEntry = struct {
     op: *ir.Op,
     hint: MaterializeHint,
+};
+
+const FromTarget = struct {
+    name: []const u8,
+    op: *ir.Op,
 };
 
 pub const Parser = struct {
@@ -779,7 +792,6 @@ pub const Parser = struct {
         return root;
     }
 
-
     pub fn parseTableRef(self: *Parser) ParseError!ir.TableRef {
         var parts_buf: [3][]const u8 = undefined;
         var n: usize = 0;
@@ -802,7 +814,6 @@ pub const Parser = struct {
             else => unreachable,
         };
     }
-
 
     pub fn dupedIdent(self: *Parser) ParseError![]const u8 {
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
@@ -1246,7 +1257,6 @@ pub const Parser = struct {
         } } };
     }
 
-
     /// One argument to a scalar function call. Entry point for the
     /// expression sub-language used inside call args / projections.
     /// Precedence layers:
@@ -1518,7 +1528,6 @@ pub const Parser = struct {
         return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args } };
     }
 
-
     /// Helper for the `identifier (. identifier)?` shape. The two-part
     /// form is preserved as the dotted string `qualifier.col` so the
     /// reference survives long enough for a renamed scan (`FROM t AS
@@ -1667,7 +1676,7 @@ pub const Parser = struct {
     /// reference) or a parenthesized subquery with an alias. Returns
     /// the resolved *ir.Op plus the name to use for ON-clause
     /// qualifier resolution.
-    fn parseFromTarget(self: *Parser) ParseError!struct { name: []const u8, op: *ir.Op } {
+    fn parseFromTarget(self: *Parser) ParseError!FromTarget {
         if (self.cur.tag == .lparen) {
             // Anonymous subquery: ( select_stmt ) [AS] alias
             try self.advance();
@@ -1684,11 +1693,24 @@ pub const Parser = struct {
         // only). If it's a CTE, use the stored op. Otherwise parse 1-,
         // 2-, or 3-part `[db.][schema.]table` into a TableRef-backed
         // Scan.
+        if (self.cur.tag == .string) {
+            const path = try self.arena.dupe(u8, self.cur.value.string);
+            try self.advance();
+            const op = try self.allocOp(.{ .file_scan = .{
+                .format = .auto,
+                .path = path,
+                .alias = null,
+            } });
+            return try self.applyFromAlias(op, path);
+        }
         const first = try self.expectIdent();
         const first_dup = try self.arena.dupe(u8, first);
         var op: *ir.Op = undefined;
         var resolved_name: []const u8 = first_dup;
-        if (self.cur.tag != .dot and self.ctes.get(first) != null) {
+        if (self.cur.tag == .lparen) {
+            const format = fileFormatForFunction(first) orelse return ParseError.SqlUnsupportedFileFunction;
+            op = try self.parseFileTableFunction(format);
+        } else if (self.cur.tag != .dot and self.ctes.get(first) != null) {
             op = self.ctes.get(first).?.op;
         } else {
             var parts_buf: [3][]const u8 = undefined;
@@ -1719,6 +1741,8 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             if (op.* == .scan) {
                 op.scan.alias = resolved_name;
+            } else if (op.* == .file_scan) {
+                op.file_scan.alias = resolved_name;
             }
             try self.advance();
         } else if (self.cur.tag == .identifier) {
@@ -1728,10 +1752,158 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             if (op.* == .scan) {
                 op.scan.alias = resolved_name;
+            } else if (op.* == .file_scan) {
+                op.file_scan.alias = resolved_name;
             }
             try self.advance();
         }
         return .{ .name = resolved_name, .op = op };
+    }
+
+    fn parseFileTableFunction(self: *Parser, format: ir.FileFormat) ParseError!*ir.Op {
+        try self.expect(.lparen);
+        if (self.cur.tag != .string) return ParseError.SqlExpectedValue;
+        const path = try self.arena.dupe(u8, self.cur.value.string);
+        try self.advance();
+
+        var options: ir.FileScanOptions = .{};
+        while (self.cur.tag == .comma) {
+            try self.advance();
+            const name = try self.parseFileOptionName();
+            if (self.cur.tag != .eq) return ParseError.SqlExpectedToken;
+            try self.advance();
+            try self.parseFileOptionValue(format, name, &options);
+        }
+        try self.expect(.rparen);
+
+        return try self.allocOp(.{ .file_scan = .{
+            .format = format,
+            .path = path,
+            .alias = null,
+            .options = options,
+        } });
+    }
+
+    fn applyFromAlias(self: *Parser, op: *ir.Op, fallback: []const u8) ParseError!FromTarget {
+        var resolved_name = fallback;
+        if (self.cur.tag == .kw_as) {
+            try self.advance();
+            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+            resolved_name = try self.arena.dupe(u8, self.cur.text);
+            if (op.* == .scan) {
+                op.scan.alias = resolved_name;
+            } else if (op.* == .file_scan) {
+                op.file_scan.alias = resolved_name;
+            }
+            try self.advance();
+        } else if (self.cur.tag == .identifier) {
+            resolved_name = try self.arena.dupe(u8, self.cur.text);
+            if (op.* == .scan) {
+                op.scan.alias = resolved_name;
+            } else if (op.* == .file_scan) {
+                op.file_scan.alias = resolved_name;
+            }
+            try self.advance();
+        }
+        return .{ .name = resolved_name, .op = op };
+    }
+
+    fn parseFileOptionName(self: *Parser) ParseError![]const u8 {
+        return switch (self.cur.tag) {
+            .identifier => blk: {
+                const name = self.cur.text;
+                try self.advance();
+                break :blk name;
+            },
+            .kw_null => blk: {
+                try self.advance();
+                break :blk "null";
+            },
+            else => ParseError.SqlExpectedIdent,
+        };
+    }
+
+    fn parseFileOptionValue(self: *Parser, format: ir.FileFormat, name: []const u8, options: *ir.FileScanOptions) ParseError!void {
+        if (format == .csv) {
+            if (std.ascii.eqlIgnoreCase(name, "header")) {
+                options.csv.header = try self.parseFileBool();
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "delim") or std.ascii.eqlIgnoreCase(name, "sep")) {
+                options.csv.delim = try self.parseFileString();
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "quote")) {
+                options.csv.quote = try self.parseFileString();
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "escape")) {
+                options.csv.escape = try self.parseFileString();
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "nullstr") or std.ascii.eqlIgnoreCase(name, "null")) {
+                options.csv.nullstr = try self.parseFileString();
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "skip")) {
+                options.csv.skip = try self.parseFileU64();
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "sample_size")) {
+                options.csv.sample_size = try self.parseFileU64();
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "auto_detect")) {
+                options.csv.auto_detect = try self.parseFileBool();
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "all_varchar")) {
+                options.csv.all_varchar = try self.parseFileBool();
+                return;
+            }
+        } else if (format == .json) {
+            if (std.ascii.eqlIgnoreCase(name, "sample_size")) {
+                options.json.sample_size = try self.parseFileU64();
+                return;
+            }
+        }
+        return ParseError.SqlUnsupportedFileOption;
+    }
+
+    fn parseFileBool(self: *Parser) ParseError!bool {
+        return switch (self.cur.tag) {
+            .kw_true => blk: {
+                try self.advance();
+                break :blk true;
+            },
+            .kw_false => blk: {
+                try self.advance();
+                break :blk false;
+            },
+            .identifier => blk: {
+                const text = self.cur.text;
+                try self.advance();
+                if (std.ascii.eqlIgnoreCase(text, "true")) break :blk true;
+                if (std.ascii.eqlIgnoreCase(text, "false")) break :blk false;
+                return ParseError.SqlExpectedValue;
+            },
+            else => ParseError.SqlExpectedValue,
+        };
+    }
+
+    fn parseFileString(self: *Parser) ParseError![]const u8 {
+        if (self.cur.tag != .string) return ParseError.SqlExpectedValue;
+        const value = try self.arena.dupe(u8, self.cur.value.string);
+        try self.advance();
+        return value;
+    }
+
+    fn parseFileU64(self: *Parser) ParseError!u64 {
+        if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+        const value = self.cur.value.integer;
+        if (value < 0) return ParseError.SqlExpectedValue;
+        try self.advance();
+        return @intCast(value);
     }
 
     /// Parse a `WITH cte AS [MATERIALIZED|NOT MATERIALIZED]? (...) [, ...]*`
@@ -2333,7 +2505,7 @@ fn countRefs(
     op: *ir.Op,
 ) ParseError!void {
     switch (op.*) {
-        .scan, .single_row => {},
+        .scan, .single_row, .file_scan => {},
         .explain => |e| try visitChild(arena, refs, e.inner),
         .limit => |l| try visitChild(arena, refs, l.upstream),
         .select => |p| try visitChild(arena, refs, p.upstream),
@@ -2414,10 +2586,10 @@ fn countAggs(proj: []const ProjItem) usize {
 /// correct the moment they land.
 fn isNondeterministicFn(name: []const u8) bool {
     const names = [_][]const u8{
-        "now",           "current_date",      "current_timestamp",
-        "current_time",  "localtime",         "localtimestamp",
-        "random",        "rand",              "uuid",
-        "uuid_short",    "sysdate",           "unix_timestamp",
+        "now",          "current_date", "current_timestamp",
+        "current_time", "localtime",    "localtimestamp",
+        "random",       "rand",         "uuid",
+        "uuid_short",   "sysdate",      "unix_timestamp",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(n, name)) return true;
     return false;
@@ -2573,4 +2745,3 @@ fn nameIn(needle: []const u8, names: []const []const u8) bool {
     for (names) |n| if (std.mem.eql(u8, n, needle)) return true;
     return false;
 }
-

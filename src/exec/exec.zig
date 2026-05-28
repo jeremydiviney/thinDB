@@ -628,6 +628,16 @@ pub fn scanWithProjection(
     return @import("scan.zig").Scan.createWithProjection(allocator, table, accountant_ptr, needed);
 }
 
+pub fn fileScan(
+    allocator: Allocator,
+    io: std.Io,
+    access: api.FileScanAccess,
+    spec: @import("../ir/ir.zig").FileScan,
+    needed: ?[]const []const u8,
+) !Query {
+    return @import("file_scan.zig").FileScan.create(allocator, io, access, spec, needed);
+}
+
 /// Build a late-materialization plan for `SELECT <output_names> FROM table
 /// WHERE <pred> [ORDER BY <order_specs>] LIMIT n OFFSET offset`.
 ///
@@ -717,6 +727,7 @@ pub const isNotNullExpr = predicate.isNotNullExpr;
 pub const statsOverlapPredicate = predicate.statsOverlapPredicate;
 
 pub const Scan = @import("scan.zig").Scan;
+pub const FileScan = @import("file_scan.zig").FileScan;
 pub const Filter = @import("filter.zig").Filter;
 pub const Project = @import("project_limit.zig").Project;
 pub const Limit = @import("project_limit.zig").Limit;

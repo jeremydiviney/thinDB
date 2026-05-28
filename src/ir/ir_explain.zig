@@ -49,6 +49,18 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             }
             try out.append(allocator, '\n');
         },
+        .file_scan => |f| {
+            try out.appendSlice(allocator, "FileScan ");
+            try out.appendSlice(allocator, @tagName(f.format));
+            try out.appendSlice(allocator, " '");
+            try out.appendSlice(allocator, f.path);
+            try out.append(allocator, '\'');
+            if (f.alias) |a| {
+                try out.appendSlice(allocator, " AS ");
+                try out.appendSlice(allocator, a);
+            }
+            try out.append(allocator, '\n');
+        },
         .limit => |l| {
             var buf: [48]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "Limit n={d}\n", .{l.n});

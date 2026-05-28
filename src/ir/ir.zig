@@ -66,6 +66,41 @@ pub const TableRef = struct {
     name: []const u8,
 };
 
+pub const FileFormat = enum(u8) {
+    auto = 0,
+    csv = 1,
+    json = 2,
+    parquet = 3,
+};
+
+pub const CsvOptions = struct {
+    header: ?bool = null,
+    delim: ?[]const u8 = null,
+    quote: ?[]const u8 = null,
+    escape: ?[]const u8 = null,
+    nullstr: ?[]const u8 = null,
+    skip: u64 = 0,
+    sample_size: u64 = 20_480,
+    auto_detect: bool = true,
+    all_varchar: bool = false,
+};
+
+pub const JsonOptions = struct {
+    sample_size: u64 = 20_480,
+};
+
+pub const FileScanOptions = struct {
+    csv: CsvOptions = .{},
+    json: JsonOptions = .{},
+};
+
+pub const FileScan = struct {
+    format: FileFormat,
+    path: []const u8,
+    alias: ?[]const u8 = null,
+    options: FileScanOptions = .{},
+};
+
 /// Side-effect statement payload. DDL ops don't produce rows; their
 /// `Query` returns null on the first `next()` call after invoking the
 /// side effect against the active Session.
@@ -393,6 +428,9 @@ pub const OpTag = enum(u8) {
     /// on top evaluates the projected expressions (`SELECT 1+1`,
     /// `SELECT now()`). The SQL standard's implicit single-row table.
     single_row = 23,
+    /// External file source (`FROM 'x.csv'`, `read_csv('x.csv')`, ...).
+    /// The compile path materializes it as a normal source operator.
+    file_scan = 24,
 };
 
 pub const BatchOp = struct {
@@ -508,6 +546,7 @@ pub const Op = union(OpTag) {
     update_op: UpdateOp,
     explain: ExplainOp,
     single_row: void,
+    file_scan: FileScan,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -621,7 +660,7 @@ pub const Op = union(OpTag) {
     /// whose strings come from caller storage.
     pub fn deinitDecoded(self: *Op, allocator: Allocator) void {
         switch (self.*) {
-            .scan, .single_row => {},
+            .scan, .single_row, .file_scan => {},
             .explain => |e| {
                 e.inner.deinitDecoded(allocator);
                 allocator.destroy(e.inner);
@@ -759,6 +798,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             try encodeTableRef(allocator, out, s.table);
             try encodeOptString(allocator, out, s.alias);
         },
+        .file_scan => |f| try encodeFileScan(allocator, out, f),
         .limit => |l| {
             try appendU64(allocator, out, l.n);
             try appendU64(allocator, out, l.offset);
@@ -819,6 +859,36 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .explain => return EncodeError.OutOfMemory,
         // Void op — the tag byte above is the whole encoding.
         .single_row => {},
+    }
+}
+
+fn encodeFileScan(allocator: Allocator, out: *std.ArrayList(u8), f: FileScan) EncodeError!void {
+    try out.append(allocator, @intFromEnum(f.format));
+    try appendU32(allocator, out, @intCast(f.path.len));
+    try out.appendSlice(allocator, f.path);
+    try encodeOptString(allocator, out, f.alias);
+    try encodeCsvOptions(allocator, out, f.options.csv);
+    try appendU64(allocator, out, f.options.json.sample_size);
+}
+
+fn encodeCsvOptions(allocator: Allocator, out: *std.ArrayList(u8), opts: CsvOptions) EncodeError!void {
+    try encodeOptBool(allocator, out, opts.header);
+    try encodeOptString(allocator, out, opts.delim);
+    try encodeOptString(allocator, out, opts.quote);
+    try encodeOptString(allocator, out, opts.escape);
+    try encodeOptString(allocator, out, opts.nullstr);
+    try appendU64(allocator, out, opts.skip);
+    try appendU64(allocator, out, opts.sample_size);
+    try out.append(allocator, @intFromBool(opts.auto_detect));
+    try out.append(allocator, @intFromBool(opts.all_varchar));
+}
+
+fn encodeOptBool(allocator: Allocator, out: *std.ArrayList(u8), b: ?bool) EncodeError!void {
+    if (b) |v| {
+        try out.append(allocator, 1);
+        try out.append(allocator, @intFromBool(v));
+    } else {
+        try out.append(allocator, 0);
     }
 }
 
@@ -1476,7 +1546,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.update_op)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.file_scan)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1485,6 +1555,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             const alias = try decodeOptString(bytes, cursor);
             break :blk Op{ .scan = .{ .table = ref, .alias = alias } };
         },
+        .file_scan => Op{ .file_scan = try decodeFileScan(bytes, cursor) },
         .limit => blk: {
             if (cursor.* + 16 > bytes.len) return Error.IrCorrupt;
             const n = readU64(bytes[cursor.* .. cursor.* + 8]);
@@ -1891,6 +1962,68 @@ fn decodeFrameBound(bytes: []const u8, cursor: *usize) DecodeError!FrameBound {
         4 => FrameBound{ .unbounded_following = {} },
         else => Error.IrCorrupt,
     };
+}
+
+fn decodeFileScan(bytes: []const u8, cursor: *usize) DecodeError!FileScan {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const fmt_byte = bytes[cursor.*];
+    cursor.* += 1;
+    if (fmt_byte > @intFromEnum(FileFormat.parquet)) return Error.IrCorrupt;
+    const format: FileFormat = @enumFromInt(fmt_byte);
+    const path = try readString(bytes, cursor);
+    const alias = try decodeOptString(bytes, cursor);
+    const csv = try decodeCsvOptions(bytes, cursor);
+    if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;
+    const json_sample = readU64(bytes[cursor.* .. cursor.* + 8]);
+    cursor.* += 8;
+    return .{
+        .format = format,
+        .path = path,
+        .alias = alias,
+        .options = .{
+            .csv = csv,
+            .json = .{ .sample_size = json_sample },
+        },
+    };
+}
+
+fn decodeCsvOptions(bytes: []const u8, cursor: *usize) DecodeError!CsvOptions {
+    const header = try decodeOptBool(bytes, cursor);
+    const delim = try decodeOptString(bytes, cursor);
+    const quote = try decodeOptString(bytes, cursor);
+    const escape = try decodeOptString(bytes, cursor);
+    const nullstr = try decodeOptString(bytes, cursor);
+    if (cursor.* + 16 + 2 > bytes.len) return Error.IrCorrupt;
+    const skip = readU64(bytes[cursor.* .. cursor.* + 8]);
+    cursor.* += 8;
+    const sample_size = readU64(bytes[cursor.* .. cursor.* + 8]);
+    cursor.* += 8;
+    const auto_detect = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    const all_varchar = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    return .{
+        .header = header,
+        .delim = delim,
+        .quote = quote,
+        .escape = escape,
+        .nullstr = nullstr,
+        .skip = skip,
+        .sample_size = sample_size,
+        .auto_detect = auto_detect,
+        .all_varchar = all_varchar,
+    };
+}
+
+fn decodeOptBool(bytes: []const u8, cursor: *usize) DecodeError!?bool {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const present = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    if (!present) return null;
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const value = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    return value;
 }
 
 fn decodeCopy(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!CopyOp {
@@ -2320,7 +2453,6 @@ pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
 // EXPLAIN rendering lives in `ir_explain.zig`; re-exported here so
 // existing callers (`api/plan.zig` etc.) keep working unchanged.
 pub const explain = @import("ir_explain.zig").explain;
-
 
 fn decodeProject(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!Op.Project {
     if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;

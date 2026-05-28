@@ -34,6 +34,7 @@ pub const Schema = api.Schema;
 pub const DbSchema = api.Schema;
 pub const Table = api.Table;
 pub const Config = api.Config;
+pub const FileScanAccess = api.FileScanAccess;
 pub const SyncMode = api.SyncMode;
 pub const TableOptions = api.TableOptions;
 pub const OpenOptions = api.OpenOptions;

@@ -24,6 +24,18 @@ pub const Error = error{
 
 pub const SyncMode = enum { none, per_flush };
 
+pub const FileScanAccess = union(enum) {
+    /// Embedded/default behavior: paths resolve exactly as the process sees
+    /// them, matching DuckDB's local-file ergonomics.
+    process,
+    /// Server default: SQL file scans are disabled unless an operator provides
+    /// a root directory explicitly.
+    disabled,
+    /// Server allow-list root. SQL paths must be relative and stay under this
+    /// directory.
+    root: []const u8,
+};
+
 /// One schema-change operation. `alterTable` takes a slice of these and
 /// applies them in order to derive the new schema, then rewrites every
 /// segment under that schema.
@@ -156,6 +168,11 @@ pub const Config = struct {
     /// won't have their idle pool members killed). Common production
     /// values: 1800 (30 min), 3600 (1 hour).
     idle_timeout_secs: u32 = 0,
+
+    /// SQL external file scans (`FROM 'x.csv'`, `read_csv(...)`, etc.).
+    /// Embedded callers get process-local paths by default. The standalone
+    /// server overrides this to `.disabled` unless started with `--file-root`.
+    file_scan_access: FileScanAccess = .process,
 };
 
 /// Resolve the decompressed-block cache budget. A non-zero `configured` is

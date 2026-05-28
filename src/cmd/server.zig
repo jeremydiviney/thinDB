@@ -38,6 +38,9 @@ const usage_text =
     \\                          ~20% of physical RAM, floored at 256 MiB). Accepts raw bytes or a
     \\                          K/M/G suffix (e.g. 8G). Shared across all queries against a table;
     \\                          blocks in use are pinned and never evicted.
+    \\  --file-root PATH        Enable SQL file scans for paths under PATH. Without this flag,
+    \\                          thindb-server rejects read_csv/read_json/read_parquet and
+    \\                          FROM 'file.csv' sources.
     \\  --force-group-by S      Diagnostic: force GROUP BY path — auto (default) | hash | sort | radix.
     \\                          Bypasses cardinality routing; for hash-vs-sort benchmarking only.
     \\  --profile-ops           Print a per-operator INCLUSIVE time breakdown to stderr after each
@@ -78,6 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
     var idle_timeout_secs: u32 = 0;
     var query_memory_budget: ?usize = null;
     var cache_size_bytes: ?usize = null;
+    var file_root: ?[]const u8 = null;
     var mysql_password: ?[]const u8 = null;
     var pg_password: ?[]const u8 = null;
     const mysql_profile = envFlag(init.environ_map, "THINDB_MYSQL_PROFILE");
@@ -172,6 +176,10 @@ pub fn main(init: std.process.Init) !u8 {
             };
             continue;
         }
+        if (try takeValue(arg, "--file-root", &args_iter, err_w)) |v| {
+            file_root = v;
+            continue;
+        }
         if (try takeValue(arg, "--mysql-password", &args_iter, err_w)) |v| {
             mysql_password = v;
             continue;
@@ -211,6 +219,7 @@ pub fn main(init: std.process.Init) !u8 {
         .idle_timeout_secs = idle_timeout_secs,
         .query_memory_budget = query_memory_budget orelse (thindb.Config{}).query_memory_budget,
         .cache_size_bytes = cache_size_bytes orelse (thindb.Config{}).cache_size_bytes,
+        .file_scan_access = if (file_root) |root| .{ .root = root } else .disabled,
     };
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
