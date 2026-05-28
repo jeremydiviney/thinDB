@@ -447,6 +447,26 @@ test "zonemap multi-key with float secondary" {
     }
 }
 
+test "zonemap multi numeric-key prefix (int secondary, mixed dirs)" {
+    // Both keys numeric ⇒ the prunable prefix is the full tuple (k1, k2, w),
+    // exercising the multi-element corner sort + early-stop comparison. `ties`
+    // appends the unique `w` for a total order, so the kept set is unambiguous.
+    const dirs = .{ .{ false, false }, .{ true, true }, .{ false, true }, .{ true, false } };
+    inline for (dirs) |d| {
+        try runScenario(.{
+            .lead_type = .int,
+            .second_type = .int,
+            .lead_desc = d[0],
+            .second_desc = d[1],
+            .ties = true,
+            .n = 7,
+            .flush_groups = &.{ 10, 10, 10 },
+            .memtable_rows = 5,
+            .seed = 0xC0FFEE,
+        });
+    }
+}
+
 test "zonemap with selective and non-selective filters" {
     inline for (.{ 1, 2 }) |f| {
         try runScenario(.{
@@ -621,6 +641,119 @@ test "zonemap all RGs pruned after the first (disjoint ascending ranges)" {
     try std.testing.expectEqual(@as(usize, 3), got.rows.items.len);
     try std.testing.expectEqual(@as(i128, 0), got.rows.items[0].cells[0].int);
     try std.testing.expectEqual(@as(i128, 2), got.rows.items[2].cells[0].int);
+}
+
+test "zonemap secondary key extends pruning past leading-key ties" {
+    // Both segments share k1=0, so the LEADING key alone can't prune the second
+    // segment (its corner k1 ties the worst-kept). The secondary key must do it:
+    // seg A's k2 is 0..7, seg B's is 100..107, so the prefix corner (0,100) of
+    // seg B is lexicographically worse than the worst-kept (0,4) ⇒ B is pruned.
+    // Result must still match the full lateScan reference exactly.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "k1", .type = .int },
+            .{ .name = "k2", .type = .int },
+            .{ .name = "w", .type = .bigint },
+            .{ .name = "tag", .type = .string },
+        },
+        .order_key = &.{"k1"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k1"}, .row_group_size = 4 });
+
+    inline for (.{ @as(i32, 0), @as(i32, 100) }) |k2_base| {
+        var rows: [8]struct { k1: i32, k2: i32, w: i64, tag: []const u8 } = undefined;
+        for (0..8) |i| rows[i] = .{ .k1 = 0, .k2 = k2_base + @as(i32, @intCast(i)), .w = @intCast(@as(i64, k2_base) + @as(i64, @intCast(i))), .tag = "x" };
+        try t.insert(&rows);
+        try t.flush();
+    }
+
+    const probe = &[_][]const u8{ "k1", "k2" };
+    const specs = &[_]SortSpec{ .{ .col = "k1", .desc = false }, .{ .col = "k2", .desc = false } };
+    const out = &[_][]const u8{ "k1", "k2", "w", "tag" };
+
+    var ref_q = try exec.lateScan(allocator, t, null, probe, .{ .always = true }, specs, out, 5, 0);
+    defer ref_q.deinit();
+    var ref = try capture(allocator, &ref_q);
+    defer ref.deinit();
+
+    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 5, 0)).?;
+    defer z_q.deinit();
+    var got = try capture(allocator, &z_q);
+    defer got.deinit();
+
+    try expectSameRows(ref, got);
+    // Top-5 by (k1, k2) ASC are all from seg A: k2 = 0..4.
+    try std.testing.expectEqual(@as(usize, 5), got.rows.items.len);
+    try std.testing.expectEqual(@as(i128, 0), got.rows.items[0].cells[1].int);
+    try std.testing.expectEqual(@as(i128, 4), got.rows.items[4].cells[1].int);
+}
+
+test "zonemap narrow projection: output subset of probe (Q26 shape)" {
+    // `SELECT k1 ... ORDER BY k1 LIMIT n` — the output is a SUBSET of the probe
+    // set, the shape the narrow-projection routing now sends here. The fetched
+    // rows must match the lateScan reference for the same narrow projection.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "k1", .type = .int },
+            .{ .name = "k2", .type = .int },
+            .{ .name = "w", .type = .bigint },
+        },
+        .order_key = &.{"k1"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k1"}, .row_group_size = 4 });
+
+    var base: i32 = 0;
+    for (0..3) |_| {
+        var rows: [8]struct { k1: i32, k2: i32, w: i64 } = undefined;
+        for (0..8) |i| rows[i] = .{ .k1 = base + @as(i32, @intCast(i)), .k2 = @intCast(i), .w = @intCast(base + @as(i32, @intCast(i))) };
+        try t.insert(&rows);
+        try t.flush();
+        base += 100;
+    }
+
+    const probe = &[_][]const u8{ "k1", "k2" };
+    const specs = &[_]SortSpec{ .{ .col = "k1", .desc = false }, .{ .col = "k2", .desc = false } };
+    const out = &[_][]const u8{"k1"}; // output ⊊ probe
+
+    var ref_q = try exec.lateScan(allocator, t, null, probe, .{ .always = true }, specs, out, 5, 0);
+    defer ref_q.deinit();
+    var ref = try capture(allocator, &ref_q);
+    defer ref.deinit();
+
+    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 5, 0)).?;
+    defer z_q.deinit();
+    var got = try capture(allocator, &z_q);
+    defer got.deinit();
+
+    try expectSameRows(ref, got);
+    try std.testing.expectEqual(@as(usize, 5), got.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 1), got.rows.items[0].cells.len); // single output column
+    try std.testing.expectEqual(@as(i128, 0), got.rows.items[0].cells[0].int);
+    try std.testing.expectEqual(@as(i128, 4), got.rows.items[4].cells[0].int);
 }
 
 test "zonemap NO RGs pruned (heavily overlapping ranges)" {

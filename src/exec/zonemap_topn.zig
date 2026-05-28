@@ -8,29 +8,33 @@
 //! bound.
 //!
 //! Algorithm (need top `K = n + m`):
-//!   1. Enumerate every (segment, row_group). For each, read the leading order
-//!      key's min/max from the footer `Stats`.
-//!   2. best-corner = the most-preferred value the RG could hold per key: ASC →
-//!      min, DESC → max. Only the leading key is encoded; secondary keys (and
-//!      any key without usable stats) contribute a non-tightening sentinel —
-//!      only the leading key prunes in v1.
-//!   3. Sort the RG list by best-corner (leading-key direction).
+//!   1. Enumerate every (segment, row_group). For each, read the footer min/max
+//!      of every key in the prunable PREFIX — the longest leading run of order
+//!      keys that are non-nullable with usable numeric/temporal stats.
+//!   2. best-corner = per prefix key, the most-preferred value the RG could
+//!      hold: ASC → min, DESC → max. This per-key-independent tuple is still a
+//!      valid lexicographic lower bound on every row's key tuple, because lex
+//!      compares left-to-right and each component is independently bounded.
+//!      Keys past the prefix (strings/floats/nullable) don't prune but still
+//!      order rows in the heap comparator.
+//!   3. Sort the RG list by best-corner, lexicographically over the prefix
+//!      (per-key direction).
 //!   4. Bounded max-heap of the K best rows (worst at root), keyed by the FULL
 //!      ORDER BY comparator over actual decoded values (`compareInColumn` +
 //!      per-key `desc`, identical to `TopN.Comparator`).
 //!   5. Visit RGs in best-corner order. Once the heap holds K rows AND this
-//!      RG's best-corner is worse than the heap's worst-kept leading key →
-//!      STOP (every later RG is also worse).
+//!      RG's best-corner is lexicographically worse than the heap's worst-kept
+//!      prefix tuple → STOP (every later RG is also worse).
 //!   6. Else decode this RG's probe columns, apply WHERE + tombstones, push
 //!      each survivor (sort keys + packed `__rowloc`) into the heap.
 //!   7. The memtable (no zonemap) is always scanned — never skippable.
 //!   8. Sort the heap's survivors, drop `m`, keep `n`.
 //!   9. Materialize the WIDE output columns by `__rowloc` via `LateScan`.
 //!
-//! CORRECTNESS: best-corner is a provable lower (ASC) / upper (DESC) bound on
-//! the leading key of every row in the RG. Once it's worse than the K-th best
-//! already held, the RG can't improve the answer; visiting in best-corner order
-//! makes "this RG fails ⇒ all later fail" hold. The heap comparator and final
+//! CORRECTNESS: best-corner is a provable most-preferred bound on the prefix
+//! key tuple of every row in the RG. Once it's lexicographically worse than the
+//! K-th best already held, the RG can't improve the answer; visiting in
+//! best-corner order makes "this RG fails ⇒ all later fail" hold. The heap comparator and final
 //! sort match `TopN` exactly, so the output is byte-identical to the lateScan
 //! reference path. When ANY precondition isn't met, the builder returns null
 //! and the caller falls back to lateScan.
@@ -66,13 +70,13 @@ const rowloc = @import("rowloc.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 
-/// One row group's identity + its leading-key best-corner bound.
+/// One row group's identity + the offset of its best-corner prefix tuple in the
+/// flat `corners` buffer (`prefix_len` consecutive i128s).
 const RgRef = struct {
     seg_idx: usize,
     rg_idx: usize,
     row_count: u32,
-    /// best-corner leading-key value: ASC → min, DESC → max.
-    corner: i128,
+    corner_off: usize,
 };
 
 pub const ZonemapTopN = struct {
@@ -97,9 +101,13 @@ pub const ZonemapTopN = struct {
     key_desc: []bool,
     /// Probe-batch index of each ORDER BY key column. Owned.
     key_probe_idx: []usize,
-    /// Leading order key (the column whose footer stats drive pruning).
-    leading_phys: usize,
-    leading_desc: bool,
+    /// Prunable prefix length: the longest leading run of ORDER BY keys with
+    /// non-nullable numeric/temporal footer stats (≥1). Only these keys drive
+    /// row-group pruning; the rest still order rows in the heap comparator.
+    prefix_len: usize,
+    /// Flat best-corner store, `prefix_len` i128s per row group. Scratch for one
+    /// `collectTopK`; allocated in `enumerateRowGroups`, freed at its end.
+    corners: []i128 = &.{},
 
     n: usize,
     offset: usize,
@@ -156,6 +164,16 @@ pub const ZonemapTopN = struct {
         for (order_specs, 0..) |sp, i| {
             key_phys[i] = types.findColumn(table.schema.columns, sp.col) orelse return null;
             key_desc[i] = sp.desc;
+        }
+
+        // Prunable prefix: the leading key is already validated as prunable;
+        // extend while each subsequent key is also non-nullable with usable
+        // numeric/temporal footer stats. The first key that isn't (a string/
+        // float/nullable secondary key) caps the prefix.
+        var prefix_len: usize = 1;
+        while (prefix_len < order_specs.len) : (prefix_len += 1) {
+            const c = table.schema.columns[key_phys[prefix_len]];
+            if (c.nullable or !leadingKeyTypeSupported(c.type)) break;
         }
 
         const probe_phys = try allocator.alloc(usize, probe_names.len);
@@ -224,8 +242,7 @@ pub const ZonemapTopN = struct {
             .key_phys = key_phys,
             .key_desc = key_desc,
             .key_probe_idx = key_probe_idx,
-            .leading_phys = lead_idx,
-            .leading_desc = lead.desc,
+            .prefix_len = prefix_len,
             .n = n,
             .offset = offset,
             .keep = keep,
@@ -303,10 +320,14 @@ pub const ZonemapTopN = struct {
     fn collectTopK(self: *ZonemapTopN) ![]i64 {
         const refs = try self.enumerateRowGroups();
         defer self.allocator.free(refs);
+        defer {
+            self.allocator.free(self.corners);
+            self.corners = &.{};
+        }
         std.sort.pdq(RgRef, refs, self, cornerLess);
 
         for (refs) |ref| {
-            if (self.keep > 0 and self.heap.items.len >= self.keep and self.cornerWorseThanWorst(ref.corner)) break;
+            if (self.keep > 0 and self.heap.items.len >= self.keep and self.cornerWorseThanWorst(ref)) break;
             try self.processSegmentRowGroup(ref);
         }
 
@@ -314,12 +335,15 @@ pub const ZonemapTopN = struct {
         return self.finalize();
     }
 
-    /// Read the leading-key min/max footer stat for each (segment, row group),
-    /// computing the best-corner. A segment that can't be opened propagates the
-    /// error (correctness over silent skip).
+    /// Read the prefix keys' min/max footer stats for each (segment, row group),
+    /// building the flat best-corner store (`self.corners`) and the RG list. A
+    /// segment that can't be opened propagates the error (correctness over
+    /// silent skip).
     fn enumerateRowGroups(self: *ZonemapTopN) ![]RgRef {
         var list: std.ArrayListUnmanaged(RgRef) = .empty;
         errdefer list.deinit(self.allocator);
+        var corners: std.ArrayListUnmanaged(i128) = .empty;
+        errdefer corners.deinit(self.allocator);
 
         var seg_idx: usize = 0;
         while (seg_idx < self.segment_count) : (seg_idx += 1) {
@@ -336,34 +360,56 @@ pub const ZonemapTopN = struct {
             defer seg.deinit();
 
             for (seg.info.row_groups, 0..) |rg, rg_idx| {
-                const s = rg.stats[self.leading_phys];
-                const corner: i128 = if (self.leading_desc) s.max else s.min;
+                const off = corners.items.len;
+                for (0..self.prefix_len) |k| {
+                    const s = rg.stats[self.key_phys[k]];
+                    try corners.append(self.allocator, if (self.key_desc[k]) s.max else s.min);
+                }
                 try list.append(self.allocator, .{
                     .seg_idx = seg_idx,
                     .rg_idx = rg_idx,
                     .row_count = rg.row_count,
-                    .corner = corner,
+                    .corner_off = off,
                 });
             }
         }
-        return list.toOwnedSlice(self.allocator);
+        const refs = try list.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(refs);
+        self.corners = try corners.toOwnedSlice(self.allocator);
+        return refs;
     }
 
-    /// best-corner visit order: most-preferred first (ASC → smaller corner
-    /// first; DESC → larger corner first). Only the leading key is encoded.
+    /// The prefix best-corner tuple stored for a row group.
+    fn cornerOf(self: *ZonemapTopN, ref: RgRef) []const i128 {
+        return self.corners[ref.corner_off..][0..self.prefix_len];
+    }
+
+    /// best-corner visit order: most-preferred first, lexicographically over the
+    /// prefix (per-key ASC → smaller first; DESC → larger first).
     fn cornerLess(self: *ZonemapTopN, a: RgRef, b: RgRef) bool {
-        if (a.corner == b.corner) return false;
-        return if (self.leading_desc) a.corner > b.corner else a.corner < b.corner;
+        const ca = self.cornerOf(a);
+        const cb = self.cornerOf(b);
+        for (ca, cb, 0..) |av, bv, i| {
+            if (av == bv) continue;
+            return if (self.key_desc[i]) av > bv else av < bv;
+        }
+        return false;
     }
 
-    /// True when a row group whose best-corner leading value is `corner` cannot
-    /// beat the current worst-kept row — its smallest (ASC) / largest (DESC)
-    /// possible leading value already sorts strictly after the worst-kept's
-    /// leading key. Conservative on equality (returns false) so a tie-on-leading
-    /// RG is still processed (secondary keys could displace the incumbent).
-    fn cornerWorseThanWorst(self: *ZonemapTopN, corner: i128) bool {
-        const worst_lead = leadingValueI128(self.key_cols[0], self.heap.items[0]);
-        return if (self.leading_desc) corner < worst_lead else corner > worst_lead;
+    /// True when a row group cannot beat the current worst-kept row — its
+    /// best-corner prefix tuple already sorts strictly after the worst-kept's
+    /// prefix-key tuple under the per-key directions. Conservative on a full tie
+    /// (returns false) so a tie-on-prefix RG is still processed (later keys
+    /// could displace the incumbent).
+    fn cornerWorseThanWorst(self: *ZonemapTopN, ref: RgRef) bool {
+        const worst = self.heap.items[0];
+        const corner = self.cornerOf(ref);
+        for (corner, 0..) |c, i| {
+            const w = keyValueI128(self.key_cols[i], worst);
+            if (c == w) continue;
+            return if (self.key_desc[i]) c < w else c > w;
+        }
+        return false;
     }
 
     fn processSegmentRowGroup(self: *ZonemapTopN, ref: RgRef) !void {
@@ -633,9 +679,10 @@ fn leadingKeyTypeSupported(t: types.Type) bool {
     };
 }
 
-/// Read stored row `r`'s leading-key value as an i128 (same domain as the
-/// footer `Stats`), for the corner comparison. Only called on supported types.
-fn leadingValueI128(col: ColumnStore, r: u32) i128 {
+/// Read stored row `r`'s key value as an i128 (same domain as the footer
+/// `Stats`), for the corner comparison. Only called on prefix keys, which are
+/// guaranteed to be supported numeric/temporal types.
+fn keyValueI128(col: ColumnStore, r: u32) i128 {
     return switch (col.data) {
         .int => |l| l.items[r],
         .smallint => |l| l.items[r],

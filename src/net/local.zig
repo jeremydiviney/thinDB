@@ -1588,17 +1588,21 @@ fn aggOutTypeForReduction(family: AggFamily, base_type: types.Type, aff: AffineA
 // Any deviation bails to the existing plan, which is always correct.
 // ---------------------------------------------------------------------------
 
-/// The `Filter{ Scan }` core of a late-mat candidate, plus the optional
-/// ORDER BY and top Project peeled above it.
+/// The `[Filter] Scan` core of a late-mat candidate, plus the optional ORDER BY
+/// and top Project peeled above it. `has_filter` is false for a bare scan with
+/// no WHERE (then `predicate` is the always-true constant).
 const LateMatPeel = struct {
     select: ?ir.Op.Project,
     order_specs: ?[]const SortSpec,
-    filter: ir.Op.Filter,
+    predicate: PredicateExpr,
+    has_filter: bool,
     scan: ir.Op.Scan,
 };
 
-/// Peel `Limit{ [Project] [OrderBy] Filter{ Scan } }`. Returns null unless the
-/// shape bottoms out in a bare, unaliased single-table scan under a filter.
+/// Peel `Limit{ [Project] [OrderBy] [Filter] Scan }`. Returns null unless the
+/// shape bottoms out in a bare, unaliased single-table scan. The Filter is
+/// optional: a no-WHERE `ORDER BY ... LIMIT` still qualifies (predicate ⇒
+/// always-true), which lets the zonemap top-N skip row groups for it too.
 fn lateMatPeel(l: ir.Op.Limit) ?LateMatPeel {
     var node = l.upstream;
     var select: ?ir.Op.Project = null;
@@ -1611,14 +1615,19 @@ fn lateMatPeel(l: ir.Op.Limit) ?LateMatPeel {
         order_specs = node.order_by.specs;
         node = node.order_by.upstream;
     }
-    if (node.* != .filter) return null;
-    const filter = node.filter;
-    if (filter.upstream.* != .scan) return null;
-    const scan = filter.upstream.scan;
+    var pred: PredicateExpr = .{ .always = true };
+    var has_filter = false;
+    if (node.* == .filter) {
+        pred = node.filter.predicate;
+        has_filter = true;
+        node = node.filter.upstream;
+    }
+    if (node.* != .scan) return null;
+    const scan = node.scan;
     // Aliased scans expose `alias.col` names via an AliasRename wrapper —
     // resolving the output back to base columns gets murky. Bail.
     if (scan.alias != null) return null;
-    return .{ .select = select, .order_specs = order_specs, .filter = filter, .scan = scan };
+    return .{ .select = select, .order_specs = order_specs, .predicate = pred, .has_filter = has_filter, .scan = scan };
 }
 
 const LateMatShape = struct {
@@ -1632,6 +1641,14 @@ const LateMatShape = struct {
     order_specs: ?[]const SortSpec,
     /// Owned: `output_names` for the `SELECT *` case (else borrowed from IR).
     owns_output: bool,
+    /// True when the output decodes strictly more columns than the probe set —
+    /// the precondition for late materialization to save work. (Zonemap top-N
+    /// benefits regardless, so it isn't gated on this.)
+    output_wider: bool,
+    /// True when a real WHERE was peeled (false ⇒ predicate is always-true).
+    /// LateScan is only used when there's a real filter; zonemap top-N handles
+    /// the no-filter case directly.
+    has_filter: bool,
 
     fn deinit(self: *LateMatShape, allocator: Allocator) void {
         allocator.free(@constCast(self.probe_names));
@@ -1688,7 +1705,7 @@ fn lateMatShape(allocator: Allocator, table: *ApiTable, l: ir.Op.Limit) !?LateMa
     // bail rather than risk a wrong plan.
     var probe: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer probe.deinit(allocator);
-    collectPredicateNames(allocator, &probe, peel.filter.predicate) catch {
+    collectPredicateNames(allocator, &probe, peel.predicate) catch {
         probe.deinit(allocator);
         return null;
     };
@@ -1721,20 +1738,19 @@ fn lateMatShape(allocator: Allocator, table: *ApiTable, l: ir.Op.Limit) !?LateMa
     };
     errdefer if (owns_output) allocator.free(@constCast(output_names));
 
-    // Only worth it when the output decodes strictly more columns than the
-    // probe set — otherwise the inner scan already reads everything.
-    if (!outputWiderThanProbe(table, output_names, probe.items)) {
-        if (owns_output) allocator.free(@constCast(output_names));
-        probe.deinit(allocator);
-        return null;
-    }
+    // LateScan only pays off when the output decodes strictly more columns
+    // than the probe set; zonemap top-N benefits either way. Record it and let
+    // `buildLateMat` decide — don't reject the shape here.
+    const output_wider = outputWiderThanProbe(table, output_names, probe.items);
 
     return .{
         .output_names = output_names,
         .probe_names = try probe.toOwnedSlice(allocator),
-        .predicate = peel.filter.predicate,
+        .predicate = peel.predicate,
         .order_specs = peel.order_specs,
         .owns_output = owns_output,
+        .output_wider = output_wider,
+        .has_filter = peel.has_filter,
     };
 }
 
@@ -1763,18 +1779,20 @@ fn outputWiderThanProbe(
     return extra > 0;
 }
 
+/// Build the zonemap top-N or late-materialization plan for a matched shape, or
+/// null when neither applies (caller falls through to its Top-N / Limit plan).
 fn buildLateMat(
     allocator: Allocator,
     table: *ApiTable,
     acct: ?*exec.memory.MemoryAccountant,
     shape: LateMatShape,
     l: ir.Op.Limit,
-) !Query {
+) !?Query {
     // Prefer the zonemap block-skipping top-N path when there's an ORDER BY and
     // its leading key qualifies (non-nullable numeric/temporal with footer
     // stats). It prunes whole row groups via per-RG min/max and produces the
-    // byte-identical answer to lateScan. Returns null on any unsupported shape
-    // ⇒ fall back to the always-correct lateScan plan below.
+    // byte-identical answer to the full-scan plan — regardless of projection
+    // width, and even with no WHERE. Returns null on any unsupported shape.
     if (shape.order_specs) |specs| {
         if (try exec.zonemapTopN(
             allocator,
@@ -1788,7 +1806,11 @@ fn buildLateMat(
             @intCast(l.offset),
         )) |q| return q;
     }
-    return exec.lateScan(
+    // LateScan is only worthwhile (and only validated) with a real WHERE that
+    // decodes fewer columns than the wide output. Otherwise signal the caller
+    // to use its plain Top-N / Limit plan.
+    if (!shape.output_wider or !shape.has_filter) return null;
+    return try exec.lateScan(
         allocator,
         table,
         acct,
@@ -1831,7 +1853,7 @@ pub fn buildServerQuerySession(
                     if (try lateMatShape(allocator, t, l)) |shape| {
                         var sh = shape;
                         defer sh.deinit(allocator);
-                        break :blk try buildLateMat(allocator, t, null, sh, l);
+                        if (try buildLateMat(allocator, t, null, sh, l)) |q| break :blk q;
                     }
                 }
             }
@@ -2703,7 +2725,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                         var sh = shape;
                         defer sh.deinit(ctx.allocator);
                         const acct = try ctx.queryAccountant();
-                        break :blk try buildLateMat(ctx.allocator, t, acct, sh, l);
+                        if (try buildLateMat(ctx.allocator, t, acct, sh, l)) |q| break :blk q;
                     }
                 }
             }
