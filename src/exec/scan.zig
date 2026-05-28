@@ -632,14 +632,17 @@ pub const Scan = struct {
     }
 
     /// Accept a full predicate for scan-side in-place filtering. Declines
-    /// (returns false) for the count-only scan (no columns to filter) and the
-    /// late-materialization scan (`emit_loc`, which has its own pipeline). On
-    /// acceptance the predicate's leaves must reference only columns this scan
+    /// (returns false) only for the count-only scan (no columns to filter). The
+    /// late-materialization scan (`emit_loc`) IS now fused: the survivor-
+    /// compaction paths (`materializeSurvivors` / `evalAndCompact`) additionally
+    /// pack each survivor's `__rowloc` from the same mask, so the filter runs in
+    /// the scan and only survivors flow out — no separate Filter over all rows.
+    /// On acceptance the predicate's leaves must reference only columns this scan
     /// projects — guaranteed when the fusing Filter sits directly above and
     /// shares this scan's output schema. The expr is stored by value; its
     /// backing memory is owned by the caller and must outlive this scan.
     pub fn tryFuseFilter(self: *Scan, expr: PredicateExpr) !bool {
-        if (self.out_phys.len == 0 or self.emit_loc) return false;
+        if (self.out_phys.len == 0) return false;
         if (self.fused_filter != null) return false;
         self.fused_filter = expr;
         return true;
@@ -1094,7 +1097,7 @@ pub const Scan = struct {
             defer self.allocator.free(mem_views);
             for (self.out_phys, 0..) |phys, j| mem_views[j] = self.memtable_snap.columns[phys].view();
 
-            const matched = try self.evalAndCompact(mem_views, n, null, expr);
+            const matched = try self.evalAndCompact(mem_views, n, null, expr, .memtable);
             if (matched == 0) return null;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
             return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded };
@@ -1136,14 +1139,14 @@ pub const Scan = struct {
         // can't be viewed (misalignment / big-endian).
         if (try self.tryBorrowViews(seg, rg_idx, rg_count)) |borrow| {
             defer for (borrow.blocks) |*b| b.release(self.allocator, &self.table.cache);
-            return self.evalAndCompact(borrow.views, rg_count, tomb_mask, expr);
+            return self.evalAndCompact(borrow.views, rg_count, tomb_mask, expr, .{ .segment = rg_idx });
         }
 
         // Fallback: owned decode (as the non-fused path), then evaluate +
         // compact through the same kernel.
         const owned_views = try self.decodeOwnedViews(seg, rg_idx, rg_count);
         defer self.releaseDecoded();
-        return self.evalAndCompact(owned_views, rg_count, tomb_mask, expr);
+        return self.evalAndCompact(owned_views, rg_count, tomb_mask, expr, .{ .segment = rg_idx });
     }
 
     /// FOR-aware fused filter (Phase 2B + per-leaf AND generalization). Handles a
@@ -1434,6 +1437,10 @@ pub const Scan = struct {
     /// k <op> c` shape.
     fn tryFusedLeafGather(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, expr: PredicateExpr) !?usize {
         if (self.n_coded != 0) return null;
+        // Late-mat needs each survivor's `__rowloc`; this single-column gather
+        // path doesn't produce the mask the loc emission rides on, so let the
+        // mask-based paths (FOR-guided / borrow / owned) handle the row group.
+        if (self.emit_loc) return null;
         if (self.out_phys.len != 1) return null;
         if (self.cur_segment_tomb) |t| {
             if (t.len != 0) return null;
@@ -1660,7 +1667,26 @@ pub const Scan = struct {
                 try engine.memtable.appendMaskedColumn(self.allocator, owned.view(), mask, &filtered_cols[j]);
             }
         }
+        if (self.emit_loc) try self.appendSurvivorLocs(mask, rg_idx);
         self.filtered_coded = slots;
+    }
+
+    /// Late-mat: append each survivor's packed `__rowloc` into the trailing
+    /// filtered buffer (a bigint `ColumnStore`), in the same mask order the
+    /// projected columns were compacted — so loc[k] matches survivor row k.
+    /// `rg_idx` non-null → segment row group (pack seg/rg/in-group-offset);
+    /// null → memtable (pack the row index). The local offset `i` is exactly
+    /// what `LateScan` unpacks to re-fetch the survivor's wide columns.
+    fn appendSurvivorLocs(self: *Scan, mask: []const bool, rg_idx: ?usize) !void {
+        const loc_col = &self.filtered.?[self.out_phys.len];
+        for (mask, 0..) |m, i| {
+            if (!m) continue;
+            const loc: i64 = if (rg_idx) |rg|
+                rowloc.packSegment(self.cur_seg_idx, rg, i)
+            else
+                rowloc.packMemtable(i);
+            try loc_col.data.bigint.append(self.allocator, loc);
+        }
     }
 
     /// Fill `code_bufs[j]` with the global dict codes of just the surviving rows
@@ -1866,10 +1892,15 @@ pub const Scan = struct {
         }
     }
 
+    /// Where a fused late-mat survivor's `__rowloc` comes from — the compaction
+    /// packs it from the same mask. Segment row group (by index) vs memtable.
+    const SurvivorLoc = union(enum) { segment: usize, memtable };
+
     /// Evaluate `expr` over `views` (a batch of `n` rows), AND in the optional
-    /// `tomb_mask` (true = keep), and compact survivors into `filtered`.
+    /// `tomb_mask` (true = keep), and compact survivors into `filtered`. When
+    /// late-mat (`emit_loc`), also packs each survivor's `__rowloc` per `loc`.
     /// Returns the survivor count.
-    fn evalAndCompact(self: *Scan, views: []const ColumnView, n: usize, tomb_mask: ?[]const bool, expr: PredicateExpr) !usize {
+    fn evalAndCompact(self: *Scan, views: []const ColumnView, n: usize, tomb_mask: ?[]const bool, expr: PredicateExpr, loc: SurvivorLoc) !usize {
         const mask = try self.ensureMask(n);
         const batch = Batch{ .schema = self.out_schema, .values = views, .row_count = n };
         try predicate.evaluateExprGuided(self.allocator, expr, self.out_schema, batch, mask, null);
@@ -1888,7 +1919,9 @@ pub const Scan = struct {
 
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
-        for (views, filtered_cols, 0..) |src, *dst, j| {
+        // `filtered_cols` carries a trailing `__rowloc` buffer under emit_loc;
+        // the projected columns are the first `views.len`.
+        for (views, filtered_cols[0..views.len], 0..) |src, *dst, j| {
             // Coded group key: intern just the survivors' strings into the code
             // buffer (the views are already decoded here); placeholder in the
             // value column. The aggregate reads the sidecar codes.
@@ -1911,6 +1944,10 @@ pub const Scan = struct {
             }
             try engine.memtable.appendMaskedColumn(self.allocator, src, mask[0..n], dst);
         }
+        if (self.emit_loc) switch (loc) {
+            .segment => |rg| try self.appendSurvivorLocs(mask[0..n], rg),
+            .memtable => try self.appendSurvivorLocs(mask[0..n], null),
+        };
         self.filtered_coded = slots;
         return matched;
     }
