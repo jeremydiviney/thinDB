@@ -2282,7 +2282,7 @@ fn routeStreamGroupBy(
             if (groupKeysSortedPrefix(st.sort_state, group_cols)) {
                 return try upstream.streamGroupBy(group_cols, aggs);
             }
-            if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), group_cols, aggs.len, budget)) {
+            if (!groupKeysCardUnderLimit(st, upstream.outputSchema(), group_cols, aggs, budget)) {
                 const specs = try allocator.alloc(exec.SortSpec, group_cols.len);
                 defer allocator.free(specs);
                 for (group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
@@ -2365,8 +2365,8 @@ fn routeRadixGroupBy(
         // unknown-but-low for bounded behaviour on unknown-but-high.
         if (known) {
             est = @min(est, @max(st.upper_rows, 1));
-            const per_group_bytes: u64 = @as(u64, aggs.len) * 16 + 16; // ≈ state + key
-            if (est *| per_group_bytes <= RADIX_CACHE_BYTES) return null;
+            const per_group_bytes = perGroupTableBytes(schema, group_cols, aggs);
+            if (per_group_bytes != 0 and est *| per_group_bytes <= RADIX_CACHE_BYTES) return null;
         }
     }
 
@@ -2383,22 +2383,44 @@ fn routeRadixGroupBy(
     };
 }
 
+/// Approximate allocated bytes per group in the hash / radix Aggregate table:
+/// the representative slot `{key/hash + gid}`, the per-group key copy
+/// (`gkeys_int` u128 / byte-key slice header), the group-key column bytes, and
+/// each aggregate's real SoA state-column width (`aggStateWidth`: count 8,
+/// sum 16, avg 16, numeric min/max 16, 48 for the wide `.other` column). Scaled
+/// by the 0.75 load-factor headroom, since the slot table, key array, and state
+/// columns are all sized to capacity ≈ groups / 0.75. Single source of truth for
+/// both the hash-vs-sort budget gate and the radix-vs-hash cache-residency gate
+/// so they size the table identically. Returns 0 iff a group column is missing.
+fn perGroupTableBytes(
+    schema: []const types.Column,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+) u64 {
+    var raw: u64 = 16 + 16; // slot {key/hash, gid} + per-group key copy
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse return 0;
+        raw += exec.memory.estimateColumnBytes(schema[idx].type);
+    }
+    for (aggs) |a| {
+        const in_t: ?types.Type = if (a.col) |name| blk: {
+            const idx = types.findColumn(schema, name) orelse break :blk null;
+            break :blk schema[idx].type;
+        } else null;
+        raw += exec.aggregate_op.aggStateWidth(a.func, in_t);
+    }
+    return raw * 4 / 3; // 0.75 load-factor headroom
+}
+
 fn groupKeysCardUnderLimit(
     st: exec.PipelineStats,
     schema: []const types.Column,
     group_cols: []const []const u8,
-    n_aggs: usize,
+    aggs: []const ir.AggSpec,
     budget: usize,
 ) bool {
-    // Per-group footprint: dup'd key bytes + one accumulator per aggregate
-    // + StringHashMap entry/load-factor overhead. Deliberately generous so
-    // an HLL under-estimate doesn't push the real table over budget.
-    var per_group: u64 = 96; // map entry + value slice + load-factor slack
-    for (group_cols) |gc| {
-        const idx = types.findColumn(schema, gc) orelse return false;
-        per_group += exec.memory.estimateColumnBytes(schema[idx].type);
-    }
-    per_group += @as(u64, n_aggs) * 32; // accumulator state per aggregate (AccState)
+    const per_group = perGroupTableBytes(schema, group_cols, aggs);
+    if (per_group == 0) return false; // missing group column → conservative: sort
 
     // Use up to half the budget for the group table; the rest covers input
     // batches, the output, and any sibling operators. budget==0 means

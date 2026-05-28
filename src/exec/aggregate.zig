@@ -225,6 +225,75 @@ const AccState = union(enum) {
     concat: ?*ConcatAcc,
 };
 
+/// Per-aggregate accumulator storage, one entry per aggregate. The hybrid
+/// Struct-of-Arrays replacement for the old flat `[]AccState gstate`: each
+/// aggregate gets ONE typed column sized to the group-table capacity and
+/// indexed by gid, so a COUNT/SUM/AVG group costs ~40 B instead of the old
+/// 96 B (three 32-B `AccState` cells). The narrow variants hold exactly the
+/// same semantic value as the matching `AccState` field; the complex
+/// aggregates (string MIN/MAX, 128-bit MIN/MAX, welford, all distinct sets,
+/// percentile, group_concat, and combined-distinct aggs) keep a real
+/// `[]AccState` so the per-row `updateStateRow` path operates on a stable
+/// `*AccState` unchanged.
+const AggCol = union(enum) {
+    count: []u64,
+    sum_int: []i128,
+    sum_float: []f64,
+    avg: []AvgAcc,
+    min_int: []?i64,
+    max_int: []?i64,
+    min_float: []?f64,
+    max_float: []?f64,
+    other: []AccState,
+};
+
+/// Choose the `AggCol` kind for an aggregate, mirroring exactly what
+/// `initialState` picks for that aggregate's `AccState` variant. The narrow
+/// kinds (count/sum/avg/numeric min-max) are stored in their own typed column;
+/// everything else (string min/max, 128-bit min/max, welford, distinct sets,
+/// percentile, group_concat) lands in `.other`. Combined-distinct aggregates
+/// (`cd[ai] != null`) also use `.other` — their cell value is unused (the count
+/// is read from the combined counter), so a default-initialized `AccState` does.
+const AggColKind = enum { count, sum_int, sum_float, avg, min_int, max_int, min_float, max_float, other };
+
+fn aggColKind(func: AggFunc, in: ?Type) AggColKind {
+    return switch (func) {
+        .count => .count,
+        .sum => if (in != null and in.?.isFloat()) .sum_float else .sum_int,
+        .avg => .avg,
+        .min => if (in != null and in.?.isFloat())
+            .min_float
+        else if (in != null and (in.?.isString() or in.? == .largeint or in.? == .decimal128))
+            .other
+        else
+            .min_int,
+        .max => if (in != null and in.?.isFloat())
+            .max_float
+        else if (in != null and (in.?.isString() or in.? == .largeint or in.? == .decimal128))
+            .other
+        else
+            .max_int,
+        else => .other,
+    };
+}
+
+/// Byte width of one aggregate's per-group state cell in the SoA layout — the
+/// element size of the `AggCol` column that `aggColKind` selects. The GROUP BY
+/// router (net/local.zig) sums these to size the hash table against the budget,
+/// so it must track the real column widths rather than a flat per-AccState
+/// estimate.
+pub fn aggStateWidth(func: AggFunc, in: ?Type) usize {
+    return switch (aggColKind(func, in)) {
+        .count => @sizeOf(u64),
+        .sum_int => @sizeOf(i128),
+        .sum_float => @sizeOf(f64),
+        .avg => @sizeOf(AvgAcc),
+        .min_int, .max_int => @sizeOf(?i64),
+        .min_float, .max_float => @sizeOf(?f64),
+        .other => @sizeOf(AccState),
+    };
+}
+
 /// Inline MIN/MAX accumulator for 128-bit inputs. `align(8)` on the i128 keeps
 /// the enclosing `AccState` union 8-aligned (32 B) rather than 16-aligned.
 const LargeAcc = struct { v: i128 align(8) = 0, present: bool = false };
@@ -265,7 +334,7 @@ const CombinedDistinct = struct {
     /// memory-bound insert.
     table: IntTable96,
     /// Per-GROUP-gid distinct count, indexed by the aggregate's group gid.
-    /// `appendInitialState` appends a 0 for every new group.
+    /// `initGroupCells` appends a 0 for every new group.
     counts: std.ArrayListUnmanaged(u64) = .empty,
     /// Bit width of the value column (`intKeyBits(value_type)`, ≤64): the shift
     /// amount that places gid above the value bits in the combined key.
@@ -366,13 +435,18 @@ pub const Aggregate = struct {
     inline_table_16: ?InlineTable16 = null,
     inline_table_32: ?InlineTable32 = null,
     inline_table_64: ?InlineTable64 = null,
-    /// Flat per-group accumulator storage: group `g`'s accumulators occupy
-    /// `gstate.items[g * aggs.len ..][0..aggs.len]`. New groups append here in
-    /// gid order, and emit walks it in gid order — both sequential, so the
-    /// cost stays cache-friendly at millions of groups (a slice-per-group map
-    /// value would scatter the state across the arena and force a random read
-    /// per group on both the accumulate and emit passes).
-    gstate: std.ArrayListUnmanaged(AccState) = .empty,
+    /// Per-aggregate accumulator columns (hybrid Struct-of-Arrays), one entry
+    /// per aggregate. Each entry is a typed slice sized to the group-table
+    /// capacity and indexed by gid, so group `g`'s state for aggregate `ai`
+    /// is `agg_cols[ai].<kind>[g]`. Replaces the old flat `[]AccState gstate`
+    /// (which paid one 32-B `AccState` cell per (group, aggregate)); the narrow
+    /// per-aggregate columns cut a COUNT/SUM/AVG group from 96 B to ~40 B.
+    /// Arena-owned (the backing slices live in `arena`), like `gstate` was.
+    agg_cols: []AggCol = &.{},
+    /// Reused scratch (arena, length `aggs.len`) into which the emit paths
+    /// gather one group's columns back into `[]AccState`, so the existing
+    /// `appendGroupRow` / `topkEntry` (which take `[]AccState`) run unchanged.
+    state_scratch: []AccState = &.{},
     /// Per-group key bytes, indexed by gid (arena-owned). Byte-key path only.
     /// Lets emit reconstruct each group's key columns in gid order without
     /// touching the hash table.
@@ -611,6 +685,8 @@ pub const Aggregate = struct {
         // us here when this count fits the budget, so the up-front allocation
         // is safe. Below the threshold we still init a small table.
         if (group_col_indices.len > 0) {
+            // Per-group gather scratch shared by every grouped emit path.
+            self.state_scratch = try self.arena.allocator().alloc(AccState, aggs.len);
             const st = self.upstream.stats();
             var est: u64 = 1;
             var known = true;
@@ -675,29 +751,32 @@ pub const Aggregate = struct {
                     .w64 => self.inline_table_64 = InlineTable64.init(aa, cap) catch InlineTable64.empty,
                 }
             } else if (self.int_layout) |layout| {
-                switch (layout.tier) {
-                    .bits32 => {
+                const slots: usize = switch (layout.tier) {
+                    .bits32 => blk: {
                         self.int_table_32 = IntTable32.init(aa, init_cap) catch try IntTable32.init(aa, 0);
                         if (cap > 0) self.int_table_32.?.grow_target = group_table.capacityFor(cap);
+                        break :blk self.int_table_32.?.slots.len;
                     },
-                    .bits96 => {
+                    .bits96 => blk: {
                         self.int_table_96 = IntTable96.init(aa, init_cap) catch try IntTable96.init(aa, 0);
                         if (cap > 0) self.int_table_96.?.grow_target = group_table.capacityFor(cap);
+                        break :blk self.int_table_96.?.slots.len;
                     },
-                    .bits128 => {
+                    .bits128 => blk: {
                         self.int_table_128 = IntTable128.init(aa, init_cap) catch try IntTable128.init(aa, 0);
                         if (cap > 0) self.int_table_128.?.grow_target = group_table.capacityFor(cap);
+                        break :blk self.int_table_128.?.slots.len;
                     },
-                }
+                };
                 if (init_cap > 0) {
-                    self.gstate.ensureTotalCapacity(aa, init_cap * self.aggs.len) catch {};
+                    try self.allocAggCols(aa, slots);
                     self.gkeys_int.ensureTotalCapacity(aa, init_cap) catch {};
                 }
             } else {
                 self.byte_table = ByteGroupTable.init(aa, init_cap) catch try ByteGroupTable.init(aa, 0);
                 if (cap > 0) self.byte_table.grow_target = group_table.capacityFor(cap);
                 if (init_cap > 0) {
-                    self.gstate.ensureTotalCapacity(aa, init_cap * self.aggs.len) catch {};
+                    try self.allocAggCols(aa, self.byte_table.slots.len);
                     self.gkeys.ensureTotalCapacity(aa, init_cap) catch {};
                 }
             }
@@ -906,22 +985,29 @@ pub const Aggregate = struct {
 
         const aa = self.arena.allocator();
         const init_cap: usize = if (self.group_cap > 0) @min(self.group_cap, ADAPTIVE_INITIAL) else 0;
-        switch (layout.tier) {
-            .bits32 => {
+        const slots: usize = switch (layout.tier) {
+            .bits32 => blk: {
                 self.int_table_32 = try IntTable32.init(aa, init_cap);
                 if (self.group_cap > 0) self.int_table_32.?.grow_target = group_table.capacityFor(self.group_cap);
+                break :blk self.int_table_32.?.slots.len;
             },
-            .bits96 => {
+            .bits96 => blk: {
                 self.int_table_96 = try IntTable96.init(aa, init_cap);
                 if (self.group_cap > 0) self.int_table_96.?.grow_target = group_table.capacityFor(self.group_cap);
+                break :blk self.int_table_96.?.slots.len;
             },
-            .bits128 => {
+            .bits128 => blk: {
                 self.int_table_128 = try IntTable128.init(aa, init_cap);
                 if (self.group_cap > 0) self.int_table_128.?.grow_target = group_table.capacityFor(self.group_cap);
+                break :blk self.int_table_128.?.slots.len;
             },
-        }
+        };
         if (init_cap > 0) {
-            self.gstate.ensureTotalCapacity(aa, init_cap * self.aggs.len) catch {};
+            // No groups have been assigned yet (configure runs before any
+            // accumulate), so re-allocating the columns fresh to the int
+            // table's slot count is safe — any byte-path columns become arena
+            // garbage, freed wholesale on evict.
+            try self.allocAggCols(aa, slots);
             self.gkeys_int.ensureTotalCapacity(aa, init_cap) catch {};
         }
         return true;
@@ -1057,33 +1143,34 @@ pub const Aggregate = struct {
     /// exactly one place. Results are byte-identical to the prior per-row path.
     fn accumulateAggsBatched(self: *Aggregate, batch: Batch, gids: []const u32) !void {
         const aa_state = self.arena.allocator();
-        const na = self.aggs.len;
         for (self.aggs, 0..) |a, ai| {
             switch (a.func) {
-                .count => self.scatterCount(gids, na, ai, self.agg_col_indices[ai], batch),
-                .sum => self.scatterSum(gids, na, ai, batch.values[self.agg_col_indices[ai].?]),
-                .min => try self.scatterMinMax(gids, na, ai, batch.values[self.agg_col_indices[ai].?], aa_state, true),
-                .max => try self.scatterMinMax(gids, na, ai, batch.values[self.agg_col_indices[ai].?], aa_state, false),
-                .avg => self.scatterAvg(gids, na, ai, batch.values[self.agg_col_indices[ai].?]),
+                .count => self.scatterCount(self.agg_cols[ai].count, gids, self.agg_col_indices[ai], batch),
+                .sum => self.scatterSum(ai, gids, batch.values[self.agg_col_indices[ai].?]),
+                .min => try self.scatterMinMax(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state, true),
+                .max => try self.scatterMinMax(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state, false),
+                .avg => self.scatterAvg(self.agg_cols[ai].avg, gids, batch.values[self.agg_col_indices[ai].?]),
                 // COUNT(DISTINCT int) under a GROUP BY runs the combined
                 // (gid, value) kernel; the gate left `cd[ai]` non-null only for
                 // those. Every other complex aggregate (stddev/var/percentile/
                 // group_concat, plus string/float/128-bit/no-group distinct)
-                // keeps the per-row update so its (single) definition of
-                // semantics is untouched.
+                // keeps the per-row update on its `.other` AccState cell so its
+                // (single) definition of semantics is untouched.
                 .count_distinct => if (self.cd[ai] != null) {
                     try self.accumulateCombinedDistinct(ai, batch.values[self.agg_col_indices[ai].?], gids);
                 } else {
+                    const col = self.agg_cols[ai].other;
                     var r: u32 = 0;
                     while (r < gids.len) : (r += 1) {
-                        const s = &self.gstate.items[@as(usize, gids[r]) * na + ai];
+                        const s = &col[gids[r]];
                         try updateStateRow(aa_state, s, a, batch, self.agg_col_indices[ai], r);
                     }
                 },
                 else => {
+                    const col = self.agg_cols[ai].other;
                     var r: u32 = 0;
                     while (r < gids.len) : (r += 1) {
-                        const s = &self.gstate.items[@as(usize, gids[r]) * na + ai];
+                        const s = &col[gids[r]];
                         try updateStateRow(aa_state, s, a, batch, self.agg_col_indices[ai], r);
                     }
                 },
@@ -1093,46 +1180,47 @@ pub const Aggregate = struct {
 
     /// COUNT scatter. COUNT(*) (`col_idx == null`) bumps every row's group;
     /// COUNT(col) skips NULLs. Mirrors `updateStateRow`/`updateState` .count.
-    inline fn scatterCount(self: *Aggregate, gids: []const u32, na: usize, ai: usize, col_idx: ?usize, batch: Batch) void {
-        const items = self.gstate.items;
+    inline fn scatterCount(self: *Aggregate, counts: []u64, gids: []const u32, col_idx: ?usize, batch: Batch) void {
+        _ = self;
         if (col_idx) |idx| {
             const view = batch.values[idx];
             if (view.nulls == null) {
-                for (gids) |g| items[@as(usize, g) * na + ai].count += 1;
+                for (gids) |g| counts[g] += 1;
             } else {
                 for (gids, 0..) |g, r| {
-                    if (view.isValid(r)) items[@as(usize, g) * na + ai].count += 1;
+                    if (view.isValid(r)) counts[g] += 1;
                 }
             }
         } else {
-            for (gids) |g| items[@as(usize, g) * na + ai].count += 1;
+            for (gids) |g| counts[g] += 1;
         }
     }
 
     /// SUM scatter. Int family widens into `sum_int` (i128); float/double into
     /// `sum_float` (f64); NULLs skipped. Mirrors `updateStateRow`/`updateState`.
-    inline fn scatterSum(self: *Aggregate, gids: []const u32, na: usize, ai: usize, view: ColumnView) void {
-        const items = self.gstate.items;
+    inline fn scatterSum(self: *Aggregate, ai: usize, gids: []const u32, view: ColumnView) void {
         const has_nulls = view.nulls != null;
         switch (view.data) {
             inline .int, .smallint, .tinyint, .boolean, .bigint, .decimal64, .largeint, .decimal128 => |sl| {
+                const sums = self.agg_cols[ai].sum_int;
                 if (has_nulls) {
                     for (gids, 0..) |g, r| {
                         if (!view.isValid(r)) continue;
-                        items[@as(usize, g) * na + ai].sum_int += sl[r];
+                        sums[g] += sl[r];
                     }
                 } else {
-                    for (gids, 0..) |g, r| items[@as(usize, g) * na + ai].sum_int += sl[r];
+                    for (gids, 0..) |g, r| sums[g] += sl[r];
                 }
             },
             inline .float, .double => |sl| {
+                const sums = self.agg_cols[ai].sum_float;
                 if (has_nulls) {
                     for (gids, 0..) |g, r| {
                         if (!view.isValid(r)) continue;
-                        items[@as(usize, g) * na + ai].sum_float += sl[r];
+                        sums[g] += sl[r];
                     }
                 } else {
-                    for (gids, 0..) |g, r| items[@as(usize, g) * na + ai].sum_float += sl[r];
+                    for (gids, 0..) |g, r| sums[g] += sl[r];
                 }
             },
             else => unreachable,
@@ -1143,21 +1231,21 @@ pub const Aggregate = struct {
     /// convert per-row (matching `updateStateRow`'s grouped path, which routed
     /// AVG through `updateState`'s scalar branch — not the no-null i128 fast
     /// path, which is single-group only). Mirrors that scalar accumulation.
-    inline fn scatterAvg(self: *Aggregate, gids: []const u32, na: usize, ai: usize, view: ColumnView) void {
-        const items = self.gstate.items;
+    inline fn scatterAvg(self: *Aggregate, avgs: []AvgAcc, gids: []const u32, view: ColumnView) void {
+        _ = self;
         const has_nulls = view.nulls != null;
         switch (view.data) {
             inline .int, .smallint, .tinyint, .boolean, .bigint, .decimal64, .largeint, .decimal128 => |sl| {
                 if (has_nulls) {
                     for (gids, 0..) |g, r| {
                         if (!view.isValid(r)) continue;
-                        const acc = &items[@as(usize, g) * na + ai].avg;
+                        const acc = &avgs[g];
                         acc.sum += @as(f64, @floatFromInt(sl[r]));
                         acc.count += 1;
                     }
                 } else {
                     for (gids, 0..) |g, r| {
-                        const acc = &items[@as(usize, g) * na + ai].avg;
+                        const acc = &avgs[g];
                         acc.sum += @as(f64, @floatFromInt(sl[r]));
                         acc.count += 1;
                     }
@@ -1167,13 +1255,13 @@ pub const Aggregate = struct {
                 if (has_nulls) {
                     for (gids, 0..) |g, r| {
                         if (!view.isValid(r)) continue;
-                        const acc = &items[@as(usize, g) * na + ai].avg;
+                        const acc = &avgs[g];
                         acc.sum += sl[r];
                         acc.count += 1;
                     }
                 } else {
                     for (gids, 0..) |g, r| {
-                        const acc = &items[@as(usize, g) * na + ai].avg;
+                        const acc = &avgs[g];
                         acc.sum += sl[r];
                         acc.count += 1;
                     }
@@ -1188,30 +1276,32 @@ pub const Aggregate = struct {
     /// skipped. Mirrors `updateStateRow`/`updateState` per-row semantics: which
     /// int widths fold into `min_int`/`max_int` (i64) vs `min_large`/`max_large`
     /// (i128), `date`→i64, `datetime`→i64, `decimal64`→i64, etc.
-    fn scatterMinMax(self: *Aggregate, gids: []const u32, na: usize, ai: usize, view: ColumnView, aa: Allocator, comptime is_min: bool) !void {
-        const items = self.gstate.items;
+    fn scatterMinMax(self: *Aggregate, ai: usize, gids: []const u32, view: ColumnView, aa: Allocator, comptime is_min: bool) !void {
         const has_nulls = view.nulls != null;
         switch (view.data) {
             // i64-accumulator int families. `date`→i64, `datetime` already i64,
             // booleans/small ints widen to i64 (matching the scalar path).
             inline .int, .date, .bigint, .datetime, .boolean, .tinyint, .smallint, .decimal64 => |sl| {
+                const col = if (is_min) self.agg_cols[ai].min_int else self.agg_cols[ai].max_int;
                 for (gids, 0..) |g, r| {
                     if (has_nulls and !view.isValid(r)) continue;
                     const iv: i64 = sl[r];
-                    const s = &items[@as(usize, g) * na + ai];
+                    const cur = &col[g];
                     if (is_min) {
-                        if (s.min_int == null or iv < s.min_int.?) s.min_int = iv;
+                        if (cur.* == null or iv < cur.*.?) cur.* = iv;
                     } else {
-                        if (s.max_int == null or iv > s.max_int.?) s.max_int = iv;
+                        if (cur.* == null or iv > cur.*.?) cur.* = iv;
                     }
                 }
             },
-            // i128-accumulator families (don't fit in i64).
+            // i128-accumulator families (don't fit in i64). These keep their
+            // `min_large`/`max_large` AccState cell on the `.other` column.
             inline .largeint, .decimal128 => |sl| {
+                const col = self.agg_cols[ai].other;
                 for (gids, 0..) |g, r| {
                     if (has_nulls and !view.isValid(r)) continue;
                     const v: i128 = sl[r];
-                    const s = &items[@as(usize, g) * na + ai];
+                    const s = &col[g];
                     if (is_min) {
                         if (!s.min_large.present or v < s.min_large.v) s.min_large = .{ .v = v, .present = true };
                     } else {
@@ -1220,22 +1310,24 @@ pub const Aggregate = struct {
                 }
             },
             inline .float, .double => |sl| {
+                const col = if (is_min) self.agg_cols[ai].min_float else self.agg_cols[ai].max_float;
                 for (gids, 0..) |g, r| {
                     if (has_nulls and !view.isValid(r)) continue;
                     const fv: f64 = sl[r];
-                    const s = &items[@as(usize, g) * na + ai];
+                    const cur = &col[g];
                     if (is_min) {
-                        if (s.min_float == null or fv < s.min_float.?) s.min_float = fv;
+                        if (cur.* == null or fv < cur.*.?) cur.* = fv;
                     } else {
-                        if (s.max_float == null or fv > s.max_float.?) s.max_float = fv;
+                        if (cur.* == null or fv > cur.*.?) cur.* = fv;
                     }
                 }
             },
             .varchar, .string, .char => |sv| {
+                const col = self.agg_cols[ai].other;
                 for (gids, 0..) |g, r| {
                     if (has_nulls and !view.isValid(r)) continue;
                     const bytes = sv.rowBytes(r);
-                    const s = &items[@as(usize, g) * na + ai];
+                    const s = &col[g];
                     if (is_min) {
                         if (s.min_str == null or std.mem.order(u8, bytes, s.min_str.?) == .lt) {
                             s.min_str = try aa.dupe(u8, bytes);
@@ -1360,26 +1452,27 @@ pub const Aggregate = struct {
         }
     }
 
-    /// Lower the count-in-slot table into the operator's `gkeys_int` / `gstate`
-    /// arrays so the existing emit / top-k dispatch runs unchanged. Walks the
-    /// occupied slots (plus the sentinel group, if present), assigning a dense
-    /// gid 0,1,2,…: `gkeys_int[gid] = key`, `gstate[gid] = .{ .count = c }` (the
-    /// single aggregate is COUNT, matching `initialState(.count, null)`).
+    /// Lower the count-in-slot table into the operator's `gkeys_int` /
+    /// `agg_cols` arrays so the existing emit / top-k dispatch runs unchanged.
+    /// Walks the occupied slots (plus the sentinel group, if present), assigning
+    /// a dense gid 0,1,2,…: `gkeys_int[gid] = key`, `agg_cols[0].count[gid] = c`
+    /// (the single aggregate is COUNT, matching `initialState(.count, null)`).
     fn lowerCountSlot(self: *Aggregate, aa: Allocator) !void {
         const t = &self.count_table.?;
         const total = t.count();
         try self.gkeys_int.ensureTotalCapacity(aa, total);
-        try self.gstate.ensureTotalCapacity(aa, total);
+        try self.allocAggCols(aa, total);
+        const counts = self.agg_cols[0].count;
         var gid: u32 = 0;
         for (t.slots) |s| {
             if (s.key == CountSlotTable.SENTINEL) continue;
             self.gkeys_int.appendAssumeCapacity(@as(u128, s.key));
-            self.gstate.appendAssumeCapacity(.{ .count = s.count });
+            counts[gid] = s.count;
             gid += 1;
         }
         if (t.has_sentinel) {
             self.gkeys_int.appendAssumeCapacity(@as(u128, CountSlotTable.SENTINEL));
-            self.gstate.appendAssumeCapacity(.{ .count = t.sentinel_count });
+            counts[gid] = t.sentinel_count;
             gid += 1;
         }
         self.n_groups = gid;
@@ -1408,12 +1501,12 @@ pub const Aggregate = struct {
         }
     }
 
-    /// Lower the FOR-narrow inline table into `gkeys_int` / `gstate` so the
+    /// Lower the FOR-narrow inline table into `gkeys_int` / `agg_cols` so the
     /// existing emit / top-k dispatch runs unchanged. Walks the occupied slots,
     /// assigning a dense gid 0,1,2,…: reconstructs `value = base + code`, packs
     /// it into the single-column u128 key exactly as `orKeyColumn` would (so
     /// `appendIntGroupKey` decodes it identically), and lowers the i64 state into
-    /// the matching `AccState` variant (`.sum_int` / `.min_int` / `.max_int`,
+    /// the matching narrow column (`.sum_int` / `.min_int` / `.max_int`,
     /// mirroring `initialState`). A group whose value column was all-NULL keeps
     /// the fold identity, matching the canonical path's empty-set MIN/MAX/SUM.
     fn lowerInlineFor(self: *Aggregate, aa: Allocator) !void {
@@ -1431,7 +1524,8 @@ pub const Aggregate = struct {
                 };
                 const total = t.count();
                 try self.gkeys_int.ensureTotalCapacity(aa, total);
-                try self.gstate.ensureTotalCapacity(aa, total);
+                try self.allocAggCols(aa, total);
+                const col = self.agg_cols[0];
                 const SENTINEL = @TypeOf(t.*).SENTINEL;
                 var gid: u32 = 0;
                 for (t.slots) |s| {
@@ -1440,11 +1534,11 @@ pub const Aggregate = struct {
                     // proved it fits i64, so the i128 add narrows losslessly.
                     const value: i64 = @intCast(@as(i128, plan.base) + @as(i128, s.key));
                     self.gkeys_int.appendAssumeCapacity(packSingleIntField(field, value));
-                    self.gstate.appendAssumeCapacity(switch (plan.kind) {
-                        .sum => .{ .sum_int = @as(i128, s.state) },
-                        .min => .{ .min_int = s.state },
-                        .max => .{ .max_int = s.state },
-                    });
+                    switch (plan.kind) {
+                        .sum => col.sum_int[gid] = @as(i128, s.state),
+                        .min => col.min_int[gid] = s.state,
+                        .max => col.max_int[gid] = s.state,
+                    }
                     gid += 1;
                 }
                 self.n_groups = gid;
@@ -1452,34 +1546,88 @@ pub const Aggregate = struct {
         }
     }
 
-    /// Append the initial accumulator state for a freshly-assigned group.
-    /// Runs once per new group; also seeds each combined-distinct aggregate's
-    /// gid-indexed counter with 0 so the count array stays in lockstep with the
-    /// group gids.
-    ///
-    /// The per-aggregate initial values are invariant across groups, so they are
-    /// copied in bulk (one `memcpy`) from the precomputed `single_state` template
-    /// — which holds exactly `initialState(func, in_t)` per aggregate and is never
-    /// mutated on the grouped path. The prior code recomputed `initialState` (a
-    /// func/type switch + an upstream-schema lookup) and ran a capacity-checked
-    /// append for every aggregate of every one of millions of groups.
-    fn appendInitialState(self: *Aggregate, aa: Allocator) !void {
-        try self.gstate.appendSlice(aa, self.single_state);
+    /// Allocate the per-aggregate columns to `capacity` (== the group table's
+    /// `slots.len`) and initialize every cell to its aggregate's initial value
+    /// (`initialState`'s semantics, mirrored per column). Each column's kind is
+    /// chosen by `aggColKind`; `.other` cells get `initialState` directly (so
+    /// the per-row `updateStateRow` path sees a correctly-shaped `*AccState`).
+    fn allocAggCols(self: *Aggregate, aa: Allocator, capacity: usize) !void {
+        const up_schema = self.upstream.outputSchema();
+        const cols = try aa.alloc(AggCol, self.aggs.len);
+        for (self.aggs, self.agg_col_indices, 0..) |a, maybe_idx, ai| {
+            const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
+            cols[ai] = try initAggCol(aa, a.func, in_t, capacity);
+        }
+        self.agg_cols = cols;
+    }
+
+    /// Current cell count of the per-aggregate columns (every column shares it).
+    /// 0 when the columns have not been allocated yet.
+    fn aggColsLen(self: *const Aggregate) usize {
+        if (self.agg_cols.len == 0) return 0;
+        return switch (self.agg_cols[0]) {
+            inline else => |s| s.len,
+        };
+    }
+
+    /// Ensure the per-aggregate columns hold at least `capacity` cells, allocating
+    /// fresh if unallocated or growing in place otherwise. New cells get the
+    /// aggregate's initial value. Idempotent when already large enough.
+    fn ensureAggColsCapacity(self: *Aggregate, aa: Allocator, capacity: usize) !void {
+        if (self.agg_cols.len == 0) {
+            try self.allocAggCols(aa, capacity);
+        } else if (self.aggColsLen() < capacity) {
+            try self.growAggCols(aa, capacity);
+        }
+    }
+
+    /// Grow the per-aggregate columns from their current length to
+    /// `new_capacity`, initializing the freshly-added region to each
+    /// aggregate's initial value. Mirrors a group-table grow: the table jumps
+    /// straight to its ceiling, so this normally fires at most once.
+    fn growAggCols(self: *Aggregate, aa: Allocator, new_capacity: usize) !void {
+        const up_schema = self.upstream.outputSchema();
+        for (self.agg_cols, self.aggs, self.agg_col_indices) |*col, a, maybe_idx| {
+            const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
+            try growAggCol(aa, col, a.func, in_t, new_capacity);
+        }
+    }
+
+    /// Mark a freshly-assigned group `gid` as initialized: seed each
+    /// combined-distinct aggregate's gid-indexed counter with 0. Every
+    /// accumulator cell (narrow column AND `.other` AccState) was already set to
+    /// its `initialState` value at column-allocation / grow time — gids are
+    /// dense and monotonic (each assigned exactly once, never reused, the table
+    /// never shrinks), so the cell at `gid` still holds that fresh initial value
+    /// when this fires. No per-group cell write is needed.
+    fn initGroupCells(self: *Aggregate, aa: Allocator, gid: u32) !void {
+        _ = gid;
         for (self.cd) |*maybe| {
             if (maybe.*) |*c| try c.counts.append(aa, 0);
         }
     }
 
-    /// Like `appendInitialState` but assumes the caller pre-reserved `gstate`
-    /// capacity for this group's aggregates (the int hot path ensures the whole
-    /// batch's worst case up front). The combined-distinct `counts` array — only
-    /// present for COUNT(DISTINCT) aggregates and absent on the hot Q32-shape
-    /// path — still grows on demand.
-    fn appendInitialStateAssumeCap(self: *Aggregate, aa: Allocator) !void {
-        self.gstate.appendSliceAssumeCapacity(self.single_state);
-        for (self.cd) |*maybe| {
-            if (maybe.*) |*c| try c.counts.append(aa, 0);
+    /// Gather one group's accumulator cells (gid) from the per-aggregate columns
+    /// into `self.state_scratch` as `[]AccState`, wrapping each narrow column
+    /// value back into its matching `AccState` variant. Lets the emit paths keep
+    /// passing a `[]AccState` to `appendGroupRow` / `topkEntry` unchanged.
+    fn readGroupState(self: *Aggregate, gid: u32) []AccState {
+        const g: usize = gid;
+        const out = self.state_scratch;
+        for (self.agg_cols, out) |col, *dst| {
+            dst.* = switch (col) {
+                .count => |s| .{ .count = s[g] },
+                .sum_int => |s| .{ .sum_int = s[g] },
+                .sum_float => |s| .{ .sum_float = s[g] },
+                .avg => |s| .{ .avg = s[g] },
+                .min_int => |s| .{ .min_int = s[g] },
+                .max_int => |s| .{ .max_int = s[g] },
+                .min_float => |s| .{ .min_float = s[g] },
+                .max_float => |s| .{ .max_float = s[g] },
+                .other => |s| s[g],
+            };
         }
+        return out;
     }
 
     /// Integer fast path: pack each row's group columns into a u128 (phase a),
@@ -1497,17 +1645,18 @@ pub const Aggregate = struct {
 
         if (table.needsGrow(n)) {
             try table.grow(aa, n);
-            // Couple the flat state + key arrays to the table's new capacity so
-            // appends below run amortized-free instead of double-copying as
-            // groups fill toward the (now-jumped) ceiling.
-            self.gstate.ensureTotalCapacity(aa, table.slots.len * self.aggs.len) catch {};
+            // Couple the per-aggregate columns + key array to the table's new
+            // capacity so the new-group writes below land in bounds (gid <
+            // slots.len always) with no per-group reallocation.
             self.gkeys_int.ensureTotalCapacity(aa, table.slots.len) catch {};
         }
-        // Every row could be a new group; reserve for the worst case up front so
-        // the per-row new-group appends below are bounds-free (assume-capacity).
-        // After the (rare) grow this is a no-op check; it also `try`-propagates a
-        // genuine OOM that the grow-coupling above swallowed.
-        try self.gstate.ensureUnusedCapacity(aa, n * self.aggs.len);
+        // Ensure the per-aggregate columns are sized to the table's slot count
+        // (gids index into them directly). On the `init_cap == 0` path they are
+        // unallocated until here; otherwise a grow above may have enlarged the
+        // table past their current length.
+        try self.ensureAggColsCapacity(aa, table.slots.len);
+        // Every row could be a new group; reserve the key array for the worst
+        // case up front so the per-row new-group appends below are bounds-free.
         try self.gkeys_int.ensureUnusedCapacity(aa, n);
 
         // Phase (a): pack every row's key, column-major — the per-column ValueView
@@ -1541,7 +1690,7 @@ pub const Aggregate = struct {
                 self.n_groups += 1;
                 table.commit(probe.slot, key, new_gid);
                 self.gkeys_int.appendAssumeCapacity(key);
-                try self.appendInitialStateAssumeCap(aa);
+                try self.initGroupCells(aa, new_gid);
                 break :blk new_gid;
             };
             self.pf_gids.appendAssumeCapacity(gid);
@@ -1562,12 +1711,14 @@ pub const Aggregate = struct {
 
         if (self.byte_table.needsGrow(n)) {
             try self.byte_table.grow(aa, n);
-            // Couple the flat state + key arrays to the table's new capacity so
-            // appends below run amortized-free instead of double-copying as
-            // groups fill toward the (now-jumped) ceiling.
-            self.gstate.ensureTotalCapacity(aa, self.byte_table.slots.len * self.aggs.len) catch {};
+            // Couple the key array to the table's new capacity so the per-group
+            // appends below run amortized-free as groups fill toward the ceiling.
             self.gkeys.ensureTotalCapacity(aa, self.byte_table.slots.len) catch {};
         }
+        // Per-aggregate columns are indexed by gid, so they must cover every slot
+        // the table can hold (gid < slots.len always). Unallocated on the
+        // `init_cap == 0` path until here; a grow above may have enlarged them.
+        try self.ensureAggColsCapacity(aa, self.byte_table.slots.len);
 
         // Single string key: the key is the row's raw string bytes, already
         // sitting decoded in the batch — no scratch copy / length prefix. Its
@@ -1674,7 +1825,7 @@ pub const Aggregate = struct {
                 // into the arena to survive past this batch. Only new groups pay
                 // this copy now, not every row.
                 try self.gkeys.append(aa, try aa.dupe(u8, key));
-                try self.appendInitialState(aa);
+                try self.initGroupCells(aa, new_gid);
                 break :blk new_gid;
             };
             self.pf_gids.appendAssumeCapacity(gid);
@@ -1694,7 +1845,6 @@ pub const Aggregate = struct {
     }
 
     fn appendGroupedResults(self: *Aggregate) !void {
-        const na = self.aggs.len;
         // An unordered `GROUP BY … LIMIT n` caps the emit at the first n groups
         // (group-insertion order). The build already consumed all input, so the
         // counts/aggregates of those groups are exact — only the emit stops
@@ -1702,8 +1852,7 @@ pub const Aggregate = struct {
         const stop: u32 = if (self.emit_limit) |cap| @min(cap, self.n_groups) else self.n_groups;
         var gid: u32 = 0;
         while (gid < stop) : (gid += 1) {
-            const base = @as(usize, gid) * na;
-            try self.appendGroupRow(gid, self.gstate.items[base .. base + na]);
+            try self.appendGroupRow(gid, self.readGroupState(gid));
         }
     }
 
@@ -1749,14 +1898,14 @@ pub const Aggregate = struct {
     /// for TopN to discard them.
     fn appendTopKResults(self: *Aggregate, r: ResolvedTopK) !void {
         const k = r.k;
-        const na = self.aggs.len;
         const heap = try self.arena.allocator().alloc(TopKEntry, k);
         var len: usize = 0;
 
         var gid: u32 = 0;
         while (gid < self.n_groups) : (gid += 1) {
-            const base = @as(usize, gid) * na;
-            const cand = topkEntry(gid, self.gstate.items[base .. base + na], r.keys, self.cd);
+            // `topkEntry` caches each key's order value into the entry up front,
+            // so reusing the single `state_scratch` across iterations is safe.
+            const cand = topkEntry(gid, self.readGroupState(gid), r.keys, self.cd);
             if (len < k) {
                 heap[len] = cand;
                 len += 1;
@@ -1770,8 +1919,7 @@ pub const Aggregate = struct {
         }
 
         for (heap[0..len]) |w| {
-            const base = @as(usize, w.gid) * na;
-            try self.appendGroupRow(w.gid, self.gstate.items[base .. base + na]);
+            try self.appendGroupRow(w.gid, self.readGroupState(w.gid));
         }
     }
 };
@@ -2172,6 +2320,102 @@ fn foldMinFloat(s: *AccState, m: f64) void {
 }
 fn foldMaxFloat(s: *AccState, m: f64) void {
     if (s.max_float == null or m > s.max_float.?) s.max_float = m;
+}
+
+/// Allocate one aggregate's accumulator column to `capacity` cells and fill it
+/// with the aggregate's initial value (mirroring `initialState`). The narrow
+/// kinds get a typed slice; everything else gets a `[]AccState` (`.other`).
+fn initAggCol(aa: Allocator, func: AggFunc, in: ?Type, capacity: usize) !AggCol {
+    return switch (aggColKind(func, in)) {
+        .count => blk: {
+            const s = try aa.alloc(u64, capacity);
+            @memset(s, 0);
+            break :blk .{ .count = s };
+        },
+        .sum_int => blk: {
+            const s = try aa.alloc(i128, capacity);
+            @memset(s, 0);
+            break :blk .{ .sum_int = s };
+        },
+        .sum_float => blk: {
+            const s = try aa.alloc(f64, capacity);
+            @memset(s, 0.0);
+            break :blk .{ .sum_float = s };
+        },
+        .avg => blk: {
+            const s = try aa.alloc(AvgAcc, capacity);
+            @memset(s, .{ .sum = 0.0, .count = 0 });
+            break :blk .{ .avg = s };
+        },
+        .min_int => blk: {
+            const s = try aa.alloc(?i64, capacity);
+            @memset(s, null);
+            break :blk .{ .min_int = s };
+        },
+        .max_int => blk: {
+            const s = try aa.alloc(?i64, capacity);
+            @memset(s, null);
+            break :blk .{ .max_int = s };
+        },
+        .min_float => blk: {
+            const s = try aa.alloc(?f64, capacity);
+            @memset(s, null);
+            break :blk .{ .min_float = s };
+        },
+        .max_float => blk: {
+            const s = try aa.alloc(?f64, capacity);
+            @memset(s, null);
+            break :blk .{ .max_float = s };
+        },
+        .other => blk: {
+            const s = try aa.alloc(AccState, capacity);
+            const init = initialState(func, in);
+            @memset(s, init);
+            break :blk .{ .other = s };
+        },
+    };
+}
+
+/// Grow one aggregate's column to `new_capacity`, initializing only the newly
+/// added cells (`old_len .. new_capacity`) to the aggregate's initial value.
+fn growAggCol(aa: Allocator, col: *AggCol, func: AggFunc, in: ?Type, new_capacity: usize) !void {
+    switch (col.*) {
+        .count => |*s| {
+            const old = s.len;
+            s.* = try aa.realloc(s.*, new_capacity);
+            @memset(s.*[old..], 0);
+        },
+        .sum_int => |*s| {
+            const old = s.len;
+            s.* = try aa.realloc(s.*, new_capacity);
+            @memset(s.*[old..], 0);
+        },
+        .sum_float => |*s| {
+            const old = s.len;
+            s.* = try aa.realloc(s.*, new_capacity);
+            @memset(s.*[old..], 0.0);
+        },
+        .avg => |*s| {
+            const old = s.len;
+            s.* = try aa.realloc(s.*, new_capacity);
+            @memset(s.*[old..], .{ .sum = 0.0, .count = 0 });
+        },
+        .min_int, .max_int => |*s| {
+            const old = s.len;
+            s.* = try aa.realloc(s.*, new_capacity);
+            @memset(s.*[old..], null);
+        },
+        .min_float, .max_float => |*s| {
+            const old = s.len;
+            s.* = try aa.realloc(s.*, new_capacity);
+            @memset(s.*[old..], null);
+        },
+        .other => |*s| {
+            const old = s.len;
+            s.* = try aa.realloc(s.*, new_capacity);
+            @memset(s.*[old..], initialState(func, in));
+        },
+    }
 }
 
 fn initialState(func: AggFunc, in: ?Type) AccState {
