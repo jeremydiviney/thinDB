@@ -1363,7 +1363,7 @@ test "compactor: tombstone-pressure trigger reclaims a heavily-deleted segment" 
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 }
 
-test "execTieredCompact: no-op when no tier has enough segments" {
+test "tier-0 sweep: backgroundCompactSweep collapses adjacent small segments" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1375,7 +1375,7 @@ test "execTieredCompact: no-op when no tier has enough segments" {
 
     const t = try db.table("orders", schema_v1, opts_v1);
 
-    // Just 3 segments → below the default tier_target_count of 4.
+    // Three tiny segments — all tier 0 (far below the 2^19 tier-1 floor).
     inline for (.{ 1, 2, 3 }) |i| {
         try t.insert(&.{.{
             .id = @as(i64, i),
@@ -1387,13 +1387,14 @@ test "execTieredCompact: no-op when no tier has enough segments" {
     }
     try std.testing.expectEqual(@as(usize, 3), t.segmentCount());
 
-    // backgroundCompactSweep WITHOUT the count gate: threshold defaults to 8.
-    // With 3 segments < 8 it doesn't even try.
+    // The tier-0 sweep collapses the run of small segments into one in a single
+    // merge (fires at >=2 segments, well under the 2M cap), rather than waiting
+    // for a 4-wide tier group.
     try db.backgroundCompactSweep();
-    try std.testing.expectEqual(@as(usize, 3), t.segmentCount());
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 }
 
-test "compactor: count-based tier trigger merges incrementally and preserves rows" {
+test "compactor: tier-0 sweep collapses small segments and preserves rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1403,7 +1404,7 @@ test "compactor: count-based tier trigger merges incrementally and preserves row
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{
         .row_group_size = 4,
         .compact_min_segments = 4,
-        // Disable the tombstone trigger; exercise the count-based path only.
+        // Disable the tombstone trigger; exercise the tier path only.
         .compact_tombstone_threshold = 2.0,
         .auto_flush_secs = 0,
         .auto_flush_rows = 1_000_000,
@@ -1413,7 +1414,7 @@ test "compactor: count-based tier trigger merges incrementally and preserves row
 
     const t = try db.table("orders", schema_v1, opts_v1);
 
-    // 10 single-row segments, all tier 0.
+    // 10 single-row segments, all tier 0 (far below the 2^19 tier-1 floor).
     var i: i64 = 1;
     while (i <= 10) : (i += 1) {
         try t.insert(&.{.{ .id = i, .qty = @as(i32, @intCast(i * 10)), .active = true, .tag = "x" }});
@@ -1421,20 +1422,13 @@ test "compactor: count-based tier trigger merges incrementally and preserves row
     }
     try std.testing.expectEqual(@as(usize, 10), t.segmentCount());
 
-    // One sweep merges exactly one tier group (tier_target_count = 4):
-    // 10 - 4 + 1 = 7. Proves it's incremental, not "compact everything".
+    // The tier-0 sweep collapses the whole run of small segments in a single
+    // merge (>=2 segments triggers it; 10 rows are well under the 2M cap) —
+    // not 4-at-a-time.
     try db.backgroundCompactSweep();
-    try std.testing.expectEqual(@as(usize, 7), t.segmentCount());
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
 
-    // Keep sweeping until it converges (each pass merges at most one group).
-    var guard: usize = 0;
-    while (t.segmentCount() > 1 and guard < 20) : (guard += 1) {
-        const before = t.segmentCount();
-        try db.backgroundCompactSweep();
-        if (t.segmentCount() == before) break;
-    }
-
-    // Every row survives the merges, whatever order they happened in.
+    // Every row survives the merge.
     var q = try thindb.scan(allocator, t);
     defer q.deinit();
     var ids: std.ArrayList(i64) = .empty;

@@ -23,12 +23,19 @@ const comparison = @import("comparison.zig");
 // segments accumulate at the same tier, they get merged into one and the
 // output joins the next tier up.
 
-/// Row count cap for tier 0. Roughly one row group's worth.
-pub const tier_base_rows: u64 = 65_536;
+/// Tier-1 floor: a segment with fewer rows than this is "tier 0" (staging).
+/// 2^19 ≈ 0.5M, so a freshly-flushed load segment (~125K rows) starts in tier 0
+/// and gets swept up into a tier-1 segment by `pickTier0Group`.
+pub const tier_base_rows: u64 = 1 << 19;
 /// Each tier holds segments up to `tier_ratio`× the previous tier's cap.
 pub const tier_ratio: u64 = 4;
-/// Number of adjacent same-tier segments that triggers a merge.
+/// Number of adjacent same-tier segments that triggers a merge (tier 1+).
 pub const tier_target_count: usize = 4;
+/// Cap on rows accumulated by a single tier-0 sweep merge. Bounds the merge's
+/// memory and lands the result in tier 1 (just under the 2^21 tier-2 floor),
+/// so a pile of small segments collapses in one pass instead of climbing
+/// 4-at-a-time.
+pub const tier0_sweep_cap: u64 = 2_000_000;
 
 /// The tier index of a segment, derived from its row count. Tier 0 is the
 /// smallest; the cap doubles by `tier_ratio` per level.
@@ -90,7 +97,14 @@ pub fn execTieredCompact(t: *Table, tomb_threshold: f32) !void {
             return;
         }
     }
-    // 2. Tier-based count trigger.
+    // 2. Tier-0 sweep: collapse a run of small staging segments into one
+    // ~2M (tier-1) segment in a single merge, ahead of the 4-wide picker.
+    if (try pickTier0Group(t.allocator, metas)) |ids| {
+        defer t.allocator.free(ids);
+        try mergeSegments(t, ids);
+        return;
+    }
+    // 3. Tier-based count trigger (tier 1+).
     const seg_ids = try pickCompactionGroup(t.allocator, metas) orelse return;
     defer t.allocator.free(seg_ids);
     try mergeSegments(t, seg_ids);
@@ -173,6 +187,37 @@ pub fn pickCompactionGroup(
     const out = try allocator.alloc(u64, tier_target_count);
     for (out, 0..) |*id, i| id.* = segments[best_start + i].id;
     return out;
+}
+
+/// Tier-0 sweep picker. Finds the first run of adjacent tier-0 segments
+/// (row_count < `tier_base_rows`) and returns a prefix of that run whose rows
+/// sum to at most `tier0_sweep_cap` — so a wad of freshly-flushed small
+/// segments collapses into one ~2M segment in a single merge (landing in
+/// tier 1) instead of climbing four-at-a-time. Returns null unless ≥2 tier-0
+/// segments can be swept together: a lone small segment is left to accumulate
+/// rather than rewritten on every sweep. Caller owns the returned slice.
+pub fn pickTier0Group(allocator: std.mem.Allocator, segments: []const SegMeta) !?[]u64 {
+    var i: usize = 0;
+    while (i < segments.len) {
+        if (segmentTier(segments[i].rows) != 0) {
+            i += 1;
+            continue;
+        }
+        // Start of a tier-0 run; gather a ≤cap prefix (always take the first).
+        var sum: u64 = 0;
+        var j: usize = i;
+        while (j < segments.len and segmentTier(segments[j].rows) == 0) : (j += 1) {
+            if (j > i and sum + segments[j].rows > tier0_sweep_cap) break;
+            sum += segments[j].rows;
+        }
+        if (j - i >= 2) {
+            const out = try allocator.alloc(u64, j - i);
+            for (out, 0..) |*id, k| id.* = segments[i + k].id;
+            return out;
+        }
+        i = j; // too-short run (≤1 tier-0 seg here) — skip and keep scanning
+    }
+    return null;
 }
 
 /// Merge the given segments into one. `seg_ids` must be a subset of the
@@ -353,11 +398,65 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
 // ---------- tests --------------------------------------------------------
 
 test "segmentTier buckets row counts logarithmically" {
+    // tier-1 floor is 2^19 (524,288); each tier is 4x the previous.
     try std.testing.expectEqual(@as(u8, 0), segmentTier(0));
     try std.testing.expectEqual(@as(u8, 0), segmentTier(1));
-    try std.testing.expectEqual(@as(u8, 0), segmentTier(65_535));
-    try std.testing.expectEqual(@as(u8, 1), segmentTier(65_536));
-    try std.testing.expectEqual(@as(u8, 1), segmentTier(65_536 * 3));
-    try std.testing.expectEqual(@as(u8, 2), segmentTier(65_536 * 4));
-    try std.testing.expectEqual(@as(u8, 3), segmentTier(65_536 * 16));
+    try std.testing.expectEqual(@as(u8, 0), segmentTier(524_287));
+    try std.testing.expectEqual(@as(u8, 1), segmentTier(524_288));
+    try std.testing.expectEqual(@as(u8, 1), segmentTier(524_288 * 3));
+    try std.testing.expectEqual(@as(u8, 2), segmentTier(524_288 * 4));
+    try std.testing.expectEqual(@as(u8, 3), segmentTier(524_288 * 16));
+}
+
+test "pickTier0Group sweeps a run of small segments up to the cap" {
+    const a = std.testing.allocator;
+    // Six ~125K tier-0 segments + one tier-1 segment. A sweep should grab the
+    // first run of tier-0 segments (all six here, summing 750K < 2M cap).
+    const metas = [_]SegMeta{
+        .{ .id = 1, .rows = 125_000 },
+        .{ .id = 2, .rows = 125_000 },
+        .{ .id = 3, .rows = 125_000 },
+        .{ .id = 4, .rows = 125_000 },
+        .{ .id = 5, .rows = 125_000 },
+        .{ .id = 6, .rows = 125_000 },
+        .{ .id = 7, .rows = 600_000 }, // tier 1, not swept
+    };
+    const got = (try pickTier0Group(a, &metas)).?;
+    defer a.free(got);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5, 6 }, got);
+
+    // A lone tier-0 segment (next is tier-1) is left alone.
+    const metas2 = [_]SegMeta{ .{ .id = 1, .rows = 100_000 }, .{ .id = 2, .rows = 600_000 } };
+    try std.testing.expectEqual(@as(?[]u64, null), try pickTier0Group(a, &metas2));
+
+    // A long run is capped at ~2M (16 x 125K = 2.0M; the 17th would overflow).
+    var big: [20]SegMeta = undefined;
+    for (&big, 0..) |*m, k| m.* = .{ .id = @intCast(k + 1), .rows = 125_000 };
+    const got3 = (try pickTier0Group(a, &big)).?;
+    defer a.free(got3);
+    try std.testing.expectEqual(@as(usize, 16), got3.len);
+}
+
+test "pickCompactionGroup picks 4 adjacent same-tier segments (tier 1+)" {
+    const a = std.testing.allocator;
+    // Five tier-1 segments (~600K rows each, in [2^19, 2^21)): the picker takes
+    // the first full run of `tier_target_count` (4).
+    const metas = [_]SegMeta{
+        .{ .id = 1, .rows = 600_000 },
+        .{ .id = 2, .rows = 600_000 },
+        .{ .id = 3, .rows = 600_000 },
+        .{ .id = 4, .rows = 600_000 },
+        .{ .id = 5, .rows = 600_000 },
+    };
+    const got = (try pickCompactionGroup(a, &metas)).?;
+    defer a.free(got);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, got);
+
+    // Only three same-tier segments → no group yet.
+    const metas2 = [_]SegMeta{
+        .{ .id = 1, .rows = 600_000 },
+        .{ .id = 2, .rows = 600_000 },
+        .{ .id = 3, .rows = 600_000 },
+    };
+    try std.testing.expectEqual(@as(?[]u64, null), try pickCompactionGroup(a, &metas2));
 }
