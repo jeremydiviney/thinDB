@@ -147,4 +147,58 @@ describe("mysql table", () => {
       await conn.end().catch(() => undefined);
     }
   });
+
+  test("REPLACE returns OK packets and replaces by primary key", async () => {
+    const conn: Connection = await mysql.createConnection({
+      host: server.bind,
+      port: server.ports.mysql,
+      user: "thindb",
+      password: "",
+      database: "main__public",
+    });
+    try {
+      await conn.query("CREATE TABLE repl_t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+      await conn.query("CREATE TABLE repl_src (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+      await conn.query("INSERT INTO repl_t VALUES (1, 10)");
+      await conn.query("INSERT INTO repl_src VALUES (1, 100), (2, 200)");
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const [replaceRes] = (await conn.query("REPLACE INTO repl_t VALUES (1, 99)")) as [
+        any,
+        unknown,
+      ];
+      expect(replaceRes.affectedRows).toBe(1);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const [replaceNoIntoRes] = (await conn.query("REPLACE repl_t (id, qty) VALUES (3, 300)")) as [
+        any,
+        unknown,
+      ];
+      expect(replaceNoIntoRes.affectedRows).toBe(1);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const [replaceSelectRes] = (await conn.query("REPLACE INTO repl_t SELECT id, qty FROM repl_src")) as [
+        any,
+        unknown,
+      ];
+      expect(replaceSelectRes.affectedRows).toBe(2);
+
+      const [rows] = (await conn.query("SELECT id, qty FROM repl_t ORDER BY id ASC")) as [
+        Array<Record<string, unknown>>,
+        unknown,
+      ];
+      expect(rows.length).toBe(3);
+      expect(String(rows[0]?.id)).toBe("1");
+      expect(Number(rows[0]?.qty)).toBe(100);
+      expect(String(rows[1]?.id)).toBe("2");
+      expect(Number(rows[1]?.qty)).toBe(200);
+      expect(String(rows[2]?.id)).toBe("3");
+      expect(Number(rows[2]?.qty)).toBe(300);
+
+      await conn.query("DROP TABLE repl_src");
+      await conn.query("DROP TABLE repl_t");
+    } finally {
+      await conn.end().catch(() => undefined);
+    }
+  });
 });

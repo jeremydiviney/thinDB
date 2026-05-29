@@ -2739,7 +2739,7 @@ fn runSingleStatement(
 
 fn isSideEffectOp(op: ir.Op) bool {
     return switch (op) {
-        .ddl, .insert => true,
+        .ddl, .insert, .insert_select => true,
         else => false,
     };
 }

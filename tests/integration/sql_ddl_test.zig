@@ -172,6 +172,38 @@ test "sql ddl: parser recognizes rename, alter add column, and truncate" {
     }
 }
 
+test "sql replace: parser recognizes values and select forms" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    {
+        const root = try thindb.sql.parse(arena.allocator(), "REPLACE INTO t (id, v) VALUES (1, 'a')");
+        try std.testing.expect(root.* == .insert);
+        try std.testing.expectEqual(thindb.ir.InsertMode.replace, root.insert.mode);
+        try std.testing.expectEqualStrings("t", root.insert.table.name);
+        try std.testing.expectEqual(@as(usize, 2), root.insert.columns.?.len);
+        try std.testing.expectEqual(@as(usize, 1), root.insert.rows.len);
+    }
+    {
+        const root = try thindb.sql.parse(arena.allocator(), "REPLACE t (id, v) VALUES (1, 'a')");
+        try std.testing.expect(root.* == .insert);
+        try std.testing.expectEqual(thindb.ir.InsertMode.replace, root.insert.mode);
+        try std.testing.expectEqualStrings("t", root.insert.table.name);
+    }
+    {
+        const root = try thindb.sql.parse(arena.allocator(), "REPLACE INTO dst SELECT id, v FROM src");
+        try std.testing.expect(root.* == .insert_select);
+        try std.testing.expectEqual(thindb.ir.InsertMode.replace, root.insert_select.mode);
+        try std.testing.expectEqualStrings("dst", root.insert_select.table.name);
+        try std.testing.expect(root.insert_select.source.* == .select);
+    }
+    {
+        const root = try thindb.sql.parse(arena.allocator(), "SELECT REPLACE('abc', 'a', 'z')");
+        try std.testing.expect(root.* == .select);
+    }
+}
+
 test "sql ddl: RENAME TABLE moves data to the new name" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -589,4 +621,128 @@ test "sql roundtrip: BOOLEAN column with TRUE/FALSE literals" {
     const b = (try q3.next()).?;
     try std.testing.expectEqual(@as(u8, 1), b.values[1].data.boolean[0]);
     try std.testing.expectEqual(@as(u8, 0), b.values[1].data.boolean[1]);
+}
+
+test "sql replace: primary key conflict keeps the new row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1, 10)");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db, "REPLACE INTO t VALUES (1, 99)");
+    defer q.deinit();
+    _ = try q.next();
+    try std.testing.expectEqual(@as(u64, 1), q.affectedRows());
+
+    var got = try runSql(allocator, db, "SELECT id, qty FROM t ORDER BY id ASC");
+    defer got.deinit();
+    const b = (try got.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i32, 99), b.values[1].data.int[0]);
+    try std.testing.expect((try got.next()) == null);
+}
+
+test "sql replace: omitted columns are fresh defaults or NULL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, note TEXT, score INT NOT NULL DEFAULT 0)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1, 10, 'old', 5)");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    try exec(allocator, db, "REPLACE INTO t (id, qty) VALUES (1, 99)");
+
+    var q = try runSql(allocator, db, "SELECT qty, note, score FROM t ORDER BY id ASC");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expectEqual(@as(i32, 99), b.values[0].data.int[0]);
+    try std.testing.expect(!b.values[1].isValid(0));
+    try std.testing.expectEqual(@as(i32, 0), b.values[2].data.int[0]);
+    try std.testing.expect((try q.next()) == null);
+}
+
+test "sql replace: duplicate values keep the last row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "REPLACE INTO t VALUES (1, 10), (1, 20), (2, 30)");
+
+    var q = try runSql(allocator, db, "SELECT id, qty FROM t ORDER BY id ASC");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), b.row_count);
+    try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i32, 20), b.values[1].data.int[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[0].data.bigint[1]);
+    try std.testing.expectEqual(@as(i32, 30), b.values[1].data.int[1]);
+}
+
+test "sql replace: insert select replaces conflicting target rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "CREATE TABLE dst (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, 100), (2, 200)");
+    try exec(allocator, db, "INSERT INTO dst VALUES (1, 10)");
+    const dst = try db.openTable("dst", .{});
+    try dst.flush();
+
+    var repl = try runSql(allocator, db, "REPLACE INTO dst SELECT id, qty FROM src");
+    defer repl.deinit();
+    _ = try repl.next();
+    try std.testing.expectEqual(@as(u64, 2), repl.affectedRows());
+
+    var q = try runSql(allocator, db, "SELECT id, qty FROM dst ORDER BY id ASC");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), b.row_count);
+    try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i32, 100), b.values[1].data.int[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[0].data.bigint[1]);
+    try std.testing.expectEqual(@as(i32, 200), b.values[1].data.int[1]);
+}
+
+test "sql replace: non-unique table appends rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, 10)");
+    try exec(allocator, db, "CREATE TABLE dst AS SELECT id, qty FROM src");
+    try exec(allocator, db, "REPLACE dst VALUES (1, 99)");
+
+    var q = try runSql(allocator, db, "SELECT qty FROM dst ORDER BY qty ASC");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), b.row_count);
+    try std.testing.expectEqual(@as(i32, 10), b.values[0].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 99), b.values[0].data.int[1]);
 }
