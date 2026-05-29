@@ -1092,6 +1092,94 @@ test "scan: string eq predicate prunes row groups via prefix stats" {
     try std.testing.expectEqualSlices(i64, &[_]i64{3}, ids.items);
 }
 
+test "scan: string range predicate prunes row groups via prefix stats" {
+    // Same disjoint name ranges as the eq test; `name > 'dave'` must skip the
+    // groups whose prefix max is below 'dave' and return only the matches —
+    // proving range pruning (not just eq) is sound on the prefix class.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "name", .type = .string },
+        },
+        .order_key = &.{"name"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 2 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"name"}, .row_group_size = 2 });
+
+    // RGs: ["alice","bob"], ["carol","dave"], ["eve","frank"].
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .name = @as([]const u8, "alice") },
+        .{ .id = @as(i64, 2), .name = @as([]const u8, "bob") },
+        .{ .id = @as(i64, 3), .name = @as([]const u8, "carol") },
+        .{ .id = @as(i64, 4), .name = @as([]const u8, "dave") },
+        .{ .id = @as(i64, 5), .name = @as([]const u8, "eve") },
+        .{ .id = @as(i64, 6), .name = @as([]const u8, "frank") },
+    });
+    try t.flush();
+
+    var base = try scan(allocator, t);
+    var q = try base.filter(leafExpr("name", .gt, .{ .text = "dave" }));
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |b| {
+        try ids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+    }
+    // Only "eve" and "frank" exceed "dave".
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 6 }, ids.items);
+}
+
+test "topn: heavily-tied ORDER BY LIMIT keeps correct values (no tie churn)" {
+    // 500 rows tied at k=7, then 5 at k=2. DESC LIMIT 3 must return three 7s
+    // (the buffer fills with 7s, then further 7s tie the worst and are dropped
+    // instead of churning the buffer); ASC LIMIT 3 must return three 2s (the
+    // strictly-smaller rows still displace the tied incumbents).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "k", .type = .int },
+            .{ .name = "id", .type = .bigint },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    var rows: [505]struct { k: i32, id: i64 } = undefined;
+    for (0..500) |i| rows[i] = .{ .k = 7, .id = @intCast(i) };
+    for (500..505) |i| rows[i] = .{ .k = 2, .id = @intCast(i) };
+    try t.insert(&rows);
+    try t.flush();
+
+    inline for (.{ .{ true, @as(i32, 7) }, .{ false, @as(i32, 2) } }) |c| {
+        var base = try scan(allocator, t);
+        var q = try base.topN(&[_]SortSpec{.{ .col = "k", .desc = c[0] }}, 3, 0);
+        defer q.deinit();
+        var n: usize = 0;
+        while (try q.next()) |b| {
+            for (0..b.row_count) |r| {
+                try std.testing.expectEqual(c[1], b.values[0].data.int[r]);
+                n += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 3), n);
+    }
+}
+
 test "scan: float range predicate prunes row groups via order-preserving stats" {
     // Row groups with disjoint double ranges; `f > 4.5` must skip the groups
     // whose max is below it and still return the matching rows — proving the

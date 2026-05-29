@@ -39,8 +39,10 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
 
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
-            // Quick prune via stats for fixed-width columns.
-            if (!col_type.isString() and !exec.statsOverlapPredicate(rg.stats[col_idx], pred.op, pred.val)) {
+            // Quick prune via stats. String columns prune too (eq + range via
+            // the 16-byte prefix class — `statsOverlapPredicate` stays
+            // conservative on prefix ties, so no matching row is skipped).
+            if (!exec.statsOverlapPredicate(rg.stats[col_idx], pred.op, pred.val)) {
                 row_offset += rg.row_count;
                 continue;
             }

@@ -1572,11 +1572,10 @@ pub fn valueToRangeI128(v: Value) ?i128 {
 /// predicate value is encoded with the same scheme so signed i128
 /// comparison gives the right answer for every type.
 ///
-/// String predicates use the 16-byte prefix encoding. `eq` prunes via the
-/// prefix range; `neq` and all range ops (lt/lte/gt/gte) stay conservative
-/// (return true, never prune) — prefix loss beyond 16 bytes makes a sound
-/// range decision impossible at tied prefixes, so the row group is kept and
-/// the per-row evaluator decides exactly.
+/// String predicates use the 16-byte prefix encoding. `eq` and the range ops
+/// (lt/lte/gt/gte) prune via the prefix class, staying conservative on a class
+/// tie (prefix loss beyond 16 bytes), so no match is ever wrongly skipped;
+/// `neq` never prunes (values may differ past the prefix).
 pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value) bool {
     const wanted: i128 = switch (v) {
         .int => |x| x,
@@ -1590,10 +1589,19 @@ pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value)
         .largeint, .decimal128 => |x| x,
         .uuid => |x| storage.format.encodeUnsignedU128(x),
         .text => |x| {
-            if (op == .neq) return true;
-            if (op != .eq) return true;
+            // Stats are 16-byte prefix classes. Prune only when the literal's
+            // class is strictly outside the row group's [min,max] prefix range
+            // in the relevant direction; stay conservative on a class tie, where
+            // the true order past 16 bytes is unknown. So `lt`/`gt` use the
+            // non-strict `<=`/`>=` (a tied class might still contain a match),
+            // unlike the strict integer forms below.
             const enc = storage.format.encodeStringPrefix(x);
-            return enc >= s.min and enc <= s.max;
+            return switch (op) {
+                .eq => enc >= s.min and enc <= s.max,
+                .neq => true, // values may differ past the prefix; never prune
+                .lt, .lte => s.min <= enc,
+                .gt, .gte => s.max >= enc,
+            };
         },
         // Floats: encode the literal with the same order-preserving transform as
         // the stats. A NaN literal can't match any range/eq, but the stats skip

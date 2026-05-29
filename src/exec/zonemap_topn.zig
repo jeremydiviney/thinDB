@@ -537,16 +537,17 @@ pub const ZonemapTopN = struct {
         return slot;
     }
 
-    /// True when candidate (`views`,`row`) sorts strictly AFTER stored row
-    /// `other` — i.e. it is worse and would be rejected when the heap is full.
-    /// Equal tuples return false (a tie can displace, matching `TopN.isCandidate`).
+    /// True when candidate (`views`,`row`) is NOT strictly better than stored
+    /// row `other` — i.e. it would be rejected when the heap is full. Equal
+    /// tuples return true (a tie does NOT displace once full: it can't improve
+    /// the answer and would churn the heap, matching `TopN.isCandidate`).
     fn candidateWorseThanRow(self: *ZonemapTopN, views: []const ColumnView, row: usize, other: u32) bool {
         for (self.key_cols, 0..) |kc, i| {
             const ord = transform.compareViewRows(views[self.key_probe_idx[i]], row, kc.view(), other);
             if (ord == .lt) return self.key_desc[i];
             if (ord == .gt) return !self.key_desc[i];
         }
-        return false;
+        return true;
     }
 
     /// Heap order: is stored row `a` WORSE than stored row `b` (sorts after it

@@ -277,12 +277,14 @@ pub const TopN = struct {
     }
 
     /// True when batch row `row` (addressed through `batch_views`) is a
-    /// candidate for the kept set — i.e. it is NOT strictly worse than the
-    /// current worst-kept row, which lives at `worst_idx` in `accumulated`.
-    /// "Worse" is the multi-key lexicographic order in the sorted buffer's
-    /// direction, so a row that is equal on every key still qualifies (a tie
-    /// can displace the incumbent). `lessThan(threshold, row)` being true is
-    /// exactly "row sorts strictly after the threshold" ⇒ reject.
+    /// candidate for the kept set — i.e. it is STRICTLY better than the current
+    /// worst-kept row, which lives at `worst_idx` in `accumulated`. Only reached
+    /// once the buffer is full (`threshold_active`), so a row that merely TIES
+    /// the worst-kept can't improve the answer — and accepting it would append
+    /// an equivalent row and force a re-sort on every such tie, turning a
+    /// heavily-tied key (e.g. `ORDER BY x LIMIT k` where many rows share x) into
+    /// O(rows) buffer churn. Reject ties: the kept set already holds `keep` rows
+    /// no worse, and tie order beyond the boundary is unspecified anyway.
     fn isCandidate(self: *TopN, batch_views: []const ColumnView, row: usize, worst_idx: u32) bool {
         for (self.sort_col_indices, 0..) |ci, i| {
             const ord = compareAcrossViews(
@@ -296,7 +298,7 @@ pub const TopN = struct {
             if (ord == .lt) return self.sort_desc[i];
             if (ord == .gt) return !self.sort_desc[i];
         }
-        return true;
+        return false; // exact tie on all keys ⇒ not strictly better ⇒ reject.
     }
 
     /// Free the bounded buffer + permutation and release the remaining
