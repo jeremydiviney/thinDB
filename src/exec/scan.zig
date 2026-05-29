@@ -204,6 +204,10 @@ pub const Scan = struct {
     /// all others false, so the memtable is scanned exactly once and ordered
     /// last. Default true (serial scans always cover the memtable).
     scan_memtable: bool = true,
+    /// Whether this scan owns the table's shared ddl_lock (released in deinit).
+    /// False for parallel workers — the orchestrator holds one shared lock for
+    /// all of them. Default true (serial scans take and release their own).
+    holds_ddl: bool = true,
 
     cur_segment: ?storage.ReadSegment = null,
     /// Sorted, deduped tombstone offsets for the current segment (or null).
@@ -456,8 +460,15 @@ pub const Scan = struct {
         // This blocks DDL (drop/alter/rename) from running while we have
         // segment files and a pinned memtable in-flight. DDL waits at its
         // exclusive lock acquisition until we deinit and release.
-        table.ddl_lock.lockSharedUncancelable(table.io);
-        errdefer table.ddl_lock.unlockShared(table.io);
+        //
+        // A parallel-scan worker (injected_snap != null) does NOT take it: the
+        // orchestrator holds a single shared lock covering all its workers.
+        // Multiple shared acquisitions during construction could otherwise
+        // deadlock against an arriving DDL writer (writer-preference would block
+        // the next worker's acquire while the orchestrator can't finish).
+        const holds_ddl = injected_snap == null;
+        if (holds_ddl) table.ddl_lock.lockSharedUncancelable(table.io);
+        errdefer if (holds_ddl) table.ddl_lock.unlockShared(table.io);
 
         // Capture (segment_count, memtable_snap, memtable_row_count) atomically
         // under the table mutex so we see a consistent (segments, memtable)
@@ -528,6 +539,7 @@ pub const Scan = struct {
             .out_schema = out_schema,
             .out_schema_owned = out_schema_owned,
             .emit_loc = emit_loc,
+            .holds_ddl = holds_ddl,
             .prunes = .empty,
             .owned_accountant = owned_accountant,
             .owns_accountant = owns_accountant,
@@ -677,7 +689,8 @@ pub const Scan = struct {
         self.memtable_snap.release();
         // Release our shared ddl_lock — any DDL waiter on the exclusive
         // lock can now proceed once all shared holders have released.
-        self.table.ddl_lock.unlockShared(self.table.io);
+        // Parallel workers don't hold it (the orchestrator does).
+        if (self.holds_ddl) self.table.ddl_lock.unlockShared(self.table.io);
         const allocator = self.allocator;
         allocator.destroy(self);
     }

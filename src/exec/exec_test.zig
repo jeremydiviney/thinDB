@@ -1168,6 +1168,91 @@ test "scan: row-group range restriction tiles to the full serial scan" {
     try std.testing.expectEqualSlices(i64, full.items, tiled.items);
 }
 
+test "parallel scan matches serial across DOP levels (with fused filter)" {
+    // ParallelScan over disjoint row-group ranges + a fused WHERE must return
+    // the exact same row SET as the serial scan at every DOP (order differs at
+    // DOP>1 — reproducible-per-DOP — so compare as a sorted multiset). DOP=1
+    // must additionally match serial order exactly. Also stresses the shared
+    // block cache under concurrent worker decodes.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "v", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    // 4 segments × 100 rows (~7 RGs each), then a 30-row memtable tail.
+    var next_id: i64 = 0;
+    for (0..4) |_| {
+        var rows: [100]struct { id: i64, v: i32 } = undefined;
+        for (&rows) |*r| {
+            r.id = next_id;
+            r.v = @intCast(@mod(next_id, 7));
+            next_id += 1;
+        }
+        try t.insert(&rows);
+        try t.flush();
+    }
+    var tail: [30]struct { id: i64, v: i32 } = undefined;
+    for (&tail) |*r| {
+        r.id = next_id;
+        r.v = @intCast(@mod(next_id, 7));
+        next_id += 1;
+    }
+    try t.insert(&tail);
+
+    const collect = struct {
+        fn run(a: std.mem.Allocator, q: *Query, out: *std.ArrayList(i64)) !void {
+            defer q.deinit();
+            while (try q.next()) |b| try out.appendSlice(a, b.values[0].data.bigint[0..b.row_count]);
+        }
+    }.run;
+
+    // Serial reference: SELECT id FROM t WHERE id >= 150.
+    var serial: std.ArrayList(i64) = .empty;
+    defer serial.deinit(allocator);
+    {
+        var base = try scan(allocator, t);
+        var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
+        try collect(allocator, &q, &serial);
+    }
+    try std.testing.expectEqual(@as(usize, 280), serial.items.len); // 430 rows, ids 150..429
+
+    inline for (.{ 1, 2, 4, 8 }) |dop| {
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        var base = try exec.ParallelScan.create(allocator, t, null, null, dop);
+        var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
+        try collect(allocator, &q, &got);
+
+        try std.testing.expectEqual(serial.items.len, got.items.len);
+        if (dop == 1) {
+            // Single worker, whole table → identical order to serial.
+            try std.testing.expectEqualSlices(i64, serial.items, got.items);
+        } else {
+            // Reproducible-per-DOP but interleaved: compare as a sorted multiset.
+            const a = try allocator.dupe(i64, serial.items);
+            defer allocator.free(a);
+            const b = try allocator.dupe(i64, got.items);
+            defer allocator.free(b);
+            std.sort.pdq(i64, a, {}, std.sort.asc(i64));
+            std.sort.pdq(i64, b, {}, std.sort.asc(i64));
+            try std.testing.expectEqualSlices(i64, a, b);
+        }
+    }
+}
+
 test "scan: string range predicate prunes row groups via prefix stats" {
     // Same disjoint name ranges as the eq test; `name > 'dave'` must skip the
     // groups whose prefix max is below 'dave' and return only the matches —

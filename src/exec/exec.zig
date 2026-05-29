@@ -758,6 +758,7 @@ pub const isNotNullExpr = predicate.isNotNullExpr;
 pub const statsOverlapPredicate = predicate.statsOverlapPredicate;
 
 pub const Scan = @import("scan.zig").Scan;
+pub const ParallelScan = @import("parallel_scan.zig").ParallelScan;
 pub const FileScan = @import("file_scan.zig").FileScan;
 pub const Filter = @import("filter.zig").Filter;
 pub const Project = @import("project_limit.zig").Project;
