@@ -662,6 +662,15 @@ test "mysql wire: COM_QUERY against seeded table returns rows" {
     try std.testing.expectEqualStrings("3", rows[2][0].?);
     try std.testing.expectEqualStrings("c", rows[2][2].?);
 
+    try client.sendQuery("SELECT o.*, NULL AS note, qty + 1 AS next_qty FROM orders AS o ORDER BY id ASC");
+    const rows2 = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 3), rows2.len);
+    try std.testing.expectEqual(@as(usize, 5), rows2[0].len);
+    try std.testing.expectEqualStrings("1", rows2[0][0].?);
+    try std.testing.expectEqualStrings("10", rows2[0][1].?);
+    try std.testing.expect(rows2[0][3] == null);
+    try std.testing.expectEqualStrings("11", rows2[0][4].?);
+
     try client.sendQuit();
     if (sctx.err) |e| return e;
 }

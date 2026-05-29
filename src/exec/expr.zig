@@ -28,6 +28,8 @@ pub const Expr = union(enum) {
     col_ref: []const u8,
     /// Constant value. Type comes from the active union tag.
     lit: Value,
+    /// SQL NULL with a resolved storage type.
+    null_lit: Type,
     /// Function invocation. `fn_name` is matched against the registry
     /// at plan time. `args` may be empty (for nullary functions).
     call: Call,
@@ -108,6 +110,7 @@ pub fn deepClone(out_arena: Allocator, e: Expr) Allocator.Error!Expr {
     return switch (e) {
         .col_ref => |name| .{ .col_ref = try out_arena.dupe(u8, name) },
         .lit => |v| .{ .lit = try cloneValue(out_arena, v) },
+        .null_lit => |t| .{ .null_lit = t },
         .call => |c| blk: {
             const name_dup = try out_arena.dupe(u8, c.fn_name);
             const args_dup = try out_arena.alloc(Expr, c.args.len);

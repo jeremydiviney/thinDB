@@ -782,6 +782,122 @@ test "sql: SELECT * FROM t returns all rows" {
     try std.testing.expectEqual(@as(usize, 5), rows);
 }
 
+test "sql: mixed star and expression projection preserves source columns first" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT *, qty + 1 AS next_qty FROM t ORDER BY id ASC");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(@as(usize, 5), schema.len);
+    try std.testing.expectEqualStrings("id", schema[0].name);
+    try std.testing.expectEqualStrings("k", schema[1].name);
+    try std.testing.expectEqualStrings("qty", schema[2].name);
+    try std.testing.expectEqualStrings("tag", schema[3].name);
+    try std.testing.expectEqualStrings("next_qty", schema[4].name);
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i32, 11), b.values[4].data.int[0]);
+}
+
+test "sql: alias star strips the alias prefix and rejects duplicate output names" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT tt.* FROM t AS tt");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(@as(usize, 4), schema.len);
+    try std.testing.expectEqualStrings("id", schema[0].name);
+    try std.testing.expectEqualStrings("k", schema[1].name);
+    try std.testing.expectEqualStrings("qty", schema[2].name);
+    try std.testing.expectEqualStrings("tag", schema[3].name);
+
+    try helpers.expectRunError(
+        allocator,
+        db,
+        "SELECT a.*, b.* FROM t AS a JOIN t AS b ON a.id = b.id",
+        thindb.exec.Error.ComputeNameCollision,
+    );
+
+    var cte_q = try runSql(allocator, db,
+        \\WITH left_rows AS (SELECT id, qty FROM t),
+        \\     right_rows AS (SELECT id AS rid, tag FROM t)
+        \\SELECT l.*, r.tag AS right_tag
+        \\FROM left_rows AS l
+        \\JOIN right_rows AS r ON l.id = r.rid
+        \\ORDER BY id ASC
+        \\LIMIT 1
+    );
+    defer cte_q.deinit();
+    const cte_schema = cte_q.outputSchema();
+    try std.testing.expectEqual(@as(usize, 3), cte_schema.len);
+    try std.testing.expectEqualStrings("id", cte_schema[0].name);
+    try std.testing.expectEqualStrings("qty", cte_schema[1].name);
+    try std.testing.expectEqualStrings("right_tag", cte_schema[2].name);
+}
+
+test "sql: plain column aliases materialize through CTE output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\WITH renamed AS (SELECT qty AS amount FROM t)
+        \\SELECT amount FROM renamed ORDER BY amount ASC
+    );
+    defer q.deinit();
+    try std.testing.expectEqualStrings("amount", q.outputSchema()[0].name);
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i32, 10), b.values[0].data.int[0]);
+
+    try helpers.expectRunError(
+        allocator,
+        db,
+        "WITH renamed AS (SELECT qty AS amount FROM t) SELECT qty FROM renamed",
+        thindb.exec.Error.ColumnNotFound,
+    );
+}
+
+test "sql: NULL scalar projections produce nullable columns" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT NULL AS note, CAST(NULL AS INT) AS score FROM t");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(@as(usize, 2), schema.len);
+    try std.testing.expectEqualStrings("note", schema[0].name);
+    try std.testing.expectEqual(thindb.Type{ .string = {} }, schema[0].type);
+    try std.testing.expect(schema[0].nullable);
+    try std.testing.expectEqualStrings("score", schema[1].name);
+    try std.testing.expectEqual(thindb.Type{ .int = {} }, schema[1].type);
+    try std.testing.expect(schema[1].nullable);
+
+    const b = (try q.next()).?;
+    try std.testing.expect(!b.values[0].isValid(0));
+    try std.testing.expect(!b.values[1].isValid(0));
+}
+
 test "sql: SELECT id, qty FROM t (column projection)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

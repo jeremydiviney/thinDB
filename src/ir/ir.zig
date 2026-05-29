@@ -54,7 +54,7 @@ const exec_expr = @import("../exec/expr.zig");
 pub const Expr = exec_expr.Expr;
 
 pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
-pub const version: u16 = 3;
+pub const version: u16 = 4;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -437,6 +437,8 @@ pub const OpTag = enum(u8) {
     /// External file source (`FROM 'x.csv'`, `read_csv('x.csv')`, ...).
     /// The compile path materializes it as a normal source operator.
     file_scan = 24,
+    /// FROM-clause alias over a non-scan source such as a CTE or subquery.
+    alias = 25,
 };
 
 pub const BatchOp = struct {
@@ -554,6 +556,7 @@ pub const Op = union(OpTag) {
     explain: ExplainOp,
     single_row: void,
     file_scan: FileScan,
+    alias: Alias,
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -580,6 +583,14 @@ pub const Op = union(OpTag) {
         /// Column names. Shared variant for both .select (keep) and
         /// .exclude (drop) — disambiguated by the outer Op tag.
         columns: []const []const u8,
+        /// Optional output names for .select. Null entries keep the
+        /// resolved upstream column name. Ignored by .exclude.
+        outputs: ?[]const ?[]const u8 = null,
+        /// Star projections expand against the upstream schema before
+        /// SELECT-derived columns appended by Compute/Window. This count
+        /// records how many trailing derived columns to exclude from `*`
+        /// and `alias.*` expansion.
+        star_skip_trailing: u32 = 0,
         upstream: *Op,
     };
 
@@ -642,6 +653,11 @@ pub const Op = union(OpTag) {
         upstream: *Op,
     };
 
+    pub const Alias = struct {
+        alias: []const u8,
+        upstream: *Op,
+    };
+
     pub const Join = struct {
         /// Join algorithm choice. `.auto` lets compile() route via
         /// stats; explicit values pin the operator.
@@ -668,6 +684,10 @@ pub const Op = union(OpTag) {
     pub fn deinitDecoded(self: *Op, allocator: Allocator) void {
         switch (self.*) {
             .scan, .single_row, .file_scan => {},
+            .alias => |a| {
+                a.upstream.deinitDecoded(allocator);
+                allocator.destroy(a.upstream);
+            },
             .explain => |e| {
                 e.inner.deinitDecoded(allocator);
                 allocator.destroy(e.inner);
@@ -783,6 +803,7 @@ fn freeProject(p: Op.Project, allocator: Allocator) void {
     // string slices are borrowed from the encoded buffer (not owned).
     // Only free the outer slice.
     allocator.free(p.columns);
+    if (p.outputs) |outs| allocator.free(outs);
     p.upstream.deinitDecoded(allocator);
     allocator.destroy(p.upstream);
 }
@@ -809,6 +830,10 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             try encodeOptString(allocator, out, s.alias);
         },
         .file_scan => |f| try encodeFileScan(allocator, out, f),
+        .alias => |a| {
+            try encodeOptString(allocator, out, a.alias);
+            try encodeOp(allocator, out, a.upstream.*);
+        },
         .limit => |l| {
             try appendU64(allocator, out, l.n);
             try appendU64(allocator, out, l.offset);
@@ -1291,6 +1316,21 @@ fn encodeProject(allocator: Allocator, out: *std.ArrayList(u8), p: Op.Project) E
         try appendU32(allocator, out, @intCast(c.len));
         try out.appendSlice(allocator, c);
     }
+    try appendU32(allocator, out, p.star_skip_trailing);
+    if (p.outputs) |outs| {
+        try out.append(allocator, 1);
+        for (outs) |maybe_name| {
+            if (maybe_name) |name| {
+                try out.append(allocator, 1);
+                try appendU32(allocator, out, @intCast(name.len));
+                try out.appendSlice(allocator, name);
+            } else {
+                try out.append(allocator, 0);
+            }
+        }
+    } else {
+        try out.append(allocator, 0);
+    }
     try encodeOp(allocator, out, p.upstream.*);
 }
 
@@ -1350,7 +1390,7 @@ fn encodeJoin(allocator: Allocator, out: *std.ArrayList(u8), j: Op.Join) EncodeE
     try encodeOp(allocator, out, j.right.*);
 }
 
-const ExprTag = enum(u8) { col_ref = 0, lit = 1, call = 2, case = 3 };
+const ExprTag = enum(u8) { col_ref = 0, lit = 1, call = 2, case = 3, null_lit = 4 };
 
 /// Wire-encode an Expr tree (col_ref / lit / call / case). Recursive
 /// — mirrors the recursive Predicate encoding above.
@@ -1364,6 +1404,10 @@ pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) Encode
         .lit => |v| {
             try out.append(allocator, @intFromEnum(ExprTag.lit));
             try encodeValue(allocator, out, v);
+        },
+        .null_lit => |t| {
+            try out.append(allocator, @intFromEnum(ExprTag.null_lit));
+            try encodeType(allocator, out, t);
         },
         .call => |c| {
             try out.append(allocator, @intFromEnum(ExprTag.call));
@@ -1564,7 +1608,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.file_scan)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.alias)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1574,6 +1618,13 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             break :blk Op{ .scan = .{ .table = ref, .alias = alias } };
         },
         .file_scan => Op{ .file_scan = try decodeFileScan(bytes, cursor) },
+        .alias => blk: {
+            const alias = (try decodeOptString(bytes, cursor)) orelse return Error.IrCorrupt;
+            const upstream = try allocator.create(Op);
+            errdefer allocator.destroy(upstream);
+            upstream.* = try decodeOp(allocator, bytes, cursor);
+            break :blk Op{ .alias = .{ .alias = alias, .upstream = upstream } };
+        },
         .limit => blk: {
             if (cursor.* + 16 > bytes.len) return Error.IrCorrupt;
             const n = readU64(bytes[cursor.* .. cursor.* + 8]);
@@ -2253,11 +2304,12 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(ExprTag.case)) return Error.IrCorrupt;
+    if (tag_byte > @intFromEnum(ExprTag.null_lit)) return Error.IrCorrupt;
     const tag: ExprTag = @enumFromInt(tag_byte);
     return switch (tag) {
         .col_ref => Expr{ .col_ref = try readString(bytes, cursor) },
         .lit => Expr{ .lit = try decodeValue(bytes, cursor) },
+        .null_lit => Expr{ .null_lit = try decodeType(bytes, cursor) },
         .call => blk: {
             const name = try readString(bytes, cursor);
             if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
@@ -2294,7 +2346,7 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
 
 pub fn freeDecodedExpr(e: Expr, allocator: Allocator) void {
     switch (e) {
-        .col_ref, .lit, .scalar_subquery, .exists_subquery, .var_ref => {},
+        .col_ref, .lit, .null_lit, .scalar_subquery, .exists_subquery, .var_ref => {},
         .call => |c| {
             for (c.args) |child| freeDecodedExpr(child, allocator);
             allocator.free(c.args);
@@ -2513,10 +2565,34 @@ fn decodeProject(allocator: Allocator, bytes: []const u8, cursor: *usize) Decode
         cursor.* += col_len;
     }
 
+    if (cursor.* + 5 > bytes.len) return Error.IrCorrupt;
+    const star_skip_trailing = readU32(bytes[cursor.* .. cursor.* + 4]);
+    cursor.* += 4;
+    const has_outputs = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    var outputs: ?[]const ?[]const u8 = null;
+    if (has_outputs) {
+        const outs = try allocator.alloc(?[]const u8, n_cols);
+        errdefer allocator.free(outs);
+        for (outs) |*out_name| {
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const present = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            out_name.* = if (present) try readString(bytes, cursor) else null;
+        }
+        outputs = outs;
+    }
+    errdefer if (outputs) |outs| allocator.free(outs);
+
     const upstream = try allocator.create(Op);
     errdefer allocator.destroy(upstream);
     upstream.* = try decodeOp(allocator, bytes, cursor);
-    return .{ .columns = cols, .upstream = upstream };
+    return .{
+        .columns = cols,
+        .outputs = outputs,
+        .star_skip_trailing = star_skip_trailing,
+        .upstream = upstream,
+    };
 }
 
 // ---------------------------------------------------------------------------

@@ -569,6 +569,7 @@ fn classifySqlKind(op: ir.Op) SqlKind {
         .compute,
         .join,
         .materialize,
+        .alias,
         .show,
         .window,
         .set_union,

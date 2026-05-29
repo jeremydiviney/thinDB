@@ -61,6 +61,7 @@ fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !@import("../types.zig")
 pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
     switch (op.*) {
         .scan, .file_scan, .ddl, .show, .insert, .copy, .single_row => {},
+        .alias => |a| try resolveSubqueriesInOp(ctx, @constCast(a.upstream)),
         .explain => |e| try resolveSubqueriesInOp(ctx, e.inner),
         .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value),
         .delete_op => |*d| {
@@ -148,7 +149,7 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
 
 fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
     switch (e.*) {
-        .col_ref, .lit => {},
+        .col_ref, .lit, .null_lit => {},
         .var_ref => |name| {
             const resolved = try lookupSessionVar(ctx, name);
             e.* = .{ .lit = resolved };
@@ -199,7 +200,7 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
 /// Otherwise tries one more `next()` to handle batched-empty-then-data
 /// from upstream operators that emit a heading empty batch.
 fn runExistsSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !bool {
-    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(source_opaque)));
+    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
     try resolveSubqueriesInOp(ctx, inner);
 
     var q = try local.compileOp(ctx, inner);
@@ -217,7 +218,7 @@ fn runExistsSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !bool {
 /// NULL handling per thinDB dialect: NULLs are dropped from the set —
 /// see [[thindb-not-in-nonstandard]] memory for the rationale.
 fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Value {
-    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(source_opaque)));
+    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
     try resolveSubqueriesInOp(ctx, inner);
 
     var q = try local.compileOp(ctx, inner);
@@ -256,7 +257,7 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
 /// in PredicateExpr.leaf isn't well-defined yet — the caller can
 /// re-emit IS NULL if they want zero-or-one semantics).
 fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !Value {
-    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(source_opaque)));
+    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
     // Resolve any further-nested subqueries first.
     try resolveSubqueriesInOp(ctx, inner);
 
@@ -557,7 +558,7 @@ fn maybeResolveCorrelatedExists(
     source_opaque: *const anyopaque,
     negate: bool,
 ) !bool {
-    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(source_opaque)));
+    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
     var info = (try analyzeCorrelation(ctx, inner)) orelse return false;
     defer info.deinit(ctx.allocator);
 
@@ -778,7 +779,7 @@ fn valueLessThan(_: void, a: Value, b: Value) bool {
 /// Detect + decorrelate a correlated IN / NOT IN inner. Returns true
 /// when correlated; otherwise the caller does the uncorrelated path.
 fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) !bool {
-    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(s.source)));
+    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(s.source)));
     var info = (try analyzeCorrelation(ctx, inner)) orelse return false;
     defer info.deinit(ctx.allocator);
     if (info.outer_cols.items.len == 0) return false;
@@ -839,7 +840,7 @@ fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) 
 /// predicates, and materialize key_tuple → agg_value. Returns true
 /// when correlated and pred.* was rewritten.
 fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anytype) !bool {
-    const inner: *ir.Op = @constCast(@ptrCast(@alignCast(sq.source)));
+    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(sq.source)));
 
     // Walk through Select/Project layers to find a GroupBy.
     var cur: *const ir.Op = inner;

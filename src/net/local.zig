@@ -1733,7 +1733,15 @@ fn lateMatShape(allocator: Allocator, table: *ApiTable, l: ir.Op.Limit) !?LateMa
     // names; `SELECT *` expands to every base column.
     var owns_output = false;
     const output_names: []const []const u8 = if (peel.select) |p| blk: {
+        if (p.outputs != null or p.star_skip_trailing != 0) {
+            probe.deinit(allocator);
+            return null;
+        }
         for (p.columns) |nm| {
+            if (std.mem.eql(u8, nm, "*") or aliasStarSource(nm) != null) {
+                probe.deinit(allocator);
+                return null;
+            }
             if (types.findColumn(table.schema.columns, nm) == null) {
                 probe.deinit(allocator);
                 return null;
@@ -1853,7 +1861,12 @@ pub fn buildServerQuerySession(
         .scan => |s| blk: {
             const catalog = catalogFor(db) orelse return Error.DatabaseNotFound;
             const t = try resolveTable(catalog, session, s.table);
-            break :blk try exec.scan(allocator, t);
+            const base = try exec.scan(allocator, t);
+            if (s.alias) |alias| {
+                errdefer @constCast(&base).deinit();
+                break :blk try exec.AliasRename.create(allocator, base, alias);
+            }
+            break :blk base;
         },
         .file_scan => |f| blk: {
             const base = try exec.fileScan(allocator, db.io, db.config.file_scan_access, f, null);
@@ -1862,6 +1875,11 @@ pub fn buildServerQuerySession(
                 break :blk try exec.AliasRename.create(allocator, base, alias);
             }
             break :blk base;
+        },
+        .alias => |a| blk: {
+            var upstream = try buildServerQuerySession(allocator, db, session, a.upstream.*);
+            errdefer upstream.deinit();
+            break :blk try exec.AliasRename.create(allocator, upstream, a.alias);
         },
         .limit => |l| blk: {
             // Late materialization (see compileOp for the rationale + the
@@ -1886,7 +1904,7 @@ pub fn buildServerQuerySession(
                 var topn = try inner.topN(f.order_by.specs, @intCast(l.n), @intCast(l.offset));
                 if (f.project) |p| {
                     errdefer topn.deinit();
-                    topn = try topn.project(p.columns);
+                    topn = try compileSelectProject(allocator, topn, p);
                 }
                 break :blk topn;
             }
@@ -1900,7 +1918,7 @@ pub fn buildServerQuerySession(
         .select => |s| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, s.upstream.*);
             errdefer upstream.deinit();
-            break :blk try upstream.project(s.columns);
+            break :blk try compileSelectProject(allocator, upstream, s);
         },
         .exclude => |e| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, e.upstream.*);
@@ -2574,7 +2592,7 @@ fn projWalkExpr(c: *ProjScan, allocator: Allocator, e: ir.Expr) void {
     if (c.bail) return;
     switch (e) {
         .col_ref => |nm| c.add(allocator, nm),
-        .lit => {},
+        .lit, .null_lit => {},
         .call => |call| for (call.args) |a| projWalkExpr(c, allocator, a),
         .case => |cs| {
             for (cs.branches) |br| {
@@ -2591,11 +2609,18 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
     if (c.bail) return;
     switch (op.*) {
         .scan, .file_scan => {},
+        .alias => |a| projWalkOp(c, allocator, a.upstream),
         .single_row => {},
         .limit => |l| projWalkOp(c, allocator, l.upstream),
         .select => |p| {
             c.has_shaper = true;
-            for (p.columns) |nm| c.add(allocator, nm);
+            for (p.columns) |nm| {
+                if (std.mem.eql(u8, nm, "*") or aliasStarSource(nm) != null) {
+                    c.bail = true;
+                    return;
+                }
+                c.add(allocator, nm);
+            }
             projWalkOp(c, allocator, p.upstream);
         },
         .filter => |f| {
@@ -2718,6 +2743,68 @@ fn stripAlias(alias: []const u8, name: []const u8) ?[]const u8 {
     return name[dot + 1 ..];
 }
 
+fn aliasStarSource(name: []const u8) ?[]const u8 {
+    if (name.len <= 2) return null;
+    if (name[name.len - 2] != '.' or name[name.len - 1] != '*') return null;
+    return name[0 .. name.len - 2];
+}
+
+fn appendExpandedProjectItem(
+    allocator: Allocator,
+    sources: *std.ArrayListUnmanaged([]const u8),
+    outputs: *std.ArrayListUnmanaged([]const u8),
+    schema: []const types.Column,
+    item: []const u8,
+    output: ?[]const u8,
+) !void {
+    if (std.mem.eql(u8, item, "*")) {
+        for (schema) |c| {
+            try sources.append(allocator, c.name);
+            try outputs.append(allocator, c.name);
+        }
+        return;
+    }
+    if (aliasStarSource(item)) |alias| {
+        var matched = false;
+        for (schema) |c| {
+            if (stripAlias(alias, c.name)) |bare| {
+                matched = true;
+                try sources.append(allocator, c.name);
+                try outputs.append(allocator, bare);
+            }
+        }
+        if (!matched) return Error.ColumnNotFound;
+        return;
+    }
+
+    const idx = types.findColumn(schema, item) orelse return Error.ColumnNotFound;
+    try sources.append(allocator, item);
+    try outputs.append(allocator, output orelse schema[idx].name);
+}
+
+fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Project) !Query {
+    const schema = upstream.outputSchema();
+    if (p.star_skip_trailing > schema.len) return Error.BadRequest;
+    const star_schema = schema[0 .. schema.len - p.star_skip_trailing];
+
+    var sources: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer sources.deinit(allocator);
+    var outputs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer outputs.deinit(allocator);
+
+    for (p.columns, 0..) |item, i| {
+        const explicit_output: ?[]const u8 = if (p.outputs) |outs| outs[i] else null;
+        const expansion_schema = if (std.mem.eql(u8, item, "*") or aliasStarSource(item) != null) star_schema else schema;
+        try appendExpandedProjectItem(allocator, &sources, &outputs, expansion_schema, item, explicit_output);
+    }
+
+    const source_slice = try sources.toOwnedSlice(allocator);
+    defer allocator.free(source_slice);
+    const output_slice = try outputs.toOwnedSlice(allocator);
+    defer allocator.free(output_slice);
+    return upstream.projectNamed(source_slice, output_slice);
+}
+
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
@@ -2780,6 +2867,11 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             }
             break :blk base;
         },
+        .alias => |a| blk: {
+            var upstream = try compileOp(ctx, a.upstream);
+            errdefer upstream.deinit();
+            break :blk try exec.AliasRename.create(ctx.allocator, upstream, a.alias);
+        },
         .limit => |l| blk: {
             // Late materialization: a wide `SELECT` over a single base table
             // with a selective WHERE [+ ORDER BY] LIMIT decodes only the probe
@@ -2805,7 +2897,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 var topn = try inner.topN(f.order_by.specs, @intCast(l.n), @intCast(l.offset));
                 if (f.project) |p| {
                     errdefer topn.deinit();
-                    topn = try topn.project(p.columns);
+                    topn = try compileSelectProject(ctx.allocator, topn, p);
                 }
                 break :blk topn;
             }
@@ -2818,7 +2910,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .select => |s| blk: {
             var upstream = try compileOp(ctx, s.upstream);
             errdefer upstream.deinit();
-            break :blk try upstream.project(s.columns);
+            break :blk try compileSelectProject(ctx.allocator, upstream, s);
         },
         .exclude => |e| blk: {
             var upstream = try compileOp(ctx, e.upstream);

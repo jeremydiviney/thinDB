@@ -29,6 +29,37 @@ test "CTAS: basic — copies source rows into a new table" {
     try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, ids);
 }
 
+test "CTAS and INSERT SELECT preserve aliases and NULL projection schemas" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO src (id, qty) VALUES (1, 10), (2, 20)");
+    const src = try db.openTable("src", .{});
+    try src.flush();
+
+    try exec(allocator, db, "CREATE TABLE dst AS SELECT id, qty AS amount, NULL AS note FROM src");
+    const dst = try db.openTable("dst", .{});
+    try std.testing.expectEqualStrings("amount", dst.schema.columns[1].name);
+    try std.testing.expectEqual(thindb.Type{ .int = {} }, dst.schema.columns[1].type);
+    try std.testing.expectEqualStrings("note", dst.schema.columns[2].name);
+    try std.testing.expectEqual(thindb.Type{ .string = {} }, dst.schema.columns[2].type);
+    try std.testing.expect(dst.schema.columns[2].nullable);
+
+    try exec(allocator, db, "CREATE TABLE sink (id BIGINT PRIMARY KEY, amount INT NOT NULL, note STRING NULL)");
+    try exec(allocator, db, "INSERT INTO sink SELECT id, amount, note FROM dst");
+    const sink = try db.openTable("sink", .{});
+    try sink.flush();
+
+    const ids = try collectBigints(allocator, db, "SELECT id FROM sink ORDER BY id ASC");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, ids);
+}
+
 test "CTAS: rejects when target exists (unless IF NOT EXISTS)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

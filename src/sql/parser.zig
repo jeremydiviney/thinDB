@@ -211,6 +211,8 @@ const ProjItem = struct {
     kind: union(enum) {
         /// Plain column reference. `column` is the column name.
         col: []const u8,
+        /// Star expansion. Null means `*`; otherwise `qualifier.*`.
+        star: ?[]const u8,
         /// Aggregate call. `agg_func` is the function; `agg_col` is
         /// the argument column name (null for COUNT(*) — or null
         /// when `arg_expr` is set and the actual argument is a
@@ -517,7 +519,7 @@ pub const Parser = struct {
             for (proj, 0..) |p, i| switch (p.kind) {
                 .agg => {},
                 .col, .expr => if (!grouping_key[i]) return ParseError.SqlMixedAggAndPlainProjection,
-                .window => return ParseError.SqlMixedAggAndPlainProjection,
+                .star, .window => return ParseError.SqlMixedAggAndPlainProjection,
             };
         }
         if (has_window and (has_agg or has_group)) {
@@ -739,17 +741,8 @@ pub const Parser = struct {
             // Reorder output to match the SELECT list if necessary. The
             // GroupBy emits group_cols first then aggs in registered order;
             // a Project on top reorders/keeps only the SELECT items.
-            if (!projMatchesGroupByOrder(proj, group_cols)) {
-                const out_names = try self.arena.alloc([]const u8, proj.len);
-                for (proj, out_names) |p, *o| switch (p.kind) {
-                    // A plain column is present in the grouped output under
-                    // its real column name (group keys group on the column,
-                    // not any SELECT alias). Computed exprs and aggregates
-                    // surface under their derived/alias name.
-                    .col => |c| o.* = c,
-                    else => o.* = p.name,
-                };
-                root = try self.allocOp(.{ .select = .{ .columns = out_names, .upstream = root } });
+            if (!projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+                root = try self.addSelectProject(root, proj, 0);
             }
         } else {
             // HAVING without GROUP BY / aggregates is rejected — would
@@ -784,20 +777,8 @@ pub const Parser = struct {
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
             }
-            // Plain projection: select the listed columns. `SELECT *`
-            // is encoded as an empty proj slice → no Project node added.
-            if (proj.len > 0) {
-                const cols = try self.arena.alloc([]const u8, proj.len);
-                for (proj, cols) |p, *out| {
-                    switch (p.kind) {
-                        .col => |c| out.* = c,
-                        // Computed exprs and window outputs surface under
-                        // their derived name (the alias).
-                        .expr, .window => out.* = p.name,
-                        .agg => unreachable, // already handled by the agg branch
-                    }
-                }
-                root = try self.allocOp(.{ .select = .{ .columns = cols, .upstream = root } });
+            if (!isBareStarProjection(proj)) {
+                root = try self.addSelectProject(root, proj, selectDerivedCount(proj));
             }
         }
         // Optional LIMIT / OFFSET applies last. A bare OFFSET (no limit,
@@ -858,14 +839,47 @@ pub const Parser = struct {
         return out;
     }
 
-    fn parseProjection(self: *Parser) ParseError![]const ProjItem {
-        // `SELECT *` → empty proj list (means "all columns from
-        // upstream"); the Scan + downstream operators inherit the
-        // table's full schema.
-        if (self.cur.tag == .star) {
-            try self.advance();
-            return &.{};
+    fn addSelectProject(
+        self: *Parser,
+        upstream: *ir.Op,
+        proj: []const ProjItem,
+        star_skip_trailing: u32,
+    ) ParseError!*ir.Op {
+        const cols = try self.arena.alloc([]const u8, proj.len);
+        const outputs = try self.arena.alloc(?[]const u8, proj.len);
+        var any_output = false;
+        for (proj, 0..) |p, i| {
+            cols[i] = try self.projectSourceName(p);
+            outputs[i] = projectOutputName(p);
+            if (outputs[i] != null) any_output = true;
         }
+        return try self.allocOp(.{ .select = .{
+            .columns = cols,
+            .outputs = if (any_output) outputs else null,
+            .star_skip_trailing = star_skip_trailing,
+            .upstream = upstream,
+        } });
+    }
+
+    fn projectSourceName(self: *Parser, p: ProjItem) ParseError![]const u8 {
+        return switch (p.kind) {
+            .star => |qual| if (qual) |q|
+                try std.fmt.allocPrint(self.arena, "{s}.*", .{q})
+            else
+                "*",
+            .col => |c| c,
+            .agg, .expr, .window => p.name,
+        };
+    }
+
+    fn projectOutputName(p: ProjItem) ?[]const u8 {
+        return switch (p.kind) {
+            .col => |c| if (types.columnNameEql(c, p.name)) null else p.name,
+            else => null,
+        };
+    }
+
+    fn parseProjection(self: *Parser) ParseError![]const ProjItem {
         var items: std.ArrayList(ProjItem) = .empty;
         defer items.deinit(self.arena);
         while (true) {
@@ -878,6 +892,11 @@ pub const Parser = struct {
     }
 
     fn parseProjItem(self: *Parser) ParseError!ProjItem {
+        if (self.cur.tag == .star) {
+            try self.advance();
+            return ProjItem{ .name = "*", .kind = .{ .star = null } };
+        }
+
         // Parenthesized expression at projection start: `(expr) [AS name]`.
         // Routes through the expression parser (which handles binary
         // operators) without going through the identifier path.
@@ -913,7 +932,7 @@ pub const Parser = struct {
         // operators and aliasing work. (`GROUP BY 1` then references it
         // as ordinal 1.)
         switch (self.cur.tag) {
-            .integer, .floating, .string, .kw_true, .kw_false => {
+            .integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
                 const expr = try self.parseAddSub();
                 const default_name = try self.exprDefaultName(expr);
                 const alias = try self.maybeAlias(default_name);
@@ -1076,6 +1095,12 @@ pub const Parser = struct {
         const dup_col = blk: {
             if (self.cur.tag == .dot) {
                 try self.advance();
+                if (self.cur.tag == .star) {
+                    try self.advance();
+                    const qual = try self.arena.dupe(u8, first);
+                    const name = try std.fmt.allocPrint(self.arena, "{s}.*", .{qual});
+                    return ProjItem{ .name = name, .kind = .{ .star = qual } };
+                }
                 if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
                 const second = self.cur.text;
                 try self.advance();
@@ -1507,6 +1532,7 @@ pub const Parser = struct {
     /// and the `inner::T` postfix.
     fn parseCastTarget(self: *Parser, inner: ir.Expr) ParseError!ir.Expr {
         const ty = try parse_ddl.parseColumnType(self);
+        if (inner == .null_lit) return ir.Expr{ .null_lit = ty };
         const fn_name = castFnName(ty) orelse return ParseError.SqlInvalidProjection;
         const args = try self.arena.alloc(ir.Expr, 1);
         args[0] = inner;
@@ -1584,6 +1610,10 @@ pub const Parser = struct {
                 const col_dup = try self.dupQualifiedColRef(name);
                 return ir.Expr{ .col_ref = col_dup };
             },
+            .kw_null => {
+                try self.advance();
+                return ir.Expr{ .null_lit = .string };
+            },
             .plus, .minus, .integer, .floating, .string, .kw_true, .kw_false => {
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
@@ -1646,6 +1676,7 @@ pub const Parser = struct {
         switch (e) {
             .col_ref => |c| return try self.arena.dupe(u8, c),
             .lit => |v| return try self.renderLit(v),
+            .null_lit => return try self.arena.dupe(u8, "NULL"),
             .call => |c| {
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(self.arena);
@@ -1779,7 +1810,7 @@ pub const Parser = struct {
             if (self.cur.tag != .identifier) return ParseError.SqlSubqueryNeedsAlias;
             const alias = try self.arena.dupe(u8, self.cur.text);
             try self.advance();
-            return .{ .name = alias, .op = op };
+            return .{ .name = alias, .op = try self.applyAliasToFromOp(op, alias, false) };
         }
         // Plain identifier — first check the CTE map (single-part name
         // only). If it's a CTE, use the stored op. Otherwise parse 1-,
@@ -1799,11 +1830,13 @@ pub const Parser = struct {
         const first_dup = try self.arena.dupe(u8, first);
         var op: *ir.Op = undefined;
         var resolved_name: []const u8 = first_dup;
+        var alias_in_place = true;
         if (self.cur.tag == .lparen) {
             const format = fileFormatForFunction(first) orelse return ParseError.SqlUnsupportedFileFunction;
             op = try self.parseFileTableFunction(format);
         } else if (self.cur.tag != .dot and self.ctes.get(first) != null) {
             op = self.ctes.get(first).?.op;
+            alias_in_place = false;
         } else {
             var parts_buf: [3][]const u8 = undefined;
             parts_buf[0] = first_dup;
@@ -1831,22 +1864,14 @@ pub const Parser = struct {
             try self.advance();
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
             resolved_name = try self.arena.dupe(u8, self.cur.text);
-            if (op.* == .scan) {
-                op.scan.alias = resolved_name;
-            } else if (op.* == .file_scan) {
-                op.file_scan.alias = resolved_name;
-            }
+            op = try self.applyAliasToFromOp(op, resolved_name, alias_in_place);
             try self.advance();
         } else if (self.cur.tag == .identifier) {
             // Implicit alias: bare identifier after the FROM target.
             // SQL clause keywords (JOIN/WHERE/ON/...) aren't .identifier
             // tokens so they don't trigger this.
             resolved_name = try self.arena.dupe(u8, self.cur.text);
-            if (op.* == .scan) {
-                op.scan.alias = resolved_name;
-            } else if (op.* == .file_scan) {
-                op.file_scan.alias = resolved_name;
-            }
+            op = try self.applyAliasToFromOp(op, resolved_name, alias_in_place);
             try self.advance();
         }
         return .{ .name = resolved_name, .op = op };
@@ -1877,27 +1902,37 @@ pub const Parser = struct {
     }
 
     fn applyFromAlias(self: *Parser, op: *ir.Op, fallback: []const u8) ParseError!FromTarget {
+        var aliased_op = op;
         var resolved_name = fallback;
         if (self.cur.tag == .kw_as) {
             try self.advance();
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
             resolved_name = try self.arena.dupe(u8, self.cur.text);
-            if (op.* == .scan) {
-                op.scan.alias = resolved_name;
-            } else if (op.* == .file_scan) {
-                op.file_scan.alias = resolved_name;
-            }
+            aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
         } else if (self.cur.tag == .identifier) {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
-            if (op.* == .scan) {
-                op.scan.alias = resolved_name;
-            } else if (op.* == .file_scan) {
-                op.file_scan.alias = resolved_name;
-            }
+            aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
         }
-        return .{ .name = resolved_name, .op = op };
+        return .{ .name = resolved_name, .op = aliased_op };
+    }
+
+    fn applyAliasToFromOp(self: *Parser, op: *ir.Op, alias: []const u8, allow_in_place: bool) ParseError!*ir.Op {
+        if (allow_in_place) {
+            switch (op.*) {
+                .scan => {
+                    op.scan.alias = alias;
+                    return op;
+                },
+                .file_scan => {
+                    op.file_scan.alias = alias;
+                    return op;
+                },
+                else => {},
+            }
+        }
+        return try self.allocOp(.{ .alias = .{ .alias = alias, .upstream = op } });
     }
 
     fn parseFileOptionName(self: *Parser) ParseError![]const u8 {
@@ -2205,6 +2240,7 @@ pub const Parser = struct {
                 const p = proj[@intCast(k - 1)];
                 col = switch (p.kind) {
                     .col => |c| try self.arena.dupe(u8, c),
+                    .star => return ParseError.SqlInvalidProjection,
                     else => try self.arena.dupe(u8, p.name),
                 };
             } else {
@@ -2377,7 +2413,7 @@ pub const Parser = struct {
                 try cols.append(self.arena, proj[idx].name);
             },
             // Can't group by an aggregate or window output.
-            .agg, .window => return ParseError.SqlInvalidProjection,
+            .star, .agg, .window => return ParseError.SqlInvalidProjection,
         }
     }
 
@@ -2604,6 +2640,7 @@ fn countRefs(
 ) ParseError!void {
     switch (op.*) {
         .scan, .single_row, .file_scan => {},
+        .alias => |a| try visitChild(arena, refs, a.upstream),
         .explain => |e| try visitChild(arena, refs, e.inner),
         .limit => |l| try visitChild(arena, refs, l.upstream),
         .select => |p| try visitChild(arena, refs, p.upstream),
@@ -2647,6 +2684,31 @@ fn visitChild(
 
 /// Returns true when the projection's name+order already match the
 /// natural output of a GroupBy: `[group_cols..., agg_aliases...]`.
+fn isBareStarProjection(proj: []const ProjItem) bool {
+    if (proj.len != 1) return false;
+    return switch (proj[0].kind) {
+        .star => |qual| qual == null,
+        else => false,
+    };
+}
+
+fn selectDerivedCount(proj: []const ProjItem) u32 {
+    var n: u32 = 0;
+    for (proj) |p| switch (p.kind) {
+        .expr, .window => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+fn projectionHasRenamedCols(proj: []const ProjItem) bool {
+    for (proj) |p| switch (p.kind) {
+        .col => |c| if (!types.columnNameEql(c, p.name)) return true,
+        else => {},
+    };
+    return false;
+}
+
 fn projMatchesGroupByOrder(proj: []const ProjItem, group_cols: []const []const u8) bool {
     if (proj.len != group_cols.len + countAggs(proj)) return false;
     var i: usize = 0;
@@ -2704,6 +2766,7 @@ fn isNondeterministicFn(name: []const u8) bool {
 fn exprCollapsesOnto(proj: []const ProjItem, grouping_key: []const bool, e: ir.Expr) bool {
     return switch (e) {
         .lit => true,
+        .null_lit => true,
         .col_ref => |name| isPlainGroupKey(proj, grouping_key, name),
         .call => |c| blk: {
             if (isNondeterministicFn(c.fn_name)) break :blk false;
@@ -2740,6 +2803,7 @@ fn exprEqual(a: ir.Expr, b: ir.Expr) bool {
     return switch (a) {
         .col_ref => |x| std.ascii.eqlIgnoreCase(x, b.col_ref),
         .lit => |x| valueEqual(x, b.lit),
+        .null_lit => |x| std.meta.eql(x, b.null_lit),
         .call => |x| blk: {
             const y = b.call;
             if (!std.mem.eql(u8, x.fn_name, y.fn_name)) break :blk false;

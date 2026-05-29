@@ -394,6 +394,10 @@ pub const Query = struct {
         return @import("project_limit.zig").Project.create(self.allocator, self, columns);
     }
 
+    pub fn projectNamed(self: Query, columns: []const []const u8, output_names: []const []const u8) !Query {
+        return @import("project_limit.zig").Project.createNamed(self.allocator, self, columns, output_names);
+    }
+
     pub fn limit(self: Query, n: usize) !Query {
         return @import("project_limit.zig").Limit.create(self.allocator, self, n);
     }

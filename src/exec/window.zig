@@ -970,7 +970,7 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
                         plan.default_kind = .literal;
                         plan.default_literal = v;
                     },
-                    .call, .case, .scalar_subquery, .exists_subquery, .var_ref => return Error.WindowUnsupported,
+                    .null_lit, .call, .case, .scalar_subquery, .exists_subquery, .var_ref => return Error.WindowUnsupported,
                 }
             }
         },

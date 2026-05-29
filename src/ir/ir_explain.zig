@@ -61,6 +61,12 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             }
             try out.append(allocator, '\n');
         },
+        .alias => |a| {
+            try out.appendSlice(allocator, "Alias ");
+            try out.appendSlice(allocator, a.alias);
+            try out.append(allocator, '\n');
+            try explainOp(allocator, out, a.upstream.*, depth + 1);
+        },
         .limit => |l| {
             var buf: [48]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "Limit n={d}\n", .{l.n});
@@ -69,7 +75,7 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
         },
         .select => |p| {
             try out.appendSlice(allocator, "Select [");
-            try writeJoinedNames(allocator, out, p.columns);
+            try writeProjectNames(allocator, out, p);
             try out.appendSlice(allocator, "]\n");
             try explainOp(allocator, out, p.upstream.*, depth + 1);
         },
@@ -445,6 +451,19 @@ fn writeJoinedNames(allocator: Allocator, out: *std.ArrayList(u8), names: []cons
     }
 }
 
+fn writeProjectNames(allocator: Allocator, out: *std.ArrayList(u8), p: Op.Project) !void {
+    for (p.columns, 0..) |n, i| {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, n);
+        if (p.outputs) |outs| {
+            if (outs[i]) |alias| {
+                try out.appendSlice(allocator, " AS ");
+                try out.appendSlice(allocator, alias);
+            }
+        }
+    }
+}
+
 fn opSymbol(op: PredicateOp) []const u8 {
     return switch (op) {
         .eq => "=",
@@ -460,6 +479,7 @@ fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!
     switch (e) {
         .col_ref => |name| try out.appendSlice(allocator, name),
         .lit => |v| try writeValue(allocator, out, v),
+        .null_lit => try out.appendSlice(allocator, "NULL"),
         .call => |c| {
             try out.appendSlice(allocator, c.fn_name);
             try out.append(allocator, '(');

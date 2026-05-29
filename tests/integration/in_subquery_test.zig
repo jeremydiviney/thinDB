@@ -149,7 +149,7 @@ test "IN (subquery): multi-column inner rejected" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const root = try thindb.sql.parse(arena.allocator(),
-        "SELECT id FROM customer WHERE id IN (SELECT cust_id, cust_id FROM premium)",
+        "SELECT id FROM customer WHERE id IN (SELECT cust_id, 1 AS marker FROM premium)",
     );
     const cq = thindb.net.compile(allocator, db, root);
     if (cq) |ok| {

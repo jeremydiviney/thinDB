@@ -323,6 +323,7 @@ pub fn defaultName(arena: Allocator, func_name: []const u8, args: []const ir.Exp
         switch (a) {
             .col_ref => |c| try buf.appendSlice(arena, c),
             .lit => try buf.appendSlice(arena, "?"),
+            .null_lit => try buf.appendSlice(arena, "NULL"),
             .call => |c| {
                 try buf.appendSlice(arena, c.fn_name);
                 try buf.appendSlice(arena, "(...)");
