@@ -145,7 +145,15 @@ pub const PlanBuilder = struct {
         const dup_groups = try aa.alloc([]const u8, group_cols.len);
         for (group_cols, dup_groups) |c, *out| out.* = try aa.dupe(u8, c);
         const dup_aggs = try aa.alloc(ir.AggSpec, aggs.len);
-        @memcpy(dup_aggs, aggs);
+        for (aggs, dup_aggs) |a, *out| {
+            const udf_arg_cols = try aa.alloc([]const u8, a.udf_arg_cols.len);
+            for (a.udf_arg_cols, udf_arg_cols) |c, *dst| dst.* = try aa.dupe(u8, c);
+            out.* = a;
+            out.udf_arg_cols = udf_arg_cols;
+            if (a.udf_name) |n| out.udf_name = try aa.dupe(u8, n);
+            if (a.col) |c| out.col = try aa.dupe(u8, c);
+            out.as = try aa.dupe(u8, a.as);
+        }
         const op = try aa.create(ir.Op);
         op.* = .{ .group_by = .{
             .group_cols = dup_groups,

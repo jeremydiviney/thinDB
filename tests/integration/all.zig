@@ -64,6 +64,7 @@ test {
     _ = @import("for_encoding_test.zig");
     _ = @import("for_filter_test.zig");
     _ = @import("dict_encoding_test.zig");
+    _ = @import("udf_test.zig");
 }
 
 test "integration entry exists" {
