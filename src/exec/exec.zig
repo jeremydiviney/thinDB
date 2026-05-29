@@ -663,6 +663,7 @@ pub fn lateScan(
         accountant_ptr,
         probe_names,
         true,
+        null,
     );
     var inner = makeQuery(allocator, scan_ptr);
     errdefer inner.deinit();

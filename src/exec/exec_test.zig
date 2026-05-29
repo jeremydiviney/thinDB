@@ -1147,7 +1147,7 @@ test "scan: row-group range restriction tiles to the full serial scan" {
     // Reference: full serial scan.
     var full: std.ArrayList(i64) = .empty;
     defer full.deinit(allocator);
-    try drain(allocator, try exec.Scan.allocWithProjectionLoc(allocator, t, null, null, false), &full);
+    try drain(allocator, try exec.Scan.allocWithProjectionLoc(allocator, t, null, null, false, null), &full);
     try std.testing.expectEqual(@as(usize, 35), full.items.len);
 
     // Tile: seg 0 | seg 1 + seg 2's RG0 (mid-segment end) | seg 2's RG1,2 + memtable.
@@ -1160,7 +1160,7 @@ test "scan: row-group range restriction tiles to the full serial scan" {
     var tiled: std.ArrayList(i64) = .empty;
     defer tiled.deinit(allocator);
     for (tiles) |r| {
-        const s = try exec.Scan.allocWithProjectionLoc(allocator, t, null, null, false);
+        const s = try exec.Scan.allocWithProjectionLoc(allocator, t, null, null, false, null);
         s.setRange(r.ss, r.sr, r.es, r.er, r.mt);
         try drain(allocator, s, &tiled);
     }

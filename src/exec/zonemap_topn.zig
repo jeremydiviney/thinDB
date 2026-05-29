@@ -202,7 +202,7 @@ pub const ZonemapTopN = struct {
 
         // Build the inner late-mat plan: pins the memtable + ddl_lock and gives
         // us the wide-column materializer. We never call `inner.next()`.
-        const scan_ptr = try Scan.allocWithProjectionLoc(allocator, table, accountant_ptr, probe_names, true);
+        const scan_ptr = try Scan.allocWithProjectionLoc(allocator, table, accountant_ptr, probe_names, true, null);
         var inner = makeQuery(allocator, scan_ptr);
         var late_built = false;
         errdefer if (!late_built) inner.deinit();

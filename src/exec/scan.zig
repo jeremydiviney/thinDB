@@ -384,7 +384,7 @@ pub const Scan = struct {
         needed: ?[]const []const u8,
         emit_loc: bool,
     ) !Query {
-        const self = try allocWithProjectionLoc(allocator, table, injected, needed, emit_loc);
+        const self = try allocWithProjectionLoc(allocator, table, injected, needed, emit_loc, null);
         return makeQuery(allocator, self);
     }
 
@@ -392,12 +392,39 @@ pub const Scan = struct {
     /// the type-erased `Query`. `LateScan` builds its inner Scan through this
     /// so it can reach `memtableSnap()` directly, then wraps the pointer in a
     /// `Query` via `exec.makeQuery`.
+    /// A consistent `(segments, memtable)` view captured once under the table
+    /// mutex. The parallel-scan orchestrator captures this and hands the SAME
+    /// snapshot to every worker (via `allocWithProjectionLoc`'s `injected_snap`)
+    /// so a flush between worker constructions can't make them disagree on which
+    /// rows live in segments vs. the memtable.
+    pub const Snapshot = struct {
+        segment_count: usize,
+        memtable_snap: *engine.Memtable,
+        memtable_row_count: u64,
+    };
+
+    /// Capture a consistent snapshot, pinning the memtable. The caller owns the
+    /// returned pin and must `memtable_snap.release()` it once every worker Scan
+    /// (each of which acquires its own pin) has been constructed.
+    pub fn captureSnapshot(table: *Table) Snapshot {
+        table.mutex.lockUncancelable(table.io);
+        defer table.mutex.unlock(table.io);
+        const ms = table.memtable;
+        ms.acquire();
+        return .{
+            .segment_count = table.manifest.segments.items.len,
+            .memtable_snap = ms,
+            .memtable_row_count = ms.row_count,
+        };
+    }
+
     pub fn allocWithProjectionLoc(
         allocator: Allocator,
         table: *Table,
         injected: ?*exec.memory.MemoryAccountant,
         needed: ?[]const []const u8,
         emit_loc: bool,
+        injected_snap: ?Snapshot,
     ) !*Scan {
         const out_phys = try resolveOutPhys(allocator, table.schema.columns, needed);
         errdefer allocator.free(out_phys);
@@ -444,12 +471,24 @@ pub const Scan = struct {
         // `Table.insertLocked` / `insertBatch` detect a pinned memtable
         // (`Memtable.hasSnapshotReaders`) and clone-then-replace before
         // mutating, leaving our snapshot's buffers untouched.
-        table.mutex.lockUncancelable(table.io);
-        const segment_count = table.manifest.segments.items.len;
-        const memtable_snap = table.memtable;
-        memtable_snap.acquire();
-        const memtable_row_count = memtable_snap.row_count;
-        table.mutex.unlock(table.io);
+        var segment_count: usize = undefined;
+        var memtable_snap: *engine.Memtable = undefined;
+        var memtable_row_count: u64 = undefined;
+        if (injected_snap) |snap| {
+            // Parallel worker: reuse the orchestrator's single captured view so
+            // every worker agrees. Acquire our own pin (balanced by deinit).
+            segment_count = snap.segment_count;
+            memtable_snap = snap.memtable_snap;
+            memtable_snap.acquire();
+            memtable_row_count = snap.memtable_row_count;
+        } else {
+            table.mutex.lockUncancelable(table.io);
+            segment_count = table.manifest.segments.items.len;
+            memtable_snap = table.memtable;
+            memtable_snap.acquire();
+            memtable_row_count = memtable_snap.row_count;
+            table.mutex.unlock(table.io);
+        }
 
         // Use the injected query-scoped accountant when present. Otherwise
         // mint our own from the table's configured budget (heap-allocated
