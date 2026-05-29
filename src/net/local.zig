@@ -2719,6 +2719,15 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 needed = try keep.toOwnedSlice(ctx.allocator);
             }
             defer if (needed) |n| ctx.allocator.free(n);
+            // Parallel scan leaf: when DOP > 1 and the scan isn't aliased, hand
+            // the row-group ranges to up to max_dop workers (ParallelScan).
+            // Aliased scans keep the serial path (ParallelScan doesn't wrap the
+            // AliasRename). Coded GROUP BY / late-mat aren't parallel-aware yet:
+            // they fall back to materialized/serial via the operator declining
+            // setDictCodeColumn, which is correctness-safe.
+            if (ctx.db.config.max_dop > 1 and s.alias == null) {
+                break :blk try exec.ParallelScan.create(ctx.allocator, t, acct, needed, ctx.db.config.max_dop);
+            }
             const base = try exec.scanWithProjection(ctx.allocator, t, acct, needed);
             if (s.alias) |alias| {
                 errdefer @constCast(&base).deinit();
