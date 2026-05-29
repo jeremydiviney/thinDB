@@ -156,6 +156,15 @@ pub const Config = struct {
     /// (spill-to-disk) is future work.
     query_memory_budget: usize = 2 * 1024 * 1024 * 1024,
 
+    /// Maximum intra-query degree of parallelism (worker threads per query for
+    /// the parallel scan/filter leaf). `1` (default) = fully serial, byte-
+    /// identical to the single-threaded engine — the canonical result and the
+    /// test baseline. `>1` lets a single query's leaf scan hand out contiguous
+    /// row-group ranges across up to this many workers; the per-query count is
+    /// further bounded by a global worker-slot budget so concurrent queries
+    /// share cores instead of oversubscribing. `0` is treated as `1`.
+    max_dop: usize = 1,
+
     /// Max concurrent client connections across all wire protocols.
     /// Server-wide cap; reject (close immediately) when exceeded.
     /// Default 256 — generous for embedded use; bump for high-

@@ -185,6 +185,26 @@ pub const Scan = struct {
     phase: Phase = .segments,
     cur_seg_idx: usize = 0,
     cur_rg_idx: usize = 0,
+
+    /// Half-open row-group range this scan covers, as `(segment, row_group)`
+    /// coordinates over the manifest snapshot. Default = the whole table:
+    /// start `(0,0)`, end `(maxInt,0)` (a sentinel above any real segment
+    /// index, so `atRangeEnd` is a no-op and iteration stops at the natural
+    /// `segment_count` boundary). A parallel scan hands each worker a
+    /// contiguous slice of the flat row-group list via `setRange` — the slice
+    /// may start and end mid-segment, crossing segment boundaries. The
+    /// COUNT(*)-style 0-column fast path is never range-split (it's manifest-
+    /// only) so these only constrain the column-decoding paths.
+    range_start_seg: usize = 0,
+    range_start_rg: usize = 0,
+    range_end_seg: usize = std.math.maxInt(usize),
+    range_end_rg: usize = 0,
+    /// Whether this scan also drains the memtable after its segment range.
+    /// In a parallel scan exactly one worker (the last range) sets this true;
+    /// all others false, so the memtable is scanned exactly once and ordered
+    /// last. Default true (serial scans always cover the memtable).
+    scan_memtable: bool = true,
+
     cur_segment: ?storage.ReadSegment = null,
     /// Sorted, deduped tombstone offsets for the current segment (or null).
     cur_segment_tomb: ?[]u32 = null,
@@ -489,6 +509,27 @@ pub const Scan = struct {
 
     pub fn accountant(self: *Scan) ?*exec.memory.MemoryAccountant {
         return self.owned_accountant;
+    }
+
+    /// Restrict this scan to the half-open flat row-group range
+    /// `[(start_seg,start_rg), (end_seg,end_rg))` and choose whether it drains
+    /// the memtable. Must be called before the first `next()`. The parallel
+    /// scan orchestrator uses this to hand each worker a contiguous block span.
+    pub fn setRange(self: *Scan, start_seg: usize, start_rg: usize, end_seg: usize, end_rg: usize, scan_memtable: bool) void {
+        self.range_start_seg = start_seg;
+        self.range_start_rg = start_rg;
+        self.range_end_seg = end_seg;
+        self.range_end_rg = end_rg;
+        self.scan_memtable = scan_memtable;
+        self.cur_seg_idx = start_seg;
+    }
+
+    /// True once the cursor has reached this scan's assigned range end — the
+    /// signal to stop the segments phase (mid-segment ends are honored). A
+    /// no-op for the default full-table range (`range_end_seg == maxInt`).
+    fn atRangeEnd(self: *const Scan) bool {
+        return self.cur_seg_idx > self.range_end_seg or
+            (self.cur_seg_idx == self.range_end_seg and self.cur_rg_idx >= self.range_end_rg);
     }
 
     /// Projected-column position of `name` if it can be emitted as global dict
@@ -879,7 +920,7 @@ pub const Scan = struct {
             }
             if (self.phase == .memtable) {
                 self.phase = .done;
-                if (self.memtable_row_count == 0) return null;
+                if (!self.scan_memtable or self.memtable_row_count == 0) return null;
                 return Batch{ .schema = self.out_schema, .values = self.views, .row_count = @intCast(self.memtable_row_count) };
             }
             return null;
@@ -890,6 +931,13 @@ pub const Scan = struct {
             if (self.cur_segment == null and !try self.openCurSegment()) break;
 
             const seg = &self.cur_segment.?;
+            // Reached this worker's assigned range end (possibly mid-segment) —
+            // stop the segments phase and fall through to the memtable.
+            if (self.atRangeEnd()) {
+                self.closeCurSegment();
+                self.phase = .memtable;
+                continue;
+            }
             if (self.cur_rg_idx >= seg.info.row_groups.len) {
                 self.closeCurSegment();
                 self.cur_seg_idx += 1;
@@ -985,7 +1033,7 @@ pub const Scan = struct {
         // create time; rows appended after that are invisible to this scan.
         if (self.phase == .memtable) {
             self.phase = .done;
-            if (self.memtable_row_count == 0) return null;
+            if (!self.scan_memtable or self.memtable_row_count == 0) return null;
 
             for (self.out_phys, 0..) |phys, j| {
                 self.views[j] = self.memtable_snap.columns[phys].view();
@@ -1043,7 +1091,9 @@ pub const Scan = struct {
             self.cur_rg_first_row[i] = running;
             running += rg.row_count;
         }
-        self.cur_rg_idx = 0;
+        // Honor the assigned range's start row group on the first segment of a
+        // parallel worker's span; every later segment starts at row group 0.
+        self.cur_rg_idx = if (self.cur_seg_idx == self.range_start_seg) self.range_start_rg else 0;
         return true;
     }
 
@@ -1065,6 +1115,13 @@ pub const Scan = struct {
             if (self.cur_segment == null and !try self.openCurSegment()) break;
 
             const seg = &self.cur_segment.?;
+            // Reached this worker's assigned range end (possibly mid-segment) —
+            // stop the segments phase and fall through to the memtable.
+            if (self.atRangeEnd()) {
+                self.closeCurSegment();
+                self.phase = .memtable;
+                continue;
+            }
             if (self.cur_rg_idx >= seg.info.row_groups.len) {
                 self.closeCurSegment();
                 self.cur_seg_idx += 1;
@@ -1090,7 +1147,7 @@ pub const Scan = struct {
 
         if (self.phase == .memtable) {
             self.phase = .done;
-            if (self.memtable_row_count == 0) return null;
+            if (!self.scan_memtable or self.memtable_row_count == 0) return null;
 
             const n: usize = @intCast(self.memtable_row_count);
             const mem_views = try self.allocator.alloc(ColumnView, self.out_phys.len);

@@ -1092,6 +1092,82 @@ test "scan: string eq predicate prunes row groups via prefix stats" {
     try std.testing.expectEqualSlices(i64, &[_]i64{3}, ids.items);
 }
 
+test "scan: row-group range restriction tiles to the full serial scan" {
+    // Parallel-scan foundation (Step 1a): a Scan can be confined to a half-open
+    // (seg,rg) range, and a set of ranges tiling [0,total) — including a mid-
+    // segment split and the memtable on the last range — reproduces exactly the
+    // full serial scan's rows, in order. No threads: proves the range mechanism.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 4 });
+
+    // 3 segments × 10 rows (row groups [4,4,2] each ⇒ 3 RGs/segment, 9 total),
+    // then a 5-row memtable tail. Flushed in id order so stored order == id.
+    var next_id: i64 = 0;
+    for (0..3) |_| {
+        var rows: [10]struct { id: i64 } = undefined;
+        for (&rows) |*r| {
+            r.id = next_id;
+            next_id += 1;
+        }
+        try t.insert(&rows);
+        try t.flush();
+    }
+    var tail: [5]struct { id: i64 } = undefined;
+    for (&tail) |*r| {
+        r.id = next_id;
+        next_id += 1;
+    }
+    try t.insert(&tail); // stays in the memtable
+
+    const drain = struct {
+        fn run(a: std.mem.Allocator, s: *exec.Scan, out: *std.ArrayList(i64)) !void {
+            var q = exec.makeQuery(a, s);
+            defer q.deinit();
+            while (try q.next()) |b| {
+                try out.appendSlice(a, b.values[0].data.bigint[0..b.row_count]);
+            }
+        }
+    }.run;
+
+    // Reference: full serial scan.
+    var full: std.ArrayList(i64) = .empty;
+    defer full.deinit(allocator);
+    try drain(allocator, try exec.Scan.allocWithProjectionLoc(allocator, t, null, null, false), &full);
+    try std.testing.expectEqual(@as(usize, 35), full.items.len);
+
+    // Tile: seg 0 | seg 1 + seg 2's RG0 (mid-segment end) | seg 2's RG1,2 + memtable.
+    const Range = struct { ss: usize, sr: usize, es: usize, er: usize, mt: bool };
+    const tiles = [_]Range{
+        .{ .ss = 0, .sr = 0, .es = 1, .er = 0, .mt = false },
+        .{ .ss = 1, .sr = 0, .es = 2, .er = 1, .mt = false },
+        .{ .ss = 2, .sr = 1, .es = std.math.maxInt(usize), .er = 0, .mt = true },
+    };
+    var tiled: std.ArrayList(i64) = .empty;
+    defer tiled.deinit(allocator);
+    for (tiles) |r| {
+        const s = try exec.Scan.allocWithProjectionLoc(allocator, t, null, null, false);
+        s.setRange(r.ss, r.sr, r.es, r.er, r.mt);
+        try drain(allocator, s, &tiled);
+    }
+
+    try std.testing.expectEqualSlices(i64, full.items, tiled.items);
+}
+
 test "scan: string range predicate prunes row groups via prefix stats" {
     // Same disjoint name ranges as the eq test; `name > 'dave'` must skip the
     // groups whose prefix max is below 'dave' and return only the matches —
