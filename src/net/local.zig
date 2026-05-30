@@ -2867,6 +2867,23 @@ fn fuseSplitCompute(ctx: *CompileCtx, upstream: Query, derived: []const ir.Deriv
     return up.computeWithRegistry(serial.items, ctx.udf_registry);
 }
 
+/// Tell `upstream` the exact set of columns this GROUP BY reads — its group keys
+/// plus every aggregate argument. A parallel scan uses it to drop columns from
+/// its survivor deep-copy that were decoded only to feed a fused filter/compute
+/// and are dead above (e.g. raw `URL` behind `length(URL)` + `URL<>''`). Best
+/// effort: non-parallel scans and unfused filters ignore it (see
+/// `Query.setEmitProjection`).
+fn pushAggEmitProjection(ctx: *CompileCtx, upstream: Query, group_cols: []const []const u8, aggs: []const AggSpec) !void {
+    var keep: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keep.deinit(ctx.allocator);
+    for (group_cols) |c| try keep.append(ctx.allocator, c);
+    for (aggs) |a| {
+        if (a.col) |c| try keep.append(ctx.allocator, c);
+        for (a.udf_arg_cols) |c| try keep.append(ctx.allocator, c);
+    }
+    try upstream.setEmitProjection(keep.items);
+}
+
 fn aliasStarSource(name: []const u8) ?[]const u8 {
     if (name.len <= 2) return null;
     if (name[name.len - 2] != '.' or name[name.len - 1] != '*') return null;
@@ -3094,6 +3111,9 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             // derived into the parallel-scan workers (the serial remainder is
             // UDF-registry-aware). A UDF aggregate then takes the udfGroupBy path.
             if (agg_args.len > 0) upstream = try fuseSplitCompute(ctx, upstream, agg_args);
+            // Drop columns the aggregate never reads from the parallel-scan
+            // materialize (decoded only for a fused filter/compute — dead above).
+            try pushAggEmitProjection(ctx, upstream, g.group_cols, g.aggs);
             if (hasUdfAgg(g.aggs)) {
                 const registry = ctx.udf_registry orelse return Error.UnsupportedOp;
                 break :blk try upstream.udfGroupBy(g.group_cols, g.aggs, registry);

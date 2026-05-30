@@ -108,7 +108,14 @@ pub const ParallelScan = struct {
 
     acct: ?*exec.memory.MemoryAccountant,
     owns_acct: bool,
-    out_schema: []const Column, // borrowed from workers[0]
+    out_schema: []const Column, // borrowed from workers[0], or owned when projected
+
+    // Emit projection (materialize path): when a downstream consumer (a GROUP BY)
+    // reports it reads only a subset of columns, drop the rest from the deep-copy
+    // — they were decoded only to feed a fused filter/compute and are dead above.
+    // `emit_keep[j]` is the worker-output index of projected output column j.
+    emit_keep: ?[]const usize = null,
+    owns_out_schema: bool = false,
 
     // Round state (touched only on the calling thread, between fork-joins).
     round: []?Batch, // one slot per worker; the batch it produced this round
@@ -118,6 +125,21 @@ pub const ParallelScan = struct {
     exhausted: []bool, // worker has returned null (done)
     round_cursor: usize, // next round slot to emit; == workers.len ⇒ run a round
     all_done: bool,
+
+    // Round-mode persistent worker pool. The fork-join in `runRound` reuses
+    // `n_threads-1` long-lived threads (the calling thread is the nth) that
+    // work-steal the `n_chunks` chunk-scans from `next_chunk` each round — so a
+    // DOP-N scan runs N threads, NOT N*CHUNK_FACTOR, and never oversubscribes the
+    // cores (one thread per chunk thrashed 48 threads onto 12 cores and the idle
+    // ones stole cycles from the serial consumer). Persisting the threads avoids
+    // re-spawning per round (hundreds–thousands of rounds for a big unfiltered
+    // scan cost more in spawns than the decode). Workers spin on a sense-reversing
+    // generation barrier (no std.Thread.Condition in this Zig fork): main bumps
+    // `round_gen` to release them and waits on `round_done` to reach `n_chunks`.
+    pool_started: bool = false,
+    round_gen: std.atomic.Value(u32) = .{ .raw = 0 },
+    round_done: std.atomic.Value(u32) = .{ .raw = 0 },
+    pool_shutdown: std.atomic.Value(bool) = .{ .raw = false },
 
     // Materialize-mode state (fused-filter path). Chosen lazily on the first
     // next() once we know whether a filter was fused in. `wbufs`/`emit_views`
@@ -265,6 +287,9 @@ pub const ParallelScan = struct {
     }
 
     pub fn deinit(self: *ParallelScan) void {
+        // Round-mode pool may still be parked on the barrier (query abandoned
+        // before the stream drained, e.g. an error or early LIMIT). Join first.
+        self.shutdownRoundPool();
         // Materialize-mode buffers: column data is owned by the table's
         // allocator (workers allocated it); the wbufs/views slices are the
         // operator's own. Release the charged bytes before the accountant is
@@ -296,6 +321,8 @@ pub const ParallelScan = struct {
         self.allocator.free(self.threads);
         self.allocator.free(self.thread_active);
         self.allocator.free(self.exhausted);
+        if (self.emit_keep) |k| self.allocator.free(k);
+        if (self.owns_out_schema) self.allocator.free(@constCast(self.out_schema));
         self.table.ddl_lock.unlockShared(self.table.io);
         if (self.owns_acct) {
             if (self.acct) |a| self.allocator.destroy(a);
@@ -350,6 +377,42 @@ pub const ParallelScan = struct {
         self.out_schema = q[0].outputSchema();
         self.compute_fused = true;
         return true;
+    }
+
+    /// A downstream consumer reports it reads only `keep`. On the materialize
+    /// path, drop every other output column from the survivor deep-copy — they
+    /// were decoded purely to feed a fused filter/compute (e.g. `URL` behind
+    /// `length(URL)` + `URL<>''`) and nothing above reads them. Safe because the
+    /// forwarding chain only reaches here past a fused (pass-through) Filter; an
+    /// unfused Filter swallows the call (its predicate still needs the columns).
+    /// No-op for the round (stream) path — that emits the scan's already-pruned
+    /// columns, so there is nothing dead to drop.
+    pub fn setEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
+        if (self.emit_keep != null) return;
+        if (!(self.workers[0].fusedActive() or self.compute_fused)) return;
+        const full = self.out_schema;
+        var idxs = try self.allocator.alloc(usize, full.len);
+        errdefer self.allocator.free(idxs);
+        var n: usize = 0;
+        for (full, 0..) |c, i| {
+            for (keep) |k| {
+                if (types.columnNameEql(c.name, k)) {
+                    idxs[n] = i;
+                    n += 1;
+                    break;
+                }
+            }
+        }
+        if (n == full.len) { // consumer reads everything — nothing to drop
+            self.allocator.free(idxs);
+            return;
+        }
+        const reduced = try self.allocator.alloc(Column, n);
+        errdefer self.allocator.free(reduced);
+        for (0..n) |j| reduced[j] = full[idxs[j]];
+        self.emit_keep = try self.allocator.realloc(idxs, n);
+        self.out_schema = reduced;
+        self.owns_out_schema = true;
     }
 
     pub fn stats(self: *ParallelScan) exec.PipelineStats {
@@ -497,31 +560,28 @@ pub const ParallelScan = struct {
     }
 
     /// Run one `next()` on every live worker concurrently, then stage their
-    /// batches for in-order emission.
+    /// batches for in-order emission. The workers are a persistent pool spawned
+    /// on the first round; each round is a generation-barrier fork-join, so a
+    /// long unfiltered scan no longer pays N thread spawns per round.
     fn runRound(self: *ParallelScan) !void {
         const n = self.workers.len;
+        if (!self.pool_started) self.startRoundPool();
+
         for (self.round) |*r| r.* = null;
         for (self.werr) |*e| e.* = null;
-        @memset(self.thread_active, false);
 
-        // Spawn the non-exhausted workers 1..n-1; run worker 0 inline.
-        var i: usize = 1;
-        while (i < n) : (i += 1) {
-            if (self.exhausted[i]) continue;
-            if (std.Thread.spawn(.{}, runOne, .{ self.workers[i], &self.round[i], &self.werr[i] })) |th| {
-                self.threads[i] = th;
-                self.thread_active[i] = true;
-            } else |_| {
-                // Spawn failed (slot/OOM): run it inline rather than drop it.
-                runOne(self.workers[i], &self.round[i], &self.werr[i]);
-            }
-        }
-        if (!self.exhausted[0]) runOne(self.workers[0], &self.round[0], &self.werr[0]);
+        // Open this round: reset the steal cursor + done counter, then bump the
+        // generation the pooled workers are parked on. They — and this thread —
+        // claim chunks from `next_chunk` until it passes `n`.
+        self.next_chunk.store(0, .release);
+        self.round_done.store(0, .release);
+        _ = self.round_gen.fetchAdd(1, .release);
 
-        i = 1;
-        while (i < n) : (i += 1) {
-            if (self.thread_active[i]) self.threads[i].join();
-        }
+        // The calling thread is a worker too; it would otherwise just block here.
+        self.roundSteal();
+
+        // Wait until every chunk has been run this round (one increment each).
+        while (self.round_done.load(.acquire) < n) std.Thread.yield() catch {};
 
         // Propagate the first worker error (others' batches are discarded).
         for (self.werr) |e| if (e) |err| return err;
@@ -533,6 +593,59 @@ pub const ParallelScan = struct {
         }
         self.all_done = all;
         self.round_cursor = 0;
+        // Stream exhausted: tear the pool down so its threads stop spinning. The
+        // already-staged batches in `round[]` stay valid (they alias the worker
+        // Scans, freed only in deinit) and are emitted by `nextRound`.
+        if (all) self.shutdownRoundPool();
+    }
+
+    /// Claim chunk-scans from `next_chunk` and run one `next()` on each into its
+    /// own `round`/`werr` slot, until the cursor passes the chunk count. Shared by
+    /// the calling thread and every pooled worker — `n_threads` runners draining
+    /// `workers.len` chunks. Every claimed chunk bumps `round_done` (even an
+    /// already-exhausted one, which is skipped) so the barrier counts exactly `n`.
+    fn roundSteal(self: *ParallelScan) void {
+        const n = self.workers.len;
+        while (true) {
+            const i = self.next_chunk.fetchAdd(1, .acq_rel);
+            if (i >= n) break;
+            if (!self.exhausted[i]) runOne(self.workers[i], &self.round[i], &self.werr[i]);
+            _ = self.round_done.fetchAdd(1, .release);
+        }
+    }
+
+    /// Spawn `n_threads-1` persistent work-stealing threads (the calling thread is
+    /// the nth runner). A thread that fails to spawn is simply absent — the steal
+    /// cursor guarantees the remaining runners still cover every chunk, so the
+    /// scan stays correct at any spawn count.
+    fn startRoundPool(self: *ParallelScan) void {
+        self.round_gen.store(0, .monotonic);
+        self.round_done.store(0, .monotonic);
+        self.pool_shutdown.store(false, .monotonic);
+        @memset(self.thread_active, false);
+        var i: usize = 1;
+        while (i < self.n_threads) : (i += 1) {
+            if (std.Thread.spawn(.{}, roundWorker, .{self})) |th| {
+                self.threads[i] = th;
+                self.thread_active[i] = true;
+            } else |_| {}
+        }
+        self.pool_started = true;
+    }
+
+    /// Signal the pool to exit and join every spawned worker. Idempotent.
+    fn shutdownRoundPool(self: *ParallelScan) void {
+        if (!self.pool_started) return;
+        self.pool_shutdown.store(true, .release);
+        _ = self.round_gen.fetchAdd(1, .release); // wake workers parked on the barrier
+        var i: usize = 1;
+        while (i < self.n_threads) : (i += 1) {
+            if (self.thread_active[i]) {
+                self.threads[i].join();
+                self.thread_active[i] = false;
+            }
+        }
+        self.pool_started = false;
     }
 };
 
@@ -542,6 +655,38 @@ fn runOne(scan: *Scan, out_batch: *?Batch, out_err: *?anyerror) void {
         return;
     };
     out_batch.* = r;
+}
+
+/// One persistent round-mode pool thread. Parks on the generation barrier, then
+/// work-steals chunk-scans for the round via `roundSteal`. Exits when
+/// `pool_shutdown` is set. Touches only the chunk slots it claims plus the shared
+/// barrier/cursor atomics, so — like the materialize-mode steal workers — it needs
+/// no further locking (the cache + table allocator are thread-safe; the accountant
+/// is untouched here).
+fn roundWorker(self: *ParallelScan) void {
+    var seen: u32 = 0;
+    while (true) {
+        var spins: u32 = 0;
+        while (true) {
+            const g = self.round_gen.load(.acquire);
+            if (g != seen) {
+                seen = g;
+                break;
+            }
+            if (self.pool_shutdown.load(.acquire)) return;
+            // Park on the barrier with a PAUSE-heavy spin: between rounds the
+            // serial consumer (often a GROUP BY hash aggregate) is the bottleneck,
+            // and a worker busy-spinning on its own logical core would steal the
+            // sibling hyperthread's execution units from it. `spinLoopHint` (PAUSE)
+            // cedes those units without giving up the core, so the worker still
+            // wakes instantly on the next gen bump — no sleep latency. An occasional
+            // OS yield covers genuine oversubscription (DOP > physical cores).
+            spins +%= 1;
+            if (spins & 63 == 0) std.Thread.yield() catch {} else std.atomic.spinLoopHint();
+        }
+        if (self.pool_shutdown.load(.acquire)) return;
+        self.roundSteal();
+    }
 }
 
 /// One worker thread's steal loop: repeatedly claim the next chunk from the
@@ -565,7 +710,7 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
             lease = sched.acquire();
             leased = true;
         }
-        drainWorker(drainables[i], ta, self.out_schema, &self.wbufs[i], &self.werr[i]);
+        drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, &self.wbufs[i], &self.werr[i]);
     }
 }
 
@@ -576,7 +721,7 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
 /// be thread-safe (the table allocator) — workers run concurrently and never
 /// touch the query accountant. `drainable` is `*Scan` or `Query`; both expose
 /// `.next()`, so this is monomorphized per call site.
-fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, wb: *WorkerBuf, out_err: *?anyerror) void {
+fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, keep: ?[]const usize, wb: *WorkerBuf, out_err: *?anyerror) void {
     var d = drainable;
     const cols = alloc.alloc(ColumnStore, schema.len) catch |e| {
         out_err.* = e;
@@ -607,8 +752,11 @@ fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, wb:
         if (timing) scan_ticks += @intCast(exec.prof.nowTicks() - s0);
         const batch = mb orelse break;
         const c0 = if (timing) exec.prof.nowTicks() else 0;
-        for (batch.values, 0..) |view, i| {
-            transform.appendAllColumn(alloc, view, &cols[i]) catch |e| {
+        // `keep[j]` maps projected output column j to its batch index; without a
+        // projection the mapping is the identity (copy every column).
+        for (cols, 0..) |*store, j| {
+            const src = if (keep) |k| k[j] else j;
+            transform.appendAllColumn(alloc, batch.values[src], store) catch |e| {
                 out_err.* = e;
                 break :outer;
             };

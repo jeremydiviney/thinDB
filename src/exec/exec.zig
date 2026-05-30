@@ -210,6 +210,14 @@ pub const VTable = struct {
     configureCodedKeys: *const fn (ptr: *anyopaque, coded_mask: []const bool, dicts: []const ?*global_dict.GlobalDict) anyerror!bool,
     /// Phase 4.2 multi-key: roll back a Scan's coded-column setup (gate undo).
     clearDictCodeColumns: *const fn (ptr: *anyopaque) void,
+    /// Restrict this operator's MATERIALIZED output to the named columns — the
+    /// only ones a downstream consumer (e.g. a GROUP BY) actually reads. Lets the
+    /// parallel-scan materialize skip deep-copying columns that were decoded only
+    /// to feed a fused filter/compute (e.g. `URL` behind `length(URL)` + `URL<>''`)
+    /// and are dead above. A fused (pass-through) Filter forwards it; an UNFUSED
+    /// Filter swallows it (its predicate still needs those columns at runtime).
+    /// Every other operator no-ops via `makeQuery`'s `@hasDecl` guard.
+    setEmitProjection: *const fn (ptr: *anyopaque, keep: []const []const u8) anyerror!void,
 };
 
 /// Write `depth` levels of indentation then a complete label line.
@@ -385,6 +393,13 @@ pub const Query = struct {
     /// Returns true iff an eligible Aggregate accepted.
     pub fn setCodedKey(self: Query, dict: *global_dict.GlobalDict) bool {
         return self.vtable.setCodedKey(self.ptr, dict);
+    }
+
+    /// Tell the underlying parallel scan that the consumer above only reads
+    /// `keep` — so its materialize can drop dead columns (decoded for a fused
+    /// filter/compute, never read above). See `VTable.setEmitProjection`.
+    pub fn setEmitProjection(self: Query, keep: []const []const u8) !void {
+        return self.vtable.setEmitProjection(self.ptr, keep);
     }
 
     /// Phase 4.2 multi-key: can the underlying Scan emit `name` as codes?
@@ -615,6 +630,11 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             o.clearDictCodeColumns();
         }
+        fn setEmitProjectionWrap(ptr: *anyopaque, keep: []const []const u8) anyerror!void {
+            if (!@hasDecl(Op, "setEmitProjection")) return;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.setEmitProjection(keep);
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
@@ -631,6 +651,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .canCodeColumn = canCodeColumnWrap,
             .configureCodedKeys = configureCodedKeysWrap,
             .clearDictCodeColumns = clearDictCodeColumnsWrap,
+            .setEmitProjection = setEmitProjectionWrap,
         };
     };
 

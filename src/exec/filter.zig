@@ -191,6 +191,14 @@ pub const Filter = struct {
         if (self.fused) self.upstream.clearDictCodeColumns();
     }
 
+    /// Forward the consumer's emit-projection upstream ONLY when this Filter is a
+    /// pass-through (its predicate already ran in the Scan). A non-fused Filter
+    /// still evaluates its predicate over the upstream batch at runtime, so it
+    /// needs those columns materialized — swallow the projection to keep them.
+    pub fn setEmitProjection(self: *Filter, keep: []const []const u8) !void {
+        if (self.fused) try self.upstream.setEmitProjection(keep);
+    }
+
     /// Forward a projection-Compute fusion to the upstream, but only when this
     /// Filter is itself fused (a pass-through). A non-fused Filter still
     /// evaluates rows here, so a Compute above it must stay a separate operator.
