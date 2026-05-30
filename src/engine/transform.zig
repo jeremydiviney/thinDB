@@ -380,7 +380,14 @@ fn compactInto(
     var survivors: usize = 0;
     for (mask) |m| survivors += @intFromBool(m);
     if (survivors == 0) return;
-    try list.ensureUnusedCapacity(allocator, survivors);
+    // The branchless body writes `base[pos] = v` for EVERY row and advances
+    // `pos` only on survivors, so after the last survivor any trailing
+    // non-survivor stores into `base[len + survivors]` — one slot past the
+    // `survivors` live elements. Reserve that extra scratch slot so the throw-
+    // away store stays in-bounds (its value is never committed: `len` below is
+    // set to `pos == old_len + survivors`). Omitting the +1 is a heap overrun
+    // whenever the last selected row is filtered out.
+    try list.ensureUnusedCapacity(allocator, survivors + 1);
     const base = list.items.ptr;
     var pos = list.items.len;
     for (src, mask) |v, m| {
@@ -616,4 +623,29 @@ pub fn applyPermutation(
     }
 
     return .{ .data = dst_data, .nulls = nulls };
+}
+
+test "appendMaskedColumn fixed-width: trailing filtered-out row never overruns" {
+    const testing = std.testing;
+    // The branchless compaction in `compactInto` stores `base[pos]` for EVERY
+    // source row and only advances `pos` on survivors, so the final trailing
+    // non-survivor writes one slot past the survivor count. Reservation must
+    // include that scratch slot; otherwise this is a heap overrun (only the
+    // *last* row being filtered out triggers it). Exercise that exact shape.
+    const cases = .{
+        .{ .src = [_]i64{ 10, 20, 30, 40, 50 }, .mask = [_]bool{ true, false, true, false, false }, .want = [_]i64{ 10, 30 } },
+        .{ .src = [_]i64{ 1, 2, 3 }, .mask = [_]bool{ false, false, false }, .want = [_]i64{} }, // all out
+        .{ .src = [_]i64{ 7, 8, 9 }, .mask = [_]bool{ true, true, true }, .want = [_]i64{ 7, 8, 9 } }, // none out
+        .{ .src = [_]i64{ 5 }, .mask = [_]bool{false}, .want = [_]i64{} }, // single, filtered
+    };
+    inline for (cases) |c| {
+        var src = c.src; // runtime copies — comptime-var pointers can't reach a runtime fn
+        var mask = c.mask;
+        const want = c.want;
+        var out = try ColumnStore.init(testing.allocator, .bigint, false);
+        defer out.deinit(testing.allocator);
+        const view = ColumnView{ .data = .{ .bigint = &src } };
+        try appendMaskedColumn(testing.allocator, view, &mask, &out);
+        try testing.expectEqualSlices(i64, &want, out.data.bigint.items);
+    }
 }
