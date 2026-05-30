@@ -598,7 +598,7 @@ fn extended_handleExecute(
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const op = try sql.parseDialect(aa, portal.bound_sql, .postgres);
+    const op = try sql.parseDialectWithUdfs(aa, portal.bound_sql, .postgres, &catalog.udfs);
 
     if (op.* == .batch) {
         for (op.batch.statements) |stmt| {
@@ -975,7 +975,7 @@ fn runEngineQuery(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const op = try sql.parseDialect(arena.allocator(), sql_text, .postgres);
+    const op = try sql.parseDialectWithUdfs(arena.allocator(), sql_text, .postgres, &catalog.udfs);
 
     if (op.* == .batch) {
         // PG simple-Query protocol natively supports `;`-separated

@@ -66,6 +66,8 @@ pub const Error = error{
     DatabaseAlreadyExists,
     SchemaNotFound,
     SchemaAlreadyExists,
+    FunctionAlreadyExists,
+    FunctionInvalidDefinition,
     /// In-flight query was cancelled by a peer (MySQL KILL or PG
     /// CancelRequest / pg_cancel_backend). Caller should map this to
     /// the protocol-specific abort code and continue serving the
@@ -582,11 +584,19 @@ pub const ClientQuery = struct {
         for (group_cols, 0..) |c, i| grp_dup[i] = try aa.dupe(u8, c);
 
         const aggs_dup = try aa.alloc(AggSpec, aggs.len);
-        for (aggs, 0..) |a, i| aggs_dup[i] = .{
-            .func = a.func,
-            .col = if (a.col) |c| try aa.dupe(u8, c) else null,
-            .as = try aa.dupe(u8, a.as),
-        };
+        for (aggs, 0..) |a, i| {
+            const udf_arg_cols = try aa.alloc([]const u8, a.udf_arg_cols.len);
+            for (a.udf_arg_cols, udf_arg_cols) |c, *dst| dst.* = try aa.dupe(u8, c);
+            aggs_dup[i] = .{
+                .func = a.func,
+                .udf_name = if (a.udf_name) |n| try aa.dupe(u8, n) else null,
+                .udf_arg_cols = udf_arg_cols,
+                .col = if (a.col) |c| try aa.dupe(u8, c) else null,
+                .as = try aa.dupe(u8, a.as),
+                .params = a.params,
+                .out_type_override = a.out_type_override,
+            };
+        }
 
         const upstream = try aa.create(ir.Op);
         upstream.* = prev_root;
@@ -1723,7 +1733,15 @@ fn lateMatShape(allocator: Allocator, table: *ApiTable, l: ir.Op.Limit) !?LateMa
     // names; `SELECT *` expands to every base column.
     var owns_output = false;
     const output_names: []const []const u8 = if (peel.select) |p| blk: {
+        if (p.outputs != null or p.star_skip_trailing != 0) {
+            probe.deinit(allocator);
+            return null;
+        }
         for (p.columns) |nm| {
+            if (std.mem.eql(u8, nm, "*") or aliasStarSource(nm) != null) {
+                probe.deinit(allocator);
+                return null;
+            }
             if (types.findColumn(table.schema.columns, nm) == null) {
                 probe.deinit(allocator);
                 return null;
@@ -1843,7 +1861,12 @@ pub fn buildServerQuerySession(
         .scan => |s| blk: {
             const catalog = catalogFor(db) orelse return Error.DatabaseNotFound;
             const t = try resolveTable(catalog, session, s.table);
-            break :blk try exec.scan(allocator, t);
+            const base = try exec.scan(allocator, t);
+            if (s.alias) |alias| {
+                errdefer @constCast(&base).deinit();
+                break :blk try exec.AliasRename.create(allocator, base, alias);
+            }
+            break :blk base;
         },
         .file_scan => |f| blk: {
             const base = try exec.fileScan(allocator, db.io, db.config.file_scan_access, f, null);
@@ -1852,6 +1875,11 @@ pub fn buildServerQuerySession(
                 break :blk try exec.AliasRename.create(allocator, base, alias);
             }
             break :blk base;
+        },
+        .alias => |a| blk: {
+            var upstream = try buildServerQuerySession(allocator, db, session, a.upstream.*);
+            errdefer upstream.deinit();
+            break :blk try exec.AliasRename.create(allocator, upstream, a.alias);
         },
         .limit => |l| blk: {
             // Late materialization (see compileOp for the rationale + the
@@ -1876,7 +1904,7 @@ pub fn buildServerQuerySession(
                 var topn = try inner.topN(f.order_by.specs, @intCast(l.n), @intCast(l.offset));
                 if (f.project) |p| {
                     errdefer topn.deinit();
-                    topn = try topn.project(p.columns);
+                    topn = try compileSelectProject(allocator, topn, p);
                 }
                 break :blk topn;
             }
@@ -1890,7 +1918,7 @@ pub fn buildServerQuerySession(
         .select => |s| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, s.upstream.*);
             errdefer upstream.deinit();
-            break :blk try upstream.project(s.columns);
+            break :blk try compileSelectProject(allocator, upstream, s);
         },
         .exclude => |e| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, e.upstream.*);
@@ -1913,7 +1941,7 @@ pub fn buildServerQuerySession(
         .group_by => |g| blk: {
             // Metadata-only MIN/MAX over a bare table scan — answer from the
             // manifest stats without building (or draining) a scan at all.
-            if (g.group_cols.len == 0) switch (g.upstream.*) {
+            if (!hasUdfAgg(g.aggs) and g.group_cols.len == 0) switch (g.upstream.*) {
                 .scan => |s| {
                     if (catalogFor(db)) |catalog| {
                         if (resolveTable(catalog, session, s.table)) |t| {
@@ -1925,6 +1953,10 @@ pub fn buildServerQuerySession(
             };
             var upstream = try buildServerQuerySession(allocator, db, session, g.upstream.*);
             errdefer upstream.deinit();
+            if (hasUdfAgg(g.aggs)) {
+                const registry = if (catalogFor(db)) |catalog| &catalog.udfs else return Error.UnsupportedOp;
+                break :blk try upstream.udfGroupBy(g.group_cols, g.aggs, registry);
+            }
             if (try routeStreamGroupBy(allocator, &upstream, g.group_cols, g.aggs, db.config.query_memory_budget)) |q| {
                 break :blk q;
             }
@@ -1936,8 +1968,11 @@ pub fn buildServerQuerySession(
         .compute => |c| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, c.upstream.*);
             errdefer upstream.deinit();
+            const udfs = if (catalogFor(db)) |catalog| &catalog.udfs else null;
+            // Try fusing row-local derived into the parallel scan workers; a UDF
+            // (not fusable) declines, falling back to the UDF-aware compute.
             if (try upstream.tryFuseCompute(c.derived)) break :blk upstream;
-            break :blk try upstream.compute(c.derived);
+            break :blk try upstream.computeWithRegistry(c.derived, udfs);
         },
         .join => |j| blk: {
             var left = try buildServerQuerySession(allocator, db, session, j.left.*);
@@ -2016,6 +2051,7 @@ pub fn buildServerQuerySession(
 pub const CompileCtx = struct {
     allocator: Allocator,
     db: *Database,
+    udf_registry: ?*const @import("../udf.zig").UdfRegistry = null,
     /// Mutable so DDL `USE` statements can update `current_db` /
     /// `current_schema` for subsequent statements that share the
     /// same Session. Borrowed; caller owns the value.
@@ -2219,6 +2255,7 @@ pub fn compileWithSession(
     var ctx = CompileCtx{
         .allocator = allocator,
         .db = db,
+        .udf_registry = if (catalogFor(db)) |catalog| &catalog.udfs else null,
         .session = session_cell,
         .now_micros = std.Io.Timestamp.now(db.io, .real).toMicroseconds(),
     };
@@ -2649,7 +2686,7 @@ fn projWalkExpr(c: *ProjScan, allocator: Allocator, e: ir.Expr) void {
     if (c.bail) return;
     switch (e) {
         .col_ref => |nm| c.add(allocator, nm),
-        .lit => {},
+        .lit, .null_lit => {},
         .call => |call| for (call.args) |a| projWalkExpr(c, allocator, a),
         .case => |cs| {
             for (cs.branches) |br| {
@@ -2666,11 +2703,18 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
     if (c.bail) return;
     switch (op.*) {
         .scan, .file_scan => {},
+        .alias => |a| projWalkOp(c, allocator, a.upstream),
         .single_row => {},
         .limit => |l| projWalkOp(c, allocator, l.upstream),
         .select => |p| {
             c.has_shaper = true;
-            for (p.columns) |nm| c.add(allocator, nm);
+            for (p.columns) |nm| {
+                if (std.mem.eql(u8, nm, "*") or aliasStarSource(nm) != null) {
+                    c.bail = true;
+                    return;
+                }
+                c.add(allocator, nm);
+            }
             projWalkOp(c, allocator, p.upstream);
         },
         .filter => |f| {
@@ -2684,7 +2728,10 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
         .group_by => |g| {
             c.has_shaper = true;
             for (g.group_cols) |nm| c.add(allocator, nm);
-            for (g.aggs) |a| if (a.col) |nm| c.add(allocator, nm);
+            for (g.aggs) |a| {
+                if (a.col) |nm| c.add(allocator, nm);
+                for (a.udf_arg_cols) |nm| c.add(allocator, nm);
+            }
             projWalkOp(c, allocator, g.upstream);
         },
         .compute => |cmp| {
@@ -2770,6 +2817,16 @@ fn aggUsesColumn(aggs: []const AggSpec, name: []const u8) bool {
         if (a.col) |c| {
             if (@import("../types.zig").columnNameEql(c, name)) return true;
         }
+        for (a.udf_arg_cols) |c| {
+            if (@import("../types.zig").columnNameEql(c, name)) return true;
+        }
+    }
+    return false;
+}
+
+fn hasUdfAgg(aggs: []const AggSpec) bool {
+    for (aggs) |a| {
+        if (a.func == .udf) return true;
     }
     return false;
 }
@@ -2785,7 +2842,8 @@ fn stripAlias(alias: []const u8, name: []const u8) ?[]const u8 {
 /// and the remainder (CASE, anything referencing a sibling derived, etc.) runs
 /// in a serial Compute above the parallel merge. When nothing is fusable — or
 /// the upstream isn't a parallel scan (DOP=1) — it degrades to a single serial
-/// Compute over all derived, identical to the old behavior.
+/// Compute over all derived. The serial Compute is UDF-registry-aware so
+/// user-defined scalar fns still resolve.
 fn fuseSplitCompute(ctx: *CompileCtx, upstream: Query, derived: []const ir.Derived) !Query {
     var up = upstream;
     const scan_cols = up.outputSchema();
@@ -2801,12 +2859,74 @@ fn fuseSplitCompute(ctx: *CompileCtx, upstream: Query, derived: []const ir.Deriv
         }
     }
     // Nothing fusable, or fusion declined (no parallel scan beneath) → all serial.
-    if (fusable.items.len == 0) return up.compute(derived);
-    if (!try up.tryFuseCompute(fusable.items)) return up.compute(derived);
+    if (fusable.items.len == 0) return up.computeWithRegistry(derived, ctx.udf_registry);
+    if (!try up.tryFuseCompute(fusable.items)) return up.computeWithRegistry(derived, ctx.udf_registry);
     // Fused subset now runs in the workers; layer the remainder serially (it can
     // reference the fused columns, which are now in `up`'s output schema).
     if (serial.items.len == 0) return up;
-    return up.compute(serial.items);
+    return up.computeWithRegistry(serial.items, ctx.udf_registry);
+}
+
+fn aliasStarSource(name: []const u8) ?[]const u8 {
+    if (name.len <= 2) return null;
+    if (name[name.len - 2] != '.' or name[name.len - 1] != '*') return null;
+    return name[0 .. name.len - 2];
+}
+
+fn appendExpandedProjectItem(
+    allocator: Allocator,
+    sources: *std.ArrayListUnmanaged([]const u8),
+    outputs: *std.ArrayListUnmanaged([]const u8),
+    schema: []const types.Column,
+    item: []const u8,
+    output: ?[]const u8,
+) !void {
+    if (std.mem.eql(u8, item, "*")) {
+        for (schema) |c| {
+            try sources.append(allocator, c.name);
+            try outputs.append(allocator, c.name);
+        }
+        return;
+    }
+    if (aliasStarSource(item)) |alias| {
+        var matched = false;
+        for (schema) |c| {
+            if (stripAlias(alias, c.name)) |bare| {
+                matched = true;
+                try sources.append(allocator, c.name);
+                try outputs.append(allocator, bare);
+            }
+        }
+        if (!matched) return Error.ColumnNotFound;
+        return;
+    }
+
+    const idx = types.findColumn(schema, item) orelse return Error.ColumnNotFound;
+    try sources.append(allocator, item);
+    try outputs.append(allocator, output orelse schema[idx].name);
+}
+
+fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Project) !Query {
+    const schema = upstream.outputSchema();
+    if (p.star_skip_trailing > schema.len) return Error.BadRequest;
+    const star_schema = schema[0 .. schema.len - p.star_skip_trailing];
+
+    var sources: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer sources.deinit(allocator);
+    var outputs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer outputs.deinit(allocator);
+
+    for (p.columns, 0..) |item, i| {
+        const explicit_output: ?[]const u8 = if (p.outputs) |outs| outs[i] else null;
+        const expansion_schema = if (std.mem.eql(u8, item, "*") or aliasStarSource(item) != null) star_schema else schema;
+        try appendExpandedProjectItem(allocator, &sources, &outputs, expansion_schema, item, explicit_output);
+    }
+
+    const source_slice = try sources.toOwnedSlice(allocator);
+    defer allocator.free(source_slice);
+    const output_slice = try outputs.toOwnedSlice(allocator);
+    defer allocator.free(output_slice);
+    return upstream.projectNamed(source_slice, output_slice);
 }
 
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
@@ -2880,6 +3000,11 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             }
             break :blk base;
         },
+        .alias => |a| blk: {
+            var upstream = try compileOp(ctx, a.upstream);
+            errdefer upstream.deinit();
+            break :blk try exec.AliasRename.create(ctx.allocator, upstream, a.alias);
+        },
         .limit => |l| blk: {
             // Late materialization: a wide `SELECT` over a single base table
             // with a selective WHERE [+ ORDER BY] LIMIT decodes only the probe
@@ -2905,7 +3030,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 var topn = try inner.topN(f.order_by.specs, @intCast(l.n), @intCast(l.offset));
                 if (f.project) |p| {
                     errdefer topn.deinit();
-                    topn = try topn.project(p.columns);
+                    topn = try compileSelectProject(ctx.allocator, topn, p);
                 }
                 break :blk topn;
             }
@@ -2918,7 +3043,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .select => |s| blk: {
             var upstream = try compileOp(ctx, s.upstream);
             errdefer upstream.deinit();
-            break :blk try upstream.project(s.columns);
+            break :blk try compileSelectProject(ctx.allocator, upstream, s);
         },
         .exclude => |e| blk: {
             var upstream = try compileOp(ctx, e.upstream);
@@ -2941,7 +3066,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .group_by => |g| blk: {
             // Metadata-only MIN/MAX over a bare table scan — answer from the
             // manifest stats without building (or draining) a scan at all.
-            if (g.group_cols.len == 0) switch (g.upstream.*) {
+            if (!hasUdfAgg(g.aggs) and g.group_cols.len == 0) switch (g.upstream.*) {
                 .scan => |s| {
                     if (catalogFor(ctx.db)) |catalog| {
                         if (resolveTable(catalog, ctx.session.*, s.table)) |t| {
@@ -2965,10 +3090,14 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 break :blk q;
             }
             std.debug.assert(!consumed_base);
-            // Not reduced: re-layer the peeled Compute onto the built base,
-            // splitting it so row-local derived columns run in the parallel scan
-            // workers and the rest stays serial.
+            // Not reduced: re-layer the peeled Compute, splitting row-local
+            // derived into the parallel-scan workers (the serial remainder is
+            // UDF-registry-aware). A UDF aggregate then takes the udfGroupBy path.
             if (agg_args.len > 0) upstream = try fuseSplitCompute(ctx, upstream, agg_args);
+            if (hasUdfAgg(g.aggs)) {
+                const registry = ctx.udf_registry orelse return Error.UnsupportedOp;
+                break :blk try upstream.udfGroupBy(g.group_cols, g.aggs, registry);
+            }
             // Global aggregate (no group keys) is O(1) — always hash.
             if (try routeStreamGroupBy(ctx.allocator, &upstream, g.group_cols, g.aggs, ctx.db.config.query_memory_budget)) |q| {
                 break :blk q;
@@ -3047,7 +3176,8 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             var upstream = try compileOp(ctx, c.upstream);
             errdefer upstream.deinit();
             // Split: row-local derived columns run in the parallel scan workers
-            // (forwarding through a fused Filter); the remainder stays serial.
+            // (forwarding through a fused Filter); the remainder stays serial
+            // (UDF-registry-aware via fuseSplitCompute).
             break :blk try fuseSplitCompute(ctx, upstream, c.derived);
         },
         .join => |j| blk: {

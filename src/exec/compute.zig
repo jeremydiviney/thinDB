@@ -38,6 +38,7 @@ const scalar_fn = @import("scalar_fn.zig");
 const ScalarFn = scalar_fn.ScalarFn;
 const simd = @import("../util/simd.zig");
 const NullStrategy = scalar_fn.NullStrategy;
+const udf_mod = @import("../udf.zig");
 
 const cast = @import("cast.zig");
 const CastKernel = cast.CastKernel;
@@ -62,6 +63,7 @@ pub const Derived = struct {
 const ArgPlan = union(enum) {
     col: usize,
     lit: *LitSlot,
+    null_lit: *NullSlot,
     call: *CallPlan,
 };
 
@@ -69,6 +71,12 @@ const ArgPlan = union(enum) {
 /// `row_count` copies of `value`.
 const LitSlot = struct {
     value: types.Value,
+    buf: ColumnStore,
+};
+
+/// Per-typed-NULL scratch, refilled each batch with invalid placeholders.
+const NullSlot = struct {
+    ty: Type,
     buf: ColumnStore,
 };
 
@@ -139,6 +147,7 @@ const ResolvedDerived = struct {
     stat_class: StatClass,
     kind: union(enum) {
         rename: struct { src_idx: usize },
+        null_only: Type,
         lit_only: *LitSlot,
         call: *CallPlan,
         case: *CasePlan,
@@ -159,6 +168,7 @@ const CaseBranch = struct {
 const BranchSrc = union(enum) {
     col: usize,
     lit: *LitSlot,
+    null_lit: *NullSlot,
     call: *CallPlan,
 };
 
@@ -199,6 +209,15 @@ pub const Compute = struct {
         upstream: Query,
         derived: []const Derived,
     ) !Query {
+        return createWithRegistry(allocator, upstream, derived, null);
+    }
+
+    pub fn createWithRegistry(
+        allocator: Allocator,
+        upstream: Query,
+        derived: []const Derived,
+        udf_registry: ?*const udf_mod.UdfRegistry,
+    ) !Query {
         if (derived.len == 0) return Error.ComputeNoColumns;
         const up_schema = upstream.outputSchema();
 
@@ -207,7 +226,7 @@ pub const Compute = struct {
         const aa = arena.allocator();
 
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
-        for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema);
+        for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema, udf_registry);
 
         // Validate no duplicate derived names AND no collision with
         // upstream column names (downstream wouldn't be able to
@@ -275,6 +294,7 @@ pub const Compute = struct {
                 .lit_only => |slot| slot.buf.deinit(self.allocator),
                 .case => |plan| freeCasePlan(self.allocator, plan),
                 .rename => {},
+                .null_only => {},
                 .fused_scalar => {},
             }
         }
@@ -360,6 +380,7 @@ pub const Compute = struct {
             out_col.clear();
             switch (r.kind) {
                 .rename => |rn| try appendCopiedColumn(self.allocator, out_col, in.values[rn.src_idx], n),
+                .null_only => try fillNullColumn(self.allocator, out_col, n),
                 .lit_only => |slot| {
                     slot.buf.clear();
                     try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
@@ -410,6 +431,11 @@ pub const Compute = struct {
                     try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
                     view.* = slot.buf.view();
                 },
+                .null_lit => |slot| {
+                    slot.buf.clear();
+                    try fillNullColumn(self.allocator, &slot.buf, n);
+                    view.* = slot.buf.view();
+                },
                 .call => |sub| {
                     try self.evalCall(sub, in_values, n);
                     view.* = sub.output.view();
@@ -432,7 +458,14 @@ pub const Compute = struct {
         }
 
         // 3. Run the kernel.
-        try plan.func.kernel(self.allocator, arg_views, plan.output, n);
+        if (plan.func.kernel) |k| {
+            try k(self.allocator, arg_views, plan.output, n);
+        } else if (plan.func.udf_kernel) |k| {
+            const ctx: udf_mod.ScalarContext = .{ .allocator = self.allocator, .user_data = plan.func.user_data };
+            try k(&ctx, arg_views, plan.output, n);
+        } else {
+            return Error.ComputeNoSuchOverload;
+        }
 
         // 4. Null bookkeeping. Internal calls always have a nullable
         // output (we allocated it that way) so the parent's null-check
@@ -512,6 +545,11 @@ pub const Compute = struct {
             .lit => |slot| blk: {
                 slot.buf.clear();
                 try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
+                break :blk slot.buf.view();
+            },
+            .null_lit => |slot| blk: {
+                slot.buf.clear();
+                try fillNullColumn(self.allocator, &slot.buf, n);
                 break :blk slot.buf.view();
             },
             .call => |sub| blk: {
@@ -819,6 +857,7 @@ fn singleColIndex(c: Expr.Call, up_schema: []const Column) ?usize {
             } else found = idx;
         },
         .lit => {},
+        .null_lit => {},
         else => return null, // nested call / case / subquery: can't prove single-col
     };
     return found;
@@ -939,6 +978,7 @@ fn resolveDerived(
     aa: Allocator,
     d: Derived,
     up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
 ) !ResolvedDerived {
     switch (d.expr) {
         .col_ref => |name| {
@@ -963,6 +1003,14 @@ fn resolveDerived(
                 .kind = .{ .lit_only = slot },
             };
         },
+        .null_lit => |ty| {
+            return .{
+                .name = try aa.dupe(u8, d.name),
+                .output_type = ty,
+                .stat_class = .none,
+                .kind = .{ .null_only = ty },
+            };
+        },
         .call => {
             const stat_class = classifyExpr(d.expr, up_schema);
             // Fast path: `col +/-/* const` collapses to one widening SIMD pass.
@@ -974,7 +1022,7 @@ fn resolveDerived(
                     .kind = .{ .fused_scalar = fs },
                 };
             }
-            const plan = try buildCallPlan(runtime_allocator, aa, d.expr, up_schema);
+            const plan = try buildCallPlan(runtime_allocator, aa, d.expr, up_schema, udf_registry);
             return .{
                 .name = try aa.dupe(u8, d.name),
                 .output_type = plan.output_type,
@@ -983,7 +1031,7 @@ fn resolveDerived(
             };
         },
         .case => {
-            const plan = try buildCasePlan(runtime_allocator, aa, d.expr.case, up_schema);
+            const plan = try buildCasePlan(runtime_allocator, aa, d.expr.case, up_schema, udf_registry);
             return .{
                 .name = try aa.dupe(u8, d.name),
                 .output_type = plan.output_type,
@@ -1006,6 +1054,7 @@ fn buildCasePlan(
     aa: Allocator,
     cs: Expr.Case,
     up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
 ) !*CasePlan {
     if (cs.branches.len == 0) return Error.ComputeUnsupportedExpr;
 
@@ -1019,7 +1068,7 @@ fn buildCasePlan(
     var inferred_type: ?Type = null;
     var may_null = cs.else_branch == null;
     for (cs.branches, branches) |src, *dst| {
-        const then_src = try buildBranchSrc(runtime_allocator, aa, src.then, up_schema);
+        const then_src = try buildBranchSrc(runtime_allocator, aa, src.then, up_schema, udf_registry);
         const t = branchSrcType(then_src, up_schema);
         if (inferred_type) |it| {
             if (std.meta.activeTag(it) != std.meta.activeTag(t)) {
@@ -1040,7 +1089,7 @@ fn buildCasePlan(
 
     var else_src: ?BranchSrc = null;
     if (cs.else_branch) |eb| {
-        const es = try buildBranchSrc(runtime_allocator, aa, eb.*, up_schema);
+        const es = try buildBranchSrc(runtime_allocator, aa, eb.*, up_schema, udf_registry);
         errdefer freeBranchSrc(runtime_allocator, es);
         const t = branchSrcType(es, up_schema);
         if (inferred_type) |it| {
@@ -1074,6 +1123,7 @@ fn buildBranchSrc(
     aa: Allocator,
     e: Expr,
     up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
 ) !BranchSrc {
     return switch (e) {
         .col_ref => |name| blk: {
@@ -1088,8 +1138,16 @@ fn buildBranchSrc(
             };
             break :blk BranchSrc{ .lit = slot };
         },
+        .null_lit => |ty| blk: {
+            const slot = try aa.create(NullSlot);
+            slot.* = .{
+                .ty = ty,
+                .buf = try ColumnStore.init(runtime_allocator, ty, true),
+            };
+            break :blk BranchSrc{ .null_lit = slot };
+        },
         .call => blk: {
-            const sub = try buildCallPlan(runtime_allocator, aa, e, up_schema);
+            const sub = try buildCallPlan(runtime_allocator, aa, e, up_schema, udf_registry);
             break :blk BranchSrc{ .call = sub };
         },
         .case => return Error.ComputeUnsupportedExpr,
@@ -1101,6 +1159,7 @@ fn branchSrcType(s: BranchSrc, up_schema: []const Column) Type {
     return switch (s) {
         .col => |idx| up_schema[idx].type,
         .lit => |slot| literalType(slot.value),
+        .null_lit => |slot| slot.ty,
         .call => |plan| plan.output_type,
     };
 }
@@ -1109,6 +1168,7 @@ fn branchSrcNullable(s: BranchSrc, up_schema: []const Column) bool {
     return switch (s) {
         .col => |idx| up_schema[idx].nullable,
         .lit => false,
+        .null_lit => true,
         .call => |plan| callPlanNullable(plan, up_schema),
     };
 }
@@ -1117,6 +1177,7 @@ fn freeBranchSrc(allocator: Allocator, s: BranchSrc) void {
     switch (s) {
         .col => {},
         .lit => |slot| slot.buf.deinit(allocator),
+        .null_lit => |slot| slot.buf.deinit(allocator),
         .call => |sub| freeCallPlan(allocator, sub),
     }
 }
@@ -1144,6 +1205,7 @@ fn buildCallPlan(
     aa: Allocator,
     expr: Expr,
     up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
 ) !*CallPlan {
     const c = switch (expr) {
         .call => |x| x,
@@ -1168,8 +1230,17 @@ fn buildCallPlan(
                 arg_plans[i] = .{ .lit = slot };
                 arg_types[i] = literalType(v);
             },
+            .null_lit => |ty| {
+                const slot = try aa.create(NullSlot);
+                slot.* = .{
+                    .ty = ty,
+                    .buf = try ColumnStore.init(runtime_allocator, ty, true),
+                };
+                arg_plans[i] = .{ .null_lit = slot };
+                arg_types[i] = ty;
+            },
             .call => {
-                const sub = try buildCallPlan(runtime_allocator, aa, arg, up_schema);
+                const sub = try buildCallPlan(runtime_allocator, aa, arg, up_schema, udf_registry);
                 arg_plans[i] = .{ .call = sub };
                 arg_types[i] = sub.output_type;
             },
@@ -1178,7 +1249,7 @@ fn buildCallPlan(
         }
     }
 
-    const r = (try scalar_fn.resolve(aa, c.fn_name, arg_types)) orelse return Error.ComputeNoSuchOverload;
+    const r = (try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types)) orelse return Error.ComputeNoSuchOverload;
 
     // Cast scratch buffers (one per coerced arg).
     var cast_buffers: ?[]?ColumnStore = null;
@@ -1192,6 +1263,7 @@ fn buildCallPlan(
             const src_nullable = switch (ap) {
                 .col => |idx| up_schema[idx].nullable,
                 .lit => false,
+                .null_lit => true,
                 // Sub-call outputs are nullable (allocated below).
                 .call => true,
             };
@@ -1226,6 +1298,7 @@ fn freeCallPlan(runtime_allocator: Allocator, plan: *CallPlan) void {
     for (plan.args) |arg| switch (arg) {
         .col => {},
         .lit => |slot| slot.buf.deinit(runtime_allocator),
+        .null_lit => |slot| slot.buf.deinit(runtime_allocator),
         .call => |sub| freeCallPlan(runtime_allocator, sub),
     };
     if (plan.cast_buffers) |buffers| {
@@ -1331,6 +1404,7 @@ fn derivedColStat(d: ResolvedDerived, up_stats: []const exec.ColStat) exec.ColSt
 fn derivedNullable(r: ResolvedDerived, up_schema: []const Column) bool {
     return switch (r.kind) {
         .rename => |rn| up_schema[rn.src_idx].nullable,
+        .null_only => true,
         .lit_only => false, // literal-only derived: constant column, never null
         .call => |plan| callPlanNullable(plan, up_schema),
         .case => |plan| plan.may_produce_null,
@@ -1349,6 +1423,7 @@ fn callPlanNullable(plan: *CallPlan, up_schema: []const Column) bool {
     for (plan.args) |arg| switch (arg) {
         .col => |idx| if (up_schema[idx].nullable) return true,
         .lit => {},
+        .null_lit => return true,
         .call => |sub| if (callPlanNullable(sub, up_schema)) return true,
     };
     return false;
@@ -1494,5 +1569,13 @@ fn fillLiteralColumn(allocator: Allocator, buf: *ColumnStore, v: types.Value, n:
         .datetime => |x| while (i < n) : (i += 1) try buf.data.datetime.append(allocator, x),
         .decimal64, .decimal128 => unreachable, // literalType() panics before we get here
         .uuid => |x| while (i < n) : (i += 1) try buf.data.uuid.append(allocator, x),
+    }
+}
+
+fn fillNullColumn(allocator: Allocator, buf: *ColumnStore, n: usize) !void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        try buf.data.appendNullPlaceholder(allocator);
+        try buf.appendValidBit(allocator, buf.data.rowCount() - 1, false);
     }
 }

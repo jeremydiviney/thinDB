@@ -639,6 +639,7 @@ fn exprFusable(e: Expr, scan_cols: []const Column) bool {
     return switch (e) {
         .col_ref => |name| types.findColumn(scan_cols, name) != null,
         .lit => true,
+        .null_lit => true,
         .call => |c| {
             for (c.args) |a| {
                 if (!exprFusable(a, scan_cols)) return false;

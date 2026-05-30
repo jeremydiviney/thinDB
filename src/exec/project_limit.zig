@@ -25,6 +25,7 @@ pub const Project = struct {
     allocator: Allocator,
     upstream: Query,
     output_schema: []Column,
+    owned_names: ?[][]u8 = null,
     column_map: []usize, // output_idx → upstream_idx
     views: []ColumnView,
     /// Upstream per-column stats remapped to the projected columns (a
@@ -33,6 +34,18 @@ pub const Project = struct {
     cached_stats: []const exec.ColStat = &.{},
 
     pub fn create(allocator: Allocator, upstream: Query, names: []const []const u8) !Query {
+        return createNamed(allocator, upstream, names, null);
+    }
+
+    pub fn createNamed(
+        allocator: Allocator,
+        upstream: Query,
+        names: []const []const u8,
+        output_names: ?[]const []const u8,
+    ) !Query {
+        if (output_names) |outs| {
+            if (outs.len != names.len) return Error.TypeMismatch;
+        }
         const up_schema = upstream.outputSchema();
         const out_schema = try allocator.alloc(Column, names.len);
         errdefer allocator.free(out_schema);
@@ -45,7 +58,13 @@ pub const Project = struct {
             const idx = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
             column_map[i] = idx;
             out_schema[i] = up_schema[idx];
+            if (output_names) |outs| out_schema[i].name = outs[i];
+            for (out_schema[0..i]) |prior| {
+                if (types.columnNameEql(prior.name, out_schema[i].name)) return Error.ComputeNameCollision;
+            }
         }
+        const owned_names: ?[][]u8 = if (output_names != null) try cloneOutputNames(allocator, out_schema) else null;
+        errdefer if (owned_names) |owned| freeOutputNames(allocator, owned);
 
         // Remap per-column stats to the projected column order.
         const up = upstream.stats();
@@ -63,6 +82,7 @@ pub const Project = struct {
             .allocator = allocator,
             .upstream = upstream,
             .output_schema = out_schema,
+            .owned_names = owned_names,
             .column_map = column_map,
             .views = views,
             .cached_stats = cached_stats,
@@ -73,6 +93,7 @@ pub const Project = struct {
     pub fn deinit(self: *Project) void {
         var up = self.upstream;
         up.deinit();
+        if (self.owned_names) |owned| freeOutputNames(self.allocator, owned);
         self.allocator.free(self.output_schema);
         self.allocator.free(self.column_map);
         self.allocator.free(self.views);
@@ -138,6 +159,27 @@ pub const Project = struct {
         };
     }
 };
+
+fn cloneOutputNames(allocator: Allocator, out_schema: []Column) ![][]u8 {
+    const names = try allocator.alloc([]u8, out_schema.len);
+    errdefer allocator.free(names);
+    var inited: usize = 0;
+    errdefer {
+        for (names[0..inited]) |name| allocator.free(name);
+    }
+    for (out_schema, 0..) |*col, i| {
+        const duped = try allocator.dupe(u8, col.name);
+        names[i] = duped;
+        inited += 1;
+        col.name = duped;
+    }
+    return names;
+}
+
+fn freeOutputNames(allocator: Allocator, names: [][]u8) void {
+    for (names) |name| allocator.free(name);
+    allocator.free(names);
+}
 
 pub const Limit = struct {
     allocator: Allocator,

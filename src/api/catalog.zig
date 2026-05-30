@@ -15,12 +15,14 @@ const DatabaseMod = @import("database.zig");
 const Database = DatabaseMod.Database;
 
 const snapshot = @import("../util/snapshot.zig");
+const udf_mod = @import("../udf.zig");
 
 pub const Catalog = struct {
     allocator: Allocator,
     io: Io,
     root_dir: Io.Dir,
     config: Config,
+    udfs: udf_mod.UdfRegistry,
     databases: std.StringHashMap(*Database),
     /// True when the Catalog allocator-owns its struct (the user called
     /// `Catalog.open` and gets a `*Catalog`). False when the Catalog is
@@ -57,17 +59,35 @@ pub const Catalog = struct {
             .io = io,
             .root_dir = root_dir,
             .config = config,
+            .udfs = udf_mod.UdfRegistry.init(allocator),
             .databases = .init(allocator),
         };
         errdefer {
             var it = self.databases.iterator();
             while (it.next()) |entry| entry.value_ptr.*.closeInPlace();
+            self.udfs.deinit();
             self.databases.deinit();
         }
         try discoverDatabasesOnDisk(allocator, io, root_dir, config, &self.databases);
         var it = self.databases.iterator();
         while (it.next()) |entry| entry.value_ptr.*.catalog = self;
         return self;
+    }
+
+    pub fn registerScalarUdf(self: *Catalog, desc: udf_mod.ScalarUdf) !void {
+        return self.udfs.registerScalar(desc) catch |err| switch (err) {
+            udf_mod.Error.FunctionAlreadyExists => Error.FunctionAlreadyExists,
+            udf_mod.Error.FunctionInvalidDefinition => Error.FunctionInvalidDefinition,
+            else => err,
+        };
+    }
+
+    pub fn registerAggregateUdf(self: *Catalog, desc: udf_mod.AggregateUdf) !void {
+        return self.udfs.registerAggregate(desc) catch |err| switch (err) {
+            udf_mod.Error.FunctionAlreadyExists => Error.FunctionAlreadyExists,
+            udf_mod.Error.FunctionInvalidDefinition => Error.FunctionInvalidDefinition,
+            else => err,
+        };
     }
 
     /// Scan `root_dir` for subdirectories and adopt each one as a Database
@@ -103,6 +123,7 @@ pub const Catalog = struct {
     pub fn close(self: *Catalog) void {
         var it = self.databases.iterator();
         while (it.next()) |entry| entry.value_ptr.*.closeInPlace();
+        self.udfs.deinit();
         self.databases.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);

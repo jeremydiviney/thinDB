@@ -611,6 +611,7 @@ All fallible API calls return a Zig error union. The public error surface is spl
 SchemaMismatch, UnsupportedUniqueKeyType, UpsertRequiresUniqueKey,
 TableNotFound, TableAlreadyExists, ColumnNotFound,
 ColumnAlreadyExists, UnsupportedAlterOp,
+FunctionAlreadyExists, FunctionInvalidDefinition,
 ```
 
 **Execution-level (`src/exec/exec.zig`):**
@@ -625,7 +626,7 @@ ComputeNoColumns, ComputeNameCollision, ComputeUnsupportedExpr,
 ComputeNoSuchOverload, ComputeTooManyArgs,
 JoinUnsupportedType, JoinEmptyOnClause, JoinKeyTypeMismatch,
 JoinColumnNameCollision,
-MemoryBudgetExceeded,
+MemoryBudgetExceeded, WindowUnsupported,
 ```
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
@@ -750,7 +751,7 @@ The biggest piece is a **compiled query-plan tree** as IR — most of v2 builds 
 | Database / namespace system | 2-level (catalog.schema.table) per Postgres/Iceberg/BI-tool convention. Each level a directory under the Database root. |
 | Temp tables + per-connection sessions | Sessions own a temp-table overlay isolated from other connections. Per-session timezone, isolation knobs later. |
 | EXPLAIN plan output | Render the plan tree as text (and later JSON). Cheap once the plan-tree IR exists. |
-| Scalar UDFs | User-registered scalar fns participate in the existing coercion machinery automatically. |
+| Zig UDFs | Trusted in-process scalar and aggregate functions registered on the catalog. Scalar UDFs participate in existing overload/coercion resolution; aggregate UDFs use a generic state-backed path. |
 | Window functions | `ROW_NUMBER`, `RANK`, `LAG`/`LEAD`, framed aggregates (`OVER PARTITION BY … ORDER BY … ROWS BETWEEN …`). Likely a new `Window` operator. |
 | Column defaults + auto-increment | New column metadata (`default`, `auto_increment`, future: `on_update`). Memtable insert resolves defaults / picks next ID when the row omits the field. |
 | `TIMESTAMPTZ` | New type alongside `DATETIME`; existing columns unaffected. |
@@ -816,9 +817,13 @@ Walking-skeleton scope today: `Scan(table_name)` and `Limit(n)`. Roadmap:
 - `Pipe(fn)` — compose a sub-pipeline (`fn(ClientQuery) → ClientQuery`)
 - (post-server) `PipeUdf(name)` — invoke a server-registered UDF; see §17
 
-### 15.2 User-defined functions (v2+)
+### 15.2 User-defined functions
 
-Endgame: clients in many languages (Rust, Zig, C, JS, TS, Python, Go) author UDFs and register them with the server. The server holds a UDF registry; queries reference UDFs by name via `.pipeUdf("name")`. Two runtime tiers behind a common adapter interface:
+Current scope: embedded applications register trusted in-process Zig UDFs on the catalog through `Database.registerScalarUdf` / `Database.registerAggregateUdf`. UDF definitions are process-local configuration, not persisted catalog objects. Scalar UDFs receive vectorized `ColumnView` inputs and append into a `ColumnStore`; aggregate UDFs declare a state size/alignment plus `init`, `update_one`, optional batch/combine hooks, `finalize`, and optional `destroy`. Bad UDF code is trusted native code and can crash the process.
+
+SQL references registered scalar UDFs as ordinary calls (`SELECT my_fn(col) ...`). Registered aggregate names are recognized during parse/analyze and run through a generic state-backed aggregate operator; built-in aggregates keep the specialized hash/radix/streaming paths. UDAFs currently support regular grouped and global aggregation; table, window, SQL-defined, dynamic-library, WASM, Python, and JS UDFs remain deferred.
+
+Endgame: clients in many languages (Rust, Zig, C, JS, TS, Python, Go) author UDFs and register them with the server. The server holds a UDF registry; queries reference UDFs by name via SQL or `.pipeUdf("name")`. Two runtime tiers behind a common adapter interface:
 
 | Tier | Runtime | Languages | Speed | Sandbox |
 |---|---|---|---|---|

@@ -630,6 +630,16 @@ test "pg wire: SELECT * FROM orders returns seeded rows" {
     try std.testing.expectEqualStrings("c", reply.rows[2][2].?);
     try std.testing.expectEqualStrings("SELECT 3", reply.command_tag);
 
+    try client.sendQuery("SELECT o.*, NULL AS note, qty + 1 AS next_qty FROM orders AS o ORDER BY id ASC");
+    const reply2 = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply2.error_code == null);
+    try std.testing.expectEqual(@as(usize, 3), reply2.rows.len);
+    try std.testing.expectEqual(@as(usize, 5), reply2.rows[0].len);
+    try std.testing.expectEqualStrings("1", reply2.rows[0][0].?);
+    try std.testing.expectEqualStrings("10", reply2.rows[0][1].?);
+    try std.testing.expect(reply2.rows[0][3] == null);
+    try std.testing.expectEqualStrings("11", reply2.rows[0][4].?);
+
     try client.sendTerminate();
     if (sctx.err) |e| return e;
 }
