@@ -177,6 +177,12 @@ pub const VTable = struct {
     /// scalar work — e.g. REGEXP_REPLACE — runs in its parallel workers); every
     /// other operator declines. A fused Filter forwards it to its upstream.
     tryFuseCompute: *const fn (ptr: *anyopaque, derived: []const @import("compute.zig").Derived) anyerror!bool,
+    /// Offer a PARTIAL aggregate to run inside this operator's parallel workers
+    /// (two-phase GROUP BY): each worker aggregates its own slice on its own core
+    /// — no cross-core feed — and emits partial groups; a serial combine aggregate
+    /// re-aggregates them. Only ParallelScan accepts (and only for combinable
+    /// aggregates); every other operator declines via the `@hasDecl` guard.
+    tryFuseAggregate: *const fn (ptr: *anyopaque, group_cols: []const []const u8, aggs: []const AggSpec) anyerror!bool,
     /// Pre-execution statistics on this operator's OUTPUT: upper bound
     /// on rows, sort state. Cheap — computed from manifest + operator
     /// definitions, no data read required. Used by downstream planners
@@ -355,6 +361,12 @@ pub const Query = struct {
     /// took ownership (caller becomes a pass-through). See `VTable.tryFuseCompute`.
     pub fn tryFuseCompute(self: *Query, derived: []const @import("compute.zig").Derived) !bool {
         return self.vtable.tryFuseCompute(self.ptr, derived);
+    }
+
+    /// Offer a partial aggregate to run inside this operator's parallel workers
+    /// (two-phase GROUP BY). Returns true iff accepted. See `VTable.tryFuseAggregate`.
+    pub fn tryFuseAggregate(self: *Query, group_cols: []const []const u8, aggs: []const AggSpec) !bool {
+        return self.vtable.tryFuseAggregate(self.ptr, group_cols, aggs);
     }
 
     /// Pre-execution stats on this operator's output. Cheap; no data
@@ -593,6 +605,11 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.tryFuseCompute(derived);
         }
+        fn tryFuseAggregateWrap(ptr: *anyopaque, group_cols: []const []const u8, aggs: []const AggSpec) anyerror!bool {
+            if (!@hasDecl(Op, "tryFuseAggregate")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.tryFuseAggregate(group_cols, aggs);
+        }
         fn statsWrap(ptr: *anyopaque) PipelineStats {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.stats();
@@ -643,6 +660,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .addPrune = addPruneWrap,
             .tryFuseFilter = tryFuseFilterWrap,
             .tryFuseCompute = tryFuseComputeWrap,
+            .tryFuseAggregate = tryFuseAggregateWrap,
             .stats = statsWrap,
             .accountant = accountantWrap,
             .explain = explainWrap,

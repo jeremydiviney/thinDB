@@ -160,6 +160,16 @@ pub const ParallelScan = struct {
     compute_built: usize = 0,
     compute_fused: bool = false,
 
+    // Fused PARTIAL aggregate (set via tryFuseAggregate, two-phase GROUP BY):
+    // each worker drains `agg_q[i]` (a partial Aggregate over its ranged Scan)
+    // and emits its partial groups, which the materialize path concats for a
+    // downstream serial combine aggregate. `agg_q[i]` OWNS `workers[i]`;
+    // `agg_built` drives deinit ownership. Mutually exclusive with compute fusion
+    // in P1 (the gate declines when a compute already fused).
+    agg_q: []Query = &.{},
+    agg_built: usize = 0,
+    agg_fused: bool = false,
+
     /// Build a parallel scan over `table` projecting `needed` (null = all
     /// columns), with up to `max_dop` workers. Always returns a valid operator:
     /// when only one slot is available it runs serially through the same
@@ -309,12 +319,21 @@ pub const ParallelScan = struct {
         // owned by their per-worker Compute (compute_q) and freed by its deinit;
         // scans [compute_built..) are still bare and freed directly. With no
         // fused compute, compute_built == 0 → all scans freed here as usual.
+        for (self.agg_q[0..self.agg_built]) |q| {
+            var qq = q;
+            qq.deinit();
+        }
+        if (self.agg_q.len > 0) self.allocator.free(self.agg_q);
         for (self.compute_q[0..self.compute_built]) |q| {
             var qq = q;
             qq.deinit();
         }
         if (self.compute_q.len > 0) self.allocator.free(self.compute_q);
-        for (self.workers[self.compute_built..]) |w| w.deinit();
+        // agg-fusion and compute-fusion are mutually exclusive, so exactly one of
+        // these counts is non-zero; their wrappers own workers[0..owned], the rest
+        // are freed directly.
+        const owned = self.agg_built + self.compute_built;
+        for (self.workers[owned..]) |w| w.deinit();
         self.allocator.free(self.workers);
         self.allocator.free(self.round);
         self.allocator.free(self.werr);
@@ -379,6 +398,29 @@ pub const ParallelScan = struct {
         return true;
     }
 
+    /// Two-phase GROUP BY (P1): wrap each worker in a PARTIAL aggregate so it
+    /// aggregates its own slice on its own core — no cross-core feed — and emits
+    /// partial groups; a downstream serial combine aggregate re-aggregates the
+    /// concatenated partials. Declines once a mode/compute/aggregate is settled.
+    /// `agg_q[i]` OWNS `workers[i]`; `agg_built` drives the deinit ownership split.
+    /// (The partial aggregates touch the shared, non-thread-safe accountant only
+    /// to bump a fixed per-source usize counter — benign undercounting under
+    /// concurrency; the materialize step does the real byte reservation. TODO:
+    /// null the partial accountant before enabling this path by default.)
+    pub fn tryFuseAggregate(self: *ParallelScan, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
+        if (self.mode != .unset or self.compute_fused or self.agg_fused) return false;
+        const q = try self.allocator.alloc(Query, self.workers.len);
+        self.agg_q = q;
+        for (self.workers, 0..) |w, i| {
+            const sq = makeQuery(self.table.allocator, w);
+            q[i] = try sq.groupBy(group_cols, aggs);
+            self.agg_built = i + 1;
+        }
+        self.out_schema = q[0].outputSchema();
+        self.agg_fused = true;
+        return true;
+    }
+
     /// A downstream consumer reports it reads only `keep`. On the materialize
     /// path, drop every other output column from the survivor deep-copy — they
     /// were decoded purely to feed a fused filter/compute (e.g. `URL` behind
@@ -416,16 +458,19 @@ pub const ParallelScan = struct {
     }
 
     pub fn stats(self: *ParallelScan) exec.PipelineStats {
+        if (self.agg_fused) return self.agg_q[0].stats();
         if (self.compute_fused) return self.compute_q[0].stats();
         return self.workers[0].stats();
     }
 
     pub fn explain(self: *ParallelScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
         var buf: [64]u8 = undefined;
-        const tag = if (self.compute_fused) "materialize+compute" else if (self.workers[0].fusedActive()) "materialize" else "stream";
+        const tag = if (self.agg_fused) "materialize+partial-agg" else if (self.compute_fused) "materialize+compute" else if (self.workers[0].fusedActive()) "materialize" else "stream";
         const line = std.fmt.bufPrint(&buf, "ParallelScan (DOP={d}, {s})", .{ self.n_threads, tag }) catch "ParallelScan";
         try exec.explainLine(out, allocator, depth, line);
-        if (self.compute_fused) {
+        if (self.agg_fused) {
+            try self.agg_q[0].explain(out, allocator, depth + 1);
+        } else if (self.compute_fused) {
             try self.compute_q[0].explain(out, allocator, depth + 1);
         } else {
             try self.workers[0].explain(out, allocator, depth + 1);
@@ -439,7 +484,7 @@ pub const ParallelScan = struct {
             // fused filter (bounded survivors) OR a fused compute (we run the
             // derived columns in the workers) ⇒ materialize + concat; otherwise
             // survivors would be the whole table, so stream via fork-join rounds.
-            self.mode = if (self.workers[0].fusedActive() or self.compute_fused) .materialize else .round;
+            self.mode = if (self.agg_fused or self.workers[0].fusedActive() or self.compute_fused) .materialize else .round;
             if (self.mode == .materialize) try self.runMaterialize();
         }
         return switch (self.mode) {
@@ -487,7 +532,9 @@ pub const ParallelScan = struct {
         // rest spawned) each claim chunks from `next_chunk` until exhausted. The
         // drainables are the Compute(scan) chains when a projection was fused in,
         // else the bare chunk scans. Output is emitted later in chunk order.
-        if (self.compute_fused) {
+        if (self.agg_fused) {
+            self.workSteal(self.agg_q, ta);
+        } else if (self.compute_fused) {
             self.workSteal(self.compute_q, ta);
         } else {
             self.workSteal(self.workers, ta);

@@ -2468,6 +2468,75 @@ fn routeRadixGroupBy(
     };
 }
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// P1 two-phase parallel GROUP BY (env-gated `THINDB_PARALLEL_AGG`): each
+/// parallel scan worker aggregates its own slice locally — on the core that
+/// decoded it, no cross-core feed — into partial groups; a serial combine
+/// aggregate re-aggregates the concatenated partials (COUNT/SUM → SUM, MIN → MIN,
+/// MAX → MAX, output type forced to the partial's so COUNT's bigint isn't widened
+/// by SUM). Gated to fixed-output combinable aggregates and LOW/MEDIUM
+/// cardinality — above the radix cache line the serial combine over the N partial
+/// tables would itself dominate (that's P2 radix territory). Returns null to fall
+/// through to the existing serial routing; consumes `upstream` only on success.
+fn routeParallelGroupBy(
+    ctx: *CompileCtx,
+    upstream: Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    top_k: ?ir.Op.TopK,
+    emit_limit: ?u32,
+) !?Query {
+    if (getenv("THINDB_PARALLEL_AGG") == null) return null;
+    if (group_cols.len == 0) return null;
+    for (aggs) |a| switch (a.func) {
+        .count, .sum, .min, .max => {},
+        else => return null,
+    };
+
+    // Low/med-card gate (reuses the radix cache model): a partial set above the
+    // 16MB line makes the serial combine the new bottleneck — leave to P2.
+    const schema = upstream.outputSchema();
+    const st = upstream.stats();
+    var est: u64 = 1;
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse return null;
+        if (idx >= st.column_stats.len) return null;
+        switch (st.column_stats[idx].ndv) {
+            .exact => |nd| est *|= nd,
+            .unknown => return null,
+        }
+    }
+    est = @min(est, @max(st.upper_rows, 1));
+    const per_group = perGroupTableBytes(schema, group_cols, aggs);
+    if (per_group != 0 and est *| per_group > RADIX_CACHE_BYTES) return null;
+
+    // Fuse the partial aggregate (original specs) into the workers; declines (and
+    // we fall through) if the upstream isn't a parallel scan / fused pass-through.
+    // `up` aliases the same operator ptr, so the fusion is visible via `upstream`.
+    var up = upstream;
+    if (!try up.tryFuseAggregate(group_cols, aggs)) return null;
+
+    // Combine specs over the partial outputs, read by `.as`, type-forced to the
+    // partial output type. From here `upstream` is consumed — never return null.
+    const part_schema = upstream.outputSchema();
+    const combine = try ctx.allocator.alloc(ir.AggSpec, aggs.len);
+    for (aggs, 0..) |a, i| {
+        combine[i] = .{
+            .func = switch (a.func) {
+                .count, .sum => .sum,
+                .min => .min,
+                .max => .max,
+                else => unreachable,
+            },
+            .col = a.as,
+            .as = a.as,
+            .out_type_override = part_schema[group_cols.len + i].type,
+        };
+    }
+    return try upstream.groupByTopK(group_cols, combine, top_k, emit_limit);
+}
+
 /// Approximate allocated bytes per group in the hash / radix Aggregate table:
 /// the representative slot `{key/hash + gid}`, the per-group key copy
 /// (`gkeys_int` u128 / byte-key slice header), the group-key column bytes, and
@@ -3111,6 +3180,10 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             // derived into the parallel-scan workers (the serial remainder is
             // UDF-registry-aware). A UDF aggregate then takes the udfGroupBy path.
             if (agg_args.len > 0) upstream = try fuseSplitCompute(ctx, upstream, agg_args);
+            // Two-phase parallel GROUP BY (env-gated): aggregate per-worker on the
+            // decoding core, then combine — avoids the cross-core feed. Self-
+            // declines (falls through) for compute-fused / high-card / non-parallel.
+            if (try routeParallelGroupBy(ctx, upstream, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| break :blk q;
             // Drop columns the aggregate never reads from the parallel-scan
             // materialize (decoded only for a fused filter/compute — dead above).
             try pushAggEmitProjection(ctx, upstream, g.group_cols, g.aggs);

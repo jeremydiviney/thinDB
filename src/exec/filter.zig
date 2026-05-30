@@ -199,6 +199,14 @@ pub const Filter = struct {
         if (self.fused) try self.upstream.setEmitProjection(keep);
     }
 
+    /// Forward a partial-aggregate fusion upstream only when this Filter is a
+    /// fused pass-through (its predicate already runs in the scan); a non-fused
+    /// Filter must evaluate rows itself, so the aggregate can't push below it.
+    pub fn tryFuseAggregate(self: *Filter, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
+        if (!self.fused) return false;
+        return self.upstream.tryFuseAggregate(group_cols, aggs);
+    }
+
     /// Forward a projection-Compute fusion to the upstream, but only when this
     /// Filter is itself fused (a pass-through). A non-fused Filter still
     /// evaluates rows here, so a Compute above it must stay a separate operator.
