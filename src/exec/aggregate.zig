@@ -83,6 +83,19 @@ pub const AggFunc = enum {
     udf,
 };
 
+/// True when every aggregate keeps BOUNDED per-group state — so the bare-LIMIT
+/// table cap's shared overflow group (which absorbs all post-cap rows) can't
+/// grow without bound. COUNT(DISTINCT) (a per-group set), PERCENTILE (keeps every
+/// value), GROUP_CONCAT (keeps every value), and UDAFs (opaque state) are
+/// excluded; count/sum/min/max/avg/stddev/variance all keep fixed-size state.
+fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
+    for (aggs) |a| switch (a.func) {
+        .count, .sum, .min, .max, .avg, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
+        .count_distinct, .percentile, .group_concat, .udf => return false,
+    };
+    return true;
+}
+
 /// Per-aggregate parameters not expressible via `col` / `as`. `.none`
 /// covers all existing aggregates; percentile and group_concat carry
 /// their own payload.
@@ -521,10 +534,20 @@ pub const Aggregate = struct {
     top_k: ?ResolvedTopK = null,
 
     /// Emit cap from an unordered `GROUP BY … LIMIT n`: stop after this many
-    /// groups (in group-insertion order). null = emit every group. The build
-    /// still consumes all input, so emitted groups' counts are exact; only the
+    /// groups (in group-insertion order). null = emit every group. The emitted
+    /// groups' counts are exact (every matching row still updates them); only the
     /// emit is bounded. Mutually exclusive with `top_k`.
     emit_limit: ?u32 = null,
+
+    /// Table cap for the `emit_limit` path: once `emit_limit` distinct groups
+    /// exist, route every further new key into one never-emitted `overflow_gid`
+    /// instead of growing the table to millions of dead groups. Output is
+    /// identical (the first n groups still see all their rows), only far cheaper.
+    /// Enabled only when every aggregate has bounded per-group state (the
+    /// overflow group accumulates too, so distinct/percentile/group_concat — which
+    /// grow without bound — disable it and keep the build-everything path).
+    cap_groups: bool = false,
+    overflow_gid: ?u32 = null,
 
     emitted: bool = false,
     /// Bytes charged against the query budget for the group hash table /
@@ -656,6 +679,7 @@ pub const Aggregate = struct {
             // Only the hash-grouped emit honors the cap; a global aggregate is
             // one row already, and the top-k path owns its own bounded emit.
             .emit_limit = if (group_col_indices.len > 0 and resolved_top_k == null) emit_limit else null,
+            .cap_groups = group_col_indices.len > 0 and resolved_top_k == null and emit_limit != null and aggsAllowGroupCap(aggs),
         };
 
         try self.computeOutputStats(up_schema);
@@ -1645,6 +1669,21 @@ pub const Aggregate = struct {
     /// runtime tier decision is hoisted to `accumulateBatch`'s switch. `orKeyColumn`
     /// keeps producing the full u128 — the table truncates/splits it losslessly
     /// to its tier on store (the layout guarantees the key fits).
+    /// Lazily create the bare-LIMIT overflow group (`cap_groups`): one extra,
+    /// never-emitted gid that absorbs every post-cap new key, so the table stops
+    /// growing once `emit_limit` real groups exist. Its key is a placeholder
+    /// (never read — the emit stops at `emit_limit`, below this gid); its bounded
+    /// agg state is updated like any group, then discarded. Idempotent.
+    fn ensureOverflowGroup(self: *Aggregate, aa: Allocator, int_path: bool) !u32 {
+        if (self.overflow_gid) |g| return g;
+        const g = self.n_groups;
+        self.n_groups += 1;
+        if (int_path) self.gkeys_int.appendAssumeCapacity(0) else try self.gkeys.append(aa, &.{});
+        try self.initGroupCells(aa, g);
+        self.overflow_gid = g;
+        return g;
+    }
+
     fn accumulateBatchIntT(self: *Aggregate, batch: Batch, comptime Table: type, table: *Table) !void {
         const n = batch.row_count;
         const aa = self.arena.allocator();
@@ -1690,7 +1729,9 @@ pub const Aggregate = struct {
             }
             const key = keys[i];
             const probe = table.getOrPut(Table.hashKey(key), key);
-            const gid = if (probe.found) probe.gid else blk: {
+            const gid = if (probe.found) probe.gid else if (self.cap_groups and self.n_groups >= self.emit_limit.?)
+                try self.ensureOverflowGroup(aa, true)
+            else blk: {
                 if (acct) |a| try a.reserve(.hash_aggregate, approx_per);
                 self.reserved_bytes += approx_per;
                 const new_gid = self.n_groups;
@@ -1820,7 +1861,9 @@ pub const Aggregate = struct {
             const key = keys[i];
             const h = hashes[i];
             const probe = self.byte_table.getOrPut(h, key, self.gkeys.items);
-            const gid = if (probe.found) probe.gid else blk: {
+            const gid = if (probe.found) probe.gid else if (self.cap_groups and self.n_groups >= self.emit_limit.?)
+                try self.ensureOverflowGroup(aa, false)
+            else blk: {
                 const approx = key.len + self.aggs.len * @sizeOf(AccState) + 32;
                 if (acct) |a| try a.reserve(.hash_aggregate, approx);
                 self.reserved_bytes += approx;
