@@ -98,9 +98,9 @@ fn sortStringPermAsc(perm: []u32, view: storage.StringView) void {
     std.sort.pdq(u32, perm, Cmp{ .v = view }, Cmp.lessThan);
 }
 
-fn sortStringPermCompare(perm: []u32, view: storage.StringView, desc: bool) void {
+fn sortStringPermCompare(perm: []u32, view: anytype, desc: bool) void {
     const Cmp = struct {
-        v: storage.StringView,
+        v: @TypeOf(view),
         d: bool,
         pub fn lessThan(c: @This(), a: u32, b: u32) bool {
             const ord = std.mem.order(u8, c.v.rowBytes(a), c.v.rowBytes(b));
@@ -110,6 +110,29 @@ fn sortStringPermCompare(perm: []u32, view: storage.StringView, desc: bool) void
     std.sort.pdq(u32, perm, Cmp{ .v = view, .d = desc }, Cmp.lessThan);
 }
 
+/// Emit the rows in `idxs` of `src` into `out`. For a string column that
+/// crossed 4 GiB (u64 sidecar) the u32-offset `appendByIndices` can't read it,
+/// so copy via `rowBytesWide` into the small per-batch `out` (which stays
+/// narrow — emit batches are well under 4 GiB). Everything else takes the fast
+/// `appendByIndices`.
+fn emitColumn(allocator: Allocator, src: ColumnStore, idxs: []const u32, out: *ColumnStore) !void {
+    switch (src.data) {
+        inline .varchar, .string, .char => |s| {
+            if (s.isWide()) {
+                switch (out.data) {
+                    inline .varchar, .string, .char => |*dst| {
+                        for (idxs) |idx| try dst.appendValue(allocator, s.rowBytesWide(idx));
+                    },
+                    else => unreachable,
+                }
+                return;
+            }
+        },
+        else => {},
+    }
+    try engine.memtable.appendByIndices(allocator, src.view(), idxs, out);
+}
+
 /// Sort `perm` by a single key column, with a comparator monomorphized to
 /// the column's concrete type. The typed slice / StringView is captured
 /// once, so each comparison avoids the tagged-union dispatch and view
@@ -117,6 +140,13 @@ fn sortStringPermCompare(perm: []u32, view: storage.StringView, desc: bool) void
 fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) void {
     switch (col.data) {
         inline .varchar, .string, .char => |s| {
+            // A column past 4 GiB carries u64 offsets (StringStore.wide_offsets);
+            // the u32-offset radix can't index it, so fall back to the generic
+            // comparison sort over the wide view (correct, just slower). Rare.
+            if (s.isWide()) {
+                sortStringPermCompare(perm, s.wideView(), desc);
+                return;
+            }
             const view = s.view();
             // MSD radix sort by string bytes — O(n · key-prefix) instead of
             // the comparison sort's O(n log n · compare-length). Algorithmic
@@ -325,9 +355,9 @@ pub const Sort = struct {
 
         for (self.output_columns) |*c| c.clear();
         for (self.output_columns, 0..) |*out, ci| {
-            try engine.memtable.appendByIndices(
+            try emitColumn(
                 self.allocator,
-                self.accumulated[ci].view(),
+                self.accumulated[ci],
                 self.perm[self.emit_offset .. self.emit_offset + n],
                 out,
             );

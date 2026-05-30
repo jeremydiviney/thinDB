@@ -1235,3 +1235,87 @@ test "regex: stationary bulk-skip equals reference matcher (fuzz)" {
         }
     }
 }
+
+// Diagnostic micro-benchmark: isolate Pike-VM regex throughput from the query
+// engine. Builds a flat array of synthetic Referer-like URLs (contiguous,
+// best-case locality) and runs the EXACT `replaceAllScratch` the query uses,
+// 1/2/4/8 threads, each thread its own compiled Regex + Scratch (mirrors the
+// per-worker Computes). Pattern uses [.] for the literal dot and a literal
+// replacement (the match cost — the bottleneck — is identical to `\1`; only the
+// trivial substitution differs). Gated behind THINDB_REGEX_BENCH so the normal
+// suite skips it. Build ReleaseFast, then run the test exe with the env set.
+test "regex throughput micro-bench" {
+    // Diagnostic only — flip to true and build ReleaseFast to measure raw
+    // Pike-VM throughput + thread scaling outside the query engine.
+    const run_bench = false;
+    if (!run_bench) return;
+    const prof = @import("prof.zig");
+    const A = std.heap.page_allocator;
+    const N: usize = 3_000_000;
+
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(A);
+    try data.ensureTotalCapacity(A, N * 80);
+    const offsets = try A.alloc(usize, N + 1);
+    defer A.free(offsets);
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+    const hosts = [_][]const u8{ "example.com", "news.site.org", "shop.bigstore.co.uk", "a.b", "verylongsubdomain.example.museum", "cdn.assets.net" };
+    var k: usize = 0;
+    while (k < N) : (k += 1) {
+        offsets[k] = data.items.len;
+        try data.appendSlice(A, if (rnd.boolean()) "https://" else "http://");
+        if (rnd.boolean()) try data.appendSlice(A, "www.");
+        try data.appendSlice(A, hosts[rnd.uintLessThan(usize, hosts.len)]);
+        try data.append(A, '/');
+        const path_len = rnd.uintLessThan(usize, 80);
+        var p: usize = 0;
+        while (p < path_len) : (p += 1) {
+            try data.append(A, if (p % 8 == 7) '/' else @as(u8, 'a') + rnd.uintLessThan(u8, 26));
+        }
+    }
+    offsets[N] = data.items.len;
+    const total_bytes = data.items.len;
+    std.debug.print("\n[regex-bench] {d} urls, {d} bytes (avg {d:.1} B/url)\n", .{ N, total_bytes, @as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(N)) });
+
+    const PATTERN = "^https?://(?:www[.])?([^/]+)/.*$";
+    const Job = struct { data: []const u8, offsets: []const usize, lo: usize, hi: usize, checksum: *usize };
+    const worker = struct {
+        fn run(job: Job) void {
+            var re = Regex.compile(std.heap.page_allocator, PATTERN) catch return;
+            defer re.deinit();
+            var scratch = Scratch.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var cs: usize = 0;
+            var i = job.lo;
+            while (i < job.hi) : (i += 1) {
+                const url = job.data[job.offsets[i]..job.offsets[i + 1]];
+                const outp = re.replaceAllScratch(url, "x", &scratch) catch break;
+                cs +%= outp.len;
+            }
+            job.checksum.* = cs;
+        }
+    }.run;
+
+    inline for (.{ 1, 2, 4, 8 }) |dop| {
+        var checksums: [dop]usize = [_]usize{0} ** dop;
+        var threads: [dop]std.Thread = undefined;
+        const t0 = prof.nowTicks();
+        for (0..dop) |t| {
+            const lo = t * N / dop;
+            const hi = (t + 1) * N / dop;
+            threads[t] = try std.Thread.spawn(.{}, worker, .{Job{ .data = data.items, .offsets = offsets, .lo = lo, .hi = hi, .checksum = &checksums[t] }});
+        }
+        for (0..dop) |t| threads[t].join();
+        const ms = prof.ticksToMs(prof.nowTicks() - t0);
+        var total_cs: usize = 0;
+        for (checksums) |c| total_cs += c;
+        std.mem.doNotOptimizeAway(total_cs);
+        const secs = ms / 1000.0;
+        const mbps = @as(f64, @floatFromInt(total_bytes)) / secs / 1e6;
+        const us_per = ms * 1000.0 / @as(f64, @floatFromInt(N));
+        const mrps = @as(f64, @floatFromInt(N)) / secs / 1e6;
+        std.debug.print("[regex-bench] dop={d}: {d:.0}ms  {d:.0} MB/s  {d:.2} M urls/s  {d:.3} us/url\n", .{ dop, ms, mbps, mrps, us_per });
+    }
+}

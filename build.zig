@@ -134,6 +134,22 @@ pub fn build(b: *std.Build) void {
     const gbmicro_step = b.step("gbmicro", "Run the isolated GROUP BY probe microbench (ReleaseFast)");
     gbmicro_step.dependOn(&run_gbmicro.step);
 
+    // ---- Real-data regex throughput microbench: bench/regex_real.zig -------
+    // Opens .clickbench-db, pulls the real Referer column into RAM (untimed),
+    // then times ONLY the Pike-VM replace loop at 1/2/4/8 threads — isolates
+    // raw regex throughput + scaling from the query pipeline.
+    const regex_real_mod = b.createModule(.{
+        .root_source_file = b.path("bench/regex_real.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    regex_real_mod.addImport("thindb", thindb_fast);
+    const regex_real_exe = b.addExecutable(.{ .name = "regex_real", .root_module = regex_real_mod });
+    const run_regex_real = b.addRunArtifact(regex_real_exe);
+    if (b.args) |args| run_regex_real.addArgs(args);
+    const regex_real_step = b.step("regexreal", "Run the real-data regex throughput microbench (ReleaseFast)");
+    regex_real_step.dependOn(&run_regex_real.step);
+
     // ---- ClickBench loader: bench/clickbench/main.zig ----------------------
     const clickbench_mod = b.createModule(.{
         .root_source_file = b.path("bench/clickbench/main.zig"),

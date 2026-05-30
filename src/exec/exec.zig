@@ -34,6 +34,13 @@ pub const prof = @import("../util/prof.zig");
 /// paths on the same query only.
 pub var force_group_by: enum { auto, hash, sort, radix } = .auto;
 
+/// Diagnostic (`--trace-group-by`): when set, the GROUP BY router prints the
+/// inputs to every hash-vs-sort decision — the estimated group count, per-group
+/// footprint, the budget-derived cutoff, each key's propagated NDV (or `OOB`
+/// when a schema/stats desync drops it, the #337 class of bug), and the chosen
+/// path. Turns a multi-hour stats-propagation trace into a one-flag read.
+pub var trace_group_by: bool = false;
+
 /// Benchmark override for the scan sub-batch size (rows). 0 = use the
 /// cache-aware auto size (`autoScanBatch`); >0 forces this many rows.
 pub var scan_sub_batch: usize = 0;
@@ -165,6 +172,11 @@ pub const VTable = struct {
     /// its own masking. The borrowed view the Scan builds lives entirely
     /// inside one `next()` call — no cross-operator lifetime contract.
     tryFuseFilter: *const fn (ptr: *anyopaque, expr: predicate.PredicateExpr) anyerror!bool,
+    /// Offer a projection Compute (derived columns) to this operator to run
+    /// internally. ParallelScan accepts row-local derived (so the per-row
+    /// scalar work — e.g. REGEXP_REPLACE — runs in its parallel workers); every
+    /// other operator declines. A fused Filter forwards it to its upstream.
+    tryFuseCompute: *const fn (ptr: *anyopaque, derived: []const @import("compute.zig").Derived) anyerror!bool,
     /// Pre-execution statistics on this operator's OUTPUT: upper bound
     /// on rows, sort state. Cheap — computed from manifest + operator
     /// definitions, no data read required. Used by downstream planners
@@ -329,6 +341,12 @@ pub const Query = struct {
     /// becomes a pass-through). See `VTable.tryFuseFilter`.
     pub fn tryFuseFilter(self: *Query, expr: predicate.PredicateExpr) !bool {
         return self.vtable.tryFuseFilter(self.ptr, expr);
+    }
+
+    /// Offer a projection Compute to this operator to absorb. Returns true if it
+    /// took ownership (caller becomes a pass-through). See `VTable.tryFuseCompute`.
+    pub fn tryFuseCompute(self: *Query, derived: []const @import("compute.zig").Derived) !bool {
+        return self.vtable.tryFuseCompute(self.ptr, derived);
     }
 
     /// Pre-execution stats on this operator's output. Cheap; no data
@@ -534,6 +552,11 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.tryFuseFilter(expr);
         }
+        fn tryFuseComputeWrap(ptr: *anyopaque, derived: []const @import("compute.zig").Derived) anyerror!bool {
+            if (!@hasDecl(Op, "tryFuseCompute")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.tryFuseCompute(derived);
+        }
         fn statsWrap(ptr: *anyopaque) PipelineStats {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.stats();
@@ -578,6 +601,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .outputSchema = outputSchemaWrap,
             .addPrune = addPruneWrap,
             .tryFuseFilter = tryFuseFilterWrap,
+            .tryFuseCompute = tryFuseComputeWrap,
             .stats = statsWrap,
             .accountant = accountantWrap,
             .explain = explainWrap,
@@ -759,6 +783,10 @@ pub const statsOverlapPredicate = predicate.statsOverlapPredicate;
 
 pub const Scan = @import("scan.zig").Scan;
 pub const ParallelScan = @import("parallel_scan.zig").ParallelScan;
+/// True if a derived projection column is row-local (so a parallel scan can run
+/// it in its workers). Used by the compile layer to split a Compute into a
+/// fusable subset + a serial remainder. See `parallel_scan.derivedFusable`.
+pub const derivedFusable = @import("parallel_scan.zig").derivedFusable;
 pub const FileScan = @import("file_scan.zig").FileScan;
 pub const Filter = @import("filter.zig").Filter;
 pub const Project = @import("project_limit.zig").Project;

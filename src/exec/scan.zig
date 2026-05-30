@@ -734,6 +734,13 @@ pub const Scan = struct {
     /// projects — guaranteed when the fusing Filter sits directly above and
     /// shares this scan's output schema. The expr is stored by value; its
     /// backing memory is owned by the caller and must outlive this scan.
+    /// True once a WHERE predicate has been fused into this scan (so `next()`
+    /// emits compacted survivors, not raw row groups). ParallelScan reads this
+    /// to choose its execution strategy.
+    pub fn fusedActive(self: *const Scan) bool {
+        return self.fused_filter != null;
+    }
+
     pub fn tryFuseFilter(self: *Scan, expr: PredicateExpr) !bool {
         if (self.out_phys.len == 0) return false;
         if (self.fused_filter != null) return false;

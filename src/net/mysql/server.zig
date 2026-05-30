@@ -26,6 +26,7 @@ const local = @import("../local.zig");
 const ir = @import("../../ir/ir.zig");
 const sql = @import("../../sql/sql.zig");
 const types = @import("../../types.zig");
+const core_scheduler = @import("../../util/core_scheduler.zig");
 
 const packet = @import("packet.zig");
 const handshake = @import("handshake.zig");
@@ -2658,6 +2659,16 @@ fn runSingleStatement(
     extra_status: u16,
     profiler: *MysqlProfiler,
 ) !void {
+    // Serial-stage core lease: pin this connection thread to one core for the
+    // whole statement (compile + execute + drain). Parallel-scan workers lease
+    // ADDITIONAL cores per stage and release between them; this thread reuses
+    // its lease as the inline worker (the scheduler's no-hold-and-wait guard).
+    // For a single-threaded query this is the only lease — it still gets a
+    // reserved core. Blocking here when the machine is saturated is the
+    // intended admission control. Best-effort: a no-op when pinning is off/unsupported.
+    var qlease = core_scheduler.global().acquire();
+    defer qlease.release();
+
     profiler.recordSqlKind(classifySqlKind(op.*));
     const main_db = catalog.database(session.current_db) orelse {
         try handshake.sendErrPacket(allocator, w, seq_id.*, 1049, "42000".*, "Unknown database");

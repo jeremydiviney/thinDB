@@ -157,6 +157,13 @@ pub const Filter = struct {
     }
 
     pub fn outputSchema(self: *Filter) []const Column {
+        // A fused Filter is a pass-through and emits its upstream's batches
+        // verbatim — so it must report the upstream's CURRENT schema, which may
+        // have grown columns if a projection Compute fused down through us after
+        // construction. (Non-fused: our own schema == upstream's, but read it
+        // live anyway.) Without this the cached schema goes stale and a fused
+        // Compute's new columns become "unknown" to downstream operators.
+        if (self.fused) return self.upstream.outputSchema();
         return self.schema;
     }
 
@@ -182,6 +189,26 @@ pub const Filter = struct {
 
     pub fn clearDictCodeColumns(self: *Filter) void {
         if (self.fused) self.upstream.clearDictCodeColumns();
+    }
+
+    /// Forward a projection-Compute fusion to the upstream, but only when this
+    /// Filter is itself fused (a pass-through). A non-fused Filter still
+    /// evaluates rows here, so a Compute above it must stay a separate operator.
+    pub fn tryFuseCompute(self: *Filter, derived: []const @import("compute.zig").Derived) !bool {
+        if (!self.fused) return false;
+        const ok = try self.upstream.tryFuseCompute(derived);
+        // The fused derived columns grow the upstream's output schema, so our
+        // pre-fusion `cached_stats` (tightened for the OLD, narrower schema) is
+        // now stale + too short — a derived GROUP BY key would index past its
+        // end and look unknown, mis-sizing the hash table. Drop it; `stats()`
+        // then forwards the fresh upstream stats (which carry the fused
+        // columns' propagated NDV). Losing the predicate's min/max tightening
+        // here is safe: untightened bounds are still valid upper bounds.
+        if (ok and self.cached_stats.len > 0) {
+            self.allocator.free(@constCast(self.cached_stats));
+            self.cached_stats = &.{};
+        }
+        return ok;
     }
 
     /// Filter only restricts rows — `upper_rows` is unchanged (a filter is

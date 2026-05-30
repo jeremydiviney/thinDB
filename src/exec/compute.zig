@@ -325,13 +325,18 @@ pub const Compute = struct {
     pub fn stats(self: *Compute) exec.PipelineStats {
         var up = self.upstream.stats();
         const up_n = self.upstream.outputSchema().len;
-        // Only extend when upstream reports a full per-column stat array;
-        // otherwise the indices wouldn't line up and fabricating is unsafe.
-        if (up.column_stats.len != up_n) return up;
         const out_stats = self.arena.allocator().alloc(exec.ColStat, up_n + self.derived.len) catch return up;
-        @memcpy(out_stats[0..up_n], up.column_stats);
+        // Align to the OUTPUT schema: copy the upstream stats we have, padding
+        // any the upstream didn't report (a short/empty array) with unknown so
+        // indices line up. Then extend with the derived columns. Bailing here
+        // instead would leave column_stats shorter than the schema, so a
+        // derived GROUP BY key reads out-of-bounds → unknown → the router
+        // mis-sizes the hash table (the Q28 regex-key sort regression).
+        for (out_stats[0..up_n], 0..) |*s, i| {
+            s.* = if (i < up.column_stats.len) up.column_stats[i] else .{ .ndv = .unknown };
+        }
         for (self.derived, 0..) |d, i| {
-            out_stats[up_n + i] = derivedColStat(d, up.column_stats);
+            out_stats[up_n + i] = derivedColStat(d, out_stats[0..up_n]);
         }
         exec.capColStats(out_stats, up.upper_rows);
         up.column_stats = out_stats;
@@ -817,6 +822,49 @@ fn singleColIndex(c: Expr.Call, up_schema: []const Column) ?usize {
         else => return null, // nested call / case / subquery: can't prove single-col
     };
     return found;
+}
+
+test "NDV chains through deterministic functions (pigeonhole, never grows)" {
+    const up_schema = [_]Column{
+        .{ .name = "Referer", .type = .{ .varchar = 255 } },
+        .{ .name = "n", .type = .int },
+    };
+    const up_stats = [_]exec.ColStat{
+        .{ .ndv = .{ .exact = 19_700_000 } }, // NDV(Referer)
+        .{ .ndv = .{ .exact = 1000 } },
+    };
+
+    // REGEXP_REPLACE(Referer, '<pat>', '<rep>') — one column arg + two literals.
+    // Must classify as single-column ⇒ a deterministic function can't
+    // manufacture distinct outputs from equal inputs: ndv ≤ NDV(Referer).
+    const regex_args = [_]Expr{
+        .{ .col_ref = "Referer" },
+        .{ .lit = .{ .int = 0 } }, // pattern literal (value irrelevant to the bound)
+        .{ .lit = .{ .int = 0 } }, // replacement literal
+    };
+    const cls = classifyExpr(.{ .call = .{ .fn_name = "regexp_replace", .args = &regex_args } }, &up_schema);
+    try std.testing.expect(cls == .unary);
+    try std.testing.expectEqual(@as(usize, 0), cls.unary.src_idx);
+
+    const k = ResolvedDerived{
+        .name = "k",
+        .output_type = .{ .varchar = 255 },
+        .stat_class = cls,
+        .kind = .{ .call = undefined }, // derivedColStat only reads the tag for non-rename
+    };
+    try std.testing.expectEqual(exec.ColCard{ .exact = 19_700_000 }, derivedColStat(k, &up_stats).ndv);
+
+    // Two-column arithmetic ⇒ ndv ≤ NDV1·NDV2, SATURATING at u32 max (never
+    // wraps — a wrapped bound could read smaller than reality and mis-route).
+    const add_args = [_]Expr{ .{ .col_ref = "Referer" }, .{ .col_ref = "n" } };
+    const cls2 = classifyExpr(.{ .call = .{ .fn_name = "add", .args = &add_args } }, &up_schema);
+    try std.testing.expect(cls2 == .binary);
+    const p = ResolvedDerived{ .name = "p", .output_type = .int, .stat_class = cls2, .kind = .{ .call = undefined } };
+    try std.testing.expectEqual(exec.ColCard{ .exact = std.math.maxInt(u32) }, derivedColStat(p, &up_stats).ndv);
+
+    // No provable shape (opaque) ⇒ unknown — never a fabricated number.
+    const o = ResolvedDerived{ .name = "o", .output_type = .int, .stat_class = .none, .kind = .{ .call = undefined } };
+    try std.testing.expectEqual(exec.ColCard.unknown, derivedColStat(o, &up_stats).ndv);
 }
 
 /// Checked i128 add — null on overflow so a derived bound is never wrong.

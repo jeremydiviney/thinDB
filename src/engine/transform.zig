@@ -21,9 +21,10 @@ pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
         .int => |l| std.math.order(l.items[a], l.items[b]),
         .bigint => |l| std.math.order(l.items[a], l.items[b]),
         .boolean => |l| std.math.order(l.items[a], l.items[b]),
-        .varchar => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
-        .string => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
-        .char => |s| std.mem.order(u8, s.view().rowBytes(a), s.view().rowBytes(b)),
+        // rowBytesWide transparently honors the u64 sidecar (Sort over >4 GiB).
+        .varchar => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
+        .string => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
+        .char => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
         .tinyint => |l| std.math.order(l.items[a], l.items[b]),
         .smallint => |l| std.math.order(l.items[a], l.items[b]),
         .largeint => |l| std.math.order(l.items[a], l.items[b]),

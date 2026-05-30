@@ -1936,6 +1936,7 @@ pub fn buildServerQuerySession(
         .compute => |c| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, c.upstream.*);
             errdefer upstream.deinit();
+            if (try upstream.tryFuseCompute(c.derived)) break :blk upstream;
             break :blk try upstream.compute(c.derived);
         },
         .join => |j| blk: {
@@ -2491,7 +2492,98 @@ fn groupKeysCardUnderLimit(
         }
     }
     const est: u64 = if (any_unknown) ceiling else @min(product, ceiling);
+    if (exec.trace_group_by) traceGroupByDecision(st, schema, group_cols, per_group, est, max_groups);
     return est < max_groups;
+}
+
+/// `--trace-group-by` diagnostic: dump the hash-vs-sort decision inputs. An
+/// `OOB` key (schema index ≥ stats length) flags a schema/stats desync — the
+/// derived-key NDV-dropping bug class (#337). Off by default; no hot-path cost.
+fn traceGroupByDecision(
+    st: exec.PipelineStats,
+    schema: []const types.Column,
+    group_cols: []const []const u8,
+    per_group: u64,
+    est: u64,
+    max_groups: u64,
+) void {
+    std.debug.print("[gbroute] schema_len={d} stats_len={d} per_group={d} ", .{ schema.len, st.column_stats.len, per_group });
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse {
+            std.debug.print("{s}=NOTFOUND ", .{gc});
+            continue;
+        };
+        if (idx >= st.column_stats.len) {
+            std.debug.print("{s}@{d}=OOB ", .{ gc, idx });
+        } else switch (st.column_stats[idx].ndv) {
+            .unknown => std.debug.print("{s}@{d}=unknown ", .{ gc, idx }),
+            .exact => |n| std.debug.print("{s}@{d}=ndv({d}) ", .{ gc, idx, n }),
+        }
+    }
+    std.debug.print("| est_groups={d} cutoff_groups={d} -> {s}\n", .{ est, max_groups, if (est < max_groups) "HASH" else "SORT" });
+}
+
+test "GROUP BY size estimate + NDV-driven hash/sort gate" {
+    const Column = types.Column;
+    // Mirrors Q28's shape: a string group key `k` plus an int column feeding
+    // AVG, with a COUNT(*). The router sizes the hash table as
+    // groups × perGroupTableBytes and routes to sort only when that exceeds
+    // budget/2 — so a KNOWN-low key NDV must pick hash, an UNKNOWN one (the
+    // derived-key fallback to the row ceiling) must pick sort.
+    const schema = [_]Column{
+        .{ .name = "k", .type = .{ .varchar = 255 } },
+        .{ .name = "len_src", .type = .int },
+    };
+    const group_cols = [_][]const u8{"k"};
+    const aggs = [_]ir.AggSpec{
+        .{ .func = .avg, .col = "len_src", .as = "l" },
+        .{ .func = .count, .col = null, .as = "c" },
+    };
+
+    // The per-group footprint is a real, bounded number (slot + key + state +
+    // load factor), dominated by fixed overhead — NOT the string bytes.
+    const pg = perGroupTableBytes(&schema, &group_cols, &aggs);
+    try std.testing.expect(pg >= 64 and pg <= 256);
+
+    // Budget chosen so the cutoff (budget/2 = 2 GiB) sits between the real
+    // 3M-group table (~0.4 GiB) and the 81M row-ceiling fallback (~10 GiB).
+    const budget: usize = 4 * 1024 * 1024 * 1024;
+    const upper_rows: u64 = 81_000_000;
+
+    // KNOWN low NDV (the real ~3M distinct hosts) → table fits → HASH.
+    const known = exec.PipelineStats{
+        .upper_rows = upper_rows,
+        .column_stats = &.{
+            .{ .ndv = .{ .exact = 3_000_000 } },
+            .{ .ndv = .unknown },
+        },
+    };
+    try std.testing.expect(groupKeysCardUnderLimit(known, &schema, &group_cols, &aggs, budget));
+
+    // UNKNOWN key NDV → fall back to the row ceiling (81M) → over budget/2 → SORT.
+    const unknown = exec.PipelineStats{
+        .upper_rows = upper_rows,
+        .column_stats = &.{
+            .{ .ndv = .unknown },
+            .{ .ndv = .unknown },
+        },
+    };
+    try std.testing.expect(!groupKeysCardUnderLimit(unknown, &schema, &group_cols, &aggs, budget));
+
+    // And the propagated bound is what flips it: the SAME query with the key's
+    // NDV bounded (e.g. NDV(REGEXP_REPLACE(Referer)) ≤ NDV(Referer)=19.7M) at a
+    // budget whose cutoff clears 19.7M×pg but not 81M×pg → HASH not SORT.
+    const big_budget: usize = 12 * 1024 * 1024 * 1024; // cutoff 6 GiB
+    const bounded = exec.PipelineStats{
+        .upper_rows = upper_rows,
+        .column_stats = &.{
+            .{ .ndv = .{ .exact = 19_700_000 } }, // bound from the source column
+            .{ .ndv = .unknown },
+        },
+    };
+    try std.testing.expect(groupKeysCardUnderLimit(bounded, &schema, &group_cols, &aggs, big_budget));
+    // Without the bound, the same budget would sort (81M × pg ≈ 10 GiB > 6 GiB).
+    try std.testing.expect(!groupKeysCardUnderLimit(unknown, &schema, &group_cols, &aggs, big_budget));
 }
 
 // ---------------------------------------------------------------------------
@@ -2688,6 +2780,35 @@ fn stripAlias(alias: []const u8, name: []const u8) ?[]const u8 {
     return name[dot + 1 ..];
 }
 
+/// Layer a projection Compute onto `upstream`, splitting it so row-local
+/// derived columns (regex / scalar fns) run inside the parallel scan workers
+/// and the remainder (CASE, anything referencing a sibling derived, etc.) runs
+/// in a serial Compute above the parallel merge. When nothing is fusable — or
+/// the upstream isn't a parallel scan (DOP=1) — it degrades to a single serial
+/// Compute over all derived, identical to the old behavior.
+fn fuseSplitCompute(ctx: *CompileCtx, upstream: Query, derived: []const ir.Derived) !Query {
+    var up = upstream;
+    const scan_cols = up.outputSchema();
+    var fusable: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    defer fusable.deinit(ctx.allocator);
+    var serial: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    defer serial.deinit(ctx.allocator);
+    for (derived) |d| {
+        if (exec.derivedFusable(d, scan_cols)) {
+            try fusable.append(ctx.allocator, d);
+        } else {
+            try serial.append(ctx.allocator, d);
+        }
+    }
+    // Nothing fusable, or fusion declined (no parallel scan beneath) → all serial.
+    if (fusable.items.len == 0) return up.compute(derived);
+    if (!try up.tryFuseCompute(fusable.items)) return up.compute(derived);
+    // Fused subset now runs in the workers; layer the remainder serially (it can
+    // reference the fused columns, which are now in `up`'s output schema).
+    if (serial.items.len == 0) return up;
+    return up.compute(serial.items);
+}
+
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
     return switch (op.*) {
         .scan => |s| blk: {
@@ -2844,8 +2965,10 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 break :blk q;
             }
             std.debug.assert(!consumed_base);
-            // Not reduced: re-layer the peeled Compute onto the built base.
-            if (agg_args.len > 0) upstream = try upstream.compute(agg_args);
+            // Not reduced: re-layer the peeled Compute onto the built base,
+            // splitting it so row-local derived columns run in the parallel scan
+            // workers and the rest stays serial.
+            if (agg_args.len > 0) upstream = try fuseSplitCompute(ctx, upstream, agg_args);
             // Global aggregate (no group keys) is O(1) — always hash.
             if (try routeStreamGroupBy(ctx.allocator, &upstream, g.group_cols, g.aggs, ctx.db.config.query_memory_budget)) |q| {
                 break :blk q;
@@ -2923,7 +3046,9 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .compute => |c| blk: {
             var upstream = try compileOp(ctx, c.upstream);
             errdefer upstream.deinit();
-            break :blk try upstream.compute(c.derived);
+            // Split: row-local derived columns run in the parallel scan workers
+            // (forwarding through a fused Filter); the remainder stays serial.
+            break :blk try fuseSplitCompute(ctx, upstream, c.derived);
         },
         .join => |j| blk: {
             var left = try compileOp(ctx, j.left);

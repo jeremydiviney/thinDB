@@ -35,6 +35,14 @@ fn freq() i64 {
     return if (f == 0) 1 else f;
 }
 
+/// Convert a raw performance-counter tick delta to milliseconds. Used by
+/// operators that time their own internal phases (e.g. ParallelScan's worker
+/// drain) and print directly, outside the per-type `add`/`dump` path.
+pub fn ticksToMs(ticks: i64) f64 {
+    const hz: f64 = @floatFromInt(freq());
+    return @as(f64, @floatFromInt(ticks)) * 1000.0 / hz;
+}
+
 pub inline fn add(name: []const u8, ticks: u64) void {
     if (!enabled) return;
     var i: usize = 0;

@@ -11,13 +11,26 @@
 //! scratch and allocates from the table's thread-safe allocator — so concurrent
 //! `worker.next()` calls are safe with no further locking.
 //!
-//! Execution is fork-join by round: each `next()` round runs one
-//! `worker.next()` per live worker concurrently (worker 0 inline, the rest
-//! spawned), then emits the produced batches in worker order. In-flight memory
-//! is bounded to `dop` batches; the emission order is reproducible for a given
+//! Two execution strategies, chosen lazily on the first `next()` once filter
+//! fusion (which happens after `create`) has settled:
+//!   * `materialize` (a WHERE predicate was fused in): spawn workers once —
+//!     worker 0 inline, the rest on their own threads — each draining its WHOLE
+//!     slice to completion and deep-copying its survivors into owned
+//!     ColumnStores. We then emit the per-worker buffers in slice order (concat).
+//!     One spawn+join for the whole scan; bounded by the filter's survivor count
+//!     (charged to the query budget after the join).
+//!   * `round` (no fused filter ⇒ survivors would be the whole table): the
+//!     streaming fork-join path — each `next()` runs one `worker.next()` per
+//!     live worker concurrently and emits in worker order, in-flight memory
+//!     bounded to `dop` batches.
+//! Both emit in worker/slice order, so results are reproducible for a given
 //! `dop` (DOP=1 is the canonical serial result). Per-query parallelism is capped
-//! by `max_dop` and globally by a shared worker-slot budget (~cores−1) so
-//! concurrent queries share cores instead of oversubscribing.
+//! by `max_dop`; the process-global CoreScheduler (util/core_scheduler.zig) then
+//! throttles globally — each worker leases (and pins to) a physical core for its
+//! run and blocks when the machine is saturated, so concurrent queries share
+//! cores instead of oversubscribing, and the lease bucket doubles as admission
+//! control. Pinning recovers the ~40% scaling the OS scheduler loses by parking
+//! two of our threads on one core's SMT siblings while another core idles.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -36,49 +49,62 @@ const makeQuery = exec.makeQuery;
 const predicate = @import("predicate.zig");
 const Scan = @import("scan.zig").Scan;
 
-/// Process-global worker-slot budget shared across all queries. The inline
-/// (calling) thread is always free; these slots gate the SPAWNED workers, so
-/// total spawned threads across concurrent queries stay near `cores − 1`.
-const GlobalSlots = struct {
-    var used = std.atomic.Value(usize).init(0);
-
-    fn cap() usize {
-        const total = std.Thread.getCpuCount() catch 2;
-        return if (total > 1) total - 1 else 1;
-    }
-
-    /// Grant up to `want` slots (0 when none free). CAS so concurrent queries
-    /// don't over-grant.
-    fn acquire(want: usize) usize {
-        if (want == 0) return 0;
-        const c = cap();
-        while (true) {
-            const cur = used.load(.monotonic);
-            if (cur >= c) return 0;
-            const grant = @min(want, c - cur);
-            if (grant == 0) return 0;
-            if (used.cmpxchgWeak(cur, cur + grant, .acquire, .monotonic) == null) return grant;
-        }
-    }
-
-    fn release(n: usize) void {
-        if (n > 0) _ = used.fetchSub(n, .release);
-    }
-};
+const storage = @import("../storage/storage.zig");
+const ColumnView = storage.ColumnView;
+const engine = @import("../engine/engine.zig");
+const ColumnStore = engine.ColumnStore;
+const transform = @import("../engine/transform.zig");
+const Derived = @import("compute.zig").Derived;
+const core_scheduler = @import("../util/core_scheduler.zig");
+const Expr = @import("expr.zig").Expr;
 
 /// A (segment, row_group) coordinate over the flat row-group list.
 const Coord = struct { seg: usize, rg: usize };
+
+/// Materialize-mode chunking: cut the row groups into `dop * CHUNK_FACTOR`
+/// byte-balanced chunks (not one per thread) and let `dop` threads steal them
+/// from a shared cursor. Finer chunks + dynamic claiming smooth out work skew —
+/// a thread that draws light chunks grabs more, instead of one fat slice gating
+/// the join. Survivor count (the real cost for filter+regex) isn't predictable
+/// from bytes, so static per-thread slices leave imbalance that stealing fixes.
+const CHUNK_FACTOR: usize = 4;
+
+/// Execution strategy, chosen lazily on the first `next()` (fusion happens
+/// after `create`). `materialize` is the fused-filter path: each worker drains
+/// its whole slice and deep-copies survivors, then we concat. `round` is the
+/// streaming fork-join path used when no filter was fused (so survivors would
+/// be the whole table — can't materialize).
+const Mode = enum { unset, round, materialize };
+
+/// One worker's fully-drained, deep-copied survivor set (materialize mode).
+/// `columns` are owned and allocated from the table's thread-safe allocator
+/// (workers run concurrently); freed in `deinit`.
+const WorkerBuf = struct {
+    columns: []ColumnStore = &.{},
+    row_count: u32 = 0,
+    bytes: usize = 0,
+    // Perf-counter ticks spent in scan.next() (decode + filter) vs.
+    // appendAllColumn (deep-copying survivors). Populated only when
+    // `exec.prof.enabled`; printed by runMaterialize.
+    scan_ticks: u64 = 0,
+    copy_ticks: u64 = 0,
+};
 
 pub const ParallelScan = struct {
     allocator: Allocator,
     table: *Table,
 
-    /// One full range-restricted Scan per worker. `workers[0]` runs on the
-    /// calling thread; `workers[1..]` are spawned each round.
+    /// One range-restricted Scan per CHUNK (materialize mode cuts ~`dop *
+    /// CHUNK_FACTOR` byte-balanced chunks; round mode uses one per thread). In
+    /// materialize mode `n_threads` worker threads steal these via `next_chunk`;
+    /// in round mode it's one batch per chunk per fork-join round.
     workers: []*Scan,
-    /// Extra worker slots granted by `GlobalSlots` (== workers.len − 1),
-    /// returned at deinit.
-    granted: usize,
+    /// Worker thread count (the effective DOP). ≤ `workers.len`; in materialize
+    /// mode `n_threads` threads steal `workers.len` chunks.
+    n_threads: usize,
+    /// Shared steal cursor: each worker claims chunk `next_chunk.fetchAdd(1)`
+    /// until it reaches `workers.len`. Materialize mode only.
+    next_chunk: std.atomic.Value(usize),
 
     acct: ?*exec.memory.MemoryAccountant,
     owns_acct: bool,
@@ -93,6 +119,25 @@ pub const ParallelScan = struct {
     round_cursor: usize, // next round slot to emit; == workers.len ⇒ run a round
     all_done: bool,
 
+    // Materialize-mode state (fused-filter path). Chosen lazily on the first
+    // next() once we know whether a filter was fused in. `wbufs`/`emit_views`
+    // are allocated then, not in create(); both stay empty in round mode.
+    mode: Mode = .unset,
+    wbufs: []WorkerBuf = &.{},
+    emit_views: []ColumnView = &.{},
+    emit_cursor: usize = 0,
+    reserved_bytes: usize = 0,
+
+    // Fused projection Compute (set via tryFuseCompute): when present, each
+    // worker drains `compute_q[i]` (a Compute over its ranged Scan) instead of
+    // the bare scan, so row-local derived columns (regex / scalar fns) compute
+    // in parallel. `compute_q[i]` OWNS `workers[i]` (built from the thread-safe
+    // table allocator); `compute_built` is how many were constructed (drives
+    // deinit ownership, incl. the partial-build error path).
+    compute_q: []Query = &.{},
+    compute_built: usize = 0,
+    compute_fused: bool = false,
+
     /// Build a parallel scan over `table` projecting `needed` (null = all
     /// columns), with up to `max_dop` workers. Always returns a valid operator:
     /// when only one slot is available it runs serially through the same
@@ -104,10 +149,10 @@ pub const ParallelScan = struct {
         needed: ?[]const []const u8,
         max_dop: usize,
     ) !Query {
-        const want_extra = if (max_dop > 1) max_dop - 1 else 0;
-        const granted = GlobalSlots.acquire(want_extra);
-        errdefer GlobalSlots.release(granted);
-        const dop = 1 + granted;
+        // Spawn up to `max_dop` workers; the CoreScheduler throttles at run time
+        // (each worker leases+pins a core, blocking when the machine is full), so
+        // there's no up-front global slot budget to negotiate here.
+        const dop = @max(@as(usize, 1), max_dop);
 
         table.ddl_lock.lockSharedUncancelable(table.io);
         errdefer table.ddl_lock.unlockShared(table.io);
@@ -127,13 +172,11 @@ pub const ParallelScan = struct {
         }
         seg_start[snap.segment_count] = total_rgs;
 
-        // No point in more workers than blocks (+1 lets a tiny/empty table still
-        // have one worker for the memtable). Return the now-excess slots.
-        const eff = @max(@as(usize, 1), @min(dop, @max(total_rgs, 1)));
-        if (dop > eff) {
-            GlobalSlots.release(dop - eff);
-        }
-        const eff_granted = eff - 1;
+        // `n_threads` worker threads (the effective DOP) bounded by row-group
+        // count. `n_chunks` is the finer work unit they steal — `dop *
+        // CHUNK_FACTOR`, capped to the row-group total and never below n_threads.
+        const n_threads = @max(@as(usize, 1), @min(dop, @max(total_rgs, 1)));
+        const n_chunks = @max(n_threads, @min(dop * CHUNK_FACTOR, @max(total_rgs, 1)));
 
         // Mint or adopt the single accountant exposed to the downstream serial
         // tail. Workers get it as `injected` (they never touch it, so sharing is
@@ -150,37 +193,51 @@ pub const ParallelScan = struct {
             if (acct) |a| allocator.destroy(a);
         };
 
-        const workers = try allocator.alloc(*Scan, eff);
+        // Byte-aware partition: weight each row group by the on-disk bytes of the
+        // PROJECTED columns and cut contiguous spans of ~equal bytes, instead of
+        // equal row-group COUNT. Variable-length columns make equal-count spans
+        // carry very unequal work (one worker's URLs may be 2× another's), so the
+        // join waits on a straggler. Reads each segment footer once (footer-only;
+        // ~1 MB/segment, warm in page cache). Returns null — falling back to the
+        // equal-count split below — on any footer-read failure, so a sizing
+        // hiccup can never break the query.
+        const bounds: ?[]const usize = if (n_chunks > 1 and total_rgs > n_chunks)
+            byteAwareBounds(allocator, table, snap.segment_count, total_rgs, n_chunks, needed)
+        else
+            null;
+        defer if (bounds) |b| allocator.free(b);
+
+        const workers = try allocator.alloc(*Scan, n_chunks);
         var built: usize = 0;
         errdefer {
             for (workers[0..built]) |w| w.deinit();
             allocator.free(workers);
         }
-        for (0..eff) |i| {
-            const lo = i * total_rgs / eff;
-            const hi = if (i == eff - 1) total_rgs else (i + 1) * total_rgs / eff;
+        for (0..n_chunks) |i| {
+            const lo = if (bounds) |b| b[i] else i * total_rgs / n_chunks;
+            const hi = if (bounds) |b| b[i + 1] else (if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks);
             const start = flatToCoord(lo, seg_start, snap.segment_count, total_rgs);
             const end = flatToCoord(hi, seg_start, snap.segment_count, total_rgs);
             const w = try Scan.allocWithProjectionLoc(table.allocator, table, acct, needed, false, snap);
             workers[i] = w;
             built += 1;
-            // The last worker also drains the memtable (ordered last).
-            w.setRange(start.seg, start.rg, end.seg, end.rg, i == eff - 1);
+            // The last chunk also drains the memtable (ordered last).
+            w.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
         }
 
-        // Workers each pinned the memtable; drop the orchestrator's capture pin.
+        // Each chunk pinned the memtable; drop the orchestrator's capture pin.
         snap.memtable_snap.release();
         pin_held = false;
 
-        const round = try allocator.alloc(?Batch, eff);
+        const round = try allocator.alloc(?Batch, n_chunks);
         errdefer allocator.free(round);
-        const werr = try allocator.alloc(?anyerror, eff);
+        const werr = try allocator.alloc(?anyerror, n_chunks);
         errdefer allocator.free(werr);
-        const threads = try allocator.alloc(std.Thread, eff);
+        const threads = try allocator.alloc(std.Thread, n_chunks);
         errdefer allocator.free(threads);
-        const thread_active = try allocator.alloc(bool, eff);
+        const thread_active = try allocator.alloc(bool, n_chunks);
         errdefer allocator.free(thread_active);
-        const exhausted = try allocator.alloc(bool, eff);
+        const exhausted = try allocator.alloc(bool, n_chunks);
         errdefer allocator.free(exhausted);
         @memset(exhausted, false);
 
@@ -191,7 +248,8 @@ pub const ParallelScan = struct {
             .allocator = allocator,
             .table = table,
             .workers = workers,
-            .granted = eff_granted,
+            .n_threads = n_threads,
+            .next_chunk = std.atomic.Value(usize).init(0),
             .acct = acct,
             .owns_acct = owns_acct,
             .out_schema = workers[0].outputSchema(),
@@ -200,21 +258,44 @@ pub const ParallelScan = struct {
             .threads = threads,
             .thread_active = thread_active,
             .exhausted = exhausted,
-            .round_cursor = eff, // force a round on the first next()
+            .round_cursor = n_chunks, // force a round on the first next()
             .all_done = false,
         };
         return makeQuery(allocator, self);
     }
 
     pub fn deinit(self: *ParallelScan) void {
-        for (self.workers) |w| w.deinit();
+        // Materialize-mode buffers: column data is owned by the table's
+        // allocator (workers allocated it); the wbufs/views slices are the
+        // operator's own. Release the charged bytes before the accountant is
+        // torn down below.
+        if (self.reserved_bytes > 0) {
+            if (self.acct) |a| a.release(.materialize, self.reserved_bytes);
+        }
+        const ta = self.table.allocator;
+        for (self.wbufs) |*wb| {
+            for (wb.columns) |*c| c.deinit(ta);
+            if (wb.columns.len > 0) ta.free(wb.columns);
+        }
+        if (self.wbufs.len > 0) self.allocator.free(self.wbufs);
+        if (self.emit_views.len > 0) self.allocator.free(self.emit_views);
+
+        // Ownership split (compute-fused path): scans [0..compute_built) are
+        // owned by their per-worker Compute (compute_q) and freed by its deinit;
+        // scans [compute_built..) are still bare and freed directly. With no
+        // fused compute, compute_built == 0 → all scans freed here as usual.
+        for (self.compute_q[0..self.compute_built]) |q| {
+            var qq = q;
+            qq.deinit();
+        }
+        if (self.compute_q.len > 0) self.allocator.free(self.compute_q);
+        for (self.workers[self.compute_built..]) |w| w.deinit();
         self.allocator.free(self.workers);
         self.allocator.free(self.round);
         self.allocator.free(self.werr);
         self.allocator.free(self.threads);
         self.allocator.free(self.thread_active);
         self.allocator.free(self.exhausted);
-        GlobalSlots.release(self.granted);
         self.table.ddl_lock.unlockShared(self.table.io);
         if (self.owns_acct) {
             if (self.acct) |a| self.allocator.destroy(a);
@@ -246,18 +327,66 @@ pub const ParallelScan = struct {
         return fused;
     }
 
+    /// Absorb a row-local projection Compute: build one Compute per worker over
+    /// its ranged scan (each owns the scan, allocated from the thread-safe table
+    /// allocator with its own derived scratch), so the derived columns — incl.
+    /// the per-row scalar work like REGEXP_REPLACE — evaluate inside the workers.
+    /// Declines (stays serial) for non-row-local derived (CASE / subquery / var).
+    /// `compute_built` tracks construction so deinit's ownership split is correct
+    /// even if a mid-build allocation fails.
+    pub fn tryFuseCompute(self: *ParallelScan, derived: []const Derived) !bool {
+        if (self.mode != .unset or self.compute_fused) return false;
+        const scan_cols = self.workers[0].outputSchema();
+        for (derived) |d| {
+            if (!derivedFusable(d, scan_cols)) return false;
+        }
+        const q = try self.allocator.alloc(Query, self.workers.len);
+        self.compute_q = q;
+        for (self.workers, 0..) |w, i| {
+            const sq = makeQuery(self.table.allocator, w);
+            q[i] = try sq.compute(derived);
+            self.compute_built = i + 1;
+        }
+        self.out_schema = q[0].outputSchema();
+        self.compute_fused = true;
+        return true;
+    }
+
     pub fn stats(self: *ParallelScan) exec.PipelineStats {
+        if (self.compute_fused) return self.compute_q[0].stats();
         return self.workers[0].stats();
     }
 
     pub fn explain(self: *ParallelScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        var buf: [48]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "ParallelScan (DOP={d})", .{self.workers.len}) catch "ParallelScan";
+        var buf: [64]u8 = undefined;
+        const tag = if (self.compute_fused) "materialize+compute" else if (self.workers[0].fusedActive()) "materialize" else "stream";
+        const line = std.fmt.bufPrint(&buf, "ParallelScan (DOP={d}, {s})", .{ self.n_threads, tag }) catch "ParallelScan";
         try exec.explainLine(out, allocator, depth, line);
-        try self.workers[0].explain(out, allocator, depth + 1);
+        if (self.compute_fused) {
+            try self.compute_q[0].explain(out, allocator, depth + 1);
+        } else {
+            try self.workers[0].explain(out, allocator, depth + 1);
+        }
     }
 
     pub fn next(self: *ParallelScan) !?Batch {
+        if (self.mode == .unset) {
+            // Fusion happens after create() (the wrapping Filter/Compute fuse on
+            // their way up), so the strategy is settled by the first pull. A
+            // fused filter (bounded survivors) OR a fused compute (we run the
+            // derived columns in the workers) ⇒ materialize + concat; otherwise
+            // survivors would be the whole table, so stream via fork-join rounds.
+            self.mode = if (self.workers[0].fusedActive() or self.compute_fused) .materialize else .round;
+            if (self.mode == .materialize) try self.runMaterialize();
+        }
+        return switch (self.mode) {
+            .materialize => self.nextMaterialize(),
+            .round => self.nextRound(),
+            .unset => unreachable,
+        };
+    }
+
+    fn nextRound(self: *ParallelScan) !?Batch {
         while (true) {
             // Emit this round's batches in worker order.
             while (self.round_cursor < self.workers.len) {
@@ -268,6 +397,103 @@ pub const ParallelScan = struct {
             if (self.all_done) return null;
             try self.runRound();
         }
+    }
+
+    /// Fused-filter path: spawn workers 1..n-1 once (worker 0 inline), each
+    /// draining its entire slice to completion and deep-copying its survivors
+    /// into its own ColumnStores. One spawn+join for the whole scan instead of
+    /// one per sub-batch. Charges the merged survivor bytes against the query
+    /// budget after the join (single-threaded — the accountant isn't
+    /// thread-safe and workers never touch it).
+    fn runMaterialize(self: *ParallelScan) !void {
+        const n = self.workers.len;
+        const ta = self.table.allocator;
+
+        const wbufs = try self.allocator.alloc(WorkerBuf, n);
+        for (wbufs) |*wb| wb.* = .{};
+        self.wbufs = wbufs;
+        self.emit_views = try self.allocator.alloc(ColumnView, self.out_schema.len);
+
+        for (self.werr) |*e| e.* = null;
+        @memset(self.thread_active, false);
+        self.next_chunk.store(0, .monotonic);
+
+        const wall0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+
+        // Work-steal the chunks: `n_threads` workers (the calling thread + the
+        // rest spawned) each claim chunks from `next_chunk` until exhausted. The
+        // drainables are the Compute(scan) chains when a projection was fused in,
+        // else the bare chunk scans. Output is emitted later in chunk order.
+        if (self.compute_fused) {
+            self.workSteal(self.compute_q, ta);
+        } else {
+            self.workSteal(self.workers, ta);
+        }
+
+        if (exec.prof.enabled) self.reportDrain(exec.prof.ticksToMs(exec.prof.nowTicks() - wall0));
+
+        for (self.werr) |e| if (e) |err| return err;
+
+        var total: usize = 0;
+        for (self.wbufs) |wb| total += wb.bytes;
+        if (self.acct) |a| try a.reserve(.materialize, total);
+        self.reserved_bytes = total;
+    }
+
+    /// Spawn `n_threads-1` workers (the calling thread is the last); each runs
+    /// `stealLoop`, claiming chunks from the shared cursor until none remain,
+    /// then join. Finer chunks + dynamic claiming balance work that static
+    /// per-thread slices can't (survivor count ≠ bytes for filter/regex).
+    fn workSteal(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
+        var t: usize = 1;
+        while (t < self.n_threads) : (t += 1) {
+            if (std.Thread.spawn(.{}, stealLoop, .{ self, drainables, ta })) |th| {
+                self.threads[t] = th;
+                self.thread_active[t] = true;
+            } else |_| {
+                stealLoop(self, drainables, ta);
+            }
+        }
+        stealLoop(self, drainables, ta); // calling thread is a worker too
+        t = 1;
+        while (t < self.n_threads) : (t += 1) {
+            if (self.thread_active[t]) self.threads[t].join();
+        }
+    }
+
+    /// Drain breakdown summary (only when --profile-ops): the spawn→join wall and
+    /// the per-CHUNK time spread (min/max/mean) — a tighter spread than the old
+    /// per-thread slices means finer chunks + stealing balanced the work.
+    fn reportDrain(self: *ParallelScan, drain_wall_ms: f64) void {
+        var rows: u64 = 0;
+        var min_t: u64 = std.math.maxInt(u64);
+        var max_t: u64 = 0;
+        var sum_t: u64 = 0;
+        for (self.wbufs) |wb| {
+            rows += wb.row_count;
+            const t = wb.scan_ticks + wb.copy_ticks;
+            min_t = @min(min_t, t);
+            max_t = @max(max_t, t);
+            sum_t += t;
+        }
+        std.debug.print("[pscan] threads={d} chunks={d} drain_wall={d:.1}ms survivors={d} chunk_ms[min={d:.1} max={d:.1} mean={d:.1}]\n", .{
+            self.n_threads,                                       self.workers.len,                  drain_wall_ms, rows,
+            exec.prof.ticksToMs(@intCast(min_t)),                 exec.prof.ticksToMs(@intCast(max_t)),
+            exec.prof.ticksToMs(@intCast(sum_t / self.workers.len)),
+        });
+    }
+
+    /// Emit each worker's materialized survivor buffer as one batch, in slice
+    /// order (worker 0 first) — the canonical serial row order.
+    fn nextMaterialize(self: *ParallelScan) !?Batch {
+        while (self.emit_cursor < self.wbufs.len) {
+            const wb = &self.wbufs[self.emit_cursor];
+            self.emit_cursor += 1;
+            if (wb.row_count == 0) continue;
+            for (wb.columns, self.emit_views) |*c, *v| v.* = c.view();
+            return Batch{ .schema = self.out_schema, .values = self.emit_views, .row_count = wb.row_count };
+        }
+        return null;
     }
 
     /// Run one `next()` on every live worker concurrently, then stage their
@@ -318,6 +544,111 @@ fn runOne(scan: *Scan, out_batch: *?Batch, out_err: *?anyerror) void {
     out_batch.* = r;
 }
 
+/// One worker thread's steal loop: repeatedly claim the next chunk from the
+/// shared `next_chunk` cursor and drain it into its WorkerBuf, until the cursor
+/// passes the chunk count. `drainables` is `[]Query` (compute-fused) or `[]*Scan`
+/// (bare); monomorphized per call site.
+fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
+    // Lease a core only AFTER claiming the first chunk: a worker that loses the
+    // race for every chunk (all drained by faster peers) never blocks on the
+    // scheduler and never stalls the join. A worker already holding a core (the
+    // inline calling thread carrying a serial-stage lease) reuses it — the
+    // scheduler's no-hold-and-wait guard returns a non-owning lease.
+    const sched = core_scheduler.global();
+    var lease: core_scheduler.Lease = undefined;
+    var leased = false;
+    defer if (leased) lease.release();
+    while (true) {
+        const i = self.next_chunk.fetchAdd(1, .monotonic);
+        if (i >= drainables.len) break;
+        if (!leased) {
+            lease = sched.acquire();
+            leased = true;
+        }
+        drainWorker(drainables[i], ta, self.out_schema, &self.wbufs[i], &self.werr[i]);
+    }
+}
+
+/// Drain `drainable` (a range-restricted, filter-fused Scan, or a Compute over
+/// one when a projection was fused) to completion on its own thread,
+/// deep-copying every output batch into freshly-allocated owned ColumnStores
+/// (batches alias reused scratch, so we can't just retain them). `alloc` must
+/// be thread-safe (the table allocator) — workers run concurrently and never
+/// touch the query accountant. `drainable` is `*Scan` or `Query`; both expose
+/// `.next()`, so this is monomorphized per call site.
+fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, wb: *WorkerBuf, out_err: *?anyerror) void {
+    var d = drainable;
+    const cols = alloc.alloc(ColumnStore, schema.len) catch |e| {
+        out_err.* = e;
+        return;
+    };
+    var inited: usize = 0;
+    for (schema, cols) |col, *store| {
+        store.* = ColumnStore.init(alloc, col.type, col.nullable) catch |e| {
+            for (cols[0..inited]) |*c| c.deinit(alloc);
+            alloc.free(cols);
+            out_err.* = e;
+            return;
+        };
+        inited += 1;
+    }
+    wb.columns = cols; // hand to deinit for cleanup, even if a later step errors
+
+    const timing = exec.prof.enabled;
+    var scan_ticks: u64 = 0;
+    var copy_ticks: u64 = 0;
+    var rc: u32 = 0;
+    outer: while (true) {
+        const s0 = if (timing) exec.prof.nowTicks() else 0;
+        const mb = d.next() catch |e| {
+            out_err.* = e;
+            break;
+        };
+        if (timing) scan_ticks += @intCast(exec.prof.nowTicks() - s0);
+        const batch = mb orelse break;
+        const c0 = if (timing) exec.prof.nowTicks() else 0;
+        for (batch.values, 0..) |view, i| {
+            transform.appendAllColumn(alloc, view, &cols[i]) catch |e| {
+                out_err.* = e;
+                break :outer;
+            };
+        }
+        if (timing) copy_ticks += @intCast(exec.prof.nowTicks() - c0);
+        rc += @intCast(batch.row_count);
+    }
+    wb.row_count = rc;
+    wb.bytes = rc * exec.memory.estimateRowBytes(schema);
+    wb.scan_ticks = scan_ticks;
+    wb.copy_ticks = copy_ticks;
+}
+
+/// A single derived column is fusable into the parallel workers iff its
+/// expression is row-local: literals, scalar function calls (recursively), and
+/// column refs that resolve to an UPSTREAM (scan) column. CASE and the
+/// subquery/variable Expr variants are rejected — a CASE branch condition can
+/// carry a correlated predicate, and subquery/var nodes touch query-wide state.
+/// A col_ref to a SIBLING derived (a name not in `scan_cols`) is also rejected,
+/// so the compile split leaves it for the serial post-parallel Compute, where
+/// that column exists. (Subquery/var nodes are normally pre-resolved to literals
+/// before operators are built; rejecting them defensively guards future changes.)
+pub fn derivedFusable(d: Derived, scan_cols: []const Column) bool {
+    return exprFusable(d.expr, scan_cols);
+}
+
+fn exprFusable(e: Expr, scan_cols: []const Column) bool {
+    return switch (e) {
+        .col_ref => |name| types.findColumn(scan_cols, name) != null,
+        .lit => true,
+        .call => |c| {
+            for (c.args) |a| {
+                if (!exprFusable(a, scan_cols)) return false;
+            }
+            return true;
+        },
+        .case, .scalar_subquery, .exists_subquery, .var_ref => false,
+    };
+}
+
 /// Map a flat row-group index to its `(segment, row_group)` coordinate. `f ==
 /// total` (a worker's exclusive end) maps to the past-the-end sentinel.
 fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: usize) Coord {
@@ -325,4 +656,100 @@ fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: 
     var seg: usize = 0;
     while (seg + 1 < segment_count and seg_start[seg + 1] <= f) seg += 1;
     return .{ .seg = seg, .rg = f - seg_start[seg] };
+}
+
+/// On-disk byte weight of one row group for partitioning: the summed block
+/// length of the PROJECTED columns (`proj` = their schema indices), or the whole
+/// row group's `length` when projecting all columns (`proj == null`). A column's
+/// block runs from its `col_offsets[ci]` to the next column's offset (the last
+/// column ends at `rg.offset + rg.length`). Falls back to whole-RG `length` if
+/// the footer didn't carry per-column offsets.
+fn rgWeight(rg: storage.RowGroupMeta, proj: ?[]const usize, ncols: usize) u64 {
+    const cols = proj orelse return rg.length;
+    if (cols.len == 0 or rg.col_offsets.len < ncols) return rg.length;
+    var sum: u64 = 0;
+    for (cols) |ci| {
+        const start = rg.col_offsets[ci];
+        const end = if (ci + 1 < ncols) rg.col_offsets[ci + 1] else rg.offset + rg.length;
+        sum += end - start;
+    }
+    return sum;
+}
+
+/// Compute `eff + 1` contiguous row-group boundaries that split the flat
+/// row-group list into spans of ~equal projected bytes (see `rgWeight`). Reads
+/// each segment's footer once. Returns null on any failure (caller falls back to
+/// the equal-count split) — never partially applied. Caller owns the returned
+/// slice.
+fn byteAwareBounds(
+    allocator: Allocator,
+    table: *Table,
+    segment_count: usize,
+    total_rgs: usize,
+    eff: usize,
+    needed: ?[]const []const u8,
+) ?[]const usize {
+    const ncols = table.schema.columns.len;
+
+    // Projected physical column indices (null ⇒ all columns ⇒ whole-RG length).
+    var proj: ?[]usize = null;
+    defer if (proj) |p| allocator.free(p);
+    if (needed) |names| {
+        const p = allocator.alloc(usize, names.len) catch return null;
+        var n: usize = 0;
+        for (names) |nm| {
+            if (types.findColumn(table.schema.columns, nm)) |idx| {
+                p[n] = idx;
+                n += 1;
+            }
+        }
+        proj = p[0..n];
+    }
+
+    const weights = allocator.alloc(u64, total_rgs) catch return null;
+    defer allocator.free(weights);
+
+    var total_bytes: u64 = 0;
+    var flat: usize = 0;
+    for (table.manifest.segments.items[0..segment_count]) |entry| {
+        var name_buf: [32]u8 = undefined;
+        const fname = Table.segmentFileName(&name_buf, entry.segment_id) catch return null;
+        var seg = storage.readSegment(allocator, table.io, table.segments_dir, fname, table.schema) catch return null;
+        defer seg.deinit();
+        for (seg.info.row_groups) |rg| {
+            if (flat >= total_rgs) return null; // manifest/footer row-group disagreement
+            weights[flat] = rgWeight(rg, proj, ncols);
+            total_bytes += weights[flat];
+            flat += 1;
+        }
+    }
+    if (flat != total_rgs or total_bytes == 0) return null;
+
+    const bounds = allocator.alloc(usize, eff + 1) catch return null;
+    bounds[0] = 0;
+    bounds[eff] = total_rgs;
+    var cum: u64 = 0;
+    var bi: usize = 1;
+    for (weights, 0..) |w, idx| {
+        cum += w;
+        // First RG whose cumulative weight reaches bi/eff of the total ends
+        // span bi-1. `cum * eff` vs `total_bytes * bi` avoids division rounding;
+        // both stay well within u64 (bytes × small dop).
+        while (bi < eff and cum *% eff >= total_bytes *% @as(u64, bi)) {
+            bounds[bi] = idx + 1;
+            bi += 1;
+        }
+    }
+    while (bi < eff) : (bi += 1) bounds[bi] = total_rgs;
+
+    if (exec.prof.enabled) {
+        std.debug.print("[pscan-part] byte-aware DOP={d} total_bytes={d}\n", .{ eff, total_bytes });
+        for (0..eff) |i| {
+            var span: u64 = 0;
+            for (bounds[i]..bounds[i + 1]) |k| span += weights[k];
+            std.debug.print("[pscan-part]   w{d}: rgs[{d}..{d}) bytes={d}\n", .{ i, bounds[i], bounds[i + 1], span });
+        }
+    }
+
+    return bounds;
 }

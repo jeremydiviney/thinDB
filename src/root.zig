@@ -20,6 +20,7 @@ pub const storage = @import("storage/storage.zig");
 pub const engine = @import("engine/engine.zig");
 pub const api = @import("api/api.zig");
 pub const exec = @import("exec/exec.zig");
+pub const regex = @import("util/regex.zig");
 
 pub const Database = api.Database;
 pub const Catalog = api.Catalog;
@@ -116,4 +117,6 @@ test {
     _ = @import("net/random_seed.zig");
     _ = @import("util/snapshot.zig");
     _ = @import("util/hll.zig");
+    _ = @import("util/affinity.zig");
+    _ = @import("util/core_scheduler.zig");
 }

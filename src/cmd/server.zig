@@ -46,6 +46,8 @@ const usage_text =
     \\                          FROM 'file.csv' sources.
     \\  --force-group-by S      Diagnostic: force GROUP BY path — auto (default) | hash | sort | radix.
     \\                          Bypasses cardinality routing; for hash-vs-sort benchmarking only.
+    \\  --trace-group-by        Diagnostic: print each GROUP BY hash-vs-sort decision (est groups,
+    \\                          per-group bytes, budget cutoff, each key's NDV / OOB) to stderr.
     \\  --profile-ops           Print a per-operator INCLUSIVE time breakdown to stderr after each
     \\                          query (diagnostic; ~zero overhead when off). Self time of an operator
     \\                          is its inclusive minus its upstream's in a linear pipeline.
@@ -110,6 +112,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (std.mem.eql(u8, arg, "--profile-ops")) {
             thindb.exec.prof.enabled = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--trace-group-by")) {
+            thindb.exec.trace_group_by = true;
             continue;
         }
         if (try takeValue(arg, "--scan-batch", &args_iter, err_w)) |v| {

@@ -14,11 +14,35 @@ const ColumnView = storage.ColumnView;
 const ValueView = storage.column.ValueView;
 const StringView = storage.StringView;
 
+/// Borrowed view over a string column whose total bytes exceed 4 GiB, so its
+/// offsets need u64. Only big in-memory accumulations (the Sort operator over a
+/// huge result) ever produce one — see `StringStore.wide_offsets`. Mirrors
+/// `storage.StringView`'s read interface (`rowBytes`/`rowCount`) so the radix
+/// sort and comparators are generic over both.
+pub const WideStringView = struct {
+    offsets: []const u64,
+    bytes: []const u8,
+
+    pub fn rowCount(self: WideStringView) usize {
+        return self.offsets.len - 1;
+    }
+    pub fn rowBytes(self: WideStringView, row: usize) []const u8 {
+        return self.bytes[@intCast(self.offsets[row])..@intCast(self.offsets[row + 1])];
+    }
+};
+
 /// Variable-width string column buffer. `offsets` is invariant length
 /// `row_count + 1` with `offsets[0] == 0` and `offsets[row_count]` = total bytes.
 pub const StringStore = struct {
     offsets: std.ArrayList(u32),
     bytes: std.ArrayList(u8),
+    /// u64 offset sidecar, lazily allocated the moment `bytes` would cross the
+    /// u32 (4 GiB) limit. While null the column is "narrow" (the common case,
+    /// zero overhead). Once set, the u32 `offsets` is frozen/stale and all reads
+    /// go through `wide_offsets` — see `rowBytesWide`/`wideView`/`isWide`. Only
+    /// the Sort's full-result accumulation realistically gets here; a memtable
+    /// flushes long before 4 GiB.
+    wide_offsets: ?std.ArrayList(u64) = null,
 
     pub fn init(allocator: Allocator) Allocator.Error!StringStore {
         return initCapacity(allocator, 0, 0);
@@ -42,12 +66,48 @@ pub const StringStore = struct {
     pub fn deinit(self: *StringStore, allocator: Allocator) void {
         self.offsets.deinit(allocator);
         self.bytes.deinit(allocator);
+        if (self.wide_offsets) |*wo| wo.deinit(allocator);
         self.* = undefined;
     }
 
     pub fn appendValue(self: *StringStore, allocator: Allocator, slice: []const u8) !void {
         try self.bytes.appendSlice(allocator, slice);
-        try self.offsets.append(allocator, @intCast(self.bytes.items.len));
+        const total = self.bytes.items.len;
+        if (self.wide_offsets) |*wo| {
+            try wo.append(allocator, total);
+            return;
+        }
+        // First value that pushes the column past 4 GiB: migrate the u32 offsets
+        // into a u64 sidecar and append there from now on (instead of
+        // @intCast-panicking). Rare; the narrow path above stays the norm.
+        if (total > std.math.maxInt(u32)) {
+            var wo: std.ArrayList(u64) = .empty;
+            errdefer wo.deinit(allocator);
+            try wo.ensureTotalCapacity(allocator, self.offsets.items.len + 1);
+            for (self.offsets.items) |o| wo.appendAssumeCapacity(o);
+            wo.appendAssumeCapacity(total);
+            self.wide_offsets = wo;
+            return;
+        }
+        try self.offsets.append(allocator, @intCast(total));
+    }
+
+    pub fn isWide(self: StringStore) bool {
+        return self.wide_offsets != null;
+    }
+
+    /// Read row `row`'s bytes, transparently honoring the u64 sidecar. Use this
+    /// (not `view().rowBytes`) anywhere a column might have crossed 4 GiB.
+    pub fn rowBytesWide(self: StringStore, row: usize) []const u8 {
+        if (self.wide_offsets) |wo| {
+            return self.bytes.items[@intCast(wo.items[row])..@intCast(wo.items[row + 1])];
+        }
+        return self.bytes.items[self.offsets.items[row]..self.offsets.items[row + 1]];
+    }
+
+    /// Borrowed wide view; only valid when `isWide()`.
+    pub fn wideView(self: StringStore) WideStringView {
+        return .{ .offsets = self.wide_offsets.?.items, .bytes = self.bytes.items };
     }
 
     /// Reserve room for `rows` more values totaling `bytes_len` more bytes, so a
@@ -64,17 +124,26 @@ pub const StringStore = struct {
     }
 
     pub fn rowCount(self: StringStore) usize {
+        if (self.wide_offsets) |wo| return wo.items.len - 1;
         return self.offsets.items.len - 1;
     }
 
     pub fn view(self: StringStore) StringView {
+        // A wide column can't be represented by u32 offsets; readers that might
+        // see >4 GiB columns (the Sort) must use `rowBytesWide`/`wideView`.
+        std.debug.assert(self.wide_offsets == null);
         return .{ .offsets = self.offsets.items, .bytes = self.bytes.items };
     }
 
     pub fn clear(self: *StringStore) void {
-        self.offsets.clearRetainingCapacity();
         self.bytes.clearRetainingCapacity();
-        self.offsets.appendAssumeCapacity(0);
+        if (self.wide_offsets) |*wo| {
+            wo.clearRetainingCapacity();
+            wo.appendAssumeCapacity(0);
+        } else {
+            self.offsets.clearRetainingCapacity();
+            self.offsets.appendAssumeCapacity(0);
+        }
     }
 };
 

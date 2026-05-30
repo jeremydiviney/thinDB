@@ -1253,6 +1253,82 @@ test "parallel scan matches serial across DOP levels (with fused filter)" {
     }
 }
 
+test "parallel scan matches serial — byte-skewed string row groups" {
+    // Exercises the byte-aware partition: a string column whose row groups vary
+    // ~250× in byte size. Equal-row-group spans would carry wildly unequal work;
+    // byte-aware spans cut on bytes. Either way the materialized SET must equal
+    // the serial scan at every DOP. Also stresses deep-copy of long survivors.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    const short: []const u8 = "z";
+    const long: []const u8 = "z" ** 250;
+    // 128 rows → 8 row groups of 16. First 4 short, last 4 long → ~250× byte
+    // skew across the segment's row groups. Flush, then a 16-row memtable tail.
+    var rows: [128]struct { id: i64, s: []const u8 } = undefined;
+    for (&rows, 0..) |*r, i| {
+        r.id = @intCast(i);
+        r.s = if (i < 64) short else long;
+    }
+    try t.insert(&rows);
+    try t.flush();
+    var tail: [16]struct { id: i64, s: []const u8 } = undefined;
+    for (&tail, 0..) |*r, i| {
+        r.id = @intCast(128 + i);
+        r.s = short;
+    }
+    try t.insert(&tail);
+
+    const collect = struct {
+        fn run(a: std.mem.Allocator, q: *Query, out: *std.ArrayList(i64)) !void {
+            defer q.deinit();
+            while (try q.next()) |b| try out.appendSlice(a, b.values[0].data.bigint[0..b.row_count]);
+        }
+    }.run;
+
+    // Serial reference: SELECT id FROM t WHERE s <> '' (all 144 rows match).
+    var serial: std.ArrayList(i64) = .empty;
+    defer serial.deinit(allocator);
+    {
+        var base = try scan(allocator, t);
+        var q = try base.filter(leafExpr("s", .neq, .{ .text = "" }));
+        try collect(allocator, &q, &serial);
+    }
+    try std.testing.expectEqual(@as(usize, 144), serial.items.len);
+
+    inline for (.{ 1, 2, 4, 8 }) |dop| {
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        var base = try exec.ParallelScan.create(allocator, t, null, null, dop);
+        var q = try base.filter(leafExpr("s", .neq, .{ .text = "" }));
+        try collect(allocator, &q, &got);
+
+        try std.testing.expectEqual(serial.items.len, got.items.len);
+        const a = try allocator.dupe(i64, serial.items);
+        defer allocator.free(a);
+        const b = try allocator.dupe(i64, got.items);
+        defer allocator.free(b);
+        std.sort.pdq(i64, a, {}, std.sort.asc(i64));
+        std.sort.pdq(i64, b, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, a, b);
+    }
+}
+
 test "scan: string range predicate prunes row groups via prefix stats" {
     // Same disjoint name ranges as the eq test; `name > 'dave'` must skip the
     // groups whose prefix max is below 'dave' and return only the matches —
@@ -2484,4 +2560,184 @@ test "fused filter: tombstoned rows removed before the predicate applies" {
     while (try q.next()) |b| try ids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
     // qty>=20 → {2,3,4,5}; tombstone removes 3 → {2,4,5}.
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 4, 5 }, ids.items);
+}
+
+test "parallel scan + fused projection compute matches serial" {
+    // A row-local scalar projection (length(s)) fused into the parallel workers
+    // must produce the same (filtered, computed) rows as the serial
+    // scan→filter→compute path at every DOP. Exercises the per-worker Compute
+    // isolation (own program + scratch) and the materialize/concat path over a
+    // widened output schema.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    // s length cycles 1..5 (so length() is verifiable), every 7th row empty so
+    // the `s <> ''` filter has work. 128 rows flushed + a 16-row memtable tail.
+    const pool = [_][]const u8{ "x", "xx", "xxx", "xxxx", "xxxxx" };
+    var rows: [128]struct { id: i64, s: []const u8 } = undefined;
+    for (&rows, 0..) |*r, i| {
+        r.id = @intCast(i);
+        r.s = if (i % 7 == 0) "" else pool[i % 5];
+    }
+    try t.insert(&rows);
+    try t.flush();
+    var tail: [16]struct { id: i64, s: []const u8 } = undefined;
+    for (&tail, 0..) |*r, i| {
+        r.id = @intCast(128 + i);
+        r.s = if (i % 3 == 0) "" else pool[i % 5];
+    }
+    try t.insert(&tail);
+
+    const derived = [_]@import("compute.zig").Derived{
+        .{ .name = "l", .expr = .{ .call = .{ .fn_name = "length", .args = &.{.{ .col_ref = "s" }} } } },
+    };
+
+    const collectL = struct {
+        fn run(a: std.mem.Allocator, q: *Query, out: *std.ArrayList(i32)) !void {
+            defer q.deinit();
+            while (try q.next()) |b| try out.appendSlice(a, b.values[2].data.int[0..b.row_count]);
+        }
+    }.run;
+
+    // Serial reference: scan → filter(s<>'') → compute(l = length(s)).
+    var serial: std.ArrayList(i32) = .empty;
+    defer serial.deinit(allocator);
+    {
+        var base = try scan(allocator, t);
+        var filtered = try base.filter(leafExpr("s", .neq, .{ .text = "" }));
+        var q = try filtered.compute(&derived);
+        try collectL(allocator, &q, &serial);
+    }
+    try std.testing.expect(serial.items.len > 0);
+
+    inline for (.{ 1, 2, 4, 8 }) |dop| {
+        var got: std.ArrayList(i32) = .empty;
+        defer got.deinit(allocator);
+        var base = try exec.ParallelScan.create(allocator, t, null, null, dop);
+        var q = try base.filter(leafExpr("s", .neq, .{ .text = "" }));
+        const fused = try q.tryFuseCompute(&derived);
+        try std.testing.expect(fused); // length(s) is row-local → must fuse
+        try collectL(allocator, &q, &got);
+
+        try std.testing.expectEqual(serial.items.len, got.items.len);
+        const a = try allocator.dupe(i32, serial.items);
+        defer allocator.free(a);
+        const b = try allocator.dupe(i32, got.items);
+        defer allocator.free(b);
+        std.sort.pdq(i32, a, {}, std.sort.asc(i32));
+        std.sort.pdq(i32, b, {}, std.sort.asc(i32));
+        try std.testing.expectEqualSlices(i32, a, b);
+    }
+}
+
+test "parallel scan compute split: safe derived fused, unsafe (CASE) stays serial" {
+    // A mixed projection — `l = length(s)` (row-local → fusable) and `c = CASE`
+    // (rejected → must stay serial above the merge) — must split and still match
+    // the all-serial scan→filter→compute. Verifies derivedFusable classification
+    // and that fusing only the safe subset + layering the unsafe subset serially
+    // produces identical (l, c) rows.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    const pool = [_][]const u8{ "x", "xx", "xxx", "xxxx", "xxxxx" };
+    var rows: [96]struct { id: i64, s: []const u8 } = undefined;
+    for (&rows, 0..) |*r, i| {
+        r.id = @intCast(i);
+        r.s = if (i % 7 == 0) "" else pool[i % 5];
+    }
+    try t.insert(&rows);
+    try t.flush();
+    var tail: [16]struct { id: i64, s: []const u8 } = undefined;
+    for (&tail, 0..) |*r, i| {
+        r.id = @intCast(96 + i);
+        r.s = pool[i % 5];
+    }
+    try t.insert(&tail);
+
+    const Derived = @import("compute.zig").Derived;
+    const safe = Derived{ .name = "l", .expr = .{ .call = .{ .fn_name = "length", .args = &.{.{ .col_ref = "s" }} } } };
+    const else_zero = @import("expr.zig").Expr{ .lit = .{ .int = 0 } };
+    const unsafe = Derived{ .name = "c", .expr = .{ .case = .{
+        .branches = &.{.{ .cond = leafExpr("id", .gte, .{ .bigint = 50 }), .then = .{ .lit = .{ .int = 1 } } }},
+        .else_branch = &else_zero,
+    } } };
+
+    // Classification: length(s) is fusable; CASE is not.
+    try std.testing.expect(exec.derivedFusable(safe, schema.columns));
+    try std.testing.expect(!exec.derivedFusable(unsafe, schema.columns));
+
+    // Encode each surviving row's (l, c) as one i64 so we can compare multisets.
+    const collectLC = struct {
+        fn run(a: std.mem.Allocator, q: *Query, out: *std.ArrayList(i64)) !void {
+            defer q.deinit();
+            while (try q.next()) |b| {
+                const ls = b.values[2].data.int;
+                const cs = b.values[3].data.int;
+                for (0..b.row_count) |i| try out.append(a, @as(i64, ls[i]) * 100 + cs[i]);
+            }
+        }
+    }.run;
+
+    // Serial reference: scan → filter → compute([l, c]) (both serial).
+    var serial: std.ArrayList(i64) = .empty;
+    defer serial.deinit(allocator);
+    {
+        var base = try scan(allocator, t);
+        var filtered = try base.filter(leafExpr("s", .neq, .{ .text = "" }));
+        var q = try filtered.compute(&.{ safe, unsafe });
+        try collectLC(allocator, &q, &serial);
+    }
+    try std.testing.expect(serial.items.len > 0);
+
+    inline for (.{ 1, 2, 4, 8 }) |dop| {
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        var base = try exec.ParallelScan.create(allocator, t, null, null, dop);
+        var filtered = try base.filter(leafExpr("s", .neq, .{ .text = "" }));
+        // Split: fuse only the safe derived into the workers, then layer the
+        // unsafe CASE serially above — what fuseSplitCompute does at compile.
+        const fused = try filtered.tryFuseCompute(&.{safe});
+        try std.testing.expect(fused);
+        var q = try filtered.compute(&.{unsafe});
+        try collectLC(allocator, &q, &got);
+
+        try std.testing.expectEqual(serial.items.len, got.items.len);
+        const a = try allocator.dupe(i64, serial.items);
+        defer allocator.free(a);
+        const b = try allocator.dupe(i64, got.items);
+        defer allocator.free(b);
+        std.sort.pdq(i64, a, {}, std.sort.asc(i64));
+        std.sort.pdq(i64, b, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, a, b);
+    }
 }
