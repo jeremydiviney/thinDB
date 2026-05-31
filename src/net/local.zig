@@ -2486,9 +2486,14 @@ fn routeParallelGroupBy(
     aggs: []const ir.AggSpec,
     top_k: ?ir.Op.TopK,
     emit_limit: ?u32,
+    has_filter: bool,
 ) !?Query {
     if (getenv("THINDB_PARALLEL_AGG") == null) return null;
     if (group_cols.len == 0) return null;
+    // KNOWN BUG: a filtered (materialize-mode) upstream feeding the threaded
+    // phase-B merge produces wrong/non-deterministic results (Q38/40/41).
+    // Unfiltered (round-mode) is validated correct, so decline filtered for now.
+    if (has_filter) return null;
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max => {},
         else => return null,
@@ -3176,7 +3181,8 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             // Two-phase parallel GROUP BY (env-gated): aggregate per-worker on the
             // decoding core, then combine — avoids the cross-core feed. Self-
             // declines (falls through) for compute-fused / high-card / non-parallel.
-            if (try routeParallelGroupBy(ctx, upstream, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| break :blk q;
+            const gb_has_filter = base_op.* == .filter or (base_op.* == .compute and base_op.compute.upstream.* == .filter);
+            if (try routeParallelGroupBy(ctx, upstream, g.group_cols, g.aggs, g.top_k, g.emit_limit, gb_has_filter)) |q| break :blk q;
             // Drop columns the aggregate never reads from the parallel-scan
             // materialize (decoded only for a fused filter/compute — dead above).
             try pushAggEmitProjection(ctx, upstream, g.group_cols, g.aggs);
