@@ -793,11 +793,15 @@ pub const RadixLeaseAggregate = struct {
     // lease reads bucket b across all shards.
     buckets: []Bucket = &.{},
     shard_arenas: []std.heap.ArenaAllocator = &.{},
-    // Flat materialization of the input (built once, serially): packed key per row
-    // + the agg-input columns. The parallel scatter reads disjoint row-slices.
-    flat_keys: []u128 = &.{},
-    flat_cols: []ColumnStore = &.{}, // aligned to used_cols
+    // Flat materialization of the input (built once, serially): the RAW group-key
+    // and agg-input columns. The expensive u128 key-pack is deferred into the
+    // parallel scatter (each thread packs its own row-slice), so the serial pass
+    // is just a cheap column copy. The parallel scatter reads disjoint row-slices.
+    flat_cols: []ColumnStore = &.{}, // aligned to need_cols
     n_rows: usize = 0,
+    need_cols: []usize, // distinct group-key ∪ agg-input columns (flat_cols order)
+    key_flat_slot: []usize, // flat slot per group-key column
+    val_flat_slot: []usize, // flat slot per used (agg-input) column
 
     // One bucket's partitioned rows: packed keys + a value buffer per used column.
     const Bucket = struct {
@@ -856,6 +860,33 @@ pub const RadixLeaseAggregate = struct {
         }
         const used_cols = try used.toOwnedSlice(allocator);
         errdefer allocator.free(used_cols);
+
+        // Union of group-key and agg-input columns — materialize copies these raw;
+        // the parallel scatter packs keys from them per row-slice (slot maps below).
+        var need = std.ArrayListUnmanaged(usize).empty;
+        errdefer need.deinit(allocator);
+        const addUniq = struct {
+            fn f(list: *std.ArrayListUnmanaged(usize), al: Allocator, ci: usize) !void {
+                for (list.items) |x| if (x == ci) return;
+                try list.append(al, ci);
+            }
+        }.f;
+        for (gci) |ci| try addUniq(&need, allocator, ci);
+        for (used_cols) |ci| try addUniq(&need, allocator, ci);
+        const need_cols = try need.toOwnedSlice(allocator);
+        errdefer allocator.free(need_cols);
+        const slotOf = struct {
+            fn f(nc: []const usize, ci: usize) usize {
+                for (nc, 0..) |x, i| if (x == ci) return i;
+                unreachable;
+            }
+        }.f;
+        const key_flat_slot = try allocator.alloc(usize, gci.len);
+        errdefer allocator.free(key_flat_slot);
+        for (gci, key_flat_slot) |ci, *d| d.* = slotOf(need_cols, ci);
+        const val_flat_slot = try allocator.alloc(usize, used_cols.len);
+        errdefer allocator.free(val_flat_slot);
+        for (used_cols, val_flat_slot) |ci, *d| d.* = slotOf(need_cols, ci);
 
         const out_schema = try allocator.alloc(types.Column, group_cols.len + aggs.len);
         errdefer allocator.free(out_schema);
@@ -947,6 +978,9 @@ pub const RadixLeaseAggregate = struct {
             .n_buckets = nb,
             .bshift = if (nbits == 0) 0 else @intCast(64 - @as(usize, nbits)), // unused when n_buckets==1 (bucketOf short-circuits)
             .used_cols = used_cols,
+            .need_cols = need_cols,
+            .key_flat_slot = key_flat_slot,
+            .val_flat_slot = val_flat_slot,
         };
         return makeQuery(allocator, self);
     }
@@ -964,35 +998,23 @@ pub const RadixLeaseAggregate = struct {
         try self.runScatter();
     }
 
-    // Serial single pass: pack each row's int key and deep-copy the agg-input
-    // columns into flat owned arrays. The parallel scatter then reads disjoint
-    // row-slices of these — no upstream-lifetime assumptions, no cross-thread
-    // contention on the source. (The pack+copy is cheap and sequential; the
-    // bucket scatter, which is the real cost, is what gets parallelized.)
+    // Serial single pass: deep-copy the RAW group-key + agg-input columns into
+    // owned flat arrays — no per-row packing, just a column copy. The expensive
+    // u128 key-pack is deferred to the parallel scatter (each thread packs its own
+    // slice), so the serial pass moves far less memory.
     fn materializeFlat(self: *RadixLeaseAggregate) !void {
         const aa = self.arena.allocator();
         const up_schema = self.upstream.outputSchema();
         const exp: usize = @intCast(@max(self.upstream.stats().upper_rows, 1));
-        var fkeys: std.ArrayListUnmanaged(u128) = .empty;
-        try fkeys.ensureTotalCapacity(aa, exp);
-        self.flat_cols = try aa.alloc(ColumnStore, self.used_cols.len);
-        for (self.used_cols, self.flat_cols) |ci, *cs| cs.* = try ColumnStore.initCapacity(aa, up_schema[ci].type, up_schema[ci].nullable, exp, 0);
-
-        var kb: std.ArrayListUnmanaged(u128) = .empty;
-        const layout = self.int_layout;
+        self.flat_cols = try aa.alloc(ColumnStore, self.need_cols.len);
+        for (self.need_cols, self.flat_cols) |ci, *cs| cs.* = try ColumnStore.initCapacity(aa, up_schema[ci].type, up_schema[ci].nullable, exp, 0);
         var n_total: usize = 0;
         while (try self.upstream.next()) |batch| {
             const n = batch.row_count;
             if (n == 0) continue;
-            try kb.ensureTotalCapacity(aa, n);
-            kb.clearRetainingCapacity();
-            kb.appendNTimesAssumeCapacity(0, n);
-            for (self.group_col_indices, layout.fields) |ci, f| agg.orKeyColumn(kb.items[0..n], batch, ci, f);
-            try fkeys.appendSlice(aa, kb.items[0..n]);
-            for (self.used_cols, self.flat_cols) |ci, *cs| try transform.appendAllColumn(aa, batch.values[ci], cs);
+            for (self.need_cols, self.flat_cols) |ci, *cs| try transform.appendAllColumn(aa, batch.values[ci], cs);
             n_total += n;
         }
-        self.flat_keys = fkeys.items;
         self.n_rows = n_total;
     }
 
@@ -1049,12 +1071,22 @@ pub const RadixLeaseAggregate = struct {
         const hi = (s + 1) * self.n_rows / S;
         const n = hi - lo;
         if (n == 0) return;
+        const up_schema = self.upstream.outputSchema();
         const shard_buckets = self.buckets[s * self.n_buckets .. (s + 1) * self.n_buckets];
+
+        // Pack this slice's keys from the flat group-key columns (rows [lo,hi)).
+        const kb = try sa.alloc(u128, n);
+        @memset(kb, 0);
+        const mini_vals = try sa.alloc(ColumnView, up_schema.len);
+        for (self.group_col_indices, self.key_flat_slot) |ci, ks| mini_vals[ci] = self.flat_cols[ks].view();
+        const mini = Batch{ .schema = up_schema, .values = mini_vals, .row_count = self.n_rows };
+        for (self.group_col_indices, self.int_layout.fields) |ci, f| agg.orKeyColumnRange(kb, mini, ci, f, lo);
+
         var bof: std.ArrayListUnmanaged(u16) = .empty;
         try bof.ensureTotalCapacity(sa, n);
-        for (lo..hi) |r| bof.appendAssumeCapacity(@intCast(self.bucketOf(self.flat_keys[r])));
-        for (0..n) |i| try shard_buckets[bof.items[i]].keys.append(sa, self.flat_keys[lo + i]);
-        for (self.used_cols, 0..) |_, ui| try scatterColumnToBuckets(sa, self.flat_cols[ui].view(), lo, ui, bof.items[0..n], shard_buckets, n);
+        for (0..n) |i| bof.appendAssumeCapacity(@intCast(self.bucketOf(kb[i])));
+        for (0..n) |i| try shard_buckets[bof.items[i]].keys.append(sa, kb[i]);
+        for (self.val_flat_slot, 0..) |vs, ui| try scatterColumnToBuckets(sa, self.flat_cols[vs].view(), lo, ui, bof.items[0..n], shard_buckets, n);
     }
 
     // Append rows [src_off, src_off+n) of `src` to their buckets' buffer for
@@ -1287,6 +1319,9 @@ pub const RadixLeaseAggregate = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.output_schema);
         self.allocator.free(self.used_cols);
+        self.allocator.free(self.need_cols);
+        self.allocator.free(self.key_flat_slot);
+        self.allocator.free(self.val_flat_slot);
         self.compact.deinit(self.allocator);
         self.int_layout.deinit(self.allocator);
         self.allocator.free(self.agg_col_indices);
