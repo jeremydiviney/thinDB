@@ -765,6 +765,20 @@ inline fn bucketHashU128(key: u128) u64 {
 
 const MAX_LEASE_THREADS: usize = 64;
 
+// Tiny test-and-set spinlock. This Zig routes mutexes through the async Io
+// abstraction (no plain blocking mutex), and the raw-thread paths here already
+// coordinate with atomics. The partition's critical section (one upstream
+// next() + a per-batch column copy) is short, so a spinlock is the right tool.
+const SpinLock = struct {
+    flag: std.atomic.Value(u32) = .init(0),
+    fn lock(self: *SpinLock) void {
+        while (self.flag.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *SpinLock) void {
+        self.flag.store(0, .release);
+    }
+};
+
 /// Test-only: force the bucket count (the synthetic source reports no NDV, so the
 /// real heuristic would pick 1). Set/cleared by the differential tests.
 var force_buckets: ?usize = null;
@@ -793,15 +807,12 @@ pub const RadixLeaseAggregate = struct {
     // lease reads bucket b across all shards.
     buckets: []Bucket = &.{},
     shard_arenas: []std.heap.ArenaAllocator = &.{},
-    // Flat materialization of the input (built once, serially): the RAW group-key
-    // and agg-input columns. The expensive u128 key-pack is deferred into the
-    // parallel scatter (each thread packs its own row-slice), so the serial pass
-    // is just a cheap column copy. The parallel scatter reads disjoint row-slices.
-    flat_cols: []ColumnStore = &.{}, // aligned to need_cols
-    n_rows: usize = 0,
-    need_cols: []usize, // distinct group-key ∪ agg-input columns (flat_cols order)
-    key_flat_slot: []usize, // flat slot per group-key column
-    val_flat_slot: []usize, // flat slot per used (agg-input) column
+    // The distinct group-key ∪ agg-input columns each partition worker deep-copies
+    // per batch (mini-batch order), plus the slot maps from a group-key / agg-input
+    // column to its index in that order.
+    need_cols: []usize,
+    key_flat_slot: []usize, // mini-col slot per group-key column
+    val_flat_slot: []usize, // mini-col slot per used (agg-input) column
 
     // One bucket's partitioned rows: packed keys + a value buffer per used column.
     const Bucket = struct {
@@ -936,12 +947,11 @@ pub const RadixLeaseAggregate = struct {
             }
         }
 
-        // Bucket count: trade per-bucket table cache-residency (more buckets) vs
-        // the serial partition's scatter cost (fewer cache-line write-fronts =
-        // fewer buckets). With the partition still serial, the operator-level
-        // sweep favors ~512; once the partition is parallelized the optimum moves
-        // back up toward 1-2K. Scale to the group estimate, round to pow2.
-        const want_buckets = std.math.clamp(cap_groups / 16384, 1, 1024);
+        // Bucket count: more buckets keep each per-bucket table cache-resident.
+        // With the partition fully parallel (each thread radix-sorts its own
+        // batches), the operator-level optimum sits near ~1024. Scale to the
+        // group estimate, round to pow2.
+        const want_buckets = std.math.clamp(cap_groups / 8192, 1, 2048);
         var nb: usize = 1;
         var nbits: u6 = 0;
         while (nb < want_buckets) {
@@ -992,42 +1002,18 @@ pub const RadixLeaseAggregate = struct {
         return @intCast(bucketHashU128(key) >> self.bshift);
     }
 
-    // --- Phase 1: materialize input flat, then scatter into per-shard buckets ---
+    // --- Phase 1: each thread drains its own batches off a shared cursor and
+    // radix-sorts them into its private per-bucket blocks — no serial materialize.
+    // A mutex guards only the upstream cursor + the per-batch copy; the key-pack
+    // and bucket scatter (the real cost) run lock-free. The lease (phase 2) then
+    // reads bucket b across every shard.
     fn partition(self: *RadixLeaseAggregate) !void {
-        try self.materializeFlat();
-        try self.runScatter();
-    }
-
-    // Serial single pass: deep-copy the RAW group-key + agg-input columns into
-    // owned flat arrays — no per-row packing, just a column copy. The expensive
-    // u128 key-pack is deferred to the parallel scatter (each thread packs its own
-    // slice), so the serial pass moves far less memory.
-    fn materializeFlat(self: *RadixLeaseAggregate) !void {
-        const aa = self.arena.allocator();
-        const up_schema = self.upstream.outputSchema();
-        const exp: usize = @intCast(@max(self.upstream.stats().upper_rows, 1));
-        self.flat_cols = try aa.alloc(ColumnStore, self.need_cols.len);
-        for (self.need_cols, self.flat_cols) |ci, *cs| cs.* = try ColumnStore.initCapacity(aa, up_schema[ci].type, up_schema[ci].nullable, exp, 0);
-        var n_total: usize = 0;
-        while (try self.upstream.next()) |batch| {
-            const n = batch.row_count;
-            if (n == 0) continue;
-            for (self.need_cols, self.flat_cols) |ci, *cs| try transform.appendAllColumn(aa, batch.values[ci], cs);
-            n_total += n;
-        }
-        self.n_rows = n_total;
-    }
-
-    // Parallel: shard s scatters flat rows [s·n/S, (s+1)·n/S) into its own bucket
-    // buffers (private arena → zero contention). The lease later reads bucket b
-    // across every shard.
-    fn runScatter(self: *RadixLeaseAggregate) !void {
         const up_schema = self.upstream.outputSchema();
         const S = self.dop;
         self.buckets = try self.arena.allocator().alloc(Bucket, S * self.n_buckets);
         self.shard_arenas = try self.allocator.alloc(std.heap.ArenaAllocator, S);
         for (self.shard_arenas) |*ar| ar.* = std.heap.ArenaAllocator.init(self.allocator);
-        const per_shard = (self.n_rows + S - 1) / S;
+        const per_shard = @as(usize, @intCast(@max(self.upstream.stats().upper_rows, 1))) / S;
         const reserve = @min((per_shard / self.n_buckets) * 3 / 2 + 16, 1 << 20);
         for (0..S) |s| {
             const sa = self.shard_arenas[s].allocator();
@@ -1039,9 +1025,10 @@ pub const RadixLeaseAggregate = struct {
             }
         }
 
+        var mutex: SpinLock = .{};
         const Entry = struct {
-            fn go(op: *RadixLeaseAggregate, s: usize, errp: *?anyerror) void {
-                op.scatterShard(s) catch |e| {
+            fn go(op: *RadixLeaseAggregate, mx: *SpinLock, s: usize, errp: *?anyerror) void {
+                op.partitionShard(mx, s) catch |e| {
                     errp.* = e;
                 };
             }
@@ -1053,40 +1040,66 @@ pub const RadixLeaseAggregate = struct {
         var spawned: usize = 0;
         var t: usize = 1;
         while (t < S) : (t += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, t, &errs[t] }) catch {
-                Entry.go(self, t, &errs[t]);
+            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &mutex, t, &errs[t] }) catch {
+                Entry.go(self, &mutex, t, &errs[t]);
                 continue;
             };
             spawned += 1;
         }
-        Entry.go(self, 0, &errs[0]);
+        Entry.go(self, &mutex, 0, &errs[0]);
         for (threads[0..spawned]) |th| th.join();
         for (errs) |e| if (e) |err| return err;
     }
 
-    fn scatterShard(self: *RadixLeaseAggregate, s: usize) !void {
+    // One partition worker: pull a batch off the shared upstream cursor, deep-copy
+    // its group-key + agg-input columns into thread-local buffers under the mutex
+    // (so they stay valid for ANY upstream lifetime after release), then pack the
+    // int key and radix-scatter each row into this shard's bucket blocks lock-free.
+    fn partitionShard(self: *RadixLeaseAggregate, mutex: *SpinLock, s: usize) !void {
         const sa = self.shard_arenas[s].allocator();
-        const S = self.dop;
-        const lo = s * self.n_rows / S;
-        const hi = (s + 1) * self.n_rows / S;
-        const n = hi - lo;
-        if (n == 0) return;
         const up_schema = self.upstream.outputSchema();
         const shard_buckets = self.buckets[s * self.n_buckets .. (s + 1) * self.n_buckets];
+        const layout = self.int_layout;
 
-        // Pack this slice's keys from the flat group-key columns (rows [lo,hi)).
-        const kb = try sa.alloc(u128, n);
-        @memset(kb, 0);
+        const mini_cols = try sa.alloc(ColumnStore, self.need_cols.len);
+        for (self.need_cols, mini_cols) |ci, *cs| cs.* = try ColumnStore.init(sa, up_schema[ci].type, up_schema[ci].nullable);
         const mini_vals = try sa.alloc(ColumnView, up_schema.len);
-        for (self.group_col_indices, self.key_flat_slot) |ci, ks| mini_vals[ci] = self.flat_cols[ks].view();
-        const mini = Batch{ .schema = up_schema, .values = mini_vals, .row_count = self.n_rows };
-        for (self.group_col_indices, self.int_layout.fields) |ci, f| agg.orKeyColumnRange(kb, mini, ci, f, lo);
-
+        var kb: std.ArrayListUnmanaged(u128) = .empty;
         var bof: std.ArrayListUnmanaged(u16) = .empty;
-        try bof.ensureTotalCapacity(sa, n);
-        for (0..n) |i| bof.appendAssumeCapacity(@intCast(self.bucketOf(kb[i])));
-        for (0..n) |i| try shard_buckets[bof.items[i]].keys.append(sa, kb[i]);
-        for (self.val_flat_slot, 0..) |vs, ui| try scatterColumnToBuckets(sa, self.flat_cols[vs].view(), lo, ui, bof.items[0..n], shard_buckets, n);
+
+        while (true) {
+            mutex.lock();
+            const maybe = self.upstream.next() catch |e| {
+                mutex.unlock();
+                return e;
+            };
+            const batch = maybe orelse {
+                mutex.unlock();
+                break;
+            };
+            const n = batch.row_count;
+            if (n != 0) {
+                for (self.need_cols, mini_cols) |ci, *cs| {
+                    cs.clear();
+                    try transform.appendAllColumn(sa, batch.values[ci], cs);
+                }
+            }
+            mutex.unlock();
+            if (n == 0) continue;
+
+            try kb.ensureTotalCapacity(sa, n);
+            kb.clearRetainingCapacity();
+            kb.appendNTimesAssumeCapacity(0, n);
+            for (self.group_col_indices, self.key_flat_slot) |ci, ks| mini_vals[ci] = mini_cols[ks].view();
+            const mini = Batch{ .schema = up_schema, .values = mini_vals, .row_count = n };
+            for (self.group_col_indices, layout.fields) |ci, f| agg.orKeyColumn(kb.items[0..n], mini, ci, f);
+
+            try bof.ensureTotalCapacity(sa, n);
+            bof.clearRetainingCapacity();
+            for (0..n) |i| bof.appendAssumeCapacity(@intCast(self.bucketOf(kb.items[i])));
+            for (0..n) |i| try shard_buckets[bof.items[i]].keys.append(sa, kb.items[i]);
+            for (self.val_flat_slot, 0..) |vs, ui| try scatterColumnToBuckets(sa, mini_cols[vs].view(), 0, ui, bof.items[0..n], shard_buckets, n);
+        }
     }
 
     // Append rows [src_off, src_off+n) of `src` to their buckets' buffer for

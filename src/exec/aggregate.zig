@@ -3627,44 +3627,6 @@ pub fn orKeyColumn(keys: []u128, batch: Batch, ci: usize, f: IntKeyField) void {
     }
 }
 
-/// Like `orKeyColumn` but packs only rows `[row_off, row_off+keys.len)` of the
-/// column — so a parallel partitioner can pack each thread's row-slice from a
-/// shared materialized column without slicing the (bit-packed) null bitmap.
-pub fn orKeyColumnRange(keys: []u128, batch: Batch, ci: usize, f: IntKeyField, row_off: usize) void {
-    const off: u7 = @intCast(f.offset);
-    const bits = f.bits;
-    const n = keys.len;
-    if (f.coded) {
-        const codes = batch.coded.?[ci].?.codes[row_off..][0..n];
-        for (keys, codes) |*k, code| k.* |= fieldBits(u32, code, bits) << off;
-        return;
-    }
-    switch (batch.values[ci].data) {
-        .boolean => |s| for (keys, s[row_off..][0..n]) |*k, v| {
-            k.* |= fieldBits(u8, v, bits) << off;
-        },
-        .tinyint => |s| for (keys, s[row_off..][0..n]) |*k, v| {
-            k.* |= fieldBits(i8, v, bits) << off;
-        },
-        .smallint => |s| for (keys, s[row_off..][0..n]) |*k, v| {
-            k.* |= fieldBits(i16, v, bits) << off;
-        },
-        inline .int, .date => |s| for (keys, s[row_off..][0..n]) |*k, v| {
-            k.* |= fieldBits(i32, v, bits) << off;
-        },
-        inline .bigint, .datetime, .decimal64 => |s| for (keys, s[row_off..][0..n]) |*k, v| {
-            k.* |= fieldBits(i64, v, bits) << off;
-        },
-        inline .largeint, .decimal128 => |s| for (keys, s[row_off..][0..n]) |*k, v| {
-            k.* |= fieldBits(i128, v, bits) << off;
-        },
-        .uuid => |s| for (keys, s[row_off..][0..n]) |*k, v| {
-            k.* |= fieldBits(u128, v, bits) << off;
-        },
-        else => unreachable,
-    }
-}
-
 /// Pack a single integer-family group column's `value` into the u128 key,
 /// matching `orKeyColumn` for the one-column case (`fieldBits` of the column's
 /// stored type at the field's offset). The inline-FOR lower produces keys
