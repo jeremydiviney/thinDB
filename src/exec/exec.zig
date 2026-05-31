@@ -912,4 +912,5 @@ test {
     _ = @import("group_table.zig");
     _ = @import("global_dict.zig");
     _ = @import("radix_aggregate.zig");
+    _ = @import("concurrent_int_table.zig");
 }
