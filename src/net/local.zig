@@ -2494,22 +2494,10 @@ fn routeParallelGroupBy(
         else => return null,
     };
 
-    // Low/med-card gate (reuses the radix cache model): a partial set above the
-    // 16MB line makes the serial combine the new bottleneck — leave to P2.
-    const schema = upstream.outputSchema();
-    const st = upstream.stats();
-    var est: u64 = 1;
-    for (group_cols) |gc| {
-        const idx = types.findColumn(schema, gc) orelse return null;
-        if (idx >= st.column_stats.len) return null;
-        switch (st.column_stats[idx].ndv) {
-            .exact => |nd| est *|= nd,
-            .unknown => return null,
-        }
-    }
-    est = @min(est, @max(st.upper_rows, 1));
-    const per_group = perGroupTableBytes(schema, group_cols, aggs);
-    if (per_group != 0 and est *| per_group > RADIX_CACHE_BYTES) return null;
+    // No cardinality gate: the combine is itself a parallel hash-partition merge
+    // (ParallelCombine), so high card is handled by fanning the merge across
+    // threads rather than declining to a serial aggregate. Low card runs the
+    // merge single-threaded (adaptive degree inside ParallelCombine).
 
     // Fuse the partial aggregate (original specs) into the workers; declines (and
     // we fall through) if the upstream isn't a parallel scan / fused pass-through.

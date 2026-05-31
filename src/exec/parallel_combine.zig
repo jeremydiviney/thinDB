@@ -113,6 +113,11 @@ fn hashRowKey(views: []const ColumnView, key_idx: []const usize, r: usize) u64 {
 /// headroom for skew; the per-partition `Aggregate` sizes its own table.
 const N_PARTS: usize = 32;
 
+/// Below this many partial rows the merge runs single-threaded — the thread-
+/// spawn cost would dwarf the work (low/med-card GROUP BYs whose per-worker
+/// partials already collapsed to a handful of groups).
+const PARALLEL_MIN_ROWS: usize = 16384;
+
 pub const ParallelCombine = struct {
     allocator: Allocator,
     upstream: Query,
@@ -129,6 +134,12 @@ pub const ParallelCombine = struct {
     built: bool = false,
     emitted: bool = false,
     n_out: usize = 0,
+
+    // Phase-A partition buffers, read by the phase-B worker threads (each
+    // partition is claimed by exactly one thread via the work-steal cursor, so
+    // there is no shared mutable access). `ncol` = upstream column count.
+    part: [][]ColumnStore = &.{},
+    ncol: usize = 0,
 
     pub fn create(
         allocator: Allocator,
@@ -171,8 +182,9 @@ pub const ParallelCombine = struct {
 
     fn build(self: *ParallelCombine) !void {
         const a = self.allocator;
-        const up_schema = self.upstream.outputSchema();
+        const up_schema = self.out_schema; // dup of the partial schema (same cols)
         const ncol = up_schema.len;
+        self.ncol = ncol;
 
         // Per-(partition, column) accumulators for the hash exchange.
         const part: [][]ColumnStore = try a.alloc([]ColumnStore, N_PARTS);
@@ -180,6 +192,7 @@ pub const ParallelCombine = struct {
             p.* = try a.alloc(ColumnStore, ncol);
             for (p.*, up_schema) |*c, col| c.* = try ColumnStore.init(a, col.type, col.nullable);
         }
+        self.part = part;
 
         // Phase A: drain partials, route each row to its key-hash partition.
         while (try self.upstream.next()) |batch| {
@@ -190,34 +203,96 @@ pub const ParallelCombine = struct {
                 for (0..ncol) |c| try appendCellFromView(a, &part[p][c], batch.values[c], r);
             }
         }
-
-        // Output accumulators (final groups).
         for (self.out_cols, up_schema) |*c, col| c.* = try ColumnStore.init(a, col.type, col.nullable);
-        const views = try a.alloc(ColumnView, ncol);
-        defer a.free(views);
 
-        // Phase B: combine each partition independently. (Serial here; threaded
-        // in the next commit — the partitions are disjoint by construction.)
+        // Phase B: combine the disjoint partitions across threads. Each thread
+        // owns a page-backed arena for its outputs (survives join) and a fresh
+        // per-partition scratch arena (freed per partition). The work-steal
+        // cursor hands each partition to exactly one thread.
+        //
+        // Adaptive degree: a small partial set (low/med card, where the per-worker
+        // partial already collapsed the rows) isn't worth the thread-spawn cost —
+        // run it on the calling thread. Only the high-card merges fan out.
+        var total_partials: usize = 0;
+        for (part) |pcols| total_partials += pcols[0].rowCount();
+        const T = if (total_partials < PARALLEL_MIN_ROWS) 1 else @min(N_PARTS, @max(@as(usize, 1), std.Thread.getCpuCount() catch 1));
+        const arenas = try a.alloc(std.heap.ArenaAllocator, T);
+        const touts = try a.alloc([]ColumnStore, T);
+        const terr = try a.alloc(?anyerror, T);
+        for (0..T) |t| {
+            arenas[t] = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            terr[t] = null;
+            const ta = arenas[t].allocator();
+            touts[t] = try ta.alloc(ColumnStore, ncol);
+            for (touts[t], up_schema) |*c, col| c.* = try ColumnStore.init(ta, col.type, col.nullable);
+        }
+        defer for (arenas) |*ar| ar.deinit();
+
+        var cursor = std.atomic.Value(usize).init(0);
+        const threads = try a.alloc(std.Thread, T);
+        var spawned: usize = 0;
+        var ti: usize = 1;
+        while (ti < T) : (ti += 1) {
+            threads[ti] = std.Thread.spawn(.{}, worker, .{ self, &cursor, arenas, touts, terr, ti }) catch break;
+            spawned = ti;
+        }
+        worker(self, &cursor, arenas, touts, terr, 0);
+        var j: usize = 1;
+        while (j <= spawned) : (j += 1) threads[j].join();
+        for (terr) |e| if (e) |err| return err;
+
+        // Concat per-thread outputs into the query-arena result + apply LIMIT.
         var produced: usize = 0;
-        for (part) |pcols| {
-            if (pcols[0].rowCount() == 0) continue;
-            for (0..ncol) |c| views[c] = pcols[c].view();
-            const pbatch = Batch{ .schema = up_schema, .values = views, .row_count = @intCast(pcols[0].rowCount()) };
-            const src = try single_batch.SingleBatchSource.create(a, pbatch);
-            var agg = try aggregate.Aggregate.create(a, src, self.group_cols, self.combine, null, null);
-            defer agg.deinit();
-            while (try agg.next()) |ob| {
-                const on = ob.row_count;
-                var r: usize = 0;
-                while (r < on) : (r += 1) {
-                    if (self.emit_limit) |lim| if (produced >= lim) break;
-                    for (0..ncol) |c| try appendCellFromView(a, &self.out_cols[c], ob.values[c], r);
-                    produced += 1;
-                }
+        outer: for (touts) |to| {
+            const n = to[0].rowCount();
+            var r: usize = 0;
+            while (r < n) : (r += 1) {
+                if (self.emit_limit) |lim| if (produced >= lim) break :outer;
+                for (0..ncol) |c| try appendCellFromView(a, &self.out_cols[c], to[c].view(), r);
+                produced += 1;
             }
         }
         self.n_out = produced;
         self.built = true;
+    }
+
+    /// Phase-B thread body: claim partitions off the shared cursor and combine
+    /// each into this thread's output `touts[t]`. Errors land in `terr[t]`.
+    fn worker(self: *ParallelCombine, cursor: *std.atomic.Value(usize), arenas: []std.heap.ArenaAllocator, touts: [][]ColumnStore, terr: []?anyerror, t: usize) void {
+        const out_alloc = arenas[t].allocator();
+        while (true) {
+            const p = cursor.fetchAdd(1, .monotonic);
+            if (p >= N_PARTS) break;
+            const pcols = self.part[p];
+            if (pcols[0].rowCount() == 0) continue;
+            self.combinePartition(pcols, out_alloc, touts[t]) catch |e| {
+                terr[t] = e;
+                return;
+            };
+        }
+    }
+
+    /// Aggregate one partition's rows with the combine specs, appending the final
+    /// groups onto `out` (owned by the caller's surviving arena). Uses a fresh
+    /// page-backed scratch arena for the hash table, freed on return.
+    fn combinePartition(self: *ParallelCombine, pcols: []ColumnStore, out_alloc: Allocator, out: []ColumnStore) !void {
+        var scr = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scr.deinit();
+        const sa = scr.allocator();
+        const ncol = self.ncol;
+        const views = try sa.alloc(ColumnView, ncol);
+        for (0..ncol) |c| views[c] = pcols[c].view();
+        const pbatch = Batch{ .schema = self.out_schema, .values = views, .row_count = @intCast(pcols[0].rowCount()) };
+        const src = try single_batch.SingleBatchSource.create(sa, pbatch);
+        var agg = try aggregate.Aggregate.create(sa, src, self.group_cols, self.combine, null, null);
+        defer agg.deinit();
+        while (try agg.next()) |ob| {
+            const on = ob.row_count;
+            var r: usize = 0;
+            while (r < on) : (r += 1) {
+                for (0..ncol) |c| try appendCellFromView(out_alloc, &out[c], ob.values[c], r);
+            }
+        }
     }
 
     pub fn next(self: *ParallelCombine) !?Batch {
