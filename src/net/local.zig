@@ -2534,7 +2534,12 @@ fn routeParallelGroupBy(
             .out_type_override = part_schema[group_cols.len + i].type,
         };
     }
-    return try upstream.groupByTopK(group_cols, combine, top_k, emit_limit);
+    // Parallel hash-partition merge of the partials (replaces the serial combine
+    // that bottlenecked high card). top_k is only an emit-cap optimization — the
+    // real TopN sits above — so the combine emits all groups and lets it sort.
+    _ = top_k;
+    const pc = @import("../exec/parallel_combine.zig");
+    return try pc.ParallelCombine.create(ctx.allocator, upstream, group_cols, combine, emit_limit);
 }
 
 /// Approximate allocated bytes per group in the hash / radix Aggregate table:
