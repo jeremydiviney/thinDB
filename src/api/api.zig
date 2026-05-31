@@ -95,7 +95,7 @@ pub const Config = struct {
     auto_flush_min_bytes: usize = 0,
 
     /// LRU cache budget for decompressed column blocks. The special value
-    /// `0` means "auto" — resolved at open time to ~20% of physical RAM
+    /// `0` means "auto" — resolved at open time to ~60% of physical RAM
     /// (floored at 256 MiB) by `autoCacheSizeBytes`. Set an explicit non-zero
     /// value to pin the budget; there is no separate "disable cache" — a tiny
     /// explicit value (e.g. 1) is the way to effectively turn it off.
@@ -150,13 +150,15 @@ pub const Config = struct {
     /// every query either runs entirely within `query_memory_budget`
     /// or fails fast with a clear error — never silently degrades.
     ///
-    /// Default 2 GB: high-cardinality GROUP BY / large sorts on
-    /// multi-million-row tables hold their whole hash table or buffer
-    /// at once (eviction can't shrink the single peak), so the budget
-    /// has to clear that peak. Comfortable on a 16 GB+ box; production
-    /// deployments override. A real fix for the GROUP BY ceiling
-    /// (spill-to-disk) is future work.
-    query_memory_budget: usize = 2 * 1024 * 1024 * 1024,
+    /// Default `auto_query_budget` → resolved at open to ~25% of physical RAM
+    /// by `autoQueryBudgetBytes`. High-cardinality GROUP BY / large sorts on
+    /// hundred-million-row tables hold their whole hash table or buffer at once
+    /// (eviction can't shrink the single peak), so the budget has to clear that
+    /// peak; a RAM fraction scales it to the box. Independent of the decoded-
+    /// block cache (a separate bucket — see `cache_size_bytes`). An explicit
+    /// non-zero value pins the budget; `0` disables tracking. A real fix for the
+    /// GROUP BY ceiling (spill-to-disk) is future work.
+    query_memory_budget: usize = auto_query_budget,
 
     /// Maximum intra-query degree of parallelism (worker threads per query for
     /// the parallel scan/filter leaf). `1` (default) = fully serial, byte-
@@ -187,7 +189,7 @@ pub const Config = struct {
 };
 
 /// Resolve the decompressed-block cache budget. A non-zero `configured` is
-/// honored verbatim; `0` means "auto" — ~20% of physical RAM, floored at
+/// honored verbatim; `0` means "auto" — ~50% of physical RAM, floored at
 /// 256 MiB so small machines still get a usable pool. The LRU fills lazily and
 /// evicts to this bound, so a large auto budget on a big box costs nothing
 /// until the workload's hot set actually grows into it. Falls back to the
@@ -196,7 +198,24 @@ pub fn autoCacheSizeBytes(configured: usize) usize {
     if (configured != 0) return configured;
     const floor: u64 = 256 * 1024 * 1024;
     const total = std.process.totalSystemMemory() catch return @intCast(floor);
-    return @intCast(@max(total / 5, floor));
+    return @intCast(@max(total / 2, floor));
+}
+
+/// Auto-resolve sentinel for `Config.query_memory_budget`: the default leaves
+/// the budget unset so it resolves to a RAM fraction at open. An explicit value
+/// (including `0` = no tracking) is honored verbatim. Distinct from `0` so the
+/// "disable tracking" escape hatch survives.
+pub const auto_query_budget: usize = std.math.maxInt(usize);
+
+/// Resolve the per-query memory budget. The `auto_query_budget` sentinel (the
+/// `Config` default) means "auto" — ~25% of physical RAM, floored at 256 MiB.
+/// Any other value (including `0` = disable tracking) is honored verbatim.
+/// Falls back to the floor if the OS can't report total memory.
+pub fn autoQueryBudgetBytes(configured: usize) usize {
+    if (configured != auto_query_budget) return configured;
+    const floor: u64 = 256 * 1024 * 1024;
+    const total = std.process.totalSystemMemory() catch return @intCast(floor);
+    return @intCast(@max(total / 4, floor));
 }
 
 pub const TableOptions = struct {

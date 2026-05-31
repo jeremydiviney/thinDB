@@ -35,10 +35,11 @@ const usage_text =
     \\  --max-dop N             Max worker threads per query for the parallel scan leaf (default 1 =
     \\                          serial). >1 hands row-group ranges to up to N workers; the per-query
     \\                          count is also bounded by a global ~(cores-1) worker-slot budget.
-    \\  --query-memory-budget B Per-query memory budget in bytes (default 2 GiB; also gates the
-    \\                          hash-vs-sort GROUP BY decision). 0 disables tracking.
+    \\  --query-memory-budget B Per-query memory budget in bytes (default: auto, ~25% of physical
+    \\                          RAM, floored at 256 MiB; also gates the hash-vs-sort GROUP BY
+    \\                          decision). Separate bucket from --cache-size. 0 disables tracking.
     \\  --cache-size B          Per-table decompressed-block buffer-pool budget (default: auto,
-    \\                          ~20% of physical RAM, floored at 256 MiB). Accepts raw bytes or a
+    \\                          ~50% of physical RAM, floored at 256 MiB). Accepts raw bytes or a
     \\                          K/M/G suffix (e.g. 8G). Shared across all queries against a table;
     \\                          blocks in use are pinned and never evicted.
     \\  --file-root PATH        Enable SQL file scans for paths under PATH. Without this flag,
