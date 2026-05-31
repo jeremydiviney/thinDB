@@ -2490,28 +2490,55 @@ fn routeParallelGroupBy(
 ) !?Query {
     if (getenv("THINDB_PARALLEL_AGG") == null) return null;
     if (group_cols.len == 0) return null;
-    // KNOWN BUG: a filtered (materialize-mode) upstream feeding the threaded
-    // phase-B merge produces wrong/non-deterministic results (Q38/40/41).
-    // Unfiltered (round-mode) is validated correct, so decline filtered for now.
-    if (has_filter) return null;
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max => {},
         else => return null,
     };
 
-    // No cardinality gate: the combine is itself a parallel hash-partition merge
-    // (ParallelCombine), so high card is handled by fanning the merge across
-    // threads rather than declining to a serial aggregate. Low card runs the
-    // merge single-threaded (adaptive degree inside ParallelCombine).
+    // DIAGNOSTIC (THINDB_AGG_NOMERGE): each worker does a full independent GROUP
+    // BY on its slice; the ParallelScan drain just CONCATENATES the per-silo
+    // groups — NO merge. Results are inaccurate (duplicate groups across silos,
+    // partial counts) but it isolates the raw per-silo aggregate + concat speed
+    // from any merge/exchange cost. Pick a moderate-cardinality query.
+    if (getenv("THINDB_AGG_NOMERGE") != null) {
+        var upn = upstream;
+        if (!try upn.tryFuseAggregate(group_cols, aggs)) return null;
+        return upstream;
+    }
 
-    // Fuse the partial aggregate (original specs) into the workers; declines (and
-    // we fall through) if the upstream isn't a parallel scan / fused pass-through.
-    // `up` aliases the same operator ptr, so the fusion is visible via `upstream`.
+    _ = has_filter;
+
+    // Low-card gate: this path (per-silo partial + serial combine) only wins when
+    // the per-silo partials are small. Above the line the serial combine over the
+    // ~unreduced partials is slower than a plain serial aggregate — leave those to
+    // the concurrent shared-table path (Move 2). Measured crossover: Q42 (~100k
+    // groups) wins at 28ms; Q12 (~6M) loses. 16MB ≈ a few-hundred-k group ceiling.
+    {
+        const schema = upstream.outputSchema();
+        const st = upstream.stats();
+        var est: u64 = 1;
+        for (group_cols) |gc| {
+            const idx = types.findColumn(schema, gc) orelse return null;
+            if (idx >= st.column_stats.len) return null;
+            switch (st.column_stats[idx].ndv) {
+                .exact => |nd| est *|= nd,
+                .unknown => return null,
+            }
+        }
+        est = @min(est, @max(st.upper_rows, 1));
+        const per_group = perGroupTableBytes(schema, group_cols, aggs);
+        if (per_group != 0 and est *| per_group > RADIX_CACHE_BYTES) return null;
+    }
+
+    // Move 1: per-worker partial aggregate (parallel, on the decoding core) + an
+    // EFFICIENT serial combine — the normal `Aggregate` scatters straight from the
+    // partial batches into its hash table with no per-cell copy. Cheap exactly
+    // when the per-silo partials are small (the gate above).
     var up = upstream;
     if (!try up.tryFuseAggregate(group_cols, aggs)) return null;
 
-    // Combine specs over the partial outputs, read by `.as`, type-forced to the
-    // partial output type. From here `upstream` is consumed — never return null.
+    // Combine specs over the partials, read by `.as`, type-forced to the partial
+    // output type. From here `upstream` is consumed — never return null.
     const part_schema = upstream.outputSchema();
     const combine = try ctx.allocator.alloc(ir.AggSpec, aggs.len);
     for (aggs, 0..) |a, i| {
@@ -2527,12 +2554,7 @@ fn routeParallelGroupBy(
             .out_type_override = part_schema[group_cols.len + i].type,
         };
     }
-    // Parallel hash-partition merge of the partials (replaces the serial combine
-    // that bottlenecked high card). top_k is only an emit-cap optimization — the
-    // real TopN sits above — so the combine emits all groups and lets it sort.
-    _ = top_k;
-    const pc = @import("../exec/parallel_combine.zig");
-    return try pc.ParallelCombine.create(ctx.allocator, upstream, group_cols, combine, emit_limit);
+    return try upstream.groupByTopK(group_cols, combine, top_k, emit_limit);
 }
 
 /// Approximate allocated bytes per group in the hash / radix Aggregate table:
