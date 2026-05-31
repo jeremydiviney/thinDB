@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // ---- Unit tests: every `test` block in src/root.zig and its imports ----
-    const lib_tests = b.addTest(.{ .root_module = thindb_mod });
+    const lib_tests = b.addTest(.{ .root_module = thindb_mod, .filters = b.option([]const []const u8, "test-filter", "only run unit tests whose name contains this substring") orelse &.{} });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
     // ---- Integration tests: tests/integration/all.zig pulls in scenario files ----

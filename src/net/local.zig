@@ -2468,6 +2468,73 @@ fn routeRadixGroupBy(
     };
 }
 
+/// Parallel partition+lease high-card GROUP BY (experimental). Same eligibility
+/// as routeRadixGroupBy — int key ≤128 bits, fixed-state aggregates, high-card —
+/// but partitions rows into buckets and aggregates them across `dop` threads.
+/// Gated behind THINDB_LEASE_AGG so it's a no-op unless explicitly enabled; when
+/// it declines or is off, the caller falls through to the serial radix path.
+/// Consumes `upstream` only on success (create declines without consuming).
+fn routeLeaseGroupBy(
+    upstream: Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    top_k: ?ir.Op.TopK,
+    emit_limit: ?u32,
+    dop: usize,
+) !?Query {
+    if (getenv("THINDB_LEASE_AGG") == null) return null;
+    if (dop <= 1) return null;
+    if (group_cols.len == 0) return null;
+    if (emit_limit != null) return null;
+    if (top_k) |tk| {
+        if (tk.keys.len != 1) return null;
+    }
+
+    const schema = upstream.outputSchema();
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse return null;
+        switch (schema[idx].type) {
+            .varchar, .string, .char => return null,
+            else => {},
+        }
+    }
+
+    // Only worth the partition overhead for high card — decline known-low (the
+    // hash path's inline-state/count-slot fast paths win there), mirroring radix.
+    const st = upstream.stats();
+    var est: u64 = 1;
+    var known = true;
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc).?;
+        if (idx >= st.column_stats.len) {
+            known = false;
+            break;
+        }
+        switch (st.column_stats[idx].ndv) {
+            .exact => |nd| est *|= nd,
+            .unknown => {
+                known = false;
+                break;
+            },
+        }
+    }
+    if (known) {
+        est = @min(est, @max(st.upper_rows, 1));
+        const per_group_bytes = perGroupTableBytes(schema, group_cols, aggs);
+        if (per_group_bytes != 0 and est *| per_group_bytes <= RADIX_CACHE_BYTES) return null;
+    }
+
+    const rtk: ?exec.radix_aggregate.TopK = if (top_k) |tk|
+        .{ .k = tk.k, .col = tk.keys[0].col, .desc = tk.keys[0].desc }
+    else
+        null;
+
+    return upstream.leaseGroupBy(group_cols, aggs, rtk, dop) catch |e| switch (e) {
+        error.UnsupportedOperatorForType, error.AggregateUnsupportedType => null,
+        else => e,
+    };
+}
+
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// P1 two-phase parallel GROUP BY (env-gated `THINDB_PARALLEL_AGG`): each
@@ -3214,6 +3281,11 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             }
             // Global aggregate (no group keys) is O(1) — always hash.
             if (try routeStreamGroupBy(ctx.allocator, &upstream, g.group_cols, g.aggs, ctx.db.config.query_memory_budget)) |q| {
+                break :blk q;
+            }
+            // Parallel partition+lease high-card GROUP BY (experimental, gated by
+            // THINDB_LEASE_AGG; off → no effect). Same eligibility as radix.
+            if (try routeLeaseGroupBy(upstream, g.group_cols, g.aggs, g.top_k, g.emit_limit, ctx.db.config.max_dop)) |q| {
                 break :blk q;
             }
             // Native-int-key high-card GROUP BY → radix aggregate. Gated to

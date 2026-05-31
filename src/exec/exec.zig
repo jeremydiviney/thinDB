@@ -489,6 +489,13 @@ pub const Query = struct {
         return @import("radix_aggregate.zig").RadixAggregate.create(self.allocator, self, group_cols, aggs, top_k);
     }
 
+    /// Parallel partition+lease grouped aggregation (high-card path). Same
+    /// eligibility as radixGroupBy (int key ≤128 bits, fixed-state aggs) but
+    /// partitions rows into buckets and aggregates them across `dop` threads.
+    pub fn leaseGroupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("radix_aggregate.zig").TopK, dop: usize) !Query {
+        return @import("radix_aggregate.zig").RadixLeaseAggregate.create(self.allocator, self, group_cols, aggs, top_k, dop);
+    }
+
     /// Streaming sort-based grouped aggregation. Requires the input to be
     /// sorted such that equal group keys are adjacent. Holds only one
     /// group's state at a time (O(1) in cardinality). Caller (planner)

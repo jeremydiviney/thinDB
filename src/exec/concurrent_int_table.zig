@@ -16,6 +16,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 pub const ConcurrentIntTable = struct {
     keys: []u64, // 0 = empty slot; every access is atomic
     counts: []u64, // per-slot running count; every access is atomic
@@ -88,6 +90,100 @@ pub const ConcurrentIntTable = struct {
         return self.n_groups.load(.monotonic);
     }
 };
+
+test "racy memory-pattern scaling (isolates atomics vs DRAM)" {
+    if (getenv("THINDB_BENCH") == null) return error.SkipZigTest;
+    const allocator = std.heap.page_allocator;
+    var cap: usize = 1;
+    while (cap < 33_000_000) cap <<= 1;
+    const arr = try allocator.alloc(u64, cap);
+    defer allocator.free(arr);
+    @memset(arr, 0);
+    var T: usize = 12;
+    if (getenv("THINDB_BENCH_T")) |s| T = std.fmt.parseInt(usize, std.mem.span(s), 10) catch 12;
+    const total: usize = 100_000_000;
+    const per = total / T;
+    const Ctx = struct {
+        a: []u64,
+        m: u64,
+        per: usize,
+        seed: u64,
+        fn run(self: @This()) void {
+            var x = self.seed;
+            var j: usize = 0;
+            while (j < self.per) : (j += 1) {
+                x = (x *% 6364136223846793005) +% 1442695040888963407;
+                self.a[(x >> 16) & self.m] +%= 1; // plain RMW: same memory pattern, NO atomics
+            }
+        }
+    };
+    const win = std.os.windows;
+    const qpc = struct {
+        fn now() i64 {
+            var c: win.LARGE_INTEGER = undefined;
+            _ = win.ntdll.RtlQueryPerformanceCounter(&c);
+            return c;
+        }
+        fn freq() i64 {
+            var f: win.LARGE_INTEGER = undefined;
+            _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
+            return f;
+        }
+    };
+    var threads: [64]std.Thread = undefined;
+    const t0 = qpc.now();
+    for (threads[0..T], 0..) |*th, i| th.* = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .a = arr, .m = cap - 1, .per = per, .seed = @as(u64, i) *% 0x9e3779b97f4a7c15 +% 1 }});
+    for (threads[0..T]) |th| th.join();
+    const ms = @as(f64, @floatFromInt(qpc.now() - t0)) / @as(f64, @floatFromInt(qpc.freq())) * 1000.0;
+    var chk: u64 = 0;
+    for (arr) |v| chk +%= v;
+    std.debug.print("\n[bench-racy] {d} plain RMW (no atomics), {d} threads: {d:.1} ms (chk={d})\n", .{ total, T, ms, chk });
+}
+
+test "ConcurrentIntTable: throughput (Q9-shaped: 100M bumps, ~17M distinct, 12 threads)" {
+    if (getenv("THINDB_BENCH") == null) return error.SkipZigTest;
+    const allocator = std.heap.page_allocator;
+    const distinct: u64 = 17_000_000;
+    var t = try ConcurrentIntTable.init(allocator, distinct);
+    defer t.deinit();
+    const Ctx = struct {
+        tbl: *ConcurrentIntTable,
+        per: usize,
+        seed: u64,
+        d: u64,
+        fn run(self: @This()) void {
+            var x = self.seed;
+            var j: usize = 0;
+            while (j < self.per) : (j += 1) {
+                x = (x *% 6364136223846793005) +% 1442695040888963407; // LCG
+                self.tbl.bump((x >> 16) % self.d +% 1);
+            }
+        }
+    };
+    var T: usize = 12;
+    if (getenv("THINDB_BENCH_T")) |s| T = std.fmt.parseInt(usize, std.mem.span(s), 10) catch 12;
+    const total: usize = 100_000_000;
+    const per = total / T;
+    const win = std.os.windows;
+    const qpc = struct {
+        fn now() i64 {
+            var c: win.LARGE_INTEGER = undefined;
+            _ = win.ntdll.RtlQueryPerformanceCounter(&c);
+            return c;
+        }
+        fn freq() i64 {
+            var f: win.LARGE_INTEGER = undefined;
+            _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
+            return f;
+        }
+    };
+    var threads: [64]std.Thread = undefined;
+    const t0 = qpc.now();
+    for (threads[0..T], 0..) |*th, i| th.* = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .tbl = &t, .per = per, .seed = @as(u64, i) *% 0x9e3779b97f4a7c15 +% 1, .d = distinct }});
+    for (threads[0..T]) |th| th.join();
+    const ms = @as(f64, @floatFromInt(qpc.now() - t0)) / @as(f64, @floatFromInt(qpc.freq())) * 1000.0;
+    std.debug.print("\n[bench] {d} bumps, {d} distinct, {d} threads: {d:.1} ms ({d:.0} M bumps/s)\n", .{ total, t.groupCount(), T, ms, @as(f64, @floatFromInt(total)) / (ms / 1000.0) / 1e6 });
+}
 
 test "ConcurrentIntTable: concurrent bump is exact" {
     const allocator = std.testing.allocator;
