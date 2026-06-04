@@ -297,6 +297,7 @@ const WorkerParts = struct {
     raw_stage_slice_ticks: i64 = 0,
     raw_stage_publish_ticks: i64 = 0,
     raw_stage_recycle_ticks: i64 = 0,
+    raw_stage_input_chunks: u64 = 0,
     sched_loops: u64 = 0,
     sched_scan_jobs: u64 = 0,
     sched_stage_jobs: u64 = 0,
@@ -1228,6 +1229,7 @@ fn resetWorkerParts(parts: *WorkerParts, worker_index: usize) void {
     parts.raw_stage_slice_ticks = 0;
     parts.raw_stage_publish_ticks = 0;
     parts.raw_stage_recycle_ticks = 0;
+    parts.raw_stage_input_chunks = 0;
     parts.sched_loops = 0;
     parts.sched_scan_jobs = 0;
     parts.sched_stage_jobs = 0;
@@ -4387,6 +4389,7 @@ fn drainRawDedicatedStage(
     releaseRawQueueLane(shared.raw_scan_queues, scan_lane);
     if (profile) local.raw_stage_pop_ticks += nowTicks() - pop_t0;
     if (popped_total == 0) return false;
+    local.raw_stage_input_chunks += @intCast(popped_total);
     _ = shared.active_stage_jobs.fetchAdd(1, .release);
     defer _ = shared.active_stage_jobs.fetchSub(1, .release);
 
@@ -7492,6 +7495,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     var raw_stage_slice_ticks: i64 = 0;
     var raw_stage_publish_ticks: i64 = 0;
     var raw_stage_recycle_ticks: i64 = 0;
+    var raw_stage_input_chunks: u64 = 0;
     var sched_loops: u64 = 0;
     var sched_scan_jobs: u64 = 0;
     var sched_stage_jobs: u64 = 0;
@@ -7523,6 +7527,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         raw_stage_slice_ticks += p.raw_stage_slice_ticks;
         raw_stage_publish_ticks += p.raw_stage_publish_ticks;
         raw_stage_recycle_ticks += p.raw_stage_recycle_ticks;
+        raw_stage_input_chunks += p.raw_stage_input_chunks;
         sched_loops += p.sched_loops;
         sched_scan_jobs += p.sched_scan_jobs;
         sched_stage_jobs += p.sched_stage_jobs;
@@ -7668,7 +7673,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             },
         );
         std.debug.print(
-            "[clientip-raw-stage-breakdown] query={s} pop_cpu={d:.3}ms cluster_cpu={d:.3}ms slice_copy_alloc_cpu={d:.3}ms publish_group_queue_cpu={d:.3}ms recycle_input_cpu={d:.3}ms total_stage_measured={d:.3}ms\n",
+            "[clientip-raw-stage-breakdown] query={s} pop_cpu={d:.3}ms cluster_cpu={d:.3}ms slice_copy_alloc_cpu={d:.3}ms publish_group_queue_cpu={d:.3}ms recycle_input_cpu={d:.3}ms total_stage_measured={d:.3}ms input_chunks={d} avg_input_chunks_per_stage_job={d:.2}\n",
             .{
                 cfg.kind.label(),
                 ticksToMs(raw_stage_pop_ticks, freq),
@@ -7677,6 +7682,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 ticksToMs(raw_stage_publish_ticks, freq),
                 ticksToMs(raw_stage_recycle_ticks, freq),
                 ticksToMs(raw_stage_pop_ticks + raw_stage_ticks + raw_stage_slice_ticks + raw_stage_publish_ticks + raw_stage_recycle_ticks, freq),
+                raw_stage_input_chunks,
+                if (sched_stage_jobs == 0) 0.0 else @as(f64, @floatFromInt(raw_stage_input_chunks)) / @as(f64, @floatFromInt(sched_stage_jobs)),
             },
         );
         std.debug.print(
