@@ -24,6 +24,7 @@ const Table = api.Table;
 pub const memory = @import("../memory.zig");
 
 pub const prof = @import("../util/prof.zig");
+pub const group_topn_harness_core = @import("group_topn_harness_core.zig");
 
 /// Diagnostic override for the GROUP BY path selection (see net/local.zig).
 /// `.auto` is normal cardinality/budget-based routing; `.hash`, `.sort`, and
@@ -183,6 +184,11 @@ pub const VTable = struct {
     /// re-aggregates them. Only ParallelScan accepts (and only for combinable
     /// aggregates); every other operator declines via the `@hasDecl` guard.
     tryFuseAggregate: *const fn (ptr: *anyopaque, group_cols: []const []const u8, aggs: []const AggSpec) anyerror!bool,
+    /// Offer a full parallel lease GROUP BY replacement to this operator. Only
+    /// a directly-adjacent ParallelScan should accept: it can let its scan
+    /// workers build radix partitions directly and return a specialized
+    /// aggregate query. Blocking operators decline, preserving the normal path.
+    tryLeaseGroupBy: *const fn (ptr: *anyopaque, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK, emit_limit: ?u32, dop: usize) anyerror!?Query,
     /// Pre-execution statistics on this operator's OUTPUT: upper bound
     /// on rows, sort state. Cheap — computed from manifest + operator
     /// definitions, no data read required. Used by downstream planners
@@ -367,6 +373,12 @@ pub const Query = struct {
     /// (two-phase GROUP BY). Returns true iff accepted. See `VTable.tryFuseAggregate`.
     pub fn tryFuseAggregate(self: *Query, group_cols: []const []const u8, aggs: []const AggSpec) !bool {
         return self.vtable.tryFuseAggregate(self.ptr, group_cols, aggs);
+    }
+
+    /// Offer a full lease GROUP BY replacement to this operator. Returns a new
+    /// query only when accepted; otherwise the caller should use its fallback.
+    pub fn tryLeaseGroupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK, emit_limit: ?u32, dop: usize) !?Query {
+        return self.vtable.tryLeaseGroupBy(self.ptr, group_cols, aggs, top_k, emit_limit, dop);
     }
 
     /// Pre-execution stats on this operator's output. Cheap; no data
@@ -617,6 +629,11 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.tryFuseAggregate(group_cols, aggs);
         }
+        fn tryLeaseGroupByWrap(ptr: *anyopaque, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK, emit_limit: ?u32, dop: usize) anyerror!?Query {
+            if (!@hasDecl(Op, "tryLeaseGroupBy")) return null;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.tryLeaseGroupBy(group_cols, aggs, top_k, emit_limit, dop);
+        }
         fn statsWrap(ptr: *anyopaque) PipelineStats {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.stats();
@@ -668,6 +685,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .tryFuseFilter = tryFuseFilterWrap,
             .tryFuseCompute = tryFuseComputeWrap,
             .tryFuseAggregate = tryFuseAggregateWrap,
+            .tryLeaseGroupBy = tryLeaseGroupByWrap,
             .stats = statsWrap,
             .accountant = accountantWrap,
             .explain = explainWrap,

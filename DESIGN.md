@@ -6,6 +6,9 @@ This document is the working spec. v1 is effectively complete as of 2026-05-18 â
 
 Decisions are presented as decisions, not options. Rationale is included where it isn't obvious; alternatives we considered and rejected are listed in `## Alternatives considered`.
 
+For the planned next-generation physical execution path for simple analytical
+query blocks, see `docs/simple_query_pipeline.md`.
+
 ---
 
 ## 1. Goals & Non-goals
@@ -765,6 +768,7 @@ The biggest piece is a **compiled query-plan tree** as IR â€” most of v2 builds 
 | MySQL wire-protocol compatibility | Listener that speaks the MySQL client/server protocol so any mysql/MariaDB client connects. Replaces the "design our own protocol" path. |
 | Table-valued UDFs | TVFs act as pipeline operators; invokable from SQL once the parser ships. |
 | Auto-partitioned parallel execution | Split safely-partitionable queries into N parallel sub-queries; partial graph splits where safe. Single-threaded today; revisit after the plan-tree IR. |
+| ML/RL-driven query tuning | Learn per-query and per-data-shape settings for execution knobs such as scan tile size, chunk rows, route block rows, group bucket count, bucket granularity, flush thresholds, and scheduler/backlog thresholds. Start with offline benchmark traces and cardinality/runtime stats; later allow safe online exploration with guardrails for memory and tail latency. |
 | Partition key on tables | Per-key-value or hash-bucket physical partitioning. Natural parallelism axis for the auto-parallel work above. |
 | Schema evolution via in-place changes | Order-key changes, column reorder. v1's copy-and-swap covers most needs. |
 

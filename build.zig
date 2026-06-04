@@ -150,6 +150,21 @@ pub fn build(b: *std.Build) void {
     const regex_real_step = b.step("regexreal", "Run the real-data regex throughput microbench (ReleaseFast)");
     regex_real_step.dependOn(&run_regex_real.step);
 
+    // ---- Simplified ClientIP GROUP BY top-N pipeline: bench/clientip_pipeline.zig
+    // Uses the real scan/decode path, then a purpose-built fixed pipeline:
+    // scan -> bucket partition -> bucket-owned GROUP BY -> ORDER BY/LIMIT top-N.
+    const clientip_mod = b.createModule(.{
+        .root_source_file = b.path("bench/clientip_pipeline.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    clientip_mod.addImport("thindb", thindb_fast);
+    const clientip_exe = b.addExecutable(.{ .name = "clientip_pipeline", .root_module = clientip_mod });
+    const run_clientip = b.addRunArtifact(clientip_exe);
+    if (b.args) |args| run_clientip.addArgs(args);
+    const clientip_step = b.step("clientip", "Run the simplified ClientIP GROUP BY top-N pipeline benchmark (ReleaseFast)");
+    clientip_step.dependOn(&run_clientip.step);
+
     // ---- ClickBench loader: bench/clickbench/main.zig ----------------------
     const clickbench_mod = b.createModule(.{
         .root_source_file = b.path("bench/clickbench/main.zig"),

@@ -40,6 +40,7 @@ const TableSchema = types.TableSchema;
 const Value = types.Value;
 
 const exec = @import("../exec/exec.zig");
+const engine_v2 = @import("../exec/engine_v2.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
 const PredicateExpr = exec.PredicateExpr;
@@ -2268,6 +2269,14 @@ pub fn compileWithSession(
     // Projection pushdown: after subqueries are resolved to constants,
     // figure out which base columns the (single) scan must produce.
     ctx.prune_names = analyzeProjection(allocator, root);
+    if (try engine_v2.tryCompile(.{
+        .allocator = allocator,
+        .db = db,
+        .session = session_cell.*,
+        .prune_names = ctx.prune_names,
+    }, root)) |q| {
+        return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
+    }
     const q = try compileOp(&ctx, root);
     return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
 }
@@ -2528,6 +2537,8 @@ fn routeLeaseGroupBy(
         .{ .k = tk.k, .col = tk.keys[0].col, .desc = tk.keys[0].desc }
     else
         null;
+
+    if (try upstream.tryLeaseGroupBy(group_cols, aggs, top_k, emit_limit, dop)) |q| return q;
 
     return upstream.leaseGroupBy(group_cols, aggs, rtk, dop) catch |e| switch (e) {
         error.UnsupportedOperatorForType, error.AggregateUnsupportedType => null,

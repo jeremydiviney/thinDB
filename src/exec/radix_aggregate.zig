@@ -40,6 +40,7 @@ const ColumnStore = engine.ColumnStore;
 const gt = @import("group_table.zig");
 const prof = @import("../util/prof.zig");
 const transform = @import("../engine/transform.zig");
+const ParallelScan = @import("parallel_scan.zig").ParallelScan;
 
 const PREFETCH_DIST: usize = 12;
 
@@ -577,7 +578,7 @@ pub const RadixAggregate = struct {
         return makeQuery(allocator, self);
     }
 
-    fn drainTier(self: *RadixAggregate, comptime Table: type) !void {
+    fn drainTier(self: *RadixAggregate, comptime Table: type, prof_on: bool) !void {
         const aa = self.arena.allocator();
         const words = self.compact.words;
         const layout = self.int_layout;
@@ -600,10 +601,21 @@ pub const RadixAggregate = struct {
         var hb: std.ArrayListUnmanaged(u64) = .empty;
         var gidbuf: std.ArrayListUnmanaged(u32) = .empty;
         var n_groups: u32 = 0;
+        var rows: usize = 0;
+        const t0 = if (prof_on) prof.nowTicks() else 0;
+        var scan_ticks: i64 = 0;
+        var group_ticks: i64 = 0;
 
-        while (try self.upstream.next()) |batch| {
+        while (true) {
+            const scan_t0 = if (prof_on) prof.nowTicks() else 0;
+            const maybe = try self.upstream.next();
+            if (prof_on) scan_ticks += prof.nowTicks() - scan_t0;
+            const batch = maybe orelse break;
             const n = batch.row_count;
             if (n == 0) continue;
+
+            const group_t0 = if (prof_on) prof.nowTicks() else 0;
+            rows += n;
             if (table.needsGrow(n)) {
                 try table.grow(aa, n);
                 try gstate.ensureTotalCapacity(aa, table.slots.len * words);
@@ -639,9 +651,27 @@ pub const RadixAggregate = struct {
                 gidbuf.appendAssumeCapacity(g);
             }
             scatter(self.compact, gstate.items, gidbuf.items[0..n], batch);
+            if (prof_on) group_ticks += prof.nowTicks() - group_t0;
         }
 
+        const t1 = if (prof_on) prof.nowTicks() else 0;
         try self.emitGroups(gstate.items, gkeys.items[0..n_groups]);
+        if (prof_on) {
+            const t2 = prof.nowTicks();
+            std.debug.print("[radix-prof] drain={d:.1}ms emit={d:.1}ms rows={d} groups={d}\n", .{
+                prof.ticksToMs(t1 - t0),
+                prof.ticksToMs(t2 - t1),
+                rows,
+                n_groups,
+            });
+            std.debug.print("[group-pipeline] scan_filter={d:.1}ms group_by={d:.1}ms order_topn_emit={d:.1}ms rows={d} groups={d} dop=1\n", .{
+                prof.ticksToMs(scan_ticks),
+                prof.ticksToMs(group_ticks),
+                prof.ticksToMs(t2 - t1),
+                rows,
+                n_groups,
+            });
+        }
     }
 
     /// Emit group `g`'s row into the allocator-owned output columns: decode its
@@ -690,10 +720,11 @@ pub const RadixAggregate = struct {
     pub fn next(self: *RadixAggregate) !?Batch {
         if (self.done) return null;
         self.done = true;
+        const prof_on = getenv("THINDB_LEASE_PROF") != null;
         switch (self.int_layout.tier) {
-            .bits32 => try self.drainTier(gt.IntKeyTable(32)),
-            .bits96 => try self.drainTier(gt.IntKeyTable(96)),
-            .bits128 => try self.drainTier(gt.IntKeyTable(128)),
+            .bits32 => try self.drainTier(gt.IntKeyTable(32), prof_on),
+            .bits96 => try self.drainTier(gt.IntKeyTable(96), prof_on),
+            .bits128 => try self.drainTier(gt.IntKeyTable(128), prof_on),
         }
         _ = self.arena.reset(.free_all); // group table/state no longer needed
         for (self.output_columns, 0..) |c, i| self.views[i] = c.view();
@@ -743,11 +774,13 @@ pub const RadixAggregate = struct {
 // bucket → concatenate), work-stealing balances skew. Each bucket's table is
 // small enough to stay cache-resident, so it beats even a private one-big-table.
 //
-// Phase 1 (partition, serial for now): drain the upstream, pack each row's int
-// key, and scatter (key, agg-input values) into per-bucket buffers.
+// Phase 1 (partition): drain the upstream, pack each row's int key, radix-order
+// each batch inside a worker, and append bucket-contiguous runs into per-shard
+// buffers.
 // Phase 2 (lease, parallel): threads pull buckets off one atomic counter and
-// aggregate each into a fresh compact-state table, accumulating finalized groups
-// into per-thread output. Phase 3 (emit): concatenate (or global top-k).
+// aggregate each into a fresh compact-state table, publishing finalized groups
+// into central per-bucket result slots. Phase 3 (emit): concatenate (or global
+// top-k).
 //
 // Reuses the compact core (planCompact/scatter/finalize/appendFinalized), the
 // int-key packing (agg.orKeyColumn/appendIntGroupKey), and the top-k heap — so it
@@ -798,10 +831,15 @@ pub const RadixLeaseAggregate = struct {
     cap_groups: usize,
     top_k: ?ResolvedTopK,
     dop: usize,
+    n_shards: usize,
     n_buckets: usize,
     bshift: u6,
     used_cols: []usize, // distinct upstream column indices referenced by the aggregates
     done: bool = false,
+    prof_scan_ticks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    prof_radix_ticks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    prof_group_ticks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    prof_bucket_topk_ticks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // Per-shard bucket buffers: shard s owns buckets[s*n_buckets .. +n_buckets].
     // The partition scatter is parallelized across shards (one thread each); the
     // lease reads bucket b across all shards.
@@ -813,27 +851,77 @@ pub const RadixLeaseAggregate = struct {
     need_cols: []usize,
     key_flat_slot: []usize, // mini-col slot per group-key column
     val_flat_slot: []usize, // mini-col slot per used (agg-input) column
+    fused_pscan: ?*ParallelScan = null,
 
     // One bucket's partitioned rows: packed keys + a value buffer per used column.
     const Bucket = struct {
         keys: std.ArrayListUnmanaged(u128) = .empty,
+        keys32: std.ArrayListUnmanaged(u32) = .empty,
         cols: []ColumnStore = &.{}, // aligned to `used_cols`
     };
 
-    // One lease worker's private output: finalized groups (key + compact state),
-    // accumulated across every bucket it leases. Disjoint keys across workers.
-    const LeaseWorker = struct {
-        arena: std.heap.ArenaAllocator,
-        out_keys: std.ArrayListUnmanaged(u128) = .empty,
-        out_state: std.ArrayListUnmanaged(u64) = .empty, // words-strided, aligned to out_keys
-        // Local top-k over this worker's groups (computed in parallel after its
-        // lease loop). `sel` holds gids into out_keys/out_state; `ov` their order
-        // values. emit merges the dop small candidate sets.
+    // One bucket's finalized groups in the central lease result set. A bucket is
+    // claimed by exactly one worker through the lease counter, so that worker is
+    // the only writer for `results[b]`; emit can later walk the central bucket
+    // array without a merge because keys are disjoint across buckets.
+    const BucketResult = struct {
+        keys: std.ArrayListUnmanaged(u128) = .empty,
+        keys32: std.ArrayListUnmanaged(u32) = .empty,
+        state: std.ArrayListUnmanaged(u64) = .empty, // words-strided, aligned to keys
         sel: []usize = &.{},
         ov: []OrderVal = &.{},
         sel_len: usize = 0,
+    };
+
+    // One lease worker's private scratch. Completed groups are published into
+    // the central `BucketResult` slot for the bucket the worker leased, not into
+    // a per-worker result silo.
+    const LeaseWorker = struct {
+        arena: std.heap.ArenaAllocator,
         err: ?anyerror = null,
     };
+
+    const CountSumAvgPlan = struct {
+        count_off: usize,
+        sum_off: usize,
+        avg_off: usize,
+        sum_ui: usize,
+        avg_ui: usize,
+    };
+
+    fn countSumAvgPlan(self: *const RadixLeaseAggregate) ?CountSumAvgPlan {
+        if (self.compact.aggs.len != 3) return null;
+        var out: CountSumAvgPlan = undefined;
+        var have_count = false;
+        var have_sum = false;
+        var have_avg = false;
+        for (self.compact.aggs) |ca| {
+            switch (ca.kind) {
+                .count => {
+                    if (ca.col_idx != null) return null;
+                    out.count_off = ca.off;
+                    have_count = true;
+                },
+                .sum_int => {
+                    out.sum_ui = self.usedSlot(ca.col_idx orelse return null) orelse return null;
+                    out.sum_off = ca.off;
+                    have_sum = true;
+                },
+                .avg => {
+                    out.avg_ui = self.usedSlot(ca.col_idx orelse return null) orelse return null;
+                    out.avg_off = ca.off;
+                    have_avg = true;
+                },
+                else => return null,
+            }
+        }
+        return if (have_count and have_sum and have_avg) out else null;
+    }
+
+    fn usedSlot(self: *const RadixLeaseAggregate, ci: usize) ?usize {
+        for (self.used_cols, 0..) |u, i| if (u == ci) return i;
+        return null;
+    }
 
     pub fn create(allocator: Allocator, upstream: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?TopK, dop: usize) !Query {
         if (aggs.len == 0) return Error.AggregateNoSpecs;
@@ -947,11 +1035,23 @@ pub const RadixLeaseAggregate = struct {
             }
         }
 
-        // Bucket count: more buckets keep each per-bucket table cache-resident.
-        // With the partition fully parallel (each thread radix-sorts its own
-        // batches), the operator-level optimum sits near ~1024. Scale to the
-        // group estimate, round to pow2.
-        const want_buckets = std.math.clamp(cap_groups / 8192, 1, 2048);
+        const eff_dop = @max(@as(usize, 1), @min(dop, MAX_LEASE_THREADS));
+
+        // Bucket count is a global logical hash partition count. Each shard owns
+        // a local slice for every bucket, and the lease phase assigns those
+        // global bucket IDs to workers. Too many buckets make partition/emit
+        // metadata and locality dominate; current ClickBench high-cardinality
+        // sweeps on the focused ClientIP top-count workload now favor 128-256:
+        // fewer buckets substantially reduce partition metadata and allocator
+        // churn, while still leaving enough bucket work for 12-way leasing.
+        // Scale from propagated row/cardinality
+        // estimates, but keep a cap until scan-fused partitioning changes this
+        // tradeoff.
+        const stat_rows: usize = @intCast(@min(st.upper_rows, @as(u64, std.math.maxInt(usize))));
+        const sizing_rows = @max(@max(cap_groups, stat_rows), eff_dop * @as(usize, 32 * 1024));
+        const target_rows_per_bucket: usize = 32 * 1024;
+        const max_auto_buckets: usize = 256;
+        const want_buckets = std.math.clamp(sizing_rows / target_rows_per_bucket, 1, max_auto_buckets);
         var nb: usize = 1;
         var nbits: u6 = 0;
         while (nb < want_buckets) {
@@ -967,7 +1067,6 @@ pub const RadixLeaseAggregate = struct {
                 nbits += 1;
             }
         }
-        const eff_dop = @max(@as(usize, 1), @min(dop, MAX_LEASE_THREADS));
 
         const self = try allocator.create(RadixLeaseAggregate);
         self.* = .{
@@ -985,6 +1084,7 @@ pub const RadixLeaseAggregate = struct {
             .cap_groups = @max(cap_groups, 256),
             .top_k = resolved_tk,
             .dop = eff_dop,
+            .n_shards = eff_dop,
             .n_buckets = nb,
             .bshift = if (nbits == 0) 0 else @intCast(64 - @as(usize, nbits)), // unused when n_buckets==1 (bucketOf short-circuits)
             .used_cols = used_cols,
@@ -995,11 +1095,54 @@ pub const RadixLeaseAggregate = struct {
         return makeQuery(allocator, self);
     }
 
+    pub fn createFromParallelScan(allocator: Allocator, pscan: *ParallelScan, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?TopK, dop: usize) !Query {
+        const q = try create(allocator, makeQuery(allocator, pscan), group_cols, aggs, top_k, dop);
+        const self: *RadixLeaseAggregate = @ptrCast(@alignCast(q.ptr));
+        self.fused_pscan = pscan;
+        return q;
+    }
+
     inline fn bucketOf(self: *const RadixLeaseAggregate, key: u128) usize {
+        return self.bucketOfHash(bucketHashU128(key));
+    }
+
+    inline fn bucketOfHash(self: *const RadixLeaseAggregate, h: u64) usize {
         // Top `nbits` of the hash → independent of the low bits the per-bucket
-        // table uses for its slot. `n_buckets == 1` ⇒ bshift 64 ⇒ all → bucket 0.
+        // table uses for its slot. `n_buckets == 1` ⇒ all → bucket 0.
         if (self.n_buckets == 1) return 0;
-        return @intCast(bucketHashU128(key) >> self.bshift);
+        return @intCast(h >> self.bshift);
+    }
+
+    inline fn addProfileTicks(counter: *std.atomic.Value(u64), start: i64, enabled: bool) void {
+        if (!enabled) return;
+        const elapsed = prof.nowTicks() - start;
+        if (elapsed > 0) _ = counter.fetchAdd(@intCast(elapsed), .monotonic);
+    }
+
+    fn useKey32Partitions(self: *const RadixLeaseAggregate) bool {
+        // The focused ClientIP query is a single native 32-bit integer key. Keep
+        // the narrower partition/result buffers to that shape so compound and
+        // coded keys continue through the canonical u128 path.
+        return self.fused_pscan != null and self.int_layout.tier == .bits32 and self.int_layout.fields.len == 1 and !self.int_layout.fields[0].coded and self.int_layout.fields[0].offset == 0;
+    }
+
+    fn fillKey32(out: []u32, batch: Batch, ci: usize, f: agg.IntKeyField) void {
+        std.debug.assert(f.offset == 0);
+        switch (batch.values[ci].data) {
+            .boolean => |s| {
+                for (out, s) |*k, v| k.* = @as(u32, v);
+            },
+            .tinyint => |s| {
+                for (out, s) |*k, v| k.* = @as(u32, @as(u8, @bitCast(v)));
+            },
+            .smallint => |s| {
+                for (out, s) |*k, v| k.* = @as(u32, @as(u16, @bitCast(v)));
+            },
+            inline .int, .date => |s| {
+                for (out, s) |*k, v| k.* = @as(u32, @bitCast(v));
+            },
+            else => unreachable,
+        }
     }
 
     // --- Phase 1: each thread drains its own batches off a shared cursor and
@@ -1007,9 +1150,10 @@ pub const RadixLeaseAggregate = struct {
     // A mutex guards only the upstream cursor + the per-batch copy; the key-pack
     // and bucket scatter (the real cost) run lock-free. The lease (phase 2) then
     // reads bucket b across every shard.
-    fn partition(self: *RadixLeaseAggregate) !void {
+    fn initPartitionBuffers(self: *RadixLeaseAggregate, shard_count: usize) !void {
         const up_schema = self.upstream.outputSchema();
-        const S = self.dop;
+        self.n_shards = shard_count;
+        const S = self.n_shards;
         self.buckets = try self.arena.allocator().alloc(Bucket, S * self.n_buckets);
         self.shard_arenas = try self.allocator.alloc(std.heap.ArenaAllocator, S);
         for (self.shard_arenas) |*ar| ar.* = std.heap.ArenaAllocator.init(self.allocator);
@@ -1020,10 +1164,21 @@ pub const RadixLeaseAggregate = struct {
             for (0..self.n_buckets) |b| {
                 const bk = &self.buckets[s * self.n_buckets + b];
                 bk.* = .{ .cols = try sa.alloc(ColumnStore, self.used_cols.len) };
-                try bk.keys.ensureTotalCapacity(sa, reserve);
+                if (self.useKey32Partitions()) {
+                    try bk.keys32.ensureTotalCapacity(sa, reserve);
+                } else {
+                    try bk.keys.ensureTotalCapacity(sa, reserve);
+                }
                 for (self.used_cols, bk.cols) |ci, *cs| cs.* = try ColumnStore.initCapacity(sa, up_schema[ci].type, up_schema[ci].nullable, reserve, 0);
             }
         }
+    }
+
+    fn partition(self: *RadixLeaseAggregate) !void {
+        if (self.fused_pscan) |ps| return self.partitionParallelScan(ps);
+
+        const S = self.dop;
+        try self.initPartitionBuffers(S);
 
         var mutex: SpinLock = .{};
         const Entry = struct {
@@ -1066,8 +1221,16 @@ pub const RadixLeaseAggregate = struct {
         const mini_vals = try sa.alloc(ColumnView, up_schema.len);
         var kb: std.ArrayListUnmanaged(u128) = .empty;
         var bof: std.ArrayListUnmanaged(u16) = .empty;
+        var nonempty: std.ArrayListUnmanaged(usize) = .empty;
+        var row_order: std.ArrayListUnmanaged(usize) = .empty;
+        var sorted_keys: std.ArrayListUnmanaged(u128) = .empty;
+        const counts = try sa.alloc(usize, self.n_buckets);
+        const offsets = try sa.alloc(usize, self.n_buckets + 1);
+        const cursors = try sa.alloc(usize, self.n_buckets);
 
         while (true) {
+            const prof_on = getenv("THINDB_LEASE_PROF") != null;
+            const scan_t0 = if (prof_on) prof.nowTicks() else 0;
             mutex.lock();
             const maybe = self.upstream.next() catch |e| {
                 mutex.unlock();
@@ -1085,8 +1248,10 @@ pub const RadixLeaseAggregate = struct {
                 }
             }
             mutex.unlock();
+            addProfileTicks(&self.prof_scan_ticks, scan_t0, prof_on);
             if (n == 0) continue;
 
+            const radix_t0 = if (prof_on) prof.nowTicks() else 0;
             try kb.ensureTotalCapacity(sa, n);
             kb.clearRetainingCapacity();
             kb.appendNTimesAssumeCapacity(0, n);
@@ -1096,35 +1261,335 @@ pub const RadixLeaseAggregate = struct {
 
             try bof.ensureTotalCapacity(sa, n);
             bof.clearRetainingCapacity();
-            for (0..n) |i| bof.appendAssumeCapacity(@intCast(self.bucketOf(kb.items[i])));
-            for (0..n) |i| try shard_buckets[bof.items[i]].keys.append(sa, kb.items[i]);
-            for (self.val_flat_slot, 0..) |vs, ui| try scatterColumnToBuckets(sa, mini_cols[vs].view(), 0, ui, bof.items[0..n], shard_buckets, n);
+            try nonempty.ensureTotalCapacity(sa, @min(n, self.n_buckets));
+            nonempty.clearRetainingCapacity();
+            @memset(counts, 0);
+            for (0..n) |i| {
+                const b: u16 = @intCast(self.bucketOf(kb.items[i]));
+                bof.appendAssumeCapacity(b);
+                if (counts[b] == 0) nonempty.appendAssumeCapacity(b);
+                counts[b] += 1;
+            }
+            offsets[0] = 0;
+            for (0..self.n_buckets) |b| offsets[b + 1] = offsets[b] + counts[b];
+            @memcpy(cursors, offsets[0..self.n_buckets]);
+
+            try row_order.ensureTotalCapacity(sa, n);
+            row_order.clearRetainingCapacity();
+            row_order.appendNTimesAssumeCapacity(0, n);
+            try sorted_keys.ensureTotalCapacity(sa, n);
+            sorted_keys.clearRetainingCapacity();
+            sorted_keys.appendNTimesAssumeCapacity(0, n);
+            for (0..n) |i| {
+                const b = bof.items[i];
+                const dst = cursors[b];
+                cursors[b] = dst + 1;
+                row_order.items[dst] = i;
+                sorted_keys.items[dst] = kb.items[i];
+            }
+
+            for (nonempty.items) |b| {
+                const start = offsets[b];
+                const end = offsets[b + 1];
+                try shard_buckets[b].keys.appendSlice(sa, sorted_keys.items[start..end]);
+            }
+            for (self.val_flat_slot, 0..) |vs, ui| {
+                const view = mini_cols[vs].view();
+                for (nonempty.items) |b| {
+                    const start = offsets[b];
+                    const end = offsets[b + 1];
+                    try appendColumnRows(sa, view, row_order.items[start..end], &shard_buckets[b].cols[ui]);
+                }
+            }
+            addProfileTicks(&self.prof_radix_ticks, radix_t0, prof_on);
         }
     }
 
-    // Append rows [src_off, src_off+n) of `src` to their buckets' buffer for
-    // used-column slot `ui`. Compact path excludes string/uuid agg inputs.
-    fn scatterColumnToBuckets(aa: Allocator, src: ColumnView, src_off: usize, ui: usize, bof: []const u16, buckets: []Bucket, n: usize) !void {
-        const has_nulls = src.nulls != null;
+    fn partitionParallelScan(self: *RadixLeaseAggregate, pscan: *ParallelScan) !void {
+        if (pscan.mode != .unset or pscan.agg_fused) return Error.UnsupportedOperatorForType;
+        const shard_count = pscan.n_threads;
+        try self.initPartitionBuffers(shard_count);
+
+        const Entry = struct {
+            fn scanGo(op: *RadixLeaseAggregate, ps: *ParallelScan, cursor: *std.atomic.Value(usize), shard: usize, errp: *?anyerror) void {
+                while (true) {
+                    const i = cursor.fetchAdd(1, .monotonic);
+                    if (i >= ps.workers.len) break;
+                    op.partitionDrain(shard, ps.workers[i]) catch |e| {
+                        errp.* = e;
+                        break;
+                    };
+                }
+            }
+            fn queryGo(op: *RadixLeaseAggregate, ps: *ParallelScan, cursor: *std.atomic.Value(usize), shard: usize, errp: *?anyerror) void {
+                while (true) {
+                    const i = cursor.fetchAdd(1, .monotonic);
+                    if (i >= ps.compute_q.len) break;
+                    op.partitionDrain(shard, ps.compute_q[i]) catch |e| {
+                        errp.* = e;
+                        break;
+                    };
+                }
+            }
+        };
+
+        const errs = try self.allocator.alloc(?anyerror, pscan.n_threads);
+        defer self.allocator.free(errs);
+        @memset(errs, null);
+        var cursor = std.atomic.Value(usize).init(0);
+        var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
+        var spawned: usize = 0;
+        var t: usize = 1;
+        if (pscan.compute_fused) {
+            while (t < pscan.n_threads and t < MAX_LEASE_THREADS) : (t += 1) {
+                threads[spawned] = std.Thread.spawn(.{}, Entry.queryGo, .{ self, pscan, &cursor, t, &errs[t] }) catch {
+                    Entry.queryGo(self, pscan, &cursor, t, &errs[t]);
+                    continue;
+                };
+                spawned += 1;
+            }
+            Entry.queryGo(self, pscan, &cursor, 0, &errs[0]);
+        } else {
+            while (t < pscan.n_threads and t < MAX_LEASE_THREADS) : (t += 1) {
+                threads[spawned] = std.Thread.spawn(.{}, Entry.scanGo, .{ self, pscan, &cursor, t, &errs[t] }) catch {
+                    Entry.scanGo(self, pscan, &cursor, t, &errs[t]);
+                    continue;
+                };
+                spawned += 1;
+            }
+            Entry.scanGo(self, pscan, &cursor, 0, &errs[0]);
+        }
+        for (threads[0..spawned]) |th| th.join();
+        for (errs) |e| if (e) |err| return err;
+    }
+
+    fn partitionDrain(self: *RadixLeaseAggregate, s: usize, drainable: anytype) !void {
+        if (self.useKey32Partitions()) return self.partitionDrain32(s, drainable);
+
+        const sa = self.shard_arenas[s].allocator();
+        const shard_buckets = self.buckets[s * self.n_buckets .. (s + 1) * self.n_buckets];
+        const layout = self.int_layout;
+
+        var d = drainable;
+        var kb: std.ArrayListUnmanaged(u128) = .empty;
+        var bof: std.ArrayListUnmanaged(u16) = .empty;
+        var nonempty: std.ArrayListUnmanaged(usize) = .empty;
+        var row_order: std.ArrayListUnmanaged(usize) = .empty;
+        var sorted_keys: std.ArrayListUnmanaged(u128) = .empty;
+        const counts = try sa.alloc(usize, self.n_buckets);
+        const offsets = try sa.alloc(usize, self.n_buckets + 1);
+        const cursors = try sa.alloc(usize, self.n_buckets);
+
+        const prof_on = getenv("THINDB_LEASE_PROF") != null;
+        while (true) {
+            const scan_t0 = if (prof_on) prof.nowTicks() else 0;
+            const maybe = try d.next();
+            addProfileTicks(&self.prof_scan_ticks, scan_t0, prof_on);
+            const batch = maybe orelse break;
+            const n = batch.row_count;
+            if (n == 0) continue;
+
+            const radix_t0 = if (prof_on) prof.nowTicks() else 0;
+            try kb.ensureTotalCapacity(sa, n);
+            kb.clearRetainingCapacity();
+            kb.appendNTimesAssumeCapacity(0, n);
+            for (self.group_col_indices, layout.fields) |ci, f| agg.orKeyColumn(kb.items[0..n], batch, ci, f);
+
+            try bof.ensureTotalCapacity(sa, n);
+            bof.clearRetainingCapacity();
+            try nonempty.ensureTotalCapacity(sa, @min(n, self.n_buckets));
+            nonempty.clearRetainingCapacity();
+            @memset(counts, 0);
+            for (0..n) |i| {
+                const b: u16 = @intCast(self.bucketOf(kb.items[i]));
+                bof.appendAssumeCapacity(b);
+                if (counts[b] == 0) nonempty.appendAssumeCapacity(b);
+                counts[b] += 1;
+            }
+            offsets[0] = 0;
+            for (0..self.n_buckets) |b| offsets[b + 1] = offsets[b] + counts[b];
+            @memcpy(cursors, offsets[0..self.n_buckets]);
+
+            try row_order.ensureTotalCapacity(sa, n);
+            row_order.clearRetainingCapacity();
+            row_order.appendNTimesAssumeCapacity(0, n);
+            try sorted_keys.ensureTotalCapacity(sa, n);
+            sorted_keys.clearRetainingCapacity();
+            sorted_keys.appendNTimesAssumeCapacity(0, n);
+            for (0..n) |i| {
+                const b = bof.items[i];
+                const dst = cursors[b];
+                cursors[b] = dst + 1;
+                row_order.items[dst] = i;
+                sorted_keys.items[dst] = kb.items[i];
+            }
+
+            for (nonempty.items) |b| {
+                const start = offsets[b];
+                const end = offsets[b + 1];
+                try shard_buckets[b].keys.appendSlice(sa, sorted_keys.items[start..end]);
+            }
+            for (self.used_cols, 0..) |ci, ui| {
+                const view = batch.values[ci];
+                for (nonempty.items) |b| {
+                    const start = offsets[b];
+                    const end = offsets[b + 1];
+                    try appendColumnRows(sa, view, row_order.items[start..end], &shard_buckets[b].cols[ui]);
+                }
+            }
+            addProfileTicks(&self.prof_radix_ticks, radix_t0, prof_on);
+        }
+    }
+
+    fn partitionDrain32(self: *RadixLeaseAggregate, s: usize, drainable: anytype) !void {
+        const sa = self.shard_arenas[s].allocator();
+        const shard_buckets = self.buckets[s * self.n_buckets .. (s + 1) * self.n_buckets];
+        const field = self.int_layout.fields[0];
+        const ci = self.group_col_indices[0];
+
+        var d = drainable;
+        var kb: std.ArrayListUnmanaged(u32) = .empty;
+        var bof: std.ArrayListUnmanaged(u16) = .empty;
+        var nonempty: std.ArrayListUnmanaged(usize) = .empty;
+        var row_order: std.ArrayListUnmanaged(usize) = .empty;
+        var sorted_keys: std.ArrayListUnmanaged(u32) = .empty;
+        const counts = try sa.alloc(usize, self.n_buckets);
+        const offsets = try sa.alloc(usize, self.n_buckets + 1);
+        const cursors = try sa.alloc(usize, self.n_buckets);
+
+        const Table32 = gt.IntKeyTable(32);
+        const prof_on = getenv("THINDB_LEASE_PROF") != null;
+        while (true) {
+            const scan_t0 = if (prof_on) prof.nowTicks() else 0;
+            const maybe = try d.next();
+            addProfileTicks(&self.prof_scan_ticks, scan_t0, prof_on);
+            const batch = maybe orelse break;
+            const n = batch.row_count;
+            if (n == 0) continue;
+
+            const radix_t0 = if (prof_on) prof.nowTicks() else 0;
+            try kb.ensureTotalCapacity(sa, n);
+            kb.clearRetainingCapacity();
+            kb.appendNTimesAssumeCapacity(0, n);
+            fillKey32(kb.items[0..n], batch, ci, field);
+
+            try bof.ensureTotalCapacity(sa, n);
+            bof.clearRetainingCapacity();
+            try nonempty.ensureTotalCapacity(sa, @min(n, self.n_buckets));
+            nonempty.clearRetainingCapacity();
+            @memset(counts, 0);
+            for (0..n) |i| {
+                const b: u16 = @intCast(self.bucketOfHash(Table32.hashKey(@as(u128, kb.items[i]))));
+                bof.appendAssumeCapacity(b);
+                if (counts[b] == 0) nonempty.appendAssumeCapacity(b);
+                counts[b] += 1;
+            }
+            offsets[0] = 0;
+            for (0..self.n_buckets) |b| offsets[b + 1] = offsets[b] + counts[b];
+            @memcpy(cursors, offsets[0..self.n_buckets]);
+
+            try row_order.ensureTotalCapacity(sa, n);
+            row_order.clearRetainingCapacity();
+            row_order.appendNTimesAssumeCapacity(0, n);
+            try sorted_keys.ensureTotalCapacity(sa, n);
+            sorted_keys.clearRetainingCapacity();
+            sorted_keys.appendNTimesAssumeCapacity(0, n);
+            for (0..n) |i| {
+                const b = bof.items[i];
+                const dst = cursors[b];
+                cursors[b] = dst + 1;
+                row_order.items[dst] = i;
+                sorted_keys.items[dst] = kb.items[i];
+            }
+
+            for (nonempty.items) |b| {
+                const start = offsets[b];
+                const end = offsets[b + 1];
+                try shard_buckets[b].keys32.appendSlice(sa, sorted_keys.items[start..end]);
+            }
+            for (self.used_cols, 0..) |ci_val, ui| {
+                const view = batch.values[ci_val];
+                for (nonempty.items) |b| {
+                    const start = offsets[b];
+                    const end = offsets[b + 1];
+                    try appendColumnRows(sa, view, row_order.items[start..end], &shard_buckets[b].cols[ui]);
+                }
+            }
+            addProfileTicks(&self.prof_radix_ticks, radix_t0, prof_on);
+        }
+    }
+
+    // Append an already-radix-ordered row run from `src` into one bucket column.
+    // The compact aggregate path excludes string/uuid aggregate inputs.
+    fn appendColumnRows(aa: Allocator, src: ColumnView, rows: []const usize, out: *ColumnStore) !void {
+        const dst_start = out.rowCount();
         switch (src.data) {
             inline .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .largeint, .decimal64, .decimal128, .float, .double => |sl, tag| {
-                for (0..n) |r| {
-                    const cs = &buckets[bof[r]].cols[ui];
-                    if (has_nulls) try cs.appendValidBit(aa, cs.rowCount(), src.isValid(src_off + r));
-                    try @field(cs.data, @tagName(tag)).append(aa, sl[src_off + r]);
-                }
+                const list = &@field(out.data, @tagName(tag));
+                try list.ensureUnusedCapacity(aa, rows.len);
+                for (rows) |r| list.appendAssumeCapacity(sl[r]);
             },
             else => unreachable,
+        }
+        if (out.nulls) |*nulls| {
+            try nulls.ensureTotalCapacity(aa, (dst_start + rows.len + 7) >> 3);
+            for (rows, 0..) |r, i| try out.appendValidBit(aa, dst_start + i, src.isValid(r));
+        }
+    }
+
+    fn readIntAsI128(view: ColumnView, row: usize) i128 {
+        return switch (view.data) {
+            .int => |sl| sl[row],
+            .smallint => |sl| sl[row],
+            .tinyint => |sl| sl[row],
+            .boolean => |sl| sl[row],
+            .bigint => |sl| sl[row],
+            .decimal64 => |sl| sl[row],
+            .largeint => |sl| sl[row],
+            .decimal128 => |sl| sl[row],
+            else => unreachable,
+        };
+    }
+
+    fn readNumericAsF64(view: ColumnView, row: usize) f64 {
+        return switch (view.data) {
+            .int => |sl| @floatFromInt(sl[row]),
+            .smallint => |sl| @floatFromInt(sl[row]),
+            .tinyint => |sl| @floatFromInt(sl[row]),
+            .boolean => |sl| @floatFromInt(sl[row]),
+            .bigint => |sl| @floatFromInt(sl[row]),
+            .decimal64 => |sl| @floatFromInt(sl[row]),
+            .float => |sl| sl[row],
+            .double => |sl| sl[row],
+            else => unreachable,
+        };
+    }
+
+    inline fn accumulateCountSumAvg(plan: CountSumAvgPlan, state: []u64, words: usize, gid: u32, sum_view: ColumnView, avg_view: ColumnView, row: usize) void {
+        const base = @as(usize, gid) * words;
+        state[base + plan.count_off] += 1;
+        if (sum_view.isValid(row)) addI128(state, base + plan.sum_off, readIntAsI128(sum_view, row));
+        if (avg_view.isValid(row)) {
+            const slot = base + plan.avg_off;
+            var sum: f64 = @bitCast(state[slot]);
+            sum += readNumericAsF64(avg_view, row);
+            state[slot] = @bitCast(sum);
+            state[slot + 1] += 1;
         }
     }
 
     // --- Phase 2: lease + aggregate (parallel) -----------------------------
-    fn workerRun(self: *RadixLeaseAggregate, comptime Table: type, worker: *LeaseWorker, ctr: *std.atomic.Value(usize)) !void {
+    fn workerRun(
+        self: *RadixLeaseAggregate,
+        comptime Table: type,
+        worker: *LeaseWorker,
+        ctr: *std.atomic.Value(usize),
+        results: []BucketResult,
+    ) !void {
         const aa = worker.arena.allocator();
         const words = self.compact.words;
         const up_schema = self.upstream.outputSchema();
         var gidbuf: std.ArrayListUnmanaged(u32) = .empty;
-        var gstate: std.ArrayListUnmanaged(u64) = .empty;
         const vbuf = try aa.alloc(ColumnView, up_schema.len);
 
         while (true) {
@@ -1133,15 +1598,18 @@ pub const RadixLeaseAggregate = struct {
             // Bucket b's rows are spread across all shards (the partition wrote one
             // shard per scatter thread). One table per bucket combines them.
             var total: usize = 0;
-            for (0..self.dop) |s| total += self.buckets[s * self.n_buckets + b].keys.items.len;
+            for (0..self.n_shards) |s| total += self.buckets[s * self.n_buckets + b].keys.items.len;
             if (total == 0) continue;
 
+            const prof_on = getenv("THINDB_LEASE_PROF") != null;
+            const group_t0 = if (prof_on) prof.nowTicks() else 0;
             var table = try Table.init(aa, total);
-            gstate.clearRetainingCapacity();
+            const result = &results[b];
+            result.keys.clearRetainingCapacity();
+            result.state.clearRetainingCapacity();
             var local_groups: u32 = 0;
-            const out_base = worker.out_keys.items.len;
 
-            for (0..self.dop) |s| {
+            for (0..self.n_shards) |s| {
                 const bucket = &self.buckets[s * self.n_buckets + b];
                 const n = bucket.keys.items.len;
                 if (n == 0) continue;
@@ -1157,11 +1625,11 @@ pub const RadixLeaseAggregate = struct {
                     const p = table.getOrPut(h, key);
                     const g = if (p.found) p.gid else blk: {
                         table.commit(p.slot, key, local_groups);
-                        try worker.out_keys.append(worker.arena.allocator(), key);
+                        try result.keys.append(aa, key);
                         const base = @as(usize, local_groups) * words;
-                        try gstate.ensureTotalCapacity(aa, base + words);
-                        gstate.items.len = base + words;
-                        @memset(gstate.items[base .. base + words], 0);
+                        try result.state.ensureTotalCapacity(aa, base + words);
+                        result.state.items.len = base + words;
+                        @memset(result.state.items[base .. base + words], 0);
                         const ng = local_groups;
                         local_groups += 1;
                         break :blk ng;
@@ -1172,50 +1640,53 @@ pub const RadixLeaseAggregate = struct {
                 // rows into the shared per-bucket state at their resolved gids.
                 for (self.used_cols, 0..) |ci, ui| vbuf[ci] = bucket.cols[ui].view();
                 const synth = Batch{ .schema = up_schema, .values = vbuf, .row_count = n };
-                scatter(self.compact, gstate.items, gidbuf.items[0..n], synth);
+                scatter(self.compact, result.state.items, gidbuf.items[0..n], synth);
             }
+            addProfileTicks(&self.prof_group_ticks, group_t0, prof_on);
 
-            // out_keys holds this bucket's `local_groups` keys (gid order); append
-            // the matching state so out_state stays aligned.
-            std.debug.assert(worker.out_keys.items.len - out_base == local_groups);
-            try worker.out_state.appendSlice(worker.arena.allocator(), gstate.items[0 .. @as(usize, local_groups) * words]);
+            // The lease counter guarantees that no other worker wrote this
+            // central result slot while we filled it.
+            std.debug.assert(result.keys.items.len == local_groups);
+            if (self.top_k != null) {
+                const topk_t0 = if (prof_on) prof.nowTicks() else 0;
+                try self.bucketTopK(result, aa);
+                addProfileTicks(&self.prof_bucket_topk_ticks, topk_t0, prof_on);
+            }
         }
-        if (self.top_k != null) try self.localTopK(worker);
     }
 
-    /// Reduce a worker's groups to its own top-k by the order aggregate, in
-    /// parallel with the other workers — so emit only merges dop·k candidates
-    /// instead of re-scanning every group serially. Bounded min-heap, O(g·log k).
-    fn localTopK(self: *RadixLeaseAggregate, worker: *LeaseWorker) !void {
+    /// Reduce one leased bucket's groups to a bucket-local top-k while this
+    /// worker still owns the bucket. Emit merges bucket-local candidates from the
+    /// central result array instead of rescanning every group serially.
+    fn bucketTopK(self: *RadixLeaseAggregate, result: *BucketResult, aa: Allocator) !void {
         const tk = self.top_k.?;
-        const ng = worker.out_keys.items.len;
+        const ng = if (self.useKey32Partitions()) result.keys32.items.len else result.keys.items.len;
         const k = @min(@as(usize, tk.k), ng);
-        const aa = worker.arena.allocator();
-        worker.sel = try aa.alloc(usize, k);
-        worker.ov = try aa.alloc(OrderVal, k);
+        result.sel = try aa.alloc(usize, k);
+        result.ov = try aa.alloc(OrderVal, k);
         var len: usize = 0;
         for (0..ng) |g| {
-            const val = orderValOf(self.compact, worker.out_state.items, g, tk.agg_idx);
+            const val = orderValOf(self.compact, result.state.items, g, tk.agg_idx);
             if (len < k) {
-                worker.sel[len] = g;
-                worker.ov[len] = val;
+                result.sel[len] = g;
+                result.ov[len] = val;
                 len += 1;
-                if (len == k) topkBuildHeap(worker.sel, worker.ov, tk.desc);
-            } else if (val.preferred(worker.ov[0], tk.desc)) {
-                worker.sel[0] = g;
-                worker.ov[0] = val;
-                topkSiftDown(worker.sel, worker.ov, 0, k, tk.desc);
+                if (len == k) topkBuildHeap(result.sel, result.ov, tk.desc);
+            } else if (val.preferred(result.ov[0], tk.desc)) {
+                result.sel[0] = g;
+                result.ov[0] = val;
+                topkSiftDown(result.sel, result.ov, 0, k, tk.desc);
             }
         }
-        worker.sel_len = len;
+        result.sel_len = len;
     }
 
-    fn runLease(self: *RadixLeaseAggregate, comptime Table: type, workers: []LeaseWorker) !void {
+    fn runLease(self: *RadixLeaseAggregate, comptime Table: type, workers: []LeaseWorker, results: []BucketResult) !void {
         // Entry captures `Table` at comptime (it can't ride through Thread.spawn's
         // runtime arg tuple); only the runtime self/worker/ctr are passed.
         const Entry = struct {
-            fn go(s: *RadixLeaseAggregate, w: *LeaseWorker, c: *std.atomic.Value(usize)) void {
-                s.workerRun(Table, w, c) catch |e| {
+            fn go(s: *RadixLeaseAggregate, w: *LeaseWorker, c: *std.atomic.Value(usize), r: []BucketResult) void {
+                s.workerRun(Table, w, c, r) catch |e| {
                     w.err = e;
                 };
             }
@@ -1226,39 +1697,222 @@ pub const RadixLeaseAggregate = struct {
         // Spawn dop-1 helpers; the calling thread runs the last share.
         var t: usize = 1;
         while (t < self.dop) : (t += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &workers[t], &ctr }) catch {
-                Entry.go(self, &workers[t], &ctr); // spawn failed: run inline
+            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &workers[t], &ctr, results }) catch {
+                Entry.go(self, &workers[t], &ctr, results); // spawn failed: run inline
                 continue;
             };
             spawned += 1;
         }
-        Entry.go(self, &workers[0], &ctr);
+        Entry.go(self, &workers[0], &ctr, results);
+        for (threads[0..spawned]) |th| th.join();
+    }
+
+    fn workerRun32(
+        self: *RadixLeaseAggregate,
+        worker: *LeaseWorker,
+        ctr: *std.atomic.Value(usize),
+        results: []BucketResult,
+    ) !void {
+        const Table = gt.IntKeyTable(32);
+        const aa = worker.arena.allocator();
+        const words = self.compact.words;
+        const up_schema = self.upstream.outputSchema();
+        var gidbuf: std.ArrayListUnmanaged(u32) = .empty;
+        const vbuf = try aa.alloc(ColumnView, up_schema.len);
+
+        while (true) {
+            const b = ctr.fetchAdd(1, .monotonic);
+            if (b >= self.n_buckets) break;
+            var total: usize = 0;
+            for (0..self.n_shards) |s| total += self.buckets[s * self.n_buckets + b].keys32.items.len;
+            if (total == 0) continue;
+
+            const prof_on = getenv("THINDB_LEASE_PROF") != null;
+            const group_t0 = if (prof_on) prof.nowTicks() else 0;
+            var table = try Table.init(aa, total);
+            const result = &results[b];
+            result.keys32.clearRetainingCapacity();
+            result.state.clearRetainingCapacity();
+            var local_groups: u32 = 0;
+
+            for (0..self.n_shards) |s| {
+                const bucket = &self.buckets[s * self.n_buckets + b];
+                const n = bucket.keys32.items.len;
+                if (n == 0) continue;
+                gidbuf.clearRetainingCapacity();
+                try gidbuf.ensureTotalCapacity(aa, n);
+                for (0..n) |j| {
+                    const key32 = bucket.keys32.items[j];
+                    const key = @as(u128, key32);
+                    const h = Table.hashKey(key);
+                    if (j + PREFETCH_DIST < n) {
+                        const pk = @as(u128, bucket.keys32.items[j + PREFETCH_DIST]);
+                        @prefetch(table.slotAddr(table.bucketOf(Table.hashKey(pk))), .{ .rw = .write, .locality = 1 });
+                    }
+                    const p = table.getOrPut(h, key);
+                    const g = if (p.found) p.gid else blk: {
+                        table.commit(p.slot, key, local_groups);
+                        try result.keys32.append(aa, key32);
+                        const base = @as(usize, local_groups) * words;
+                        try result.state.ensureTotalCapacity(aa, base + words);
+                        result.state.items.len = base + words;
+                        @memset(result.state.items[base .. base + words], 0);
+                        const ng = local_groups;
+                        local_groups += 1;
+                        break :blk ng;
+                    };
+                    gidbuf.appendAssumeCapacity(g);
+                }
+                for (self.used_cols, 0..) |ci, ui| vbuf[ci] = bucket.cols[ui].view();
+                const synth = Batch{ .schema = up_schema, .values = vbuf, .row_count = n };
+                scatter(self.compact, result.state.items, gidbuf.items[0..n], synth);
+            }
+            addProfileTicks(&self.prof_group_ticks, group_t0, prof_on);
+
+            std.debug.assert(result.keys32.items.len == local_groups);
+            if (self.top_k != null) {
+                const topk_t0 = if (prof_on) prof.nowTicks() else 0;
+                try self.bucketTopK(result, aa);
+                addProfileTicks(&self.prof_bucket_topk_ticks, topk_t0, prof_on);
+            }
+        }
+    }
+
+    fn runLease32(self: *RadixLeaseAggregate, workers: []LeaseWorker, results: []BucketResult) !void {
+        const Entry = struct {
+            fn go(s: *RadixLeaseAggregate, w: *LeaseWorker, c: *std.atomic.Value(usize), r: []BucketResult) void {
+                s.workerRun32(w, c, r) catch |e| {
+                    w.err = e;
+                };
+            }
+        };
+        var ctr = std.atomic.Value(usize).init(0);
+        var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
+        var spawned: usize = 0;
+        var t: usize = 1;
+        while (t < self.dop) : (t += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &workers[t], &ctr, results }) catch {
+                Entry.go(self, &workers[t], &ctr, results);
+                continue;
+            };
+            spawned += 1;
+        }
+        Entry.go(self, &workers[0], &ctr, results);
+        for (threads[0..spawned]) |th| th.join();
+    }
+
+    fn workerRunCountSumAvg(
+        self: *RadixLeaseAggregate,
+        comptime Table: type,
+        plan: CountSumAvgPlan,
+        worker: *LeaseWorker,
+        ctr: *std.atomic.Value(usize),
+        results: []BucketResult,
+    ) !void {
+        const aa = worker.arena.allocator();
+        const words = self.compact.words;
+        while (true) {
+            const b = ctr.fetchAdd(1, .monotonic);
+            if (b >= self.n_buckets) break;
+            var total: usize = 0;
+            for (0..self.n_shards) |s| total += self.buckets[s * self.n_buckets + b].keys.items.len;
+            if (total == 0) continue;
+
+            const prof_on = getenv("THINDB_LEASE_PROF") != null;
+            const group_t0 = if (prof_on) prof.nowTicks() else 0;
+            var table = try Table.init(aa, total);
+            const result = &results[b];
+            result.keys.clearRetainingCapacity();
+            result.state.clearRetainingCapacity();
+            var local_groups: u32 = 0;
+
+            for (0..self.n_shards) |s| {
+                const bucket = &self.buckets[s * self.n_buckets + b];
+                const n = bucket.keys.items.len;
+                if (n == 0) continue;
+                const sum_view = bucket.cols[plan.sum_ui].view();
+                const avg_view = bucket.cols[plan.avg_ui].view();
+                for (0..n) |j| {
+                    const key = bucket.keys.items[j];
+                    const h = Table.hashKey(key);
+                    if (j + PREFETCH_DIST < n) {
+                        const pk = bucket.keys.items[j + PREFETCH_DIST];
+                        @prefetch(table.slotAddr(table.bucketOf(Table.hashKey(pk))), .{ .rw = .write, .locality = 1 });
+                    }
+                    const p = table.getOrPut(h, key);
+                    const g = if (p.found) p.gid else blk: {
+                        table.commit(p.slot, key, local_groups);
+                        try result.keys.append(aa, key);
+                        const base = @as(usize, local_groups) * words;
+                        try result.state.ensureTotalCapacity(aa, base + words);
+                        result.state.items.len = base + words;
+                        @memset(result.state.items[base .. base + words], 0);
+                        const ng = local_groups;
+                        local_groups += 1;
+                        break :blk ng;
+                    };
+                    accumulateCountSumAvg(plan, result.state.items, words, g, sum_view, avg_view, j);
+                }
+            }
+            addProfileTicks(&self.prof_group_ticks, group_t0, prof_on);
+            std.debug.assert(result.keys.items.len == local_groups);
+            if (self.top_k != null) {
+                const topk_t0 = if (prof_on) prof.nowTicks() else 0;
+                try self.bucketTopK(result, aa);
+                addProfileTicks(&self.prof_bucket_topk_ticks, topk_t0, prof_on);
+            }
+        }
+    }
+
+    fn runLeaseCountSumAvg(self: *RadixLeaseAggregate, comptime Table: type, plan: CountSumAvgPlan, workers: []LeaseWorker, results: []BucketResult) !void {
+        const Entry = struct {
+            fn go(s: *RadixLeaseAggregate, p: CountSumAvgPlan, w: *LeaseWorker, c: *std.atomic.Value(usize), r: []BucketResult) void {
+                s.workerRunCountSumAvg(Table, p, w, c, r) catch |e| {
+                    w.err = e;
+                };
+            }
+        };
+        var ctr = std.atomic.Value(usize).init(0);
+        var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
+        var spawned: usize = 0;
+        var t: usize = 1;
+        while (t < self.dop) : (t += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, plan, &workers[t], &ctr, results }) catch {
+                Entry.go(self, plan, &workers[t], &ctr, results);
+                continue;
+            };
+            spawned += 1;
+        }
+        Entry.go(self, plan, &workers[0], &ctr, results);
         for (threads[0..spawned]) |th| th.join();
     }
 
     // --- Phase 3: emit (serial concat / global top-k) ----------------------
-    fn emitWorkers(self: *RadixLeaseAggregate, workers: []const LeaseWorker) !void {
+    fn emitBucketResults(self: *RadixLeaseAggregate, results: []const BucketResult) !void {
+        const key32 = self.useKey32Partitions();
         const tk = self.top_k orelse {
-            for (workers) |*w| {
-                const ng = w.out_keys.items.len;
-                for (0..ng) |g| try self.emitOne(w.out_state.items, g, w.out_keys.items[g]);
+            for (results) |*r| {
+                if (key32) {
+                    for (r.keys32.items, 0..) |key, g| try self.emitOne(r.state.items, g, @as(u128, key));
+                } else {
+                    for (r.keys.items, 0..) |key, g| try self.emitOne(r.state.items, g, key);
+                }
             }
             return;
         };
-        // Merge the workers' local top-k (each computed in parallel) — only dop·k
-        // candidates, not a re-scan of every group. Encode (worker<<40 | gid).
+        // Merge bucket-local top-k candidates. Encode (bucket<<40 | gid).
         var total_cand: usize = 0;
-        for (workers) |*w| total_cand += w.sel_len;
+        for (results) |*r| total_cand += r.sel_len;
         const k = @min(@as(usize, tk.k), total_cand);
         if (k == 0) return;
         const aa = self.arena.allocator();
         const sel = try aa.alloc(usize, k);
         const ov = try aa.alloc(OrderVal, k);
         var len: usize = 0;
-        for (workers, 0..) |*w, wi| {
-            for (0..w.sel_len) |i| {
-                const v = w.ov[i];
-                const tag = (wi << 40) | w.sel[i];
+        for (results, 0..) |*r, bi| {
+            for (0..r.sel_len) |i| {
+                const v = r.ov[i];
+                const tag = (bi << 40) | r.sel[i];
                 if (len < k) {
                     sel[len] = tag;
                     ov[len] = v;
@@ -1272,9 +1926,10 @@ pub const RadixLeaseAggregate = struct {
             }
         }
         for (0..len) |i| {
-            const wi = sel[i] >> 40;
+            const bi = sel[i] >> 40;
             const g = sel[i] & ((1 << 40) - 1);
-            try self.emitOne(workers[wi].out_state.items, g, workers[wi].out_keys.items[g]);
+            const key: u128 = if (key32) @as(u128, results[bi].keys32.items[g]) else results[bi].keys.items[g];
+            try self.emitOne(results[bi].state.items, g, key);
         }
     }
 
@@ -1292,31 +1947,82 @@ pub const RadixLeaseAggregate = struct {
         self.shard_arenas = &.{};
     }
 
+    fn partitionRowCount(self: *const RadixLeaseAggregate) usize {
+        var rows: usize = 0;
+        if (self.useKey32Partitions()) {
+            for (self.buckets) |*bucket| rows += bucket.keys32.items.len;
+        } else {
+            for (self.buckets) |*bucket| rows += bucket.keys.items.len;
+        }
+        return rows;
+    }
+
+    fn resultGroupCount(self: *const RadixLeaseAggregate, results: []const BucketResult) usize {
+        var groups: usize = 0;
+        if (self.useKey32Partitions()) {
+            for (results) |*result| groups += result.keys32.items.len;
+        } else {
+            for (results) |*result| groups += result.keys.items.len;
+        }
+        return groups;
+    }
+
     pub fn next(self: *RadixLeaseAggregate) !?Batch {
         if (self.done) return null;
         self.done = true;
 
         const prof_on = getenv("THINDB_LEASE_PROF") != null;
+        if (prof_on) {
+            self.prof_scan_ticks.store(0, .monotonic);
+            self.prof_radix_ticks.store(0, .monotonic);
+            self.prof_group_ticks.store(0, .monotonic);
+            self.prof_bucket_topk_ticks.store(0, .monotonic);
+        }
+
         const t0 = prof.nowTicks();
         try self.partition();
         const t1 = prof.nowTicks();
+        const rows = if (prof_on) self.partitionRowCount() else 0;
 
+        const results = try self.arena.allocator().alloc(BucketResult, self.n_buckets);
+        for (results) |*r| r.* = .{};
         const workers = try self.allocator.alloc(LeaseWorker, self.dop);
         defer self.allocator.free(workers);
         for (workers) |*w| w.* = .{ .arena = std.heap.ArenaAllocator.init(self.allocator) };
         defer for (workers) |*w| w.arena.deinit();
 
-        switch (self.int_layout.tier) {
-            .bits32 => try self.runLease(gt.IntKeyTable(32), workers),
-            .bits96 => try self.runLease(gt.IntKeyTable(96), workers),
-            .bits128 => try self.runLease(gt.IntKeyTable(128), workers),
+        if (self.useKey32Partitions()) {
+            try self.runLease32(workers, results);
+        } else {
+            const special_csa = if (getenv("THINDB_LEASE_CSA") != null) self.countSumAvgPlan() else null;
+            switch (self.int_layout.tier) {
+                .bits32 => if (special_csa) |plan| try self.runLeaseCountSumAvg(gt.IntKeyTable(32), plan, workers, results) else try self.runLease(gt.IntKeyTable(32), workers, results),
+                .bits96 => if (special_csa) |plan| try self.runLeaseCountSumAvg(gt.IntKeyTable(96), plan, workers, results) else try self.runLease(gt.IntKeyTable(96), workers, results),
+                .bits128 => if (special_csa) |plan| try self.runLeaseCountSumAvg(gt.IntKeyTable(128), plan, workers, results) else try self.runLease(gt.IntKeyTable(128), workers, results),
+            }
         }
         for (workers) |*w| if (w.err) |e| return e;
         const t2 = prof.nowTicks();
-        if (prof_on) std.debug.print("[lease-prof] partition={d:.1}ms lease={d:.1}ms buckets={d} dop={d}\n", .{ prof.ticksToMs(t1 - t0), prof.ticksToMs(t2 - t1), self.n_buckets, self.dop });
+        const groups = if (prof_on) self.resultGroupCount(results) else 0;
 
-        self.freeShards(); // bucket data no longer needed (workers hold the result)
-        try self.emitWorkers(workers);
+        // Do not tear down the per-shard partition arenas before returning the
+        // result batch. Arena deinit is pure cleanup and was showing up as
+        // ~100ms of query latency on large GROUP BY + LIMIT queries. The query
+        // owner calls deinit immediately after draining us, where freeShards()
+        // releases the same memory off the result-producing critical path.
+        const tf0 = prof.nowTicks();
+        const tf1 = tf0;
+        try self.emitBucketResults(results);
+        const t3 = prof.nowTicks();
+        if (prof_on) {
+            const scan_cpu = prof.ticksToMs(@intCast(self.prof_scan_ticks.load(.monotonic)));
+            const radix_cpu = prof.ticksToMs(@intCast(self.prof_radix_ticks.load(.monotonic)));
+            const group_cpu = prof.ticksToMs(@intCast(self.prof_group_ticks.load(.monotonic)));
+            const topk_cpu = prof.ticksToMs(@intCast(self.prof_bucket_topk_ticks.load(.monotonic)));
+            std.debug.print("[lease-prof] partition={d:.1}ms lease={d:.1}ms emit={d:.1}ms rows={d} groups={d} buckets={d} dop={d}\n", .{ prof.ticksToMs(t1 - t0), prof.ticksToMs(t2 - t1), prof.ticksToMs(t3 - t2), rows, groups, self.n_buckets, self.dop });
+            std.debug.print("[lease-prof-detail] scan_next_cpu={d:.1}ms radix_partition_cpu={d:.1}ms group_by_cpu={d:.1}ms bucket_topk_cpu={d:.1}ms free_partitions_wall={d:.1}ms final_topk_emit_wall={d:.1}ms\n", .{ scan_cpu, radix_cpu, group_cpu, topk_cpu, prof.ticksToMs(tf1 - tf0), prof.ticksToMs(t3 - tf1) });
+            std.debug.print("[group-pipeline] scan_filter_cpu={d:.1}ms radix_partition_cpu={d:.1}ms group_by_cpu={d:.1}ms order_topn_cpu={d:.1}ms wall_scan_partition={d:.1}ms wall_group_stage={d:.1}ms wall_emit_final_topn={d:.1}ms rows={d} groups={d} buckets={d} dop={d}\n", .{ scan_cpu, radix_cpu, group_cpu, topk_cpu, prof.ticksToMs(t1 - t0), prof.ticksToMs(t2 - t1), prof.ticksToMs(t3 - t2), rows, groups, self.n_buckets, self.dop });
+        }
 
         _ = self.arena.reset(.free_all);
         for (self.output_columns, 0..) |c, i| self.views[i] = c.view();
@@ -1493,6 +2199,71 @@ test "RadixAggregate top-k emits only the k most-preferred groups" {
     try std.testing.expectEqual(@as(i64, 100), rr[0].s);
     try std.testing.expectEqual(@as(i32, 4), rr[1].k); // g4, sum 80
     try std.testing.expectEqual(@as(i64, 80), rr[1].s);
+}
+
+test "RadixLeaseAggregate 32-bit partition key encoding round-trips signed and narrow keys" {
+    const ta = std.testing.allocator;
+
+    {
+        const expected = [_]i32{ -39921974, -1, 0, 17 };
+        const col = types.Column{ .name = "i", .type = .int };
+        const field = agg.IntKeyField{ .offset = 0, .bits = 32, .type_tag = .int };
+        const batch = Batch{ .schema = &.{col}, .values = &.{.{ .data = .{ .int = &expected } }}, .row_count = expected.len };
+        var keys: [expected.len]u32 = undefined;
+        RadixLeaseAggregate.fillKey32(keys[0..], batch, 0, field);
+        var out_cols = [_]ColumnStore{try ColumnStore.init(ta, col.type, false)};
+        defer out_cols[0].deinit(ta);
+        for (keys) |key| try agg.appendIntGroupKey(ta, @as(u128, key), .{ .fields = @constCast(&[_]agg.IntKeyField{field}), .tier = .bits32 }, out_cols[0..]);
+        try std.testing.expectEqualSlices(i32, &expected, out_cols[0].view().data.int);
+    }
+    {
+        const expected = [_]i16{ -32768, -1, 0, 1234 };
+        const col = types.Column{ .name = "s", .type = .smallint };
+        const field = agg.IntKeyField{ .offset = 0, .bits = 16, .type_tag = .smallint };
+        const batch = Batch{ .schema = &.{col}, .values = &.{.{ .data = .{ .smallint = &expected } }}, .row_count = expected.len };
+        var keys: [expected.len]u32 = undefined;
+        RadixLeaseAggregate.fillKey32(keys[0..], batch, 0, field);
+        var out_cols = [_]ColumnStore{try ColumnStore.init(ta, col.type, false)};
+        defer out_cols[0].deinit(ta);
+        for (keys) |key| try agg.appendIntGroupKey(ta, @as(u128, key), .{ .fields = @constCast(&[_]agg.IntKeyField{field}), .tier = .bits32 }, out_cols[0..]);
+        try std.testing.expectEqualSlices(i16, &expected, out_cols[0].view().data.smallint);
+    }
+    {
+        const expected = [_]i8{ -128, -1, 0, 12 };
+        const col = types.Column{ .name = "t", .type = .tinyint };
+        const field = agg.IntKeyField{ .offset = 0, .bits = 8, .type_tag = .tinyint };
+        const batch = Batch{ .schema = &.{col}, .values = &.{.{ .data = .{ .tinyint = &expected } }}, .row_count = expected.len };
+        var keys: [expected.len]u32 = undefined;
+        RadixLeaseAggregate.fillKey32(keys[0..], batch, 0, field);
+        var out_cols = [_]ColumnStore{try ColumnStore.init(ta, col.type, false)};
+        defer out_cols[0].deinit(ta);
+        for (keys) |key| try agg.appendIntGroupKey(ta, @as(u128, key), .{ .fields = @constCast(&[_]agg.IntKeyField{field}), .tier = .bits32 }, out_cols[0..]);
+        try std.testing.expectEqualSlices(i8, &expected, out_cols[0].view().data.tinyint);
+    }
+    {
+        const expected = [_]u8{ 0, 1, 1, 0 };
+        const col = types.Column{ .name = "b", .type = .boolean };
+        const field = agg.IntKeyField{ .offset = 0, .bits = 8, .type_tag = .boolean };
+        const batch = Batch{ .schema = &.{col}, .values = &.{.{ .data = .{ .boolean = &expected } }}, .row_count = expected.len };
+        var keys: [expected.len]u32 = undefined;
+        RadixLeaseAggregate.fillKey32(keys[0..], batch, 0, field);
+        var out_cols = [_]ColumnStore{try ColumnStore.init(ta, col.type, false)};
+        defer out_cols[0].deinit(ta);
+        for (keys) |key| try agg.appendIntGroupKey(ta, @as(u128, key), .{ .fields = @constCast(&[_]agg.IntKeyField{field}), .tier = .bits32 }, out_cols[0..]);
+        try std.testing.expectEqualSlices(u8, &expected, out_cols[0].view().data.boolean);
+    }
+    {
+        const expected = [_]i32{ -365, 0, 19000, 25000 };
+        const col = types.Column{ .name = "d", .type = .date };
+        const field = agg.IntKeyField{ .offset = 0, .bits = 32, .type_tag = .date };
+        const batch = Batch{ .schema = &.{col}, .values = &.{.{ .data = .{ .date = &expected } }}, .row_count = expected.len };
+        var keys: [expected.len]u32 = undefined;
+        RadixLeaseAggregate.fillKey32(keys[0..], batch, 0, field);
+        var out_cols = [_]ColumnStore{try ColumnStore.init(ta, col.type, false)};
+        defer out_cols[0].deinit(ta);
+        for (keys) |key| try agg.appendIntGroupKey(ta, @as(u128, key), .{ .fields = @constCast(&[_]agg.IntKeyField{field}), .tier = .bits32 }, out_cols[0..]);
+        try std.testing.expectEqualSlices(i32, &expected, out_cols[0].view().data.date);
+    }
 }
 
 // ---------------------------------------------------------------------------

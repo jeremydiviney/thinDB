@@ -176,7 +176,6 @@ pub fn IntKeyTable(comptime max_bits: u16) type {
 
     return struct {
         const Self = @This();
-
         slots: []Slot,
         mask: usize,
         len: usize,
@@ -288,6 +287,575 @@ pub fn IntKeyTable(comptime max_bits: u16) type {
             allocator.free(self.slots);
             self.slots = slots;
             self.mask = new_mask;
+        }
+
+        pub fn clearRetainingCapacity(self: *Self) void {
+            for (self.slots) |*s| s.gid = EMPTY;
+            self.len = 0;
+        }
+
+        pub fn deinit(self: *Self, allocator: Allocator) void {
+            allocator.free(self.slots);
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn IntKeyBitmapTable(comptime max_bits: u16) type {
+    const tier32 = max_bits <= 32;
+    const tier96 = max_bits <= 96 and !tier32;
+    const Slot = if (tier32)
+        struct { key32: u32, gid: u32 }
+    else if (tier96)
+        struct { lo: u64, hi: u32, gid: u32 }
+    else
+        struct { key: u128, gid: u32 };
+
+    return struct {
+        const Self = @This();
+        slots: []Slot,
+        occupied: []usize,
+        mask: usize,
+        len: usize,
+        grow_target: usize = 0,
+
+        pub inline fn hashKey(key: u128) u64 {
+            return hashSlotKey(key);
+        }
+
+        inline fn hashSlotKey(key: u128) u64 {
+            if (tier32) {
+                return mix64(@as(u64, @as(u32, @truncate(key))));
+            } else if (tier96) {
+                const lo: u64 = @truncate(key);
+                const hi: u32 = @truncate(key >> 64);
+                return mix64(lo ^ mix64(@as(u64, hi)));
+            } else {
+                return hashU128(key);
+            }
+        }
+
+        inline fn hashStored(s: Slot) u64 {
+            if (tier32) {
+                return mix64(@as(u64, s.key32));
+            } else if (tier96) {
+                return mix64(s.lo ^ mix64(@as(u64, s.hi)));
+            } else {
+                return hashU128(s.key);
+            }
+        }
+
+        inline fn storeKey(key: u128, gid: u32) Slot {
+            if (tier32) {
+                return .{ .key32 = @truncate(key), .gid = gid };
+            } else if (tier96) {
+                return .{ .lo = @truncate(key), .hi = @truncate(key >> 64), .gid = gid };
+            } else {
+                return .{ .key = key, .gid = gid };
+            }
+        }
+
+        inline fn keyEq(s: Slot, key: u128) bool {
+            if (tier32) {
+                return s.key32 == @as(u32, @truncate(key));
+            } else if (tier96) {
+                return s.lo == @as(u64, @truncate(key)) and s.hi == @as(u32, @truncate(key >> 64));
+            } else {
+                return s.key == key;
+            }
+        }
+
+        inline fn occWordCount(cap: usize) usize {
+            return (cap + @bitSizeOf(usize) - 1) / @bitSizeOf(usize);
+        }
+
+        inline fn isOccupied(self: Self, idx: usize) bool {
+            const bit = idx & (@bitSizeOf(usize) - 1);
+            return (self.occupied[idx / @bitSizeOf(usize)] & (@as(usize, 1) << @intCast(bit))) != 0;
+        }
+
+        inline fn setOccupied(self: *Self, idx: usize) void {
+            const bit = idx & (@bitSizeOf(usize) - 1);
+            self.occupied[idx / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(bit);
+        }
+
+        pub fn init(allocator: Allocator, expected: usize) !Self {
+            const cap = capacityFor(expected);
+            const slots = try allocator.alloc(Slot, cap);
+            errdefer allocator.free(slots);
+            const occupied = try allocator.alloc(usize, occWordCount(cap));
+            @memset(occupied, 0);
+            return .{ .slots = slots, .occupied = occupied, .mask = cap - 1, .len = 0 };
+        }
+
+        pub inline fn bucketOf(self: Self, hash: u64) usize {
+            return @as(usize, @truncate(hash)) & self.mask;
+        }
+
+        pub inline fn slotAddr(self: *Self, bucket: usize) *Slot {
+            return &self.slots[bucket];
+        }
+
+        pub fn getOrPut(self: *Self, hash: u64, key: u128) Probe {
+            var i = self.bucketOf(hash);
+            while (true) : (i = (i + 1) & self.mask) {
+                if (!self.isOccupied(i)) return .{ .slot = i, .found = false, .gid = 0 };
+                const s = self.slots[i];
+                if (keyEq(s, key)) return .{ .slot = i, .found = true, .gid = s.gid };
+            }
+        }
+
+        pub fn commit(self: *Self, slot: usize, key: u128, gid: u32) void {
+            self.slots[slot] = storeKey(key, gid);
+            self.setOccupied(slot);
+            self.len += 1;
+        }
+
+        pub fn needsGrow(self: Self, additional: usize) bool {
+            return (self.len + additional) * 4 >= self.slots.len * 3;
+        }
+
+        pub fn grow(self: *Self, allocator: Allocator, additional: usize) !void {
+            var new_cap = self.slots.len;
+            while ((self.len + additional) * 4 >= new_cap * 3) new_cap *= 2;
+            new_cap = @max(new_cap, self.grow_target);
+            const slots = try allocator.alloc(Slot, new_cap);
+            errdefer allocator.free(slots);
+            const occupied = try allocator.alloc(usize, occWordCount(new_cap));
+            @memset(occupied, 0);
+            errdefer allocator.free(occupied);
+
+            const old_slots = self.slots;
+            const old_occupied = self.occupied;
+            const new_mask = new_cap - 1;
+            self.slots = slots;
+            self.occupied = occupied;
+            self.mask = new_mask;
+            self.len = 0;
+
+            for (old_slots, 0..) |old, old_i| {
+                const bit = old_i & (@bitSizeOf(usize) - 1);
+                if ((old_occupied[old_i / @bitSizeOf(usize)] & (@as(usize, 1) << @intCast(bit))) == 0) continue;
+                var i = @as(usize, @truncate(hashStored(old))) & new_mask;
+                while (self.isOccupied(i)) : (i = (i + 1) & new_mask) {}
+                self.slots[i] = old;
+                self.setOccupied(i);
+                self.len += 1;
+            }
+            allocator.free(old_slots);
+            allocator.free(old_occupied);
+        }
+
+        pub fn clearRetainingCapacity(self: *Self) void {
+            @memset(self.occupied, 0);
+            self.len = 0;
+        }
+
+        pub fn deinit(self: *Self, allocator: Allocator) void {
+            allocator.free(self.slots);
+            allocator.free(self.occupied);
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn IntKeySplitGidTable(comptime max_bits: u16) type {
+    const tier32 = max_bits <= 32;
+    const tier96 = max_bits <= 96 and !tier32;
+    const KeySlot = if (tier32)
+        struct { key32: u32 }
+    else if (tier96)
+        struct { lo: u64, hi: u32 }
+    else
+        struct { key: u128 };
+
+    return struct {
+        const Self = @This();
+        keys: []KeySlot,
+        gids: []u32,
+        mask: usize,
+        len: usize,
+        grow_target: usize = 0,
+
+        pub inline fn hashKey(key: u128) u64 {
+            return hashSlotKey(key);
+        }
+
+        inline fn hashSlotKey(key: u128) u64 {
+            if (tier32) {
+                return mix64(@as(u64, @as(u32, @truncate(key))));
+            } else if (tier96) {
+                const lo: u64 = @truncate(key);
+                const hi: u32 = @truncate(key >> 64);
+                return mix64(lo ^ mix64(@as(u64, hi)));
+            } else {
+                return hashU128(key);
+            }
+        }
+
+        inline fn hashStored(s: KeySlot) u64 {
+            if (tier32) {
+                return mix64(@as(u64, s.key32));
+            } else if (tier96) {
+                return mix64(s.lo ^ mix64(@as(u64, s.hi)));
+            } else {
+                return hashU128(s.key);
+            }
+        }
+
+        inline fn storeKey(key: u128) KeySlot {
+            if (tier32) {
+                return .{ .key32 = @truncate(key) };
+            } else if (tier96) {
+                return .{ .lo = @truncate(key), .hi = @truncate(key >> 64) };
+            } else {
+                return .{ .key = key };
+            }
+        }
+
+        inline fn keyEq(s: KeySlot, key: u128) bool {
+            if (tier32) {
+                return s.key32 == @as(u32, @truncate(key));
+            } else if (tier96) {
+                return s.lo == @as(u64, @truncate(key)) and s.hi == @as(u32, @truncate(key >> 64));
+            } else {
+                return s.key == key;
+            }
+        }
+
+        pub fn init(allocator: Allocator, expected: usize) !Self {
+            const cap = capacityFor(expected);
+            const keys = try allocator.alloc(KeySlot, cap);
+            errdefer allocator.free(keys);
+            const gids = try allocator.alloc(u32, cap);
+            @memset(gids, EMPTY);
+            return .{ .keys = keys, .gids = gids, .mask = cap - 1, .len = 0 };
+        }
+
+        pub inline fn bucketOf(self: Self, hash: u64) usize {
+            return @as(usize, @truncate(hash)) & self.mask;
+        }
+
+        pub inline fn slotAddr(self: *Self, bucket: usize) *KeySlot {
+            return &self.keys[bucket];
+        }
+
+        pub fn getOrPut(self: *Self, hash: u64, key: u128) Probe {
+            var i = self.bucketOf(hash);
+            while (true) : (i = (i + 1) & self.mask) {
+                const gid = self.gids[i];
+                if (gid == EMPTY) return .{ .slot = i, .found = false, .gid = 0 };
+                if (keyEq(self.keys[i], key)) return .{ .slot = i, .found = true, .gid = gid };
+            }
+        }
+
+        pub fn commit(self: *Self, slot: usize, key: u128, gid: u32) void {
+            self.keys[slot] = storeKey(key);
+            self.gids[slot] = gid;
+            self.len += 1;
+        }
+
+        pub fn needsGrow(self: Self, additional: usize) bool {
+            return (self.len + additional) * 4 >= self.keys.len * 3;
+        }
+
+        pub fn grow(self: *Self, allocator: Allocator, additional: usize) !void {
+            var new_cap = self.keys.len;
+            while ((self.len + additional) * 4 >= new_cap * 3) new_cap *= 2;
+            new_cap = @max(new_cap, self.grow_target);
+            const keys = try allocator.alloc(KeySlot, new_cap);
+            errdefer allocator.free(keys);
+            const gids = try allocator.alloc(u32, new_cap);
+            @memset(gids, EMPTY);
+            errdefer allocator.free(gids);
+
+            const old_keys = self.keys;
+            const old_gids = self.gids;
+            const new_mask = new_cap - 1;
+            self.keys = keys;
+            self.gids = gids;
+            self.mask = new_mask;
+            self.len = 0;
+            for (old_keys, old_gids) |old_key, old_gid| {
+                if (old_gid == EMPTY) continue;
+                var i = @as(usize, @truncate(hashStored(old_key))) & new_mask;
+                while (self.gids[i] != EMPTY) : (i = (i + 1) & new_mask) {}
+                self.keys[i] = old_key;
+                self.gids[i] = old_gid;
+                self.len += 1;
+            }
+            allocator.free(old_keys);
+            allocator.free(old_gids);
+        }
+
+        pub fn clearRetainingCapacity(self: *Self) void {
+            @memset(self.gids, EMPTY);
+            self.len = 0;
+        }
+
+        pub fn deinit(self: *Self, allocator: Allocator) void {
+            allocator.free(self.keys);
+            allocator.free(self.gids);
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn IntKeyZeroTable(comptime max_bits: u16) type {
+    const tier32 = max_bits <= 32;
+    const tier96 = max_bits <= 96 and !tier32;
+    const Slot = if (tier32)
+        struct { key32: u32, gid_plus_one: u32 }
+    else if (tier96)
+        struct { lo: u64, hi: u32, gid_plus_one: u32 }
+    else
+        struct { key: u128, gid_plus_one: u32 };
+
+    return struct {
+        const Self = @This();
+        slots: []Slot,
+        mask: usize,
+        len: usize,
+        grow_target: usize = 0,
+
+        pub inline fn hashKey(key: u128) u64 {
+            return hashSlotKey(key);
+        }
+
+        inline fn hashSlotKey(key: u128) u64 {
+            if (tier32) {
+                return mix64(@as(u64, @as(u32, @truncate(key))));
+            } else if (tier96) {
+                const lo: u64 = @truncate(key);
+                const hi: u32 = @truncate(key >> 64);
+                return mix64(lo ^ mix64(@as(u64, hi)));
+            } else {
+                return hashU128(key);
+            }
+        }
+
+        inline fn hashStored(s: Slot) u64 {
+            if (tier32) {
+                return mix64(@as(u64, s.key32));
+            } else if (tier96) {
+                return mix64(s.lo ^ mix64(@as(u64, s.hi)));
+            } else {
+                return hashU128(s.key);
+            }
+        }
+
+        inline fn storeKey(key: u128, gid: u32) Slot {
+            if (tier32) {
+                return .{ .key32 = @truncate(key), .gid_plus_one = gid + 1 };
+            } else if (tier96) {
+                return .{ .lo = @truncate(key), .hi = @truncate(key >> 64), .gid_plus_one = gid + 1 };
+            } else {
+                return .{ .key = key, .gid_plus_one = gid + 1 };
+            }
+        }
+
+        inline fn keyEq(s: Slot, key: u128) bool {
+            if (tier32) {
+                return s.key32 == @as(u32, @truncate(key));
+            } else if (tier96) {
+                return s.lo == @as(u64, @truncate(key)) and s.hi == @as(u32, @truncate(key >> 64));
+            } else {
+                return s.key == key;
+            }
+        }
+
+        pub fn init(allocator: Allocator, expected: usize) !Self {
+            const cap = capacityFor(expected);
+            const slots = try allocator.alloc(Slot, cap);
+            @memset(slots, std.mem.zeroes(Slot));
+            return .{ .slots = slots, .mask = cap - 1, .len = 0 };
+        }
+
+        pub inline fn bucketOf(self: Self, hash: u64) usize {
+            return @as(usize, @truncate(hash)) & self.mask;
+        }
+
+        pub inline fn slotAddr(self: *Self, bucket: usize) *Slot {
+            return &self.slots[bucket];
+        }
+
+        pub fn getOrPut(self: *Self, hash: u64, key: u128) Probe {
+            var i = self.bucketOf(hash);
+            while (true) : (i = (i + 1) & self.mask) {
+                const s = self.slots[i];
+                if (s.gid_plus_one == 0) return .{ .slot = i, .found = false, .gid = 0 };
+                if (keyEq(s, key)) return .{ .slot = i, .found = true, .gid = s.gid_plus_one - 1 };
+            }
+        }
+
+        pub fn commit(self: *Self, slot: usize, key: u128, gid: u32) void {
+            self.slots[slot] = storeKey(key, gid);
+            self.len += 1;
+        }
+
+        pub fn needsGrow(self: Self, additional: usize) bool {
+            return (self.len + additional) * 4 >= self.slots.len * 3;
+        }
+
+        pub fn grow(self: *Self, allocator: Allocator, additional: usize) !void {
+            var new_cap = self.slots.len;
+            while ((self.len + additional) * 4 >= new_cap * 3) new_cap *= 2;
+            new_cap = @max(new_cap, self.grow_target);
+            const slots = try allocator.alloc(Slot, new_cap);
+            @memset(slots, std.mem.zeroes(Slot));
+            const old_slots = self.slots;
+            const new_mask = new_cap - 1;
+            for (old_slots) |old| {
+                if (old.gid_plus_one == 0) continue;
+                var i = @as(usize, @truncate(hashStored(old))) & new_mask;
+                while (slots[i].gid_plus_one != 0) : (i = (i + 1) & new_mask) {}
+                slots[i] = old;
+            }
+            allocator.free(old_slots);
+            self.slots = slots;
+            self.mask = new_mask;
+        }
+
+        pub fn clearRetainingCapacity(self: *Self) void {
+            @memset(self.slots, std.mem.zeroes(Slot));
+            self.len = 0;
+        }
+
+        pub fn deinit(self: *Self, allocator: Allocator) void {
+            allocator.free(self.slots);
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn IntKeyMemsetTable(comptime max_bits: u16) type {
+    const tier32 = max_bits <= 32;
+    const tier96 = max_bits <= 96 and !tier32;
+    const Slot = if (tier32)
+        struct { key32: u32, gid: u32 }
+    else if (tier96)
+        struct { lo: u64, hi: u32, gid: u32 }
+    else
+        struct { key: u128, gid: u32 };
+
+    return struct {
+        const Self = @This();
+        slots: []Slot,
+        mask: usize,
+        len: usize,
+        grow_target: usize = 0,
+
+        inline fn emptySlot() Slot {
+            if (tier32) {
+                return .{ .key32 = std.math.maxInt(u32), .gid = EMPTY };
+            } else if (tier96) {
+                return .{ .lo = std.math.maxInt(u64), .hi = std.math.maxInt(u32), .gid = EMPTY };
+            } else {
+                return .{ .key = std.math.maxInt(u128), .gid = EMPTY };
+            }
+        }
+
+        pub inline fn hashKey(key: u128) u64 {
+            return hashSlotKey(key);
+        }
+
+        inline fn hashSlotKey(key: u128) u64 {
+            if (tier32) {
+                return mix64(@as(u64, @as(u32, @truncate(key))));
+            } else if (tier96) {
+                const lo: u64 = @truncate(key);
+                const hi: u32 = @truncate(key >> 64);
+                return mix64(lo ^ mix64(@as(u64, hi)));
+            } else {
+                return hashU128(key);
+            }
+        }
+
+        inline fn hashStored(s: Slot) u64 {
+            if (tier32) {
+                return mix64(@as(u64, s.key32));
+            } else if (tier96) {
+                return mix64(s.lo ^ mix64(@as(u64, s.hi)));
+            } else {
+                return hashU128(s.key);
+            }
+        }
+
+        inline fn storeKey(key: u128, gid: u32) Slot {
+            if (tier32) {
+                return .{ .key32 = @truncate(key), .gid = gid };
+            } else if (tier96) {
+                return .{ .lo = @truncate(key), .hi = @truncate(key >> 64), .gid = gid };
+            } else {
+                return .{ .key = key, .gid = gid };
+            }
+        }
+
+        inline fn keyEq(s: Slot, key: u128) bool {
+            if (tier32) {
+                return s.key32 == @as(u32, @truncate(key));
+            } else if (tier96) {
+                return s.lo == @as(u64, @truncate(key)) and s.hi == @as(u32, @truncate(key >> 64));
+            } else {
+                return s.key == key;
+            }
+        }
+
+        pub fn init(allocator: Allocator, expected: usize) !Self {
+            const cap = capacityFor(expected);
+            const slots = try allocator.alloc(Slot, cap);
+            @memset(slots, emptySlot());
+            return .{ .slots = slots, .mask = cap - 1, .len = 0 };
+        }
+
+        pub inline fn bucketOf(self: Self, hash: u64) usize {
+            return @as(usize, @truncate(hash)) & self.mask;
+        }
+
+        pub inline fn slotAddr(self: *Self, bucket: usize) *Slot {
+            return &self.slots[bucket];
+        }
+
+        pub fn getOrPut(self: *Self, hash: u64, key: u128) Probe {
+            var i = self.bucketOf(hash);
+            while (true) : (i = (i + 1) & self.mask) {
+                const s = self.slots[i];
+                if (s.gid == EMPTY) return .{ .slot = i, .found = false, .gid = 0 };
+                if (keyEq(s, key)) return .{ .slot = i, .found = true, .gid = s.gid };
+            }
+        }
+
+        pub fn commit(self: *Self, slot: usize, key: u128, gid: u32) void {
+            self.slots[slot] = storeKey(key, gid);
+            self.len += 1;
+        }
+
+        pub fn needsGrow(self: Self, additional: usize) bool {
+            return (self.len + additional) * 4 >= self.slots.len * 3;
+        }
+
+        pub fn grow(self: *Self, allocator: Allocator, additional: usize) !void {
+            var new_cap = self.slots.len;
+            while ((self.len + additional) * 4 >= new_cap * 3) new_cap *= 2;
+            new_cap = @max(new_cap, self.grow_target);
+            const slots = try allocator.alloc(Slot, new_cap);
+            @memset(slots, emptySlot());
+            const old_slots = self.slots;
+            const new_mask = new_cap - 1;
+            for (old_slots) |old| {
+                if (old.gid == EMPTY) continue;
+                var i = @as(usize, @truncate(hashStored(old))) & new_mask;
+                while (slots[i].gid != EMPTY) : (i = (i + 1) & new_mask) {}
+                slots[i] = old;
+            }
+            allocator.free(old_slots);
+            self.slots = slots;
+            self.mask = new_mask;
+        }
+
+        pub fn clearRetainingCapacity(self: *Self) void {
+            @memset(self.slots, emptySlot());
+            self.len = 0;
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {

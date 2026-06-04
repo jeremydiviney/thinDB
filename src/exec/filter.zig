@@ -207,6 +207,11 @@ pub const Filter = struct {
         return self.upstream.tryFuseAggregate(group_cols, aggs);
     }
 
+    pub fn tryLeaseGroupBy(self: *Filter, group_cols: []const []const u8, aggs: []const exec.AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK, emit_limit: ?u32, dop: usize) !?exec.Query {
+        if (!self.fused) return null;
+        return self.upstream.tryLeaseGroupBy(group_cols, aggs, top_k, emit_limit, dop);
+    }
+
     /// Forward a projection-Compute fusion to the upstream, but only when this
     /// Filter is itself fused (a pass-through). A non-fused Filter still
     /// evaluates rows here, so a Compute above it must stay a separate operator.

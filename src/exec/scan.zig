@@ -575,6 +575,22 @@ pub const Scan = struct {
         self.cur_seg_idx = start_seg;
     }
 
+    /// Reuse this scan object for another half-open row-group range. This keeps
+    /// projection/filter setup cached while allowing a scheduler to lease scan
+    /// tiles dynamically.
+    pub fn resetRange(self: *Scan, start_seg: usize, start_rg: usize, end_seg: usize, end_rg: usize, scan_memtable: bool) void {
+        self.releaseBatch();
+        self.closeCurSegment();
+        self.phase = .segments;
+        self.cur_seg_idx = start_seg;
+        self.cur_rg_idx = start_rg;
+        self.range_start_seg = start_seg;
+        self.range_start_rg = start_rg;
+        self.range_end_seg = end_seg;
+        self.range_end_rg = end_rg;
+        self.scan_memtable = scan_memtable;
+    }
+
     /// True once the cursor has reached this scan's assigned range end — the
     /// signal to stop the segments phase (mid-segment ends are honored). A
     /// no-op for the default full-table range (`range_end_seg == maxInt`).
@@ -1336,16 +1352,16 @@ pub const Scan = struct {
         switch (leaf.op) {
             .eq, .neq, .lt, .lte, .gt, .gte => {},
         }
-        const proj_phys = blk: {
-            for (self.out_phys) |phys| {
-                if (@import("../types.zig").columnNameEql(self.table.schema.columns[phys].name, leaf.col)) break :blk phys;
+        const pred_phys = blk: {
+            for (self.table.schema.columns, 0..) |col, phys| {
+                if (@import("../types.zig").columnNameEql(col.name, leaf.col)) break :blk phys;
             }
             return false;
         };
-        const col_type = self.table.schema.columns[proj_phys].type;
+        const col_type = self.table.schema.columns[pred_phys].type;
 
-        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[proj_phys].nullable };
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, proj_phys, &self.table.cache);
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, &self.table.cache);
         defer block.release(self.allocator, &self.table.cache);
 
         // Dict-encoded string column: test the comparison against each distinct
@@ -1362,13 +1378,26 @@ pub const Scan = struct {
             return true;
         }
 
+        switch (col_type) {
+            .varchar, .string, .char => {
+                const lit: []const u8 = switch (leaf.val) {
+                    .text => |t| t,
+                    else => return false,
+                };
+                if (block.encoding != .raw) return false;
+                evalRawStringLeafBlock(block.bytes, rg_count, flags, leaf.op, lit, out);
+                return true;
+            },
+            else => {},
+        }
+
         if (!predicate.typeHasRange(col_type)) return false;
 
         if (block.encoding == .for_) {
             const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
             // span = max - base (base == stats.min for a FOR block); resolves the
             // boundary (.none/.all) cases precisely.
-            const col_stats = seg.info.row_groups[rg_idx].stats[proj_phys];
+            const col_stats = seg.info.row_groups[rg_idx].stats[pred_phys];
             if (col_stats.max < fv.block.base) return false; // degenerate all-null sentinel — shouldn't reach FOR
             const span: u128 = @intCast(col_stats.max - fv.block.base);
             const plan = predicate.translateForLeaf(fv.block.base, span, leaf.op, leaf.val) orelse return false;
@@ -1447,6 +1476,65 @@ pub const Scan = struct {
         }
     }
 
+    fn cmpStringBytes(v: []const u8, literal: []const u8, op: predicate.PredicateOp) bool {
+        return switch (op) {
+            .eq => std.mem.eql(u8, v, literal),
+            .neq => !std.mem.eql(u8, v, literal),
+            .lt => std.mem.order(u8, v, literal) == .lt,
+            .lte => std.mem.order(u8, v, literal) != .gt,
+            .gt => std.mem.order(u8, v, literal) == .gt,
+            .gte => std.mem.order(u8, v, literal) != .lt,
+        };
+    }
+
+    fn evalRawStringLeafBlock(
+        raw: []const u8,
+        rg_count: u32,
+        flags: storage.format.ColumnBlockFlags,
+        op: predicate.PredicateOp,
+        literal: []const u8,
+        out: []bool,
+    ) void {
+        var nulls: ?[]const u8 = null;
+        var values = raw;
+        if (flags.has_nulls) {
+            const bm_len = storage.column.bitmapBytes(rg_count);
+            nulls = raw[0..bm_len];
+            values = raw[bm_len..];
+        }
+
+        const off_start: usize = 4;
+        const off_count = @as(usize, rg_count) + 1;
+        const data_start = off_start + off_count * 4;
+        const bytes = values[data_start..];
+
+        if (literal.len == 0 and (op == .eq or op == .neq)) {
+            const want_non_empty = op == .neq;
+            var i: usize = 0;
+            while (i < rg_count) : (i += 1) {
+                if (!storage.column.isValidBit(nulls, i)) {
+                    out[i] = false;
+                    continue;
+                }
+                const a: usize = storage.format.readU32(values[off_start + i * 4 ..][0..4]);
+                const b: usize = storage.format.readU32(values[off_start + (i + 1) * 4 ..][0..4]);
+                out[i] = (b != a) == want_non_empty;
+            }
+            return;
+        }
+
+        var i: usize = 0;
+        while (i < rg_count) : (i += 1) {
+            if (!storage.column.isValidBit(nulls, i)) {
+                out[i] = false;
+                continue;
+            }
+            const a: usize = storage.format.readU32(values[off_start + i * 4 ..][0..4]);
+            const b: usize = storage.format.readU32(values[off_start + (i + 1) * 4 ..][0..4]);
+            out[i] = cmpStringBytes(bytes[a..b], literal, op);
+        }
+    }
+
     /// Dispatch one guided-filter child (a comparison `.leaf` or a `.like`) into
     /// `out`. Returns false (declining the whole guided path) for any other shape
     /// or any block the narrow path can't handle.
@@ -1478,19 +1566,19 @@ pub const Scan = struct {
         lp: predicate.LikePred,
         out: []bool,
     ) !bool {
-        const proj_phys = blk: {
-            for (self.out_phys) |phys| {
-                if (@import("../types.zig").columnNameEql(self.table.schema.columns[phys].name, lp.col)) break :blk phys;
+        const pred_phys = blk: {
+            for (self.table.schema.columns, 0..) |col, phys| {
+                if (@import("../types.zig").columnNameEql(col.name, lp.col)) break :blk phys;
             }
             return false;
         };
-        switch (self.table.schema.columns[proj_phys].type) {
+        switch (self.table.schema.columns[pred_phys].type) {
             .varchar, .string, .char => {},
             else => return false,
         }
 
-        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[proj_phys].nullable };
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, proj_phys, &self.table.cache);
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, &self.table.cache);
         defer block.release(self.allocator, &self.table.cache);
 
         if (block.encoding != .dict) return false; // raw → general path

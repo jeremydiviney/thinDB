@@ -116,6 +116,7 @@ pub const ParallelScan = struct {
     // `emit_keep[j]` is the worker-output index of projected output column j.
     emit_keep: ?[]const usize = null,
     owns_out_schema: bool = false,
+    out_col_stats: []exec.ColStat = &.{},
 
     // Round state (touched only on the calling thread, between fork-joins).
     round: []?Batch, // one slot per worker; the batch it produced this round
@@ -342,6 +343,7 @@ pub const ParallelScan = struct {
         self.allocator.free(self.exhausted);
         if (self.emit_keep) |k| self.allocator.free(k);
         if (self.owns_out_schema) self.allocator.free(@constCast(self.out_schema));
+        if (self.out_col_stats.len > 0) self.allocator.free(self.out_col_stats);
         self.table.ddl_lock.unlockShared(self.table.io);
         if (self.owns_acct) {
             if (self.acct) |a| self.allocator.destroy(a);
@@ -421,17 +423,46 @@ pub const ParallelScan = struct {
         return true;
     }
 
-    /// A downstream consumer reports it reads only `keep`. On the materialize
-    /// path, drop every other output column from the survivor deep-copy — they
-    /// were decoded purely to feed a fused filter/compute (e.g. `URL` behind
-    /// `length(URL)` + `URL<>''`) and nothing above reads them. Safe because the
-    /// forwarding chain only reaches here past a fused (pass-through) Filter; an
-    /// unfused Filter swallows the call (its predicate still needs the columns).
-    /// No-op for the round (stream) path — that emits the scan's already-pruned
-    /// columns, so there is nothing dead to drop.
-    pub fn setEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
+    /// Full high-cardinality lease GROUP BY replacement. The aggregate owns this
+    /// ParallelScan on success and drives the chunk scans directly into radix
+    /// partitions, bypassing the normal `Query.next()` batch cursor.
+    pub fn tryLeaseGroupBy(self: *ParallelScan, group_cols: []const []const u8, aggs: []const exec.AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK, emit_limit: ?u32, dop: usize) !?Query {
+        if (getenv("THINDB_LEASE_SCAN_FUSE") == null and !self.shouldDirectLeaseGroupBy(group_cols)) return null;
+        if (self.mode != .unset or self.agg_fused) return null;
+        if (emit_limit != null) return null;
+        const ra = @import("radix_aggregate.zig");
+        const rtk: ?ra.TopK = if (top_k) |tk| blk: {
+            if (tk.keys.len != 1) return null;
+            break :blk .{ .k = tk.k, .col = tk.keys[0].col, .desc = tk.keys[0].desc };
+        } else null;
+        return ra.RadixLeaseAggregate.createFromParallelScan(self.allocator, self, group_cols, aggs, rtk, dop) catch |e| switch (e) {
+            error.UnsupportedOperatorForType, error.AggregateUnsupportedType => null,
+            else => e,
+        };
+    }
+
+    fn shouldDirectLeaseGroupBy(self: *ParallelScan, group_cols: []const []const u8) bool {
+        const st = self.baseStats();
+        if (st.upper_rows == 0 or st.column_stats.len == 0) return false;
+        var est: u64 = 1;
+        for (group_cols) |gc| {
+            const idx = types.findColumn(self.out_schema, gc) orelse return false;
+            if (idx >= st.column_stats.len) return false;
+            switch (st.column_stats[idx].ndv) {
+                .exact => |nd| est *|= nd,
+                .unknown => return false,
+            }
+        }
+        est = @min(est, st.upper_rows);
+        // The scan-fused path wins when many rows collapse into materially fewer
+        // groups because it avoids the serialized ParallelScan.next() boundary.
+        // Near-unique groupings pay the same partition cost but get little reuse,
+        // so leave those on the default lease path unless explicitly forced.
+        return est *| 4 <= st.upper_rows;
+    }
+
+    fn applyEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
         if (self.emit_keep != null) return;
-        if (!(self.workers[0].fusedActive() or self.compute_fused)) return;
         const full = self.out_schema;
         var idxs = try self.allocator.alloc(usize, full.len);
         errdefer self.allocator.free(idxs);
@@ -452,15 +483,43 @@ pub const ParallelScan = struct {
         const reduced = try self.allocator.alloc(Column, n);
         errdefer self.allocator.free(reduced);
         for (0..n) |j| reduced[j] = full[idxs[j]];
+        const full_stats = self.baseStats();
+        if (full_stats.column_stats.len >= full.len) {
+            const reduced_stats = try self.allocator.alloc(exec.ColStat, n);
+            errdefer self.allocator.free(reduced_stats);
+            for (0..n) |j| reduced_stats[j] = full_stats.column_stats[idxs[j]];
+            self.out_col_stats = reduced_stats;
+        }
         self.emit_keep = try self.allocator.realloc(idxs, n);
         self.out_schema = reduced;
         self.owns_out_schema = true;
     }
 
-    pub fn stats(self: *ParallelScan) exec.PipelineStats {
+    /// A downstream consumer reports it reads only `keep`. On the materialize
+    /// path, drop every other output column from the survivor deep-copy — they
+    /// were decoded purely to feed a fused filter/compute (e.g. `URL` behind
+    /// `length(URL)` + `URL<>''`) and nothing above reads them. Safe because the
+    /// forwarding chain only reaches here past a fused (pass-through) Filter; an
+    /// unfused Filter swallows the projection before it reaches us.
+    /// No-op for the round (stream) path — that emits the scan's already-pruned
+    /// columns, so there is nothing dead to drop.
+    pub fn setEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
+        if (!(self.workers[0].fusedActive() or self.compute_fused)) return;
+        try self.applyEmitProjection(keep);
+    }
+
+    fn baseStats(self: *ParallelScan) exec.PipelineStats {
         if (self.agg_fused) return self.agg_q[0].stats();
         if (self.compute_fused) return self.compute_q[0].stats();
         return self.workers[0].stats();
+    }
+
+    pub fn stats(self: *ParallelScan) exec.PipelineStats {
+        const st = self.baseStats();
+        if (self.out_col_stats.len > 0) {
+            return .{ .upper_rows = st.upper_rows, .sort_state = st.sort_state, .column_stats = self.out_col_stats };
+        }
+        return st;
     }
 
     pub fn explain(self: *ParallelScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
@@ -587,9 +646,8 @@ pub const ParallelScan = struct {
             sum_t += t;
         }
         std.debug.print("[pscan] threads={d} chunks={d} drain_wall={d:.1}ms survivors={d} chunk_ms[min={d:.1} max={d:.1} mean={d:.1}]\n", .{
-            self.n_threads,                                       self.workers.len,                  drain_wall_ms, rows,
-            exec.prof.ticksToMs(@intCast(min_t)),                 exec.prof.ticksToMs(@intCast(max_t)),
-            exec.prof.ticksToMs(@intCast(sum_t / self.workers.len)),
+            self.n_threads,                       self.workers.len,                     drain_wall_ms,                                           rows,
+            exec.prof.ticksToMs(@intCast(min_t)), exec.prof.ticksToMs(@intCast(max_t)), exec.prof.ticksToMs(@intCast(sum_t / self.workers.len)),
         });
     }
 
@@ -844,6 +902,8 @@ fn exprFusable(e: Expr, scan_cols: []const Column) bool {
         .case, .scalar_subquery, .exists_subquery, .var_ref => false,
     };
 }
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// Map a flat row-group index to its `(segment, row_group)` coordinate. `f ==
 /// total` (a worker's exclusive end) maps to the past-the-end sentinel.

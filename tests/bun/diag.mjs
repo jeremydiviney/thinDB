@@ -1,0 +1,10 @@
+import mysql from "mysql2/promise";
+const c = await mysql.createConnection({host:"127.0.0.1",port:7880,user:"thindb",password:"",database:"clickbench__public",rowsAsArray:true});
+const q = async (sql) => { const [r] = await c.query(sql); return r; };
+console.log("total rows         :", (await q("SELECT COUNT(*) FROM hits"))[0][0]);
+console.log("SearchPhrase <> '' :", (await q("SELECT COUNT(*) FROM hits WHERE SearchPhrase <> ''"))[0][0]);
+console.log("distinct SearchPhrase:", (await q("SELECT COUNT(DISTINCT SearchPhrase) FROM hits"))[0][0]);
+console.log("distinct UserID    :", (await q("SELECT COUNT(DISTINCT UserID) FROM hits"))[0][0]);
+console.log("distinct RegionID  :", (await q("SELECT COUNT(DISTINCT RegionID) FROM hits"))[0][0]);
+console.log("distinct (Region,User) pairs:", (await q("SELECT COUNT(*) FROM (SELECT RegionID, UserID FROM hits GROUP BY RegionID, UserID) t"))[0][0]);
+await c.end();

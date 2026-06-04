@@ -1,0 +1,13 @@
+import mysql from "mysql2/promise";
+const c = await mysql.createConnection({host:"127.0.0.1",port:7880,user:"thindb",password:"",database:"clickbench__public",rowsAsArray:true});
+const q = async (sql) => (await c.query(sql))[0];
+const r = (await q("SELECT MIN(UserID), MAX(UserID) FROM hits"))[0];
+const min = BigInt(r[0]), max = BigInt(r[1]);
+const range = max - min;
+const bits = range.toString(2).length;
+console.log("MIN(UserID):", min.toString());
+console.log("MAX(UserID):", max.toString());
+console.log("range (max-min):", range.toString());
+console.log("bits to store range:", bits);
+console.log("distinct UserID:", (await q("SELECT COUNT(DISTINCT UserID) FROM hits"))[0][0], "→ dense-code bits:", Math.ceil(Math.log2(1062330)));
+await c.end();
