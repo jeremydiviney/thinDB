@@ -4186,8 +4186,7 @@ inline fn rowBucketIndex(row: Row, bucket_count: usize) usize {
 }
 
 inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) usize {
-    const row = rows.rowAt(row_idx);
-    const h = routeHashRowBits(row.key_lo, row.key_hi);
+    const h = routeHashRowBits(rows.keyLoAll()[row_idx], rows.keyHiAll()[row_idx]);
     return if (std.math.isPowerOfTwo(bucket_count))
         (@as(usize, @truncate(h)) & (bucket_count - 1))
         else
@@ -8272,7 +8271,6 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     const total = totalRows(table);
     const dop = @max(@as(usize, 1), cfg.dop);
-    if (dop == 1) return runSerialDirect(allocator, table, cfg);
 
     const bucket_count = cfg.bucket_count;
     const n_workers = @max(@as(usize, 1), @min(dop, cpus.len));
