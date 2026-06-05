@@ -523,6 +523,22 @@ fn applyInSet(stats: []exec.ColStat, schema: []const Column, in: predicate.InSet
 /// most-likely-true first. `.not` children are left untouched. `eq` in range,
 /// `neq`, LIKE, col-col, subquery forms, and is_null pass through. Returns the
 /// (possibly rebuilt) expr; `.always` carries a proven constant outcome.
+/// Reorder a validated predicate's AND/OR conjuncts cheapest + most-selective
+/// first and fold any conjunct proven always-true/false by `stats` (per-schema
+/// column). Commutative — never changes results. Child arrays allocated for
+/// reordered nodes are appended to `rewritten` (caller owns + frees them).
+/// Pass an all-`.unknown` `stats` to order by kernel cost alone, no folding.
+/// Shared by the legacy Filter operator and the fused-scan path.
+pub fn orderPredicate(
+    allocator: Allocator,
+    rewritten: *std.ArrayListUnmanaged([]PredicateExpr),
+    expr: PredicateExpr,
+    schema: []const Column,
+    stats: []const exec.ColStat,
+) !PredicateExpr {
+    return simplifyPredicate(allocator, rewritten, expr, schema, stats);
+}
+
 fn simplifyPredicate(
     allocator: Allocator,
     rewritten: *std.ArrayListUnmanaged([]PredicateExpr),

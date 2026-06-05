@@ -15,11 +15,13 @@ const win = std.os.windows;
 const exec_mod = @import("exec.zig");
 const api_mod = @import("../api/api.zig");
 const storage_mod = @import("../storage/storage.zig");
+const types_mod = @import("../types.zig");
 
 const thindb = struct {
     pub const exec = exec_mod;
     pub const api = api_mod;
     pub const storage = storage_mod;
+    pub const types = types_mod;
     pub const Batch = exec_mod.Batch;
     pub const Predicate = exec_mod.Predicate;
 };
@@ -53,6 +55,7 @@ const AUTO_ROUTE_BLOCK_ROWS: usize = 0;
 const MAX_GROUP_LEASE_BUCKETS: usize = 64;
 const MAX_WORKSPACE_PROFILE_WORKERS: usize = 128;
 const MAX_RAW_BATCH_CHUNKS: usize = 64;
+const MAX_GENERIC_GROUP_KEYS: usize = 8;
 
 pub const QueryKind = enum {
     clientip,
@@ -60,6 +63,7 @@ pub const QueryKind = enum {
     q30,
     q31,
     q32,
+    generic,
 
     pub fn label(self: QueryKind) []const u8 {
         return switch (self) {
@@ -68,6 +72,7 @@ pub const QueryKind = enum {
             .q30 => "q30",
             .q31 => "q31",
             .q32 => "q32",
+            .generic => "generic",
         };
     }
 
@@ -103,6 +108,7 @@ fn querySpec(kind: QueryKind) QuerySpec {
         .q30 => .{ .columns = &COLS_Q30, .payload_columns = &COLS_Q30_PAYLOAD, .group_key_columns = 2, .filter = phrase_non_empty },
         .q31 => .{ .columns = &COLS_Q31, .payload_columns = &COLS_Q31_PAYLOAD, .group_key_columns = 2, .filter = phrase_non_empty },
         .q32 => .{ .columns = &COLS_Q32, .group_key_columns = 2 },
+        .generic => .{ .columns = &.{}, .group_key_columns = 0 },
     };
 }
 
@@ -396,6 +402,14 @@ pub const GroupColumnSource = enum {
 pub const GroupColumnSpec = struct {
     physical_type: GroupColumnType,
     source: GroupColumnSource = .is_refresh,
+    source_name: []const u8 = "",
+};
+
+pub const GroupKeyColumnSpec = struct {
+    name: []const u8,
+    typ: thindb.types.Type,
+    offset_bits: u8,
+    width_bits: u8,
 };
 
 pub const GroupAggregateOp = enum {
@@ -413,7 +427,7 @@ pub const GroupAggregateSpec = struct {
     state_index: u16,
 };
 
-const MAX_GROUP_AGG_STATES: usize = 3;
+const MAX_GROUP_AGG_STATES: usize = 4;
 const MAX_GROUP_PAYLOAD_COLUMNS: usize = 8;
 
 const DEFAULT_GROUP_AGGREGATES = [_]GroupAggregateSpec{
@@ -429,6 +443,7 @@ const CountSumAvgProgram = struct {
 
 pub const GroupRowsLayout = struct {
     key_width: GroupKeyWidth = .u128,
+    key_columns: []const GroupKeyColumnSpec = &.{},
     columns: []const GroupColumnSpec = &DEFAULT_GROUP_COLUMNS,
     aggregates: []const GroupAggregateSpec = &DEFAULT_GROUP_AGGREGATES,
 
@@ -439,10 +454,25 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.columns.len != b.columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.aggregates.len != b.aggregates.len) return false;
+    var key_i: usize = 0;
+    while (key_i < a.key_columns.len) : (key_i += 1) {
+        if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
+            !std.meta.eql(a.key_columns[key_i].typ, b.key_columns[key_i].typ) or
+            a.key_columns[key_i].offset_bits != b.key_columns[key_i].offset_bits or
+            a.key_columns[key_i].width_bits != b.key_columns[key_i].width_bits)
+        {
+            return false;
+        }
+    }
     var i: usize = 0;
     while (i < a.columns.len) : (i += 1) {
-        if (a.columns[i].physical_type != b.columns[i].physical_type or a.columns[i].source != b.columns[i].source) return false;
+        if (a.columns[i].physical_type != b.columns[i].physical_type or
+            a.columns[i].source != b.columns[i].source or
+            !std.mem.eql(u8, a.columns[i].source_name, b.columns[i].source_name))
+        {
+            return false;
+        }
     }
     i = 0;
     while (i < a.aggregates.len) : (i += 1) {
@@ -938,6 +968,7 @@ const State = struct {
     count: u64,
     refresh_sum: i64,
     width_sum: i64,
+    extra_sum: i64 = 0,
 };
 
 const Q30InlineState = struct {
@@ -1125,6 +1156,7 @@ const PipeShared = struct {
     raw_group_queues: []GroupQueue = &.{},
     stage_builders: []StageBucketBuilder = &.{},
     group_rows_layout: GroupRowsLayout = .{},
+    generic_filter_required: bool = false,
     stage_outstanding_chunks: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     stage_outstanding_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stage_builder_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -2326,7 +2358,18 @@ pub const TopRow = struct {
     count: u64,
     refresh_sum: i64,
     width_sum: i64,
+    extra_sum: i64 = 0,
 };
+
+inline fn topRowFromState(s: State) TopRow {
+    return .{
+        .key = s.key,
+        .count = s.count,
+        .refresh_sum = s.refresh_sum,
+        .width_sum = s.width_sum,
+        .extra_sum = s.extra_sum,
+    };
+}
 
 fn better(a: TopRow, b: TopRow) bool {
     if (a.count != b.count) return a.count > b.count;
@@ -2573,11 +2616,50 @@ inline fn keyFromViews(v: BatchViews, row: usize) !u128 {
         .q15 => @as(u128, @as(u64, @bitCast(v.user_id.?[row]))),
         .q30 => packQ30(try readSearchEngine(v.search_engine.?, row), v.client_ip[row]),
         .q31, .q32 => packWatchClient(v.watch_id.?[row], v.client_ip[row]),
+        .generic => error.UnsupportedOperatorForType,
     };
 }
 
 inline fn rowPasses(v: BatchViews, row: usize) bool {
     return if (v.phrase) |p| p.offsets[row] != p.offsets[row + 1] else true;
+}
+
+inline fn readGenericKeyBits(view: thindb.storage.ColumnView, typ: thindb.types.Type, row: usize) !u128 {
+    return switch (typ) {
+        .boolean => switch (view.data) {
+            .boolean => |v| @as(u128, v[row]),
+            else => error.TypeMismatch,
+        },
+        .tinyint => switch (view.data) {
+            .tinyint => |v| @as(u128, @as(u8, @bitCast(v[row]))),
+            else => error.TypeMismatch,
+        },
+        .smallint => switch (view.data) {
+            .smallint => |v| @as(u128, @as(u16, @bitCast(v[row]))),
+            else => error.TypeMismatch,
+        },
+        .int, .date => switch (view.data) {
+            .int => |v| @as(u128, @as(u32, @bitCast(v[row]))),
+            .date => |v| @as(u128, @as(u32, @bitCast(v[row]))),
+            else => error.TypeMismatch,
+        },
+        .bigint, .datetime, .decimal64 => switch (view.data) {
+            .bigint => |v| @as(u128, @as(u64, @bitCast(v[row]))),
+            .datetime => |v| @as(u128, @as(u64, @bitCast(v[row]))),
+            .decimal64 => |v| @as(u128, @as(u64, @bitCast(v[row]))),
+            else => error.TypeMismatch,
+        },
+        else => error.TypeMismatch,
+    };
+}
+
+fn genericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storage.ColumnView, row: usize) !u128 {
+    var key: u128 = 0;
+    for (layout.key_columns, 0..) |part, i| {
+        const raw = try readGenericKeyBits(key_views[i], part.typ, row);
+        key |= raw << @intCast(part.offset_bits);
+    }
+    return key;
 }
 
 fn searchPhrasePred() thindb.Predicate {
@@ -2588,6 +2670,13 @@ fn applyScanFilter(scan: *Scan, kind: QueryKind) !bool {
     const pred = querySpec(kind).filter orelse return false;
     try scan.addPrune(pred);
     return try scan.tryFuseFilter(.{ .leaf = pred });
+}
+
+fn applyScanFilterExpr(scan: *Scan, expr: thindb.exec.PredicateExpr) !bool {
+    // The scan owns all filter handling: literal coercion, zone-map prune-hint
+    // extraction (incl. IN), and block-sourced evaluation of unprojected
+    // columns. The core pipeline just hands it the predicate.
+    return try scan.tryFuseFilter(expr);
 }
 
 fn rowKey(kind: QueryKind, batch: thindb.Batch, row: usize) !u128 {
@@ -3215,6 +3304,7 @@ fn appendBatchRoutedEx(parts: *WorkerParts, allocator: Allocator, bucket_count: 
         .q30 => appendBatchQ30(parts, allocator, bucket_count, views, batch.row_count, route_block_rows, skip_filter_check),
         .q31 => appendBatchQ31(parts, allocator, bucket_count, views, batch.row_count, route_block_rows, skip_filter_check),
         .q32 => appendBatchQ32(parts, allocator, bucket_count, views, batch.row_count, route_block_rows),
+        .generic => error.UnsupportedOperatorForType,
     };
 }
 
@@ -3347,7 +3437,250 @@ inline fn appendRawPacked(parts: *WorkerParts, shared: *PipeShared, raw_chunk_ro
     }
 }
 
+fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
+    if (shared.generic_filter_required and !skip_filter_check) return error.UnsupportedOperatorForType;
+    const layout = shared.group_rows_layout;
+    if (layout.key_columns.len == 0 or layout.key_columns.len > MAX_GENERIC_GROUP_KEYS) return error.UnsupportedOperatorForType;
+    if (parts.raw_active_rows.capacity() == 0) parts.raw_active_rows = try acquireRawRows(shared, raw_chunk_rows, &parts.raw_recycle_lock_ticks);
+
+    var key_views_buf: [MAX_GENERIC_GROUP_KEYS]thindb.storage.ColumnView = undefined;
+    for (layout.key_columns, 0..) |part, i| {
+        key_views_buf[i] = batch.columnView(part.name) orelse return error.ColumnNotFound;
+    }
+    if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
+    var payload_views_buf: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
+    for (layout.columns, 0..) |column, i| {
+        if (column.source_name.len == 0) return error.UnsupportedOperatorForType;
+        const view = batch.columnView(column.source_name) orelse return error.ColumnNotFound;
+        payload_views_buf[i] = switch (view.data) {
+            .smallint => |v| v,
+            .tinyint => return error.UnsupportedOperatorForType,
+            .int => return error.UnsupportedOperatorForType,
+            else => return error.TypeMismatch,
+        };
+    }
+
+    if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_views_buf[0..layout.columns.len], raw_chunk_rows, profile)) return;
+
+    const route_t0 = if (profile) nowTicks() else 0;
+    var accepted: u64 = 0;
+    var r: usize = 0;
+    while (r < batch.row_count) {
+        var active = &parts.raw_active_rows;
+        const key_lo = active.keyLoAll();
+        const key_hi = active.keyHiAll();
+        while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
+            const key = try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
+            const idx = active.len();
+            key_lo[idx] = @truncate(key);
+            key_hi[idx] = @truncate(key >> 64);
+            var col: usize = 0;
+            while (col < layout.columns.len) : (col += 1) {
+                active.columnI16All(col)[idx] = payload_views_buf[col][r];
+            }
+            active.len_rows = idx + 1;
+            accepted += 1;
+        }
+        if (active.len() == raw_chunk_rows) {
+            if (shared.raw_scan_queues.len > 0) {
+                const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
+                try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, active, raw_chunk_rows, &shared.outstanding_chunks, &shared.outstanding_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
+            } else {
+                try publishRawRows(shared, parts.worker_index, active, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
+            }
+            parts.published_chunks += 1;
+        }
+    }
+    parts.scanned_count += batch.row_count;
+    parts.row_count += accepted;
+    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+}
+
+fn appendBatchRawChunksGenericFast(
+    parts: *WorkerParts,
+    shared: *PipeShared,
+    batch: thindb.Batch,
+    layout: GroupRowsLayout,
+    key_views: []const thindb.storage.ColumnView,
+    payload_views: []const []const i16,
+    raw_chunk_rows: usize,
+    profile: bool,
+) !bool {
+    if (layout.key_columns.len == 1) {
+        const p0 = layout.key_columns[0];
+        if (p0.offset_bits == 0 and p0.width_bits == 64 and p0.typ == .bigint) {
+            const k0 = switch (key_views[0].data) {
+                .bigint => |v| v,
+                else => return false,
+            };
+            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_views, raw_chunk_rows, profile);
+            return true;
+        }
+    }
+
+    if (layout.key_columns.len == 2) {
+        const p0 = layout.key_columns[0];
+        const p1 = layout.key_columns[1];
+        if (p0.offset_bits == 0 and p0.width_bits == 16 and p0.typ == .smallint and
+            p1.offset_bits == 16 and p1.width_bits == 32 and (p1.typ == .int or p1.typ == .date))
+        {
+            const k0 = switch (key_views[0].data) {
+                .smallint => |v| v,
+                else => return false,
+            };
+            const k1 = switch (key_views[1].data) {
+                .int => |v| v,
+                .date => |v| v,
+                else => return false,
+            };
+            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_views, raw_chunk_rows, profile);
+            return true;
+        }
+
+        if (p0.offset_bits == 0 and p0.width_bits == 64 and (p0.typ == .bigint or p0.typ == .datetime or p0.typ == .decimal64) and
+            p1.offset_bits == 64 and p1.width_bits == 32 and (p1.typ == .int or p1.typ == .date))
+        {
+            const k0 = switch (key_views[0].data) {
+                .bigint => |v| v,
+                .datetime => |v| v,
+                .decimal64 => |v| v,
+                else => return false,
+            };
+            const k1 = switch (key_views[1].data) {
+                .int => |v| v,
+                .date => |v| v,
+                else => return false,
+            };
+            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_views, raw_chunk_rows, profile);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn appendBatchRawChunksGenericKey1I64(
+    parts: *WorkerParts,
+    shared: *PipeShared,
+    row_count: usize,
+    key0: []const i64,
+    payload_views: []const []const i16,
+    raw_chunk_rows: usize,
+    profile: bool,
+) !void {
+    const route_t0 = if (profile) nowTicks() else 0;
+    var accepted: u64 = 0;
+    var r: usize = 0;
+    while (r < row_count) {
+        var active = &parts.raw_active_rows;
+        const key_lo = active.keyLoAll();
+        const key_hi = active.keyHiAll();
+        while (r < row_count and active.len() < raw_chunk_rows) : (r += 1) {
+            const idx = active.len();
+            key_lo[idx] = @as(u64, @bitCast(key0[r]));
+            key_hi[idx] = 0;
+            appendGenericPayload(active, payload_views, idx, r);
+            active.len_rows = idx + 1;
+            accepted += 1;
+        }
+        if (active.len() == raw_chunk_rows) try publishActiveRawRows(parts, shared, raw_chunk_rows);
+    }
+    parts.scanned_count += row_count;
+    parts.row_count += accepted;
+    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+}
+
+fn appendBatchRawChunksGenericKeyI16I32(
+    parts: *WorkerParts,
+    shared: *PipeShared,
+    row_count: usize,
+    key0: []const i16,
+    key1: []const i32,
+    payload_views: []const []const i16,
+    raw_chunk_rows: usize,
+    profile: bool,
+) !void {
+    const route_t0 = if (profile) nowTicks() else 0;
+    var accepted: u64 = 0;
+    var r: usize = 0;
+    while (r < row_count) {
+        var active = &parts.raw_active_rows;
+        const key_lo = active.keyLoAll();
+        const key_hi = active.keyHiAll();
+        while (r < row_count and active.len() < raw_chunk_rows) : (r += 1) {
+            const idx = active.len();
+            key_lo[idx] = @as(u16, @bitCast(key0[r])) |
+                (@as(u64, @as(u32, @bitCast(key1[r]))) << 16);
+            key_hi[idx] = 0;
+            appendGenericPayload(active, payload_views, idx, r);
+            active.len_rows = idx + 1;
+            accepted += 1;
+        }
+        if (active.len() == raw_chunk_rows) try publishActiveRawRows(parts, shared, raw_chunk_rows);
+    }
+    parts.scanned_count += row_count;
+    parts.row_count += accepted;
+    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+}
+
+fn appendBatchRawChunksGenericKeyI64I32(
+    parts: *WorkerParts,
+    shared: *PipeShared,
+    row_count: usize,
+    key0: []const i64,
+    key1: []const i32,
+    payload_views: []const []const i16,
+    raw_chunk_rows: usize,
+    profile: bool,
+) !void {
+    const route_t0 = if (profile) nowTicks() else 0;
+    var accepted: u64 = 0;
+    var r: usize = 0;
+    while (r < row_count) {
+        var active = &parts.raw_active_rows;
+        const key_lo = active.keyLoAll();
+        const key_hi = active.keyHiAll();
+        while (r < row_count and active.len() < raw_chunk_rows) : (r += 1) {
+            const idx = active.len();
+            key_lo[idx] = @as(u64, @bitCast(key0[r]));
+            key_hi[idx] = @as(u32, @bitCast(key1[r]));
+            appendGenericPayload(active, payload_views, idx, r);
+            active.len_rows = idx + 1;
+            accepted += 1;
+        }
+        if (active.len() == raw_chunk_rows) try publishActiveRawRows(parts, shared, raw_chunk_rows);
+    }
+    parts.scanned_count += row_count;
+    parts.row_count += accepted;
+    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+}
+
+inline fn appendGenericPayload(active: *RawRows, payload_views: []const []const i16, dst: usize, src: usize) void {
+    if (payload_views.len == 2) {
+        active.columnI16All(0)[dst] = payload_views[0][src];
+        active.columnI16All(1)[dst] = payload_views[1][src];
+        return;
+    }
+    var col: usize = 0;
+    while (col < payload_views.len) : (col += 1) {
+        active.columnI16All(col)[dst] = payload_views[col][src];
+    }
+}
+
+fn publishActiveRawRows(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows: usize) !void {
+    if (shared.raw_scan_queues.len > 0) {
+        const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
+        try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &shared.outstanding_chunks, &shared.outstanding_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
+    } else {
+        try publishRawRows(shared, parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
+    }
+    parts.published_chunks += 1;
+}
+
 fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, kind: QueryKind, batch: thindb.Batch, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
+    if (shared.group_rows_layout.key_columns.len != 0) {
+        return appendBatchRawChunksGeneric(parts, shared, batch, raw_chunk_rows, profile, skip_filter_check);
+    }
     const route_t0 = if (profile) nowTicks() else 0;
     const views = try loadViewsMaybePhrase(kind, batch, !(skip_filter_check and kind.hasFilter()));
     if (parts.raw_active_rows.capacity() == 0) parts.raw_active_rows = try acquireRawRows(shared, raw_chunk_rows, &parts.raw_recycle_lock_ticks);
@@ -3506,16 +3839,17 @@ fn initGroupStateProgram(
 }
 
 fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, columns: []const []const i16, row_idx: usize) !void {
+    st.count += 1;
     for (aggregates) |agg| {
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         const state_index: usize = agg.state_index;
         switch (agg.op) {
             .count_star => {
-                try addAggregateStateValue(st, state_index, 1);
+                if (state_index != 0) try setAggregateStateValue(st, state_index, st.count);
             },
             .count_col => {
                 _ = aggregateInputValue(agg, columns, row_idx) catch return error.UnsupportedOperatorForType;
-                try addAggregateStateValue(st, state_index, 1);
+                if (state_index != 0) try setAggregateStateValue(st, state_index, st.count);
             },
             .sum => {
                 const value = try aggregateInputValue(agg, columns, row_idx);
@@ -3527,11 +3861,11 @@ fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, c
             },
             .min => {
                 const value = try aggregateInputValue(agg, columns, row_idx);
-                if (st.count == 0 or value < aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+                if (st.count == 1 or value < aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
             },
             .max => {
                 const value = try aggregateInputValue(agg, columns, row_idx);
-                if (st.count == 0 or value > aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+                if (st.count == 1 or value > aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
             },
         }
     }
@@ -3548,6 +3882,7 @@ inline fn aggregateStateValue(st: *const State, state_index: usize) i128 {
         0 => @intCast(st.count),
         1 => st.refresh_sum,
         2 => st.width_sum,
+        3 => st.extra_sum,
         else => unreachable,
     };
 }
@@ -3557,6 +3892,7 @@ inline fn addAggregateStateValue(st: *State, state_index: usize, value: i128) !v
         0 => st.count += @intCast(value),
         1 => st.refresh_sum += @intCast(value),
         2 => st.width_sum += @intCast(value),
+        3 => st.extra_sum += @intCast(value),
         else => return error.UnsupportedOperatorForType,
     }
 }
@@ -3566,6 +3902,7 @@ inline fn setAggregateStateValue(st: *State, state_index: usize, value: i128) !v
         0 => st.count = @intCast(value),
         1 => st.refresh_sum = @intCast(value),
         2 => st.width_sum = @intCast(value),
+        3 => st.extra_sum = @intCast(value),
         else => return error.UnsupportedOperatorForType,
     }
 }
@@ -3836,6 +4173,7 @@ fn mergeStatesDirect(
         st.count += src.count;
         st.refresh_sum += src.refresh_sum;
         st.width_sum += src.width_sum;
+        st.extra_sum += src.extra_sum;
     }
 }
 
@@ -4093,14 +4431,7 @@ fn groupBucket(allocator: Allocator, parts: []WorkerParts, bucket_idx: usize) !B
         .row_count = @intCast(rows),
         .group_count = @intCast(states.items.len),
     };
-    for (states.items) |s| {
-        result.top.consider(.{
-            .key = s.key,
-            .count = s.count,
-            .refresh_sum = s.refresh_sum,
-            .width_sum = s.width_sum,
-        });
-    }
+    for (states.items) |s| result.top.consider(topRowFromState(s));
     return result;
 }
 
@@ -4131,14 +4462,7 @@ fn groupBucketTimed(allocator: Allocator, parts: []WorkerParts, bucket_idx: usiz
         .group_count = @intCast(states.items.len),
     };
     const top_t0 = nowTicks();
-    for (states.items) |s| {
-        result.top.consider(.{
-            .key = s.key,
-            .count = s.count,
-            .refresh_sum = s.refresh_sum,
-            .width_sum = s.width_sum,
-        });
-    }
+    for (states.items) |s| result.top.consider(topRowFromState(s));
     local_top_ticks.* += nowTicks() - top_t0;
     return result;
 }
@@ -4291,14 +4615,7 @@ fn mergeStateBucket(allocator: Allocator, aggs: []WorkerAgg, bucket_idx: usize) 
         .row_count = @intCast(rows),
         .group_count = @intCast(states.items.len),
     };
-    for (states.items) |s| {
-        result.top.consider(.{
-            .key = s.key,
-            .count = s.count,
-            .refresh_sum = s.refresh_sum,
-            .width_sum = s.width_sum,
-        });
-    }
+    for (states.items) |s| result.top.consider(topRowFromState(s));
     return result;
 }
 
@@ -4673,14 +4990,7 @@ fn siloGroupWorkerErr(job: SiloGroupJob) !void {
     var local_top: TopSet = .{};
     var b = job.worker_index;
     while (b < bucket_count) : (b += job.worker_count) {
-        for (job.shared.buckets[b].states.items) |s| {
-            local_top.consider(.{
-                .key = s.key,
-                .count = s.count,
-                .refresh_sum = s.refresh_sum,
-                .width_sum = s.width_sum,
-            });
-        }
+        for (job.shared.buckets[b].states.items) |s| local_top.consider(topRowFromState(s));
     }
     job.top.* = local_top;
     if (job.profile) job.top_ticks.* += nowTicks() - top_t0;
@@ -5299,23 +5609,25 @@ fn drainRawDedicatedStageSharedBuilders(
 
         row_idx = 0;
         i = 0;
+        const ncols = shared.group_rows_layout.columns.len;
         const flat_key_lo = local.flat_raw_rows.keyLoAll();
         const flat_key_hi = local.flat_raw_rows.keyHiAll();
-        const flat_refresh = local.flat_raw_rows.columnI16All(0);
-        const flat_width = local.flat_raw_rows.columnI16All(1);
+        var flat_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]i16 = undefined;
+        for (0..ncols) |c| flat_cols[c] = local.flat_raw_rows.columnI16All(c);
         while (i < popped_total) : (i += 1) {
             const src_key_lo = raw_chunks[i].rows.keyLoAll();
             const src_key_hi = raw_chunks[i].rows.keyHiAll();
-            const src_refresh = raw_chunks[i].rows.columnI16All(0);
-            const src_width = raw_chunks[i].rows.columnI16All(1);
+            var src_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
+            for (0..ncols) |c| src_cols[c] = raw_chunks[i].rows.columnI16All(c);
+            const chunk_rows_n = raw_chunks[i].rows.len();
             var r: usize = 0;
-            while (r < raw_chunks[i].rows.len()) : (r += 1) {
+            while (r < chunk_rows_n) : (r += 1) {
                 const bucket_idx: usize = local.flat_bucket_ids.items[row_idx];
                 const pos = local.flat_next[bucket_idx];
                 flat_key_lo[pos] = src_key_lo[r];
                 flat_key_hi[pos] = src_key_hi[r];
-                flat_refresh[pos] = src_refresh[r];
-                flat_width[pos] = src_width[r];
+                var c: usize = 0;
+                while (c < ncols) : (c += 1) flat_cols[c][pos] = src_cols[c][r];
                 local.flat_next[bucket_idx] = pos + 1;
                 row_idx += 1;
             }
@@ -5422,14 +5734,7 @@ fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize
     var local_top: TopSet = .{};
     var b = worker_index;
     while (b < shared.buckets.len) : (b += worker_count) {
-        for (shared.buckets[b].states.items) |s| {
-            local_top.consider(.{
-                .key = s.key,
-                .count = s.count,
-                .refresh_sum = s.refresh_sum,
-                .width_sum = s.width_sum,
-            });
-        }
+        for (shared.buckets[b].states.items) |s| local_top.consider(topRowFromState(s));
     }
     top_out.* = local_top;
     if (profile) top_ticks.* += nowTicks() - top_t0;
@@ -5477,14 +5782,7 @@ fn siloElevatorWorkerErr(job: SiloElevatorJob) !void {
     var local_top: TopSet = .{};
     var b = job.worker_index;
     while (b < job.shared.bucket_count) : (b += job.worker_count) {
-        for (job.shared.buckets[b].states.items) |s| {
-            local_top.consider(.{
-                .key = s.key,
-                .count = s.count,
-                .refresh_sum = s.refresh_sum,
-                .width_sum = s.width_sum,
-            });
-        }
+        for (job.shared.buckets[b].states.items) |s| local_top.consider(topRowFromState(s));
     }
     job.top.* = local_top;
     if (job.profile) job.top_ticks.* += nowTicks() - top_t0;
@@ -5975,10 +6273,13 @@ pub const RunConfig = struct {
     raw_group_chunk_rows: usize = 0,
     raw_batch_chunks: usize = 4,
     group_rows_layout: GroupRowsLayout = .{},
+    scan_columns: ?[]const []const u8 = null,
+    filter_expr: ?thindb.exec.PredicateExpr = null,
     shared_stage_builders: bool = false,
     no_profile: bool = false,
     quiet: bool = false,
     result_out: ?*std.ArrayListUnmanaged(TopRow) = null,
+    result_all_groups: bool = false,
     trace_timing: bool = false,
     workspace: ?*SiloGridWorkspace = null,
 };
@@ -6015,11 +6316,14 @@ fn estimateGroupCountFromStats(stats: thindb.exec.PipelineStats, key_cols: usize
     return @min(est, @max(stats.upper_rows, 1));
 }
 
-fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.exec.PipelineStats, kind: QueryKind) usize {
+fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.exec.PipelineStats, kind: QueryKind, generic_key_count: usize, generic_key_width: GroupKeyWidth, generic_has_filter: bool) usize {
     const conservative_total = @max(@as(u64, 16), total_rows / 4);
-    const estimated_total = estimateGroupCountFromStats(stats, kind.groupKeyColumnCount()) orelse conservative_total;
-    const no_filter_near_unique = !kind.hasFilter() and estimated_total * 4 >= total_rows * 3;
-    const total_groups = if (no_filter_near_unique) estimated_total else conservative_total;
+    const key_count = if (generic_key_count != 0) generic_key_count else kind.groupKeyColumnCount();
+    const estimated_total = estimateGroupCountFromStats(stats, key_count) orelse conservative_total;
+    const has_filter = if (generic_key_count != 0) generic_has_filter else kind.hasFilter();
+    const generic_wide_no_filter = generic_key_count != 0 and !has_filter and (generic_key_width == .u96 or generic_key_width == .u128);
+    const no_filter_near_unique = !has_filter and estimated_total * 4 >= total_rows * 3;
+    const total_groups = if (generic_wide_no_filter) total_rows else if (no_filter_near_unique) estimated_total else conservative_total;
     const per_bucket = (total_groups + @as(u64, @intCast(bucket_count)) - 1) / @as(u64, @intCast(bucket_count));
     return @intCast(@max(@as(u64, 16), per_bucket));
 }
@@ -6061,14 +6365,7 @@ fn runSerialDirect(allocator: Allocator, table_ref: *thindb.api.Table, cfg: RunC
 
     const top_t0 = nowTicks();
     var top: TopSet = .{};
-    for (states.items) |s| {
-        top.consider(.{
-            .key = s.key,
-            .count = s.count,
-            .refresh_sum = s.refresh_sum,
-            .width_sum = s.width_sum,
-        });
-    }
+    for (states.items) |s| top.consider(topRowFromState(s));
     std.mem.sort(TopRow, top.items[0..top.len], {}, topLess);
     const top_ticks = nowTicks() - top_t0;
     const total_ticks = nowTicks() - total_t0;
@@ -6218,14 +6515,7 @@ fn runStream(allocator: Allocator, table: *thindb.api.Table, cpus: []const usize
     for (central) |*cb| {
         group_count += cb.states.items.len;
         var local_top: TopSet = .{};
-        for (cb.states.items) |s| {
-            local_top.consider(.{
-                .key = s.key,
-                .count = s.count,
-                .refresh_sum = s.refresh_sum,
-                .width_sum = s.width_sum,
-            });
-        }
+        for (cb.states.items) |s| local_top.consider(topRowFromState(s));
         for (local_top.items[0..local_top.len]) |candidate| top.consider(candidate);
     }
     std.mem.sort(TopRow, top.items[0..top.len], {}, topLess);
@@ -6542,14 +6832,7 @@ fn runPipe(allocator: Allocator, table: *thindb.api.Table, cpus: []const usize, 
         grouped_rows += bucket.row_count;
         if (!cfg.silo) {
             var local_top: TopSet = .{};
-            for (bucket.states.items) |s| {
-                local_top.consider(.{
-                    .key = s.key,
-                    .count = s.count,
-                    .refresh_sum = s.refresh_sum,
-                    .width_sum = s.width_sum,
-                });
-            }
+            for (bucket.states.items) |s| local_top.consider(topRowFromState(s));
             for (local_top.items[0..local_top.len]) |candidate| top.consider(candidate);
         }
     }
@@ -6836,7 +7119,13 @@ fn runSiloElevator(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const final_merge_ticks = nowTicks() - final_t0;
     const total_ticks = nowTicks() - total_t0;
     if (cfg.result_out) |out| {
-        try out.appendSlice(allocator, top.items[0..top.len]);
+        if (cfg.result_all_groups) {
+            for (buckets) |*bucket| {
+                for (bucket.states.items) |s| try out.append(allocator, topRowFromState(s));
+            }
+        } else {
+            try out.appendSlice(allocator, top.items[0..top.len]);
+        }
     }
 
     if (!cfg.quiet and cfg.no_profile) {
@@ -8031,7 +8320,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     seg_start[snap.segment_count] = total_rgs;
 
-    const scan_columns = if (cfg.scan_filter and cfg.kind.hasFilter() and table.memtable.row_count == 0)
+    const scan_columns = cfg.scan_columns orelse if (cfg.scan_filter and cfg.kind.hasFilter() and table.memtable.row_count == 0)
         cfg.kind.payloadColumns()
     else
         cfg.kind.columns();
@@ -8044,7 +8333,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             ticksToMs(nowTicks() - cleanup_t0, freq),
         });
     }
-    const expected_groups_per_bucket = expectedGroupsPerBucket(total, bucket_count, stats_scan.stats(), cfg.kind);
+    const expected_groups_per_bucket = expectedGroupsPerBucket(total, bucket_count, stats_scan.stats(), cfg.kind, group_rows_layout.key_columns.len, group_rows_layout.key_width, cfg.filter_expr != null);
     const init_groups_per_bucket = if (cfg.group_init_cap > 0)
         @max(@as(usize, 16), @min(expected_groups_per_bucket, cfg.group_init_cap))
     else
@@ -8170,6 +8459,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .raw_group_queues = raw_group_queues,
         .stage_builders = stage_builders,
         .group_rows_layout = group_rows_layout,
+        .generic_filter_required = cfg.filter_expr != null,
         .scan_threads = n_workers,
         .total_scan_rgs = total_rgs,
         .local_reserve_per_bucket = local_reserve_per_bucket,
@@ -8205,7 +8495,13 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
         scans[i] = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, false, snap);
-        if (cfg.scan_filter) _ = try applyScanFilter(scans[i], cfg.kind);
+        if (cfg.scan_filter) {
+            if (cfg.filter_expr) |expr| {
+                _ = try applyScanFilterExpr(scans[i], expr);
+            } else {
+                _ = try applyScanFilter(scans[i], cfg.kind);
+            }
+        }
         built_scans += 1;
         scans[i].setRange(0, 0, 0, 0, false);
     }
@@ -8378,7 +8674,13 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const total_ticks = nowTicks() - total_t0;
     const function_ticks = nowTicks() - function_t0;
     if (cfg.result_out) |out| {
-        try out.appendSlice(allocator, top.items[0..top.len]);
+        if (cfg.result_all_groups) {
+            for (buckets) |*bucket| {
+                for (bucket.states.items) |s| try out.append(allocator, topRowFromState(s));
+            }
+        } else {
+            try out.appendSlice(allocator, top.items[0..top.len]);
+        }
     }
     if (cfg.trace_timing) {
         std.debug.print(

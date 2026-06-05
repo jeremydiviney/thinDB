@@ -58,8 +58,40 @@ const Predicate = predicate.Predicate;
 const PredicateExpr = predicate.PredicateExpr;
 const PredicateOp = predicate.PredicateOp;
 const statsOverlapPredicate = predicate.statsOverlapPredicate;
+const filter_mod = @import("filter.zig");
 
 const rowloc = @import("rowloc.zig");
+
+/// Collect the schema indices of every column a predicate references (deduped),
+/// for any predicate shape the evaluator supports. Unknown column names are
+/// skipped — the evaluator surfaces them loudly if they are genuinely absent.
+fn collectPredicateColumns(
+    allocator: std.mem.Allocator,
+    expr: PredicateExpr,
+    schema: []const Column,
+    out: *std.ArrayListUnmanaged(usize),
+) !void {
+    const t = @import("../types.zig");
+    switch (expr) {
+        .leaf => |p| try addPredicateColumn(allocator, out, t.findColumn(schema, p.col)),
+        .leaf_col_col => |lc| {
+            try addPredicateColumn(allocator, out, t.findColumn(schema, lc.left));
+            try addPredicateColumn(allocator, out, t.findColumn(schema, lc.right));
+        },
+        .is_null, .is_not_null => |col_name| try addPredicateColumn(allocator, out, t.findColumn(schema, col_name)),
+        .like => |lp| try addPredicateColumn(allocator, out, t.findColumn(schema, lp.col)),
+        .in_set => |s| try addPredicateColumn(allocator, out, t.findColumn(schema, s.col)),
+        .@"and", .@"or" => |children| for (children) |child| try collectPredicateColumns(allocator, child, schema, out),
+        .not => |child| try collectPredicateColumns(allocator, child.*, schema, out),
+        else => {},
+    }
+}
+
+fn addPredicateColumn(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(usize), idx_opt: ?usize) !void {
+    const idx = idx_opt orelse return;
+    for (out.items) |e| if (e == idx) return;
+    try out.append(allocator, idx);
+}
 
 /// Build the per-projected-column propagated statistic for the whole scan:
 ///   - `ndv`: merge each column's per-segment HyperLogLog sketches
@@ -262,6 +294,11 @@ pub const Scan = struct {
 
     /// Pushed-down predicates used to skip row groups via min/max stats.
     prunes: std.ArrayList(PruneHint),
+    /// Pushed-down `IN (...)` set hints for the same min/max row-group skip.
+    in_prunes: std.ArrayListUnmanaged(InPruneHint) = .empty,
+    /// Owns the reordered AND/OR child arrays produced when cost-ordering the
+    /// fused predicate (see `orderFusedConjuncts`); freed in `deinit`.
+    filter_rewritten: std.ArrayListUnmanaged([]PredicateExpr) = .empty,
 
     /// Fused WHERE predicate (set via `tryFuseFilter`). When non-null the Scan
     /// evaluates it itself: for each row group it builds a BORROWED typed view
@@ -284,6 +321,25 @@ pub const Scan = struct {
     /// one slot per projected column. Reused across `next()` calls; the pins
     /// it holds are released within each call. Freed in `deinit`.
     borrow_blocks: []storage.ReadSegment.BorrowedBlock = &.{},
+
+    /// Fused-filter eval-only columns: table-schema indices referenced by
+    /// `fused_filter` that are NOT in `out_phys`. The scan decodes these per
+    /// row group purely to evaluate the predicate against blocks — they are
+    /// never emitted (the output stays exactly `out_phys`). Empty unless a
+    /// fused filter references unprojected columns (the V2 group-topN path);
+    /// the legacy path projects its filter columns, so this stays empty and
+    /// the whole mechanism is a no-op. Owned; freed in `deinit`.
+    filter_phys: []usize = &.{},
+    /// Eval schema = `out_schema` ++ the `filter_phys` columns, used to resolve
+    /// predicate column names. Owned; freed in `deinit`.
+    filter_eval_schema: []Column = &.{},
+    /// Scratch view array sized `out_schema.len + filter_phys.len`, presenting
+    /// the combined (output ++ filter-only) batch to the evaluator. Owned.
+    filter_eval_views: []ColumnView = &.{},
+    /// Owned decode of the `filter_phys` columns for the current row group
+    /// (segment path). Reused; released after each row group. Owned.
+    filter_decoded: []storage.OwnedColumn = &.{},
+    filter_decoded_valid: bool = false,
 
     /// The query memory accountant shared by every operator above this
     /// Scan (reached via `Query.accountant()`). Null = no tracking.
@@ -344,6 +400,14 @@ pub const Scan = struct {
         col_idx: usize,
         op: PredicateOp,
         val: Value,
+    };
+
+    /// Set-membership (`col IN (...)`) zone-map hint: a row group can be
+    /// skipped when none of `values` falls in the column's [min,max]. `values`
+    /// are the IN literals reduced to i128 (owned; freed in `deinit`).
+    pub const InPruneHint = struct {
+        col_idx: usize,
+        values: []i128,
     };
 
     /// Standalone scan: mints + owns its own accountant from the table's
@@ -687,6 +751,10 @@ pub const Scan = struct {
         if (self.coded_dicts_by_j.len > 0) self.allocator.free(self.coded_dicts_by_j);
         if (self.coded_slots.len > 0) self.allocator.free(self.coded_slots);
         self.prunes.deinit(self.allocator);
+        for (self.in_prunes.items) |hint| self.allocator.free(hint.values);
+        self.in_prunes.deinit(self.allocator);
+        for (self.filter_rewritten.items) |slice| self.allocator.free(slice);
+        self.filter_rewritten.deinit(self.allocator);
         if (self.owns_accountant) {
             if (self.owned_accountant) |a| self.allocator.destroy(a);
         }
@@ -697,6 +765,10 @@ pub const Scan = struct {
         }
         self.allocator.free(self.decoded);
         self.allocator.free(self.views);
+        if (self.filter_phys.len > 0) self.allocator.free(self.filter_phys);
+        if (self.filter_eval_schema.len > 0) self.allocator.free(self.filter_eval_schema);
+        if (self.filter_eval_views.len > 0) self.allocator.free(self.filter_eval_views);
+        if (self.filter_decoded.len > 0) self.allocator.free(self.filter_decoded);
         self.allocator.free(self.out_phys);
         if (self.out_schema_owned) self.allocator.free(@constCast(self.out_schema));
         // Drop our pinned memtable reference. If we held the last one and
@@ -760,8 +832,118 @@ pub const Scan = struct {
     pub fn tryFuseFilter(self: *Scan, expr: PredicateExpr) !bool {
         if (self.out_phys.len == 0) return false;
         if (self.fused_filter != null) return false;
-        self.fused_filter = expr;
+        // Coerce/validate the predicate's literals against the table schema
+        // (e.g. a text date literal `'2013-07-01'` → a date value). The legacy
+        // path does this in `Filter.create` before fusing; a directly-fused
+        // V2 filter would otherwise compare a date column to raw text and match
+        // nothing. Idempotent — re-validating an already-coerced expr is a
+        // no-op.
+        var coerced = expr;
+        try predicate.validateExpr(&coerced, self.table.schema.columns);
+        self.fused_filter = coerced;
+        try self.setupFilterEval(coerced);
+        try self.extractPruneHints(coerced);
+        try self.orderFusedConjuncts();
         return true;
+    }
+
+    /// Cost-order the fused predicate's conjuncts (cheapest/most-selective
+    /// first) so the evaluator's short-circuit skips already-excluded rows in
+    /// the costlier predicates — parity with the legacy Filter operator's
+    /// `simplifyPredicate`. Reordering is commutative, so results are
+    /// unchanged. Stats are passed as `.unknown` here (no per-column stats at
+    /// the scan), so ordering is by kernel cost; stats-based folding stays the
+    /// legacy operator's job.
+    fn orderFusedConjuncts(self: *Scan) !void {
+        const expr = self.fused_filter orelse return;
+        const schema = self.table.schema.columns;
+        const unknown_stats = try self.allocator.alloc(exec.ColStat, schema.len);
+        defer self.allocator.free(unknown_stats);
+        @memset(unknown_stats, .{});
+        self.fused_filter = try filter_mod.orderPredicate(self.allocator, &self.filter_rewritten, expr, schema, unknown_stats);
+    }
+
+    /// Walk the top-level AND conjuncts and register zone-map hints for each
+    /// comparison leaf (eq/neq/range, via `addPrune`) and each `IN (...)` set
+    /// (via `addInPrune`). Conjunction is sound for pruning: every conjunct
+    /// must hold, so a row group excluded by any one can be skipped. OR/NOT
+    /// subtrees are not descended — pruning a disjunct's column is unsound.
+    fn extractPruneHints(self: *Scan, expr: PredicateExpr) !void {
+        switch (expr) {
+            .@"and" => |children| for (children) |child| try self.extractPruneHints(child),
+            .leaf => |p| self.addPrune(p) catch {},
+            .in_set => |s| if (!s.negate) try self.addInPrune(s),
+            else => {},
+        }
+    }
+
+    fn addInPrune(self: *Scan, s: predicate.InSet) !void {
+        const col_idx = types.findColumn(self.table.schema.columns, s.col) orelse return;
+        if (!storage.format.typeHasStats(self.table.schema.columns[col_idx].type)) return;
+        var values = try self.allocator.alloc(i128, s.values.len);
+        errdefer self.allocator.free(values);
+        var n: usize = 0;
+        for (s.values) |v| {
+            if (predicate.valueToRangeI128(v)) |iv| {
+                values[n] = iv;
+                n += 1;
+            }
+        }
+        if (n == 0) {
+            self.allocator.free(values);
+            return;
+        }
+        try self.in_prunes.append(self.allocator, .{ .col_idx = col_idx, .values = values[0..n] });
+    }
+
+    /// Set up block-sourced evaluation for any predicate column not already in
+    /// the projection, so the fused filter evaluates without projecting those
+    /// columns into the output. No-op when every filter column is projected
+    /// (the legacy path) or under late-materialization (those paths project
+    /// their filter columns anyway).
+    fn setupFilterEval(self: *Scan, expr: PredicateExpr) !void {
+        if (self.emit_loc) return;
+        var refs: std.ArrayListUnmanaged(usize) = .empty;
+        defer refs.deinit(self.allocator);
+        try collectPredicateColumns(self.allocator, expr, self.table.schema.columns, &refs);
+
+        var extra: std.ArrayListUnmanaged(usize) = .empty;
+        errdefer extra.deinit(self.allocator);
+        for (refs.items) |phys| {
+            var projected = false;
+            for (self.out_phys) |o| {
+                if (o == phys) {
+                    projected = true;
+                    break;
+                }
+            }
+            if (!projected) try extra.append(self.allocator, phys);
+        }
+        if (extra.items.len == 0) {
+            extra.deinit(self.allocator);
+            return;
+        }
+        self.filter_phys = try extra.toOwnedSlice(self.allocator);
+        errdefer {
+            self.allocator.free(self.filter_phys);
+            self.filter_phys = &.{};
+        }
+        const out_w = self.out_schema.len;
+        const eval_schema = try self.allocator.alloc(Column, out_w + self.filter_phys.len);
+        errdefer self.allocator.free(eval_schema);
+        @memcpy(eval_schema[0..out_w], self.out_schema);
+        for (self.filter_phys, 0..) |phys, i| eval_schema[out_w + i] = self.table.schema.columns[phys];
+        self.filter_eval_schema = eval_schema;
+        self.filter_eval_views = try self.allocator.alloc(ColumnView, out_w + self.filter_phys.len);
+        errdefer self.allocator.free(self.filter_eval_views);
+        self.filter_decoded = try self.allocator.alloc(storage.OwnedColumn, self.filter_phys.len);
+    }
+
+    fn releaseFilterDecoded(self: *Scan) void {
+        if (self.filter_decoded_valid) {
+            for (self.filter_decoded) |*c| c.deinit(self.allocator);
+            self.filter_decoded_valid = false;
+        }
     }
 
     pub fn addPrune(self: *Scan, pred: Predicate) !void {
@@ -816,6 +998,17 @@ pub const Scan = struct {
         for (self.prunes.items) |hint| {
             const col_stats = rg.stats[hint.col_idx];
             if (!statsOverlapPredicate(col_stats, hint.op, hint.val)) return false;
+        }
+        for (self.in_prunes.items) |hint| {
+            const col_stats = rg.stats[hint.col_idx];
+            var any = false;
+            for (hint.values) |v| {
+                if (v >= col_stats.min and v <= col_stats.max) {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any) return false;
         }
         return true;
     }
@@ -1229,7 +1422,14 @@ pub const Scan = struct {
             defer self.allocator.free(mem_views);
             for (self.out_phys, 0..) |phys, j| mem_views[j] = self.memtable_snap.columns[phys].view();
 
-            const matched = try self.evalAndCompact(mem_views, n, null, expr, .memtable);
+            const matched = if (self.filter_phys.len == 0)
+                try self.evalAndCompact(mem_views, self.out_schema, mem_views.len, n, null, expr, .memtable)
+            else blk: {
+                const oc = mem_views.len;
+                @memcpy(self.filter_eval_views[0..oc], mem_views);
+                for (self.filter_phys, 0..) |phys, j| self.filter_eval_views[oc + j] = self.memtable_snap.columns[phys].view();
+                break :blk try self.evalAndCompact(self.filter_eval_views[0 .. oc + self.filter_phys.len], self.filter_eval_schema, oc, n, null, expr, .memtable);
+            };
             if (matched == 0) return null;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
             return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded };
@@ -1271,14 +1471,33 @@ pub const Scan = struct {
         // can't be viewed (misalignment / big-endian).
         if (try self.tryBorrowViews(seg, rg_idx, rg_count)) |borrow| {
             defer for (borrow.blocks) |*b| b.release(self.allocator, &self.table.cache);
-            return self.evalAndCompact(borrow.views, rg_count, tomb_mask, expr, .{ .segment = rg_idx });
+            return self.evalAndCompactSegment(seg, rg_idx, rg_count, borrow.views, tomb_mask, expr, .{ .segment = rg_idx });
         }
 
         // Fallback: owned decode (as the non-fused path), then evaluate +
         // compact through the same kernel.
         const owned_views = try self.decodeOwnedViews(seg, rg_idx, rg_count);
         defer self.releaseDecoded();
-        return self.evalAndCompact(owned_views, rg_count, tomb_mask, expr, .{ .segment = rg_idx });
+        return self.evalAndCompactSegment(seg, rg_idx, rg_count, owned_views, tomb_mask, expr, .{ .segment = rg_idx });
+    }
+
+    /// Evaluate the fused predicate for one segment row group. When the filter
+    /// references unprojected columns (`filter_phys`), owned-decode those from
+    /// the same row group, present them to the evaluator alongside `out_views`,
+    /// and release them after — they never reach the output.
+    fn evalAndCompactSegment(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, out_views: []const ColumnView, tomb_mask: ?[]const bool, expr: PredicateExpr, loc: SurvivorLoc) !usize {
+        if (self.filter_phys.len == 0) {
+            return self.evalAndCompact(out_views, self.out_schema, out_views.len, rg_count, tomb_mask, expr, loc);
+        }
+        for (self.filter_phys, 0..) |phys, j| {
+            self.filter_decoded[j] = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+        }
+        self.filter_decoded_valid = true;
+        defer self.releaseFilterDecoded();
+        const oc = out_views.len;
+        @memcpy(self.filter_eval_views[0..oc], out_views);
+        for (self.filter_decoded, 0..) |c, j| self.filter_eval_views[oc + j] = c.view();
+        return self.evalAndCompact(self.filter_eval_views[0 .. oc + self.filter_phys.len], self.filter_eval_schema, oc, rg_count, tomb_mask, expr, loc);
     }
 
     /// FOR-aware fused filter (Phase 2B + per-leaf AND generalization). Handles a
@@ -2104,10 +2323,14 @@ pub const Scan = struct {
     /// `tomb_mask` (true = keep), and compact survivors into `filtered`. When
     /// late-mat (`emit_loc`), also packs each survivor's `__rowloc` per `loc`.
     /// Returns the survivor count.
-    fn evalAndCompact(self: *Scan, views: []const ColumnView, n: usize, tomb_mask: ?[]const bool, expr: PredicateExpr, loc: SurvivorLoc) !usize {
+    /// Evaluate `expr` over `eval_views`/`eval_schema` (which may carry trailing
+    /// filter-only columns past `out_count`), AND in the optional `tomb_mask`,
+    /// and compact only the first `out_count` (output) columns into `filtered`.
+    /// `out_count == eval_views.len` whenever there are no filter-only columns.
+    fn evalAndCompact(self: *Scan, eval_views: []const ColumnView, eval_schema: []const Column, out_count: usize, n: usize, tomb_mask: ?[]const bool, expr: PredicateExpr, loc: SurvivorLoc) !usize {
         const mask = try self.ensureMask(n);
-        const batch = Batch{ .schema = self.out_schema, .values = views, .row_count = n };
-        try predicate.evaluateExprGuided(self.allocator, expr, self.out_schema, batch, mask, null);
+        const batch = Batch{ .schema = eval_schema, .values = eval_views, .row_count = n };
+        try predicate.evaluateExprGuided(self.allocator, expr, eval_schema, batch, mask, null);
         if (tomb_mask) |tm| {
             for (mask[0..n], tm) |*m, keep| m.* = m.* and keep;
         }
@@ -2123,9 +2346,10 @@ pub const Scan = struct {
 
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
-        // `filtered_cols` carries a trailing `__rowloc` buffer under emit_loc;
-        // the projected columns are the first `views.len`.
-        for (views, filtered_cols[0..views.len], 0..) |src, *dst, j| {
+        // Only the first `out_count` columns are emitted; any trailing entries
+        // in `eval_views` are filter-only and stay inside the scan. (Under
+        // emit_loc `filtered_cols` also carries a trailing `__rowloc` buffer.)
+        for (eval_views[0..out_count], filtered_cols[0..out_count], 0..) |src, *dst, j| {
             // Coded group key: intern just the survivors' strings into the code
             // buffer (the views are already decoded here); placeholder in the
             // value column. The aggregate reads the sidecar codes.

@@ -2,8 +2,8 @@
 //!
 //! Parser, SQL lowering, and IR stay unchanged. The local compile path hands
 //! the resolved IR block here first; when V2 can build the selected physical
-//! shape it returns an executable Query, otherwise the existing engine remains
-//! the fallback.
+//! shape it returns an executable Query, otherwise the caller receives an
+//! unsupported-shape error for that V2-owned path.
 
 const std = @import("std");
 
@@ -12,7 +12,6 @@ const types = @import("../types.zig");
 const ir = @import("../ir/ir.zig");
 const exec = @import("exec.zig");
 const v2_pipeline = @import("v2_pipeline.zig");
-const v2_group_topn = @import("v2_group_topn.zig");
 
 pub const SourceKind = enum {
     table_scan,
@@ -61,11 +60,58 @@ pub const CompileInput = struct {
 /// it classifies supported simple shapes, then declines until the concrete V2
 /// builders are introduced for those shapes.
 pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
-    if (getenv("THINDB_ENGINE_V2") == null) return null;
-    const spec = classifySimplePipeline(root) orelse return null;
+    // Engine V2 is the default path for SELECT-shaped queries. Setting
+    // THINDB_ENGINE_V1 reverts the whole compile path to the legacy engine.
+    if (getenv("THINDB_ENGINE_V1") != null) return null;
+    // Side-effecting statements (DDL/DML/SET/SHOW/EXPLAIN/...) are not the V2
+    // engine's concern; the legacy compile path owns them.
+    if (!isSelectQuery(root)) return null;
+    // Every SELECT shape is now V2's responsibility: build it or fail. There is
+    // deliberately no fallback to the legacy operator engine for these.
+    const spec = classifySimplePipeline(root) orelse return error.UnsupportedQueryShape;
     return switch (spec.shape) {
-        .group_topn => try buildGroupTopN(input, root),
-        else => null,
+        // All three grouped shapes share one builder: the group-topN core
+        // already emits every group (no LIMIT) and sorts on demand (ORDER BY),
+        // so full-sort and bare-aggregate are just the limit/order-optional
+        // forms of the same pipeline.
+        .group_topn, .group_full_sort, .group_aggregate => (try buildGroupTopN(input, root)) orelse return error.UnsupportedQueryShape,
+        else => error.UnsupportedQueryShape,
+    };
+}
+
+/// A row-producing SELECT query, as opposed to a side-effecting statement
+/// (DDL/DML/SET/SHOW/EXPLAIN). Distinguished by the root op tag: queries are
+/// rooted in a pipeline operator, statements in their own dedicated op.
+fn isSelectQuery(op: *const ir.Op) bool {
+    return switch (op.*) {
+        .scan,
+        .limit,
+        .select,
+        .exclude,
+        .filter,
+        .order_by,
+        .group_by,
+        .compute,
+        .join,
+        .materialize,
+        .window,
+        .set_union,
+        .single_row,
+        .file_scan,
+        .alias,
+        => true,
+        .ddl,
+        .show,
+        .insert,
+        .batch,
+        .copy,
+        .create_table_as,
+        .insert_select,
+        .set_var,
+        .delete_op,
+        .update_op,
+        .explain,
+        => false,
     };
 }
 
@@ -169,8 +215,8 @@ const GroupTopNPlan = struct {
     scan: ir.Op.Scan,
     where_filter: ?ir.Op.Filter,
     group_by: ir.Op.GroupBy,
-    order_by: ir.Op.OrderBy,
-    limit: ir.Op.Limit,
+    order_by: ?ir.Op.OrderBy,
+    limit: ?ir.Op.Limit,
 };
 
 fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
@@ -181,12 +227,18 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
         op = op.select.upstream;
     }
 
-    if (op.* != .limit) return null;
-    const limit = op.limit;
-    if (limit.upstream.* != .order_by) return null;
-    const order_by = limit.upstream.order_by;
-    if (order_by.upstream.* != .group_by) return null;
-    const group_by = order_by.upstream.group_by;
+    var limit: ?ir.Op.Limit = null;
+    var order_by: ?ir.Op.OrderBy = null;
+    if (op.* == .limit) {
+        limit = op.limit;
+        op = op.limit.upstream;
+    }
+    if (op.* == .order_by) {
+        order_by = op.order_by;
+        op = op.order_by.upstream;
+    }
+    if (op.* != .group_by) return null;
+    const group_by = op.group_by;
     if (group_by.group_cols.len == 0) return null;
     if (top_project) |p| {
         if (!projectMatchesGroupOutput(p, group_by)) return null;
@@ -238,9 +290,9 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const request = v2_pipeline.GroupTopNRequest{
         .group_cols = plan.group_by.group_cols,
         .aggs = plan.group_by.aggs,
-        .order_specs = plan.order_by.specs,
-        .limit = @intCast(plan.limit.n),
-        .offset = @intCast(plan.limit.offset),
+        .order_specs = if (plan.order_by) |o| o.specs else &.{},
+        .limit = if (plan.limit) |l| @intCast(l.n) else 0,
+        .offset = if (plan.limit) |l| @intCast(l.offset) else 0,
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .needed = needed,
         .dop = input.db.config.max_dop,
@@ -250,39 +302,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         return q;
     }
 
-    if (try v2_group_topn.tryCreate(input.allocator, table, .{
-        .group_cols = request.group_cols,
-        .aggs = request.aggs,
-        .order_specs = request.order_specs,
-        .limit = request.limit,
-        .offset = request.offset,
-        .where_filter = request.where_filter,
-        .needed = request.needed,
-        .dop = request.dop,
-    })) |q| {
-        return q;
-    }
-
-    var cur = if (input.db.config.max_dop > 1)
-        try exec.ParallelScan.create(input.allocator, table, null, needed, input.db.config.max_dop)
-    else
-        try exec.scanWithProjection(input.allocator, table, null, needed);
-    var owns_cur = true;
-    errdefer if (owns_cur) cur.deinit();
-
-    if (plan.where_filter) |f| {
-        cur = try cur.filter(f.predicate);
-    }
-
-    const top_k_n = std.math.cast(u32, plan.limit.n +| plan.limit.offset) orelse return null;
-    const top_k = ir.Op.TopK{
-        .k = top_k_n,
-        .keys = plan.order_by.specs,
-    };
-    cur = try cur.groupByTopK(plan.group_by.group_cols, plan.group_by.aggs, top_k, null);
-    cur = try cur.topN(plan.order_by.specs, @intCast(plan.limit.n), @intCast(plan.limit.offset));
-    owns_cur = false;
-    return cur;
+    return error.UnsupportedQueryShape;
 }
 
 fn projectedBaseColumns(

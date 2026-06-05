@@ -124,6 +124,17 @@ const TopRows = struct {
     }
 };
 
+const FinalRows = struct {
+    allocator: Allocator,
+    items: []HarnessCore.TopRow = &.{},
+    owned: bool = false,
+
+    fn deinit(self: *FinalRows) void {
+        if (self.owned and self.items.len > 0) self.allocator.free(self.items);
+        self.* = .{ .allocator = self.allocator };
+    }
+};
+
 pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Query {
     const plan = validateShape(table, request) orelse return null;
     traceAccepted(request, plan);
@@ -231,7 +242,9 @@ const GroupTopNPipeline = struct {
         var rows = try runGroupTopNStage(&ctx);
         defer rows.deinit();
         const emit_t0 = exec.prof.nowTicks();
-        try emitResultStage(self, rows.items);
+        var final_rows = try prepareFinalRows(self, rows.items);
+        defer final_rows.deinit();
+        try emitResultStage(self, final_rows.items);
         ctx.times.emit_ticks = exec.prof.nowTicks() - emit_t0;
         traceProfile(ctx);
     }
@@ -291,22 +304,46 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .state_index = agg_plan.state_index,
         };
     }
+    var group_key_inputs: [MAX_GROUP_KEYS]GroupTopNEngine.GroupKeyInput = undefined;
+    i = 0;
+    while (i < ctx.plan.layout.part_count) : (i += 1) {
+        const part = ctx.plan.layout.parts[i];
+        group_key_inputs[i] = .{
+            .name = part.name,
+            .source_type = part.typ,
+            .offset_bits = part.offset_bits,
+            .width_bits = part.width_bits,
+        };
+    }
+    // Only the group keys + aggregate inputs are projected. The scan sources
+    // any filter-only columns itself (fused, block-sourced eval) — they never
+    // enter this projection or the staged output.
+    var scan_columns: [MAX_GROUP_KEYS + MAX_AGG_INPUTS][]const u8 = undefined;
+    const scan_column_count = buildCoreScanColumns(
+        &scan_columns,
+        group_key_inputs[0..ctx.plan.layout.part_count],
+        aggregate_inputs[0..ctx.plan.aggregate_input_count],
+    );
 
     var result = try GroupTopNEngine.run(core_allocator, .{
         .table = ctx.table,
-        .kind = ctx.plan.core_kind,
+        .kind = .generic,
         .shape = .{
             .key_width = GroupTopNEngine.KeyWidth.fromBits(ctx.plan.layout.total_bits),
             .key_bits = ctx.plan.layout.total_bits,
             .group_key_count = ctx.plan.layout.part_count,
+            .group_key_inputs = group_key_inputs[0..ctx.plan.layout.part_count],
             .aggregate_inputs = aggregate_inputs[0..ctx.plan.aggregate_input_count],
             .aggregate_program = aggregate_program[0..ctx.plan.aggregate_count],
             .has_filter = ctx.request.where_filter != null,
             .order_by_count_desc = true,
             .limit = ctx.request.limit,
             .offset = ctx.request.offset,
+            .emit_all_groups = !canUseCoreCountDescTopN(ctx),
         },
         .params = params,
+        .scan_columns = scan_columns[0..scan_column_count],
+        .filter_expr = ctx.request.where_filter,
     });
 
     ctx.times.run_core_ticks = exec.prof.nowTicks() - t0 - result.times.workspace_teardown_ticks;
@@ -316,10 +353,166 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
     return .{ .allocator = result.allocator, .items = rows };
 }
 
+fn buildCoreScanColumns(
+    out: *[MAX_GROUP_KEYS + MAX_AGG_INPUTS][]const u8,
+    group_key_inputs: []const GroupTopNEngine.GroupKeyInput,
+    aggregate_inputs: []const GroupTopNEngine.AggregateInput,
+) usize {
+    var len: usize = 0;
+    for (group_key_inputs) |input| {
+        len = appendUniqueColumn(out, len, input.name);
+    }
+    for (aggregate_inputs) |input| {
+        len = appendUniqueColumn(out, len, input.source_name);
+    }
+    return len;
+}
+
+fn appendUniqueColumn(out: *[MAX_GROUP_KEYS + MAX_AGG_INPUTS][]const u8, len: usize, name: []const u8) usize {
+    if (name.len == 0) return len;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        if (types.columnNameEql(out[i], name)) return len;
+    }
+    out[len] = name;
+    return len + 1;
+}
+
+fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
+    if (ctx.request.order_specs.len != 1) return false;
+    if (!ctx.request.order_specs[0].desc) return false;
+    if (ctx.request.limit == 0) return false;
+    if (ctx.request.limit + ctx.request.offset > 10) return false;
+    for (ctx.plan.aggregates[0..ctx.plan.aggregate_count]) |agg| {
+        if (agg.func == .count and types.columnNameEql(agg.name, ctx.request.order_specs[0].col)) return true;
+    }
+    return false;
+}
+
+fn prepareFinalRows(op: *GroupTopNPipeline, rows: []HarnessCore.TopRow) !FinalRows {
+    if (rows.len == 0) return .{ .allocator = op.allocator };
+    if (op.request.order_specs.len == 0) {
+        const start = @min(op.request.offset, rows.len);
+        const end = limitEnd(start, rows.len, op.request.limit);
+        return .{ .allocator = op.allocator, .items = rows[start..end] };
+    }
+
+    if (op.request.limit == 0) {
+        std.mem.sort(HarnessCore.TopRow, rows, op, finalRowLess);
+        return .{ .allocator = op.allocator, .items = rows };
+    }
+
+    const keep = @min(rows.len, op.request.limit + op.request.offset);
+    if (keep == 0) return .{ .allocator = op.allocator };
+    var candidates = try op.allocator.alloc(HarnessCore.TopRow, keep);
+    errdefer op.allocator.free(candidates);
+    var len: usize = 0;
+    var worst_i: usize = 0;
+    for (rows) |row| {
+        if (len < keep) {
+            candidates[len] = row;
+            if (len == 0 or finalRowLess(op, candidates[worst_i], row)) worst_i = len;
+            len += 1;
+            continue;
+        }
+        if (!finalRowLess(op, row, candidates[worst_i])) continue;
+        candidates[worst_i] = row;
+        worst_i = 0;
+        var i: usize = 1;
+        while (i < len) : (i += 1) {
+            if (finalRowLess(op, candidates[worst_i], candidates[i])) worst_i = i;
+        }
+    }
+    std.mem.sort(HarnessCore.TopRow, candidates[0..len], op, finalRowLess);
+    const start = @min(op.request.offset, len);
+    const end = limitEnd(start, len, op.request.limit);
+    const emit_len = end - start;
+    if (start != 0 and emit_len != 0) std.mem.copyForwards(HarnessCore.TopRow, candidates[0..emit_len], candidates[start..end]);
+    return .{ .allocator = op.allocator, .items = candidates[0..emit_len], .owned = true };
+}
+
+fn limitEnd(start: usize, len: usize, limit: usize) usize {
+    if (limit == 0) return len;
+    return @min(len, start + limit);
+}
+
+fn finalRowLess(op: *GroupTopNPipeline, a: HarnessCore.TopRow, b: HarnessCore.TopRow) bool {
+    for (op.request.order_specs) |spec| {
+        const cmp = compareOutputValue(op, spec.col, a, b) catch 0;
+        if (cmp == 0) continue;
+        return if (spec.desc) cmp > 0 else cmp < 0;
+    }
+    return a.key < b.key;
+}
+
+fn compareOutputValue(op: *GroupTopNPipeline, name: []const u8, a: HarnessCore.TopRow, b: HarnessCore.TopRow) !i8 {
+    for (op.plan.layout.parts[0..op.plan.layout.part_count]) |part| {
+        if (types.columnNameEql(name, part.name)) {
+            return compareI128(keyPartValue(part, a.key), keyPartValue(part, b.key));
+        }
+    }
+    for (op.plan.aggregates[0..op.plan.aggregate_count]) |agg_plan| {
+        if (types.columnNameEql(name, agg_plan.name)) {
+            return compareAggregateValue(agg_plan, a, b);
+        }
+    }
+    return error.UnsupportedOrderBy;
+}
+
+fn compareAggregateValue(agg_plan: AggregatePlan, a: HarnessCore.TopRow, b: HarnessCore.TopRow) i8 {
+    return switch (agg_plan.func) {
+        .count => compareU64(a.count, b.count),
+        .sum, .min, .max => compareI128(rowStateValue(a, agg_plan.state_index), rowStateValue(b, agg_plan.state_index)),
+        .avg => compareF64(avgValue(a, agg_plan.state_index), avgValue(b, agg_plan.state_index)),
+        else => 0,
+    };
+}
+
+fn avgValue(row: HarnessCore.TopRow, state_index: u16) f64 {
+    return if (row.count == 0) 0.0 else @as(f64, @floatFromInt(rowStateValue(row, state_index))) / @as(f64, @floatFromInt(row.count));
+}
+
+fn rowStateValue(row: HarnessCore.TopRow, state_index: u16) i128 {
+    return switch (state_index) {
+        0 => @intCast(row.count),
+        1 => row.refresh_sum,
+        2 => row.width_sum,
+        3 => row.extra_sum,
+        else => 0,
+    };
+}
+
+fn keyPartValue(part: KeyPart, key: u128) i128 {
+    const raw = (key >> @intCast(part.offset_bits)) & ((@as(u128, 1) << @intCast(part.width_bits)) - 1);
+    return switch (part.typ) {
+        .boolean, .tinyint => @as(i8, @bitCast(@as(u8, @truncate(raw)))),
+        .smallint => @as(i16, @bitCast(@as(u16, @truncate(raw)))),
+        .int, .date => @as(i32, @bitCast(@as(u32, @truncate(raw)))),
+        .bigint, .datetime, .decimal64 => @as(i64, @bitCast(@as(u64, @truncate(raw)))),
+        else => @intCast(raw),
+    };
+}
+
+fn compareI128(a: i128, b: i128) i8 {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
+fn compareU64(a: u64, b: u64) i8 {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
+fn compareF64(a: f64, b: f64) i8 {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
 fn emitResultStage(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !void {
-    const start = @min(op.request.offset, rows.len);
-    const end = @min(rows.len, start + op.request.limit);
-    for (rows[start..end]) |row| {
+    for (rows) |row| {
         for (op.plan.layout.parts[0..op.plan.layout.part_count], 0..) |part, i| {
             try appendKeyPart(op.allocator, &op.output_cols[i], part, row.key);
         }
@@ -333,10 +526,10 @@ fn emitResultStage(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !vo
 fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: AggregatePlan, row: HarnessCore.TopRow) !void {
     switch (agg_plan.func) {
         .count => try col.data.bigint.append(allocator, @intCast(row.count)),
-        .sum => try appendIntegerAggregate(allocator, col, agg_plan.output_type, row.refresh_sum),
+        .sum, .min, .max => try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index)),
         .avg => try col.data.double.append(
             allocator,
-            if (row.count == 0) 0.0 else @as(f64, @floatFromInt(row.width_sum)) / @as(f64, @floatFromInt(row.count)),
+            avgValue(row, agg_plan.state_index),
         ),
         else => return error.UnsupportedOperatorForType,
     }
@@ -345,37 +538,28 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
 fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
     if (request.group_cols.len == 0 or request.group_cols.len > MAX_GROUP_KEYS) return traceDecline(request, "group key count");
     if (request.aggs.len == 0 or request.aggs.len > MAX_AGGS) return traceDecline(request, "aggregate count");
-    if (request.order_specs.len != 1) return traceDecline(request, "order key count");
-    if (request.limit == 0) return traceDecline(request, "zero limit");
-
-    var count_order_found = false;
-    for (request.aggs) |agg| {
-        if (agg.func == .count and types.columnNameEql(request.order_specs[0].col, agg.as)) {
-            count_order_found = true;
-            break;
-        }
-    }
-    if (!count_order_found or !request.order_specs[0].desc) return traceDecline(request, "order key");
-
     var parts: [MAX_GROUP_KEYS]KeyPart = undefined;
     var offset: u8 = 0;
     for (request.group_cols, 0..) |name, i| {
         const idx = types.findColumn(table.schema.columns, name) orelse return traceDecline(request, "group key column");
         const typ = table.schema.columns[idx].type;
         const width = intTypeBits(typ) orelse return traceDecline(request, "group key type");
+        // Keys bit-pack into the staged raw-row key, which is u64 lo + u32 hi =
+        // 96 bits today. 97-128-bit keys (e.g. two 64-bit fields) silently lose
+        // the top bits until the staged key is widened to a full u128 (Row /
+        // RawRows key_hi u32 -> u64). DuckDB-verified: raising this to 128 with
+        // the 96-bit stage truncates the high field. Keep at 96 until widened.
         if (offset + width > 96) return traceDecline(request, "group key width");
         parts[i] = .{ .name = name, .typ = typ, .offset_bits = offset, .width_bits = width };
         offset += width;
     }
 
-    const core_kind = classifyClickBenchCoreKind(request) orelse return traceDecline(request, "core adapter");
-
     var aggregate_inputs: [MAX_AGG_INPUTS]AggregateInputPlan = undefined;
     var aggregate_input_count: usize = 0;
     var aggregates: [MAX_AGGS]AggregatePlan = undefined;
+    var next_numeric_state_index: u16 = 1;
     for (request.aggs, 0..) |agg, agg_i| {
         if (agg_i >= MAX_AGGS) return traceDecline(request, "aggregate count");
-        const state_index: u16 = @intCast(agg_i);
         switch (agg.func) {
             .count => {
                 const input_column_index = if (agg.col) |col_name| blk: {
@@ -387,11 +571,12 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
                     .func = agg.func,
                     .input_column_index = input_column_index,
                     .input_type = .u64,
-                    .state_index = state_index,
+                    .state_index = 0,
                     .output_type = aggregate.aggOutputTypeFor(agg, if (agg.col) |col_name| columnType(table, col_name) orelse return traceDecline(request, "count input type") else null) catch return null,
                 };
             },
-            .sum, .avg => {
+            .sum, .avg, .min, .max => {
+                if (next_numeric_state_index >= 4) return traceDecline(request, "aggregate state count");
                 const col_name = agg.col orelse return traceDecline(request, "aggregate column");
                 const input_idx = addAggregateInput(table, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
                 const input_type = columnType(table, col_name) orelse return traceDecline(request, "aggregate type");
@@ -402,22 +587,34 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
                     .func = agg.func,
                     .input_column_index = input_idx,
                     .input_type = physicalTypeFor(input_type),
-                    .state_index = state_index,
+                    .state_index = next_numeric_state_index,
                     .output_type = output_type,
                 };
+                next_numeric_state_index += 1;
             },
             else => return traceDecline(request, "aggregate func"),
+        }
+    }
+    for (request.order_specs) |spec| {
+        if (!outputColumnExists(parts[0..request.group_cols.len], aggregates[0..request.aggs.len], spec.col)) {
+            return traceDecline(request, "order key");
         }
     }
 
     return .{
         .layout = .{ .parts = parts, .part_count = request.group_cols.len, .total_bits = offset },
-        .core_kind = core_kind,
+        .core_kind = .generic,
         .aggregate_inputs = aggregate_inputs,
         .aggregate_input_count = aggregate_input_count,
         .aggregates = aggregates,
         .aggregate_count = request.aggs.len,
     };
+}
+
+fn outputColumnExists(parts: []const KeyPart, aggregates: []const AggregatePlan, name: []const u8) bool {
+    for (parts) |part| if (types.columnNameEql(part.name, name)) return true;
+    for (aggregates) |agg| if (types.columnNameEql(agg.name, name)) return true;
+    return false;
 }
 
 fn classifyClickBenchCoreKind(request: Request) ?HarnessCore.QueryKind {
@@ -523,9 +720,9 @@ fn appendKeyPart(allocator: Allocator, col: *ColumnStore, part: KeyPart, key: u1
     }
 }
 
-fn appendIntegerAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i64) !void {
+fn appendIntegerAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i128) !void {
     switch (out_type) {
-        .bigint => try col.data.bigint.append(allocator, value),
+        .bigint => try col.data.bigint.append(allocator, @intCast(value)),
         .largeint => try col.data.largeint.append(allocator, value),
         .double => try col.data.double.append(allocator, @floatFromInt(value)),
         else => return error.TypeMismatch,

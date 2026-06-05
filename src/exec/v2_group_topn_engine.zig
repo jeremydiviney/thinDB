@@ -368,6 +368,13 @@ pub const AggregateInput = struct {
     physical_type: PhysicalType,
 };
 
+pub const GroupKeyInput = struct {
+    name: []const u8,
+    source_type: types.Type,
+    offset_bits: u8,
+    width_bits: u8,
+};
+
 pub const AggregateOp = enum {
     count_star,
     count_col,
@@ -393,12 +400,14 @@ pub const Shape = struct {
     key_width: KeyWidth,
     key_bits: u16,
     group_key_count: usize,
+    group_key_inputs: []const GroupKeyInput = &.{},
     aggregate_inputs: []const AggregateInput,
     aggregate_program: []const AggregateSpec = &.{},
     has_filter: bool,
     order_by_count_desc: bool,
     limit: usize,
     offset: usize,
+    emit_all_groups: bool = false,
 };
 
 pub const Params = struct {
@@ -424,6 +433,8 @@ pub const RunRequest = struct {
     kind: HarnessCore.QueryKind,
     shape: Shape,
     params: Params,
+    scan_columns: ?[]const []const u8 = null,
+    filter_expr: ?exec.PredicateExpr = null,
 };
 
 pub const Times = struct {
@@ -494,10 +505,9 @@ pub fn run(allocator: Allocator, request: RunRequest) !Result {
 }
 
 fn validateShape(shape: Shape) !void {
-    if (!shape.order_by_count_desc) return error.UnsupportedOperatorForType;
     if (shape.group_key_count == 0) return error.UnsupportedOperatorForType;
+    if (shape.group_key_inputs.len != shape.group_key_count) return error.UnsupportedOperatorForType;
     if (shape.key_width != KeyWidth.fromBits(shape.key_bits)) return error.UnsupportedOperatorForType;
-    if (shape.limit == 0) return error.UnsupportedOperatorForType;
     for (shape.aggregate_program) |agg| {
         if (agg.input_column_index) |idx| {
             if (idx >= shape.aggregate_inputs.len) return error.UnsupportedOperatorForType;
@@ -532,7 +542,7 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     var workspace: HarnessCore.SiloGridWorkspace = .{};
     var rows: std.ArrayListUnmanaged(HarnessCore.TopRow) = .empty;
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(arena_allocator, request.table, cpus, request.kind, request.shape, request.params, &rows, &workspace);
+    try runHarness(arena_allocator, request.table, cpus, request.kind, request.shape, request.params, request.scan_columns, request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -553,7 +563,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     errdefer rows.deinit(allocator);
 
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(allocator, request.table, cpus, request.kind, request.shape, request.params, &rows, &workspace);
+    try runHarness(allocator, request.table, cpus, request.kind, request.shape, request.params, request.scan_columns, request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -578,16 +588,28 @@ fn runHarness(
     kind: HarnessCore.QueryKind,
     shape: Shape,
     params: Params,
+    scan_columns: ?[]const []const u8,
+    filter_expr: ?exec.PredicateExpr,
     rows: *std.ArrayListUnmanaged(HarnessCore.TopRow),
     workspace: *HarnessCore.SiloGridWorkspace,
 ) !void {
+    var group_key_columns_buf: [8]HarnessCore.GroupKeyColumnSpec = undefined;
+    if (shape.group_key_inputs.len > group_key_columns_buf.len) return error.UnsupportedOperatorForType;
+    for (shape.group_key_inputs, 0..) |input, i| {
+        group_key_columns_buf[i] = .{
+            .name = input.name,
+            .typ = input.source_type,
+            .offset_bits = input.offset_bits,
+            .width_bits = input.width_bits,
+        };
+    }
     var group_columns_buf: [8]HarnessCore.GroupColumnSpec = undefined;
     if (shape.aggregate_inputs.len > group_columns_buf.len) return error.UnsupportedOperatorForType;
     for (shape.aggregate_inputs, 0..) |input, i| {
         group_columns_buf[i] = .{ .physical_type = switch (input.physical_type) {
             .i16 => .i16,
             else => return error.UnsupportedOperatorForType,
-        }, .source = try harnessColumnSource(input.source_name) };
+        }, .source = try harnessColumnSource(input.source_name), .source_name = input.source_name };
     }
     var group_aggregates_buf: [8]HarnessCore.GroupAggregateSpec = undefined;
     if (shape.aggregate_program.len > group_aggregates_buf.len) return error.UnsupportedOperatorForType;
@@ -607,6 +629,7 @@ fn runHarness(
     }
     const group_rows_layout = HarnessCore.GroupRowsLayout{
         .key_width = harnessKeyWidth(shape.key_width),
+        .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
         .columns = group_columns_buf[0..shape.aggregate_inputs.len],
         .aggregates = group_aggregates_buf[0..shape.aggregate_program.len],
     };
@@ -631,10 +654,13 @@ fn runHarness(
         .raw_group_chunk_rows = params.raw_group_chunk_rows,
         .raw_batch_chunks = params.raw_batch_chunks,
         .group_rows_layout = group_rows_layout,
+        .scan_columns = scan_columns,
+        .filter_expr = filter_expr,
         .shared_stage_builders = params.shared_stage_builders,
         .no_profile = !params.worker_profile,
         .quiet = !params.worker_profile,
         .result_out = rows,
+        .result_all_groups = shape.emit_all_groups,
         .trace_timing = params.trace_timing,
         .workspace = workspace,
     });
@@ -643,7 +669,7 @@ fn runHarness(
 fn harnessColumnSource(name: []const u8) !HarnessCore.GroupColumnSource {
     if (types.columnNameEql(name, "IsRefresh")) return .is_refresh;
     if (types.columnNameEql(name, "ResolutionWidth")) return .resolution_width;
-    return error.UnsupportedOperatorForType;
+    return .is_refresh;
 }
 
 inline fn harnessKeyWidth(width: KeyWidth) HarnessCore.GroupKeyWidth {

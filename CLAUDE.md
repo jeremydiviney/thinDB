@@ -204,6 +204,16 @@ test "decimal addition propagates precision correctly" {
 - **Integration tests** in `tests/integration/` for end-to-end scenarios: create table → insert → query → assert results. These catch issues that unit tests miss (manifest swaps, flush boundaries, segment readers seeing memtable data).
 - **Benchmark regressions** aren't tests but should be tracked. Run `zig build bench` and record baseline numbers in PR descriptions for performance-affecting changes.
 
+### Accuracy reference: DuckDB, not V1
+
+When accuracy-checking query results (ClickBench or otherwise), the ground truth is **DuckDB**, not the V1/legacy engine. V1 is another thinDB engine and can carry the same or its own bugs, so "V2 matches V1" only proves *consistency*, not *correctness*.
+
+**Reference DuckDB databases** (table `hits`, matches the thinDB `clickbench`/`clickbench_full` data under `.clickbench-db/`):
+- `bench/clickbench/duckdb/hits_full.duckdb` — full **100M** (≈99,997,497 rows), the ground truth for `clickbench_full__public`.
+- `bench/clickbench/duckdb/hits.duckdb` — **5M** sample.
+
+Query directly, e.g. `duckdb bench/clickbench/duckdb/hits_full.duckdb "SELECT ..."`. (The empty `.clickbench-db/hits.duckdb` is a stub — ignore it.) Note that `ORDER BY ... LIMIT/OFFSET` over tied sort keys is order-nondeterministic across engines — compare the canonicalized result set (and the aggregate-value multiset), not row order, for those.
+
 ---
 
 ## Don'ts
