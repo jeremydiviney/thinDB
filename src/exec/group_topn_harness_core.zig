@@ -30,6 +30,7 @@ const GroupTable = thindb.exec.group_table.IntKeyMemsetTable(96);
 const Q30InlineTable = thindb.exec.group_table.InlineSlotTable(u64, Q30InlineState);
 
 const COLS_CLIENTIP = [_][]const u8{ "ClientIP", "IsRefresh", "ResolutionWidth" };
+const COLS_USERID = [_][]const u8{"UserID"};
 const COLS_Q30 = [_][]const u8{ "SearchEngineID", "ClientIP", "IsRefresh", "ResolutionWidth", "SearchPhrase" };
 const COLS_Q31 = [_][]const u8{ "WatchID", "ClientIP", "IsRefresh", "ResolutionWidth", "SearchPhrase" };
 const COLS_Q32 = [_][]const u8{ "WatchID", "ClientIP", "IsRefresh", "ResolutionWidth" };
@@ -55,6 +56,7 @@ const MAX_RAW_BATCH_CHUNKS: usize = 64;
 
 pub const QueryKind = enum {
     clientip,
+    q15,
     q30,
     q31,
     q32,
@@ -62,6 +64,7 @@ pub const QueryKind = enum {
     pub fn label(self: QueryKind) []const u8 {
         return switch (self) {
             .clientip => "clientip",
+            .q15 => "q15",
             .q30 => "q30",
             .q31 => "q31",
             .q32 => "q32",
@@ -96,6 +99,7 @@ fn querySpec(kind: QueryKind) QuerySpec {
     const phrase_non_empty = searchPhrasePred();
     return switch (kind) {
         .clientip => .{ .columns = &COLS_CLIENTIP, .group_key_columns = 1 },
+        .q15 => .{ .columns = &COLS_USERID, .group_key_columns = 1 },
         .q30 => .{ .columns = &COLS_Q30, .payload_columns = &COLS_Q30_PAYLOAD, .group_key_columns = 2, .filter = phrase_non_empty },
         .q31 => .{ .columns = &COLS_Q31, .payload_columns = &COLS_Q31_PAYLOAD, .group_key_columns = 2, .filter = phrase_non_empty },
         .q32 => .{ .columns = &COLS_Q32, .group_key_columns = 2 },
@@ -207,6 +211,546 @@ inline fn stagedRowKey(row: Row) u128 {
     return @as(u128, row.key_lo) | (@as(u128, row.key_hi) << 64);
 }
 
+const RawRows = struct {
+    slab: []align(16) u8 = &.{},
+    len_rows: usize = 0,
+    capacity_rows: usize = 0,
+    layout: GroupRowsLayout = .{},
+
+    inline fn len(self: RawRows) usize {
+        return self.len_rows;
+    }
+
+    inline fn capacity(self: RawRows) usize {
+        return self.capacity_rows;
+    }
+
+    fn slabBytes(layout: GroupRowsLayout, capacity_rows: usize) usize {
+        var bytes: usize = 0;
+        bytes = alignForward(bytes, @alignOf(u64));
+        bytes += @sizeOf(u64) * capacity_rows;
+        bytes = alignForward(bytes, @alignOf(u32));
+        bytes += @sizeOf(u32) * capacity_rows;
+        for (layout.columns) |column| {
+            bytes = alignForward(bytes, groupColumnAlign(column.physical_type));
+            bytes += groupColumnSize(column.physical_type) * capacity_rows;
+        }
+        return bytes;
+    }
+
+    inline fn keyLoOffset(_: RawRows) usize {
+        return 0;
+    }
+
+    inline fn keyHiOffset(self: RawRows) usize {
+        return self.capacity_rows * @sizeOf(u64);
+    }
+
+    fn columnOffset(self: RawRows, column_index: usize) usize {
+        var offset = self.keyHiOffset() + self.capacity_rows * @sizeOf(u32);
+        var i: usize = 0;
+        while (i < column_index) : (i += 1) {
+            offset = alignForward(offset, groupColumnAlign(self.layout.columns[i].physical_type));
+            offset += groupColumnSize(self.layout.columns[i].physical_type) * self.capacity_rows;
+        }
+        return alignForward(offset, groupColumnAlign(self.layout.columns[column_index].physical_type));
+    }
+
+    inline fn keyLoAll(self: RawRows) []u64 {
+        return @as([*]u64, @ptrCast(@alignCast(self.slab.ptr + self.keyLoOffset())))[0..self.capacity_rows];
+    }
+
+    inline fn keyHiAll(self: RawRows) []u32 {
+        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.keyHiOffset())))[0..self.capacity_rows];
+    }
+
+    inline fn columnI16All(self: RawRows, column_index: usize) []i16 {
+        std.debug.assert(self.layout.columns[column_index].physical_type == .i16);
+        return @as([*]i16, @ptrCast(@alignCast(self.slab.ptr + self.columnOffset(column_index))))[0..self.capacity_rows];
+    }
+
+    inline fn keyLoItems(self: RawRows) []u64 {
+        return self.keyLoAll()[0..self.len_rows];
+    }
+
+    inline fn keyHiItems(self: RawRows) []u32 {
+        return self.keyHiAll()[0..self.len_rows];
+    }
+
+    inline fn columnI16Items(self: RawRows, column_index: usize) []i16 {
+        return self.columnI16All(column_index)[0..self.len_rows];
+    }
+
+    fn ensureTotalCapacity(self: *RawRows, allocator: Allocator, layout: GroupRowsLayout, capacity_rows: usize) !void {
+        if (!sameRowsLayout(self.layout, layout)) {
+            self.deinit(allocator);
+            self.layout = layout;
+        }
+        if (capacity_rows <= self.capacity_rows) return;
+        var next: RawRows = .{
+            .slab = try allocator.alignedAlloc(u8, .@"16", slabBytes(layout, capacity_rows)),
+            .len_rows = self.len_rows,
+            .capacity_rows = capacity_rows,
+            .layout = layout,
+        };
+        if (self.len_rows != 0) {
+            @memcpy(next.keyLoItems(), self.keyLoItems());
+            @memcpy(next.keyHiItems(), self.keyHiItems());
+            var col: usize = 0;
+            while (col < layout.columns.len) : (col += 1) {
+                switch (layout.columns[col].physical_type) {
+                    .i16 => @memcpy(next.columnI16Items(col), self.columnI16Items(col)),
+                }
+            }
+        }
+        allocator.free(self.slab);
+        self.* = next;
+    }
+
+    fn resize(self: *RawRows, allocator: Allocator, layout: GroupRowsLayout, new_len: usize) !void {
+        try self.ensureTotalCapacity(allocator, layout, new_len);
+        self.len_rows = new_len;
+    }
+
+    fn clearRetainingCapacity(self: *RawRows) void {
+        self.len_rows = 0;
+    }
+
+    fn deinit(self: *RawRows, allocator: Allocator) void {
+        allocator.free(self.slab);
+        self.* = .{};
+    }
+
+    inline fn appendAssumeCapacity(self: *RawRows, key: u128, refresh: i16, width: i16) void {
+        const idx = self.len_rows;
+        self.keyLoAll()[idx] = @truncate(key);
+        self.keyHiAll()[idx] = @truncate(key >> 64);
+        self.columnI16All(0)[idx] = refresh;
+        self.columnI16All(1)[idx] = width;
+        self.len_rows = idx + 1;
+    }
+
+    fn appendRow(self: *RawRows, allocator: Allocator, row: Row) !void {
+        if (self.len_rows == self.capacity_rows) {
+            const next_capacity = if (self.capacity_rows == 0) 8 else self.capacity_rows * 2;
+            try self.ensureTotalCapacity(allocator, self.layout, next_capacity);
+        }
+        self.appendAssumeCapacity(stagedRowKey(row), row.refresh, row.width);
+    }
+
+    fn appendRows(self: *RawRows, allocator: Allocator, rows: []const Row) !void {
+        const old_len = self.len();
+        const new_len = old_len + rows.len;
+        try self.resize(allocator, self.layout, new_len);
+        const key_lo = self.keyLoAll();
+        const key_hi = self.keyHiAll();
+        const refresh = self.columnI16All(0);
+        const width = self.columnI16All(1);
+        var i: usize = 0;
+        while (i < rows.len) : (i += 1) {
+            key_lo[old_len + i] = rows[i].key_lo;
+            key_hi[old_len + i] = rows[i].key_hi;
+            refresh[old_len + i] = rows[i].refresh;
+            width[old_len + i] = rows[i].width;
+        }
+    }
+
+    inline fn rowAt(self: RawRows, idx: usize) Row {
+        return .{
+            .key_lo = self.keyLoAll()[idx],
+            .key_hi = self.keyHiAll()[idx],
+            .refresh = self.columnI16All(0)[idx],
+            .width = self.columnI16All(1)[idx],
+        };
+    }
+
+    inline fn keyAt(self: RawRows, idx: usize) u128 {
+        return @as(u128, self.keyLoAll()[idx]) | (@as(u128, self.keyHiAll()[idx]) << 64);
+    }
+
+    inline fn refreshAt(self: RawRows, idx: usize) i16 {
+        return self.columnI16All(0)[idx];
+    }
+
+    inline fn widthAt(self: RawRows, idx: usize) i16 {
+        return self.columnI16All(1)[idx];
+    }
+};
+
+pub const GroupKeyWidth = enum {
+    u32,
+    u64,
+    u96,
+    u128,
+};
+
+pub const GroupColumnType = enum {
+    i16,
+};
+
+pub const GroupColumnSource = enum {
+    is_refresh,
+    resolution_width,
+};
+
+pub const GroupColumnSpec = struct {
+    physical_type: GroupColumnType,
+    source: GroupColumnSource = .is_refresh,
+};
+
+pub const GroupAggregateOp = enum {
+    count_star,
+    count_col,
+    sum,
+    avg,
+    min,
+    max,
+};
+
+pub const GroupAggregateSpec = struct {
+    op: GroupAggregateOp,
+    input_column_index: ?u16 = null,
+    state_index: u16,
+};
+
+const MAX_GROUP_AGG_STATES: usize = 3;
+const MAX_GROUP_PAYLOAD_COLUMNS: usize = 8;
+
+const DEFAULT_GROUP_AGGREGATES = [_]GroupAggregateSpec{
+    .{ .op = .count_star, .input_column_index = null, .state_index = 0 },
+    .{ .op = .sum, .input_column_index = 0, .state_index = 1 },
+    .{ .op = .avg, .input_column_index = 1, .state_index = 2 },
+};
+
+const CountSumAvgProgram = struct {
+    sum_input_index: usize,
+    avg_input_index: usize,
+};
+
+pub const GroupRowsLayout = struct {
+    key_width: GroupKeyWidth = .u128,
+    columns: []const GroupColumnSpec = &DEFAULT_GROUP_COLUMNS,
+    aggregates: []const GroupAggregateSpec = &DEFAULT_GROUP_AGGREGATES,
+
+    const DEFAULT_GROUP_COLUMNS = [_]GroupColumnSpec{
+        .{ .physical_type = .i16, .source = .is_refresh },
+        .{ .physical_type = .i16, .source = .resolution_width },
+    };
+};
+
+fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
+    if (a.key_width != b.key_width or a.columns.len != b.columns.len or a.aggregates.len != b.aggregates.len) return false;
+    var i: usize = 0;
+    while (i < a.columns.len) : (i += 1) {
+        if (a.columns[i].physical_type != b.columns[i].physical_type or a.columns[i].source != b.columns[i].source) return false;
+    }
+    i = 0;
+    while (i < a.aggregates.len) : (i += 1) {
+        if (a.aggregates[i].op != b.aggregates[i].op or
+            a.aggregates[i].input_column_index != b.aggregates[i].input_column_index or
+            a.aggregates[i].state_index != b.aggregates[i].state_index)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn alignForward(value: usize, alignment: usize) usize {
+    std.debug.assert(alignment != 0);
+    std.debug.assert((alignment & (alignment - 1)) == 0);
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+fn groupKeySize(width: GroupKeyWidth) usize {
+    return switch (width) {
+        .u32 => @sizeOf(u32),
+        .u64 => @sizeOf(u64),
+        .u96 => @sizeOf(u64) + @sizeOf(u32),
+        .u128 => @sizeOf(u128),
+    };
+}
+
+fn groupKeyAlign(width: GroupKeyWidth) usize {
+    return switch (width) {
+        .u32 => @alignOf(u32),
+        .u64 => @alignOf(u64),
+        .u96 => @alignOf(u64),
+        .u128 => @alignOf(u128),
+    };
+}
+
+fn groupColumnSize(typ: GroupColumnType) usize {
+    return switch (typ) {
+        .i16 => @sizeOf(i16),
+    };
+}
+
+fn groupColumnAlign(typ: GroupColumnType) usize {
+    return switch (typ) {
+        .i16 => @alignOf(i16),
+    };
+}
+
+const GroupRows = struct {
+    slab: []align(16) u8 = &.{},
+    len_rows: usize = 0,
+    capacity_rows: usize = 0,
+    layout: GroupRowsLayout = .{},
+
+    inline fn len(self: GroupRows) usize {
+        return self.len_rows;
+    }
+
+    inline fn capacity(self: GroupRows) usize {
+        return self.capacity_rows;
+    }
+
+    fn slabBytes(layout: GroupRowsLayout, capacity_rows: usize) usize {
+        var bytes: usize = 0;
+        bytes = alignForward(bytes, groupKeyAlign(layout.key_width));
+        bytes += groupKeySize(layout.key_width) * capacity_rows;
+        for (layout.columns) |column| {
+            bytes = alignForward(bytes, groupColumnAlign(column.physical_type));
+            bytes += groupColumnSize(column.physical_type) * capacity_rows;
+        }
+        return bytes;
+    }
+
+    inline fn keyOffset(_: GroupRows) usize {
+        return 0;
+    }
+
+    fn columnOffset(self: GroupRows, column_index: usize) usize {
+        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
+        var i: usize = 0;
+        while (i < column_index) : (i += 1) {
+            offset = alignForward(offset, groupColumnAlign(self.layout.columns[i].physical_type));
+            offset += groupColumnSize(self.layout.columns[i].physical_type) * self.capacity_rows;
+        }
+        return alignForward(offset, groupColumnAlign(self.layout.columns[column_index].physical_type));
+    }
+
+    inline fn keyU32All(self: GroupRows) []u32 {
+        std.debug.assert(self.layout.key_width == .u32);
+        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
+    }
+
+    inline fn keyU64All(self: GroupRows) []u64 {
+        std.debug.assert(self.layout.key_width == .u64);
+        return @as([*]u64, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
+    }
+
+    inline fn keyU96LoAll(self: GroupRows) []u64 {
+        std.debug.assert(self.layout.key_width == .u96);
+        return @as([*]u64, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
+    }
+
+    inline fn keyU96HiAll(self: GroupRows) []u32 {
+        std.debug.assert(self.layout.key_width == .u96);
+        const offset = self.keyOffset() + self.capacity_rows * @sizeOf(u64);
+        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + offset)))[0..self.capacity_rows];
+    }
+
+    inline fn keyU128All(self: GroupRows) []u128 {
+        std.debug.assert(self.layout.key_width == .u128);
+        return @as([*]u128, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
+    }
+
+    inline fn columnI16All(self: GroupRows, column_index: usize) []i16 {
+        std.debug.assert(self.layout.columns[column_index].physical_type == .i16);
+        return @as([*]i16, @ptrCast(@alignCast(self.slab.ptr + self.columnOffset(column_index))))[0..self.capacity_rows];
+    }
+
+    inline fn columnI16Items(self: GroupRows, column_index: usize) []i16 {
+        return self.columnI16All(column_index)[0..self.len_rows];
+    }
+
+    inline fn refreshAll(self: GroupRows) []i16 {
+        return self.columnI16All(0);
+    }
+
+    inline fn widthAll(self: GroupRows) []i16 {
+        return self.columnI16All(1);
+    }
+
+    inline fn refreshItems(self: GroupRows) []i16 {
+        return self.refreshAll()[0..self.len_rows];
+    }
+
+    inline fn widthItems(self: GroupRows) []i16 {
+        return self.widthAll()[0..self.len_rows];
+    }
+
+    fn ensureTotalCapacity(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, capacity_rows: usize) !void {
+        if (!sameRowsLayout(self.layout, layout)) {
+            self.deinit(allocator);
+            self.layout = layout;
+        }
+        if (capacity_rows <= self.capacity_rows) return;
+        var next: GroupRows = .{
+            .slab = try allocator.alignedAlloc(u8, .@"16", slabBytes(layout, capacity_rows)),
+            .len_rows = self.len_rows,
+            .capacity_rows = capacity_rows,
+            .layout = layout,
+        };
+        if (self.len_rows != 0) {
+            var i: usize = 0;
+            while (i < self.len_rows) : (i += 1) next.setKey(i, self.keyAt(i));
+            var col: usize = 0;
+            while (col < layout.columns.len) : (col += 1) {
+                switch (layout.columns[col].physical_type) {
+                    .i16 => @memcpy(next.columnI16Items(col), self.columnI16Items(col)),
+                }
+            }
+        }
+        allocator.free(self.slab);
+        self.* = next;
+    }
+
+    fn resize(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, new_len: usize) !void {
+        try self.ensureTotalCapacity(allocator, layout, new_len);
+        self.len_rows = new_len;
+    }
+
+    fn clearRetainingCapacity(self: *GroupRows) void {
+        self.len_rows = 0;
+    }
+
+    fn deinit(self: *GroupRows, allocator: Allocator) void {
+        allocator.free(self.slab);
+        self.* = .{};
+    }
+
+    inline fn appendAssumeCapacity(self: *GroupRows, key: u128, refresh: i16, width: i16) void {
+        const idx = self.len_rows;
+        self.setKey(idx, key);
+        self.refreshAll()[idx] = refresh;
+        self.widthAll()[idx] = width;
+        self.len_rows = idx + 1;
+    }
+
+    fn appendRows(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, rows: []const Row) !void {
+        const old_len = self.len();
+        const new_len = old_len + rows.len;
+        try self.resize(allocator, layout, new_len);
+        const refresh = self.refreshAll();
+        const width = self.widthAll();
+        switch (self.layout.key_width) {
+            .u32 => {
+                const key_dst = self.keyU32All();
+                var i: usize = 0;
+                while (i < rows.len) : (i += 1) {
+                    key_dst[old_len + i] = @truncate(rows[i].key_lo);
+                    refresh[old_len + i] = rows[i].refresh;
+                    width[old_len + i] = rows[i].width;
+                }
+            },
+            .u64 => {
+                const key_dst = self.keyU64All();
+                var i: usize = 0;
+                while (i < rows.len) : (i += 1) {
+                    key_dst[old_len + i] = rows[i].key_lo;
+                    refresh[old_len + i] = rows[i].refresh;
+                    width[old_len + i] = rows[i].width;
+                }
+            },
+            .u96 => {
+                const key_lo_dst = self.keyU96LoAll();
+                const key_hi_dst = self.keyU96HiAll();
+                var i: usize = 0;
+                while (i < rows.len) : (i += 1) {
+                    key_lo_dst[old_len + i] = rows[i].key_lo;
+                    key_hi_dst[old_len + i] = rows[i].key_hi;
+                    refresh[old_len + i] = rows[i].refresh;
+                    width[old_len + i] = rows[i].width;
+                }
+            },
+            .u128 => {
+                const key_dst = self.keyU128All();
+                var i: usize = 0;
+                while (i < rows.len) : (i += 1) {
+                    key_dst[old_len + i] = stagedRowKey(rows[i]);
+                    refresh[old_len + i] = rows[i].refresh;
+                    width[old_len + i] = rows[i].width;
+                }
+            },
+        }
+    }
+
+    fn appendRawRowsSlice(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, rows: RawRows, start: usize, count: usize) !void {
+        if (count == 0) return;
+        const old_len = self.len();
+        const new_len = old_len + count;
+        try self.resize(allocator, layout, new_len);
+
+        const src_key_lo = rows.keyLoAll()[start .. start + count];
+        const src_key_hi = rows.keyHiAll()[start .. start + count];
+        switch (self.layout.key_width) {
+            .u32 => {
+                const dst = self.keyU32All()[old_len..new_len];
+                var i: usize = 0;
+                while (i < count) : (i += 1) dst[i] = @truncate(src_key_lo[i]);
+            },
+            .u64 => @memcpy(self.keyU64All()[old_len..new_len], src_key_lo),
+            .u96 => {
+                @memcpy(self.keyU96LoAll()[old_len..new_len], src_key_lo);
+                @memcpy(self.keyU96HiAll()[old_len..new_len], src_key_hi);
+            },
+            .u128 => {
+                const dst = self.keyU128All()[old_len..new_len];
+                var i: usize = 0;
+                while (i < count) : (i += 1) dst[i] = @as(u128, src_key_lo[i]) | (@as(u128, src_key_hi[i]) << 64);
+            },
+        }
+        var col: usize = 0;
+        while (col < self.layout.columns.len) : (col += 1) {
+            switch (self.layout.columns[col].physical_type) {
+                .i16 => @memcpy(self.columnI16All(col)[old_len..new_len], rows.columnI16All(col)[start .. start + count]),
+            }
+        }
+    }
+
+    inline fn rowAt(self: GroupRows, idx: usize) Row {
+        const key = self.keyAt(idx);
+        return .{
+            .key_lo = @truncate(key),
+            .key_hi = @truncate(key >> 64),
+            .refresh = self.refreshAll()[idx],
+            .width = self.widthAll()[idx],
+        };
+    }
+
+    inline fn keyAt(self: GroupRows, idx: usize) u128 {
+        return switch (self.layout.key_width) {
+            .u32 => @as(u128, self.keyU32All()[idx]),
+            .u64 => @as(u128, self.keyU64All()[idx]),
+            .u96 => @as(u128, self.keyU96LoAll()[idx]) | (@as(u128, self.keyU96HiAll()[idx]) << 64),
+            .u128 => self.keyU128All()[idx],
+        };
+    }
+
+    inline fn setKey(self: GroupRows, idx: usize, key: u128) void {
+        switch (self.layout.key_width) {
+            .u32 => self.keyU32All()[idx] = @truncate(key),
+            .u64 => self.keyU64All()[idx] = @truncate(key),
+            .u96 => {
+                self.keyU96LoAll()[idx] = @truncate(key);
+                self.keyU96HiAll()[idx] = @truncate(key >> 64);
+            },
+            .u128 => self.keyU128All()[idx] = key,
+        }
+    }
+
+    inline fn refreshAt(self: GroupRows, idx: usize) i16 {
+        return self.refreshAll()[idx];
+    }
+
+    inline fn widthAt(self: GroupRows, idx: usize) i16 {
+        return self.widthAll()[idx];
+    }
+};
+
 const PartBucket = struct {
     rows: std.ArrayListUnmanaged(Row) = .empty,
 
@@ -264,11 +808,12 @@ const WorkerParts = struct {
     flat_scan_partitions: bool = false,
     flat_partitioned: bool = false,
     flat_rows: std.ArrayListUnmanaged(Row) = .empty,
+    flat_raw_rows: RawRows = .{},
     flat_bucket_ids: std.ArrayListUnmanaged(u16) = .empty,
     flat_counts: []u32 = &.{},
     flat_offsets: []u32 = &.{},
     flat_next: []u32 = &.{},
-    raw_active_rows: std.ArrayListUnmanaged(Row) = .empty,
+    raw_active_rows: RawRows = .{},
     worker_index: usize = 0,
     raw_scan_lane: usize = 0,
     scanned_count: u64 = 0,
@@ -292,12 +837,14 @@ const WorkerParts = struct {
     raw_group_queue_lock_ticks: i64 = 0,
     raw_recycle_lock_ticks: i64 = 0,
     raw_agg_lock_ticks: i64 = 0,
+    raw_stage_builder_lock_ticks: i64 = 0,
     raw_stage_ticks: i64 = 0,
     raw_stage_pop_ticks: i64 = 0,
     raw_stage_slice_ticks: i64 = 0,
     raw_stage_publish_ticks: i64 = 0,
     raw_stage_recycle_ticks: i64 = 0,
     raw_stage_input_chunks: u64 = 0,
+    raw_stage_buffered_rows: u64 = 0,
     sched_loops: u64 = 0,
     sched_scan_jobs: u64 = 0,
     sched_stage_jobs: u64 = 0,
@@ -344,6 +891,7 @@ const WorkerParts = struct {
         for (self.buckets) |*b| b.deinit(allocator);
         if (self.buckets.len > 0) allocator.free(self.buckets);
         self.flat_rows.deinit(allocator);
+        self.flat_raw_rows.deinit(allocator);
         self.flat_bucket_ids.deinit(allocator);
         self.raw_active_rows.deinit(allocator);
         if (self.flat_counts.len > 0) allocator.free(self.flat_counts);
@@ -489,8 +1037,14 @@ const PipeChunk = struct {
 };
 
 const RawChunk = struct {
-    rows: std.ArrayListUnmanaged(Row),
+    rows: RawRows,
     owner_worker: usize,
+};
+
+const GroupChunk = struct {
+    rows: GroupRows,
+    owner_worker: usize,
+    bucket_idx: usize,
 };
 
 const RawQueue = struct {
@@ -505,6 +1059,32 @@ const RawQueue = struct {
     fn deinit(self: *RawQueue, allocator: Allocator) void {
         for (self.chunks.items) |*chunk| chunk.rows.deinit(allocator);
         self.chunks.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+const GroupQueue = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    lease: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    scan_lease: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    chunks: std.ArrayListUnmanaged(GroupChunk) = .empty,
+    queued_rows: u64 = 0,
+    queued_rows_atomic: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    queued_chunks_atomic: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn deinit(self: *GroupQueue, allocator: Allocator) void {
+        for (self.chunks.items) |*chunk| chunk.rows.deinit(allocator);
+        self.chunks.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+const StageBucketBuilder = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    rows: GroupRows = .{},
+
+    fn deinit(self: *StageBucketBuilder, allocator: Allocator) void {
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 };
@@ -538,12 +1118,16 @@ const PipeShared = struct {
     raw_queue_lock: std.atomic.Mutex = .unlocked,
     raw_chunks: std.ArrayListUnmanaged(RawChunk) = .empty,
     raw_recycle_lock: std.atomic.Mutex = .unlocked,
-    raw_recycled_rows: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Row)) = .empty,
+    raw_recycled_rows: std.ArrayListUnmanaged(RawRows) = .empty,
+    group_recycled_rows: std.ArrayListUnmanaged(GroupRows) = .empty,
     raw_merge_lock: std.atomic.Mutex = .unlocked,
     raw_scan_queues: []RawQueue = &.{},
-    raw_group_queues: []RawQueue = &.{},
+    raw_group_queues: []GroupQueue = &.{},
+    stage_builders: []StageBucketBuilder = &.{},
+    group_rows_layout: GroupRowsLayout = .{},
     stage_outstanding_chunks: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     stage_outstanding_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    stage_builder_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     active_stage_jobs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     scan_threads: usize,
     scans_done: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -565,12 +1149,7 @@ const PipeShared = struct {
 
 pub const RawGroupMode = enum {
     off,
-    radix_global,
-    radix_batch,
-    radix_cluster,
-    radix_staged,
-    preagg_merge,
-    sort_preagg,
+    staged_final,
 };
 
 pub const WorkspaceProfile = struct {
@@ -1196,6 +1775,7 @@ fn resetWorkerParts(parts: *WorkerParts, worker_index: usize) void {
     parts.flat_scan_partitions = false;
     parts.flat_partitioned = false;
     parts.flat_rows.clearRetainingCapacity();
+    parts.flat_raw_rows.clearRetainingCapacity();
     parts.flat_bucket_ids.clearRetainingCapacity();
     parts.raw_active_rows.clearRetainingCapacity();
     if (parts.flat_counts.len > 0) @memset(parts.flat_counts, 0);
@@ -1224,12 +1804,14 @@ fn resetWorkerParts(parts: *WorkerParts, worker_index: usize) void {
     parts.raw_group_queue_lock_ticks = 0;
     parts.raw_recycle_lock_ticks = 0;
     parts.raw_agg_lock_ticks = 0;
+    parts.raw_stage_builder_lock_ticks = 0;
     parts.raw_stage_ticks = 0;
     parts.raw_stage_pop_ticks = 0;
     parts.raw_stage_slice_ticks = 0;
     parts.raw_stage_publish_ticks = 0;
     parts.raw_stage_recycle_ticks = 0;
     parts.raw_stage_input_chunks = 0;
+    parts.raw_stage_buffered_rows = 0;
     parts.sched_loops = 0;
     parts.sched_scan_jobs = 0;
     parts.sched_stage_jobs = 0;
@@ -1275,11 +1857,17 @@ fn resetRawQueues(shared: *PipeShared) void {
         queue.scan_lease.store(false, .release);
         queue.lock = .unlocked;
     }
+    for (shared.stage_builders) |*builder| {
+        builder.rows.clearRetainingCapacity();
+        builder.lock = .unlocked;
+    }
     for (shared.raw_recycled_rows.items) |*rows| rows.clearRetainingCapacity();
+    for (shared.group_recycled_rows.items) |*rows| rows.clearRetainingCapacity();
     shared.raw_queue_lock = .unlocked;
     shared.raw_recycle_lock = .unlocked;
     shared.stage_outstanding_chunks.store(0, .release);
     shared.stage_outstanding_rows.store(0, .release);
+    shared.stage_builder_rows.store(0, .release);
     shared.active_stage_jobs.store(0, .release);
 }
 
@@ -1290,15 +1878,19 @@ fn deinitRawQueues(shared: *PipeShared) void {
     if (shared.raw_scan_queues.len > 0) shared.allocator.free(shared.raw_scan_queues);
     for (shared.raw_group_queues) |*queue| queue.deinit(shared.allocator);
     if (shared.raw_group_queues.len > 0) shared.allocator.free(shared.raw_group_queues);
+    for (shared.stage_builders) |*builder| builder.deinit(shared.allocator);
+    if (shared.stage_builders.len > 0) shared.allocator.free(shared.stage_builders);
     for (shared.raw_recycled_rows.items) |*rows| rows.deinit(shared.allocator);
     shared.raw_recycled_rows.deinit(shared.allocator);
+    for (shared.group_recycled_rows.items) |*rows| rows.deinit(shared.allocator);
+    shared.group_recycled_rows.deinit(shared.allocator);
 }
 
 fn lockSpin(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
-fn acquireRawRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !std.ArrayListUnmanaged(Row) {
+fn acquireRawRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !RawRows {
     const lock_t0 = if (lock_ticks != null) nowTicks() else 0;
     lockSpin(&shared.raw_recycle_lock);
     if (lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
@@ -1308,19 +1900,23 @@ fn acquireRawRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !
         shared.raw_recycled_rows.items.len = idx;
         shared.raw_recycle_lock.unlock();
         rows.clearRetainingCapacity();
-        if (rows.capacity < reserve_rows) try rows.ensureTotalCapacity(shared.allocator, reserve_rows);
+        if (rows.capacity() < reserve_rows or !sameRowsLayout(rows.layout, shared.group_rows_layout)) {
+            try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
+        }
         return rows;
     }
     shared.raw_recycle_lock.unlock();
-    var rows: std.ArrayListUnmanaged(Row) = .empty;
-    if (reserve_rows > 0) try rows.ensureTotalCapacity(shared.allocator, reserve_rows);
+    var rows = RawRows{ .layout = shared.group_rows_layout };
+    if (reserve_rows > 0) try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
     return rows;
 }
 
-fn recycleRawRows(shared: *PipeShared, rows_raw: std.ArrayListUnmanaged(Row), reserve_rows: usize, lock_ticks: ?*i64) !void {
+fn recycleRawRows(shared: *PipeShared, rows_raw: RawRows, reserve_rows: usize, lock_ticks: ?*i64) !void {
     var rows = rows_raw;
     rows.clearRetainingCapacity();
-    if (rows.capacity < reserve_rows) try rows.ensureTotalCapacity(shared.allocator, reserve_rows);
+    if (rows.capacity() < reserve_rows or !sameRowsLayout(rows.layout, shared.group_rows_layout)) {
+        try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
+    }
     const lock_t0 = if (lock_ticks != null) nowTicks() else 0;
     lockSpin(&shared.raw_recycle_lock);
     if (lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
@@ -1328,10 +1924,40 @@ fn recycleRawRows(shared: *PipeShared, rows_raw: std.ArrayListUnmanaged(Row), re
     try shared.raw_recycled_rows.append(shared.allocator, rows);
 }
 
-fn publishRawRows(shared: *PipeShared, owner_worker: usize, rows_ptr: *std.ArrayListUnmanaged(Row), reserve_rows: usize, queue_lock_ticks: ?*i64, recycle_lock_ticks: ?*i64) !void {
-    if (rows_ptr.items.len == 0) return;
+fn acquireGroupRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !GroupRows {
+    const lock_t0 = if (lock_ticks != null) nowTicks() else 0;
+    lockSpin(&shared.raw_recycle_lock);
+    if (lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (shared.group_recycled_rows.items.len > 0) {
+        const idx = shared.group_recycled_rows.items.len - 1;
+        var rows = shared.group_recycled_rows.items[idx];
+        shared.group_recycled_rows.items.len = idx;
+        shared.raw_recycle_lock.unlock();
+        rows.clearRetainingCapacity();
+        if (rows.capacity() < reserve_rows) try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
+        return rows;
+    }
+    shared.raw_recycle_lock.unlock();
+    var rows = GroupRows{ .layout = shared.group_rows_layout };
+    if (reserve_rows > 0) try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
+    return rows;
+}
+
+fn recycleGroupRows(shared: *PipeShared, rows_group: GroupRows, reserve_rows: usize, lock_ticks: ?*i64) !void {
+    var rows = rows_group;
+    rows.clearRetainingCapacity();
+    if (rows.capacity() < reserve_rows) try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
+    const lock_t0 = if (lock_ticks != null) nowTicks() else 0;
+    lockSpin(&shared.raw_recycle_lock);
+    if (lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    defer shared.raw_recycle_lock.unlock();
+    try shared.group_recycled_rows.append(shared.allocator, rows);
+}
+
+fn publishRawRows(shared: *PipeShared, owner_worker: usize, rows_ptr: *RawRows, reserve_rows: usize, queue_lock_ticks: ?*i64, recycle_lock_ticks: ?*i64) !void {
+    if (rows_ptr.len() == 0) return;
     const rows = rows_ptr.*;
-    const row_count: u64 = @intCast(rows.items.len);
+    const row_count: u64 = @intCast(rows.len());
     rows_ptr.* = try acquireRawRows(shared, reserve_rows, recycle_lock_ticks);
     errdefer {
         rows_ptr.deinit(shared.allocator);
@@ -1356,16 +1982,16 @@ fn publishRawRowsToQueue(
     shared: *PipeShared,
     queue: *RawQueue,
     owner_worker: usize,
-    rows_ptr: *std.ArrayListUnmanaged(Row),
+    rows_ptr: *RawRows,
     reserve_rows: usize,
     chunks_counter: *std.atomic.Value(usize),
     rows_counter: *std.atomic.Value(u64),
     queue_lock_ticks: ?*i64,
     recycle_lock_ticks: ?*i64,
 ) !void {
-    if (rows_ptr.items.len == 0) return;
+    if (rows_ptr.len() == 0) return;
     const rows = rows_ptr.*;
-    const row_count: u64 = @intCast(rows.items.len);
+    const row_count: u64 = @intCast(rows.len());
     rows_ptr.* = try acquireRawRows(shared, reserve_rows, recycle_lock_ticks);
     errdefer {
         rows_ptr.deinit(shared.allocator);
@@ -1397,7 +2023,33 @@ fn publishRawChunkToQueue(
     rows_counter: *std.atomic.Value(u64),
     queue_lock_ticks: ?*i64,
 ) !void {
-    const row_count: u64 = @intCast(chunk.rows.items.len);
+    const row_count: u64 = @intCast(chunk.rows.len());
+    _ = chunks_counter.fetchAdd(1, .release);
+    _ = rows_counter.fetchAdd(row_count, .release);
+    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
+    lockSpin(&queue.lock);
+    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    errdefer {
+        _ = chunks_counter.fetchSub(1, .release);
+        _ = rows_counter.fetchSub(row_count, .release);
+        queue.lock.unlock();
+    }
+    try queue.chunks.append(shared.allocator, chunk);
+    queue.queued_rows += row_count;
+    _ = queue.queued_rows_atomic.fetchAdd(row_count, .release);
+    _ = queue.queued_chunks_atomic.fetchAdd(1, .release);
+    queue.lock.unlock();
+}
+
+fn publishGroupChunkToQueue(
+    shared: *PipeShared,
+    queue: *GroupQueue,
+    chunk: GroupChunk,
+    chunks_counter: *std.atomic.Value(usize),
+    rows_counter: *std.atomic.Value(u64),
+    queue_lock_ticks: ?*i64,
+) !void {
+    const row_count: u64 = @intCast(chunk.rows.len());
     _ = chunks_counter.fetchAdd(1, .release);
     _ = rows_counter.fetchAdd(row_count, .release);
     const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
@@ -1452,8 +2104,8 @@ fn popRawChunkFromQueue(queue: *RawQueue, queue_lock_ticks: ?*i64) ?RawChunk {
     if (len == 0) return null;
     const chunk = queue.chunks.items[len - 1];
     queue.chunks.items.len = len - 1;
-    queue.queued_rows -= chunk.rows.items.len;
-    _ = queue.queued_rows_atomic.fetchSub(@intCast(chunk.rows.items.len), .release);
+    queue.queued_rows -= chunk.rows.len();
+    _ = queue.queued_rows_atomic.fetchSub(@intCast(chunk.rows.len()), .release);
     _ = queue.queued_chunks_atomic.fetchSub(1, .release);
     return chunk;
 }
@@ -1471,8 +2123,28 @@ fn popRawChunkBatchFromQueue(queue: *RawQueue, out: *[MAX_RAW_BATCH_CHUNKS]RawCh
         const chunk = queue.chunks.items[idx];
         out[popped] = chunk;
         queue.chunks.items.len = idx;
-        queue.queued_rows -= chunk.rows.items.len;
-        _ = queue.queued_rows_atomic.fetchSub(@intCast(chunk.rows.items.len), .release);
+        queue.queued_rows -= chunk.rows.len();
+        _ = queue.queued_rows_atomic.fetchSub(@intCast(chunk.rows.len()), .release);
+        _ = queue.queued_chunks_atomic.fetchSub(1, .release);
+    }
+    return popped;
+}
+
+fn popGroupChunkBatchFromQueue(queue: *GroupQueue, out: *[MAX_RAW_BATCH_CHUNKS]GroupChunk, max_chunks_raw: usize, queue_lock_ticks: ?*i64) usize {
+    const max_chunks = @max(@as(usize, 1), @min(max_chunks_raw, MAX_RAW_BATCH_CHUNKS));
+    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
+    lockSpin(&queue.lock);
+    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    defer queue.lock.unlock();
+
+    var popped: usize = 0;
+    while (popped < max_chunks and queue.chunks.items.len > 0) : (popped += 1) {
+        const idx = queue.chunks.items.len - 1;
+        const chunk = queue.chunks.items[idx];
+        out[popped] = chunk;
+        queue.chunks.items.len = idx;
+        queue.queued_rows -= chunk.rows.len();
+        _ = queue.queued_rows_atomic.fetchSub(@intCast(chunk.rows.len()), .release);
         _ = queue.queued_chunks_atomic.fetchSub(1, .release);
     }
     return popped;
@@ -1494,19 +2166,6 @@ fn popRawScanBatch(shared: *PipeShared, worker_index: usize, out: *[MAX_RAW_BATC
         }
     }
     return popped;
-}
-
-fn popRawGroupChunk(shared: *PipeShared, worker_index: usize, queue_lock_ticks: ?*i64) ?RawChunk {
-    if (shared.raw_group_queues.len == 0) return null;
-    var checked: usize = 0;
-    var cursor = worker_index % shared.raw_group_queues.len;
-    while (checked < shared.raw_group_queues.len) : (checked += 1) {
-        const qidx = cursor;
-        cursor += 1;
-        if (cursor == shared.raw_group_queues.len) cursor = 0;
-        if (popRawChunkFromQueue(&shared.raw_group_queues[qidx], queue_lock_ticks)) |chunk| return chunk;
-    }
-    return null;
 }
 
 fn claimRawQueueLane(queues: []RawQueue, start_index: usize) ?usize {
@@ -1553,6 +2212,27 @@ const RawLaneChoice = struct {
     rows: u64,
 };
 
+fn chooseRawScanPublishLane(shared: *PipeShared, preferred_raw: usize, close_rows_raw: usize) usize {
+    if (shared.raw_scan_queues.len == 0) return 0;
+    const preferred = preferred_raw % shared.raw_scan_queues.len;
+    const preferred_rows = shared.raw_scan_queues[preferred].queued_rows_atomic.load(.acquire);
+    const close_rows: u64 = @intCast(close_rows_raw);
+
+    var best_lane = preferred;
+    var best_rows = preferred_rows;
+    var lane: usize = 0;
+    while (lane < shared.raw_scan_queues.len) : (lane += 1) {
+        const rows = shared.raw_scan_queues[lane].queued_rows_atomic.load(.acquire);
+        if (rows < best_rows) {
+            best_rows = rows;
+            best_lane = lane;
+        }
+    }
+
+    if (preferred_rows <= best_rows + close_rows) return preferred;
+    return best_lane;
+}
+
 fn minUnlockedScanLane(queues: []RawQueue, start_index: usize) ?RawLaneChoice {
     if (queues.len == 0) return null;
     var best: ?RawLaneChoice = null;
@@ -1569,7 +2249,7 @@ fn minUnlockedScanLane(queues: []RawQueue, start_index: usize) ?RawLaneChoice {
     return best;
 }
 
-fn maxUnlockedQueueLaneRows(queues: []RawQueue, start_index: usize) ?RawLaneChoice {
+fn maxUnlockedQueueLaneRows(queues: anytype, start_index: usize) ?RawLaneChoice {
     if (queues.len == 0) return null;
     var best: ?RawLaneChoice = null;
     var checked: usize = 0;
@@ -1586,7 +2266,7 @@ fn maxUnlockedQueueLaneRows(queues: []RawQueue, start_index: usize) ?RawLaneChoi
     return best;
 }
 
-fn claimRawQueueLaneExact(queues: []RawQueue, lane: usize) bool {
+fn claimRawQueueLaneExact(queues: anytype, lane: usize) bool {
     if (lane >= queues.len) return false;
     if (queues[lane].queued_rows_atomic.load(.acquire) == 0) return false;
     return queues[lane].lease.cmpxchgWeak(false, true, .acq_rel, .acquire) == null;
@@ -1601,7 +2281,7 @@ fn releaseRawScanLane(queues: []RawQueue, lane: usize) void {
     if (lane < queues.len) queues[lane].scan_lease.store(false, .release);
 }
 
-fn releaseRawQueueLane(queues: []RawQueue, lane: usize) void {
+fn releaseRawQueueLane(queues: anytype, lane: usize) void {
     if (lane < queues.len) queues[lane].lease.store(false, .release);
 }
 
@@ -1794,11 +2474,12 @@ fn searchPhraseNonEmpty(batch: thindb.Batch, idx: usize, row: usize) bool {
 
 const BatchViews = struct {
     kind: QueryKind,
-    client_ip: []const i32,
+    client_ip: []const i32 = &.{},
+    user_id: ?[]const i64 = null,
     watch_id: ?[]const i64 = null,
     search_engine: ?thindb.storage.ColumnView = null,
-    refresh: []const i16,
-    width: []const i16,
+    refresh: []const i16 = &.{},
+    width: []const i16 = &.{},
     phrase: ?thindb.storage.StringView = null,
 };
 
@@ -1835,6 +2516,15 @@ fn loadPayloadViews(kind: QueryKind, batch: thindb.Batch) !PayloadViews {
 }
 
 fn loadViewsMaybePhrase(kind: QueryKind, batch: thindb.Batch, need_phrase: bool) !BatchViews {
+    if (kind == .q15) {
+        return .{
+            .kind = kind,
+            .user_id = switch ((batch.columnView("UserID") orelse return error.ColumnNotFound).data) {
+                .bigint => |v| v,
+                else => return error.UnexpectedUserIDType,
+            },
+        };
+    }
     const client_ip = switch ((batch.columnView("ClientIP") orelse return error.ColumnNotFound).data) {
         .int => |v| v,
         else => return error.UnexpectedClientIPType,
@@ -1880,6 +2570,7 @@ inline fn readSearchEngine(v: thindb.storage.ColumnView, row: usize) !i16 {
 inline fn keyFromViews(v: BatchViews, row: usize) !u128 {
     return switch (v.kind) {
         .clientip => packClientIP(v.client_ip[row]),
+        .q15 => @as(u128, @as(u64, @bitCast(v.user_id.?[row]))),
         .q30 => packQ30(try readSearchEngine(v.search_engine.?, row), v.client_ip[row]),
         .q31, .q32 => packWatchClient(v.watch_id.?[row], v.client_ip[row]),
     };
@@ -1907,6 +2598,13 @@ fn rowKey(kind: QueryKind, batch: thindb.Batch, row: usize) !u128 {
                 else => return error.UnexpectedClientIPType,
             };
             break :blk packClientIP(ip[row]);
+        },
+        .q15 => blk: {
+            const user = switch (batch.values[0].data) {
+                .bigint => |v| v,
+                else => return error.UnexpectedUserIDType,
+            };
+            break :blk @as(u128, @as(u64, @bitCast(user[row])));
         },
         .q30 => blk: {
             const ip = switch (batch.values[1].data) {
@@ -1938,6 +2636,7 @@ fn rowKey(kind: QueryKind, batch: thindb.Batch, row: usize) !u128 {
 fn aggViews(kind: QueryKind, batch: thindb.Batch) !struct { refresh: []const i16, width: []const i16 } {
     const refresh_idx: usize = switch (kind) {
         .clientip => 1,
+        .q15 => return error.UnsupportedOperatorForType,
         .q30, .q31, .q32 => 2,
     };
     const width_idx: usize = switch (kind) {
@@ -2512,10 +3211,19 @@ fn appendBatchRoutedEx(parts: *WorkerParts, allocator: Allocator, bucket_count: 
     const route_block_rows = normalizeRouteBlockRows(route_block_rows_raw);
     return switch (kind) {
         .clientip => appendBatchClientIP(parts, allocator, bucket_count, views, batch.row_count, route_block_rows),
+        .q15 => appendBatchCountOnly(parts, allocator, bucket_count, views, batch.row_count),
         .q30 => appendBatchQ30(parts, allocator, bucket_count, views, batch.row_count, route_block_rows, skip_filter_check),
         .q31 => appendBatchQ31(parts, allocator, bucket_count, views, batch.row_count, route_block_rows, skip_filter_check),
         .q32 => appendBatchQ32(parts, allocator, bucket_count, views, batch.row_count, route_block_rows),
     };
+}
+
+fn appendBatchCountOnly(parts: *WorkerParts, allocator: Allocator, bucket_count: usize, views: BatchViews, row_count: usize) !void {
+    var r: usize = 0;
+    while (r < row_count) : (r += 1) {
+        const key = try keyFromViews(views, r);
+        try appendHashedRow(parts, allocator, bucket_count, key, 0, 0);
+    }
 }
 
 fn appendBatchRouted(parts: *WorkerParts, allocator: Allocator, bucket_count: usize, kind: QueryKind, batch: thindb.Batch, route_block_rows_raw: usize) !void {
@@ -2627,10 +3335,10 @@ fn appendBatchSiloLocal(parts: *WorkerParts, shared: *PipeShared, kind: QueryKin
 }
 
 inline fn appendRawPacked(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows: usize, key: u128, refresh: i16, width: i16) !void {
-    parts.raw_active_rows.appendAssumeCapacity(makeRow(key, refresh, width));
-    if (parts.raw_active_rows.items.len == raw_chunk_rows) {
+    parts.raw_active_rows.appendAssumeCapacity(key, refresh, width);
+    if (parts.raw_active_rows.len() == raw_chunk_rows) {
         if (shared.raw_scan_queues.len > 0) {
-            const qidx = parts.raw_scan_lane % shared.raw_scan_queues.len;
+            const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
             try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &shared.outstanding_chunks, &shared.outstanding_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
         } else {
             try publishRawRows(shared, parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
@@ -2642,19 +3350,63 @@ inline fn appendRawPacked(parts: *WorkerParts, shared: *PipeShared, raw_chunk_ro
 fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, kind: QueryKind, batch: thindb.Batch, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
     const route_t0 = if (profile) nowTicks() else 0;
     const views = try loadViewsMaybePhrase(kind, batch, !(skip_filter_check and kind.hasFilter()));
-    if (parts.raw_active_rows.capacity == 0) parts.raw_active_rows = try acquireRawRows(shared, raw_chunk_rows, &parts.raw_recycle_lock_ticks);
+    if (parts.raw_active_rows.capacity() == 0) parts.raw_active_rows = try acquireRawRows(shared, raw_chunk_rows, &parts.raw_recycle_lock_ticks);
 
     var accepted: u64 = 0;
     var r: usize = 0;
-    while (r < batch.row_count) : (r += 1) {
-        if (!rowPasses(views, r)) continue;
-        const key = try keyFromViews(views, r);
-        try appendRawPacked(parts, shared, raw_chunk_rows, key, views.refresh[r], views.width[r]);
-        accepted += 1;
+    var empty_i16_buf: [0]i16 = .{};
+    while (r < batch.row_count) {
+        var active = &parts.raw_active_rows;
+        const key_lo = active.keyLoAll();
+        const key_hi = active.keyHiAll();
+        const columns = active.layout.columns;
+        const fast_payload = columns.len == 2 and
+            columns[0].physical_type == .i16 and columns[0].source == .is_refresh and
+            columns[1].physical_type == .i16 and columns[1].source == .resolution_width;
+        const col0: []i16 = if (fast_payload) active.columnI16All(0) else empty_i16_buf[0..0];
+        const col1: []i16 = if (fast_payload) active.columnI16All(1) else empty_i16_buf[0..0];
+
+        while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
+            if (!rowPasses(views, r)) continue;
+            const key = try keyFromViews(views, r);
+            const idx = active.len();
+            key_lo[idx] = @truncate(key);
+            key_hi[idx] = @truncate(key >> 64);
+            if (fast_payload) {
+                col0[idx] = views.refresh[r];
+                col1[idx] = views.width[r];
+            } else {
+                var col: usize = 0;
+                while (col < columns.len) : (col += 1) {
+                    switch (columns[col].physical_type) {
+                        .i16 => active.columnI16All(col)[idx] = payloadValueI16(views, columns[col].source, r),
+                    }
+                }
+            }
+            active.len_rows = idx + 1;
+            accepted += 1;
+        }
+
+        if (active.len() == raw_chunk_rows) {
+            if (shared.raw_scan_queues.len > 0) {
+                const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
+                try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, active, raw_chunk_rows, &shared.outstanding_chunks, &shared.outstanding_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
+            } else {
+                try publishRawRows(shared, parts.worker_index, active, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
+            }
+            parts.published_chunks += 1;
+        }
     }
     parts.scanned_count += batch.row_count;
     parts.row_count += accepted;
     if (profile) parts.partition_ticks += nowTicks() - route_t0;
+}
+
+inline fn payloadValueI16(views: BatchViews, source: GroupColumnSource, row: usize) i16 {
+    return switch (source) {
+        .is_refresh => views.refresh[row],
+        .resolution_width => views.width[row],
+    };
 }
 
 fn publishFullLocalBuckets(shared: *PipeShared, parts: *WorkerParts, chunk_rows: usize, profile: bool) !void {
@@ -2703,14 +3455,144 @@ fn initGroupState(states: *std.ArrayListUnmanaged(State), key: u128) u32 {
 }
 
 fn initGroupStateFromRow(states: *std.ArrayListUnmanaged(State), key: u128, row: Row) u32 {
+    return initGroupStateValues(states, key, row.refresh, row.width);
+}
+
+fn initGroupStateValues(states: *std.ArrayListUnmanaged(State), key: u128, refresh: i16, width: i16) u32 {
     const gid: u32 = @intCast(states.items.len);
     states.appendAssumeCapacity(.{
         .key = key,
         .count = 1,
-        .refresh_sum = row.refresh,
-        .width_sum = row.width,
+        .refresh_sum = refresh,
+        .width_sum = width,
     });
     return gid;
+}
+
+fn initGroupStateCountSumAvg(states: *std.ArrayListUnmanaged(State), key: u128, sum_value: i16, avg_value: i16) u32 {
+    const gid: u32 = @intCast(states.items.len);
+    states.appendAssumeCapacity(.{
+        .key = key,
+        .count = 1,
+        .refresh_sum = sum_value,
+        .width_sum = avg_value,
+    });
+    return gid;
+}
+
+inline fn updateGroupStateCountSumAvg(st: *State, sum_value: i16, avg_value: i16) void {
+    st.count += 1;
+    st.refresh_sum += sum_value;
+    st.width_sum += avg_value;
+}
+
+fn initGroupStateProgram(
+    states: *std.ArrayListUnmanaged(State),
+    key: u128,
+    aggregates: []const GroupAggregateSpec,
+    columns: []const []const i16,
+    row_idx: usize,
+) !u32 {
+    const gid: u32 = @intCast(states.items.len);
+    states.appendAssumeCapacity(.{
+        .key = key,
+        .count = 0,
+        .refresh_sum = 0,
+        .width_sum = 0,
+    });
+    const st = &states.items[gid];
+    try updateGroupStateProgram(st, aggregates, columns, row_idx);
+    return gid;
+}
+
+fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, columns: []const []const i16, row_idx: usize) !void {
+    for (aggregates) |agg| {
+        if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
+        const state_index: usize = agg.state_index;
+        switch (agg.op) {
+            .count_star => {
+                try addAggregateStateValue(st, state_index, 1);
+            },
+            .count_col => {
+                _ = aggregateInputValue(agg, columns, row_idx) catch return error.UnsupportedOperatorForType;
+                try addAggregateStateValue(st, state_index, 1);
+            },
+            .sum => {
+                const value = try aggregateInputValue(agg, columns, row_idx);
+                try addAggregateStateValue(st, state_index, value);
+            },
+            .avg => {
+                const value = try aggregateInputValue(agg, columns, row_idx);
+                try addAggregateStateValue(st, state_index, value);
+            },
+            .min => {
+                const value = try aggregateInputValue(agg, columns, row_idx);
+                if (st.count == 0 or value < aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+            },
+            .max => {
+                const value = try aggregateInputValue(agg, columns, row_idx);
+                if (st.count == 0 or value > aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+            },
+        }
+    }
+}
+
+fn aggregateInputValue(agg: GroupAggregateSpec, columns: []const []const i16, row_idx: usize) !i128 {
+    const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
+    if (input_index >= columns.len) return error.UnsupportedOperatorForType;
+    return columns[input_index][row_idx];
+}
+
+inline fn aggregateStateValue(st: *const State, state_index: usize) i128 {
+    return switch (state_index) {
+        0 => @intCast(st.count),
+        1 => st.refresh_sum,
+        2 => st.width_sum,
+        else => unreachable,
+    };
+}
+
+inline fn addAggregateStateValue(st: *State, state_index: usize, value: i128) !void {
+    switch (state_index) {
+        0 => st.count += @intCast(value),
+        1 => st.refresh_sum += @intCast(value),
+        2 => st.width_sum += @intCast(value),
+        else => return error.UnsupportedOperatorForType,
+    }
+}
+
+inline fn setAggregateStateValue(st: *State, state_index: usize, value: i128) !void {
+    switch (state_index) {
+        0 => st.count = @intCast(value),
+        1 => st.refresh_sum = @intCast(value),
+        2 => st.width_sum = @intCast(value),
+        else => return error.UnsupportedOperatorForType,
+    }
+}
+
+fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_count: usize) !void {
+    if (aggregates.len == 0) return error.UnsupportedOperatorForType;
+    for (aggregates) |agg| {
+        if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
+        switch (agg.op) {
+            .count_star => {},
+            .count_col, .sum, .avg, .min, .max => {
+                const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
+                if (input_index >= column_count) return error.UnsupportedOperatorForType;
+            },
+        }
+    }
+}
+
+fn countSumAvgProgram(aggregates: []const GroupAggregateSpec, column_count: usize) ?CountSumAvgProgram {
+    if (aggregates.len != 3) return null;
+    if (aggregates[0].op != .count_star or aggregates[0].state_index != 0 or aggregates[0].input_column_index != null) return null;
+    if (aggregates[1].op != .sum or aggregates[1].state_index != 1) return null;
+    if (aggregates[2].op != .avg or aggregates[2].state_index != 2) return null;
+    const sum_input_index = aggregates[1].input_column_index orelse return null;
+    const avg_input_index = aggregates[2].input_column_index orelse return null;
+    if (sum_input_index >= column_count or avg_input_index >= column_count) return null;
+    return .{ .sum_input_index = sum_input_index, .avg_input_index = avg_input_index };
 }
 
 fn groupBatchDirect(
@@ -2794,11 +3676,122 @@ fn groupRowsDirect(
             table.commit(probe.slot, key, new_gid);
             continue;
         }
-        var st = &states.items[probe.gid];
+        const st = &states.items[probe.gid];
         st.count += 1;
         st.refresh_sum += row.refresh;
         st.width_sum += row.width;
     }
+}
+
+fn groupChunkRowsDirect(
+    table: *GroupTable,
+    states: *std.ArrayListUnmanaged(State),
+    scratch: *GroupScratch,
+    allocator: Allocator,
+    rows: GroupRows,
+) !void {
+    const n = rows.len();
+    if (n == 0) return;
+    if (table.needsGrow(n)) try table.grow(allocator, n);
+    try states.ensureUnusedCapacity(allocator, n);
+    _ = scratch;
+
+    if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
+    try validateGroupAggregateProgram(rows.layout.aggregates, rows.layout.columns.len);
+    var column_slices_buf: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
+    var col: usize = 0;
+    while (col < rows.layout.columns.len) : (col += 1) {
+        column_slices_buf[col] = switch (rows.layout.columns[col].physical_type) {
+            .i16 => rows.columnI16Items(col),
+        };
+    }
+    const column_slices = column_slices_buf[0..rows.layout.columns.len];
+    if (countSumAvgProgram(rows.layout.aggregates, rows.layout.columns.len)) |program| {
+        const sum_values = column_slices[program.sum_input_index];
+        const avg_values = column_slices[program.avg_input_index];
+        switch (rows.layout.key_width) {
+            .u32 => try groupChunkRowsDirectKeysCountSumAvg(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, sum_values, avg_values),
+            .u64 => try groupChunkRowsDirectKeysCountSumAvg(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, sum_values, avg_values),
+            .u96 => try groupChunkRowsDirectKeysCountSumAvg(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, sum_values, avg_values),
+            .u128 => try groupChunkRowsDirectKeysCountSumAvg(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, sum_values, avg_values),
+        }
+        return;
+    }
+    switch (rows.layout.key_width) {
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, column_slices),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, column_slices),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, column_slices),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, column_slices),
+    }
+}
+
+fn groupChunkRowsDirectKeysCountSumAvg(
+    comptime key_width: GroupKeyWidth,
+    table: *GroupTable,
+    states: *std.ArrayListUnmanaged(State),
+    keys: anytype,
+    key_hi: []const u32,
+    row_count: usize,
+    sum_values: []const i16,
+    avg_values: []const i16,
+) !void {
+    var r: usize = 0;
+    while (r < row_count) : (r += 1) {
+        const pf = r + PREFETCH_DIST_BUCKET;
+        if (pf < row_count) {
+            const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
+            @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
+        }
+
+        const key = groupKeyAt(key_width, keys, key_hi, r);
+        const probe = table.getOrPut(GroupTable.hashKey(key), key);
+        if (!probe.found) {
+            const new_gid = initGroupStateCountSumAvg(states, key, sum_values[r], avg_values[r]);
+            table.commit(probe.slot, key, new_gid);
+            continue;
+        }
+        updateGroupStateCountSumAvg(&states.items[probe.gid], sum_values[r], avg_values[r]);
+    }
+}
+
+fn groupChunkRowsDirectKeys(
+    comptime key_width: GroupKeyWidth,
+    table: *GroupTable,
+    states: *std.ArrayListUnmanaged(State),
+    keys: anytype,
+    key_hi: []const u32,
+    row_count: usize,
+    aggregates: []const GroupAggregateSpec,
+    columns: []const []const i16,
+) !void {
+    const n = row_count;
+    var r: usize = 0;
+    while (r < n) : (r += 1) {
+        const pf = r + PREFETCH_DIST_BUCKET;
+        if (pf < n) {
+            const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
+            @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
+        }
+
+        const key = groupKeyAt(key_width, keys, key_hi, r);
+        const probe = table.getOrPut(GroupTable.hashKey(key), key);
+        if (!probe.found) {
+            const new_gid = try initGroupStateProgram(states, key, aggregates, columns, r);
+            table.commit(probe.slot, key, new_gid);
+            continue;
+        }
+        const st = &states.items[probe.gid];
+        try updateGroupStateProgram(st, aggregates, columns, r);
+    }
+}
+
+inline fn groupKeyAt(comptime key_width: GroupKeyWidth, keys: anytype, key_hi: []const u32, idx: usize) u128 {
+    return switch (key_width) {
+        .u32 => @as(u128, keys[idx]),
+        .u64 => @as(u128, keys[idx]),
+        .u96 => @as(u128, keys[idx]) | (@as(u128, key_hi[idx]) << 64),
+        .u128 => keys[idx],
+    };
 }
 
 fn mergeStatesDirect(
@@ -2854,269 +3847,13 @@ inline fn rowBucketIndex(row: Row, bucket_count: usize) usize {
         bucketIndexHash(h, bucket_count);
 }
 
-inline fn stateBucketIndex(state: State, bucket_count: usize) usize {
-    const h = GroupTable.hashKey(state.key);
+inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) usize {
+    const row = rows.rowAt(row_idx);
+    const h = routeHashRowBits(row.key_lo, row.key_hi);
     return if (std.math.isPowerOfTwo(bucket_count))
         (@as(usize, @truncate(h)) & (bucket_count - 1))
         else
         bucketIndexHash(h, bucket_count);
-}
-
-fn processRawChunkRadixGlobal(
-    allocator: Allocator,
-    shared: *PipeShared,
-    local: *WorkerParts,
-    scratch: *GroupScratch,
-    rows: []const Row,
-    group_ticks: *i64,
-    chunks: *u64,
-    profile: bool,
-) !void {
-    const bucket_count = shared.bucket_count;
-    try local.ensureWideBucketScratch(allocator, bucket_count);
-    @memset(local.flat_counts[0..bucket_count], 0);
-
-    var r: usize = 0;
-    while (r < rows.len) : (r += 1) {
-        local.flat_counts[rowBucketIndex(rows[r], bucket_count)] += 1;
-    }
-
-    var offset: u32 = 0;
-    var b: usize = 0;
-    while (b < bucket_count) : (b += 1) {
-        local.flat_offsets[b] = offset;
-        offset += local.flat_counts[b];
-        local.flat_counts[b] = 0;
-    }
-
-    try local.flat_rows.resize(allocator, rows.len);
-    r = 0;
-    while (r < rows.len) : (r += 1) {
-        const bidx = rowBucketIndex(rows[r], bucket_count);
-        const pos = local.flat_offsets[bidx] + local.flat_counts[bidx];
-        local.flat_rows.items[pos] = rows[r];
-        local.flat_counts[bidx] += 1;
-    }
-
-    b = 0;
-    while (b < bucket_count) : (b += 1) {
-        const count: usize = local.flat_counts[b];
-        if (count == 0) continue;
-        const start: usize = local.flat_offsets[b];
-        const slice = local.flat_rows.items[start .. start + count];
-        const bucket = &shared.buckets[b];
-        const lock_t0 = if (profile) nowTicks() else 0;
-        lockSpin(&bucket.agg_lock);
-        if (profile) local.raw_agg_lock_ticks += nowTicks() - lock_t0;
-        const g0 = if (profile) nowTicks() else 0;
-        try groupRowsDirect(&bucket.table, &bucket.states, scratch, allocator, slice);
-        bucket.row_count += slice.len;
-        if (profile) group_ticks.* += nowTicks() - g0;
-        bucket.agg_lock.unlock();
-        chunks.* += 1;
-    }
-}
-
-fn processRawChunkPreAggMerge(
-    allocator: Allocator,
-    shared: *PipeShared,
-    local: *WorkerParts,
-    scratch: *GroupScratch,
-    local_table: *GroupTable,
-    local_states: *std.ArrayListUnmanaged(State),
-    rows: []const Row,
-    group_ticks: *i64,
-    chunks: *u64,
-    profile: bool,
-) !void {
-    local_table.clearRetainingCapacity();
-    local_states.clearRetainingCapacity();
-    const local_t0 = if (profile) nowTicks() else 0;
-    try groupRowsDirect(local_table, local_states, scratch, allocator, rows);
-    if (profile) group_ticks.* += nowTicks() - local_t0;
-
-    const bucket_count = shared.bucket_count;
-    try local.ensureWideBucketScratch(allocator, bucket_count);
-    @memset(local.flat_counts[0..bucket_count], 0);
-
-    var i: usize = 0;
-    while (i < local_states.items.len) : (i += 1) {
-        local.flat_counts[stateBucketIndex(local_states.items[i], bucket_count)] += 1;
-    }
-
-    var offset: u32 = 0;
-    var b: usize = 0;
-    while (b < bucket_count) : (b += 1) {
-        local.flat_offsets[b] = offset;
-        offset += local.flat_counts[b];
-        local.flat_counts[b] = 0;
-    }
-
-    scratch.states.clearRetainingCapacity();
-    try scratch.states.resize(allocator, local_states.items.len);
-    i = 0;
-    while (i < local_states.items.len) : (i += 1) {
-        const bidx = stateBucketIndex(local_states.items[i], bucket_count);
-        const pos = local.flat_offsets[bidx] + local.flat_counts[bidx];
-        scratch.states.items[pos] = local_states.items[i];
-        local.flat_counts[bidx] += 1;
-    }
-
-    b = 0;
-    while (b < bucket_count) : (b += 1) {
-        const count: usize = local.flat_counts[b];
-        if (count == 0) continue;
-        const start: usize = local.flat_offsets[b];
-        const slice = scratch.states.items[start .. start + count];
-        var row_count_sum: u64 = 0;
-        for (slice) |state| row_count_sum += state.count;
-        const bucket = &shared.buckets[b];
-        const lock_t0 = if (profile) nowTicks() else 0;
-        lockSpin(&bucket.agg_lock);
-        if (profile) local.raw_agg_lock_ticks += nowTicks() - lock_t0;
-        const g0 = if (profile) nowTicks() else 0;
-        try mergeStatesDirect(&bucket.table, &bucket.states, scratch, allocator, slice);
-        bucket.row_count += row_count_sum;
-        if (profile) group_ticks.* += nowTicks() - g0;
-        bucket.agg_lock.unlock();
-        chunks.* += 1;
-    }
-}
-
-inline fn rowSortByte(row: Row, pass: usize) u8 {
-    return @as(u8, @truncate(stagedRowKey(row) >> @intCast(pass * 8)));
-}
-
-fn radixSortRowsByKey(allocator: Allocator, dst: *std.ArrayListUnmanaged(Row), scratch_rows: *std.ArrayListUnmanaged(Row), rows: []const Row) ![]const Row {
-    dst.clearRetainingCapacity();
-    try dst.appendSlice(allocator, rows);
-    scratch_rows.clearRetainingCapacity();
-    try scratch_rows.resize(allocator, rows.len);
-    if (rows.len <= 1) return dst.items;
-
-    var in_buf = dst.items;
-    var out_buf = scratch_rows.items;
-    var pass: usize = 0;
-    while (pass < 16) : (pass += 1) {
-        var counts: [256]usize = [_]usize{0} ** 256;
-        var i: usize = 0;
-        while (i < in_buf.len) : (i += 1) counts[rowSortByte(in_buf[i], pass)] += 1;
-
-        var offsets: [256]usize = undefined;
-        var sum: usize = 0;
-        i = 0;
-        while (i < 256) : (i += 1) {
-            offsets[i] = sum;
-            sum += counts[i];
-        }
-
-        i = 0;
-        while (i < in_buf.len) : (i += 1) {
-            const bucket = rowSortByte(in_buf[i], pass);
-            const pos = offsets[bucket];
-            out_buf[pos] = in_buf[i];
-            offsets[bucket] = pos + 1;
-        }
-
-        const tmp = in_buf;
-        in_buf = out_buf;
-        out_buf = tmp;
-    }
-
-    if (in_buf.ptr != dst.items.ptr) {
-        @memcpy(dst.items, in_buf);
-        return dst.items;
-    }
-    return in_buf;
-}
-
-fn buildStatesFromSortedRows(allocator: Allocator, out_states: *std.ArrayListUnmanaged(State), sorted_rows: []const Row) !void {
-    out_states.clearRetainingCapacity();
-    if (sorted_rows.len == 0) return;
-    try out_states.ensureUnusedCapacity(allocator, sorted_rows.len);
-
-    var i: usize = 0;
-    while (i < sorted_rows.len) {
-        const key = stagedRowKey(sorted_rows[i]);
-        var count: u64 = 0;
-        var refresh_sum: i64 = 0;
-        var width_sum: i64 = 0;
-        while (i < sorted_rows.len and stagedRowKey(sorted_rows[i]) == key) : (i += 1) {
-            count += 1;
-            refresh_sum += sorted_rows[i].refresh;
-            width_sum += sorted_rows[i].width;
-        }
-        out_states.appendAssumeCapacity(.{
-            .key = key,
-            .count = count,
-            .refresh_sum = refresh_sum,
-            .width_sum = width_sum,
-        });
-    }
-}
-
-fn processRawChunkSortPreAgg(
-    allocator: Allocator,
-    shared: *PipeShared,
-    local: *WorkerParts,
-    scratch: *GroupScratch,
-    rows: []const Row,
-    group_ticks: *i64,
-    chunks: *u64,
-    profile: bool,
-) !void {
-    const local_t0 = if (profile) nowTicks() else 0;
-    const sorted = try radixSortRowsByKey(allocator, &local.flat_rows, &scratch.rows, rows);
-    try buildStatesFromSortedRows(allocator, &scratch.states, sorted);
-    if (profile) group_ticks.* += nowTicks() - local_t0;
-
-    const bucket_count = shared.bucket_count;
-    try local.ensureWideBucketScratch(allocator, bucket_count);
-    @memset(local.flat_counts[0..bucket_count], 0);
-
-    var i: usize = 0;
-    while (i < scratch.states.items.len) : (i += 1) {
-        local.flat_counts[stateBucketIndex(scratch.states.items[i], bucket_count)] += 1;
-    }
-
-    var offset: u32 = 0;
-    var b: usize = 0;
-    while (b < bucket_count) : (b += 1) {
-        local.flat_offsets[b] = offset;
-        offset += local.flat_counts[b];
-        local.flat_counts[b] = 0;
-    }
-
-    var grouped_states: std.ArrayListUnmanaged(State) = .empty;
-    defer grouped_states.deinit(allocator);
-    try grouped_states.resize(allocator, scratch.states.items.len);
-    i = 0;
-    while (i < scratch.states.items.len) : (i += 1) {
-        const bidx = stateBucketIndex(scratch.states.items[i], bucket_count);
-        const pos = local.flat_offsets[bidx] + local.flat_counts[bidx];
-        grouped_states.items[pos] = scratch.states.items[i];
-        local.flat_counts[bidx] += 1;
-    }
-
-    const merge_lock_t0 = if (profile) nowTicks() else 0;
-    lockSpin(&shared.raw_merge_lock);
-    if (profile) local.raw_agg_lock_ticks += nowTicks() - merge_lock_t0;
-    defer shared.raw_merge_lock.unlock();
-    b = 0;
-    while (b < bucket_count) : (b += 1) {
-        const count: usize = local.flat_counts[b];
-        if (count == 0) continue;
-        const start: usize = local.flat_offsets[b];
-        const slice = grouped_states.items[start .. start + count];
-        var row_count_sum: u64 = 0;
-        for (slice) |state| row_count_sum += state.count;
-        const bucket = &shared.buckets[b];
-        const g0 = if (profile) nowTicks() else 0;
-        try mergeStatesDirect(&bucket.table, &bucket.states, scratch, allocator, slice);
-        bucket.row_count += row_count_sum;
-        if (profile) group_ticks.* += nowTicks() - g0;
-        chunks.* += 1;
-    }
 }
 
 const ScanJob = struct {
@@ -3756,9 +4493,8 @@ const SiloGridJob = struct {
     group_lease_rows: u64,
     raw_group_mode: RawGroupMode,
     raw_chunk_rows: usize,
+    raw_group_chunk_rows: usize,
     raw_batch_chunks: usize,
-    raw_stage_lanes: usize,
-    raw_group_lane_claim: bool,
     filter_fused: bool,
     profile: bool,
     cpu: usize,
@@ -4217,280 +4953,394 @@ fn drainNextFinalLocalBucket(
     }
 }
 
-fn drainRawChunk(
-    allocator: Allocator,
+fn publishSharedStageBuilderLocked(
     shared: *PipeShared,
-    local: *WorkerParts,
-    scratch: *GroupScratch,
-    raw_group_mode: RawGroupMode,
-    raw_chunk_rows: usize,
-    local_table: *GroupTable,
-    local_states: *std.ArrayListUnmanaged(State),
-    group_ticks: *i64,
-    chunks: *u64,
-    profile: bool,
-) !bool {
-    const chunk = popRawChunk(shared, &local.raw_queue_lock_ticks) orelse return false;
-    const row_count = chunk.rows.items.len;
-    _ = shared.active_group_jobs.fetchAdd(1, .release);
-    defer _ = shared.active_group_jobs.fetchSub(1, .release);
+    builder: *StageBucketBuilder,
+    bucket_idx: usize,
+    raw_group_chunk_rows: usize,
+    queue_lock_ticks: ?*i64,
+    recycle_lock_ticks: ?*i64,
+) !void {
+    if (bucket_idx >= shared.raw_group_queues.len) return;
+    const row_count = builder.rows.len();
+    if (row_count == 0) return;
 
-    switch (raw_group_mode) {
-        .radix_global => try processRawChunkRadixGlobal(allocator, shared, local, scratch, chunk.rows.items, group_ticks, chunks, profile),
-        .radix_batch => unreachable,
-        .radix_cluster => unreachable,
-        .radix_staged => unreachable,
-        .preagg_merge => try processRawChunkPreAggMerge(allocator, shared, local, scratch, local_table, local_states, chunk.rows.items, group_ticks, chunks, profile),
-        .sort_preagg => try processRawChunkSortPreAgg(allocator, shared, local, scratch, chunk.rows.items, group_ticks, chunks, profile),
-        .off => unreachable,
+    const rows = builder.rows;
+    builder.rows = try acquireGroupRows(shared, raw_group_chunk_rows, recycle_lock_ticks);
+    errdefer {
+        builder.rows.deinit(shared.allocator);
+        builder.rows = rows;
     }
+    _ = shared.stage_builder_rows.fetchSub(@intCast(row_count), .release);
 
-    _ = shared.outstanding_rows.fetchSub(@intCast(row_count), .release);
-    _ = shared.outstanding_chunks.fetchSub(1, .release);
-    try recycleRawRows(shared, chunk.rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
-    return true;
+    try publishGroupChunkToQueue(
+        shared,
+        &shared.raw_group_queues[bucket_idx],
+        .{ .rows = rows, .owner_worker = 0, .bucket_idx = bucket_idx },
+        &shared.stage_outstanding_chunks,
+        &shared.stage_outstanding_rows,
+        queue_lock_ticks,
+    );
 }
 
-fn drainRawChunkBatch(
-    allocator: Allocator,
+fn appendSharedStageBuilderSlice(
     shared: *PipeShared,
     local: *WorkerParts,
-    scratch: *GroupScratch,
-    raw_chunk_rows: usize,
-    raw_batch_chunks: usize,
-    group_ticks: *i64,
-    chunks: *u64,
+    bucket_idx: usize,
+    rows: []const Row,
+    raw_group_chunk_rows: usize,
     profile: bool,
-) !bool {
-    var raw_chunks: [MAX_RAW_BATCH_CHUNKS]RawChunk = undefined;
-    const popped_total = popRawChunkBatch(shared, &raw_chunks, raw_batch_chunks, &local.raw_queue_lock_ticks);
-    if (popped_total == 0) return false;
-    _ = shared.active_group_jobs.fetchAdd(1, .release);
-    defer _ = shared.active_group_jobs.fetchSub(1, .release);
+) !void {
+    if (rows.len == 0 or bucket_idx >= shared.stage_builders.len) return;
+    const builder = &shared.stage_builders[bucket_idx];
+    const lock_t0 = if (profile) nowTicks() else 0;
+    lockSpin(&builder.lock);
+    if (profile) local.raw_stage_builder_lock_ticks += nowTicks() - lock_t0;
+    defer builder.lock.unlock();
 
-    scratch.rows.clearRetainingCapacity();
-    var total_rows: u64 = 0;
-    var popped_chunks: usize = 0;
-    while (popped_chunks < popped_total) : (popped_chunks += 1) {
-        const chunk = raw_chunks[popped_chunks];
-        try scratch.rows.appendSlice(allocator, chunk.rows.items);
-        total_rows += @intCast(chunk.rows.items.len);
-        try recycleRawRows(shared, chunk.rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
-    }
+    var pos: usize = 0;
+    while (pos < rows.len) {
+        if (builder.rows.capacity() == 0) {
+            builder.rows = try acquireGroupRows(shared, raw_group_chunk_rows, &local.raw_recycle_lock_ticks);
+        }
+        if (builder.rows.len() >= raw_group_chunk_rows) {
+            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
+            continue;
+        }
 
-    try processRawChunkRadixGlobal(allocator, shared, local, scratch, scratch.rows.items, group_ticks, chunks, profile);
+        const free = raw_group_chunk_rows - builder.rows.len();
+        const take = @min(free, rows.len - pos);
+        try builder.rows.appendRows(shared.allocator, shared.group_rows_layout, rows[pos .. pos + take]);
+        _ = shared.stage_builder_rows.fetchAdd(@intCast(take), .release);
+        pos += take;
 
-    _ = shared.outstanding_rows.fetchSub(total_rows, .release);
-    _ = shared.outstanding_chunks.fetchSub(popped_chunks, .release);
-    return true;
-}
-
-fn coarseClusterRawChunks(
-    allocator: Allocator,
-    local: *WorkerParts,
-    scratch: *GroupScratch,
-    raw_chunks: []RawChunk,
-    stage_lanes_raw: usize,
-) !usize {
-    var total_rows: usize = 0;
-    for (raw_chunks) |chunk| total_rows += chunk.rows.items.len;
-    if (total_rows == 0) return 0;
-
-    const stage_lanes = @max(@as(usize, 1), @min(stage_lanes_raw, @max(@as(usize, 1), local.flat_counts.len)));
-    @memset(local.flat_counts[0..stage_lanes], 0);
-
-    for (raw_chunks) |chunk| {
-        for (chunk.rows.items) |row| {
-            local.flat_counts[rowBucketIndex(row, stage_lanes)] += 1;
+        if (builder.rows.len() >= raw_group_chunk_rows) {
+            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
         }
     }
+}
 
-    var offset: u32 = 0;
-    var lane: usize = 0;
-    while (lane < stage_lanes) : (lane += 1) {
-        local.flat_offsets[lane] = offset;
-        offset += local.flat_counts[lane];
-        local.flat_counts[lane] = 0;
-    }
+fn appendSharedStageBuilderRawSlice(
+    shared: *PipeShared,
+    local: *WorkerParts,
+    bucket_idx: usize,
+    rows: RawRows,
+    start: usize,
+    count: usize,
+    raw_group_chunk_rows: usize,
+    profile: bool,
+) !void {
+    if (count == 0 or bucket_idx >= shared.stage_builders.len) return;
+    const builder = &shared.stage_builders[bucket_idx];
+    const lock_t0 = if (profile) nowTicks() else 0;
+    lockSpin(&builder.lock);
+    if (profile) local.raw_stage_builder_lock_ticks += nowTicks() - lock_t0;
+    defer builder.lock.unlock();
 
-    scratch.rows.clearRetainingCapacity();
-    try scratch.rows.resize(allocator, total_rows);
-    for (raw_chunks) |chunk| {
-        for (chunk.rows.items) |row| {
-            const lane_idx = rowBucketIndex(row, stage_lanes);
-            const pos = local.flat_offsets[lane_idx] + local.flat_counts[lane_idx];
-            scratch.rows.items[pos] = row;
-            local.flat_counts[lane_idx] += 1;
+    var pos: usize = 0;
+    while (pos < count) {
+        if (builder.rows.capacity() == 0) {
+            builder.rows = try acquireGroupRows(shared, raw_group_chunk_rows, &local.raw_recycle_lock_ticks);
+        }
+        if (builder.rows.len() >= raw_group_chunk_rows) {
+            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
+            continue;
+        }
+
+        const free = raw_group_chunk_rows - builder.rows.len();
+        const take = @min(free, count - pos);
+        try builder.rows.appendRawRowsSlice(shared.allocator, shared.group_rows_layout, rows, start + pos, take);
+        _ = shared.stage_builder_rows.fetchAdd(@intCast(take), .release);
+        pos += take;
+
+        if (builder.rows.len() >= raw_group_chunk_rows) {
+            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
         }
     }
-
-    var src_off: usize = 0;
-    for (raw_chunks) |chunk| {
-        const len = chunk.rows.items.len;
-        @memcpy(chunk.rows.items, scratch.rows.items[src_off .. src_off + len]);
-        src_off += len;
-    }
-    return total_rows;
 }
 
-fn drainRawChunkCluster(
-    allocator: Allocator,
+fn flushSharedStageBuilders(
     shared: *PipeShared,
     local: *WorkerParts,
-    scratch: *GroupScratch,
-    raw_chunk_rows: usize,
-    raw_batch_chunks: usize,
-    raw_stage_lanes: usize,
-    group_ticks: *i64,
-    chunks: *u64,
+    raw_group_chunk_rows: usize,
     profile: bool,
 ) !bool {
-    var raw_chunks: [MAX_RAW_BATCH_CHUNKS]RawChunk = undefined;
-    const popped_total = popRawChunkBatch(shared, &raw_chunks, raw_batch_chunks, &local.raw_queue_lock_ticks);
-    if (popped_total == 0) return false;
-    _ = shared.active_group_jobs.fetchAdd(1, .release);
-    defer _ = shared.active_group_jobs.fetchSub(1, .release);
-
-    const stage_t0 = if (profile) nowTicks() else 0;
-    _ = try coarseClusterRawChunks(allocator, local, scratch, raw_chunks[0..popped_total], raw_stage_lanes);
-    if (profile) local.raw_stage_ticks += nowTicks() - stage_t0;
-
-    var total_rows: u64 = 0;
-    var i: usize = 0;
-    while (i < popped_total) : (i += 1) {
-        const chunk = raw_chunks[i];
-        total_rows += @intCast(chunk.rows.items.len);
-        try processRawChunkRadixGlobal(allocator, shared, local, scratch, chunk.rows.items, group_ticks, chunks, profile);
-        try recycleRawRows(shared, chunk.rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+    if (shared.stage_builder_rows.load(.acquire) == 0) return false;
+    const publish_t0 = if (profile) nowTicks() else 0;
+    var flushed = false;
+    var b: usize = 0;
+    while (b < shared.stage_builders.len) : (b += 1) {
+        const builder = &shared.stage_builders[b];
+        const lock_t0 = if (profile) nowTicks() else 0;
+        lockSpin(&builder.lock);
+        if (profile) local.raw_stage_builder_lock_ticks += nowTicks() - lock_t0;
+        if (builder.rows.len() > 0) {
+            try publishSharedStageBuilderLocked(shared, builder, b, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
+            flushed = true;
+        }
+        builder.lock.unlock();
     }
-
-    _ = shared.outstanding_rows.fetchSub(total_rows, .release);
-    _ = shared.outstanding_chunks.fetchSub(popped_total, .release);
-    return true;
+    if (profile) local.raw_stage_publish_ticks += nowTicks() - publish_t0;
+    return flushed;
 }
 
-fn drainRawDedicatedStage(
+fn publishRawStageFinalBucket(
+    shared: *PipeShared,
+    local: *WorkerParts,
+    bucket_idx: usize,
+    raw_group_chunk_rows: usize,
+    queue_lock_ticks: ?*i64,
+) !void {
+    if (bucket_idx >= local.buckets.len or bucket_idx >= shared.raw_group_queues.len) return;
+    const row_count = local.buckets[bucket_idx].rows.items.len;
+    if (row_count == 0) return;
+
+    const rows_aos = local.buckets[bucket_idx].rows;
+    var rows = try acquireGroupRows(shared, raw_group_chunk_rows, &local.raw_recycle_lock_ticks);
+    try rows.appendRows(shared.allocator, shared.group_rows_layout, rows_aos.items);
+    local.buckets[bucket_idx].rows.clearRetainingCapacity();
+    local.dirty_marks[bucket_idx] = false;
+    local.raw_stage_buffered_rows -= row_count;
+
+    try publishGroupChunkToQueue(
+        shared,
+        &shared.raw_group_queues[bucket_idx],
+        .{ .rows = rows, .owner_worker = local.worker_index, .bucket_idx = bucket_idx },
+        &shared.stage_outstanding_chunks,
+        &shared.stage_outstanding_rows,
+        queue_lock_ticks,
+    );
+}
+
+fn appendRawStageFinalRow(
+    shared: *PipeShared,
+    local: *WorkerParts,
+    bucket_idx: usize,
+    row: Row,
+    raw_group_chunk_rows: usize,
+    queue_lock_ticks: ?*i64,
+) !void {
+    if (bucket_idx >= local.buckets.len) return;
+    var bucket = &local.buckets[bucket_idx];
+    if (bucket.rows.capacity == 0) {
+        try bucket.rows.ensureTotalCapacity(shared.allocator, raw_group_chunk_rows);
+    }
+    if (!local.dirty_marks[bucket_idx]) {
+        local.dirty_marks[bucket_idx] = true;
+        try local.dirty_buckets.append(shared.allocator, bucket_idx);
+    }
+    if (bucket.rows.items.len < bucket.rows.capacity) {
+        bucket.rows.appendAssumeCapacity(row);
+    } else {
+        try bucket.rows.append(shared.allocator, row);
+    }
+    local.raw_stage_buffered_rows += 1;
+    if (bucket.rows.items.len >= raw_group_chunk_rows) {
+        try publishRawStageFinalBucket(shared, local, bucket_idx, raw_group_chunk_rows, queue_lock_ticks);
+    }
+}
+
+fn flushRawStageFinalBuckets(
+    shared: *PipeShared,
+    local: *WorkerParts,
+    raw_group_chunk_rows: usize,
+    profile: bool,
+) !bool {
+    if (local.raw_stage_buffered_rows == 0) return false;
+    const publish_t0 = if (profile) nowTicks() else 0;
+    var kept: usize = 0;
+    var flushed = false;
+    for (local.dirty_buckets.items) |bucket_idx| {
+        if (bucket_idx >= local.dirty_marks.len or !local.dirty_marks[bucket_idx]) continue;
+        if (bucket_idx < local.buckets.len and local.buckets[bucket_idx].rows.items.len > 0) {
+            try publishRawStageFinalBucket(shared, local, bucket_idx, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks);
+            flushed = true;
+        } else {
+            local.dirty_marks[bucket_idx] = false;
+        }
+        if (bucket_idx < local.dirty_marks.len and local.dirty_marks[bucket_idx]) {
+            local.dirty_buckets.items[kept] = bucket_idx;
+            kept += 1;
+        }
+    }
+    local.dirty_buckets.items.len = kept;
+    if (profile) local.raw_stage_publish_ticks += nowTicks() - publish_t0;
+    return flushed;
+}
+
+fn drainRawDedicatedStageFinalBuckets(
     allocator: Allocator,
     shared: *PipeShared,
     local: *WorkerParts,
-    scratch: *GroupScratch,
     worker_index: usize,
     scan_lane: usize,
     raw_chunk_rows: usize,
+    raw_group_chunk_rows: usize,
     raw_batch_chunks: usize,
-    raw_stage_lanes: usize,
     profile: bool,
 ) !bool {
-    _ = scratch;
+    _ = allocator;
+    _ = worker_index;
     var raw_chunks: [MAX_RAW_BATCH_CHUNKS]RawChunk = undefined;
     if (scan_lane >= shared.raw_scan_queues.len) return false;
-    const pop_t0 = if (profile) nowTicks() else 0;
-    const popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
-    releaseRawQueueLane(shared.raw_scan_queues, scan_lane);
+    defer releaseRawQueueLane(shared.raw_scan_queues, scan_lane);
+
+    var pop_t0 = if (profile) nowTicks() else 0;
+    var popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
     if (profile) local.raw_stage_pop_ticks += nowTicks() - pop_t0;
     if (popped_total == 0) return false;
-    local.raw_stage_input_chunks += @intCast(popped_total);
+
     _ = shared.active_stage_jobs.fetchAdd(1, .release);
     defer _ = shared.active_stage_jobs.fetchSub(1, .release);
 
-    var total_rows: u64 = 0;
-    var i: usize = 0;
-    while (i < popped_total) : (i += 1) total_rows += @intCast(raw_chunks[i].rows.items.len);
-    _ = shared.outstanding_rows.fetchSub(total_rows, .release);
-    _ = shared.outstanding_chunks.fetchSub(popped_total, .release);
+    const final_bucket_count = @min(shared.bucket_count, shared.raw_group_queues.len);
+    while (popped_total > 0) {
+        local.raw_stage_input_chunks += @intCast(popped_total);
 
-    const actual_stage_lanes = @max(@as(usize, 1), @min(@min(raw_stage_lanes, @max(@as(usize, 1), shared.raw_group_queues.len)), @max(@as(usize, 1), local.flat_counts.len)));
-    const stage_t0 = if (profile) nowTicks() else 0;
-    @memset(local.flat_counts[0..actual_stage_lanes], 0);
-    i = 0;
-    while (i < popped_total) : (i += 1) {
-        for (raw_chunks[i].rows.items) |row| {
-            local.flat_counts[rowBucketIndex(row, actual_stage_lanes)] += 1;
-        }
-    }
-    if (profile) local.raw_stage_ticks += nowTicks() - stage_t0;
+        var total_rows: u64 = 0;
+        var i: usize = 0;
+        while (i < popped_total) : (i += 1) total_rows += @intCast(raw_chunks[i].rows.len());
+        _ = shared.outstanding_rows.fetchSub(total_rows, .release);
+        _ = shared.outstanding_chunks.fetchSub(popped_total, .release);
 
-    const fill_t0 = if (profile) nowTicks() else 0;
-    var publish_ticks: i64 = 0;
-    const lane_rows = try allocator.alloc(std.ArrayListUnmanaged(Row), actual_stage_lanes);
-    defer allocator.free(lane_rows);
-    const lane_active = try allocator.alloc(bool, actual_stage_lanes);
-    defer allocator.free(lane_active);
-    for (lane_rows) |*rows| rows.* = .empty;
-    @memset(lane_active, false);
-    errdefer {
-        var cleanup_lane: usize = 0;
-        while (cleanup_lane < actual_stage_lanes) : (cleanup_lane += 1) {
-            if (lane_active[cleanup_lane]) lane_rows[cleanup_lane].deinit(shared.allocator);
-        }
-    }
-
-    i = 0;
-    while (i < popped_total) : (i += 1) {
-        for (raw_chunks[i].rows.items) |row| {
-            const lane = rowBucketIndex(row, actual_stage_lanes);
-            if (!lane_active[lane]) {
-                lane_rows[lane] = try acquireRawRows(shared, raw_chunk_rows, &local.raw_recycle_lock_ticks);
-                lane_active[lane] = true;
-            }
-            try lane_rows[lane].append(shared.allocator, row);
-            if (lane_rows[lane].items.len >= raw_chunk_rows) {
-                const qidx = if (shared.raw_group_queues.len == 0) 0 else lane % shared.raw_group_queues.len;
-                const publish_t0 = if (profile) nowTicks() else 0;
-                try publishRawChunkToQueue(shared, &shared.raw_group_queues[qidx], .{ .rows = lane_rows[lane], .owner_worker = worker_index }, &shared.stage_outstanding_chunks, &shared.stage_outstanding_rows, &local.raw_group_queue_lock_ticks);
-                if (profile) publish_ticks += nowTicks() - publish_t0;
-                lane_rows[lane] = .empty;
-                lane_active[lane] = false;
+        const stage_t0 = if (profile) nowTicks() else 0;
+        i = 0;
+        while (i < popped_total) : (i += 1) {
+            var r: usize = 0;
+            while (r < raw_chunks[i].rows.len()) : (r += 1) {
+                const row = raw_chunks[i].rows.rowAt(r);
+                const b = rowBucketIndex(row, final_bucket_count);
+                try appendRawStageFinalRow(shared, local, b, row, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks);
             }
         }
-    }
+        if (profile) local.raw_stage_ticks += nowTicks() - stage_t0;
 
-    var lane: usize = 0;
-    while (lane < actual_stage_lanes) : (lane += 1) {
-        if (!lane_active[lane]) continue;
-        if (lane_rows[lane].items.len > 0) {
-            const qidx = if (shared.raw_group_queues.len == 0) 0 else lane % shared.raw_group_queues.len;
-            const publish_t0 = if (profile) nowTicks() else 0;
-            try publishRawChunkToQueue(shared, &shared.raw_group_queues[qidx], .{ .rows = lane_rows[lane], .owner_worker = worker_index }, &shared.stage_outstanding_chunks, &shared.stage_outstanding_rows, &local.raw_group_queue_lock_ticks);
-            if (profile) publish_ticks += nowTicks() - publish_t0;
-        } else {
-            lane_rows[lane].deinit(shared.allocator);
-        }
-        lane_rows[lane] = .empty;
-        lane_active[lane] = false;
+        i = 0;
+        const recycle_t0 = if (profile) nowTicks() else 0;
+        while (i < popped_total) : (i += 1) try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+        if (profile) local.raw_stage_recycle_ticks += nowTicks() - recycle_t0;
+
+        pop_t0 = if (profile) nowTicks() else 0;
+        popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
+        if (profile) local.raw_stage_pop_ticks += nowTicks() - pop_t0;
     }
-    if (profile) {
-        const fill_ticks = nowTicks() - fill_t0;
-        local.raw_stage_publish_ticks += publish_ticks;
-        local.raw_stage_slice_ticks += if (fill_ticks > publish_ticks) fill_ticks - publish_ticks else 0;
-    }
-    i = 0;
-    const recycle_t0 = if (profile) nowTicks() else 0;
-    while (i < popped_total) : (i += 1) try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
-    if (profile) local.raw_stage_recycle_ticks += nowTicks() - recycle_t0;
     return true;
 }
 
-fn drainRawDedicatedGroup(
+fn drainRawDedicatedStageSharedBuilders(
     allocator: Allocator,
     shared: *PipeShared,
     local: *WorkerParts,
-    scratch: *GroupScratch,
-    worker_index: usize,
+    scan_lane: usize,
     raw_chunk_rows: usize,
-    group_ticks: *i64,
-    chunks: *u64,
+    raw_group_chunk_rows: usize,
+    raw_batch_chunks: usize,
     profile: bool,
 ) !bool {
-    const chunk = popRawGroupChunk(shared, worker_index, &local.raw_group_queue_lock_ticks) orelse return false;
-    _ = shared.active_group_jobs.fetchAdd(1, .release);
-    defer _ = shared.active_group_jobs.fetchSub(1, .release);
+    var raw_chunks: [MAX_RAW_BATCH_CHUNKS]RawChunk = undefined;
+    if (scan_lane >= shared.raw_scan_queues.len) return false;
+    defer releaseRawQueueLane(shared.raw_scan_queues, scan_lane);
 
-    const row_count: u64 = @intCast(chunk.rows.items.len);
-    try processRawChunkRadixGlobal(allocator, shared, local, scratch, chunk.rows.items, group_ticks, chunks, profile);
-    _ = shared.stage_outstanding_rows.fetchSub(row_count, .release);
-    _ = shared.stage_outstanding_chunks.fetchSub(1, .release);
-    try recycleRawRows(shared, chunk.rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+    var pop_t0 = if (profile) nowTicks() else 0;
+    var popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
+    if (profile) local.raw_stage_pop_ticks += nowTicks() - pop_t0;
+    if (popped_total == 0) return false;
+
+    _ = shared.active_stage_jobs.fetchAdd(1, .release);
+    defer _ = shared.active_stage_jobs.fetchSub(1, .release);
+
+    const bucket_count = @min(shared.bucket_count, shared.raw_group_queues.len);
+    std.debug.assert(bucket_count <= @as(usize, std.math.maxInt(u16)) + 1);
+    try local.ensureWideBucketScratch(allocator, bucket_count);
+
+    while (popped_total > 0) {
+        local.raw_stage_input_chunks += @intCast(popped_total);
+
+        var total_rows: usize = 0;
+        var i: usize = 0;
+        while (i < popped_total) : (i += 1) total_rows += raw_chunks[i].rows.len();
+        _ = shared.outstanding_rows.fetchSub(@intCast(total_rows), .release);
+        _ = shared.outstanding_chunks.fetchSub(popped_total, .release);
+        if (total_rows == 0) {
+            i = 0;
+            const recycle_t0 = if (profile) nowTicks() else 0;
+            while (i < popped_total) : (i += 1) try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+            if (profile) local.raw_stage_recycle_ticks += nowTicks() - recycle_t0;
+            pop_t0 = if (profile) nowTicks() else 0;
+            popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
+            if (profile) local.raw_stage_pop_ticks += nowTicks() - pop_t0;
+            continue;
+        }
+
+        try local.flat_raw_rows.resize(allocator, shared.group_rows_layout, total_rows);
+        try local.flat_bucket_ids.resize(allocator, total_rows);
+
+        const stage_t0 = if (profile) nowTicks() else 0;
+        @memset(local.flat_counts[0..bucket_count], 0);
+        var row_idx: usize = 0;
+        i = 0;
+        while (i < popped_total) : (i += 1) {
+            var r: usize = 0;
+            while (r < raw_chunks[i].rows.len()) : (r += 1) {
+                const b = rawRowBucketIndex(raw_chunks[i].rows, r, bucket_count);
+                local.flat_bucket_ids.items[row_idx] = @intCast(b);
+                local.flat_counts[b] += 1;
+                row_idx += 1;
+            }
+        }
+
+        var offset: u32 = 0;
+        var b: usize = 0;
+        while (b < bucket_count) : (b += 1) {
+            local.flat_offsets[b] = offset;
+            local.flat_next[b] = offset;
+            offset += local.flat_counts[b];
+        }
+
+        row_idx = 0;
+        i = 0;
+        const flat_key_lo = local.flat_raw_rows.keyLoAll();
+        const flat_key_hi = local.flat_raw_rows.keyHiAll();
+        const flat_refresh = local.flat_raw_rows.columnI16All(0);
+        const flat_width = local.flat_raw_rows.columnI16All(1);
+        while (i < popped_total) : (i += 1) {
+            const src_key_lo = raw_chunks[i].rows.keyLoAll();
+            const src_key_hi = raw_chunks[i].rows.keyHiAll();
+            const src_refresh = raw_chunks[i].rows.columnI16All(0);
+            const src_width = raw_chunks[i].rows.columnI16All(1);
+            var r: usize = 0;
+            while (r < raw_chunks[i].rows.len()) : (r += 1) {
+                const bucket_idx: usize = local.flat_bucket_ids.items[row_idx];
+                const pos = local.flat_next[bucket_idx];
+                flat_key_lo[pos] = src_key_lo[r];
+                flat_key_hi[pos] = src_key_hi[r];
+                flat_refresh[pos] = src_refresh[r];
+                flat_width[pos] = src_width[r];
+                local.flat_next[bucket_idx] = pos + 1;
+                row_idx += 1;
+            }
+        }
+        if (profile) local.raw_stage_ticks += nowTicks() - stage_t0;
+
+        const append_t0 = if (profile) nowTicks() else 0;
+        b = 0;
+        while (b < bucket_count) : (b += 1) {
+            const count: usize = local.flat_counts[b];
+            if (count == 0) continue;
+            const start: usize = local.flat_offsets[b];
+            try appendSharedStageBuilderRawSlice(shared, local, b, local.flat_raw_rows, start, count, raw_group_chunk_rows, profile);
+        }
+        if (profile) local.raw_stage_slice_ticks += nowTicks() - append_t0;
+
+        i = 0;
+        const recycle_t0 = if (profile) nowTicks() else 0;
+        while (i < popped_total) : (i += 1) try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+        if (profile) local.raw_stage_recycle_ticks += nowTicks() - recycle_t0;
+
+        pop_t0 = if (profile) nowTicks() else 0;
+        popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
+        if (profile) local.raw_stage_pop_ticks += nowTicks() - pop_t0;
+    }
     return true;
 }
 
@@ -4500,23 +5350,39 @@ fn drainRawDedicatedGroupLane(
     local: *WorkerParts,
     scratch: *GroupScratch,
     group_lane: usize,
-    raw_chunk_rows: usize,
+    raw_group_chunk_rows: usize,
+    raw_batch_chunks: usize,
     group_ticks: *i64,
     chunks: *u64,
     profile: bool,
 ) !bool {
     if (group_lane >= shared.raw_group_queues.len) return false;
-    const maybe_chunk = popRawChunkFromQueue(&shared.raw_group_queues[group_lane], &local.raw_group_queue_lock_ticks);
+    var group_chunks: [MAX_RAW_BATCH_CHUNKS]GroupChunk = undefined;
+    const popped_total = popGroupChunkBatchFromQueue(&shared.raw_group_queues[group_lane], &group_chunks, raw_batch_chunks, &local.raw_group_queue_lock_ticks);
     releaseRawQueueLane(shared.raw_group_queues, group_lane);
-    const chunk = maybe_chunk orelse return false;
+    if (popped_total == 0) return false;
     _ = shared.active_group_jobs.fetchAdd(1, .release);
     defer _ = shared.active_group_jobs.fetchSub(1, .release);
 
-    const row_count: u64 = @intCast(chunk.rows.items.len);
-    try processRawChunkRadixGlobal(allocator, shared, local, scratch, chunk.rows.items, group_ticks, chunks, profile);
-    _ = shared.stage_outstanding_rows.fetchSub(row_count, .release);
-    _ = shared.stage_outstanding_chunks.fetchSub(1, .release);
-    try recycleRawRows(shared, chunk.rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+    const bucket = &shared.buckets[group_lane % shared.bucket_count];
+    var total_rows: u64 = 0;
+    var i: usize = 0;
+    while (i < popped_total) : (i += 1) {
+        const rows = group_chunks[i].rows;
+        total_rows += @intCast(rows.len());
+        const lock_t0 = if (profile) nowTicks() else 0;
+        lockSpin(&bucket.agg_lock);
+        if (profile) local.raw_agg_lock_ticks += nowTicks() - lock_t0;
+        const g0 = if (profile) nowTicks() else 0;
+        try groupChunkRowsDirect(&bucket.table, &bucket.states, scratch, allocator, rows);
+        bucket.row_count += rows.len();
+        if (profile) group_ticks.* += nowTicks() - g0;
+        bucket.agg_lock.unlock();
+        chunks.* += 1;
+        try recycleGroupRows(shared, group_chunks[i].rows, raw_group_chunk_rows, &local.raw_recycle_lock_ticks);
+    }
+    _ = shared.stage_outstanding_rows.fetchSub(total_rows, .release);
+    _ = shared.stage_outstanding_chunks.fetchSub(popped_total, .release);
     return true;
 }
 
@@ -4555,7 +5421,7 @@ fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize
     const top_t0 = if (profile) nowTicks() else 0;
     var local_top: TopSet = .{};
     var b = worker_index;
-    while (b < shared.bucket_count) : (b += worker_count) {
+    while (b < shared.buckets.len) : (b += worker_count) {
         for (shared.buckets[b].states.items) |s| {
             local_top.consider(.{
                 .key = s.key,
@@ -4784,9 +5650,9 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
         }
     }
 
-    if (job.raw_group_mode == .radix_staged and job.shared.raw_scan_queues.len > 0) {
+    if (job.raw_group_mode != .off and job.shared.raw_scan_queues.len > 0) {
         const publish_t0 = if (job.profile) nowTicks() else 0;
-        const qidx = job.local.raw_scan_lane % job.shared.raw_scan_queues.len;
+        const qidx = chooseRawScanPublishLane(job.shared, job.local.raw_scan_lane, @max(@as(usize, 1), job.raw_chunk_rows / 2));
         try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.outstanding_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
         if (job.profile) job.local.publish_ticks += nowTicks() - publish_t0;
     }
@@ -4803,11 +5669,9 @@ fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
     if (marked_scan_done.*) return;
     if (job.raw_group_mode != .off) {
         const publish_t0 = if (job.profile) nowTicks() else 0;
-        if (job.raw_group_mode == .radix_staged and job.shared.raw_scan_queues.len > 0) {
-            const qidx = job.local.raw_scan_lane % job.shared.raw_scan_queues.len;
+        if (job.shared.raw_scan_queues.len > 0) {
+            const qidx = chooseRawScanPublishLane(job.shared, job.local.raw_scan_lane, @max(@as(usize, 1), job.raw_chunk_rows / 2));
             try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.outstanding_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
-        } else {
-            try publishRawRows(job.shared, job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.local.raw_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
         }
         if (job.profile) job.local.publish_ticks += nowTicks() - publish_t0;
     } else if (job.shared.direct_final_local and job.local.flat_scan_partitions) {
@@ -4826,18 +5690,6 @@ fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
 fn siloGridWorkerErr(job: SiloGridJob) !void {
     var scratch: GroupScratch = .{};
     defer scratch.deinit(job.shared.allocator);
-    var raw_local_table: GroupTable = undefined;
-    var raw_local_table_inited = false;
-    var raw_local_states: std.ArrayListUnmanaged(State) = .empty;
-    defer {
-        if (raw_local_table_inited) raw_local_table.deinit(job.shared.allocator);
-        raw_local_states.deinit(job.shared.allocator);
-    }
-    if (job.raw_group_mode == .preagg_merge) {
-        raw_local_table = try GroupTable.init(job.shared.allocator, @max(@as(usize, 16), job.raw_chunk_rows / 4));
-        raw_local_table_inited = true;
-        try raw_local_states.ensureTotalCapacity(job.shared.allocator, @max(@as(usize, 16), job.raw_chunk_rows / 4));
-    }
 
     var cursor = (job.worker_index * 17) % job.shared.bucket_count;
     var marked_scan_done = false;
@@ -4862,10 +5714,10 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
         const group_first = group_queued_rows > scan_buffered_rows or !scan_claims_available;
         if (job.profile) job.local.sched_decision_ticks += nowTicks() - decision_t0;
 
-        if (job.raw_group_mode == .radix_staged) {
-            const scan_choice = if (scan_claims_available) minUnlockedScanLane(job.shared.raw_scan_queues, job.worker_index) else null;
-            const stage_choice = maxUnlockedQueueLaneRows(job.shared.raw_scan_queues, job.worker_index);
-            const group_choice = maxUnlockedQueueLaneRows(job.shared.raw_group_queues, job.worker_index);
+        if (job.raw_group_mode == .staged_final) {
+        const scan_choice = if (scan_claims_available) minUnlockedScanLane(job.shared.raw_scan_queues, job.worker_index) else null;
+        const stage_choice = maxUnlockedQueueLaneRows(job.shared.raw_scan_queues, job.worker_index);
+        const group_choice = maxUnlockedQueueLaneRows(job.shared.raw_group_queues, job.worker_index);
             const max_stage_rows = if (stage_choice) |choice| choice.rows else 0;
             const max_group_rows = if (group_choice) |choice| choice.rows else 0;
             const downstream_max_rows = @max(max_stage_rows, max_group_rows);
@@ -4884,23 +5736,35 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
             }
 
             if (max_stage_rows > max_group_rows) {
-                if (stage_choice) |choice| {
-                    if (claimRawQueueLaneExact(job.shared.raw_scan_queues, choice.lane)) {
-                        if (try drainRawDedicatedStage(
+            if (stage_choice) |choice| {
+                if (claimRawQueueLaneExact(job.shared.raw_scan_queues, choice.lane)) {
+                    const did_stage = if (job.shared.stage_builders.len > 0)
+                        try drainRawDedicatedStageSharedBuilders(
                             job.shared.allocator,
                             job.shared,
                             job.local,
-                            &scratch,
+                            choice.lane,
+                            job.raw_chunk_rows,
+                            job.raw_group_chunk_rows,
+                            job.raw_batch_chunks,
+                            job.profile,
+                        )
+                    else
+                        try drainRawDedicatedStageFinalBuckets(
+                            job.shared.allocator,
+                            job.shared,
+                            job.local,
                             job.worker_index,
                             choice.lane,
                             job.raw_chunk_rows,
+                            job.raw_group_chunk_rows,
                             job.raw_batch_chunks,
-                            job.raw_stage_lanes,
                             job.profile,
-                        )) {
-                            job.local.sched_stage_jobs += 1;
-                            idle_spins = 0;
-                            continue;
+                        );
+                    if (did_stage) {
+                        job.local.sched_stage_jobs += 1;
+                        idle_spins = 0;
+                        continue;
                         }
                         job.local.sched_group_misses += 1;
                     }
@@ -4916,7 +5780,8 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
                             job.local,
                             &scratch,
                             choice.lane,
-                            job.raw_chunk_rows,
+                            job.raw_group_chunk_rows,
+                            job.raw_batch_chunks,
                             job.group_ticks,
                             job.chunks,
                             job.profile,
@@ -4927,6 +5792,24 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
                         }
                         job.local.sched_group_misses += 1;
                     }
+                }
+            }
+
+            const no_more_stage_input = global_scan_finished and
+                job.shared.outstanding_chunks.load(.acquire) == 0 and
+                job.shared.active_stage_jobs.load(.acquire) == 0;
+            const has_stage_partials = if (job.shared.stage_builders.len > 0)
+                job.shared.stage_builder_rows.load(.acquire) > 0
+            else
+                job.local.raw_stage_buffered_rows > 0;
+            if (no_more_stage_input and has_stage_partials) {
+                const flushed = if (job.shared.stage_builders.len > 0)
+                    try flushSharedStageBuilders(job.shared, job.local, job.raw_group_chunk_rows, job.profile)
+                else
+                    try flushRawStageFinalBuckets(job.shared, job.local, job.raw_group_chunk_rows, job.profile);
+                if (flushed) {
+                    idle_spins = 0;
+                    continue;
                 }
             }
 
@@ -4966,47 +5849,7 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
         }
 
         if (group_first and group_queued_rows > 0) {
-            const did_group_work = if (job.raw_group_mode == .radix_cluster)
-                try drainRawChunkCluster(
-                    job.shared.allocator,
-                    job.shared,
-                    job.local,
-                    &scratch,
-                    job.raw_chunk_rows,
-                    job.raw_batch_chunks,
-                    job.raw_stage_lanes,
-                    job.group_ticks,
-                    job.chunks,
-                    job.profile,
-                )
-            else if (job.raw_group_mode == .radix_batch)
-                try drainRawChunkBatch(
-                    job.shared.allocator,
-                    job.shared,
-                    job.local,
-                    &scratch,
-                    job.raw_chunk_rows,
-                    job.raw_batch_chunks,
-                    job.group_ticks,
-                    job.chunks,
-                    job.profile,
-                )
-            else if (job.raw_group_mode != .off)
-                try drainRawChunk(
-                    job.shared.allocator,
-                    job.shared,
-                    job.local,
-                    &scratch,
-                    job.raw_group_mode,
-                    job.raw_chunk_rows,
-                    &raw_local_table,
-                    &raw_local_states,
-                    job.group_ticks,
-                    job.chunks,
-                    job.profile,
-                )
-            else
-                try drainLeasedSilos(
+            const did_group_work = try drainLeasedSilos(
                     job.shared.allocator,
                     job.shared,
                     &scratch,
@@ -5034,47 +5877,7 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
         }
 
         if (!group_first and group_queued_rows > 0 and !scan_claims_available) {
-            const did_group_work = if (job.raw_group_mode == .radix_cluster)
-                try drainRawChunkCluster(
-                    job.shared.allocator,
-                    job.shared,
-                    job.local,
-                    &scratch,
-                    job.raw_chunk_rows,
-                    job.raw_batch_chunks,
-                    job.raw_stage_lanes,
-                    job.group_ticks,
-                    job.chunks,
-                    job.profile,
-                )
-            else if (job.raw_group_mode == .radix_batch)
-                try drainRawChunkBatch(
-                    job.shared.allocator,
-                    job.shared,
-                    job.local,
-                    &scratch,
-                    job.raw_chunk_rows,
-                    job.raw_batch_chunks,
-                    job.group_ticks,
-                    job.chunks,
-                    job.profile,
-                )
-            else if (job.raw_group_mode != .off)
-                try drainRawChunk(
-                    job.shared.allocator,
-                    job.shared,
-                    job.local,
-                    &scratch,
-                    job.raw_group_mode,
-                    job.raw_chunk_rows,
-                    &raw_local_table,
-                    &raw_local_states,
-                    job.group_ticks,
-                    job.chunks,
-                    job.profile,
-                )
-            else
-                try drainLeasedSilos(
+            const did_group_work = try drainLeasedSilos(
                     job.shared.allocator,
                     job.shared,
                     &scratch,
@@ -5169,9 +5972,10 @@ pub const RunConfig = struct {
     flat_scan_partitions: bool = false,
     raw_group_mode: RawGroupMode = .off,
     raw_chunk_rows: usize = 32768,
+    raw_group_chunk_rows: usize = 0,
     raw_batch_chunks: usize = 4,
-    raw_stage_lanes: usize = 16,
-    raw_group_lane_claim: bool = false,
+    group_rows_layout: GroupRowsLayout = .{},
+    shared_stage_builders: bool = false,
     no_profile: bool = false,
     quiet: bool = false,
     result_out: ?*std.ArrayListUnmanaged(TopRow) = null,
@@ -7185,8 +7989,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const n_workers = @max(@as(usize, 1), @min(dop, cpus.len));
     const chunk_rows = chooseGridChunkRows(cfg.chunk_rows, cfg.chunk_rows_set);
     const raw_chunk_rows = @max(@as(usize, 1), cfg.raw_chunk_rows);
+    const raw_group_chunk_rows = if (cfg.raw_group_chunk_rows == 0) raw_chunk_rows else @max(@as(usize, 1), cfg.raw_group_chunk_rows);
     const raw_batch_chunks = @max(@as(usize, 1), cfg.raw_batch_chunks);
-    const raw_stage_lanes = @max(@as(usize, 1), @min(cfg.raw_stage_lanes, bucket_count));
+    const group_rows_layout = cfg.group_rows_layout;
     const use_raw_group = cfg.raw_group_mode != .off;
     const scan_tile_rgs = chooseGridScanTileRgs(cfg.kind, cfg.scan_tile_rgs, cfg.scan_tile_rgs_set);
     const scan_coalesce_tiles = cfg.scan_coalesce_tiles;
@@ -7248,8 +8053,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
 
     if (!cfg.quiet) {
         std.debug.print(
-            "[clientip] query={s} DOP={d} buckets={d} rows={d} mode=silo-grid workers={d} chunk_rows={d} raw_chunk_rows={d} raw_batch_chunks={d} raw_stage_lanes={d} scan_tile_rgs={d} scan_coalesce_tiles={d} route_block_rows={d} group_lease_buckets={d} group_lease_rows={d} local_reserve_per_bucket={d} worker_local_reserve_per_bucket={d} shared_scan_banks={d} shared_scan_reserve_per_bucket={d} flat_reserve_per_worker={d} expected_groups_per_bucket={d} init_groups_per_bucket={d} direct_final_local={s} force_queue_publish={s} shared_scan_buffers={s} flat_scan_partitions={s} raw_group_mode={s} scheduler=group_rows_vs_scan_buffer_rows\n",
-            .{ cfg.kind.label(), dop, bucket_count, total, n_workers, chunk_rows, raw_chunk_rows, raw_batch_chunks, raw_stage_lanes, scan_tile_rgs, scan_coalesce_tiles, route_block_rows, cfg.group_lease_buckets, cfg.group_lease_rows, local_reserve_per_bucket, worker_local_reserve_per_bucket, shared_scan_bank_count, shared_scan_reserve_per_bucket, flat_reserve_per_worker, expected_groups_per_bucket, init_groups_per_bucket, if (direct_final_local) "true" else "false", if (cfg.force_queue_publish) "true" else "false", if (use_shared_scan_buffers) "true" else "false", if (use_flat_scan_partitions) "true" else "false", @tagName(cfg.raw_group_mode) },
+            "[clientip] query={s} DOP={d} buckets={d} rows={d} mode=silo-grid workers={d} chunk_rows={d} raw_chunk_rows={d} raw_group_chunk_rows={d} raw_batch_chunks={d} scan_tile_rgs={d} scan_coalesce_tiles={d} route_block_rows={d} group_lease_buckets={d} group_lease_rows={d} local_reserve_per_bucket={d} worker_local_reserve_per_bucket={d} shared_scan_banks={d} shared_scan_reserve_per_bucket={d} flat_reserve_per_worker={d} expected_groups_per_bucket={d} init_groups_per_bucket={d} direct_final_local={s} force_queue_publish={s} shared_scan_buffers={s} flat_scan_partitions={s} raw_group_mode={s} shared_stage_builders={s} scheduler=group_rows_vs_scan_buffer_rows\n",
+            .{ cfg.kind.label(), dop, bucket_count, total, n_workers, chunk_rows, raw_chunk_rows, raw_group_chunk_rows, raw_batch_chunks, scan_tile_rgs, scan_coalesce_tiles, route_block_rows, cfg.group_lease_buckets, cfg.group_lease_rows, local_reserve_per_bucket, worker_local_reserve_per_bucket, shared_scan_bank_count, shared_scan_reserve_per_bucket, flat_reserve_per_worker, expected_groups_per_bucket, init_groups_per_bucket, if (direct_final_local) "true" else "false", if (cfg.force_queue_publish) "true" else "false", if (use_shared_scan_buffers) "true" else "false", if (use_flat_scan_partitions) "true" else "false", @tagName(cfg.raw_group_mode), if (cfg.shared_stage_builders) "true" else "false" },
         );
         std.debug.print("[clientip-cpu-assign] mode=silo-grid workers=", .{});
         for (cpus[0..@min(n_workers, cpus.len)], 0..) |cpu, ci| {
@@ -7336,19 +8141,25 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     defer if (shared_scan_buffers_ptr != null) shared_scan_buffers_storage.deinit(allocator);
 
-    const use_dedicated_raw_stage = cfg.raw_group_mode == .radix_staged;
+    const use_dedicated_raw_stage = cfg.raw_group_mode == .staged_final;
     var raw_scan_queues: []RawQueue = &.{};
-    var raw_group_queues: []RawQueue = &.{};
+    var raw_group_queues: []GroupQueue = &.{};
+    var stage_builders: []StageBucketBuilder = &.{};
     var raw_queues_moved_to_shared = false;
     errdefer if (!raw_queues_moved_to_shared) {
         if (raw_scan_queues.len > 0) allocator.free(raw_scan_queues);
         if (raw_group_queues.len > 0) allocator.free(raw_group_queues);
+        if (stage_builders.len > 0) allocator.free(stage_builders);
     };
     if (use_dedicated_raw_stage) {
         raw_scan_queues = try allocator.alloc(RawQueue, n_workers);
-        raw_group_queues = try allocator.alloc(RawQueue, n_workers);
+        raw_group_queues = try allocator.alloc(GroupQueue, bucket_count);
         for (raw_scan_queues) |*queue| queue.* = .{};
         for (raw_group_queues) |*queue| queue.* = .{};
+        if (cfg.shared_stage_builders) {
+            stage_builders = try allocator.alloc(StageBucketBuilder, bucket_count);
+            for (stage_builders) |*builder| builder.* = .{};
+        }
     }
 
     var shared = PipeShared{
@@ -7357,6 +8168,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .bucket_count = bucket_count,
         .raw_scan_queues = raw_scan_queues,
         .raw_group_queues = raw_group_queues,
+        .stage_builders = stage_builders,
+        .group_rows_layout = group_rows_layout,
         .scan_threads = n_workers,
         .total_scan_rgs = total_rgs,
         .local_reserve_per_bucket = local_reserve_per_bucket,
@@ -7385,9 +8198,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         if (use_flat_scan_partitions) try parts[i].enableFlatScanPartitions(allocator, bucket_count, flat_reserve_per_worker);
         if (use_raw_group) {
             try parts[i].ensureWideBucketScratch(allocator, bucket_count);
-            try parts[i].raw_active_rows.ensureTotalCapacity(allocator, raw_chunk_rows);
-            try parts[i].flat_rows.ensureTotalCapacity(allocator, raw_chunk_rows);
-            try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, raw_chunk_rows);
+            try parts[i].raw_active_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, raw_chunk_rows);
+            const stage_scratch_rows = if (cfg.shared_stage_builders) raw_chunk_rows * @max(@as(usize, 1), @min(raw_batch_chunks, MAX_RAW_BATCH_CHUNKS)) else raw_chunk_rows;
+            try parts[i].flat_rows.ensureTotalCapacity(allocator, stage_scratch_rows);
+            try parts[i].flat_raw_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, stage_scratch_rows);
+            try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
         scans[i] = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, false, snap);
         if (cfg.scan_filter) _ = try applyScanFilter(scans[i], cfg.kind);
@@ -7450,9 +8265,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             .group_lease_rows = cfg.group_lease_rows,
             .raw_group_mode = cfg.raw_group_mode,
             .raw_chunk_rows = raw_chunk_rows,
+            .raw_group_chunk_rows = raw_group_chunk_rows,
             .raw_batch_chunks = raw_batch_chunks,
-            .raw_stage_lanes = raw_stage_lanes,
-            .raw_group_lane_claim = cfg.raw_group_lane_claim,
             .filter_fused = scans[i].fusedActive(),
             .profile = !cfg.no_profile,
             .cpu = cpus[i % cpus.len],
@@ -7490,6 +8304,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     var raw_group_queue_lock_ticks: i64 = 0;
     var raw_recycle_lock_ticks: i64 = 0;
     var raw_agg_lock_ticks: i64 = 0;
+    var raw_stage_builder_lock_ticks: i64 = 0;
     var raw_stage_ticks: i64 = 0;
     var raw_stage_pop_ticks: i64 = 0;
     var raw_stage_slice_ticks: i64 = 0;
@@ -7522,6 +8337,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         raw_group_queue_lock_ticks += p.raw_group_queue_lock_ticks;
         raw_recycle_lock_ticks += p.raw_recycle_lock_ticks;
         raw_agg_lock_ticks += p.raw_agg_lock_ticks;
+        raw_stage_builder_lock_ticks += p.raw_stage_builder_lock_ticks;
         raw_stage_ticks += p.raw_stage_ticks;
         raw_stage_pop_ticks += p.raw_stage_pop_ticks;
         raw_stage_slice_ticks += p.raw_stage_slice_ticks;
@@ -7687,15 +8503,16 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             },
         );
         std.debug.print(
-            "[clientip-raw-contention] query={s} raw_queue_lock={d:.3}ms raw_scan_queue_lock={d:.3}ms raw_group_queue_lock={d:.3}ms raw_recycle_lock={d:.3}ms central_group_lock={d:.3}ms total_raw_lock={d:.3}ms\n",
+            "[clientip-raw-contention] query={s} raw_queue_lock={d:.3}ms raw_scan_queue_lock={d:.3}ms raw_group_queue_lock={d:.3}ms raw_recycle_lock={d:.3}ms stage_builder_lock={d:.3}ms central_group_lock={d:.3}ms total_raw_lock={d:.3}ms\n",
             .{
                 cfg.kind.label(),
                 ticksToMs(raw_queue_lock_ticks, freq),
                 ticksToMs(raw_scan_queue_lock_ticks, freq),
                 ticksToMs(raw_group_queue_lock_ticks, freq),
                 ticksToMs(raw_recycle_lock_ticks, freq),
+                ticksToMs(raw_stage_builder_lock_ticks, freq),
                 ticksToMs(raw_agg_lock_ticks, freq),
-                ticksToMs(raw_queue_lock_ticks + raw_scan_queue_lock_ticks + raw_group_queue_lock_ticks + raw_recycle_lock_ticks + raw_agg_lock_ticks, freq),
+                ticksToMs(raw_queue_lock_ticks + raw_scan_queue_lock_ticks + raw_group_queue_lock_ticks + raw_recycle_lock_ticks + raw_stage_builder_lock_ticks + raw_agg_lock_ticks, freq),
             },
         );
         std.debug.print("[clientip-silo-grid-workers] query={s} aggregate_cpu_by_worker_ms=", .{cfg.kind.label()});

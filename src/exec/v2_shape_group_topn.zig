@@ -26,15 +26,21 @@ const PredicateExpr = exec.PredicateExpr;
 const SortSpec = exec.SortSpec;
 const AggSpec = exec.AggSpec;
 const HarnessCore = exec.group_topn_harness_core;
+const GroupTopNEngine = exec.v2_group_topn_engine;
 
 const DEFAULT_DOP: usize = 12;
-const DEFAULT_BUCKET_COUNT: usize = 128;
+const DEFAULT_BUCKET_COUNT: usize = 256;
 const DEFAULT_CHUNK_ROWS: usize = 8192;
 const DEFAULT_SCAN_TILE_RGS: usize = 16;
 const DEFAULT_ROUTE_BLOCK_ROWS: usize = 2048;
 const DEFAULT_GROUP_LEASE_BUCKETS: usize = 8;
 const DEFAULT_GROUP_INIT_CAP: usize = 0;
-const DEFAULT_RAW_CHUNK_ROWS: usize = 32768;
+const DEFAULT_RAW_CHUNK_ROWS: usize = 8192;
+const DEFAULT_RAW_GROUP_CHUNK_ROWS: usize = 8192;
+const DEFAULT_RAW_BATCH_CHUNKS: usize = 12;
+const MAX_GROUP_KEYS: usize = 8;
+const MAX_AGGS: usize = 3;
+const MAX_AGG_INPUTS: usize = 8;
 
 pub const Request = struct {
     group_cols: []const []const u8,
@@ -55,22 +61,33 @@ const KeyPart = struct {
 };
 
 const KeyLayout = struct {
-    parts: [2]KeyPart,
+    parts: [MAX_GROUP_KEYS]KeyPart,
+    part_count: usize,
     total_bits: u8,
+};
+
+const AggregateInputPlan = struct {
+    source_name: []const u8,
+    source_type: Type,
+    physical_type: GroupTopNEngine.PhysicalType,
+};
+
+const AggregatePlan = struct {
+    name: []const u8,
+    func: exec.AggFunc,
+    input_column_index: ?u16,
+    input_type: GroupTopNEngine.PhysicalType,
+    state_index: u16,
+    output_type: Type,
 };
 
 const ShapePlan = struct {
     layout: KeyLayout,
     core_kind: HarnessCore.QueryKind,
-    sum_col: []const u8,
-    sum_type: Type,
-    sum_out_type: Type,
-    avg_col: []const u8,
-    avg_type: Type,
-    avg_out_type: Type,
-    count_name: []const u8,
-    sum_name: []const u8,
-    avg_name: []const u8,
+    aggregate_inputs: [MAX_AGG_INPUTS]AggregateInputPlan,
+    aggregate_input_count: usize,
+    aggregates: [MAX_AGGS]AggregatePlan,
+    aggregate_count: usize,
 };
 
 const StageTimes = struct {
@@ -90,6 +107,9 @@ const ExecutionContext = struct {
     chunk_rows: usize = DEFAULT_CHUNK_ROWS,
     route_block_rows: usize = DEFAULT_ROUTE_BLOCK_ROWS,
     group_init_cap: usize = DEFAULT_GROUP_INIT_CAP,
+    raw_group_chunk_rows: usize = DEFAULT_RAW_GROUP_CHUNK_ROWS,
+    raw_batch_chunks: usize = DEFAULT_RAW_BATCH_CHUNKS,
+    shared_stage_builders: bool = true,
     times: StageTimes = .{},
 };
 
@@ -102,16 +122,6 @@ const TopRows = struct {
         if (self.items.len > 0) self.allocator.free(self.items);
         self.* = .{ .allocator = allocator };
     }
-};
-
-const AsyncWorkspaceTeardownTask = struct {
-    allocator: Allocator,
-    workspace: HarnessCore.SiloGridWorkspace,
-    cpus: []usize,
-    n_workers: usize,
-    trace_timing: bool,
-    query_label: []const u8,
-    bucket_count: usize,
 };
 
 pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Query {
@@ -145,12 +155,12 @@ const GroupTopNPipeline = struct {
 
         const output_schema = try allocator.alloc(Column, request.group_cols.len + request.aggs.len);
         errdefer allocator.free(output_schema);
-        for (plan.layout.parts, 0..) |part, i| {
+        for (plan.layout.parts[0..plan.layout.part_count], 0..) |part, i| {
             output_schema[i] = .{ .name = part.name, .type = part.typ };
         }
-        output_schema[2] = .{ .name = plan.count_name, .type = .bigint };
-        output_schema[3] = .{ .name = plan.sum_name, .type = plan.sum_out_type };
-        output_schema[4] = .{ .name = plan.avg_name, .type = plan.avg_out_type };
+        for (plan.aggregates[0..plan.aggregate_count], 0..) |agg_plan, i| {
+            output_schema[plan.layout.part_count + i] = .{ .name = agg_plan.name, .type = agg_plan.output_type };
+        }
 
         const output_cols = try allocator.alloc(ColumnStore, output_schema.len);
         errdefer allocator.free(output_cols);
@@ -244,239 +254,110 @@ fn prepareExecution(allocator: Allocator, table: *api.Table, request: Request, p
 fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
     const t0 = exec.prof.nowTicks();
     const core_allocator = std.heap.page_allocator;
-    var layout = try HarnessCore.cpuLayout(core_allocator);
-    defer layout.deinit(core_allocator);
-    const n = @min(@max(@as(usize, 1), ctx.dop), layout.order.len);
-    if (n == 0) return .{ .allocator = core_allocator };
-    const bucket_count = @max(@as(usize, 1), envUsize("THINDB_V2_BUCKET_COUNT", DEFAULT_BUCKET_COUNT));
-    const chunk_rows = @max(@as(usize, 1), envUsize("THINDB_V2_CHUNK_ROWS", DEFAULT_CHUNK_ROWS));
-    const route_block_rows = @max(@as(usize, 1), envUsize("THINDB_V2_ROUTE_BLOCK_ROWS", DEFAULT_ROUTE_BLOCK_ROWS));
-    const group_init_cap = envUsize("THINDB_V2_GROUP_INIT_CAP", DEFAULT_GROUP_INIT_CAP);
-    const group_lease_buckets = @max(@as(usize, 1), envUsize("THINDB_V2_GROUP_LEASE_BUCKETS", DEFAULT_GROUP_LEASE_BUCKETS));
-    const group_lease_rows = @as(u64, @intCast(envUsize("THINDB_V2_GROUP_LEASE_ROWS", 0)));
-    ctx.bucket_count = bucket_count;
-    ctx.chunk_rows = chunk_rows;
-    ctx.route_block_rows = route_block_rows;
-    ctx.group_init_cap = group_init_cap;
-    var workspace: HarnessCore.SiloGridWorkspace = .{};
-    const trace_timing = getenv("THINDB_V2_PIPELINE_TRACE") != null;
-    const arena_workspace = getenv("THINDB_V2_ARENA_WORKSPACE") != null;
-    const shared_scan_buffers = getenv("THINDB_V2_SHARED_SCAN_BUFFERS") != null;
-    const shared_scan_banks = @max(@as(usize, 1), envUsize("THINDB_V2_SHARED_SCAN_BANKS", 1));
-    const force_queue_publish = getenv("THINDB_V2_FORCE_QUEUE_PUBLISH") != null;
-    const flat_scan_partitions = getenv("THINDB_V2_FLAT_SCAN_PARTITIONS") != null;
-    const raw_chunk_rows = @max(@as(usize, 1), envUsize("THINDB_V2_RAW_CHUNK_ROWS", DEFAULT_RAW_CHUNK_ROWS));
-    const raw_batch_chunks = @max(@as(usize, 1), envUsize("THINDB_V2_RAW_BATCH_CHUNKS", 4));
-    const raw_stage_lanes = @max(@as(usize, 1), envUsize("THINDB_V2_STAGE_LANES", 16));
-    const raw_group_lane_claim = getenv("THINDB_V2_GROUP_LANE_CLAIM") != null;
-    const raw_group_mode: HarnessCore.RawGroupMode = if (getenv("THINDB_V2_RAW_GROUP_MODE")) |mode_z| blk: {
-        const mode = std.mem.span(mode_z);
-        break :blk if (std.mem.eql(u8, mode, "radix"))
-            .radix_global
-        else if (std.mem.eql(u8, mode, "batch") or std.mem.eql(u8, mode, "radix_batch"))
-            .radix_batch
-        else if (std.mem.eql(u8, mode, "cluster") or std.mem.eql(u8, mode, "radix_cluster"))
-            .radix_cluster
-        else if (std.mem.eql(u8, mode, "staged") or std.mem.eql(u8, mode, "radix_staged"))
-            .radix_staged
-        else if (std.mem.eql(u8, mode, "preagg"))
-            .preagg_merge
-        else if (std.mem.eql(u8, mode, "sortpreagg"))
-            .sort_preagg
-        else
-            .off;
-    } else .radix_global;
-    const worker_profile = getenv("THINDB_V2_WORKER_PROFILE") != null;
-    if (arena_workspace) {
-        var arena = std.heap.ArenaAllocator.init(core_allocator);
-        const arena_allocator = arena.allocator();
-        errdefer arena.deinit();
+    const params = GroupTopNEngine.paramsFromEnv(ctx.dop);
+    ctx.bucket_count = params.bucket_count;
+    ctx.chunk_rows = params.raw_chunk_rows;
+    ctx.route_block_rows = params.route_block_rows;
+    ctx.group_init_cap = params.group_init_cap;
+    ctx.raw_group_chunk_rows = params.raw_group_chunk_rows;
+    ctx.raw_batch_chunks = params.raw_batch_chunks;
+    ctx.shared_stage_builders = params.shared_stage_builders;
 
-        var rows: std.ArrayListUnmanaged(HarnessCore.TopRow) = .empty;
-        try HarnessCore.runSiloGrid(arena_allocator, ctx.table, layout.order[0..n], .{
-            .dop = ctx.dop,
-            .bucket_count = bucket_count,
-            .kind = ctx.plan.core_kind,
-            .silo_grid = true,
-            .scan_filter = true,
-            .chunk_rows = chunk_rows,
-            .chunk_rows_set = true,
-            .scan_tile_rgs = DEFAULT_SCAN_TILE_RGS,
-            .scan_tile_rgs_set = true,
-            .route_block_rows = route_block_rows,
-            .route_block_rows_set = true,
-            .group_lease_buckets = group_lease_buckets,
-            .group_lease_rows = group_lease_rows,
-            .group_init_cap = group_init_cap,
-            .shared_scan_buffers = shared_scan_buffers,
-            .shared_scan_banks = shared_scan_banks,
-            .force_queue_publish = force_queue_publish,
-            .flat_scan_partitions = flat_scan_partitions,
-            .raw_group_mode = raw_group_mode,
-            .raw_chunk_rows = raw_chunk_rows,
-            .raw_batch_chunks = raw_batch_chunks,
-            .raw_stage_lanes = raw_stage_lanes,
-            .raw_group_lane_claim = raw_group_lane_claim,
-            .no_profile = !worker_profile,
-            .quiet = !worker_profile,
-            .result_out = &rows,
-            .trace_timing = trace_timing,
-            .workspace = &workspace,
-        });
-        const owned = try core_allocator.dupe(HarnessCore.TopRow, rows.items);
-        ctx.times.run_core_ticks = exec.prof.nowTicks() - t0;
-        const teardown_t0 = exec.prof.nowTicks();
-        arena.deinit();
-        ctx.times.workspace_teardown_ticks = exec.prof.nowTicks() - teardown_t0;
-        if (trace_timing) {
-            std.debug.print("[workspace-arena-teardown] query={s} total={d:.3}ms mode=arena-bulk-free\n", .{
-                ctx.plan.core_kind.label(),
-                exec.prof.ticksToMs(ctx.times.workspace_teardown_ticks),
-            });
-        }
-        return .{ .allocator = core_allocator, .items = owned };
+    var aggregate_inputs: [MAX_AGG_INPUTS]GroupTopNEngine.AggregateInput = undefined;
+    var i: usize = 0;
+    while (i < ctx.plan.aggregate_input_count) : (i += 1) {
+        const input = ctx.plan.aggregate_inputs[i];
+        aggregate_inputs[i] = .{
+            .source_name = input.source_name,
+            .source_type = input.source_type,
+            .physical_type = input.physical_type,
+        };
+    }
+    var aggregate_program: [MAX_AGGS]GroupTopNEngine.AggregateSpec = undefined;
+    i = 0;
+    while (i < ctx.plan.aggregate_count) : (i += 1) {
+        const agg_plan = ctx.plan.aggregates[i];
+        aggregate_program[i] = .{
+            .op = switch (agg_plan.func) {
+                .count => if (agg_plan.input_column_index == null) .count_star else .count_col,
+                .sum => .sum,
+                .avg => .avg,
+                .min => .min,
+                .max => .max,
+                else => return error.UnsupportedOperatorForType,
+            },
+            .input_column_index = agg_plan.input_column_index,
+            .input_type = agg_plan.input_type,
+            .state_index = agg_plan.state_index,
+        };
     }
 
-    errdefer workspace.deinitParallel(core_allocator, n, layout.order[0..n], null);
-
-    var rows: std.ArrayListUnmanaged(HarnessCore.TopRow) = .empty;
-    errdefer rows.deinit(core_allocator);
-    try HarnessCore.runSiloGrid(core_allocator, ctx.table, layout.order[0..n], .{
-        .dop = ctx.dop,
-        .bucket_count = bucket_count,
+    var result = try GroupTopNEngine.run(core_allocator, .{
+        .table = ctx.table,
         .kind = ctx.plan.core_kind,
-        .silo_grid = true,
-        .scan_filter = true,
-        .chunk_rows = chunk_rows,
-        .chunk_rows_set = true,
-        .scan_tile_rgs = DEFAULT_SCAN_TILE_RGS,
-        .scan_tile_rgs_set = true,
-        .route_block_rows = route_block_rows,
-        .route_block_rows_set = true,
-        .group_lease_buckets = group_lease_buckets,
-        .group_lease_rows = group_lease_rows,
-        .group_init_cap = group_init_cap,
-        .shared_scan_buffers = shared_scan_buffers,
-        .shared_scan_banks = shared_scan_banks,
-        .force_queue_publish = force_queue_publish,
-        .flat_scan_partitions = flat_scan_partitions,
-        .raw_group_mode = raw_group_mode,
-        .raw_chunk_rows = raw_chunk_rows,
-        .raw_batch_chunks = raw_batch_chunks,
-        .raw_stage_lanes = raw_stage_lanes,
-        .raw_group_lane_claim = raw_group_lane_claim,
-        .no_profile = !worker_profile,
-        .quiet = !worker_profile,
-        .result_out = &rows,
-        .trace_timing = trace_timing,
-        .workspace = &workspace,
+        .shape = .{
+            .key_width = GroupTopNEngine.KeyWidth.fromBits(ctx.plan.layout.total_bits),
+            .key_bits = ctx.plan.layout.total_bits,
+            .group_key_count = ctx.plan.layout.part_count,
+            .aggregate_inputs = aggregate_inputs[0..ctx.plan.aggregate_input_count],
+            .aggregate_program = aggregate_program[0..ctx.plan.aggregate_count],
+            .has_filter = ctx.request.where_filter != null,
+            .order_by_count_desc = true,
+            .limit = ctx.request.limit,
+            .offset = ctx.request.offset,
+        },
+        .params = params,
     });
-    const owned = try rows.toOwnedSlice(core_allocator);
-    ctx.times.run_core_ticks = exec.prof.nowTicks() - t0;
-    ctx.times.workspace_teardown_ticks = scheduleWorkspaceTeardown(
-        core_allocator,
-        &workspace,
-        n,
-        layout.order[0..n],
-        trace_timing,
-        ctx.plan.core_kind.label(),
-        bucket_count,
-    );
-    return .{ .allocator = core_allocator, .items = owned };
-}
 
-fn scheduleWorkspaceTeardown(
-    allocator: Allocator,
-    workspace: *HarnessCore.SiloGridWorkspace,
-    n_workers: usize,
-    cpus: []const usize,
-    trace_timing: bool,
-    query_label: []const u8,
-    bucket_count: usize,
-) i64 {
-    const t0 = exec.prof.nowTicks();
-    if (getenv("THINDB_V2_SYNC_TEARDOWN") != null) {
-        var teardown_profile: HarnessCore.WorkspaceProfile = .{};
-        const profile_ptr: ?*HarnessCore.WorkspaceProfile = if (trace_timing) &teardown_profile else null;
-        workspace.deinitParallel(allocator, n_workers, cpus, profile_ptr);
-        if (profile_ptr) |profile| profile.printTeardown(query_label, bucket_count);
-        return exec.prof.nowTicks() - t0;
-    }
-
-    const task = allocator.create(AsyncWorkspaceTeardownTask) catch {
-        workspace.deinitParallel(allocator, n_workers, cpus, null);
-        return exec.prof.nowTicks() - t0;
-    };
-    const cpus_copy = allocator.dupe(usize, cpus) catch {
-        allocator.destroy(task);
-        workspace.deinitParallel(allocator, n_workers, cpus, null);
-        return exec.prof.nowTicks() - t0;
-    };
-    task.* = .{
-        .allocator = allocator,
-        .workspace = workspace.*,
-        .cpus = cpus_copy,
-        .n_workers = n_workers,
-        .trace_timing = trace_timing,
-        .query_label = query_label,
-        .bucket_count = bucket_count,
-    };
-    workspace.* = .{};
-    const thread = std.Thread.spawn(.{}, asyncWorkspaceTeardown, .{task}) catch {
-        var teardown_profile: HarnessCore.WorkspaceProfile = .{};
-        const profile_ptr: ?*HarnessCore.WorkspaceProfile = if (trace_timing) &teardown_profile else null;
-        task.workspace.deinitParallel(allocator, n_workers, cpus_copy, profile_ptr);
-        if (profile_ptr) |profile| profile.printTeardown(query_label, bucket_count);
-        allocator.free(cpus_copy);
-        allocator.destroy(task);
-        return exec.prof.nowTicks() - t0;
-    };
-    thread.detach();
-    return exec.prof.nowTicks() - t0;
-}
-
-fn asyncWorkspaceTeardown(task: *AsyncWorkspaceTeardownTask) void {
-    var teardown_profile: HarnessCore.WorkspaceProfile = .{};
-    const profile_ptr: ?*HarnessCore.WorkspaceProfile = if (task.trace_timing) &teardown_profile else null;
-    task.workspace.deinitParallel(task.allocator, task.n_workers, task.cpus, profile_ptr);
-    if (profile_ptr) |profile| {
-        profile.printTeardown(task.query_label, task.bucket_count);
-        std.debug.print("[workspace-teardown-async] query={s} complete=true\n", .{task.query_label});
-    }
-    task.allocator.free(task.cpus);
-    const allocator = task.allocator;
-    allocator.destroy(task);
+    ctx.times.run_core_ticks = exec.prof.nowTicks() - t0 - result.times.workspace_teardown_ticks;
+    ctx.times.workspace_teardown_ticks = result.times.workspace_teardown_ticks;
+    const rows = result.rows;
+    result.rows = &.{};
+    return .{ .allocator = result.allocator, .items = rows };
 }
 
 fn emitResultStage(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !void {
     const start = @min(op.request.offset, rows.len);
     const end = @min(rows.len, start + op.request.limit);
     for (rows[start..end]) |row| {
-        try appendKeyPart(op.allocator, &op.output_cols[0], op.plan.layout.parts[0], row.key);
-        try appendKeyPart(op.allocator, &op.output_cols[1], op.plan.layout.parts[1], row.key);
-        try op.output_cols[2].data.bigint.append(op.allocator, @intCast(row.count));
-        try appendSum(op.allocator, &op.output_cols[3], op.plan.sum_out_type, row.refresh_sum);
-        try op.output_cols[4].data.double.append(
-            op.allocator,
-            if (row.count == 0) 0.0 else @as(f64, @floatFromInt(row.width_sum)) / @as(f64, @floatFromInt(row.count)),
-        );
+        for (op.plan.layout.parts[0..op.plan.layout.part_count], 0..) |part, i| {
+            try appendKeyPart(op.allocator, &op.output_cols[i], part, row.key);
+        }
+        for (op.plan.aggregates[0..op.plan.aggregate_count], 0..) |agg_plan, i| {
+            try appendAggregateValue(op.allocator, &op.output_cols[op.plan.layout.part_count + i], agg_plan, row);
+        }
         op.row_count += 1;
     }
 }
 
+fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: AggregatePlan, row: HarnessCore.TopRow) !void {
+    switch (agg_plan.func) {
+        .count => try col.data.bigint.append(allocator, @intCast(row.count)),
+        .sum => try appendIntegerAggregate(allocator, col, agg_plan.output_type, row.refresh_sum),
+        .avg => try col.data.double.append(
+            allocator,
+            if (row.count == 0) 0.0 else @as(f64, @floatFromInt(row.width_sum)) / @as(f64, @floatFromInt(row.count)),
+        ),
+        else => return error.UnsupportedOperatorForType,
+    }
+}
+
 fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
-    if (request.group_cols.len != 2) return traceDecline(request, "group key count");
-    if (request.aggs.len != 3) return traceDecline(request, "aggregate count");
+    if (request.group_cols.len == 0 or request.group_cols.len > MAX_GROUP_KEYS) return traceDecline(request, "group key count");
+    if (request.aggs.len == 0 or request.aggs.len > MAX_AGGS) return traceDecline(request, "aggregate count");
     if (request.order_specs.len != 1) return traceDecline(request, "order key count");
     if (request.limit == 0) return traceDecline(request, "zero limit");
-    if (request.aggs[0].func != .count or request.aggs[0].col != null) return traceDecline(request, "count agg");
-    if (request.aggs[1].func != .sum or request.aggs[1].col == null) return traceDecline(request, "sum agg");
-    if (request.aggs[2].func != .avg or request.aggs[2].col == null) return traceDecline(request, "avg agg");
-    if (!types.columnNameEql(request.order_specs[0].col, request.aggs[0].as) or !request.order_specs[0].desc) {
-        return traceDecline(request, "order key");
-    }
 
-    var parts: [2]KeyPart = undefined;
+    var count_order_found = false;
+    for (request.aggs) |agg| {
+        if (agg.func == .count and types.columnNameEql(request.order_specs[0].col, agg.as)) {
+            count_order_found = true;
+            break;
+        }
+    }
+    if (!count_order_found or !request.order_specs[0].desc) return traceDecline(request, "order key");
+
+    var parts: [MAX_GROUP_KEYS]KeyPart = undefined;
     var offset: u8 = 0;
     for (request.group_cols, 0..) |name, i| {
         const idx = types.findColumn(table.schema.columns, name) orelse return traceDecline(request, "group key column");
@@ -487,40 +368,69 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
         offset += width;
     }
 
-    const sum_col = request.aggs[1].col.?;
-    const sum_idx = types.findColumn(table.schema.columns, sum_col) orelse return traceDecline(request, "sum column");
-    const sum_type = table.schema.columns[sum_idx].type;
-    if (intTypeBits(sum_type) == null or !smallPayloadIntType(sum_type)) return traceDecline(request, "sum type");
-
-    const avg_col = request.aggs[2].col.?;
-    const avg_idx = types.findColumn(table.schema.columns, avg_col) orelse return traceDecline(request, "avg column");
-    const avg_type = table.schema.columns[avg_idx].type;
-    if (intTypeBits(avg_type) == null or !smallPayloadIntType(avg_type)) return traceDecline(request, "avg type");
-
     const core_kind = classifyClickBenchCoreKind(request) orelse return traceDecline(request, "core adapter");
-    const sum_out_type = aggregate.aggOutputTypeFor(request.aggs[1], sum_type) catch return null;
-    const avg_out_type = aggregate.aggOutputTypeFor(request.aggs[2], avg_type) catch return null;
-    if (avg_out_type != .double) return traceDecline(request, "avg output type");
+
+    var aggregate_inputs: [MAX_AGG_INPUTS]AggregateInputPlan = undefined;
+    var aggregate_input_count: usize = 0;
+    var aggregates: [MAX_AGGS]AggregatePlan = undefined;
+    for (request.aggs, 0..) |agg, agg_i| {
+        if (agg_i >= MAX_AGGS) return traceDecline(request, "aggregate count");
+        const state_index: u16 = @intCast(agg_i);
+        switch (agg.func) {
+            .count => {
+                const input_column_index = if (agg.col) |col_name| blk: {
+                    const input_idx = addAggregateInput(table, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "count input");
+                    break :blk input_idx;
+                } else null;
+                aggregates[agg_i] = .{
+                    .name = agg.as,
+                    .func = agg.func,
+                    .input_column_index = input_column_index,
+                    .input_type = .u64,
+                    .state_index = state_index,
+                    .output_type = aggregate.aggOutputTypeFor(agg, if (agg.col) |col_name| columnType(table, col_name) orelse return traceDecline(request, "count input type") else null) catch return null,
+                };
+            },
+            .sum, .avg => {
+                const col_name = agg.col orelse return traceDecline(request, "aggregate column");
+                const input_idx = addAggregateInput(table, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
+                const input_type = columnType(table, col_name) orelse return traceDecline(request, "aggregate type");
+                const output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null;
+                if (agg.func == .avg and output_type != .double) return traceDecline(request, "avg output type");
+                aggregates[agg_i] = .{
+                    .name = agg.as,
+                    .func = agg.func,
+                    .input_column_index = input_idx,
+                    .input_type = physicalTypeFor(input_type),
+                    .state_index = state_index,
+                    .output_type = output_type,
+                };
+            },
+            else => return traceDecline(request, "aggregate func"),
+        }
+    }
 
     return .{
-        .layout = .{ .parts = parts, .total_bits = offset },
+        .layout = .{ .parts = parts, .part_count = request.group_cols.len, .total_bits = offset },
         .core_kind = core_kind,
-        .sum_col = sum_col,
-        .sum_type = sum_type,
-        .sum_out_type = sum_out_type,
-        .avg_col = avg_col,
-        .avg_type = avg_type,
-        .avg_out_type = avg_out_type,
-        .count_name = request.aggs[0].as,
-        .sum_name = request.aggs[1].as,
-        .avg_name = request.aggs[2].as,
+        .aggregate_inputs = aggregate_inputs,
+        .aggregate_input_count = aggregate_input_count,
+        .aggregates = aggregates,
+        .aggregate_count = request.aggs.len,
     };
 }
 
 fn classifyClickBenchCoreKind(request: Request) ?HarnessCore.QueryKind {
+    const has_filter = request.where_filter != null;
+    if (!has_filter and request.group_cols.len == 1 and request.aggs.len == 1 and
+        request.aggs[0].func == .count and request.aggs[0].col == null and
+        types.columnNameEql(request.group_cols[0], "UserID"))
+    {
+        return .q15;
+    }
+    if (request.group_cols.len != 2) return null;
     const a = request.group_cols[0];
     const b = request.group_cols[1];
-    const has_filter = request.where_filter != null;
     if (has_filter) {
         if (!isSearchPhraseNotEmpty(request.where_filter.?)) return null;
         if (types.columnNameEql(a, "SearchEngineID") and types.columnNameEql(b, "ClientIP")) return .q30;
@@ -529,6 +439,36 @@ fn classifyClickBenchCoreKind(request: Request) ?HarnessCore.QueryKind {
     }
     if (types.columnNameEql(a, "WatchID") and types.columnNameEql(b, "ClientIP")) return .q32;
     return null;
+}
+
+fn columnType(table: *api.Table, name: []const u8) ?Type {
+    const idx = types.findColumn(table.schema.columns, name) orelse return null;
+    return table.schema.columns[idx].type;
+}
+
+fn addAggregateInput(
+    table: *api.Table,
+    inputs: *[MAX_AGG_INPUTS]AggregateInputPlan,
+    input_count: *usize,
+    name: []const u8,
+) ?u16 {
+    var i: usize = 0;
+    while (i < input_count.*) : (i += 1) {
+        if (types.columnNameEql(inputs[i].source_name, name)) return @intCast(i);
+    }
+    if (input_count.* >= MAX_AGG_INPUTS) return null;
+    const typ = columnType(table, name) orelse return null;
+    if (intTypeBits(typ) == null or !smallPayloadIntType(typ)) return null;
+    const physical_type = physicalTypeFor(typ);
+    if (physical_type != .i16) return null;
+    const idx = input_count.*;
+    inputs[idx] = .{
+        .source_name = name,
+        .source_type = typ,
+        .physical_type = physical_type,
+    };
+    input_count.* = idx + 1;
+    return @intCast(idx);
 }
 
 fn isSearchPhraseNotEmpty(pred: PredicateExpr) bool {
@@ -545,6 +485,16 @@ fn smallPayloadIntType(typ: Type) bool {
     return switch (typ) {
         .boolean, .tinyint, .smallint => true,
         else => false,
+    };
+}
+
+fn physicalTypeFor(typ: Type) GroupTopNEngine.PhysicalType {
+    return switch (typ) {
+        .boolean, .tinyint => .i8,
+        .smallint => .i16,
+        .int, .date => .i32,
+        .bigint, .datetime, .decimal64 => .i64,
+        else => .i64,
     };
 }
 
@@ -573,7 +523,7 @@ fn appendKeyPart(allocator: Allocator, col: *ColumnStore, part: KeyPart, key: u1
     }
 }
 
-fn appendSum(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i64) !void {
+fn appendIntegerAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i64) !void {
     switch (out_type) {
         .bigint => try col.data.bigint.append(allocator, value),
         .largeint => try col.data.largeint.append(allocator, value),
@@ -598,9 +548,12 @@ fn traceDecline(request: Request, reason: []const u8) ?ShapePlan {
 
 fn traceAccepted(request: Request, plan: ShapePlan) void {
     if (getenv("THINDB_V2_TRACE") != null) {
-        std.debug.print("V2Pipeline group-topN accepted kind={s} groups={} aggs={} order={} limit={} offset={}\n", .{
+        const key_width = GroupTopNEngine.KeyWidth.fromBits(plan.layout.total_bits);
+        std.debug.print("V2Pipeline group-topN accepted kind={s} groups={} key_bits={} key_width={s} aggs={} order={} limit={} offset={}\n", .{
             plan.core_kind.label(),
             request.group_cols.len,
+            plan.layout.total_bits,
+            key_width.label(),
             request.aggs.len,
             request.order_specs.len,
             request.limit,
@@ -611,8 +564,11 @@ fn traceAccepted(request: Request, plan: ShapePlan) void {
 
 fn traceProfile(ctx: ExecutionContext) void {
     if (getenv("THINDB_V2_PIPELINE_TRACE") == null) return;
-    std.debug.print("[v2-pipeline] shape=group-topN kind={s} prepare={d:.3}ms core={d:.1}ms workspace_teardown={d:.1}ms emit={d:.3}ms dop={} buckets={} chunk_rows={} route_block_rows={} group_init_cap={} shared_scan_buffers={s} shared_scan_banks={} force_queue_publish={s} flat_scan_partitions={s} raw_group_mode={s} raw_chunk_rows={} raw_batch_chunks={} raw_stage_lanes={}\n", .{
+    const key_width = GroupTopNEngine.KeyWidth.fromBits(ctx.plan.layout.total_bits);
+    std.debug.print("[v2-pipeline] shape=group-topN kind={s} key_bits={} key_width={s} prepare={d:.3}ms core={d:.1}ms workspace_teardown={d:.1}ms emit={d:.3}ms dop={} buckets={} chunk_rows={} route_block_rows={} group_init_cap={} shared_scan_buffers={s} shared_scan_banks={} force_queue_publish={s} flat_scan_partitions={s} raw_group_mode=staged_final raw_chunk_rows={} raw_group_chunk_rows={} raw_batch_chunks={} shared_stage_builders={s}\n", .{
         ctx.plan.core_kind.label(),
+        ctx.plan.layout.total_bits,
+        key_width.label(),
         exec.prof.ticksToMs(ctx.times.prepare_ticks),
         exec.prof.ticksToMs(ctx.times.run_core_ticks),
         exec.prof.ticksToMs(ctx.times.workspace_teardown_ticks),
@@ -626,10 +582,10 @@ fn traceProfile(ctx: ExecutionContext) void {
         @max(@as(usize, 1), envUsize("THINDB_V2_SHARED_SCAN_BANKS", 1)),
         if (getenv("THINDB_V2_FORCE_QUEUE_PUBLISH") != null) "true" else "false",
         if (getenv("THINDB_V2_FLAT_SCAN_PARTITIONS") != null) "true" else "false",
-        if (getenv("THINDB_V2_RAW_GROUP_MODE")) |mode_z| std.mem.span(mode_z) else "off",
-        @max(@as(usize, 1), envUsize("THINDB_V2_RAW_CHUNK_ROWS", DEFAULT_RAW_CHUNK_ROWS)),
-        @max(@as(usize, 1), envUsize("THINDB_V2_RAW_BATCH_CHUNKS", 4)),
-        @max(@as(usize, 1), envUsize("THINDB_V2_STAGE_LANES", 16)),
+        ctx.chunk_rows,
+        ctx.raw_group_chunk_rows,
+        ctx.raw_batch_chunks,
+        if (ctx.shared_stage_builders) "true" else "false",
     });
 }
 
