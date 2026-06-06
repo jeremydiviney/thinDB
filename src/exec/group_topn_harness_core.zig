@@ -277,6 +277,18 @@ const RawRows = struct {
         }
     }
 
+    inline fn copyKeyFrom(dst: RawRows, comptime key_width: GroupKeyWidth, dst_idx: usize, src: RawRows, src_idx: usize) void {
+        switch (key_width) {
+            .u32 => dst.keyU32All()[dst_idx] = src.keyU32All()[src_idx],
+            .u64 => dst.keyU64All()[dst_idx] = src.keyU64All()[src_idx],
+            .u96 => {
+                dst.keyU96LoAll()[dst_idx] = src.keyU96LoAll()[src_idx];
+                dst.keyU96HiAll()[dst_idx] = src.keyU96HiAll()[src_idx];
+            },
+            .u128 => dst.keyU128All()[dst_idx] = src.keyU128All()[src_idx],
+        }
+    }
+
     inline fn refreshAt(self: RawRows, idx: usize) i16 {
         return self.columnI16All(0)[idx];
     }
@@ -3205,25 +3217,30 @@ fn drainRawDedicatedStageSharedBuilders(
         }
 
         row_idx = 0;
-        i = 0;
         const ncols = shared.group_rows_layout.columns.len;
         var flat_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]i16 = undefined;
         for (0..ncols) |c| flat_cols[c] = local.flat_raw_rows.columnI16All(c);
-        while (i < popped_total) : (i += 1) {
-            const src = raw_chunks[i].rows;
-            var src_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
-            for (0..ncols) |c| src_cols[c] = src.columnI16All(c);
-            const chunk_rows_n = src.len();
-            var r: usize = 0;
-            while (r < chunk_rows_n) : (r += 1) {
-                const bucket_idx: usize = local.flat_bucket_ids.items[row_idx];
-                const pos = local.flat_next[bucket_idx];
-                local.flat_raw_rows.setKey(pos, src.keyAt(r));
-                var c: usize = 0;
-                while (c < ncols) : (c += 1) flat_cols[c][pos] = src_cols[c][r];
-                local.flat_next[bucket_idx] = pos + 1;
-                row_idx += 1;
-            }
+        switch (local.flat_raw_rows.layout.key_width) {
+            inline else => |kw| {
+                const flat = local.flat_raw_rows;
+                i = 0;
+                while (i < popped_total) : (i += 1) {
+                    const src = raw_chunks[i].rows;
+                    var src_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
+                    for (0..ncols) |c| src_cols[c] = src.columnI16All(c);
+                    const chunk_rows_n = src.len();
+                    var r: usize = 0;
+                    while (r < chunk_rows_n) : (r += 1) {
+                        const bucket_idx: usize = local.flat_bucket_ids.items[row_idx];
+                        const pos = local.flat_next[bucket_idx];
+                        flat.copyKeyFrom(kw, pos, src, r);
+                        var c: usize = 0;
+                        while (c < ncols) : (c += 1) flat_cols[c][pos] = src_cols[c][r];
+                        local.flat_next[bucket_idx] = pos + 1;
+                        row_idx += 1;
+                    }
+                }
+            },
         }
         if (profile) local.raw_stage_ticks += nowTicks() - stage_t0;
 
