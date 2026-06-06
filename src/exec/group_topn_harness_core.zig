@@ -150,10 +150,8 @@ const RawRows = struct {
 
     fn slabBytes(layout: GroupRowsLayout, capacity_rows: usize) usize {
         var bytes: usize = 0;
-        bytes = alignForward(bytes, @alignOf(u64));
-        bytes += @sizeOf(u64) * capacity_rows;
-        bytes = alignForward(bytes, @alignOf(u32));
-        bytes += @sizeOf(u32) * capacity_rows;
+        bytes = alignForward(bytes, groupKeyAlign(layout.key_width));
+        bytes += groupKeySize(layout.key_width) * capacity_rows;
         for (layout.columns) |column| {
             bytes = alignForward(bytes, groupColumnAlign(column.physical_type));
             bytes += groupColumnSize(column.physical_type) * capacity_rows;
@@ -161,16 +159,12 @@ const RawRows = struct {
         return bytes;
     }
 
-    inline fn keyLoOffset(_: RawRows) usize {
+    inline fn keyOffset(_: RawRows) usize {
         return 0;
     }
 
-    inline fn keyHiOffset(self: RawRows) usize {
-        return self.capacity_rows * @sizeOf(u64);
-    }
-
     fn columnOffset(self: RawRows, column_index: usize) usize {
-        var offset = self.keyHiOffset() + self.capacity_rows * @sizeOf(u32);
+        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
         var i: usize = 0;
         while (i < column_index) : (i += 1) {
             offset = alignForward(offset, groupColumnAlign(self.layout.columns[i].physical_type));
@@ -179,25 +173,35 @@ const RawRows = struct {
         return alignForward(offset, groupColumnAlign(self.layout.columns[column_index].physical_type));
     }
 
-    inline fn keyLoAll(self: RawRows) []u64 {
-        return @as([*]u64, @ptrCast(@alignCast(self.slab.ptr + self.keyLoOffset())))[0..self.capacity_rows];
+    inline fn keyU32All(self: RawRows) []u32 {
+        std.debug.assert(self.layout.key_width == .u32);
+        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
     }
 
-    inline fn keyHiAll(self: RawRows) []u32 {
-        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.keyHiOffset())))[0..self.capacity_rows];
+    inline fn keyU64All(self: RawRows) []u64 {
+        std.debug.assert(self.layout.key_width == .u64);
+        return @as([*]u64, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
+    }
+
+    inline fn keyU96LoAll(self: RawRows) []u64 {
+        std.debug.assert(self.layout.key_width == .u96);
+        return @as([*]u64, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
+    }
+
+    inline fn keyU96HiAll(self: RawRows) []u32 {
+        std.debug.assert(self.layout.key_width == .u96);
+        const offset = self.keyOffset() + self.capacity_rows * @sizeOf(u64);
+        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + offset)))[0..self.capacity_rows];
+    }
+
+    inline fn keyU128All(self: RawRows) []u128 {
+        std.debug.assert(self.layout.key_width == .u128);
+        return @as([*]u128, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
     }
 
     inline fn columnI16All(self: RawRows, column_index: usize) []i16 {
         std.debug.assert(self.layout.columns[column_index].physical_type == .i16);
         return @as([*]i16, @ptrCast(@alignCast(self.slab.ptr + self.columnOffset(column_index))))[0..self.capacity_rows];
-    }
-
-    inline fn keyLoItems(self: RawRows) []u64 {
-        return self.keyLoAll()[0..self.len_rows];
-    }
-
-    inline fn keyHiItems(self: RawRows) []u32 {
-        return self.keyHiAll()[0..self.len_rows];
     }
 
     inline fn columnI16Items(self: RawRows, column_index: usize) []i16 {
@@ -217,8 +221,8 @@ const RawRows = struct {
             .layout = layout,
         };
         if (self.len_rows != 0) {
-            @memcpy(next.keyLoItems(), self.keyLoItems());
-            @memcpy(next.keyHiItems(), self.keyHiItems());
+            var i: usize = 0;
+            while (i < self.len_rows) : (i += 1) next.setKey(i, self.keyAt(i));
             var col: usize = 0;
             while (col < layout.columns.len) : (col += 1) {
                 switch (layout.columns[col].physical_type) {
@@ -246,15 +250,31 @@ const RawRows = struct {
 
     inline fn appendAssumeCapacity(self: *RawRows, key: u128, refresh: i16, width: i16) void {
         const idx = self.len_rows;
-        self.keyLoAll()[idx] = @truncate(key);
-        self.keyHiAll()[idx] = @truncate(key >> 64);
+        self.setKey(idx, key);
         self.columnI16All(0)[idx] = refresh;
         self.columnI16All(1)[idx] = width;
         self.len_rows = idx + 1;
     }
 
     inline fn keyAt(self: RawRows, idx: usize) u128 {
-        return @as(u128, self.keyLoAll()[idx]) | (@as(u128, self.keyHiAll()[idx]) << 64);
+        return switch (self.layout.key_width) {
+            .u32 => @as(u128, self.keyU32All()[idx]),
+            .u64 => @as(u128, self.keyU64All()[idx]),
+            .u96 => @as(u128, self.keyU96LoAll()[idx]) | (@as(u128, self.keyU96HiAll()[idx]) << 64),
+            .u128 => self.keyU128All()[idx],
+        };
+    }
+
+    inline fn setKey(self: RawRows, idx: usize, key: u128) void {
+        switch (self.layout.key_width) {
+            .u32 => self.keyU32All()[idx] = @truncate(key),
+            .u64 => self.keyU64All()[idx] = @truncate(key),
+            .u96 => {
+                self.keyU96LoAll()[idx] = @truncate(key);
+                self.keyU96HiAll()[idx] = @truncate(key >> 64);
+            },
+            .u128 => self.keyU128All()[idx] = key,
+        }
     }
 
     inline fn refreshAt(self: RawRows, idx: usize) i16 {
@@ -549,24 +569,14 @@ const GroupRows = struct {
         const new_len = old_len + count;
         try self.resize(allocator, layout, new_len);
 
-        const src_key_lo = rows.keyLoAll()[start .. start + count];
-        const src_key_hi = rows.keyHiAll()[start .. start + count];
         switch (self.layout.key_width) {
-            .u32 => {
-                const dst = self.keyU32All()[old_len..new_len];
-                var i: usize = 0;
-                while (i < count) : (i += 1) dst[i] = @truncate(src_key_lo[i]);
-            },
-            .u64 => @memcpy(self.keyU64All()[old_len..new_len], src_key_lo),
+            .u32 => @memcpy(self.keyU32All()[old_len..new_len], rows.keyU32All()[start .. start + count]),
+            .u64 => @memcpy(self.keyU64All()[old_len..new_len], rows.keyU64All()[start .. start + count]),
             .u96 => {
-                @memcpy(self.keyU96LoAll()[old_len..new_len], src_key_lo);
-                @memcpy(self.keyU96HiAll()[old_len..new_len], src_key_hi);
+                @memcpy(self.keyU96LoAll()[old_len..new_len], rows.keyU96LoAll()[start .. start + count]);
+                @memcpy(self.keyU96HiAll()[old_len..new_len], rows.keyU96HiAll()[start .. start + count]);
             },
-            .u128 => {
-                const dst = self.keyU128All()[old_len..new_len];
-                var i: usize = 0;
-                while (i < count) : (i += 1) dst[i] = @as(u128, src_key_lo[i]) | (@as(u128, src_key_hi[i]) << 64);
-            },
+            .u128 => @memcpy(self.keyU128All()[old_len..new_len], rows.keyU128All()[start .. start + count]),
         }
         var col: usize = 0;
         while (col < self.layout.columns.len) : (col += 1) {
@@ -2388,13 +2398,10 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     var r: usize = 0;
     while (r < batch.row_count) {
         var active = &parts.raw_active_rows;
-        const key_lo = active.keyLoAll();
-        const key_hi = active.keyHiAll();
         while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
             const key = try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
-            key_lo[idx] = @truncate(key);
-            key_hi[idx] = @truncate(key >> 64);
+            active.setKey(idx, key);
             var col: usize = 0;
             while (col < layout.columns.len) : (col += 1) {
                 active.columnI16All(col)[idx] = payload_views_buf[col][r];
@@ -2494,12 +2501,10 @@ fn appendBatchRawChunksGenericKey1I64(
     var r: usize = 0;
     while (r < row_count) {
         var active = &parts.raw_active_rows;
-        const key_lo = active.keyLoAll();
-        const key_hi = active.keyHiAll();
+        const keys = active.keyU64All();
         while (r < row_count and active.len() < raw_chunk_rows) : (r += 1) {
             const idx = active.len();
-            key_lo[idx] = @as(u64, @bitCast(key0[r]));
-            key_hi[idx] = 0;
+            keys[idx] = @as(u64, @bitCast(key0[r]));
             appendGenericPayload(active, payload_views, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
@@ -2526,13 +2531,11 @@ fn appendBatchRawChunksGenericKeyI16I32(
     var r: usize = 0;
     while (r < row_count) {
         var active = &parts.raw_active_rows;
-        const key_lo = active.keyLoAll();
-        const key_hi = active.keyHiAll();
+        const keys = active.keyU64All();
         while (r < row_count and active.len() < raw_chunk_rows) : (r += 1) {
             const idx = active.len();
-            key_lo[idx] = @as(u16, @bitCast(key0[r])) |
+            keys[idx] = @as(u16, @bitCast(key0[r])) |
                 (@as(u64, @as(u32, @bitCast(key1[r]))) << 16);
-            key_hi[idx] = 0;
             appendGenericPayload(active, payload_views, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
@@ -2559,8 +2562,8 @@ fn appendBatchRawChunksGenericKeyI64I32(
     var r: usize = 0;
     while (r < row_count) {
         var active = &parts.raw_active_rows;
-        const key_lo = active.keyLoAll();
-        const key_hi = active.keyHiAll();
+        const key_lo = active.keyU96LoAll();
+        const key_hi = active.keyU96HiAll();
         while (r < row_count and active.len() < raw_chunk_rows) : (r += 1) {
             const idx = active.len();
             key_lo[idx] = @as(u64, @bitCast(key0[r]));
@@ -2912,7 +2915,8 @@ fn mergeStatesDirect(
 }
 
 inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) usize {
-    const h = routeHashRowBits(rows.keyLoAll()[row_idx], rows.keyHiAll()[row_idx]);
+    const key = rows.keyAt(row_idx);
+    const h = routeHashRowBits(@truncate(key), @truncate(key >> 64));
     return if (std.math.isPowerOfTwo(bucket_count))
         (@as(usize, @truncate(h)) & (bucket_count - 1))
         else
@@ -3203,22 +3207,18 @@ fn drainRawDedicatedStageSharedBuilders(
         row_idx = 0;
         i = 0;
         const ncols = shared.group_rows_layout.columns.len;
-        const flat_key_lo = local.flat_raw_rows.keyLoAll();
-        const flat_key_hi = local.flat_raw_rows.keyHiAll();
         var flat_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]i16 = undefined;
         for (0..ncols) |c| flat_cols[c] = local.flat_raw_rows.columnI16All(c);
         while (i < popped_total) : (i += 1) {
-            const src_key_lo = raw_chunks[i].rows.keyLoAll();
-            const src_key_hi = raw_chunks[i].rows.keyHiAll();
+            const src = raw_chunks[i].rows;
             var src_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
-            for (0..ncols) |c| src_cols[c] = raw_chunks[i].rows.columnI16All(c);
-            const chunk_rows_n = raw_chunks[i].rows.len();
+            for (0..ncols) |c| src_cols[c] = src.columnI16All(c);
+            const chunk_rows_n = src.len();
             var r: usize = 0;
             while (r < chunk_rows_n) : (r += 1) {
                 const bucket_idx: usize = local.flat_bucket_ids.items[row_idx];
                 const pos = local.flat_next[bucket_idx];
-                flat_key_lo[pos] = src_key_lo[r];
-                flat_key_hi[pos] = src_key_hi[r];
+                local.flat_raw_rows.setKey(pos, src.keyAt(r));
                 var c: usize = 0;
                 while (c < ncols) : (c += 1) flat_cols[c][pos] = src_cols[c][r];
                 local.flat_next[bucket_idx] = pos + 1;

@@ -542,12 +542,9 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
         const idx = types.findColumn(table.schema.columns, name) orelse return traceDecline(request, "group key column");
         const typ = table.schema.columns[idx].type;
         const width = intTypeBits(typ) orelse return traceDecline(request, "group key type");
-        // Keys bit-pack into the staged raw-row key, which is u64 lo + u32 hi =
-        // 96 bits today. 97-128-bit keys (e.g. two 64-bit fields) silently lose
-        // the top bits until the staged key is widened to a full u128 (Row /
-        // RawRows key_hi u32 -> u64). DuckDB-verified: raising this to 128 with
-        // the 96-bit stage truncates the high field. Keep at 96 until widened.
-        if (offset + width > 96) return traceDecline(request, "group key width");
+        // Keys bit-pack into the staged raw-row key. RawRows/GroupRows are
+        // width-aware (u32/u64/u96/u128), so the full 128 bits are preserved.
+        if (offset + width > 128) return traceDecline(request, "group key width");
         parts[i] = .{ .name = name, .typ = typ, .offset_bits = offset, .width_bits = width };
         offset += width;
     }
