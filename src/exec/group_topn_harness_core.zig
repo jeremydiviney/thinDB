@@ -1030,6 +1030,12 @@ const PipeShared = struct {
     scan_buffered_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     active_scan_jobs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     active_group_jobs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    // Set by any worker that fails. Peers poll it at the top of their schedule
+    // loop and break immediately, so one worker's error tears the run down
+    // cleanly (the orchestrator joins, sees the error, and returns it) instead
+    // of the survivors spinning forever waiting on a `scans_done` that the
+    // failed worker never signalled.
+    aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     next_scan_rg: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     next_final_local_bucket: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     total_scan_rgs: usize = 0,
@@ -2640,6 +2646,9 @@ fn siloGridWorker(job: SiloGridJob) void {
     pinToCpu(job.cpu);
     siloGridWorkerErr(job) catch |e| {
         job.err.* = e;
+        // Wake the peers so they stop waiting on coordination counters this
+        // worker will never advance (e.g. its `scans_done` increment).
+        job.shared.aborted.store(true, .release);
     };
 }
 
@@ -3001,6 +3010,9 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
     var idle_spins: usize = 0;
 
     while (true) {
+        // A peer failed: stop scheduling and tear down (the failing worker's
+        // error is already recorded; ours would just race it).
+        if (job.shared.aborted.load(.acquire)) break;
         job.local.sched_loops += 1;
         const decision_t0 = if (job.profile) nowTicks() else 0;
         const scan_claims_available = !scan_exhausted and job.shared.next_scan_rg.load(.acquire) < job.shared.total_scan_rgs;

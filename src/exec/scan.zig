@@ -898,11 +898,18 @@ pub const Scan = struct {
 
     /// Set up block-sourced evaluation for any predicate column not already in
     /// the projection, so the fused filter evaluates without projecting those
-    /// columns into the output. No-op when every filter column is projected
-    /// (the legacy path) or under late-materialization (those paths project
-    /// their filter columns anyway).
+    /// columns into the output. No-op when every filter column is already
+    /// projected (nothing extra to source). Runs for late-materialization
+    /// (`emit_loc`) scans too: the V2 group-topN string-key path projects only
+    /// its group keys, so the WHERE columns are unprojected and must be
+    /// block-sourced here — decoded on demand for the predicate, then discarded,
+    /// never carried into the grouped rows (the same thin treatment the key
+    /// values get via the rowref). The eval schema is sized to the projected
+    /// physical columns (`out_phys`), excluding the synthesized trailing
+    /// `__rowloc` that `out_schema` carries under `emit_loc`: the filtered path
+    /// presents `out_phys` views + the block-sourced columns, and packs each
+    /// survivor's `__rowloc` separately.
     fn setupFilterEval(self: *Scan, expr: PredicateExpr) !void {
-        if (self.emit_loc) return;
         var refs: std.ArrayListUnmanaged(usize) = .empty;
         defer refs.deinit(self.allocator);
         try collectPredicateColumns(self.allocator, expr, self.table.schema.columns, &refs);
@@ -928,10 +935,10 @@ pub const Scan = struct {
             self.allocator.free(self.filter_phys);
             self.filter_phys = &.{};
         }
-        const out_w = self.out_schema.len;
+        const out_w = self.out_phys.len;
         const eval_schema = try self.allocator.alloc(Column, out_w + self.filter_phys.len);
         errdefer self.allocator.free(eval_schema);
-        @memcpy(eval_schema[0..out_w], self.out_schema);
+        @memcpy(eval_schema[0..out_w], self.out_schema[0..out_w]);
         for (self.filter_phys, 0..) |phys, i| eval_schema[out_w + i] = self.table.schema.columns[phys];
         self.filter_eval_schema = eval_schema;
         self.filter_eval_views = try self.allocator.alloc(ColumnView, out_w + self.filter_phys.len);
