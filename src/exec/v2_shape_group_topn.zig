@@ -19,6 +19,7 @@ const ColumnStore = store.ColumnStore;
 
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
+const compute = @import("compute.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const transform = @import("../engine/engine.zig").transform;
@@ -54,6 +55,11 @@ pub const Request = struct {
     where_filter: ?PredicateExpr,
     having_filter: ?PredicateExpr,
     needed: ?[]const []const u8,
+    // Row-local derived columns (e.g. ClientIP - 1, DATE_TRUNC('minute',
+    // EventTime), length(URL)). A group key or aggregate input may name one of
+    // these; the scan layer wraps in a Compute operator so the derived column
+    // appears in each batch by name. Empty for plain column shapes.
+    derived: []const compute.Derived = &.{},
     dop: usize,
 };
 
@@ -94,6 +100,12 @@ const ShapePlan = struct {
     // The key is a hash (string keys, or integer combos wider than 128 bits);
     // real key values are late-materialized from each row's __rowloc at emit.
     hashed: bool = false,
+    // Derived columns evaluated by the scan-layer Compute. Borrowed from the IR.
+    derived: []const compute.Derived = &.{},
+    // Base columns the scan must project to back the keys, aggregate inputs, and
+    // derived expressions. Owned by the pipeline. Replaces the by-name key/agg
+    // projection so derived names (not real columns) never reach the scan.
+    scan_base_columns: []const []const u8 = &.{},
 };
 
 const StageTimes = struct {
@@ -142,12 +154,85 @@ const FinalRows = struct {
 };
 
 pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Query {
-    const plan = validateShape(table, request) orelse return null;
+    // Base columns the scan projects to back keys, aggregate inputs, and the
+    // derived expressions that feed them. Derived key/agg names are produced by
+    // the Compute layer, never projected directly.
+    var base_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer base_cols.deinit(allocator);
+    if (!try collectScanBaseColumns(allocator, &base_cols, table, request)) {
+        base_cols.deinit(allocator);
+        return null;
+    }
+
+    // Resolve derived key/aggregate-input types from the Compute output schema.
+    // The probe fetches no rows — it only exposes the post-Compute schema, then
+    // is torn down.
+    var probe_q: ?Query = null;
+    defer if (probe_q) |*q| q.deinit();
+    var probe_schema: ?[]const Column = null;
+    if (request.derived.len > 0) {
+        const scan = try Scan.allocWithProjectionLoc(allocator, table, null, base_cols.items, false, null);
+        var sq = exec.makeQuery(allocator, scan);
+        probe_q = sq.compute(request.derived) catch |e| {
+            sq.deinit();
+            return e;
+        };
+        probe_schema = probe_q.?.outputSchema();
+    }
+
+    var plan = validateShape(table, request, probe_schema) orelse {
+        base_cols.deinit(allocator);
+        return null;
+    };
+    plan.derived = request.derived;
+    plan.scan_base_columns = try base_cols.toOwnedSlice(allocator);
+    errdefer allocator.free(plan.scan_base_columns);
+
     traceAccepted(request, plan);
     const op = try allocator.create(GroupTopNPipeline);
     errdefer allocator.destroy(op);
     op.* = try GroupTopNPipeline.init(allocator, table, request, plan);
     return exec.makeQuery(allocator, op);
+}
+
+fn findDerived(derived: []const compute.Derived, name: []const u8) ?compute.Derived {
+    for (derived) |d| if (types.columnNameEql(d.name, name)) return d;
+    return null;
+}
+
+fn appendUniqueCol(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
+    if (name.len == 0) return;
+    for (out.items) |existing| if (types.columnNameEql(existing, name)) return;
+    try out.append(allocator, name);
+}
+
+// Project the base columns that back every group key and aggregate input: a
+// real table column is projected as-is; a derived name expands to the base
+// columns its expression reads. Returns false (decline) on a name that is
+// neither a table column nor a known derived column.
+fn collectScanBaseColumns(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), table: *api.Table, request: Request) !bool {
+    for (request.group_cols) |name| {
+        if (types.findColumn(table.schema.columns, name) != null) {
+            try appendUniqueCol(allocator, out, name);
+        } else if (findDerived(request.derived, name)) |d| {
+            try compute.collectColumnRefs(allocator, out, d.expr);
+        } else return false;
+    }
+    for (request.aggs) |agg| {
+        const name = agg.col orelse continue;
+        if (types.findColumn(table.schema.columns, name) != null) {
+            try appendUniqueCol(allocator, out, name);
+        } else if (findDerived(request.derived, name)) |d| {
+            try compute.collectColumnRefs(allocator, out, d.expr);
+        } else return false;
+    }
+    return true;
+}
+
+fn resolveColumnType(table: *api.Table, schema: ?[]const Column, name: []const u8) ?Type {
+    if (types.findColumn(table.schema.columns, name)) |idx| return table.schema.columns[idx].type;
+    if (schema) |s| for (s) |c| if (types.columnNameEql(c.name, name)) return c.type;
+    return null;
 }
 
 const GroupTopNPipeline = struct {
@@ -209,6 +294,7 @@ const GroupTopNPipeline = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.output_schema);
         if (self.owned_needed) |n| self.allocator.free(n);
+        if (self.plan.scan_base_columns.len > 0) self.allocator.free(self.plan.scan_base_columns);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -322,15 +408,11 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .width_bits = part.width_bits,
         };
     }
-    // Only the group keys + aggregate inputs are projected. The scan sources
-    // any filter-only columns itself (fused, block-sourced eval) — they never
-    // enter this projection or the staged output.
-    var scan_columns: [MAX_GROUP_KEYS + MAX_AGG_INPUTS][]const u8 = undefined;
-    const scan_column_count = buildCoreScanColumns(
-        &scan_columns,
-        group_key_inputs[0..ctx.plan.layout.part_count],
-        aggregate_inputs[0..ctx.plan.aggregate_input_count],
-    );
+    // The scan projects the precomputed base columns (keys, aggregate inputs,
+    // and the base columns their derived expressions read). The derived columns
+    // themselves are added by the Compute layer the engine wraps the scan in;
+    // any filter-only columns are sourced by the fused filter itself.
+    const scan_columns = ctx.plan.scan_base_columns;
 
     var result = try GroupTopNEngine.run(core_allocator, .{
         .table = ctx.table,
@@ -349,7 +431,8 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .hashed = ctx.plan.hashed,
         },
         .params = params,
-        .scan_columns = scan_columns[0..scan_column_count],
+        .scan_columns = scan_columns,
+        .derived = ctx.plan.derived,
         .filter_expr = ctx.request.where_filter,
     });
 
@@ -358,31 +441,6 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
     const rows = result.rows;
     result.rows = &.{};
     return .{ .allocator = result.allocator, .items = rows };
-}
-
-fn buildCoreScanColumns(
-    out: *[MAX_GROUP_KEYS + MAX_AGG_INPUTS][]const u8,
-    group_key_inputs: []const GroupTopNEngine.GroupKeyInput,
-    aggregate_inputs: []const GroupTopNEngine.AggregateInput,
-) usize {
-    var len: usize = 0;
-    for (group_key_inputs) |input| {
-        len = appendUniqueColumn(out, len, input.name);
-    }
-    for (aggregate_inputs) |input| {
-        len = appendUniqueColumn(out, len, input.source_name);
-    }
-    return len;
-}
-
-fn appendUniqueColumn(out: *[MAX_GROUP_KEYS + MAX_AGG_INPUTS][]const u8, len: usize, name: []const u8) usize {
-    if (name.len == 0) return len;
-    var i: usize = 0;
-    while (i < len) : (i += 1) {
-        if (types.columnNameEql(out[i], name)) return len;
-    }
-    out[len] = name;
-    return len + 1;
 }
 
 fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
@@ -609,7 +667,7 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
     }
 }
 
-fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
+fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?ShapePlan {
     if (request.group_cols.len == 0 or request.group_cols.len > MAX_GROUP_KEYS) return traceDecline(request, "group key count");
     if (request.aggs.len == 0 or request.aggs.len > MAX_AGGS) return traceDecline(request, "aggregate count");
     // Decide packed vs hashed: integer keys totalling ≤128 bits bit-pack
@@ -620,8 +678,7 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
     var hashed = false;
     var total_bits: u32 = 0;
     for (request.group_cols) |name| {
-        const idx = types.findColumn(table.schema.columns, name) orelse return traceDecline(request, "group key column");
-        const typ = table.schema.columns[idx].type;
+        const typ = resolveColumnType(table, schema, name) orelse return traceDecline(request, "group key column");
         if (intTypeBits(typ)) |width| {
             total_bits += width;
         } else if (isStringKeyType(typ)) {
@@ -632,11 +689,21 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
     }
     if (total_bits > 128) hashed = true;
 
+    // A derived key in a hashed layout can't be recovered at emit: the hashed
+    // path late-materializes each key from the row's source location, which a
+    // computed value has no backing for. Decline (string-derived keys are a
+    // later phase); integer-packed derived keys carry their value in the key
+    // bits and emit fine.
+    if (hashed) {
+        for (request.group_cols) |name| {
+            if (findDerived(request.derived, name) != null) return traceDecline(request, "derived hashed key");
+        }
+    }
+
     var parts: [MAX_GROUP_KEYS]KeyPart = undefined;
     var offset: u8 = 0;
     for (request.group_cols, 0..) |name, i| {
-        const idx = types.findColumn(table.schema.columns, name).?;
-        const typ = table.schema.columns[idx].type;
+        const typ = resolveColumnType(table, schema, name).?;
         if (hashed) {
             parts[i] = .{ .name = name, .typ = typ, .offset_bits = 0, .width_bits = 0 };
         } else {
@@ -656,7 +723,7 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
         switch (agg.func) {
             .count => {
                 const input_column_index = if (agg.col) |col_name| blk: {
-                    const input_idx = addAggregateInput(table, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "count input");
+                    const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "count input");
                     break :blk input_idx;
                 } else null;
                 aggregates[agg_i] = .{
@@ -665,14 +732,14 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
                     .input_column_index = input_column_index,
                     .input_type = .u64,
                     .state_index = 0,
-                    .output_type = aggregate.aggOutputTypeFor(agg, if (agg.col) |col_name| columnType(table, col_name) orelse return traceDecline(request, "count input type") else null) catch return null,
+                    .output_type = aggregate.aggOutputTypeFor(agg, if (agg.col) |col_name| resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "count input type") else null) catch return null,
                 };
             },
             .sum, .avg, .min, .max => {
                 if (next_numeric_state_index >= 4) return traceDecline(request, "aggregate state count");
                 const col_name = agg.col orelse return traceDecline(request, "aggregate column");
-                const input_idx = addAggregateInput(table, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
-                const input_type = columnType(table, col_name) orelse return traceDecline(request, "aggregate type");
+                const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
+                const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "aggregate type");
                 const output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null;
                 if (agg.func == .avg and output_type != .double) return traceDecline(request, "avg output type");
                 aggregates[agg_i] = .{
@@ -837,13 +904,9 @@ fn applyHaving(op: *GroupTopNPipeline, expr: PredicateExpr, rows: []HarnessCore.
     return rows[0..w];
 }
 
-fn columnType(table: *api.Table, name: []const u8) ?Type {
-    const idx = types.findColumn(table.schema.columns, name) orelse return null;
-    return table.schema.columns[idx].type;
-}
-
 fn addAggregateInput(
     table: *api.Table,
+    schema: ?[]const Column,
     inputs: *[MAX_AGG_INPUTS]AggregateInputPlan,
     input_count: *usize,
     name: []const u8,
@@ -853,7 +916,7 @@ fn addAggregateInput(
         if (types.columnNameEql(inputs[i].source_name, name)) return @intCast(i);
     }
     if (input_count.* >= MAX_AGG_INPUTS) return null;
-    const typ = columnType(table, name) orelse return null;
+    const typ = resolveColumnType(table, schema, name) orelse return null;
     if (!aggInputSupported(typ)) return null;
     const physical_type = physicalTypeFor(typ);
     const idx = input_count.*;

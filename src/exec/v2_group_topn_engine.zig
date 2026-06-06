@@ -437,6 +437,9 @@ pub const RunRequest = struct {
     shape: Shape,
     params: Params,
     scan_columns: ?[]const []const u8 = null,
+    // Derived columns the scan-layer Compute adds to each batch before keying
+    // and aggregation (e.g. ClientIP - 1, length(URL)). Empty for plain shapes.
+    derived: []const exec.Derived = &.{},
     filter_expr: ?exec.PredicateExpr = null,
 };
 
@@ -545,7 +548,7 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     var workspace: HarnessCore.SiloGridWorkspace = .{};
     var rows: std.ArrayListUnmanaged(HarnessCore.TopRow) = .empty;
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(arena_allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.filter_expr, &rows, &workspace);
+    try runHarness(arena_allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.derived, request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -566,7 +569,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     errdefer rows.deinit(allocator);
 
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.filter_expr, &rows, &workspace);
+    try runHarness(allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.derived, request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -591,6 +594,7 @@ fn runHarness(
     shape: Shape,
     params: Params,
     scan_columns: ?[]const []const u8,
+    derived: []const exec.Derived,
     filter_expr: ?exec.PredicateExpr,
     rows: *std.ArrayListUnmanaged(HarnessCore.TopRow),
     workspace: *HarnessCore.SiloGridWorkspace,
@@ -666,6 +670,7 @@ fn runHarness(
         .raw_batch_chunks = params.raw_batch_chunks,
         .group_rows_layout = group_rows_layout,
         .scan_columns = scan_columns,
+        .derived = derived,
         .filter_expr = filter_expr,
         .shared_stage_builders = params.shared_stage_builders,
         .no_profile = !params.worker_profile,

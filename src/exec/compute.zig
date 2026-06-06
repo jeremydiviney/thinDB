@@ -56,6 +56,50 @@ pub const Derived = struct {
     expr: Expr,
 };
 
+fn appendUniqueName(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
+    if (name.len == 0) return;
+    for (out.items) |existing| if (types.columnNameEql(existing, name)) return;
+    try out.append(allocator, name);
+}
+
+/// Append every base column name referenced by `e` into `out`, deduplicated.
+/// Recurses through call arguments and CASE branches (including branch
+/// predicates). Used to compute the scan projection that must back a set of
+/// derived columns: a derived expression can only be evaluated if every column
+/// it reads is projected by the upstream scan.
+pub fn collectColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), e: Expr) !void {
+    switch (e) {
+        .col_ref => |nm| try appendUniqueName(allocator, out, nm),
+        .call => |c| for (c.args) |arg| try collectColumnRefs(allocator, out, arg),
+        .case => |cs| {
+            for (cs.branches) |b| {
+                try collectPredicateColumnRefs(allocator, out, b.cond);
+                try collectColumnRefs(allocator, out, b.then);
+            }
+            if (cs.else_branch) |eb| try collectColumnRefs(allocator, out, eb.*);
+        },
+        else => {},
+    }
+}
+
+/// Companion to `collectColumnRefs` for the predicate trees inside CASE
+/// conditions (and any other predicate whose columns must be projected).
+pub fn collectPredicateColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), p: PredicateExpr) !void {
+    switch (p) {
+        .leaf => |l| try appendUniqueName(allocator, out, l.col),
+        .leaf_col_col => |c| {
+            try appendUniqueName(allocator, out, c.left);
+            try appendUniqueName(allocator, out, c.right);
+        },
+        .is_null, .is_not_null => |nm| try appendUniqueName(allocator, out, nm),
+        .like => |lk| try appendUniqueName(allocator, out, lk.col),
+        .in_set => |s| try appendUniqueName(allocator, out, s.col),
+        .@"and", .@"or" => |kids| for (kids) |k| try collectPredicateColumnRefs(allocator, out, k),
+        .not => |k| try collectPredicateColumnRefs(allocator, out, k.*),
+        else => {},
+    }
+}
+
 /// One argument to a function call inside the resolved expression
 /// tree. Args can be: an upstream column reference, a literal (which
 /// materializes as a per-batch replicated constant column), or a

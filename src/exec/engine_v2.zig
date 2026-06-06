@@ -220,25 +220,37 @@ const GroupTopNPlan = struct {
     group_by: ir.Op.GroupBy,
     order_by: ?ir.Op.OrderBy,
     limit: ?ir.Op.Limit,
+    derived: []const ir.Derived = &.{},
 };
 
 fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
     var op = root;
+    // The reordering Project, LIMIT, and ORDER BY decorators can nest in either
+    // order above the aggregate. A renamed or computed output column forces a
+    // Project that lands *below* the LIMIT (Limit → Project → OrderBy → GroupBy),
+    // so peel all three in a single any-order pass rather than a fixed sequence.
     var top_project: ?ir.Op.Project = null;
-    if (op.* == .select) {
-        top_project = op.select;
-        op = op.select.upstream;
-    }
-
     var limit: ?ir.Op.Limit = null;
     var order_by: ?ir.Op.OrderBy = null;
-    if (op.* == .limit) {
-        limit = op.limit;
-        op = op.limit.upstream;
-    }
-    if (op.* == .order_by) {
-        order_by = op.order_by;
-        op = op.order_by.upstream;
+    while (true) {
+        switch (op.*) {
+            .select => {
+                if (top_project != null) return null;
+                top_project = op.select;
+                op = op.select.upstream;
+            },
+            .limit => {
+                if (limit != null) return null;
+                limit = op.limit;
+                op = op.limit.upstream;
+            },
+            .order_by => {
+                if (order_by != null) return null;
+                order_by = op.order_by;
+                op = op.order_by.upstream;
+            },
+            else => break,
+        }
     }
     var having_filter: ?ir.Op.Filter = null;
     if (op.* == .filter) {
@@ -252,11 +264,27 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
         if (!projectMatchesGroupOutput(p, group_by)) return null;
     }
 
+    // Peel an optional row-local Compute (derived group keys / aggregate
+    // inputs, e.g. ClientIP - 1 or length(URL)) and an optional WHERE filter,
+    // in either order, down to the scan. Derived columns are evaluated in the
+    // scan layer's Compute wrapper.
     var where_filter: ?ir.Op.Filter = null;
+    var derived: []const ir.Derived = &.{};
     var source = group_by.upstream;
-    if (source.* == .filter) {
-        where_filter = source.filter;
-        source = source.filter.upstream;
+    while (true) {
+        switch (source.*) {
+            .compute => {
+                if (derived.len != 0) return null;
+                derived = source.compute.derived;
+                source = source.compute.upstream;
+            },
+            .filter => {
+                if (where_filter != null) return null;
+                where_filter = source.filter;
+                source = source.filter.upstream;
+            },
+            else => break,
+        }
     }
     if (source.* != .scan) return null;
     if (source.scan.alias != null) return null;
@@ -268,6 +296,7 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
         .group_by = group_by,
         .order_by = order_by,
         .limit = limit,
+        .derived = derived,
     };
 }
 
@@ -305,6 +334,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .having_filter = if (plan.having_filter) |f| f.predicate else null,
         .needed = needed,
+        .derived = plan.derived,
         .dop = input.db.config.max_dop,
     };
 

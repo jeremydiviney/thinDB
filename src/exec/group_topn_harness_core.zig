@@ -2605,6 +2605,11 @@ inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) 
 
 const SiloGridJob = struct {
     scan: *Scan,
+    // Batch source driven each tile: a Compute-wrapped scan when the shape has
+    // derived columns, else a bare scan. `scan` is the same underlying object,
+    // retained for range resets; `drive` produces the batches (with derived
+    // columns appended). Points into the harness-owned `drives` array.
+    drive: *thindb.exec.Query,
     local: *WorkerParts,
     shared: *PipeShared,
     seg_start: []const usize,
@@ -2953,7 +2958,7 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
     job.local.scan_quanta += 1;
     while (true) {
         const t0 = if (job.profile) nowTicks() else 0;
-        const maybe_batch = try job.scan.next();
+        const maybe_batch = try job.drive.next();
         if (job.profile) job.local.scan_ticks += nowTicks() - t0;
         const batch = maybe_batch orelse break;
         job.local.scan_batches += 1;
@@ -3168,6 +3173,7 @@ pub const RunConfig = struct {
     raw_batch_chunks: usize = 4,
     group_rows_layout: GroupRowsLayout = .{},
     scan_columns: ?[]const []const u8 = null,
+    derived: []const thindb.exec.Derived = &.{},
     filter_expr: ?thindb.exec.PredicateExpr = null,
     shared_stage_builders: bool = false,
     no_profile: bool = false,
@@ -3318,10 +3324,15 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
 
     var scans = try allocator.alloc(*Scan, n_workers);
     defer allocator.free(scans);
+    // Each worker's batch source: a Compute-wrapped scan (derived shapes) or the
+    // bare scan. The drive owns its underlying scan, so teardown frees through
+    // `drives`, not `scans`.
+    var drives = try allocator.alloc(thindb.exec.Query, n_workers);
+    defer allocator.free(drives);
     var built_scans: usize = 0;
     defer {
         const cleanup_t0 = if (cfg.trace_timing) nowTicks() else 0;
-        for (scans[0..built_scans]) |s| s.deinit();
+        for (drives[0..built_scans]) |*d| d.deinit();
         if (cfg.trace_timing) std.debug.print("[harness-core-cleanup] query={s} worker_scans={d:.1}ms count={d}\n", .{
             "generic",
             ticksToMs(nowTicks() - cleanup_t0, freq),
@@ -3454,12 +3465,19 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
         scans[i] = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, cfg.group_rows_layout.has_rowref, snap);
+        {
+            var sq = thindb.exec.makeQuery(table.allocator, scans[i]);
+            drives[i] = if (cfg.derived.len == 0) sq else sq.compute(cfg.derived) catch |e| {
+                sq.deinit();
+                return e;
+            };
+        }
+        built_scans += 1;
         if (cfg.scan_filter) {
             if (cfg.filter_expr) |expr| {
                 _ = try applyScanFilterExpr(scans[i], expr);
             }
         }
-        built_scans += 1;
         scans[i].setRange(0, 0, 0, 0, false);
     }
     const worker_setup_ticks = if (cfg.trace_timing) nowTicks() - worker_setup_t0 else 0;
@@ -3504,6 +3522,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     while (i < n_workers) : (i += 1) {
         threads[i] = try std.Thread.spawn(.{}, siloGridWorker, .{SiloGridJob{
             .scan = scans[i],
+            .drive = &drives[i],
             .local = &parts[i],
             .shared = &shared,
             .seg_start = seg_start,
