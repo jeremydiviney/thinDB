@@ -213,15 +213,6 @@ const RawRows = struct {
         return @as([*]u128, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
     }
 
-    inline fn columnI16All(self: RawRows, column_index: usize) []i16 {
-        std.debug.assert(self.layout.columns[column_index].physical_type == .i16);
-        return @as([*]i16, @ptrCast(@alignCast(self.slab.ptr + self.columnOffset(column_index))))[0..self.capacity_rows];
-    }
-
-    inline fn columnI16Items(self: RawRows, column_index: usize) []i16 {
-        return self.columnI16All(column_index)[0..self.len_rows];
-    }
-
     inline fn columnByteSlab(self: RawRows, column_index: usize) []u8 {
         const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
         return (self.slab.ptr + self.columnOffset(column_index))[0 .. sz * self.capacity_rows];
@@ -267,14 +258,6 @@ const RawRows = struct {
         self.* = .{};
     }
 
-    inline fn appendAssumeCapacity(self: *RawRows, key: u128, refresh: i16, width: i16) void {
-        const idx = self.len_rows;
-        self.setKey(idx, key);
-        self.columnI16All(0)[idx] = refresh;
-        self.columnI16All(1)[idx] = width;
-        self.len_rows = idx + 1;
-    }
-
     inline fn keyAt(self: RawRows, idx: usize) u128 {
         return switch (self.layout.key_width) {
             .u32 => @as(u128, self.keyU32All()[idx]),
@@ -308,13 +291,6 @@ const RawRows = struct {
         }
     }
 
-    inline fn refreshAt(self: RawRows, idx: usize) i16 {
-        return self.columnI16All(0)[idx];
-    }
-
-    inline fn widthAt(self: RawRows, idx: usize) i16 {
-        return self.columnI16All(1)[idx];
-    }
 };
 
 pub const GroupKeyWidth = enum {
@@ -367,6 +343,10 @@ pub const GroupAggregateSpec = struct {
 };
 
 const MAX_GROUP_AGG_STATES: usize = 4;
+// Generic numeric accumulator slots per group, indexed by `state_index - 1`
+// (state_index 0 is the dedicated row counter). No slot maps to a named or
+// query-specific column.
+const MAX_GROUP_AGG_SLOTS: usize = MAX_GROUP_AGG_STATES - 1;
 const MAX_GROUP_PAYLOAD_COLUMNS: usize = 8;
 
 const DEFAULT_GROUP_AGGREGATES = [_]GroupAggregateSpec{
@@ -560,15 +540,6 @@ const GroupRows = struct {
         return @as([*]u128, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
     }
 
-    inline fn columnI16All(self: GroupRows, column_index: usize) []i16 {
-        std.debug.assert(self.layout.columns[column_index].physical_type == .i16);
-        return @as([*]i16, @ptrCast(@alignCast(self.slab.ptr + self.columnOffset(column_index))))[0..self.capacity_rows];
-    }
-
-    inline fn columnI16Items(self: GroupRows, column_index: usize) []i16 {
-        return self.columnI16All(column_index)[0..self.len_rows];
-    }
-
     inline fn columnTypedAll(self: GroupRows, comptime T: type, column_index: usize) []T {
         return @as([*]T, @ptrCast(@alignCast(self.slab.ptr + self.columnOffset(column_index))))[0..self.capacity_rows];
     }
@@ -602,14 +573,6 @@ const GroupRows = struct {
     inline fn columnByteSlab(self: GroupRows, column_index: usize) []u8 {
         const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
         return (self.slab.ptr + self.columnOffset(column_index))[0 .. sz * self.capacity_rows];
-    }
-
-    inline fn refreshAll(self: GroupRows) []i16 {
-        return self.columnI16All(0);
-    }
-
-    inline fn widthAll(self: GroupRows) []i16 {
-        return self.columnI16All(1);
     }
 
     fn ensureTotalCapacity(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, capacity_rows: usize) !void {
@@ -650,14 +613,6 @@ const GroupRows = struct {
     fn deinit(self: *GroupRows, allocator: Allocator) void {
         allocator.free(self.slab);
         self.* = .{};
-    }
-
-    inline fn appendAssumeCapacity(self: *GroupRows, key: u128, refresh: i16, width: i16) void {
-        const idx = self.len_rows;
-        self.setKey(idx, key);
-        self.refreshAll()[idx] = refresh;
-        self.widthAll()[idx] = width;
-        self.len_rows = idx + 1;
     }
 
     fn appendRawRowsSlice(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, rows: RawRows, start: usize, count: usize) !void {
@@ -704,13 +659,6 @@ const GroupRows = struct {
         }
     }
 
-    inline fn refreshAt(self: GroupRows, idx: usize) i16 {
-        return self.refreshAll()[idx];
-    }
-
-    inline fn widthAt(self: GroupRows, idx: usize) i16 {
-        return self.widthAll()[idx];
-    }
 };
 
 const PartBucket = struct {
@@ -883,10 +831,12 @@ const WorkerParts = struct {
 
 const State = struct {
     key: u128,
-    count: u64,
-    refresh_sum: i64,
-    width_sum: i64,
-    extra_sum: i64 = 0,
+    count: u64 = 0,
+    // Generic per-aggregate accumulators, indexed by `state_index - 1`. Each
+    // slot's meaning is decided solely by its aggregate's {op, input type} in
+    // the program — never a fixed column. Holds an i64 (int sum/min/max) or an
+    // f64 bit-pattern (float sum/min/max, avg) per the aggregate.
+    slots: [MAX_GROUP_AGG_SLOTS]i64 = [_]i64{0} ** MAX_GROUP_AGG_SLOTS,
     // Packed __rowloc of the first row that created this group; only meaningful
     // when the layout has a hashed key (has_rowref). Used at emit to
     // late-materialize the real key column values.
@@ -1930,10 +1880,10 @@ fn releaseRawQueueLane(queues: anytype, lane: usize) void {
 
 pub const TopRow = struct {
     key: u128,
-    count: u64,
-    refresh_sum: i64,
-    width_sum: i64,
-    extra_sum: i64 = 0,
+    count: u64 = 0,
+    // Generic per-aggregate accumulators (mirror of State.slots), indexed by
+    // `state_index - 1`. Interpreted by the aggregate program at emit.
+    slots: [MAX_GROUP_AGG_SLOTS]i64 = [_]i64{0} ** MAX_GROUP_AGG_SLOTS,
     rowref: i64 = 0,
 };
 
@@ -1941,9 +1891,7 @@ inline fn topRowFromState(s: State) TopRow {
     return .{
         .key = s.key,
         .count = s.count,
-        .refresh_sum = s.refresh_sum,
-        .width_sum = s.width_sum,
-        .extra_sum = s.extra_sum,
+        .slots = s.slots,
         .rowref = s.rowref,
     };
 }
@@ -2374,19 +2322,17 @@ fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, batch: thindb.
 
 fn initGroupStateCountSumAvg(states: *std.ArrayListUnmanaged(State), key: u128, sum_value: i64, avg_value: i64) u32 {
     const gid: u32 = @intCast(states.items.len);
-    states.appendAssumeCapacity(.{
-        .key = key,
-        .count = 1,
-        .refresh_sum = sum_value,
-        .width_sum = avg_value,
-    });
+    var st: State = .{ .key = key, .count = 1 };
+    st.slots[0] = sum_value;
+    st.slots[1] = avg_value;
+    states.appendAssumeCapacity(st);
     return gid;
 }
 
 inline fn updateGroupStateCountSumAvg(st: *State, sum_value: i64, avg_value: i64) void {
     st.count += 1;
-    st.refresh_sum += sum_value;
-    st.width_sum += avg_value;
+    st.slots[0] += sum_value;
+    st.slots[1] += avg_value;
 }
 
 fn initGroupStateProgram(
@@ -2400,8 +2346,6 @@ fn initGroupStateProgram(
     states.appendAssumeCapacity(.{
         .key = key,
         .count = 0,
-        .refresh_sum = 0,
-        .width_sum = 0,
     });
     const st = &states.items[gid];
     try updateGroupStateProgram(st, aggregates, rows, row_idx);
@@ -2474,15 +2418,11 @@ fn aggregateInputFloat(agg: GroupAggregateSpec, rows: GroupRows, row_idx: usize)
     return rows.columnFloatAt(input_index, row_idx);
 }
 
-// Float aggregates store an f64 accumulator in the i64 State slot via @bitCast
-// (slot 0 is the integer count and is never used for a float agg).
+// Float aggregates store an f64 accumulator in the i64 slot via @bitCast
+// (state_index 0 is the integer counter and is never used for a float agg).
 inline fn floatStateValue(st: *const State, state_index: usize) f64 {
-    return @bitCast(switch (state_index) {
-        1 => st.refresh_sum,
-        2 => st.width_sum,
-        3 => st.extra_sum,
-        else => @as(i64, 0),
-    });
+    const bits: i64 = if (state_index >= 1 and state_index - 1 < st.slots.len) st.slots[state_index - 1] else 0;
+    return @bitCast(bits);
 }
 
 inline fn addFloatStateValue(st: *State, state_index: usize, value: f64) !void {
@@ -2490,43 +2430,31 @@ inline fn addFloatStateValue(st: *State, state_index: usize, value: f64) !void {
 }
 
 inline fn setFloatStateValue(st: *State, state_index: usize, value: f64) !void {
-    const bits: i64 = @bitCast(value);
-    switch (state_index) {
-        1 => st.refresh_sum = bits,
-        2 => st.width_sum = bits,
-        3 => st.extra_sum = bits,
-        else => return error.UnsupportedOperatorForType,
-    }
+    if (state_index == 0 or state_index - 1 >= st.slots.len) return error.UnsupportedOperatorForType;
+    st.slots[state_index - 1] = @bitCast(value);
 }
 
 inline fn aggregateStateValue(st: *const State, state_index: usize) i128 {
-    return switch (state_index) {
-        0 => @intCast(st.count),
-        1 => st.refresh_sum,
-        2 => st.width_sum,
-        3 => st.extra_sum,
-        else => unreachable,
-    };
+    if (state_index == 0) return @intCast(st.count);
+    return st.slots[state_index - 1];
 }
 
 inline fn addAggregateStateValue(st: *State, state_index: usize, value: i128) !void {
-    switch (state_index) {
-        0 => st.count += @intCast(value),
-        1 => st.refresh_sum += @intCast(value),
-        2 => st.width_sum += @intCast(value),
-        3 => st.extra_sum += @intCast(value),
-        else => return error.UnsupportedOperatorForType,
+    if (state_index == 0) {
+        st.count += @intCast(value);
+        return;
     }
+    if (state_index - 1 >= st.slots.len) return error.UnsupportedOperatorForType;
+    st.slots[state_index - 1] += @intCast(value);
 }
 
 inline fn setAggregateStateValue(st: *State, state_index: usize, value: i128) !void {
-    switch (state_index) {
-        0 => st.count = @intCast(value),
-        1 => st.refresh_sum = @intCast(value),
-        2 => st.width_sum = @intCast(value),
-        3 => st.extra_sum = @intCast(value),
-        else => return error.UnsupportedOperatorForType,
+    if (state_index == 0) {
+        st.count = @intCast(value);
+        return;
     }
+    if (state_index - 1 >= st.slots.len) return error.UnsupportedOperatorForType;
+    st.slots[state_index - 1] = @intCast(value);
 }
 
 fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_count: usize) !void {

@@ -490,23 +490,15 @@ fn avgValue(row: HarnessCore.TopRow, state_index: u16) f64 {
 }
 
 fn rowStateValue(row: HarnessCore.TopRow, state_index: u16) i128 {
-    return switch (state_index) {
-        0 => @intCast(row.count),
-        1 => row.refresh_sum,
-        2 => row.width_sum,
-        3 => row.extra_sum,
-        else => 0,
-    };
+    if (state_index == 0) return @intCast(row.count);
+    if (state_index - 1 >= row.slots.len) return 0;
+    return row.slots[state_index - 1];
 }
 
-// Float aggregates carry their f64 accumulator in the i64 State slot bits.
+// Float aggregates carry their f64 accumulator in the i64 slot bits.
 fn rowStateFloat(row: HarnessCore.TopRow, state_index: u16) f64 {
-    return @bitCast(switch (state_index) {
-        1 => row.refresh_sum,
-        2 => row.width_sum,
-        3 => row.extra_sum,
-        else => @as(i64, 0),
-    });
+    const bits: i64 = if (state_index >= 1 and state_index - 1 < row.slots.len) row.slots[state_index - 1] else 0;
+    return @bitCast(bits);
 }
 
 fn avgFloatValue(row: HarnessCore.TopRow, state_index: u16) f64 {
