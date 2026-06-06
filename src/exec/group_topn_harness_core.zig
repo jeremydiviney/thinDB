@@ -585,6 +585,20 @@ const GroupRows = struct {
         };
     }
 
+    // Read aggregate-input column `column_index` at `row` as f64 (float
+    // physical types direct/widened; integer physical types converted) — the
+    // float counterpart to columnIntAt for SUM/AVG/MIN/MAX over float inputs.
+    inline fn columnFloatAt(self: GroupRows, column_index: usize, row: usize) f64 {
+        return switch (self.layout.columns[column_index].physical_type) {
+            .i8 => @floatFromInt(self.columnTypedAll(i8, column_index)[row]),
+            .i16 => @floatFromInt(self.columnTypedAll(i16, column_index)[row]),
+            .i32 => @floatFromInt(self.columnTypedAll(i32, column_index)[row]),
+            .i64 => @floatFromInt(self.columnTypedAll(i64, column_index)[row]),
+            .f32 => @floatCast(self.columnTypedAll(f32, column_index)[row]),
+            .f64 => self.columnTypedAll(f64, column_index)[row],
+        };
+    }
+
     inline fn columnByteSlab(self: GroupRows, column_index: usize) []u8 {
         const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
         return (self.slab.ptr + self.columnOffset(column_index))[0 .. sz * self.capacity_rows];
@@ -2407,21 +2421,32 @@ fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, r
                 _ = aggregateInputValue(agg, rows, row_idx) catch return error.UnsupportedOperatorForType;
                 if (state_index != 0) try setAggregateStateValue(st, state_index, st.count);
             },
-            .sum => {
-                const value = try aggregateInputValue(agg, rows, row_idx);
-                try addAggregateStateValue(st, state_index, value);
-            },
-            .avg => {
-                const value = try aggregateInputValue(agg, rows, row_idx);
-                try addAggregateStateValue(st, state_index, value);
+            .sum, .avg => {
+                if (aggInputIsFloat(rows, agg)) {
+                    const value = try aggregateInputFloat(agg, rows, row_idx);
+                    try addFloatStateValue(st, state_index, value);
+                } else {
+                    const value = try aggregateInputValue(agg, rows, row_idx);
+                    try addAggregateStateValue(st, state_index, value);
+                }
             },
             .min => {
-                const value = try aggregateInputValue(agg, rows, row_idx);
-                if (st.count == 1 or value < aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+                if (aggInputIsFloat(rows, agg)) {
+                    const value = try aggregateInputFloat(agg, rows, row_idx);
+                    if (st.count == 1 or value < floatStateValue(st, state_index)) try setFloatStateValue(st, state_index, value);
+                } else {
+                    const value = try aggregateInputValue(agg, rows, row_idx);
+                    if (st.count == 1 or value < aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+                }
             },
             .max => {
-                const value = try aggregateInputValue(agg, rows, row_idx);
-                if (st.count == 1 or value > aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+                if (aggInputIsFloat(rows, agg)) {
+                    const value = try aggregateInputFloat(agg, rows, row_idx);
+                    if (st.count == 1 or value > floatStateValue(st, state_index)) try setFloatStateValue(st, state_index, value);
+                } else {
+                    const value = try aggregateInputValue(agg, rows, row_idx);
+                    if (st.count == 1 or value > aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+                }
             },
         }
     }
@@ -2431,6 +2456,47 @@ fn aggregateInputValue(agg: GroupAggregateSpec, rows: GroupRows, row_idx: usize)
     const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
     if (input_index >= rows.layout.columns.len) return error.UnsupportedOperatorForType;
     return rows.columnIntAt(input_index, row_idx);
+}
+
+inline fn physicalIsFloat(pt: GroupColumnType) bool {
+    return pt == .f32 or pt == .f64;
+}
+
+inline fn aggInputIsFloat(rows: GroupRows, agg: GroupAggregateSpec) bool {
+    const input_index = agg.input_column_index orelse return false;
+    if (input_index >= rows.layout.columns.len) return false;
+    return physicalIsFloat(rows.layout.columns[input_index].physical_type);
+}
+
+fn aggregateInputFloat(agg: GroupAggregateSpec, rows: GroupRows, row_idx: usize) !f64 {
+    const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
+    if (input_index >= rows.layout.columns.len) return error.UnsupportedOperatorForType;
+    return rows.columnFloatAt(input_index, row_idx);
+}
+
+// Float aggregates store an f64 accumulator in the i64 State slot via @bitCast
+// (slot 0 is the integer count and is never used for a float agg).
+inline fn floatStateValue(st: *const State, state_index: usize) f64 {
+    return @bitCast(switch (state_index) {
+        1 => st.refresh_sum,
+        2 => st.width_sum,
+        3 => st.extra_sum,
+        else => @as(i64, 0),
+    });
+}
+
+inline fn addFloatStateValue(st: *State, state_index: usize, value: f64) !void {
+    try setFloatStateValue(st, state_index, floatStateValue(st, state_index) + value);
+}
+
+inline fn setFloatStateValue(st: *State, state_index: usize, value: f64) !void {
+    const bits: i64 = @bitCast(value);
+    switch (state_index) {
+        1 => st.refresh_sum = bits,
+        2 => st.width_sum = bits,
+        3 => st.extra_sum = bits,
+        else => return error.UnsupportedOperatorForType,
+    }
 }
 
 inline fn aggregateStateValue(st: *const State, state_index: usize) i128 {
@@ -2504,7 +2570,11 @@ fn groupChunkRowsDirect(
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
     try validateGroupAggregateProgram(rows.layout.aggregates, rows.layout.columns.len);
     const rowrefs: []const i64 = if (rows.layout.has_rowref) rows.rowrefAll()[0..n] else &.{};
-    if (countSumAvgProgram(rows.layout.aggregates, rows.layout.columns.len)) |program| {
+    if (countSumAvgProgram(rows.layout.aggregates, rows.layout.columns.len)) |program| blk: {
+        // The CountSumAvg fast path reads inputs as i64; float inputs route to
+        // the generic per-aggregate program path instead.
+        if (physicalIsFloat(rows.layout.columns[program.sum_input_index].physical_type) or
+            physicalIsFloat(rows.layout.columns[program.avg_input_index].physical_type)) break :blk;
         switch (rows.layout.key_width) {
             .u32 => try groupChunkRowsDirectKeysCountSumAvg(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, rows, program, rowrefs),
             .u64 => try groupChunkRowsDirectKeysCountSumAvg(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, rows, program, rowrefs),

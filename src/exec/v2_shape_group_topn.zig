@@ -470,10 +470,17 @@ fn compareOutputValue(op: *GroupTopNPipeline, name: []const u8, a: HarnessCore.T
 }
 
 fn compareAggregateValue(agg_plan: AggregatePlan, a: HarnessCore.TopRow, b: HarnessCore.TopRow) i8 {
+    const float_input = isFloatPhysical(agg_plan.input_type);
     return switch (agg_plan.func) {
         .count => compareU64(a.count, b.count),
-        .sum, .min, .max => compareI128(rowStateValue(a, agg_plan.state_index), rowStateValue(b, agg_plan.state_index)),
-        .avg => compareF64(avgValue(a, agg_plan.state_index), avgValue(b, agg_plan.state_index)),
+        .sum, .min, .max => if (float_input)
+            compareF64(rowStateFloat(a, agg_plan.state_index), rowStateFloat(b, agg_plan.state_index))
+        else
+            compareI128(rowStateValue(a, agg_plan.state_index), rowStateValue(b, agg_plan.state_index)),
+        .avg => if (float_input)
+            compareF64(avgFloatValue(a, agg_plan.state_index), avgFloatValue(b, agg_plan.state_index))
+        else
+            compareF64(avgValue(a, agg_plan.state_index), avgValue(b, agg_plan.state_index)),
         else => 0,
     };
 }
@@ -490,6 +497,20 @@ fn rowStateValue(row: HarnessCore.TopRow, state_index: u16) i128 {
         3 => row.extra_sum,
         else => 0,
     };
+}
+
+// Float aggregates carry their f64 accumulator in the i64 State slot bits.
+fn rowStateFloat(row: HarnessCore.TopRow, state_index: u16) f64 {
+    return @bitCast(switch (state_index) {
+        1 => row.refresh_sum,
+        2 => row.width_sum,
+        3 => row.extra_sum,
+        else => @as(i64, 0),
+    });
+}
+
+fn avgFloatValue(row: HarnessCore.TopRow, state_index: u16) f64 {
+    return if (row.count == 0) 0.0 else rowStateFloat(row, state_index) / @as(f64, @floatFromInt(row.count));
 }
 
 fn keyPartValue(part: KeyPart, key: u128) i128 {
@@ -581,12 +602,16 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRo
 }
 
 fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: AggregatePlan, row: HarnessCore.TopRow) !void {
+    const float_input = isFloatPhysical(agg_plan.input_type);
     switch (agg_plan.func) {
         .count => try col.data.bigint.append(allocator, @intCast(row.count)),
-        .sum, .min, .max => try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index)),
+        .sum, .min, .max => if (float_input)
+            try appendFloatAggregate(allocator, col, agg_plan.output_type, rowStateFloat(row, agg_plan.state_index))
+        else
+            try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index)),
         .avg => try col.data.double.append(
             allocator,
-            avgValue(row, agg_plan.state_index),
+            if (float_input) avgFloatValue(row, agg_plan.state_index) else avgValue(row, agg_plan.state_index),
         ),
         else => return error.UnsupportedOperatorForType,
     }
@@ -764,10 +789,14 @@ fn havingOutputNum(op: *GroupTopNPipeline, name: []const u8, row: HarnessCore.To
     }
     for (op.plan.aggregates[0..op.plan.aggregate_count]) |agg_plan| {
         if (types.columnNameEql(name, agg_plan.name)) {
+            const float_input = isFloatPhysical(agg_plan.input_type);
             return switch (agg_plan.func) {
                 .count => .{ .i = @intCast(row.count) },
-                .sum, .min, .max => .{ .i = rowStateValue(row, agg_plan.state_index) },
-                .avg => .{ .f = avgValue(row, agg_plan.state_index) },
+                .sum, .min, .max => if (float_input)
+                    Num{ .f = rowStateFloat(row, agg_plan.state_index) }
+                else
+                    Num{ .i = rowStateValue(row, agg_plan.state_index) },
+                .avg => .{ .f = if (float_input) avgFloatValue(row, agg_plan.state_index) else avgValue(row, agg_plan.state_index) },
                 else => null,
             };
         }
@@ -833,7 +862,7 @@ fn addAggregateInput(
     }
     if (input_count.* >= MAX_AGG_INPUTS) return null;
     const typ = columnType(table, name) orelse return null;
-    if (!plainIntType(typ)) return null;
+    if (!aggInputSupported(typ)) return null;
     const physical_type = physicalTypeFor(typ);
     const idx = input_count.*;
     inputs[idx] = .{
@@ -855,9 +884,9 @@ fn isSearchPhraseNotEmpty(pred: PredicateExpr) bool {
     };
 }
 
-fn plainIntType(typ: Type) bool {
+fn aggInputSupported(typ: Type) bool {
     return switch (typ) {
-        .boolean, .tinyint, .smallint, .int, .bigint => true,
+        .boolean, .tinyint, .smallint, .int, .bigint, .float, .double => true,
         else => false,
     };
 }
@@ -868,8 +897,14 @@ fn physicalTypeFor(typ: Type) GroupTopNEngine.PhysicalType {
         .smallint => .i16,
         .int, .date => .i32,
         .bigint, .datetime, .decimal64 => .i64,
+        .float => .f32,
+        .double => .f64,
         else => .i64,
     };
+}
+
+fn isFloatPhysical(pt: GroupTopNEngine.PhysicalType) bool {
+    return pt == .f32 or pt == .f64;
 }
 
 fn intTypeBits(t: Type) ?u8 {
@@ -894,6 +929,14 @@ fn appendKeyPart(allocator: Allocator, col: *ColumnStore, part: KeyPart, key: u1
         .datetime => try col.data.datetime.append(allocator, @bitCast(@as(u64, @truncate(raw)))),
         .decimal64 => try col.data.decimal64.append(allocator, @bitCast(@as(u64, @truncate(raw)))),
         else => unreachable,
+    }
+}
+
+fn appendFloatAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type, value: f64) !void {
+    switch (out_type) {
+        .float => try col.data.float.append(allocator, @floatCast(value)),
+        .double => try col.data.double.append(allocator, value),
+        else => return error.TypeMismatch,
     }
 }
 

@@ -87,6 +87,21 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_integration_client_tests.step);
 
+    // ---- V2-engine integration tests: tests/integration/v2_group_topn_test.zig ----
+    // These exercise group-topN SELECT shapes that the V2 engine fully owns, so
+    // they run against the DEFAULT engine (no THINDB_ENGINE_V1) — the broad
+    // suite above is pinned to V1 only because it asserts legacy-only shapes.
+    const v2_integration_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration/v2_group_topn_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    v2_integration_mod.addImport("thindb", thindb_mod);
+    const v2_integration_tests = b.addTest(.{ .root_module = v2_integration_mod });
+    const run_v2_integration_tests = b.addRunArtifact(v2_integration_tests);
+    const test_v2_step = b.step("test-v2", "Run V2-engine integration tests (default engine)");
+    test_v2_step.dependOn(&run_v2_integration_tests.step);
+
     // ---- ReleaseFast thinDB module for performance tooling -----------------
     // Benchmarks (and the ClickBench loader) are only meaningful against
     // production-optimized code, so they always build at ReleaseFast
