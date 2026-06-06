@@ -222,6 +222,11 @@ const RawRows = struct {
         return self.columnI16All(column_index)[0..self.len_rows];
     }
 
+    inline fn columnByteSlab(self: RawRows, column_index: usize) []u8 {
+        const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
+        return (self.slab.ptr + self.columnOffset(column_index))[0 .. sz * self.capacity_rows];
+    }
+
     fn ensureTotalCapacity(self: *RawRows, allocator: Allocator, layout: GroupRowsLayout, capacity_rows: usize) !void {
         if (!sameRowsLayout(self.layout, layout)) {
             self.deinit(allocator);
@@ -239,9 +244,8 @@ const RawRows = struct {
             while (i < self.len_rows) : (i += 1) next.setKey(i, self.keyAt(i));
             var col: usize = 0;
             while (col < layout.columns.len) : (col += 1) {
-                switch (layout.columns[col].physical_type) {
-                    .i16 => @memcpy(next.columnI16Items(col), self.columnI16Items(col)),
-                }
+                const sz = groupColumnSize(layout.columns[col].physical_type);
+                @memcpy(next.columnByteSlab(col)[0 .. sz * self.len_rows], self.columnByteSlab(col)[0 .. sz * self.len_rows]);
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
         }
@@ -321,7 +325,12 @@ pub const GroupKeyWidth = enum {
 };
 
 pub const GroupColumnType = enum {
+    i8,
     i16,
+    i32,
+    i64,
+    f32,
+    f64,
 };
 
 pub const GroupColumnSource = enum {
@@ -448,13 +457,23 @@ fn groupKeyAlign(width: GroupKeyWidth) usize {
 
 fn groupColumnSize(typ: GroupColumnType) usize {
     return switch (typ) {
+        .i8 => @sizeOf(i8),
         .i16 => @sizeOf(i16),
+        .i32 => @sizeOf(i32),
+        .i64 => @sizeOf(i64),
+        .f32 => @sizeOf(f32),
+        .f64 => @sizeOf(f64),
     };
 }
 
 fn groupColumnAlign(typ: GroupColumnType) usize {
     return switch (typ) {
+        .i8 => @alignOf(i8),
         .i16 => @alignOf(i16),
+        .i32 => @alignOf(i32),
+        .i64 => @alignOf(i64),
+        .f32 => @alignOf(f32),
+        .f64 => @alignOf(f64),
     };
 }
 
@@ -550,6 +569,11 @@ const GroupRows = struct {
         return self.columnI16All(column_index)[0..self.len_rows];
     }
 
+    inline fn columnByteSlab(self: GroupRows, column_index: usize) []u8 {
+        const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
+        return (self.slab.ptr + self.columnOffset(column_index))[0 .. sz * self.capacity_rows];
+    }
+
     inline fn refreshAll(self: GroupRows) []i16 {
         return self.columnI16All(0);
     }
@@ -575,9 +599,8 @@ const GroupRows = struct {
             while (i < self.len_rows) : (i += 1) next.setKey(i, self.keyAt(i));
             var col: usize = 0;
             while (col < layout.columns.len) : (col += 1) {
-                switch (layout.columns[col].physical_type) {
-                    .i16 => @memcpy(next.columnI16Items(col), self.columnI16Items(col)),
-                }
+                const sz = groupColumnSize(layout.columns[col].physical_type);
+                @memcpy(next.columnByteSlab(col)[0 .. sz * self.len_rows], self.columnByteSlab(col)[0 .. sz * self.len_rows]);
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
         }
@@ -624,9 +647,8 @@ const GroupRows = struct {
         }
         var col: usize = 0;
         while (col < self.layout.columns.len) : (col += 1) {
-            switch (self.layout.columns[col].physical_type) {
-                .i16 => @memcpy(self.columnI16All(col)[old_len..new_len], rows.columnI16All(col)[start .. start + count]),
-            }
+            const sz = groupColumnSize(self.layout.columns[col].physical_type);
+            @memcpy(self.columnByteSlab(col)[old_len * sz .. new_len * sz], rows.columnByteSlab(col)[start * sz .. (start + count) * sz]);
         }
         if (self.layout.has_rowref) @memcpy(self.rowrefAll()[old_len..new_len], rows.rowrefAll()[start .. start + count]);
     }
@@ -2443,6 +2465,7 @@ fn groupChunkRowsDirect(
     while (col < rows.layout.columns.len) : (col += 1) {
         column_slices_buf[col] = switch (rows.layout.columns[col].physical_type) {
             .i16 => rows.columnI16Items(col),
+            else => return error.UnsupportedOperatorForType,
         };
     }
     const column_slices = column_slices_buf[0..rows.layout.columns.len];
