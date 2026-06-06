@@ -320,6 +320,7 @@ const GlobalAggregatePlan = struct {
     where_filter: ?ir.Op.Filter,
     having_filter: ?ir.Op.Filter,
     group_by: ir.Op.GroupBy,
+    derived: []const ir.Derived = &.{},
 };
 
 fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
@@ -345,11 +346,26 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
         if (!projectMatchesGroupOutput(p, group_by)) return null;
     }
 
+    // Peel an optional row-local Compute (derived aggregate inputs, e.g.
+    // SUM(ResolutionWidth + 1)) and an optional WHERE filter, in either order,
+    // down to the scan. The derived columns are computed in the scan layer.
     var where_filter: ?ir.Op.Filter = null;
+    var derived: []const ir.Derived = &.{};
     var source = group_by.upstream;
-    if (source.* == .filter) {
-        where_filter = source.filter;
-        source = source.filter.upstream;
+    while (true) {
+        switch (source.*) {
+            .compute => {
+                if (derived.len != 0) return null;
+                derived = source.compute.derived;
+                source = source.compute.upstream;
+            },
+            .filter => {
+                if (where_filter != null) return null;
+                where_filter = source.filter;
+                source = source.filter.upstream;
+            },
+            else => break,
+        }
     }
     if (source.* != .scan) return null;
     if (source.scan.alias != null) return null;
@@ -359,6 +375,7 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
         .where_filter = where_filter,
         .having_filter = having_filter,
         .group_by = group_by,
+        .derived = derived,
     };
 }
 
@@ -372,6 +389,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .aggs = plan.group_by.aggs,
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .having_filter = if (plan.having_filter) |f| f.predicate else null,
+        .derived = plan.derived,
         .dop = input.db.config.max_dop,
     });
 }

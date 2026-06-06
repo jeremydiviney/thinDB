@@ -28,6 +28,8 @@ const ColumnStore = store.ColumnStore;
 
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
+const compute = @import("compute.zig");
+const expr = @import("expr.zig");
 const Scan = @import("scan.zig").Scan;
 const HarnessCore = exec.group_topn_harness_core;
 
@@ -40,8 +42,57 @@ pub const Request = struct {
     aggs: []const AggSpec,
     where_filter: ?PredicateExpr,
     having_filter: ?PredicateExpr,
+    // Row-local derived columns (e.g. SUM(ResolutionWidth + 1)) computed in
+    // the scan layer by a Compute operator before the fold sees them. Empty
+    // for plain column aggregates.
+    derived: []const compute.Derived,
     dop: usize,
 };
+
+// A scan wrapped in an optional Compute layer (for aggregate-over-expression
+// inputs). `scan` is borrowed for range resets; `drive` owns the operator
+// chain (Compute → Scan, or just Scan) for iteration and teardown.
+const ScanSource = struct {
+    scan: *Scan,
+    drive: Query,
+
+    fn next(self: *ScanSource) !?Batch {
+        return self.drive.next();
+    }
+
+    fn resetRange(self: *ScanSource, start_seg: usize, start_rg: usize, end_seg: usize, end_rg: usize, scan_memtable: bool) void {
+        self.scan.resetRange(start_seg, start_rg, end_seg, end_rg, scan_memtable);
+    }
+
+    fn schema(self: *ScanSource) []const Column {
+        return self.drive.outputSchema();
+    }
+
+    fn deinit(self: *ScanSource) void {
+        self.drive.deinit();
+    }
+};
+
+fn openScanSource(
+    allocator: Allocator,
+    table: *api.Table,
+    needed: []const []const u8,
+    where_filter: ?PredicateExpr,
+    derived: []const compute.Derived,
+    snap: ?Scan.Snapshot,
+) !ScanSource {
+    const scan = try Scan.allocWithProjectionLoc(allocator, table, null, needed, false, snap);
+    errdefer scan.deinit();
+    if (where_filter) |w| {
+        // Never produce a result from an unapplied filter.
+        if (!try scan.tryFuseFilter(w)) return error.UnsupportedQueryShape;
+    }
+    if (derived.len == 0) {
+        return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan) };
+    }
+    const drive = try compute.Compute.create(allocator, exec.makeQuery(allocator, scan), derived);
+    return .{ .scan = scan, .drive = drive };
+}
 
 const AggOp = enum { count_star, count_col, sum, avg, min, max };
 
@@ -194,7 +245,7 @@ fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: 
 const Worker = struct {
     index: usize,
     cpu: ?usize,
-    scan: *Scan,
+    source: ScanSource,
     lane: Lane,
     plans: []const AggPlan,
     resolved: []?usize,
@@ -218,7 +269,7 @@ fn workerRun(w: *Worker) !void {
     if (w.total_rgs == 0) {
         // Memtable-only (no segments / no row groups): one lane scans it all.
         if (w.index != 0) return;
-        w.scan.resetRange(0, 0, w.segment_count, 0, true);
+        w.source.resetRange(0, 0, w.segment_count, 0, true);
         try driveTile(w, &have_resolved);
         return;
     }
@@ -229,13 +280,13 @@ fn workerRun(w: *Worker) !void {
         const start = flatToCoord(lo, w.seg_start, w.segment_count, w.total_rgs);
         const end = flatToCoord(hi, w.seg_start, w.segment_count, w.total_rgs);
         // The final tile also drains the memtable (scan_memtable = true).
-        w.scan.resetRange(start.seg, start.rg, end.seg, end.rg, hi == w.total_rgs);
+        w.source.resetRange(start.seg, start.rg, end.seg, end.rg, hi == w.total_rgs);
         try driveTile(w, &have_resolved);
     }
 }
 
 fn driveTile(w: *Worker, have_resolved: *bool) !void {
-    while (try w.scan.next()) |batch| {
+    while (try w.source.next()) |batch| {
         if (!have_resolved.*) {
             try resolveBatchIndices(w.plans, w.resolved, batch);
             have_resolved.* = true;
@@ -244,11 +295,11 @@ fn driveTile(w: *Worker, have_resolved: *bool) !void {
     }
 }
 
-fn driveScan(lane: *Lane, plans: []const AggPlan, allocator: Allocator, scan: *Scan) !void {
+fn driveScan(lane: *Lane, plans: []const AggPlan, allocator: Allocator, source: *ScanSource) !void {
     const resolved = try allocator.alloc(?usize, plans.len);
     defer allocator.free(resolved);
     var have_resolved = false;
-    while (try scan.next()) |batch| {
+    while (try source.next()) |batch| {
         if (!have_resolved) {
             try resolveBatchIndices(plans, resolved, batch);
             have_resolved = true;
@@ -276,6 +327,54 @@ fn isFloatType(typ: Type) bool {
     return typ == .float or typ == .double;
 }
 
+fn isDerivedName(derived: []const compute.Derived, name: []const u8) bool {
+    for (derived) |d| if (types.columnNameEql(d.name, name)) return true;
+    return false;
+}
+
+// Base-table type for `name` if it is a real column, else the derived
+// column's computed type from the (probe-resolved) Compute output schema.
+fn resolveAggInputType(table: *api.Table, schema: ?[]const Column, name: []const u8) ?Type {
+    if (columnType(table, name)) |t| return t;
+    if (schema) |s| {
+        for (s) |c| if (types.columnNameEql(c.name, name)) return c.type;
+    }
+    return null;
+}
+
+// Walk a derived-column expression and project every base column it reads, so
+// the scan supplies them to the Compute layer.
+fn collectExprCols(allocator: Allocator, needed: *std.ArrayListUnmanaged([]const u8), table: *api.Table, e: expr.Expr) !void {
+    switch (e) {
+        .col_ref => |nm| _ = try addNeeded(allocator, needed, table, nm),
+        .call => |c| for (c.args) |arg| try collectExprCols(allocator, needed, table, arg),
+        .case => |cs| {
+            for (cs.branches) |b| {
+                try collectPredCols(allocator, needed, table, b.cond);
+                try collectExprCols(allocator, needed, table, b.then);
+            }
+            if (cs.else_branch) |eb| try collectExprCols(allocator, needed, table, eb.*);
+        },
+        else => {},
+    }
+}
+
+fn collectPredCols(allocator: Allocator, needed: *std.ArrayListUnmanaged([]const u8), table: *api.Table, p: PredicateExpr) !void {
+    switch (p) {
+        .leaf => |l| _ = try addNeeded(allocator, needed, table, l.col),
+        .leaf_col_col => |c| {
+            _ = try addNeeded(allocator, needed, table, c.left);
+            _ = try addNeeded(allocator, needed, table, c.right);
+        },
+        .is_null, .is_not_null => |nm| _ = try addNeeded(allocator, needed, table, nm),
+        .like => |lk| _ = try addNeeded(allocator, needed, table, lk.col),
+        .in_set => |s| _ = try addNeeded(allocator, needed, table, s.col),
+        .@"and", .@"or" => |kids| for (kids) |k| try collectPredCols(allocator, needed, table, k),
+        .not => |k| try collectPredCols(allocator, needed, table, k.*),
+        else => {},
+    }
+}
+
 pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Query {
     if (request.aggs.len == 0) return null;
     // HAVING over a global aggregate is a 0/1-row post-filter; not in this cut.
@@ -289,11 +388,20 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     var needed: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer needed.deinit(allocator);
 
+    // Pass 1: shape each aggregate and project its base inputs. A folded input
+    // is either a real table column (projected here) or a derived column
+    // produced by the Compute layer (whose base inputs are projected below).
+    // sum/avg/min/max input/output types are resolved in pass 2, once a probe
+    // ScanSource can report the derived columns' computed types.
     for (request.aggs, 0..) |agg, i| {
         switch (agg.func) {
             .count => {
                 if (agg.col) |col_name| {
-                    _ = (try addNeeded(allocator, &needed, table, col_name)) orelse return declineFree(allocator, plans, &needed);
+                    if (columnType(table, col_name) != null) {
+                        _ = (try addNeeded(allocator, &needed, table, col_name)) orelse return declineFree(allocator, plans, &needed);
+                    } else if (!isDerivedName(request.derived, col_name)) {
+                        return declineFree(allocator, plans, &needed);
+                    }
                     plans[i] = .{ .op = .count_col, .input_name = col_name, .is_float = false, .output_type = .bigint, .name = agg.as };
                 } else {
                     plans[i] = .{ .op = .count_star, .input_name = null, .is_float = false, .output_type = .bigint, .name = agg.as };
@@ -301,10 +409,11 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
             },
             .sum, .avg, .min, .max => {
                 const col_name = agg.col orelse return declineFree(allocator, plans, &needed);
-                const ctyp = columnType(table, col_name) orelse return declineFree(allocator, plans, &needed);
-                if (!aggInputSupported(ctyp)) return declineFree(allocator, plans, &needed);
-                _ = (try addNeeded(allocator, &needed, table, col_name)) orelse return declineFree(allocator, plans, &needed);
-                const out_type = aggregate.aggOutputTypeFor(agg, ctyp) catch return declineFree(allocator, plans, &needed);
+                if (columnType(table, col_name) != null) {
+                    _ = (try addNeeded(allocator, &needed, table, col_name)) orelse return declineFree(allocator, plans, &needed);
+                } else if (!isDerivedName(request.derived, col_name)) {
+                    return declineFree(allocator, plans, &needed);
+                }
                 plans[i] = .{
                     .op = switch (agg.func) {
                         .sum => .sum,
@@ -314,13 +423,19 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                         else => unreachable,
                     },
                     .input_name = col_name,
-                    .is_float = isFloatType(ctyp),
-                    .output_type = out_type,
+                    .is_float = false,
+                    .output_type = .bigint,
                     .name = agg.as,
                 };
             },
             else => return declineFree(allocator, plans, &needed),
         }
+    }
+
+    // Project every base column read by a derived expression so the Compute
+    // layer can evaluate it.
+    for (request.derived) |d| {
+        try collectExprCols(allocator, &needed, table, d.expr);
     }
 
     // A column-less COUNT(*) still needs ≥1 projected column for the scan to
@@ -329,6 +444,31 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     // minimize the decode it's forced to do.
     if (needed.items.len == 0) {
         _ = (try addNeeded(allocator, &needed, table, narrowestColumn(table))) orelse return declineFree(allocator, plans, &needed);
+    }
+
+    // Pass 2: resolve sum/avg/min/max input + output types. Derived inputs need
+    // the Compute output schema, obtained from a probe ScanSource (no batch is
+    // fetched — only the schema is read, then it is torn down).
+    {
+        var probe: ?ScanSource = null;
+        defer if (probe) |*p| p.deinit();
+        var probe_schema: ?[]const Column = null;
+        if (request.derived.len > 0) {
+            probe = try openScanSource(allocator, table, needed.items, null, request.derived, null);
+            probe_schema = probe.?.schema();
+        }
+        for (request.aggs, plans) |agg, *p| {
+            switch (agg.func) {
+                .sum, .avg, .min, .max => {
+                    const ctyp = resolveAggInputType(table, probe_schema, agg.col.?) orelse return declineFree(allocator, plans, &needed);
+                    if (!aggInputSupported(ctyp)) return declineFree(allocator, plans, &needed);
+                    const out_type = aggregate.aggOutputTypeFor(agg, ctyp) catch return declineFree(allocator, plans, &needed);
+                    p.is_float = isFloatType(ctyp);
+                    p.output_type = out_type;
+                },
+                else => {},
+            }
+        }
     }
 
     const op = try allocator.create(GlobalAggregate);
@@ -388,6 +528,7 @@ const GlobalAggregate = struct {
     allocator: Allocator,
     table: *api.Table,
     where_filter: ?PredicateExpr,
+    derived: []const compute.Derived,
     dop: usize,
     plans: []AggPlan,
     needed: []const []const u8,
@@ -419,6 +560,7 @@ const GlobalAggregate = struct {
             .allocator = allocator,
             .table = table,
             .where_filter = request.where_filter,
+            .derived = request.derived,
             .dop = request.dop,
             .plans = plans,
             .needed = needed,
@@ -479,22 +621,16 @@ const GlobalAggregate = struct {
         self.row_count = 1;
     }
 
-    fn openScan(self: *GlobalAggregate, snap: ?Scan.Snapshot) !*Scan {
-        const scan = try Scan.allocWithProjectionLoc(self.allocator, self.table, null, self.needed, false, snap);
-        errdefer scan.deinit();
-        if (self.where_filter) |w| {
-            // Never produce a result from an unapplied filter.
-            if (!try scan.tryFuseFilter(w)) return error.UnsupportedQueryShape;
-        }
-        return scan;
+    fn openScan(self: *GlobalAggregate, snap: ?Scan.Snapshot) !ScanSource {
+        return openScanSource(self.allocator, self.table, self.needed, self.where_filter, self.derived, snap);
     }
 
     fn reduceSerial(self: *GlobalAggregate) !Lane {
         var lane = try Lane.init(self.allocator, self.plans.len);
         errdefer lane.deinit(self.allocator);
-        const scan = try self.openScan(null);
-        defer scan.deinit();
-        try driveScan(&lane, self.plans, self.allocator, scan);
+        var source = try self.openScan(null);
+        defer source.deinit();
+        try driveScan(&lane, self.plans, self.allocator, &source);
         return lane;
     }
 
@@ -533,18 +669,18 @@ const GlobalAggregate = struct {
         defer self.allocator.free(workers);
         var built: usize = 0;
         defer for (workers[0..built]) |*w| {
-            w.scan.deinit();
+            w.source.deinit();
             w.lane.deinit(self.allocator);
             self.allocator.free(w.resolved);
         };
 
         var next_rg = std.atomic.Value(usize).init(0);
         for (workers, 0..) |*w, i| {
-            const scan = try self.openScan(snap);
+            const source = try self.openScan(snap);
             w.* = .{
                 .index = i,
                 .cpu = if (layout.order.len == 0) null else layout.order[i % layout.order.len],
-                .scan = scan,
+                .source = source,
                 .lane = try Lane.init(self.allocator, self.plans.len),
                 .plans = self.plans,
                 .resolved = try self.allocator.alloc(?usize, self.plans.len),
