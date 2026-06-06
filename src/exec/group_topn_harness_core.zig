@@ -16,6 +16,7 @@ const exec_mod = @import("exec.zig");
 const api_mod = @import("../api/api.zig");
 const storage_mod = @import("../storage/storage.zig");
 const types_mod = @import("../types.zig");
+const rowloc = @import("rowloc.zig");
 
 const thindb = struct {
     pub const exec = exec_mod;
@@ -1999,6 +2000,31 @@ fn genericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storag
     return key;
 }
 
+inline fn updateKeyHash(h: *std.hash.Wyhash, view: thindb.storage.ColumnView, typ: thindb.types.Type, row: usize) void {
+    switch (view.data) {
+        .string, .varchar, .char => |sv| h.update(sv.rowBytes(row)),
+        else => {
+            const bits = readGenericKeyBits(view, typ, row) catch 0;
+            h.update(std.mem.asBytes(&bits));
+        },
+    }
+}
+
+// Hashed group identity for string / >128-bit keys: a 128-bit Wyhash digest of
+// the key columns' raw bytes (two independent seeds → hi/lo). The actual key
+// values are recovered at emit via the row's carried __rowloc (late
+// materialization), so collisions — astronomically unlikely at 128 bits — are
+// the only correctness caveat.
+fn hashGenericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storage.ColumnView, row: usize) u128 {
+    var lo = std.hash.Wyhash.init(0x9E3779B97F4A7C15);
+    var hi = std.hash.Wyhash.init(0xD1B54A32D192ED03);
+    for (layout.key_columns, 0..) |part, i| {
+        updateKeyHash(&lo, key_views[i], part.typ, row);
+        updateKeyHash(&hi, key_views[i], part.typ, row);
+    }
+    return (@as(u128, hi.final()) << 64) | @as(u128, lo.final());
+}
+
 fn applyScanFilterExpr(scan: *Scan, expr: thindb.exec.PredicateExpr) !bool {
     // The scan owns all filter handling: literal coercion, zone-map prune-hint
     // extraction (incl. IN), and block-sourced evaluation of unprojected
@@ -2039,7 +2065,17 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         };
     }
 
-    if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_views_buf[0..layout.columns.len], raw_chunk_rows, profile)) return;
+    if (!layout.has_rowref) {
+        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_views_buf[0..layout.columns.len], raw_chunk_rows, profile)) return;
+    }
+
+    const rowref_col: []const i64 = if (layout.has_rowref) blk: {
+        const view = batch.columnView(rowloc.col_name) orelse return error.ColumnNotFound;
+        break :blk switch (view.data) {
+            .bigint => |v| v,
+            else => return error.TypeMismatch,
+        };
+    } else &.{};
 
     const route_t0 = if (profile) nowTicks() else 0;
     var accepted: u64 = 0;
@@ -2047,9 +2083,13 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     while (r < batch.row_count) {
         var active = &parts.raw_active_rows;
         while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
-            const key = try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
+            const key = if (layout.has_rowref)
+                hashGenericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r)
+            else
+                try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
             active.setKey(idx, key);
+            if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
             var col: usize = 0;
             while (col < layout.columns.len) : (col += 1) {
                 active.columnI16All(col)[idx] = payload_views_buf[col][r];
@@ -3349,7 +3389,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try parts[i].flat_raw_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, stage_scratch_rows);
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
-        scans[i] = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, false, snap);
+        scans[i] = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, cfg.group_rows_layout.has_rowref, snap);
         if (cfg.scan_filter) {
             if (cfg.filter_expr) |expr| {
                 _ = try applyScanFilterExpr(scans[i], expr);
