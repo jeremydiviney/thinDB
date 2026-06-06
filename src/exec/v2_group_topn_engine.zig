@@ -430,7 +430,6 @@ pub const Params = struct {
 
 pub const RunRequest = struct {
     table: *api.Table,
-    kind: HarnessCore.QueryKind,
     shape: Shape,
     params: Params,
     scan_columns: ?[]const []const u8 = null,
@@ -542,7 +541,7 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     var workspace: HarnessCore.SiloGridWorkspace = .{};
     var rows: std.ArrayListUnmanaged(HarnessCore.TopRow) = .empty;
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(arena_allocator, request.table, cpus, request.kind, request.shape, request.params, request.scan_columns, request.filter_expr, &rows, &workspace);
+    try runHarness(arena_allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -563,7 +562,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     errdefer rows.deinit(allocator);
 
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(allocator, request.table, cpus, request.kind, request.shape, request.params, request.scan_columns, request.filter_expr, &rows, &workspace);
+    try runHarness(allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -576,7 +575,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
         cpus.len,
         cpus,
         request.params,
-        request.kind.label(),
+        "generic",
     );
     return .{ .allocator = allocator, .rows = owned, .params = request.params, .times = times.* };
 }
@@ -585,7 +584,6 @@ fn runHarness(
     allocator: Allocator,
     table: *api.Table,
     cpus: []const usize,
-    kind: HarnessCore.QueryKind,
     shape: Shape,
     params: Params,
     scan_columns: ?[]const []const u8,
@@ -637,7 +635,6 @@ fn runHarness(
     try HarnessCore.runSiloGrid(allocator, table, cpus, .{
         .dop = params.dop,
         .bucket_count = params.bucket_count,
-        .kind = kind,
         .silo_grid = true,
         .scan_filter = true,
         .chunk_rows = params.raw_chunk_rows,

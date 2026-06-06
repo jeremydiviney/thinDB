@@ -31,14 +31,6 @@ const Scan = thindb.exec.Scan;
 const GroupTable = thindb.exec.group_table.IntKeyMemsetTable(96);
 const Q30InlineTable = thindb.exec.group_table.InlineSlotTable(u64, Q30InlineState);
 
-const COLS_CLIENTIP = [_][]const u8{ "ClientIP", "IsRefresh", "ResolutionWidth" };
-const COLS_USERID = [_][]const u8{"UserID"};
-const COLS_Q30 = [_][]const u8{ "SearchEngineID", "ClientIP", "IsRefresh", "ResolutionWidth", "SearchPhrase" };
-const COLS_Q31 = [_][]const u8{ "WatchID", "ClientIP", "IsRefresh", "ResolutionWidth", "SearchPhrase" };
-const COLS_Q32 = [_][]const u8{ "WatchID", "ClientIP", "IsRefresh", "ResolutionWidth" };
-const COLS_PHRASE = [_][]const u8{"SearchPhrase"};
-const COLS_Q30_PAYLOAD = [_][]const u8{ "SearchEngineID", "ClientIP", "IsRefresh", "ResolutionWidth" };
-const COLS_Q31_PAYLOAD = [_][]const u8{ "WatchID", "ClientIP", "IsRefresh", "ResolutionWidth" };
 const TOP_K: usize = 10;
 const PREFETCH_DIST_DIRECT: usize = 48;
 const PREFETCH_DIST_BUCKET: usize = 32;
@@ -56,61 +48,6 @@ const MAX_GROUP_LEASE_BUCKETS: usize = 64;
 const MAX_WORKSPACE_PROFILE_WORKERS: usize = 128;
 const MAX_RAW_BATCH_CHUNKS: usize = 64;
 const MAX_GENERIC_GROUP_KEYS: usize = 8;
-
-pub const QueryKind = enum {
-    clientip,
-    q15,
-    q30,
-    q31,
-    q32,
-    generic,
-
-    pub fn label(self: QueryKind) []const u8 {
-        return switch (self) {
-            .clientip => "clientip",
-            .q15 => "q15",
-            .q30 => "q30",
-            .q31 => "q31",
-            .q32 => "q32",
-            .generic => "generic",
-        };
-    }
-
-    fn columns(self: QueryKind) []const []const u8 {
-        return querySpec(self).columns;
-    }
-
-    fn payloadColumns(self: QueryKind) []const []const u8 {
-        return querySpec(self).payload_columns orelse querySpec(self).columns;
-    }
-
-    fn groupKeyColumnCount(self: QueryKind) usize {
-        return querySpec(self).group_key_columns;
-    }
-
-    fn hasFilter(self: QueryKind) bool {
-        return querySpec(self).filter != null;
-    }
-};
-
-const QuerySpec = struct {
-    columns: []const []const u8,
-    payload_columns: ?[]const []const u8 = null,
-    group_key_columns: usize,
-    filter: ?thindb.Predicate = null,
-};
-
-fn querySpec(kind: QueryKind) QuerySpec {
-    const phrase_non_empty = searchPhrasePred();
-    return switch (kind) {
-        .clientip => .{ .columns = &COLS_CLIENTIP, .group_key_columns = 1 },
-        .q15 => .{ .columns = &COLS_USERID, .group_key_columns = 1 },
-        .q30 => .{ .columns = &COLS_Q30, .payload_columns = &COLS_Q30_PAYLOAD, .group_key_columns = 2, .filter = phrase_non_empty },
-        .q31 => .{ .columns = &COLS_Q31, .payload_columns = &COLS_Q31_PAYLOAD, .group_key_columns = 2, .filter = phrase_non_empty },
-        .q32 => .{ .columns = &COLS_Q32, .group_key_columns = 2 },
-        .generic => .{ .columns = &.{}, .group_key_columns = 0 },
-    };
-}
 
 fn nowTicks() i64 {
     var c: win.LARGE_INTEGER = 0;
@@ -2337,25 +2274,6 @@ inline fn packWatchClient(watch_id: i64, client_ip: i32) u128 {
         (@as(u128, @as(u32, @bitCast(client_ip))) << 64);
 }
 
-const BatchViews = struct {
-    kind: QueryKind,
-    client_ip: []const i32 = &.{},
-    user_id: ?[]const i64 = null,
-    watch_id: ?[]const i64 = null,
-    search_engine: ?thindb.storage.ColumnView = null,
-    refresh: []const i16 = &.{},
-    width: []const i16 = &.{},
-    phrase: ?thindb.storage.StringView = null,
-};
-
-const PayloadViews = struct {
-    client_ip: []const i32,
-    watch_id: ?[]const i64 = null,
-    search_engine: ?thindb.storage.ColumnView = null,
-    refresh: []const i16,
-    width: []const i16,
-};
-
 inline fn readSearchEngine(v: thindb.storage.ColumnView, row: usize) !i16 {
     return switch (v.data) {
         .smallint => |s| s[row],
@@ -2363,10 +2281,6 @@ inline fn readSearchEngine(v: thindb.storage.ColumnView, row: usize) !i16 {
         .int => |s| @intCast(s[row]),
         else => error.UnexpectedSearchEngineIDType,
     };
-}
-
-inline fn rowPasses(v: BatchViews, row: usize) bool {
-    return if (v.phrase) |p| p.offsets[row] != p.offsets[row + 1] else true;
 }
 
 inline fn readGenericKeyBits(view: thindb.storage.ColumnView, typ: thindb.types.Type, row: usize) !u128 {
@@ -2405,10 +2319,6 @@ fn genericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storag
         key |= raw << @intCast(part.offset_bits);
     }
     return key;
-}
-
-fn searchPhrasePred() thindb.Predicate {
-    return .{ .col = "SearchPhrase", .op = .neq, .val = .{ .text = "" } };
 }
 
 fn applyScanFilterExpr(scan: *Scan, expr: thindb.exec.PredicateExpr) !bool {
@@ -3009,49 +2919,6 @@ inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) 
         bucketIndexHash(h, bucket_count);
 }
 
-const ScanJob = struct {
-    scan: *Scan,
-    parts: *WorkerParts,
-    allocator: Allocator,
-    bucket_count: usize,
-    kind: QueryKind,
-    cpu: usize,
-    err: *?anyerror,
-};
-
-const LateFilterJob = struct {
-    filter_scan: *Scan,
-    payload_scan: *Scan,
-    parts: *WorkerParts,
-    allocator: Allocator,
-    bucket_count: usize,
-    kind: QueryKind,
-    cpu: usize,
-    err: *?anyerror,
-};
-
-const PreAggScanJob = struct {
-    scan: *Scan,
-    agg: *WorkerAgg,
-    allocator: Allocator,
-    bucket_count: usize,
-    table_expected: usize,
-    kind: QueryKind,
-    cpu: usize,
-    err: *?anyerror,
-};
-
-const StreamJob = struct {
-    scan: *Scan,
-    local: *WorkerParts,
-    central: []CentralBucket,
-    allocator: Allocator,
-    bucket_count: usize,
-    kind: QueryKind,
-    cpu: usize,
-    err: *?anyerror,
-};
-
 const GroupJob = struct {
     allocator: Allocator,
     parts: []WorkerParts,
@@ -3088,18 +2955,6 @@ const PreAggMergeJob = struct {
     err: *?anyerror,
 };
 
-const PipeScanJob = struct {
-    scan: *Scan,
-    parts: *WorkerParts,
-    shared: *PipeShared,
-    kind: QueryKind,
-    silo: bool,
-    chunk_rows: usize,
-    profile: bool,
-    cpu: usize,
-    err: *?anyerror,
-};
-
 const PipeGroupJob = struct {
     allocator: Allocator,
     shared: *PipeShared,
@@ -3125,65 +2980,10 @@ const SiloGroupJob = struct {
     err: *?anyerror,
 };
 
-const SiloElevatorJob = struct {
-    scan: *Scan,
-    local: *WorkerParts,
-    shared: *PipeShared,
-    worker_index: usize,
-    worker_count: usize,
-    kind: QueryKind,
-    chunk_rows: usize,
-    profile: bool,
-    cpu: usize,
-    group_ticks: *i64,
-    idle_ticks: *i64,
-    top_ticks: *i64,
-    chunks: *u64,
-    top: *TopSet,
-    err: *?anyerror,
-};
-
-const SiloAdaptiveScanJob = struct {
-    scan: *Scan,
-    local: *WorkerParts,
-    shared: *PipeShared,
-    worker_index: usize,
-    worker_count: usize,
-    kind: QueryKind,
-    chunk_rows: usize,
-    profile: bool,
-    cpu: usize,
-    group_ticks: *i64,
-    idle_ticks: *i64,
-    top_ticks: *i64,
-    chunks: *u64,
-    top: *TopSet,
-    err: *?anyerror,
-};
-
 const SiloAdaptiveGroupJob = struct {
     shared: *PipeShared,
     worker_index: usize,
     worker_count: usize,
-    profile: bool,
-    cpu: usize,
-    group_ticks: *i64,
-    idle_ticks: *i64,
-    top_ticks: *i64,
-    chunks: *u64,
-    top: *TopSet,
-    err: *?anyerror,
-};
-
-const SiloElasticJob = struct {
-    scan: *Scan,
-    local: *WorkerParts,
-    shared: *PipeShared,
-    worker_index: usize,
-    worker_count: usize,
-    kind: QueryKind,
-    chunk_rows: usize,
-    group_backlog_target: usize,
     profile: bool,
     cpu: usize,
     group_ticks: *i64,
@@ -3202,7 +3002,6 @@ const SiloGridJob = struct {
     segment_count: usize,
     worker_index: usize,
     worker_count: usize,
-    kind: QueryKind,
     chunk_rows: usize,
     scan_tile_rgs: usize,
     scan_coalesce_tiles: usize,
@@ -3718,7 +3517,6 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
 pub const RunConfig = struct {
     dop: usize,
     bucket_count: usize,
-    kind: QueryKind,
     stream: bool = false,
     pipe: bool = false,
     pipe_tail: bool = false,
@@ -3762,13 +3560,6 @@ pub const RunConfig = struct {
     workspace: ?*SiloGridWorkspace = null,
 };
 
-fn autoBucketCount(kind: QueryKind, dop: usize, total_rows: u64) usize {
-    _ = kind;
-    _ = dop;
-    _ = total_rows;
-    return 2028;
-}
-
 fn localReservePerBucket(total_rows: u64, dop: usize, bucket_count: usize, chunk_rows: usize, route_block_rows: usize) usize {
     const denom = @as(u64, @intCast(@max(@as(usize, 1), dop) * @max(@as(usize, 1), bucket_count)));
     const estimated_per_worker_bucket = (total_rows + denom - 1) / denom;
@@ -3794,11 +3585,11 @@ fn estimateGroupCountFromStats(stats: thindb.exec.PipelineStats, key_cols: usize
     return @min(est, @max(stats.upper_rows, 1));
 }
 
-fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.exec.PipelineStats, kind: QueryKind, generic_key_count: usize, generic_key_width: GroupKeyWidth, generic_has_filter: bool) usize {
+fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.exec.PipelineStats, generic_key_count: usize, generic_key_width: GroupKeyWidth, generic_has_filter: bool) usize {
     const conservative_total = @max(@as(u64, 16), total_rows / 4);
-    const key_count = if (generic_key_count != 0) generic_key_count else kind.groupKeyColumnCount();
+    const key_count = generic_key_count;
     const estimated_total = estimateGroupCountFromStats(stats, key_count) orelse conservative_total;
-    const has_filter = if (generic_key_count != 0) generic_has_filter else kind.hasFilter();
+    const has_filter = generic_has_filter;
     const generic_wide_no_filter = generic_key_count != 0 and !has_filter and (generic_key_width == .u96 or generic_key_width == .u128);
     const no_filter_near_unique = !has_filter and estimated_total * 4 >= total_rows * 3;
     const total_groups = if (generic_wide_no_filter) total_rows else if (no_filter_near_unique) estimated_total else conservative_total;
@@ -3810,8 +3601,7 @@ fn chooseGridChunkRows(cfg_chunk_rows: usize, chunk_rows_set: bool) usize {
     return if (chunk_rows_set) cfg_chunk_rows else GRID_CHUNK_ROWS;
 }
 
-fn chooseGridScanTileRgs(kind: QueryKind, cfg_scan_tile_rgs: usize, scan_tile_rgs_set: bool) usize {
-    _ = kind;
+fn chooseGridScanTileRgs(cfg_scan_tile_rgs: usize, scan_tile_rgs_set: bool) usize {
     if (scan_tile_rgs_set) return cfg_scan_tile_rgs;
     return GRID_SCAN_TILE_RGS;
 }
@@ -3823,7 +3613,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     defer {
         if (cfg.trace_timing and pre_return_ticks != 0) {
             std.debug.print("[harness-core-cleanup] query={s} total_cleanup_after_return={d:.1}ms\n", .{
-                cfg.kind.label(),
+                "generic",
                 ticksToMs(nowTicks() - pre_return_ticks, freq),
             });
         }
@@ -3839,7 +3629,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const raw_batch_chunks = @max(@as(usize, 1), cfg.raw_batch_chunks);
     const group_rows_layout = cfg.group_rows_layout;
     const use_raw_group = cfg.raw_group_mode != .off;
-    const scan_tile_rgs = chooseGridScanTileRgs(cfg.kind, cfg.scan_tile_rgs, cfg.scan_tile_rgs_set);
+    const scan_tile_rgs = chooseGridScanTileRgs(cfg.scan_tile_rgs, cfg.scan_tile_rgs_set);
     const scan_coalesce_tiles = cfg.scan_coalesce_tiles;
     const route_block_rows = chooseRouteBlockRows(bucket_count, cfg.route_block_rows, cfg.route_block_rows_set);
     const direct_final_local = !use_raw_group and !cfg.force_queue_publish and bucket_count >= n_workers * 8;
@@ -3877,20 +3667,17 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     seg_start[snap.segment_count] = total_rgs;
 
-    const scan_columns = cfg.scan_columns orelse if (cfg.scan_filter and cfg.kind.hasFilter() and table.memtable.row_count == 0)
-        cfg.kind.payloadColumns()
-    else
-        cfg.kind.columns();
+    const scan_columns = cfg.scan_columns orelse &[_][]const u8{};
     var stats_scan = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, false, snap);
     defer {
         const cleanup_t0 = if (cfg.trace_timing) nowTicks() else 0;
         stats_scan.deinit();
         if (cfg.trace_timing) std.debug.print("[harness-core-cleanup] query={s} stats_scan={d:.3}ms\n", .{
-            cfg.kind.label(),
+            "generic",
             ticksToMs(nowTicks() - cleanup_t0, freq),
         });
     }
-    const expected_groups_per_bucket = expectedGroupsPerBucket(total, bucket_count, stats_scan.stats(), cfg.kind, group_rows_layout.key_columns.len, group_rows_layout.key_width, cfg.filter_expr != null);
+    const expected_groups_per_bucket = expectedGroupsPerBucket(total, bucket_count, stats_scan.stats(), group_rows_layout.key_columns.len, group_rows_layout.key_width, cfg.filter_expr != null);
     const init_groups_per_bucket = if (cfg.group_init_cap > 0)
         @max(@as(usize, 16), @min(expected_groups_per_bucket, cfg.group_init_cap))
     else
@@ -3900,7 +3687,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     if (!cfg.quiet) {
         std.debug.print(
             "[clientip] query={s} DOP={d} buckets={d} rows={d} mode=silo-grid workers={d} chunk_rows={d} raw_chunk_rows={d} raw_group_chunk_rows={d} raw_batch_chunks={d} scan_tile_rgs={d} scan_coalesce_tiles={d} route_block_rows={d} group_lease_buckets={d} group_lease_rows={d} local_reserve_per_bucket={d} worker_local_reserve_per_bucket={d} shared_scan_banks={d} shared_scan_reserve_per_bucket={d} flat_reserve_per_worker={d} expected_groups_per_bucket={d} init_groups_per_bucket={d} direct_final_local={s} force_queue_publish={s} shared_scan_buffers={s} flat_scan_partitions={s} raw_group_mode={s} shared_stage_builders={s} scheduler=group_rows_vs_scan_buffer_rows\n",
-            .{ cfg.kind.label(), dop, bucket_count, total, n_workers, chunk_rows, raw_chunk_rows, raw_group_chunk_rows, raw_batch_chunks, scan_tile_rgs, scan_coalesce_tiles, route_block_rows, cfg.group_lease_buckets, cfg.group_lease_rows, local_reserve_per_bucket, worker_local_reserve_per_bucket, shared_scan_bank_count, shared_scan_reserve_per_bucket, flat_reserve_per_worker, expected_groups_per_bucket, init_groups_per_bucket, if (direct_final_local) "true" else "false", if (cfg.force_queue_publish) "true" else "false", if (use_shared_scan_buffers) "true" else "false", if (use_flat_scan_partitions) "true" else "false", @tagName(cfg.raw_group_mode), if (cfg.shared_stage_builders) "true" else "false" },
+            .{ "generic", dop, bucket_count, total, n_workers, chunk_rows, raw_chunk_rows, raw_group_chunk_rows, raw_batch_chunks, scan_tile_rgs, scan_coalesce_tiles, route_block_rows, cfg.group_lease_buckets, cfg.group_lease_rows, local_reserve_per_bucket, worker_local_reserve_per_bucket, shared_scan_bank_count, shared_scan_reserve_per_bucket, flat_reserve_per_worker, expected_groups_per_bucket, init_groups_per_bucket, if (direct_final_local) "true" else "false", if (cfg.force_queue_publish) "true" else "false", if (use_shared_scan_buffers) "true" else "false", if (use_flat_scan_partitions) "true" else "false", @tagName(cfg.raw_group_mode), if (cfg.shared_stage_builders) "true" else "false" },
         );
         std.debug.print("[clientip-cpu-assign] mode=silo-grid workers=", .{});
         for (cpus[0..@min(n_workers, cpus.len)], 0..) |cpu, ci| {
@@ -3918,7 +3705,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         const cleanup_t0 = if (cfg.trace_timing) nowTicks() else 0;
         for (scans[0..built_scans]) |s| s.deinit();
         if (cfg.trace_timing) std.debug.print("[harness-core-cleanup] query={s} worker_scans={d:.1}ms count={d}\n", .{
-            cfg.kind.label(),
+            "generic",
             ticksToMs(nowTicks() - cleanup_t0, freq),
             built_scans,
         });
@@ -3935,7 +3722,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         const cleanup_t0 = if (cfg.trace_timing) nowTicks() else 0;
         for (owned_parts[0..built_parts]) |*p| p.deinit(allocator);
         if (cfg.trace_timing) std.debug.print("[harness-core-cleanup] query={s} worker_parts={d:.1}ms count={d}\n", .{
-            cfg.kind.label(),
+            "generic",
             ticksToMs(nowTicks() - cleanup_t0, freq),
             built_parts,
         });
@@ -3947,7 +3734,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         const cleanup_t0 = if (cfg.trace_timing) nowTicks() else 0;
         for (owned_buckets[0..built_buckets]) |*bkt| bkt.deinit(allocator);
         if (cfg.trace_timing) std.debug.print("[harness-core-cleanup] query={s} pipe_buckets={d:.1}ms count={d}\n", .{
-            cfg.kind.label(),
+            "generic",
             ticksToMs(nowTicks() - cleanup_t0, freq),
             built_buckets,
         });
@@ -3976,7 +3763,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     const bucket_setup_ticks = if (cfg.trace_timing) nowTicks() - bucket_setup_t0 else 0;
     if (workspace_profile_ptr) |profile| {
-        profile.printSetup(cfg.kind.label(), bucket_count, worker_local_reserve_per_bucket, init_groups_per_bucket);
+        profile.printSetup("generic", bucket_count, worker_local_reserve_per_bucket, init_groups_per_bucket);
     }
 
     var shared_scan_buffers_storage: SharedScanBuffers = .{};
@@ -4080,7 +3867,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const setup_ticks = nowTicks() - function_t0;
     if (cfg.trace_timing) {
         std.debug.print("[harness-core-setup] query={s} total={d:.1}ms snapshot_stats={d:.1}ms pipe_buckets={d:.1}ms worker_parts_scans={d:.1}ms other={d:.1}ms\n", .{
-            cfg.kind.label(),
+            "generic",
             ticksToMs(setup_ticks, freq),
             ticksToMs(snapshot_setup_ticks, freq),
             ticksToMs(bucket_setup_ticks, freq),
@@ -4105,7 +3892,6 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             .segment_count = snap.segment_count,
             .worker_index = i,
             .worker_count = n_workers,
-            .kind = cfg.kind,
             .chunk_rows = chunk_rows,
             .scan_tile_rgs = scan_tile_rgs,
             .scan_coalesce_tiles = scan_coalesce_tiles,
@@ -4238,7 +4024,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         std.debug.print(
             "[harness-core-timing] query={s} full={d:.1}ms setup_before_workers={d:.1}ms worker_and_final={d:.1}ms final_merge={d:.3}ms result_rows={d}\n",
             .{
-                cfg.kind.label(),
+                "generic",
                 ticksToMs(function_ticks, freq),
                 ticksToMs(setup_ticks, freq),
                 ticksToMs(total_ticks, freq),
@@ -4253,7 +4039,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         std.debug.print(
             "[clientip-result] query={s} DOP={d} mode=silo-grid workers={d} chunk_rows={d} scan_tile_rgs={d} scan_coalesce_tiles={d} group_lease_buckets={d} group_lease_rows={d} scheduler=group_rows_vs_scan_buffer_rows scanned={d}/{d} filtered={d} grouped_rows={d} groups={d} total={d:.1}ms worker_wall={d:.1}ms final_merge={d:.3}ms no_profile=true\n",
             .{
-                cfg.kind.label(),
+                "generic",
                 n_workers,
                 n_workers,
                 chunk_rows,
@@ -4275,7 +4061,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         std.debug.print(
             "[clientip-prof] query={s} DOP={d} scanned={d}/{d} filtered={d} grouped_rows={d} groups={d} total={d:.1}ms mode=silo-grid workers={d} worker_wall={d:.1}ms final_merge={d:.3}ms group_lease_buckets={d} group_lease_rows={d}\n",
             .{
-                cfg.kind.label(),
+                "generic",
                 n_workers,
                 scanned_rows,
                 total,
@@ -4293,7 +4079,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         std.debug.print(
             "[clientip-silo-grid-stages] query={s} scan_decode_cpu={d:.1}ms scan_reset_cpu={d:.3}ms route_partition_cpu={d:.1}ms raw_stage_cpu={d:.1}ms publish_queue_cpu={d:.1}ms aggregate_cpu={d:.1}ms idle_cpu={d:.1}ms local_topn_cpu={d:.1}ms final_merge_wall={d:.3}ms chunks={d} rows_per_chunk={d:.1} scan_ranges={d} scan_quanta={d} scan_batches={d} segments_opened={d} fused_scans={d}/{d} scan_tile_rgs={d} scan_coalesce_tiles={d} route_block_rows={d} group_lease_buckets={d} group_lease_rows={d} final_scan_queue_rows={d} final_stage_queue_rows={d} final_scan_buffered_rows={d} active_scan_jobs={d} active_stage_jobs={d} active_group_jobs={d}\n",
             .{
-                cfg.kind.label(),
+                "generic",
                 ticksToMs(scan_cpu_ticks, freq),
                 ticksToMs(scan_reset_ticks, freq),
                 ticksToMs(partition_cpu_ticks, freq),
@@ -4328,7 +4114,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         std.debug.print(
             "[clientip-silo-grid-scheduler] query={s} scheduler_cpu={d:.3}ms decision={d:.3}ms scan_claim={d:.3}ms group_pick={d:.3}ms group_lock={d:.3}ms loops={d} scan_jobs={d} stage_jobs={d} group_jobs={d} group_misses={d} idle_loops={d}\n",
             .{
-                cfg.kind.label(),
+                "generic",
                 ticksToMs(sched_cpu_ticks, freq),
                 ticksToMs(sched_decision_ticks, freq),
                 ticksToMs(sched_scan_claim_ticks, freq),
@@ -4345,7 +4131,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         std.debug.print(
             "[clientip-raw-stage-breakdown] query={s} pop_cpu={d:.3}ms cluster_cpu={d:.3}ms slice_copy_alloc_cpu={d:.3}ms publish_group_queue_cpu={d:.3}ms recycle_input_cpu={d:.3}ms total_stage_measured={d:.3}ms input_chunks={d} avg_input_chunks_per_stage_job={d:.2}\n",
             .{
-                cfg.kind.label(),
+                "generic",
                 ticksToMs(raw_stage_pop_ticks, freq),
                 ticksToMs(raw_stage_ticks, freq),
                 ticksToMs(raw_stage_slice_ticks, freq),
@@ -4359,7 +4145,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         std.debug.print(
             "[clientip-raw-contention] query={s} raw_queue_lock={d:.3}ms raw_scan_queue_lock={d:.3}ms raw_group_queue_lock={d:.3}ms raw_recycle_lock={d:.3}ms stage_builder_lock={d:.3}ms central_group_lock={d:.3}ms total_raw_lock={d:.3}ms\n",
             .{
-                cfg.kind.label(),
+                "generic",
                 ticksToMs(raw_queue_lock_ticks, freq),
                 ticksToMs(raw_scan_queue_lock_ticks, freq),
                 ticksToMs(raw_group_queue_lock_ticks, freq),
@@ -4369,7 +4155,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 ticksToMs(raw_queue_lock_ticks + raw_scan_queue_lock_ticks + raw_group_queue_lock_ticks + raw_recycle_lock_ticks + raw_stage_builder_lock_ticks + raw_agg_lock_ticks, freq),
             },
         );
-        std.debug.print("[clientip-silo-grid-workers] query={s} aggregate_cpu_by_worker_ms=", .{cfg.kind.label()});
+        std.debug.print("[clientip-silo-grid-workers] query={s} aggregate_cpu_by_worker_ms=", .{"generic"});
         for (group_ticks, 0..) |ticks, worker_idx| {
             if (worker_idx != 0) std.debug.print(",", .{});
             std.debug.print("{d:.1}", .{ticksToMs(ticks, freq)});

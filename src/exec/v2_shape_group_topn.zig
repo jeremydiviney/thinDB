@@ -83,7 +83,6 @@ const AggregatePlan = struct {
 
 const ShapePlan = struct {
     layout: KeyLayout,
-    core_kind: HarnessCore.QueryKind,
     aggregate_inputs: [MAX_AGG_INPUTS]AggregateInputPlan,
     aggregate_input_count: usize,
     aggregates: [MAX_AGGS]AggregatePlan,
@@ -327,7 +326,6 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
 
     var result = try GroupTopNEngine.run(core_allocator, .{
         .table = ctx.table,
-        .kind = .generic,
         .shape = .{
             .key_width = GroupTopNEngine.KeyWidth.fromBits(ctx.plan.layout.total_bits),
             .key_bits = ctx.plan.layout.total_bits,
@@ -603,7 +601,6 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
 
     return .{
         .layout = .{ .parts = parts, .part_count = request.group_cols.len, .total_bits = offset },
-        .core_kind = .generic,
         .aggregate_inputs = aggregate_inputs,
         .aggregate_input_count = aggregate_input_count,
         .aggregates = aggregates,
@@ -615,27 +612,6 @@ fn outputColumnExists(parts: []const KeyPart, aggregates: []const AggregatePlan,
     for (parts) |part| if (types.columnNameEql(part.name, name)) return true;
     for (aggregates) |agg| if (types.columnNameEql(agg.name, name)) return true;
     return false;
-}
-
-fn classifyClickBenchCoreKind(request: Request) ?HarnessCore.QueryKind {
-    const has_filter = request.where_filter != null;
-    if (!has_filter and request.group_cols.len == 1 and request.aggs.len == 1 and
-        request.aggs[0].func == .count and request.aggs[0].col == null and
-        types.columnNameEql(request.group_cols[0], "UserID"))
-    {
-        return .q15;
-    }
-    if (request.group_cols.len != 2) return null;
-    const a = request.group_cols[0];
-    const b = request.group_cols[1];
-    if (has_filter) {
-        if (!isSearchPhraseNotEmpty(request.where_filter.?)) return null;
-        if (types.columnNameEql(a, "SearchEngineID") and types.columnNameEql(b, "ClientIP")) return .q30;
-        if (types.columnNameEql(a, "WatchID") and types.columnNameEql(b, "ClientIP")) return .q31;
-        return null;
-    }
-    if (types.columnNameEql(a, "WatchID") and types.columnNameEql(b, "ClientIP")) return .q32;
-    return null;
 }
 
 fn columnType(table: *api.Table, name: []const u8) ?Type {
@@ -747,7 +723,7 @@ fn traceAccepted(request: Request, plan: ShapePlan) void {
     if (getenv("THINDB_V2_TRACE") != null) {
         const key_width = GroupTopNEngine.KeyWidth.fromBits(plan.layout.total_bits);
         std.debug.print("V2Pipeline group-topN accepted kind={s} groups={} key_bits={} key_width={s} aggs={} order={} limit={} offset={}\n", .{
-            plan.core_kind.label(),
+            "generic",
             request.group_cols.len,
             plan.layout.total_bits,
             key_width.label(),
@@ -763,7 +739,7 @@ fn traceProfile(ctx: ExecutionContext) void {
     if (getenv("THINDB_V2_PIPELINE_TRACE") == null) return;
     const key_width = GroupTopNEngine.KeyWidth.fromBits(ctx.plan.layout.total_bits);
     std.debug.print("[v2-pipeline] shape=group-topN kind={s} key_bits={} key_width={s} prepare={d:.3}ms core={d:.1}ms workspace_teardown={d:.1}ms emit={d:.3}ms dop={} buckets={} chunk_rows={} route_block_rows={} group_init_cap={} shared_scan_buffers={s} shared_scan_banks={} force_queue_publish={s} flat_scan_partitions={s} raw_group_mode=staged_final raw_chunk_rows={} raw_group_chunk_rows={} raw_batch_chunks={} shared_stage_builders={s}\n", .{
-        ctx.plan.core_kind.label(),
+        "generic",
         ctx.plan.layout.total_bits,
         key_width.label(),
         exec.prof.ticksToMs(ctx.times.prepare_ticks),
