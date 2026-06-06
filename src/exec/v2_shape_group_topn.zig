@@ -91,6 +91,9 @@ const ShapePlan = struct {
     aggregate_input_count: usize,
     aggregates: [MAX_AGGS]AggregatePlan,
     aggregate_count: usize,
+    // The key is a hash (string keys, or integer combos wider than 128 bits);
+    // real key values are late-materialized from each row's __rowloc at emit.
+    hashed: bool = false,
 };
 
 const StageTimes = struct {
@@ -332,7 +335,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
     var result = try GroupTopNEngine.run(core_allocator, .{
         .table = ctx.table,
         .shape = .{
-            .key_width = GroupTopNEngine.KeyWidth.fromBits(ctx.plan.layout.total_bits),
+            .key_width = if (ctx.plan.hashed) .u128 else GroupTopNEngine.KeyWidth.fromBits(ctx.plan.layout.total_bits),
             .key_bits = ctx.plan.layout.total_bits,
             .group_key_count = ctx.plan.layout.part_count,
             .group_key_inputs = group_key_inputs[0..ctx.plan.layout.part_count],
@@ -343,6 +346,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .limit = ctx.request.limit,
             .offset = ctx.request.offset,
             .emit_all_groups = !canUseCoreCountDescTopN(ctx),
+            .hashed = ctx.plan.hashed,
         },
         .params = params,
         .scan_columns = scan_columns[0..scan_column_count],
@@ -518,7 +522,7 @@ fn compareF64(a: f64, b: f64) i8 {
 }
 
 fn emitResultStage(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !void {
-    if (getenv("THINDB_V2_FORCE_HASH_KEY") != null) return emitResultStageHashed(op, rows);
+    if (op.plan.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null) return emitResultStageHashed(op, rows);
     for (rows) |row| {
         for (op.plan.layout.parts[0..op.plan.layout.part_count], 0..) |part, i| {
             try appendKeyPart(op.allocator, &op.output_cols[i], part, row.key);
@@ -591,18 +595,40 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
 fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
     if (request.group_cols.len == 0 or request.group_cols.len > MAX_GROUP_KEYS) return traceDecline(request, "group key count");
     if (request.aggs.len == 0 or request.aggs.len > MAX_AGGS) return traceDecline(request, "aggregate count");
+    // Decide packed vs hashed: integer keys totalling ≤128 bits bit-pack
+    // losslessly into the staged key (exact, reversible at emit). A string key
+    // or an integer combo wider than 128 bits can't pack, so the key becomes a
+    // 128-bit hash and the real values are late-materialized from each row's
+    // __rowloc at emit.
+    var hashed = false;
+    var total_bits: u32 = 0;
+    for (request.group_cols) |name| {
+        const idx = types.findColumn(table.schema.columns, name) orelse return traceDecline(request, "group key column");
+        const typ = table.schema.columns[idx].type;
+        if (intTypeBits(typ)) |width| {
+            total_bits += width;
+        } else if (isStringKeyType(typ)) {
+            hashed = true;
+        } else {
+            return traceDecline(request, "group key type");
+        }
+    }
+    if (total_bits > 128) hashed = true;
+
     var parts: [MAX_GROUP_KEYS]KeyPart = undefined;
     var offset: u8 = 0;
     for (request.group_cols, 0..) |name, i| {
-        const idx = types.findColumn(table.schema.columns, name) orelse return traceDecline(request, "group key column");
+        const idx = types.findColumn(table.schema.columns, name).?;
         const typ = table.schema.columns[idx].type;
-        const width = intTypeBits(typ) orelse return traceDecline(request, "group key type");
-        // Keys bit-pack into the staged raw-row key. RawRows/GroupRows are
-        // width-aware (u32/u64/u96/u128), so the full 128 bits are preserved.
-        if (offset + width > 128) return traceDecline(request, "group key width");
-        parts[i] = .{ .name = name, .typ = typ, .offset_bits = offset, .width_bits = width };
-        offset += width;
+        if (hashed) {
+            parts[i] = .{ .name = name, .typ = typ, .offset_bits = 0, .width_bits = 0 };
+        } else {
+            const width = intTypeBits(typ).?;
+            parts[i] = .{ .name = name, .typ = typ, .offset_bits = offset, .width_bits = width };
+            offset += width;
+        }
     }
+    if (hashed) offset = 128;
 
     var aggregate_inputs: [MAX_AGG_INPUTS]AggregateInputPlan = undefined;
     var aggregate_input_count: usize = 0;
@@ -662,6 +688,14 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
         .aggregate_input_count = aggregate_input_count,
         .aggregates = aggregates,
         .aggregate_count = request.aggs.len,
+        .hashed = hashed,
+    };
+}
+
+fn isStringKeyType(t: Type) bool {
+    return switch (t) {
+        .varchar, .string, .char => true,
+        else => false,
     };
 }
 

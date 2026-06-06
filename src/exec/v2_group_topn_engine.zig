@@ -408,6 +408,10 @@ pub const Shape = struct {
     limit: usize,
     offset: usize,
     emit_all_groups: bool = false,
+    // The group key is a hash of the key columns (string / >128-bit keys); each
+    // staged row carries its __rowloc so the real key values are recovered at
+    // emit via late materialization. Forces the u128 key lane + rowref region.
+    hashed: bool = false,
 };
 
 pub const Params = struct {
@@ -625,11 +629,10 @@ fn runHarness(
             .state_index = agg.state_index,
         };
     }
-    // Dev toggle: route an integer-key query through the hashed-key + rowref
-    // path so it can be cross-checked against the exact integer-packed result
-    // (count multiset must match) before string keys are enabled at the shape
-    // gate. Forces the full 128-bit hash lane.
-    const force_hash = getenv("THINDB_V2_FORCE_HASH_KEY") != null;
+    // shape.hashed comes from the shape gate (string / >128-bit keys). The env
+    // toggle additionally forces an integer-key query down the same path for
+    // cross-checking against the exact integer-packed result.
+    const force_hash = shape.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null;
     const group_rows_layout = HarnessCore.GroupRowsLayout{
         .key_width = if (force_hash) .u128 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
