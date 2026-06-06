@@ -29,18 +29,13 @@ const thindb = struct {
 const Allocator = std.mem.Allocator;
 const Scan = thindb.exec.Scan;
 const GroupTable = thindb.exec.group_table.IntKeyMemsetTable(96);
-const Q30InlineTable = thindb.exec.group_table.InlineSlotTable(u64, Q30InlineState);
-
 const TOP_K: usize = 10;
-const PREFETCH_DIST_DIRECT: usize = 48;
 const PREFETCH_DIST_BUCKET: usize = 32;
 const PIPE_CHUNK_ROWS: usize = 8192;
-const ELASTIC_BACKLOG_CHUNKS: usize = 2048;
 const GRID_CHUNK_ROWS: usize = 1024;
 const GRID_SCAN_TILE_RGS: usize = 16;
 const GRID_SCAN_COALESCE_TILES: usize = 1;
 const GRID_SCAN_YIELD_CHUNKS: usize = 16384;
-const LOCAL_PREAGG_FLUSH_GROUPS: usize = 131072;
 const DEFAULT_ROUTE_BLOCK_ROWS: usize = 2048;
 const MAX_ROUTE_BLOCK_ROWS: usize = 2048;
 const AUTO_ROUTE_BLOCK_ROWS: usize = 0;
@@ -519,14 +514,6 @@ const GroupRows = struct {
         return self.columnI16All(1);
     }
 
-    inline fn refreshItems(self: GroupRows) []i16 {
-        return self.refreshAll()[0..self.len_rows];
-    }
-
-    inline fn widthItems(self: GroupRows) []i16 {
-        return self.widthAll()[0..self.len_rows];
-    }
-
     fn ensureTotalCapacity(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, capacity_rows: usize) !void {
         if (!sameRowsLayout(self.layout, layout)) {
             self.deinit(allocator);
@@ -802,12 +789,6 @@ const State = struct {
     refresh_sum: i64,
     width_sum: i64,
     extra_sum: i64 = 0,
-};
-
-const Q30InlineState = struct {
-    count: u64,
-    refresh_sum: i64,
-    width_sum: i64,
 };
 
 const GroupScratch = struct {
@@ -1492,143 +1473,6 @@ fn workspaceFreshInitWorker(job: *WorkspaceFreshInitJob) void {
     }
 }
 
-const WorkspacePartsInitJob = struct {
-    allocator: Allocator,
-    parts: []WorkerParts,
-    bucket_count: usize,
-    local_reserve_per_bucket: usize,
-    worker_index: usize,
-    worker_count: usize,
-    cpu: ?usize,
-    err: ?anyerror = null,
-};
-
-fn initWorkspacePartsParallel(
-    allocator: Allocator,
-    parts: []WorkerParts,
-    bucket_count: usize,
-    local_reserve_per_bucket: usize,
-    n_workers: usize,
-    cpus: []const usize,
-) !void {
-    const workers = @max(@as(usize, 1), @min(n_workers, @max(cpus.len, 1)));
-    if (workers == 1 or parts.len < 2) {
-        for (parts, 0..) |*p, i| {
-            p.* = try WorkerParts.init(allocator, bucket_count, local_reserve_per_bucket);
-            p.worker_index = i;
-        }
-        return;
-    }
-
-    const threads = try allocator.alloc(std.Thread, workers);
-    defer allocator.free(threads);
-    var jobs = try allocator.alloc(WorkspacePartsInitJob, workers);
-    defer allocator.free(jobs);
-
-    var i: usize = 0;
-    while (i < workers) : (i += 1) {
-        jobs[i] = .{
-            .allocator = allocator,
-            .parts = parts,
-            .bucket_count = bucket_count,
-            .local_reserve_per_bucket = local_reserve_per_bucket,
-            .worker_index = i,
-            .worker_count = workers,
-            .cpu = if (cpus.len == 0) null else cpus[i % cpus.len],
-        };
-        threads[i] = try std.Thread.spawn(.{}, workspacePartsInitWorker, .{&jobs[i]});
-    }
-    for (threads) |thread| thread.join();
-    for (jobs) |job| if (job.err) |err| return err;
-}
-
-fn workspacePartsInitWorker(job: *WorkspacePartsInitJob) void {
-    if (job.cpu) |cpu| pinToCpu(cpu);
-    var i = job.worker_index;
-    while (i < job.parts.len) : (i += job.worker_count) {
-        job.parts[i] = WorkerParts.init(job.allocator, job.bucket_count, job.local_reserve_per_bucket) catch |err| {
-            job.err = err;
-            return;
-        };
-        job.parts[i].worker_index = i;
-    }
-}
-
-const WorkspaceBucketsInitJob = struct {
-    allocator: Allocator,
-    buckets: []PipeBucket,
-    inited: []bool,
-    expected_groups_per_bucket: usize,
-    worker_index: usize,
-    worker_count: usize,
-    cpu: ?usize,
-    err: ?anyerror = null,
-};
-
-fn initWorkspaceBucketsParallel(
-    allocator: Allocator,
-    buckets: []PipeBucket,
-    inited: []bool,
-    expected_groups_per_bucket: usize,
-    n_workers: usize,
-    cpus: []const usize,
-) !void {
-    const workers = @max(@as(usize, 1), @min(n_workers, @max(cpus.len, 1)));
-    if (workers == 1 or buckets.len < 128) {
-        for (buckets, 0..) |*bucket, i| {
-            bucket.* = try PipeBucket.init(allocator, expected_groups_per_bucket);
-            inited[i] = true;
-            try bucket.states.ensureTotalCapacity(allocator, expected_groups_per_bucket);
-            try bucket.chunks.ensureTotalCapacity(allocator, 8);
-        }
-        return;
-    }
-
-    const threads = try allocator.alloc(std.Thread, workers);
-    defer allocator.free(threads);
-    var jobs = try allocator.alloc(WorkspaceBucketsInitJob, workers);
-    defer allocator.free(jobs);
-
-    var i: usize = 0;
-    while (i < workers) : (i += 1) {
-        jobs[i] = .{
-            .allocator = allocator,
-            .buckets = buckets,
-            .inited = inited,
-            .expected_groups_per_bucket = expected_groups_per_bucket,
-            .worker_index = i,
-            .worker_count = workers,
-            .cpu = if (cpus.len == 0) null else cpus[i % cpus.len],
-        };
-        threads[i] = try std.Thread.spawn(.{}, workspaceBucketsInitWorker, .{&jobs[i]});
-    }
-    for (threads) |thread| thread.join();
-    for (jobs) |job| if (job.err) |err| return err;
-}
-
-fn workspaceBucketsInitWorker(job: *WorkspaceBucketsInitJob) void {
-    if (job.cpu) |cpu| pinToCpu(cpu);
-    const bucket_count = job.buckets.len;
-    const start = job.worker_index * bucket_count / job.worker_count;
-    const end = (job.worker_index + 1) * bucket_count / job.worker_count;
-    var i = start;
-    while (i < end) : (i += 1) {
-        job.buckets[i] = PipeBucket.init(job.allocator, job.expected_groups_per_bucket) catch |err| {
-            job.err = err;
-            return;
-        };
-        job.inited[i] = true;
-        job.buckets[i].states.ensureTotalCapacity(job.allocator, job.expected_groups_per_bucket) catch |err| {
-            job.err = err;
-            return;
-        };
-        job.buckets[i].chunks.ensureTotalCapacity(job.allocator, 8) catch |err| {
-            job.err = err;
-            return;
-        };
-    }
-}
-
 fn resetWorkerParts(parts: *WorkerParts, worker_index: usize) void {
     parts.shared_buffers = null;
     parts.shared_bank_index = 0;
@@ -1692,40 +1536,6 @@ fn resetPipeBucket(bucket: *PipeBucket, _: Allocator) void {
     bucket.agg_lock = .unlocked;
     bucket.table.clearRetainingCapacity();
     bucket.states.clearRetainingCapacity();
-}
-
-fn resetRawQueues(shared: *PipeShared) void {
-    shared.raw_chunks.clearRetainingCapacity();
-    for (shared.raw_scan_queues) |*queue| {
-        queue.chunks.clearRetainingCapacity();
-        queue.queued_rows = 0;
-        queue.queued_rows_atomic.store(0, .release);
-        queue.queued_chunks_atomic.store(0, .release);
-        queue.lease.store(false, .release);
-        queue.scan_lease.store(false, .release);
-        queue.lock = .unlocked;
-    }
-    for (shared.raw_group_queues) |*queue| {
-        queue.chunks.clearRetainingCapacity();
-        queue.queued_rows = 0;
-        queue.queued_rows_atomic.store(0, .release);
-        queue.queued_chunks_atomic.store(0, .release);
-        queue.lease.store(false, .release);
-        queue.scan_lease.store(false, .release);
-        queue.lock = .unlocked;
-    }
-    for (shared.stage_builders) |*builder| {
-        builder.rows.clearRetainingCapacity();
-        builder.lock = .unlocked;
-    }
-    for (shared.raw_recycled_rows.items) |*rows| rows.clearRetainingCapacity();
-    for (shared.group_recycled_rows.items) |*rows| rows.clearRetainingCapacity();
-    shared.raw_queue_lock = .unlocked;
-    shared.raw_recycle_lock = .unlocked;
-    shared.stage_outstanding_chunks.store(0, .release);
-    shared.stage_outstanding_rows.store(0, .release);
-    shared.stage_builder_rows.store(0, .release);
-    shared.active_stage_jobs.store(0, .release);
 }
 
 fn deinitRawQueues(shared: *PipeShared) void {
@@ -1872,32 +1682,6 @@ fn publishRawRowsToQueue(
     queue.lock.unlock();
 }
 
-fn publishRawChunkToQueue(
-    shared: *PipeShared,
-    queue: *RawQueue,
-    chunk: RawChunk,
-    chunks_counter: *std.atomic.Value(usize),
-    rows_counter: *std.atomic.Value(u64),
-    queue_lock_ticks: ?*i64,
-) !void {
-    const row_count: u64 = @intCast(chunk.rows.len());
-    _ = chunks_counter.fetchAdd(1, .release);
-    _ = rows_counter.fetchAdd(row_count, .release);
-    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
-    lockSpin(&queue.lock);
-    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
-    errdefer {
-        _ = chunks_counter.fetchSub(1, .release);
-        _ = rows_counter.fetchSub(row_count, .release);
-        queue.lock.unlock();
-    }
-    try queue.chunks.append(shared.allocator, chunk);
-    queue.queued_rows += row_count;
-    _ = queue.queued_rows_atomic.fetchAdd(row_count, .release);
-    _ = queue.queued_chunks_atomic.fetchAdd(1, .release);
-    queue.lock.unlock();
-}
-
 fn publishGroupChunkToQueue(
     shared: *PipeShared,
     queue: *GroupQueue,
@@ -1922,49 +1706,6 @@ fn publishGroupChunkToQueue(
     _ = queue.queued_rows_atomic.fetchAdd(row_count, .release);
     _ = queue.queued_chunks_atomic.fetchAdd(1, .release);
     queue.lock.unlock();
-}
-
-fn popRawChunk(shared: *PipeShared, queue_lock_ticks: ?*i64) ?RawChunk {
-    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
-    lockSpin(&shared.raw_queue_lock);
-    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
-    defer shared.raw_queue_lock.unlock();
-    const len = shared.raw_chunks.items.len;
-    if (len == 0) return null;
-    const chunk = shared.raw_chunks.items[len - 1];
-    shared.raw_chunks.items.len = len - 1;
-    return chunk;
-}
-
-fn popRawChunkBatch(shared: *PipeShared, out: *[MAX_RAW_BATCH_CHUNKS]RawChunk, max_chunks_raw: usize, queue_lock_ticks: ?*i64) usize {
-    const max_chunks = @max(@as(usize, 1), @min(max_chunks_raw, MAX_RAW_BATCH_CHUNKS));
-    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
-    lockSpin(&shared.raw_queue_lock);
-    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
-    defer shared.raw_queue_lock.unlock();
-
-    var popped: usize = 0;
-    while (popped < max_chunks and shared.raw_chunks.items.len > 0) : (popped += 1) {
-        const idx = shared.raw_chunks.items.len - 1;
-        out[popped] = shared.raw_chunks.items[idx];
-        shared.raw_chunks.items.len = idx;
-    }
-    return popped;
-}
-
-fn popRawChunkFromQueue(queue: *RawQueue, queue_lock_ticks: ?*i64) ?RawChunk {
-    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
-    lockSpin(&queue.lock);
-    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
-    defer queue.lock.unlock();
-    const len = queue.chunks.items.len;
-    if (len == 0) return null;
-    const chunk = queue.chunks.items[len - 1];
-    queue.chunks.items.len = len - 1;
-    queue.queued_rows -= chunk.rows.len();
-    _ = queue.queued_rows_atomic.fetchSub(@intCast(chunk.rows.len()), .release);
-    _ = queue.queued_chunks_atomic.fetchSub(1, .release);
-    return chunk;
 }
 
 fn popRawChunkBatchFromQueue(queue: *RawQueue, out: *[MAX_RAW_BATCH_CHUNKS]RawChunk, max_chunks_raw: usize, queue_lock_ticks: ?*i64) usize {
@@ -2005,63 +1746,6 @@ fn popGroupChunkBatchFromQueue(queue: *GroupQueue, out: *[MAX_RAW_BATCH_CHUNKS]G
         _ = queue.queued_chunks_atomic.fetchSub(1, .release);
     }
     return popped;
-}
-
-fn popRawScanBatch(shared: *PipeShared, worker_index: usize, out: *[MAX_RAW_BATCH_CHUNKS]RawChunk, max_chunks_raw: usize, queue_lock_ticks: ?*i64) usize {
-    if (shared.raw_scan_queues.len == 0) return 0;
-    const max_chunks = @max(@as(usize, 1), @min(max_chunks_raw, MAX_RAW_BATCH_CHUNKS));
-    var popped: usize = 0;
-    var checked: usize = 0;
-    var cursor = worker_index % shared.raw_scan_queues.len;
-    while (checked < shared.raw_scan_queues.len and popped < max_chunks) : (checked += 1) {
-        const qidx = cursor;
-        cursor += 1;
-        if (cursor == shared.raw_scan_queues.len) cursor = 0;
-        if (popRawChunkFromQueue(&shared.raw_scan_queues[qidx], queue_lock_ticks)) |chunk| {
-            out[popped] = chunk;
-            popped += 1;
-        }
-    }
-    return popped;
-}
-
-fn claimRawQueueLane(queues: []RawQueue, start_index: usize) ?usize {
-    if (queues.len == 0) return null;
-    var checked: usize = 0;
-    var cursor = start_index % queues.len;
-    while (checked < queues.len) : (checked += 1) {
-        const lane = cursor;
-        cursor += 1;
-        if (cursor == queues.len) cursor = 0;
-        if (queues[lane].queued_rows_atomic.load(.acquire) == 0) continue;
-        if (queues[lane].lease.cmpxchgWeak(false, true, .acq_rel, .acquire) == null) return lane;
-    }
-    return null;
-}
-
-fn claimRawQueueLaneMostChunks(queues: []RawQueue, start_index: usize) ?usize {
-    if (queues.len == 0) return null;
-    var attempts: usize = 0;
-    while (attempts < 2) : (attempts += 1) {
-        var best_lane: usize = 0;
-        var best_chunks: usize = 0;
-        var checked: usize = 0;
-        var cursor = start_index % queues.len;
-        while (checked < queues.len) : (checked += 1) {
-            const lane = cursor;
-            cursor += 1;
-            if (cursor == queues.len) cursor = 0;
-            if (queues[lane].lease.load(.acquire)) continue;
-            const chunk_count = queues[lane].queued_chunks_atomic.load(.acquire);
-            if (chunk_count > best_chunks) {
-                best_chunks = chunk_count;
-                best_lane = lane;
-            }
-        }
-        if (best_chunks == 0) return null;
-        if (queues[best_lane].lease.cmpxchgWeak(false, true, .acq_rel, .acquire) == null) return best_lane;
-    }
-    return null;
 }
 
 const RawLaneChoice = struct {
@@ -2201,53 +1885,6 @@ fn topLess(_: void, a: TopRow, b: TopRow) bool {
     return better(a, b);
 }
 
-fn tableHasColumns(table: *thindb.api.Table) bool {
-    const required = [_][]const u8{ "WatchID", "SearchEngineID", "ClientIP", "IsRefresh", "ResolutionWidth", "SearchPhrase" };
-    for (required) |want| {
-        var found = false;
-        for (table.schema.columns) |c| {
-            if (std.mem.eql(u8, c.name, want)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    return true;
-}
-
-fn findHitsTable(allocator: Allocator, catalog: anytype) !*thindb.api.Table {
-    const db_names = try catalog.listDatabases(allocator);
-    defer {
-        for (db_names) |n| allocator.free(n);
-        allocator.free(db_names);
-    }
-    for (db_names) |dn| {
-        const db = catalog.database(dn).?;
-        const schema_names = try db.listSchemas(allocator);
-        defer {
-            for (schema_names) |n| allocator.free(n);
-            allocator.free(schema_names);
-        }
-        for (schema_names) |sn| {
-            const schema = db.schema(sn).?;
-            const table_names = try schema.listTables(allocator);
-            defer {
-                for (table_names) |n| allocator.free(n);
-                allocator.free(table_names);
-            }
-            for (table_names) |tn| {
-                const table = schema.openTable(tn, .{}) catch continue;
-                if (tableHasColumns(table)) {
-                    std.debug.print("[clientip] table {s}.{s}.{s}\n", .{ dn, sn, tn });
-                    return table;
-                }
-            }
-        }
-    }
-    return error.NotFound;
-}
-
 fn totalRows(table: *thindb.api.Table) u64 {
     var n: u64 = table.memtable.row_count;
     for (table.manifest.segments.items) |s| n += s.row_count;
@@ -2268,41 +1905,9 @@ inline fn routeHashRowBits(lo: u64, hi: u32) u64 {
     return x;
 }
 
-fn bucketIndex(key: u128, bucket_count: usize) usize {
-    const h = routeHashKey(key);
-    return bucketIndexHash(h, bucket_count);
-}
-
 inline fn bucketIndexHash(hash: u64, bucket_count: usize) usize {
     if (std.math.isPowerOfTwo(bucket_count)) return @as(usize, @truncate(hash)) & (bucket_count - 1);
     return @as(usize, @truncate(hash % bucket_count));
-}
-
-inline fn bucketIdsFitU8(bucket_count: usize) bool {
-    return bucket_count <= @as(usize, std.math.maxInt(u8)) + 1;
-}
-
-inline fn packClientIP(client_ip: i32) u128 {
-    return @as(u128, @as(u32, @bitCast(client_ip)));
-}
-
-inline fn packQ30(search_engine_id: i16, client_ip: i32) u128 {
-    return @as(u128, @as(u16, @bitCast(search_engine_id))) |
-        (@as(u128, @as(u32, @bitCast(client_ip))) << 16);
-}
-
-inline fn packWatchClient(watch_id: i64, client_ip: i32) u128 {
-    return @as(u128, @as(u64, @bitCast(watch_id))) |
-        (@as(u128, @as(u32, @bitCast(client_ip))) << 64);
-}
-
-inline fn readSearchEngine(v: thindb.storage.ColumnView, row: usize) !i16 {
-    return switch (v.data) {
-        .smallint => |s| s[row],
-        .tinyint => |s| s[row],
-        .int => |s| @intCast(s[row]),
-        else => error.UnexpectedSearchEngineIDType,
-    };
 }
 
 inline fn readGenericKeyBits(view: thindb.storage.ColumnView, typ: thindb.types.Type, row: usize) !u128 {
@@ -2350,13 +1955,6 @@ fn applyScanFilterExpr(scan: *Scan, expr: thindb.exec.PredicateExpr) !bool {
     return try scan.tryFuseFilter(expr);
 }
 
-inline fn markDirtyBucket(parts: *WorkerParts, allocator: Allocator, bucket_idx: usize) !void {
-    if (!parts.dirty_marks[bucket_idx]) {
-        parts.dirty_marks[bucket_idx] = true;
-        try parts.dirty_buckets.append(allocator, bucket_idx);
-    }
-}
-
 fn normalizeRouteBlockRows(route_block_rows: usize) usize {
     return @max(@as(usize, 1), @min(route_block_rows, MAX_ROUTE_BLOCK_ROWS));
 }
@@ -2365,19 +1963,6 @@ fn chooseRouteBlockRows(bucket_count: usize, cfg_route_block_rows: usize, route_
     _ = bucket_count;
     if (route_block_rows_set) return normalizeRouteBlockRows(cfg_route_block_rows);
     return DEFAULT_ROUTE_BLOCK_ROWS;
-}
-
-inline fn appendRawPacked(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows: usize, key: u128, refresh: i16, width: i16) !void {
-    parts.raw_active_rows.appendAssumeCapacity(key, refresh, width);
-    if (parts.raw_active_rows.len() == raw_chunk_rows) {
-        if (shared.raw_scan_queues.len > 0) {
-            const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
-            try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &shared.outstanding_chunks, &shared.outstanding_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
-        } else {
-            try publishRawRows(shared, parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
-        }
-        parts.published_chunks += 1;
-    }
 }
 
 fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
@@ -2615,28 +2200,6 @@ fn publishActiveRawRows(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows
 
 fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
     return appendBatchRawChunksGeneric(parts, shared, batch, raw_chunk_rows, profile, skip_filter_check);
-}
-
-fn initGroupState(states: *std.ArrayListUnmanaged(State), key: u128) u32 {
-    const gid: u32 = @intCast(states.items.len);
-    states.appendAssumeCapacity(.{
-        .key = key,
-        .count = 0,
-        .refresh_sum = 0,
-        .width_sum = 0,
-    });
-    return gid;
-}
-
-fn initGroupStateValues(states: *std.ArrayListUnmanaged(State), key: u128, refresh: i16, width: i16) u32 {
-    const gid: u32 = @intCast(states.items.len);
-    states.appendAssumeCapacity(.{
-        .key = key,
-        .count = 1,
-        .refresh_sum = refresh,
-        .width_sum = width,
-    });
-    return gid;
 }
 
 fn initGroupStateCountSumAvg(states: *std.ArrayListUnmanaged(State), key: u128, sum_value: i16, avg_value: i16) u32 {
@@ -2880,52 +2443,6 @@ inline fn groupKeyAt(comptime key_width: GroupKeyWidth, keys: anytype, key_hi: [
     };
 }
 
-fn mergeStatesDirect(
-    table: *GroupTable,
-    states: *std.ArrayListUnmanaged(State),
-    scratch: *GroupScratch,
-    allocator: Allocator,
-    input: []const State,
-) !void {
-    const n = input.len;
-    if (n == 0) return;
-    if (table.needsGrow(n)) try table.grow(allocator, n);
-    try states.ensureUnusedCapacity(allocator, n);
-    scratch.gids.clearRetainingCapacity();
-    try scratch.gids.ensureTotalCapacity(allocator, n);
-
-    var r: usize = 0;
-    while (r < n) : (r += 1) {
-        const pf = r + PREFETCH_DIST_BUCKET;
-        if (pf < n) {
-            const pf_key = input[pf].key;
-            @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
-        }
-
-        const key = input[r].key;
-        const probe = table.getOrPut(GroupTable.hashKey(key), key);
-        const gid = if (probe.found) probe.gid else blk: {
-            const new_gid = initGroupState(states, key);
-            table.commit(probe.slot, key, new_gid);
-            break :blk new_gid;
-        };
-        scratch.gids.appendAssumeCapacity(gid);
-    }
-
-    const gids = scratch.gids.items;
-    r = 0;
-    while (r < n) : (r += 1) {
-        const pf = r + PREFETCH_DIST_BUCKET;
-        if (pf < n) @prefetch(&states.items[gids[pf]], .{ .rw = .write, .locality = 1 });
-        const src = input[r];
-        var st = &states.items[gids[r]];
-        st.count += src.count;
-        st.refresh_sum += src.refresh_sum;
-        st.width_sum += src.width_sum;
-        st.extra_sum += src.extra_sum;
-    }
-}
-
 inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) usize {
     const key = rows.keyAt(row_idx);
     const h = routeHashRowBits(@truncate(key), @truncate(key >> 64));
@@ -2934,81 +2451,6 @@ inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) 
         else
         bucketIndexHash(h, bucket_count);
 }
-
-const GroupJob = struct {
-    allocator: Allocator,
-    parts: []WorkerParts,
-    results: []BucketResult,
-    next_bucket: *std.atomic.Value(usize),
-    bucket_count: usize,
-    q30_inline: bool,
-    cpu: usize,
-    err: *?anyerror,
-};
-
-const SiloStagedJob = struct {
-    allocator: Allocator,
-    parts: []WorkerParts,
-    results: []BucketResult,
-    worker_index: usize,
-    worker_count: usize,
-    bucket_count: usize,
-    cpu: usize,
-    agg_ticks: *i64,
-    local_top_ticks: *i64,
-    chunks: *u64,
-    err: *?anyerror,
-};
-
-const PreAggMergeJob = struct {
-    allocator: Allocator,
-    aggs: []WorkerAgg,
-    results: []BucketResult,
-    next_bucket: *std.atomic.Value(usize),
-    bucket_count: usize,
-    cpu: usize,
-    ticks: *i64,
-    err: *?anyerror,
-};
-
-const PipeGroupJob = struct {
-    allocator: Allocator,
-    shared: *PipeShared,
-    worker_index: usize,
-    worker_count: usize,
-    cpu: usize,
-    ticks: *i64,
-    err: *?anyerror,
-};
-
-const SiloGroupJob = struct {
-    allocator: Allocator,
-    shared: *PipeShared,
-    worker_index: usize,
-    worker_count: usize,
-    cpu: usize,
-    ticks: *i64,
-    idle_ticks: *i64,
-    top_ticks: *i64,
-    chunks: *u64,
-    top: *TopSet,
-    profile: bool,
-    err: *?anyerror,
-};
-
-const SiloAdaptiveGroupJob = struct {
-    shared: *PipeShared,
-    worker_index: usize,
-    worker_count: usize,
-    profile: bool,
-    cpu: usize,
-    group_ticks: *i64,
-    idle_ticks: *i64,
-    top_ticks: *i64,
-    chunks: *u64,
-    top: *TopSet,
-    err: *?anyerror,
-};
 
 const SiloGridJob = struct {
     scan: *Scan,
