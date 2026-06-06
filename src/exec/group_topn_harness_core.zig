@@ -114,7 +114,7 @@ pub fn cpuLayout(allocator: Allocator) !CpuLayout {
     };
 }
 
-fn pinToCpu(cpu: usize) void {
+pub fn pinToCpu(cpu: usize) void {
     if (cpu < @bitSizeOf(usize)) {
         _ = SetThreadAffinityMask(GetCurrentThread(), @as(usize, 1) << @intCast(cpu));
     }

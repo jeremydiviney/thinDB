@@ -29,6 +29,7 @@ const ColumnStore = store.ColumnStore;
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
 const Scan = @import("scan.zig").Scan;
+const HarnessCore = exec.group_topn_harness_core;
 
 const Batch = exec.Batch;
 const Query = exec.Query;
@@ -192,6 +193,7 @@ fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: 
 
 const Worker = struct {
     index: usize,
+    cpu: ?usize,
     scan: *Scan,
     lane: Lane,
     plans: []const AggPlan,
@@ -205,6 +207,7 @@ const Worker = struct {
 };
 
 fn workerMain(w: *Worker) void {
+    if (w.cpu) |cpu| HarnessCore.pinToCpu(cpu);
     workerRun(w) catch |e| {
         w.err = e;
     };
@@ -516,7 +519,13 @@ const GlobalAggregate = struct {
         }
         seg_start[snap.segment_count] = total_rgs;
 
-        const cpu_count = std.Thread.getCpuCount() catch 1;
+        // Pin lanes round-robin across the CPU layout (physical cores first,
+        // then hyperthread siblings). Capping at the logical count means
+        // workers stack evenly — e.g. dop=24 on a 12-core/24-thread host pins
+        // 2 lanes per physical core (one on each of its logical CPUs).
+        var layout = HarnessCore.cpuLayout(self.allocator) catch HarnessCore.CpuLayout{ .order = &.{}, .physical_count = 0 };
+        defer layout.deinit(self.allocator);
+        const cpu_count = @max(@as(usize, 1), layout.order.len);
         var n_workers = @max(@as(usize, 1), @min(self.dop, cpu_count));
         if (total_rgs > 0) n_workers = @min(n_workers, total_rgs);
 
@@ -534,6 +543,7 @@ const GlobalAggregate = struct {
             const scan = try self.openScan(snap);
             w.* = .{
                 .index = i,
+                .cpu = if (layout.order.len == 0) null else layout.order[i % layout.order.len],
                 .scan = scan,
                 .lane = try Lane.init(self.allocator, self.plans.len),
                 .plans = self.plans,
@@ -550,22 +560,27 @@ const GlobalAggregate = struct {
         snap.memtable_snap.release();
         pin_held = false;
 
+        // Spawn every lane as its own pinned thread; the calling thread only
+        // orchestrates and merges (left unpinned). A lane whose thread fails to
+        // spawn runs inline unpinned — the shared atomic tile claim keeps every
+        // row-group counted exactly once regardless of where lanes run.
         const threads = try self.allocator.alloc(std.Thread, n_workers);
         defer self.allocator.free(threads);
         const spawned = try self.allocator.alloc(bool, n_workers);
         defer self.allocator.free(spawned);
         @memset(spawned, false);
-        for (workers[1..], 1..) |*w, i| {
+        for (workers, 0..) |*w, i| {
             if (std.Thread.spawn(.{}, workerMain, .{w})) |th| {
                 threads[i] = th;
                 spawned[i] = true;
             } else |_| {}
         }
-        workerMain(&workers[0]);
-        // Any worker whose thread failed to spawn runs inline — the shared
-        // atomic tile claim keeps every row-group counted exactly once.
-        for (workers[1..], 1..) |*w, i| if (!spawned[i]) workerMain(w);
-        for (workers[1..], 1..) |_, i| if (spawned[i]) threads[i].join();
+        for (workers, 0..) |*w, i| if (!spawned[i]) {
+            workerRun(w) catch |e| {
+                w.err = e;
+            };
+        };
+        for (workers, 0..) |_, i| if (spawned[i]) threads[i].join();
 
         for (workers) |*w| if (w.err) |e| return e;
 
