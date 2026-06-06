@@ -49,6 +49,7 @@ pub const Request = struct {
     limit: usize,
     offset: usize,
     where_filter: ?PredicateExpr,
+    having_filter: ?PredicateExpr,
     needed: ?[]const []const u8,
     dop: usize,
 };
@@ -241,7 +242,8 @@ const GroupTopNPipeline = struct {
         var rows = try runGroupTopNStage(&ctx);
         defer rows.deinit();
         const emit_t0 = exec.prof.nowTicks();
-        var final_rows = try prepareFinalRows(self, rows.items);
+        const grouped = if (self.request.having_filter) |hexpr| applyHaving(self, hexpr, rows.items) else rows.items;
+        var final_rows = try prepareFinalRows(self, grouped);
         defer final_rows.deinit();
         try emitResultStage(self, final_rows.items);
         ctx.times.emit_ticks = exec.prof.nowTicks() - emit_t0;
@@ -377,6 +379,9 @@ fn appendUniqueColumn(out: *[MAX_GROUP_KEYS + MAX_AGG_INPUTS][]const u8, len: us
 }
 
 fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
+    // HAVING reduces the group set before LIMIT, so the core must emit every
+    // group; the top-N is then taken after applyHaving in prepareFinalRows.
+    if (ctx.request.having_filter != null) return false;
     if (ctx.request.order_specs.len != 1) return false;
     if (!ctx.request.order_specs[0].desc) return false;
     if (ctx.request.limit == 0) return false;
@@ -595,6 +600,11 @@ fn validateShape(table: *api.Table, request: Request) ?ShapePlan {
             return traceDecline(request, "order key");
         }
     }
+    if (request.having_filter) |hexpr| {
+        if (!havingExprSupported(parts[0..request.group_cols.len], aggregates[0..request.aggs.len], hexpr)) {
+            return traceDecline(request, "having");
+        }
+    }
 
     return .{
         .layout = .{ .parts = parts, .part_count = request.group_cols.len, .total_bits = offset },
@@ -609,6 +619,117 @@ fn outputColumnExists(parts: []const KeyPart, aggregates: []const AggregatePlan,
     for (parts) |part| if (types.columnNameEql(part.name, name)) return true;
     for (aggregates) |agg| if (types.columnNameEql(agg.name, name)) return true;
     return false;
+}
+
+// HAVING runs single-threaded after grouping, before ORDER BY / LIMIT: each
+// grouped row's output values are tested against the predicate and failing
+// groups are dropped. Only column-vs-constant comparisons over output columns
+// (group keys + aggregate results) are supported; richer predicate forms are
+// declined at validateShape so we never reach the evaluator with one.
+const Num = union(enum) { i: i128, f: f64 };
+
+fn valueAsNum(v: types.Value) ?Num {
+    return switch (v) {
+        .int => |x| .{ .i = x },
+        .bigint => |x| .{ .i = x },
+        .smallint => |x| .{ .i = x },
+        .tinyint => |x| .{ .i = x },
+        .largeint => |x| .{ .i = x },
+        .date => |x| .{ .i = x },
+        .datetime => |x| .{ .i = x },
+        .decimal64 => |x| .{ .i = x },
+        .decimal128 => |x| .{ .i = x },
+        .boolean => |b| .{ .i = @intFromBool(b) },
+        .float => |x| .{ .f = x },
+        .double => |x| .{ .f = x },
+        .text, .uuid => null,
+    };
+}
+
+fn numOrder(a: Num, b: Num) std.math.Order {
+    if (a == .f or b == .f) {
+        const af: f64 = switch (a) {
+            .i => |v| @floatFromInt(v),
+            .f => |v| v,
+        };
+        const bf: f64 = switch (b) {
+            .i => |v| @floatFromInt(v),
+            .f => |v| v,
+        };
+        return std.math.order(af, bf);
+    }
+    return std.math.order(a.i, b.i);
+}
+
+fn havingExprSupported(parts: []const KeyPart, aggregates: []const AggregatePlan, expr: PredicateExpr) bool {
+    return switch (expr) {
+        .leaf => |p| outputColumnExists(parts, aggregates, p.col) and valueAsNum(p.val) != null,
+        .is_null, .is_not_null => |name| outputColumnExists(parts, aggregates, name),
+        .not => |child| havingExprSupported(parts, aggregates, child.*),
+        .@"and", .@"or" => |children| {
+            for (children) |child| if (!havingExprSupported(parts, aggregates, child)) return false;
+            return true;
+        },
+        else => false,
+    };
+}
+
+fn havingOutputNum(op: *GroupTopNPipeline, name: []const u8, row: HarnessCore.TopRow) ?Num {
+    for (op.plan.layout.parts[0..op.plan.layout.part_count]) |part| {
+        if (types.columnNameEql(name, part.name)) return .{ .i = keyPartValue(part, row.key) };
+    }
+    for (op.plan.aggregates[0..op.plan.aggregate_count]) |agg_plan| {
+        if (types.columnNameEql(name, agg_plan.name)) {
+            return switch (agg_plan.func) {
+                .count => .{ .i = @intCast(row.count) },
+                .sum, .min, .max => .{ .i = rowStateValue(row, agg_plan.state_index) },
+                .avg => .{ .f = avgValue(row, agg_plan.state_index) },
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
+fn havingPasses(op: *GroupTopNPipeline, expr: PredicateExpr, row: HarnessCore.TopRow) bool {
+    return switch (expr) {
+        .leaf => |p| {
+            const lhs = havingOutputNum(op, p.col, row) orelse return false;
+            const rhs = valueAsNum(p.val) orelse return false;
+            const ord = numOrder(lhs, rhs);
+            return switch (p.op) {
+                .eq => ord == .eq,
+                .neq => ord != .eq,
+                .lt => ord == .lt,
+                .lte => ord != .gt,
+                .gt => ord == .gt,
+                .gte => ord != .lt,
+            };
+        },
+        .is_null => false,
+        .is_not_null => true,
+        .not => |child| !havingPasses(op, child.*, row),
+        .@"and" => |children| {
+            for (children) |child| if (!havingPasses(op, child, row)) return false;
+            return true;
+        },
+        .@"or" => |children| {
+            for (children) |child| if (havingPasses(op, child, row)) return true;
+            return false;
+        },
+        else => true,
+    };
+}
+
+fn applyHaving(op: *GroupTopNPipeline, expr: PredicateExpr, rows: []HarnessCore.TopRow) []HarnessCore.TopRow {
+    var w: usize = 0;
+    for (rows) |row| {
+        if (havingPasses(op, expr, row)) {
+            rows[w] = row;
+            w += 1;
+        }
+    }
+    return rows[0..w];
 }
 
 fn columnType(table: *api.Table, name: []const u8) ?Type {

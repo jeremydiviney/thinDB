@@ -214,6 +214,7 @@ fn chooseShape(spec: SimplePipelineSpec) Shape {
 const GroupTopNPlan = struct {
     scan: ir.Op.Scan,
     where_filter: ?ir.Op.Filter,
+    having_filter: ?ir.Op.Filter,
     group_by: ir.Op.GroupBy,
     order_by: ?ir.Op.OrderBy,
     limit: ?ir.Op.Limit,
@@ -237,6 +238,11 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
         order_by = op.order_by;
         op = op.order_by.upstream;
     }
+    var having_filter: ?ir.Op.Filter = null;
+    if (op.* == .filter) {
+        having_filter = op.filter;
+        op = op.filter.upstream;
+    }
     if (op.* != .group_by) return null;
     const group_by = op.group_by;
     if (group_by.group_cols.len == 0) return null;
@@ -256,6 +262,7 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
     return .{
         .scan = source.scan,
         .where_filter = where_filter,
+        .having_filter = having_filter,
         .group_by = group_by,
         .order_by = order_by,
         .limit = limit,
@@ -294,6 +301,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .limit = if (plan.limit) |l| @intCast(l.n) else 0,
         .offset = if (plan.limit) |l| @intCast(l.offset) else 0,
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
+        .having_filter = if (plan.having_filter) |f| f.predicate else null,
         .needed = needed,
         .dop = input.db.config.max_dop,
     };
