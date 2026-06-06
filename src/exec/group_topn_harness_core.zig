@@ -151,11 +151,29 @@ const RawRows = struct {
             bytes = alignForward(bytes, groupColumnAlign(column.physical_type));
             bytes += groupColumnSize(column.physical_type) * capacity_rows;
         }
+        if (layout.has_rowref) {
+            bytes = alignForward(bytes, @alignOf(i64));
+            bytes += @sizeOf(i64) * capacity_rows;
+        }
         return bytes;
     }
 
     inline fn keyOffset(_: RawRows) usize {
         return 0;
+    }
+
+    fn rowrefOffset(self: RawRows) usize {
+        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
+        for (self.layout.columns) |column| {
+            offset = alignForward(offset, groupColumnAlign(column.physical_type));
+            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
+        }
+        return alignForward(offset, @alignOf(i64));
+    }
+
+    inline fn rowrefAll(self: RawRows) []i64 {
+        std.debug.assert(self.layout.has_rowref);
+        return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.rowrefOffset())))[0..self.capacity_rows];
     }
 
     fn columnOffset(self: RawRows, column_index: usize) usize {
@@ -224,6 +242,7 @@ const RawRows = struct {
                     .i16 => @memcpy(next.columnI16Items(col), self.columnI16Items(col)),
                 }
             }
+            if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
         }
         allocator.free(self.slab);
         self.* = next;
@@ -356,6 +375,12 @@ pub const GroupRowsLayout = struct {
     key_columns: []const GroupKeyColumnSpec = &.{},
     columns: []const GroupColumnSpec = &DEFAULT_GROUP_COLUMNS,
     aggregates: []const GroupAggregateSpec = &DEFAULT_GROUP_AGGREGATES,
+    // When the group key is a hash (string / >128-bit keys), each staged row
+    // also carries the source row's packed __rowloc (see rowloc.zig) in a
+    // dedicated i64 region after the payload columns, captured into the group
+    // State on first insert so the actual key values can be late-materialized
+    // at emit. Dormant (region absent) for the integer-packed-key queries.
+    has_rowref: bool = false,
 
     const DEFAULT_GROUP_COLUMNS = [_]GroupColumnSpec{
         .{ .physical_type = .i16, .source = .is_refresh },
@@ -364,7 +389,7 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.aggregates.len != b.aggregates.len) return false;
     var key_i: usize = 0;
     while (key_i < a.key_columns.len) : (key_i += 1) {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
@@ -454,11 +479,29 @@ const GroupRows = struct {
             bytes = alignForward(bytes, groupColumnAlign(column.physical_type));
             bytes += groupColumnSize(column.physical_type) * capacity_rows;
         }
+        if (layout.has_rowref) {
+            bytes = alignForward(bytes, @alignOf(i64));
+            bytes += @sizeOf(i64) * capacity_rows;
+        }
         return bytes;
     }
 
     inline fn keyOffset(_: GroupRows) usize {
         return 0;
+    }
+
+    fn rowrefOffset(self: GroupRows) usize {
+        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
+        for (self.layout.columns) |column| {
+            offset = alignForward(offset, groupColumnAlign(column.physical_type));
+            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
+        }
+        return alignForward(offset, @alignOf(i64));
+    }
+
+    inline fn rowrefAll(self: GroupRows) []i64 {
+        std.debug.assert(self.layout.has_rowref);
+        return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.rowrefOffset())))[0..self.capacity_rows];
     }
 
     fn columnOffset(self: GroupRows, column_index: usize) usize {
@@ -535,6 +578,7 @@ const GroupRows = struct {
                     .i16 => @memcpy(next.columnI16Items(col), self.columnI16Items(col)),
                 }
             }
+            if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
         }
         allocator.free(self.slab);
         self.* = next;
@@ -583,6 +627,7 @@ const GroupRows = struct {
                 .i16 => @memcpy(self.columnI16All(col)[old_len..new_len], rows.columnI16All(col)[start .. start + count]),
             }
         }
+        if (self.layout.has_rowref) @memcpy(self.rowrefAll()[old_len..new_len], rows.rowrefAll()[start .. start + count]);
     }
 
     inline fn keyAt(self: GroupRows, idx: usize) u128 {
@@ -789,6 +834,10 @@ const State = struct {
     refresh_sum: i64,
     width_sum: i64,
     extra_sum: i64 = 0,
+    // Packed __rowloc of the first row that created this group; only meaningful
+    // when the layout has a hashed key (has_rowref). Used at emit to
+    // late-materialize the real key column values.
+    rowref: i64 = 0,
 };
 
 const GroupScratch = struct {
@@ -1832,6 +1881,7 @@ pub const TopRow = struct {
     refresh_sum: i64,
     width_sum: i64,
     extra_sum: i64 = 0,
+    rowref: i64 = 0,
 };
 
 inline fn topRowFromState(s: State) TopRow {
@@ -1841,6 +1891,7 @@ inline fn topRowFromState(s: State) TopRow {
         .refresh_sum = s.refresh_sum,
         .width_sum = s.width_sum,
         .extra_sum = s.extra_sum,
+        .rowref = s.rowref,
     };
 }
 
@@ -2662,6 +2713,8 @@ fn drainRawDedicatedStageSharedBuilders(
         const ncols = shared.group_rows_layout.columns.len;
         var flat_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]i16 = undefined;
         for (0..ncols) |c| flat_cols[c] = local.flat_raw_rows.columnI16All(c);
+        const has_rowref = shared.group_rows_layout.has_rowref;
+        const flat_rowref: []i64 = if (has_rowref) local.flat_raw_rows.rowrefAll() else &.{};
         switch (local.flat_raw_rows.layout.key_width) {
             inline else => |kw| {
                 const flat = local.flat_raw_rows;
@@ -2670,6 +2723,7 @@ fn drainRawDedicatedStageSharedBuilders(
                     const src = raw_chunks[i].rows;
                     var src_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
                     for (0..ncols) |c| src_cols[c] = src.columnI16All(c);
+                    const src_rowref: []const i64 = if (has_rowref) src.rowrefAll() else &.{};
                     const chunk_rows_n = src.len();
                     var r: usize = 0;
                     while (r < chunk_rows_n) : (r += 1) {
@@ -2678,6 +2732,7 @@ fn drainRawDedicatedStageSharedBuilders(
                         flat.copyKeyFrom(kw, pos, src, r);
                         var c: usize = 0;
                         while (c < ncols) : (c += 1) flat_cols[c][pos] = src_cols[c][r];
+                        if (has_rowref) flat_rowref[pos] = src_rowref[r];
                         local.flat_next[bucket_idx] = pos + 1;
                         row_idx += 1;
                     }
