@@ -179,6 +179,89 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
     }
 }
 
+const TILE_RGS: usize = 16;
+
+const Coord = struct { seg: usize, rg: usize };
+
+fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: usize) Coord {
+    if (f >= total) return .{ .seg = segment_count, .rg = 0 };
+    var seg: usize = 0;
+    while (seg + 1 < segment_count and seg_start[seg + 1] <= f) seg += 1;
+    return .{ .seg = seg, .rg = f - seg_start[seg] };
+}
+
+const Worker = struct {
+    index: usize,
+    scan: *Scan,
+    lane: Lane,
+    plans: []const AggPlan,
+    resolved: []?usize,
+    allocator: Allocator,
+    seg_start: []const usize,
+    segment_count: usize,
+    total_rgs: usize,
+    next_rg: *std.atomic.Value(usize),
+    err: ?anyerror = null,
+};
+
+fn workerMain(w: *Worker) void {
+    workerRun(w) catch |e| {
+        w.err = e;
+    };
+}
+
+fn workerRun(w: *Worker) !void {
+    var have_resolved = false;
+    if (w.total_rgs == 0) {
+        // Memtable-only (no segments / no row groups): one lane scans it all.
+        if (w.index != 0) return;
+        w.scan.resetRange(0, 0, w.segment_count, 0, true);
+        try driveTile(w, &have_resolved);
+        return;
+    }
+    while (true) {
+        const lo = w.next_rg.fetchAdd(TILE_RGS, .monotonic);
+        if (lo >= w.total_rgs) break;
+        const hi = @min(lo + TILE_RGS, w.total_rgs);
+        const start = flatToCoord(lo, w.seg_start, w.segment_count, w.total_rgs);
+        const end = flatToCoord(hi, w.seg_start, w.segment_count, w.total_rgs);
+        // The final tile also drains the memtable (scan_memtable = true).
+        w.scan.resetRange(start.seg, start.rg, end.seg, end.rg, hi == w.total_rgs);
+        try driveTile(w, &have_resolved);
+    }
+}
+
+fn driveTile(w: *Worker, have_resolved: *bool) !void {
+    while (try w.scan.next()) |batch| {
+        if (!have_resolved.*) {
+            try resolveBatchIndices(w.plans, w.resolved, batch);
+            have_resolved.* = true;
+        }
+        foldBatch(&w.lane, w.plans, w.resolved, batch);
+    }
+}
+
+fn driveScan(lane: *Lane, plans: []const AggPlan, allocator: Allocator, scan: *Scan) !void {
+    const resolved = try allocator.alloc(?usize, plans.len);
+    defer allocator.free(resolved);
+    var have_resolved = false;
+    while (try scan.next()) |batch| {
+        if (!have_resolved) {
+            try resolveBatchIndices(plans, resolved, batch);
+            have_resolved = true;
+        }
+        foldBatch(lane, plans, resolved, batch);
+    }
+}
+
+// The scan projects in table-schema order, so each aggregate's folded column
+// is resolved by NAME against the batch schema (not by request order).
+fn resolveBatchIndices(plans: []const AggPlan, resolved: []?usize, batch: Batch) !void {
+    for (plans, 0..) |p, i| {
+        resolved[i] = if (p.input_name) |nm| (batch.columnIndex(nm) orelse return error.UnsupportedQueryShape) else null;
+    }
+}
+
 fn aggInputSupported(typ: Type) bool {
     return switch (typ) {
         .boolean, .tinyint, .smallint, .int, .bigint, .date, .datetime, .decimal64, .float, .double => true,
@@ -237,10 +320,12 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         }
     }
 
-    // A pure COUNT(*) with no folded column still needs the scan to iterate
-    // row-groups; project the narrowest column so it yields row counts.
+    // A column-less COUNT(*) still needs ≥1 projected column for the scan to
+    // iterate row-groups with correct visibility (an empty projection neither
+    // counts correctly nor lets a WHERE fuse). Project the narrowest column to
+    // minimize the decode it's forced to do.
     if (needed.items.len == 0) {
-        _ = (try addNeeded(allocator, &needed, table, table.schema.columns[0].name)) orelse return declineFree(allocator, plans, &needed);
+        _ = (try addNeeded(allocator, &needed, table, narrowestColumn(table))) orelse return declineFree(allocator, plans, &needed);
     }
 
     const op = try allocator.create(GlobalAggregate);
@@ -260,6 +345,32 @@ fn columnType(table: *api.Table, name: []const u8) ?Type {
     return table.schema.columns[idx].type;
 }
 
+// Byte width for ranking the cheapest column to project; strings/variable
+// types rank last so a fixed narrow column wins.
+fn typeWidthRank(t: Type) usize {
+    return switch (t) {
+        .boolean, .tinyint => 1,
+        .smallint => 2,
+        .int, .date, .float => 4,
+        .bigint, .datetime, .double, .decimal64 => 8,
+        .largeint, .decimal128, .uuid => 16,
+        else => 64,
+    };
+}
+
+fn narrowestColumn(table: *api.Table) []const u8 {
+    var best: usize = 0;
+    var best_rank: usize = typeWidthRank(table.schema.columns[0].type);
+    for (table.schema.columns, 0..) |c, i| {
+        const rank = typeWidthRank(c.type);
+        if (rank < best_rank) {
+            best_rank = rank;
+            best = i;
+        }
+    }
+    return table.schema.columns[best].name;
+}
+
 fn addNeeded(allocator: Allocator, needed: *std.ArrayListUnmanaged([]const u8), table: *api.Table, name: []const u8) !?usize {
     if (types.findColumn(table.schema.columns, name) == null) return null;
     for (needed.items, 0..) |existing, i| {
@@ -274,6 +385,7 @@ const GlobalAggregate = struct {
     allocator: Allocator,
     table: *api.Table,
     where_filter: ?PredicateExpr,
+    dop: usize,
     plans: []AggPlan,
     needed: []const []const u8,
     output_schema: []Column,
@@ -304,6 +416,7 @@ const GlobalAggregate = struct {
             .allocator = allocator,
             .table = table,
             .where_filter = request.where_filter,
+            .dop = request.dop,
             .plans = plans,
             .needed = needed,
             .output_schema = output_schema,
@@ -354,35 +467,112 @@ const GlobalAggregate = struct {
     }
 
     fn execute(self: *GlobalAggregate) !void {
-        var lane = try Lane.init(self.allocator, self.plans.len);
+        var lane = if (self.dop > 1)
+            try self.reduceParallel()
+        else
+            try self.reduceSerial();
         defer lane.deinit(self.allocator);
-
-        const scan = try Scan.allocWithProjectionLoc(self.allocator, self.table, null, self.needed, false, null);
-        defer scan.deinit();
-        if (self.where_filter) |w| {
-            const fused = try scan.tryFuseFilter(w);
-            // Never produce a result from an unapplied filter.
-            if (!fused) return error.UnsupportedQueryShape;
-        }
-
-        // Resolve each aggregate's folded column to its batch index by name
-        // (the scan projects in table-schema order, not request order).
-        const resolved = try self.allocator.alloc(?usize, self.plans.len);
-        defer self.allocator.free(resolved);
-        var have_resolved = false;
-
-        while (try scan.next()) |batch| {
-            if (!have_resolved) {
-                for (self.plans, 0..) |p, i| {
-                    resolved[i] = if (p.input_name) |nm| (batch.columnIndex(nm) orelse return error.UnsupportedQueryShape) else null;
-                }
-                have_resolved = true;
-            }
-            foldBatch(&lane, self.plans, resolved, batch);
-        }
-
         try self.emitRow(lane);
         self.row_count = 1;
+    }
+
+    fn openScan(self: *GlobalAggregate, snap: ?Scan.Snapshot) !*Scan {
+        const scan = try Scan.allocWithProjectionLoc(self.allocator, self.table, null, self.needed, false, snap);
+        errdefer scan.deinit();
+        if (self.where_filter) |w| {
+            // Never produce a result from an unapplied filter.
+            if (!try scan.tryFuseFilter(w)) return error.UnsupportedQueryShape;
+        }
+        return scan;
+    }
+
+    fn reduceSerial(self: *GlobalAggregate) !Lane {
+        var lane = try Lane.init(self.allocator, self.plans.len);
+        errdefer lane.deinit(self.allocator);
+        const scan = try self.openScan(null);
+        defer scan.deinit();
+        try driveScan(&lane, self.plans, self.allocator, scan);
+        return lane;
+    }
+
+    // Dedicated reduction scheduler: one scan per lane over a disjoint,
+    // dynamically-claimed row-group range (balanced under zone-map skew), each
+    // folding into its own accumulator, then a single-thread merge.
+    fn reduceParallel(self: *GlobalAggregate) !Lane {
+        const table = self.table;
+        table.ddl_lock.lockSharedUncancelable(table.io);
+        defer table.ddl_lock.unlockShared(table.io);
+
+        const snap = Scan.captureSnapshot(table);
+        var pin_held = true;
+        defer if (pin_held) snap.memtable_snap.release();
+
+        const seg_start = try self.allocator.alloc(usize, snap.segment_count + 1);
+        defer self.allocator.free(seg_start);
+        var total_rgs: usize = 0;
+        for (table.manifest.segments.items[0..snap.segment_count], 0..) |entry, i| {
+            seg_start[i] = total_rgs;
+            total_rgs += entry.row_group_count;
+        }
+        seg_start[snap.segment_count] = total_rgs;
+
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        var n_workers = @max(@as(usize, 1), @min(self.dop, cpu_count));
+        if (total_rgs > 0) n_workers = @min(n_workers, total_rgs);
+
+        const workers = try self.allocator.alloc(Worker, n_workers);
+        defer self.allocator.free(workers);
+        var built: usize = 0;
+        defer for (workers[0..built]) |*w| {
+            w.scan.deinit();
+            w.lane.deinit(self.allocator);
+            self.allocator.free(w.resolved);
+        };
+
+        var next_rg = std.atomic.Value(usize).init(0);
+        for (workers, 0..) |*w, i| {
+            const scan = try self.openScan(snap);
+            w.* = .{
+                .index = i,
+                .scan = scan,
+                .lane = try Lane.init(self.allocator, self.plans.len),
+                .plans = self.plans,
+                .resolved = try self.allocator.alloc(?usize, self.plans.len),
+                .allocator = self.allocator,
+                .seg_start = seg_start,
+                .segment_count = snap.segment_count,
+                .total_rgs = total_rgs,
+                .next_rg = &next_rg,
+            };
+            built += 1;
+        }
+        // All worker scans now hold their own memtable pins.
+        snap.memtable_snap.release();
+        pin_held = false;
+
+        const threads = try self.allocator.alloc(std.Thread, n_workers);
+        defer self.allocator.free(threads);
+        const spawned = try self.allocator.alloc(bool, n_workers);
+        defer self.allocator.free(spawned);
+        @memset(spawned, false);
+        for (workers[1..], 1..) |*w, i| {
+            if (std.Thread.spawn(.{}, workerMain, .{w})) |th| {
+                threads[i] = th;
+                spawned[i] = true;
+            } else |_| {}
+        }
+        workerMain(&workers[0]);
+        // Any worker whose thread failed to spawn runs inline — the shared
+        // atomic tile claim keeps every row-group counted exactly once.
+        for (workers[1..], 1..) |*w, i| if (!spawned[i]) workerMain(w);
+        for (workers[1..], 1..) |_, i| if (spawned[i]) threads[i].join();
+
+        for (workers) |*w| if (w.err) |e| return e;
+
+        var merged = try Lane.init(self.allocator, self.plans.len);
+        errdefer merged.deinit(self.allocator);
+        for (workers) |*w| merged.mergeFrom(w.lane, self.plans);
+        return merged;
     }
 
     fn emitRow(self: *GlobalAggregate, lane: Lane) !void {
