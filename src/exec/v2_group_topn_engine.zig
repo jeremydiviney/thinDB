@@ -609,7 +609,10 @@ fn runHarness(
     if (shape.aggregate_inputs.len > group_columns_buf.len) return error.UnsupportedOperatorForType;
     for (shape.aggregate_inputs, 0..) |input, i| {
         group_columns_buf[i] = .{ .physical_type = switch (input.physical_type) {
+            .i8 => .i8,
             .i16 => .i16,
+            .i32 => .i32,
+            .i64 => .i64,
             else => return error.UnsupportedOperatorForType,
         }, .source = try harnessColumnSource(input.source_name), .source_name = input.source_name };
     }

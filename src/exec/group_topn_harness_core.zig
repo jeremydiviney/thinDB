@@ -569,6 +569,22 @@ const GroupRows = struct {
         return self.columnI16All(column_index)[0..self.len_rows];
     }
 
+    inline fn columnTypedAll(self: GroupRows, comptime T: type, column_index: usize) []T {
+        return @as([*]T, @ptrCast(@alignCast(self.slab.ptr + self.columnOffset(column_index))))[0..self.capacity_rows];
+    }
+
+    // Read aggregate-input column `column_index` at `row` as i64 (integer
+    // physical types, sign-extended) — the generic native-width group read.
+    inline fn columnIntAt(self: GroupRows, column_index: usize, row: usize) i64 {
+        return switch (self.layout.columns[column_index].physical_type) {
+            .i8 => self.columnTypedAll(i8, column_index)[row],
+            .i16 => self.columnTypedAll(i16, column_index)[row],
+            .i32 => self.columnTypedAll(i32, column_index)[row],
+            .i64 => self.columnTypedAll(i64, column_index)[row],
+            .f32, .f64 => 0,
+        };
+    }
+
     inline fn columnByteSlab(self: GroupRows, column_index: usize) []u8 {
         const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
         return (self.slab.ptr + self.columnOffset(column_index))[0 .. sz * self.capacity_rows];
@@ -2064,6 +2080,22 @@ fn chooseRouteBlockRows(bucket_count: usize, cfg_route_block_rows: usize, route_
     return DEFAULT_ROUTE_BLOCK_ROWS;
 }
 
+fn aggInputViewBytes(view: thindb.storage.ColumnView, pt: GroupColumnType) ?[]const u8 {
+    return switch (view.data) {
+        .boolean => |v| if (pt == .i8) std.mem.sliceAsBytes(v) else null,
+        .tinyint => |v| if (pt == .i8) std.mem.sliceAsBytes(v) else null,
+        .smallint => |v| if (pt == .i16) std.mem.sliceAsBytes(v) else null,
+        .int => |v| if (pt == .i32) std.mem.sliceAsBytes(v) else null,
+        .date => |v| if (pt == .i32) std.mem.sliceAsBytes(v) else null,
+        .bigint => |v| if (pt == .i64) std.mem.sliceAsBytes(v) else null,
+        .datetime => |v| if (pt == .i64) std.mem.sliceAsBytes(v) else null,
+        .decimal64 => |v| if (pt == .i64) std.mem.sliceAsBytes(v) else null,
+        .float => |v| if (pt == .f32) std.mem.sliceAsBytes(v) else null,
+        .double => |v| if (pt == .f64) std.mem.sliceAsBytes(v) else null,
+        else => null,
+    };
+}
+
 fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
     if (shared.generic_filter_required and !skip_filter_check) return error.UnsupportedOperatorForType;
     const layout = shared.group_rows_layout;
@@ -2075,20 +2107,21 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         key_views_buf[i] = batch.columnView(part.name) orelse return error.ColumnNotFound;
     }
     if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
-    var payload_views_buf: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
+
+    // Per-column native source bytes + element size — one typed (copyElem) path
+    // covering every int/float agg-input width.
+    var payload_bytes: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
+    var payload_elt: [MAX_GROUP_PAYLOAD_COLUMNS]usize = undefined;
     for (layout.columns, 0..) |column, i| {
         if (column.source_name.len == 0) return error.UnsupportedOperatorForType;
         const view = batch.columnView(column.source_name) orelse return error.ColumnNotFound;
-        payload_views_buf[i] = switch (view.data) {
-            .smallint => |v| v,
-            .tinyint => return error.UnsupportedOperatorForType,
-            .int => return error.UnsupportedOperatorForType,
-            else => return error.TypeMismatch,
-        };
+        payload_bytes[i] = aggInputViewBytes(view, column.physical_type) orelse return error.TypeMismatch;
+        payload_elt[i] = groupColumnSize(column.physical_type);
     }
 
+    // Key-shape fast variants (no hashed key). Payload is type-generic.
     if (!layout.has_rowref) {
-        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_views_buf[0..layout.columns.len], raw_chunk_rows, profile)) return;
+        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], raw_chunk_rows, profile)) return;
     }
 
     const rowref_col: []const i64 = if (layout.has_rowref) blk: {
@@ -2112,10 +2145,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             const idx = active.len();
             active.setKey(idx, key);
             if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
-            var col: usize = 0;
-            while (col < layout.columns.len) : (col += 1) {
-                active.columnI16All(col)[idx] = payload_views_buf[col][r];
-            }
+            appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -2140,7 +2170,8 @@ fn appendBatchRawChunksGenericFast(
     batch: thindb.Batch,
     layout: GroupRowsLayout,
     key_views: []const thindb.storage.ColumnView,
-    payload_views: []const []const i16,
+    payload_bytes: []const []const u8,
+    payload_elt: []const usize,
     raw_chunk_rows: usize,
     profile: bool,
 ) !bool {
@@ -2151,7 +2182,7 @@ fn appendBatchRawChunksGenericFast(
                 .bigint => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_views, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_bytes, payload_elt, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -2171,7 +2202,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_views, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, raw_chunk_rows, profile);
             return true;
         }
 
@@ -2189,7 +2220,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_views, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -2202,7 +2233,8 @@ fn appendBatchRawChunksGenericKey1I64(
     shared: *PipeShared,
     row_count: usize,
     key0: []const i64,
-    payload_views: []const []const i16,
+    payload_bytes: []const []const u8,
+    payload_elt: []const usize,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -2215,7 +2247,7 @@ fn appendBatchRawChunksGenericKey1I64(
         while (r < row_count and active.len() < raw_chunk_rows) : (r += 1) {
             const idx = active.len();
             keys[idx] = @as(u64, @bitCast(key0[r]));
-            appendGenericPayload(active, payload_views, idx, r);
+            appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -2232,7 +2264,8 @@ fn appendBatchRawChunksGenericKeyI16I32(
     row_count: usize,
     key0: []const i16,
     key1: []const i32,
-    payload_views: []const []const i16,
+    payload_bytes: []const []const u8,
+    payload_elt: []const usize,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -2246,7 +2279,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
             const idx = active.len();
             keys[idx] = @as(u16, @bitCast(key0[r])) |
                 (@as(u64, @as(u32, @bitCast(key1[r]))) << 16);
-            appendGenericPayload(active, payload_views, idx, r);
+            appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -2263,7 +2296,8 @@ fn appendBatchRawChunksGenericKeyI64I32(
     row_count: usize,
     key0: []const i64,
     key1: []const i32,
-    payload_views: []const []const i16,
+    payload_bytes: []const []const u8,
+    payload_elt: []const usize,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -2278,7 +2312,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
             const idx = active.len();
             key_lo[idx] = @as(u64, @bitCast(key0[r]));
             key_hi[idx] = @as(u32, @bitCast(key1[r]));
-            appendGenericPayload(active, payload_views, idx, r);
+            appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -2289,15 +2323,24 @@ fn appendBatchRawChunksGenericKeyI64I32(
     if (profile) parts.partition_ticks += nowTicks() - route_t0;
 }
 
-inline fn appendGenericPayload(active: *RawRows, payload_views: []const []const i16, dst: usize, src: usize) void {
-    if (payload_views.len == 2) {
-        active.columnI16All(0)[dst] = payload_views[0][src];
-        active.columnI16All(1)[dst] = payload_views[1][src];
-        return;
+// Copy one payload element (1/2/4/8-byte typed move per element size — so each
+// int/float width gets a real typed path, not a byte loop). Element width is
+// the only thing that matters for the copy; int-vs-float is decided later, at
+// aggregation.
+inline fn copyElem(dst: []u8, src: []const u8, sz: usize, dst_idx: usize, src_idx: usize) void {
+    switch (sz) {
+        1 => dst[dst_idx] = src[src_idx],
+        2 => @as([*]u16, @ptrCast(@alignCast(dst.ptr)))[dst_idx] = @as([*]const u16, @ptrCast(@alignCast(src.ptr)))[src_idx],
+        4 => @as([*]u32, @ptrCast(@alignCast(dst.ptr)))[dst_idx] = @as([*]const u32, @ptrCast(@alignCast(src.ptr)))[src_idx],
+        8 => @as([*]u64, @ptrCast(@alignCast(dst.ptr)))[dst_idx] = @as([*]const u64, @ptrCast(@alignCast(src.ptr)))[src_idx],
+        else => @memcpy(dst[dst_idx * sz ..][0..sz], src[src_idx * sz ..][0..sz]),
     }
+}
+
+inline fn appendGenericPayload(active: *RawRows, payload_bytes: []const []const u8, payload_elt: []const usize, dst: usize, src: usize) void {
     var col: usize = 0;
-    while (col < payload_views.len) : (col += 1) {
-        active.columnI16All(col)[dst] = payload_views[col][src];
+    while (col < payload_bytes.len) : (col += 1) {
+        copyElem(active.columnByteSlab(col), payload_bytes[col], payload_elt[col], dst, src);
     }
 }
 
@@ -2315,7 +2358,7 @@ fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, batch: thindb.
     return appendBatchRawChunksGeneric(parts, shared, batch, raw_chunk_rows, profile, skip_filter_check);
 }
 
-fn initGroupStateCountSumAvg(states: *std.ArrayListUnmanaged(State), key: u128, sum_value: i16, avg_value: i16) u32 {
+fn initGroupStateCountSumAvg(states: *std.ArrayListUnmanaged(State), key: u128, sum_value: i64, avg_value: i64) u32 {
     const gid: u32 = @intCast(states.items.len);
     states.appendAssumeCapacity(.{
         .key = key,
@@ -2326,7 +2369,7 @@ fn initGroupStateCountSumAvg(states: *std.ArrayListUnmanaged(State), key: u128, 
     return gid;
 }
 
-inline fn updateGroupStateCountSumAvg(st: *State, sum_value: i16, avg_value: i16) void {
+inline fn updateGroupStateCountSumAvg(st: *State, sum_value: i64, avg_value: i64) void {
     st.count += 1;
     st.refresh_sum += sum_value;
     st.width_sum += avg_value;
@@ -2336,7 +2379,7 @@ fn initGroupStateProgram(
     states: *std.ArrayListUnmanaged(State),
     key: u128,
     aggregates: []const GroupAggregateSpec,
-    columns: []const []const i16,
+    rows: GroupRows,
     row_idx: usize,
 ) !u32 {
     const gid: u32 = @intCast(states.items.len);
@@ -2347,11 +2390,11 @@ fn initGroupStateProgram(
         .width_sum = 0,
     });
     const st = &states.items[gid];
-    try updateGroupStateProgram(st, aggregates, columns, row_idx);
+    try updateGroupStateProgram(st, aggregates, rows, row_idx);
     return gid;
 }
 
-fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, columns: []const []const i16, row_idx: usize) !void {
+fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
     st.count += 1;
     for (aggregates) |agg| {
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
@@ -2361,33 +2404,33 @@ fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, c
                 if (state_index != 0) try setAggregateStateValue(st, state_index, st.count);
             },
             .count_col => {
-                _ = aggregateInputValue(agg, columns, row_idx) catch return error.UnsupportedOperatorForType;
+                _ = aggregateInputValue(agg, rows, row_idx) catch return error.UnsupportedOperatorForType;
                 if (state_index != 0) try setAggregateStateValue(st, state_index, st.count);
             },
             .sum => {
-                const value = try aggregateInputValue(agg, columns, row_idx);
+                const value = try aggregateInputValue(agg, rows, row_idx);
                 try addAggregateStateValue(st, state_index, value);
             },
             .avg => {
-                const value = try aggregateInputValue(agg, columns, row_idx);
+                const value = try aggregateInputValue(agg, rows, row_idx);
                 try addAggregateStateValue(st, state_index, value);
             },
             .min => {
-                const value = try aggregateInputValue(agg, columns, row_idx);
+                const value = try aggregateInputValue(agg, rows, row_idx);
                 if (st.count == 1 or value < aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
             },
             .max => {
-                const value = try aggregateInputValue(agg, columns, row_idx);
+                const value = try aggregateInputValue(agg, rows, row_idx);
                 if (st.count == 1 or value > aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
             },
         }
     }
 }
 
-fn aggregateInputValue(agg: GroupAggregateSpec, columns: []const []const i16, row_idx: usize) !i128 {
+fn aggregateInputValue(agg: GroupAggregateSpec, rows: GroupRows, row_idx: usize) !i128 {
     const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
-    if (input_index >= columns.len) return error.UnsupportedOperatorForType;
-    return columns[input_index][row_idx];
+    if (input_index >= rows.layout.columns.len) return error.UnsupportedOperatorForType;
+    return rows.columnIntAt(input_index, row_idx);
 }
 
 inline fn aggregateStateValue(st: *const State, state_index: usize) i128 {
@@ -2460,32 +2503,21 @@ fn groupChunkRowsDirect(
 
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
     try validateGroupAggregateProgram(rows.layout.aggregates, rows.layout.columns.len);
-    var column_slices_buf: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
-    var col: usize = 0;
-    while (col < rows.layout.columns.len) : (col += 1) {
-        column_slices_buf[col] = switch (rows.layout.columns[col].physical_type) {
-            .i16 => rows.columnI16Items(col),
-            else => return error.UnsupportedOperatorForType,
-        };
-    }
-    const column_slices = column_slices_buf[0..rows.layout.columns.len];
     const rowrefs: []const i64 = if (rows.layout.has_rowref) rows.rowrefAll()[0..n] else &.{};
     if (countSumAvgProgram(rows.layout.aggregates, rows.layout.columns.len)) |program| {
-        const sum_values = column_slices[program.sum_input_index];
-        const avg_values = column_slices[program.avg_input_index];
         switch (rows.layout.key_width) {
-            .u32 => try groupChunkRowsDirectKeysCountSumAvg(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, sum_values, avg_values, rowrefs),
-            .u64 => try groupChunkRowsDirectKeysCountSumAvg(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, sum_values, avg_values, rowrefs),
-            .u96 => try groupChunkRowsDirectKeysCountSumAvg(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, sum_values, avg_values, rowrefs),
-            .u128 => try groupChunkRowsDirectKeysCountSumAvg(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, sum_values, avg_values, rowrefs),
+            .u32 => try groupChunkRowsDirectKeysCountSumAvg(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, rows, program, rowrefs),
+            .u64 => try groupChunkRowsDirectKeysCountSumAvg(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, rows, program, rowrefs),
+            .u96 => try groupChunkRowsDirectKeysCountSumAvg(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows, program, rowrefs),
+            .u128 => try groupChunkRowsDirectKeysCountSumAvg(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, rows, program, rowrefs),
         }
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, column_slices, rowrefs),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, column_slices, rowrefs),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, column_slices, rowrefs),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, column_slices, rowrefs),
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
     }
 }
 
@@ -2496,8 +2528,8 @@ fn groupChunkRowsDirectKeysCountSumAvg(
     keys: anytype,
     key_hi: []const u32,
     row_count: usize,
-    sum_values: []const i16,
-    avg_values: []const i16,
+    rows: GroupRows,
+    program: CountSumAvgProgram,
     rowrefs: []const i64,
 ) !void {
     var r: usize = 0;
@@ -2508,15 +2540,17 @@ fn groupChunkRowsDirectKeysCountSumAvg(
             @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
         }
 
+        const sum_value = rows.columnIntAt(program.sum_input_index, r);
+        const avg_value = rows.columnIntAt(program.avg_input_index, r);
         const key = groupKeyAt(key_width, keys, key_hi, r);
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         if (!probe.found) {
-            const new_gid = initGroupStateCountSumAvg(states, key, sum_values[r], avg_values[r]);
+            const new_gid = initGroupStateCountSumAvg(states, key, sum_value, avg_value);
             if (rowrefs.len != 0) states.items[new_gid].rowref = rowrefs[r];
             table.commit(probe.slot, key, new_gid);
             continue;
         }
-        updateGroupStateCountSumAvg(&states.items[probe.gid], sum_values[r], avg_values[r]);
+        updateGroupStateCountSumAvg(&states.items[probe.gid], sum_value, avg_value);
     }
 }
 
@@ -2528,7 +2562,7 @@ fn groupChunkRowsDirectKeys(
     key_hi: []const u32,
     row_count: usize,
     aggregates: []const GroupAggregateSpec,
-    columns: []const []const i16,
+    rows: GroupRows,
     rowrefs: []const i64,
 ) !void {
     const n = row_count;
@@ -2543,13 +2577,13 @@ fn groupChunkRowsDirectKeys(
         const key = groupKeyAt(key_width, keys, key_hi, r);
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         if (!probe.found) {
-            const new_gid = try initGroupStateProgram(states, key, aggregates, columns, r);
+            const new_gid = try initGroupStateProgram(states, key, aggregates, rows, r);
             if (rowrefs.len != 0) states.items[new_gid].rowref = rowrefs[r];
             table.commit(probe.slot, key, new_gid);
             continue;
         }
         const st = &states.items[probe.gid];
-        try updateGroupStateProgram(st, aggregates, columns, r);
+        try updateGroupStateProgram(st, aggregates, rows, r);
     }
 }
 
@@ -2779,8 +2813,12 @@ fn drainRawDedicatedStageSharedBuilders(
 
         row_idx = 0;
         const ncols = shared.group_rows_layout.columns.len;
-        var flat_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]i16 = undefined;
-        for (0..ncols) |c| flat_cols[c] = local.flat_raw_rows.columnI16All(c);
+        var flat_slabs: [MAX_GROUP_PAYLOAD_COLUMNS][]u8 = undefined;
+        var col_elt: [MAX_GROUP_PAYLOAD_COLUMNS]usize = undefined;
+        for (0..ncols) |c| {
+            flat_slabs[c] = local.flat_raw_rows.columnByteSlab(c);
+            col_elt[c] = groupColumnSize(shared.group_rows_layout.columns[c].physical_type);
+        }
         const has_rowref = shared.group_rows_layout.has_rowref;
         const flat_rowref: []i64 = if (has_rowref) local.flat_raw_rows.rowrefAll() else &.{};
         switch (local.flat_raw_rows.layout.key_width) {
@@ -2789,8 +2827,8 @@ fn drainRawDedicatedStageSharedBuilders(
                 i = 0;
                 while (i < popped_total) : (i += 1) {
                     const src = raw_chunks[i].rows;
-                    var src_cols: [MAX_GROUP_PAYLOAD_COLUMNS][]const i16 = undefined;
-                    for (0..ncols) |c| src_cols[c] = src.columnI16All(c);
+                    var src_slabs: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
+                    for (0..ncols) |c| src_slabs[c] = src.columnByteSlab(c);
                     const src_rowref: []const i64 = if (has_rowref) src.rowrefAll() else &.{};
                     const chunk_rows_n = src.len();
                     var r: usize = 0;
@@ -2799,7 +2837,7 @@ fn drainRawDedicatedStageSharedBuilders(
                         const pos = local.flat_next[bucket_idx];
                         flat.copyKeyFrom(kw, pos, src, r);
                         var c: usize = 0;
-                        while (c < ncols) : (c += 1) flat_cols[c][pos] = src_cols[c][r];
+                        while (c < ncols) : (c += 1) copyElem(flat_slabs[c], src_slabs[c], col_elt[c], pos, r);
                         if (has_rowref) flat_rowref[pos] = src_rowref[r];
                         local.flat_next[bucket_idx] = pos + 1;
                         row_idx += 1;

@@ -833,9 +833,8 @@ fn addAggregateInput(
     }
     if (input_count.* >= MAX_AGG_INPUTS) return null;
     const typ = columnType(table, name) orelse return null;
-    if (intTypeBits(typ) == null or !smallPayloadIntType(typ)) return null;
+    if (!plainIntType(typ)) return null;
     const physical_type = physicalTypeFor(typ);
-    if (physical_type != .i16) return null;
     const idx = input_count.*;
     inputs[idx] = .{
         .source_name = name,
@@ -856,9 +855,9 @@ fn isSearchPhraseNotEmpty(pred: PredicateExpr) bool {
     };
 }
 
-fn smallPayloadIntType(typ: Type) bool {
+fn plainIntType(typ: Type) bool {
     return switch (typ) {
-        .boolean, .tinyint, .smallint => true,
+        .boolean, .tinyint, .smallint, .int, .bigint => true,
         else => false,
     };
 }
@@ -900,6 +899,10 @@ fn appendKeyPart(allocator: Allocator, col: *ColumnStore, part: KeyPart, key: u1
 
 fn appendIntegerAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i128) !void {
     switch (out_type) {
+        .boolean => try col.data.boolean.append(allocator, @intCast(value)),
+        .tinyint => try col.data.tinyint.append(allocator, @intCast(value)),
+        .smallint => try col.data.smallint.append(allocator, @intCast(value)),
+        .int => try col.data.int.append(allocator, @intCast(value)),
         .bigint => try col.data.bigint.append(allocator, @intCast(value)),
         .largeint => try col.data.largeint.append(allocator, value),
         .double => try col.data.double.append(allocator, @floatFromInt(value)),
