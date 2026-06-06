@@ -12,6 +12,7 @@ const types = @import("../types.zig");
 const ir = @import("../ir/ir.zig");
 const exec = @import("exec.zig");
 const v2_pipeline = @import("v2_pipeline.zig");
+const v2_global_aggregate = @import("v2_global_aggregate.zig");
 
 pub const SourceKind = enum {
     table_scan,
@@ -75,6 +76,7 @@ pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
         // so full-sort and bare-aggregate are just the limit/order-optional
         // forms of the same pipeline.
         .group_topn, .group_full_sort, .group_aggregate => (try buildGroupTopN(input, root)) orelse return error.UnsupportedQueryShape,
+        .global_aggregate => (try buildGlobalAggregate(input, root)) orelse return error.UnsupportedQueryShape,
         else => error.UnsupportedQueryShape,
     };
 }
@@ -311,6 +313,67 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     }
 
     return error.UnsupportedQueryShape;
+}
+
+const GlobalAggregatePlan = struct {
+    scan: ir.Op.Scan,
+    where_filter: ?ir.Op.Filter,
+    having_filter: ?ir.Op.Filter,
+    group_by: ir.Op.GroupBy,
+};
+
+fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
+    var op = root;
+    var top_project: ?ir.Op.Project = null;
+    if (op.* == .select) {
+        top_project = op.select;
+        op = op.select.upstream;
+    }
+    // ORDER BY / LIMIT over a one-row result are no-ops; accept and ignore.
+    if (op.* == .limit) op = op.limit.upstream;
+    if (op.* == .order_by) op = op.order_by.upstream;
+
+    var having_filter: ?ir.Op.Filter = null;
+    if (op.* == .filter) {
+        having_filter = op.filter;
+        op = op.filter.upstream;
+    }
+    if (op.* != .group_by) return null;
+    const group_by = op.group_by;
+    if (group_by.group_cols.len != 0) return null;
+    if (top_project) |p| {
+        if (!projectMatchesGroupOutput(p, group_by)) return null;
+    }
+
+    var where_filter: ?ir.Op.Filter = null;
+    var source = group_by.upstream;
+    if (source.* == .filter) {
+        where_filter = source.filter;
+        source = source.filter.upstream;
+    }
+    if (source.* != .scan) return null;
+    if (source.scan.alias != null) return null;
+
+    return .{
+        .scan = source.scan,
+        .where_filter = where_filter,
+        .having_filter = having_filter,
+        .group_by = group_by,
+    };
+}
+
+fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
+    const plan = matchGlobalAggregate(root) orelse return null;
+    if (hasUdfAgg(plan.group_by.aggs)) return null;
+
+    const table = try resolveTable(input.db, input.session, plan.scan.table);
+
+    return v2_global_aggregate.tryBuild(input.allocator, table, .{
+        .aggs = plan.group_by.aggs,
+        .where_filter = if (plan.where_filter) |f| f.predicate else null,
+        .having_filter = if (plan.having_filter) |f| f.predicate else null,
+        .dop = input.db.config.max_dop,
+    });
 }
 
 fn projectedBaseColumns(
