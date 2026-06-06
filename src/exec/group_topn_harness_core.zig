@@ -197,26 +197,6 @@ fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: 
     return .{ .seg = seg, .rg = f - seg_start[seg] };
 }
 
-const Row = extern struct {
-    key_lo: u64,
-    key_hi: u32,
-    refresh: i16,
-    width: i16,
-};
-
-inline fn makeRow(key: u128, refresh: i16, width: i16) Row {
-    return .{
-        .key_lo = @truncate(key),
-        .key_hi = @truncate(key >> 64),
-        .refresh = refresh,
-        .width = width,
-    };
-}
-
-inline fn stagedRowKey(row: Row) u128 {
-    return @as(u128, row.key_lo) | (@as(u128, row.key_hi) << 64);
-}
-
 const RawRows = struct {
     slab: []align(16) u8 = &.{},
     len_rows: usize = 0,
@@ -334,40 +314,6 @@ const RawRows = struct {
         self.columnI16All(0)[idx] = refresh;
         self.columnI16All(1)[idx] = width;
         self.len_rows = idx + 1;
-    }
-
-    fn appendRow(self: *RawRows, allocator: Allocator, row: Row) !void {
-        if (self.len_rows == self.capacity_rows) {
-            const next_capacity = if (self.capacity_rows == 0) 8 else self.capacity_rows * 2;
-            try self.ensureTotalCapacity(allocator, self.layout, next_capacity);
-        }
-        self.appendAssumeCapacity(stagedRowKey(row), row.refresh, row.width);
-    }
-
-    fn appendRows(self: *RawRows, allocator: Allocator, rows: []const Row) !void {
-        const old_len = self.len();
-        const new_len = old_len + rows.len;
-        try self.resize(allocator, self.layout, new_len);
-        const key_lo = self.keyLoAll();
-        const key_hi = self.keyHiAll();
-        const refresh = self.columnI16All(0);
-        const width = self.columnI16All(1);
-        var i: usize = 0;
-        while (i < rows.len) : (i += 1) {
-            key_lo[old_len + i] = rows[i].key_lo;
-            key_hi[old_len + i] = rows[i].key_hi;
-            refresh[old_len + i] = rows[i].refresh;
-            width[old_len + i] = rows[i].width;
-        }
-    }
-
-    inline fn rowAt(self: RawRows, idx: usize) Row {
-        return .{
-            .key_lo = self.keyLoAll()[idx],
-            .key_hi = self.keyHiAll()[idx],
-            .refresh = self.columnI16All(0)[idx],
-            .width = self.columnI16All(1)[idx],
-        };
     }
 
     inline fn keyAt(self: RawRows, idx: usize) u128 {
@@ -660,54 +606,6 @@ const GroupRows = struct {
         self.len_rows = idx + 1;
     }
 
-    fn appendRows(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, rows: []const Row) !void {
-        const old_len = self.len();
-        const new_len = old_len + rows.len;
-        try self.resize(allocator, layout, new_len);
-        const refresh = self.refreshAll();
-        const width = self.widthAll();
-        switch (self.layout.key_width) {
-            .u32 => {
-                const key_dst = self.keyU32All();
-                var i: usize = 0;
-                while (i < rows.len) : (i += 1) {
-                    key_dst[old_len + i] = @truncate(rows[i].key_lo);
-                    refresh[old_len + i] = rows[i].refresh;
-                    width[old_len + i] = rows[i].width;
-                }
-            },
-            .u64 => {
-                const key_dst = self.keyU64All();
-                var i: usize = 0;
-                while (i < rows.len) : (i += 1) {
-                    key_dst[old_len + i] = rows[i].key_lo;
-                    refresh[old_len + i] = rows[i].refresh;
-                    width[old_len + i] = rows[i].width;
-                }
-            },
-            .u96 => {
-                const key_lo_dst = self.keyU96LoAll();
-                const key_hi_dst = self.keyU96HiAll();
-                var i: usize = 0;
-                while (i < rows.len) : (i += 1) {
-                    key_lo_dst[old_len + i] = rows[i].key_lo;
-                    key_hi_dst[old_len + i] = rows[i].key_hi;
-                    refresh[old_len + i] = rows[i].refresh;
-                    width[old_len + i] = rows[i].width;
-                }
-            },
-            .u128 => {
-                const key_dst = self.keyU128All();
-                var i: usize = 0;
-                while (i < rows.len) : (i += 1) {
-                    key_dst[old_len + i] = stagedRowKey(rows[i]);
-                    refresh[old_len + i] = rows[i].refresh;
-                    width[old_len + i] = rows[i].width;
-                }
-            },
-        }
-    }
-
     fn appendRawRowsSlice(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, rows: RawRows, start: usize, count: usize) !void {
         if (count == 0) return;
         const old_len = self.len();
@@ -741,16 +639,6 @@ const GroupRows = struct {
         }
     }
 
-    inline fn rowAt(self: GroupRows, idx: usize) Row {
-        const key = self.keyAt(idx);
-        return .{
-            .key_lo = @truncate(key),
-            .key_hi = @truncate(key >> 64),
-            .refresh = self.refreshAll()[idx],
-            .width = self.widthAll()[idx],
-        };
-    }
-
     inline fn keyAt(self: GroupRows, idx: usize) u128 {
         return switch (self.layout.key_width) {
             .u32 => @as(u128, self.keyU32All()[idx]),
@@ -782,20 +670,16 @@ const GroupRows = struct {
 };
 
 const PartBucket = struct {
-    rows: std.ArrayListUnmanaged(Row) = .empty,
 
-    fn deinit(self: *PartBucket, allocator: Allocator) void {
-        self.rows.deinit(allocator);
+    fn deinit(self: *PartBucket, _: Allocator) void {
         self.* = .{};
     }
 };
 
 const SharedScanBucket = struct {
     lock: std.atomic.Mutex = .unlocked,
-    rows: std.ArrayListUnmanaged(Row) = .empty,
 
-    fn deinit(self: *SharedScanBucket, allocator: Allocator) void {
-        self.rows.deinit(allocator);
+    fn deinit(self: *SharedScanBucket, _: Allocator) void {
         self.* = .{};
     }
 };
@@ -805,13 +689,12 @@ const SharedScanBuffers = struct {
     bucket_count: usize = 0,
     bank_count: usize = 0,
 
-    fn init(allocator: Allocator, bucket_count: usize, bank_count_raw: usize, reserve_per_bucket: usize) !SharedScanBuffers {
+    fn init(allocator: Allocator, bucket_count: usize, bank_count_raw: usize, _: usize) !SharedScanBuffers {
         const bank_count = @max(@as(usize, 1), bank_count_raw);
         const buckets = try allocator.alloc(SharedScanBucket, bucket_count * bank_count);
         errdefer allocator.free(buckets);
         for (buckets) |*bucket| {
             bucket.* = .{};
-            if (reserve_per_bucket > 0) try bucket.rows.ensureTotalCapacity(allocator, reserve_per_bucket);
         }
         return .{
             .buckets = buckets,
@@ -837,7 +720,6 @@ const WorkerParts = struct {
     shared_bank_index: usize = 0,
     flat_scan_partitions: bool = false,
     flat_partitioned: bool = false,
-    flat_rows: std.ArrayListUnmanaged(Row) = .empty,
     flat_raw_rows: RawRows = .{},
     flat_bucket_ids: std.ArrayListUnmanaged(u16) = .empty,
     flat_counts: []u32 = &.{},
@@ -887,9 +769,8 @@ const WorkerParts = struct {
     route_offsets: []u16 = &.{},
     route_touched: std.ArrayListUnmanaged(u16) = .empty,
     recycle_lock: std.atomic.Mutex = .unlocked,
-    recycled_rows: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Row)) = .empty,
 
-    fn init(allocator: Allocator, bucket_count: usize, reserve_per_bucket: usize) !WorkerParts {
+    fn init(allocator: Allocator, bucket_count: usize, _: usize) !WorkerParts {
         const buckets = try allocator.alloc(PartBucket, bucket_count);
         for (buckets) |*b| b.* = .{};
         errdefer allocator.free(buckets);
@@ -905,9 +786,6 @@ const WorkerParts = struct {
         var route_touched: std.ArrayListUnmanaged(u16) = .empty;
         errdefer route_touched.deinit(allocator);
         try route_touched.ensureTotalCapacity(allocator, @min(bucket_count, MAX_ROUTE_BLOCK_ROWS));
-        if (reserve_per_bucket > 0) {
-            for (buckets) |*b| try b.rows.ensureTotalCapacity(allocator, reserve_per_bucket);
-        }
         return .{
             .buckets = buckets,
             .dirty_marks = dirty_marks,
@@ -920,7 +798,6 @@ const WorkerParts = struct {
     fn deinit(self: *WorkerParts, allocator: Allocator) void {
         for (self.buckets) |*b| b.deinit(allocator);
         if (self.buckets.len > 0) allocator.free(self.buckets);
-        self.flat_rows.deinit(allocator);
         self.flat_raw_rows.deinit(allocator);
         self.flat_bucket_ids.deinit(allocator);
         self.raw_active_rows.deinit(allocator);
@@ -932,8 +809,6 @@ const WorkerParts = struct {
         if (self.route_counts.len > 0) allocator.free(self.route_counts);
         if (self.route_offsets.len > 0) allocator.free(self.route_offsets);
         self.route_touched.deinit(allocator);
-        for (self.recycled_rows.items) |*rows| rows.deinit(allocator);
-        self.recycled_rows.deinit(allocator);
         self.* = .{};
     }
 
@@ -942,7 +817,6 @@ const WorkerParts = struct {
         self.flat_partitioned = false;
         try self.ensureWideBucketScratch(allocator, bucket_count);
         if (reserve_rows > 0) {
-            try self.flat_rows.ensureTotalCapacity(allocator, reserve_rows);
             try self.flat_bucket_ids.ensureTotalCapacity(allocator, reserve_rows);
         }
     }
@@ -980,13 +854,11 @@ const Q30InlineState = struct {
 const GroupScratch = struct {
     gids: std.ArrayListUnmanaged(u32) = .empty,
     row_idxs: std.ArrayListUnmanaged(u32) = .empty,
-    rows: std.ArrayListUnmanaged(Row) = .empty,
     states: std.ArrayListUnmanaged(State) = .empty,
 
     fn deinit(self: *GroupScratch, allocator: Allocator) void {
         self.gids.deinit(allocator);
         self.row_idxs.deinit(allocator);
-        self.rows.deinit(allocator);
         self.states.deinit(allocator);
         self.* = .{};
     }
@@ -1063,7 +935,6 @@ const CentralBucket = struct {
 };
 
 const PipeChunk = struct {
-    rows: std.ArrayListUnmanaged(Row),
     owner_worker: usize,
 };
 
@@ -1134,7 +1005,6 @@ const PipeBucket = struct {
     }
 
     fn deinit(self: *PipeBucket, allocator: Allocator) void {
-        for (self.chunks.items) |*chunk| chunk.rows.deinit(allocator);
         self.chunks.deinit(allocator);
         self.table.deinit(allocator);
         self.states.deinit(allocator);
@@ -1801,12 +1671,10 @@ fn workspaceBucketsInitWorker(job: *WorkspaceBucketsInitJob) void {
 }
 
 fn resetWorkerParts(parts: *WorkerParts, worker_index: usize) void {
-    for (parts.buckets) |*bucket| bucket.rows.clearRetainingCapacity();
     parts.shared_buffers = null;
     parts.shared_bank_index = 0;
     parts.flat_scan_partitions = false;
     parts.flat_partitioned = false;
-    parts.flat_rows.clearRetainingCapacity();
     parts.flat_raw_rows.clearRetainingCapacity();
     parts.flat_bucket_ids.clearRetainingCapacity();
     parts.raw_active_rows.clearRetainingCapacity();
@@ -1855,11 +1723,9 @@ fn resetWorkerParts(parts: *WorkerParts, worker_index: usize) void {
     if (parts.route_counts.len > 0) @memset(parts.route_counts, 0);
     if (parts.route_offsets.len > 0) @memset(parts.route_offsets, 0);
     parts.route_touched.clearRetainingCapacity();
-    for (parts.recycled_rows.items) |*rows| rows.clearRetainingCapacity();
 }
 
-fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
-    for (bucket.chunks.items) |*chunk| chunk.rows.deinit(allocator);
+fn resetPipeBucket(bucket: *PipeBucket, _: Allocator) void {
     bucket.chunks.clearRetainingCapacity();
     bucket.queued_rows = 0;
     bucket.row_count = 0;
@@ -2317,42 +2183,6 @@ fn releaseRawQueueLane(queues: anytype, lane: usize) void {
     if (lane < queues.len) queues[lane].lease.store(false, .release);
 }
 
-fn acquireRecycledRows(shared: *PipeShared, owner_worker: usize) ?std.ArrayListUnmanaged(Row) {
-    if (shared.local_parts.len == 0 or owner_worker >= shared.local_parts.len) return null;
-    const owner = &shared.local_parts[owner_worker];
-    lockSpin(&owner.recycle_lock);
-    defer owner.recycle_lock.unlock();
-    const len = owner.recycled_rows.items.len;
-    if (len == 0) return null;
-    const rows = owner.recycled_rows.items[len - 1];
-    owner.recycled_rows.items.len = len - 1;
-    return rows;
-}
-
-fn prepareEmptyLocalRows(shared: *PipeShared, owner_worker: usize) !std.ArrayListUnmanaged(Row) {
-    var rows = acquireRecycledRows(shared, owner_worker) orelse std.ArrayListUnmanaged(Row).empty;
-    rows.clearRetainingCapacity();
-    if (shared.local_reserve_per_bucket > 0 and rows.capacity < shared.local_reserve_per_bucket) {
-        try rows.ensureTotalCapacity(shared.allocator, shared.local_reserve_per_bucket);
-    }
-    return rows;
-}
-
-fn recycleChunkRows(shared: *PipeShared, owner_worker: usize, rows: std.ArrayListUnmanaged(Row)) !void {
-    if (shared.local_reserve_per_bucket == 0 or shared.local_parts.len == 0 or owner_worker >= shared.local_parts.len) {
-        var disposable = rows;
-        disposable.deinit(shared.allocator);
-        return;
-    }
-    const owner = &shared.local_parts[owner_worker];
-    var reusable = rows;
-    reusable.clearRetainingCapacity();
-    lockSpin(&owner.recycle_lock);
-    errdefer owner.recycle_lock.unlock();
-    try owner.recycled_rows.append(shared.allocator, reusable);
-    owner.recycle_lock.unlock();
-}
-
 pub const TopRow = struct {
     key: u128,
     count: u64,
@@ -2593,77 +2423,6 @@ inline fn markDirtyBucket(parts: *WorkerParts, allocator: Allocator, bucket_idx:
         parts.dirty_marks[bucket_idx] = true;
         try parts.dirty_buckets.append(allocator, bucket_idx);
     }
-}
-
-inline fn appendFlatPartitionRow(parts: *WorkerParts, allocator: Allocator, bucket_idx: usize, row: Row) !void {
-    try parts.flat_rows.append(allocator, row);
-    try parts.flat_bucket_ids.append(allocator, @intCast(bucket_idx));
-}
-
-inline fn appendPartitionRow(parts: *WorkerParts, bucket_idx: usize, allocator: Allocator, row: Row) !void {
-    if (parts.flat_scan_partitions) {
-        return appendFlatPartitionRow(parts, allocator, bucket_idx, row);
-    }
-    if (parts.shared_buffers) |shared_buffers| {
-        var bucket = shared_buffers.at(parts.shared_bank_index, bucket_idx);
-        lockSpin(&bucket.lock);
-        defer bucket.lock.unlock();
-        if (bucket.rows.items.len < bucket.rows.capacity) {
-            bucket.rows.appendAssumeCapacity(row);
-        } else {
-            try bucket.rows.append(allocator, row);
-        }
-        return;
-    }
-    var bucket = &parts.buckets[bucket_idx];
-    if (bucket.rows.items.len == 0) try markDirtyBucket(parts, allocator, bucket_idx);
-    if (bucket.rows.items.len < bucket.rows.capacity) {
-        bucket.rows.appendAssumeCapacity(row);
-    } else {
-        try bucket.rows.append(allocator, row);
-    }
-}
-
-inline fn appendPartitionRows(parts: *WorkerParts, bucket_idx: usize, allocator: Allocator, rows: []const Row) !void {
-    if (rows.len == 0) return;
-    if (parts.flat_scan_partitions) {
-        try parts.flat_rows.appendSlice(allocator, rows);
-        const old_len = parts.flat_bucket_ids.items.len;
-        try parts.flat_bucket_ids.resize(allocator, old_len + rows.len);
-        @memset(parts.flat_bucket_ids.items[old_len..], @as(u16, @intCast(bucket_idx)));
-        return;
-    }
-    if (parts.shared_buffers) |shared_buffers| {
-        var bucket = shared_buffers.at(parts.shared_bank_index, bucket_idx);
-        lockSpin(&bucket.lock);
-        defer bucket.lock.unlock();
-        const old_len = bucket.rows.items.len;
-        const new_len = old_len + rows.len;
-        if (new_len <= bucket.rows.capacity) {
-            bucket.rows.items.len = new_len;
-            @memcpy(bucket.rows.items[old_len..new_len], rows);
-        } else {
-            try bucket.rows.appendSlice(allocator, rows);
-        }
-        return;
-    }
-    var bucket = &parts.buckets[bucket_idx];
-    if (bucket.rows.items.len == 0) try markDirtyBucket(parts, allocator, bucket_idx);
-    const old_len = bucket.rows.items.len;
-    const new_len = old_len + rows.len;
-    if (new_len <= bucket.rows.capacity) {
-        bucket.rows.items.len = new_len;
-        @memcpy(bucket.rows.items[old_len..new_len], rows);
-    } else {
-        try bucket.rows.appendSlice(allocator, rows);
-    }
-}
-
-inline fn appendHashedRow(parts: *WorkerParts, allocator: Allocator, bucket_count: usize, key: u128, refresh: i16, width: i16) !void {
-    const h = routeHashKey(key);
-    const b = bucketIndexHash(h, bucket_count);
-    try appendPartitionRow(parts, b, allocator, makeRow(key, refresh, width));
-    parts.row_count += 1;
 }
 
 fn normalizeRouteBlockRows(route_block_rows: usize) usize {
@@ -3242,14 +3001,6 @@ fn mergeStatesDirect(
     }
 }
 
-inline fn rowBucketIndex(row: Row, bucket_count: usize) usize {
-    const h = routeHashRowBits(row.key_lo, row.key_hi);
-    return if (std.math.isPowerOfTwo(bucket_count))
-        (@as(usize, @truncate(h)) & (bucket_count - 1))
-        else
-        bucketIndexHash(h, bucket_count);
-}
-
 inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) usize {
     const h = routeHashRowBits(rows.keyLoAll()[row_idx], rows.keyHiAll()[row_idx]);
     return if (std.math.isPowerOfTwo(bucket_count))
@@ -3514,43 +3265,6 @@ fn publishSharedStageBuilderLocked(
         &shared.stage_outstanding_rows,
         queue_lock_ticks,
     );
-}
-
-fn appendSharedStageBuilderSlice(
-    shared: *PipeShared,
-    local: *WorkerParts,
-    bucket_idx: usize,
-    rows: []const Row,
-    raw_group_chunk_rows: usize,
-    profile: bool,
-) !void {
-    if (rows.len == 0 or bucket_idx >= shared.stage_builders.len) return;
-    const builder = &shared.stage_builders[bucket_idx];
-    const lock_t0 = if (profile) nowTicks() else 0;
-    lockSpin(&builder.lock);
-    if (profile) local.raw_stage_builder_lock_ticks += nowTicks() - lock_t0;
-    defer builder.lock.unlock();
-
-    var pos: usize = 0;
-    while (pos < rows.len) {
-        if (builder.rows.capacity() == 0) {
-            builder.rows = try acquireGroupRows(shared, raw_group_chunk_rows, &local.raw_recycle_lock_ticks);
-        }
-        if (builder.rows.len() >= raw_group_chunk_rows) {
-            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
-            continue;
-        }
-
-        const free = raw_group_chunk_rows - builder.rows.len();
-        const take = @min(free, rows.len - pos);
-        try builder.rows.appendRows(shared.allocator, shared.group_rows_layout, rows[pos .. pos + take]);
-        _ = shared.stage_builder_rows.fetchAdd(@intCast(take), .release);
-        pos += take;
-
-        if (builder.rows.len() >= raw_group_chunk_rows) {
-            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
-        }
-    }
 }
 
 fn appendSharedStageBuilderRawSlice(
@@ -4331,7 +4045,6 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try parts[i].ensureWideBucketScratch(allocator, bucket_count);
             try parts[i].raw_active_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, raw_chunk_rows);
             const stage_scratch_rows = if (cfg.shared_stage_builders) raw_chunk_rows * @max(@as(usize, 1), @min(raw_batch_chunks, MAX_RAW_BATCH_CHUNKS)) else raw_chunk_rows;
-            try parts[i].flat_rows.ensureTotalCapacity(allocator, stage_scratch_rows);
             try parts[i].flat_raw_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, stage_scratch_rows);
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
