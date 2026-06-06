@@ -19,6 +19,9 @@ const ColumnStore = store.ColumnStore;
 
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
+const Scan = @import("scan.zig").Scan;
+const LateScan = @import("latescan.zig").LateScan;
+const transform = @import("../engine/engine.zig").transform;
 
 const Batch = exec.Batch;
 const Query = exec.Query;
@@ -515,6 +518,7 @@ fn compareF64(a: f64, b: f64) i8 {
 }
 
 fn emitResultStage(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !void {
+    if (getenv("THINDB_V2_FORCE_HASH_KEY") != null) return emitResultStageHashed(op, rows);
     for (rows) |row| {
         for (op.plan.layout.parts[0..op.plan.layout.part_count], 0..) |part, i| {
             try appendKeyPart(op.allocator, &op.output_cols[i], part, row.key);
@@ -524,6 +528,52 @@ fn emitResultStage(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !vo
         }
         op.row_count += 1;
     }
+}
+
+// Hashed-key emit: the group key is a hash, so the real key column values are
+// recovered by late-materializing each survivor's carried __rowloc against the
+// base table (reusing LateScan's per-(segment,row-group) single-row reader).
+// Aggregates still come straight from the grouped TopRow. Single-threaded, per
+// the scan/staging/group-only-parallel policy; survivors are bounded by LIMIT
+// for top-N queries.
+fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !void {
+    if (rows.len == 0) return;
+    const allocator = op.allocator;
+    const part_count = op.plan.layout.part_count;
+
+    var key_names: [MAX_GROUP_KEYS][]const u8 = undefined;
+    for (op.plan.layout.parts[0..part_count], 0..) |part, j| key_names[j] = part.name;
+    const names = key_names[0..part_count];
+
+    const scan_ptr = try Scan.allocWithProjectionLoc(allocator, op.table, null, names, false, null);
+    var inner = exec.makeQuery(allocator, scan_ptr);
+    var late_built = false;
+    errdefer if (!late_built) inner.deinit();
+    var late_q = try LateScan.create(allocator, inner, scan_ptr, op.table, names);
+    late_built = true;
+    defer late_q.deinit();
+    const late: *LateScan = @ptrCast(@alignCast(late_q.ptr));
+
+    const locs = try allocator.alloc(i64, rows.len);
+    defer allocator.free(locs);
+    for (rows, 0..) |row, i| locs[i] = row.rowref;
+
+    try late.materializeInto(locs, scan_ptr.memtableSnap());
+    const materialized = late.outputColumns();
+
+    const idx_buf = try allocator.alloc(u32, rows.len);
+    defer allocator.free(idx_buf);
+    for (0..rows.len) |i| idx_buf[i] = @intCast(i);
+
+    for (0..part_count) |j| {
+        try transform.appendByIndices(allocator, materialized.columns[j].view(), idx_buf, &op.output_cols[j]);
+    }
+    for (rows) |row| {
+        for (op.plan.aggregates[0..op.plan.aggregate_count], 0..) |agg_plan, i| {
+            try appendAggregateValue(allocator, &op.output_cols[part_count + i], agg_plan, row);
+        }
+    }
+    op.row_count += rows.len;
 }
 
 fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: AggregatePlan, row: HarnessCore.TopRow) !void {
