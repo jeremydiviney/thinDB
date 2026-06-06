@@ -2446,22 +2446,23 @@ fn groupChunkRowsDirect(
         };
     }
     const column_slices = column_slices_buf[0..rows.layout.columns.len];
+    const rowrefs: []const i64 = if (rows.layout.has_rowref) rows.rowrefAll()[0..n] else &.{};
     if (countSumAvgProgram(rows.layout.aggregates, rows.layout.columns.len)) |program| {
         const sum_values = column_slices[program.sum_input_index];
         const avg_values = column_slices[program.avg_input_index];
         switch (rows.layout.key_width) {
-            .u32 => try groupChunkRowsDirectKeysCountSumAvg(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, sum_values, avg_values),
-            .u64 => try groupChunkRowsDirectKeysCountSumAvg(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, sum_values, avg_values),
-            .u96 => try groupChunkRowsDirectKeysCountSumAvg(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, sum_values, avg_values),
-            .u128 => try groupChunkRowsDirectKeysCountSumAvg(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, sum_values, avg_values),
+            .u32 => try groupChunkRowsDirectKeysCountSumAvg(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, sum_values, avg_values, rowrefs),
+            .u64 => try groupChunkRowsDirectKeysCountSumAvg(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, sum_values, avg_values, rowrefs),
+            .u96 => try groupChunkRowsDirectKeysCountSumAvg(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, sum_values, avg_values, rowrefs),
+            .u128 => try groupChunkRowsDirectKeysCountSumAvg(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, sum_values, avg_values, rowrefs),
         }
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, column_slices),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, column_slices),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, column_slices),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, column_slices),
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, column_slices, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, column_slices, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, column_slices, rowrefs),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, column_slices, rowrefs),
     }
 }
 
@@ -2474,6 +2475,7 @@ fn groupChunkRowsDirectKeysCountSumAvg(
     row_count: usize,
     sum_values: []const i16,
     avg_values: []const i16,
+    rowrefs: []const i64,
 ) !void {
     var r: usize = 0;
     while (r < row_count) : (r += 1) {
@@ -2487,6 +2489,7 @@ fn groupChunkRowsDirectKeysCountSumAvg(
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         if (!probe.found) {
             const new_gid = initGroupStateCountSumAvg(states, key, sum_values[r], avg_values[r]);
+            if (rowrefs.len != 0) states.items[new_gid].rowref = rowrefs[r];
             table.commit(probe.slot, key, new_gid);
             continue;
         }
@@ -2503,6 +2506,7 @@ fn groupChunkRowsDirectKeys(
     row_count: usize,
     aggregates: []const GroupAggregateSpec,
     columns: []const []const i16,
+    rowrefs: []const i64,
 ) !void {
     const n = row_count;
     var r: usize = 0;
@@ -2517,6 +2521,7 @@ fn groupChunkRowsDirectKeys(
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         if (!probe.found) {
             const new_gid = try initGroupStateProgram(states, key, aggregates, columns, r);
+            if (rowrefs.len != 0) states.items[new_gid].rowref = rowrefs[r];
             table.commit(probe.slot, key, new_gid);
             continue;
         }

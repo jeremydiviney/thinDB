@@ -625,11 +625,17 @@ fn runHarness(
             .state_index = agg.state_index,
         };
     }
+    // Dev toggle: route an integer-key query through the hashed-key + rowref
+    // path so it can be cross-checked against the exact integer-packed result
+    // (count multiset must match) before string keys are enabled at the shape
+    // gate. Forces the full 128-bit hash lane.
+    const force_hash = getenv("THINDB_V2_FORCE_HASH_KEY") != null;
     const group_rows_layout = HarnessCore.GroupRowsLayout{
-        .key_width = harnessKeyWidth(shape.key_width),
+        .key_width = if (force_hash) .u128 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
         .columns = group_columns_buf[0..shape.aggregate_inputs.len],
         .aggregates = group_aggregates_buf[0..shape.aggregate_program.len],
+        .has_rowref = force_hash,
     };
 
     try HarnessCore.runSiloGrid(allocator, table, cpus, .{
