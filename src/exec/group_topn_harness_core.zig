@@ -943,6 +943,13 @@ const State = struct {
     rowref: i64 = 0,
 };
 
+// Per-group running MIN/MAX bytes for a string aggregate. Kept in a side array
+// parallel to a bucket's `states` (NOT in `State`, which would bloat the
+// million-group numeric hot path). `bytes` is owned by the bucket allocator
+// until emit, where survivors are re-dup'd into the result allocator.
+const StrAcc = struct { bytes: []const u8 = &.{}, present: bool = false };
+const StrAccRow = [MAX_GROUP_STR_SLOTS]StrAcc;
+
 const GroupScratch = struct {
     gids: std.ArrayListUnmanaged(u32) = .empty,
     row_idxs: std.ArrayListUnmanaged(u32) = .empty,
@@ -1090,13 +1097,24 @@ const PipeBucket = struct {
     queued_rows: u64 = 0,
     table: GroupTable,
     states: std.ArrayListUnmanaged(State) = .empty,
+    // Parallel to `states` (gid-indexed); populated only for string MIN/MAX
+    // queries. Empty for the numeric common case.
+    str_states: std.ArrayListUnmanaged(StrAccRow) = .empty,
     row_count: u64 = 0,
 
     fn init(allocator: Allocator, expected_groups: usize) !PipeBucket {
         return .{ .table = try GroupTable.init(allocator, expected_groups) };
     }
 
+    fn freeStrBytes(self: *PipeBucket, allocator: Allocator) void {
+        for (self.str_states.items) |*row| {
+            for (row) |*acc| if (acc.bytes.len > 0) allocator.free(acc.bytes);
+        }
+    }
+
     fn deinit(self: *PipeBucket, allocator: Allocator) void {
+        self.freeStrBytes(allocator);
+        self.str_states.deinit(allocator);
         self.chunks.deinit(allocator);
         self.table.deinit(allocator);
         self.states.deinit(allocator);
@@ -1686,7 +1704,7 @@ fn resetWorkerParts(parts: *WorkerParts, worker_index: usize) void {
     parts.route_touched.clearRetainingCapacity();
 }
 
-fn resetPipeBucket(bucket: *PipeBucket, _: Allocator) void {
+fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
     bucket.chunks.clearRetainingCapacity();
     bucket.queued_rows = 0;
     bucket.row_count = 0;
@@ -1694,6 +1712,8 @@ fn resetPipeBucket(bucket: *PipeBucket, _: Allocator) void {
     bucket.agg_lock = .unlocked;
     bucket.table.clearRetainingCapacity();
     bucket.states.clearRetainingCapacity();
+    bucket.freeStrBytes(allocator);
+    bucket.str_states.clearRetainingCapacity();
 }
 
 fn deinitRawQueues(shared: *PipeShared) void {
@@ -2628,6 +2648,7 @@ fn countSumAvgProgram(aggregates: []const GroupAggregateSpec, column_count: usiz
 fn groupChunkRowsDirect(
     table: *GroupTable,
     states: *std.ArrayListUnmanaged(State),
+    str_states: *std.ArrayListUnmanaged(StrAccRow),
     scratch: *GroupScratch,
     allocator: Allocator,
     rows: GroupRows,
@@ -2636,6 +2657,7 @@ fn groupChunkRowsDirect(
     if (n == 0) return;
     if (table.needsGrow(n)) try table.grow(allocator, n);
     try states.ensureUnusedCapacity(allocator, n);
+    if (rows.layout.has_str_payload) try str_states.ensureUnusedCapacity(allocator, n);
     _ = scratch;
 
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
@@ -2655,10 +2677,34 @@ fn groupChunkRowsDirect(
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+    }
+}
+
+// Fold one row's string MIN/MAX values into group `gid`'s side accumulators.
+// Bytes are owned by `allocator` (the bucket allocator); on a new extreme the
+// previous copy is freed and the new value dup'd. Called only when the layout
+// has string aggregates.
+fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), allocator: Allocator, gid: usize, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
+    const k = rows.layout.str_columns.len;
+    for (aggregates) |agg| {
+        if (!agg.is_string) continue;
+        const b = rows.str.get(k, row_idx, agg.str_input_index);
+        const acc = &str_states.items[gid][agg.str_state_index];
+        if (!acc.present) {
+            acc.bytes = try allocator.dupe(u8, b);
+            acc.present = true;
+        } else {
+            const cmp = std.mem.order(u8, b, acc.bytes);
+            const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
+            if (is_better) {
+                if (acc.bytes.len > 0) allocator.free(acc.bytes);
+                acc.bytes = try allocator.dupe(u8, b);
+            }
+        }
     }
 }
 
@@ -2699,6 +2745,8 @@ fn groupChunkRowsDirectKeys(
     comptime key_width: GroupKeyWidth,
     table: *GroupTable,
     states: *std.ArrayListUnmanaged(State),
+    str_states: *std.ArrayListUnmanaged(StrAccRow),
+    allocator: Allocator,
     keys: anytype,
     key_hi: []const u32,
     row_count: usize,
@@ -2706,6 +2754,7 @@ fn groupChunkRowsDirectKeys(
     rows: GroupRows,
     rowrefs: []const i64,
 ) !void {
+    const has_str = rows.layout.has_str_payload;
     const n = row_count;
     var r: usize = 0;
     while (r < n) : (r += 1) {
@@ -2721,10 +2770,15 @@ fn groupChunkRowsDirectKeys(
             const new_gid = try initGroupStateProgram(states, key, aggregates, rows, r);
             if (rowrefs.len != 0) states.items[new_gid].rowref = rowrefs[r];
             table.commit(probe.slot, key, new_gid);
+            if (has_str) {
+                str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
+                try foldGroupStr(str_states, allocator, new_gid, aggregates, rows, r);
+            }
             continue;
         }
         const st = &states.items[probe.gid];
         try updateGroupStateProgram(st, aggregates, rows, r);
+        if (has_str) try foldGroupStr(str_states, allocator, probe.gid, aggregates, rows, r);
     }
 }
 
@@ -3048,7 +3102,7 @@ fn drainRawDedicatedGroupLane(
         lockSpin(&bucket.agg_lock);
         if (profile) local.raw_agg_lock_ticks += nowTicks() - lock_t0;
         const g0 = if (profile) nowTicks() else 0;
-        try groupChunkRowsDirect(&bucket.table, &bucket.states, scratch, allocator, rows);
+        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, scratch, allocator, rows);
         bucket.row_count += rows.len();
         if (profile) group_ticks.* += nowTicks() - g0;
         bucket.agg_lock.unlock();
