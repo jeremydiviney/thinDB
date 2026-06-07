@@ -1172,7 +1172,14 @@ pub const Scan = struct {
     }
 
     pub fn next(self: *Scan) !?Batch {
-        if (self.fused_filter != null) return self.nextFiltered();
+        if (self.fused_filter) |ff| {
+            // Proven-empty predicate (e.g. an out-of-range equality folded to
+            // `.always = false` by the Filter's stats simplification): no row
+            // group or memtable row can match, so emit nothing instead of
+            // scanning the whole table to filter every row out.
+            if (ff == .always and !ff.always) return null;
+            return self.nextFiltered();
+        }
 
         // Scan sub-batch experiment: serve the next slice of the already-decoded
         // row group without releasing or re-decoding it.

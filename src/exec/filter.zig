@@ -256,6 +256,12 @@ pub const Filter = struct {
     }
 
     pub fn next(self: *Filter) !?Batch {
+        // Proven-empty predicate (stats simplification folded it to
+        // `.always = false`): no row can match, so emit nothing without
+        // draining the upstream scan. Covers the non-fused path; the fused
+        // path short-circuits in the Scan itself.
+        if (self.expr == .always and !self.expr.always) return null;
+
         // Fused: the Scan already applied the predicate and returns compacted
         // owned survivors. Forward verbatim.
         if (self.fused) return self.upstream.next();
