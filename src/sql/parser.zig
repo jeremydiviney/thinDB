@@ -2438,9 +2438,16 @@ pub const Parser = struct {
     fn findGroupMatch(proj: []const ProjItem, ge: ir.Expr) ?usize {
         switch (ge) {
             .col_ref => |name| {
+                // Output-name (alias) match takes precedence.
                 for (proj, 0..) |p, i| {
                     if (std.ascii.eqlIgnoreCase(p.name, name)) return i;
                 }
+                // Else bind to an aliased plain column by its underlying name,
+                // so `GROUP BY URL` matches a `URL AS Dst` projection item.
+                for (proj, 0..) |p, i| switch (p.kind) {
+                    .col => |c| if (std.ascii.eqlIgnoreCase(c, name)) return i,
+                    else => {},
+                };
                 return null;
             },
             else => {
