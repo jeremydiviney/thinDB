@@ -72,11 +72,28 @@ pub fn lowerKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnS
     }
 }
 
+// octet_length / byte length: raw byte count.
 pub fn lengthKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
         try out.data.int.append(allocator, @intCast(sv.rowBytes(i).len));
+    }
+}
+
+// length / char_length: UTF-8 character (codepoint) count, matching DuckDB and
+// the SQL standard. Counts the bytes that begin a codepoint (every byte except
+// a 0b10xxxxxx continuation byte), so a Cyrillic/multi-byte string measures
+// shorter than its byte length.
+pub fn charLengthKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        var n: usize = 0;
+        for (sv.rowBytes(i)) |b| {
+            if (b & 0xC0 != 0x80) n += 1;
+        }
+        try out.data.int.append(allocator, @intCast(n));
     }
 }
 

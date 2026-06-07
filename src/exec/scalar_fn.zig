@@ -229,11 +229,11 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "trim", .arg_types = &.{.string}, .return_type = .string, .kernel = string.trimKernel },
     .{ .name = "reverse", .arg_types = &.{.string}, .return_type = .string, .kernel = string.reverseKernel },
     // --- string → int ---
-    .{ .name = "length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.lengthKernel },
+    // length / char_length count UTF-8 characters (DuckDB/standard semantics);
+    // octet_length counts raw bytes.
+    .{ .name = "length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.charLengthKernel },
     .{ .name = "octet_length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.lengthKernel },
-    // char_length is byte-length for ASCII; UTF-8-aware counterpart
-    // is a v2 follow-up (need codepoint iteration).
-    .{ .name = "char_length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.lengthKernel },
+    .{ .name = "char_length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.charLengthKernel },
     // --- multi-arg string ---
     .{ .name = "concat", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.concat2Kernel },
     .{ .name = "concat", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.concat3Kernel },
