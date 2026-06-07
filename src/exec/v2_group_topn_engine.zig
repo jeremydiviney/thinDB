@@ -390,6 +390,16 @@ pub const AggregateSpec = struct {
     input_type: PhysicalType,
     state_index: u16,
     nullable: bool = false,
+    // String MIN/MAX: reads `Shape.string_aggregate_inputs[str_input_index]` and
+    // keeps its result in string state slot `str_state_index` (not the numeric
+    // slots). False/0 for every numeric aggregate.
+    is_string: bool = false,
+    str_input_index: u16 = 0,
+    str_state_index: u16 = 0,
+};
+
+pub const StringAggInput = struct {
+    source_name: []const u8,
 };
 
 pub const AggregateProgram = struct {
@@ -402,6 +412,9 @@ pub const Shape = struct {
     group_key_count: usize,
     group_key_inputs: []const GroupKeyInput = &.{},
     aggregate_inputs: []const AggregateInput,
+    // String agg-input columns (for string MIN/MAX), carried as variable-length
+    // values. Empty for numeric-only shapes.
+    string_aggregate_inputs: []const StringAggInput = &.{},
     aggregate_program: []const AggregateSpec = &.{},
     has_filter: bool,
     order_by_count_desc: bool,
@@ -622,6 +635,11 @@ fn runHarness(
             else => return error.UnsupportedOperatorForType,
         }, .source = try harnessColumnSource(input.source_name), .source_name = input.source_name };
     }
+    var group_str_columns_buf: [4]HarnessCore.GroupStrColumnSpec = undefined;
+    if (shape.string_aggregate_inputs.len > group_str_columns_buf.len) return error.UnsupportedOperatorForType;
+    for (shape.string_aggregate_inputs, 0..) |sin, i| {
+        group_str_columns_buf[i] = .{ .source_name = sin.source_name };
+    }
     var group_aggregates_buf: [8]HarnessCore.GroupAggregateSpec = undefined;
     if (shape.aggregate_program.len > group_aggregates_buf.len) return error.UnsupportedOperatorForType;
     for (shape.aggregate_program, 0..) |agg, i| {
@@ -636,6 +654,9 @@ fn runHarness(
             },
             .input_column_index = agg.input_column_index,
             .state_index = agg.state_index,
+            .is_string = agg.is_string,
+            .str_input_index = agg.str_input_index,
+            .str_state_index = agg.str_state_index,
         };
     }
     // shape.hashed comes from the shape gate (string / >128-bit keys). The env
@@ -647,6 +668,8 @@ fn runHarness(
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
         .columns = group_columns_buf[0..shape.aggregate_inputs.len],
         .aggregates = group_aggregates_buf[0..shape.aggregate_program.len],
+        .str_columns = group_str_columns_buf[0..shape.string_aggregate_inputs.len],
+        .has_str_payload = shape.string_aggregate_inputs.len > 0,
         .has_rowref = force_hash,
     };
 

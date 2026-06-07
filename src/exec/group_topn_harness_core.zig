@@ -2538,6 +2538,8 @@ fn initGroupStateProgram(
 fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
     st.count += 1;
     for (aggregates) |agg| {
+        // String MIN/MAX is folded separately into the side str_states array.
+        if (agg.is_string) continue;
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         const state_index: usize = agg.state_index;
         switch (agg.op) {
@@ -2643,6 +2645,9 @@ inline fn setAggregateStateValue(st: *State, state_index: usize, value: i128) !v
 fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_count: usize) !void {
     if (aggregates.len == 0) return error.UnsupportedOperatorForType;
     for (aggregates) |agg| {
+        // String MIN/MAX has no numeric slot/payload column; its input is a
+        // str_columns entry validated by the layout, not here.
+        if (agg.is_string) continue;
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         switch (agg.op) {
             .count_star => {},
@@ -3011,6 +3016,9 @@ fn drainRawDedicatedStageSharedBuilders(
 
         try local.flat_raw_rows.resize(allocator, shared.group_rows_layout, total_rows);
         try local.flat_bucket_ids.resize(allocator, total_rows);
+        const flat_has_str = shared.group_rows_layout.has_str_payload;
+        const flat_str_cols = shared.group_rows_layout.str_columns.len;
+        if (flat_has_str) local.flat_raw_rows.str.clear();
 
         const stage_t0 = if (profile) nowTicks() else 0;
         @memset(local.flat_counts[0..bucket_count], 0);
@@ -3062,6 +3070,11 @@ fn drainRawDedicatedStageSharedBuilders(
                         var c: usize = 0;
                         while (c < ncols) : (c += 1) copyElem(flat_slabs[c], src_slabs[c], col_elt[c], pos, r);
                         if (has_rowref) flat_rowref[pos] = src_rowref[r];
+                        if (flat_has_str) {
+                            var sc: usize = 0;
+                            while (sc < flat_str_cols) : (sc += 1)
+                                try local.flat_raw_rows.str.append(allocator, flat_str_cols, pos, sc, src.str.get(flat_str_cols, r, sc));
+                        }
                         local.flat_next[bucket_idx] = pos + 1;
                         row_idx += 1;
                     }

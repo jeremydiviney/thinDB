@@ -45,6 +45,8 @@ const DEFAULT_RAW_BATCH_CHUNKS: usize = 12;
 const MAX_GROUP_KEYS: usize = 8;
 const MAX_AGGS: usize = 3;
 const MAX_AGG_INPUTS: usize = 8;
+const MAX_STRING_AGG_INPUTS: usize = 2;
+const MAX_STRING_AGG_SLOTS: usize = 2;
 
 pub const Request = struct {
     group_cols: []const []const u8,
@@ -89,12 +91,24 @@ const AggregatePlan = struct {
     input_type: GroupTopNEngine.PhysicalType,
     state_index: u16,
     output_type: Type,
+    // String MIN/MAX: the result is carried in TopRow.str[str_state_index],
+    // sourced from the scan-projected string column string_aggregate_inputs[
+    // str_input_index]. Numeric state_index/input are unused when is_string.
+    is_string: bool = false,
+    str_input_index: u16 = 0,
+    str_state_index: u16 = 0,
+};
+
+const StringAggInputPlan = struct {
+    source_name: []const u8,
 };
 
 const ShapePlan = struct {
     layout: KeyLayout,
     aggregate_inputs: [MAX_AGG_INPUTS]AggregateInputPlan,
     aggregate_input_count: usize,
+    string_aggregate_inputs: [MAX_STRING_AGG_INPUTS]StringAggInputPlan = undefined,
+    string_aggregate_input_count: usize = 0,
     aggregates: [MAX_AGGS]AggregatePlan,
     aggregate_count: usize,
     // The key is a hash (string keys, or integer combos wider than 128 bits);
@@ -137,7 +151,12 @@ const TopRows = struct {
 
     fn deinit(self: *TopRows) void {
         const allocator = self.allocator;
-        if (self.items.len > 0) self.allocator.free(self.items);
+        // String MIN/MAX results are re-dup'd into this allocator at emit; free
+        // them here. Numeric rows carry only empty slices (free is a no-op).
+        for (self.items) |row| {
+            for (row.str) |s| if (s.len > 0) allocator.free(s);
+        }
+        if (self.items.len > 0) allocator.free(self.items);
         self.* = .{ .allocator = allocator };
     }
 };
@@ -379,6 +398,11 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .physical_type = input.physical_type,
         };
     }
+    var string_aggregate_inputs: [MAX_STRING_AGG_INPUTS]GroupTopNEngine.StringAggInput = undefined;
+    i = 0;
+    while (i < ctx.plan.string_aggregate_input_count) : (i += 1) {
+        string_aggregate_inputs[i] = .{ .source_name = ctx.plan.string_aggregate_inputs[i].source_name };
+    }
     var aggregate_program: [MAX_AGGS]GroupTopNEngine.AggregateSpec = undefined;
     i = 0;
     while (i < ctx.plan.aggregate_count) : (i += 1) {
@@ -395,6 +419,9 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .input_column_index = agg_plan.input_column_index,
             .input_type = agg_plan.input_type,
             .state_index = agg_plan.state_index,
+            .is_string = agg_plan.is_string,
+            .str_input_index = agg_plan.str_input_index,
+            .str_state_index = agg_plan.str_state_index,
         };
     }
     var group_key_inputs: [MAX_GROUP_KEYS]GroupTopNEngine.GroupKeyInput = undefined;
@@ -422,6 +449,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .group_key_count = ctx.plan.layout.part_count,
             .group_key_inputs = group_key_inputs[0..ctx.plan.layout.part_count],
             .aggregate_inputs = aggregate_inputs[0..ctx.plan.aggregate_input_count],
+            .string_aggregate_inputs = string_aggregate_inputs[0..ctx.plan.string_aggregate_input_count],
             .aggregate_program = aggregate_program[0..ctx.plan.aggregate_count],
             .has_filter = ctx.request.where_filter != null,
             .order_by_count_desc = true,
@@ -651,7 +679,19 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRo
     op.row_count += rows.len;
 }
 
+fn appendStringAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type, bytes: []const u8) !void {
+    switch (out_type) {
+        .varchar => try col.data.varchar.appendValue(allocator, bytes),
+        .string => try col.data.string.appendValue(allocator, bytes),
+        .char => try col.data.char.appendValue(allocator, bytes),
+        else => return error.TypeMismatch,
+    }
+}
+
 fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: AggregatePlan, row: HarnessCore.TopRow) !void {
+    if (agg_plan.is_string) {
+        return appendStringAggregate(allocator, col, agg_plan.output_type, row.str[agg_plan.str_state_index]);
+    }
     const float_input = isFloatPhysical(agg_plan.input_type);
     switch (agg_plan.func) {
         .count => try col.data.bigint.append(allocator, @intCast(row.count)),
@@ -716,8 +756,11 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
 
     var aggregate_inputs: [MAX_AGG_INPUTS]AggregateInputPlan = undefined;
     var aggregate_input_count: usize = 0;
+    var string_aggregate_inputs: [MAX_STRING_AGG_INPUTS]StringAggInputPlan = undefined;
+    var string_aggregate_input_count: usize = 0;
     var aggregates: [MAX_AGGS]AggregatePlan = undefined;
     var next_numeric_state_index: u16 = 1;
+    var next_string_state_index: u16 = 0;
     for (request.aggs, 0..) |agg, agg_i| {
         if (agg_i >= MAX_AGGS) return traceDecline(request, "aggregate count");
         switch (agg.func) {
@@ -736,10 +779,27 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 };
             },
             .sum, .avg, .min, .max => {
-                if (next_numeric_state_index >= 4) return traceDecline(request, "aggregate state count");
                 const col_name = agg.col orelse return traceDecline(request, "aggregate column");
-                const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
                 const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "aggregate type");
+                if ((agg.func == .min or agg.func == .max) and isStringKeyType(input_type)) {
+                    if (next_string_state_index >= MAX_STRING_AGG_SLOTS) return traceDecline(request, "string aggregate slot count");
+                    const str_input_idx = addStringAggInput(&string_aggregate_inputs, &string_aggregate_input_count, col_name) orelse return traceDecline(request, "string aggregate input");
+                    aggregates[agg_i] = .{
+                        .name = agg.as,
+                        .func = agg.func,
+                        .input_column_index = null,
+                        .input_type = .i64,
+                        .state_index = 0,
+                        .output_type = input_type,
+                        .is_string = true,
+                        .str_input_index = str_input_idx,
+                        .str_state_index = next_string_state_index,
+                    };
+                    next_string_state_index += 1;
+                    continue;
+                }
+                if (next_numeric_state_index >= 4) return traceDecline(request, "aggregate state count");
+                const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
                 const output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null;
                 if (agg.func == .avg and output_type != .double) return traceDecline(request, "avg output type");
                 aggregates[agg_i] = .{
@@ -759,6 +819,13 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
         if (!outputColumnExists(parts[0..request.group_cols.len], aggregates[0..request.aggs.len], spec.col)) {
             return traceDecline(request, "order key");
         }
+        // Sorting on a string MIN/MAX result isn't wired through the final
+        // top-N comparator yet; such queries order by COUNT in practice.
+        for (aggregates[0..request.aggs.len]) |agg_plan| {
+            if (agg_plan.is_string and types.columnNameEql(agg_plan.name, spec.col)) {
+                return traceDecline(request, "order by string aggregate");
+            }
+        }
     }
     if (request.having_filter) |hexpr| {
         if (!havingExprSupported(parts[0..request.group_cols.len], aggregates[0..request.aggs.len], hexpr)) {
@@ -770,6 +837,8 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
         .layout = .{ .parts = parts, .part_count = request.group_cols.len, .total_bits = offset },
         .aggregate_inputs = aggregate_inputs,
         .aggregate_input_count = aggregate_input_count,
+        .string_aggregate_inputs = string_aggregate_inputs,
+        .string_aggregate_input_count = string_aggregate_input_count,
         .aggregates = aggregates,
         .aggregate_count = request.aggs.len,
         .hashed = hashed,
@@ -925,6 +994,22 @@ fn addAggregateInput(
         .source_type = typ,
         .physical_type = physical_type,
     };
+    input_count.* = idx + 1;
+    return @intCast(idx);
+}
+
+fn addStringAggInput(
+    inputs: *[MAX_STRING_AGG_INPUTS]StringAggInputPlan,
+    input_count: *usize,
+    name: []const u8,
+) ?u16 {
+    var i: usize = 0;
+    while (i < input_count.*) : (i += 1) {
+        if (types.columnNameEql(inputs[i].source_name, name)) return @intCast(i);
+    }
+    if (input_count.* >= MAX_STRING_AGG_INPUTS) return null;
+    const idx = input_count.*;
+    inputs[idx] = .{ .source_name = name };
     input_count.* = idx + 1;
     return @intCast(idx);
 }
