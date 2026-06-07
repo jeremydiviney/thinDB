@@ -45,6 +45,7 @@ const IntTable32 = group_table.IntKeyTable(32);
 const IntTable96 = group_table.IntKeyTable(96);
 const IntTable128 = group_table.IntKeyTable(128);
 const DistinctU64Set = group_table.DistinctU64Set;
+const DistinctU32Set = group_table.DistinctU32Set;
 const CountSlotTable = group_table.CountSlotTable;
 /// FOR-narrow inline-state group tables for the single-int-key + single
 /// inline aggregate fast path. The state is always `i64` (SUM over ≤32-bit
@@ -235,8 +236,12 @@ const AccState = union(enum) {
     /// open-addressing set probed via a software-prefetch pipeline. The slot is
     /// 8 bytes (no gid) and the global insert is pure-latency-bound (no group
     /// probe to overlap it), so prefetch + the narrow slot win big over the
-    /// generic `AutoHashMap`. Selected by `initialState` for ≤64-bit int inputs.
+    /// generic `AutoHashMap`. Selected by `initialState` for 33–64-bit int inputs.
     distinct_int64: group_table.DistinctU64Set,
+    /// Exact distinct count over an integer-family column ≤32 bits: like
+    /// `distinct_int64` but a 4-byte slot, halving the set's footprint and the
+    /// bytes touched per probe. Selected by `initialState` for ≤32-bit inputs.
+    distinct_int32: group_table.DistinctU32Set,
     /// Exact percentile: keep every observed value (as f64), sort + interpolate at finalize.
     percentile_values: std.ArrayListUnmanaged(f64),
     /// group_concat buffer, lazily boxed (the `ConcatAcc` is 32 bytes — too
@@ -346,13 +351,19 @@ const ConcatAcc = struct {
 /// (gid, value) pairs map 1:1 to distinct keys (an exact per-group count). A
 /// >64-bit value (largeint/decimal128/uuid) can't combine (gid + 128 overflows
 /// 128) and stays on the per-group set.
+/// Combined (gid, value) membership set for grouped COUNT(DISTINCT int). Two
+/// tiers by packed-key width: `narrow` (value ≤32 bits ⇒ `gid<<vbits | value`
+/// fits a u64, since gid is a u32) uses a key-only 8-byte-slot `DistinctU64Set`;
+/// `wide` (value 33–64 bits ⇒ key ≤96 bits) reuses `IntTable96` (16-byte slot)
+/// as a pure set with its `gid` slot field unused. The narrow tier halves the
+/// bytes moved per probe on this memory-bound insert.
+const CombinedSet = union(enum) {
+    narrow: DistinctU64Set,
+    wide: IntTable96,
+};
+
 const CombinedDistinct = struct {
-    /// Combined (gid, value) membership set. `IntTable96` is reused as a pure
-    /// set: the stored `gid` slot field is unused (`commit(slot, key, 0)`),
-    /// membership is the probe's `found` flag. The 96-bit tier's 16-byte slot
-    /// (vs the 128-bit tier's 32-byte) halves the bytes moved per probe on this
-    /// memory-bound insert.
-    table: IntTable96,
+    set: CombinedSet,
     /// Per-GROUP-gid distinct count, indexed by the aggregate's group gid.
     /// `initGroupCells` appends a 0 for every new group.
     counts: std.ArrayListUnmanaged(u64) = .empty,
@@ -705,7 +716,12 @@ pub const Aggregate = struct {
                     .unknown => {},
                 };
                 set_cap = @min(set_cap, PRESIZE_CAP);
-                if (set_cap > 0) s.* = .{ .distinct_int64 = DistinctU64Set.init(aa, set_cap) catch DistinctU64Set.empty };
+                if (set_cap > 0) {
+                    s.* = if (vb <= 32)
+                        .{ .distinct_int32 = DistinctU32Set.init(aa, set_cap) catch DistinctU32Set.empty }
+                    else
+                        .{ .distinct_int64 = DistinctU64Set.init(aa, set_cap) catch DistinctU64Set.empty };
+                }
             }
         }
 
@@ -851,11 +867,18 @@ pub const Aggregate = struct {
                     }
                 }
                 const presize = @min(bound, ADAPTIVE_INITIAL);
-                slot.* = .{
-                    .table = IntTable96.init(aa, presize) catch try IntTable96.init(aa, 0),
-                    .vbits = vbits,
-                };
-                if (bound > presize) slot.*.?.table.grow_target = group_table.capacityFor(bound);
+                if (vbits <= 32) {
+                    // value ≤32 bits + u32 gid ⇒ combined key fits a u64: an
+                    // 8-byte-slot key-only set (no `grow_target`; it doubles).
+                    slot.* = .{
+                        .set = .{ .narrow = DistinctU64Set.init(aa, presize) catch DistinctU64Set.empty },
+                        .vbits = vbits,
+                    };
+                } else {
+                    var table = IntTable96.init(aa, presize) catch try IntTable96.init(aa, 0);
+                    if (bound > presize) table.grow_target = group_table.capacityFor(bound);
+                    slot.* = .{ .set = .{ .wide = table }, .vbits = vbits };
+                }
                 if (cap > 0) slot.*.?.counts.ensureTotalCapacity(aa, cap) catch {};
             }
         }
@@ -1374,40 +1397,38 @@ pub const Aggregate = struct {
         }
     }
 
-    /// Batched COUNT(DISTINCT int) for aggregate `ai` (gate-confirmed: int
-    /// value column ≤64 bits, under a GROUP BY). One probe per valid row into a
-    /// single combined open-addressing set keyed on `pack(gid, value)`, plus a
-    /// flat per-gid counter bumped on each first sighting — no per-row dispatch,
-    /// no per-group scattered hash map. Mirrors the prefetch-pipelined shape of
-    /// `accumulateBatchIntT`: the table is grown for the whole batch up front so
-    /// slot addresses stay stable across the look-ahead window, then phase (a)
-    /// packs key+hash for every valid row and phase (b) probes with a look-ahead
-    /// `@prefetch`. NULL rows are skipped (SQL excludes them from DISTINCT).
-    /// The combined key is bijective (gid < 2^23, vbits ≤ 64), so distinct
-    /// (gid, value) pairs map 1:1 to distinct keys ⇒ exact per-group count —
-    /// byte-identical to the per-group `distinct_int` path it replaces.
+    /// Batched COUNT(DISTINCT int) for aggregate `ai` (gate-confirmed: int value
+    /// column ≤64 bits, under a GROUP BY). One probe per valid row into a single
+    /// combined set keyed on `pack(gid, value)`, plus a flat per-gid counter
+    /// bumped on each first sighting — no per-row dispatch, no per-group
+    /// scattered hash map. Two tiers by packed-key width (see `CombinedSet`); the
+    /// per-group count is exact for both because the pack is bijective.
     fn accumulateCombinedDistinct(self: *Aggregate, ai: usize, view: ColumnView, gids: []const u32) !void {
         const c = &self.cd[ai].?;
+        switch (c.set) {
+            .wide => try self.combinedDistinctWide(c, view, gids),
+            .narrow => try self.combinedDistinctNarrow(c, view, gids),
+        }
+    }
+
+    /// Wide tier (value 33–64 bits): the `(gid, value)` pack is a ≤96-bit key in
+    /// an `IntTable96` set. The table is grown for the whole batch up front so
+    /// slot addresses stay stable across the look-ahead, then phase (a) packs
+    /// key+hash per valid row and phase (b) probes with a look-ahead `@prefetch`,
+    /// bumping the owning group on each first sighting. NULLs are excluded.
+    fn combinedDistinctWide(self: *Aggregate, c: *CombinedDistinct, view: ColumnView, gids: []const u32) !void {
+        const table = &c.set.wide;
         const aa = self.arena.allocator();
         const n: usize = gids.len;
         const vbits: u7 = @intCast(c.vbits);
         const has_nulls = view.nulls != null;
 
-        // Grow once up front for the worst case (every row a new pair), keeping
-        // slot addresses stable for the prefetch look-ahead below.
-        if (c.table.needsGrow(n)) try c.table.grow(aa, n);
+        if (table.needsGrow(n)) try table.grow(aa, n);
 
-        // Phase (a): pack each valid row's combined key + its hash. NULL rows
-        // contribute nothing and are dropped here, so phase (b) needs no
-        // validity branch and the look-ahead indexes line up with the keys.
         self.pf_cd_keys.clearRetainingCapacity();
         self.pf_cd_hashes.clearRetainingCapacity();
         try self.pf_cd_keys.ensureTotalCapacity(aa, n);
         try self.pf_cd_hashes.ensureTotalCapacity(aa, n);
-        // Hoist the column-type dispatch out of the per-row loop: bind the typed
-        // value slice once (inline switch) so the pack is a single monomorphized
-        // read+pack+hash, no per-row `distinctIntKey` union branch over 5M rows.
-        // Only int-family ≤64-bit columns reach here (the CombinedDistinct gate).
         switch (view.data) {
             inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |sl| {
                 const Child = @typeInfo(@TypeOf(sl)).pointer.child;
@@ -1426,22 +1447,62 @@ pub const Aggregate = struct {
         const hashes = self.pf_cd_hashes.items;
         const m = keys.len;
 
-        // Phase (b): probe with look-ahead prefetch; a first sighting commits
-        // the pair and bumps the owning group's counter. The owning gid is the
-        // key's high bits (`key >> vbits`) — no parallel gid array needed.
         var i: usize = 0;
         while (i < m) : (i += 1) {
             const pf = i + PREFETCH_DIST;
             if (pf < m) {
-                const b = c.table.bucketOf(hashes[pf]);
-                @prefetch(c.table.slotAddr(b), .{ .rw = .write, .locality = 1 });
+                const b = table.bucketOf(hashes[pf]);
+                @prefetch(table.slotAddr(b), .{ .rw = .write, .locality = 1 });
             }
             const key = keys[i];
-            const probe = c.table.getOrPut(hashes[i], key);
+            const probe = table.getOrPut(hashes[i], key);
             if (!probe.found) {
-                c.table.commit(probe.slot, key, 0);
+                table.commit(probe.slot, key, 0);
                 c.counts.items[@intCast(key >> vbits)] += 1;
             }
+        }
+    }
+
+    /// Narrow tier (value ≤32 bits): the `gid<<vbits | value` key fits a u64
+    /// (gid is a u32, vbits ≤ 32), so a key-only 8-byte-slot `DistinctU64Set`
+    /// replaces the 16-byte `IntTable96` — half the bytes touched per probe on
+    /// this memory-bound insert. Phase (a) packs the u64 keys into the shared
+    /// `pf_cd_keys` scratch; phase (b) reserves for the batch, then probes with a
+    /// look-ahead `@prefetch`, bumping the owning group on each first sighting.
+    fn combinedDistinctNarrow(self: *Aggregate, c: *CombinedDistinct, view: ColumnView, gids: []const u32) !void {
+        const set = &c.set.narrow;
+        const aa = self.arena.allocator();
+        const n: usize = gids.len;
+        const vbits: u6 = @intCast(c.vbits);
+        const has_nulls = view.nulls != null;
+
+        self.pf_cd_keys.clearRetainingCapacity();
+        try self.pf_cd_keys.ensureTotalCapacity(aa, n);
+        switch (view.data) {
+            inline .boolean, .tinyint, .smallint, .int, .date => |sl| {
+                const Child = @typeInfo(@TypeOf(sl)).pointer.child;
+                const bits: u8 = @bitSizeOf(Child);
+                for (0..n) |r| {
+                    if (has_nulls and !view.isValid(r)) continue;
+                    const value_bits: u64 = @intCast(fieldBits(Child, sl[r], bits));
+                    self.pf_cd_keys.appendAssumeCapacity((@as(u64, gids[r]) << vbits) | value_bits);
+                }
+            },
+            else => unreachable,
+        }
+        const keys = self.pf_cd_keys.items;
+        const m = keys.len;
+
+        // Reserve for the whole batch up front so no grow fires across the
+        // look-ahead window (slot addresses must stay stable for the prefetch).
+        try set.ensureFor(aa, m);
+
+        var i: usize = 0;
+        while (i < m) : (i += 1) {
+            const pf = i + PREFETCH_DIST;
+            if (pf < m) set.prefetch(@as(u64, @truncate(keys[pf])));
+            const key: u64 = @truncate(keys[i]);
+            if (set.insertNew(key)) c.counts.items[@intCast(key >> vbits)] += 1;
         }
     }
 
@@ -2282,6 +2343,7 @@ fn aggOrderValue(s: AccState) OrderVal {
         .distinct => |d| .{ .int = @intCast(d.set.count() + @as(u32, @intFromBool(d.seen_empty))) },
         .distinct_int => |set| .{ .int = @intCast(set.count()) },
         .distinct_int64 => |set| .{ .int = @intCast(set.count()) },
+        .distinct_int32 => |set| .{ .int = @intCast(set.count()) },
         else => unreachable,
     };
 }
@@ -2494,10 +2556,15 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
             .{ .max_int = null },
         .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
-        .count_distinct => if (in != null and intKeyBits(in.?) != null)
-            (if (intKeyBits(in.?).? <= 64) .{ .distinct_int64 = .empty } else .{ .distinct_int = .empty })
-        else
-            .{ .distinct = .{} },
+        .count_distinct => blk: {
+            if (in) |t| if (intKeyBits(t)) |vb| break :blk if (vb <= 32)
+                .{ .distinct_int32 = .empty }
+            else if (vb <= 64)
+                .{ .distinct_int64 = .empty }
+            else
+                .{ .distinct_int = .empty };
+            break :blk .{ .distinct = .{} };
+        },
         .percentile => .{ .percentile_values = .empty },
         .group_concat => .{ .concat = null },
         .udf => unreachable,
@@ -3029,6 +3096,16 @@ fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32,
                 else => unreachable,
             }
         },
+        .distinct_int32 => |*set| {
+            try set.ensureFor(aa, row_end - row_start);
+            switch (view.data) {
+                .boolean => |sl| insertDistinctRange(set, view, u8, sl, row_start, row_end),
+                .tinyint => |sl| insertDistinctRange(set, view, i8, sl, row_start, row_end),
+                .smallint => |sl| insertDistinctRange(set, view, i16, sl, row_start, row_end),
+                .int, .date => |sl| insertDistinctRange(set, view, i32, sl, row_start, row_end),
+                else => unreachable,
+            }
+        },
         .distinct_int => |*set| {
             var r: u32 = row_start;
             while (r < row_end) : (r += 1) {
@@ -3075,7 +3152,7 @@ fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32,
 /// NULLs are skipped (excluded from DISTINCT). `ensureFor` must have reserved
 /// the range up front so no grow invalidates the look-ahead's slot addresses.
 fn insertDistinctRange(
-    set: *DistinctU64Set,
+    set: anytype,
     view: ColumnView,
     comptime T: type,
     sl: []const T,
@@ -3083,19 +3160,20 @@ fn insertDistinctRange(
     row_end: u32,
 ) void {
     const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const KeyT = std.meta.Elem(@TypeOf(set.slots));
     const D: u32 = 12;
     if (view.nulls == null) {
         var r: u32 = row_start;
         while (r < row_end) : (r += 1) {
-            if (r + D < row_end) set.prefetch(@as(u64, @as(U, @bitCast(sl[r + D]))));
-            set.insert(@as(u64, @as(U, @bitCast(sl[r]))));
+            if (r + D < row_end) set.prefetch(@as(KeyT, @as(U, @bitCast(sl[r + D]))));
+            set.insert(@as(KeyT, @as(U, @bitCast(sl[r]))));
         }
     } else {
         var r: u32 = row_start;
         while (r < row_end) : (r += 1) {
-            if (r + D < row_end) set.prefetch(@as(u64, @as(U, @bitCast(sl[r + D]))));
+            if (r + D < row_end) set.prefetch(@as(KeyT, @as(U, @bitCast(sl[r + D]))));
             if (!view.isValid(r)) continue;
-            set.insert(@as(u64, @as(U, @bitCast(sl[r]))));
+            set.insert(@as(KeyT, @as(U, @bitCast(sl[r]))));
         }
     }
 }
@@ -3341,6 +3419,7 @@ fn appendAccToColumn(
                 .distinct => |d| d.set.count() + @as(u32, @intFromBool(d.seen_empty)),
                 .distinct_int => |set| set.count(),
                 .distinct_int64 => |set| set.count(),
+                .distinct_int32 => |set| set.count(),
                 else => unreachable,
             };
             try col.data.bigint.append(allocator, @intCast(n));

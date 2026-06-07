@@ -961,7 +961,114 @@ pub const DistinctU64Set = struct {
         }
     }
 
+    /// Like `insert`, but returns whether `key` was newly added (false ⟺ it was
+    /// already present). The combined grouped COUNT(DISTINCT) kernel bumps the
+    /// owning group's counter only on a first sighting, so it needs the verdict.
+    pub inline fn insertNew(self: *DistinctU64Set, key: u64) bool {
+        if (key == SENTINEL) {
+            const was_new = !self.has_sentinel;
+            self.has_sentinel = true;
+            return was_new;
+        }
+        const mask = self.slots.len - 1;
+        var b = @as(usize, @truncate(mix64(key))) & mask;
+        while (true) : (b = (b + 1) & mask) {
+            const s = self.slots[b];
+            if (s == SENTINEL) {
+                self.slots[b] = key;
+                self.len += 1;
+                return true;
+            }
+            if (s == key) return false;
+        }
+    }
+
     pub fn count(self: DistinctU64Set) usize {
+        return @as(usize, self.len) + @intFromBool(self.has_sentinel);
+    }
+};
+
+/// Like `DistinctU64Set` but with 4-byte slots, for COUNT(DISTINCT) over an
+/// integer-family column whose values fit in 32 bits. Halves the per-entry
+/// footprint and the bytes moved per (memory-bound) probe versus the 64-bit
+/// set. `SENTINEL` (all-ones u32) marks an empty slot; an actual all-ones value
+/// is counted via `has_sentinel`, exactly as in the 64-bit set.
+pub const DistinctU32Set = struct {
+    slots: []u32,
+    len: u32,
+    has_sentinel: bool,
+
+    pub const SENTINEL: u32 = std.math.maxInt(u32);
+
+    pub const empty: DistinctU32Set = .{ .slots = &.{}, .len = 0, .has_sentinel = false };
+
+    pub fn init(allocator: Allocator, expected: usize) !DistinctU32Set {
+        const cap = capacityFor(expected);
+        const slots = try allocator.alloc(u32, cap);
+        @memset(slots, SENTINEL);
+        return .{ .slots = slots, .len = 0, .has_sentinel = false };
+    }
+
+    pub fn deinit(self: *DistinctU32Set, allocator: Allocator) void {
+        if (self.slots.len != 0) allocator.free(self.slots);
+        self.* = undefined;
+    }
+
+    /// Reserve room for `additional` more keys so no grow fires mid-batch (slot
+    /// addresses must stay stable across the caller's prefetch look-ahead).
+    pub fn ensureFor(self: *DistinctU32Set, allocator: Allocator, additional: usize) !void {
+        if (self.slots.len == 0) {
+            const cap = capacityFor(additional);
+            const slots = try allocator.alloc(u32, cap);
+            @memset(slots, SENTINEL);
+            self.slots = slots;
+            return;
+        }
+        if ((@as(usize, self.len) + additional) * 4 >= self.slots.len * 3) try self.grow(allocator, additional);
+    }
+
+    fn grow(self: *DistinctU32Set, allocator: Allocator, additional: usize) !void {
+        var new_cap = self.slots.len;
+        while ((@as(usize, self.len) + additional) * 4 >= new_cap * 3) new_cap *= 2;
+        const slots = try allocator.alloc(u32, new_cap);
+        @memset(slots, SENTINEL);
+        const new_mask = new_cap - 1;
+        for (self.slots) |k| {
+            if (k == SENTINEL) continue;
+            var i = @as(usize, @truncate(mix64(@as(u64, k)))) & new_mask;
+            while (slots[i] != SENTINEL) : (i = (i + 1) & new_mask) {}
+            slots[i] = k;
+        }
+        allocator.free(self.slots);
+        self.slots = slots;
+    }
+
+    /// `@prefetch` the slot a future `insert(key)` will probe first.
+    pub inline fn prefetch(self: *DistinctU32Set, key: u32) void {
+        @prefetch(&self.slots[@as(usize, @truncate(mix64(@as(u64, key)))) & (self.slots.len - 1)], .{ .rw = .write, .locality = 1 });
+    }
+
+    /// Insert `key`; no-op if already present. The caller must have reserved
+    /// space via `ensureFor` for the whole batch so no grow fires here.
+    pub inline fn insert(self: *DistinctU32Set, key: u32) void {
+        if (key == SENTINEL) {
+            self.has_sentinel = true;
+            return;
+        }
+        const mask = self.slots.len - 1;
+        var b = @as(usize, @truncate(mix64(@as(u64, key)))) & mask;
+        while (true) : (b = (b + 1) & mask) {
+            const s = self.slots[b];
+            if (s == SENTINEL) {
+                self.slots[b] = key;
+                self.len += 1;
+                return;
+            }
+            if (s == key) return;
+        }
+    }
+
+    pub fn count(self: DistinctU32Set) usize {
         return @as(usize, self.len) + @intFromBool(self.has_sentinel);
     }
 };
