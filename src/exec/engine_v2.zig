@@ -398,6 +398,28 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
 // `scan -> filter -> compute -> groupByTopK -> ...` floor, reusing the shared
 // operators verbatim. `needed` is the projected base-column set (borrowed; only
 // read during scan construction).
+// Push the fusable subset of derived columns DOWN into the ParallelScan workers
+// so row-local scalar fns (e.g. REGEXP_REPLACE, length()) compute in parallel —
+// instead of stacking a serial Compute that the single-threaded aggregate drain
+// evaluates one row at a time (the Q29 40s trap). Any non-fusable remainder
+// (CASE, subqueries) is layered as a serial Compute referencing the fused cols.
+// Mirrors net/local.zig's fusion split.
+fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived: []const ir.Derived) !exec.Query {
+    var result = q;
+    const scan_cols = result.outputSchema();
+    var fusable: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    defer fusable.deinit(allocator);
+    var serial: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    defer serial.deinit(allocator);
+    for (derived) |d| {
+        if (exec.derivedFusable(d, scan_cols)) try fusable.append(allocator, d) else try serial.append(allocator, d);
+    }
+    if (fusable.items.len == 0) return result.compute(derived);
+    if (!try result.tryFuseCompute(fusable.items)) return result.compute(derived);
+    if (serial.items.len == 0) return result;
+    return result.compute(serial.items);
+}
+
 fn buildGroupAggregateGeneric(
     input: CompileInput,
     table: *api.Table,
@@ -414,7 +436,7 @@ fn buildGroupAggregateGeneric(
     errdefer q.deinit();
 
     if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try q.compute(plan.derived);
+    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived);
     q = try q.groupByTopK(plan.group_by.group_cols, plan.group_by.aggs, null, null);
     if (plan.post_agg_derived.len > 0) q = try q.compute(plan.post_agg_derived);
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
@@ -531,7 +553,7 @@ fn buildGlobalAggregateGeneric(
     errdefer q.deinit();
 
     if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try q.compute(plan.derived);
+    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived);
     q = try q.aggregate(plan.group_by.aggs);
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
     return q;
