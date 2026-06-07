@@ -28,6 +28,7 @@ const thindb = struct {
 };
 
 const Allocator = std.mem.Allocator;
+const StringView = storage_mod.StringView;
 const Scan = thindb.exec.Scan;
 const GroupTable = thindb.exec.group_table.IntKeyMemsetTable(96);
 const TOP_K: usize = 10;
@@ -722,6 +723,19 @@ const GroupRows = struct {
             @memcpy(self.columnByteSlab(col)[old_len * sz .. new_len * sz], rows.columnByteSlab(col)[start * sz .. (start + count) * sz]);
         }
         if (self.layout.has_rowref) @memcpy(self.rowrefAll()[old_len..new_len], rows.rowrefAll()[start .. start + count]);
+        // Variable-length string payload: copy each scattered row's string
+        // values from the source RawRows store into this bucket's store. Owned
+        // bytes, so the bucket survives the source chunk's recycle.
+        if (self.layout.has_str_payload) {
+            const k = self.layout.str_columns.len;
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                var c: usize = 0;
+                while (c < k) : (c += 1) {
+                    try self.str.append(allocator, k, old_len + i, c, rows.str.get(k, start + i, c));
+                }
+            }
+        }
     }
 
     inline fn keyAt(self: GroupRows, idx: usize) u128 {
@@ -2173,9 +2187,27 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         payload_elt[i] = groupColumnSize(column.physical_type);
     }
 
-    // Key-shape fast variants (no hashed key). Payload is type-generic.
+    // String agg-input columns (string MIN/MAX). Bound once; carried into the
+    // active chunk's StrStore per row. Empty for numeric-only queries, so every
+    // append path's `if (str_views.len != 0)` guard is a free no-op there.
+    var str_views_buf: [MAX_GROUP_STR_COLUMNS]StringView = undefined;
+    var str_views: []const StringView = &.{};
+    if (layout.has_str_payload) {
+        if (layout.str_columns.len > MAX_GROUP_STR_COLUMNS) return error.UnsupportedOperatorForType;
+        for (layout.str_columns, 0..) |sc, i| {
+            const view = batch.columnView(sc.source_name) orelse return error.ColumnNotFound;
+            str_views_buf[i] = switch (view.data) {
+                .varchar, .string, .char => |sv| sv,
+                else => return error.TypeMismatch,
+            };
+        }
+        str_views = str_views_buf[0..layout.str_columns.len];
+    }
+
+    // Key-shape fast variants (no hashed key). Payload is type-generic; the
+    // string lane (if any) rides along via appendStrPayload inside each kernel.
     if (!layout.has_rowref) {
-        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], raw_chunk_rows, profile)) return;
+        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], str_views, raw_chunk_rows, profile)) return;
     }
 
     const rowref_col: []const i64 = if (layout.has_rowref) blk: {
@@ -2200,6 +2232,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             active.setKey(idx, key);
             if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
             appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
+            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -2226,6 +2259,7 @@ fn appendBatchRawChunksGenericFast(
     key_views: []const thindb.storage.ColumnView,
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
+    str_views: []const StringView,
     raw_chunk_rows: usize,
     profile: bool,
 ) !bool {
@@ -2236,7 +2270,7 @@ fn appendBatchRawChunksGenericFast(
                 .bigint => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_bytes, payload_elt, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_bytes, payload_elt, str_views, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -2256,7 +2290,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, str_views, raw_chunk_rows, profile);
             return true;
         }
 
@@ -2274,7 +2308,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, str_views, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -2289,6 +2323,7 @@ fn appendBatchRawChunksGenericKey1I64(
     key0: []const i64,
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
+    str_views: []const StringView,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -2302,6 +2337,7 @@ fn appendBatchRawChunksGenericKey1I64(
             const idx = active.len();
             keys[idx] = @as(u64, @bitCast(key0[r]));
             appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
+            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -2320,6 +2356,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
     key1: []const i32,
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
+    str_views: []const StringView,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -2334,6 +2371,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
             keys[idx] = @as(u16, @bitCast(key0[r])) |
                 (@as(u64, @as(u32, @bitCast(key1[r]))) << 16);
             appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
+            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -2352,6 +2390,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
     key1: []const i32,
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
+    str_views: []const StringView,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -2367,6 +2406,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
             key_lo[idx] = @as(u64, @bitCast(key0[r]));
             key_hi[idx] = @as(u32, @bitCast(key1[r]));
             appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
+            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -2395,6 +2435,17 @@ inline fn appendGenericPayload(active: *RawRows, payload_bytes: []const []const 
     var col: usize = 0;
     while (col < payload_bytes.len) : (col += 1) {
         copyElem(active.columnByteSlab(col), payload_bytes[col], payload_elt[col], dst, src);
+    }
+}
+
+// Append the string agg-input values for source row `src` into the active
+// chunk's variable-length StrStore at staged index `dst`. Key-independent, so
+// every append path (generic + fast key kernels) calls it identically. A no-op
+// for numeric queries (`str_views.len == 0`), so the caller's guard keeps it off
+// the hot path entirely.
+inline fn appendStrPayload(active: *RawRows, allocator: Allocator, str_views: []const StringView, dst: usize, src: usize) !void {
+    for (str_views, 0..) |sv, col| {
+        try active.str.append(allocator, str_views.len, dst, col, sv.rowBytes(src));
     }
 }
 
