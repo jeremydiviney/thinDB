@@ -221,6 +221,14 @@ const GroupTopNPlan = struct {
     order_by: ?ir.Op.OrderBy,
     limit: ?ir.Op.Limit,
     derived: []const ir.Derived = &.{},
+    // Post-aggregate derived columns: collapsed group keys (a function of a
+    // surviving plain-column key, e.g. `ClientIP - 1`) recomputed once per
+    // output group above the aggregate. Empty for plain shapes.
+    post_agg_derived: []const ir.Derived = &.{},
+    // Final output column order (SELECT list) when a reordering Project sits
+    // above the post-aggregate Compute. Null when the group output order is the
+    // final order.
+    output_columns: ?[]const []const u8 = null,
 };
 
 fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
@@ -257,11 +265,30 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
         having_filter = op.filter;
         op = op.filter.upstream;
     }
+    // A post-aggregate Compute (collapsed group keys recomputed above the
+    // aggregate) sits directly on the GroupBy, below HAVING/ORDER BY. Peel it;
+    // the handler recomputes those columns over the grouped output.
+    var post_agg_derived: []const ir.Derived = &.{};
+    if (op.* == .compute) {
+        post_agg_derived = op.compute.derived;
+        op = op.compute.upstream;
+    }
     if (op.* != .group_by) return null;
     const group_by = op.group_by;
     if (group_by.group_cols.len == 0) return null;
+    // The top Project's column order is the final output order. With a
+    // post-aggregate Compute it genuinely reorders (group output is
+    // [keys, aggs]; SELECT interleaves the derived columns), so capture the
+    // order instead of demanding a pass-through. Only a plain column-name
+    // reorder is handled (no nested output expressions at this level).
+    var output_columns: ?[]const []const u8 = null;
     if (top_project) |p| {
-        if (!projectMatchesGroupOutput(p, group_by)) return null;
+        if (post_agg_derived.len != 0) {
+            if (p.outputs != null) return null;
+            output_columns = p.columns;
+        } else if (!projectMatchesGroupOutput(p, group_by)) {
+            return null;
+        }
     }
 
     // Peel an optional row-local Compute (derived group keys / aggregate
@@ -297,6 +324,8 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
         .order_by = order_by,
         .limit = limit,
         .derived = derived,
+        .post_agg_derived = post_agg_derived,
+        .output_columns = output_columns,
     };
 }
 
@@ -338,11 +367,20 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .dop = input.db.config.max_dop,
     };
 
-    if (try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request)) |q| {
-        return q;
-    }
+    var q = (try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request)) orelse return error.UnsupportedQueryShape;
 
-    return error.UnsupportedQueryShape;
+    // Post-aggregate enrich: the grouped pipeline emits [keys, aggs] in
+    // count-/order-ranked order; recompute the collapsed group keys over that
+    // small output and reorder to the SELECT list using the generic Compute and
+    // Project operators (no bespoke materialization — the pipeline is just a
+    // Query like any other). ORDER BY/LIMIT already ran inside the pipeline on
+    // the grouped columns, so nothing re-runs here.
+    if (plan.post_agg_derived.len > 0) {
+        errdefer q.deinit();
+        q = try q.compute(plan.post_agg_derived);
+        if (plan.output_columns) |cols| q = try q.project(cols);
+    }
+    return q;
 }
 
 const GlobalAggregatePlan = struct {
