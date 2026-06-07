@@ -635,13 +635,155 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     };
 }
 
+/// Walk a resolved WHERE predicate and collect every base-column name it
+/// references (case-insensitive dedup). Returns error.UnsupportedOp for any
+/// subquery / correlated / var shape — those never appear under a single
+/// base-table late-mat candidate and signal the caller to skip late-mat. Mirror
+/// of net/local.collectPredicateNames; kept here so engine_v2 stays free of a
+/// net/ dependency.
+fn collectPredicateColumns(
+    allocator: std.mem.Allocator,
+    set: *std.ArrayListUnmanaged([]const u8),
+    p: exec.PredicateExpr,
+) !void {
+    switch (p) {
+        .leaf => |lf| try addColumnUnique(allocator, set, lf.col),
+        .leaf_col_col => |lc| {
+            try addColumnUnique(allocator, set, lc.left);
+            try addColumnUnique(allocator, set, lc.right);
+        },
+        .is_null, .is_not_null => |col| try addColumnUnique(allocator, set, col),
+        .like => |lp| try addColumnUnique(allocator, set, lp.col),
+        .in_set => |s| try addColumnUnique(allocator, set, s.col),
+        .@"and", .@"or" => |children| for (children) |ch| try collectPredicateColumns(allocator, set, ch),
+        .not => |child| try collectPredicateColumns(allocator, set, child.*),
+        .always => {},
+        else => return error.UnsupportedOp,
+    }
+}
+
+fn addColumnUnique(
+    allocator: std.mem.Allocator,
+    set: *std.ArrayListUnmanaged([]const u8),
+    name: []const u8,
+) !void {
+    for (set.items) |existing| {
+        if (types.columnNameEql(existing, name)) return;
+    }
+    try set.append(allocator, name);
+}
+
+/// True when at least one output column isn't already decoded by the probe set,
+/// so fetching the wide output for only the survivors saves decoding work.
+fn outputWiderThanProbe(
+    table: *api.Table,
+    output_names: []const []const u8,
+    probe: []const []const u8,
+) bool {
+    for (output_names) |on| {
+        const oi = types.findColumn(table.schema.columns, on) orelse return false;
+        var in_probe = false;
+        for (probe) |pn| {
+            if (types.findColumn(table.schema.columns, pn)) |pi| {
+                if (pi == oi) {
+                    in_probe = true;
+                    break;
+                }
+            }
+        }
+        if (!in_probe) return true;
+    }
+    return false;
+}
+
+/// Late-materialization fast path for `SELECT <wide> FROM t WHERE <pred>
+/// [ORDER BY <keys>] LIMIT n`. Decodes only the probe columns (filter ∪ ORDER
+/// BY) through the bounded top-k, then fetches the wide output columns for just
+/// the ≤ n survivors — instead of decoding every output column for every
+/// filtered row. Prefers the zonemap block-skipping top-N when an ORDER BY key
+/// qualifies. Returns null when the shape doesn't benefit (caller falls back to
+/// the naive wide scan), so it's only ever a speedup, never a correctness risk.
+fn tryScanSelectLateMat(
+    input: CompileInput,
+    table: *api.Table,
+    plan: ScanSelectPlan,
+    limit: ir.Op.Limit,
+) !?exec.Query {
+    // Derived output/probe columns aren't base columns the late-mat fetch can
+    // resolve by location — leave those to the naive path.
+    if (plan.derived.len > 0) return null;
+
+    const allocator = input.allocator;
+
+    // Probe set = WHERE columns ∪ ORDER BY columns, all base columns.
+    var probe: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer probe.deinit(allocator);
+    if (plan.where_filter) |f| {
+        collectPredicateColumns(allocator, &probe, f.predicate) catch return null;
+    }
+    if (plan.order_by) |o| {
+        for (o.specs) |sp| try addColumnUnique(allocator, &probe, sp.col);
+    }
+    for (probe.items) |nm| {
+        if (types.findColumn(table.schema.columns, nm) == null) return null;
+    }
+
+    // Output projection: explicit SELECT-list names, or every base column for
+    // SELECT *. Owned only in the SELECT * case.
+    var owns_output = false;
+    const output_names: []const []const u8 = if (plan.project_columns) |cols| blk: {
+        for (cols) |nm| {
+            if (types.findColumn(table.schema.columns, nm) == null) return null;
+        }
+        break :blk cols;
+    } else blk: {
+        const all = try allocator.alloc([]const u8, table.schema.columns.len);
+        for (all, table.schema.columns) |*o, c| o.* = c.name;
+        owns_output = true;
+        break :blk all;
+    };
+    defer if (owns_output) allocator.free(@constCast(output_names));
+
+    const n: usize = @intCast(limit.n);
+    const offset: usize = @intCast(limit.offset);
+
+    // Zonemap block-skipping top-N: prunes whole row groups via per-RG min/max
+    // and is byte-identical to the full scan regardless of projection width or
+    // a WHERE — so try it first whenever there's an ORDER BY.
+    if (plan.order_by) |o| {
+        if (try exec.zonemapTopN(allocator, table, null, probe.items, predicateOrAlways(plan.where_filter), o.specs, output_names, n, offset)) |q| {
+            return q;
+        }
+    }
+
+    // LateScan only pays off with a real WHERE that decodes fewer columns than
+    // the wide output; otherwise the naive bounded scan is as good or better.
+    if (plan.where_filter == null) return null;
+    if (!outputWiderThanProbe(table, output_names, probe.items)) return null;
+
+    const specs: ?[]const exec.SortSpec = if (plan.order_by) |o| o.specs else null;
+    return try exec.lateScan(allocator, table, null, probe.items, plan.where_filter.?.predicate, specs, output_names, n, offset);
+}
+
+fn predicateOrAlways(filter: ?ir.Op.Filter) exec.PredicateExpr {
+    return if (filter) |f| f.predicate else .{ .always = true };
+}
+
 // Build the non-aggregating SELECT pipeline: parallel scan with the WHERE fused
 // into its workers (Filter.create auto-fuses via tryFuseFilter), row-local
 // derived columns fused too, then ORDER BY + LIMIT as a single heap top-N (or
-// either alone), then the SELECT-list projection.
+// either alone), then the SELECT-list projection. When a LIMIT bounds the
+// output, late materialization (zonemap top-N / LateScan) is tried first — it
+// decodes only the probe columns through the top-k and fetches the wide output
+// for just the survivors.
 fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const plan = matchScanSelect(root) orelse return null;
     const table = try resolveTable(input.db, input.session, plan.scan.table);
+
+    if (plan.limit) |l| {
+        if (try tryScanSelectLateMat(input, table, plan, l)) |q| return q;
+    }
+
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
     defer if (needed) |n| input.allocator.free(n);
     const allocator = input.allocator;
