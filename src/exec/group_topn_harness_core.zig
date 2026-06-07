@@ -135,6 +135,9 @@ const RawRows = struct {
     len_rows: usize = 0,
     capacity_rows: usize = 0,
     layout: GroupRowsLayout = .{},
+    // Variable-length string payload (string MIN/MAX only). Empty/unallocated
+    // unless `layout.has_str_payload`, so numeric staging is unaffected.
+    str: StrStore = .{},
 
     inline fn len(self: RawRows) usize {
         return self.len_rows;
@@ -240,6 +243,10 @@ const RawRows = struct {
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
         }
+        // The string side store lives outside the slab; grow its ref array in
+        // place (preserving the live prefix), then move it into `next`.
+        if (layout.has_str_payload) try self.str.ensure(allocator, layout.str_columns.len, capacity_rows, self.len_rows);
+        next.str = self.str;
         allocator.free(self.slab);
         self.* = next;
     }
@@ -251,9 +258,11 @@ const RawRows = struct {
 
     fn clearRetainingCapacity(self: *RawRows) void {
         self.len_rows = 0;
+        self.str.clear();
     }
 
     fn deinit(self: *RawRows, allocator: Allocator) void {
+        self.str.deinit(allocator);
         allocator.free(self.slab);
         self.* = .{};
     }
@@ -340,6 +349,12 @@ pub const GroupAggregateSpec = struct {
     op: GroupAggregateOp,
     input_column_index: ?u16 = null,
     state_index: u16,
+    // String MIN/MAX: reads `layout.str_columns[str_input_index]` and keeps its
+    // running extreme in the parallel string-state slot `str_state_index` (not
+    // the numeric `slots[]`). `is_string` is false for every numeric aggregate.
+    is_string: bool = false,
+    str_input_index: u16 = 0,
+    str_state_index: u16 = 0,
 };
 
 const MAX_GROUP_AGG_STATES: usize = 4;
@@ -348,6 +363,59 @@ const MAX_GROUP_AGG_STATES: usize = 4;
 // query-specific column.
 const MAX_GROUP_AGG_SLOTS: usize = MAX_GROUP_AGG_STATES - 1;
 const MAX_GROUP_PAYLOAD_COLUMNS: usize = 8;
+
+// String MIN/MAX support. A query may carry up to this many distinct string
+// agg-input columns (Q23 needs 2: MIN(URL), MIN(Title)) and that many string
+// aggregate slots. Both are 0/unused for the numeric-only common case.
+const MAX_GROUP_STR_COLUMNS: usize = 2;
+const MAX_GROUP_STR_SLOTS: usize = 2;
+
+pub const GroupStrColumnSpec = struct {
+    source_name: []const u8,
+};
+
+const StrRef = struct { off: u32, len: u32 };
+
+// Variable-length string payload carried alongside a fixed-width slab
+// (RawRows / GroupRows). Used ONLY when a query has a string MIN/MAX aggregate
+// (`layout.has_str_payload`); otherwise nothing here allocates or runs, so the
+// numeric path is byte-for-byte unchanged. `refs` is row-major — row r, column
+// c at `r*str_cols + c` — so the live prefix stays contiguous across capacity
+// growth. `bytes` is the single growing value buffer the refs index into.
+const StrStore = struct {
+    refs: []StrRef = &.{},
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *StrStore, allocator: Allocator) void {
+        if (self.refs.len > 0) allocator.free(self.refs);
+        self.bytes.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn clear(self: *StrStore) void {
+        self.bytes.clearRetainingCapacity();
+    }
+
+    fn ensure(self: *StrStore, allocator: Allocator, str_cols: usize, capacity_rows: usize, len_rows: usize) !void {
+        const need = str_cols * capacity_rows;
+        if (self.refs.len >= need) return;
+        const next = try allocator.alloc(StrRef, need);
+        if (len_rows > 0) @memcpy(next[0 .. str_cols * len_rows], self.refs[0 .. str_cols * len_rows]);
+        if (self.refs.len > 0) allocator.free(self.refs);
+        self.refs = next;
+    }
+
+    fn append(self: *StrStore, allocator: Allocator, str_cols: usize, row: usize, col: usize, b: []const u8) !void {
+        const off: u32 = @intCast(self.bytes.items.len);
+        try self.bytes.appendSlice(allocator, b);
+        self.refs[row * str_cols + col] = .{ .off = off, .len = @intCast(b.len) };
+    }
+
+    fn get(self: StrStore, str_cols: usize, row: usize, col: usize) []const u8 {
+        const ref = self.refs[row * str_cols + col];
+        return self.bytes.items[ref.off..][0..ref.len];
+    }
+};
 
 const DEFAULT_GROUP_AGGREGATES = [_]GroupAggregateSpec{
     .{ .op = .count_star, .input_column_index = null, .state_index = 0 },
@@ -365,6 +433,11 @@ pub const GroupRowsLayout = struct {
     key_columns: []const GroupKeyColumnSpec = &.{},
     columns: []const GroupColumnSpec = &DEFAULT_GROUP_COLUMNS,
     aggregates: []const GroupAggregateSpec = &DEFAULT_GROUP_AGGREGATES,
+    // String agg-input columns (for string MIN/MAX), carried as variable-length
+    // values in the slab structs' side `StrStore`. Empty for numeric-only
+    // queries, in which case `has_str_payload` is false and no string path runs.
+    str_columns: []const GroupStrColumnSpec = &.{},
+    has_str_payload: bool = false,
     // When the group key is a hash (string / >128-bit keys), each staged row
     // also carries the source row's packed __rowloc (see rowloc.zig) in a
     // dedicated i64 region after the payload columns, captured into the group
@@ -379,7 +452,7 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.has_str_payload != b.has_str_payload or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
     var key_i: usize = 0;
     while (key_i < a.key_columns.len) : (key_i += 1) {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
@@ -403,10 +476,17 @@ fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
     while (i < a.aggregates.len) : (i += 1) {
         if (a.aggregates[i].op != b.aggregates[i].op or
             a.aggregates[i].input_column_index != b.aggregates[i].input_column_index or
-            a.aggregates[i].state_index != b.aggregates[i].state_index)
+            a.aggregates[i].state_index != b.aggregates[i].state_index or
+            a.aggregates[i].is_string != b.aggregates[i].is_string or
+            a.aggregates[i].str_input_index != b.aggregates[i].str_input_index or
+            a.aggregates[i].str_state_index != b.aggregates[i].str_state_index)
         {
             return false;
         }
+    }
+    i = 0;
+    while (i < a.str_columns.len) : (i += 1) {
+        if (!std.mem.eql(u8, a.str_columns[i].source_name, b.str_columns[i].source_name)) return false;
     }
     return true;
 }
@@ -462,6 +542,8 @@ const GroupRows = struct {
     len_rows: usize = 0,
     capacity_rows: usize = 0,
     layout: GroupRowsLayout = .{},
+    // Variable-length string payload (string MIN/MAX only); see RawRows.str.
+    str: StrStore = .{},
 
     inline fn len(self: GroupRows) usize {
         return self.len_rows;
@@ -597,6 +679,8 @@ const GroupRows = struct {
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
         }
+        if (layout.has_str_payload) try self.str.ensure(allocator, layout.str_columns.len, capacity_rows, self.len_rows);
+        next.str = self.str;
         allocator.free(self.slab);
         self.* = next;
     }
@@ -608,9 +692,11 @@ const GroupRows = struct {
 
     fn clearRetainingCapacity(self: *GroupRows) void {
         self.len_rows = 0;
+        self.str.clear();
     }
 
     fn deinit(self: *GroupRows, allocator: Allocator) void {
+        self.str.deinit(allocator);
         allocator.free(self.slab);
         self.* = .{};
     }
