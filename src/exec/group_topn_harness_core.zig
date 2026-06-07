@@ -2011,6 +2011,10 @@ pub const TopRow = struct {
     // `state_index - 1`. Interpreted by the aggregate program at emit.
     slots: [MAX_GROUP_AGG_SLOTS]i64 = [_]i64{0} ** MAX_GROUP_AGG_SLOTS,
     rowref: i64 = 0,
+    // String MIN/MAX results, indexed by the aggregate's str_state_index. Empty
+    // for numeric queries. Borrows the bucket's str_states bytes during the
+    // top-N merge, then re-dup'd into the result allocator at the final emit.
+    str: [MAX_GROUP_STR_SLOTS][]const u8 = [_][]const u8{&.{}} ** MAX_GROUP_STR_SLOTS,
 };
 
 inline fn topRowFromState(s: State) TopRow {
@@ -2020,6 +2024,22 @@ inline fn topRowFromState(s: State) TopRow {
         .slots = s.slots,
         .rowref = s.rowref,
     };
+}
+
+// Build a TopRow carrying its group's string MIN/MAX results (borrowed from the
+// bucket's str_states; re-dup'd into the result allocator at final emit).
+inline fn topRowFromStateStr(s: State, str_row: StrAccRow) TopRow {
+    var row = topRowFromState(s);
+    for (str_row, 0..) |acc, i| row.str[i] = acc.bytes;
+    return row;
+}
+
+// Re-dup a TopRow's (borrowed) string results into `allocator` so they outlive
+// the bucket teardown. No-op for numeric rows (all slices empty).
+fn ownTopRowStr(row: *TopRow, allocator: Allocator) !void {
+    for (&row.str) |*s| {
+        if (s.len > 0) s.* = try allocator.dupe(u8, s.*);
+    }
 }
 
 fn better(a: TopRow, b: TopRow) bool {
@@ -3118,8 +3138,14 @@ fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize
     const top_t0 = if (profile) nowTicks() else 0;
     var local_top: TopSet = .{};
     var b = worker_index;
+    const has_str = shared.group_rows_layout.has_str_payload;
     while (b < shared.buckets.len) : (b += worker_count) {
-        for (shared.buckets[b].states.items) |s| local_top.consider(topRowFromState(s));
+        const bkt = &shared.buckets[b];
+        if (has_str) {
+            for (bkt.states.items, 0..) |s, gid| local_top.consider(topRowFromStateStr(s, bkt.str_states.items[gid]));
+        } else {
+            for (bkt.states.items) |s| local_top.consider(topRowFromState(s));
+        }
     }
     top_out.* = local_top;
     if (profile) top_ticks.* += nowTicks() - top_t0;
@@ -3852,12 +3878,27 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const total_ticks = nowTicks() - total_t0;
     const function_ticks = nowTicks() - function_t0;
     if (cfg.result_out) |out| {
+        const has_str_out = cfg.group_rows_layout.has_str_payload;
         if (cfg.result_all_groups) {
             for (buckets) |*bucket| {
-                for (bucket.states.items) |s| try out.append(allocator, topRowFromState(s));
+                if (has_str_out) {
+                    for (bucket.states.items, 0..) |s, gid| {
+                        var row = topRowFromStateStr(s, bucket.str_states.items[gid]);
+                        try ownTopRowStr(&row, allocator);
+                        try out.append(allocator, row);
+                    }
+                } else {
+                    for (bucket.states.items) |s| try out.append(allocator, topRowFromState(s));
+                }
             }
         } else {
-            try out.appendSlice(allocator, top.items[0..top.len]);
+            // The merged top-N rows borrow each survivor's bucket str bytes;
+            // re-dup into the result allocator so they survive bucket teardown.
+            for (top.items[0..top.len]) |cand| {
+                var row = cand;
+                if (has_str_out) try ownTopRowStr(&row, allocator);
+                try out.append(allocator, row);
+            }
         }
     }
     if (cfg.trace_timing) {
