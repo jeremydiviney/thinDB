@@ -358,12 +358,14 @@ pub const GroupAggregateSpec = struct {
     str_state_index: u16 = 0,
 };
 
-const MAX_GROUP_AGG_STATES: usize = 4;
-// Generic numeric accumulator slots per group, indexed by `state_index - 1`
-// (state_index 0 is the dedicated row counter). No slot maps to a named or
-// query-specific column.
-const MAX_GROUP_AGG_SLOTS: usize = MAX_GROUP_AGG_STATES - 1;
-const MAX_GROUP_PAYLOAD_COLUMNS: usize = 8;
+// Per-group numeric accumulators are stored in a runtime variable-stride slab
+// (StateSlab) sized to exactly the aggregate program's slot count, so the
+// per-group memory never carries unused slots and a wide-aggregate query is not
+// declined. MAX_GROUP_AGG_SLOTS is only the inline ceiling on the transient
+// result row (TopRow) and the validation cap — generous, not the per-group cost.
+const MAX_GROUP_AGG_SLOTS: usize = 16;
+const MAX_GROUP_AGG_STATES: usize = MAX_GROUP_AGG_SLOTS + 1;
+const MAX_GROUP_PAYLOAD_COLUMNS: usize = 16;
 
 // String MIN/MAX support. A query may carry up to this many distinct string
 // agg-input columns (Q23 needs 2: MIN(URL), MIN(Title)) and that many string
@@ -929,18 +931,115 @@ const WorkerParts = struct {
     }
 };
 
-const State = struct {
-    key: u128,
+// Fixed head of one group's record in a StateSlab. The variable number of
+// numeric accumulator slots (i64 each) follows inline, immediately after the
+// head, so a group's whole record is one contiguous, cache-friendly run.
+// `key` is u128 (16-align) → the head is 32 bytes and the slab stride is kept a
+// multiple of 16 so every record's key stays aligned.
+const StateHead = extern struct {
+    key: u128 = 0,
+    // Row counter for the group (also the COUNT(*) result, state_index 0).
     count: u64 = 0,
-    // Generic per-aggregate accumulators, indexed by `state_index - 1`. Each
-    // slot's meaning is decided solely by its aggregate's {op, input type} in
-    // the program — never a fixed column. Holds an i64 (int sum/min/max) or an
-    // f64 bit-pattern (float sum/min/max, avg) per the aggregate.
-    slots: [MAX_GROUP_AGG_SLOTS]i64 = [_]i64{0} ** MAX_GROUP_AGG_SLOTS,
     // Packed __rowloc of the first row that created this group; only meaningful
     // when the layout has a hashed key (has_rowref). Used at emit to
     // late-materialize the real key column values.
     rowref: i64 = 0,
+};
+
+const STATE_HEAD_BYTES: usize = @sizeOf(StateHead);
+
+// A borrowed view of one group's record: its head plus a slice over its
+// inline accumulator slots. The aggregate program indexes `slots` by
+// `state_index - 1`; each slot holds an i64 (int sum/min/max) or an f64
+// bit-pattern (float sum/min/max, avg) decided solely by the aggregate.
+const StateRef = struct {
+    head: *StateHead,
+    slots: []i64,
+};
+
+// Per-bucket group accumulator store. Replaces ArrayListUnmanaged(State): the
+// per-group slot count is a runtime value (`n_slots`), so the record stride is
+// computed once per query from the aggregate program rather than baked into a
+// fixed array. gid is a dense 0..len index (the GroupTable maps key→gid).
+const StateSlab = struct {
+    bytes: []align(16) u8 = &.{},
+    len: usize = 0,
+    cap: usize = 0,
+    n_slots: usize = 0,
+    stride: usize = 0,
+    // Group-count reservation requested before the layout (hence stride) is
+    // known; applied on the first prepare().
+    reserve_hint: usize = 0,
+
+    fn strideFor(n_slots: usize) usize {
+        return std.mem.alignForward(usize, STATE_HEAD_BYTES + n_slots * @sizeOf(i64), 16);
+    }
+
+    fn reserve(self: *StateSlab, records: usize) void {
+        if (records > self.reserve_hint) self.reserve_hint = records;
+    }
+
+    // Bind the slab to the query's slot count before folding. First call (or a
+    // layout change) sets the stride and honours any pending reservation.
+    fn prepare(self: *StateSlab, allocator: Allocator, n_slots: usize) !void {
+        if (self.stride != 0 and self.n_slots == n_slots) return;
+        if (self.bytes.len > 0) allocator.free(self.bytes);
+        self.bytes = &.{};
+        self.len = 0;
+        self.cap = 0;
+        self.n_slots = n_slots;
+        self.stride = strideFor(n_slots);
+        if (self.reserve_hint > 0) try self.growTo(allocator, self.reserve_hint);
+    }
+
+    fn growTo(self: *StateSlab, allocator: Allocator, records: usize) !void {
+        if (records <= self.cap) return;
+        const next = try allocator.alignedAlloc(u8, .@"16", records * self.stride);
+        if (self.len > 0) @memcpy(next[0 .. self.len * self.stride], self.bytes[0 .. self.len * self.stride]);
+        if (self.bytes.len > 0) allocator.free(self.bytes);
+        self.bytes = next;
+        self.cap = records;
+    }
+
+    fn ensureUnusedCapacity(self: *StateSlab, allocator: Allocator, additional: usize) !void {
+        const need = self.len + additional;
+        if (need <= self.cap) return;
+        var new_cap = if (self.cap == 0) @max(self.reserve_hint, 8) else self.cap * 2;
+        while (new_cap < need) new_cap *= 2;
+        try self.growTo(allocator, new_cap);
+    }
+
+    inline fn head(self: StateSlab, gid: usize) *StateHead {
+        return @ptrCast(@alignCast(self.bytes.ptr + gid * self.stride));
+    }
+
+    inline fn slotsOf(self: StateSlab, gid: usize) []i64 {
+        const p = self.bytes.ptr + gid * self.stride + STATE_HEAD_BYTES;
+        return @as([*]i64, @ptrCast(@alignCast(p)))[0..self.n_slots];
+    }
+
+    inline fn ref(self: StateSlab, gid: usize) StateRef {
+        return .{ .head = self.head(gid), .slots = self.slotsOf(gid) };
+    }
+
+    // Append a fresh zeroed record (key/count/rowref/slots all 0) and return its
+    // gid. Caller has ensured capacity.
+    inline fn pushAssumeCapacity(self: *StateSlab) u32 {
+        const gid: u32 = @intCast(self.len);
+        const base = self.bytes.ptr + self.len * self.stride;
+        @memset(base[0..self.stride], 0);
+        self.len += 1;
+        return gid;
+    }
+
+    fn clearRetainingCapacity(self: *StateSlab) void {
+        self.len = 0;
+    }
+
+    fn deinit(self: *StateSlab, allocator: Allocator) void {
+        if (self.bytes.len > 0) allocator.free(self.bytes);
+        self.* = .{};
+    }
 };
 
 // Per-group running MIN/MAX bytes for a string aggregate. Kept in a side array
@@ -953,12 +1052,10 @@ const StrAccRow = [MAX_GROUP_STR_SLOTS]StrAcc;
 const GroupScratch = struct {
     gids: std.ArrayListUnmanaged(u32) = .empty,
     row_idxs: std.ArrayListUnmanaged(u32) = .empty,
-    states: std.ArrayListUnmanaged(State) = .empty,
 
     fn deinit(self: *GroupScratch, allocator: Allocator) void {
         self.gids.deinit(allocator);
         self.row_idxs.deinit(allocator);
-        self.states.deinit(allocator);
         self.* = .{};
     }
 };
@@ -971,65 +1068,6 @@ const BucketResult = struct {
     fn deinit(self: *BucketResult, allocator: Allocator) void {
         _ = allocator;
         self.* = .{};
-    }
-};
-
-const StateBucket = struct {
-    states: std.ArrayListUnmanaged(State) = .empty,
-
-    fn deinit(self: *StateBucket, allocator: Allocator) void {
-        self.states.deinit(allocator);
-        self.* = .{};
-    }
-};
-
-const WorkerAgg = struct {
-    table: GroupTable,
-    states: std.ArrayListUnmanaged(State) = .empty,
-    buckets: []StateBucket = &.{},
-    scratch: GroupScratch = .{},
-    scanned_count: u64 = 0,
-    row_count: u64 = 0,
-    scan_ticks: i64 = 0,
-    group_ticks: i64 = 0,
-    partition_ticks: i64 = 0,
-    partitioned_count: u64 = 0,
-
-    fn init(allocator: Allocator, bucket_count: usize, expected_groups: usize) !WorkerAgg {
-        const buckets = try allocator.alloc(StateBucket, bucket_count);
-        for (buckets) |*b| b.* = .{};
-        errdefer allocator.free(buckets);
-        return .{
-            .table = try GroupTable.init(allocator, expected_groups),
-            .buckets = buckets,
-        };
-    }
-
-    fn deinit(self: *WorkerAgg, allocator: Allocator) void {
-        self.table.deinit(allocator);
-        self.states.deinit(allocator);
-        self.scratch.deinit(allocator);
-        for (self.buckets) |*b| b.deinit(allocator);
-        if (self.buckets.len > 0) allocator.free(self.buckets);
-        self.* = undefined;
-    }
-};
-
-const CentralBucket = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    table: GroupTable,
-    states: std.ArrayListUnmanaged(State) = .empty,
-
-    fn init(allocator: Allocator, expected_groups: usize) !CentralBucket {
-        return .{
-            .table = try GroupTable.init(allocator, expected_groups),
-        };
-    }
-
-    fn deinit(self: *CentralBucket, allocator: Allocator) void {
-        self.table.deinit(allocator);
-        self.states.deinit(allocator);
-        self.* = undefined;
     }
 };
 
@@ -1096,7 +1134,7 @@ const PipeBucket = struct {
     chunks: std.ArrayListUnmanaged(PipeChunk) = .empty,
     queued_rows: u64 = 0,
     table: GroupTable,
-    states: std.ArrayListUnmanaged(State) = .empty,
+    states: StateSlab = .{},
     // Parallel to `states` (gid-indexed); populated only for string MIN/MAX
     // queries. Empty for the numeric common case.
     str_states: std.ArrayListUnmanaged(StrAccRow) = .empty,
@@ -1561,7 +1599,7 @@ fn initWorkspaceFreshParallel(
         for (buckets, 0..) |*bucket, i| {
             bucket.* = try PipeBucket.init(allocator, expected_groups_per_bucket);
             bucket_inited[i] = true;
-            try bucket.states.ensureTotalCapacity(allocator, expected_groups_per_bucket);
+            bucket.states.reserve(expected_groups_per_bucket);
             try bucket.chunks.ensureTotalCapacity(allocator, 8);
         }
         if (profile) |p| {
@@ -1631,10 +1669,7 @@ fn workspaceFreshInitWorker(job: *WorkspaceFreshInitJob) void {
             return;
         };
         job.bucket_inited[b] = true;
-        job.buckets[b].states.ensureTotalCapacity(job.allocator, job.expected_groups_per_bucket) catch |err| {
-            job.err = err;
-            return;
-        };
+        job.buckets[b].states.reserve(job.expected_groups_per_bucket);
         job.buckets[b].chunks.ensureTotalCapacity(job.allocator, 8) catch |err| {
             job.err = err;
             return;
@@ -2007,8 +2042,12 @@ fn releaseRawQueueLane(queues: anytype, lane: usize) void {
 pub const TopRow = struct {
     key: u128,
     count: u64 = 0,
-    // Generic per-aggregate accumulators (mirror of State.slots), indexed by
-    // `state_index - 1`. Interpreted by the aggregate program at emit.
+    // Generic per-aggregate accumulators, indexed by `state_index - 1`.
+    // Interpreted by the aggregate program at emit. This is the transient
+    // result row (bounded by the top-N heap or the all-groups emit), so it
+    // carries the slots inline up to the generous MAX_GROUP_AGG_SLOTS ceiling
+    // rather than allocating per row — the per-group store (StateSlab) is the
+    // one sized to exactly the program's slot count.
     slots: [MAX_GROUP_AGG_SLOTS]i64 = [_]i64{0} ** MAX_GROUP_AGG_SLOTS,
     rowref: i64 = 0,
     // String MIN/MAX results, indexed by the aggregate's str_state_index. Empty
@@ -2017,19 +2056,20 @@ pub const TopRow = struct {
     str: [MAX_GROUP_STR_SLOTS][]const u8 = [_][]const u8{&.{}} ** MAX_GROUP_STR_SLOTS,
 };
 
-inline fn topRowFromState(s: State) TopRow {
-    return .{
-        .key = s.key,
-        .count = s.count,
-        .slots = s.slots,
-        .rowref = s.rowref,
+inline fn topRowFromState(ref: StateRef) TopRow {
+    var row: TopRow = .{
+        .key = ref.head.key,
+        .count = ref.head.count,
+        .rowref = ref.head.rowref,
     };
+    for (ref.slots, 0..) |v, i| row.slots[i] = v;
+    return row;
 }
 
 // Build a TopRow carrying its group's string MIN/MAX results (borrowed from the
 // bucket's str_states; re-dup'd into the result allocator at final emit).
-inline fn topRowFromStateStr(s: State, str_row: StrAccRow) TopRow {
-    var row = topRowFromState(s);
+inline fn topRowFromStateStr(ref: StateRef, str_row: StrAccRow) TopRow {
+    var row = topRowFromState(ref);
     for (str_row, 0..) |acc, i| row.str[i] = acc.bytes;
     return row;
 }
@@ -2503,40 +2543,38 @@ fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, batch: thindb.
     return appendBatchRawChunksGeneric(parts, shared, batch, raw_chunk_rows, profile, skip_filter_check);
 }
 
-fn initGroupStateCountSumAvg(states: *std.ArrayListUnmanaged(State), key: u128, sum_value: i64, avg_value: i64) u32 {
-    const gid: u32 = @intCast(states.items.len);
-    var st: State = .{ .key = key, .count = 1 };
-    st.slots[0] = sum_value;
-    st.slots[1] = avg_value;
-    states.appendAssumeCapacity(st);
+fn initGroupStateCountSumAvg(states: *StateSlab, key: u128, sum_value: i64, avg_value: i64) u32 {
+    const gid = states.pushAssumeCapacity();
+    const head = states.head(gid);
+    head.key = key;
+    head.count = 1;
+    const slots = states.slotsOf(gid);
+    slots[0] = sum_value;
+    slots[1] = avg_value;
     return gid;
 }
 
-inline fn updateGroupStateCountSumAvg(st: *State, sum_value: i64, avg_value: i64) void {
-    st.count += 1;
-    st.slots[0] += sum_value;
-    st.slots[1] += avg_value;
+inline fn updateGroupStateCountSumAvg(ref: StateRef, sum_value: i64, avg_value: i64) void {
+    ref.head.count += 1;
+    ref.slots[0] += sum_value;
+    ref.slots[1] += avg_value;
 }
 
 fn initGroupStateProgram(
-    states: *std.ArrayListUnmanaged(State),
+    states: *StateSlab,
     key: u128,
     aggregates: []const GroupAggregateSpec,
     rows: GroupRows,
     row_idx: usize,
 ) !u32 {
-    const gid: u32 = @intCast(states.items.len);
-    states.appendAssumeCapacity(.{
-        .key = key,
-        .count = 0,
-    });
-    const st = &states.items[gid];
-    try updateGroupStateProgram(st, aggregates, rows, row_idx);
+    const gid = states.pushAssumeCapacity();
+    states.head(gid).key = key;
+    try updateGroupStateProgram(states.ref(gid), aggregates, rows, row_idx);
     return gid;
 }
 
-fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
-    st.count += 1;
+fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
+    ref.head.count += 1;
     for (aggregates) |agg| {
         // String MIN/MAX is folded separately into the side str_states array.
         if (agg.is_string) continue;
@@ -2544,37 +2582,37 @@ fn updateGroupStateProgram(st: *State, aggregates: []const GroupAggregateSpec, r
         const state_index: usize = agg.state_index;
         switch (agg.op) {
             .count_star => {
-                if (state_index != 0) try setAggregateStateValue(st, state_index, st.count);
+                if (state_index != 0) try setAggregateStateValue(ref, state_index, ref.head.count);
             },
             .count_col => {
                 _ = aggregateInputValue(agg, rows, row_idx) catch return error.UnsupportedOperatorForType;
-                if (state_index != 0) try setAggregateStateValue(st, state_index, st.count);
+                if (state_index != 0) try setAggregateStateValue(ref, state_index, ref.head.count);
             },
             .sum, .avg => {
                 if (aggInputIsFloat(rows, agg)) {
                     const value = try aggregateInputFloat(agg, rows, row_idx);
-                    try addFloatStateValue(st, state_index, value);
+                    try addFloatStateValue(ref, state_index, value);
                 } else {
                     const value = try aggregateInputValue(agg, rows, row_idx);
-                    try addAggregateStateValue(st, state_index, value);
+                    try addAggregateStateValue(ref, state_index, value);
                 }
             },
             .min => {
                 if (aggInputIsFloat(rows, agg)) {
                     const value = try aggregateInputFloat(agg, rows, row_idx);
-                    if (st.count == 1 or value < floatStateValue(st, state_index)) try setFloatStateValue(st, state_index, value);
+                    if (ref.head.count == 1 or value < floatStateValue(ref, state_index)) try setFloatStateValue(ref, state_index, value);
                 } else {
                     const value = try aggregateInputValue(agg, rows, row_idx);
-                    if (st.count == 1 or value < aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+                    if (ref.head.count == 1 or value < aggregateStateValue(ref, state_index)) try setAggregateStateValue(ref, state_index, value);
                 }
             },
             .max => {
                 if (aggInputIsFloat(rows, agg)) {
                     const value = try aggregateInputFloat(agg, rows, row_idx);
-                    if (st.count == 1 or value > floatStateValue(st, state_index)) try setFloatStateValue(st, state_index, value);
+                    if (ref.head.count == 1 or value > floatStateValue(ref, state_index)) try setFloatStateValue(ref, state_index, value);
                 } else {
                     const value = try aggregateInputValue(agg, rows, row_idx);
-                    if (st.count == 1 or value > aggregateStateValue(st, state_index)) try setAggregateStateValue(st, state_index, value);
+                    if (ref.head.count == 1 or value > aggregateStateValue(ref, state_index)) try setAggregateStateValue(ref, state_index, value);
                 }
             },
         }
@@ -2605,41 +2643,41 @@ fn aggregateInputFloat(agg: GroupAggregateSpec, rows: GroupRows, row_idx: usize)
 
 // Float aggregates store an f64 accumulator in the i64 slot via @bitCast
 // (state_index 0 is the integer counter and is never used for a float agg).
-inline fn floatStateValue(st: *const State, state_index: usize) f64 {
-    const bits: i64 = if (state_index >= 1 and state_index - 1 < st.slots.len) st.slots[state_index - 1] else 0;
+inline fn floatStateValue(ref: StateRef, state_index: usize) f64 {
+    const bits: i64 = if (state_index >= 1 and state_index - 1 < ref.slots.len) ref.slots[state_index - 1] else 0;
     return @bitCast(bits);
 }
 
-inline fn addFloatStateValue(st: *State, state_index: usize, value: f64) !void {
-    try setFloatStateValue(st, state_index, floatStateValue(st, state_index) + value);
+inline fn addFloatStateValue(ref: StateRef, state_index: usize, value: f64) !void {
+    try setFloatStateValue(ref, state_index, floatStateValue(ref, state_index) + value);
 }
 
-inline fn setFloatStateValue(st: *State, state_index: usize, value: f64) !void {
-    if (state_index == 0 or state_index - 1 >= st.slots.len) return error.UnsupportedOperatorForType;
-    st.slots[state_index - 1] = @bitCast(value);
+inline fn setFloatStateValue(ref: StateRef, state_index: usize, value: f64) !void {
+    if (state_index == 0 or state_index - 1 >= ref.slots.len) return error.UnsupportedOperatorForType;
+    ref.slots[state_index - 1] = @bitCast(value);
 }
 
-inline fn aggregateStateValue(st: *const State, state_index: usize) i128 {
-    if (state_index == 0) return @intCast(st.count);
-    return st.slots[state_index - 1];
+inline fn aggregateStateValue(ref: StateRef, state_index: usize) i128 {
+    if (state_index == 0) return @intCast(ref.head.count);
+    return ref.slots[state_index - 1];
 }
 
-inline fn addAggregateStateValue(st: *State, state_index: usize, value: i128) !void {
+inline fn addAggregateStateValue(ref: StateRef, state_index: usize, value: i128) !void {
     if (state_index == 0) {
-        st.count += @intCast(value);
+        ref.head.count += @intCast(value);
         return;
     }
-    if (state_index - 1 >= st.slots.len) return error.UnsupportedOperatorForType;
-    st.slots[state_index - 1] += @intCast(value);
+    if (state_index - 1 >= ref.slots.len) return error.UnsupportedOperatorForType;
+    ref.slots[state_index - 1] += @intCast(value);
 }
 
-inline fn setAggregateStateValue(st: *State, state_index: usize, value: i128) !void {
+inline fn setAggregateStateValue(ref: StateRef, state_index: usize, value: i128) !void {
     if (state_index == 0) {
-        st.count = @intCast(value);
+        ref.head.count = @intCast(value);
         return;
     }
-    if (state_index - 1 >= st.slots.len) return error.UnsupportedOperatorForType;
-    st.slots[state_index - 1] = @intCast(value);
+    if (state_index - 1 >= ref.slots.len) return error.UnsupportedOperatorForType;
+    ref.slots[state_index - 1] = @intCast(value);
 }
 
 fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_count: usize) !void {
@@ -2670,9 +2708,20 @@ fn countSumAvgProgram(aggregates: []const GroupAggregateSpec, column_count: usiz
     return .{ .sum_input_index = sum_input_index, .avg_input_index = avg_input_index };
 }
 
+// The number of runtime accumulator slots the program needs: the max numeric
+// state_index (slot `state_index - 1`), so count-only is 0, count+sum+avg is 2.
+fn aggSlotCount(layout: GroupRowsLayout) usize {
+    var n: usize = 0;
+    for (layout.aggregates) |agg| {
+        if (agg.is_string) continue;
+        if (agg.state_index > n) n = agg.state_index;
+    }
+    return n;
+}
+
 fn groupChunkRowsDirect(
     table: *GroupTable,
-    states: *std.ArrayListUnmanaged(State),
+    states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     scratch: *GroupScratch,
     allocator: Allocator,
@@ -2681,6 +2730,7 @@ fn groupChunkRowsDirect(
     const n = rows.len();
     if (n == 0) return;
     if (table.needsGrow(n)) try table.grow(allocator, n);
+    try states.prepare(allocator, aggSlotCount(rows.layout));
     try states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_str_payload) try str_states.ensureUnusedCapacity(allocator, n);
     _ = scratch;
@@ -2736,7 +2786,7 @@ fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), allocator: Alloc
 fn groupChunkRowsDirectKeysCountSumAvg(
     comptime key_width: GroupKeyWidth,
     table: *GroupTable,
-    states: *std.ArrayListUnmanaged(State),
+    states: *StateSlab,
     keys: anytype,
     key_hi: []const u32,
     row_count: usize,
@@ -2758,18 +2808,18 @@ fn groupChunkRowsDirectKeysCountSumAvg(
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         if (!probe.found) {
             const new_gid = initGroupStateCountSumAvg(states, key, sum_value, avg_value);
-            if (rowrefs.len != 0) states.items[new_gid].rowref = rowrefs[r];
+            if (rowrefs.len != 0) states.head(new_gid).rowref = rowrefs[r];
             table.commit(probe.slot, key, new_gid);
             continue;
         }
-        updateGroupStateCountSumAvg(&states.items[probe.gid], sum_value, avg_value);
+        updateGroupStateCountSumAvg(states.ref(probe.gid), sum_value, avg_value);
     }
 }
 
 fn groupChunkRowsDirectKeys(
     comptime key_width: GroupKeyWidth,
     table: *GroupTable,
-    states: *std.ArrayListUnmanaged(State),
+    states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     allocator: Allocator,
     keys: anytype,
@@ -2793,7 +2843,7 @@ fn groupChunkRowsDirectKeys(
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         if (!probe.found) {
             const new_gid = try initGroupStateProgram(states, key, aggregates, rows, r);
-            if (rowrefs.len != 0) states.items[new_gid].rowref = rowrefs[r];
+            if (rowrefs.len != 0) states.head(new_gid).rowref = rowrefs[r];
             table.commit(probe.slot, key, new_gid);
             if (has_str) {
                 str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
@@ -2801,8 +2851,7 @@ fn groupChunkRowsDirectKeys(
             }
             continue;
         }
-        const st = &states.items[probe.gid];
-        try updateGroupStateProgram(st, aggregates, rows, r);
+        try updateGroupStateProgram(states.ref(probe.gid), aggregates, rows, r);
         if (has_str) try foldGroupStr(str_states, allocator, probe.gid, aggregates, rows, r);
     }
 }
@@ -3155,9 +3204,11 @@ fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize
     while (b < shared.buckets.len) : (b += worker_count) {
         const bkt = &shared.buckets[b];
         if (has_str) {
-            for (bkt.states.items, 0..) |s, gid| local_top.consider(topRowFromStateStr(s, bkt.str_states.items[gid]));
+            var gid: usize = 0;
+            while (gid < bkt.states.len) : (gid += 1) local_top.consider(topRowFromStateStr(bkt.states.ref(gid), bkt.str_states.items[gid]));
         } else {
-            for (bkt.states.items) |s| local_top.consider(topRowFromState(s));
+            var gid: usize = 0;
+            while (gid < bkt.states.len) : (gid += 1) local_top.consider(topRowFromState(bkt.states.ref(gid)));
         }
     }
     top_out.* = local_top;
@@ -3628,7 +3679,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         while (b < bucket_count) : (b += 1) {
             buckets[b] = try PipeBucket.init(allocator, init_groups_per_bucket);
             built_buckets += 1;
-            try buckets[b].states.ensureTotalCapacity(allocator, init_groups_per_bucket);
+            buckets[b].states.reserve(init_groups_per_bucket);
             try buckets[b].chunks.ensureTotalCapacity(allocator, 8);
         }
     }
@@ -3880,7 +3931,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     var group_count: u64 = 0;
     var grouped_rows: u64 = 0;
     for (buckets) |*bucket| {
-        group_count += bucket.states.items.len;
+        group_count += bucket.states.len;
         grouped_rows += bucket.row_count;
     }
     for (worker_tops) |worker_top| {
@@ -3895,13 +3946,15 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         if (cfg.result_all_groups) {
             for (buckets) |*bucket| {
                 if (has_str_out) {
-                    for (bucket.states.items, 0..) |s, gid| {
-                        var row = topRowFromStateStr(s, bucket.str_states.items[gid]);
+                    var gid: usize = 0;
+                    while (gid < bucket.states.len) : (gid += 1) {
+                        var row = topRowFromStateStr(bucket.states.ref(gid), bucket.str_states.items[gid]);
                         try ownTopRowStr(&row, allocator);
                         try out.append(allocator, row);
                     }
                 } else {
-                    for (bucket.states.items) |s| try out.append(allocator, topRowFromState(s));
+                    var gid: usize = 0;
+                    while (gid < bucket.states.len) : (gid += 1) try out.append(allocator, topRowFromState(bucket.states.ref(gid)));
                 }
             }
         } else {

@@ -622,7 +622,7 @@ fn runHarness(
             .width_bits = input.width_bits,
         };
     }
-    var group_columns_buf: [8]HarnessCore.GroupColumnSpec = undefined;
+    var group_columns_buf: [16]HarnessCore.GroupColumnSpec = undefined;
     if (shape.aggregate_inputs.len > group_columns_buf.len) return error.UnsupportedOperatorForType;
     for (shape.aggregate_inputs, 0..) |input, i| {
         group_columns_buf[i] = .{ .physical_type = switch (input.physical_type) {
@@ -640,7 +640,7 @@ fn runHarness(
     for (shape.string_aggregate_inputs, 0..) |sin, i| {
         group_str_columns_buf[i] = .{ .source_name = sin.source_name };
     }
-    var group_aggregates_buf: [8]HarnessCore.GroupAggregateSpec = undefined;
+    var group_aggregates_buf: [16]HarnessCore.GroupAggregateSpec = undefined;
     if (shape.aggregate_program.len > group_aggregates_buf.len) return error.UnsupportedOperatorForType;
     for (shape.aggregate_program, 0..) |agg, i| {
         group_aggregates_buf[i] = .{

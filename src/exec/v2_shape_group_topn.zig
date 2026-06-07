@@ -43,8 +43,11 @@ const DEFAULT_RAW_CHUNK_ROWS: usize = 8192;
 const DEFAULT_RAW_GROUP_CHUNK_ROWS: usize = 8192;
 const DEFAULT_RAW_BATCH_CHUNKS: usize = 12;
 const MAX_GROUP_KEYS: usize = 8;
-const MAX_AGGS: usize = 3;
-const MAX_AGG_INPUTS: usize = 8;
+// Aggregate-count ceiling. The per-group accumulator store in the silo core is
+// a runtime variable-stride slab, so this is just a generous planner bound (and
+// the inline ceiling on the transient result row), not a per-group memory cost.
+const MAX_AGGS: usize = 16;
+const MAX_AGG_INPUTS: usize = 16;
 const MAX_STRING_AGG_INPUTS: usize = 2;
 const MAX_STRING_AGG_SLOTS: usize = 2;
 
@@ -798,7 +801,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     next_string_state_index += 1;
                     continue;
                 }
-                if (next_numeric_state_index >= 4) return traceDecline(request, "aggregate state count");
+                if (next_numeric_state_index > MAX_AGGS) return traceDecline(request, "aggregate state count");
                 const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
                 const output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null;
                 if (agg.func == .avg and output_type != .double) return traceDecline(request, "avg output type");
