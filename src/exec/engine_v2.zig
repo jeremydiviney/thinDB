@@ -77,6 +77,8 @@ pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
         // forms of the same pipeline.
         .group_topn, .group_full_sort, .group_aggregate => (try buildGroupTopN(input, root)) orelse return error.UnsupportedQueryShape,
         .global_aggregate => (try buildGlobalAggregate(input, root)) orelse return error.UnsupportedQueryShape,
+        // Non-aggregating SELECT: filter/order/limit/project over a parallel scan.
+        .stream_scan, .scan_topn, .scan_full_sort => (try buildScanSelect(input, root)) orelse return error.UnsupportedQueryShape,
         else => error.UnsupportedQueryShape,
     };
 }
@@ -556,6 +558,113 @@ fn buildGlobalAggregateGeneric(
     if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived);
     q = try q.aggregate(plan.group_by.aggs);
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
+    return q;
+}
+
+// A non-aggregating SELECT: scan → optional WHERE → optional row-local derived
+// → optional ORDER BY → optional LIMIT → optional projection. Covers the
+// stream_scan / scan_topn / scan_full_sort shapes (e.g. ClickBench Q20, Q24-27).
+const ScanSelectPlan = struct {
+    scan: ir.Op.Scan,
+    where_filter: ?ir.Op.Filter = null,
+    derived: []const ir.Derived = &.{},
+    order_by: ?ir.Op.OrderBy = null,
+    limit: ?ir.Op.Limit = null,
+    // SELECT-list columns (whitelist projection). Null = emit the scan's columns
+    // as-is (e.g. SELECT *).
+    project_columns: ?[]const []const u8 = null,
+};
+
+fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
+    var op = root;
+    // Top decorators — Project (SELECT list), LIMIT, ORDER BY — can nest in any
+    // order above the scan body; peel each at most once.
+    var project_columns: ?[]const []const u8 = null;
+    var limit: ?ir.Op.Limit = null;
+    var order_by: ?ir.Op.OrderBy = null;
+    while (true) {
+        switch (op.*) {
+            .select => |p| {
+                if (project_columns != null) return null;
+                // Aliased / computed output expressions aren't handled here.
+                if (p.outputs) |outs| for (outs) |o| if (o != null) return null;
+                project_columns = p.columns;
+                op = p.upstream;
+            },
+            .limit => |l| {
+                if (limit != null) return null;
+                limit = l;
+                op = l.upstream;
+            },
+            .order_by => |o| {
+                if (order_by != null) return null;
+                order_by = o;
+                op = o.upstream;
+            },
+            else => break,
+        }
+    }
+    // The scan body: an optional row-local Compute and an optional WHERE, in
+    // either order, down to the table scan.
+    var where_filter: ?ir.Op.Filter = null;
+    var derived: []const ir.Derived = &.{};
+    while (true) {
+        switch (op.*) {
+            .compute => |c| {
+                if (derived.len != 0) return null;
+                derived = c.derived;
+                op = c.upstream;
+            },
+            .filter => |f| {
+                if (where_filter != null) return null;
+                where_filter = f;
+                op = f.upstream;
+            },
+            else => break,
+        }
+    }
+    if (op.* != .scan) return null;
+    if (op.scan.alias != null) return null;
+    return .{
+        .scan = op.scan,
+        .where_filter = where_filter,
+        .derived = derived,
+        .order_by = order_by,
+        .limit = limit,
+        .project_columns = project_columns,
+    };
+}
+
+// Build the non-aggregating SELECT pipeline: parallel scan with the WHERE fused
+// into its workers (Filter.create auto-fuses via tryFuseFilter), row-local
+// derived columns fused too, then ORDER BY + LIMIT as a single heap top-N (or
+// either alone), then the SELECT-list projection.
+fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
+    const plan = matchScanSelect(root) orelse return null;
+    const table = try resolveTable(input.db, input.session, plan.scan.table);
+    const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
+    defer if (needed) |n| input.allocator.free(n);
+    const allocator = input.allocator;
+    const max_dop = input.db.config.max_dop;
+
+    var q = if (max_dop > 1)
+        try exec.ParallelScan.create(allocator, table, null, needed, max_dop)
+    else
+        try exec.scanWithProjection(allocator, table, null, needed);
+    errdefer q.deinit();
+
+    if (plan.where_filter) |f| q = try q.filter(f.predicate);
+    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived);
+    if (plan.order_by) |o| {
+        if (plan.limit) |l| {
+            q = try q.topN(o.specs, @intCast(l.n), @intCast(l.offset));
+        } else {
+            q = try q.orderBy(o.specs);
+        }
+    } else if (plan.limit) |l| {
+        q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
+    }
+    if (plan.project_columns) |cols| q = try q.project(cols);
     return q;
 }
 
