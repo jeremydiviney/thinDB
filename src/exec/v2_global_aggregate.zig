@@ -103,6 +103,9 @@ const AggPlan = struct {
     // not in the order columns were requested.
     input_name: ?[]const u8,
     is_float: bool,
+    // MIN/MAX over a string column: the accumulator is the running extreme
+    // bytes (`Lane.sstr`), not a numeric slot. Only ever set for .min/.max.
+    is_string: bool = false,
     output_type: Type,
     name: []const u8,
 };
@@ -118,6 +121,11 @@ const Lane = struct {
     isum: []i128,
     fsum: []f64,
     ns: []u64,
+    // Per-aggregate running MIN/MAX bytes for string aggregates (owned by
+    // `allocator`; empty slice when the agg isn't a string min/max or no row
+    // has been seen). Only slot `i` of a `.is_string` plan is ever populated.
+    sstr: [][]const u8,
+    allocator: Allocator,
 
     fn init(allocator: Allocator, n: usize) !Lane {
         const isum = try allocator.alloc(i128, n);
@@ -125,22 +133,44 @@ const Lane = struct {
         const fsum = try allocator.alloc(f64, n);
         errdefer allocator.free(fsum);
         const ns = try allocator.alloc(u64, n);
+        errdefer allocator.free(ns);
+        const sstr = try allocator.alloc([]const u8, n);
         @memset(isum, 0);
         @memset(fsum, 0);
         @memset(ns, 0);
-        return .{ .isum = isum, .fsum = fsum, .ns = ns };
+        @memset(sstr, &.{});
+        return .{ .isum = isum, .fsum = fsum, .ns = ns, .sstr = sstr, .allocator = allocator };
     }
 
     fn deinit(self: *Lane, allocator: Allocator) void {
+        for (self.sstr) |s| if (s.len > 0) allocator.free(s);
+        allocator.free(self.sstr);
         allocator.free(self.isum);
         allocator.free(self.fsum);
         allocator.free(self.ns);
     }
 
-    fn mergeFrom(self: *Lane, other: Lane, plans: []const AggPlan) void {
+    // Replace this lane's slot-`i` min/max bytes with an owned copy of `b`.
+    fn setStr(self: *Lane, i: usize, b: []const u8) !void {
+        if (self.sstr[i].len > 0) self.allocator.free(self.sstr[i]);
+        self.sstr[i] = try self.allocator.dupe(u8, b);
+    }
+
+    fn mergeFrom(self: *Lane, other: Lane, plans: []const AggPlan) !void {
         self.count += other.count;
         for (plans, 0..) |p, i| {
             if (other.ns[i] == 0) continue;
+            if (p.is_string) {
+                if (self.ns[i] == 0) {
+                    try self.setStr(i, other.sstr[i]);
+                } else {
+                    const cmp = std.mem.order(u8, other.sstr[i], self.sstr[i]);
+                    const better = if (p.op == .min) cmp == .lt else cmp == .gt;
+                    if (better) try self.setStr(i, other.sstr[i]);
+                }
+                self.ns[i] += other.ns[i];
+                continue;
+            }
             const had = self.ns[i];
             self.ns[i] += other.ns[i];
             switch (p.op) {
@@ -192,13 +222,36 @@ inline fn readFloatView(v: ValueView, row: usize) f64 {
     };
 }
 
-fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batch: Batch) void {
+fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batch: Batch) !void {
     lane.count += batch.row_count;
+    const n = batch.row_count;
     for (plans, 0..) |p, i| {
         const idx = resolved[i] orelse continue;
         const view = batch.values[idx];
+        if (p.is_string) {
+            // MIN/MAX over a string column: keep an owned copy of the running
+            // extreme bytes. The batch's StringView is transient (recycled per
+            // batch), so the kept value must be dup'd, not borrowed.
+            const sv = switch (view.data) {
+                .varchar, .string, .char => |s| s,
+                else => continue,
+            };
+            var r: usize = 0;
+            while (r < n) : (r += 1) {
+                if (!view.isValid(r)) continue;
+                lane.ns[i] += 1;
+                const b = sv.rowBytes(r);
+                if (lane.ns[i] == 1) {
+                    try lane.setStr(i, b);
+                } else {
+                    const cmp = std.mem.order(u8, b, lane.sstr[i]);
+                    const better = if (p.op == .min) cmp == .lt else cmp == .gt;
+                    if (better) try lane.setStr(i, b);
+                }
+            }
+            continue;
+        }
         var r: usize = 0;
-        const n = batch.row_count;
         while (r < n) : (r += 1) {
             if (!view.isValid(r)) continue;
             lane.ns[i] += 1;
@@ -291,7 +344,7 @@ fn driveTile(w: *Worker, have_resolved: *bool) !void {
             try resolveBatchIndices(w.plans, w.resolved, batch);
             have_resolved.* = true;
         }
-        foldBatch(&w.lane, w.plans, w.resolved, batch);
+        try foldBatch(&w.lane, w.plans, w.resolved, batch);
     }
 }
 
@@ -304,7 +357,7 @@ fn driveScan(lane: *Lane, plans: []const AggPlan, allocator: Allocator, source: 
             try resolveBatchIndices(plans, resolved, batch);
             have_resolved = true;
         }
-        foldBatch(lane, plans, resolved, batch);
+        try foldBatch(lane, plans, resolved, batch);
     }
 }
 
@@ -325,6 +378,13 @@ fn aggInputSupported(typ: Type) bool {
 
 fn isFloatType(typ: Type) bool {
     return typ == .float or typ == .double;
+}
+
+fn isStringType(typ: Type) bool {
+    return switch (typ) {
+        .varchar, .string, .char => true,
+        else => false,
+    };
 }
 
 fn isDerivedName(derived: []const compute.Derived, name: []const u8) bool {
@@ -461,10 +521,19 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
             switch (agg.func) {
                 .sum, .avg, .min, .max => {
                     const ctyp = resolveAggInputType(table, probe_schema, agg.col.?) orelse return declineFree(allocator, plans, &needed);
-                    if (!aggInputSupported(ctyp)) return declineFree(allocator, plans, &needed);
-                    const out_type = aggregate.aggOutputTypeFor(agg, ctyp) catch return declineFree(allocator, plans, &needed);
-                    p.is_float = isFloatType(ctyp);
-                    p.output_type = out_type;
+                    if (isStringType(ctyp)) {
+                        // Only MIN/MAX have string semantics; SUM/AVG over a
+                        // string column is a type error → decline.
+                        if (agg.func != .min and agg.func != .max) return declineFree(allocator, plans, &needed);
+                        p.is_string = true;
+                        p.is_float = false;
+                        p.output_type = ctyp;
+                    } else {
+                        if (!aggInputSupported(ctyp)) return declineFree(allocator, plans, &needed);
+                        const out_type = aggregate.aggOutputTypeFor(agg, ctyp) catch return declineFree(allocator, plans, &needed);
+                        p.is_float = isFloatType(ctyp);
+                        p.output_type = out_type;
+                    }
                 },
                 else => {},
             }
@@ -722,7 +791,7 @@ const GlobalAggregate = struct {
 
         var merged = try Lane.init(self.allocator, self.plans.len);
         errdefer merged.deinit(self.allocator);
-        for (workers) |*w| merged.mergeFrom(w.lane, self.plans);
+        for (workers) |*w| try merged.mergeFrom(w.lane, self.plans);
         return merged;
     }
 
@@ -750,8 +819,17 @@ const GlobalAggregate = struct {
                 },
                 .min, .max => {
                     // MIN/MAX over an empty input is SQL NULL; this cut emits 0
-                    // for that (no ClickBench query hits it). Non-empty is exact.
-                    if (lane.ns[i] == 0) {
+                    // (numeric) / "" (string) for that (no ClickBench query hits
+                    // it). Non-empty is exact.
+                    if (p.is_string) {
+                        const v: []const u8 = if (lane.ns[i] == 0) "" else lane.sstr[i];
+                        switch (p.output_type) {
+                            .varchar => try col.data.varchar.appendValue(a, v),
+                            .string => try col.data.string.appendValue(a, v),
+                            .char => try col.data.char.appendValue(a, v),
+                            else => return error.TypeMismatch,
+                        }
+                    } else if (lane.ns[i] == 0) {
                         if (p.is_float) try appendFloat(a, col, p.output_type, 0) else try appendInt(a, col, p.output_type, 0);
                     } else if (p.is_float) {
                         try appendFloat(a, col, p.output_type, lane.fsum[i]);
