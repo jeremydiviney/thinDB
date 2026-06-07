@@ -367,19 +367,60 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .dop = input.db.config.max_dop,
     };
 
-    var q = (try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request)) orelse return error.UnsupportedQueryShape;
-
-    // Post-aggregate enrich: the grouped pipeline emits [keys, aggs] in
-    // count-/order-ranked order; recompute the collapsed group keys over that
-    // small output and reorder to the SELECT list using the generic Compute and
-    // Project operators (no bespoke materialization — the pipeline is just a
-    // Query like any other). ORDER BY/LIMIT already ran inside the pipeline on
-    // the grouped columns, so nothing re-runs here.
-    if (plan.post_agg_derived.len > 0) {
-        errdefer q.deinit();
-        q = try q.compute(plan.post_agg_derived);
-        if (plan.output_columns) |cols| q = try q.project(cols);
+    if (try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request)) |silo_q| {
+        var q = silo_q;
+        // Post-aggregate enrich: the grouped pipeline emits [keys, aggs] in
+        // count-/order-ranked order; recompute the collapsed group keys over that
+        // small output and reorder to the SELECT list using the generic Compute and
+        // Project operators (no bespoke materialization — the pipeline is just a
+        // Query like any other). ORDER BY/LIMIT already ran inside the pipeline on
+        // the grouped columns, so nothing re-runs here.
+        if (plan.post_agg_derived.len > 0) {
+            errdefer q.deinit();
+            q = try q.compute(plan.post_agg_derived);
+            if (plan.output_columns) |cols| q = try q.project(cols);
+        }
+        return q;
     }
+
+    // The silo-grid core carries fixed numeric state slots, so it declines
+    // string MIN/MAX, COUNT(DISTINCT), percentile, group_concat, and other
+    // variable-state aggregates. Fall back to a composition of the generic
+    // operators — the same `Aggregate` the legacy engine uses for these — which
+    // keep per-group string/set/heap state. Parallel scan + fused filter feed a
+    // single-threaded grouped aggregate; ORDER BY / LIMIT / post-agg enrich layer
+    // on top as ordinary operators.
+    return try buildGroupAggregateGeneric(input, table, needed, plan);
+}
+
+// Generic grouped-aggregate composition: the correctness fallback for grouped
+// shapes the silo core can't run. Mirrors the legacy engine's
+// `scan -> filter -> compute -> groupByTopK -> ...` floor, reusing the shared
+// operators verbatim. `needed` is the projected base-column set (borrowed; only
+// read during scan construction).
+fn buildGroupAggregateGeneric(
+    input: CompileInput,
+    table: *api.Table,
+    needed: ?[]const []const u8,
+    plan: GroupTopNPlan,
+) !exec.Query {
+    const allocator = input.allocator;
+    const max_dop = input.db.config.max_dop;
+
+    var q = if (max_dop > 1)
+        try exec.ParallelScan.create(allocator, table, null, needed, max_dop)
+    else
+        try exec.scanWithProjection(allocator, table, null, needed);
+    errdefer q.deinit();
+
+    if (plan.where_filter) |f| q = try q.filter(f.predicate);
+    if (plan.derived.len > 0) q = try q.compute(plan.derived);
+    q = try q.groupByTopK(plan.group_by.group_cols, plan.group_by.aggs, null, null);
+    if (plan.post_agg_derived.len > 0) q = try q.compute(plan.post_agg_derived);
+    if (plan.having_filter) |f| q = try q.filter(f.predicate);
+    if (plan.order_by) |o| q = try q.orderBy(o.specs);
+    if (plan.limit) |l| q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
+    if (plan.output_columns) |cols| q = try q.project(cols);
     return q;
 }
 
