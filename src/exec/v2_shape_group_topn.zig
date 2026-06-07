@@ -801,6 +801,14 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     next_string_state_index += 1;
                     continue;
                 }
+                // SUM/AVG over a 64-bit integer accumulates into i128 (the result
+                // widens to LARGEINT). The silo's per-group slots are i64, so
+                // route these to the generic i128 accumulator path instead of
+                // overflowing here. MIN/MAX over a 64-bit int is fine — it holds a
+                // single value, never grows. Float SUM/AVG (f64) is also fine.
+                if ((agg.func == .sum or agg.func == .avg) and physicalTypeFor(input_type) == .i64) {
+                    return traceDecline(request, "64-bit sum/avg needs i128 accumulator");
+                }
                 if (next_numeric_state_index > MAX_AGGS) return traceDecline(request, "aggregate state count");
                 const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
                 const output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null;

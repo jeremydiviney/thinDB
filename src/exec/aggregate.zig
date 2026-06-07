@@ -2634,7 +2634,11 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
             // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s).
             if (t.decimalSpec()) |spec| break :blk .{ .decimal128 = .{ .p = 38, .s = spec.s } };
             if (t.isFloat()) break :blk .double;
-            if (t == .largeint) break :blk .largeint;
+            // A 64-bit integer SUM widens its accumulator and result to i128 so a
+            // large-magnitude sum (e.g. SUM(UserID)) can't overflow; 8/16/32-bit
+            // inputs stay in i64 (a sum can't overflow i64 short of billions of
+            // rows). See DESIGN.md §3.4 (accumulator promotion).
+            if (t == .largeint or t == .bigint) break :blk .largeint;
             break :blk .bigint;
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,

@@ -40,7 +40,8 @@ test "agg on expr: SUM(price * qty)" {
     defer q.deinit();
     const batch = (try q.next()).?;
     // 100*2 + 200*3 + 50*5 = 200 + 600 + 250 = 1050
-    try std.testing.expectEqual(@as(i64, 1050), batch.values[0].data.bigint[0]);
+    // SUM over a 64-bit integer widens to LARGEINT (i128).
+    try std.testing.expectEqual(@as(i128, 1050), batch.values[0].data.largeint[0]);
 }
 
 test "agg on expr: AVG(price + qty)" {
@@ -72,9 +73,9 @@ test "agg on expr: mixed with plain col agg" {
     defer q.deinit();
     const batch = (try q.next()).?;
     // SUM(price) = 100+200+50 = 350
-    // SUM(price * qty) = 1050
-    try std.testing.expectEqual(@as(i64, 350), batch.values[0].data.bigint[0]);
-    try std.testing.expectEqual(@as(i64, 1050), batch.values[1].data.bigint[0]);
+    // SUM(price * qty) = 1050; both SUM over 64-bit ints → LARGEINT (i128).
+    try std.testing.expectEqual(@as(i128, 350), batch.values[0].data.largeint[0]);
+    try std.testing.expectEqual(@as(i128, 1050), batch.values[1].data.largeint[0]);
 }
 
 test "agg on expr: GROUP BY column with agg-on-expr" {
@@ -100,11 +101,11 @@ test "agg on expr: GROUP BY column with agg-on-expr" {
     defer q.deinit();
     const batch = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 2), batch.row_count);
-    // east: 10*2 + 20*3 = 80; west: 30*1 = 30
+    // east: 10*2 + 20*3 = 80; west: 30*1 = 30; SUM over 64-bit ints → LARGEINT.
     try std.testing.expectEqualStrings("east", batch.values[0].data.varchar.rowBytes(0));
-    try std.testing.expectEqual(@as(i64, 80), batch.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i128, 80), batch.values[1].data.largeint[0]);
     try std.testing.expectEqualStrings("west", batch.values[0].data.varchar.rowBytes(1));
-    try std.testing.expectEqual(@as(i64, 30), batch.values[1].data.bigint[1]);
+    try std.testing.expectEqual(@as(i128, 30), batch.values[1].data.largeint[1]);
 }
 
 test "agg on expr: SUM(CASE WHEN ...) — conditional sum" {

@@ -594,15 +594,15 @@ test "aggregate: combined distinct alongside other aggregates (Q09 shape)" {
             rows_seen += 1;
             const r = b.values[0].data.int[i];
             const c = b.values[1].data.bigint[i];
-            const s = b.values[2].data.bigint[i];
+            const s = b.values[2].data.largeint[i]; // SUM(bigint) → LARGEINT (i128)
             const nd = b.values[3].data.bigint[i];
             if (r == 1) {
                 try std.testing.expectEqual(@as(i64, 3), c);
-                try std.testing.expectEqual(@as(i64, 23), s); // 7+7+9
+                try std.testing.expectEqual(@as(i128, 23), s); // 7+7+9
                 try std.testing.expectEqual(@as(i64, 2), nd); // {7, 9}
             } else if (r == 2) {
                 try std.testing.expectEqual(@as(i64, 1), c);
-                try std.testing.expectEqual(@as(i64, 5), s);
+                try std.testing.expectEqual(@as(i128, 5), s);
                 try std.testing.expectEqual(@as(i64, 1), nd);
             } else return error.UnexpectedGroup;
         }
@@ -731,10 +731,10 @@ test "aggregate: high-NDV key behind a selective filter stays under the adaptive
             groups_seen += 1;
             const k = b.values[0].data.int[row];
             const c = b.values[1].data.bigint[row];
-            const s = b.values[2].data.bigint[row];
+            const s = b.values[2].data.largeint[row]; // SUM(bigint) → LARGEINT (i128)
             try std.testing.expectEqual(@as(i32, 3), @mod(k, 10)); // only sel==3 keys
             try std.testing.expectEqual(@as(i64, 1), c);
-            try std.testing.expectEqual(@as(i64, k), s); // v == id == k
+            try std.testing.expectEqual(@as(i128, k), s); // v == id == k
         }
     }
     try std.testing.expectEqual(expected_groups, groups_seen);
@@ -783,10 +783,10 @@ test "aggregate: genuinely high-card group-by overflows the initial size and jum
             groups_seen += 1;
             const k = b.values[0].data.int[row];
             const c = b.values[1].data.bigint[row];
-            const s = b.values[2].data.bigint[row];
+            const s = b.values[2].data.largeint[row]; // SUM(bigint) → LARGEINT (i128)
             count_sum += @intCast(c);
             try std.testing.expectEqual(@as(i64, 2), c); // each key inserted twice
-            try std.testing.expectEqual(@as(i64, @as(i64, k) * 2), s); // v == k, summed twice
+            try std.testing.expectEqual(@as(i128, @as(i64, k) * 2), s); // v == k, summed twice
         }
     }
     try std.testing.expectEqual(n_keys, groups_seen);

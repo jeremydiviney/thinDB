@@ -111,11 +111,15 @@ fn assertAgg(allocator: std.mem.Allocator, db: anytype, comptime agg: []const u8
         var j: usize = 0;
         while (j < batch.row_count) : (j += 1) {
             const k: i64 = batch.values[0].data.int[j];
-            const a: i64 = batch.values[1].data.bigint[j];
             try std.testing.expect(!seen.contains(k)); // no duplicate groups
             try seen.put(k, {});
             const want = ref.get(k) orelse return error.UnexpectedGroup;
-            try std.testing.expectEqual(@field(want, field), a);
+            // SUM over a 64-bit int widens to LARGEINT (i128); MIN/MAX stay i64.
+            if (comptime std.mem.eql(u8, agg, "SUM")) {
+                try std.testing.expectEqual(@as(i128, @field(want, field)), batch.values[1].data.largeint[j]);
+            } else {
+                try std.testing.expectEqual(@field(want, field), batch.values[1].data.bigint[j]);
+            }
             if (k == KEY_MIN) saw_min_key = true;
             if (k == KEY_MAX) saw_max_key = true;
             rows += 1;
@@ -202,7 +206,11 @@ test "GROUP BY int col with a single group: SUM/MIN/MAX over one group" {
             var j: usize = 0;
             while (j < batch.row_count) : (j += 1) {
                 try std.testing.expectEqual(@as(i64, 42), batch.values[0].data.int[j]);
-                try std.testing.expectEqual(c.want.*, batch.values[1].data.bigint[j]);
+                if (comptime std.mem.eql(u8, c.agg, "SUM")) {
+                    try std.testing.expectEqual(@as(i128, c.want.*), batch.values[1].data.largeint[j]);
+                } else {
+                    try std.testing.expectEqual(c.want.*, batch.values[1].data.bigint[j]);
+                }
                 rows += 1;
             }
         }
@@ -232,10 +240,10 @@ test "GROUP BY int col SUM(v), MIN(v): two aggs fall back, both correct" {
         var j: usize = 0;
         while (j < batch.row_count) : (j += 1) {
             const k: i64 = batch.values[0].data.int[j];
-            const s: i64 = batch.values[1].data.bigint[j];
+            const s: i128 = batch.values[1].data.largeint[j]; // SUM(bigint) → LARGEINT
             const m: i64 = batch.values[2].data.bigint[j];
             const want = ref.get(k) orelse return error.UnexpectedGroup;
-            try std.testing.expectEqual(want.sum, s);
+            try std.testing.expectEqual(@as(i128, want.sum), s);
             try std.testing.expectEqual(want.min, m);
             rows += 1;
         }
@@ -269,11 +277,11 @@ test "GROUP BY nullable int col SUM(v): falls back to the canonical path, correc
         var j: usize = 0;
         while (j < batch.row_count) : (j += 1) {
             const k: i64 = batch.values[0].data.int[j];
-            const a: i64 = batch.values[1].data.bigint[j];
+            const a: i128 = batch.values[1].data.largeint[j]; // SUM(bigint) → LARGEINT
             try std.testing.expect(!seen.contains(k));
             try seen.put(k, {});
             const want = ref.get(k) orelse return error.UnexpectedGroup;
-            try std.testing.expectEqual(want.sum, a);
+            try std.testing.expectEqual(@as(i128, want.sum), a);
             rows += 1;
         }
     }
