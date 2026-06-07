@@ -425,14 +425,26 @@ pub const Lexer = struct {
             }
             if (c == '\\' and process_backslash and i + 1 < raw.len) {
                 i += 1;
-                buf[out] = switch (raw[i]) {
+                const e = raw[i];
+                // Keep the backslash before a digit so regex backreferences
+                // (\1..\9, e.g. REGEXP_REPLACE(x, pat, '\1')) reach the regex
+                // engine intact, matching DuckDB/PostgreSQL — which never treat
+                // backslash as an escape in ordinary strings. Real C escapes
+                // (\n \t \r \0 \b \Z) still process for MySQL-client parity.
+                if (e >= '1' and e <= '9') {
+                    buf[out] = '\\';
+                    buf[out + 1] = e;
+                    out += 2;
+                    continue;
+                }
+                buf[out] = switch (e) {
                     'n' => '\n',
                     't' => '\t',
                     'r' => '\r',
                     '0' => 0,
                     'b' => 8,
                     'Z' => 26,
-                    else => raw[i], // \\, \', \", \<other> → the literal char
+                    else => e, // \\, \', \", \<other> → the literal char
                 };
                 out += 1;
                 continue;
