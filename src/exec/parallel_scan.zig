@@ -645,9 +645,31 @@ pub const ParallelScan = struct {
             max_t = @max(max_t, t);
             sum_t += t;
         }
+        // Pruning effectiveness: how many row groups the workers actually decoded
+        // vs considered within their assigned ranges. `considered - scanned` is
+        // the zone-map prune count; `max_rgs` shows per-worker skew.
+        var considered: u64 = 0;
+        var scanned: u64 = 0;
+        var rows_in: u64 = 0;
+        var max_rgs: u64 = 0;
+        for (self.workers) |w| {
+            considered += w.rgs_considered;
+            scanned += w.rgs_scanned;
+            rows_in += w.rows_scanned;
+            max_rgs = @max(max_rgs, w.rgs_scanned);
+        }
         std.debug.print("[pscan] threads={d} chunks={d} drain_wall={d:.1}ms survivors={d} chunk_ms[min={d:.1} max={d:.1} mean={d:.1}]\n", .{
             self.n_threads,                       self.workers.len,                     drain_wall_ms,                                           rows,
             exec.prof.ticksToMs(@intCast(min_t)), exec.prof.ticksToMs(@intCast(max_t)), exec.prof.ticksToMs(@intCast(sum_t / self.workers.len)),
+        });
+        std.debug.print("[pscan] rowgroups: considered={d} scanned={d} pruned={d} ({d:.1}%)  rows_decoded={d}  busiest_worker_rgs={d}\n", .{
+            considered,                  scanned, considered - scanned,
+            if (considered > 0) @as(f64, @floatFromInt(considered - scanned)) * 100.0 / @as(f64, @floatFromInt(considered)) else 0.0,
+            rows_in,                     max_rgs,
+        });
+        const w0 = self.workers[0];
+        std.debug.print("[pscan] prune hints on worker0: leaf={d} in_set={d} seg_skip={}\n", .{
+            w0.prunes.items.len, w0.in_prunes.items.len, w0.seg_skip != null,
         });
     }
 

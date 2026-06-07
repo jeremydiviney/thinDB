@@ -368,6 +368,15 @@ pub const Scan = struct {
     /// this to verify segment-level pruning fires.
     segments_opened: u32 = 0,
 
+    /// Diagnostic counters (read by ParallelScan's `--profile-ops` report and
+    /// pruning tests): row groups this scan considered within its assigned
+    /// range, how many it actually decoded (passed `rowGroupCanMatch`), and the
+    /// total rows in those decoded row groups. `rgs_considered - rgs_scanned`
+    /// is the zone-map row-group prune count for this scan.
+    rgs_considered: u64 = 0,
+    rgs_scanned: u64 = 0,
+    rows_scanned: u64 = 0,
+
     /// Phase 4.2 (Option A): when set, the projected column at `out_phys[code_col]`
     /// is emitted as global dict CODES (via the `Batch.coded` sidecar) instead of
     /// materialized strings — the consuming aggregate groups on the narrow code,
@@ -1220,10 +1229,13 @@ pub const Scan = struct {
             }
 
             const rg = seg.info.row_groups[self.cur_rg_idx];
+            self.rgs_considered += 1;
             if (!self.rowGroupCanMatch(rg)) {
                 self.cur_rg_idx += 1;
                 continue;
             }
+            self.rgs_scanned += 1;
+            self.rows_scanned += rg.row_count;
 
             const rg_count = rg.row_count;
 
@@ -1404,10 +1416,13 @@ pub const Scan = struct {
             }
 
             const rg = seg.info.row_groups[self.cur_rg_idx];
+            self.rgs_considered += 1;
             if (!self.rowGroupCanMatch(rg)) {
                 self.cur_rg_idx += 1;
                 continue;
             }
+            self.rgs_scanned += 1;
+            self.rows_scanned += rg.row_count;
 
             const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
             const rg_count = rg.row_count;
