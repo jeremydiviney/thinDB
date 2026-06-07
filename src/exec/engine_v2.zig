@@ -231,6 +231,10 @@ const GroupTopNPlan = struct {
     // above the post-aggregate Compute. Null when the group output order is the
     // final order.
     output_columns: ?[]const []const u8 = null,
+    // Per-output rename from the SELECT-list Project (`URL AS Dst`), parallel to
+    // `output_columns`. A null entry keeps the selected column's own name. Null
+    // (the whole field) when the Project renames nothing.
+    output_names: ?[]const ?[]const u8 = null,
 };
 
 fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
@@ -284,12 +288,20 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
     // order instead of demanding a pass-through. Only a plain column-name
     // reorder is handled (no nested output expressions at this level).
     var output_columns: ?[]const []const u8 = null;
+    var output_names: ?[]const ?[]const u8 = null;
     if (top_project) |p| {
         if (post_agg_derived.len != 0) {
-            if (p.outputs != null) return null;
+            // The post-agg Compute genuinely reorders [keys, aggs]; trust the
+            // SELECT order. A per-column rename (`URL AS Dst`) rides along.
             output_columns = p.columns;
+            output_names = p.outputs;
         } else if (!projectMatchesGroupOutput(p, group_by)) {
             return null;
+        } else if (p.outputs != null) {
+            // Pure rename passthrough of the group output (`SELECT col AS x`):
+            // columns already match the group output order, only names change.
+            output_columns = p.columns;
+            output_names = p.outputs;
         }
     }
 
@@ -328,13 +340,14 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
         .derived = derived,
         .post_agg_derived = post_agg_derived,
         .output_columns = output_columns,
+        .output_names = output_names,
     };
 }
 
+// Whether `project`'s selected columns are exactly the group output
+// (`[keys, aggs]`) in canonical order. Output RENAMES are tolerated — the
+// caller captures them separately and applies them via `applyOutputProjection`.
 fn projectMatchesGroupOutput(project: ir.Op.Project, group_by: ir.Op.GroupBy) bool {
-    if (project.outputs) |outputs| {
-        for (outputs) |out| if (out != null) return false;
-    }
     if (project.columns.len != group_by.group_cols.len + group_by.aggs.len) return false;
     var i: usize = 0;
     for (group_by.group_cols) |name| {
@@ -346,6 +359,19 @@ fn projectMatchesGroupOutput(project: ir.Op.Project, group_by: ir.Op.GroupBy) bo
         i += 1;
     }
     return true;
+}
+
+// Apply the SELECT-list Project captured during shape matching: select
+// `output_columns` (reorder) and, when the Project renamed any column
+// (`output_names`), rename them via `Project.createNamed`. A null `output_names`
+// entry keeps the selected column's own name. No-op when no Project was captured.
+fn applyOutputProjection(allocator: std.mem.Allocator, q: exec.Query, plan: GroupTopNPlan) !exec.Query {
+    const cols = plan.output_columns orelse return q;
+    const renames = plan.output_names orelse return q.project(cols);
+    const names = try allocator.alloc([]const u8, cols.len);
+    defer allocator.free(names);
+    for (cols, renames, names) |col, rename, *out| out.* = rename orelse col;
+    return exec.Project.createNamed(allocator, q, cols, names);
 }
 
 fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
@@ -377,11 +403,9 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         // Project operators (no bespoke materialization — the pipeline is just a
         // Query like any other). ORDER BY/LIMIT already ran inside the pipeline on
         // the grouped columns, so nothing re-runs here.
-        if (plan.post_agg_derived.len > 0) {
-            errdefer q.deinit();
-            q = try q.compute(plan.post_agg_derived);
-            if (plan.output_columns) |cols| q = try q.project(cols);
-        }
+        errdefer q.deinit();
+        if (plan.post_agg_derived.len > 0) q = try q.compute(plan.post_agg_derived);
+        q = try applyOutputProjection(input.allocator, q, plan);
         return q;
     }
 
@@ -444,7 +468,7 @@ fn buildGroupAggregateGeneric(
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
     if (plan.order_by) |o| q = try q.orderBy(o.specs);
     if (plan.limit) |l| q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
-    if (plan.output_columns) |cols| q = try q.project(cols);
+    q = try applyOutputProjection(input.allocator, q, plan);
     return q;
 }
 
