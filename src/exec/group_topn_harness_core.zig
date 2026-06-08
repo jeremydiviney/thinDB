@@ -1213,20 +1213,29 @@ const PipeBucket = struct {
     // Parallel to `states` (gid-indexed); populated only for string MIN/MAX
     // queries. Empty for the numeric common case.
     str_states: std.ArrayListUnmanaged(StrAccRow) = .empty,
+    // Bump arena for the running-MIN/MAX bytes. A per-improvement `dupe` from a
+    // shared allocator scatters each group's current value across the heap, so
+    // reading it back for the next row's compare is a main-memory miss — the
+    // dominant cost of string MIN over millions of groups. Allocating from a
+    // contiguous arena keeps those values L2/L3-resident and drops the
+    // per-improvement `free` (superseded values are arena garbage, reclaimed
+    // wholesale at reset/teardown).
+    str_arena: std.heap.ArenaAllocator,
     row_count: u64 = 0,
 
     fn init(allocator: Allocator, expected_groups: usize) !PipeBucket {
-        return .{ .table = try GroupTable.init(allocator, expected_groups) };
+        return .{
+            .table = try GroupTable.init(allocator, expected_groups),
+            .str_arena = std.heap.ArenaAllocator.init(allocator),
+        };
     }
 
-    fn freeStrBytes(self: *PipeBucket, allocator: Allocator) void {
-        for (self.str_states.items) |*row| {
-            for (row) |*acc| if (acc.bytes.len > 0) allocator.free(acc.bytes);
-        }
+    fn freeStrBytes(self: *PipeBucket) void {
+        _ = self.str_arena.reset(.free_all);
     }
 
     fn deinit(self: *PipeBucket, allocator: Allocator) void {
-        self.freeStrBytes(allocator);
+        self.str_arena.deinit();
         self.str_states.deinit(allocator);
         self.chunks.deinit(allocator);
         self.table.deinit(allocator);
@@ -1540,18 +1549,18 @@ pub const SiloGridWorkspace = struct {
         }
     }
 
-    fn reset(self: *SiloGridWorkspace, allocator: Allocator) !void {
+    fn reset(self: *SiloGridWorkspace) !void {
         for (self.parts, 0..) |*p, worker_idx| {
             resetWorkerParts(p, worker_idx);
         }
         for (self.buckets) |*bucket| {
-            resetPipeBucket(bucket, allocator);
+            resetPipeBucket(bucket);
         }
     }
 
     fn resetParallel(self: *SiloGridWorkspace, allocator: Allocator, n_workers: usize, cpus: []const usize) !void {
         const workers = @max(@as(usize, 1), @min(n_workers, @max(cpus.len, 1)));
-        if (workers == 1 or (self.parts.len + self.buckets.len) < 128) return self.reset(allocator);
+        if (workers == 1 or (self.parts.len + self.buckets.len) < 128) return self.reset();
 
         const threads = try allocator.alloc(std.Thread, workers);
         defer allocator.free(threads);
@@ -1629,7 +1638,7 @@ fn workspaceResetWorker(job: *WorkspaceResetJob) void {
     const end = (job.worker_index + 1) * bucket_count / job.worker_count;
     var b = start;
     while (b < end) : (b += 1) {
-        resetPipeBucket(&job.workspace.buckets[b], job.allocator);
+        resetPipeBucket(&job.workspace.buckets[b]);
     }
 }
 
@@ -1814,7 +1823,7 @@ fn resetWorkerParts(parts: *WorkerParts, worker_index: usize) void {
     parts.route_touched.clearRetainingCapacity();
 }
 
-fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
+fn resetPipeBucket(bucket: *PipeBucket) void {
     bucket.chunks.clearRetainingCapacity();
     bucket.queued_rows = 0;
     bucket.row_count = 0;
@@ -1822,7 +1831,7 @@ fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
     bucket.agg_lock = .unlocked;
     bucket.table.clearRetainingCapacity();
     bucket.states.clearRetainingCapacity();
-    bucket.freeStrBytes(allocator);
+    bucket.freeStrBytes();
     bucket.str_states.clearRetainingCapacity();
 }
 
@@ -2811,6 +2820,7 @@ fn groupChunkRowsDirect(
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     scratch: *GroupScratch,
     allocator: Allocator,
+    str_arena: Allocator,
     rows: GroupRows,
 ) !void {
     const n = rows.len();
@@ -2838,33 +2848,30 @@ fn groupChunkRowsDirect(
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, str_arena, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, str_arena, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, str_arena, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, str_arena, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
     }
 }
 
 // Fold one row's string MIN/MAX values into group `gid`'s side accumulators.
-// Bytes are owned by `allocator` (the bucket allocator); on a new extreme the
-// previous copy is freed and the new value dup'd. Called only when the layout
-// has string aggregates.
-fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), allocator: Allocator, gid: usize, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
+// New extremes are dup'd from `str_arena` (a contiguous bump arena); a superseded
+// value is left as arena garbage rather than freed, so the compare reads of the
+// current value stay cache-local. Called only when the layout has string aggs.
+fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), str_arena: Allocator, gid: usize, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
     const k = rows.layout.str_columns.len;
     for (aggregates) |agg| {
         if (!agg.is_string) continue;
         const b = rows.str.get(k, row_idx, agg.str_input_index);
         const acc = &str_states.items[gid][agg.str_state_index];
         if (!acc.present) {
-            acc.bytes = try allocator.dupe(u8, b);
+            acc.bytes = try str_arena.dupe(u8, b);
             acc.present = true;
         } else {
             const cmp = std.mem.order(u8, b, acc.bytes);
             const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
-            if (is_better) {
-                if (acc.bytes.len > 0) allocator.free(acc.bytes);
-                acc.bytes = try allocator.dupe(u8, b);
-            }
+            if (is_better) acc.bytes = try str_arena.dupe(u8, b);
         }
     }
 }
@@ -2907,7 +2914,7 @@ fn groupChunkRowsDirectKeys(
     table: *GroupTable,
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
-    allocator: Allocator,
+    str_arena: Allocator,
     keys: anytype,
     key_hi: []const u32,
     row_count: usize,
@@ -2933,12 +2940,12 @@ fn groupChunkRowsDirectKeys(
             table.commit(probe.slot, key, new_gid);
             if (has_str) {
                 str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
-                try foldGroupStr(str_states, allocator, new_gid, aggregates, rows, r);
+                try foldGroupStr(str_states, str_arena, new_gid, aggregates, rows, r);
             }
             continue;
         }
         try updateGroupStateProgram(states.ref(probe.gid), aggregates, rows, r);
-        if (has_str) try foldGroupStr(str_states, allocator, probe.gid, aggregates, rows, r);
+        if (has_str) try foldGroupStr(str_states, str_arena, probe.gid, aggregates, rows, r);
     }
 }
 
@@ -3270,7 +3277,7 @@ fn drainRawDedicatedGroupLane(
         lockSpin(&bucket.agg_lock);
         if (profile) local.raw_agg_lock_ticks += nowTicks() - lock_t0;
         const g0 = if (profile) nowTicks() else 0;
-        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, scratch, allocator, rows);
+        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, scratch, allocator, bucket.str_arena.allocator(), rows);
         bucket.row_count += rows.len();
         if (profile) group_ticks.* += nowTicks() - g0;
         bucket.agg_lock.unlock();
