@@ -57,6 +57,33 @@ const SpinLock = struct {
     }
 };
 
+// Process-wide cache counters, summed across all tables' caches. Diagnostic
+// only (read by the MySQL handler under `--profile-ops` to print per-query
+// deltas): a spike in `g_misses`/`g_miss_bytes` on a query that was fast in
+// isolation pins the slowdown to cache thrashing (re-read + re-decompress from
+// disk), not CPU. Incremented with the per-cache counters; atomic so the
+// parallel scan workers don't race.
+pub var g_hits = std.atomic.Value(u64).init(0);
+pub var g_misses = std.atomic.Value(u64).init(0);
+pub var g_evictions = std.atomic.Value(u64).init(0);
+pub var g_miss_bytes = std.atomic.Value(u64).init(0);
+// Live bytes held across all caches (decompressed block payloads only). Insert
+// adds, eviction/deinit subtracts. Lets a leak check separate cache memory from
+// the rest of the process's committed footprint.
+pub var g_cache_bytes = std.atomic.Value(u64).init(0);
+
+pub const GlobalStats = struct { hits: u64, misses: u64, evictions: u64, miss_bytes: u64, cache_bytes: u64 };
+
+pub fn globalStats() GlobalStats {
+    return .{
+        .hits = g_hits.load(.monotonic),
+        .misses = g_misses.load(.monotonic),
+        .evictions = g_evictions.load(.monotonic),
+        .miss_bytes = g_miss_bytes.load(.monotonic),
+        .cache_bytes = g_cache_bytes.load(.monotonic),
+    };
+}
+
 pub const Cache = struct {
     allocator: Allocator,
     capacity_bytes: usize,
@@ -98,6 +125,7 @@ pub const Cache = struct {
     }
 
     pub fn deinit(self: *Cache) void {
+        _ = g_cache_bytes.fetchSub(self.current_bytes, .monotonic);
         var cur = self.head;
         while (cur) |e| {
             const nxt = e.next;
@@ -120,9 +148,11 @@ pub const Cache = struct {
             entry.pins += 1;
             self.touch(entry);
             self.hits += 1;
+            _ = g_hits.fetchAdd(1, .monotonic);
             return entry;
         }
         self.misses += 1;
+        _ = g_misses.fetchAdd(1, .monotonic);
         return null;
     }
 
@@ -152,6 +182,8 @@ pub const Cache = struct {
 
         self.linkHead(entry);
         self.current_bytes += bytes.len;
+        _ = g_miss_bytes.fetchAdd(bytes.len, .monotonic);
+        _ = g_cache_bytes.fetchAdd(bytes.len, .monotonic);
         self.evictUnpinnedToCapacity();
         return entry;
     }
@@ -178,9 +210,11 @@ pub const Cache = struct {
                 self.unlink(v);
                 _ = self.map.remove(v.key);
                 self.current_bytes -= v.bytes.len;
+                _ = g_cache_bytes.fetchSub(v.bytes.len, .monotonic);
                 self.allocator.free(v.bytes);
                 self.allocator.destroy(v);
                 self.evictions += 1;
+                _ = g_evictions.fetchAdd(1, .monotonic);
             }
             victim = prev;
         }

@@ -38,6 +38,12 @@ const prepared = @import("prepared.zig");
 const sql_text_mod = @import("../sql_text.zig");
 const conn_registry = @import("../conn_registry.zig");
 const oprof = @import("../../util/prof.zig");
+const counting_allocator = @import("../../util/counting_allocator.zig");
+const rg_cache = @import("../../storage/cache.zig");
+
+// Previous process-wide cache counters, per connection thread, so the handler
+// can print this query's hit/miss/evict delta under `--profile-ops`.
+threadlocal var prev_cache_stats: rg_cache.GlobalStats = .{ .hits = 0, .misses = 0, .evictions = 0, .miss_bytes = 0, .cache_bytes = 0 };
 const ConnectionState = conn_registry.ConnectionState;
 const ConnectionRegistry = conn_registry.Registry;
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
@@ -2684,14 +2690,30 @@ fn runSingleStatement(
         };
     }
 
+    // Under --profile-ops, route the handler-thread's query allocations through
+    // a counting wrapper (operator construction + teardown; parallel-scan
+    // workers allocate from the table allocator, not this one) and reset the
+    // sub-phase timers so construction timings survive the execute-time reset.
+    var mem_stats = counting_allocator.Stats{};
+    var counter = counting_allocator.CountingAllocator.init(allocator, &mem_stats);
+    const qalloc = if (oprof.enabled) counter.allocator() else allocator;
+    if (oprof.enabled) oprof.resetPhases();
+
     const compile_start = profiler.start();
-    var compiled = local.compileWithSession(allocator, main_db, session.asSession(), op) catch |err| {
+    var compiled = local.compileWithSession(qalloc, main_db, session.asSession(), op) catch |err| {
         profiler.recordSince(.query_compile, compile_start);
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
         return;
     };
     profiler.recordSince(.query_compile, compile_start);
+    // Registered BEFORE the deinit defer so it runs AFTER teardown (LIFO) — the
+    // sub-phase timers then include `pscan.deinit.*`, and the memory totals
+    // reflect the full construct→drain→teardown lifecycle.
+    defer if (oprof.enabled) {
+        oprof.dumpPhases("handler");
+        counting_allocator.dump("handler-alloc", mem_stats);
+    };
     defer compiled.deinit();
 
     // Clear any stale cancel flag from a previous statement on this
@@ -2744,6 +2766,18 @@ fn runSingleStatement(
     );
     profiler.recordSince(.query_execute_write, write_start);
     oprof.dump("query");
+    if (oprof.enabled) {
+        const cs = rg_cache.globalStats();
+        const p = prev_cache_stats;
+        const dh = cs.hits - p.hits;
+        const dm = cs.misses - p.misses;
+        const de = cs.evictions - p.evictions;
+        const dmb = cs.miss_bytes - p.miss_bytes;
+        const total = dh + dm;
+        const hit_pct: f64 = if (total == 0) 0 else @as(f64, @floatFromInt(dh)) * 100.0 / @as(f64, @floatFromInt(total));
+        std.debug.print("[rgcache] query: hits={d} misses={d} hit%={d:.1} evictions={d} miss_decompressed_MB={d:.1} cache_live_GB={d:.2}\n", .{ dh, dm, hit_pct, de, @as(f64, @floatFromInt(dmb)) / (1024.0 * 1024.0), @as(f64, @floatFromInt(cs.cache_bytes)) / (1024.0 * 1024.0 * 1024.0) });
+        prev_cache_stats = cs;
+    }
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);

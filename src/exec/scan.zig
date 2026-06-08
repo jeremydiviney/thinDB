@@ -377,6 +377,14 @@ pub const Scan = struct {
     rgs_scanned: u64 = 0,
     rows_scanned: u64 = 0,
 
+    /// Tight scan-kernel accounting (--profile-ops): ticks spent in the per-row-
+    /// group data work, split into `scan_borrow_ticks` (decompress / cache-pin a
+    /// column block) and `scan_kernel_ticks` (the actual compare / gather over
+    /// the bytes — the inner SIMD loop). Excludes loop control, rowGroupCanMatch
+    /// decisions, segment opening, and the ParallelScan worker farm-out.
+    scan_borrow_ticks: u64 = 0,
+    scan_kernel_ticks: u64 = 0,
+
     /// Phase 4.2 (Option A): when set, the projected column at `out_phys[code_col]`
     /// is emitted as global dict CODES (via the `Batch.coded` sidecar) instead of
     /// materialized strings — the consuming aggregate groups on the narrow code,
@@ -1574,11 +1582,15 @@ pub const Scan = struct {
             for (mask[0..rg_count], tm) |*m, keep| m.* = m.* and keep;
         }
 
+        const _tcnt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         var matched: usize = 0;
         for (mask[0..rg_count]) |m| matched += @intFromBool(m);
+        if (exec.prof.enabled) exec.prof.add("scan.mask_count", @intCast(@max(0, exec.prof.nowTicks() - _tcnt)));
         if (matched == 0) return @as(usize, 0);
 
+        const _tm = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         try self.materializeSurvivors(seg, rg_idx, rg_count, mask[0..rg_count]);
+        if (exec.prof.enabled) exec.prof.add("scan.materialize_survivors", @intCast(@max(0, exec.prof.nowTicks() - _tm)));
         return matched;
     }
 
@@ -1609,8 +1621,10 @@ pub const Scan = struct {
         const col_type = self.table.schema.columns[pred_phys].type;
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
+        const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, &self.table.cache);
         defer block.release(self.allocator, &self.table.cache);
+        if (exec.prof.enabled) exec.prof.add("scan.leaf.borrow_block", @intCast(@max(0, exec.prof.nowTicks() - _tb)));
 
         // Dict-encoded string column: test the comparison against each distinct
         // dict value once into a matched-codes bitset, then map per row via the
@@ -1666,7 +1680,9 @@ pub const Scan = struct {
         // if the bytes can't be viewed in place (misaligned / big-endian) — the
         // caller's owned-decode fallback handles it.
         const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
+        const _tc = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         try predicate.evaluateMaskWithPred(view, leaf, rg_count, out);
+        if (exec.prof.enabled) exec.prof.add("scan.leaf.compare_raw", @intCast(@max(0, exec.prof.nowTicks() - _tc)));
         return true;
     }
 
@@ -1912,9 +1928,12 @@ pub const Scan = struct {
         const want = predicate.valueToRangeI128(leaf.val) orelse return null;
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = false };
+        const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
         defer block.release(self.allocator, &self.table.cache);
+        if (exec.prof.enabled) self.scan_borrow_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tb));
         const filtered = try self.ensureFilteredBuffers();
+        const _tk = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         const matched: usize = switch (block.encoding) {
             .for_ => fr: {
                 const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
@@ -1932,6 +1951,7 @@ pub const Scan = struct {
             },
             else => return null,
         };
+        if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tk));
         self.filtered_coded = null;
         return matched;
     }

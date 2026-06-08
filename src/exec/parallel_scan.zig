@@ -187,10 +187,14 @@ pub const ParallelScan = struct {
         // there's no up-front global slot budget to negotiate here.
         const dop = @max(@as(usize, 1), max_dop);
 
+        const t_lock = exec.prof.nowTicks();
         table.ddl_lock.lockSharedUncancelable(table.io);
         errdefer table.ddl_lock.unlockShared(table.io);
+        exec.prof.addPhase("pscan.create.ddl_lock", @intCast(exec.prof.nowTicks() - t_lock));
 
+        const t_snap = exec.prof.nowTicks();
         const snap = Scan.captureSnapshot(table);
+        exec.prof.addPhase("pscan.create.snapshot", @intCast(exec.prof.nowTicks() - t_snap));
         var pin_held = true;
         errdefer if (pin_held) snap.memtable_snap.release();
 
@@ -234,12 +238,15 @@ pub const ParallelScan = struct {
         // ~1 MB/segment, warm in page cache). Returns null — falling back to the
         // equal-count split below — on any footer-read failure, so a sizing
         // hiccup can never break the query.
+        const t_part = exec.prof.nowTicks();
         const bounds: ?[]const usize = if (n_chunks > 1 and total_rgs > n_chunks)
             byteAwareBounds(allocator, table, snap.segment_count, total_rgs, n_chunks, needed)
         else
             null;
         defer if (bounds) |b| allocator.free(b);
+        exec.prof.addPhase("pscan.create.byte_partition(footers)", @intCast(exec.prof.nowTicks() - t_part));
 
+        const t_workers = exec.prof.nowTicks();
         const workers = try allocator.alloc(*Scan, n_chunks);
         var built: usize = 0;
         errdefer {
@@ -257,6 +264,7 @@ pub const ParallelScan = struct {
             // The last chunk also drains the memtable (ordered last).
             w.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
         }
+        exec.prof.addPhase("pscan.create.worker_scans", @intCast(exec.prof.nowTicks() - t_workers));
 
         // Each chunk pinned the memtable; drop the orchestrator's capture pin.
         snap.memtable_snap.release();
@@ -300,7 +308,11 @@ pub const ParallelScan = struct {
     pub fn deinit(self: *ParallelScan) void {
         // Round-mode pool may still be parked on the barrier (query abandoned
         // before the stream drained, e.g. an error or early LIMIT). Join first.
+        const t_pool = exec.prof.nowTicks();
         self.shutdownRoundPool();
+        exec.prof.addPhase("pscan.deinit.thread_join", @intCast(exec.prof.nowTicks() - t_pool));
+        const t_free = exec.prof.nowTicks();
+        defer exec.prof.addPhase("pscan.deinit.free_buffers", @intCast(exec.prof.nowTicks() - t_free));
         // Materialize-mode buffers: column data is owned by the table's
         // allocator (workers allocated it); the wbufs/views slices are the
         // operator's own. Release the charged bytes before the accountant is
@@ -671,6 +683,46 @@ pub const ParallelScan = struct {
         std.debug.print("[pscan] prune hints on worker0: leaf={d} in_set={d} seg_skip={}\n", .{
             w0.prunes.items.len, w0.in_prunes.items.len, w0.seg_skip != null,
         });
+
+        // Tight scan-kernel time: summed ACROSS workers (so it exceeds drain_wall
+        // when DOP>1 — it's total core-time in the inner loop, not wall). Borrow =
+        // block decompress/cache-pin; kernel = the actual compare/gather over the
+        // bytes. Everything else in drain_wall is loop/decision/farm-out overhead.
+        var borrow_ticks: u64 = 0;
+        var kernel_ticks: u64 = 0;
+        for (self.workers) |w| {
+            borrow_ticks +%= w.scan_borrow_ticks;
+            kernel_ticks +%= w.scan_kernel_ticks;
+        }
+        std.debug.print("[pscan] scan-kernel core-time (summed over workers): borrow={d:.2}ms kernel(compare/gather)={d:.2}ms  rows_decoded={d} → {d:.1} M rows/core-sec in kernel\n", .{
+            exec.prof.ticksToMs(@intCast(borrow_ticks)),
+            exec.prof.ticksToMs(@intCast(kernel_ticks)),
+            rows_in,
+            if (kernel_ticks > 0) @as(f64, @floatFromInt(rows_in)) / (exec.prof.ticksToMs(@intCast(kernel_ticks)) * 1000.0) else 0.0,
+        });
+
+        // Per-chunk scan balance: how many row groups each chunk actually
+        // decoded vs. pruned. With work-stealing the n_threads workers steal
+        // these n_chunks chunks, so a chunk whose whole range zone-map-prunes
+        // costs ~nothing while a chunk full of survivors gates a thread.
+        var min_s: u64 = std.math.maxInt(u64);
+        var sum_s: u64 = 0;
+        var n_empty: usize = 0;
+        for (self.workers) |w| {
+            min_s = @min(min_s, w.rgs_scanned);
+            sum_s += w.rgs_scanned;
+            if (w.rgs_scanned == 0) n_empty += 1;
+        }
+        const mean_s = if (self.workers.len > 0) sum_s / self.workers.len else 0;
+        const skew = if (mean_s > 0) @as(f64, @floatFromInt(max_rgs)) / @as(f64, @floatFromInt(mean_s)) else 0.0;
+        std.debug.print("[pscan] chunk scan balance: scanned/considered min={d} max={d} mean={d}  empty_chunks={d}/{d}  max/mean_skew={d:.2}x\n", .{
+            min_s, max_rgs, mean_s, n_empty, self.workers.len, skew,
+        });
+        std.debug.print("[pscan] per-chunk scanned: ", .{});
+        for (self.workers, 0..) |w, i| {
+            std.debug.print("{d}:{d}/{d} ", .{ i, w.rgs_scanned, w.rgs_considered });
+        }
+        std.debug.print("\n", .{});
     }
 
     /// Emit each worker's materialized survivor buffer as one batch, in slice

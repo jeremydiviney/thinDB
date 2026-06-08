@@ -63,6 +63,43 @@ pub fn reset() void {
     count = 0;
 }
 
+// Separate "phase" namespace for handler sub-step breakdowns (operator
+// construction / teardown), kept apart from the per-operator `slots` above so
+// the execute-time `reset()` doesn't clobber construction timings. Accumulate
+// with `addPhase`, clear with `resetPhases`, print with `dumpPhases`.
+threadlocal var phase_slots: [32]Slot = undefined;
+threadlocal var phase_count: usize = 0;
+
+pub inline fn addPhase(name: []const u8, ticks: u64) void {
+    if (!enabled) return;
+    var i: usize = 0;
+    while (i < phase_count) : (i += 1) {
+        if (phase_slots[i].name.ptr == name.ptr) {
+            phase_slots[i].ticks += ticks;
+            phase_slots[i].calls += 1;
+            return;
+        }
+    }
+    if (phase_count < phase_slots.len) {
+        phase_slots[phase_count] = .{ .name = name, .ticks = ticks, .calls = 1 };
+        phase_count += 1;
+    }
+}
+
+pub fn resetPhases() void {
+    phase_count = 0;
+}
+
+pub fn dumpPhases(label: []const u8) void {
+    if (!enabled or phase_count == 0) return;
+    const hz: f64 = @floatFromInt(freq());
+    std.debug.print("[hprof] {s} — handler sub-phase time:\n", .{label});
+    for (phase_slots[0..phase_count]) |s| {
+        const ms = @as(f64, @floatFromInt(s.ticks)) * 1000.0 / hz;
+        std.debug.print("[hprof]   {s: <34} {d: >9.3} ms  ({d}×)\n", .{ s.name, ms, s.calls });
+    }
+}
+
 pub fn dump(label: []const u8) void {
     if (!enabled or count == 0) return;
     const hz: f64 = @floatFromInt(freq());
