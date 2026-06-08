@@ -94,7 +94,14 @@ fn openScanSource(
     return .{ .scan = scan, .drive = drive };
 }
 
-const AggOp = enum { count_star, count_col, sum, avg, min, max };
+const AggOp = enum { count_star, count_col, sum, avg, min, max, count_distinct };
+
+// COUNT(DISTINCT col): reuse the silo core's membership set. With a single global
+// group there's no key to partition on, so each lane builds a partial set (gid 0,
+// the integer value's bit pattern, NULLs skipped) and the single-threaded merge
+// layer unions the lanes per distinct field via DistinctSet.mergeInto. Exact for
+// ≤64-bit integer columns.
+const DistinctSet = HarnessCore.DistinctSet;
 
 const AggPlan = struct {
     op: AggOp,
@@ -125,6 +132,9 @@ const Lane = struct {
     // `allocator`; empty slice when the agg isn't a string min/max or no row
     // has been seen). Only slot `i` of a `.is_string` plan is ever populated.
     sstr: [][]const u8,
+    // Per-aggregate distinct membership set; only slot `i` of a `.count_distinct`
+    // plan is ever populated (others stay empty and allocate nothing).
+    dsets: []DistinctSet,
     allocator: Allocator,
 
     fn init(allocator: Allocator, n: usize) !Lane {
@@ -135,15 +145,20 @@ const Lane = struct {
         const ns = try allocator.alloc(u64, n);
         errdefer allocator.free(ns);
         const sstr = try allocator.alloc([]const u8, n);
+        errdefer allocator.free(sstr);
+        const dsets = try allocator.alloc(DistinctSet, n);
         @memset(isum, 0);
         @memset(fsum, 0);
         @memset(ns, 0);
         @memset(sstr, &.{});
-        return .{ .isum = isum, .fsum = fsum, .ns = ns, .sstr = sstr, .allocator = allocator };
+        @memset(dsets, .{});
+        return .{ .isum = isum, .fsum = fsum, .ns = ns, .sstr = sstr, .dsets = dsets, .allocator = allocator };
     }
 
     fn deinit(self: *Lane, allocator: Allocator) void {
         for (self.sstr) |s| if (s.len > 0) allocator.free(s);
+        for (self.dsets) |*d| d.deinit(allocator);
+        allocator.free(self.dsets);
         allocator.free(self.sstr);
         allocator.free(self.isum);
         allocator.free(self.fsum);
@@ -171,9 +186,16 @@ const Lane = struct {
                 self.ns[i] += other.ns[i];
                 continue;
             }
+            if (p.op == .count_distinct) {
+                try self.dsets[i].mergeInto(self.allocator, &other.dsets[i]);
+                self.ns[i] += other.ns[i];
+                continue;
+            }
             const had = self.ns[i];
             self.ns[i] += other.ns[i];
             switch (p.op) {
+                // Unioned above via DistinctSet.mergeInto before this switch.
+                .count_distinct => unreachable,
                 .count_star, .count_col => {},
                 .sum, .avg => {
                     if (p.is_float) self.fsum[i] += other.fsum[i] else self.isum[i] += other.isum[i];
@@ -258,6 +280,10 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
             switch (p.op) {
                 .count_star => unreachable,
                 .count_col => {},
+                .count_distinct => {
+                    const v: u64 = @bitCast(readIntView(view.data, r));
+                    _ = try lane.dsets[i].insertIsNew(lane.allocator, DistinctSet.key(0, v));
+                },
                 .sum, .avg => {
                     if (p.is_float) lane.fsum[i] += readFloatView(view.data, r) else lane.isum[i] += readIntView(view.data, r);
                 },
@@ -380,6 +406,16 @@ fn isFloatType(typ: Type) bool {
     return typ == .float or typ == .double;
 }
 
+// COUNT(DISTINCT col) v1 scopes the distinct column to ≤64-bit integer-family
+// types: readIntView yields an i64 whose bit pattern keys the set losslessly.
+// 128-bit (largeint/decimal128), float, and string distinct columns are declined.
+fn isDistinctIntType(typ: Type) bool {
+    return switch (typ) {
+        .boolean, .tinyint, .smallint, .int, .bigint, .date, .datetime, .decimal64 => true,
+        else => false,
+    };
+}
+
 fn isStringType(typ: Type) bool {
     return switch (typ) {
         .varchar, .string, .char => true,
@@ -488,6 +524,15 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                     .name = agg.as,
                 };
             },
+            .count_distinct => {
+                const col_name = agg.col orelse return declineFree(allocator, plans, &needed);
+                if (columnType(table, col_name) != null) {
+                    _ = (try addNeeded(allocator, &needed, table, col_name)) orelse return declineFree(allocator, plans, &needed);
+                } else if (!isDerivedName(request.derived, col_name)) {
+                    return declineFree(allocator, plans, &needed);
+                }
+                plans[i] = .{ .op = .count_distinct, .input_name = col_name, .is_float = false, .output_type = .bigint, .name = agg.as };
+            },
             else => return declineFree(allocator, plans, &needed),
         }
     }
@@ -534,6 +579,10 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                         p.is_float = isFloatType(ctyp);
                         p.output_type = out_type;
                     }
+                },
+                .count_distinct => {
+                    const ctyp = resolveAggInputType(table, probe_schema, agg.col.?) orelse return declineFree(allocator, plans, &needed);
+                    if (!isDistinctIntType(ctyp)) return declineFree(allocator, plans, &needed);
                 },
                 else => {},
             }
@@ -802,6 +851,7 @@ const GlobalAggregate = struct {
             switch (p.op) {
                 .count_star => try col.data.bigint.append(a, @intCast(lane.count)),
                 .count_col => try col.data.bigint.append(a, @intCast(lane.ns[i])),
+                .count_distinct => try col.data.bigint.append(a, @intCast(lane.dsets[i].count())),
                 .sum => {
                     if (p.is_float) {
                         try appendFloat(a, col, p.output_type, lane.fsum[i]);

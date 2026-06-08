@@ -460,31 +460,33 @@ const MAX_GROUP_STR_SLOTS: usize = 2;
 // each gets one combined per-bucket membership set. 0/unused for the common case.
 const MAX_GROUP_DISTINCT_SLOTS: usize = 8;
 
-// One COUNT(DISTINCT) field's combined membership set for a single bucket. Keys
-// are pack(gid, value) (gid in the high 64 bits, the integer value's bit pattern
-// in the low 64) — exact, so no value is stored beyond the u128 key and the
-// per-group count falls out as the number of never-before-seen inserts. Lives
-// under the bucket's agg_lock, so insert/merge need no internal synchronization.
-const DistinctSet = struct {
+// One COUNT(DISTINCT) field's combined membership set. Keys are pack(gid, value)
+// (gid in the high 64 bits, the integer value's bit pattern in the low 64) —
+// exact, so no value is stored beyond the u128 key and the distinct count falls
+// out as the number of never-before-seen inserts. The grouped silo folds it under
+// the bucket agg_lock (no synchronization needed); the global aggregate reuses it
+// as a per-lane partial (gid 0) and unions lanes via `mergeInto` at the single-
+// threaded merge layer.
+pub const DistinctSet = struct {
     set: std.AutoHashMapUnmanaged(u128, void) = .empty,
 
-    inline fn key(gid: u32, value_bits: u64) u128 {
+    pub inline fn key(gid: u32, value_bits: u64) u128 {
         return (@as(u128, gid) << 64) | @as(u128, value_bits);
     }
 
-    fn insertIsNew(self: *DistinctSet, allocator: Allocator, composite: u128) !bool {
+    pub fn insertIsNew(self: *DistinctSet, allocator: Allocator, composite: u128) !bool {
         const gop = try self.set.getOrPut(allocator, composite);
         return !gop.found_existing;
     }
 
     // Fold another lane's partial set into this one (global aggregate merge).
-    fn mergeInto(self: *DistinctSet, allocator: Allocator, other: *const DistinctSet) !void {
+    pub fn mergeInto(self: *DistinctSet, allocator: Allocator, other: *const DistinctSet) !void {
         try self.set.ensureUnusedCapacity(allocator, other.set.count());
         var it = other.set.keyIterator();
         while (it.next()) |k| self.set.putAssumeCapacity(k.*, {});
     }
 
-    fn count(self: *const DistinctSet) u64 {
+    pub fn count(self: *const DistinctSet) u64 {
         return self.set.count();
     }
 
@@ -492,7 +494,7 @@ const DistinctSet = struct {
         self.set.clearRetainingCapacity();
     }
 
-    fn deinit(self: *DistinctSet, allocator: Allocator) void {
+    pub fn deinit(self: *DistinctSet, allocator: Allocator) void {
         self.set.deinit(allocator);
     }
 };
