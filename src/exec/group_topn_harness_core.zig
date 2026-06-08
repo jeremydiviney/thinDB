@@ -419,6 +419,7 @@ pub const GroupAggregateOp = enum {
     avg,
     min,
     max,
+    count_distinct,
 };
 
 pub const GroupAggregateSpec = struct {
@@ -431,6 +432,13 @@ pub const GroupAggregateSpec = struct {
     is_string: bool = false,
     str_input_index: u16 = 0,
     str_state_index: u16 = 0,
+    // COUNT(DISTINCT col): reads the carried integer payload `input_column_index`
+    // and tracks membership in the per-bucket combined set `distinct_state_index`
+    // (keyed by (gid,value)); `state_index` is the running distinct-count slot,
+    // bumped only on a never-before-seen (gid,value). `is_distinct` is false for
+    // every other aggregate.
+    is_distinct: bool = false,
+    distinct_state_index: u16 = 0,
 };
 
 // Per-group numeric accumulators are stored in a runtime variable-stride slab
@@ -447,6 +455,47 @@ const MAX_GROUP_PAYLOAD_COLUMNS: usize = 16;
 // aggregate slots. Both are 0/unused for the numeric-only common case.
 const MAX_GROUP_STR_COLUMNS: usize = 2;
 const MAX_GROUP_STR_SLOTS: usize = 2;
+
+// COUNT(DISTINCT) support. A query may carry up to this many distinct aggregates;
+// each gets one combined per-bucket membership set. 0/unused for the common case.
+const MAX_GROUP_DISTINCT_SLOTS: usize = 8;
+
+// One COUNT(DISTINCT) field's combined membership set for a single bucket. Keys
+// are pack(gid, value) (gid in the high 64 bits, the integer value's bit pattern
+// in the low 64) — exact, so no value is stored beyond the u128 key and the
+// per-group count falls out as the number of never-before-seen inserts. Lives
+// under the bucket's agg_lock, so insert/merge need no internal synchronization.
+const DistinctSet = struct {
+    set: std.AutoHashMapUnmanaged(u128, void) = .empty,
+
+    inline fn key(gid: u32, value_bits: u64) u128 {
+        return (@as(u128, gid) << 64) | @as(u128, value_bits);
+    }
+
+    fn insertIsNew(self: *DistinctSet, allocator: Allocator, composite: u128) !bool {
+        const gop = try self.set.getOrPut(allocator, composite);
+        return !gop.found_existing;
+    }
+
+    // Fold another lane's partial set into this one (global aggregate merge).
+    fn mergeInto(self: *DistinctSet, allocator: Allocator, other: *const DistinctSet) !void {
+        try self.set.ensureUnusedCapacity(allocator, other.set.count());
+        var it = other.set.keyIterator();
+        while (it.next()) |k| self.set.putAssumeCapacity(k.*, {});
+    }
+
+    fn count(self: *const DistinctSet) u64 {
+        return self.set.count();
+    }
+
+    fn clear(self: *DistinctSet) void {
+        self.set.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *DistinctSet, allocator: Allocator) void {
+        self.set.deinit(allocator);
+    }
+};
 
 pub const GroupStrColumnSpec = struct {
     source_name: []const u8,
@@ -516,6 +565,10 @@ pub const GroupRowsLayout = struct {
     // queries, in which case `has_str_payload` is false and no string path runs.
     str_columns: []const GroupStrColumnSpec = &.{},
     has_str_payload: bool = false,
+    // COUNT(DISTINCT): number of distinct membership sets the query needs (one per
+    // distinct aggregate). 0 for the common case, in which case no distinct path
+    // runs and the buckets allocate no sets.
+    distinct_slot_count: u16 = 0,
     // When the group key is a hash (string / >128-bit keys), each staged row
     // also carries the source row's packed __rowloc (see rowloc.zig) in a
     // dedicated i64 region after the payload columns, captured into the group
@@ -530,7 +583,7 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.has_str_payload != b.has_str_payload or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
     var key_i: usize = 0;
     while (key_i < a.key_columns.len) : (key_i += 1) {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
@@ -1221,6 +1274,10 @@ const PipeBucket = struct {
     // per-improvement `free` (superseded values are arena garbage, reclaimed
     // wholesale at reset/teardown).
     str_arena: std.heap.ArenaAllocator,
+    // One combined membership set per COUNT(DISTINCT) field. Indexed by the
+    // aggregate's distinct_state_index; only the first `layout.distinct_slot_count`
+    // are touched. Each holds (gid,value) keys for this bucket's groups.
+    distinct_sets: [MAX_GROUP_DISTINCT_SLOTS]DistinctSet = [_]DistinctSet{.{}} ** MAX_GROUP_DISTINCT_SLOTS,
     row_count: u64 = 0,
 
     fn init(allocator: Allocator, expected_groups: usize) !PipeBucket {
@@ -1237,6 +1294,7 @@ const PipeBucket = struct {
     fn deinit(self: *PipeBucket, allocator: Allocator) void {
         self.str_arena.deinit();
         self.str_states.deinit(allocator);
+        for (&self.distinct_sets) |*d| d.deinit(allocator);
         self.chunks.deinit(allocator);
         self.table.deinit(allocator);
         self.states.deinit(allocator);
@@ -1833,6 +1891,7 @@ fn resetPipeBucket(bucket: *PipeBucket) void {
     bucket.states.clearRetainingCapacity();
     bucket.freeStrBytes();
     bucket.str_states.clearRetainingCapacity();
+    for (&bucket.distinct_sets) |*d| d.clear();
 }
 
 fn deinitRawQueues(shared: *PipeShared) void {
@@ -2671,8 +2730,10 @@ fn initGroupStateProgram(
 fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
     ref.head.count += 1;
     for (aggregates) |agg| {
-        // String MIN/MAX is folded separately into the side str_states array.
-        if (agg.is_string) continue;
+        // String MIN/MAX is folded separately into the side str_states array, and
+        // COUNT(DISTINCT) into the side distinct_sets (its count slot is bumped
+        // there, not here).
+        if (agg.is_string or agg.is_distinct) continue;
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         const state_index: usize = agg.state_index;
         switch (agg.op) {
@@ -2710,6 +2771,9 @@ fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec
                     if (ref.head.count == 1 or value > aggregateStateValue(ref, state_index)) try setAggregateStateValue(ref, state_index, value);
                 }
             },
+            // Folded into the side distinct_sets by foldGroupDistinct; the
+            // `is_distinct` guard above means control never reaches here.
+            .count_distinct => unreachable,
         }
     }
 }
@@ -2782,9 +2846,10 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
         // str_columns entry validated by the layout, not here.
         if (agg.is_string) continue;
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
+        if (agg.is_distinct and agg.distinct_state_index >= MAX_GROUP_DISTINCT_SLOTS) return error.UnsupportedOperatorForType;
         switch (agg.op) {
             .count_star => {},
-            .count_col, .sum, .avg, .min, .max => {
+            .count_col, .sum, .avg, .min, .max, .count_distinct => {
                 const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
                 if (input_index >= column_count) return error.UnsupportedOperatorForType;
             },
@@ -2818,6 +2883,7 @@ fn groupChunkRowsDirect(
     table: *GroupTable,
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
+    distinct_sets: []DistinctSet,
     scratch: *GroupScratch,
     allocator: Allocator,
     str_arena: Allocator,
@@ -2829,6 +2895,7 @@ fn groupChunkRowsDirect(
     try states.prepare(allocator, aggSlotCount(rows.layout));
     try states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_str_payload) try str_states.ensureUnusedCapacity(allocator, n);
+    if (rows.layout.distinct_slot_count > distinct_sets.len) return error.UnsupportedOperatorForType;
     _ = scratch;
 
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
@@ -2848,10 +2915,10 @@ fn groupChunkRowsDirect(
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, str_arena, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, str_arena, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, str_arena, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, str_arena, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, str_arena, distinct_sets, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, str_arena, distinct_sets, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, str_arena, distinct_sets, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, str_arena, distinct_sets, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
     }
 }
 
@@ -2872,6 +2939,29 @@ fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), str_arena: Alloc
             const cmp = std.mem.order(u8, b, acc.bytes);
             const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
             if (is_better) acc.bytes = try str_arena.dupe(u8, b);
+        }
+    }
+}
+
+// Fold one row's COUNT(DISTINCT) inputs into group `gid`. Each distinct field's
+// combined set is probed with the exact (gid,value) composite; a never-before-seen
+// pair bumps that aggregate's running count slot. Called under the bucket agg_lock.
+fn foldGroupDistinct(
+    distinct_sets: []DistinctSet,
+    allocator: Allocator,
+    states: *StateSlab,
+    gid: u32,
+    aggregates: []const GroupAggregateSpec,
+    rows: GroupRows,
+    row_idx: usize,
+) !void {
+    for (aggregates) |agg| {
+        if (!agg.is_distinct) continue;
+        const value = try aggregateInputValue(agg, rows, row_idx);
+        const value_bits: u64 = @bitCast(@as(i64, @truncate(value)));
+        const composite = DistinctSet.key(gid, value_bits);
+        if (try distinct_sets[agg.distinct_state_index].insertIsNew(allocator, composite)) {
+            try addAggregateStateValue(states.ref(gid), agg.state_index, 1);
         }
     }
 }
@@ -2915,6 +3005,8 @@ fn groupChunkRowsDirectKeys(
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     str_arena: Allocator,
+    distinct_sets: []DistinctSet,
+    allocator: Allocator,
     keys: anytype,
     key_hi: []const u32,
     row_count: usize,
@@ -2923,6 +3015,7 @@ fn groupChunkRowsDirectKeys(
     rowrefs: []const i64,
 ) !void {
     const has_str = rows.layout.has_str_payload;
+    const has_distinct = rows.layout.distinct_slot_count > 0;
     const n = row_count;
     var r: usize = 0;
     while (r < n) : (r += 1) {
@@ -2942,10 +3035,12 @@ fn groupChunkRowsDirectKeys(
                 str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
                 try foldGroupStr(str_states, str_arena, new_gid, aggregates, rows, r);
             }
+            if (has_distinct) try foldGroupDistinct(distinct_sets, allocator, states, new_gid, aggregates, rows, r);
             continue;
         }
         try updateGroupStateProgram(states.ref(probe.gid), aggregates, rows, r);
         if (has_str) try foldGroupStr(str_states, str_arena, probe.gid, aggregates, rows, r);
+        if (has_distinct) try foldGroupDistinct(distinct_sets, allocator, states, probe.gid, aggregates, rows, r);
     }
 }
 
@@ -3277,7 +3372,7 @@ fn drainRawDedicatedGroupLane(
         lockSpin(&bucket.agg_lock);
         if (profile) local.raw_agg_lock_ticks += nowTicks() - lock_t0;
         const g0 = if (profile) nowTicks() else 0;
-        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, scratch, allocator, bucket.str_arena.allocator(), rows);
+        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), rows);
         bucket.row_count += rows.len();
         if (profile) group_ticks.* += nowTicks() - g0;
         bucket.agg_lock.unlock();

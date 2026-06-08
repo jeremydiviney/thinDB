@@ -52,6 +52,8 @@ const MAX_AGGS: usize = 16;
 const MAX_AGG_INPUTS: usize = 16;
 const MAX_STRING_AGG_INPUTS: usize = 2;
 const MAX_STRING_AGG_SLOTS: usize = 2;
+// Must match HarnessCore.MAX_GROUP_DISTINCT_SLOTS (one combined set per field).
+const MAX_DISTINCT_AGG_SLOTS: usize = 8;
 
 pub const Request = struct {
     group_cols: []const []const u8,
@@ -102,6 +104,11 @@ const AggregatePlan = struct {
     is_string: bool = false,
     str_input_index: u16 = 0,
     str_state_index: u16 = 0,
+    // COUNT(DISTINCT col): the carried integer input is input_column_index, the
+    // combined membership set is distinct_state_index, and the running count lives
+    // in the numeric state_index. Output is a bigint count.
+    is_distinct: bool = false,
+    distinct_state_index: u16 = 0,
 };
 
 const StringAggInputPlan = struct {
@@ -419,6 +426,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
                 .avg => .avg,
                 .min => .min,
                 .max => .max,
+                .count_distinct => .count_distinct,
                 else => return error.UnsupportedOperatorForType,
             },
             .input_column_index = agg_plan.input_column_index,
@@ -427,6 +435,8 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .is_string = agg_plan.is_string,
             .str_input_index = agg_plan.str_input_index,
             .str_state_index = agg_plan.str_state_index,
+            .is_distinct = agg_plan.is_distinct,
+            .distinct_state_index = agg_plan.distinct_state_index,
         };
     }
     var group_key_inputs: [MAX_GROUP_KEYS]GroupTopNEngine.GroupKeyInput = undefined;
@@ -595,6 +605,8 @@ fn compareAggregateValue(agg_plan: AggregatePlan, a: HarnessCore.TopRow, b: Harn
             compareF64(avgFloatValue(a, agg_plan.state_index), avgFloatValue(b, agg_plan.state_index))
         else
             compareF64(avgValue(a, agg_plan.state_index), avgValue(b, agg_plan.state_index)),
+        // The distinct count accumulates in the numeric state slot.
+        .count_distinct => compareI128(rowStateValue(a, agg_plan.state_index), rowStateValue(b, agg_plan.state_index)),
         else => 0,
     };
 }
@@ -763,6 +775,7 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
             allocator,
             if (float_input) avgFloatValue(row, agg_plan.state_index) else avgValue(row, agg_plan.state_index),
         ),
+        .count_distinct => try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index)),
         else => return error.UnsupportedOperatorForType,
     }
 }
@@ -816,6 +829,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
     var aggregates: [MAX_AGGS]AggregatePlan = undefined;
     var next_numeric_state_index: u16 = 1;
     var next_string_state_index: u16 = 0;
+    var next_distinct_state_index: u16 = 0;
     for (request.aggs, 0..) |agg, agg_i| {
         if (agg_i >= MAX_AGGS) return traceDecline(request, "aggregate count");
         switch (agg.func) {
@@ -874,6 +888,30 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     .output_type = output_type,
                 };
                 next_numeric_state_index += 1;
+            },
+            .count_distinct => {
+                const col_name = agg.col orelse return traceDecline(request, "count distinct column");
+                const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "count distinct type");
+                // v1 scopes the distinct column to ≤64-bit integers: the value
+                // bit-packs into the (gid,value) composite key losslessly. String
+                // / float / >64-bit distinct columns are declined (not yet wired).
+                const width = intTypeBits(input_type) orelse return traceDecline(request, "count distinct non-integer");
+                if (width > 64) return traceDecline(request, "count distinct width");
+                if (next_distinct_state_index >= MAX_DISTINCT_AGG_SLOTS) return traceDecline(request, "count distinct slot count");
+                if (next_numeric_state_index > MAX_AGGS) return traceDecline(request, "aggregate state count");
+                const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "count distinct input");
+                aggregates[agg_i] = .{
+                    .name = agg.as,
+                    .func = agg.func,
+                    .input_column_index = input_idx,
+                    .input_type = physicalTypeFor(input_type),
+                    .state_index = next_numeric_state_index,
+                    .output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null,
+                    .is_distinct = true,
+                    .distinct_state_index = next_distinct_state_index,
+                };
+                next_numeric_state_index += 1;
+                next_distinct_state_index += 1;
             },
             else => return traceDecline(request, "aggregate func"),
         }

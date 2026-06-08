@@ -383,6 +383,7 @@ pub const AggregateOp = enum {
     avg,
     min,
     max,
+    count_distinct,
 };
 
 pub const AggregateSpec = struct {
@@ -397,6 +398,11 @@ pub const AggregateSpec = struct {
     is_string: bool = false,
     str_input_index: u16 = 0,
     str_state_index: u16 = 0,
+    // COUNT(DISTINCT col): reads the carried integer `input_column_index` and
+    // tracks membership in combined set `distinct_state_index`; `state_index` is
+    // the running count slot. False/0 for every other aggregate.
+    is_distinct: bool = false,
+    distinct_state_index: u16 = 0,
 };
 
 pub const StringAggInput = struct {
@@ -653,7 +659,9 @@ fn runHarness(
     }
     var group_aggregates_buf: [16]HarnessCore.GroupAggregateSpec = undefined;
     if (shape.aggregate_program.len > group_aggregates_buf.len) return error.UnsupportedOperatorForType;
+    var distinct_slot_count: u16 = 0;
     for (shape.aggregate_program, 0..) |agg, i| {
+        if (agg.is_distinct) distinct_slot_count = @max(distinct_slot_count, agg.distinct_state_index + 1);
         group_aggregates_buf[i] = .{
             .op = switch (agg.op) {
                 .count_star => .count_star,
@@ -662,12 +670,15 @@ fn runHarness(
                 .avg => .avg,
                 .min => .min,
                 .max => .max,
+                .count_distinct => .count_distinct,
             },
             .input_column_index = agg.input_column_index,
             .state_index = agg.state_index,
             .is_string = agg.is_string,
             .str_input_index = agg.str_input_index,
             .str_state_index = agg.str_state_index,
+            .is_distinct = agg.is_distinct,
+            .distinct_state_index = agg.distinct_state_index,
         };
     }
     // shape.hashed comes from the shape gate (string / >128-bit keys). The env
@@ -681,6 +692,7 @@ fn runHarness(
         .aggregates = group_aggregates_buf[0..shape.aggregate_program.len],
         .str_columns = group_str_columns_buf[0..shape.string_aggregate_inputs.len],
         .has_str_payload = shape.string_aggregate_inputs.len > 0,
+        .distinct_slot_count = distinct_slot_count,
         .has_rowref = force_hash,
     };
 
