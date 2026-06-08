@@ -17,6 +17,13 @@ const api_mod = @import("../api/api.zig");
 const storage_mod = @import("../storage/storage.zig");
 const types_mod = @import("../types.zig");
 const rowloc = @import("rowloc.zig");
+const build_options = @import("build_options");
+
+// Comptime master switch for the developer execution-trace profilers. False in
+// every production build (default), which makes every `PROFILING and …` gate
+// below comptime-false so the trace code — branches, prints, and globals — is
+// never emitted. Flip on with `-Dprofiling=true`.
+const PROFILING = build_options.profiling;
 
 const thindb = struct {
     pub const exec = exec_mod;
@@ -45,6 +52,74 @@ const MAX_GROUP_LEASE_BUCKETS: usize = 64;
 const MAX_WORKSPACE_PROFILE_WORKERS: usize = 128;
 const MAX_RAW_BATCH_CHUNKS: usize = 64;
 const MAX_GENERIC_GROUP_KEYS: usize = 8;
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+// Chunk-flow profiler (THINDB_V2_CHUNK_PROFILE): quantifies what the staging
+// layer actually pushes through the queues per scan→group hop — row counts, the
+// numeric slab volume, and the variable-length string payload (string MIN/MAX).
+// A string MIN over a wide column materializes the whole column into these
+// chunks; this makes that visible. Counters are process-wide and reset at the
+// start of each `runSiloGrid`.
+var g_cp_on: bool = false;
+var g_cp_chunks: u64 = 0;
+var g_cp_rows: u64 = 0;
+var g_cp_str_bytes: u64 = 0;
+var g_cp_slab_bytes: u64 = 0;
+var g_cp_sampled: u32 = 0;
+
+fn chunkProfileReset() void {
+    g_cp_chunks = 0;
+    g_cp_rows = 0;
+    g_cp_str_bytes = 0;
+    g_cp_slab_bytes = 0;
+    g_cp_sampled = 0;
+}
+
+fn chunkProfileRecord(rows: RawRows) void {
+    if (comptime !PROFILING) return;
+    if (!g_cp_on) return;
+    const n = rows.len_rows;
+    const str_bytes = rows.str.bytes.items.len;
+    _ = @atomicRmw(u64, &g_cp_chunks, .Add, 1, .monotonic);
+    _ = @atomicRmw(u64, &g_cp_rows, .Add, @intCast(n), .monotonic);
+    _ = @atomicRmw(u64, &g_cp_str_bytes, .Add, @intCast(str_bytes), .monotonic);
+    _ = @atomicRmw(u64, &g_cp_slab_bytes, .Add, @intCast(rows.slab.len), .monotonic);
+    // One-shot dump of a representative chunk's shape + a few sample strings.
+    if (@cmpxchgStrong(u32, &g_cp_sampled, 0, 1, .acq_rel, .monotonic) == null) {
+        const k = rows.layout.str_columns.len;
+        std.debug.print("[chunk-sample] rows={d} slab_bytes={d} str_cols={d} str_payload_bytes={d} avg_str_bytes_per_row={d:.1}\n", .{
+            n, rows.slab.len, k, str_bytes, if (n > 0) @as(f64, @floatFromInt(str_bytes)) / @as(f64, @floatFromInt(n)) else 0,
+        });
+        if (k > 0 and n > 0) {
+            const sample_rows = @min(n, @as(usize, 3));
+            var r: usize = 0;
+            while (r < sample_rows) : (r += 1) {
+                const v = rows.str.get(k, r, 0);
+                const show = v[0..@min(v.len, @as(usize, 60))];
+                std.debug.print("[chunk-sample]   row{d} str0.len={d} \"{s}\"\n", .{ r, v.len, show });
+            }
+        }
+    }
+}
+
+fn chunkProfileDump() void {
+    if (comptime !PROFILING) return;
+    if (!g_cp_on) return;
+    const chunks = @atomicLoad(u64, &g_cp_chunks, .monotonic);
+    const rows = @atomicLoad(u64, &g_cp_rows, .monotonic);
+    const str_bytes = @atomicLoad(u64, &g_cp_str_bytes, .monotonic);
+    const slab_bytes = @atomicLoad(u64, &g_cp_slab_bytes, .monotonic);
+    const mb: f64 = 1024.0 * 1024.0;
+    std.debug.print("[chunk-profile] chunks={d} rows={d} str_payload_MB={d:.1} slab_MB={d:.1} avg_rows_per_chunk={d:.0} avg_str_bytes_per_row={d:.1}\n", .{
+        chunks,
+        rows,
+        @as(f64, @floatFromInt(str_bytes)) / mb,
+        @as(f64, @floatFromInt(slab_bytes)) / mb,
+        if (chunks > 0) @as(f64, @floatFromInt(rows)) / @as(f64, @floatFromInt(chunks)) else 0,
+        if (rows > 0) @as(f64, @floatFromInt(str_bytes)) / @as(f64, @floatFromInt(rows)) else 0,
+    });
+}
 
 fn nowTicks() i64 {
     var c: win.LARGE_INTEGER = 0;
@@ -1837,6 +1912,7 @@ fn recycleGroupRows(shared: *PipeShared, rows_group: GroupRows, reserve_rows: us
 fn publishRawRows(shared: *PipeShared, owner_worker: usize, rows_ptr: *RawRows, reserve_rows: usize, queue_lock_ticks: ?*i64, recycle_lock_ticks: ?*i64) !void {
     if (rows_ptr.len() == 0) return;
     const rows = rows_ptr.*;
+    chunkProfileRecord(rows);
     const row_count: u64 = @intCast(rows.len());
     rows_ptr.* = try acquireRawRows(shared, reserve_rows, recycle_lock_ticks);
     errdefer {
@@ -1871,6 +1947,7 @@ fn publishRawRowsToQueue(
 ) !void {
     if (rows_ptr.len() == 0) return;
     const rows = rows_ptr.*;
+    chunkProfileRecord(rows);
     const row_count: u64 = @intCast(rows.len());
     rows_ptr.* = try acquireRawRows(shared, reserve_rows, recycle_lock_ticks);
     errdefer {
@@ -3541,9 +3618,12 @@ fn chooseGridScanTileRgs(cfg_scan_tile_rgs: usize, scan_tile_rgs_set: bool) usiz
 pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const usize, cfg: RunConfig) !void {
     const freq = perfFreq();
     const function_t0 = nowTicks();
+    g_cp_on = PROFILING and (getenv("THINDB_V2_CHUNK_PROFILE") != null);
+    if (comptime PROFILING) chunkProfileReset();
+    defer chunkProfileDump();
     var pre_return_ticks: i64 = 0;
     defer {
-        if (cfg.trace_timing and pre_return_ticks != 0) {
+        if ((PROFILING and cfg.trace_timing) and pre_return_ticks != 0) {
             std.debug.print("[harness-core-cleanup] query={s} total_cleanup_after_return={d:.1}ms\n", .{
                 "generic",
                 ticksToMs(nowTicks() - pre_return_ticks, freq),
@@ -3582,7 +3662,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     else
         0;
 
-    const snapshot_setup_t0 = if (cfg.trace_timing) nowTicks() else 0;
+    const snapshot_setup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
     table.ddl_lock.lockSharedUncancelable(table.io);
     defer table.ddl_lock.unlockShared(table.io);
 
@@ -3602,9 +3682,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const scan_columns = cfg.scan_columns orelse &[_][]const u8{};
     var stats_scan = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, false, snap);
     defer {
-        const cleanup_t0 = if (cfg.trace_timing) nowTicks() else 0;
+        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
         stats_scan.deinit();
-        if (cfg.trace_timing) std.debug.print("[harness-core-cleanup] query={s} stats_scan={d:.3}ms\n", .{
+        if ((PROFILING and cfg.trace_timing)) std.debug.print("[harness-core-cleanup] query={s} stats_scan={d:.3}ms\n", .{
             "generic",
             ticksToMs(nowTicks() - cleanup_t0, freq),
         });
@@ -3614,9 +3694,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         @max(@as(usize, 16), @min(expected_groups_per_bucket, cfg.group_init_cap))
     else
         expected_groups_per_bucket;
-    const snapshot_setup_ticks = if (cfg.trace_timing) nowTicks() - snapshot_setup_t0 else 0;
+    const snapshot_setup_ticks = if ((PROFILING and cfg.trace_timing)) nowTicks() - snapshot_setup_t0 else 0;
 
-    if (!cfg.quiet) {
+    if (PROFILING and !cfg.quiet) {
         std.debug.print(
             "[clientip] query={s} DOP={d} buckets={d} rows={d} mode=silo-grid workers={d} chunk_rows={d} raw_chunk_rows={d} raw_group_chunk_rows={d} raw_batch_chunks={d} scan_tile_rgs={d} scan_coalesce_tiles={d} route_block_rows={d} group_lease_buckets={d} group_lease_rows={d} local_reserve_per_bucket={d} worker_local_reserve_per_bucket={d} shared_scan_banks={d} shared_scan_reserve_per_bucket={d} flat_reserve_per_worker={d} expected_groups_per_bucket={d} init_groups_per_bucket={d} direct_final_local={s} force_queue_publish={s} shared_scan_buffers={s} flat_scan_partitions={s} raw_group_mode={s} shared_stage_builders={s} scheduler=group_rows_vs_scan_buffer_rows\n",
             .{ "generic", dop, bucket_count, total, n_workers, chunk_rows, raw_chunk_rows, raw_group_chunk_rows, raw_batch_chunks, scan_tile_rgs, scan_coalesce_tiles, route_block_rows, cfg.group_lease_buckets, cfg.group_lease_rows, local_reserve_per_bucket, worker_local_reserve_per_bucket, shared_scan_bank_count, shared_scan_reserve_per_bucket, flat_reserve_per_worker, expected_groups_per_bucket, init_groups_per_bucket, if (direct_final_local) "true" else "false", if (cfg.force_queue_publish) "true" else "false", if (use_shared_scan_buffers) "true" else "false", if (use_flat_scan_partitions) "true" else "false", @tagName(cfg.raw_group_mode), if (cfg.shared_stage_builders) "true" else "false" },
@@ -3639,26 +3719,26 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     defer allocator.free(drives);
     var built_scans: usize = 0;
     defer {
-        const cleanup_t0 = if (cfg.trace_timing) nowTicks() else 0;
+        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
         for (drives[0..built_scans]) |*d| d.deinit();
-        if (cfg.trace_timing) std.debug.print("[harness-core-cleanup] query={s} worker_scans={d:.1}ms count={d}\n", .{
+        if ((PROFILING and cfg.trace_timing)) std.debug.print("[harness-core-cleanup] query={s} worker_scans={d:.1}ms count={d}\n", .{
             "generic",
             ticksToMs(nowTicks() - cleanup_t0, freq),
             built_scans,
         });
     }
 
-    const bucket_setup_t0 = if (cfg.trace_timing) nowTicks() else 0;
+    const bucket_setup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
     const using_workspace = cfg.workspace != null;
     var workspace_profile: WorkspaceProfile = .{};
-    const workspace_profile_ptr: ?*WorkspaceProfile = if (cfg.trace_timing and using_workspace) &workspace_profile else null;
+    const workspace_profile_ptr: ?*WorkspaceProfile = if ((PROFILING and cfg.trace_timing) and using_workspace) &workspace_profile else null;
     var owned_parts: []WorkerParts = &.{};
     defer if (!using_workspace and owned_parts.len > 0) allocator.free(owned_parts);
     var built_parts: usize = 0;
     defer if (!using_workspace) {
-        const cleanup_t0 = if (cfg.trace_timing) nowTicks() else 0;
+        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
         for (owned_parts[0..built_parts]) |*p| p.deinit(allocator);
-        if (cfg.trace_timing) std.debug.print("[harness-core-cleanup] query={s} worker_parts={d:.1}ms count={d}\n", .{
+        if ((PROFILING and cfg.trace_timing)) std.debug.print("[harness-core-cleanup] query={s} worker_parts={d:.1}ms count={d}\n", .{
             "generic",
             ticksToMs(nowTicks() - cleanup_t0, freq),
             built_parts,
@@ -3668,9 +3748,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     defer if (!using_workspace and owned_buckets.len > 0) allocator.free(owned_buckets);
     var built_buckets: usize = 0;
     defer if (!using_workspace) {
-        const cleanup_t0 = if (cfg.trace_timing) nowTicks() else 0;
+        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
         for (owned_buckets[0..built_buckets]) |*bkt| bkt.deinit(allocator);
-        if (cfg.trace_timing) std.debug.print("[harness-core-cleanup] query={s} pipe_buckets={d:.1}ms count={d}\n", .{
+        if ((PROFILING and cfg.trace_timing)) std.debug.print("[harness-core-cleanup] query={s} pipe_buckets={d:.1}ms count={d}\n", .{
             "generic",
             ticksToMs(nowTicks() - cleanup_t0, freq),
             built_buckets,
@@ -3698,7 +3778,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try buckets[b].chunks.ensureTotalCapacity(allocator, 8);
         }
     }
-    const bucket_setup_ticks = if (cfg.trace_timing) nowTicks() - bucket_setup_t0 else 0;
+    const bucket_setup_ticks = if ((PROFILING and cfg.trace_timing)) nowTicks() - bucket_setup_t0 else 0;
     if (workspace_profile_ptr) |profile| {
         profile.printSetup("generic", bucket_count, worker_local_reserve_per_bucket, init_groups_per_bucket);
     }
@@ -3754,7 +3834,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (shared.raw_group_queues) |*queue| try queue.chunks.ensureTotalCapacity(allocator, 8);
     }
     var i: usize = 0;
-    const worker_setup_t0 = if (cfg.trace_timing) nowTicks() else 0;
+    const worker_setup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
     while (i < n_workers) : (i += 1) {
         if (!using_workspace) {
             parts[i] = try WorkerParts.init(allocator, bucket_count, worker_local_reserve_per_bucket);
@@ -3788,7 +3868,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         }
         scans[i].setRange(0, 0, 0, 0, false);
     }
-    const worker_setup_ticks = if (cfg.trace_timing) nowTicks() - worker_setup_t0 else 0;
+    const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) nowTicks() - worker_setup_t0 else 0;
     snap.memtable_snap.release();
     pin_held = false;
 
@@ -3809,7 +3889,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     for (worker_tops) |*t| t.* = .{};
 
     const setup_ticks = nowTicks() - function_t0;
-    if (cfg.trace_timing) {
+    if ((PROFILING and cfg.trace_timing)) {
         std.debug.print("[harness-core-setup] query={s} total={d:.1}ms snapshot_stats={d:.1}ms pipe_buckets={d:.1}ms worker_parts_scans={d:.1}ms other={d:.1}ms\n", .{
             "generic",
             ticksToMs(setup_ticks, freq),
@@ -3992,7 +4072,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             }
         }
     }
-    if (cfg.trace_timing) {
+    if ((PROFILING and cfg.trace_timing)) {
         std.debug.print(
             "[harness-core-timing] query={s} full={d:.1}ms setup_before_workers={d:.1}ms worker_and_final={d:.1}ms final_merge={d:.3}ms result_rows={d}\n",
             .{
@@ -4007,7 +4087,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     pre_return_ticks = nowTicks();
 
-    if (!cfg.quiet and cfg.no_profile) {
+    if (PROFILING and !cfg.quiet and cfg.no_profile) {
         std.debug.print(
             "[clientip-result] query={s} DOP={d} mode=silo-grid workers={d} chunk_rows={d} scan_tile_rgs={d} scan_coalesce_tiles={d} group_lease_buckets={d} group_lease_rows={d} scheduler=group_rows_vs_scan_buffer_rows scanned={d}/{d} filtered={d} grouped_rows={d} groups={d} total={d:.1}ms worker_wall={d:.1}ms final_merge={d:.3}ms no_profile=true\n",
             .{
@@ -4029,7 +4109,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 ticksToMs(final_merge_ticks, freq),
             },
         );
-    } else if (!cfg.quiet) {
+    } else if (PROFILING and !cfg.quiet) {
         std.debug.print(
             "[clientip-prof] query={s} DOP={d} scanned={d}/{d} filtered={d} grouped_rows={d} groups={d} total={d:.1}ms mode=silo-grid workers={d} worker_wall={d:.1}ms final_merge={d:.3}ms group_lease_buckets={d} group_lease_rows={d}\n",
             .{

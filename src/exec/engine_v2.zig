@@ -409,27 +409,20 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         return q;
     }
 
-    // The silo-grid core carries fixed numeric state slots, so it declines
-    // string MIN/MAX, COUNT(DISTINCT), percentile, group_concat, and other
-    // variable-state aggregates. Fall back to a composition of the generic
-    // operators — the same `Aggregate` the legacy engine uses for these — which
-    // keep per-group string/set/heap state. Parallel scan + fused filter feed a
-    // single-threaded grouped aggregate; ORDER BY / LIMIT / post-agg enrich layer
-    // on top as ordinary operators.
-    return try buildGroupAggregateGeneric(input, table, needed, plan);
+    // The silo-grid core carries fixed numeric state slots and string MIN/MAX,
+    // but declines variable-state aggregates it can't hold in the group table —
+    // COUNT(DISTINCT) (a growing per-group set), percentile, group_concat. There
+    // is no single-threaded fallback: a grouped shape the parallel core can't run
+    // is unsupported, not silently serialized.
+    return error.UnsupportedQueryShape;
 }
 
-// Generic grouped-aggregate composition: the correctness fallback for grouped
-// shapes the silo core can't run. Mirrors the legacy engine's
-// `scan -> filter -> compute -> groupByTopK -> ...` floor, reusing the shared
-// operators verbatim. `needed` is the projected base-column set (borrowed; only
-// read during scan construction).
 // Push the fusable subset of derived columns DOWN into the ParallelScan workers
 // so row-local scalar fns (e.g. REGEXP_REPLACE, length()) compute in parallel —
-// instead of stacking a serial Compute that the single-threaded aggregate drain
-// evaluates one row at a time (the Q29 40s trap). Any non-fusable remainder
-// (CASE, subqueries) is layered as a serial Compute referencing the fused cols.
-// Mirrors net/local.zig's fusion split.
+// instead of stacking a serial Compute that a single-threaded drain evaluates one
+// row at a time (the Q29 40s trap). Any non-fusable remainder (CASE, subqueries)
+// is layered as a serial Compute referencing the fused cols. Mirrors
+// net/local.zig's fusion split.
 fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived: []const ir.Derived) !exec.Query {
     var result = q;
     const scan_cols = result.outputSchema();
@@ -444,32 +437,6 @@ fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived: []c
     if (!try result.tryFuseCompute(fusable.items)) return result.compute(derived);
     if (serial.items.len == 0) return result;
     return result.compute(serial.items);
-}
-
-fn buildGroupAggregateGeneric(
-    input: CompileInput,
-    table: *api.Table,
-    needed: ?[]const []const u8,
-    plan: GroupTopNPlan,
-) !exec.Query {
-    const allocator = input.allocator;
-    const max_dop = input.db.config.max_dop;
-
-    var q = if (max_dop > 1)
-        try exec.ParallelScan.create(allocator, table, null, needed, max_dop)
-    else
-        try exec.scanWithProjection(allocator, table, null, needed);
-    errdefer q.deinit();
-
-    if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived);
-    q = try q.groupByTopK(plan.group_by.group_cols, plan.group_by.aggs, null, null);
-    if (plan.post_agg_derived.len > 0) q = try q.compute(plan.post_agg_derived);
-    if (plan.having_filter) |f| q = try q.filter(f.predicate);
-    if (plan.order_by) |o| q = try q.orderBy(o.specs);
-    if (plan.limit) |l| q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
-    q = try applyOutputProjection(input.allocator, q, plan);
-    return q;
 }
 
 const GlobalAggregatePlan = struct {

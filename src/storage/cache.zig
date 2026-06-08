@@ -105,7 +105,7 @@ pub const Cache = struct {
 
     pub const Entry = struct {
         key: Key,
-        bytes: []u8,
+        bytes: []align(16) u8,
         prev: ?*Entry,
         next: ?*Entry,
         /// In-use refcount. Nonzero entries are never evicted.
@@ -162,7 +162,7 @@ pub const Cache = struct {
     /// and this call, `bytes` is freed and the existing entry is returned pinned
     /// instead. On allocation failure the entry is not stored and `bytes` is left
     /// for the caller to free. Caller MUST `release`.
-    pub fn insertPinned(self: *Cache, key: Key, bytes: []u8, encoding: format.Encoding) !*Entry {
+    pub fn insertPinned(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !*Entry {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -244,8 +244,14 @@ pub const Cache = struct {
 
 // ---------- tests --------------------------------------------------------
 
-fn put(c: *Cache, key: Key, bytes: []u8) !void {
+fn put(c: *Cache, key: Key, bytes: []align(16) u8) !void {
     c.release(try c.insertPinned(key, bytes, .raw));
+}
+
+fn adup(allocator: Allocator, s: []const u8) ![]align(16) u8 {
+    const b = try allocator.alignedAlloc(u8, .@"16", s.len);
+    @memcpy(b, s);
+    return b;
 }
 
 test "cache acquire/insert round-trip + hit/miss counters" {
@@ -257,7 +263,7 @@ test "cache acquire/insert round-trip + hit/miss counters" {
     try std.testing.expect(c.acquire(k) == null);
     try std.testing.expectEqual(@as(u64, 1), c.misses);
 
-    const e1 = try c.insertPinned(k, try allocator.dupe(u8, "hello"), .raw);
+    const e1 = try c.insertPinned(k, try adup(allocator,"hello"), .raw);
     try std.testing.expectEqualStrings("hello", e1.bytes);
     c.release(e1);
 
@@ -275,7 +281,7 @@ test "cache evicts unpinned LRU entries when over budget" {
     // Four 10-byte entries, all released so they're evictable; the fourth
     // pushes us to 40 > 30, evicting the LRU tail (rg 0).
     inline for (0..4) |i| {
-        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try allocator.dupe(u8, "0123456789"));
+        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try adup(allocator,"0123456789"));
     }
 
     try std.testing.expect(c.acquire(.{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }) == null);
@@ -291,15 +297,15 @@ test "cache LRU order updated on acquire" {
 
     const k1 = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
     const k2 = Key{ .segment_id = 1, .row_group_idx = 1, .column_idx = 0 };
-    try put(&c, k1, try allocator.dupe(u8, "0123456789"));
-    try put(&c, k2, try allocator.dupe(u8, "abcdefghij"));
+    try put(&c, k1, try adup(allocator,"0123456789"));
+    try put(&c, k2, try adup(allocator,"abcdefghij"));
 
     // Touch k1 → MRU; k2 becomes the LRU tail.
     c.release(c.acquire(k1).?);
 
     // Inserting a third 10-byte entry over a cap of 20 evicts the tail (k2).
     const k3 = Key{ .segment_id = 1, .row_group_idx = 2, .column_idx = 0 };
-    try put(&c, k3, try allocator.dupe(u8, "XXXXXXXXXX"));
+    try put(&c, k3, try adup(allocator,"XXXXXXXXXX"));
 
     try std.testing.expect(c.acquire(k2) == null);
     c.release(c.acquire(k1).?);
@@ -313,11 +319,11 @@ test "cache never evicts a pinned entry, even over budget" {
 
     // Hold k1 pinned (in-use) the whole time.
     const k1 = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
-    const pinned = try c.insertPinned(k1, try allocator.dupe(u8, "0123456789"), .raw);
+    const pinned = try c.insertPinned(k1, try adup(allocator,"0123456789"), .raw);
 
     // Flood the cache well past budget while k1 — the oldest entry — stays pinned.
     inline for (1..4) |i| {
-        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try allocator.dupe(u8, "XXXXXXXXXX"));
+        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try adup(allocator,"XXXXXXXXXX"));
     }
 
     // k1 must still be resident despite being LRU and us being over budget.
@@ -333,10 +339,10 @@ test "cache insertPinned dedupes a racing duplicate key" {
     defer c.deinit();
 
     const k = Key{ .segment_id = 7, .row_group_idx = 2, .column_idx = 3 };
-    const first = try c.insertPinned(k, try allocator.dupe(u8, "AAAA"), .raw);
+    const first = try c.insertPinned(k, try adup(allocator,"AAAA"), .raw);
     // Second insert of the same key (simulating a lost decompress race) must
     // free the redundant bytes and hand back the existing entry.
-    const second = try c.insertPinned(k, try allocator.dupe(u8, "BBBB"), .raw);
+    const second = try c.insertPinned(k, try adup(allocator,"BBBB"), .raw);
     try std.testing.expectEqual(first, second);
     try std.testing.expectEqualStrings("AAAA", second.bytes);
     try std.testing.expectEqual(@as(usize, 4), c.current_bytes);

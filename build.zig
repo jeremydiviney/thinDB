@@ -10,6 +10,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ---- build options: dev profilers ----
+    // `-Dprofiling=true` compiles in the developer-only execution traces
+    // (THINDB_V2_PIPELINE_TRACE / _WORKER_PROFILE / _CHUNK_PROFILE and the
+    // harness-core timing prints). When false (the default, and every production
+    // build) the `comptime build_options.profiling` gates eliminate that code
+    // entirely — no branches, no globals, nothing in the binary. The runtime
+    // `--profile-ops` operator profiler is a separate product feature and stays.
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "profiling", b.option(bool, "profiling", "compile in developer execution-trace profilers") orelse false);
+
     // ---- thinDB library module ----
     const thindb_mod = b.addModule("thindb", .{
         .root_source_file = b.path("src/root.zig"),
@@ -17,6 +27,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     thindb_mod.linkLibrary(zstd_dep.artifact("zstd"));
+    thindb_mod.addOptions("build_options", build_opts);
 
     // ---- Library artifact (so we have something to `zig build`) ----
     const lib = b.addLibrary(.{

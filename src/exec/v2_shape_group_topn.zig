@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const build_options = @import("build_options");
 
 const api = @import("../api/api.zig");
 const types = @import("../types.zig");
@@ -1191,6 +1192,7 @@ fn traceAccepted(request: Request, plan: ShapePlan) void {
 }
 
 fn traceProfile(ctx: ExecutionContext) void {
+    if (comptime !build_options.profiling) return;
     if (getenv("THINDB_V2_PIPELINE_TRACE") == null) return;
     const key_width = GroupTopNEngine.KeyWidth.fromBits(ctx.plan.layout.total_bits);
     std.debug.print("[v2-pipeline] shape=group-topN kind={s} key_bits={} key_width={s} prepare={d:.3}ms core={d:.1}ms workspace_teardown={d:.1}ms emit={d:.3}ms dop={} buckets={} chunk_rows={} route_block_rows={} group_init_cap={} shared_scan_buffers={s} shared_scan_banks={} force_queue_publish={s} flat_scan_partitions={s} raw_group_mode=staged_final raw_chunk_rows={} raw_group_chunk_rows={} raw_batch_chunks={} shared_stage_builders={s}\n", .{

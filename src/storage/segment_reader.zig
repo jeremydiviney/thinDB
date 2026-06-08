@@ -140,7 +140,7 @@ pub const ReadSegment = struct {
         /// keeping the rest of the projection zero-copy. Raw blocks view in place.
         encoding: format.Encoding = .raw,
         entry: ?*storage_cache.Cache.Entry = null,
-        owned: ?[]u8 = null,
+        owned: ?[]align(16) u8 = null,
         /// Native-width expansion of a FOR-encoded block, allocated by the
         /// borrow path so a single FOR column doesn't force the whole row group
         /// onto the owned-decode path. Freed on `release`. Null for raw blocks.
@@ -372,13 +372,14 @@ fn readBlockRaw(
     }
 }
 
-/// Like `readBlockRaw` but ALWAYS returns owned bytes (caller frees), so it
-/// can be inserted into the cache. For uncompressed blocks, allocates a copy.
+/// Like `readBlockRaw` but ALWAYS returns owned, 16-byte-aligned bytes (caller
+/// frees), so it can be inserted into the cache and viewed zero-copy. For
+/// uncompressed blocks, allocates an aligned copy.
 fn getDecompressedBytes(
     allocator: Allocator,
     bytes: []const u8,
     offset: usize,
-) ![]u8 {
+) ![]align(16) u8 {
     const kind_byte = bytes[offset];
     if (kind_byte > @intFromEnum(format.Compression.zstd)) return format.Error.UnknownCompression;
     const kind: format.Compression = @enumFromInt(kind_byte);
@@ -388,8 +389,12 @@ fn getDecompressedBytes(
     const payload = bytes[payload_start .. payload_start + compressed_size];
 
     switch (kind) {
-        .none => return allocator.dupe(u8, payload),
-        .zstd => return compression_mod.decompress(allocator, payload, uncompressed_size),
+        .none => {
+            const dst = try allocator.alignedAlloc(u8, .@"16", payload.len);
+            @memcpy(dst, payload);
+            return dst;
+        },
+        .zstd => return compression_mod.decompressAligned(allocator, payload, uncompressed_size),
     }
 }
 

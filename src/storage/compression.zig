@@ -86,6 +86,21 @@ pub fn decompress(allocator: Allocator, input: []const u8, uncompressed_size: us
     return dst;
 }
 
+/// Like `decompress` but the result buffer is 16-byte aligned. The row-group
+/// cache stores blocks through this so the scan can build zero-copy typed views
+/// (string offset arrays, fixed-width columns) directly over the cached bytes —
+/// an arbitrary-alignment buffer forces a redundant owned decode per row group.
+pub fn decompressAligned(allocator: Allocator, input: []const u8, uncompressed_size: usize) ![]align(16) u8 {
+    const dst = try allocator.alignedAlloc(u8, .@"16", uncompressed_size);
+    errdefer allocator.free(dst);
+
+    const written = c.ZSTD_decompress(dst.ptr, dst.len, input.ptr, input.len);
+    if (c.ZSTD_isError(written) != 0) return Error.ZstdDecodeFailed;
+    if (written != uncompressed_size) return Error.ZstdDecodeFailed;
+
+    return dst;
+}
+
 // ---------- tests --------------------------------------------------------
 
 test "compress + decompress round-trip — simple bytes" {

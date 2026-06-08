@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const build_options = @import("build_options");
 
 const api = @import("../api/api.zig");
 const types = @import("../types.zig");
@@ -508,8 +509,8 @@ pub fn paramsFromEnv(default_dop: usize) Params {
         .raw_group_chunk_rows = @max(@as(usize, 1), envUsize("THINDB_V2_RAW_GROUP_CHUNK_ROWS", DEFAULT_RAW_GROUP_CHUNK_ROWS)),
         .raw_batch_chunks = @max(@as(usize, 1), envUsize("THINDB_V2_RAW_BATCH_CHUNKS", DEFAULT_RAW_BATCH_CHUNKS)),
         .shared_stage_builders = getenv("THINDB_V2_NO_SHARED_STAGE_BUILDERS") == null,
-        .worker_profile = getenv("THINDB_V2_WORKER_PROFILE") != null,
-        .trace_timing = getenv("THINDB_V2_PIPELINE_TRACE") != null,
+        .worker_profile = build_options.profiling and (getenv("THINDB_V2_WORKER_PROFILE") != null),
+        .trace_timing = build_options.profiling and (getenv("THINDB_V2_PIPELINE_TRACE") != null),
         .arena_workspace = getenv("THINDB_V2_ARENA_WORKSPACE") != null,
         .sync_teardown = getenv("THINDB_V2_SYNC_TEARDOWN") != null,
     };
