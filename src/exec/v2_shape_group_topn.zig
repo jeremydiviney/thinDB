@@ -462,9 +462,13 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .offset = ctx.request.offset,
             .emit_all_groups = !canUseCoreCountDescTopN(ctx),
             .emit_all_groups_cap = unorderedLimitCap(ctx),
-            // When the unordered-LIMIT cap is active and a HAVING is present,
-            // the core counts only HAVING survivors toward the cap.
-            .emit_filter = if (unorderedLimitCap(ctx) != 0 and ctx.request.having_filter != null)
+            // HAVING is applied per group inside the core's all-groups emit, so
+            // only survivors are string-materialized (their MIN/MAX key bytes
+            // dup'd) and returned — the order-by/limit then runs on that small
+            // survivor set instead of every group. With an unordered-LIMIT cap
+            // active, survivors also count toward the cap so the emit can stop
+            // early.
+            .emit_filter = if (ctx.request.having_filter != null)
                 HarnessCore.EmitFilter{ .ctx = ctx, .pass = havingEmitPass }
             else
                 null,
