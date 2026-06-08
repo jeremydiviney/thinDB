@@ -22,6 +22,7 @@ const aggregate = @import("aggregate.zig");
 const compute = @import("compute.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
+const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
 const transform = @import("../engine/engine.zig").transform;
 
 const Batch = exec.Batch;
@@ -459,6 +460,13 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .limit = ctx.request.limit,
             .offset = ctx.request.offset,
             .emit_all_groups = !canUseCoreCountDescTopN(ctx),
+            .emit_all_groups_cap = unorderedLimitCap(ctx),
+            // When the unordered-LIMIT cap is active and a HAVING is present,
+            // the core counts only HAVING survivors toward the cap.
+            .emit_filter = if (unorderedLimitCap(ctx) != 0 and ctx.request.having_filter != null)
+                HarnessCore.EmitFilter{ .ctx = ctx, .pass = havingEmitPass }
+            else
+                null,
             .hashed = ctx.plan.hashed,
         },
         .params = params,
@@ -486,6 +494,18 @@ fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
         if (agg.func == .count and types.columnNameEql(agg.name, ctx.request.order_specs[0].col)) return true;
     }
     return false;
+}
+
+// A `LIMIT N` with no ORDER BY accepts any N+offset groups, so the core can
+// stop emitting once it has that many instead of materializing every group
+// (and string-dup'ing every key) only to slice the first N. With HAVING the
+// cap counts only groups that pass the predicate — the core applies HAVING in
+// the emit loop via `emit_filter` (see `havingEmitPass`), so any N+offset
+// survivors still satisfy the unordered LIMIT.
+fn unorderedLimitCap(ctx: *const ExecutionContext) usize {
+    if (ctx.request.order_specs.len != 0) return 0;
+    if (ctx.request.limit == 0) return 0;
+    return ctx.request.limit + ctx.request.offset;
 }
 
 fn prepareFinalRows(op: *GroupTopNPipeline, rows: []HarnessCore.TopRow) !FinalRows {
@@ -647,9 +667,23 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRo
     const allocator = op.allocator;
     const part_count = op.plan.layout.part_count;
 
-    var key_names: [MAX_GROUP_KEYS][]const u8 = undefined;
-    for (op.plan.layout.parts[0..part_count], 0..) |part, j| key_names[j] = part.name;
-    const names = key_names[0..part_count];
+    // Projection to late-materialize: a plain key is its own base column; a
+    // derived key has no stored column, so materialize the columns its
+    // expression reads and recompute it below.
+    var base_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer base_names.deinit(allocator);
+    var derived_keys: [MAX_GROUP_KEYS]compute.Derived = undefined;
+    var n_derived: usize = 0;
+    for (op.plan.layout.parts[0..part_count]) |part| {
+        if (findDerived(op.request.derived, part.name)) |d| {
+            try compute.collectColumnRefs(allocator, &base_names, d.expr);
+            derived_keys[n_derived] = d;
+            n_derived += 1;
+        } else {
+            try appendUniqueCol(allocator, &base_names, part.name);
+        }
+    }
+    const names = base_names.items;
 
     const scan_ptr = try Scan.allocWithProjectionLoc(allocator, op.table, null, names, false, null);
     var inner = exec.makeQuery(allocator, scan_ptr);
@@ -667,12 +701,30 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRo
     try late.materializeInto(locs, scan_ptr.memtableSnap());
     const materialized = late.outputColumns();
 
+    // Recompute any derived key columns over the materialized source rows with
+    // the standard Compute operator; the result batch then carries every key
+    // column (plain + derived) by name.
+    const mat_views = try allocator.alloc(ColumnView, materialized.columns.len);
+    defer allocator.free(mat_views);
+    for (materialized.columns, 0..) |*c, i| mat_views[i] = c.view();
+    const mat_batch = Batch{ .schema = materialized.schema, .values = mat_views, .row_count = rows.len };
+
+    var compute_q: ?Query = null;
+    defer if (compute_q) |*q| q.deinit();
+    var result = mat_batch;
+    if (n_derived > 0) {
+        const src = try SingleBatchSource.create(allocator, mat_batch);
+        compute_q = try compute.Compute.create(allocator, src, derived_keys[0..n_derived]);
+        result = (try compute_q.?.next()) orelse return error.UnsupportedQueryShape;
+    }
+
     const idx_buf = try allocator.alloc(u32, rows.len);
     defer allocator.free(idx_buf);
     for (0..rows.len) |i| idx_buf[i] = @intCast(i);
 
-    for (0..part_count) |j| {
-        try transform.appendByIndices(allocator, materialized.columns[j].view(), idx_buf, &op.output_cols[j]);
+    for (op.plan.layout.parts[0..part_count], 0..) |part, j| {
+        const ci = types.findColumn(result.schema, part.name) orelse return error.UnsupportedQueryShape;
+        try transform.appendByIndices(allocator, result.values[ci], idx_buf, &op.output_cols[j]);
     }
     for (rows) |row| {
         for (op.plan.aggregates[0..op.plan.aggregate_count], 0..) |agg_plan, i| {
@@ -732,16 +784,11 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
     }
     if (total_bits > 128) hashed = true;
 
-    // A derived key in a hashed layout can't be recovered at emit: the hashed
-    // path late-materializes each key from the row's source location, which a
-    // computed value has no backing for. Decline (string-derived keys are a
-    // later phase); integer-packed derived keys carry their value in the key
-    // bits and emit fine.
-    if (hashed) {
-        for (request.group_cols) |name| {
-            if (findDerived(request.derived, name) != null) return traceDecline(request, "derived hashed key");
-        }
-    }
+    // A derived key in a hashed layout has no stored column to read back at
+    // emit. `emitResultStageHashed` recovers it the same way it recovers any
+    // key — late-materialize from the survivor's rowref — but materializes the
+    // derived expression's SOURCE columns and recomputes the expression over
+    // them (only the ≤LIMIT survivors).
 
     var parts: [MAX_GROUP_KEYS]KeyPart = undefined;
     var offset: u8 = 0;
@@ -922,11 +969,11 @@ fn havingExprSupported(parts: []const KeyPart, aggregates: []const AggregatePlan
     };
 }
 
-fn havingOutputNum(op: *GroupTopNPipeline, name: []const u8, row: HarnessCore.TopRow) ?Num {
-    for (op.plan.layout.parts[0..op.plan.layout.part_count]) |part| {
+fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.TopRow) ?Num {
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
         if (types.columnNameEql(name, part.name)) return .{ .i = keyPartValue(part, row.key) };
     }
-    for (op.plan.aggregates[0..op.plan.aggregate_count]) |agg_plan| {
+    for (plan.aggregates[0..plan.aggregate_count]) |agg_plan| {
         if (types.columnNameEql(name, agg_plan.name)) {
             const float_input = isFloatPhysical(agg_plan.input_type);
             return switch (agg_plan.func) {
@@ -943,10 +990,10 @@ fn havingOutputNum(op: *GroupTopNPipeline, name: []const u8, row: HarnessCore.To
     return null;
 }
 
-fn havingPasses(op: *GroupTopNPipeline, expr: PredicateExpr, row: HarnessCore.TopRow) bool {
+fn havingPasses(plan: *const ShapePlan, expr: PredicateExpr, row: HarnessCore.TopRow) bool {
     return switch (expr) {
         .leaf => |p| {
-            const lhs = havingOutputNum(op, p.col, row) orelse return false;
+            const lhs = havingOutputNum(plan, p.col, row) orelse return false;
             const rhs = valueAsNum(p.val) orelse return false;
             const ord = numOrder(lhs, rhs);
             return switch (p.op) {
@@ -960,23 +1007,32 @@ fn havingPasses(op: *GroupTopNPipeline, expr: PredicateExpr, row: HarnessCore.To
         },
         .is_null => false,
         .is_not_null => true,
-        .not => |child| !havingPasses(op, child.*, row),
+        .not => |child| !havingPasses(plan, child.*, row),
         .@"and" => |children| {
-            for (children) |child| if (!havingPasses(op, child, row)) return false;
+            for (children) |child| if (!havingPasses(plan, child, row)) return false;
             return true;
         },
         .@"or" => |children| {
-            for (children) |child| if (havingPasses(op, child, row)) return true;
+            for (children) |child| if (havingPasses(plan, child, row)) return true;
             return false;
         },
         else => true,
     };
 }
 
+// Callback bridge so the core's all-groups emit can apply HAVING per group
+// (before the string key is materialized) and count only survivors toward the
+// cap. `ctx` is the owning pipeline; its plan + request supply the predicate.
+fn havingEmitPass(ctx: ?*anyopaque, row: HarnessCore.TopRow) bool {
+    const ec: *const ExecutionContext = @ptrCast(@alignCast(ctx.?));
+    const expr = ec.request.having_filter orelse return true;
+    return havingPasses(&ec.plan, expr, row);
+}
+
 fn applyHaving(op: *GroupTopNPipeline, expr: PredicateExpr, rows: []HarnessCore.TopRow) []HarnessCore.TopRow {
     var w: usize = 0;
     for (rows) |row| {
-        if (havingPasses(op, expr, row)) {
+        if (havingPasses(&op.plan, expr, row)) {
             rows[w] = row;
             w += 1;
         }

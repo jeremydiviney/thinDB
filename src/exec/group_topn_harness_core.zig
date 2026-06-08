@@ -2056,6 +2056,15 @@ pub const TopRow = struct {
     str: [MAX_GROUP_STR_SLOTS][]const u8 = [_][]const u8{&.{}} ** MAX_GROUP_STR_SLOTS,
 };
 
+// Optional per-group predicate applied during the all-groups emit (a HAVING
+// filter for a capped unordered LIMIT). Evaluated on the numeric TopRow before
+// the string key is dup'd, so failing groups cost nothing; only passing groups
+// count toward the emit cap. The caller (the pipeline) owns the context.
+pub const EmitFilter = struct {
+    ctx: ?*anyopaque,
+    pass: *const fn (?*anyopaque, TopRow) bool,
+};
+
 inline fn topRowFromState(ref: StateRef) TopRow {
     var row: TopRow = .{
         .key = ref.head.key,
@@ -3473,6 +3482,12 @@ pub const RunConfig = struct {
     quiet: bool = false,
     result_out: ?*std.ArrayListUnmanaged(TopRow) = null,
     result_all_groups: bool = false,
+    // Stop the all-groups emit after this many groups (an unordered `LIMIT N`
+    // needs only any N+offset groups). 0 means emit every group.
+    result_all_groups_cap: usize = 0,
+    // Per-group predicate applied during the all-groups emit (HAVING for a
+    // capped unordered LIMIT). Only passing groups count toward the cap.
+    result_emit_filter: ?EmitFilter = null,
     trace_timing: bool = false,
     workspace: ?*SiloGridWorkspace = null,
 };
@@ -3944,17 +3959,27 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     if (cfg.result_out) |out| {
         const has_str_out = cfg.group_rows_layout.has_str_payload;
         if (cfg.result_all_groups) {
-            for (buckets) |*bucket| {
+            const cap = cfg.result_all_groups_cap;
+            const filter = cfg.result_emit_filter;
+            emit_all: for (buckets) |*bucket| {
+                if (cap != 0 and out.items.len >= cap) break;
                 if (has_str_out) {
                     var gid: usize = 0;
                     while (gid < bucket.states.len) : (gid += 1) {
+                        if (cap != 0 and out.items.len >= cap) break :emit_all;
                         var row = topRowFromStateStr(bucket.states.ref(gid), bucket.str_states.items[gid]);
+                        if (filter) |f| if (!f.pass(f.ctx, row)) continue;
                         try ownTopRowStr(&row, allocator);
                         try out.append(allocator, row);
                     }
                 } else {
                     var gid: usize = 0;
-                    while (gid < bucket.states.len) : (gid += 1) try out.append(allocator, topRowFromState(bucket.states.ref(gid)));
+                    while (gid < bucket.states.len) : (gid += 1) {
+                        if (cap != 0 and out.items.len >= cap) break :emit_all;
+                        const row = topRowFromState(bucket.states.ref(gid));
+                        if (filter) |f| if (!f.pass(f.ctx, row)) continue;
+                        try out.append(allocator, row);
+                    }
                 }
             }
         } else {
