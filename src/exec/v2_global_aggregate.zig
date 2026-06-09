@@ -10,8 +10,11 @@
 //! layer is reused verbatim.
 //!
 //! Scope: COUNT(*), COUNT(col), SUM, AVG, MIN, MAX over any int or float column,
-//! with an optional WHERE. COUNT(DISTINCT), aggregate-over-expression, and HAVING
-//! are intentionally out of this first cut (they decline to UnsupportedQueryShape).
+//! COUNT(DISTINCT col) over ANY column type (int of any width, 128-bit numeric,
+//! float, or string), and aggregate-over-expression, all with an optional WHERE.
+//! There is NO serial fallback: a shape this handler can't run is an error, so
+//! every global aggregate goes through the parallel reduce. HAVING (a 0/1-row
+//! post-filter) is the one remaining decline.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -97,11 +100,19 @@ fn openScanSource(
 const AggOp = enum { count_star, count_col, sum, avg, min, max, count_distinct };
 
 // COUNT(DISTINCT col): reuse the silo core's membership set. With a single global
-// group there's no key to partition on, so each lane builds a partial set (gid 0,
-// the integer value's bit pattern, NULLs skipped) and the single-threaded merge
-// layer unions the lanes per distinct field via DistinctSet.mergeInto. Exact for
-// ≤64-bit integer columns.
+// group there's no key to partition on, so each lane builds a partial set over
+// its row-group share (NULLs skipped) and the single-threaded merge layer unions
+// the lanes per distinct field via DistinctSet.mergeInto. The full 128-bit key
+// space is free (no gid to pack), so every column type maps to a lossless or
+// collision-negligible u128 key — see distinctKey.
 const DistinctSet = HarnessCore.DistinctSet;
+
+// How a COUNT(DISTINCT) column's value becomes its u128 set key:
+//   .int    — ≤64-bit integer family, zero-extended bit pattern (lossless)
+//   .wide   — 128-bit numeric (largeint / decimal128 / uuid), value as-is (lossless)
+//   .float  — f32/f64 widened to f64 then bit-cast (distinct-preserving)
+//   .string — 128-bit hash of the bytes (collision-negligible at ClickBench scale)
+const DistinctKind = enum { int, wide, float, string };
 
 const AggPlan = struct {
     op: AggOp,
@@ -113,6 +124,8 @@ const AggPlan = struct {
     // MIN/MAX over a string column: the accumulator is the running extreme
     // bytes (`Lane.sstr`), not a numeric slot. Only ever set for .min/.max.
     is_string: bool = false,
+    // Distinct-key derivation; meaningful only for .count_distinct.
+    dkind: DistinctKind = .int,
     output_type: Type,
     name: []const u8,
 };
@@ -244,12 +257,57 @@ inline fn readFloatView(v: ValueView, row: usize) f64 {
     };
 }
 
+inline fn read128(v: ValueView, row: usize) u128 {
+    return switch (v) {
+        .largeint, .decimal128 => |s| @bitCast(s[row]),
+        .uuid => |s| s[row],
+        else => 0,
+    };
+}
+
+inline fn stringBytes(v: ValueView, row: usize) []const u8 {
+    return switch (v) {
+        .varchar, .string, .char => |s| s.rowBytes(row),
+        else => &.{},
+    };
+}
+
+// 128-bit content hash for string distinct keys: two independently-seeded
+// Wyhash passes packed into a u128. At ~6M distinct values the birthday
+// collision probability against 2^128 is negligible, so the distinct count is
+// exact in practice without storing the string bytes in the set.
+inline fn hashStr(bytes: []const u8) u128 {
+    const lo = std.hash.Wyhash.hash(0x9E3779B97F4A7C15, bytes);
+    const hi = std.hash.Wyhash.hash(0xD1B54A32D192ED03, bytes);
+    return (@as(u128, hi) << 64) | @as(u128, lo);
+}
+
+inline fn distinctKey(dkind: DistinctKind, v: ValueView, row: usize) u128 {
+    return switch (dkind) {
+        .int => @as(u128, @as(u64, @bitCast(readIntView(v, row)))),
+        .wide => read128(v, row),
+        .float => @as(u128, @as(u64, @bitCast(readFloatView(v, row)))),
+        .string => hashStr(stringBytes(v, row)),
+    };
+}
+
 fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batch: Batch) !void {
     lane.count += batch.row_count;
     const n = batch.row_count;
     for (plans, 0..) |p, i| {
         const idx = resolved[i] orelse continue;
         const view = batch.values[idx];
+        if (p.op == .count_distinct) {
+            // Each lane builds its own partial set; gid is irrelevant (one
+            // global group), so the value's full u128 key goes in directly.
+            var r: usize = 0;
+            while (r < n) : (r += 1) {
+                if (!view.isValid(r)) continue;
+                lane.ns[i] += 1;
+                _ = try lane.dsets[i].insertIsNew(lane.allocator, distinctKey(p.dkind, view.data, r));
+            }
+            continue;
+        }
         if (p.is_string) {
             // MIN/MAX over a string column: keep an owned copy of the running
             // extreme bytes. The batch's StringView is transient (recycled per
@@ -278,12 +336,9 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
             if (!view.isValid(r)) continue;
             lane.ns[i] += 1;
             switch (p.op) {
-                .count_star => unreachable,
+                // Handled before this loop (their own value-shaped fold paths).
+                .count_star, .count_distinct => unreachable,
                 .count_col => {},
-                .count_distinct => {
-                    const v: u64 = @bitCast(readIntView(view.data, r));
-                    _ = try lane.dsets[i].insertIsNew(lane.allocator, DistinctSet.key(0, v));
-                },
                 .sum, .avg => {
                     if (p.is_float) lane.fsum[i] += readFloatView(view.data, r) else lane.isum[i] += readIntView(view.data, r);
                 },
@@ -406,13 +461,16 @@ fn isFloatType(typ: Type) bool {
     return typ == .float or typ == .double;
 }
 
-// COUNT(DISTINCT col) v1 scopes the distinct column to ≤64-bit integer-family
-// types: readIntView yields an i64 whose bit pattern keys the set losslessly.
-// 128-bit (largeint/decimal128), float, and string distinct columns are declined.
-fn isDistinctIntType(typ: Type) bool {
+// Map a COUNT(DISTINCT) column type to its key-derivation kind. Exhaustive: the
+// handler supports distinct over every column type, so it never declines on type
+// grounds. A new Type variant breaks this switch — a deliberate compile-time
+// prompt to pick its distinct keying.
+fn distinctKindFor(typ: Type) DistinctKind {
     return switch (typ) {
-        .boolean, .tinyint, .smallint, .int, .bigint, .date, .datetime, .decimal64 => true,
-        else => false,
+        .boolean, .tinyint, .smallint, .int, .bigint, .date, .datetime, .decimal64 => .int,
+        .largeint, .decimal128, .uuid => .wide,
+        .float, .double => .float,
+        .varchar, .string, .char => .string,
     };
 }
 
@@ -582,7 +640,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                 },
                 .count_distinct => {
                     const ctyp = resolveAggInputType(table, probe_schema, agg.col.?) orelse return declineFree(allocator, plans, &needed);
-                    if (!isDistinctIntType(ctyp)) return declineFree(allocator, plans, &needed);
+                    p.dkind = distinctKindFor(ctyp);
                 },
                 else => {},
             }

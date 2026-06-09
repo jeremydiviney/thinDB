@@ -509,47 +509,18 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
-    if (try v2_global_aggregate.tryBuild(input.allocator, table, .{
+    // No serial fallback. The parallel reducer (v2_global_aggregate) is the only
+    // path for a no-GROUP-BY aggregate: every aggregate — COUNT(DISTINCT) of any
+    // type included — folds per-lane and merges. A shape it declines surfaces as
+    // UnsupportedQueryShape (the caller maps null → error) so it gets fixed in
+    // the parallel handler rather than silently run single-threaded.
+    return try v2_global_aggregate.tryBuild(input.allocator, table, .{
         .aggs = plan.group_by.aggs,
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .having_filter = if (plan.having_filter) |f| f.predicate else null,
         .derived = plan.derived,
         .dop = input.db.config.max_dop,
-    })) |q| return q;
-
-    // The specialized reducer keeps fixed numeric accumulators, so it declines
-    // COUNT(DISTINCT) (a growing set) and HAVING (a post-reduce filter). Fall
-    // back to the generic Aggregate — the same path the legacy engine uses —
-    // composed from shared operators.
-    const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
-    defer if (needed) |n| input.allocator.free(n);
-    return try buildGlobalAggregateGeneric(input, table, needed, plan);
-}
-
-// Generic global-aggregate composition: the correctness fallback for no-GROUP-BY
-// aggregates the specialized reducer can't run (COUNT(DISTINCT), HAVING). A
-// single global `aggregate(aggs)` over the (parallel) scan + fused filter, with
-// the 0/1-row HAVING layered on as an ordinary filter.
-fn buildGlobalAggregateGeneric(
-    input: CompileInput,
-    table: *api.Table,
-    needed: ?[]const []const u8,
-    plan: GlobalAggregatePlan,
-) !exec.Query {
-    const allocator = input.allocator;
-    const max_dop = input.db.config.max_dop;
-
-    var q = if (max_dop > 1)
-        try exec.ParallelScan.create(allocator, table, null, needed, max_dop)
-    else
-        try exec.scanWithProjection(allocator, table, null, needed);
-    errdefer q.deinit();
-
-    if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived);
-    q = try q.aggregate(plan.group_by.aggs);
-    if (plan.having_filter) |f| q = try q.filter(f.predicate);
-    return q;
+    });
 }
 
 // A non-aggregating SELECT: scan → optional WHERE → optional row-local derived
