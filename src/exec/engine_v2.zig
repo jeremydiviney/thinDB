@@ -366,13 +366,44 @@ fn projectMatchesGroupOutput(project: ir.Op.Project, group_by: ir.Op.GroupBy) bo
 // `output_columns` (reorder) and, when the Project renamed any column
 // (`output_names`), rename them via `Project.createNamed`. A null `output_names`
 // entry keeps the selected column's own name. No-op when no Project was captured.
-fn applyOutputProjection(allocator: std.mem.Allocator, q: exec.Query, plan: GroupTopNPlan) !exec.Query {
-    const cols = plan.output_columns orelse return q;
-    const renames = plan.output_names orelse return q.project(cols);
+fn applyOutputProjection(allocator: std.mem.Allocator, q: exec.Query, output_columns: ?[]const []const u8, output_names: ?[]const ?[]const u8) !exec.Query {
+    const cols = output_columns orelse return q;
+    const renames = output_names orelse return q.project(cols);
     const names = try allocator.alloc([]const u8, cols.len);
     defer allocator.free(names);
     for (cols, renames, names) |col, rename, *out| out.* = rename orelse col;
     return exec.Project.createNamed(allocator, q, cols, names);
+}
+
+fn appendNameUnique(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
+    for (set.items) |existing| if (types.columnNameEql(existing, name)) return;
+    try set.append(allocator, name);
+}
+
+fn collectPredicateNames(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([]const u8), p: exec.PredicateExpr) !void {
+    switch (p) {
+        .leaf => |l| try appendNameUnique(allocator, set, l.col),
+        .leaf_col_col => |c| {
+            try appendNameUnique(allocator, set, c.left);
+            try appendNameUnique(allocator, set, c.right);
+        },
+        .is_null, .is_not_null => |nm| try appendNameUnique(allocator, set, nm),
+        .like => |lk| try appendNameUnique(allocator, set, lk.col),
+        .in_set => |s| try appendNameUnique(allocator, set, s.col),
+        .@"and", .@"or" => |kids| for (kids) |k| try collectPredicateNames(allocator, set, k),
+        .not => |k| try collectPredicateNames(allocator, set, k.*),
+        else => {},
+    }
+}
+
+// Output aliases the grouped core must keep direct (computed in-core, not
+// derived afterward) because ORDER BY / HAVING ranks or filters on them.
+fn collectProtectedAggNames(allocator: std.mem.Allocator, plan: GroupTopNPlan) ![]const []const u8 {
+    var set: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer set.deinit(allocator);
+    if (plan.order_by) |o| for (o.specs) |s| try appendNameUnique(allocator, &set, s.col);
+    if (plan.having_filter) |f| try collectPredicateNames(allocator, &set, f.predicate);
+    return set.toOwnedSlice(allocator);
 }
 
 fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
@@ -383,30 +414,54 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
     defer if (needed) |n| input.allocator.free(n);
 
+    // Algebraic reduction for the grouped core, same as the global path:
+    // collapse affine aggregates (SUM/MIN/MAX of a·col+b) onto a shared base set,
+    // deriving each original output once over the (small) grouped result.
+    // Aggregates consumed by ORDER BY / HAVING stay direct — the core ranks and
+    // filters on them in-pass, before the post-core derivation runs.
+    var eff_aggs = plan.group_by.aggs;
+    var eff_derived = plan.derived;
+    var affine_post: []const ir.Derived = &.{};
+    var eff_out_cols = plan.output_columns;
+    {
+        const protected = try collectProtectedAggNames(input.allocator, plan);
+        defer input.allocator.free(protected);
+        if (try affine_agg.reduce(input.allocator, table.schema.columns, plan.group_by.group_cols, plan.group_by.aggs, plan.derived, protected)) |red| {
+            eff_aggs = red.base_aggs;
+            eff_derived = red.pre_derived;
+            affine_post = red.post_derived;
+            // The core now emits the base set, not the original aggs. When the
+            // matcher already captured a SELECT order (collapsed keys / renames),
+            // it binds the original aliases the derivations reproduce; otherwise
+            // impose the reduced output order so the base columns are dropped.
+            if (eff_out_cols == null) eff_out_cols = red.output_names;
+        }
+    }
+
     const request = v2_pipeline.GroupTopNRequest{
         .group_cols = plan.group_by.group_cols,
-        .aggs = plan.group_by.aggs,
+        .aggs = eff_aggs,
         .order_specs = if (plan.order_by) |o| o.specs else &.{},
         .limit = if (plan.limit) |l| @intCast(l.n) else 0,
         .offset = if (plan.limit) |l| @intCast(l.offset) else 0,
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .having_filter = if (plan.having_filter) |f| f.predicate else null,
         .needed = needed,
-        .derived = plan.derived,
+        .derived = eff_derived,
         .dop = input.db.config.max_dop,
     };
 
     if (try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request)) |silo_q| {
         var q = silo_q;
         // Post-aggregate enrich: the grouped pipeline emits [keys, aggs] in
-        // count-/order-ranked order; recompute the collapsed group keys over that
-        // small output and reorder to the SELECT list using the generic Compute and
-        // Project operators (no bespoke materialization — the pipeline is just a
-        // Query like any other). ORDER BY/LIMIT already ran inside the pipeline on
-        // the grouped columns, so nothing re-runs here.
+        // count-/order-ranked order. The affine late-materialization (reduced
+        // aggregates) and the collapsed-key recompute are independent Computes
+        // over that small output; then reorder to the SELECT list. ORDER BY/LIMIT
+        // already ran inside the pipeline on the grouped columns.
         errdefer q.deinit();
+        if (affine_post.len > 0) q = try q.compute(affine_post);
         if (plan.post_agg_derived.len > 0) q = try q.compute(plan.post_agg_derived);
-        q = try applyOutputProjection(input.allocator, q, plan);
+        q = try applyOutputProjection(input.allocator, q, eff_out_cols, plan.output_names);
         return q;
     }
 
@@ -516,7 +571,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // there's no HAVING (it would bind to the original aliases the base set
     // replaces; global+HAVING is declined regardless).
     if (plan.having_filter == null) {
-        if (try affine_agg.reduce(input.allocator, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived)) |red| {
+        if (try affine_agg.reduce(input.allocator, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived, &.{})) |red| {
             return try buildGlobalAggregateReduced(input, table, plan, red);
         }
     }

@@ -135,6 +135,71 @@ test "affine-agg: grouped SUM(w+k) per group identical" {
     try std.testing.expectEqual(@as(usize, 2), row);
 }
 
+test "affine-agg: grouped reduction fires for 3+ aggs (V2 group-topn path)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // Three affine SUMs collapse to one base set {SUM(w), COUNT(w)}; the core
+    // computes those and the three outputs derive per group. g=1: SUM=80,N=3.
+    // g=2: SUM=130,N=3. SUM(w+k) = SUM + k*N.
+    var q = try runSql(allocator, db,
+        "SELECT g, SUM(w), SUM(w + 1), SUM(w + 2) FROM t GROUP BY g ORDER BY g ASC",
+    );
+    defer q.deinit();
+    const exp = [2][4]i64{
+        .{ 1, 80, 83, 86 },
+        .{ 2, 130, 133, 136 },
+    };
+    var row: usize = 0;
+    while (try q.next()) |b| {
+        var i: usize = 0;
+        while (i < b.row_count) : (i += 1) {
+            try std.testing.expectEqual(exp[row][0], b.values[0].data.bigint[i]);
+            try std.testing.expectEqual(exp[row][1], b.values[1].data.bigint[i]);
+            try std.testing.expectEqual(exp[row][2], b.values[2].data.bigint[i]);
+            try std.testing.expectEqual(exp[row][3], b.values[3].data.bigint[i]);
+            row += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), row);
+}
+
+test "affine-agg: ORDER BY a reduced agg keeps it direct for ranking" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // s1 is in ORDER BY, so it must stay a direct core aggregate (the core ranks
+    // on it); s0 and s2 still reduce. Top group by s1 DESC is g=2 (133 > 83).
+    var q = try runSql(allocator, db,
+        "SELECT g, SUM(w) s0, SUM(w + 1) s1, SUM(w + 2) s2 FROM t GROUP BY g ORDER BY s1 DESC",
+    );
+    defer q.deinit();
+    const exp = [2][4]i64{
+        .{ 2, 130, 133, 136 },
+        .{ 1, 80, 83, 86 },
+    };
+    var row: usize = 0;
+    while (try q.next()) |b| {
+        var i: usize = 0;
+        while (i < b.row_count) : (i += 1) {
+            try std.testing.expectEqual(exp[row][0], b.values[0].data.bigint[i]);
+            try std.testing.expectEqual(exp[row][1], b.values[1].data.bigint[i]);
+            try std.testing.expectEqual(exp[row][2], b.values[2].data.bigint[i]);
+            try std.testing.expectEqual(exp[row][3], b.values[3].data.bigint[i]);
+            row += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), row);
+}
+
 test "affine-agg: float SUM is NOT reduced (stays direct, correct)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

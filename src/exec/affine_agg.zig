@@ -212,6 +212,11 @@ pub fn familyOf(f: AggFunc) ?AggFamily {
     };
 }
 
+fn isProtected(name: []const u8, protected: []const []const u8) bool {
+    for (protected) |p| if (types.columnNameEql(p, name)) return true;
+    return false;
+}
+
 /// Per-original-aggregate reduction plan.
 pub const ReducedAgg = struct {
     out_name: []const u8,
@@ -332,12 +337,18 @@ pub const Reduction = struct {
 /// `agg_arg_derived` maps a synthetic aggregate-argument column to its
 /// expression (empty when arguments are plain columns); `group_cols` names that
 /// are computed appear there too and are preserved in `pre_derived`.
+///
+/// `protected` lists output aliases that must NOT be reduced — aggregates a
+/// grouped query consumes in ORDER BY / HAVING, whose value the parallel core
+/// needs in-hand to rank/filter (the derivation runs after the core). The
+/// global path, with no ranking, passes an empty list.
 pub fn reduce(
     arena: Allocator,
     up_schema: []const types.Column,
     group_cols: []const []const u8,
     in_aggs: []const AggSpec,
     agg_arg_derived: []const Derived,
+    protected: []const []const u8,
 ) !?Reduction {
     if (in_aggs.len == 0) return null;
 
@@ -346,6 +357,7 @@ pub fn reduce(
     for (in_aggs, 0..) |a, i| {
         reduced[i] = null;
         const family = familyOf(a.func) orelse continue;
+        if (isProtected(a.as, protected)) continue;
         const col_name = a.col orelse continue; // COUNT(*) — no arg
         var arg_expr: Expr = .{ .col_ref = col_name };
         for (agg_arg_derived) |d| {
@@ -552,7 +564,7 @@ test "reduce collapses SUM(x), SUM(x+1), SUM(x+2) to one base set" {
         .{ .func = .sum, .col = "__a2", .as = "s2" },
     };
 
-    const red = (try reduce(a, &cols, &.{}, &aggs, &derived)).?;
+    const red = (try reduce(a, &cols, &.{}, &aggs, &derived, &.{})).?;
     // Base set is exactly {SUM(x), COUNT(x)} — 2 aggs replacing 3.
     try std.testing.expectEqual(@as(usize, 2), red.base_aggs.len);
     try std.testing.expectEqual(AggFunc.sum, red.base_aggs[0].func);
@@ -564,5 +576,5 @@ test "reduce collapses SUM(x), SUM(x+1), SUM(x+2) to one base set" {
 
     // A single SUM(x) must NOT reduce — base {SUM,COUNT} wouldn't shrink it.
     const one = [_]AggSpec{.{ .func = .sum, .col = "x", .as = "s" }};
-    try std.testing.expect((try reduce(a, &cols, &.{}, &one, &.{})) == null);
+    try std.testing.expect((try reduce(a, &cols, &.{}, &one, &.{}, &.{})) == null);
 }
