@@ -2066,6 +2066,13 @@ pub const CompileCtx = struct {
     /// IR tree borrows pointers into this arena; freed at `deinit`.
     /// Lazily initialized so plans without subqueries pay nothing.
     subquery_arena: ?std.heap.ArenaAllocator = null,
+    /// Per-query arena for plan-node data the compiled operator tree borrows
+    /// but doesn't own — notably the affine-aggregate reduction's derived
+    /// names / expression trees, which the silo / global aggregate operators
+    /// reference by pointer for their whole lifetime. Freed in `deinit` AFTER
+    /// `query.deinit()` (CompiledQuery tears the tree down first), so those
+    /// borrows stay valid until the operators are gone. Lazily initialized.
+    node_arena: ?std.heap.ArenaAllocator = null,
     /// Rows affected by a top-level side-effect statement (INSERT today).
     /// Wire layers (MySQL OK_Packet, PG CommandComplete) read this after
     /// running the CompiledQuery. Zero for ops that don't mutate data.
@@ -2108,6 +2115,7 @@ pub const CompileCtx = struct {
         for (self.session_strings.items) |s| self.allocator.free(s);
         self.session_strings.deinit(self.allocator);
         if (self.subquery_arena) |*ar| ar.deinit();
+        if (self.node_arena) |*ar| ar.deinit();
         if (self.accountant) |a| self.allocator.destroy(a);
         if (self.global_dict) |g| {
             g.deinit(self.allocator);
@@ -2163,6 +2171,15 @@ pub const CompileCtx = struct {
             self.subquery_arena = std.heap.ArenaAllocator.init(self.allocator);
         }
         return self.subquery_arena.?.allocator();
+    }
+
+    /// Get (or lazily create) the plan-node arena. Used at compile time for
+    /// data the operator tree borrows but doesn't own (see `node_arena`).
+    pub fn nodeArena(self: *CompileCtx) Allocator {
+        if (self.node_arena == null) {
+            self.node_arena = std.heap.ArenaAllocator.init(self.allocator);
+        }
+        return self.node_arena.?.allocator();
     }
 };
 
@@ -2274,6 +2291,7 @@ pub fn compileWithSession(
         .db = db,
         .session = session_cell.*,
         .prune_names = ctx.prune_names,
+        .node_arena = ctx.nodeArena(),
     }, root)) |q| {
         return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }

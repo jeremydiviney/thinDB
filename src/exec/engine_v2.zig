@@ -54,6 +54,11 @@ pub const CompileInput = struct {
     db: *api.Database,
     session: api.Session,
     prune_names: ?[][]const u8 = null,
+    // Query-lifetime arena for plan-node data the operator tree borrows but
+    // doesn't own (the affine reduction's derived names / expr trees). Freed
+    // by the CompileCtx after the operator tree is torn down, so the borrows
+    // outlive the operators that hold them.
+    node_arena: std.mem.Allocator,
 };
 
 /// Try to compile a whole query block into Engine V2.
@@ -426,7 +431,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     {
         const protected = try collectProtectedAggNames(input.allocator, plan);
         defer input.allocator.free(protected);
-        if (try affine_agg.reduce(input.allocator, table.schema.columns, plan.group_by.group_cols, plan.group_by.aggs, plan.derived, protected)) |red| {
+        if (try affine_agg.reduce(input.node_arena, table.schema.columns, plan.group_by.group_cols, plan.group_by.aggs, plan.derived, protected)) |red| {
             eff_aggs = red.base_aggs;
             eff_derived = red.pre_derived;
             affine_post = red.post_derived;
@@ -571,7 +576,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // there's no HAVING (it would bind to the original aliases the base set
     // replaces; global+HAVING is declined regardless).
     if (plan.having_filter == null) {
-        if (try affine_agg.reduce(input.allocator, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived, &.{})) |red| {
+        if (try affine_agg.reduce(input.node_arena, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived, &.{})) |red| {
             return try buildGlobalAggregateReduced(input, table, plan, red);
         }
     }
