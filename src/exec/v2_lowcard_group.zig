@@ -62,6 +62,7 @@ const MAX_KEYS: usize = 8;
 const MAX_AGGS: usize = 16;
 const TILE_RGS: usize = 16;
 const PREFETCH_DIST: usize = 32;
+const PREFETCH_DIST_DISTINCT: usize = 24;
 
 // Routing gate. The crossover against the silo is "does one worker's full
 // group table stay cache-resident": beyond it, every probe on a 100M-row
@@ -127,19 +128,6 @@ inline fn readIntView(v: ValueView, row: usize) i64 {
         .smallint => |s| @intCast(s[row]),
         .int, .date => |s| @intCast(s[row]),
         .bigint, .datetime, .decimal64 => |s| s[row],
-        else => 0,
-    };
-}
-
-inline fn readFloatView(v: ValueView, row: usize) f64 {
-    return switch (v) {
-        .float => |s| @floatCast(s[row]),
-        .double => |s| s[row],
-        .boolean => |s| @floatFromInt(s[row]),
-        .tinyint => |s| @floatFromInt(s[row]),
-        .smallint => |s| @floatFromInt(s[row]),
-        .int, .date => |s| @floatFromInt(s[row]),
-        .bigint, .datetime, .decimal64 => |s| @floatFromInt(s[row]),
         else => 0,
     };
 }
@@ -362,6 +350,10 @@ const WState = struct {
     ns: std.ArrayListUnmanaged(u64) = .empty,
     // n_distinct × parts membership sets, indexed [d * parts + partition].
     dsets: []DistinctSet = &.{},
+    // Per-batch scratch (reused): each row's packed key and resolved gid, so
+    // the per-aggregate kernels run over dense arrays instead of re-probing.
+    keys_scratch: std.ArrayListUnmanaged(u64) = .empty,
+    gids_scratch: std.ArrayListUnmanaged(u32) = .empty,
 
     fn init(allocator: Allocator, expected_groups: usize, aggs: []const AggPlan, n_distinct: u16, dop_parts: usize) !WState {
         var self: WState = .{ .table = try GroupTable.init(allocator, expected_groups) };
@@ -379,6 +371,8 @@ const WState = struct {
     fn deinit(self: *WState, allocator: Allocator) void {
         for (self.dsets) |*d| d.deinit(allocator);
         if (self.dsets.len > 0) allocator.free(self.dsets);
+        self.keys_scratch.deinit(allocator);
+        self.gids_scratch.deinit(allocator);
         self.counts.deinit(allocator);
         self.slots.deinit(allocator);
         self.ns.deinit(allocator);
@@ -464,6 +458,11 @@ inline fn packKey(w: *const Worker, batch: Batch, row: usize) u64 {
     return key;
 }
 
+// The fold runs in passes so each inner loop is monomorphic: pass 0 packs
+// every row's key (pure compute), pass 1 probes the group table with a
+// look-ahead prefetch over the packed keys, then each aggregate runs ONE
+// specialized kernel over the dense gid array — the op dispatch and the
+// ValueView tag switch both hoisted out of the row loops.
 fn foldBatch(w: *Worker, batch: Batch) !void {
     const n = batch.row_count;
     if (n == 0) return;
@@ -475,16 +474,20 @@ fn foldBatch(w: *Worker, batch: Batch) !void {
     try st.counts.ensureUnusedCapacity(allocator, n);
     try st.slots.ensureUnusedCapacity(allocator, n * n_aggs);
     try st.ns.ensureUnusedCapacity(allocator, n * n_aggs);
+    try st.keys_scratch.resize(allocator, n);
+    try st.gids_scratch.resize(allocator, n);
+    const keys = st.keys_scratch.items[0..n];
+    const gids = st.gids_scratch.items[0..n];
+
+    for (keys, 0..) |*k, r| k.* = packKey(w, batch, r);
 
     var r: usize = 0;
     while (r < n) : (r += 1) {
         const pf = r + PREFETCH_DIST;
         if (pf < n) {
-            const pf_key = packKey(w, batch, pf);
-            @prefetch(st.table.slotAddr(st.table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
+            @prefetch(st.table.slotAddr(st.table.bucketOf(GroupTable.hashKey(keys[pf]))), .{ .rw = .write, .locality = 1 });
         }
-
-        const key = packKey(w, batch, r);
+        const key = keys[r];
         const probe = st.table.getOrPut(GroupTable.hashKey(key), key);
         var gid: u32 = probe.gid;
         if (!probe.found) {
@@ -495,52 +498,145 @@ fn foldBatch(w: *Worker, batch: Batch) !void {
             st.table.commit(probe.slot, key, gid);
         }
         st.counts.items[gid] += 1;
+        gids[r] = gid;
+    }
 
-        for (w.aggs, 0..) |a, i| {
-            if (a.op == .count_star) continue;
-            const idx = w.resolved_aggs[i].?;
-            const view = batch.values[idx];
-            if (!view.isValid(r)) continue;
-            const nsv = &st.ns.items[gid * n_aggs + i];
-            nsv.* += 1;
-            const slot = &st.slots.items[gid * n_aggs + i];
-            switch (a.op) {
-                .count_star => unreachable,
-                .count_col => {},
-                .sum, .avg => {
-                    if (a.is_float) {
-                        setSlotF64(slot, slotF64(slot.*) + readFloatView(view.data, r));
-                    } else {
-                        slot.* += readIntView(view.data, r);
-                    }
-                },
-                .min => {
-                    if (a.is_float) {
-                        const v = readFloatView(view.data, r);
-                        if (nsv.* == 1 or v < slotF64(slot.*)) setSlotF64(slot, v);
-                    } else {
-                        const v: i128 = readIntView(view.data, r);
-                        if (nsv.* == 1 or v < slot.*) slot.* = v;
-                    }
-                },
-                .max => {
-                    if (a.is_float) {
-                        const v = readFloatView(view.data, r);
-                        if (nsv.* == 1 or v > slotF64(slot.*)) setSlotF64(slot, v);
-                    } else {
-                        const v: i128 = readIntView(view.data, r);
-                        if (nsv.* == 1 or v > slot.*) slot.* = v;
-                    }
-                },
-                .count_distinct => {
-                    const raw: u64 = @bitCast(readIntView(view.data, r));
-                    const composite = (@as(u128, key) << @intCast(a.value_bits)) | truncBits(raw, a.value_bits);
-                    const part = distinctPartition(a.tier, composite, w.dop_parts);
-                    _ = try st.dsets[@as(usize, a.distinct_index) * w.dop_parts + part].insertIsNew(allocator, composite);
-                },
-            }
+    const ns = st.ns.items;
+    const slots = st.slots.items;
+    for (w.aggs, 0..) |a, i| {
+        if (a.op == .count_star) continue;
+        const view = batch.values[w.resolved_aggs[i].?];
+        switch (a.op) {
+            .count_star => unreachable,
+            .count_col => foldCountCol(view, gids, ns, n_aggs, i),
+            .sum, .avg => if (a.is_float)
+                foldSumFloat(view, gids, ns, slots, n_aggs, i)
+            else
+                foldSumInt(view, gids, ns, slots, n_aggs, i),
+            .min => if (a.is_float)
+                foldExtremeFloat(true, view, gids, ns, slots, n_aggs, i)
+            else
+                foldExtremeInt(true, view, gids, ns, slots, n_aggs, i),
+            .max => if (a.is_float)
+                foldExtremeFloat(false, view, gids, ns, slots, n_aggs, i)
+            else
+                foldExtremeInt(false, view, gids, ns, slots, n_aggs, i),
+            .count_distinct => try foldDistinctKernel(
+                allocator,
+                view,
+                keys,
+                st.dsets[@as(usize, a.distinct_index) * w.dop_parts ..][0..w.dop_parts],
+                w.dop_parts,
+                a.value_bits,
+                a.tier,
+            ),
         }
     }
+}
+
+fn foldCountCol(view: ColumnView, gids: []const u32, ns: []u64, stride: usize, agg_i: usize) void {
+    for (gids, 0..) |gid, r| {
+        if (!view.isValid(r)) continue;
+        ns[@as(usize, gid) * stride + agg_i] += 1;
+    }
+}
+
+fn foldSumInt(view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+    switch (view.data) {
+        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
+            for (gids, 0..) |gid, r| {
+                if (!view.isValid(r)) continue;
+                const o = @as(usize, gid) * stride + agg_i;
+                ns[o] += 1;
+                slots[o] += s[r];
+            }
+        },
+        else => {},
+    }
+}
+
+fn foldSumFloat(view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+    switch (view.data) {
+        inline .float, .double => |s| {
+            for (gids, 0..) |gid, r| {
+                if (!view.isValid(r)) continue;
+                const o = @as(usize, gid) * stride + agg_i;
+                ns[o] += 1;
+                setSlotF64(&slots[o], slotF64(slots[o]) + @as(f64, @floatCast(s[r])));
+            }
+        },
+        else => {},
+    }
+}
+
+fn foldExtremeInt(comptime is_min: bool, view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+    switch (view.data) {
+        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
+            for (gids, 0..) |gid, r| {
+                if (!view.isValid(r)) continue;
+                const o = @as(usize, gid) * stride + agg_i;
+                ns[o] += 1;
+                const v: i128 = s[r];
+                const better = if (is_min) v < slots[o] else v > slots[o];
+                if (ns[o] == 1 or better) slots[o] = v;
+            }
+        },
+        else => {},
+    }
+}
+
+fn foldExtremeFloat(comptime is_min: bool, view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+    switch (view.data) {
+        inline .float, .double => |s| {
+            for (gids, 0..) |gid, r| {
+                if (!view.isValid(r)) continue;
+                const o = @as(usize, gid) * stride + agg_i;
+                ns[o] += 1;
+                const v: f64 = @floatCast(s[r]);
+                const better = if (is_min) v < slotF64(slots[o]) else v > slotF64(slots[o]);
+                if (ns[o] == 1 or better) setSlotF64(&slots[o], v);
+            }
+        },
+        else => {},
+    }
+}
+
+// COUNT(DISTINCT) fold: scatter composites into the partition sub-sets with a
+// look-ahead prefetch — the set probe is the cache-miss bottleneck, and the
+// composite for row r+K is computable up front (packed key + value, no group
+// probe needed), so the misses of independent rows overlap. A grow between a
+// prefetch and its insert only wastes that one hint.
+fn foldDistinctKernel(
+    allocator: Allocator,
+    view: ColumnView,
+    keys: []const u64,
+    dsets: []DistinctSet,
+    parts_n: usize,
+    value_bits: u8,
+    tier: DistinctSet.Tier,
+) !void {
+    switch (view.data) {
+        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
+            const n = keys.len;
+            var r: usize = 0;
+            while (r < n) : (r += 1) {
+                if (!view.isValid(r)) continue;
+                const pf = r + PREFETCH_DIST_DISTINCT;
+                if (pf < n and view.isValid(pf)) {
+                    const c_pf = compositeOf(keys[pf], @as(i64, s[pf]), value_bits);
+                    dsets[distinctPartition(tier, c_pf, parts_n)].prefetchKey(c_pf);
+                }
+                const comp = compositeOf(keys[r], @as(i64, s[r]), value_bits);
+                _ = try dsets[distinctPartition(tier, comp, parts_n)].insertIsNew(allocator, comp);
+            }
+        },
+        else => {},
+    }
+}
+
+inline fn compositeOf(key: u64, value: i64, value_bits: u8) u128 {
+    const raw: u64 = @bitCast(value);
+    return (@as(u128, key) << @intCast(value_bits)) | truncBits(raw, value_bits);
 }
 
 inline fn slotF64(slot: i128) f64 {

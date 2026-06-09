@@ -126,7 +126,7 @@ const AggOp = enum { count_star, count_col, sum, avg, min, max, count_distinct }
 // its row-group share (NULLs skipped) and the single-threaded merge layer unions
 // the lanes per distinct field via DistinctSet.mergeInto. The full 128-bit key
 // space is free (no gid to pack), so every column type maps to a lossless or
-// collision-negligible u128 key — see distinctKey.
+// collision-negligible u128 key — see foldDistinctGlobal.
 const DistinctSet = HarnessCore.DistinctSet;
 
 // How a COUNT(DISTINCT) column's value becomes its u128 set key:
@@ -139,7 +139,7 @@ const DistinctKind = enum { int, wide, float, string };
 // Map a distinct-key kind to the membership-set tier (slot width). int/float
 // keys are ≤64-bit (int family zero-extended, float f64-bitcast); wide is a
 // 128-bit numeric; string is a 128-bit content hash. A narrow int still uses
-// the 64-bit tier because `distinctKey` zero-extends a possibly-negative i64,
+// the 64-bit tier because the fold zero-extends a possibly-negative i64,
 // whose bit pattern needs the full 64 bits.
 fn distinctTier(dkind: DistinctKind) DistinctSet.Tier {
     return switch (dkind) {
@@ -309,43 +309,11 @@ const Lane = struct {
     }
 };
 
-inline fn readIntView(v: ValueView, row: usize) i64 {
-    return switch (v) {
-        .boolean => |s| @intCast(s[row]),
-        .tinyint => |s| @intCast(s[row]),
-        .smallint => |s| @intCast(s[row]),
-        .int, .date => |s| @intCast(s[row]),
-        .bigint, .datetime, .decimal64 => |s| s[row],
-        .largeint => |s| @intCast(s[row]),
-        else => 0,
-    };
-}
-
-inline fn readFloatView(v: ValueView, row: usize) f64 {
-    return switch (v) {
-        .float => |s| @floatCast(s[row]),
-        .double => |s| s[row],
-        .boolean => |s| @floatFromInt(s[row]),
-        .tinyint => |s| @floatFromInt(s[row]),
-        .smallint => |s| @floatFromInt(s[row]),
-        .int, .date => |s| @floatFromInt(s[row]),
-        .bigint, .datetime, .decimal64 => |s| @floatFromInt(s[row]),
-        else => 0,
-    };
-}
-
 inline fn read128(v: ValueView, row: usize) u128 {
     return switch (v) {
         .largeint, .decimal128 => |s| @bitCast(s[row]),
         .uuid => |s| s[row],
         else => 0,
-    };
-}
-
-inline fn stringBytes(v: ValueView, row: usize) []const u8 {
-    return switch (v) {
-        .varchar, .string, .char => |s| s.rowBytes(row),
-        else => &.{},
     };
 }
 
@@ -359,15 +327,9 @@ inline fn hashStr(bytes: []const u8) u128 {
     return (@as(u128, hi) << 64) | @as(u128, lo);
 }
 
-inline fn distinctKey(dkind: DistinctKind, v: ValueView, row: usize) u128 {
-    return switch (dkind) {
-        .int => @as(u128, @as(u64, @bitCast(readIntView(v, row)))),
-        .wide => read128(v, row),
-        .float => @as(u128, @as(u64, @bitCast(readFloatView(v, row)))),
-        .string => hashStr(stringBytes(v, row)),
-    };
-}
-
+// Each plan dispatches ONCE to a specialized kernel — the op switch and the
+// ValueView tag switch are hoisted out of the row loops, which accumulate into
+// locals and fold back at the end.
 fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batch: Batch) !void {
     lane.count += batch.row_count;
     const n = batch.row_count;
@@ -375,42 +337,7 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
         const idx = resolved[i] orelse continue;
         const view = batch.values[idx];
         if (p.op == .count_distinct) {
-            // Scatter each value into one of this lane's `parts` sub-tables by
-            // key-hash, so the cross-worker merge can run one partition per
-            // thread. A key hashes to the same partition in every lane, so the
-            // per-partition merges are disjoint and their counts sum.
-            const tier = distinctTier(p.dkind);
-            const base = i * lane.parts;
-            const parts = lane.parts;
-            if (p.dkind == .string) {
-                // String distinct: the dominant value in ClickBench-style data
-                // is `''` (no-value rows stored as empty string, 87% of
-                // SearchPhrase). A `len == 0` check replaces its two Wyhash
-                // passes + set probe with a boolean flip; finalize adds it back
-                // as one distinct value.
-                var r: usize = 0;
-                while (r < n) : (r += 1) {
-                    if (!view.isValid(r)) continue;
-                    lane.ns[i] += 1;
-                    const b = stringBytes(view.data, r);
-                    if (b.len == 0) {
-                        lane.has_blank[i] = true;
-                        continue;
-                    }
-                    const key = hashStr(b);
-                    const part = distinctPartition(tier, key, parts);
-                    _ = try lane.dsets[base + part].insertIsNew(lane.allocator, key);
-                }
-                continue;
-            }
-            var r: usize = 0;
-            while (r < n) : (r += 1) {
-                if (!view.isValid(r)) continue;
-                lane.ns[i] += 1;
-                const key = distinctKey(p.dkind, view.data, r);
-                const part = distinctPartition(tier, key, parts);
-                _ = try lane.dsets[base + part].insertIsNew(lane.allocator, key);
-            }
+            try foldDistinctGlobal(lane, p, i, view, n);
             continue;
         }
         if (p.is_string) {
@@ -436,41 +363,197 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
             }
             continue;
         }
-        var r: usize = 0;
-        while (r < n) : (r += 1) {
-            if (!view.isValid(r)) continue;
-            lane.ns[i] += 1;
-            switch (p.op) {
-                // Handled before this loop (their own value-shaped fold paths).
-                .count_star, .count_distinct => unreachable,
-                .count_col => {},
-                .sum, .avg => {
-                    if (p.is_float) lane.fsum[i] += readFloatView(view.data, r) else lane.isum[i] += readIntView(view.data, r);
-                },
-                .min => {
-                    if (p.is_float) {
-                        const v = readFloatView(view.data, r);
-                        if (lane.ns[i] == 1 or v < lane.fsum[i]) lane.fsum[i] = v;
-                    } else {
-                        const v: i128 = readIntView(view.data, r);
-                        if (lane.ns[i] == 1 or v < lane.isum[i]) lane.isum[i] = v;
-                    }
-                },
-                .max => {
-                    if (p.is_float) {
-                        const v = readFloatView(view.data, r);
-                        if (lane.ns[i] == 1 or v > lane.fsum[i]) lane.fsum[i] = v;
-                    } else {
-                        const v: i128 = readIntView(view.data, r);
-                        if (lane.ns[i] == 1 or v > lane.isum[i]) lane.isum[i] = v;
-                    }
-                },
-            }
+        switch (p.op) {
+            // count_star never resolves an input column; count_distinct and
+            // string MIN/MAX took their own paths above.
+            .count_star, .count_distinct => unreachable,
+            .count_col => foldCountColGlobal(view, n, &lane.ns[i]),
+            .sum, .avg => if (p.is_float)
+                foldSumFloatGlobal(view, n, &lane.ns[i], &lane.fsum[i])
+            else
+                foldSumIntGlobal(view, n, &lane.ns[i], &lane.isum[i]),
+            .min => if (p.is_float)
+                foldExtremeFloatGlobal(true, view, n, &lane.ns[i], &lane.fsum[i])
+            else
+                foldExtremeIntGlobal(true, view, n, &lane.ns[i], &lane.isum[i]),
+            .max => if (p.is_float)
+                foldExtremeFloatGlobal(false, view, n, &lane.ns[i], &lane.fsum[i])
+            else
+                foldExtremeIntGlobal(false, view, n, &lane.ns[i], &lane.isum[i]),
         }
     }
 }
 
+fn foldCountColGlobal(view: ColumnView, n: usize, ns: *u64) void {
+    var c: u64 = 0;
+    for (0..n) |r| {
+        if (view.isValid(r)) c += 1;
+    }
+    ns.* += c;
+}
+
+fn foldSumIntGlobal(view: ColumnView, n: usize, ns: *u64, acc: *i128) void {
+    switch (view.data) {
+        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
+            var c: u64 = 0;
+            var sum: i128 = 0;
+            for (0..n) |r| {
+                if (!view.isValid(r)) continue;
+                c += 1;
+                sum += s[r];
+            }
+            ns.* += c;
+            acc.* += sum;
+        },
+        else => {},
+    }
+}
+
+fn foldSumFloatGlobal(view: ColumnView, n: usize, ns: *u64, acc: *f64) void {
+    switch (view.data) {
+        inline .float, .double => |s| {
+            var c: u64 = 0;
+            var sum: f64 = 0;
+            for (0..n) |r| {
+                if (!view.isValid(r)) continue;
+                c += 1;
+                sum += @floatCast(s[r]);
+            }
+            ns.* += c;
+            acc.* += sum;
+        },
+        else => {},
+    }
+}
+
+fn foldExtremeIntGlobal(comptime is_min: bool, view: ColumnView, n: usize, ns: *u64, acc: *i128) void {
+    switch (view.data) {
+        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
+            var c: u64 = 0;
+            var ext: i128 = 0;
+            for (0..n) |r| {
+                if (!view.isValid(r)) continue;
+                const v: i128 = s[r];
+                const better = if (is_min) v < ext else v > ext;
+                if (c == 0 or better) ext = v;
+                c += 1;
+            }
+            if (c > 0) {
+                const better = if (is_min) ext < acc.* else ext > acc.*;
+                if (ns.* == 0 or better) acc.* = ext;
+                ns.* += c;
+            }
+        },
+        else => {},
+    }
+}
+
+fn foldExtremeFloatGlobal(comptime is_min: bool, view: ColumnView, n: usize, ns: *u64, acc: *f64) void {
+    switch (view.data) {
+        inline .float, .double => |s| {
+            var c: u64 = 0;
+            var ext: f64 = 0;
+            for (0..n) |r| {
+                if (!view.isValid(r)) continue;
+                const v: f64 = @floatCast(s[r]);
+                const better = if (is_min) v < ext else v > ext;
+                if (c == 0 or better) ext = v;
+                c += 1;
+            }
+            if (c > 0) {
+                const better = if (is_min) ext < acc.* else ext > acc.*;
+                if (ns.* == 0 or better) acc.* = ext;
+                ns.* += c;
+            }
+        },
+        else => {},
+    }
+}
+
+// COUNT(DISTINCT) fold: scatter values into the lane's partition sub-tables.
+// The dkind dispatch happens once, each kernel runs over a typed slice, and
+// the ≤64-bit kernels prefetch the set slot a look-ahead window ahead (the
+// probe is the cache-miss bottleneck; a grow between a prefetch and its
+// insert only wastes that one hint). Strings keep the `''` fast path — their
+// per-row cost is the Wyhash itself, which a prefetch can't hide without
+// hashing twice.
+fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, n: usize) !void {
+    const tier = distinctTier(p.dkind);
+    const parts = lane.parts;
+    const dsets = lane.dsets[i * parts ..][0..parts];
+    switch (p.dkind) {
+        .string => {
+            const sv = switch (view.data) {
+                .varchar, .string, .char => |s| s,
+                else => return,
+            };
+            var r: usize = 0;
+            while (r < n) : (r += 1) {
+                if (!view.isValid(r)) continue;
+                lane.ns[i] += 1;
+                const b = sv.rowBytes(r);
+                if (b.len == 0) {
+                    lane.has_blank[i] = true;
+                    continue;
+                }
+                const key = hashStr(b);
+                _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
+            }
+        },
+        .int => switch (view.data) {
+            inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
+                var r: usize = 0;
+                while (r < n) : (r += 1) {
+                    if (!view.isValid(r)) continue;
+                    lane.ns[i] += 1;
+                    const pf = r + PREFETCH_DIST_DISTINCT;
+                    if (pf < n and view.isValid(pf)) {
+                        const k_pf = @as(u128, @as(u64, @bitCast(@as(i64, s[pf]))));
+                        dsets[distinctPartition(tier, k_pf, parts)].prefetchKey(k_pf);
+                    }
+                    const key = @as(u128, @as(u64, @bitCast(@as(i64, s[r]))));
+                    _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
+                }
+            },
+            else => {},
+        },
+        .float => switch (view.data) {
+            inline .float, .double => |s| {
+                var r: usize = 0;
+                while (r < n) : (r += 1) {
+                    if (!view.isValid(r)) continue;
+                    lane.ns[i] += 1;
+                    const pf = r + PREFETCH_DIST_DISTINCT;
+                    if (pf < n and view.isValid(pf)) {
+                        const k_pf = @as(u128, @as(u64, @bitCast(@as(f64, @floatCast(s[pf])))));
+                        dsets[distinctPartition(tier, k_pf, parts)].prefetchKey(k_pf);
+                    }
+                    const key = @as(u128, @as(u64, @bitCast(@as(f64, @floatCast(s[r])))));
+                    _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
+                }
+            },
+            else => {},
+        },
+        .wide => {
+            var r: usize = 0;
+            while (r < n) : (r += 1) {
+                if (!view.isValid(r)) continue;
+                lane.ns[i] += 1;
+                const key = read128(view.data, r);
+                const pf = r + PREFETCH_DIST_DISTINCT;
+                if (pf < n and view.isValid(pf)) {
+                    const k_pf = read128(view.data, pf);
+                    dsets[distinctPartition(tier, k_pf, parts)].prefetchKey(k_pf);
+                }
+                _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
+            }
+        },
+    }
+}
+
 const TILE_RGS: usize = 16;
+// Look-ahead distance for the COUNT(DISTINCT) fold's set-slot prefetch.
+const PREFETCH_DIST_DISTINCT: usize = 24;
 
 const Coord = struct { seg: usize, rg: usize };
 

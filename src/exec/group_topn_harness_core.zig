@@ -552,10 +552,13 @@ pub const DistinctSet = struct {
 
     pub inline fn prefetchKey(self: *DistinctSet, composite: u128) void {
         switch (self.store) {
-            .u32 => |*s| s.prefetch(@truncate(composite)),
-            .u64 => |*s| s.prefetch(@truncate(composite)),
-            .u96 => |*s| s.prefetch(group_table.Key96.fromU128(composite)),
-            .u128 => |*s| s.prefetch(composite),
+            // The empty-set guard makes look-ahead prefetch safe against the
+            // lazily-allocated per-element insert path (`slots.len - 1` would
+            // wrap on an unallocated set).
+            .u32 => |*s| if (s.slots.len != 0) s.prefetch(@truncate(composite)),
+            .u64 => |*s| if (s.slots.len != 0) s.prefetch(@truncate(composite)),
+            .u96 => |*s| if (s.slots.len != 0) s.prefetch(group_table.Key96.fromU128(composite)),
+            .u128 => |*s| if (s.slots.len != 0) s.prefetch(composite),
         }
     }
 
@@ -3185,18 +3188,47 @@ fn foldGroupDistinctChunk(
         if (!agg.is_distinct) continue;
         const dset = &distinct_sets[agg.distinct_state_index];
         try dset.ensureForBatch(allocator, n);
-        var r: usize = 0;
-        while (r < n) : (r += 1) {
-            const pf = r + PREFETCH_DIST_DISTINCT;
-            if (pf < n) {
-                const v_pf = try aggregateInputValue(agg, rows, pf);
-                dset.prefetchKey(DistinctSet.key(gids[pf], @bitCast(@as(i64, @truncate(v_pf)))));
-            }
-            const value = try aggregateInputValue(agg, rows, r);
-            const composite = DistinctSet.key(gids[r], @bitCast(@as(i64, @truncate(value))));
-            if (dset.insertNewBatch(composite)) {
-                try addAggregateStateValue(states.ref(gids[r]), agg.state_index, 1);
-            }
+        const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
+        if (input_index >= rows.layout.columns.len) return error.UnsupportedOperatorForType;
+        // Hoist the physical-type switch out of the row loop: the kernel runs
+        // over the staged column's typed slice directly.
+        switch (rows.layout.columns[input_index].physical_type) {
+            inline .i8, .i16, .i32, .i64 => |pt| {
+                const T = switch (pt) {
+                    .i8 => i8,
+                    .i16 => i16,
+                    .i32 => i32,
+                    .i64 => i64,
+                    else => unreachable,
+                };
+                try foldGroupDistinctTyped(T, dset, states, gids, rows.columnTypedAll(T, input_index), agg.state_index);
+            },
+            // The planner scopes distinct inputs to the integer family.
+            .f32, .f64 => return error.UnsupportedOperatorForType,
+        }
+    }
+}
+
+fn foldGroupDistinctTyped(
+    comptime T: type,
+    dset: *DistinctSet,
+    states: *StateSlab,
+    gids: []const u32,
+    vals: []const T,
+    state_index: u16,
+) !void {
+    const n = gids.len;
+    var r: usize = 0;
+    while (r < n) : (r += 1) {
+        const pf = r + PREFETCH_DIST_DISTINCT;
+        if (pf < n) {
+            const v_pf: i64 = vals[pf];
+            dset.prefetchKey(DistinctSet.key(gids[pf], @bitCast(v_pf)));
+        }
+        const v: i64 = vals[r];
+        const composite = DistinctSet.key(gids[r], @bitCast(v));
+        if (dset.insertNewBatch(composite)) {
+            try addAggregateStateValue(states.ref(gids[r]), state_index, 1);
         }
     }
 }
