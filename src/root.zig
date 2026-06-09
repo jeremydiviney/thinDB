@@ -126,4 +126,5 @@ test {
     _ = @import("util/affinity.zig");
     _ = @import("util/core_scheduler.zig");
     _ = @import("util/huge_page.zig");
+    _ = @import("exec/affine_agg.zig");
 }

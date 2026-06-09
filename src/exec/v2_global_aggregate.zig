@@ -635,7 +635,10 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                         if (!aggInputSupported(ctyp)) return declineFree(allocator, plans, &needed);
                         const out_type = aggregate.aggOutputTypeFor(agg, ctyp) catch return declineFree(allocator, plans, &needed);
                         p.is_float = isFloatType(ctyp);
-                        p.output_type = out_type;
+                        // The affine-aggregate reduction pins a base SUM to
+                        // largeint so the post-agg `a·SUM + b·COUNT` derivation
+                        // runs in i128 without an intermediate narrow.
+                        p.output_type = agg.out_type_override orelse out_type;
                     }
                 },
                 .count_distinct => {

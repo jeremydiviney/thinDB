@@ -13,6 +13,7 @@ const ir = @import("../ir/ir.zig");
 const exec = @import("exec.zig");
 const v2_pipeline = @import("v2_pipeline.zig");
 const v2_global_aggregate = @import("v2_global_aggregate.zig");
+const affine_agg = @import("affine_agg.zig");
 
 pub const SourceKind = enum {
     table_scan,
@@ -509,6 +510,17 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
+    // Algebraic reduction: collapse SUM/MIN/MAX(affine(col)) onto a shared base
+    // set computed once, then derive every original output. Q29's 90
+    // SUM(ResolutionWidth+k) become SUM+COUNT + a post-agg Compute. Only when
+    // there's no HAVING (it would bind to the original aliases the base set
+    // replaces; global+HAVING is declined regardless).
+    if (plan.having_filter == null) {
+        if (try affine_agg.reduce(input.allocator, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived)) |red| {
+            return try buildGlobalAggregateReduced(input, table, plan, red);
+        }
+    }
+
     // No serial fallback. The parallel reducer (v2_global_aggregate) is the only
     // path for a no-GROUP-BY aggregate: every aggregate — COUNT(DISTINCT) of any
     // type included — folds per-lane and merges. A shape it declines surfaces as
@@ -521,6 +533,27 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .derived = plan.derived,
         .dop = input.db.config.max_dop,
     });
+}
+
+// Build the global aggregate over the reduced base set, then layer the late
+// materialization: a Compute deriving each original output from the base
+// aggregates and a Project to the original SELECT order.
+fn buildGlobalAggregateReduced(
+    input: CompileInput,
+    table: *api.Table,
+    plan: GlobalAggregatePlan,
+    red: affine_agg.Reduction,
+) !exec.Query {
+    var q = (try v2_global_aggregate.tryBuild(input.allocator, table, .{
+        .aggs = red.base_aggs,
+        .where_filter = if (plan.where_filter) |f| f.predicate else null,
+        .having_filter = null,
+        .derived = red.pre_derived,
+        .dop = input.db.config.max_dop,
+    })) orelse return error.UnsupportedQueryShape;
+    errdefer q.deinit();
+    if (red.post_derived.len > 0) q = try q.compute(red.post_derived);
+    return try q.project(red.output_names);
 }
 
 // A non-aggregating SELECT: scan → optional WHERE → optional row-local derived
