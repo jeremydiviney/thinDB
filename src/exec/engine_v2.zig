@@ -810,7 +810,7 @@ fn tryScanSelectLateMat(
     // and is byte-identical to the full scan regardless of projection width or
     // a WHERE — so try it first whenever there's an ORDER BY.
     if (plan.order_by) |o| {
-        if (try exec.zonemapTopN(allocator, table, null, probe.items, predicateOrAlways(plan.where_filter), o.specs, output_names, n, offset)) |q| {
+        if (try exec.zonemapTopN(allocator, table, null, probe.items, predicateOrAlways(plan.where_filter), o.specs, output_names, n, offset, input.db.config.max_dop)) |q| {
             return q;
         }
     }

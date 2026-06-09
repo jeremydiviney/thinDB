@@ -357,7 +357,7 @@ fn runScenario(sc: Scenario) !void {
     defer ref.deinit();
 
     // Subject: zonemap path. Must be non-null for these (supported) scenarios.
-    const z_opt = try exec.zonemapTopN(allocator, t, null, probe_names, pred, order_specs, output_names, sc.n, sc.offset);
+    const z_opt = try exec.zonemapTopN(allocator, t, null, probe_names, pred, order_specs, output_names, sc.n, sc.offset, 4);
     if (z_opt == null) return error.ZonemapShouldHaveApplied;
     var z_q = z_opt.?;
     defer z_q.deinit();
@@ -578,7 +578,7 @@ test "zonemap zero matches" {
     var ref = try capture(allocator, &ref_q);
     defer ref.deinit();
 
-    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, pred, specs, out, 5, 0)).?;
+    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, pred, specs, out, 5, 0, 4)).?;
     defer z_q.deinit();
     var got = try capture(allocator, &z_q);
     defer got.deinit();
@@ -631,7 +631,7 @@ test "zonemap all RGs pruned after the first (disjoint ascending ranges)" {
     var ref = try capture(allocator, &ref_q);
     defer ref.deinit();
 
-    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 3, 0)).?;
+    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 3, 0, 4)).?;
     defer z_q.deinit();
     var got = try capture(allocator, &z_q);
     defer got.deinit();
@@ -688,7 +688,7 @@ test "zonemap secondary key extends pruning past leading-key ties" {
     var ref = try capture(allocator, &ref_q);
     defer ref.deinit();
 
-    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 5, 0)).?;
+    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 5, 0, 4)).?;
     defer z_q.deinit();
     var got = try capture(allocator, &z_q);
     defer got.deinit();
@@ -744,7 +744,7 @@ test "zonemap narrow projection: output subset of probe (Q26 shape)" {
     var ref = try capture(allocator, &ref_q);
     defer ref.deinit();
 
-    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 5, 0)).?;
+    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 5, 0, 4)).?;
     defer z_q.deinit();
     var got = try capture(allocator, &z_q);
     defer got.deinit();
@@ -837,7 +837,7 @@ fn runStringScenario(segs: []const []const []const u8, desc: bool, n: usize) !vo
     var ref = try capture(allocator, &ref_q);
     defer ref.deinit();
 
-    const z_opt = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, n, 0);
+    const z_opt = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, n, 0, 4);
     if (z_opt == null) return error.ZonemapShouldHaveApplied;
     var z_q = z_opt.?;
     defer z_q.deinit();
@@ -921,7 +921,7 @@ test "zonemap double leading key (incl NaN) matches lateScan ASC + DESC" {
         var ref = try capture(allocator, &ref_q);
         defer ref.deinit();
 
-        const z_opt = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 4, 0);
+        const z_opt = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 4, 0, 4);
         if (z_opt == null) return error.ZonemapShouldHaveApplied;
         var z_q = z_opt.?;
         defer z_q.deinit();
@@ -958,6 +958,6 @@ test "zonemap fallback: nullable leading key returns null" {
     const specs = &[_]SortSpec{.{ .col = "k1", .desc = false }};
     const out = &[_][]const u8{ "k1", "w" };
 
-    const z = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 2, 0);
+    const z = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 2, 0, 4);
     try std.testing.expect(z == null);
 }

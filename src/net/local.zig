@@ -1806,6 +1806,7 @@ fn buildLateMat(
     acct: ?*exec.memory.MemoryAccountant,
     shape: LateMatShape,
     l: ir.Op.Limit,
+    dop: usize,
 ) !?Query {
     // Prefer the zonemap block-skipping top-N path when there's an ORDER BY and
     // its leading key qualifies (non-nullable numeric/temporal with footer
@@ -1823,6 +1824,7 @@ fn buildLateMat(
             shape.output_names,
             @intCast(l.n),
             @intCast(l.offset),
+            dop,
         )) |q| return q;
     }
     // LateScan is only worthwhile (and only validated) with a real WHERE that
@@ -1890,7 +1892,7 @@ pub fn buildServerQuerySession(
                     if (try lateMatShape(allocator, t, l)) |shape| {
                         var sh = shape;
                         defer sh.deinit(allocator);
-                        if (try buildLateMat(allocator, t, null, sh, l)) |q| break :blk q;
+                        if (try buildLateMat(allocator, t, null, sh, l, db.config.max_dop)) |q| break :blk q;
                     }
                 }
             }
@@ -3219,7 +3221,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                         var sh = shape;
                         defer sh.deinit(ctx.allocator);
                         const acct = try ctx.queryAccountant();
-                        if (try buildLateMat(ctx.allocator, t, acct, sh, l)) |q| break :blk q;
+                        if (try buildLateMat(ctx.allocator, t, acct, sh, l, ctx.db.config.max_dop)) |q| break :blk q;
                     }
                 }
             }

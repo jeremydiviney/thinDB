@@ -71,6 +71,7 @@ const SortSpec = @import("sort.zig").SortSpec;
 const rowloc = @import("rowloc.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
+const HarnessCore = exec.group_topn_harness_core;
 
 /// One row group's identity + the offset of its best-corner prefix tuple in the
 /// flat `corners` buffer (`prefix_len` consecutive i128s).
@@ -117,18 +118,18 @@ pub const ZonemapTopN = struct {
     /// K = n + m (saturating).
     keep: usize,
 
-    /// Append-only candidate store: `key_cols[i]` holds ORDER BY key `i`'s
-    /// decoded value for each appended candidate row; `loc_store` holds the
-    /// packed `__rowloc`. The heap holds row indices into these. Rows that fall
-    /// out of the heap become dead; `compact` periodically rebuilds the store
-    /// down to just the live heap rows so memory stays O(keep).
-    key_cols: []ColumnStore,
-    loc_store: std.ArrayListUnmanaged(i64) = .empty,
-    /// Binary max-heap (worst-kept at root) of row indices into `key_cols`.
-    heap: std.ArrayListUnmanaged(u32) = .empty,
+    /// Worker count for the row-group visit. Workers claim row groups off the
+    /// globally-sorted corner list and keep PRIVATE candidate heaps — a stale
+    /// (loose) local threshold only over-accepts, never over-rejects, so no
+    /// locking is needed. The early stop survives parallelism: a worker's
+    /// local K-th best is worse-or-equal to the global K-th best, so when ITS
+    /// stop condition fires on the sorted claim order, the global condition
+    /// holds for every later row group too — one shared flag stops everyone.
+    dop: usize,
 
-    decoded: []storage.OwnedColumn,
-    decoded_valid: bool = false,
+    /// Main candidate heap: receives the memtable rows and the merged
+    /// per-worker survivors; `finalize` reads it.
+    main: CandidateHeap,
 
     done: bool = false,
     out_schema: []const Column,
@@ -147,6 +148,7 @@ pub const ZonemapTopN = struct {
         output_names: []const []const u8,
         n: usize,
         offset: usize,
+        dop: usize,
     ) !?Query {
         if (order_specs.len == 0) return null;
 
@@ -214,19 +216,6 @@ pub const ZonemapTopN = struct {
         errdefer late_q.deinit();
         const late: *LateScan = @ptrCast(@alignCast(late_q.ptr));
 
-        const decoded = try allocator.alloc(storage.OwnedColumn, probe_phys.len);
-        errdefer allocator.free(decoded);
-
-        const key_cols = try allocator.alloc(ColumnStore, order_specs.len);
-        errdefer allocator.free(key_cols);
-        var kc_inited: usize = 0;
-        errdefer for (key_cols[0..kc_inited]) |*c| c.deinit(allocator);
-        for (key_phys, 0..) |phys, i| {
-            const c = table.schema.columns[phys];
-            key_cols[i] = try ColumnStore.init(allocator, c.type, c.nullable);
-            kc_inited += 1;
-        }
-
         const self = try allocator.create(ZonemapTopN);
         errdefer allocator.destroy(self);
 
@@ -248,21 +237,17 @@ pub const ZonemapTopN = struct {
             .n = n,
             .offset = offset,
             .keep = keep,
-            .key_cols = key_cols,
-            .decoded = decoded,
+            .dop = @max(dop, 1),
+            .main = undefined,
             .out_schema = late.outputSchema(),
         };
+        self.main = try CandidateHeap.init(self, allocator);
         return makeQuery(allocator, self);
     }
 
     pub fn deinit(self: *ZonemapTopN) void {
-        self.releaseDecoded();
         self.late.deinit();
-        for (self.key_cols) |*c| c.deinit(self.allocator);
-        self.allocator.free(self.key_cols);
-        self.loc_store.deinit(self.allocator);
-        self.heap.deinit(self.allocator);
-        self.allocator.free(self.decoded);
+        self.main.deinit();
         self.allocator.free(self.probe_phys);
         self.allocator.free(self.probe_schema);
         self.allocator.free(self.key_phys);
@@ -328,13 +313,95 @@ pub const ZonemapTopN = struct {
         }
         std.sort.pdq(RgRef, refs, self, cornerLess);
 
-        for (refs) |ref| {
-            if (self.keep > 0 and self.heap.items.len >= self.keep and self.cornerWorseThanWorst(ref)) break;
-            try self.processSegmentRowGroup(ref);
-        }
-
+        if (refs.len > 0) try self.visitRowGroups(refs);
         try self.processMemtable();
         return self.finalize();
+    }
+
+    /// Visit the sorted row-group list: workers claim entries off a shared
+    /// atomic cursor, fold survivors into PRIVATE heaps, and any worker whose
+    /// local stop condition fires sets the shared stop flag (its threshold is
+    /// conservative w.r.t. the global one, so the proof carries). Per-worker
+    /// survivors then merge into the main heap. dop == 1 runs the same claim
+    /// loop inline on the main heap — the serial reference behavior.
+    fn visitRowGroups(self: *ZonemapTopN, refs: []const RgRef) !void {
+        const allocator = self.allocator;
+        var layout = HarnessCore.cpuLayout(allocator) catch HarnessCore.CpuLayout{ .order = &.{}, .physical_count = 0 };
+        defer layout.deinit(allocator);
+        const cpu_count = @max(@as(usize, 1), layout.order.len);
+        const n_workers = @max(@as(usize, 1), @min(self.dop, @min(cpu_count, refs.len)));
+
+        var next_ref = std.atomic.Value(usize).init(0);
+        var stop = std.atomic.Value(bool).init(false);
+
+        if (n_workers == 1) {
+            var w: ZWorker = .{
+                .z = self,
+                .allocator = allocator,
+                .cpu = null,
+                .ch = &self.main,
+                .refs = refs,
+                .next_ref = &next_ref,
+                .stop = &stop,
+            };
+            return zWorkerRun(&w);
+        }
+
+        const workers = try allocator.alloc(ZWorker, n_workers);
+        defer allocator.free(workers);
+        const heaps = try allocator.alloc(CandidateHeap, n_workers);
+        defer allocator.free(heaps);
+        var built: usize = 0;
+        defer for (heaps[0..built]) |*h| h.deinit();
+        for (heaps) |*h| {
+            h.* = try CandidateHeap.init(self, allocator);
+            built += 1;
+        }
+        for (workers, heaps, 0..) |*w, *h, i| {
+            w.* = .{
+                .z = self,
+                .allocator = allocator,
+                .cpu = if (layout.order.len == 0) null else layout.order[i % layout.order.len],
+                .ch = h,
+                .refs = refs,
+                .next_ref = &next_ref,
+                .stop = &stop,
+            };
+        }
+
+        const threads = try allocator.alloc(std.Thread, n_workers);
+        defer allocator.free(threads);
+        const spawned = try allocator.alloc(bool, n_workers);
+        defer allocator.free(spawned);
+        @memset(spawned, false);
+        for (workers, 0..) |*w, i| {
+            if (std.Thread.spawn(.{}, zWorkerMain, .{w})) |th| {
+                threads[i] = th;
+                spawned[i] = true;
+            } else |_| {}
+        }
+        for (workers, 0..) |*w, i| if (!spawned[i]) {
+            zWorkerRun(w) catch |e| {
+                w.err = e;
+            };
+        };
+        for (0..n_workers) |i| if (spawned[i]) threads[i].join();
+        for (workers) |*w| if (w.err) |e| return e;
+
+        for (heaps) |*h| try self.mergeHeapInto(h);
+    }
+
+    /// Fold a worker's surviving candidates into the main heap. The push path
+    /// reads views only at the key positions, so a probe-shaped view buffer
+    /// with just those slots populated suffices.
+    fn mergeHeapInto(self: *ZonemapTopN, src: *CandidateHeap) !void {
+        if (src.heap.items.len == 0) return;
+        const vbuf = try self.allocator.alloc(ColumnView, self.probe_phys.len);
+        defer self.allocator.free(vbuf);
+        for (self.key_probe_idx, 0..) |pi, i| vbuf[pi] = src.key_cols[i].view();
+        for (src.heap.items) |row| {
+            try self.main.pushCandidate(vbuf, row, src.loc_store.items[row]);
+        }
     }
 
     /// Read the prefix keys' min/max footer stats for each (segment, row group),
@@ -382,13 +449,13 @@ pub const ZonemapTopN = struct {
     }
 
     /// The prefix best-corner tuple stored for a row group.
-    fn cornerOf(self: *ZonemapTopN, ref: RgRef) []const i128 {
+    fn cornerOf(self: *const ZonemapTopN, ref: RgRef) []const i128 {
         return self.corners[ref.corner_off..][0..self.prefix_len];
     }
 
     /// best-corner visit order: most-preferred first, lexicographically over the
     /// prefix (per-key ASC → smaller first; DESC → larger first).
-    fn cornerLess(self: *ZonemapTopN, a: RgRef, b: RgRef) bool {
+    fn cornerLess(self: *const ZonemapTopN, a: RgRef, b: RgRef) bool {
         const ca = self.cornerOf(a);
         const cb = self.cornerOf(b);
         for (ca, cb, 0..) |av, bv, i| {
@@ -396,63 +463,6 @@ pub const ZonemapTopN = struct {
             return if (self.key_desc[i]) av > bv else av < bv;
         }
         return false;
-    }
-
-    /// True when a row group cannot beat the current worst-kept row — its
-    /// best-corner prefix tuple already sorts strictly after the worst-kept's
-    /// prefix-key tuple under the per-key directions. Conservative on a full tie
-    /// (returns false) so a tie-on-prefix RG is still processed (later keys
-    /// could displace the incumbent).
-    fn cornerWorseThanWorst(self: *ZonemapTopN, ref: RgRef) bool {
-        const worst = self.heap.items[0];
-        const corner = self.cornerOf(ref);
-        for (corner, 0..) |c, i| {
-            const w = keyValueI128(self.key_cols[i], worst);
-            if (c == w) continue;
-            return if (self.key_desc[i]) c < w else c > w;
-        }
-        return false;
-    }
-
-    fn processSegmentRowGroup(self: *ZonemapTopN, ref: RgRef) !void {
-        const entry = self.table.manifest.segments.items[ref.seg_idx];
-        var name_buf: [32]u8 = undefined;
-        const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
-        var seg = try storage.readSegment(
-            self.allocator,
-            self.table.io,
-            self.table.segments_dir,
-            file_name,
-            self.table.schema,
-        );
-        defer seg.deinit();
-
-        const rg_count = ref.row_count;
-        for (self.probe_phys, 0..) |phys, j| {
-            self.decoded[j] = try seg.decodeColumnMaybeCached(
-                self.allocator,
-                self.table.schema,
-                ref.rg_idx,
-                phys,
-                &self.table.cache,
-            );
-        }
-        self.decoded_valid = true;
-        defer self.releaseDecoded();
-
-        const vbuf = try self.allocator.alloc(ColumnView, self.probe_phys.len);
-        defer self.allocator.free(vbuf);
-        for (self.decoded[0..self.probe_phys.len], 0..) |c, i| vbuf[i] = c.view();
-
-        const mask = try self.allocator.alloc(bool, rg_count);
-        defer self.allocator.free(mask);
-        try self.evalPredicate(vbuf, rg_count, mask);
-        try self.applyTombstones(entry.segment_id, ref.rg_idx, seg, rg_count, mask);
-
-        for (mask, 0..) |keep, row| {
-            if (!keep) continue;
-            try self.pushCandidate(vbuf, row, rowloc.packSegment(ref.seg_idx, ref.rg_idx, row));
-        }
     }
 
     fn processMemtable(self: *ZonemapTopN) !void {
@@ -466,51 +476,254 @@ pub const ZonemapTopN = struct {
 
         const mask = try self.allocator.alloc(bool, n);
         defer self.allocator.free(mask);
-        try self.evalPredicate(vbuf, n, mask);
+        try evalPredicate(self, self.allocator, vbuf, n, mask);
 
         for (mask, 0..) |keep, row| {
             if (!keep) continue;
-            try self.pushCandidate(vbuf, row, rowloc.packMemtable(row));
+            try self.main.pushCandidate(vbuf, row, rowloc.packMemtable(row));
         }
     }
 
-    /// Evaluate the WHERE predicate over a probe batch into `mask` (true =
-    /// keep). NULL handling matches the reference Filter path: `evaluateExprGuided`
-    /// clears a leaf's bit on a NULL row.
-    fn evalPredicate(self: *ZonemapTopN, views: []const ColumnView, n: usize, mask: []bool) !void {
-        const batch = Batch{ .schema = self.probe_schema, .values = views, .row_count = n };
-        try predicate.evaluateExprGuided(self.allocator, self.pred, self.probe_schema, batch, mask, null);
+    /// Sort the live heap rows by the comparator, drop the first `offset`, keep
+    /// `n`, and return their locs in emit order (caller-owned).
+    fn finalize(self: *ZonemapTopN) ![]i64 {
+        const total = self.main.heap.items.len;
+        if (total == 0) return self.allocator.alloc(i64, 0);
+
+        // Sort the live heap row indices best-first.
+        const perm = try self.allocator.alloc(u32, total);
+        defer self.allocator.free(perm);
+        @memcpy(perm, self.main.heap.items);
+        std.sort.pdq(u32, perm, &self.main, CandidateHeap.permLess);
+
+        const start = @min(self.offset, total);
+        const end = @min(std.math.add(usize, self.offset, self.n) catch total, total);
+        const out_n = if (end > start) end - start else 0;
+        const out = try self.allocator.alloc(i64, out_n);
+        for (out, 0..) |*o, i| o.* = self.main.loc_store.items[perm[start + i]];
+        return out;
+    }
+};
+
+/// One worker of the parallel row-group visit: claims sorted refs off the
+/// shared cursor, folds survivors into a private heap, and raises the shared
+/// stop flag when its own (conservative) stop condition fires.
+const ZWorker = struct {
+    z: *const ZonemapTopN,
+    allocator: Allocator,
+    cpu: ?usize,
+    ch: *CandidateHeap,
+    refs: []const RgRef,
+    next_ref: *std.atomic.Value(usize),
+    stop: *std.atomic.Value(bool),
+    err: ?anyerror = null,
+};
+
+fn zWorkerMain(w: *ZWorker) void {
+    if (w.cpu) |cpu| HarnessCore.pinToCpu(cpu);
+    zWorkerRun(w) catch |e| {
+        w.err = e;
+    };
+}
+
+fn zWorkerRun(w: *ZWorker) !void {
+    const z = w.z;
+    const allocator = w.allocator;
+    const decoded = try allocator.alloc(storage.OwnedColumn, z.probe_phys.len);
+    defer allocator.free(decoded);
+
+    // Per-worker segment + tombstone caches: the corner-sorted claim order
+    // scatters across segments, and re-opening a segment (footer parse) plus a
+    // tombstone file probe PER ROW GROUP dominated the degenerate full-visit
+    // case. Each worker opens a segment and reads its tombstones at most once.
+    var cache: SegCache = .{
+        .segs = try allocator.alloc(?storage.ReadSegment, z.segment_count),
+        .tombs = try allocator.alloc(?[]u32, z.segment_count),
+        .tombs_loaded = try allocator.alloc(bool, z.segment_count),
+    };
+    @memset(cache.segs, null);
+    @memset(cache.tombs, null);
+    @memset(cache.tombs_loaded, false);
+    defer cache.deinit(allocator);
+
+    while (true) {
+        if (w.stop.load(.acquire)) break;
+        const idx = w.next_ref.fetchAdd(1, .monotonic);
+        if (idx >= w.refs.len) break;
+        const ref = w.refs[idx];
+        // Local stop: this worker's K-th best is worse-or-equal to the global
+        // K-th best, so corner-worse-than-local implies corner-worse-than-
+        // global — and the claim order is the sorted corner order, so every
+        // later row group is worse still. Stop everyone.
+        if (z.keep > 0 and w.ch.full() and w.ch.cornerWorseThanWorst(ref)) {
+            w.stop.store(true, .release);
+            break;
+        }
+        try processSegmentRowGroup(z, allocator, w.ch, decoded, &cache, ref);
+    }
+}
+
+const SegCache = struct {
+    segs: []?storage.ReadSegment,
+    tombs: []?[]u32,
+    tombs_loaded: []bool,
+
+    fn deinit(self: *SegCache, allocator: Allocator) void {
+        for (self.segs) |*s| if (s.*) |*seg| seg.deinit();
+        allocator.free(self.segs);
+        for (self.tombs) |t| if (t) |tt| allocator.free(tt);
+        allocator.free(self.tombs);
+        allocator.free(self.tombs_loaded);
     }
 
-    fn applyTombstones(
-        self: *ZonemapTopN,
-        segment_id: u64,
-        rg_idx: usize,
-        seg: storage.ReadSegment,
-        rg_count: u32,
-        mask: []bool,
-    ) !void {
-        const tombs = try storage.tombstone.read(self.allocator, self.table.io, self.table.segments_dir, segment_id);
-        defer if (tombs) |t| self.allocator.free(t);
-        const t = tombs orelse return;
-        if (t.len == 0) return;
-
-        var rg_first: u32 = 0;
-        for (seg.info.row_groups[0..rg_idx]) |rg| rg_first += rg.row_count;
-        const rg_end = rg_first + rg_count;
-        for (t) |off| {
-            if (off >= rg_first and off < rg_end) mask[off - rg_first] = false;
+    fn segment(self: *SegCache, z: *const ZonemapTopN, allocator: Allocator, seg_idx: usize) !*storage.ReadSegment {
+        if (self.segs[seg_idx] == null) {
+            const entry = z.table.manifest.segments.items[seg_idx];
+            var name_buf: [32]u8 = undefined;
+            const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
+            self.segs[seg_idx] = try storage.readSegment(
+                allocator,
+                z.table.io,
+                z.table.segments_dir,
+                file_name,
+                z.table.schema,
+            );
         }
+        return &self.segs[seg_idx].?;
+    }
+
+    fn tombstones(self: *SegCache, z: *const ZonemapTopN, allocator: Allocator, seg_idx: usize) !?[]const u32 {
+        if (!self.tombs_loaded[seg_idx]) {
+            const entry = z.table.manifest.segments.items[seg_idx];
+            self.tombs[seg_idx] = try storage.tombstone.read(allocator, z.table.io, z.table.segments_dir, entry.segment_id);
+            self.tombs_loaded[seg_idx] = true;
+        }
+        return self.tombs[seg_idx];
+    }
+};
+
+fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *CandidateHeap, decoded: []storage.OwnedColumn, cache: *SegCache, ref: RgRef) !void {
+    const seg = try cache.segment(z, allocator, ref.seg_idx);
+
+    const rg_count = ref.row_count;
+    var decoded_n: usize = 0;
+    defer for (decoded[0..decoded_n]) |*c| c.deinit(allocator);
+    for (z.probe_phys, 0..) |phys, j| {
+        decoded[j] = try seg.decodeColumnMaybeCached(
+            allocator,
+            z.table.schema,
+            ref.rg_idx,
+            phys,
+            &z.table.cache,
+        );
+        decoded_n += 1;
+    }
+
+    const vbuf = try allocator.alloc(ColumnView, z.probe_phys.len);
+    defer allocator.free(vbuf);
+    for (decoded[0..z.probe_phys.len], 0..) |c, i| vbuf[i] = c.view();
+
+    const mask = try allocator.alloc(bool, rg_count);
+    defer allocator.free(mask);
+    try evalPredicate(z, allocator, vbuf, rg_count, mask);
+    try applyTombstones(z, allocator, cache, ref, seg.*, rg_count, mask);
+
+    for (mask, 0..) |keep, row| {
+        if (!keep) continue;
+        try ch.pushCandidate(vbuf, row, rowloc.packSegment(ref.seg_idx, ref.rg_idx, row));
+    }
+}
+
+/// Evaluate the WHERE predicate over a probe batch into `mask` (true =
+/// keep). NULL handling matches the reference Filter path: `evaluateExprGuided`
+/// clears a leaf's bit on a NULL row.
+fn evalPredicate(z: *const ZonemapTopN, allocator: Allocator, views: []const ColumnView, n: usize, mask: []bool) !void {
+    const batch = Batch{ .schema = z.probe_schema, .values = views, .row_count = n };
+    try predicate.evaluateExprGuided(allocator, z.pred, z.probe_schema, batch, mask, null);
+}
+
+fn applyTombstones(
+    z: *const ZonemapTopN,
+    allocator: Allocator,
+    cache: *SegCache,
+    ref: RgRef,
+    seg: storage.ReadSegment,
+    rg_count: u32,
+    mask: []bool,
+) !void {
+    const t = (try cache.tombstones(z, allocator, ref.seg_idx)) orelse return;
+    if (t.len == 0) return;
+
+    var rg_first: u32 = 0;
+    for (seg.info.row_groups[0..ref.rg_idx]) |rg| rg_first += rg.row_count;
+    const rg_end = rg_first + rg_count;
+    for (t) |off| {
+        if (off >= rg_first and off < rg_end) mask[off - rg_first] = false;
+    }
+}
+
+/// Bounded candidate heap: an append-only store of each candidate's ORDER BY
+/// key values (`key_cols`) + packed `__rowloc` (`loc_store`), and a binary
+/// max-heap of row indices (worst-kept at root). Rows that fall out of the
+/// heap become dead; `compact` periodically rebuilds the store down to the
+/// live rows so memory stays O(keep). One instance per visit worker (private,
+/// no locks) plus the main one that collects the memtable + the merge.
+const CandidateHeap = struct {
+    z: *const ZonemapTopN,
+    allocator: Allocator,
+    key_cols: []ColumnStore,
+    loc_store: std.ArrayListUnmanaged(i64) = .empty,
+    heap: std.ArrayListUnmanaged(u32) = .empty,
+
+    fn init(z: *const ZonemapTopN, allocator: Allocator) !CandidateHeap {
+        const key_cols = try allocator.alloc(ColumnStore, z.key_phys.len);
+        errdefer allocator.free(key_cols);
+        var inited: usize = 0;
+        errdefer for (key_cols[0..inited]) |*c| c.deinit(allocator);
+        for (z.key_phys, 0..) |phys, i| {
+            const c = z.table.schema.columns[phys];
+            key_cols[i] = try ColumnStore.init(allocator, c.type, c.nullable);
+            inited += 1;
+        }
+        return .{ .z = z, .allocator = allocator, .key_cols = key_cols };
+    }
+
+    fn deinit(self: *CandidateHeap) void {
+        for (self.key_cols) |*c| c.deinit(self.allocator);
+        self.allocator.free(self.key_cols);
+        self.loc_store.deinit(self.allocator);
+        self.heap.deinit(self.allocator);
+    }
+
+    fn full(self: *const CandidateHeap) bool {
+        return self.heap.items.len >= self.z.keep;
+    }
+
+    /// True when a row group cannot beat this heap's current worst-kept row —
+    /// its best-corner prefix tuple already sorts strictly after the worst-
+    /// kept's prefix-key tuple under the per-key directions. Conservative on a
+    /// full tie (returns false) so a tie-on-prefix RG is still processed
+    /// (later keys could displace the incumbent).
+    fn cornerWorseThanWorst(self: *const CandidateHeap, ref: RgRef) bool {
+        const z = self.z;
+        const worst = self.heap.items[0];
+        const corner = z.cornerOf(ref);
+        for (corner, 0..) |c, i| {
+            const w = keyValueI128(self.key_cols[i], worst);
+            if (c == w) continue;
+            return if (z.key_desc[i]) c < w else c > w;
+        }
+        return false;
     }
 
     /// Push one survivor (its ORDER BY key values + packed loc) into the bounded
     /// max-heap. Below `keep`: append + sift up. At capacity: if the candidate
     /// is NOT worse than the worst-kept (root), append it, replace the root with
     /// it, sift down (the old root becomes a dead row); else drop.
-    fn pushCandidate(self: *ZonemapTopN, views: []const ColumnView, row: usize, loc: i64) !void {
-        if (self.keep == 0) return;
+    fn pushCandidate(self: *CandidateHeap, views: []const ColumnView, row: usize, loc: i64) !void {
+        if (self.z.keep == 0) return;
 
-        if (self.heap.items.len < self.keep) {
+        if (self.heap.items.len < self.z.keep) {
             const slot = try self.appendCandidateRow(views, row, loc);
             try self.heap.append(self.allocator, slot);
             self.siftUp(self.heap.items.len - 1);
@@ -518,7 +731,7 @@ pub const ZonemapTopN = struct {
         }
 
         const worst_row = self.heap.items[0];
-        if (self.candidateWorseThanRow(views, row, worst_row)) return;
+        if (self.candidateWorseThanRow(views, row, loc, worst_row)) return;
 
         const slot = try self.appendCandidateRow(views, row, loc);
         self.heap.items[0] = slot;
@@ -528,40 +741,55 @@ pub const ZonemapTopN = struct {
 
     /// Append the candidate's per-key values + loc as a fresh row; return its
     /// row index.
-    fn appendCandidateRow(self: *ZonemapTopN, views: []const ColumnView, row: usize, loc: i64) !u32 {
+    fn appendCandidateRow(self: *CandidateHeap, views: []const ColumnView, row: usize, loc: i64) !u32 {
         const slot: u32 = @intCast(self.loc_store.items.len);
         for (self.key_cols, 0..) |*kc, i| {
-            try transform.appendOneRow(self.allocator, views[self.key_probe_idx[i]], row, kc);
+            try transform.appendOneRow(self.allocator, views[self.z.key_probe_idx[i]], row, kc);
         }
         try self.loc_store.append(self.allocator, loc);
         return slot;
     }
 
-    /// True when candidate (`views`,`row`) is NOT strictly better than stored
-    /// row `other` — i.e. it would be rejected when the heap is full. Equal
-    /// tuples return true (a tie does NOT displace once full: it can't improve
-    /// the answer and would churn the heap, matching `TopN.isCandidate`).
-    fn candidateWorseThanRow(self: *ZonemapTopN, views: []const ColumnView, row: usize, other: u32) bool {
+    /// True when candidate (`views`,`row`,`loc`) is NOT strictly better than
+    /// stored row `other` — i.e. it would be rejected when the heap is full.
+    /// Full key ties break on the storage location (smaller wins), making the
+    /// kept set a total order — DETERMINISTIC and independent of visit order,
+    /// so the parallel workers and the serial reference keep identical rows.
+    /// (The reference `TopN` converges to the same set: its arrival order IS
+    /// storage order and it keeps the earliest arrival among ties.)
+    fn candidateWorseThanRow(self: *const CandidateHeap, views: []const ColumnView, row: usize, loc: i64, other: u32) bool {
         for (self.key_cols, 0..) |kc, i| {
-            const ord = transform.compareViewRows(views[self.key_probe_idx[i]], row, kc.view(), other);
-            if (ord == .lt) return self.key_desc[i];
-            if (ord == .gt) return !self.key_desc[i];
+            const ord = transform.compareViewRows(views[self.z.key_probe_idx[i]], row, kc.view(), other);
+            if (ord == .lt) return self.z.key_desc[i];
+            if (ord == .gt) return !self.z.key_desc[i];
         }
-        return true;
+        return loc > self.loc_store.items[other];
     }
 
     /// Heap order: is stored row `a` WORSE than stored row `b` (sorts after it
     /// under the ORDER BY direction)? The max-heap keeps the worst at the root.
-    fn rowWorse(self: *ZonemapTopN, a: u32, b: u32) bool {
+    /// Key ties break on storage location, matching `candidateWorseThanRow`.
+    fn rowWorse(self: *const CandidateHeap, a: u32, b: u32) bool {
         for (self.key_cols, 0..) |kc, i| {
             const ord = transform.compareInColumn(kc, a, b);
-            if (ord == .lt) return self.key_desc[i];
-            if (ord == .gt) return !self.key_desc[i];
+            if (ord == .lt) return self.z.key_desc[i];
+            if (ord == .gt) return !self.z.key_desc[i];
         }
-        return false;
+        return self.loc_store.items[a] > self.loc_store.items[b];
     }
 
-    fn siftUp(self: *ZonemapTopN, start: usize) void {
+    /// Ascending sort comparator (best-first), `TopN.Comparator` plus the
+    /// location tie-break for a deterministic emit order.
+    fn permLess(self: *CandidateHeap, a: u32, b: u32) bool {
+        for (self.key_cols, 0..) |kc, i| {
+            const ord = transform.compareInColumn(kc, a, b);
+            if (ord == .lt) return !self.z.key_desc[i];
+            if (ord == .gt) return self.z.key_desc[i];
+        }
+        return self.loc_store.items[a] < self.loc_store.items[b];
+    }
+
+    fn siftUp(self: *CandidateHeap, start: usize) void {
         var idx = start;
         while (idx > 0) {
             const parent = (idx - 1) / 2;
@@ -572,7 +800,7 @@ pub const ZonemapTopN = struct {
         }
     }
 
-    fn siftDown(self: *ZonemapTopN, start: usize) void {
+    fn siftDown(self: *CandidateHeap, start: usize) void {
         const len = self.heap.items.len;
         var idx = start;
         while (true) {
@@ -590,14 +818,14 @@ pub const ZonemapTopN = struct {
     /// Rebuild the candidate store down to just the live heap rows once dead
     /// rows dominate (store grown past 2×keep), so memory stays O(keep). Heap
     /// indices are remapped to the compacted positions.
-    fn compactIfNeeded(self: *ZonemapTopN) void {
-        if (self.keep == std.math.maxInt(usize)) return;
-        const cap = std.math.mul(usize, self.keep, 2) catch return;
+    fn compactIfNeeded(self: *CandidateHeap) void {
+        if (self.z.keep == std.math.maxInt(usize)) return;
+        const cap = std.math.mul(usize, self.z.keep, 2) catch return;
         if (self.loc_store.items.len <= cap) return;
         self.compact() catch {}; // best-effort; correctness unaffected if it no-ops
     }
 
-    fn compact(self: *ZonemapTopN) !void {
+    fn compact(self: *CandidateHeap) !void {
         const live = self.heap.items.len;
         var fresh = try self.allocator.alloc(ColumnStore, self.key_cols.len);
         var finited: usize = 0;
@@ -605,11 +833,10 @@ pub const ZonemapTopN = struct {
             for (fresh[0..finited]) |*c| c.deinit(self.allocator);
             self.allocator.free(fresh);
         }
-        for (self.key_cols, 0..) |src, i| {
-            const c = self.table.schema.columns[self.key_phys[i]];
+        for (0..self.key_cols.len) |i| {
+            const c = self.z.table.schema.columns[self.z.key_phys[i]];
             fresh[i] = try ColumnStore.init(self.allocator, c.type, c.nullable);
             finited += 1;
-            _ = src;
         }
         var fresh_locs: std.ArrayListUnmanaged(i64) = .empty;
         errdefer fresh_locs.deinit(self.allocator);
@@ -631,43 +858,6 @@ pub const ZonemapTopN = struct {
         self.key_cols = fresh;
         self.loc_store.deinit(self.allocator);
         self.loc_store = fresh_locs;
-    }
-
-    /// Sort the live heap rows by the comparator, drop the first `offset`, keep
-    /// `n`, and return their locs in emit order (caller-owned).
-    fn finalize(self: *ZonemapTopN) ![]i64 {
-        const total = self.heap.items.len;
-        if (total == 0) return self.allocator.alloc(i64, 0);
-
-        // Sort the live heap row indices best-first.
-        const perm = try self.allocator.alloc(u32, total);
-        defer self.allocator.free(perm);
-        @memcpy(perm, self.heap.items);
-        std.sort.pdq(u32, perm, self, permLess);
-
-        const start = @min(self.offset, total);
-        const end = @min(std.math.add(usize, self.offset, self.n) catch total, total);
-        const out_n = if (end > start) end - start else 0;
-        const out = try self.allocator.alloc(i64, out_n);
-        for (out, 0..) |*o, i| o.* = self.loc_store.items[perm[start + i]];
-        return out;
-    }
-
-    /// Ascending sort comparator (best-first), identical to `TopN.Comparator`.
-    fn permLess(self: *ZonemapTopN, a: u32, b: u32) bool {
-        for (self.key_cols, 0..) |kc, i| {
-            const ord = transform.compareInColumn(kc, a, b);
-            if (ord == .lt) return !self.key_desc[i];
-            if (ord == .gt) return self.key_desc[i];
-        }
-        return false;
-    }
-
-    fn releaseDecoded(self: *ZonemapTopN) void {
-        if (self.decoded_valid) {
-            for (self.decoded) |*c| c.deinit(self.allocator);
-            self.decoded_valid = false;
-        }
     }
 };
 

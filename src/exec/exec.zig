@@ -803,6 +803,7 @@ pub fn zonemapTopN(
     output_names: []const []const u8,
     n: usize,
     offset: usize,
+    dop: usize,
 ) !?Query {
     return @import("zonemap_topn.zig").ZonemapTopN.create(
         allocator,
@@ -814,6 +815,7 @@ pub fn zonemapTopN(
         output_names,
         n,
         offset,
+        dop,
     );
 }
 
