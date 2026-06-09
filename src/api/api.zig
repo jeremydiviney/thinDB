@@ -198,7 +198,11 @@ pub fn autoCacheSizeBytes(configured: usize) usize {
     if (configured != 0) return configured;
     const floor: u64 = 256 * 1024 * 1024;
     const total = std.process.totalSystemMemory() catch return @intCast(floor);
-    return @intCast(@max(total / 2, floor));
+    // 35% of system memory (not 50%): a larger decompressed-block cache stops
+    // paying off once the OS starts trimming the working set — re-faulting those
+    // pages on access costs more than the decompression the cache avoids (the
+    // resident set grows past the point where address translation stays cheap).
+    return @intCast(@max(total * 35 / 100, floor));
 }
 
 /// Auto-resolve sentinel for `Config.query_memory_budget`: the default leaves

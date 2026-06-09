@@ -33,6 +33,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
+const huge_page = @import("../util/huge_page.zig");
 
 pub const Key = struct {
     segment_id: u64,
@@ -85,7 +86,14 @@ pub fn globalStats() GlobalStats {
 }
 
 pub const Cache = struct {
+    /// Metadata allocator (Entry structs + the key map). Block payloads do NOT
+    /// come from here — they're sub-allocated from `pool` so the decompressed
+    /// set lands on huge, locked pages (see huge_page.zig).
     allocator: Allocator,
+    /// Huge-page-backed pool for the decompressed block bytes. Sub-MIN_BLOCK
+    /// blocks pass straight through to `allocator`, so the cache's unit tests
+    /// (tiny payloads) behave exactly as before.
+    pool: huge_page.Pool,
     capacity_bytes: usize,
     current_bytes: usize = 0,
 
@@ -120,20 +128,30 @@ pub const Cache = struct {
     pub fn init(allocator: Allocator, capacity_bytes: usize) Cache {
         return .{
             .allocator = allocator,
+            .pool = huge_page.Pool.init(allocator),
             .capacity_bytes = capacity_bytes,
         };
     }
 
+    /// Allocator for decompressed block payloads. The segment reader allocates
+    /// the bytes it hands to `insertPinned` from here so the cache can free them
+    /// through the same pool on eviction.
+    pub fn blockAllocator(self: *Cache) Allocator {
+        return self.pool.allocator();
+    }
+
     pub fn deinit(self: *Cache) void {
         _ = g_cache_bytes.fetchSub(self.current_bytes, .monotonic);
+        const block_alloc = self.pool.allocator();
         var cur = self.head;
         while (cur) |e| {
             const nxt = e.next;
-            self.allocator.free(e.bytes);
+            block_alloc.free(e.bytes);
             self.allocator.destroy(e);
             cur = nxt;
         }
         self.map.deinit(self.allocator);
+        self.pool.deinit();
         self.* = undefined;
     }
 
@@ -167,7 +185,7 @@ pub const Cache = struct {
         defer self.mutex.unlock();
 
         if (self.map.get(key)) |existing| {
-            self.allocator.free(bytes);
+            self.pool.allocator().free(bytes);
             existing.pins += 1;
             self.touch(existing);
             self.hits += 1;
@@ -181,9 +199,13 @@ pub const Cache = struct {
         try self.map.put(self.allocator, key, entry);
 
         self.linkHead(entry);
-        self.current_bytes += bytes.len;
+        // Account the resident cell, not the logical payload, so `capacity_bytes`
+        // bounds the pool's actual footprint (slab cells round up by class).
+        // `miss_bytes` stays logical — it measures bytes decompressed per miss.
+        const resident = huge_page.cellSize(bytes.len);
+        self.current_bytes += resident;
         _ = g_miss_bytes.fetchAdd(bytes.len, .monotonic);
-        _ = g_cache_bytes.fetchAdd(bytes.len, .monotonic);
+        _ = g_cache_bytes.fetchAdd(resident, .monotonic);
         self.evictUnpinnedToCapacity();
         return entry;
     }
@@ -209,9 +231,10 @@ pub const Cache = struct {
             if (v.pins == 0) {
                 self.unlink(v);
                 _ = self.map.remove(v.key);
-                self.current_bytes -= v.bytes.len;
-                _ = g_cache_bytes.fetchSub(v.bytes.len, .monotonic);
-                self.allocator.free(v.bytes);
+                const resident = huge_page.cellSize(v.bytes.len);
+                self.current_bytes -= resident;
+                _ = g_cache_bytes.fetchSub(resident, .monotonic);
+                self.pool.allocator().free(v.bytes);
                 self.allocator.destroy(v);
                 self.evictions += 1;
                 _ = g_evictions.fetchAdd(1, .monotonic);

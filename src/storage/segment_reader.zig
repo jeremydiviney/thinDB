@@ -112,8 +112,11 @@ pub const ReadSegment = struct {
                 const block = try self.readColumnBlock(allocator, rg, column_idx);
                 defer allocator.free(block);
                 entry_encoding = blockEncoding(block, 0);
-                const raw = try getDecompressedBytes(allocator, block, 0);
-                errdefer allocator.free(raw);
+                // The persistent payload lives in the cache's huge-page pool, so
+                // it's both allocated and (on eviction) freed there.
+                const block_alloc = cc.blockAllocator();
+                const raw = try getDecompressedBytes(block_alloc, block, 0);
+                errdefer block_alloc.free(raw);
                 break :blk try cc.insertPinned(key, raw, entry_encoding);
             };
             defer cc.release(entry);
@@ -183,8 +186,9 @@ pub const ReadSegment = struct {
             const block = try self.readColumnBlock(allocator, rg, column_idx);
             defer allocator.free(block);
             const encoding = blockEncoding(block, 0);
-            const raw = try getDecompressedBytes(allocator, block, 0);
-            errdefer allocator.free(raw);
+            const block_alloc = cc.blockAllocator();
+            const raw = try getDecompressedBytes(block_alloc, block, 0);
+            errdefer block_alloc.free(raw);
             const entry = try cc.insertPinned(key, raw, encoding);
             return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
         }
