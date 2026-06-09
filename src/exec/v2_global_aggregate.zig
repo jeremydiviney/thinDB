@@ -35,6 +35,28 @@ const compute = @import("compute.zig");
 const expr = @import("expr.zig");
 const Scan = @import("scan.zig").Scan;
 const HarnessCore = exec.group_topn_harness_core;
+const group_table = exec.group_table;
+
+// Partition a distinct key into one of `parts` buckets via Lemire's multiply-
+// shift reduction — `(hash * parts) >> 64` maps a uniform 64-bit hash into
+// `[0, parts)` for ANY `parts` (no power-of-two constraint, no division), with
+// the same uniform spread as a modulo. A key lands in the same partition in
+// every worker, so the per-partition merges are over disjoint key sets and
+// their distinct counts simply sum.
+//
+// The hash is sized to the tier — a 64-bit `UserID` mixes 64 bits, not a full
+// u128 — using the SAME hash each set buckets on internally. Multiply-shift
+// reads the hash's HIGH bits while the set's `& mask` reads the LOW bits, so
+// the partition split and the in-table probe stay independent.
+inline fn distinctPartition(tier: DistinctSet.Tier, key: u128, parts: usize) usize {
+    const h: u64 = switch (tier) {
+        .u32 => group_table.mix64(@as(u64, @as(u32, @truncate(key)))),
+        .u64 => group_table.mix64(@truncate(key)),
+        .u96 => group_table.Key96.fromU128(key).hash(),
+        .u128 => group_table.hashU128(key),
+    };
+    return @intCast((@as(u128, h) *% @as(u128, parts)) >> 64);
+}
 
 const Batch = exec.Batch;
 const Query = exec.Query;
@@ -114,6 +136,18 @@ const DistinctSet = HarnessCore.DistinctSet;
 //   .string — 128-bit hash of the bytes (collision-negligible at ClickBench scale)
 const DistinctKind = enum { int, wide, float, string };
 
+// Map a distinct-key kind to the membership-set tier (slot width). int/float
+// keys are ≤64-bit (int family zero-extended, float f64-bitcast); wide is a
+// 128-bit numeric; string is a 128-bit content hash. A narrow int still uses
+// the 64-bit tier because `distinctKey` zero-extends a possibly-negative i64,
+// whose bit pattern needs the full 64 bits.
+fn distinctTier(dkind: DistinctKind) DistinctSet.Tier {
+    return switch (dkind) {
+        .int, .float => .u64,
+        .wide, .string => .u128,
+    };
+}
+
 const AggPlan = struct {
     op: AggOp,
     // Folded input column name; null for COUNT(*). The batch column index is
@@ -145,12 +179,26 @@ const Lane = struct {
     // `allocator`; empty slice when the agg isn't a string min/max or no row
     // has been seen). Only slot `i` of a `.is_string` plan is ever populated.
     sstr: [][]const u8,
-    // Per-aggregate distinct membership set; only slot `i` of a `.count_distinct`
-    // plan is ever populated (others stay empty and allocate nothing).
+    // Per-aggregate distinct membership sets, `parts` of them per aggregate
+    // (indexed `[i * parts + part]`), so a count_distinct fold scatters its
+    // values across `parts` private sub-tables by key-hash. Only count_distinct
+    // aggs touch their slots; other aggs' slots stay empty (allocate nothing).
+    // The partitioning lets the cross-worker merge run one partition per thread
+    // (disjoint key sets), replacing the single-threaded union.
     dsets: []DistinctSet,
+    parts: usize,
+    // Final distinct count per count_distinct agg (filled by the parallel
+    // partition merge, or `finalizeDistinct` on the serial path). Read by emit.
+    distinct_counts: []u64,
+    // Per-aggregate "saw the empty string" flag for string COUNT(DISTINCT).
+    // ClickBench-style data stores no-value rows as `''` (87% of SearchPhrase),
+    // so the fold short-circuits them on a `len == 0` check — no hash, no set
+    // probe — and the one `''` value re-enters the count as +1 at finalize.
+    has_blank: []bool,
     allocator: Allocator,
 
-    fn init(allocator: Allocator, n: usize) !Lane {
+    fn init(allocator: Allocator, plans: []const AggPlan, parts: usize) !Lane {
+        const n = plans.len;
         const isum = try allocator.alloc(i128, n);
         errdefer allocator.free(isum);
         const fsum = try allocator.alloc(f64, n);
@@ -159,23 +207,50 @@ const Lane = struct {
         errdefer allocator.free(ns);
         const sstr = try allocator.alloc([]const u8, n);
         errdefer allocator.free(sstr);
-        const dsets = try allocator.alloc(DistinctSet, n);
+        const distinct_counts = try allocator.alloc(u64, n);
+        errdefer allocator.free(distinct_counts);
+        const has_blank = try allocator.alloc(bool, n);
+        errdefer allocator.free(has_blank);
+        const dsets = try allocator.alloc(DistinctSet, n * parts);
         @memset(isum, 0);
         @memset(fsum, 0);
         @memset(ns, 0);
         @memset(sstr, &.{});
+        @memset(distinct_counts, 0);
+        @memset(has_blank, false);
         @memset(dsets, .{});
-        return .{ .isum = isum, .fsum = fsum, .ns = ns, .sstr = sstr, .dsets = dsets, .allocator = allocator };
+        // Size each distinct field's sub-tables to its key width: a 64-bit value
+        // uses 8-byte-slot sets, a 128-bit value / string hash 16-byte ones.
+        for (plans, 0..) |p, i| {
+            if (p.op != .count_distinct) continue;
+            for (dsets[i * parts ..][0..parts]) |*d| d.configure(distinctTier(p.dkind));
+        }
+        return .{ .isum = isum, .fsum = fsum, .ns = ns, .sstr = sstr, .dsets = dsets, .parts = parts, .distinct_counts = distinct_counts, .has_blank = has_blank, .allocator = allocator };
     }
 
     fn deinit(self: *Lane, allocator: Allocator) void {
         for (self.sstr) |s| if (s.len > 0) allocator.free(s);
         for (self.dsets) |*d| d.deinit(allocator);
         allocator.free(self.dsets);
+        allocator.free(self.has_blank);
+        allocator.free(self.distinct_counts);
         allocator.free(self.sstr);
         allocator.free(self.isum);
         allocator.free(self.fsum);
         allocator.free(self.ns);
+    }
+
+    // Sum each count_distinct agg's `parts` sub-tables into `distinct_counts`,
+    // plus 1 for the out-of-band `''` if any row carried it. Used by the serial
+    // path (one lane, `parts == 1`); the parallel path fills `distinct_counts`
+    // from the cross-worker partition merge instead.
+    fn finalizeDistinct(self: *Lane, plans: []const AggPlan) void {
+        for (plans, 0..) |p, i| {
+            if (p.op != .count_distinct) continue;
+            var total: u64 = @intFromBool(self.has_blank[i]);
+            for (self.dsets[i * self.parts ..][0..self.parts]) |d| total += d.count();
+            self.distinct_counts[i] = total;
+        }
     }
 
     // Replace this lane's slot-`i` min/max bytes with an owned copy of `b`.
@@ -200,8 +275,10 @@ const Lane = struct {
                 continue;
             }
             if (p.op == .count_distinct) {
-                try self.dsets[i].mergeInto(self.allocator, &other.dsets[i]);
-                self.ns[i] += other.ns[i];
+                // Distinct sets are unioned by the parallel partition merge, not
+                // here; this lane-to-lane merge only folds the out-of-band blank
+                // flag and leaves the sets to the partition pass.
+                if (other.has_blank[i]) self.has_blank[i] = true;
                 continue;
             }
             const had = self.ns[i];
@@ -298,13 +375,41 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
         const idx = resolved[i] orelse continue;
         const view = batch.values[idx];
         if (p.op == .count_distinct) {
-            // Each lane builds its own partial set; gid is irrelevant (one
-            // global group), so the value's full u128 key goes in directly.
+            // Scatter each value into one of this lane's `parts` sub-tables by
+            // key-hash, so the cross-worker merge can run one partition per
+            // thread. A key hashes to the same partition in every lane, so the
+            // per-partition merges are disjoint and their counts sum.
+            const tier = distinctTier(p.dkind);
+            const base = i * lane.parts;
+            const parts = lane.parts;
+            if (p.dkind == .string) {
+                // String distinct: the dominant value in ClickBench-style data
+                // is `''` (no-value rows stored as empty string, 87% of
+                // SearchPhrase). A `len == 0` check replaces its two Wyhash
+                // passes + set probe with a boolean flip; finalize adds it back
+                // as one distinct value.
+                var r: usize = 0;
+                while (r < n) : (r += 1) {
+                    if (!view.isValid(r)) continue;
+                    lane.ns[i] += 1;
+                    const b = stringBytes(view.data, r);
+                    if (b.len == 0) {
+                        lane.has_blank[i] = true;
+                        continue;
+                    }
+                    const key = hashStr(b);
+                    const part = distinctPartition(tier, key, parts);
+                    _ = try lane.dsets[base + part].insertIsNew(lane.allocator, key);
+                }
+                continue;
+            }
             var r: usize = 0;
             while (r < n) : (r += 1) {
                 if (!view.isValid(r)) continue;
                 lane.ns[i] += 1;
-                _ = try lane.dsets[i].insertIsNew(lane.allocator, distinctKey(p.dkind, view.data, r));
+                const key = distinctKey(p.dkind, view.data, r);
+                const part = distinctPartition(tier, key, parts);
+                _ = try lane.dsets[base + part].insertIsNew(lane.allocator, key);
             }
             continue;
         }
@@ -396,6 +501,47 @@ fn workerMain(w: *Worker) void {
     workerRun(w) catch |e| {
         w.err = e;
     };
+}
+
+// One partition of the cross-worker COUNT(DISTINCT) merge: union column `part`
+// (`workers[*].lane.dsets[i*parts + part]`) of every count_distinct agg into a
+// fresh set and record each agg's distinct count for this partition.
+const PartMergeJob = struct {
+    part: usize,
+    parts: usize,
+    workers: []Worker,
+    plans: []const AggPlan,
+    allocator: Allocator,
+    cpu: ?usize,
+    counts: []u64,
+    err: ?anyerror = null,
+};
+
+fn partMergeMain(job: *PartMergeJob) void {
+    if (job.cpu) |cpu| HarnessCore.pinToCpu(cpu);
+    partMergeRun(job) catch |e| {
+        job.err = e;
+    };
+}
+
+fn partMergeRun(job: *PartMergeJob) !void {
+    for (job.plans, 0..) |p, i| {
+        if (p.op != .count_distinct) continue;
+        var out: DistinctSet = .{};
+        out.configure(distinctTier(p.dkind));
+        defer out.deinit(job.allocator);
+        // Presize once to the sum of the per-worker partition counts (the union's
+        // upper bound, since a key can sit in several workers). `capacityFor`
+        // folds in the load-factor headroom, so the per-worker unions below
+        // never grow or rehash mid-merge — one allocation, zero rehashing.
+        var total: usize = 0;
+        for (job.workers) |*w| total += w.lane.dsets[i * job.parts + job.part].count();
+        try out.ensureForBatch(job.allocator, total);
+        for (job.workers) |*w| {
+            try out.mergeInto(job.allocator, &w.lane.dsets[i * job.parts + job.part]);
+        }
+        job.counts[i] = out.count();
+    }
 }
 
 fn workerRun(w: *Worker) !void {
@@ -805,11 +951,14 @@ const GlobalAggregate = struct {
     }
 
     fn reduceSerial(self: *GlobalAggregate) !Lane {
-        var lane = try Lane.init(self.allocator, self.plans.len);
+        // One lane → one partition; the fold scatters into `parts == 1` and
+        // `finalizeDistinct` just reads back that single sub-table's count.
+        var lane = try Lane.init(self.allocator, self.plans, 1);
         errdefer lane.deinit(self.allocator);
         var source = try self.openScan(null);
         defer source.deinit();
         try driveScan(&lane, self.plans, self.allocator, &source);
+        lane.finalizeDistinct(self.plans);
         return lane;
     }
 
@@ -860,7 +1009,7 @@ const GlobalAggregate = struct {
                 .index = i,
                 .cpu = if (layout.order.len == 0) null else layout.order[i % layout.order.len],
                 .source = source,
-                .lane = try Lane.init(self.allocator, self.plans.len),
+                .lane = try Lane.init(self.allocator, self.plans, n_workers),
                 .plans = self.plans,
                 .resolved = try self.allocator.alloc(?usize, self.plans.len),
                 .allocator = self.allocator,
@@ -899,10 +1048,76 @@ const GlobalAggregate = struct {
 
         for (workers) |*w| if (w.err) |e| return e;
 
-        var merged = try Lane.init(self.allocator, self.plans.len);
+        // Scalar aggregates: single-threaded lane-to-lane fold (cheap — one row).
+        var merged = try Lane.init(self.allocator, self.plans, n_workers);
         errdefer merged.deinit(self.allocator);
         for (workers) |*w| try merged.mergeFrom(w.lane, self.plans);
+        // COUNT(DISTINCT): union each partition column across all workers in
+        // parallel (disjoint key sets), then sum the partition counts.
+        try self.mergeDistinctPartitioned(workers, n_workers, layout.order, merged.distinct_counts);
+        // The out-of-band `''` (folded as a boolean, never inserted into any
+        // partition set) re-enters as one distinct value if any lane saw it.
+        for (self.plans, 0..) |p, i| {
+            if (p.op == .count_distinct and merged.has_blank[i]) merged.distinct_counts[i] += 1;
+        }
         return merged;
+    }
+
+    // Cross-worker COUNT(DISTINCT) merge. Partition `p` of every worker holds a
+    // disjoint slice of the key space, so one thread per partition unions that
+    // column (`worker[*].dsets[i*parts + p]`) into a fresh set and records its
+    // count; the per-partition counts then sum to the exact distinct total.
+    // No locks: each merge thread writes only its own output set and reads the
+    // (now-immutable) worker sets. Fills `out_counts[i]` for count_distinct aggs.
+    fn mergeDistinctPartitioned(self: *GlobalAggregate, workers: []Worker, parts: usize, cpus: []const usize, out_counts: []u64) !void {
+        var any = false;
+        for (self.plans) |p| {
+            if (p.op == .count_distinct) any = true;
+        }
+        if (!any) return;
+
+        const jobs = try self.allocator.alloc(PartMergeJob, parts);
+        defer self.allocator.free(jobs);
+        // Per-(partition, agg) count scratch; job p writes its row, main sums.
+        const counts = try self.allocator.alloc(u64, parts * self.plans.len);
+        defer self.allocator.free(counts);
+        @memset(counts, 0);
+        for (jobs, 0..) |*j, p| {
+            j.* = .{
+                .part = p,
+                .parts = parts,
+                .workers = workers,
+                .plans = self.plans,
+                .allocator = self.allocator,
+                .cpu = if (cpus.len == 0) null else cpus[p % cpus.len],
+                .counts = counts[p * self.plans.len ..][0..self.plans.len],
+            };
+        }
+
+        const threads = try self.allocator.alloc(std.Thread, parts);
+        defer self.allocator.free(threads);
+        const spawned = try self.allocator.alloc(bool, parts);
+        defer self.allocator.free(spawned);
+        @memset(spawned, false);
+        for (jobs, 0..) |*j, p| {
+            if (std.Thread.spawn(.{}, partMergeMain, .{j})) |th| {
+                threads[p] = th;
+                spawned[p] = true;
+            } else |_| {}
+        }
+        for (jobs, 0..) |*j, p| if (!spawned[p]) {
+            partMergeRun(j) catch |e| {
+                j.err = e;
+            };
+        };
+        for (0..parts) |p| if (spawned[p]) threads[p].join();
+        for (jobs) |*j| if (j.err) |e| return e;
+
+        for (jobs) |*j| {
+            for (self.plans, 0..) |p, i| {
+                if (p.op == .count_distinct) out_counts[i] += j.counts[i];
+            }
+        }
     }
 
     fn emitRow(self: *GlobalAggregate, lane: Lane) !void {
@@ -912,7 +1127,7 @@ const GlobalAggregate = struct {
             switch (p.op) {
                 .count_star => try col.data.bigint.append(a, @intCast(lane.count)),
                 .count_col => try col.data.bigint.append(a, @intCast(lane.ns[i])),
-                .count_distinct => try col.data.bigint.append(a, @intCast(lane.dsets[i].count())),
+                .count_distinct => try col.data.bigint.append(a, @intCast(lane.distinct_counts[i])),
                 .sum => {
                     if (p.is_float) {
                         try appendFloat(a, col, p.output_type, lane.fsum[i]);

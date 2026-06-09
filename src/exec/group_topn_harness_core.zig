@@ -37,9 +37,14 @@ const thindb = struct {
 const Allocator = std.mem.Allocator;
 const StringView = storage_mod.StringView;
 const Scan = thindb.exec.Scan;
-const GroupTable = thindb.exec.group_table.IntKeyMemsetTable(96);
+const group_table = thindb.exec.group_table;
+const GroupTable = group_table.IntKeyMemsetTable(96);
 const TOP_K: usize = 10;
 const PREFETCH_DIST_BUCKET: usize = 32;
+// Look-ahead distance for the grouped COUNT(DISTINCT) fold: the second pass
+// prefetches the membership-set slot this many rows ahead of the insert, so the
+// (cache-miss-bound) probe latency of independent rows overlaps.
+const PREFETCH_DIST_DISTINCT: usize = 24;
 const PIPE_CHUNK_ROWS: usize = 8192;
 const GRID_CHUNK_ROWS: usize = 1024;
 const GRID_SCAN_TILE_RGS: usize = 16;
@@ -467,35 +472,157 @@ const MAX_GROUP_DISTINCT_SLOTS: usize = 8;
 // the bucket agg_lock (no synchronization needed); the global aggregate reuses it
 // as a per-lane partial (gid 0) and unions lanes via `mergeInto` at the single-
 // threaded merge layer.
+// COUNT(DISTINCT) membership set, tiered by key width over the lean
+// open-addressing sets in `group_table`. The fold is cache-miss-bound on a
+// multi-million entry table, so the slot must be no wider than the key actually
+// needs: a narrow distinct (e.g. a 32-bit column) moves a quarter of the bytes
+// per probe versus a full u128. Tiers:
+//   .u32  — global distinct over a ≤32-bit value
+//   .u64  — global distinct over a ≤64-bit value (int family, f64-bitcast float)
+//   .u96  — grouped distinct: the composite `gid<<64 | value64` is exactly 96 bits
+//   .u128 — global distinct over a 128-bit value / 128-bit string hash
+// The grouped path never configures a tier, so the default is `.u96`; the global
+// path calls `configure` per distinct field. All tiers are keys-only lean sets:
+// open-addressing, cheap multiply-mix hash, insert-and-count only.
 pub const DistinctSet = struct {
-    set: std.AutoHashMapUnmanaged(u128, void) = .empty,
+    pub const Tier = enum { u32, u64, u96, u128 };
+
+    const Store = union(Tier) {
+        u32: group_table.DistinctU32Set,
+        u64: group_table.DistinctU64Set,
+        u96: group_table.DistinctU96Set,
+        u128: group_table.DistinctU128Set,
+    };
+
+    store: Store = .{ .u96 = group_table.DistinctU96Set.empty },
 
     pub inline fn key(gid: u32, value_bits: u64) u128 {
         return (@as(u128, gid) << 64) | @as(u128, value_bits);
     }
 
+    // Select the key-width tier. Valid only while the set is empty (re-tiering a
+    // populated set drops its slots). The grouped path relies on the `.u96`
+    // default and never calls this.
+    pub fn configure(self: *DistinctSet, tier: Tier) void {
+        self.store = switch (tier) {
+            .u32 => .{ .u32 = group_table.DistinctU32Set.empty },
+            .u64 => .{ .u64 = group_table.DistinctU64Set.empty },
+            .u96 => .{ .u96 = group_table.DistinctU96Set.empty },
+            .u128 => .{ .u128 = group_table.DistinctU128Set.empty },
+        };
+    }
+
+    // Insert `composite`, truncated to the tier's width (the caller picks a tier
+    // wide enough that the truncation is lossless). Returns whether it was newly
+    // added — the grouped fold bumps the owning group's counter on a first
+    // sighting. `ensureFor(1)` keeps the load factor bounded (a cheap branch
+    // when no grow is due) since these lean sets don't grow inside `insert`.
     pub fn insertIsNew(self: *DistinctSet, allocator: Allocator, composite: u128) !bool {
-        const gop = try self.set.getOrPut(allocator, composite);
-        return !gop.found_existing;
+        switch (self.store) {
+            .u32 => |*s| {
+                try s.ensureFor(allocator, 1);
+                return s.insertNew(@truncate(composite));
+            },
+            .u64 => |*s| {
+                try s.ensureFor(allocator, 1);
+                return s.insertNew(@truncate(composite));
+            },
+            .u96 => |*s| {
+                try s.ensureFor(allocator, 1);
+                return s.insertNew(group_table.Key96.fromU128(composite));
+            },
+            .u128 => |*s| {
+                try s.ensureFor(allocator, 1);
+                return s.insertNew(composite);
+            },
+        }
+    }
+
+    // Software-prefetch batch pipeline (the grouped distinct fold). Reserve once
+    // with `ensureForBatch(n)` so no grow fires across the batch — keeping the
+    // slot addresses prefetched by `prefetchKey(look-ahead)` valid until
+    // `insertNewBatch(current)` probes them. Splits insertIsNew's per-call grow
+    // check out of the hot loop so the cache-miss latency of independent probes
+    // overlaps.
+    pub fn ensureForBatch(self: *DistinctSet, allocator: Allocator, additional: usize) !void {
+        switch (self.store) {
+            inline else => |*s| try s.ensureFor(allocator, additional),
+        }
+    }
+
+    pub inline fn prefetchKey(self: *DistinctSet, composite: u128) void {
+        switch (self.store) {
+            .u32 => |*s| s.prefetch(@truncate(composite)),
+            .u64 => |*s| s.prefetch(@truncate(composite)),
+            .u96 => |*s| s.prefetch(group_table.Key96.fromU128(composite)),
+            .u128 => |*s| s.prefetch(composite),
+        }
+    }
+
+    pub inline fn insertNewBatch(self: *DistinctSet, composite: u128) bool {
+        switch (self.store) {
+            .u32 => |*s| return s.insertNew(@truncate(composite)),
+            .u64 => |*s| return s.insertNew(@truncate(composite)),
+            .u96 => |*s| return s.insertNew(group_table.Key96.fromU128(composite)),
+            .u128 => |*s| return s.insertNew(composite),
+        }
     }
 
     // Fold another lane's partial set into this one (global aggregate merge).
+    // Both sets share the same tier (configured from the same plan). Reserve the
+    // union upper bound once so no grow fires per inserted key.
     pub fn mergeInto(self: *DistinctSet, allocator: Allocator, other: *const DistinctSet) !void {
-        try self.set.ensureUnusedCapacity(allocator, other.set.count());
-        var it = other.set.keyIterator();
-        while (it.next()) |k| self.set.putAssumeCapacity(k.*, {});
+        switch (self.store) {
+            .u32 => |*s| {
+                const o = &other.store.u32;
+                if (o.has_sentinel) s.has_sentinel = true;
+                try s.ensureFor(allocator, o.count());
+                for (o.slots) |k| if (k != group_table.DistinctU32Set.SENTINEL) s.insert(k);
+            },
+            .u64 => |*s| {
+                const o = &other.store.u64;
+                if (o.has_sentinel) s.has_sentinel = true;
+                try s.ensureFor(allocator, o.count());
+                for (o.slots) |k| if (k != group_table.DistinctU64Set.SENTINEL) s.insert(k);
+            },
+            .u96 => |*s| {
+                const o = &other.store.u96;
+                if (o.has_sentinel) s.has_sentinel = true;
+                try s.ensureFor(allocator, o.count());
+                for (o.slots) |k| if (!k.eql(group_table.DistinctU96Set.SENTINEL)) s.insert(k);
+            },
+            .u128 => |*s| {
+                const o = &other.store.u128;
+                if (o.has_sentinel) s.has_sentinel = true;
+                try s.ensureFor(allocator, o.count());
+                for (o.slots) |k| if (k != group_table.DistinctU128Set.SENTINEL) s.insert(k);
+            },
+        }
     }
 
     pub fn count(self: *const DistinctSet) u64 {
-        return self.set.count();
+        return switch (self.store) {
+            inline else => |*s| @intCast(s.count()),
+        };
     }
 
-    fn clear(self: *DistinctSet) void {
-        self.set.clearRetainingCapacity();
+    // Reset for workspace reuse: release the (possibly large) table rather than
+    // memset it, so a pooled bucket doesn't carry a multi-hundred-MB set into an
+    // unrelated next query. Re-grows lazily on the next distinct query.
+    pub fn clear(self: *DistinctSet, allocator: Allocator) void {
+        switch (self.store) {
+            inline else => |*s, tag| {
+                s.deinit(allocator);
+                self.store = @unionInit(Store, @tagName(tag), @TypeOf(s.*).empty);
+            },
+        }
     }
 
     pub fn deinit(self: *DistinctSet, allocator: Allocator) void {
-        self.set.deinit(allocator);
+        switch (self.store) {
+            inline else => |*s| s.deinit(allocator),
+        }
+        self.* = .{};
     }
 };
 
@@ -1609,18 +1736,18 @@ pub const SiloGridWorkspace = struct {
         }
     }
 
-    fn reset(self: *SiloGridWorkspace) !void {
+    fn reset(self: *SiloGridWorkspace, allocator: Allocator) !void {
         for (self.parts, 0..) |*p, worker_idx| {
             resetWorkerParts(p, worker_idx);
         }
         for (self.buckets) |*bucket| {
-            resetPipeBucket(bucket);
+            resetPipeBucket(bucket, allocator);
         }
     }
 
     fn resetParallel(self: *SiloGridWorkspace, allocator: Allocator, n_workers: usize, cpus: []const usize) !void {
         const workers = @max(@as(usize, 1), @min(n_workers, @max(cpus.len, 1)));
-        if (workers == 1 or (self.parts.len + self.buckets.len) < 128) return self.reset();
+        if (workers == 1 or (self.parts.len + self.buckets.len) < 128) return self.reset(allocator);
 
         const threads = try allocator.alloc(std.Thread, workers);
         defer allocator.free(threads);
@@ -1698,7 +1825,7 @@ fn workspaceResetWorker(job: *WorkspaceResetJob) void {
     const end = (job.worker_index + 1) * bucket_count / job.worker_count;
     var b = start;
     while (b < end) : (b += 1) {
-        resetPipeBucket(&job.workspace.buckets[b]);
+        resetPipeBucket(&job.workspace.buckets[b], job.allocator);
     }
 }
 
@@ -1883,7 +2010,7 @@ fn resetWorkerParts(parts: *WorkerParts, worker_index: usize) void {
     parts.route_touched.clearRetainingCapacity();
 }
 
-fn resetPipeBucket(bucket: *PipeBucket) void {
+fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
     bucket.chunks.clearRetainingCapacity();
     bucket.queued_rows = 0;
     bucket.row_count = 0;
@@ -1893,7 +2020,7 @@ fn resetPipeBucket(bucket: *PipeBucket) void {
     bucket.states.clearRetainingCapacity();
     bucket.freeStrBytes();
     bucket.str_states.clearRetainingCapacity();
-    for (&bucket.distinct_sets) |*d| d.clear();
+    for (&bucket.distinct_sets) |*d| d.clear(allocator);
 }
 
 fn deinitRawQueues(shared: *PipeShared) void {
@@ -2898,7 +3025,6 @@ fn groupChunkRowsDirect(
     try states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_str_payload) try str_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.distinct_slot_count > distinct_sets.len) return error.UnsupportedOperatorForType;
-    _ = scratch;
 
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
     try validateGroupAggregateProgram(rows.layout.aggregates, rows.layout.columns.len);
@@ -2917,10 +3043,10 @@ fn groupChunkRowsDirect(
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, str_arena, distinct_sets, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, str_arena, distinct_sets, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, str_arena, distinct_sets, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, str_arena, distinct_sets, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
     }
 }
 
@@ -2948,26 +3074,6 @@ fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), str_arena: Alloc
 // Fold one row's COUNT(DISTINCT) inputs into group `gid`. Each distinct field's
 // combined set is probed with the exact (gid,value) composite; a never-before-seen
 // pair bumps that aggregate's running count slot. Called under the bucket agg_lock.
-fn foldGroupDistinct(
-    distinct_sets: []DistinctSet,
-    allocator: Allocator,
-    states: *StateSlab,
-    gid: u32,
-    aggregates: []const GroupAggregateSpec,
-    rows: GroupRows,
-    row_idx: usize,
-) !void {
-    for (aggregates) |agg| {
-        if (!agg.is_distinct) continue;
-        const value = try aggregateInputValue(agg, rows, row_idx);
-        const value_bits: u64 = @bitCast(@as(i64, @truncate(value)));
-        const composite = DistinctSet.key(gid, value_bits);
-        if (try distinct_sets[agg.distinct_state_index].insertIsNew(allocator, composite)) {
-            try addAggregateStateValue(states.ref(gid), agg.state_index, 1);
-        }
-    }
-}
-
 fn groupChunkRowsDirectKeysCountSumAvg(
     comptime key_width: GroupKeyWidth,
     table: *GroupTable,
@@ -3008,6 +3114,7 @@ fn groupChunkRowsDirectKeys(
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     str_arena: Allocator,
     distinct_sets: []DistinctSet,
+    gids_buf: *std.ArrayListUnmanaged(u32),
     allocator: Allocator,
     keys: anytype,
     key_hi: []const u32,
@@ -3019,6 +3126,16 @@ fn groupChunkRowsDirectKeys(
     const has_str = rows.layout.has_str_payload;
     const has_distinct = rows.layout.distinct_slot_count > 0;
     const n = row_count;
+
+    // With COUNT(DISTINCT), record each row's gid in pass 1 and defer the
+    // membership-set fold to a prefetch-pipelined pass 2 (the set probe is the
+    // cache-miss bottleneck; the group table is small and stays cache-resident).
+    // The distinct count slot is untouched by `updateGroupStateProgram`, so
+    // deferring the bump to pass 2 is exact. Without distinct this is the
+    // original single pass (no gid buffer, no pass 2).
+    if (has_distinct) try gids_buf.resize(allocator, n);
+    const gids: []u32 = if (has_distinct) gids_buf.items[0..n] else &.{};
+
     var r: usize = 0;
     while (r < n) : (r += 1) {
         const pf = r + PREFETCH_DIST_BUCKET;
@@ -3037,12 +3154,50 @@ fn groupChunkRowsDirectKeys(
                 str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
                 try foldGroupStr(str_states, str_arena, new_gid, aggregates, rows, r);
             }
-            if (has_distinct) try foldGroupDistinct(distinct_sets, allocator, states, new_gid, aggregates, rows, r);
+            if (has_distinct) gids[r] = new_gid;
             continue;
         }
         try updateGroupStateProgram(states.ref(probe.gid), aggregates, rows, r);
         if (has_str) try foldGroupStr(str_states, str_arena, probe.gid, aggregates, rows, r);
-        if (has_distinct) try foldGroupDistinct(distinct_sets, allocator, states, probe.gid, aggregates, rows, r);
+        if (has_distinct) gids[r] = probe.gid;
+    }
+
+    if (has_distinct) try foldGroupDistinctChunk(distinct_sets, allocator, states, gids, aggregates, rows);
+}
+
+// Pass 2 of the grouped COUNT(DISTINCT) fold: per distinct aggregate, scatter
+// each (gid, value) composite into its membership set with a software-prefetch
+// pipeline. `ensureForBatch(n)` reserves the whole chunk up front so no grow
+// fires mid-loop (slot addresses stay stable for the look-ahead prefetch), then
+// each iteration prefetches the slot `PREFETCH_DIST_DISTINCT` rows ahead while
+// inserting the current row, overlapping the independent cache misses. A
+// first-ever (gid, value) bumps the group's distinct-count slot.
+fn foldGroupDistinctChunk(
+    distinct_sets: []DistinctSet,
+    allocator: Allocator,
+    states: *StateSlab,
+    gids: []const u32,
+    aggregates: []const GroupAggregateSpec,
+    rows: GroupRows,
+) !void {
+    const n = gids.len;
+    for (aggregates) |agg| {
+        if (!agg.is_distinct) continue;
+        const dset = &distinct_sets[agg.distinct_state_index];
+        try dset.ensureForBatch(allocator, n);
+        var r: usize = 0;
+        while (r < n) : (r += 1) {
+            const pf = r + PREFETCH_DIST_DISTINCT;
+            if (pf < n) {
+                const v_pf = try aggregateInputValue(agg, rows, pf);
+                dset.prefetchKey(DistinctSet.key(gids[pf], @bitCast(@as(i64, @truncate(v_pf)))));
+            }
+            const value = try aggregateInputValue(agg, rows, r);
+            const composite = DistinctSet.key(gids[r], @bitCast(@as(i64, @truncate(value))));
+            if (dset.insertNewBatch(composite)) {
+                try addAggregateStateValue(states.ref(gids[r]), agg.state_index, 1);
+            }
+        }
     }
 }
 

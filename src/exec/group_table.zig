@@ -41,7 +41,7 @@ pub const Probe = struct {
 /// 64-bit integer mixer (splitmix64 finalizer). Used to hash the packed u128
 /// key (two mixed halves XOR-folded) — cheap, no byte serialization, and
 /// scatters the low-entropy compound keys that integer group columns produce.
-inline fn mix64(x: u64) u64 {
+pub inline fn mix64(x: u64) u64 {
     var z = x;
     z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
     z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
@@ -1068,7 +1068,202 @@ pub const DistinctU32Set = struct {
         }
     }
 
+    /// Like `insert`, but returns whether `key` was newly added (false ⟺ it was
+    /// already present), for callers that bump a side counter on a first sighting.
+    pub inline fn insertNew(self: *DistinctU32Set, key: u32) bool {
+        if (key == SENTINEL) {
+            const was_new = !self.has_sentinel;
+            self.has_sentinel = true;
+            return was_new;
+        }
+        const mask = self.slots.len - 1;
+        var b = @as(usize, @truncate(mix64(@as(u64, key)))) & mask;
+        while (true) : (b = (b + 1) & mask) {
+            const s = self.slots[b];
+            if (s == SENTINEL) {
+                self.slots[b] = key;
+                self.len += 1;
+                return true;
+            }
+            if (s == key) return false;
+        }
+    }
+
     pub fn count(self: DistinctU32Set) usize {
+        return @as(usize, self.len) + @intFromBool(self.has_sentinel);
+    }
+};
+
+/// 96-bit key as three 4-byte words (12 bytes, 4-byte aligned). Native `u96` and
+/// a `packed struct { u64, u32 }` are both backed by `u96` = 16 bytes, so only an
+/// explicit 3×u32 layout actually packs to 12. The grouped COUNT(DISTINCT)
+/// composite `gid<<64 | value64` (gid is a u32) is exactly 96 bits.
+pub const Key96 = extern struct {
+    w0: u32,
+    w1: u32,
+    w2: u32,
+
+    pub const sentinel: Key96 = .{ .w0 = M, .w1 = M, .w2 = M };
+    const M: u32 = std.math.maxInt(u32);
+
+    pub inline fn fromU128(v: u128) Key96 {
+        return .{ .w0 = @truncate(v), .w1 = @truncate(v >> 32), .w2 = @truncate(v >> 64) };
+    }
+    pub inline fn eql(a: Key96, b: Key96) bool {
+        return a.w0 == b.w0 and a.w1 == b.w1 and a.w2 == b.w2;
+    }
+    pub inline fn hash(k: Key96) u64 {
+        const lo = @as(u64, k.w0) | (@as(u64, k.w1) << 32);
+        return mix64(lo ^ mix64(@as(u64, k.w2)));
+    }
+};
+
+/// Like `DistinctU64Set` but with 12-byte `Key96` slots, for COUNT(DISTINCT)
+/// whose composite is ≤96 bits — notably the grouped form `gid<<64 | value64`.
+/// 12-byte slots vs the 32-byte `{key,gid}` `IntGroupTable` move far fewer bytes
+/// per (memory-bound) probe.
+pub const DistinctU96Set = struct {
+    slots: []Key96,
+    len: u32,
+    has_sentinel: bool,
+
+    pub const SENTINEL: Key96 = Key96.sentinel;
+    pub const empty: DistinctU96Set = .{ .slots = &.{}, .len = 0, .has_sentinel = false };
+
+    pub fn init(allocator: Allocator, expected: usize) !DistinctU96Set {
+        const cap = capacityFor(expected);
+        const slots = try allocator.alloc(Key96, cap);
+        @memset(slots, SENTINEL);
+        return .{ .slots = slots, .len = 0, .has_sentinel = false };
+    }
+    pub fn deinit(self: *DistinctU96Set, allocator: Allocator) void {
+        if (self.slots.len != 0) allocator.free(self.slots);
+        self.* = undefined;
+    }
+    pub fn ensureFor(self: *DistinctU96Set, allocator: Allocator, additional: usize) !void {
+        if (self.slots.len == 0) {
+            const slots = try allocator.alloc(Key96, capacityFor(additional));
+            @memset(slots, SENTINEL);
+            self.slots = slots;
+            return;
+        }
+        if ((@as(usize, self.len) + additional) * 4 >= self.slots.len * 3) try self.grow(allocator, additional);
+    }
+    fn grow(self: *DistinctU96Set, allocator: Allocator, additional: usize) !void {
+        var new_cap = self.slots.len;
+        while ((@as(usize, self.len) + additional) * 4 >= new_cap * 3) new_cap *= 2;
+        const slots = try allocator.alloc(Key96, new_cap);
+        @memset(slots, SENTINEL);
+        const new_mask = new_cap - 1;
+        for (self.slots) |k| {
+            if (k.eql(SENTINEL)) continue;
+            var i = @as(usize, @truncate(k.hash())) & new_mask;
+            while (!slots[i].eql(SENTINEL)) : (i = (i + 1) & new_mask) {}
+            slots[i] = k;
+        }
+        allocator.free(self.slots);
+        self.slots = slots;
+    }
+    pub inline fn prefetch(self: *DistinctU96Set, key: Key96) void {
+        @prefetch(&self.slots[@as(usize, @truncate(key.hash())) & (self.slots.len - 1)], .{ .rw = .write, .locality = 1 });
+    }
+    pub inline fn insertNew(self: *DistinctU96Set, key: Key96) bool {
+        if (key.eql(SENTINEL)) {
+            const was_new = !self.has_sentinel;
+            self.has_sentinel = true;
+            return was_new;
+        }
+        const mask = self.slots.len - 1;
+        var b = @as(usize, @truncate(key.hash())) & mask;
+        while (true) : (b = (b + 1) & mask) {
+            const s = self.slots[b];
+            if (s.eql(SENTINEL)) {
+                self.slots[b] = key;
+                self.len += 1;
+                return true;
+            }
+            if (s.eql(key)) return false;
+        }
+    }
+    pub inline fn insert(self: *DistinctU96Set, key: Key96) void {
+        _ = self.insertNew(key);
+    }
+    pub fn count(self: DistinctU96Set) usize {
+        return @as(usize, self.len) + @intFromBool(self.has_sentinel);
+    }
+};
+
+/// Like `DistinctU64Set` but with full-width 16-byte `u128` slots, for
+/// COUNT(DISTINCT) whose composite needs the full 128 bits — the global path's
+/// raw 128-bit values and 128-bit string hashes. Keys-only, so 16-byte slots vs
+/// the 32-byte `{key,gid}` `IntGroupTable`.
+pub const DistinctU128Set = struct {
+    slots: []u128,
+    len: u32,
+    has_sentinel: bool,
+
+    pub const SENTINEL: u128 = std.math.maxInt(u128);
+    pub const empty: DistinctU128Set = .{ .slots = &.{}, .len = 0, .has_sentinel = false };
+
+    pub fn init(allocator: Allocator, expected: usize) !DistinctU128Set {
+        const cap = capacityFor(expected);
+        const slots = try allocator.alloc(u128, cap);
+        @memset(slots, SENTINEL);
+        return .{ .slots = slots, .len = 0, .has_sentinel = false };
+    }
+    pub fn deinit(self: *DistinctU128Set, allocator: Allocator) void {
+        if (self.slots.len != 0) allocator.free(self.slots);
+        self.* = undefined;
+    }
+    pub fn ensureFor(self: *DistinctU128Set, allocator: Allocator, additional: usize) !void {
+        if (self.slots.len == 0) {
+            const slots = try allocator.alloc(u128, capacityFor(additional));
+            @memset(slots, SENTINEL);
+            self.slots = slots;
+            return;
+        }
+        if ((@as(usize, self.len) + additional) * 4 >= self.slots.len * 3) try self.grow(allocator, additional);
+    }
+    fn grow(self: *DistinctU128Set, allocator: Allocator, additional: usize) !void {
+        var new_cap = self.slots.len;
+        while ((@as(usize, self.len) + additional) * 4 >= new_cap * 3) new_cap *= 2;
+        const slots = try allocator.alloc(u128, new_cap);
+        @memset(slots, SENTINEL);
+        const new_mask = new_cap - 1;
+        for (self.slots) |k| {
+            if (k == SENTINEL) continue;
+            var i = @as(usize, @truncate(hashU128(k))) & new_mask;
+            while (slots[i] != SENTINEL) : (i = (i + 1) & new_mask) {}
+            slots[i] = k;
+        }
+        allocator.free(self.slots);
+        self.slots = slots;
+    }
+    pub inline fn prefetch(self: *DistinctU128Set, key: u128) void {
+        @prefetch(&self.slots[@as(usize, @truncate(hashU128(key))) & (self.slots.len - 1)], .{ .rw = .write, .locality = 1 });
+    }
+    pub inline fn insertNew(self: *DistinctU128Set, key: u128) bool {
+        if (key == SENTINEL) {
+            const was_new = !self.has_sentinel;
+            self.has_sentinel = true;
+            return was_new;
+        }
+        const mask = self.slots.len - 1;
+        var b = @as(usize, @truncate(hashU128(key))) & mask;
+        while (true) : (b = (b + 1) & mask) {
+            const s = self.slots[b];
+            if (s == SENTINEL) {
+                self.slots[b] = key;
+                self.len += 1;
+                return true;
+            }
+            if (s == key) return false;
+        }
+    }
+    pub inline fn insert(self: *DistinctU128Set, key: u128) void {
+        _ = self.insertNew(key);
+    }
+    pub fn count(self: DistinctU128Set) usize {
         return @as(usize, self.len) + @intFromBool(self.has_sentinel);
     }
 };
