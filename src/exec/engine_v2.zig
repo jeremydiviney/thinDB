@@ -456,7 +456,11 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .dop = input.db.config.max_dop,
     };
 
-    if (try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request)) |silo_q| {
+    // Provably-low-cardinality group keys take the direct (scatter-free)
+    // private-table handler; everything else runs the silo grid.
+    const built_q = (try v2_pipeline.tryBuildLowCardGroup(input.allocator, table, request)) orelse
+        (try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request));
+    if (built_q) |silo_q| {
         var q = silo_q;
         // Post-aggregate enrich: the grouped pipeline emits [keys, aggs] in
         // count-/order-ranked order. The affine late-materialization (reduced
