@@ -104,6 +104,7 @@ fn openScanSource(
     needed: []const []const u8,
     where_filter: ?PredicateExpr,
     derived: []const compute.Derived,
+    hash_cols: []const []const u8,
     snap: ?Scan.Snapshot,
 ) !ScanSource {
     const scan = try Scan.allocWithProjectionLoc(allocator, table, null, needed, false, snap);
@@ -112,6 +113,9 @@ fn openScanSource(
         // Never produce a result from an unapplied filter.
         if (!try scan.tryFuseFilter(w)) return error.UnsupportedQueryShape;
     }
+    // A decline (nullable column) or a sidecar-less batch falls back to
+    // digesting the materialized bytes in the fold — same digest either way.
+    for (hash_cols) |hc| _ = scan.setHashKeyColumn(hc);
     if (derived.len == 0) {
         return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan) };
     }
@@ -317,15 +321,11 @@ inline fn read128(v: ValueView, row: usize) u128 {
     };
 }
 
-// 128-bit content hash for string distinct keys: two independently-seeded
-// Wyhash passes packed into a u128. At ~6M distinct values the birthday
+// String distinct keys are `exec.stringKeyDigest` values (128-bit two-seed
+// Wyhash — the same digest the scan's `Batch.hashed` sidecar carries, so the
+// two sources interchange freely). At ~6M distinct values the birthday
 // collision probability against 2^128 is negligible, so the distinct count is
 // exact in practice without storing the string bytes in the set.
-inline fn hashStr(bytes: []const u8) u128 {
-    const lo = std.hash.Wyhash.hash(0x9E3779B97F4A7C15, bytes);
-    const hi = std.hash.Wyhash.hash(0xD1B54A32D192ED03, bytes);
-    return (@as(u128, hi) << 64) | @as(u128, lo);
-}
 
 // Each plan dispatches ONCE to a specialized kernel — the op switch and the
 // ValueView tag switch are hoisted out of the row loops, which accumulate into
@@ -337,7 +337,8 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
         const idx = resolved[i] orelse continue;
         const view = batch.values[idx];
         if (p.op == .count_distinct) {
-            try foldDistinctGlobal(lane, p, i, view, n);
+            const digests: ?[]const u128 = if (batch.hashed) |hs| hs[idx] else null;
+            try foldDistinctGlobal(lane, p, i, view, digests, n);
             continue;
         }
         if (p.is_string) {
@@ -477,12 +478,34 @@ fn foldExtremeFloatGlobal(comptime is_min: bool, view: ColumnView, n: usize, ns:
 // insert only wastes that one hint). Strings keep the `''` fast path — their
 // per-row cost is the Wyhash itself, which a prefetch can't hide without
 // hashing twice.
-fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, n: usize) !void {
+fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, digests: ?[]const u128, n: usize) !void {
     const tier = distinctTier(p.dkind);
     const parts = lane.parts;
     const dsets = lane.dsets[i * parts ..][0..parts];
     switch (p.dkind) {
         .string => {
+            // Scan-emitted digests: the column is non-nullable (the scan's
+            // hash gate), so every row counts; `''` keeps its fast path by
+            // digest equality, and the precomputed key finally makes the
+            // set-slot prefetch possible (hashing twice used to rule it out).
+            if (digests) |ds| {
+                const blank = exec.stringKeyDigest("");
+                lane.ns[i] += n;
+                var r: usize = 0;
+                while (r < n) : (r += 1) {
+                    const key = ds[r];
+                    if (key == blank) {
+                        lane.has_blank[i] = true;
+                        continue;
+                    }
+                    const pf = r + PREFETCH_DIST_DISTINCT;
+                    if (pf < n and ds[pf] != blank) {
+                        dsets[distinctPartition(tier, ds[pf], parts)].prefetchKey(ds[pf]);
+                    }
+                    _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
+                }
+                return;
+            }
             const sv = switch (view.data) {
                 .varchar, .string, .char => |s| s,
                 else => return,
@@ -496,7 +519,7 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, n: us
                     lane.has_blank[i] = true;
                     continue;
                 }
-                const key = hashStr(b);
+                const key = exec.stringKeyDigest(b);
                 _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
             }
         },
@@ -846,7 +869,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         defer if (probe) |*p| p.deinit();
         var probe_schema: ?[]const Column = null;
         if (request.derived.len > 0) {
-            probe = try openScanSource(allocator, table, needed.items, null, request.derived, null);
+            probe = try openScanSource(allocator, table, needed.items, null, request.derived, &.{}, null);
             probe_schema = probe.?.schema();
         }
         for (request.aggs, plans) |agg, *p| {
@@ -879,9 +902,39 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         }
     }
 
+    // Scan-side digests for string COUNT(DISTINCT) inputs: the fold only ever
+    // hashes the bytes (the digest IS the membership-set key), so the scan can
+    // emit per-row digests off the cached block and the strings never
+    // materialize. Excluded when a string MIN/MAX or a derived expression
+    // reads the column's real bytes.
+    var hash_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer hash_cols.deinit(allocator);
+    plan_loop: for (request.aggs, plans) |agg, p| {
+        if (p.op != .count_distinct or p.dkind != .string) continue;
+        const col_name = agg.col.?;
+        if (columnType(table, col_name) == null) continue; // derived input — Compute reads bytes
+        for (request.aggs, plans) |qa, q| {
+            if (q.is_string and types.columnNameEql(qa.col.?, col_name)) continue :plan_loop;
+        }
+        for (request.derived) |d| {
+            var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer refs.deinit(allocator);
+            collectExprCols(allocator, &refs, table, d.expr) catch continue :plan_loop;
+            for (refs.items) |ref| {
+                if (types.columnNameEql(ref, col_name)) continue :plan_loop;
+            }
+        }
+        for (hash_cols.items) |existing| {
+            if (types.columnNameEql(existing, col_name)) continue :plan_loop;
+        }
+        try hash_cols.append(allocator, col_name);
+    }
+
     const op = try allocator.create(GlobalAggregate);
     errdefer allocator.destroy(op);
-    op.* = try GlobalAggregate.init(allocator, table, request, plans, try needed.toOwnedSlice(allocator));
+    const hash_cols_owned = try hash_cols.toOwnedSlice(allocator);
+    errdefer allocator.free(hash_cols_owned);
+    op.* = try GlobalAggregate.init(allocator, table, request, plans, try needed.toOwnedSlice(allocator), hash_cols_owned);
     return exec.makeQuery(allocator, op);
 }
 
@@ -940,6 +993,8 @@ const GlobalAggregate = struct {
     dop: usize,
     plans: []AggPlan,
     needed: []const []const u8,
+    // String COUNT(DISTINCT) inputs the worker scans emit as key digests.
+    hash_cols: []const []const u8,
     output_schema: []Column,
     output_cols: []ColumnStore,
     views: []ColumnView,
@@ -947,7 +1002,7 @@ const GlobalAggregate = struct {
     built: bool = false,
     row_count: usize = 0,
 
-    fn init(allocator: Allocator, table: *api.Table, request: Request, plans: []AggPlan, needed: []const []const u8) !GlobalAggregate {
+    fn init(allocator: Allocator, table: *api.Table, request: Request, plans: []AggPlan, needed: []const []const u8, hash_cols: []const []const u8) !GlobalAggregate {
         const output_schema = try allocator.alloc(Column, plans.len);
         errdefer allocator.free(output_schema);
         for (plans, 0..) |p, i| {
@@ -972,6 +1027,7 @@ const GlobalAggregate = struct {
             .dop = request.dop,
             .plans = plans,
             .needed = needed,
+            .hash_cols = hash_cols,
             .output_schema = output_schema,
             .output_cols = output_cols,
             .views = views,
@@ -985,6 +1041,7 @@ const GlobalAggregate = struct {
         self.allocator.free(self.output_schema);
         self.allocator.free(self.plans);
         self.allocator.free(@constCast(self.needed));
+        if (self.hash_cols.len > 0) self.allocator.free(@constCast(self.hash_cols));
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -1030,7 +1087,7 @@ const GlobalAggregate = struct {
     }
 
     fn openScan(self: *GlobalAggregate, snap: ?Scan.Snapshot) !ScanSource {
-        return openScanSource(self.allocator, self.table, self.needed, self.where_filter, self.derived, snap);
+        return openScanSource(self.allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, snap);
     }
 
     fn reduceSerial(self: *GlobalAggregate) !Lane {

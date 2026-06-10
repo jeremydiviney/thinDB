@@ -25,6 +25,13 @@ pub const GlobalDict = struct {
     map: std.StringHashMapUnmanaged(u32) = .empty,
     /// Interned distinct strings, indexed by global code. Each is an owned copy.
     owned: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Serializes `intern` when parallel scan workers share one dict (the V2
+    /// low-card grouped handler): interning happens per segment-dict ENTRY per
+    /// row group — not per row — so the lock is cold and a spinlock suffices
+    /// (`Io.Mutex` would need an io handle intern's callers don't carry).
+    /// `decode`/`lookup`/`count` stay unlocked and are only safe once all
+    /// interning threads have joined.
+    lock_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     pub fn deinit(self: *GlobalDict, allocator: Allocator) void {
         for (self.owned.items) |s| allocator.free(@constCast(s));
@@ -41,6 +48,10 @@ pub const GlobalDict = struct {
     /// Intern `s`, returning its stable global code (assigning a new one, with
     /// an owned copy of the bytes, on first sight).
     pub fn intern(self: *GlobalDict, allocator: Allocator, s: []const u8) !u32 {
+        while (self.lock_state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+        defer self.lock_state.store(0, .release);
         const gop = try self.map.getOrPut(allocator, s);
         if (gop.found_existing) return gop.value_ptr.*;
         // First sight: own the bytes, point the (just-inserted) key at the copy
