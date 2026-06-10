@@ -38,7 +38,9 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// v7→v8: per-column stats slot widened from 16 bytes (i64 min + i64 max) to 32
 /// bytes (i128 min + i128 max). Unlocked usable stats for largeint / decimal128 /
 /// uuid and extended the string prefix from 8 to 16 bytes.
-pub const segment_version: u16 = 9;
+///
+/// v9→v10: added the `.rle` block encoding.
+pub const segment_version: u16 = 10;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -70,10 +72,27 @@ pub const Compression = enum(u8) {
 /// The dict is stored sorted so a later execution layer can binary-search it and
 /// derive ORDER BY from codes. NULL rows carry a placeholder code, masked by the
 /// validity bitmap (orthogonal, same convention as `.raw`/`.for_`).
+///
+/// `.rle` (run-length) stores a fixed-width integer-family column as runs of
+/// equal adjacent values. Chosen by the writer only when the run body beats
+/// both raw and FOR for the block, so it only appears on genuinely clustered
+/// data (sort keys, session-adjacent ids, flag columns). The post-bitmap
+/// payload layout is:
+///
+///   [n_runs: u32]
+///   [value_width: u8][3 pad]          native element width (1/2/4/8 bytes)
+///   [values: n_runs × value_width]    each run's value, native LE
+///   [lengths: n_runs × u32]           each run's row count
+///
+/// Runs are computed over the stored value stream as-is (NULL placeholder
+/// values included), so decode reproduces the exact stream and the validity
+/// bitmap stays orthogonal. The split values/lengths arrays keep both
+/// SIMD-friendly for run-aware kernels that scan without expanding.
 pub const Encoding = enum(u8) {
     raw = 0,
     for_ = 1,
     dict = 2,
+    rle = 3,
 };
 
 /// Per-column-block flags (u8). Bit 0 = has_nulls (decompressed payload is

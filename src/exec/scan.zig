@@ -1838,6 +1838,18 @@ pub const Scan = struct {
             return true;
         }
 
+        if (block.encoding == .rle) {
+            const want = predicate.valueToRangeI128(leaf.val) orelse return false;
+            const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
+            if (!rleCompareInto(rv.block, rg_count, leaf.op, want, out)) return false;
+            if (rv.nulls != null) {
+                for (0..rg_count) |i| {
+                    if (!storage.column.isValidBit(rv.nulls, i)) out[i] = false;
+                }
+            }
+            return true;
+        }
+
         // Raw block: compare over a borrowed native view (clears NULLs). Decline
         // if the bytes can't be viewed in place (misaligned / big-endian) — the
         // caller's owned-decode fallback handles it.
@@ -2057,6 +2069,32 @@ pub const Scan = struct {
         return switch (o) { .eq => v == w, .neq => v != w, .lt => v < w, .lte => v <= w, .gt => v > w, .gte => v >= w };
     }
 
+    /// Run-aware analogue of `forCompareInto`: evaluate `value <op> want` ONCE
+    /// per run and memset the run's mask range. Run values read signed at the
+    /// block's native width (boolean's 0/1 reads identically as i8). Returns
+    /// false on a width the writer never emits (decline rather than mis-filter);
+    /// a corrupt short fill clears the tail rather than leaving stale bits.
+    fn rleCompareInto(rb: storage.segment_reader.RleBlock, rg_count: u32, op: PredicateOp, want: i128, out: []bool) bool {
+        var pos: usize = 0;
+        switch (op) {
+            inline else => |o| switch (rb.value_width) {
+                inline 1, 2, 4, 8 => |W| {
+                    const T = std.meta.Int(.signed, W * 8);
+                    var run: usize = 0;
+                    while (run < rb.n_runs and pos < rg_count) : (run += 1) {
+                        const v: i128 = std.mem.readInt(T, rb.values[run * W ..][0..W], .little);
+                        const len = @min(@as(usize, rb.runLength(run)), rg_count - pos);
+                        @memset(out[pos .. pos + len], fcmpFor(o, v, want));
+                        pos += len;
+                    }
+                },
+                else => return false,
+            },
+        }
+        if (pos < rg_count) @memset(out[pos..rg_count], false);
+        return true;
+    }
+
     /// Fused single-pass compare+gather: when the filter is a single comparison
     /// leaf whose ONLY projected column is that same (non-nullable, FOR-encoded)
     /// int column, decode + compare + branchlessly gather survivors in ONE pass —
@@ -2110,6 +2148,13 @@ pub const Scan = struct {
                 const view = storage.segment_reader.viewRawColumn(col.type, block.bytes, rg_count, flags, block.encoding) orelse return null;
                 filtered[0].clear();
                 break :rw (try fusedGatherRaw(self.allocator, &filtered[0], view, rg_count, leaf.op, want)) orelse return null;
+            },
+            .rle => rl: {
+                const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
+                const w = rv.block.value_width;
+                if (w != 1 and w != 2 and w != 4 and w != 8) return null;
+                filtered[0].clear();
+                break :rl try fusedGatherRle(self.allocator, &filtered[0], rv.block, rg_count, leaf.op, want);
             },
             else => return null,
         };
@@ -2251,6 +2296,43 @@ pub const Scan = struct {
         };
     }
 
+    /// RLE sibling of `fusedGatherFor`: ONE compare per run, then a memset of
+    /// the run's value for matching runs — a selective filter never touches row
+    /// width at all, and a long matching run materializes as a single memset.
+    fn fusedGatherRle(allocator: Allocator, dst: *ColumnStore, rb: storage.segment_reader.RleBlock, rg_count: u32, op: PredicateOp, want: i128) !usize {
+        return switch (dst.data) {
+            inline .int, .date, .smallint, .tinyint, .bigint, .datetime, .decimal64 => |*list| {
+                try list.ensureUnusedCapacity(allocator, rg_count);
+                list.items.len = rg_count;
+                const out = list.items;
+                var j: usize = 0;
+                var pos: usize = 0;
+                switch (op) {
+                    inline else => |o| switch (rb.value_width) {
+                        inline 1, 2, 4, 8 => |W| {
+                            const RT = std.meta.Int(.signed, W * 8);
+                            var run: usize = 0;
+                            while (run < rb.n_runs and pos < rg_count) : (run += 1) {
+                                const v: i128 = std.mem.readInt(RT, rb.values[run * W ..][0..W], .little);
+                                const len = @min(@as(usize, rb.runLength(run)), rg_count - pos);
+                                if (fcmpFor(o, v, want)) {
+                                    const tv: std.meta.Child(@TypeOf(out)) = @intCast(v);
+                                    @memset(out[j .. j + len], tv);
+                                    j += len;
+                                }
+                                pos += len;
+                            }
+                        },
+                        else => unreachable, // caller pre-checks the width
+                    },
+                }
+                list.items.len = j;
+                return j;
+            },
+            else => unreachable,
+        };
+    }
+
     /// Compact the masked survivors of every projected column into `filtered`.
     /// Each column is borrowed from the cache; a FOR-encoded block expands only
     /// its survivors to native (`forExpandSurvivors`), a raw block is viewed in
@@ -2299,6 +2381,12 @@ pub const Scan = struct {
             if (block.encoding == .for_) {
                 const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
                 try self.appendForSurvivors(fv, mask, &filtered_cols[j]);
+                continue;
+            }
+
+            if (block.encoding == .rle) {
+                const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
+                try self.appendRleSurvivors(rv, mask, &filtered_cols[j]);
                 continue;
             }
 
@@ -2501,6 +2589,65 @@ pub const Scan = struct {
         const start = list.items.len;
         list.items.len = start + matched;
         storage.segment_reader.forExpandSurvivors(T, fb, mask, list.items[start..]);
+    }
+
+    /// RLE sibling of `appendForSurvivors`: read each run's value once and walk
+    /// only its mask range — never the full row-width expansion
+    /// `decodeRleColumn` pays.
+    fn appendRleSurvivors(self: *Scan, rv: storage.segment_reader.RleView, mask: []const bool, out: *ColumnStore) !void {
+        var matched: usize = 0;
+        for (mask) |m| matched += @intFromBool(m);
+
+        switch (out.data) {
+            .int => |*list| try self.expandRleInto(i32, rv.block, mask, matched, list),
+            .date => |*list| try self.expandRleInto(i32, rv.block, mask, matched, list),
+            .bigint => |*list| try self.expandRleInto(i64, rv.block, mask, matched, list),
+            .datetime => |*list| try self.expandRleInto(i64, rv.block, mask, matched, list),
+            .decimal64 => |*list| try self.expandRleInto(i64, rv.block, mask, matched, list),
+            .smallint => |*list| try self.expandRleInto(i16, rv.block, mask, matched, list),
+            .tinyint => |*list| try self.expandRleInto(i8, rv.block, mask, matched, list),
+            .boolean => |*list| try self.expandRleInto(u8, rv.block, mask, matched, list),
+            else => unreachable,
+        }
+
+        if (out.nulls != null) {
+            var j: usize = 0;
+            for (mask, 0..) |m, src_row| {
+                if (!m) continue;
+                const valid = storage.column.isValidBit(rv.nulls, src_row);
+                try out.appendValidBit(self.allocator, j, valid);
+                j += 1;
+            }
+        }
+    }
+
+    fn expandRleInto(
+        self: *Scan,
+        comptime T: type,
+        rb: storage.segment_reader.RleBlock,
+        mask: []const bool,
+        matched: usize,
+        list: *std.ArrayList(T),
+    ) !void {
+        if (matched == 0) return;
+        try list.ensureUnusedCapacity(self.allocator, matched);
+        const start = list.items.len;
+        list.items.len = start + matched;
+        const out = list.items[start..];
+        var j: usize = 0;
+        var pos: usize = 0;
+        var run: usize = 0;
+        while (run < rb.n_runs and pos < mask.len) : (run += 1) {
+            const v = std.mem.readInt(T, rb.values[run * @sizeOf(T) ..][0..@sizeOf(T)], .little);
+            const len = @min(@as(usize, rb.runLength(run)), mask.len - pos);
+            for (mask[pos .. pos + len]) |m| {
+                if (m) {
+                    out[j] = v;
+                    j += 1;
+                }
+            }
+            pos += len;
+        }
     }
 
     const Borrow = struct {

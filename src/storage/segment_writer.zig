@@ -437,12 +437,15 @@ fn writeColumnBlock(
         try writeValidityBitmap(allocator, &scratch, view, row_start, row_end);
     }
 
-    // Try a narrow encoding first; fall back to raw. `tryEncodeFor` (int-family)
-    // and `tryEncodeDict` (low-card strings) each append their body onto
-    // `scratch` (after the bitmap) and return true iff they committed; on false
-    // `scratch` is untouched past the bitmap. The two are mutually exclusive by
-    // column type, so the order between them doesn't matter.
-    const encoding: format.Encoding = if (try tryEncodeFor(allocator, &scratch, view, row_start, row_end))
+    // Try a narrow encoding first; fall back to raw. Each `tryEncode*` appends
+    // its body onto `scratch` (after the bitmap) and returns true iff it
+    // committed; on false `scratch` is untouched past the bitmap. RLE commits
+    // only when its run body beats BOTH raw and this block's FOR candidate, so
+    // the chain order encodes "pick the smallest". Dict (strings) is mutually
+    // exclusive with the int-family encoders by column type.
+    const encoding: format.Encoding = if (try tryEncodeRle(allocator, &scratch, view, row_start, row_end))
+        .rle
+    else if (try tryEncodeFor(allocator, &scratch, view, row_start, row_end))
         .for_
     else if (dict_eligible and try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
         .dict
@@ -503,6 +506,107 @@ fn writeColumnBlock(
 /// Returns false (leaving `scratch` unchanged past the bitmap) when the column
 /// type is ineligible or the range can't narrow below the native width; the
 /// caller then writes a raw body.
+fn tryEncodeRle(
+    allocator: Allocator,
+    scratch: *std.ArrayList(u8),
+    view: ColumnView,
+    row_start: usize,
+    row_end: usize,
+) !bool {
+    return switch (view.data) {
+        .int, .date => |d| rleEncode(i32, allocator, scratch, view, d, row_start, row_end),
+        .bigint, .datetime, .decimal64 => |d| rleEncode(i64, allocator, scratch, view, d, row_start, row_end),
+        .smallint => |d| rleEncode(i16, allocator, scratch, view, d, row_start, row_end),
+        .tinyint => |d| rleEncode(i8, allocator, scratch, view, d, row_start, row_end),
+        .boolean => |d| rleEncode(u8, allocator, scratch, view, d, row_start, row_end),
+        // Same eligibility set as FOR; variable-width and 16-byte types stay out.
+        else => false,
+    };
+}
+
+fn rleEncode(
+    comptime T: type,
+    allocator: Allocator,
+    scratch: *std.ArrayList(u8),
+    view: ColumnView,
+    data: []const T,
+    row_start: usize,
+    row_end: usize,
+) !bool {
+    const native = @sizeOf(T);
+    const n = row_end - row_start;
+    if (n == 0) return false;
+
+    // One pass: run count over the stored stream as-is (NULL placeholders
+    // included — they must round-trip exactly), plus the non-null min/max the
+    // FOR-candidate size needs. RLE only commits when it beats BOTH raw and
+    // what FOR would produce for this block, so a non-runny block falls
+    // through to `tryEncodeFor` unchanged.
+    var n_runs: usize = 1;
+    var prev = data[row_start];
+    var lo: i128 = std.math.maxInt(i128);
+    var hi: i128 = std.math.minInt(i128);
+    var any = false;
+    for (data[row_start..row_end], row_start..) |v, r| {
+        if (v != prev) {
+            n_runs += 1;
+            prev = v;
+        }
+        if (view.isValid(r)) {
+            const iv: i128 = @intCast(v);
+            if (iv < lo) lo = iv;
+            if (iv > hi) hi = iv;
+            any = true;
+        }
+    }
+
+    const rle_body_size = 4 + 1 + 3 + n_runs * (native + 4);
+    if (rle_body_size >= n * native) return false;
+    if (any) {
+        if (forWidth(@intCast(hi - lo), native)) |w| {
+            const for_body_size = 16 + 1 + 3 + n * @as(usize, w);
+            if (rle_body_size >= for_body_size) return false;
+        }
+    }
+
+    try scratch.ensureUnusedCapacity(allocator, rle_body_size);
+    var b4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b4, @intCast(n_runs), .little);
+    scratch.appendSliceAssumeCapacity(&b4);
+    scratch.appendSliceAssumeCapacity(&[_]u8{ native, 0, 0, 0 });
+
+    // Pass 2: run values, native little-endian.
+    var bv: [@sizeOf(T)]u8 = undefined;
+    prev = data[row_start];
+    std.mem.writeInt(T, &bv, prev, .little);
+    scratch.appendSliceAssumeCapacity(&bv);
+    for (data[row_start + 1 .. row_end]) |v| {
+        if (v != prev) {
+            prev = v;
+            std.mem.writeInt(T, &bv, v, .little);
+            scratch.appendSliceAssumeCapacity(&bv);
+        }
+    }
+
+    // Pass 3: run lengths, u32 little-endian.
+    prev = data[row_start];
+    var run_len: u32 = 0;
+    for (data[row_start..row_end]) |v| {
+        if (v != prev) {
+            std.mem.writeInt(u32, &b4, run_len, .little);
+            scratch.appendSliceAssumeCapacity(&b4);
+            prev = v;
+            run_len = 1;
+        } else {
+            run_len += 1;
+        }
+    }
+    std.mem.writeInt(u32, &b4, run_len, .little);
+    scratch.appendSliceAssumeCapacity(&b4);
+
+    return true;
+}
+
 fn tryEncodeFor(
     allocator: Allocator,
     scratch: *std.ArrayList(u8),

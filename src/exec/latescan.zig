@@ -277,8 +277,8 @@ pub const LateScan = struct {
                         try engine.transform.appendByIndices(self.allocator, col.view(), offsets, out);
                     }
                 },
-                .for_ => {
-                    var col = try sr.decodeColumnPayload(self.allocator, col_type, bb.bytes, rc, flags, .for_);
+                .for_, .rle => |enc| {
+                    var col = try sr.decodeColumnPayload(self.allocator, col_type, bb.bytes, rc, flags, enc);
                     defer col.deinit(self.allocator);
                     try engine.transform.appendByIndices(self.allocator, col.view(), offsets, out);
                 },

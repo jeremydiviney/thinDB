@@ -325,11 +325,11 @@ pub fn readSegment(
 /// Read the per-block `encoding` byte from a column-block header at `offset`.
 fn blockEncoding(bytes: []const u8, offset: usize) format.Encoding {
     const b = bytes[offset + format.column_block_encoding_offset];
-    // Unknown encodings degrade to raw; the writer only ever emits raw/for_, and
+    // Unknown encodings degrade to raw; the writer fully controls this byte and
     // an unknown value would be caught by a downstream decode mismatch, but we
     // keep the reader total here rather than introducing a new error path for a
     // byte the writer fully controls.
-    return if (b <= @intFromEnum(format.Encoding.dict)) @enumFromInt(b) else .raw;
+    return if (b <= @intFromEnum(format.Encoding.rle)) @enumFromInt(b) else .raw;
 }
 
 fn decodeBlock(
@@ -419,6 +419,7 @@ pub fn decodeColumnPayload(
         .raw => decodeRawColumn(allocator, col_type, raw, row_count, flags),
         .for_ => decodeForColumn(allocator, col_type, raw, row_count, flags),
         .dict => decodeDictColumn(allocator, col_type, raw, row_count, flags),
+        .rle => decodeRleColumn(allocator, col_type, raw, row_count, flags),
     };
 }
 
@@ -685,6 +686,116 @@ inline fn expandWidth(comptime T: type, comptime W: type, base: T, codes: []cons
         const delta = std.mem.readInt(W, codes[i * wsz ..][0..wsz], .little);
         out[i] = base +% @as(T, @intCast(delta));
     }
+}
+
+/// An RLE block's value region, parsed in place over the decompressed payload
+/// (past any validity bitmap): `n_runs` runs as two parallel arrays — each
+/// run's value (native element width) and its row count. This is the hook
+/// run-aware kernels consume: a predicate evaluates once per run and a
+/// SUM/COUNT folds `value × length` without expanding to row width.
+pub const RleBlock = struct {
+    n_runs: u32,
+    value_width: u8,
+    /// n_runs × value_width, native little-endian.
+    values: []const u8,
+    /// n_runs × 4, u32 little-endian.
+    lengths: []const u8,
+
+    pub fn runLength(self: RleBlock, run: usize) u32 {
+        return std.mem.readInt(u32, self.lengths[run * 4 ..][0..4], .little);
+    }
+};
+
+/// Parse the RLE header + run arrays out of a decompressed block payload.
+/// `values` is the payload past the validity bitmap. Layout:
+/// `[n_runs u32][value_width u8][3 pad][run values][run lengths u32]`.
+pub fn rleBlockOf(values: []const u8) RleBlock {
+    const n_runs = format.readU32(values[0..4]);
+    const width = values[4];
+    const vals_start = 4 + 1 + 3;
+    const vals_len = @as(usize, n_runs) * width;
+    return .{
+        .n_runs = n_runs,
+        .value_width = width,
+        .values = values[vals_start .. vals_start + vals_len],
+        .lengths = values[vals_start + vals_len .. vals_start + vals_len + @as(usize, n_runs) * 4],
+    };
+}
+
+/// Split a decompressed RLE block payload into (validity bitmap, RleBlock),
+/// mirroring `forViewOf`.
+pub const RleView = struct {
+    nulls: ?[]const u8,
+    block: RleBlock,
+};
+
+pub fn rleViewOf(raw: []const u8, row_count: u32, flags: format.ColumnBlockFlags) RleView {
+    var nulls: ?[]const u8 = null;
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        nulls = raw[0..bm_len];
+        values = raw[bm_len..];
+    }
+    return .{ .nulls = nulls, .block = rleBlockOf(values) };
+}
+
+/// Expand an RLE-encoded block back to its native-width values so the produced
+/// OwnedColumn has the identical shape a raw block would. The writer encodes
+/// the stored value stream as-is (NULL placeholders included), so expansion
+/// reproduces it exactly; the validity bitmap stays orthogonal.
+pub fn decodeRleColumn(
+    allocator: Allocator,
+    col_type: Type,
+    raw: []const u8,
+    row_count: u32,
+    flags: format.ColumnBlockFlags,
+) !OwnedColumn {
+    const _pt = if (prof.enabled) prof.nowTicks() else 0;
+    defer if (prof.enabled) prof.add("rle-decode (expand→native)", @intCast(@max(0, prof.nowTicks() - _pt)));
+
+    var nulls: ?[]u8 = null;
+    errdefer if (nulls) |n| allocator.free(n);
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        const bm_copy = try allocator.alloc(u8, bm_len);
+        @memcpy(bm_copy, raw[0..bm_len]);
+        nulls = bm_copy;
+        values = raw[bm_len..];
+    }
+
+    const rb = rleBlockOf(values);
+
+    // The writer only ever RLE-encodes these integer-family fixed-width types.
+    return switch (col_type) {
+        .int => .{ .data = .{ .int = try expandRle(i32, allocator, rb, row_count) }, .nulls = nulls },
+        .date => .{ .data = .{ .date = try expandRle(i32, allocator, rb, row_count) }, .nulls = nulls },
+        .bigint => .{ .data = .{ .bigint = try expandRle(i64, allocator, rb, row_count) }, .nulls = nulls },
+        .datetime => .{ .data = .{ .datetime = try expandRle(i64, allocator, rb, row_count) }, .nulls = nulls },
+        .decimal64 => .{ .data = .{ .decimal64 = try expandRle(i64, allocator, rb, row_count) }, .nulls = nulls },
+        .smallint => .{ .data = .{ .smallint = try expandRle(i16, allocator, rb, row_count) }, .nulls = nulls },
+        .tinyint => .{ .data = .{ .tinyint = try expandRle(i8, allocator, rb, row_count) }, .nulls = nulls },
+        .boolean => .{ .data = .{ .boolean = try expandRle(u8, allocator, rb, row_count) }, .nulls = nulls },
+        else => unreachable,
+    };
+}
+
+fn expandRle(comptime T: type, allocator: Allocator, rb: RleBlock, row_count: u32) ![]T {
+    const data = try allocator.alloc(T, row_count);
+    errdefer allocator.free(data);
+    var pos: usize = 0;
+    var run: usize = 0;
+    while (run < rb.n_runs) : (run += 1) {
+        const v = std.mem.readInt(T, rb.values[run * @sizeOf(T) ..][0..@sizeOf(T)], .little);
+        // Clamp against a corrupt length so expansion can never write past the
+        // block's row count; a short fill surfaces as a value mismatch, not UB.
+        const len = @min(@as(usize, rb.runLength(run)), row_count - pos);
+        @memset(data[pos .. pos + len], v);
+        pos += len;
+        if (pos == row_count) break;
+    }
+    return data;
 }
 
 /// Build a BORROWED `ColumnView` over the raw decompressed block bytes —
