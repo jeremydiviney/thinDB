@@ -2701,14 +2701,23 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
 
     // Per-column native source bytes + element size — one typed (copyElem) path
-    // covering every int/float agg-input width.
+    // covering every int/float agg-input width. Weighted layouts bind fold
+    // specs instead: their staged columns are pre-widened partials (i64/f64),
+    // so the source view is read typed and reduced, never byte-copied.
     var payload_bytes: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
     var payload_elt: [MAX_GROUP_PAYLOAD_COLUMNS]usize = undefined;
-    for (layout.columns, 0..) |column, i| {
-        if (column.source_name.len == 0) return error.UnsupportedOperatorForType;
-        const view = batch.columnView(column.source_name) orelse return error.ColumnNotFound;
-        payload_bytes[i] = aggInputViewBytes(view, column.physical_type) orelse return error.TypeMismatch;
-        payload_elt[i] = groupColumnSize(column.physical_type);
+    var weight_specs_buf: [MAX_GROUP_PAYLOAD_COLUMNS]WeightFoldSpec = undefined;
+    var weight_specs: []const WeightFoldSpec = &.{};
+    if (layout.has_weight) {
+        try buildWeightFoldSpecs(layout, batch, weight_specs_buf[0..layout.columns.len]);
+        weight_specs = weight_specs_buf[0..layout.columns.len];
+    } else {
+        for (layout.columns, 0..) |column, i| {
+            if (column.source_name.len == 0) return error.UnsupportedOperatorForType;
+            const view = batch.columnView(column.source_name) orelse return error.ColumnNotFound;
+            payload_bytes[i] = aggInputViewBytes(view, column.physical_type) orelse return error.TypeMismatch;
+            payload_elt[i] = groupColumnSize(column.physical_type);
+        }
     }
 
     // String agg-input columns (string MIN/MAX). Bound once; carried into the
@@ -2730,8 +2739,38 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
 
     // Key-shape fast variants (no hashed key). Payload is type-generic; the
     // string lane (if any) rides along via appendStrPayload inside each kernel.
+    // Run-native weighted emission: when every key column arrives with an RLE
+    // run sidecar, merge the columns' runs into composite spans and emit one
+    // staged row per span — key packing and the collapse compare happen per
+    // SPAN, never per row. Any missing sidecar falls through to the per-row
+    // weighted paths below (memtable, tombstoned/filtered batches, non-RLE
+    // blocks), which produce identical keys and partials.
+    if (layout.has_weight and !layout.has_rowref) runs_blk: {
+        const rb = batch.runs orelse break :runs_blk;
+        var key_runs_buf: [MAX_GENERIC_GROUP_KEYS]thindb.exec.RunsColumn = undefined;
+        for (layout.key_columns, 0..) |part, i| {
+            switch (part.typ) {
+                .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => {},
+                else => break :runs_blk,
+            }
+            const ci = batch.columnIndex(part.name) orelse break :runs_blk;
+            if (ci >= rb.len) break :runs_blk;
+            key_runs_buf[i] = rb[ci] orelse break :runs_blk;
+        }
+        // An aggregate input that also arrived run-encoded folds value×count
+        // off its header — never reading the expanded rows.
+        for (layout.columns, 0..) |column, c| {
+            weight_specs_buf[c].runs = null;
+            if (weight_specs_buf[c].is_float) continue;
+            const ci = batch.columnIndex(column.source_name) orelse continue;
+            if (ci < rb.len) weight_specs_buf[c].runs = rb[ci];
+        }
+        try appendBatchRunsWeighted(parts, shared, batch.row_count, layout, key_runs_buf[0..layout.key_columns.len], weight_specs, raw_chunk_rows, profile);
+        return;
+    }
+
     if (!layout.has_rowref) {
-        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], str_views, raw_chunk_rows, profile)) return;
+        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], weight_specs, str_views, raw_chunk_rows, profile)) return;
     }
 
     const rowref_col: []const i64 = if (layout.has_rowref) blk: {
@@ -2753,17 +2792,24 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             else
                 try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
-            // Weighted collapse (COUNT-only layouts): an adjacent-equal key
+            // Weighted collapse (decomposable programs): an adjacent-equal key
             // folds into the last staged row instead of appending — the run
-            // ships as ONE (key, weight) row. The creating row's rowref is
-            // kept (any row of the run has the same key values).
+            // ships as ONE (key, weight, partials) row. The creating row's
+            // rowref is kept (any row of the run has the same key values).
             if (layout.has_weight) {
                 if (idx > 0 and active.keyAt(idx - 1) == key) {
                     active.weightAll()[idx - 1] += 1;
+                    weightFoldRange(active, weight_specs, idx - 1, r, r + 1, false);
                     accepted += 1;
                     continue;
                 }
                 active.weightAll()[idx] = 1;
+                weightFoldRange(active, weight_specs, idx, r, r + 1, true);
+                active.setKey(idx, key);
+                if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
+                active.len_rows = idx + 1;
+                accepted += 1;
+                continue;
             }
             active.setKey(idx, key);
             if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
@@ -2787,6 +2833,92 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     if (profile) parts.partition_ticks += nowTicks() - route_t0;
 }
 
+// Native-width key bits from a run value (sign-extended i64), matching
+// `readGenericKeyBits` exactly: the value's bits at the type's own width,
+// zero-extended. Caller pre-gates the type set.
+inline fn runKeyBits(typ: thindb.types.Type, v: i64) u128 {
+    const raw: u64 = @bitCast(v);
+    return switch (typ) {
+        .boolean, .tinyint => @as(u128, raw & 0xFF),
+        .smallint => @as(u128, raw & 0xFFFF),
+        .int, .date => @as(u128, raw & 0xFFFF_FFFF),
+        else => @as(u128, raw),
+    };
+}
+
+// Run-native weighted emitter: iterate COMPOSITE key spans (a span ends where
+// any key column's run ends — a K-pointer merge over the run sidecars), pack
+// one key and emit one (key, weight, partials) staged row per span. For a
+// CounterID-class block this is ~tens of spans instead of 64K rows.
+fn appendBatchRunsWeighted(
+    parts: *WorkerParts,
+    shared: *PipeShared,
+    row_count: usize,
+    layout: GroupRowsLayout,
+    key_runs: []const thindb.exec.RunsColumn,
+    weight_specs: []const WeightFoldSpec,
+    raw_chunk_rows: usize,
+    profile: bool,
+) !void {
+    if (row_count == 0) return;
+    const route_t0 = if (profile) nowTicks() else 0;
+    var accepted: u64 = 0;
+    var run_idx = [_]usize{0} ** MAX_GENERIC_GROUP_KEYS;
+    var run_left: [MAX_GENERIC_GROUP_KEYS]usize = undefined;
+    for (key_runs, 0..) |kr, i| {
+        if (kr.lengths.len == 0) return error.UnsupportedOperatorForType;
+        run_left[i] = kr.lengths[0];
+    }
+    var spec_idx = [_]usize{0} ** MAX_GROUP_PAYLOAD_COLUMNS;
+    var spec_left = [_]usize{0} ** MAX_GROUP_PAYLOAD_COLUMNS;
+    for (weight_specs, 0..) |spec, c| {
+        if (spec.runs) |ir| {
+            if (ir.lengths.len == 0) return error.UnsupportedOperatorForType;
+            spec_left[c] = ir.lengths[0];
+        }
+    }
+    var r: usize = 0;
+    while (r < row_count) {
+        var active = &parts.raw_active_rows;
+        const weights = active.weightAll();
+        while (r < row_count and active.len() < raw_chunk_rows) {
+            var span: usize = row_count - r;
+            for (key_runs, 0..) |_, i| span = @min(span, run_left[i]);
+            // Lengths shorter than the row count would spin forever; a corrupt
+            // block surfaces as a query error, not a hang.
+            if (span == 0) return error.UnsupportedOperatorForType;
+            var key: u128 = 0;
+            for (layout.key_columns, 0..) |part, i| {
+                key |= runKeyBits(part.typ, key_runs[i].values_i64[run_idx[i]]) << @intCast(part.offset_bits);
+            }
+            const wlen: u32 = @intCast(span);
+            const idx = active.len();
+            if (idx > 0 and active.keyAt(idx - 1) == key) {
+                weights[idx - 1] += wlen;
+                try weightFoldSpan(active, weight_specs, &spec_idx, &spec_left, idx - 1, r, span, false);
+            } else {
+                active.setKey(idx, key);
+                weights[idx] = wlen;
+                try weightFoldSpan(active, weight_specs, &spec_idx, &spec_left, idx, r, span, true);
+                active.len_rows = idx + 1;
+            }
+            accepted += span;
+            r += span;
+            for (key_runs, 0..) |kr, i| {
+                run_left[i] -= span;
+                if (run_left[i] == 0) {
+                    run_idx[i] += 1;
+                    if (run_idx[i] < kr.lengths.len) run_left[i] = kr.lengths[run_idx[i]];
+                }
+            }
+        }
+        if (active.len() == raw_chunk_rows) try publishActiveRawRows(parts, shared, raw_chunk_rows);
+    }
+    parts.scanned_count += row_count;
+    parts.row_count += accepted;
+    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+}
+
 fn appendBatchRawChunksGenericFast(
     parts: *WorkerParts,
     shared: *PipeShared,
@@ -2795,6 +2927,7 @@ fn appendBatchRawChunksGenericFast(
     key_views: []const thindb.storage.ColumnView,
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
+    weight_specs: []const WeightFoldSpec,
     str_views: []const StringView,
     raw_chunk_rows: usize,
     profile: bool,
@@ -2806,7 +2939,7 @@ fn appendBatchRawChunksGenericFast(
                 .bigint => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_bytes, payload_elt, str_views, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_bytes, payload_elt, weight_specs, str_views, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -2826,7 +2959,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, str_views, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_views, raw_chunk_rows, profile);
             return true;
         }
 
@@ -2844,7 +2977,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, str_views, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_views, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -2859,6 +2992,7 @@ fn appendBatchRawChunksGenericKey1I64(
     key0: []const i64,
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
+    weight_specs: []const WeightFoldSpec,
     str_views: []const StringView,
     raw_chunk_rows: usize,
     profile: bool,
@@ -2867,9 +3001,10 @@ fn appendBatchRawChunksGenericKey1I64(
     var accepted: u64 = 0;
     var r: usize = 0;
     if (parts.raw_active_rows.layout.has_weight) {
-        // COUNT-only: stage (key, weight) rows, one per source run. The
-        // weight gate guarantees no payload/str columns ride along.
-        std.debug.assert(payload_bytes.len == 0 and str_views.len == 0);
+        // Decomposable programs: one (key, weight, partials) staged row per
+        // source run — the run's inputs reduce in registers via the fold
+        // specs. The weight gate guarantees no string payload rides along.
+        std.debug.assert(str_views.len == 0);
         while (r < row_count) {
             var active = &parts.raw_active_rows;
             const keys = active.keyU64All();
@@ -2882,9 +3017,11 @@ fn appendBatchRawChunksGenericKey1I64(
                 const idx = active.len();
                 if (idx > 0 and keys[idx - 1] == k) {
                     weights[idx - 1] += wlen;
+                    weightFoldRange(active, weight_specs, idx - 1, r, run_end, false);
                 } else {
                     keys[idx] = k;
                     weights[idx] = wlen;
+                    weightFoldRange(active, weight_specs, idx, r, run_end, true);
                     active.len_rows = idx + 1;
                 }
                 accepted += wlen;
@@ -2923,6 +3060,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
     key1: []const i32,
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
+    weight_specs: []const WeightFoldSpec,
     str_views: []const StringView,
     raw_chunk_rows: usize,
     profile: bool,
@@ -2931,7 +3069,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
     var accepted: u64 = 0;
     var r: usize = 0;
     if (parts.raw_active_rows.layout.has_weight) {
-        std.debug.assert(payload_bytes.len == 0 and str_views.len == 0);
+        std.debug.assert(str_views.len == 0);
         while (r < row_count) {
             var active = &parts.raw_active_rows;
             const keys = active.keyU64All();
@@ -2945,9 +3083,11 @@ fn appendBatchRawChunksGenericKeyI16I32(
                 const idx = active.len();
                 if (idx > 0 and keys[idx - 1] == k) {
                     weights[idx - 1] += wlen;
+                    weightFoldRange(active, weight_specs, idx - 1, r, run_end, false);
                 } else {
                     keys[idx] = k;
                     weights[idx] = wlen;
+                    weightFoldRange(active, weight_specs, idx, r, run_end, true);
                     active.len_rows = idx + 1;
                 }
                 accepted += wlen;
@@ -2987,6 +3127,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
     key1: []const i32,
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
+    weight_specs: []const WeightFoldSpec,
     str_views: []const StringView,
     raw_chunk_rows: usize,
     profile: bool,
@@ -2995,7 +3136,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
     var accepted: u64 = 0;
     var r: usize = 0;
     if (parts.raw_active_rows.layout.has_weight) {
-        std.debug.assert(payload_bytes.len == 0 and str_views.len == 0);
+        std.debug.assert(str_views.len == 0);
         while (r < row_count) {
             var active = &parts.raw_active_rows;
             const key_lo = active.keyU96LoAll();
@@ -3010,10 +3151,12 @@ fn appendBatchRawChunksGenericKeyI64I32(
                 const idx = active.len();
                 if (idx > 0 and key_lo[idx - 1] == lo and key_hi[idx - 1] == hi) {
                     weights[idx - 1] += wlen;
+                    weightFoldRange(active, weight_specs, idx - 1, r, run_end, false);
                 } else {
                     key_lo[idx] = lo;
                     key_hi[idx] = hi;
                     weights[idx] = wlen;
+                    weightFoldRange(active, weight_specs, idx, r, run_end, true);
                     active.len_rows = idx + 1;
                 }
                 accepted += wlen;
@@ -3064,6 +3207,192 @@ inline fn appendGenericPayload(active: *RawRows, payload_bytes: []const []const 
     var col: usize = 0;
     while (col < payload_bytes.len) : (col += 1) {
         copyElem(active.columnByteSlab(col), payload_bytes[col], payload_elt[col], dst, src);
+    }
+}
+
+// Weighted-collapse payload folding: each staged column belongs to exactly
+// one SUM/AVG/MIN/MAX aggregate (the engine's weight gate), is pre-widened to
+// i64/f64, and carries the RUN'S PARTIAL (sum or extreme), not a row value.
+const WeightFoldOp = enum { sum, min, max };
+
+const WeightFoldSpec = struct {
+    op: WeightFoldOp,
+    is_float: bool,
+    view: thindb.storage.ColumnView,
+    /// When the input column itself arrived with an RLE run sidecar, the
+    /// run-native emitter folds `value × covered` off the runs instead of
+    /// reading rows. Null → per-row fold. Only set on the run-native path.
+    runs: ?thindb.exec.RunsColumn = null,
+};
+
+fn buildWeightFoldSpecs(layout: GroupRowsLayout, batch: thindb.Batch, out: []WeightFoldSpec) !void {
+    for (layout.columns, 0..) |column, c| {
+        if (column.source_name.len == 0) return error.UnsupportedOperatorForType;
+        const view = batch.columnView(column.source_name) orelse return error.ColumnNotFound;
+        var op: ?WeightFoldOp = null;
+        for (layout.aggregates) |agg| {
+            if (agg.is_string or agg.is_distinct) continue;
+            const ic = agg.input_column_index orelse continue;
+            if (ic != c or op != null) continue;
+            op = switch (agg.op) {
+                .sum, .avg => .sum,
+                .min => .min,
+                .max => .max,
+                else => return error.UnsupportedOperatorForType,
+            };
+        }
+        out[c] = .{
+            .op = op orelse return error.UnsupportedOperatorForType,
+            .is_float = physicalIsFloat(column.physical_type),
+            .view = view,
+        };
+    }
+}
+
+inline fn weightSrcInt(view: thindb.storage.ColumnView, r: usize) i64 {
+    return switch (view.data) {
+        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| @intCast(s[r]),
+        else => 0,
+    };
+}
+
+inline fn weightSrcFloat(view: thindb.storage.ColumnView, r: usize) f64 {
+    return switch (view.data) {
+        inline .float, .double => |s| @floatCast(s[r]),
+        else => 0,
+    };
+}
+
+// Fold source rows [r0, r1) into staged row `idx`: reduce the range in a
+// register, then either initialize the staged partial (`init`, a freshly
+// appended row) or merge into it (the run continues a prior staged row).
+fn weightFoldRange(active: *RawRows, specs: []const WeightFoldSpec, idx: usize, r0: usize, r1: usize, init: bool) void {
+    for (specs, 0..) |spec, c| weightFoldOne(active, spec, c, idx, r0, r1, init);
+}
+
+fn weightFoldOne(active: *RawRows, spec: WeightFoldSpec, c: usize, idx: usize, r0: usize, r1: usize, init: bool) void {
+    {
+        switch (spec.op) {
+            inline else => |op| {
+                if (spec.is_float) {
+                    var acc: f64 = weightSrcFloat(spec.view, r0);
+                    var r = r0 + 1;
+                    while (r < r1) : (r += 1) {
+                        const v = weightSrcFloat(spec.view, r);
+                        switch (op) {
+                            .sum => acc += v,
+                            .min => if (v < acc) {
+                                acc = v;
+                            },
+                            .max => if (v > acc) {
+                                acc = v;
+                            },
+                        }
+                    }
+                    const col = @as([*]f64, @ptrCast(@alignCast(active.columnByteSlab(c).ptr)))[0..active.capacity_rows];
+                    if (init) {
+                        col[idx] = acc;
+                    } else switch (op) {
+                        .sum => col[idx] += acc,
+                        .min => if (acc < col[idx]) {
+                            col[idx] = acc;
+                        },
+                        .max => if (acc > col[idx]) {
+                            col[idx] = acc;
+                        },
+                    }
+                } else {
+                    var acc: i64 = weightSrcInt(spec.view, r0);
+                    var r = r0 + 1;
+                    while (r < r1) : (r += 1) {
+                        const v = weightSrcInt(spec.view, r);
+                        switch (op) {
+                            .sum => acc += v,
+                            .min => if (v < acc) {
+                                acc = v;
+                            },
+                            .max => if (v > acc) {
+                                acc = v;
+                            },
+                        }
+                    }
+                    const col = @as([*]i64, @ptrCast(@alignCast(active.columnByteSlab(c).ptr)))[0..active.capacity_rows];
+                    if (init) {
+                        col[idx] = acc;
+                    } else switch (op) {
+                        .sum => col[idx] += acc,
+                        .min => if (acc < col[idx]) {
+                            col[idx] = acc;
+                        },
+                        .max => if (acc > col[idx]) {
+                            col[idx] = acc;
+                        },
+                    }
+                }
+            },
+        }
+    }
+}
+
+// Span fold for the run-native emitter: a spec whose input column carries its
+// own run sidecar folds `value × covered` straight off the run cursor (never
+// reading expanded rows); a flat input falls back to the per-row reduce. The
+// cursors advance monotonically with the caller's span walk.
+fn weightFoldSpan(
+    active: *RawRows,
+    specs: []const WeightFoldSpec,
+    spec_idx: *[MAX_GROUP_PAYLOAD_COLUMNS]usize,
+    spec_left: *[MAX_GROUP_PAYLOAD_COLUMNS]usize,
+    idx: usize,
+    r0: usize,
+    span: usize,
+    init: bool,
+) !void {
+    for (specs, 0..) |spec, c| {
+        const ir = spec.runs orelse {
+            weightFoldOne(active, spec, c, idx, r0, r0 + span, init);
+            continue;
+        };
+        switch (spec.op) {
+            inline else => |op| {
+                var acc: i64 = 0;
+                var first = true;
+                var remaining = span;
+                while (remaining > 0) {
+                    const take = @min(remaining, spec_left[c]);
+                    if (take == 0) return error.UnsupportedOperatorForType;
+                    const v = ir.values_i64[spec_idx[c]];
+                    switch (op) {
+                        .sum => acc += v * @as(i64, @intCast(take)),
+                        .min => if (first or v < acc) {
+                            acc = v;
+                        },
+                        .max => if (first or v > acc) {
+                            acc = v;
+                        },
+                    }
+                    first = false;
+                    remaining -= take;
+                    spec_left[c] -= take;
+                    if (spec_left[c] == 0 and spec_idx[c] + 1 < ir.lengths.len) {
+                        spec_idx[c] += 1;
+                        spec_left[c] = ir.lengths[spec_idx[c]];
+                    }
+                }
+                const col = @as([*]i64, @ptrCast(@alignCast(active.columnByteSlab(c).ptr)))[0..active.capacity_rows];
+                if (init) {
+                    col[idx] = acc;
+                } else switch (op) {
+                    .sum => col[idx] += acc,
+                    .min => if (acc < col[idx]) {
+                        col[idx] = acc;
+                    },
+                    .max => if (acc > col[idx]) {
+                        col[idx] = acc;
+                    },
+                }
+            },
+        }
     }
 }
 
@@ -3351,8 +3680,10 @@ fn groupChunkRowsDirectKeysCountSumAvg(
     program: CountSumAvgProgram,
     rowrefs: []const i64,
 ) !void {
-    // The weight gate is COUNT-only; a count+sum+avg program never collapses.
-    std.debug.assert(!rows.layout.has_weight);
+    // Weighted staged rows carry pre-summed run partials in their i64-widened
+    // columns and the run's row count in the weight — the register
+    // accumulation below is identical; only run_len comes from the weights.
+    const weights: []const u32 = if (rows.layout.has_weight) rows.weightAll()[0..row_count] else &.{};
     var r: usize = 0;
     while (r < row_count) {
         const pf = r + PREFETCH_DIST_BUCKET;
@@ -3374,7 +3705,11 @@ fn groupChunkRowsDirectKeysCountSumAvg(
             sum_acc += rows.columnIntAt(program.sum_input_index, rr);
             avg_acc += rows.columnIntAt(program.avg_input_index, rr);
         }
-        const run_len: u64 = @intCast(run_end - r);
+        const run_len: u64 = if (weights.len != 0) blk: {
+            var s: u64 = 0;
+            for (weights[r..run_end]) |w| s += w;
+            break :blk s;
+        } else @intCast(run_end - r);
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         if (!probe.found) {
             const new_gid = initGroupStateCountSumAvg(states, key, sum_acc, avg_acc, run_len);
@@ -4793,6 +5128,10 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
         scans[i] = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, cfg.group_rows_layout.has_rowref, snap);
+        // Weighted integer-key programs consume RLE run headers directly (the
+        // run-native emitter); hashed-key layouts pack from digests, where the
+        // sidecar has no consumer.
+        scans[i].emit_runs = cfg.group_rows_layout.has_weight and !cfg.group_rows_layout.has_rowref;
         {
             var sq = thindb.exec.makeQuery(table.allocator, scans[i]);
             drives[i] = if (cfg.derived.len == 0) sq else sq.compute(cfg.derived) catch |e| {

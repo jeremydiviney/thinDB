@@ -13,6 +13,7 @@ const build_options = @import("build_options");
 const api = @import("../api/api.zig");
 const types = @import("../types.zig");
 const exec = @import("exec.zig");
+const storage = @import("../storage/storage.zig");
 
 const HarnessCore = exec.group_topn_harness_core;
 
@@ -617,6 +618,42 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     return .{ .allocator = allocator, .rows = owned, .params = request.params, .times = times.* };
 }
 
+// Payload-weighted collapse only pays when the COMPOSITE key actually arrives
+// in runs long enough to amortize the widened staging. The storage layer
+// already measured per-column run structure: an RLE block's header carries its
+// run count. Sample one mid-table block per key column — every column must be
+// RLE (a composite run needs all parts running at once), and the composite
+// run count (≈ the union of all columns' run boundaries, conservatively their
+// sum) must leave an average run of ≥4 rows. Derived keys (absent from the
+// schema) and segment-less tables decline — per-row staging is the default.
+fn keyColumnsRunStructured(table: *api.Table, key_columns: []const HarnessCore.GroupKeyColumnSpec) bool {
+    if (key_columns.len == 0) return false;
+    const segs = table.manifest.segments.items;
+    if (segs.len == 0) return false;
+    const entry = table.acquireSegment(segs[segs.len / 2].segment_id) catch return false;
+    defer table.releaseSegment(entry);
+    const seg = &entry.seg;
+    if (seg.info.row_groups.len == 0) return false;
+    const rg = seg.info.row_groups.len / 2;
+    const rg_count = seg.info.row_groups[rg].row_count;
+    if (rg_count == 0) return false;
+    var composite_runs: u64 = 0;
+    for (key_columns) |part| {
+        const phys = blk: {
+            for (table.schema.columns, 0..) |col, i| {
+                if (types.columnNameEql(col.name, part.name)) break :blk i;
+            }
+            return false;
+        };
+        var block = seg.borrowColumnBlock(table.allocator, rg, phys, &table.cache) catch return false;
+        defer block.release(table.allocator, &table.cache);
+        if (block.encoding != .rle) return false;
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = table.schema.columns[phys].nullable };
+        composite_runs += storage.segment_reader.rleViewOf(block.bytes, rg_count, flags).block.n_runs;
+    }
+    return @as(u64, rg_count) >= 4 * @max(composite_runs, 1);
+}
+
 fn runHarness(
     allocator: Allocator,
     table: *api.Table,
@@ -685,19 +722,56 @@ fn runHarness(
     // toggle additionally forces an integer-key query down the same path for
     // cross-checking against the exact integer-packed result.
     const force_hash = shape.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null;
-    // Weighted run collapse: COUNT(*)-only programs ship (key, weight) staged
-    // rows — the scan emitter folds a run of adjacent-equal keys (the table's
-    // physical order clusters them) into ONE row, shrinking route/stage/lane
-    // traffic by the run factor. Anything with payload/str/distinct inputs
-    // keeps per-row staging.
-    const count_only = blk: {
+    // Weighted run collapse: decomposable programs (COUNT(*) / SUM / AVG /
+    // MIN / MAX) ship (key, weight, pre-folded inputs) staged rows — the scan
+    // emitter folds a run of adjacent-equal keys (the table's physical order
+    // clusters them) into ONE row carrying the run's partial aggregates.
+    // Declined for COUNT(col)/DISTINCT/string aggs (need per-row data), for
+    // an input column shared by two aggregates (one staged value can't be
+    // both a run-sum and a run-min), and for a non-count aggregate at state
+    // slot 0 (the lane's kernel pass can't express it — mirrors its
+    // `kernelizable` check).
+    const weight_mode = blk: {
         if (shape.aggregate_program.len == 0) break :blk false;
-        if (shape.aggregate_inputs.len != 0 or shape.string_aggregate_inputs.len != 0 or distinct_slot_count != 0) break :blk false;
+        if (shape.string_aggregate_inputs.len != 0 or distinct_slot_count != 0) break :blk false;
+        var input_used = [_]bool{false} ** 16;
         for (shape.aggregate_program) |agg| {
-            if (agg.op != .count_star or agg.is_distinct or agg.is_string) break :blk false;
+            if (agg.is_distinct or agg.is_string) break :blk false;
+            switch (agg.op) {
+                .count_star => {},
+                .sum, .avg, .min, .max => {
+                    if (agg.state_index == 0) break :blk false;
+                    const ic = agg.input_column_index orelse break :blk false;
+                    if (ic >= shape.aggregate_inputs.len or input_used[ic]) break :blk false;
+                    input_used[ic] = true;
+                },
+                .count_col, .count_distinct => break :blk false,
+            }
         }
+        // Every staged column must belong to exactly one folding aggregate.
+        for (input_used[0..shape.aggregate_inputs.len]) |u| {
+            if (!u) break :blk false;
+        }
+        // COUNT-only collapse is nearly free (a 4-byte weight) and ships
+        // unconditionally. Payload-carrying collapse widens every staged
+        // column to 8 bytes, so on keys that DON'T arrive in runs it is pure
+        // staging inflation (measured: Q31/Q32-class +15-20%) — require
+        // storage-proven run structure on every key column first.
+        if (shape.aggregate_inputs.len != 0 and
+            !keyColumnsRunStructured(table, group_key_columns_buf[0..shape.group_key_inputs.len])) break :blk false;
         break :blk true;
     };
+    // Weighted staged columns carry RUN PARTIALS, not row values: widen to
+    // i64/f64 so a pre-summed run can't overflow its column (and the emitter
+    // folds into one uniform width per family).
+    if (weight_mode) {
+        for (group_columns_buf[0..shape.aggregate_inputs.len]) |*col| {
+            col.physical_type = switch (col.physical_type) {
+                .i8, .i16, .i32, .i64 => .i64,
+                .f32, .f64 => .f64,
+            };
+        }
+    }
     const group_rows_layout = HarnessCore.GroupRowsLayout{
         .key_width = if (force_hash) .u128 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
@@ -707,7 +781,7 @@ fn runHarness(
         .has_str_payload = shape.string_aggregate_inputs.len > 0,
         .distinct_slot_count = distinct_slot_count,
         .has_rowref = force_hash,
-        .has_weight = count_only,
+        .has_weight = weight_mode,
     };
 
     // Scan-side key digests: a string group key consumed only as hashed
