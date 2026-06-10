@@ -34,6 +34,11 @@ pub const Table = struct {
     /// LRU cache of decompressed column-block bytes. Lifetime = Table.
     cache: storage.cache.Cache,
 
+    /// Opened-segment cache: parsed footers + tombstone state, shared across
+    /// queries and scan workers (footer parse is ~ms; segments are immutable).
+    /// Lifetime = Table; entries retire when their files are deleted.
+    seg_handles: storage.cache.SegmentHandles = .{},
+
     // Auto-flush configuration (copied from Database.Config at open time).
     auto_flush_bytes: usize,
     auto_flush_rows: u64,
@@ -204,6 +209,7 @@ pub const Table = struct {
         const allocator = self.allocator;
         const io = self.io;
         if (self.wal) |*w| w.deinit();
+        self.seg_handles.deinit(allocator);
         self.cache.deinit();
         // Drop the Table's reference. If scans pinned a snapshot, the
         // memtable stays alive until the last reader releases it.
@@ -720,6 +726,7 @@ pub const Table = struct {
         const old_cache_capacity = self.cache.capacity_bytes;
         self.cache.deinit();
         self.cache = storage.cache.Cache.init(self.allocator, old_cache_capacity);
+        self.seg_handles.clear(self.allocator);
     }
 
     /// Merge all segments into a single new segment. Drops tombstoned rows.
@@ -730,7 +737,28 @@ pub const Table = struct {
         try @import("compact.zig").execCompact(self);
     }
 
+    /// Get-or-open the cached parsed segment (pinned; pair with
+    /// `releaseSegment`). Shared across queries and scan workers.
+    pub fn acquireSegment(self: *Table, seg_id: u64) !*storage.cache.SegmentHandles.Entry {
+        var name_buf: [32]u8 = undefined;
+        const file_name = try Table.segmentFileName(&name_buf, seg_id);
+        return self.seg_handles.acquire(self.allocator, self.io, self.segments_dir, file_name, self.schema, seg_id);
+    }
+
+    pub fn releaseSegment(self: *Table, entry: *storage.cache.SegmentHandles.Entry) void {
+        self.seg_handles.release(self.allocator, entry);
+    }
+
+    /// The segment's tombstone list as a dupe owned by `allocator` (null =
+    /// none). Cached file read; caller frees, same contract as
+    /// `storage.tombstone.read`.
+    pub fn segmentTombstones(self: *Table, allocator: Allocator, entry: *storage.cache.SegmentHandles.Entry) !?[]u32 {
+        return self.seg_handles.tombstones(allocator, self.io, self.segments_dir, entry);
+    }
+
     pub fn deleteSegmentFiles(self: *Table, seg_id: u64) !void {
+        // Close any cached handle first — Windows refuses to delete open files.
+        self.seg_handles.retire(self.allocator, seg_id);
         var dat_buf: [32]u8 = undefined;
         const dat_name = try Table.segmentFileName(&dat_buf, seg_id);
         self.segments_dir.deleteFile(self.io, dat_name) catch {};

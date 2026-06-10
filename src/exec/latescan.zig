@@ -211,9 +211,9 @@ pub const LateScan = struct {
     /// the pinned snapshot's columns by row index.
     fn materialize(self: *LateScan, locs: []const i64) !void {
         var i: usize = 0;
-        var cur_segment: ?storage.ReadSegment = null;
+        var cur_entry: ?*storage.cache.SegmentHandles.Entry = null;
         var cur_seg_idx: usize = std.math.maxInt(usize);
-        defer if (cur_segment) |*s| s.deinit();
+        defer if (cur_entry) |e| self.table.releaseSegment(e);
 
         while (i < locs.len) {
             switch (rowloc.unpack(locs[i])) {
@@ -223,19 +223,11 @@ pub const LateScan = struct {
                 },
                 .segment => |seg| {
                     if (cur_seg_idx != seg.seg_idx) {
-                        if (cur_segment) |*s| s.deinit();
-                        cur_segment = null;
+                        if (cur_entry) |e| self.table.releaseSegment(e);
+                        cur_entry = null;
                         cur_seg_idx = seg.seg_idx;
                         const entry = self.table.manifest.segments.items[seg.seg_idx];
-                        var name_buf: [32]u8 = undefined;
-                        const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
-                        cur_segment = try storage.readSegment(
-                            self.allocator,
-                            self.table.io,
-                            self.table.segments_dir,
-                            file_name,
-                            self.table.schema,
-                        );
+                        cur_entry = try self.table.acquireSegment(entry.segment_id);
                     }
                     // Gather the maximal run of consecutive survivors sharing
                     // this (segment, row group) so each column decodes once.
@@ -248,7 +240,7 @@ pub const LateScan = struct {
                         if (loc.segment.seg_idx != seg.seg_idx or loc.segment.rg_idx != seg.rg_idx) break;
                         try offsets.append(self.allocator, @intCast(loc.segment.offset));
                     }
-                    try self.appendSegmentRows(&cur_segment.?, seg.rg_idx, offsets.items);
+                    try self.appendSegmentRows(&cur_entry.?.seg, seg.rg_idx, offsets.items);
                     i = run_end;
                 },
             }

@@ -106,6 +106,7 @@ pub fn applyUpsertResolution(t: *Table) !void {
                 deleted.items,
                 t.syncEnabled(),
             );
+            t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
         }
     }
 }

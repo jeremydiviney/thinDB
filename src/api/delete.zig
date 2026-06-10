@@ -69,6 +69,7 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
                 deleted.items,
                 t.syncEnabled(),
             );
+            t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
             total += deleted.items.len;
         }
     }
@@ -182,6 +183,7 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
                 deleted.items,
                 t.syncEnabled(),
             );
+            t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
             total += deleted.items.len;
         }
     }

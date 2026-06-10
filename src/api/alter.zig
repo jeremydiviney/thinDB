@@ -409,6 +409,8 @@ fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64) !void {
     const old_cache_capacity = t.cache.capacity_bytes;
     t.cache.deinit();
     t.cache = storage.cache.Cache.init(allocator, old_cache_capacity);
+    // The parsed footers embed schema-derived structures — drop them too.
+    t.seg_handles.clear(allocator);
 
     const new_indices = try allocator.alloc(usize, t.schema.order_key.len);
     for (t.schema.order_key, 0..) |k, i| {

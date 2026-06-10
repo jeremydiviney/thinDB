@@ -241,7 +241,10 @@ pub const Scan = struct {
     /// all of them. Default true (serial scans take and release their own).
     holds_ddl: bool = true,
 
-    cur_segment: ?storage.ReadSegment = null,
+    /// Pinned handle from the table's segment cache; `cur_segment` aliases its
+    /// parsed `ReadSegment`. Released (not closed) by `closeCurSegment`.
+    cur_seg_entry: ?*storage.cache.SegmentHandles.Entry = null,
+    cur_segment: ?*storage.ReadSegment = null,
     /// Sorted, deduped tombstone offsets for the current segment (or null).
     cur_segment_tomb: ?[]u32 = null,
     /// Prefix sum: `cur_rg_first_row[k]` is the first row offset of row group k
@@ -410,6 +413,19 @@ pub const Scan = struct {
     /// `evalAndCompact`) when coding; `nextFiltered` attaches it to the emitted
     /// batch. Aliases `coded_slots`; null on a non-coded row group.
     filtered_coded: ?[]const ?exec.CodedColumn = null,
+    /// Key-digest emit (`Batch.hashed`): positions whose strings are consumed
+    /// only as hashed group identity (recovered at emit via rowref late-mat).
+    /// The digest is computed straight off the cached decompressed block — a
+    /// dict block hashes each distinct value once, a raw block hashes rows
+    /// through an in-place view — so the dict→string expansion (the dominant
+    /// scan cost on wide string keys) never runs. Tombstoned row groups and
+    /// the memtable's unfiltered path emit plain batches without the sidecar;
+    /// consumers recompute the same digest from bytes there.
+    hash_cols_by_j: []bool = &.{},
+    n_hashed: usize = 0,
+    hash_bufs: []std.ArrayListUnmanaged(u128) = &.{},
+    hashed_slots: []?[]const u128 = &.{},
+    filtered_hashed: ?[]const ?[]const u128 = null,
 
     const Phase = enum { segments, memtable, done };
 
@@ -729,6 +745,55 @@ pub const Scan = struct {
         self.n_coded = 0;
     }
 
+    /// Mark the projected column `name` for key-digest emit (`Batch.hashed`).
+    /// Qualifies: a non-nullable string column. No NDV gate — the digest
+    /// replaces materialization for keys consumed only as hashed identity, at
+    /// any cardinality.
+    pub fn setHashKeyColumn(self: *Scan, name: []const u8) bool {
+        const j = self.hashColIdx(name) orelse return false;
+        self.ensureHashArrays() catch return false;
+        if (!self.hash_cols_by_j[j]) {
+            self.hash_cols_by_j[j] = true;
+            self.n_hashed += 1;
+        }
+        return true;
+    }
+
+    fn hashColIdx(self: *Scan, name: []const u8) ?usize {
+        for (self.out_phys, 0..) |phys, j| {
+            const col = self.table.schema.columns[phys];
+            if (!@import("../types.zig").columnNameEql(col.name, name)) continue;
+            if (col.nullable) return null;
+            return switch (col.type) {
+                .varchar, .string, .char => j,
+                else => null,
+            };
+        }
+        return null;
+    }
+
+    fn ensureHashArrays(self: *Scan) !void {
+        if (self.hash_cols_by_j.len == self.out_phys.len) return;
+        const flags = try self.allocator.alloc(bool, self.out_phys.len);
+        @memset(flags, false);
+        const bufs = self.allocator.alloc(std.ArrayListUnmanaged(u128), self.out_phys.len) catch |e| {
+            self.allocator.free(flags);
+            return e;
+        };
+        for (bufs) |*b| b.* = .empty;
+        self.hash_cols_by_j = flags;
+        self.hash_bufs = bufs;
+    }
+
+    fn ensureHashedSlots(self: *Scan) ![]?[]const u128 {
+        if (self.hashed_slots.len != self.out_phys.len) {
+            if (self.hashed_slots.len > 0) self.allocator.free(self.hashed_slots);
+            self.hashed_slots = try self.allocator.alloc(?[]const u128, self.out_phys.len);
+        }
+        for (self.hashed_slots) |*s| s.* = null;
+        return self.hashed_slots;
+    }
+
     /// Lazily allocate the per-projected-column coded arrays (dict map + code
     /// buffers), sized to `out_phys.len`. Idempotent across repeated
     /// `setDictCodeColumn` calls (one per coded group column).
@@ -767,6 +832,10 @@ pub const Scan = struct {
         if (self.code_bufs.len > 0) self.allocator.free(self.code_bufs);
         if (self.coded_dicts_by_j.len > 0) self.allocator.free(self.coded_dicts_by_j);
         if (self.coded_slots.len > 0) self.allocator.free(self.coded_slots);
+        for (self.hash_bufs) |*b| b.deinit(self.allocator);
+        if (self.hash_bufs.len > 0) self.allocator.free(self.hash_bufs);
+        if (self.hash_cols_by_j.len > 0) self.allocator.free(self.hash_cols_by_j);
+        if (self.hashed_slots.len > 0) self.allocator.free(self.hashed_slots);
         self.prunes.deinit(self.allocator);
         for (self.in_prunes.items) |hint| self.allocator.free(hint.values);
         self.in_prunes.deinit(self.allocator);
@@ -801,8 +870,9 @@ pub const Scan = struct {
     }
 
     fn closeCurSegment(self: *Scan) void {
-        if (self.cur_segment) |*seg| {
-            seg.deinit();
+        if (self.cur_seg_entry) |e| {
+            self.table.releaseSegment(e);
+            self.cur_seg_entry = null;
             self.cur_segment = null;
         }
         if (self.cur_segment_tomb) |t| {
@@ -868,16 +938,26 @@ pub const Scan = struct {
     /// first) so the evaluator's short-circuit skips already-excluded rows in
     /// the costlier predicates — parity with the legacy Filter operator's
     /// `simplifyPredicate`. Reordering is commutative, so results are
-    /// unchanged. Stats are passed as `.unknown` here (no per-column stats at
-    /// the scan), so ordering is by kernel cost; stats-based folding stays the
-    /// legacy operator's job.
+    /// unchanged. Ordering uses SCHEMA-WIDE manifest stats (the filter may
+    /// reference unprojected columns): real NDVs put a hyper-selective
+    /// equality (URLHash = const, NDV ~20M) ahead of its cost-class peers,
+    /// which the guided AND's empty-mask early-exit then turns into whole
+    /// column blocks never borrowed.
     fn orderFusedConjuncts(self: *Scan) !void {
         const expr = self.fused_filter orelse return;
         const schema = self.table.schema.columns;
-        const unknown_stats = try self.allocator.alloc(exec.ColStat, schema.len);
-        defer self.allocator.free(unknown_stats);
-        @memset(unknown_stats, .{});
-        self.fused_filter = try filter_mod.orderPredicate(self.allocator, &self.filter_rewritten, expr, schema, unknown_stats);
+        const all_phys = try self.allocator.alloc(usize, schema.len);
+        defer self.allocator.free(all_phys);
+        for (all_phys, 0..) |*p, i| p.* = i;
+        const col_stats = try computeColumnStats(
+            self.allocator,
+            schema,
+            self.table.manifest.segments.items[0..self.segment_count],
+            all_phys,
+            self.memtable_row_count,
+        );
+        defer self.allocator.free(col_stats);
+        self.fused_filter = try filter_mod.orderPredicate(self.allocator, &self.filter_rewritten, expr, schema, col_stats);
     }
 
     /// Walk the top-level AND conjuncts and register zone-map hints for each
@@ -1018,7 +1098,7 @@ pub const Scan = struct {
         if (any_skipped) self.seg_skip = skipped_buf;
     }
 
-    fn rowGroupCanMatch(self: Scan, rg: storage.RowGroupMeta) bool {
+    pub fn rowGroupCanMatch(self: *const Scan, rg: storage.RowGroupMeta) bool {
         for (self.prunes.items) |hint| {
             const col_stats = rg.stats[hint.col_idx];
             if (!statsOverlapPredicate(col_stats, hint.op, hint.val)) return false;
@@ -1035,6 +1115,26 @@ pub const Scan = struct {
             if (!any) return false;
         }
         return true;
+    }
+
+    /// Work units this scan would actually decode: row groups surviving the
+    /// installed prune hints, plus the memtable as 64K-row equivalents. The
+    /// shared basis for selective-query worker right-sizing (ParallelScan,
+    /// silo grid, lowcard handler). Footers come from the per-table
+    /// segment-handle cache, so the warm cost is hash lookups. Null when the
+    /// scan has no prune hints (no basis to size below full DOP) or a footer
+    /// can't be read — callers keep their full worker count.
+    pub fn survivingWorkUnits(self: *const Scan) ?usize {
+        if (self.prunes.items.len == 0 and self.in_prunes.items.len == 0) return null;
+        var surviving: usize = (@as(usize, @intCast(self.memtable_row_count)) + 65535) / 65536;
+        for (self.table.manifest.segments.items[0..self.segment_count]) |entry| {
+            const handle = self.table.acquireSegment(entry.segment_id) catch return null;
+            defer self.table.releaseSegment(handle);
+            for (handle.seg.info.row_groups) |rg| {
+                if (self.rowGroupCanMatch(rg)) surviving += 1;
+            }
+        }
+        return surviving;
     }
 
     pub fn outputSchema(self: *Scan) []const Column {
@@ -1169,6 +1269,46 @@ pub const Scan = struct {
         return self.emptyStringColumn(col_type, rg_count);
     }
 
+    /// Fill `hash_bufs[j]` with per-row key digests for one row group's string
+    /// column, straight off the cached decompressed block: a dict block hashes
+    /// each distinct value once and translates rows through the LUT; a raw
+    /// block hashes rows through an in-place view (no decode copy). Returns
+    /// the placeholder value column.
+    fn fillKeyHashes(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, rg_count: u32, j: usize) !storage.OwnedColumn {
+        const col_type = self.table.schema.columns[phys].type;
+        try self.hash_bufs[j].resize(self.allocator, rg_count);
+        const digests = self.hash_bufs[j].items[0..rg_count];
+
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+        defer block.release(self.allocator, &self.table.cache);
+
+        if (block.encoding == .dict) {
+            var values = block.bytes;
+            if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
+            const db = storage.segment_reader.dictBlockOf(values, rg_count);
+            const lut = try self.allocator.alloc(u128, db.ndv);
+            defer self.allocator.free(lut);
+            for (lut, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+            for (0..rg_count) |i| digests[i] = lut[db.rowCode(i)];
+        } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
+            const sv = switch (view.data) {
+                .varchar, .string, .char => |s| s,
+                else => return error.TypeMismatch,
+            };
+            for (0..rg_count) |i| digests[i] = exec.stringKeyDigest(sv.rowBytes(i));
+        } else {
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+            defer owned.deinit(self.allocator);
+            const sv = switch (owned.data) {
+                .varchar, .string, .char => |s| s.view(),
+                else => return error.TypeMismatch,
+            };
+            for (0..rg_count) |i| digests[i] = exec.stringKeyDigest(sv.rowBytes(i));
+        }
+        return self.emptyStringColumn(col_type, rg_count);
+    }
+
     /// Emit the next sub-batch of the current (already-decoded) row group:
     /// slice each live `decoded` column to `[sub_off, sub_off+n)` into `views`
     /// and advance the cursor. Only the plain projection path uses this.
@@ -1229,7 +1369,7 @@ pub const Scan = struct {
         while (self.phase == .segments) {
             if (self.cur_segment == null and !try self.openCurSegment()) break;
 
-            const seg = &self.cur_segment.?;
+            const seg = self.cur_segment.?;
             // Reached this worker's assigned range end (possibly mid-segment) —
             // stop the segments phase and fall through to the memtable.
             if (self.atRangeEnd()) {
@@ -1266,9 +1406,16 @@ pub const Scan = struct {
             // materialized strings. Disabled when the segment has tombstones (the
             // survivor compaction would desync the codes) or in late-mat mode.
             const coding = self.n_coded > 0 and self.cur_segment_tomb == null and !self.emit_loc;
+            // Key-digest emit follows the same tombstone rule (the survivor
+            // compaction would desync the sidecar) but is late-mat compatible:
+            // the synthesized __rowloc column is exactly how the real key
+            // bytes come back at emit.
+            const hashing = self.n_hashed > 0 and self.cur_segment_tomb == null;
             for (self.out_phys, 0..) |phys, j| {
                 if (coding and self.coded_dicts_by_j[j] != null) {
                     self.decoded[j] = try self.fillKeyCodes(seg, self.cur_rg_idx, phys, rg_count, j);
+                } else if (hashing and self.hash_cols_by_j[j]) {
+                    self.decoded[j] = try self.fillKeyHashes(seg, self.cur_rg_idx, phys, rg_count, j);
                 } else {
                     self.decoded[j] = try seg.decodeColumnMaybeCached(
                         self.allocator,
@@ -1313,11 +1460,19 @@ pub const Scan = struct {
                 }
                 sidecar = slots;
             }
+            var hash_sidecar: ?[]const ?[]const u128 = null;
+            if (hashing) {
+                const slots = try self.ensureHashedSlots();
+                for (0..self.out_phys.len) |j| {
+                    if (self.hash_cols_by_j[j]) slots[j] = self.hash_bufs[j].items[0..rg_count];
+                }
+                hash_sidecar = slots;
+            }
             // Sub-batch experiment: emit the row group in `scan_sub_batch`-row
-            // slices (plain projection only — not coded/late-mat, which keep
-            // the full batch). The decoded buffers stay live until the cursor
-            // exhausts and the next `next()` calls `releaseBatch`.
-            if (self.sub_batch_rows > 0 and !coding and !self.emit_loc and rg_count > self.sub_batch_rows) {
+            // slices (plain projection only — not coded/hashed/late-mat, which
+            // keep the full batch). The decoded buffers stay live until the
+            // cursor exhausts and the next `next()` calls `releaseBatch`.
+            if (self.sub_batch_rows > 0 and !coding and !hashing and !self.emit_loc and rg_count > self.sub_batch_rows) {
                 self.sub_off = 0;
                 self.sub_count = rg_count;
                 return self.emitSub();
@@ -1327,6 +1482,7 @@ pub const Scan = struct {
                 .values = self.views,
                 .row_count = rg_count,
                 .coded = sidecar,
+                .hashed = hash_sidecar,
             };
         }
 
@@ -1370,22 +1526,11 @@ pub const Scan = struct {
             return false;
         }
         const entry = self.table.manifest.segments.items[self.cur_seg_idx];
-        var name_buf: [32]u8 = undefined;
-        const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
-        self.cur_segment = try storage.readSegment(
-            self.allocator,
-            self.io,
-            self.table.segments_dir,
-            file_name,
-            self.table.schema,
-        );
+        const handle = try self.table.acquireSegment(entry.segment_id);
+        self.cur_seg_entry = handle;
+        self.cur_segment = &handle.seg;
         self.segments_opened += 1;
-        self.cur_segment_tomb = try storage.tombstone.read(
-            self.allocator,
-            self.io,
-            self.table.segments_dir,
-            entry.segment_id,
-        );
+        self.cur_segment_tomb = try self.table.segmentTombstones(self.allocator, handle);
         const rgs = self.cur_segment.?.info.row_groups;
         self.cur_rg_first_row = try self.allocator.alloc(u32, rgs.len);
         var running: u32 = 0;
@@ -1416,7 +1561,7 @@ pub const Scan = struct {
         while (self.phase == .segments) {
             if (self.cur_segment == null and !try self.openCurSegment()) break;
 
-            const seg = &self.cur_segment.?;
+            const seg = self.cur_segment.?;
             // Reached this worker's assigned range end (possibly mid-segment) —
             // stop the segments phase and fall through to the memtable.
             if (self.atRangeEnd()) {
@@ -1447,7 +1592,7 @@ pub const Scan = struct {
             const matched = try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
             if (matched == 0) continue;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
-            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded };
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded, .hashed = self.filtered_hashed };
         }
 
         if (self.phase == .memtable) {
@@ -1469,7 +1614,7 @@ pub const Scan = struct {
             };
             if (matched == 0) return null;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
-            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded };
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded, .hashed = self.filtered_hashed };
         }
 
         return null;
@@ -1569,9 +1714,26 @@ pub const Scan = struct {
                 if (!try self.buildGuidedChild(seg, rg_idx, rg_count, children[0], mask[0..rg_count])) return null;
                 if (children.len > 1) {
                     const scratch = try self.ensureMask2(rg_count);
+                    // Empty-mask early exit: conjuncts arrive selectivity-
+                    // ordered, so the leading leaf often kills the whole row
+                    // group — stop borrowing/evaluating the remaining columns'
+                    // blocks the moment no row survives. Sound for an AND: the
+                    // skipped leaves could only remove more rows.
+                    var live = blk: {
+                        for (mask[0..rg_count]) |m| {
+                            if (m) break :blk true;
+                        }
+                        break :blk false;
+                    };
                     for (children[1..]) |c| {
+                        if (!live) break;
                         if (!try self.buildGuidedChild(seg, rg_idx, rg_count, c, scratch[0..rg_count])) return null;
-                        for (mask[0..rg_count], scratch[0..rg_count]) |*m, s| m.* = m.* and s;
+                        var any = false;
+                        for (mask[0..rg_count], scratch[0..rg_count]) |*m, s| {
+                            m.* = m.* and s;
+                            any = any or m.*;
+                        }
+                        live = any;
                     }
                 }
             },
@@ -1953,6 +2115,7 @@ pub const Scan = struct {
         };
         if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tk));
         self.filtered_coded = null;
+        self.filtered_hashed = null;
         return matched;
     }
 
@@ -2099,8 +2262,10 @@ pub const Scan = struct {
 
         const coding = self.n_coded > 0;
         const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
+        const hashing = self.n_hashed > 0;
+        const hash_slots: ?[]?[]const u128 = if (hashing) try self.ensureHashedSlots() else null;
         var matched: usize = 0;
-        if (coding) {
+        if (coding or hashing) {
             for (mask) |m| matched += @intFromBool(m);
         }
 
@@ -2116,6 +2281,15 @@ pub const Scan = struct {
                 try self.codeSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, mask, matched);
                 try self.fillEmptyStrings(&filtered_cols[j], matched);
                 slots.?[j] = .{ .codes = self.code_bufs[j].items[0..matched], .dict = self.coded_dicts_by_j[j].? };
+                continue;
+            }
+
+            // Hashed group key: digest only the survivors, same no-expansion
+            // rule as the coded path.
+            if (hashing and self.hash_cols_by_j[j]) {
+                try self.hashSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, mask, matched);
+                try self.fillEmptyStrings(&filtered_cols[j], matched);
+                hash_slots.?[j] = self.hash_bufs[j].items[0..matched];
                 continue;
             }
 
@@ -2141,6 +2315,7 @@ pub const Scan = struct {
         }
         if (self.emit_loc) try self.appendSurvivorLocs(mask, rg_idx);
         self.filtered_coded = slots;
+        self.filtered_hashed = hash_slots;
     }
 
     /// Late-mat: append each survivor's packed `__rowloc` into the trailing
@@ -2204,6 +2379,64 @@ pub const Scan = struct {
             var k: usize = 0;
             for (mask, 0..) |m, row| if (m) {
                 codes[k] = try gdict.intern(self.allocator, sv.rowBytes(row));
+                k += 1;
+            };
+        }
+    }
+
+    /// Survivor-granular sibling of `fillKeyHashes`: digest just the masked
+    /// rows of one row group's string column — dict block via a per-distinct
+    /// digest LUT, raw block via the in-place view, owned decode as fallback.
+    fn hashSurvivorsFromBlock(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        phys: usize,
+        j: usize,
+        rg_count: u32,
+        flags: storage.format.ColumnBlockFlags,
+        mask: []const bool,
+        matched: usize,
+    ) !void {
+        const col_type = self.table.schema.columns[phys].type;
+        try self.hash_bufs[j].resize(self.allocator, matched);
+        const digests = self.hash_bufs[j].items[0..matched];
+
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+        defer block.release(self.allocator, &self.table.cache);
+
+        if (block.encoding == .dict) {
+            var values = block.bytes;
+            if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
+            const db = storage.segment_reader.dictBlockOf(values, rg_count);
+            const lut = try self.allocator.alloc(u128, db.ndv);
+            defer self.allocator.free(lut);
+            for (lut, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+            var k: usize = 0;
+            for (mask, 0..) |m, row| if (m) {
+                digests[k] = lut[db.rowCode(row)];
+                k += 1;
+            };
+        } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
+            const sv = switch (view.data) {
+                .varchar, .string, .char => |s| s,
+                else => return error.TypeMismatch,
+            };
+            var k: usize = 0;
+            for (mask, 0..) |m, row| if (m) {
+                digests[k] = exec.stringKeyDigest(sv.rowBytes(row));
+                k += 1;
+            };
+        } else {
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+            defer owned.deinit(self.allocator);
+            const sv = switch (owned.data) {
+                .varchar, .string, .char => |s| s.view(),
+                else => return error.TypeMismatch,
+            };
+            var k: usize = 0;
+            for (mask, 0..) |m, row| if (m) {
+                digests[k] = exec.stringKeyDigest(sv.rowBytes(row));
                 k += 1;
             };
         }
@@ -2387,11 +2620,14 @@ pub const Scan = struct {
         for (mask[0..n]) |m| matched += @intFromBool(m);
         if (matched == 0) {
             self.filtered_coded = null;
+            self.filtered_hashed = null;
             return 0;
         }
 
         const coding = self.n_coded > 0;
         const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
+        const hashing = self.n_hashed > 0;
+        const hash_slots: ?[]?[]const u128 = if (hashing) try self.ensureHashedSlots() else null;
 
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
@@ -2419,6 +2655,25 @@ pub const Scan = struct {
                 slots.?[j] = .{ .codes = codes, .dict = gdict };
                 continue;
             }
+            // Hashed group key over already-decoded views (memtable / non-block
+            // sources): digest the survivors so every filtered batch carries
+            // the sidecar uniformly.
+            if (hashing and self.hash_cols_by_j[j]) {
+                try self.hash_bufs[j].resize(self.allocator, matched);
+                const digests = self.hash_bufs[j].items[0..matched];
+                const sv = switch (src.data) {
+                    .varchar, .string, .char => |s| s,
+                    else => return error.TypeMismatch,
+                };
+                var k: usize = 0;
+                for (mask[0..n], 0..) |m, row| if (m) {
+                    digests[k] = exec.stringKeyDigest(sv.rowBytes(row));
+                    k += 1;
+                };
+                try self.fillEmptyStrings(dst, matched);
+                hash_slots.?[j] = digests;
+                continue;
+            }
             try engine.memtable.appendMaskedColumn(self.allocator, src, mask[0..n], dst);
         }
         if (self.emit_loc) switch (loc) {
@@ -2426,6 +2681,7 @@ pub const Scan = struct {
             .memtable => try self.appendSurvivorLocs(mask[0..n], null),
         };
         self.filtered_coded = slots;
+        self.filtered_hashed = hash_slots;
         return matched;
     }
 

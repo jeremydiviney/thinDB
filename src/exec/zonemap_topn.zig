@@ -417,18 +417,10 @@ pub const ZonemapTopN = struct {
         var seg_idx: usize = 0;
         while (seg_idx < self.segment_count) : (seg_idx += 1) {
             const entry = self.table.manifest.segments.items[seg_idx];
-            var name_buf: [32]u8 = undefined;
-            const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
-            var seg = try storage.readSegment(
-                self.allocator,
-                self.table.io,
-                self.table.segments_dir,
-                file_name,
-                self.table.schema,
-            );
-            defer seg.deinit();
+            const handle = try self.table.acquireSegment(entry.segment_id);
+            defer self.table.releaseSegment(handle);
 
-            for (seg.info.row_groups, 0..) |rg, rg_idx| {
+            for (handle.seg.info.row_groups, 0..) |rg, rg_idx| {
                 const off = corners.items.len;
                 for (0..self.prefix_len) |k| {
                     const s = rg.stats[self.key_phys[k]];
@@ -537,14 +529,14 @@ fn zWorkerRun(w: *ZWorker) !void {
     // tombstone file probe PER ROW GROUP dominated the degenerate full-visit
     // case. Each worker opens a segment and reads its tombstones at most once.
     var cache: SegCache = .{
-        .segs = try allocator.alloc(?storage.ReadSegment, z.segment_count),
+        .entries = try allocator.alloc(?*storage.cache.SegmentHandles.Entry, z.segment_count),
         .tombs = try allocator.alloc(?[]u32, z.segment_count),
         .tombs_loaded = try allocator.alloc(bool, z.segment_count),
     };
-    @memset(cache.segs, null);
+    @memset(cache.entries, null);
     @memset(cache.tombs, null);
     @memset(cache.tombs_loaded, false);
-    defer cache.deinit(allocator);
+    defer cache.deinit(z, allocator);
 
     while (true) {
         if (w.stop.load(.acquire)) break;
@@ -564,38 +556,31 @@ fn zWorkerRun(w: *ZWorker) !void {
 }
 
 const SegCache = struct {
-    segs: []?storage.ReadSegment,
+    entries: []?*storage.cache.SegmentHandles.Entry,
     tombs: []?[]u32,
     tombs_loaded: []bool,
 
-    fn deinit(self: *SegCache, allocator: Allocator) void {
-        for (self.segs) |*s| if (s.*) |*seg| seg.deinit();
-        allocator.free(self.segs);
+    fn deinit(self: *SegCache, z: *const ZonemapTopN, allocator: Allocator) void {
+        for (self.entries) |e| if (e) |entry| z.table.releaseSegment(entry);
+        allocator.free(self.entries);
         for (self.tombs) |t| if (t) |tt| allocator.free(tt);
         allocator.free(self.tombs);
         allocator.free(self.tombs_loaded);
     }
 
     fn segment(self: *SegCache, z: *const ZonemapTopN, allocator: Allocator, seg_idx: usize) !*storage.ReadSegment {
-        if (self.segs[seg_idx] == null) {
+        _ = allocator;
+        if (self.entries[seg_idx] == null) {
             const entry = z.table.manifest.segments.items[seg_idx];
-            var name_buf: [32]u8 = undefined;
-            const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
-            self.segs[seg_idx] = try storage.readSegment(
-                allocator,
-                z.table.io,
-                z.table.segments_dir,
-                file_name,
-                z.table.schema,
-            );
+            self.entries[seg_idx] = try z.table.acquireSegment(entry.segment_id);
         }
-        return &self.segs[seg_idx].?;
+        return &self.entries[seg_idx].?.seg;
     }
 
     fn tombstones(self: *SegCache, z: *const ZonemapTopN, allocator: Allocator, seg_idx: usize) !?[]const u32 {
         if (!self.tombs_loaded[seg_idx]) {
-            const entry = z.table.manifest.segments.items[seg_idx];
-            self.tombs[seg_idx] = try storage.tombstone.read(allocator, z.table.io, z.table.segments_dir, entry.segment_id);
+            _ = try self.segment(z, allocator, seg_idx);
+            self.tombs[seg_idx] = try z.table.segmentTombstones(allocator, self.entries[seg_idx].?);
             self.tombs_loaded[seg_idx] = true;
         }
         return self.tombs[seg_idx];

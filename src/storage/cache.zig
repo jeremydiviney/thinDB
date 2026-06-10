@@ -372,3 +372,146 @@ test "cache insertPinned dedupes a racing duplicate key" {
     c.release(first);
     c.release(second);
 }
+
+// ---------------------------------------------------------------------------
+// SegmentHandles — per-table cache of opened/parsed segments
+// ---------------------------------------------------------------------------
+
+/// Per-table cache of opened segments: the parsed footer (`ReadSegment`) plus
+/// the segment's lazily-loaded tombstone list, shared across queries and
+/// across a query's scan workers. Parsing a footer costs ~4ms (hundreds of
+/// row groups × every column's stats); without this cache each of N workers
+/// paid it per segment on EVERY query (12 workers × 6 segments ≈ 61 parses ≈
+/// 244ms CPU per query on the 100M ClickBench table).
+///
+/// Segments are immutable and ids never reused, so a cached entry can't go
+/// stale in content — invalidation is pure lifecycle:
+///   - `retire` when compaction deletes the files (closing our handle FIRST —
+///     Windows refuses to delete an open file),
+///   - `clear` on ALTER/TRUNCATE/close (the parse is schema-dependent),
+///   - `invalidateTombstones` when DELETE/UPDATE/UPSERT merges new tombstones.
+///
+/// `tombstones` returns a caller-owned DUPE of the cached list, so readers
+/// keep today's ownership semantics and a concurrent invalidation can never
+/// free bytes a reader is still walking. Entries are pinned while a scan
+/// holds them; `retire` defers destruction to the last `release`.
+pub const SegmentHandles = struct {
+    const segment_reader = @import("segment_reader.zig");
+    const tombstone = @import("tombstone.zig");
+    const types_mod = @import("../types.zig");
+
+    pub const Entry = struct {
+        segment_id: u64,
+        seg: segment_reader.ReadSegment,
+        tombs: ?[]u32 = null,
+        tombs_loaded: bool = false,
+        pins: u32 = 0,
+        retired: bool = false,
+    };
+
+    map: std.AutoHashMapUnmanaged(u64, *Entry) = .empty,
+    lock: std.atomic.Mutex = .unlocked,
+
+    fn lockSpin(self: *SegmentHandles) void {
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Get-or-open the segment, pinned. A first touch parses the footer while
+    /// holding the lock — one-time per segment per table lifetime; peers spin
+    /// only on that cold start.
+    pub fn acquire(
+        self: *SegmentHandles,
+        allocator: Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        file_name: []const u8,
+        schema: types_mod.TableSchema,
+        segment_id: u64,
+    ) !*Entry {
+        self.lockSpin();
+        defer self.lock.unlock();
+        const gop = try self.map.getOrPut(allocator, segment_id);
+        if (gop.found_existing) {
+            const e = gop.value_ptr.*;
+            e.pins += 1;
+            return e;
+        }
+        errdefer _ = self.map.remove(segment_id);
+        const entry = try allocator.create(Entry);
+        errdefer allocator.destroy(entry);
+        entry.* = .{ .segment_id = segment_id, .seg = undefined, .pins = 1 };
+        entry.seg = try segment_reader.readSegment(allocator, io, dir, file_name, schema);
+        gop.value_ptr.* = entry;
+        return entry;
+    }
+
+    pub fn release(self: *SegmentHandles, allocator: Allocator, entry: *Entry) void {
+        self.lockSpin();
+        defer self.lock.unlock();
+        entry.pins -= 1;
+        if (entry.retired and entry.pins == 0) destroyEntry(allocator, entry);
+    }
+
+    /// The segment's tombstone row list as a caller-owned dupe (null = none).
+    /// The underlying file is read once and cached until `invalidateTombstones`.
+    pub fn tombstones(
+        self: *SegmentHandles,
+        allocator: Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        entry: *Entry,
+    ) !?[]u32 {
+        self.lockSpin();
+        defer self.lock.unlock();
+        if (!entry.tombs_loaded) {
+            entry.tombs = try tombstone.read(allocator, io, dir, entry.segment_id);
+            entry.tombs_loaded = true;
+        }
+        const t = entry.tombs orelse return null;
+        return try allocator.dupe(u32, t);
+    }
+
+    /// A tombstone merge wrote new offsets for `segment_id` — drop the cached
+    /// list so the next reader re-reads the file.
+    pub fn invalidateTombstones(self: *SegmentHandles, allocator: Allocator, segment_id: u64) void {
+        self.lockSpin();
+        defer self.lock.unlock();
+        const e = self.map.get(segment_id) orelse return;
+        if (e.tombs) |t| allocator.free(t);
+        e.tombs = null;
+        e.tombs_loaded = false;
+    }
+
+    /// Compaction is about to delete this segment's files: close our handle
+    /// now (Windows can't delete an open file). Runs under the ddl exclusive
+    /// lock, so no reader holds a pin in practice; a pinned entry (defense)
+    /// is destroyed by its last `release`.
+    pub fn retire(self: *SegmentHandles, allocator: Allocator, segment_id: u64) void {
+        self.lockSpin();
+        defer self.lock.unlock();
+        const kv = self.map.fetchRemove(segment_id) orelse return;
+        const e = kv.value;
+        if (e.pins == 0) destroyEntry(allocator, e) else e.retired = true;
+    }
+
+    /// Drop everything — ALTER/TRUNCATE (schema-dependent parse) and table
+    /// close. Callers hold the table exclusively; no pins outstanding.
+    pub fn clear(self: *SegmentHandles, allocator: Allocator) void {
+        self.lockSpin();
+        var it = self.map.valueIterator();
+        while (it.next()) |e| destroyEntry(allocator, e.*);
+        self.map.clearRetainingCapacity();
+        self.lock.unlock();
+    }
+
+    pub fn deinit(self: *SegmentHandles, allocator: Allocator) void {
+        self.clear(allocator);
+        self.map.deinit(allocator);
+    }
+
+    fn destroyEntry(allocator: Allocator, e: *Entry) void {
+        e.seg.deinit();
+        if (e.tombs) |t| allocator.free(t);
+        allocator.destroy(e);
+    }
+};

@@ -255,6 +255,7 @@ fn processOneSegment(
             deleted.items,
             t.syncEnabled(),
         );
+        t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
     }
     return deleted.items.len;
 }
