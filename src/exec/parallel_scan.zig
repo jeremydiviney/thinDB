@@ -69,6 +69,12 @@ const Coord = struct { seg: usize, rg: usize };
 /// from bytes, so static per-thread slices leave imbalance that stealing fixes.
 const CHUNK_FACTOR: usize = 4;
 
+/// Selective-query right-sizing: one worker thread per this many surviving
+/// (post-zone-map) row groups, so a point lookup that touches 13 of 958 row
+/// groups doesn't pay 12 thread spawns. 2 keeps per-thread wall at roughly two
+/// block decodes — small enough that the clamp never gates a real workload.
+const RGS_PER_THREAD: usize = 2;
+
 /// Execution strategy, chosen lazily on the first `next()` (fusion happens
 /// after `create`). `materialize` is the fused-filter path: each worker drains
 /// its whole slice and deep-copies survivors, then we concat. `round` is the
@@ -102,6 +108,9 @@ pub const ParallelScan = struct {
     /// Worker thread count (the effective DOP). ≤ `workers.len`; in materialize
     /// mode `n_threads` threads steal `workers.len` chunks.
     n_threads: usize,
+    /// Threads actually spawned by the last workSteal/startRoundPool — the
+    /// prune-clamped effective DOP (see `effectiveThreads`). For reporting.
+    eff_threads: usize = 0,
     /// Shared steal cursor: each worker claims chunk `next_chunk.fetchAdd(1)`
     /// until it reaches `workers.len`. Materialize mode only.
     next_chunk: std.atomic.Value(usize),
@@ -621,13 +630,26 @@ pub const ParallelScan = struct {
         self.reserved_bytes = total;
     }
 
-    /// Spawn `n_threads-1` workers (the calling thread is the last); each runs
-    /// `stealLoop`, claiming chunks from the shared cursor until none remain,
-    /// then join. Finer chunks + dynamic claiming balance work that static
-    /// per-thread slices can't (survivor count ≠ bytes for filter/regex).
+    /// Threads actually worth spawning: the configured DOP clamped by the work
+    /// that survives zone-map pruning (`Scan.survivingWorkUnits`). Runs at
+    /// spawn time — the first `next()` — which is after the Query is composed,
+    /// so the workers' prune hints are installed. No hints → full DOP.
+    fn effectiveThreads(self: *ParallelScan) usize {
+        if (self.n_threads <= 1) return self.n_threads;
+        const surviving = self.workers[0].survivingWorkUnits() orelse return self.n_threads;
+        const want = (surviving + RGS_PER_THREAD - 1) / RGS_PER_THREAD;
+        return @max(@as(usize, 1), @min(self.n_threads, want));
+    }
+
+    /// Spawn `effectiveThreads()-1` workers (the calling thread is the last);
+    /// each runs `stealLoop`, claiming chunks from the shared cursor until none
+    /// remain, then join. Finer chunks + dynamic claiming balance work that
+    /// static per-thread slices can't (survivor count ≠ bytes for filter/regex).
     fn workSteal(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
+        const eff = self.effectiveThreads();
+        self.eff_threads = eff;
         var t: usize = 1;
-        while (t < self.n_threads) : (t += 1) {
+        while (t < eff) : (t += 1) {
             if (std.Thread.spawn(.{}, stealLoop, .{ self, drainables, ta })) |th| {
                 self.threads[t] = th;
                 self.thread_active[t] = true;
@@ -637,7 +659,7 @@ pub const ParallelScan = struct {
         }
         stealLoop(self, drainables, ta); // calling thread is a worker too
         t = 1;
-        while (t < self.n_threads) : (t += 1) {
+        while (t < eff) : (t += 1) {
             if (self.thread_active[t]) self.threads[t].join();
         }
     }
@@ -670,8 +692,8 @@ pub const ParallelScan = struct {
             rows_in += w.rows_scanned;
             max_rgs = @max(max_rgs, w.rgs_scanned);
         }
-        std.debug.print("[pscan] threads={d} chunks={d} drain_wall={d:.1}ms survivors={d} chunk_ms[min={d:.1} max={d:.1} mean={d:.1}]\n", .{
-            self.n_threads,                       self.workers.len,                     drain_wall_ms,                                           rows,
+        std.debug.print("[pscan] threads={d}(eff={d}) chunks={d} drain_wall={d:.1}ms survivors={d} chunk_ms[min={d:.1} max={d:.1} mean={d:.1}]\n", .{
+            self.n_threads,                       self.eff_threads,                     self.workers.len,                                        drain_wall_ms,                        rows,
             exec.prof.ticksToMs(@intCast(min_t)), exec.prof.ticksToMs(@intCast(max_t)), exec.prof.ticksToMs(@intCast(sum_t / self.workers.len)),
         });
         std.debug.print("[pscan] rowgroups: considered={d} scanned={d} pruned={d} ({d:.1}%)  rows_decoded={d}  busiest_worker_rgs={d}\n", .{
@@ -802,8 +824,10 @@ pub const ParallelScan = struct {
         self.round_done.store(0, .monotonic);
         self.pool_shutdown.store(false, .monotonic);
         @memset(self.thread_active, false);
+        const eff = self.effectiveThreads();
+        self.eff_threads = eff;
         var i: usize = 1;
-        while (i < self.n_threads) : (i += 1) {
+        while (i < eff) : (i += 1) {
             if (std.Thread.spawn(.{}, roundWorker, .{self})) |th| {
                 self.threads[i] = th;
                 self.thread_active[i] = true;
@@ -1042,11 +1066,9 @@ fn byteAwareBounds(
     var total_bytes: u64 = 0;
     var flat: usize = 0;
     for (table.manifest.segments.items[0..segment_count]) |entry| {
-        var name_buf: [32]u8 = undefined;
-        const fname = Table.segmentFileName(&name_buf, entry.segment_id) catch return null;
-        var seg = storage.readSegment(allocator, table.io, table.segments_dir, fname, table.schema) catch return null;
-        defer seg.deinit();
-        for (seg.info.row_groups) |rg| {
+        const handle = table.acquireSegment(entry.segment_id) catch return null;
+        defer table.releaseSegment(handle);
+        for (handle.seg.info.row_groups) |rg| {
             if (flat >= total_rgs) return null; // manifest/footer row-group disagreement
             weights[flat] = rgWeight(rg, proj, ncols);
             total_bytes += weights[flat];

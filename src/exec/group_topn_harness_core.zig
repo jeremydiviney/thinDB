@@ -40,6 +40,11 @@ const Scan = thindb.exec.Scan;
 const group_table = thindb.exec.group_table;
 const GroupTable = group_table.IntKeyMemsetTable(96);
 const TOP_K: usize = 10;
+
+/// Selective-query right-sizing: one grid worker per this many surviving
+/// (post-zone-map) row groups, so a filter that touches a handful of row
+/// groups doesn't pay full-DOP worker setup (scans, staging, bucket scratch).
+const RGS_PER_GRID_WORKER: usize = 2;
 const PREFETCH_DIST_BUCKET: usize = 32;
 // Look-ahead distance for the grouped COUNT(DISTINCT) fold: the second pass
 // prefetches the membership-set slot this many rows ahead of the insert, so the
@@ -2027,18 +2032,80 @@ fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
 }
 
 fn deinitRawQueues(shared: *PipeShared) void {
-    for (shared.raw_chunks.items) |*chunk| chunk.rows.deinit(shared.allocator);
-    shared.raw_chunks.deinit(shared.allocator);
-    for (shared.raw_scan_queues) |*queue| queue.deinit(shared.allocator);
-    if (shared.raw_scan_queues.len > 0) shared.allocator.free(shared.raw_scan_queues);
-    for (shared.raw_group_queues) |*queue| queue.deinit(shared.allocator);
-    if (shared.raw_group_queues.len > 0) shared.allocator.free(shared.raw_group_queues);
-    for (shared.stage_builders) |*builder| builder.deinit(shared.allocator);
-    if (shared.stage_builders.len > 0) shared.allocator.free(shared.stage_builders);
-    for (shared.raw_recycled_rows.items) |*rows| rows.deinit(shared.allocator);
-    shared.raw_recycled_rows.deinit(shared.allocator);
-    for (shared.group_recycled_rows.items) |*rows| rows.deinit(shared.allocator);
-    shared.group_recycled_rows.deinit(shared.allocator);
+    var task = HeavyTeardownTask{
+        .allocator = shared.allocator,
+        .raw_chunks = shared.raw_chunks,
+        .raw_scan_queues = shared.raw_scan_queues,
+        .raw_group_queues = shared.raw_group_queues,
+        .stage_builders = shared.stage_builders,
+        .raw_recycled_rows = shared.raw_recycled_rows,
+        .group_recycled_rows = shared.group_recycled_rows,
+    };
+    task.run();
+}
+
+// The heavy post-result frees of a silo-grid run: every staging chunk slab the
+// run touched. Moved out of `PipeShared` so they can be released on a detached
+// thread after the result has shipped (~hundreds of MB to GB of slab frees,
+// ~200ms on a 100M-row high-card query).
+const HeavyTeardownTask = struct {
+    allocator: Allocator,
+    raw_chunks: std.ArrayListUnmanaged(RawChunk),
+    raw_scan_queues: []RawQueue,
+    raw_group_queues: []GroupQueue,
+    stage_builders: []StageBucketBuilder,
+    raw_recycled_rows: std.ArrayListUnmanaged(RawRows),
+    group_recycled_rows: std.ArrayListUnmanaged(GroupRows),
+
+    fn run(self: *HeavyTeardownTask) void {
+        const allocator = self.allocator;
+        for (self.raw_chunks.items) |*chunk| chunk.rows.deinit(allocator);
+        self.raw_chunks.deinit(allocator);
+        for (self.raw_scan_queues) |*queue| queue.deinit(allocator);
+        if (self.raw_scan_queues.len > 0) allocator.free(self.raw_scan_queues);
+        for (self.raw_group_queues) |*queue| queue.deinit(allocator);
+        if (self.raw_group_queues.len > 0) allocator.free(self.raw_group_queues);
+        for (self.stage_builders) |*builder| builder.deinit(allocator);
+        if (self.stage_builders.len > 0) allocator.free(self.stage_builders);
+        for (self.raw_recycled_rows.items) |*rows| rows.deinit(allocator);
+        self.raw_recycled_rows.deinit(allocator);
+        for (self.group_recycled_rows.items) |*rows| rows.deinit(allocator);
+        self.group_recycled_rows.deinit(allocator);
+    }
+};
+
+fn heavyTeardownMain(task: *HeavyTeardownTask) void {
+    task.run();
+    const allocator = task.allocator;
+    allocator.destroy(task);
+}
+
+// Move the queue/recycle state onto a detached thread and zero it in `shared`
+// so the unwind path has nothing left to free. Any failure falls back to
+// freeing synchronously via the regular defer (returns false).
+fn scheduleHeavyTeardown(shared: *PipeShared) bool {
+    const task = shared.allocator.create(HeavyTeardownTask) catch return false;
+    task.* = .{
+        .allocator = shared.allocator,
+        .raw_chunks = shared.raw_chunks,
+        .raw_scan_queues = shared.raw_scan_queues,
+        .raw_group_queues = shared.raw_group_queues,
+        .stage_builders = shared.stage_builders,
+        .raw_recycled_rows = shared.raw_recycled_rows,
+        .group_recycled_rows = shared.group_recycled_rows,
+    };
+    const thread = std.Thread.spawn(.{}, heavyTeardownMain, .{task}) catch {
+        shared.allocator.destroy(task);
+        return false;
+    };
+    thread.detach();
+    shared.raw_chunks = .empty;
+    shared.raw_scan_queues = &.{};
+    shared.raw_group_queues = &.{};
+    shared.stage_builders = &.{};
+    shared.raw_recycled_rows = .empty;
+    shared.group_recycled_rows = .empty;
+    return true;
 }
 
 fn lockSpin(mutex: *std.atomic.Mutex) void {
@@ -2378,30 +2445,50 @@ fn worse(a: TopRow, b: TopRow) bool {
     return a.key > b.key;
 }
 
+// Bounded top-K set, sized at runtime from the query's LIMIT+OFFSET. Kept as
+// a binary heap rooted at the WORST retained row, so the common case — a
+// candidate that doesn't make the cut — is a single comparison against the
+// root, and a replacement costs O(log k) instead of the O(k) worst-rescan the
+// old fixed-10 array paid.
 const TopSet = struct {
-    items: [TOP_K]TopRow = undefined,
+    items: []TopRow = &.{},
     len: usize = 0,
-    worst_i: usize = 0,
 
-    fn recomputeWorst(self: *TopSet) void {
-        var w: usize = 0;
-        var i: usize = 1;
-        while (i < self.len) : (i += 1) {
-            if (worse(self.items[i], self.items[w])) w = i;
-        }
-        self.worst_i = w;
+    fn init(allocator: Allocator, k: usize) !TopSet {
+        return .{ .items = try allocator.alloc(TopRow, k) };
+    }
+
+    fn deinit(self: *TopSet, allocator: Allocator) void {
+        allocator.free(self.items);
+        self.* = .{};
     }
 
     fn consider(self: *TopSet, cand: TopRow) void {
-        if (self.len < TOP_K) {
-            self.items[self.len] = cand;
-            if (self.len == 0 or worse(cand, self.items[self.worst_i])) self.worst_i = self.len;
+        if (self.len < self.items.len) {
+            var i = self.len;
+            self.items[i] = cand;
             self.len += 1;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (!worse(self.items[i], self.items[parent])) break;
+                std.mem.swap(TopRow, &self.items[i], &self.items[parent]);
+                i = parent;
+            }
             return;
         }
-        if (!better(cand, self.items[self.worst_i])) return;
-        self.items[self.worst_i] = cand;
-        self.recomputeWorst();
+        if (self.items.len == 0 or !better(cand, self.items[0])) return;
+        self.items[0] = cand;
+        var i: usize = 0;
+        while (true) {
+            const left = 2 * i + 1;
+            const right = left + 1;
+            var w = i;
+            if (left < self.len and worse(self.items[left], self.items[w])) w = left;
+            if (right < self.len and worse(self.items[right], self.items[w])) w = right;
+            if (w == i) break;
+            std.mem.swap(TopRow, &self.items[i], &self.items[w]);
+            i = w;
+        }
     }
 };
 
@@ -2482,17 +2569,30 @@ inline fn updateKeyHash(h: *std.hash.Wyhash, view: thindb.storage.ColumnView, ty
     }
 }
 
-// Hashed group identity for string / >128-bit keys: a 128-bit Wyhash digest of
-// the key columns' raw bytes (two independent seeds → hi/lo). The actual key
+// Hashed group identity for string / >128-bit keys: a 128-bit Wyhash digest
+// (two independent seeds → hi/lo) over the key columns. A STRING column
+// contributes its fixed 16-byte `stringKeyDigest` — taken from the scan's
+// `Batch.hashed` sidecar when present (the string was never materialized),
+// recomputed from bytes otherwise — so per-column digests compose identically
+// across mixed batch sources and with native int key columns. The actual key
 // values are recovered at emit via the row's carried __rowloc (late
 // materialization), so collisions — astronomically unlikely at 128 bits — are
 // the only correctness caveat.
-fn hashGenericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storage.ColumnView, row: usize) u128 {
+fn hashGenericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storage.ColumnView, key_digests: []const ?[]const u128, row: usize) u128 {
     var lo = std.hash.Wyhash.init(0x9E3779B97F4A7C15);
     var hi = std.hash.Wyhash.init(0xD1B54A32D192ED03);
     for (layout.key_columns, 0..) |part, i| {
-        updateKeyHash(&lo, key_views[i], part.typ, row);
-        updateKeyHash(&hi, key_views[i], part.typ, row);
+        switch (key_views[i].data) {
+            .string, .varchar, .char => |sv| {
+                const d: u128 = if (key_digests[i]) |ds| ds[row] else thindb.exec.stringKeyDigest(sv.rowBytes(row));
+                lo.update(std.mem.asBytes(&d));
+                hi.update(std.mem.asBytes(&d));
+            },
+            else => {
+                updateKeyHash(&lo, key_views[i], part.typ, row);
+                updateKeyHash(&hi, key_views[i], part.typ, row);
+            },
+        }
     }
     return (@as(u128, hi.final()) << 64) | @as(u128, lo.final());
 }
@@ -2537,8 +2637,11 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     if (parts.raw_active_rows.capacity() == 0) parts.raw_active_rows = try acquireRawRows(shared, raw_chunk_rows, &parts.raw_recycle_lock_ticks);
 
     var key_views_buf: [MAX_GENERIC_GROUP_KEYS]thindb.storage.ColumnView = undefined;
+    var key_digests_buf: [MAX_GENERIC_GROUP_KEYS]?[]const u128 = undefined;
     for (layout.key_columns, 0..) |part, i| {
-        key_views_buf[i] = batch.columnView(part.name) orelse return error.ColumnNotFound;
+        const ci = batch.columnIndex(part.name) orelse return error.ColumnNotFound;
+        key_views_buf[i] = batch.values[ci];
+        key_digests_buf[i] = if (batch.hashed) |hs| hs[ci] else null;
     }
     if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
 
@@ -2591,7 +2694,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         var active = &parts.raw_active_rows;
         while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
             const key = if (layout.has_rowref)
-                hashGenericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r)
+                hashGenericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], key_digests_buf[0..layout.key_columns.len], r)
             else
                 try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
@@ -3130,12 +3233,128 @@ fn groupChunkRowsDirectKeys(
     const has_distinct = rows.layout.distinct_slot_count > 0;
     const n = row_count;
 
-    // With COUNT(DISTINCT), record each row's gid in pass 1 and defer the
-    // membership-set fold to a prefetch-pipelined pass 2 (the set probe is the
-    // cache-miss bottleneck; the group table is small and stays cache-resident).
-    // The distinct count slot is untouched by `updateGroupStateProgram`, so
-    // deferring the bump to pass 2 is exact. Without distinct this is the
-    // original single pass (no gid buffer, no pass 2).
+    // Classify the program so the row loop carries only what it must: bare
+    // COUNT bumps fold inline in the probe pass; SUM/AVG/MIN/MAX run as
+    // per-aggregate monomorphic kernels over the recorded gid array (pass 2) —
+    // the op dispatch and the physical-type switch hoisted out of the row
+    // loop, with the state-record misses overlapped by a look-ahead prefetch.
+    // A shape the kernels can't express (a non-count aggregate aimed at state
+    // slot 0) keeps the original per-row program.
+    var kernelizable = true;
+    var needs_kernels = false;
+    var has_extreme = false;
+    var has_mirror = false;
+    for (aggregates) |agg| {
+        if (agg.is_string or agg.is_distinct) continue;
+        if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
+        switch (agg.op) {
+            .count_star, .count_col => {
+                if (agg.state_index != 0) has_mirror = true;
+            },
+            .sum, .avg, .min, .max => {
+                needs_kernels = true;
+                if (agg.op == .min or agg.op == .max) has_extreme = true;
+                if (agg.state_index == 0) kernelizable = false;
+            },
+            .count_distinct => unreachable,
+        }
+    }
+    if (!kernelizable) {
+        return groupChunkRowsDirectKeysProgram(key_width, table, states, str_states, str_arena, distinct_sets, gids_buf, allocator, keys, key_hi, n, aggregates, rows, rowrefs);
+    }
+
+    // The gid array feeds the aggregate kernels and the COUNT(DISTINCT) pass 2
+    // (the set probe is the cache-miss bottleneck; the group table is small
+    // and stays cache-resident). MIN/MAX first-touch is carried as a tag bit
+    // on the creating row's gid (the chunk is the group's first ever — its
+    // record was zero-initialized — exactly when the bit is set).
+    const want_gids = has_distinct or needs_kernels;
+    if (want_gids) try gids_buf.resize(allocator, n);
+    const gids: []u32 = if (want_gids) gids_buf.items[0..n] else &.{};
+    const mark_new = has_extreme;
+
+    var r: usize = 0;
+    while (r < n) : (r += 1) {
+        const pf = r + PREFETCH_DIST_BUCKET;
+        if (pf < n) {
+            const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
+            @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
+        }
+
+        const key = groupKeyAt(key_width, keys, key_hi, r);
+        const probe = table.getOrPut(GroupTable.hashKey(key), key);
+        var gid: u32 = probe.gid;
+        var tagged: u32 = probe.gid;
+        if (!probe.found) {
+            gid = states.pushAssumeCapacity();
+            const head = states.head(gid);
+            head.key = key;
+            head.count = 1;
+            if (rowrefs.len != 0) head.rowref = rowrefs[r];
+            table.commit(probe.slot, key, gid);
+            if (has_str) {
+                str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
+            }
+            tagged = if (mark_new) gid | NEW_GID_BIT else gid;
+        } else {
+            states.head(gid).count += 1;
+        }
+        if (has_str) try foldGroupStr(str_states, str_arena, gid, aggregates, rows, r);
+        if (has_mirror) mirrorCountSlots(states, gid, aggregates);
+        if (want_gids) gids[r] = tagged;
+    }
+
+    if (needs_kernels) {
+        for (aggregates) |agg| {
+            if (agg.is_string or agg.is_distinct) continue;
+            switch (agg.op) {
+                .count_star, .count_col => {},
+                .sum, .avg => if (aggInputIsFloat(rows, agg))
+                    foldKernelSumFloat(states, gids, rows, agg)
+                else
+                    foldKernelSumInt(states, gids, rows, agg),
+                .min => if (aggInputIsFloat(rows, agg))
+                    foldKernelExtremeFloat(true, states, gids, rows, agg)
+                else
+                    foldKernelExtremeInt(true, states, gids, rows, agg),
+                .max => if (aggInputIsFloat(rows, agg))
+                    foldKernelExtremeFloat(false, states, gids, rows, agg)
+                else
+                    foldKernelExtremeInt(false, states, gids, rows, agg),
+                .count_distinct => unreachable,
+            }
+        }
+    }
+
+    if (has_distinct) {
+        if (mark_new) for (gids) |*g| {
+            g.* &= ~NEW_GID_BIT;
+        };
+        try foldGroupDistinctChunk(distinct_sets, allocator, states, gids, aggregates, rows);
+    }
+}
+
+// The original per-row program loop, kept for aggregate shapes the kernel
+// pass can't express.
+fn groupChunkRowsDirectKeysProgram(
+    comptime key_width: GroupKeyWidth,
+    table: *GroupTable,
+    states: *StateSlab,
+    str_states: *std.ArrayListUnmanaged(StrAccRow),
+    str_arena: Allocator,
+    distinct_sets: []DistinctSet,
+    gids_buf: *std.ArrayListUnmanaged(u32),
+    allocator: Allocator,
+    keys: anytype,
+    key_hi: []const u32,
+    row_count: usize,
+    aggregates: []const GroupAggregateSpec,
+    rows: GroupRows,
+    rowrefs: []const i64,
+) !void {
+    const has_str = rows.layout.has_str_payload;
+    const has_distinct = rows.layout.distinct_slot_count > 0;
+    const n = row_count;
     if (has_distinct) try gids_buf.resize(allocator, n);
     const gids: []u32 = if (has_distinct) gids_buf.items[0..n] else &.{};
 
@@ -3166,6 +3385,120 @@ fn groupChunkRowsDirectKeys(
     }
 
     if (has_distinct) try foldGroupDistinctChunk(distinct_sets, allocator, states, gids, aggregates, rows);
+}
+
+// Tags the gid of the row that CREATED its group, so the MIN/MAX kernels know
+// "set unconditionally" vs "compare" without re-deriving first-touch. Group
+// counts are dense u32 indexes far below 2^31, so the bit is free.
+const NEW_GID_BIT: u32 = 1 << 31;
+const PREFETCH_DIST_STATES: usize = 24;
+
+inline fn prefetchStateSlots(states: *const StateSlab, gid: u32) void {
+    @prefetch(states.bytes.ptr + @as(usize, gid) * states.stride + STATE_HEAD_BYTES, .{ .rw = .write, .locality = 1 });
+}
+
+// COUNT aggregates aimed at a numeric slot (state_index != 0) mirror the
+// group's running count there; rare, so the probe pass calls this only when
+// the program has one.
+inline fn mirrorCountSlots(states: *StateSlab, gid: u32, aggregates: []const GroupAggregateSpec) void {
+    const count = states.head(gid).count;
+    const slots = states.slotsOf(gid);
+    for (aggregates) |agg| {
+        if (agg.is_string or agg.is_distinct) continue;
+        if ((agg.op == .count_star or agg.op == .count_col) and agg.state_index != 0) {
+            slots[agg.state_index - 1] = @intCast(count);
+        }
+    }
+}
+
+// Per-aggregate fold kernels (pass 2 of the kernelized program): one
+// monomorphic row loop per aggregate over the recorded gid array, the staged
+// column read through its typed slice and the per-group state record
+// prefetched ahead — group records are DRAM-resident at silo cardinalities,
+// and the look-ahead overlaps those independent misses (the per-row program
+// chained them).
+fn foldKernelSumInt(states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
+    const si: usize = agg.state_index;
+    switch (rows.layout.columns[agg.input_column_index.?].physical_type) {
+        inline .i8, .i16, .i32, .i64 => |pt| {
+            const T = groupPhysicalT(pt);
+            const vals = rows.columnTypedAll(T, agg.input_column_index.?);
+            for (gids, 0..) |g, r| {
+                const pf = r + PREFETCH_DIST_STATES;
+                if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
+                states.slotsOf(g & ~NEW_GID_BIT)[si - 1] += vals[r];
+            }
+        },
+        .f32, .f64 => {},
+    }
+}
+
+fn foldKernelSumFloat(states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
+    const si: usize = agg.state_index;
+    switch (rows.layout.columns[agg.input_column_index.?].physical_type) {
+        inline .f32, .f64 => |pt| {
+            const T = groupPhysicalT(pt);
+            const vals = rows.columnTypedAll(T, agg.input_column_index.?);
+            for (gids, 0..) |g, r| {
+                const pf = r + PREFETCH_DIST_STATES;
+                if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
+                const slot = &states.slotsOf(g & ~NEW_GID_BIT)[si - 1];
+                const acc: f64 = @bitCast(slot.*);
+                slot.* = @bitCast(acc + @as(f64, @floatCast(vals[r])));
+            }
+        },
+        else => {},
+    }
+}
+
+fn foldKernelExtremeInt(comptime is_min: bool, states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
+    const si: usize = agg.state_index;
+    switch (rows.layout.columns[agg.input_column_index.?].physical_type) {
+        inline .i8, .i16, .i32, .i64 => |pt| {
+            const T = groupPhysicalT(pt);
+            const vals = rows.columnTypedAll(T, agg.input_column_index.?);
+            for (gids, 0..) |g, r| {
+                const pf = r + PREFETCH_DIST_STATES;
+                if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
+                const slot = &states.slotsOf(g & ~NEW_GID_BIT)[si - 1];
+                const v: i64 = vals[r];
+                const improves = if (is_min) v < slot.* else v > slot.*;
+                if (g & NEW_GID_BIT != 0 or improves) slot.* = v;
+            }
+        },
+        .f32, .f64 => {},
+    }
+}
+
+fn foldKernelExtremeFloat(comptime is_min: bool, states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
+    const si: usize = agg.state_index;
+    switch (rows.layout.columns[agg.input_column_index.?].physical_type) {
+        inline .f32, .f64 => |pt| {
+            const T = groupPhysicalT(pt);
+            const vals = rows.columnTypedAll(T, agg.input_column_index.?);
+            for (gids, 0..) |g, r| {
+                const pf = r + PREFETCH_DIST_STATES;
+                if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
+                const slot = &states.slotsOf(g & ~NEW_GID_BIT)[si - 1];
+                const v: f64 = @floatCast(vals[r]);
+                const cur: f64 = @bitCast(slot.*);
+                const improves = if (is_min) v < cur else v > cur;
+                if (g & NEW_GID_BIT != 0 or improves) slot.* = @bitCast(v);
+            }
+        },
+        else => {},
+    }
+}
+
+inline fn groupPhysicalT(comptime pt: GroupColumnType) type {
+    return switch (pt) {
+        .i8 => i8,
+        .i16 => i16,
+        .i32 => i32,
+        .i64 => i64,
+        .f32 => f32,
+        .f64 => f64,
+    };
 }
 
 // Pass 2 of the grouped COUNT(DISTINCT) fold: per distinct aggregate, scatter
@@ -3575,20 +3908,19 @@ fn drainRawDedicatedGroupLane(
 
 fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize, top_out: *TopSet, top_ticks: *i64, profile: bool) void {
     const top_t0 = if (profile) nowTicks() else 0;
-    var local_top: TopSet = .{};
+    if (top_out.items.len == 0) return;
     var b = worker_index;
     const has_str = shared.group_rows_layout.has_str_payload;
     while (b < shared.buckets.len) : (b += worker_count) {
         const bkt = &shared.buckets[b];
         if (has_str) {
             var gid: usize = 0;
-            while (gid < bkt.states.len) : (gid += 1) local_top.consider(topRowFromStateStr(bkt.states.ref(gid), bkt.str_states.items[gid]));
+            while (gid < bkt.states.len) : (gid += 1) top_out.consider(topRowFromStateStr(bkt.states.ref(gid), bkt.str_states.items[gid]));
         } else {
             var gid: usize = 0;
-            while (gid < bkt.states.len) : (gid += 1) local_top.consider(topRowFromState(bkt.states.ref(gid)));
+            while (gid < bkt.states.len) : (gid += 1) top_out.consider(topRowFromState(bkt.states.ref(gid)));
         }
     }
-    top_out.* = local_top;
     if (profile) top_ticks.* += nowTicks() - top_t0;
 }
 
@@ -3810,6 +4142,16 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
 pub const RunConfig = struct {
     dop: usize,
     bucket_count: usize,
+    // Free the staging-chunk pools (gigabytes of recycled RawRows slabs) on a
+    // detached thread after the result is built, instead of on the wire path.
+    // Requires `allocator` to be thread-safe and to outlive the query — the
+    // engine sets this only for the fresh-workspace path (never the arena).
+    defer_heavy_teardown: bool = false,
+    // String group-key columns the worker scans emit as key digests
+    // (`Batch.hashed`) instead of materialized strings — hashed-key shapes
+    // where the key bytes only return at emit via rowref late-mat. A scan
+    // decline (or a sidecar-less batch) falls back to digesting bytes.
+    hash_key_columns: []const []const u8 = &.{},
     stream: bool = false,
     pipe: bool = false,
     pipe_tail: bool = false,
@@ -3849,6 +4191,9 @@ pub const RunConfig = struct {
     no_profile: bool = false,
     quiet: bool = false,
     result_out: ?*std.ArrayListUnmanaged(TopRow) = null,
+    // Rows retained by the in-core count-desc top-N (the query's LIMIT+OFFSET).
+    // Ignored when `result_all_groups` is set.
+    top_k: usize = TOP_K,
     result_all_groups: bool = false,
     // Stop the all-groups emit after this many groups (an unordered `LIMIT N`
     // needs only any N+offset groups). 0 means emit every group.
@@ -3872,12 +4217,18 @@ fn localReservePerBucket(total_rows: u64, dop: usize, bucket_count: usize, chunk
     return @intCast(@min(chunk_u64, @max(@as(u64, 16), reserve)));
 }
 
-fn estimateGroupCountFromStats(stats: thindb.exec.PipelineStats, key_cols: usize) ?u64 {
-    if (key_cols == 0 or stats.column_stats.len < key_cols) return null;
+// Combined-key cardinality upper bound: saturating product of the KEY
+// columns' NDVs, resolved BY NAME against the stats scan's output schema —
+// the projection orders filter columns ahead of keys, so positional indexing
+// would read the wrong columns' NDVs. A derived key has no schema entry →
+// null (caller falls back to the conservative estimate).
+fn estimateGroupCountFromStats(stats: thindb.exec.PipelineStats, schema: []const thindb.types.Column, key_columns: []const GroupKeyColumnSpec) ?u64 {
+    if (key_columns.len == 0) return null;
     var est: u64 = 1;
-    var i: usize = 0;
-    while (i < key_cols) : (i += 1) {
-        switch (stats.column_stats[i].ndv) {
+    for (key_columns) |kc| {
+        const idx = thindb.types.findColumn(schema, kc.name) orelse return null;
+        if (idx >= stats.column_stats.len) return null;
+        switch (stats.column_stats[idx].ndv) {
             .exact => |ndv| est *|= @max(@as(u64, 1), ndv),
             .unknown => return null,
         }
@@ -3885,14 +4236,30 @@ fn estimateGroupCountFromStats(stats: thindb.exec.PipelineStats, key_cols: usize
     return @min(est, @max(stats.upper_rows, 1));
 }
 
-fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.exec.PipelineStats, generic_key_count: usize, generic_key_width: GroupKeyWidth, generic_has_filter: bool) usize {
+fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.exec.PipelineStats, schema: []const thindb.types.Column, key_columns: []const GroupKeyColumnSpec, generic_key_width: GroupKeyWidth, generic_has_filter: bool) usize {
     const conservative_total = @max(@as(u64, 16), total_rows / 4);
-    const key_count = generic_key_count;
-    const estimated_total = estimateGroupCountFromStats(stats, key_count) orelse conservative_total;
+    const generic_key_count = key_columns.len;
+    const estimated_total = estimateGroupCountFromStats(stats, schema, key_columns) orelse conservative_total;
     const has_filter = generic_has_filter;
     const generic_wide_no_filter = generic_key_count != 0 and !has_filter and (generic_key_width == .u96 or generic_key_width == .u128);
     const no_filter_near_unique = !has_filter and estimated_total * 4 >= total_rows * 3;
-    const total_groups = if (generic_wide_no_filter) total_rows else if (no_filter_near_unique) estimated_total else conservative_total;
+    // A filter can only REDUCE the distinct key combinations, so the no-filter
+    // NDV-product estimate stays a sound upper bound — but a correlated
+    // compound key defeats it (WindowClientWidth × Height ≈ 25M product for
+    // ~11K real combos), so under a filter the INITIAL presize is also capped
+    // outright: zeroing rows/4-group tables costs ~20ms of setup on a query
+    // whose whole runtime is ~40ms, while a rare filtered query that really
+    // produces millions of groups just grows (amortized ~2× insert cost on a
+    // query that runs seconds anyway). Sizing only — never correctness.
+    const filtered_init_cap: u64 = 2 * 1024 * 1024;
+    const total_groups = if (generic_wide_no_filter)
+        total_rows
+    else if (no_filter_near_unique)
+        estimated_total
+    else if (has_filter)
+        @min(@min(estimated_total, conservative_total), filtered_init_cap)
+    else
+        @min(estimated_total, conservative_total);
     const per_bucket = (total_groups + @as(u64, @intCast(bucket_count)) - 1) / @as(u64, @intCast(bucket_count));
     return @intCast(@max(@as(u64, 16), per_bucket));
 }
@@ -3924,8 +4291,6 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const total = totalRows(table);
     const dop = @max(@as(usize, 1), cfg.dop);
 
-    const bucket_count = cfg.bucket_count;
-    const n_workers = @max(@as(usize, 1), @min(dop, cpus.len));
     const chunk_rows = chooseGridChunkRows(cfg.chunk_rows, cfg.chunk_rows_set);
     const raw_chunk_rows = @max(@as(usize, 1), cfg.raw_chunk_rows);
     const raw_group_chunk_rows = if (cfg.raw_group_chunk_rows == 0) raw_chunk_rows else @max(@as(usize, 1), cfg.raw_group_chunk_rows);
@@ -3934,24 +4299,6 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const use_raw_group = cfg.raw_group_mode != .off;
     const scan_tile_rgs = chooseGridScanTileRgs(cfg.scan_tile_rgs, cfg.scan_tile_rgs_set);
     const scan_coalesce_tiles = cfg.scan_coalesce_tiles;
-    const route_block_rows = chooseRouteBlockRows(bucket_count, cfg.route_block_rows, cfg.route_block_rows_set);
-    const direct_final_local = !use_raw_group and !cfg.force_queue_publish and bucket_count >= n_workers * 8;
-    const local_reserve_per_bucket = localReservePerBucket(total, n_workers, bucket_count, chunk_rows, route_block_rows);
-    const use_flat_scan_partitions = cfg.flat_scan_partitions and direct_final_local;
-    const use_shared_scan_buffers = cfg.shared_scan_buffers and direct_final_local and !use_flat_scan_partitions;
-    const shared_scan_bank_count = if (use_shared_scan_buffers)
-        @max(@as(usize, 1), @min(cfg.shared_scan_banks, n_workers))
-    else
-        @as(usize, 0);
-    const worker_local_reserve_per_bucket: usize = if (use_shared_scan_buffers or use_flat_scan_partitions or use_raw_group) 0 else local_reserve_per_bucket;
-    const shared_scan_reserve_per_bucket: usize = if (use_shared_scan_buffers)
-        @max(@as(usize, 16), chunk_rows / shared_scan_bank_count)
-    else
-        0;
-    const flat_reserve_per_worker: usize = if (use_flat_scan_partitions)
-        @intCast(@min((total + @as(u64, @intCast(n_workers)) - 1) / @as(u64, @intCast(n_workers)), @as(u64, @intCast(chunk_rows * 16))))
-    else
-        0;
 
     const snapshot_setup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
     table.ddl_lock.lockSharedUncancelable(table.io);
@@ -3980,11 +4327,55 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             ticksToMs(nowTicks() - cleanup_t0, freq),
         });
     }
-    const expected_groups_per_bucket = expectedGroupsPerBucket(total, bucket_count, stats_scan.stats(), group_rows_layout.key_columns.len, group_rows_layout.key_width, cfg.filter_expr != null);
+    // Right-size the worker fleet to the work that survives zone-map pruning:
+    // fuse the filter into the stats scan (the same hint set every worker scan
+    // gets) and count via the shared `Scan.survivingWorkUnits`. A selective
+    // filter then spins ceil(surviving/RGS_PER_GRID_WORKER) workers instead of
+    // the full DOP; an unfusable or absent filter keeps full DOP.
+    var work_rgs: usize = total_rgs + (@as(usize, @intCast(snap.memtable_snap.row_count)) + 65535) / 65536;
+    if (cfg.filter_expr) |expr| {
+        if (applyScanFilterExpr(stats_scan, expr) catch false) {
+            if (stats_scan.survivingWorkUnits()) |surviving| work_rgs = surviving;
+        }
+    }
+    const sized_workers = (work_rgs + RGS_PER_GRID_WORKER - 1) / RGS_PER_GRID_WORKER;
+    const n_workers = @max(@as(usize, 1), @min(dop, @min(cpus.len, @max(sized_workers, 1))));
+
+    // Narrow the scatter for small filtered inputs. Route blocks hold
+    // `route_block_rows` rows PER BUCKET, so at the default 256 buckets a
+    // selective query's chunks scatter a few dozen rows into each block and
+    // the flush machinery costs more than the aggregation it feeds (Q37:
+    // 13ms routing for 5.4ms of aggregate work). A handful of buckets keeps
+    // the blocks dense while the group stage stays n_workers-parallel.
+    // Measured on the 660K-row Title GROUP BY: 256 buckets ≈ 28-32ms,
+    // 4-64 ≈ 22ms, 1 ≈ 29ms (serial group lane overshoots).
+    const small_input = work_rgs <= 64;
+    const bucket_count = if (small_input) @min(cfg.bucket_count, @max(@as(usize, 4), n_workers)) else cfg.bucket_count;
+    const route_block_rows = chooseRouteBlockRows(bucket_count, cfg.route_block_rows, cfg.route_block_rows_set);
+
+    const expected_groups_per_bucket = expectedGroupsPerBucket(total, bucket_count, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null);
     const init_groups_per_bucket = if (cfg.group_init_cap > 0)
         @max(@as(usize, 16), @min(expected_groups_per_bucket, cfg.group_init_cap))
     else
         expected_groups_per_bucket;
+
+    const direct_final_local = !use_raw_group and !cfg.force_queue_publish and bucket_count >= n_workers * 8;
+    const local_reserve_per_bucket = localReservePerBucket(total, n_workers, bucket_count, chunk_rows, route_block_rows);
+    const use_flat_scan_partitions = cfg.flat_scan_partitions and direct_final_local;
+    const use_shared_scan_buffers = cfg.shared_scan_buffers and direct_final_local and !use_flat_scan_partitions;
+    const shared_scan_bank_count = if (use_shared_scan_buffers)
+        @max(@as(usize, 1), @min(cfg.shared_scan_banks, n_workers))
+    else
+        @as(usize, 0);
+    const worker_local_reserve_per_bucket: usize = if (use_shared_scan_buffers or use_flat_scan_partitions or use_raw_group) 0 else local_reserve_per_bucket;
+    const shared_scan_reserve_per_bucket: usize = if (use_shared_scan_buffers)
+        @max(@as(usize, 16), chunk_rows / shared_scan_bank_count)
+    else
+        0;
+    const flat_reserve_per_worker: usize = if (use_flat_scan_partitions)
+        @intCast(@min((total + @as(u64, @intCast(n_workers)) - 1) / @as(u64, @intCast(n_workers)), @as(u64, @intCast(chunk_rows * 16))))
+    else
+        0;
     const snapshot_setup_ticks = if ((PROFILING and cfg.trace_timing)) nowTicks() - snapshot_setup_t0 else 0;
 
     if (PROFILING and !cfg.quiet) {
@@ -4119,7 +4510,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .shared_scan_buffers = shared_scan_buffers_ptr,
     };
     raw_queues_moved_to_shared = true;
-    defer deinitRawQueues(&shared);
+    var heavy_teardown_scheduled = false;
+    defer if (!heavy_teardown_scheduled) deinitRawQueues(&shared);
     if (use_dedicated_raw_stage) {
         for (shared.raw_scan_queues) |*queue| try queue.chunks.ensureTotalCapacity(allocator, 8);
         for (shared.raw_group_queues) |*queue| try queue.chunks.ensureTotalCapacity(allocator, 8);
@@ -4157,6 +4549,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 _ = try applyScanFilterExpr(scans[i], expr);
             }
         }
+        for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
         scans[i].setRange(0, 0, 0, 0, false);
     }
     const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) nowTicks() - worker_setup_t0 else 0;
@@ -4178,6 +4571,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     var worker_tops = try allocator.alloc(TopSet, n_workers);
     defer allocator.free(worker_tops);
     for (worker_tops) |*t| t.* = .{};
+    defer for (worker_tops) |*t| t.deinit(allocator);
+    // The all-groups emit never reads the top sets; size them to zero so
+    // collectOwnedTop degenerates to a no-op walk.
+    const top_k_eff: usize = if (cfg.result_all_groups) 0 else cfg.top_k;
+    for (worker_tops) |*t| t.* = try TopSet.init(allocator, top_k_eff);
 
     const setup_ticks = nowTicks() - function_t0;
     if ((PROFILING and cfg.trace_timing)) {
@@ -4313,7 +4711,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     for (chunks) |chunk_count| total_chunks += chunk_count;
 
     const final_t0 = nowTicks();
-    var top: TopSet = .{};
+    var top = try TopSet.init(allocator, top_k_eff);
+    defer top.deinit(allocator);
     var group_count: u64 = 0;
     var grouped_rows: u64 = 0;
     for (buckets) |*bucket| {
@@ -4377,6 +4776,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         );
     }
     pre_return_ticks = nowTicks();
+    if (cfg.defer_heavy_teardown) heavy_teardown_scheduled = scheduleHeavyTeardown(&shared);
 
     if (PROFILING and !cfg.quiet and cfg.no_profile) {
         std.debug.print(

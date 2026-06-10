@@ -504,7 +504,11 @@ fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
     if (ctx.request.order_specs.len != 1) return false;
     if (!ctx.request.order_specs[0].desc) return false;
     if (ctx.request.limit == 0) return false;
-    if (ctx.request.limit + ctx.request.offset > 10) return false;
+    // Per-worker top-set memory is keep × @sizeOf(TopRow) (~200B), so 65536
+    // bounds the transient at ~12 MiB per worker while covering any realistic
+    // LIMIT+OFFSET. Past it, the all-groups emit + final selection wins anyway:
+    // keep approaches the group count and the top-set degenerates to a sort.
+    if (ctx.request.limit + ctx.request.offset > 65536) return false;
     for (ctx.plan.aggregates[0..ctx.plan.aggregate_count]) |agg| {
         if (agg.func == .count and types.columnNameEql(agg.name, ctx.request.order_specs[0].col)) return true;
     }
@@ -538,6 +542,17 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []HarnessCore.TopRow) !FinalRo
 
     const keep = @min(rows.len, op.request.limit + op.request.offset);
     if (keep == 0) return .{ .allocator = op.allocator };
+    // The selection loop below rescans all `keep` candidates on every
+    // replacement — O(replacements × keep), which degenerates exactly when
+    // keep approaches rows.len (a large OFFSET): nearly every row replaces,
+    // and each replacement walks ~keep entries. Sorting everything is
+    // O(n log n) and strictly cheaper there.
+    if (keep * 2 >= rows.len) {
+        std.mem.sort(HarnessCore.TopRow, rows, op, finalRowLess);
+        const start = @min(op.request.offset, rows.len);
+        const end = limitEnd(start, rows.len, op.request.limit);
+        return .{ .allocator = op.allocator, .items = rows[start..end] };
+    }
     var candidates = try op.allocator.alloc(HarnessCore.TopRow, keep);
     errdefer op.allocator.free(candidates);
     var len: usize = 0;

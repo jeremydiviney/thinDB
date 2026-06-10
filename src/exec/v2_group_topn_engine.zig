@@ -696,6 +696,33 @@ fn runHarness(
         .has_rowref = force_hash,
     };
 
+    // Scan-side key digests: a string group key consumed only as hashed
+    // identity (its bytes come back via rowref late-mat) never materializes —
+    // the scan emits per-row `stringKeyDigest` values straight off the cached
+    // block. Excluded when the column is also an aggregate input or read by a
+    // derived expression (those need real bytes in the batch).
+    var hash_key_cols_buf: [8][]const u8 = undefined;
+    var n_hash_keys: usize = 0;
+    if (force_hash) {
+        outer: for (shape.group_key_inputs) |input| {
+            switch (input.source_type) {
+                .varchar, .string, .char => {},
+                else => continue,
+            }
+            for (shape.aggregate_inputs) |ai| {
+                if (types.columnNameEql(ai.source_name, input.name)) continue :outer;
+            }
+            for (shape.string_aggregate_inputs) |si| {
+                if (types.columnNameEql(si.source_name, input.name)) continue :outer;
+            }
+            for (derived) |d| {
+                if (derivedReadsColumn(allocator, d, input.name) catch true) continue :outer;
+            }
+            hash_key_cols_buf[n_hash_keys] = input.name;
+            n_hash_keys += 1;
+        }
+    }
+
     try HarnessCore.runSiloGrid(allocator, table, cpus, .{
         .dop = params.dop,
         .bucket_count = params.bucket_count,
@@ -722,12 +749,27 @@ fn runHarness(
         .no_profile = !params.worker_profile,
         .quiet = !params.worker_profile,
         .result_out = rows,
+        .top_k = shape.limit + shape.offset,
         .result_all_groups = shape.emit_all_groups,
         .result_all_groups_cap = shape.emit_all_groups_cap,
         .result_emit_filter = shape.emit_filter,
         .trace_timing = params.trace_timing,
         .workspace = workspace,
+        // The arena path frees the whole arena synchronously right after the
+        // run — a detached free racing it would be use-after-free.
+        .defer_heavy_teardown = !params.arena_workspace and !params.sync_teardown,
+        .hash_key_columns = hash_key_cols_buf[0..n_hash_keys],
     });
+}
+
+fn derivedReadsColumn(allocator: Allocator, d: exec.Derived, name: []const u8) !bool {
+    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer refs.deinit(allocator);
+    try exec.compute_op.collectColumnRefs(allocator, &refs, d.expr);
+    for (refs.items) |r| {
+        if (types.columnNameEql(r, name)) return true;
+    }
+    return false;
 }
 
 fn harnessColumnSource(name: []const u8) !HarnessCore.GroupColumnSource {

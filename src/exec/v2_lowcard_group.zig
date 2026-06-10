@@ -27,6 +27,17 @@
 //! directly known. Unknown NDV on any key column declines (the silo handles
 //! it). The estimate only sizes tables — they grow dynamically, so an HLL
 //! under-estimate degrades performance, never correctness.
+//!
+//! String group keys ride the dict-code machinery: a provably low-card,
+//! non-nullable string column packs its 32-bit GLOBAL dict code into the key
+//! (the scan emits codes via the `Batch.coded` sidecar, skipping the
+//! dict→string expansion entirely), decoded back to bytes only at emit. All
+//! workers intern into ONE shared `GlobalDict` per coded column — its mutex
+//! makes that safe, and it keeps codes comparable across workers, which the
+//! scalar merge (packed-key equality) and the distinct partitioning (same
+//! composite → same partition in every worker) both rely on. A batch without
+//! the sidecar (tombstoned row group, memtable rows, a scan that declined
+//! coding) falls back to interning each row's bytes into the same dict.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -74,11 +85,15 @@ const GATE_STATE_BYTES: u64 = 4 << 20;
 
 const AggOp = enum { count_star, count_col, sum, avg, min, max, count_distinct };
 
+const GlobalDict = exec.GlobalDict;
+
 const KeyPart = struct {
     name: []const u8,
     typ: Type,
     offset: u8,
     width: u8,
+    // String key packed as its 32-bit global dict code (decoded at emit).
+    coded: bool = false,
 };
 
 const AggPlan = struct {
@@ -116,20 +131,16 @@ fn isFloatType(t: Type) bool {
     return t == .float or t == .double;
 }
 
+fn isStringType(t: Type) bool {
+    return switch (t) {
+        .varchar, .string, .char => true,
+        else => false,
+    };
+}
+
 fn columnType(table: *api.Table, name: []const u8) ?Type {
     const idx = types.findColumn(table.schema.columns, name) orelse return null;
     return table.schema.columns[idx].type;
-}
-
-inline fn readIntView(v: ValueView, row: usize) i64 {
-    return switch (v) {
-        .boolean => |s| @intCast(s[row]),
-        .tinyint => |s| @intCast(s[row]),
-        .smallint => |s| @intCast(s[row]),
-        .int, .date => |s| @intCast(s[row]),
-        .bigint, .datetime, .decimal64 => |s| s[row],
-        else => 0,
-    };
 }
 
 inline fn truncBits(x: u64, bits: u8) u64 {
@@ -158,14 +169,23 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     if (request.having_filter != null) return null;
     if (request.derived.len != 0) return null;
 
-    // Group keys: real integer-family table columns packing into ≤64 bits.
+    // Group keys: real integer-family table columns, plus low-card string
+    // columns as 32-bit dict codes (codeability proven on the probe below),
+    // packing into ≤64 bits.
     var parts: [MAX_KEYS]KeyPart = undefined;
     var key_bits: u16 = 0;
+    var n_coded: usize = 0;
     for (request.group_cols, 0..) |name, i| {
         const typ = columnType(table, name) orelse return null;
-        const width = keyTypeBits(typ) orelse return null;
-        parts[i] = .{ .name = name, .typ = typ, .offset = @intCast(key_bits), .width = width };
-        key_bits += width;
+        if (isStringType(typ)) {
+            parts[i] = .{ .name = name, .typ = typ, .offset = @intCast(key_bits), .width = 32, .coded = true };
+            key_bits += 32;
+            n_coded += 1;
+        } else {
+            const width = keyTypeBits(typ) orelse return null;
+            parts[i] = .{ .name = name, .typ = typ, .offset = @intCast(key_bits), .width = width };
+            key_bits += width;
+        }
     }
     if (key_bits > 64) return null;
 
@@ -220,6 +240,17 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         }
     }
 
+    // A coded key column's batch value is an empty-string placeholder — no
+    // aggregate may read it as input.
+    if (n_coded > 0) {
+        for (aggs) |a| {
+            const nm = a.input_name orelse continue;
+            for (parts[0..request.group_cols.len]) |p| {
+                if (p.coded and types.columnNameEql(p.name, nm)) return declineFree(allocator, aggs);
+            }
+        }
+    }
+
     // ORDER BY must reference an emitted column (group key or aggregate alias).
     for (request.order_specs) |spec| {
         var found = false;
@@ -258,6 +289,14 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                 return declineFree(allocator, aggs);
             }
         }
+        // String keys must be codeable (non-nullable, flushed, exact NDV under
+        // the dict-code cap) — otherwise the silo's hash path handles them.
+        for (parts[0..request.group_cols.len]) |p| {
+            if (p.coded and !probe.canCodeColumn(p.name)) {
+                needed.deinit(allocator);
+                return declineFree(allocator, aggs);
+            }
+        }
         const st = probe.stats();
         const schema = probe.outputSchema();
         var product: u64 = 1;
@@ -286,11 +325,27 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         return declineFree(allocator, aggs);
     }
 
+    // One shared dict per coded key column, owned by the operator: every
+    // worker interns into it, so codes are comparable across workers.
+    const dicts = try allocator.alloc(?*GlobalDict, request.group_cols.len);
+    errdefer allocator.free(dicts);
+    @memset(dicts, null);
+    errdefer for (dicts) |md| if (md) |d| {
+        d.deinit(allocator);
+        allocator.destroy(d);
+    };
+    for (parts[0..request.group_cols.len], 0..) |p, i| {
+        if (!p.coded) continue;
+        const d = try allocator.create(GlobalDict);
+        d.* = .{};
+        dicts[i] = d;
+    }
+
     const needed_owned = try needed.toOwnedSlice(allocator);
     errdefer allocator.free(needed_owned);
     const op = try allocator.create(LowCardGroup);
     errdefer allocator.destroy(op);
-    op.* = try LowCardGroup.init(allocator, table, request, parts, aggs, n_distinct, @intCast(key_bits), est_groups, needed_owned);
+    op.* = try LowCardGroup.init(allocator, table, request, parts, aggs, n_distinct, @intCast(key_bits), est_groups, needed_owned, dicts);
     return exec.makeQuery(allocator, op);
 }
 
@@ -330,12 +385,19 @@ fn openScanSource(
     needed: []const []const u8,
     where_filter: ?PredicateExpr,
     snap: ?Scan.Snapshot,
+    parts: []const KeyPart,
+    dicts: []const ?*GlobalDict,
 ) !ScanSource {
     const scan = try Scan.allocWithProjectionLoc(allocator, table, null, needed, false, snap);
     errdefer scan.deinit();
     if (where_filter) |w| {
         // tryBuild proved fusibility on the probe scan; never run unfiltered.
         if (!try scan.tryFuseFilter(w)) return error.UnsupportedQueryShape;
+    }
+    // A decline (e.g. the execute-time snapshot has memtable rows the probe
+    // didn't) is fine: the fold's per-row intern fallback covers plain batches.
+    for (parts, 0..) |p, i| {
+        if (p.coded) _ = scan.setDictCodeColumn(p.name, dicts[i].?);
     }
     return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan) };
 }
@@ -386,6 +448,7 @@ const Worker = struct {
     source: ScanSource,
     state: WState,
     parts: []const KeyPart,
+    dicts: []const ?*GlobalDict,
     aggs: []const AggPlan,
     key_bits: u8,
     dop_parts: usize,
@@ -449,20 +512,52 @@ fn driveTile(w: *Worker, have_resolved: *bool) !void {
     }
 }
 
-inline fn packKey(w: *const Worker, batch: Batch, row: usize) u64 {
-    var key: u64 = 0;
-    for (w.parts, 0..) |p, i| {
-        const raw: u64 = @bitCast(readIntView(batch.values[w.resolved_keys[i]].data, row));
-        key |= truncBits(raw, p.width) << @intCast(p.offset);
+// OR one key part into every row's packed key, column-wise so each inner loop
+// is monomorphic. A coded part normally reads the scan's code sidecar; a batch
+// without one (tombstoned row group, memtable rows, a scan that declined
+// coding) interns each row's bytes into the same shared dict instead — slower
+// but identical codes, so any mix of batch kinds groups consistently.
+fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
+    const p = w.parts[part_i];
+    const ci = w.resolved_keys[part_i];
+    const shift: u6 = @intCast(p.offset);
+    if (p.coded) {
+        const sidecar: ?exec.CodedColumn = if (batch.coded) |sc| sc[ci] else null;
+        if (sidecar) |cc| {
+            for (keys, cc.codes[0..keys.len]) |*k, code| {
+                k.* |= @as(u64, code) << shift;
+            }
+        } else {
+            const dict = w.dicts[part_i].?;
+            const sv = switch (batch.values[ci].data) {
+                .varchar, .string, .char => |s| s,
+                else => return error.UnsupportedQueryShape,
+            };
+            for (keys, 0..) |*k, r| {
+                const code = try dict.intern(w.allocator, sv.rowBytes(r));
+                k.* |= @as(u64, code) << shift;
+            }
+        }
+        return;
     }
-    return key;
+    switch (batch.values[ci].data) {
+        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
+            const width = p.width;
+            for (keys, s[0..keys.len]) |*k, v| {
+                const raw: u64 = @bitCast(@as(i64, v));
+                k.* |= truncBits(raw, width) << shift;
+            }
+        },
+        else => return error.UnsupportedQueryShape,
+    }
 }
 
 // The fold runs in passes so each inner loop is monomorphic: pass 0 packs
-// every row's key (pure compute), pass 1 probes the group table with a
-// look-ahead prefetch over the packed keys, then each aggregate runs ONE
-// specialized kernel over the dense gid array — the op dispatch and the
-// ValueView tag switch both hoisted out of the row loops.
+// every row's key column-wise (pure compute, one monomorphic loop per key
+// part), pass 1 probes the group table with a look-ahead prefetch over the
+// packed keys, then each aggregate runs ONE specialized kernel over the dense
+// gid array — the op dispatch and the ValueView tag switch both hoisted out
+// of the row loops.
 fn foldBatch(w: *Worker, batch: Batch) !void {
     const n = batch.row_count;
     if (n == 0) return;
@@ -479,7 +574,8 @@ fn foldBatch(w: *Worker, batch: Batch) !void {
     const keys = st.keys_scratch.items[0..n];
     const gids = st.gids_scratch.items[0..n];
 
-    for (keys, 0..) |*k, r| k.* = packKey(w, batch, r);
+    @memset(keys, 0);
+    for (0..w.parts.len) |pi| try packKeysForPart(w, batch, pi, keys);
 
     var r: usize = 0;
     while (r < n) : (r += 1) {
@@ -759,6 +855,8 @@ const LowCardGroup = struct {
     parts: [MAX_KEYS]KeyPart,
     part_count: usize,
     key_bits: u8,
+    // Per-key-part shared global dict (null for non-coded parts). Owned.
+    dicts: []?*GlobalDict,
     aggs: []AggPlan,
     n_distinct: u16,
     where_filter: ?PredicateExpr,
@@ -785,6 +883,7 @@ const LowCardGroup = struct {
         key_bits: u8,
         est_groups: u64,
         needed: []const []const u8,
+        dicts: []?*GlobalDict,
     ) !LowCardGroup {
         const n_out = request.group_cols.len + aggs.len;
         const output_schema = try allocator.alloc(Column, n_out);
@@ -812,6 +911,7 @@ const LowCardGroup = struct {
             .parts = parts,
             .part_count = request.group_cols.len,
             .key_bits = key_bits,
+            .dicts = dicts,
             .aggs = aggs,
             .n_distinct = n_distinct,
             .where_filter = request.where_filter,
@@ -828,6 +928,11 @@ const LowCardGroup = struct {
     }
 
     pub fn deinit(self: *LowCardGroup) void {
+        for (self.dicts) |md| if (md) |d| {
+            d.deinit(self.allocator);
+            self.allocator.destroy(d);
+        };
+        self.allocator.free(self.dicts);
         for (self.output_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_cols);
         self.allocator.free(self.views);
@@ -899,6 +1004,21 @@ const LowCardGroup = struct {
         var n_workers = @max(@as(usize, 1), @min(self.dop, cpu_count));
         if (total_rgs > 0) n_workers = @min(n_workers, total_rgs);
 
+        // Right-size to the work that survives zone-map pruning, mirroring the
+        // silo grid and ParallelScan: fuse the filter into a throwaway probe
+        // scan (installing the same prune hints the worker scans get) and
+        // count via the shared `Scan.survivingWorkUnits` — one worker per two
+        // surviving row groups. Over-spawning costs more here than in the
+        // grid: every worker pre-zeroes its own est_groups-slot direct table
+        // plus its slice of distinct-set partitions.
+        if (self.where_filter) |w| sized: {
+            const probe = Scan.allocWithProjectionLoc(allocator, table, null, self.needed, false, snap) catch break :sized;
+            defer probe.deinit();
+            if (!(probe.tryFuseFilter(w) catch break :sized)) break :sized;
+            const surviving = probe.survivingWorkUnits() orelse break :sized;
+            n_workers = @max(@as(usize, 1), @min(n_workers, @max((surviving + 1) / 2, 1)));
+        }
+
         const workers = try allocator.alloc(Worker, n_workers);
         defer allocator.free(workers);
         var built: usize = 0;
@@ -909,7 +1029,7 @@ const LowCardGroup = struct {
 
         var next_rg = std.atomic.Value(usize).init(0);
         for (workers, 0..) |*w, i| {
-            var source = try openScanSource(allocator, table, self.needed, self.where_filter, snap);
+            var source = try openScanSource(allocator, table, self.needed, self.where_filter, snap, self.parts[0..self.part_count], self.dicts);
             errdefer source.deinit();
             w.* = .{
                 .index = i,
@@ -917,6 +1037,7 @@ const LowCardGroup = struct {
                 .source = source,
                 .state = try WState.init(allocator, @intCast(self.est_groups), self.aggs, self.n_distinct, n_workers),
                 .parts = self.parts[0..self.part_count],
+                .dicts = self.dicts,
                 .aggs = self.aggs,
                 .key_bits = self.key_bits,
                 .dop_parts = n_workers,
@@ -1108,7 +1229,12 @@ const LowCardGroup = struct {
         const n_aggs = self.aggs.len;
         const key = keyOfGid(merged, gid);
         for (self.parts[0..self.part_count], 0..) |p, i| {
-            try appendInt(a, &self.output_cols[i], p.typ, unpackKeyPart(key, p));
+            if (p.coded) {
+                const code: u32 = @intCast(truncBits(key >> @intCast(p.offset), 32));
+                try appendString(a, &self.output_cols[i], self.dicts[i].?.decode(code));
+            } else {
+                try appendInt(a, &self.output_cols[i], p.typ, unpackKeyPart(key, p));
+            }
         }
         for (self.aggs, 0..) |agg, i| {
             const col = &self.output_cols[self.part_count + i];
@@ -1173,8 +1299,14 @@ const SortCtx = struct {
 fn compareBySpec(ctx: SortCtx, spec: SortSpec, a_gid: u32, b_gid: u32) std.math.Order {
     const op = ctx.op;
     const merged = ctx.merged;
-    for (op.parts[0..op.part_count]) |p| {
+    for (op.parts[0..op.part_count], 0..) |p, pi| {
         if (types.columnNameEql(p.name, spec.col)) {
+            if (p.coded) {
+                const dict = op.dicts[pi].?;
+                const ac: u32 = @intCast(truncBits(keyOfGid(merged, a_gid) >> @intCast(p.offset), 32));
+                const bc: u32 = @intCast(truncBits(keyOfGid(merged, b_gid) >> @intCast(p.offset), 32));
+                return std.mem.order(u8, dict.decode(ac), dict.decode(bc));
+            }
             const av = unpackKeyPart(keyOfGid(merged, a_gid), p);
             const bv = unpackKeyPart(keyOfGid(merged, b_gid), p);
             return std.math.order(av, bv);
@@ -1230,6 +1362,13 @@ fn appendInt(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i12
         .decimal64 => try col.data.decimal64.append(allocator, @intCast(value)),
         .largeint => try col.data.largeint.append(allocator, value),
         .double => try col.data.double.append(allocator, @floatFromInt(value)),
+        else => return error.TypeMismatch,
+    }
+}
+
+fn appendString(allocator: Allocator, col: *ColumnStore, s: []const u8) !void {
+    switch (col.data) {
+        .varchar, .string, .char => |*ss| try ss.appendValue(allocator, s),
         else => return error.TypeMismatch,
     }
 }
