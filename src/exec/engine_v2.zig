@@ -574,6 +574,18 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
+    // Metadata-only lane: a bare global aggregate (no WHERE/HAVING/derived)
+    // mixing COUNT(*) / COUNT(col) / MIN(col) / MAX(col) is answerable from
+    // the manifest — segment row counts (− tombstones + memtable) for the
+    // counts, per-segment column stats for the extremes. MetaAggStats.create
+    // owns the data-side preconditions (exact-stats types, non-nullable
+    // COUNT(col), and for MIN/MAX an empty memtable and zero tombstones — a
+    // deleted row may have been the extreme) and returns null to fall through
+    // to the scan pipeline whenever any fails.
+    if (plan.where_filter == null and plan.having_filter == null and plan.derived.len == 0) {
+        if (try tryMetaAggStats(input.allocator, table, plan.group_by.aggs)) |q| return q;
+    }
+
     // Algebraic reduction: collapse SUM/MIN/MAX(affine(col)) onto a shared base
     // set computed once, then derive every original output. Q29's 90
     // SUM(ResolutionWidth+k) become SUM+COUNT + a post-agg Compute. Only when
@@ -597,6 +609,35 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .derived = plan.derived,
         .dop = input.db.config.max_dop,
     });
+}
+
+// Shape-side gate for the metadata-only lane: every aggregate must be
+// COUNT(*), COUNT(col), MIN(col), or MAX(col) — COUNT(DISTINCT) is a separate
+// AggFunc and never matches. Data-side preconditions live in
+// MetaAggStats.create.
+fn tryMetaAggStats(allocator: std.mem.Allocator, table: *api.Table, aggs: []const exec.AggSpec) !?exec.Query {
+    if (aggs.len == 0) return null;
+    const specs = try allocator.alloc(exec.MetaAggSpec, aggs.len);
+    defer allocator.free(specs);
+    for (aggs, specs) |a, *sp| {
+        switch (a.func) {
+            .count => {
+                const col_name = a.col orelse {
+                    sp.* = .{ .kind = .count_star, .out_name = a.as };
+                    continue;
+                };
+                const idx = types.findColumn(table.schema.columns, col_name) orelse return null;
+                sp.* = .{ .kind = .count_col, .col_idx = idx, .out_name = a.as };
+            },
+            .min, .max => {
+                const col_name = a.col orelse return null;
+                const idx = types.findColumn(table.schema.columns, col_name) orelse return null;
+                sp.* = .{ .kind = if (a.func == .min) .min else .max, .col_idx = idx, .out_name = a.as };
+            },
+            else => return null,
+        }
+    }
+    return exec.metaAggStats(allocator, table, specs);
 }
 
 // Build the global aggregate over the reduced base set, then layer the late

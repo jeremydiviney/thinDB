@@ -142,6 +142,15 @@ pub const Batch = struct {
     /// narrow codes instead of hashing the strings. Same per-`next()` lifetime
     /// as `values`. Null (the default) means no column is coded.
     coded: ?[]const ?CodedColumn = null,
+    /// Optional per-column key-digest sidecar. When `hashed[j]` is set, column
+    /// `j` (a non-nullable string group key consumed only as hashed identity —
+    /// real bytes recovered later via rowref late-materialization) is available
+    /// as per-row `stringKeyDigest` values, computed by the scan directly off
+    /// the cached decompressed block — the dict→string expansion never runs.
+    /// `values[j]` holds a placeholder; a digest-aware consumer must use the
+    /// sidecar, and must fall back to `stringKeyDigest(bytes)` on batches
+    /// without one (memtable, tombstoned row group) so keys stay identical.
+    hashed: ?[]const ?[]const u128 = null,
 
     pub fn columnIndex(self: Batch, name: []const u8) ?usize {
         for (self.schema, 0..) |c, i| {
@@ -716,6 +725,17 @@ pub fn minMaxStats(allocator: Allocator, table: *Table, specs: []const MinMaxSta
     return @import("agg_stats.zig").MinMaxStats.create(allocator, table, specs);
 }
 
+pub const MetaAggSpec = @import("agg_stats.zig").MetaSpec;
+
+/// Metadata-only lane for a bare global aggregate: any mix of COUNT(*) /
+/// COUNT(non-nullable col) / MIN/MAX(exact-stats col). Counts work for any
+/// table state (tombstones subtract, memtable adds); MIN/MAX declines (null)
+/// on tombstones, unflushed rows, or inexact stats — the SHAPE gate (no
+/// WHERE/GROUP BY/HAVING/derived) is the caller's job. See `agg_stats.zig`.
+pub fn metaAggStats(allocator: Allocator, table: *Table, specs: []const MetaAggSpec) !?Query {
+    return @import("agg_stats.zig").MetaAggStats.create(allocator, table, specs);
+}
+
 /// Scan that uses a query-scoped accountant owned by the caller (the
 /// SQL compile path's `CompileCtx`). Pass `null` to fall back to the
 /// self-minting behaviour of `scan`.
@@ -886,6 +906,17 @@ pub const rowloc = @import("rowloc.zig");
 pub const global_dict = @import("global_dict.zig");
 pub const GlobalDict = global_dict.GlobalDict;
 pub const CodedColumn = global_dict.CodedColumn;
+
+/// Canonical 128-bit digest of one string group-key column's bytes — the unit
+/// every hashed-key path agrees on: the scan's `Batch.hashed` sidecar carries
+/// these, and consumers compute the identical digest from raw bytes for
+/// batches without a sidecar. The digest (not the raw bytes) is what feeds a
+/// composite key hash, so per-column digests compose across mixed sources.
+pub fn stringKeyDigest(bytes: []const u8) u128 {
+    const lo = std.hash.Wyhash.hash(0x9E3779B97F4A7C15, bytes);
+    const hi = std.hash.Wyhash.hash(0xD1B54A32D192ED03, bytes);
+    return (@as(u128, hi) << 64) | @as(u128, lo);
+}
 
 pub const sort_op = @import("sort.zig");
 pub const Sort = sort_op.Sort;
