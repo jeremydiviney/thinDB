@@ -426,6 +426,15 @@ pub const Scan = struct {
     hash_bufs: []std.ArrayListUnmanaged(u128) = &.{},
     hashed_slots: []?[]const u128 = &.{},
     filtered_hashed: ?[]const ?[]const u128 = null,
+    /// RLE run emit (`Batch.runs`): when requested, the unfiltered segment path
+    /// attaches each int-family column's run list (widened off the block's RLE
+    /// header) alongside the materialized values — a run-aware consumer skips
+    /// per-row key work entirely. Tombstoned row groups, the memtable, and the
+    /// filtered path emit no sidecar (compaction breaks run alignment).
+    emit_runs: bool = false,
+    runs_v_bufs: []std.ArrayListUnmanaged(i64) = &.{},
+    runs_l_bufs: []std.ArrayListUnmanaged(u32) = &.{},
+    runs_slots: []?exec.RunsColumn = &.{},
 
     const Phase = enum { segments, memtable, done };
 
@@ -794,6 +803,66 @@ pub const Scan = struct {
         return self.hashed_slots;
     }
 
+    /// Fill `runs_slots[j]` for every projected non-nullable int-family column
+    /// whose block in this row group is RLE: widen the run values to i64 and
+    /// copy the run lengths into reused scratch. Returns the slots when at
+    /// least one column produced runs, else null.
+    fn fillRunsSidecar(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32) !?[]const ?exec.RunsColumn {
+        const slots = try self.ensureRunsArrays();
+        var any = false;
+        for (self.out_phys, 0..) |phys, j| {
+            switch (self.table.schema.columns[phys].type) {
+                .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => {},
+                else => continue,
+            }
+            // A nullable column's run stream carries NULL placeholder values;
+            // skip rather than hand consumers placeholders as identity.
+            if (self.table.schema.columns[phys].nullable) continue;
+            const flags = storage.format.ColumnBlockFlags{ .has_nulls = false };
+            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+            defer block.release(self.allocator, &self.table.cache);
+            if (block.encoding != .rle) continue;
+            const rb = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags).block;
+            switch (rb.value_width) {
+                inline 1, 2, 4, 8 => |W| {
+                    const T = std.meta.Int(.signed, W * 8);
+                    try self.runs_v_bufs[j].resize(self.allocator, rb.n_runs);
+                    try self.runs_l_bufs[j].resize(self.allocator, rb.n_runs);
+                    const vs = self.runs_v_bufs[j].items;
+                    const ls = self.runs_l_bufs[j].items;
+                    for (0..rb.n_runs) |k| {
+                        vs[k] = std.mem.readInt(T, rb.values[k * W ..][0..W], .little);
+                        ls[k] = rb.runLength(k);
+                    }
+                    slots[j] = .{ .values_i64 = vs, .lengths = ls };
+                    any = true;
+                },
+                else => {},
+            }
+        }
+        return if (any) slots else null;
+    }
+
+    fn ensureRunsArrays(self: *Scan) ![]?exec.RunsColumn {
+        if (self.runs_v_bufs.len != self.out_phys.len) {
+            const vb = try self.allocator.alloc(std.ArrayListUnmanaged(i64), self.out_phys.len);
+            for (vb) |*b| b.* = .empty;
+            const lb = self.allocator.alloc(std.ArrayListUnmanaged(u32), self.out_phys.len) catch |e| {
+                self.allocator.free(vb);
+                return e;
+            };
+            for (lb) |*b| b.* = .empty;
+            self.runs_v_bufs = vb;
+            self.runs_l_bufs = lb;
+        }
+        if (self.runs_slots.len != self.out_phys.len) {
+            if (self.runs_slots.len > 0) self.allocator.free(self.runs_slots);
+            self.runs_slots = try self.allocator.alloc(?exec.RunsColumn, self.out_phys.len);
+        }
+        for (self.runs_slots) |*s| s.* = null;
+        return self.runs_slots;
+    }
+
     /// Lazily allocate the per-projected-column coded arrays (dict map + code
     /// buffers), sized to `out_phys.len`. Idempotent across repeated
     /// `setDictCodeColumn` calls (one per coded group column).
@@ -836,6 +905,11 @@ pub const Scan = struct {
         if (self.hash_bufs.len > 0) self.allocator.free(self.hash_bufs);
         if (self.hash_cols_by_j.len > 0) self.allocator.free(self.hash_cols_by_j);
         if (self.hashed_slots.len > 0) self.allocator.free(self.hashed_slots);
+        for (self.runs_v_bufs) |*b| b.deinit(self.allocator);
+        if (self.runs_v_bufs.len > 0) self.allocator.free(self.runs_v_bufs);
+        for (self.runs_l_bufs) |*b| b.deinit(self.allocator);
+        if (self.runs_l_bufs.len > 0) self.allocator.free(self.runs_l_bufs);
+        if (self.runs_slots.len > 0) self.allocator.free(self.runs_slots);
         self.prunes.deinit(self.allocator);
         for (self.in_prunes.items) |hint| self.allocator.free(hint.values);
         self.in_prunes.deinit(self.allocator);
@@ -1472,10 +1546,17 @@ pub const Scan = struct {
             // slices (plain projection only — not coded/hashed/late-mat, which
             // keep the full batch). The decoded buffers stay live until the
             // cursor exhausts and the next `next()` calls `releaseBatch`.
-            if (self.sub_batch_rows > 0 and !coding and !hashing and !self.emit_loc and rg_count > self.sub_batch_rows) {
+            // `emit_runs` also keeps the full row group: the run sidecar is
+            // per-RG (a run-aware consumer does near-zero per-row work, so the
+            // L2-residency slicing buys nothing there).
+            if (self.sub_batch_rows > 0 and !coding and !hashing and !self.emit_loc and !self.emit_runs and rg_count > self.sub_batch_rows) {
                 self.sub_off = 0;
                 self.sub_count = rg_count;
                 return self.emitSub();
+            }
+            var runs_sidecar: ?[]const ?exec.RunsColumn = null;
+            if (self.emit_runs and self.cur_segment_tomb == null) {
+                runs_sidecar = try self.fillRunsSidecar(seg, self.cur_rg_idx - 1, rg_count);
             }
             return Batch{
                 .schema = self.out_schema,
@@ -1483,6 +1564,7 @@ pub const Scan = struct {
                 .row_count = rg_count,
                 .coded = sidecar,
                 .hashed = hash_sidecar,
+                .runs = runs_sidecar,
             };
         }
 

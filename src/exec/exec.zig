@@ -151,6 +151,16 @@ pub const Batch = struct {
     /// sidecar, and must fall back to `stringKeyDigest(bytes)` on batches
     /// without one (memtable, tombstoned row group) so keys stay identical.
     hashed: ?[]const ?[]const u128 = null,
+    /// Optional per-column RLE run sidecar. When `runs[j]` is set, column `j`'s
+    /// rows arrive as adjacent-equal runs straight off the block's RLE header:
+    /// `values_i64[k]` (sign-extended to i64) repeated `lengths[k]` times
+    /// reproduces the column. `values[j]` stays a real materialized view, so
+    /// run-unaware consumers work unchanged; a run-aware consumer (the
+    /// weighted group emitter) iterates run spans instead of rows. Attached
+    /// only to whole, tombstone-free segment row groups on the unfiltered
+    /// path — never memtable or compacted batches. Same per-`next()` lifetime
+    /// as `values`. Filled only when the scan's `emit_runs` is requested.
+    runs: ?[]const ?RunsColumn = null,
 
     pub fn columnIndex(self: Batch, name: []const u8) ?usize {
         for (self.schema, 0..) |c, i| {
@@ -906,6 +916,14 @@ pub const rowloc = @import("rowloc.zig");
 pub const global_dict = @import("global_dict.zig");
 pub const GlobalDict = global_dict.GlobalDict;
 pub const CodedColumn = global_dict.CodedColumn;
+
+/// One column's RLE run view for `Batch.runs`: run k's value (sign-extended
+/// to i64) repeats `lengths[k]` times. Slices live in Scan-owned scratch with
+/// the batch's per-`next()` lifetime.
+pub const RunsColumn = struct {
+    values_i64: []const i64,
+    lengths: []const u32,
+};
 
 /// Canonical 128-bit digest of one string group-key column's bytes — the unit
 /// every hashed-key path agrees on: the scan's `Batch.hashed` sidecar carries
