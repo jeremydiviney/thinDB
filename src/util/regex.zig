@@ -492,6 +492,12 @@ const Thread = struct { pc: u32, caps: []?usize };
 /// rows allocates essentially nothing in steady state.
 pub const Scratch = struct {
     backing: Allocator,
+    /// Lazily-built DFA for the pattern this scratch is serving (keyed by
+    /// program identity below). Lives in the scratch — not the Regex — so
+    /// the Regex stays immutable/shareable and the DFA amortizes across all
+    /// the rows of a batch.
+    dfa: ?Dfa = null,
+    dfa_prog: usize = 0,
     /// Per-match capture arrays. Reset (retain_capacity) at the start of
     /// each `find`, so capture dups cost a bump-alloc into reused memory.
     arena: std.heap.ArenaAllocator,
@@ -519,6 +525,7 @@ pub const Scratch = struct {
     }
 
     pub fn deinit(self: *Scratch) void {
+        if (self.dfa) |*d| d.deinit();
         self.arena.deinit();
         if (self.visited.len > 0) self.backing.free(self.visited);
         if (self.seed.len > 0) self.backing.free(self.seed);
@@ -664,7 +671,53 @@ pub const Regex = struct {
     /// This is the form the batch kernels use: the visited array, thread
     /// lists, seed buffer, and capture arena all persist between rows.
     pub fn findWith(self: *const Regex, scratch: *Scratch, input: []const u8, start: usize, out_slots: []?usize) Error!bool {
+        // DFA guard for the Pike VM's pathological shape: an unanchored
+        // pattern with no usable first-byte prefilter seeds a thread at EVERY
+        // input position. The lazy DFA decides match-existence in one linear
+        // table-lookup pass, so a no-match row skips the VM entirely; rows
+        // that do match pay one bounded extra scan. Anchored or prefiltered
+        // patterns already fail fast in the VM, so the guard skips them.
+        if (!self.anchored_start and !self.has_wordbound and self.prefilter_bytes.len == 0) {
+            if (try self.dfaMatches(scratch, input, start)) |exists| {
+                if (!exists) return false;
+            }
+        }
         return self.findWithImpl(true, scratch, input, start, out_slots);
+    }
+
+    /// Exact "does any match exist at or after `start`" — no captures, no
+    /// match position. Runs the lazy DFA (one table lookup per byte, no
+    /// thread lists or capture bookkeeping) when the pattern is eligible;
+    /// falls back to the Pike VM (word boundaries, state-cache overflow).
+    /// The DFA recognizes exactly the VM's language, so the answer is
+    /// identical either way.
+    pub fn matchesWith(self: *const Regex, scratch: *Scratch, input: []const u8, start: usize) Error!bool {
+        if (try self.dfaMatches(scratch, input, start)) |exists| return exists;
+        if (scratch.slots.len < self.n_slots) {
+            scratch.slots = try scratch.backing.realloc(scratch.slots, self.n_slots);
+        }
+        return self.findWithImpl(true, scratch, input, start, scratch.slots[0..self.n_slots]);
+    }
+
+    /// `findWith` minus the DFA guard: always the Pike VM. Semantically
+    /// identical — exists so differential tests and micro-benches can pit
+    /// the two engines against each other.
+    pub fn findWithVm(self: *const Regex, scratch: *Scratch, input: []const u8, start: usize, out_slots: []?usize) Error!bool {
+        return self.findWithImpl(true, scratch, input, start, out_slots);
+    }
+
+    /// DFA-side of `matchesWith`: null when the DFA can't answer (pattern
+    /// has word boundaries, too many distinct byte classes, or the state
+    /// cache overflowed) — the caller must use the VM.
+    fn dfaMatches(self: *const Regex, scratch: *Scratch, input: []const u8, start: usize) Error!?bool {
+        if (self.has_wordbound) return null;
+        if (scratch.dfa == null or scratch.dfa_prog != @intFromPtr(self.prog.ptr)) {
+            if (scratch.dfa) |*d| d.deinit();
+            scratch.dfa = null;
+            scratch.dfa = try Dfa.init(scratch.backing, self.prog);
+            scratch.dfa_prog = @intFromPtr(self.prog.ptr);
+        }
+        return scratch.dfa.?.matches(input, start);
     }
 
     /// `enable_skip` toggles the stationary-run bulk-skip fast path. The
@@ -972,6 +1025,312 @@ pub const Regex = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Lazy DFA — exact match-existence in one linear pass
+// ---------------------------------------------------------------------------
+//
+// Subset construction over the compiled program, built lazily: a DFA state is
+// the (sorted, deduped) set of instruction pointers alive after consuming the
+// previous byte, plus a "previous byte was '\n'" flag that resolves `.bol`.
+// Transitions are built on first use per (state, byte-class); `.eol` resolves
+// against the byte being consumed (or EOF) and `.save` is plain epsilon. The
+// DFA recognizes exactly the language the Pike VM does — it answers "does a
+// match exist at or after `start`" with no priority or capture semantics
+// involved, so the answer is exact while costing one table lookup per byte.
+// The seed (pc 0) joins every closure, which is what "match may start at any
+// position" means; for a `^`-anchored program the seed's `.bol` kills it
+// mid-line, so anchoring needs no special casing.
+//
+// Self-loop runs collapse the way the VM's stationary-run bulk-skip does:
+// when the matcher observes a state transitioning to itself, it completes
+// that state's transition row, derives the byte set that LEAVES the state,
+// and crosses the run with memchr (few breaker bytes) or one membership scan
+// (dense).
+//
+// Word boundaries are declined (their closure would need prev-byte word-ness
+// in the state key — not worth doubling the state space), as are patterns
+// with more than 63 distinct class bitmaps; the state cache is capped. Any
+// of these marks the DFA failed and `matches` returns null — the caller
+// falls back to the Pike VM, so behavior is unchanged, only slower.
+
+const DfaId = u16;
+const DFA_UNSET: DfaId = std.math.maxInt(u16);
+const DFA_ACCEPT: DfaId = std.math.maxInt(u16) - 1;
+const DFA_MAX_STATES: usize = 224;
+
+const DfaState = struct {
+    pcs_off: u32,
+    pcs_len: u32,
+    prev_nl: bool,
+    eof_built: bool = false,
+    eof_accept: bool = false,
+    /// Set once the full transition row exists; enables the self-loop skip.
+    skip_ready: bool = false,
+    /// Bytes that keep the state looping on itself (valid when skip_ready).
+    stay: CharClass = .{},
+    /// When the breaker set (complement of `stay`) is small, its bytes —
+    /// each found with a vectorized memchr. 0xFF in n_break means "dense:
+    /// scan with stay.contains instead".
+    n_break: u8 = 0,
+    break_bytes: [4]u8 = .{ 0, 0, 0, 0 },
+};
+
+pub const Dfa = struct {
+    allocator: Allocator,
+    prog: []const Inst,
+    n_classes: u16 = 0,
+    class_of: [256]u8 = undefined,
+    class_rep: [256]u8 = undefined,
+    states: std.ArrayListUnmanaged(DfaState) = .empty,
+    pc_pool: std.ArrayListUnmanaged(u32) = .empty,
+    trans: std.ArrayListUnmanaged(DfaId) = .empty,
+    map: std.AutoHashMapUnmanaged(u64, DfaId) = .empty,
+    visited: []u32,
+    gen: u32 = 0,
+    stack: std.ArrayListUnmanaged(u32) = .empty,
+    next_pcs: std.ArrayListUnmanaged(u32) = .empty,
+    failed: bool = false,
+
+    fn init(backing: Allocator, prog: []const Inst) Error!Dfa {
+        var d = Dfa{
+            .allocator = backing,
+            .prog = prog,
+            .visited = try backing.alloc(u32, prog.len),
+        };
+        @memset(d.visited, 0);
+
+        // Distinct class bitmaps drive the byte-class partition: two bytes
+        // behave identically iff they agree on every bitmap and on '\n'-ness.
+        var maps: [63]*const CharClass = undefined;
+        var n_maps: usize = 0;
+        for (prog) |*inst| {
+            if (inst.* != .class) continue;
+            const cc = &inst.class;
+            var found = false;
+            for (maps[0..n_maps]) |m| {
+                if (std.mem.eql(u8, &m.bits, &cc.bits)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (n_maps == maps.len) {
+                    d.failed = true;
+                    return d;
+                }
+                maps[n_maps] = cc;
+                n_maps += 1;
+            }
+        }
+        var sigs: [256]u64 = undefined;
+        var n_classes: usize = 0;
+        for (0..256) |b| {
+            var sig: u64 = if (b == '\n') 1 else 0;
+            for (maps[0..n_maps], 0..) |m, mi| {
+                if (m.contains(@intCast(b))) sig |= @as(u64, 1) << @intCast(mi + 1);
+            }
+            var cid: usize = n_classes;
+            for (sigs[0..n_classes], 0..) |s, i| {
+                if (s == sig) {
+                    cid = i;
+                    break;
+                }
+            }
+            if (cid == n_classes) {
+                sigs[n_classes] = sig;
+                d.class_rep[n_classes] = @intCast(b);
+                n_classes += 1;
+            }
+            d.class_of[b] = @intCast(cid);
+        }
+        d.n_classes = @intCast(n_classes);
+        return d;
+    }
+
+    pub fn deinit(self: *Dfa) void {
+        self.allocator.free(self.visited);
+        self.states.deinit(self.allocator);
+        self.pc_pool.deinit(self.allocator);
+        self.trans.deinit(self.allocator);
+        self.map.deinit(self.allocator);
+        self.stack.deinit(self.allocator);
+        self.next_pcs.deinit(self.allocator);
+    }
+
+    /// Exact match-existence at or after `start`; null = DFA unavailable
+    /// (caller must use the VM).
+    pub fn matches(self: *Dfa, input: []const u8, start: usize) Error!?bool {
+        if (self.failed) return null;
+        const prev_nl = start == 0 or input[start - 1] == '\n';
+        var sid = (try self.stateFor(&.{}, prev_nl)) orelse return null;
+        var sp = start;
+        while (sp < input.len) {
+            const b = input[sp];
+            const cls: usize = self.class_of[b];
+            var t = self.trans.items[@as(usize, sid) * self.n_classes + cls];
+            if (t == DFA_UNSET) {
+                t = (try self.buildTrans(sid, cls, b)) orelse return null;
+            }
+            if (t == DFA_ACCEPT) return true;
+            if (t == sid) {
+                if (!self.states.items[sid].skip_ready) {
+                    if (!try self.completeRow(sid)) return null;
+                }
+                sp = self.runSkip(sid, input, sp + 1);
+                continue;
+            }
+            sid = t;
+            sp += 1;
+        }
+        return try self.eofAccept(sid);
+    }
+
+    fn buildTrans(self: *Dfa, sid: DfaId, cls: usize, b: u8) Error!?DfaId {
+        const t = (try self.computeTransition(sid, b)) orelse return null;
+        self.trans.items[@as(usize, sid) * self.n_classes + cls] = t;
+        return t;
+    }
+
+    /// Epsilon-close the state's pcs (plus the position seed) against byte
+    /// `b` (null = EOF), collecting the surviving class successors into
+    /// `next_pcs`. Returns true when the closure reaches `.match`.
+    fn closureWalk(self: *Dfa, sid: DfaId, b: ?u8) Error!bool {
+        if (self.gen == std.math.maxInt(u32)) {
+            @memset(self.visited, 0);
+            self.gen = 0;
+        }
+        self.gen += 1;
+        self.stack.clearRetainingCapacity();
+        self.next_pcs.clearRetainingCapacity();
+        const st = self.states.items[sid];
+        const pcs = self.pc_pool.items[st.pcs_off .. st.pcs_off + st.pcs_len];
+        // Seed last so it pops first — order is irrelevant for existence,
+        // but keeping it deterministic keeps states canonical.
+        for (pcs) |pc| try self.stack.append(self.allocator, pc);
+        try self.stack.append(self.allocator, 0);
+        var accept = false;
+        while (self.stack.items.len > 0) {
+            const pc = self.stack.items[self.stack.items.len - 1];
+            self.stack.items.len -= 1;
+            if (self.visited[pc] == self.gen) continue;
+            self.visited[pc] = self.gen;
+            switch (self.prog[pc]) {
+                .jmp => |tgt| try self.stack.append(self.allocator, tgt),
+                .split => |s| {
+                    try self.stack.append(self.allocator, s.a);
+                    try self.stack.append(self.allocator, s.b);
+                },
+                .save => try self.stack.append(self.allocator, pc + 1),
+                .bol => if (st.prev_nl) try self.stack.append(self.allocator, pc + 1),
+                .eol => if (b == null or b.? == '\n') try self.stack.append(self.allocator, pc + 1),
+                // Never compiled into a DFA-eligible program (dfaMatches
+                // declines has_wordbound patterns before building one).
+                .word_boundary, .not_word_boundary => unreachable,
+                .class => |cc| if (b) |ch| {
+                    if (cc.contains(ch)) try self.next_pcs.append(self.allocator, pc + 1);
+                },
+                .match => accept = true,
+            }
+        }
+        return accept;
+    }
+
+    fn computeTransition(self: *Dfa, sid: DfaId, b: u8) Error!?DfaId {
+        if (try self.closureWalk(sid, b)) return DFA_ACCEPT;
+        std.mem.sort(u32, self.next_pcs.items, {}, std.sort.asc(u32));
+        return self.stateFor(self.next_pcs.items, b == '\n');
+    }
+
+    fn stateFor(self: *Dfa, pcs: []const u32, prev_nl: bool) Error!?DfaId {
+        var h = std.hash.Wyhash.init(0x5EED_DFA1);
+        h.update(&[1]u8{@intFromBool(prev_nl)});
+        h.update(std.mem.sliceAsBytes(pcs));
+        const key = h.final();
+        if (self.map.get(key)) |id| {
+            // Verify against a (vanishingly unlikely) 64-bit hash collision;
+            // sound either way — a mismatch just retires the DFA.
+            const st = self.states.items[id];
+            const stored = self.pc_pool.items[st.pcs_off .. st.pcs_off + st.pcs_len];
+            if (st.prev_nl == prev_nl and std.mem.eql(u32, stored, pcs)) return id;
+            self.failed = true;
+            return null;
+        }
+        if (self.states.items.len >= DFA_MAX_STATES) {
+            self.failed = true;
+            return null;
+        }
+        const off: u32 = @intCast(self.pc_pool.items.len);
+        try self.pc_pool.appendSlice(self.allocator, pcs);
+        const id: DfaId = @intCast(self.states.items.len);
+        try self.states.append(self.allocator, .{
+            .pcs_off = off,
+            .pcs_len = @intCast(pcs.len),
+            .prev_nl = prev_nl,
+        });
+        try self.trans.appendNTimes(self.allocator, DFA_UNSET, self.n_classes);
+        try self.map.put(self.allocator, key, id);
+        return id;
+    }
+
+    /// Build every remaining transition of `sid`'s row, then derive the
+    /// self-loop skip info: the byte set that keeps the state looping and
+    /// the (small) breaker set that ends a run.
+    fn completeRow(self: *Dfa, sid: DfaId) Error!bool {
+        var c: usize = 0;
+        while (c < self.n_classes) : (c += 1) {
+            const idx = @as(usize, sid) * self.n_classes + c;
+            if (self.trans.items[idx] != DFA_UNSET) continue;
+            if ((try self.buildTrans(sid, c, self.class_rep[c])) == null) return false;
+        }
+        var stay = CharClass{};
+        var n_break: usize = 0;
+        var break_bytes: [4]u8 = .{ 0, 0, 0, 0 };
+        for (0..256) |b| {
+            if (self.trans.items[@as(usize, sid) * self.n_classes + self.class_of[b]] == sid) {
+                stay.add(@intCast(b));
+            } else {
+                if (n_break < break_bytes.len) break_bytes[n_break] = @intCast(b);
+                n_break += 1;
+            }
+        }
+        const st = &self.states.items[sid];
+        st.stay = stay;
+        st.n_break = if (n_break <= break_bytes.len) @intCast(n_break) else 0xFF;
+        st.break_bytes = break_bytes;
+        st.skip_ready = true;
+        return true;
+    }
+
+    /// First index `>= from` whose byte leaves the self-looping state, or
+    /// input.len. Mirrors the VM bulk-skip's runEnd: memchr per breaker byte
+    /// when the breaker set is small, membership scan otherwise.
+    fn runSkip(self: *const Dfa, sid: DfaId, input: []const u8, from: usize) usize {
+        const st = self.states.items[sid];
+        if (st.n_break != 0xFF) {
+            var best = input.len;
+            for (st.break_bytes[0..st.n_break]) |x| {
+                if (std.mem.indexOfScalarPos(u8, input, from, x)) |idx| {
+                    if (idx < best) best = idx;
+                }
+            }
+            return best;
+        }
+        var j = from;
+        while (j < input.len and st.stay.contains(input[j])) : (j += 1) {}
+        return j;
+    }
+
+    fn eofAccept(self: *Dfa, sid: DfaId) Error!bool {
+        if (!self.states.items[sid].eof_built) {
+            const accept = try self.closureWalk(sid, null);
+            const st = &self.states.items[sid];
+            st.eof_accept = accept;
+            st.eof_built = true;
+        }
+        return self.states.items[sid].eof_accept;
+    }
+};
+
 fn expandTemplate(allocator: Allocator, out: *std.ArrayList(u8), template: []const u8, input: []const u8, slots: []const ?usize) Error!void {
     var i: usize = 0;
     while (i < template.len) : (i += 1) {
@@ -1231,6 +1590,102 @@ test "regex: stationary bulk-skip equals reference matcher (fuzz)" {
                 const ms = try re.findWithImpl(false, &s_slow, input, start, slots_slow);
                 try std.testing.expectEqual(ms, mf);
                 if (ms) try std.testing.expectEqualSlices(?usize, slots_slow, slots_fast);
+            }
+        }
+    }
+}
+
+test "regex: DFA matchesWith basics" {
+    const cases = .{
+        .{ .pat = "^https?://(?:www\\.)?([^/]+)/.*$", .yes = "https://www.example.com/path", .no = "ftp://x/" },
+        .{ .pat = "[0-9]+", .yes = "abc42x", .no = "abcdef" },
+        .{ .pat = "a*", .yes = "", .no = "" }, // matches empty anywhere — no counterexample exists
+        .{ .pat = "^$", .yes = "", .no = "x" },
+        .{ .pat = "(cat|dog)", .yes = "hotdog!", .no = "bird" },
+        .{ .pat = "\\bcat\\b", .yes = "a cat.", .no = "scatter" }, // VM fallback (word boundary)
+    };
+    inline for (cases) |c| {
+        var re = try Regex.compile(std.testing.allocator, c.pat);
+        defer re.deinit();
+        var scratch = Scratch.init(std.testing.allocator);
+        defer scratch.deinit();
+        try std.testing.expect(try re.matchesWith(&scratch, c.yes, 0));
+        if (c.no.len > 0) try std.testing.expect(!try re.matchesWith(&scratch, c.no, 0));
+    }
+}
+
+// The DFA's existence answer must equal the reference Pike VM's for every
+// pattern (including word-boundary patterns, which exercise the VM
+// fallback), every input, and every start position. Same corpus as the
+// bulk-skip differential above — this is the DFA's correctness contract.
+test "regex: DFA matchesWith equals reference matcher (fuzz)" {
+    const patterns = [_][]const u8{
+        "^https?://(?:www\\.)?([^/]+)/.*$",
+        "^[^/]+/.*$",
+        "^[^/]+$",
+        "^.*$",
+        "^.*?b$",
+        "^a+b+$",
+        "^[ab]+c$",
+        "^[^c]+c$",
+        "^[a-y]*z$",
+        "^(a)+$",
+        "^(?:ab)+$",
+        "^x[^/]+y$",
+        "^\\w+$",
+        "^\\d+\\.\\d+$",
+        "^a*a*b$",
+        "^[^x]*x[^y]*y$",
+        "\\bcat\\b",
+        "^\\bword\\b$",
+        "[^/]+",
+        "abc",
+        "^(cat|dog)+$",
+        "google",
+        "utm[a-z]*",
+        "a*b",
+        "(cat|dog)",
+        "[0-9]+",
+        "x[ab]+y",
+        "ab+c",
+        ".*",
+        "^[a-z]+$",
+        "^[a-y]+z$",
+        "^[0-9]+x$",
+        "^[ -~]+$",
+        // Stress the seed-at-every-position semantics + eol mid-string.
+        "[a-z]+[0-9]",
+        "x$",
+        "^x",
+        "(a|ab)(c|bcd)",
+    };
+    const alphabet = "abc/xyz12. \nwd_goletum";
+    var prng = std.Random.DefaultPrng.init(0xD0FA_2026);
+    const rnd = prng.random();
+    var buf: [40]u8 = undefined;
+
+    for (patterns) |pat| {
+        var re = try Regex.compile(std.testing.allocator, pat);
+        defer re.deinit();
+        var s_dfa = Scratch.init(std.testing.allocator);
+        defer s_dfa.deinit();
+        var s_ref = Scratch.init(std.testing.allocator);
+        defer s_ref.deinit();
+        const slots = try std.testing.allocator.alloc(?usize, re.n_slots);
+        defer std.testing.allocator.free(slots);
+
+        var iter: usize = 0;
+        while (iter < 400) : (iter += 1) {
+            const len = rnd.intRangeAtMost(usize, 0, buf.len);
+            for (buf[0..len]) |*b| b.* = alphabet[rnd.intRangeLessThan(usize, 0, alphabet.len)];
+            const input = buf[0..len];
+
+            var start: usize = 0;
+            while (start <= len) : (start += 1) {
+                @memset(slots, null);
+                const ref = try re.findWithImpl(false, &s_ref, input, start, slots);
+                const dfa = try re.matchesWith(&s_dfa, input, start);
+                try std.testing.expectEqual(ref, dfa);
             }
         }
     }
