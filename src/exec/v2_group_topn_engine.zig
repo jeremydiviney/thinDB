@@ -685,6 +685,19 @@ fn runHarness(
     // toggle additionally forces an integer-key query down the same path for
     // cross-checking against the exact integer-packed result.
     const force_hash = shape.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null;
+    // Weighted run collapse: COUNT(*)-only programs ship (key, weight) staged
+    // rows — the scan emitter folds a run of adjacent-equal keys (the table's
+    // physical order clusters them) into ONE row, shrinking route/stage/lane
+    // traffic by the run factor. Anything with payload/str/distinct inputs
+    // keeps per-row staging.
+    const count_only = blk: {
+        if (shape.aggregate_program.len == 0) break :blk false;
+        if (shape.aggregate_inputs.len != 0 or shape.string_aggregate_inputs.len != 0 or distinct_slot_count != 0) break :blk false;
+        for (shape.aggregate_program) |agg| {
+            if (agg.op != .count_star or agg.is_distinct or agg.is_string) break :blk false;
+        }
+        break :blk true;
+    };
     const group_rows_layout = HarnessCore.GroupRowsLayout{
         .key_width = if (force_hash) .u128 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
@@ -694,6 +707,7 @@ fn runHarness(
         .has_str_payload = shape.string_aggregate_inputs.len > 0,
         .distinct_slot_count = distinct_slot_count,
         .has_rowref = force_hash,
+        .has_weight = count_only,
     };
 
     // Scan-side key digests: a string group key consumed only as hashed

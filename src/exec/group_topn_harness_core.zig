@@ -245,6 +245,10 @@ const RawRows = struct {
             bytes = alignForward(bytes, @alignOf(i64));
             bytes += @sizeOf(i64) * capacity_rows;
         }
+        if (layout.has_weight) {
+            bytes = alignForward(bytes, @alignOf(u32));
+            bytes += @sizeOf(u32) * capacity_rows;
+        }
         return bytes;
     }
 
@@ -264,6 +268,26 @@ const RawRows = struct {
     inline fn rowrefAll(self: RawRows) []i64 {
         std.debug.assert(self.layout.has_rowref);
         return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.rowrefOffset())))[0..self.capacity_rows];
+    }
+
+    // Must mirror slabBytes exactly: the rowref alignment step only happens
+    // when the region exists.
+    fn weightOffset(self: RawRows) usize {
+        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
+        for (self.layout.columns) |column| {
+            offset = alignForward(offset, groupColumnAlign(column.physical_type));
+            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
+        }
+        if (self.layout.has_rowref) {
+            offset = alignForward(offset, @alignOf(i64));
+            offset += @sizeOf(i64) * self.capacity_rows;
+        }
+        return alignForward(offset, @alignOf(u32));
+    }
+
+    inline fn weightAll(self: RawRows) []u32 {
+        std.debug.assert(self.layout.has_weight);
+        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.weightOffset())))[0..self.capacity_rows];
     }
 
     fn columnOffset(self: RawRows, column_index: usize) usize {
@@ -328,6 +352,7 @@ const RawRows = struct {
                 @memcpy(next.columnByteSlab(col)[0 .. sz * self.len_rows], self.columnByteSlab(col)[0 .. sz * self.len_rows]);
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
+            if (layout.has_weight) @memcpy(next.weightAll()[0..self.len_rows], self.weightAll()[0..self.len_rows]);
         }
         // The string side store lives outside the slab; grow its ref array in
         // place (preserving the live prefix), then move it into `next`.
@@ -712,6 +737,11 @@ pub const GroupRowsLayout = struct {
     // State on first insert so the actual key values can be late-materialized
     // at emit. Dormant (region absent) for the integer-packed-key queries.
     has_rowref: bool = false,
+    // COUNT-only programs (no payload/str columns, no distinct): each staged
+    // row carries a u32 weight, and the scan emitter collapses a run of
+    // adjacent-equal keys into ONE weighted row — route/stage/lane traffic
+    // shrinks by the run factor. The lane folds `count += weight`.
+    has_weight: bool = false,
 
     const DEFAULT_GROUP_COLUMNS = [_]GroupColumnSpec{
         .{ .physical_type = .i16, .source = .is_refresh },
@@ -720,7 +750,7 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
     var key_i: usize = 0;
     while (key_i < a.key_columns.len) : (key_i += 1) {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
@@ -833,6 +863,10 @@ const GroupRows = struct {
             bytes = alignForward(bytes, @alignOf(i64));
             bytes += @sizeOf(i64) * capacity_rows;
         }
+        if (layout.has_weight) {
+            bytes = alignForward(bytes, @alignOf(u32));
+            bytes += @sizeOf(u32) * capacity_rows;
+        }
         return bytes;
     }
 
@@ -852,6 +886,25 @@ const GroupRows = struct {
     inline fn rowrefAll(self: GroupRows) []i64 {
         std.debug.assert(self.layout.has_rowref);
         return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.rowrefOffset())))[0..self.capacity_rows];
+    }
+
+    // Must mirror slabBytes exactly (see RawRows.weightOffset).
+    fn weightOffset(self: GroupRows) usize {
+        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
+        for (self.layout.columns) |column| {
+            offset = alignForward(offset, groupColumnAlign(column.physical_type));
+            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
+        }
+        if (self.layout.has_rowref) {
+            offset = alignForward(offset, @alignOf(i64));
+            offset += @sizeOf(i64) * self.capacity_rows;
+        }
+        return alignForward(offset, @alignOf(u32));
+    }
+
+    inline fn weightAll(self: GroupRows) []u32 {
+        std.debug.assert(self.layout.has_weight);
+        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.weightOffset())))[0..self.capacity_rows];
     }
 
     fn columnOffset(self: GroupRows, column_index: usize) usize {
@@ -946,6 +999,7 @@ const GroupRows = struct {
                 @memcpy(next.columnByteSlab(col)[0 .. sz * self.len_rows], self.columnByteSlab(col)[0 .. sz * self.len_rows]);
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
+            if (layout.has_weight) @memcpy(next.weightAll()[0..self.len_rows], self.weightAll()[0..self.len_rows]);
         }
         if (layout.has_str_payload) try self.str.ensure(allocator, layout.str_columns.len, capacity_rows, self.len_rows);
         next.str = self.str;
@@ -990,6 +1044,7 @@ const GroupRows = struct {
             @memcpy(self.columnByteSlab(col)[old_len * sz .. new_len * sz], rows.columnByteSlab(col)[start * sz .. (start + count) * sz]);
         }
         if (self.layout.has_rowref) @memcpy(self.rowrefAll()[old_len..new_len], rows.rowrefAll()[start .. start + count]);
+        if (self.layout.has_weight) @memcpy(self.weightAll()[old_len..new_len], rows.weightAll()[start .. start + count]);
         // Variable-length string payload: copy each scattered row's string
         // values from the source RawRows store into this bucket's store. Owned
         // bytes, so the bucket survives the source chunk's recycle.
@@ -2698,6 +2753,18 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             else
                 try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
+            // Weighted collapse (COUNT-only layouts): an adjacent-equal key
+            // folds into the last staged row instead of appending — the run
+            // ships as ONE (key, weight) row. The creating row's rowref is
+            // kept (any row of the run has the same key values).
+            if (layout.has_weight) {
+                if (idx > 0 and active.keyAt(idx - 1) == key) {
+                    active.weightAll()[idx - 1] += 1;
+                    accepted += 1;
+                    continue;
+                }
+                active.weightAll()[idx] = 1;
+            }
             active.setKey(idx, key);
             if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
             appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
@@ -2799,6 +2866,37 @@ fn appendBatchRawChunksGenericKey1I64(
     const route_t0 = if (profile) nowTicks() else 0;
     var accepted: u64 = 0;
     var r: usize = 0;
+    if (parts.raw_active_rows.layout.has_weight) {
+        // COUNT-only: stage (key, weight) rows, one per source run. The
+        // weight gate guarantees no payload/str columns ride along.
+        std.debug.assert(payload_bytes.len == 0 and str_views.len == 0);
+        while (r < row_count) {
+            var active = &parts.raw_active_rows;
+            const keys = active.keyU64All();
+            const weights = active.weightAll();
+            while (r < row_count and active.len() < raw_chunk_rows) {
+                var run_end = r + 1;
+                while (run_end < row_count and key0[run_end] == key0[r]) run_end += 1;
+                const wlen: u32 = @intCast(run_end - r);
+                const k = @as(u64, @bitCast(key0[r]));
+                const idx = active.len();
+                if (idx > 0 and keys[idx - 1] == k) {
+                    weights[idx - 1] += wlen;
+                } else {
+                    keys[idx] = k;
+                    weights[idx] = wlen;
+                    active.len_rows = idx + 1;
+                }
+                accepted += wlen;
+                r = run_end;
+            }
+            if (active.len() == raw_chunk_rows) try publishActiveRawRows(parts, shared, raw_chunk_rows);
+        }
+        parts.scanned_count += row_count;
+        parts.row_count += accepted;
+        if (profile) parts.partition_ticks += nowTicks() - route_t0;
+        return;
+    }
     while (r < row_count) {
         var active = &parts.raw_active_rows;
         const keys = active.keyU64All();
@@ -2832,6 +2930,36 @@ fn appendBatchRawChunksGenericKeyI16I32(
     const route_t0 = if (profile) nowTicks() else 0;
     var accepted: u64 = 0;
     var r: usize = 0;
+    if (parts.raw_active_rows.layout.has_weight) {
+        std.debug.assert(payload_bytes.len == 0 and str_views.len == 0);
+        while (r < row_count) {
+            var active = &parts.raw_active_rows;
+            const keys = active.keyU64All();
+            const weights = active.weightAll();
+            while (r < row_count and active.len() < raw_chunk_rows) {
+                var run_end = r + 1;
+                while (run_end < row_count and key0[run_end] == key0[r] and key1[run_end] == key1[r]) run_end += 1;
+                const wlen: u32 = @intCast(run_end - r);
+                const k = @as(u16, @bitCast(key0[r])) |
+                    (@as(u64, @as(u32, @bitCast(key1[r]))) << 16);
+                const idx = active.len();
+                if (idx > 0 and keys[idx - 1] == k) {
+                    weights[idx - 1] += wlen;
+                } else {
+                    keys[idx] = k;
+                    weights[idx] = wlen;
+                    active.len_rows = idx + 1;
+                }
+                accepted += wlen;
+                r = run_end;
+            }
+            if (active.len() == raw_chunk_rows) try publishActiveRawRows(parts, shared, raw_chunk_rows);
+        }
+        parts.scanned_count += row_count;
+        parts.row_count += accepted;
+        if (profile) parts.partition_ticks += nowTicks() - route_t0;
+        return;
+    }
     while (r < row_count) {
         var active = &parts.raw_active_rows;
         const keys = active.keyU64All();
@@ -2866,6 +2994,38 @@ fn appendBatchRawChunksGenericKeyI64I32(
     const route_t0 = if (profile) nowTicks() else 0;
     var accepted: u64 = 0;
     var r: usize = 0;
+    if (parts.raw_active_rows.layout.has_weight) {
+        std.debug.assert(payload_bytes.len == 0 and str_views.len == 0);
+        while (r < row_count) {
+            var active = &parts.raw_active_rows;
+            const key_lo = active.keyU96LoAll();
+            const key_hi = active.keyU96HiAll();
+            const weights = active.weightAll();
+            while (r < row_count and active.len() < raw_chunk_rows) {
+                var run_end = r + 1;
+                while (run_end < row_count and key0[run_end] == key0[r] and key1[run_end] == key1[r]) run_end += 1;
+                const wlen: u32 = @intCast(run_end - r);
+                const lo = @as(u64, @bitCast(key0[r]));
+                const hi = @as(u32, @bitCast(key1[r]));
+                const idx = active.len();
+                if (idx > 0 and key_lo[idx - 1] == lo and key_hi[idx - 1] == hi) {
+                    weights[idx - 1] += wlen;
+                } else {
+                    key_lo[idx] = lo;
+                    key_hi[idx] = hi;
+                    weights[idx] = wlen;
+                    active.len_rows = idx + 1;
+                }
+                accepted += wlen;
+                r = run_end;
+            }
+            if (active.len() == raw_chunk_rows) try publishActiveRawRows(parts, shared, raw_chunk_rows);
+        }
+        parts.scanned_count += row_count;
+        parts.row_count += accepted;
+        if (profile) parts.partition_ticks += nowTicks() - route_t0;
+        return;
+    }
     while (r < row_count) {
         var active = &parts.raw_active_rows;
         const key_lo = active.keyU96LoAll();
@@ -2932,21 +3092,21 @@ fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, batch: thindb.
     return appendBatchRawChunksGeneric(parts, shared, batch, raw_chunk_rows, profile, skip_filter_check);
 }
 
-fn initGroupStateCountSumAvg(states: *StateSlab, key: u128, sum_value: i64, avg_value: i64) u32 {
+fn initGroupStateCountSumAvg(states: *StateSlab, key: u128, sum_acc: i64, avg_acc: i64, run_len: u64) u32 {
     const gid = states.pushAssumeCapacity();
     const head = states.head(gid);
     head.key = key;
-    head.count = 1;
+    head.count = run_len;
     const slots = states.slotsOf(gid);
-    slots[0] = sum_value;
-    slots[1] = avg_value;
+    slots[0] = sum_acc;
+    slots[1] = avg_acc;
     return gid;
 }
 
-inline fn updateGroupStateCountSumAvg(ref: StateRef, sum_value: i64, avg_value: i64) void {
-    ref.head.count += 1;
-    ref.slots[0] += sum_value;
-    ref.slots[1] += avg_value;
+inline fn updateGroupStateCountSumAvg(ref: StateRef, sum_acc: i64, avg_acc: i64, run_len: u64) void {
+    ref.head.count += run_len;
+    ref.slots[0] += sum_acc;
+    ref.slots[1] += avg_acc;
 }
 
 fn initGroupStateProgram(
@@ -3191,25 +3351,39 @@ fn groupChunkRowsDirectKeysCountSumAvg(
     program: CountSumAvgProgram,
     rowrefs: []const i64,
 ) !void {
+    // The weight gate is COUNT-only; a count+sum+avg program never collapses.
+    std.debug.assert(!rows.layout.has_weight);
     var r: usize = 0;
-    while (r < row_count) : (r += 1) {
+    while (r < row_count) {
         const pf = r + PREFETCH_DIST_BUCKET;
         if (pf < row_count) {
             const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
             @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
         }
 
-        const sum_value = rows.columnIntAt(program.sum_input_index, r);
-        const avg_value = rows.columnIntAt(program.avg_input_index, r);
+        // The table is physically ordered, so clustered group keys arrive in
+        // adjacent-equal runs: accumulate the run in registers and touch the
+        // hash table + state record ONCE per run, not once per row.
         const key = groupKeyAt(key_width, keys, key_hi, r);
+        var run_end = r + 1;
+        while (run_end < row_count and groupKeyAt(key_width, keys, key_hi, run_end) == key) run_end += 1;
+        var sum_acc: i64 = 0;
+        var avg_acc: i64 = 0;
+        var rr = r;
+        while (rr < run_end) : (rr += 1) {
+            sum_acc += rows.columnIntAt(program.sum_input_index, rr);
+            avg_acc += rows.columnIntAt(program.avg_input_index, rr);
+        }
+        const run_len: u64 = @intCast(run_end - r);
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         if (!probe.found) {
-            const new_gid = initGroupStateCountSumAvg(states, key, sum_value, avg_value);
+            const new_gid = initGroupStateCountSumAvg(states, key, sum_acc, avg_acc, run_len);
             if (rowrefs.len != 0) states.head(new_gid).rowref = rowrefs[r];
             table.commit(probe.slot, key, new_gid);
-            continue;
+        } else {
+            updateGroupStateCountSumAvg(states.ref(probe.gid), sum_acc, avg_acc, run_len);
         }
-        updateGroupStateCountSumAvg(states.ref(probe.gid), sum_value, avg_value);
+        r = run_end;
     }
 }
 
@@ -3272,16 +3446,30 @@ fn groupChunkRowsDirectKeys(
     if (want_gids) try gids_buf.resize(allocator, n);
     const gids: []u32 = if (want_gids) gids_buf.items[0..n] else &.{};
     const mark_new = has_extreme;
+    // Weighted staged rows (COUNT-only layouts): each row is a collapsed run
+    // from the scan emitter; its weight is the row count it stands for.
+    const weights: []const u32 = if (rows.layout.has_weight) rows.weightAll()[0..n] else &.{};
 
     var r: usize = 0;
-    while (r < n) : (r += 1) {
+    while (r < n) {
         const pf = r + PREFETCH_DIST_BUCKET;
         if (pf < n) {
             const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
             @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
         }
 
+        // Adjacent-equal run: probe the table once for the whole run; only the
+        // creating row carries NEW_GID_BIT (the extreme kernels' first-touch
+        // contract), the rest of the run records the bare gid.
         const key = groupKeyAt(key_width, keys, key_hi, r);
+        var run_end = r + 1;
+        while (run_end < n and groupKeyAt(key_width, keys, key_hi, run_end) == key) run_end += 1;
+        const run_len: u64 = if (weights.len != 0) blk: {
+            var s: u64 = 0;
+            for (weights[r..run_end]) |w| s += w;
+            break :blk s;
+        } else @intCast(run_end - r);
+
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         var gid: u32 = probe.gid;
         var tagged: u32 = probe.gid;
@@ -3289,7 +3477,7 @@ fn groupChunkRowsDirectKeys(
             gid = states.pushAssumeCapacity();
             const head = states.head(gid);
             head.key = key;
-            head.count = 1;
+            head.count = run_len;
             if (rowrefs.len != 0) head.rowref = rowrefs[r];
             table.commit(probe.slot, key, gid);
             if (has_str) {
@@ -3297,11 +3485,18 @@ fn groupChunkRowsDirectKeys(
             }
             tagged = if (mark_new) gid | NEW_GID_BIT else gid;
         } else {
-            states.head(gid).count += 1;
+            states.head(gid).count += run_len;
         }
-        if (has_str) try foldGroupStr(str_states, str_arena, gid, aggregates, rows, r);
+        if (has_str) {
+            var rr = r;
+            while (rr < run_end) : (rr += 1) try foldGroupStr(str_states, str_arena, gid, aggregates, rows, rr);
+        }
         if (has_mirror) mirrorCountSlots(states, gid, aggregates);
-        if (want_gids) gids[r] = tagged;
+        if (want_gids) {
+            gids[r] = tagged;
+            if (run_end > r + 1) @memset(gids[r + 1 .. run_end], gid);
+        }
+        r = run_end;
     }
 
     if (needs_kernels) {
@@ -3352,12 +3547,18 @@ fn groupChunkRowsDirectKeysProgram(
     rows: GroupRows,
     rowrefs: []const i64,
 ) !void {
+    // Weighted rows would silently undercount here (per-row +1 program); the
+    // COUNT-only weight gate guarantees this path never sees them.
+    std.debug.assert(!rows.layout.has_weight);
     const has_str = rows.layout.has_str_payload;
     const has_distinct = rows.layout.distinct_slot_count > 0;
     const n = row_count;
     if (has_distinct) try gids_buf.resize(allocator, n);
     const gids: []u32 = if (has_distinct) gids_buf.items[0..n] else &.{};
 
+    var prev_key: u128 = 0;
+    var prev_gid: u32 = 0;
+    var have_prev = false;
     var r: usize = 0;
     while (r < n) : (r += 1) {
         const pf = r + PREFETCH_DIST_BUCKET;
@@ -3367,6 +3568,15 @@ fn groupChunkRowsDirectKeysProgram(
         }
 
         const key = groupKeyAt(key_width, keys, key_hi, r);
+        // Adjacent-equal run: reuse the previous row's resolved gid, skipping
+        // the table probe (the state program still folds per row — its inputs
+        // vary within the run).
+        if (have_prev and key == prev_key) {
+            try updateGroupStateProgram(states.ref(prev_gid), aggregates, rows, r);
+            if (has_str) try foldGroupStr(str_states, str_arena, prev_gid, aggregates, rows, r);
+            if (has_distinct) gids[r] = prev_gid;
+            continue;
+        }
         const probe = table.getOrPut(GroupTable.hashKey(key), key);
         if (!probe.found) {
             const new_gid = try initGroupStateProgram(states, key, aggregates, rows, r);
@@ -3377,11 +3587,17 @@ fn groupChunkRowsDirectKeysProgram(
                 try foldGroupStr(str_states, str_arena, new_gid, aggregates, rows, r);
             }
             if (has_distinct) gids[r] = new_gid;
+            prev_key = key;
+            prev_gid = new_gid;
+            have_prev = true;
             continue;
         }
         try updateGroupStateProgram(states.ref(probe.gid), aggregates, rows, r);
         if (has_str) try foldGroupStr(str_states, str_arena, probe.gid, aggregates, rows, r);
         if (has_distinct) gids[r] = probe.gid;
+        prev_key = key;
+        prev_gid = probe.gid;
+        have_prev = true;
     }
 
     if (has_distinct) try foldGroupDistinctChunk(distinct_sets, allocator, states, gids, aggregates, rows);
@@ -3423,10 +3639,17 @@ fn foldKernelSumInt(states: *StateSlab, gids: []const u32, rows: GroupRows, agg:
         inline .i8, .i16, .i32, .i64 => |pt| {
             const T = groupPhysicalT(pt);
             const vals = rows.columnTypedAll(T, agg.input_column_index.?);
-            for (gids, 0..) |g, r| {
+            var r: usize = 0;
+            while (r < gids.len) {
                 const pf = r + PREFETCH_DIST_STATES;
                 if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
-                states.slotsOf(g & ~NEW_GID_BIT)[si - 1] += vals[r];
+                // Adjacent-equal gid run: accumulate in a register, store once.
+                const g = gids[r] & ~NEW_GID_BIT;
+                var acc: i64 = vals[r];
+                var rr = r + 1;
+                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) acc += vals[rr];
+                states.slotsOf(g)[si - 1] += acc;
+                r = rr;
             }
         },
         .f32, .f64 => {},
@@ -3439,12 +3662,18 @@ fn foldKernelSumFloat(states: *StateSlab, gids: []const u32, rows: GroupRows, ag
         inline .f32, .f64 => |pt| {
             const T = groupPhysicalT(pt);
             const vals = rows.columnTypedAll(T, agg.input_column_index.?);
-            for (gids, 0..) |g, r| {
+            var r: usize = 0;
+            while (r < gids.len) {
                 const pf = r + PREFETCH_DIST_STATES;
                 if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
-                const slot = &states.slotsOf(g & ~NEW_GID_BIT)[si - 1];
-                const acc: f64 = @bitCast(slot.*);
-                slot.* = @bitCast(acc + @as(f64, @floatCast(vals[r])));
+                const g = gids[r] & ~NEW_GID_BIT;
+                var acc: f64 = @floatCast(vals[r]);
+                var rr = r + 1;
+                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) acc += @as(f64, @floatCast(vals[rr]));
+                const slot = &states.slotsOf(g)[si - 1];
+                const cur: f64 = @bitCast(slot.*);
+                slot.* = @bitCast(cur + acc);
+                r = rr;
             }
         },
         else => {},
@@ -3457,13 +3686,24 @@ fn foldKernelExtremeInt(comptime is_min: bool, states: *StateSlab, gids: []const
         inline .i8, .i16, .i32, .i64 => |pt| {
             const T = groupPhysicalT(pt);
             const vals = rows.columnTypedAll(T, agg.input_column_index.?);
-            for (gids, 0..) |g, r| {
+            var r: usize = 0;
+            while (r < gids.len) {
                 const pf = r + PREFETCH_DIST_STATES;
                 if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
-                const slot = &states.slotsOf(g & ~NEW_GID_BIT)[si - 1];
-                const v: i64 = vals[r];
-                const improves = if (is_min) v < slot.* else v > slot.*;
-                if (g & NEW_GID_BIT != 0 or improves) slot.* = v;
+                // A run's creating row is its first, so the run inherits its
+                // NEW_GID_BIT: reduce the run in a register, one tagged store.
+                const tag_new = gids[r] & NEW_GID_BIT != 0;
+                const g = gids[r] & ~NEW_GID_BIT;
+                var best: i64 = vals[r];
+                var rr = r + 1;
+                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) {
+                    const v: i64 = vals[rr];
+                    if (if (is_min) v < best else v > best) best = v;
+                }
+                const slot = &states.slotsOf(g)[si - 1];
+                const improves = if (is_min) best < slot.* else best > slot.*;
+                if (tag_new or improves) slot.* = best;
+                r = rr;
             }
         },
         .f32, .f64 => {},
@@ -3476,14 +3716,23 @@ fn foldKernelExtremeFloat(comptime is_min: bool, states: *StateSlab, gids: []con
         inline .f32, .f64 => |pt| {
             const T = groupPhysicalT(pt);
             const vals = rows.columnTypedAll(T, agg.input_column_index.?);
-            for (gids, 0..) |g, r| {
+            var r: usize = 0;
+            while (r < gids.len) {
                 const pf = r + PREFETCH_DIST_STATES;
                 if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
-                const slot = &states.slotsOf(g & ~NEW_GID_BIT)[si - 1];
-                const v: f64 = @floatCast(vals[r]);
+                const tag_new = gids[r] & NEW_GID_BIT != 0;
+                const g = gids[r] & ~NEW_GID_BIT;
+                var best: f64 = @floatCast(vals[r]);
+                var rr = r + 1;
+                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) {
+                    const v: f64 = @floatCast(vals[rr]);
+                    if (if (is_min) v < best else v > best) best = v;
+                }
+                const slot = &states.slotsOf(g)[si - 1];
                 const cur: f64 = @bitCast(slot.*);
-                const improves = if (is_min) v < cur else v > cur;
-                if (g & NEW_GID_BIT != 0 or improves) slot.* = @bitCast(v);
+                const improves = if (is_min) best < cur else best > cur;
+                if (tag_new or improves) slot.* = @bitCast(best);
+                r = rr;
             }
         },
         else => {},
@@ -3559,6 +3808,10 @@ fn foldGroupDistinctTyped(
             dset.prefetchKey(DistinctSet.key(gids[pf], @bitCast(v_pf)));
         }
         const v: i64 = vals[r];
+        // The table's physical order clusters repeated values (UserID etc.)
+        // into adjacent runs: an identical (gid, value) pair can't be new, so
+        // skip the cache-missing set probe entirely.
+        if (r > 0 and gids[r] == gids[r - 1] and v == @as(i64, vals[r - 1])) continue;
         const composite = DistinctSet.key(gids[r], @bitCast(v));
         if (dset.insertNewBatch(composite)) {
             try addAggregateStateValue(states.ref(gids[r]), state_index, 1);
@@ -3810,7 +4063,9 @@ fn drainRawDedicatedStageSharedBuilders(
             col_elt[c] = groupColumnSize(shared.group_rows_layout.columns[c].physical_type);
         }
         const has_rowref = shared.group_rows_layout.has_rowref;
+        const has_weight = shared.group_rows_layout.has_weight;
         const flat_rowref: []i64 = if (has_rowref) local.flat_raw_rows.rowrefAll() else &.{};
+        const flat_weight: []u32 = if (has_weight) local.flat_raw_rows.weightAll() else &.{};
         switch (local.flat_raw_rows.layout.key_width) {
             inline else => |kw| {
                 const flat = local.flat_raw_rows;
@@ -3820,6 +4075,7 @@ fn drainRawDedicatedStageSharedBuilders(
                     var src_slabs: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
                     for (0..ncols) |c| src_slabs[c] = src.columnByteSlab(c);
                     const src_rowref: []const i64 = if (has_rowref) src.rowrefAll() else &.{};
+                    const src_weight: []const u32 = if (has_weight) src.weightAll() else &.{};
                     const chunk_rows_n = src.len();
                     var r: usize = 0;
                     while (r < chunk_rows_n) : (r += 1) {
@@ -3829,6 +4085,7 @@ fn drainRawDedicatedStageSharedBuilders(
                         var c: usize = 0;
                         while (c < ncols) : (c += 1) copyElem(flat_slabs[c], src_slabs[c], col_elt[c], pos, r);
                         if (has_rowref) flat_rowref[pos] = src_rowref[r];
+                        if (has_weight) flat_weight[pos] = src_weight[r];
                         if (flat_has_str) {
                             var sc: usize = 0;
                             while (sc < flat_str_cols) : (sc += 1)
