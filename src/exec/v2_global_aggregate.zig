@@ -488,9 +488,15 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
             // hash gate), so every row counts; `''` keeps its fast path by
             // digest equality, and the precomputed key finally makes the
             // set-slot prefetch possible (hashing twice used to rule it out).
+            // All four arms below skip an adjacent-equal key: physical order
+            // clusters repeated values (UserID, phrases within a session) into
+            // runs, and an identical key can't be new — the count bump still
+            // happens, only the cache-missing set probe is elided.
             if (digests) |ds| {
                 const blank = exec.stringKeyDigest("");
                 lane.ns[i] += n;
+                var prev_key: u128 = 0;
+                var have_prev = false;
                 var r: usize = 0;
                 while (r < n) : (r += 1) {
                     const key = ds[r];
@@ -498,6 +504,9 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
                         lane.has_blank[i] = true;
                         continue;
                     }
+                    if (have_prev and key == prev_key) continue;
+                    prev_key = key;
+                    have_prev = true;
                     const pf = r + PREFETCH_DIST_DISTINCT;
                     if (pf < n and ds[pf] != blank) {
                         dsets[distinctPartition(tier, ds[pf], parts)].prefetchKey(ds[pf]);
@@ -510,6 +519,8 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
                 .varchar, .string, .char => |s| s,
                 else => return,
             };
+            var prev_key: u128 = 0;
+            var have_prev = false;
             var r: usize = 0;
             while (r < n) : (r += 1) {
                 if (!view.isValid(r)) continue;
@@ -520,21 +531,29 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
                     continue;
                 }
                 const key = exec.stringKeyDigest(b);
+                if (have_prev and key == prev_key) continue;
+                prev_key = key;
+                have_prev = true;
                 _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
             }
         },
         .int => switch (view.data) {
             inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
+                var prev_key: u128 = 0;
+                var have_prev = false;
                 var r: usize = 0;
                 while (r < n) : (r += 1) {
                     if (!view.isValid(r)) continue;
                     lane.ns[i] += 1;
+                    const key = @as(u128, @as(u64, @bitCast(@as(i64, s[r]))));
+                    if (have_prev and key == prev_key) continue;
+                    prev_key = key;
+                    have_prev = true;
                     const pf = r + PREFETCH_DIST_DISTINCT;
                     if (pf < n and view.isValid(pf)) {
                         const k_pf = @as(u128, @as(u64, @bitCast(@as(i64, s[pf]))));
                         dsets[distinctPartition(tier, k_pf, parts)].prefetchKey(k_pf);
                     }
-                    const key = @as(u128, @as(u64, @bitCast(@as(i64, s[r]))));
                     _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
                 }
             },
@@ -542,27 +561,37 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
         },
         .float => switch (view.data) {
             inline .float, .double => |s| {
+                var prev_key: u128 = 0;
+                var have_prev = false;
                 var r: usize = 0;
                 while (r < n) : (r += 1) {
                     if (!view.isValid(r)) continue;
                     lane.ns[i] += 1;
+                    const key = @as(u128, @as(u64, @bitCast(@as(f64, @floatCast(s[r])))));
+                    if (have_prev and key == prev_key) continue;
+                    prev_key = key;
+                    have_prev = true;
                     const pf = r + PREFETCH_DIST_DISTINCT;
                     if (pf < n and view.isValid(pf)) {
                         const k_pf = @as(u128, @as(u64, @bitCast(@as(f64, @floatCast(s[pf])))));
                         dsets[distinctPartition(tier, k_pf, parts)].prefetchKey(k_pf);
                     }
-                    const key = @as(u128, @as(u64, @bitCast(@as(f64, @floatCast(s[r])))));
                     _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
                 }
             },
             else => {},
         },
         .wide => {
+            var prev_key: u128 = 0;
+            var have_prev = false;
             var r: usize = 0;
             while (r < n) : (r += 1) {
                 if (!view.isValid(r)) continue;
                 lane.ns[i] += 1;
                 const key = read128(view.data, r);
+                if (have_prev and key == prev_key) continue;
+                prev_key = key;
+                have_prev = true;
                 const pf = r + PREFETCH_DIST_DISTINCT;
                 if (pf < n and view.isValid(pf)) {
                     const k_pf = read128(view.data, pf);

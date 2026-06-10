@@ -578,12 +578,17 @@ fn foldBatch(w: *Worker, batch: Batch) !void {
     for (0..w.parts.len) |pi| try packKeysForPart(w, batch, pi, keys);
 
     var r: usize = 0;
-    while (r < n) : (r += 1) {
+    while (r < n) {
         const pf = r + PREFETCH_DIST;
         if (pf < n) {
             @prefetch(st.table.slotAddr(st.table.bucketOf(GroupTable.hashKey(keys[pf]))), .{ .rw = .write, .locality = 1 });
         }
+        // Adjacent-equal run over the packed keys (the table is physically
+        // ordered, so clustered group keys arrive in runs): one probe and one
+        // count bump for the whole run.
         const key = keys[r];
+        var run_end = r + 1;
+        while (run_end < n and keys[run_end] == key) run_end += 1;
         const probe = st.table.getOrPut(GroupTable.hashKey(key), key);
         var gid: u32 = probe.gid;
         if (!probe.found) {
@@ -593,8 +598,9 @@ fn foldBatch(w: *Worker, batch: Batch) !void {
             st.ns.appendNTimesAssumeCapacity(0, n_aggs);
             st.table.commit(probe.slot, key, gid);
         }
-        st.counts.items[gid] += 1;
-        gids[r] = gid;
+        st.counts.items[gid] += @intCast(run_end - r);
+        @memset(gids[r..run_end], gid);
+        r = run_end;
     }
 
     const ns = st.ns.items;
@@ -630,21 +636,41 @@ fn foldBatch(w: *Worker, batch: Batch) !void {
     }
 }
 
+// The fold kernels walk the gid array run-at-a-time: adjacent-equal gids
+// (clustered keys arrive in runs) accumulate in registers and touch the
+// group's ns/slots entries once per run. Null rows stay inside the run walk.
 fn foldCountCol(view: ColumnView, gids: []const u32, ns: []u64, stride: usize, agg_i: usize) void {
-    for (gids, 0..) |gid, r| {
-        if (!view.isValid(r)) continue;
-        ns[@as(usize, gid) * stride + agg_i] += 1;
+    var r: usize = 0;
+    while (r < gids.len) {
+        const gid = gids[r];
+        var cnt: u64 = 0;
+        var rr = r;
+        while (rr < gids.len and gids[rr] == gid) : (rr += 1) cnt += @intFromBool(view.isValid(rr));
+        if (cnt != 0) ns[@as(usize, gid) * stride + agg_i] += cnt;
+        r = rr;
     }
 }
 
 fn foldSumInt(view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     switch (view.data) {
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
-            for (gids, 0..) |gid, r| {
-                if (!view.isValid(r)) continue;
-                const o = @as(usize, gid) * stride + agg_i;
-                ns[o] += 1;
-                slots[o] += s[r];
+            var r: usize = 0;
+            while (r < gids.len) {
+                const gid = gids[r];
+                var acc: i128 = 0;
+                var cnt: u64 = 0;
+                var rr = r;
+                while (rr < gids.len and gids[rr] == gid) : (rr += 1) {
+                    if (!view.isValid(rr)) continue;
+                    acc += s[rr];
+                    cnt += 1;
+                }
+                if (cnt != 0) {
+                    const o = @as(usize, gid) * stride + agg_i;
+                    ns[o] += cnt;
+                    slots[o] += acc;
+                }
+                r = rr;
             }
         },
         else => {},
@@ -654,11 +680,23 @@ fn foldSumInt(view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, str
 fn foldSumFloat(view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     switch (view.data) {
         inline .float, .double => |s| {
-            for (gids, 0..) |gid, r| {
-                if (!view.isValid(r)) continue;
-                const o = @as(usize, gid) * stride + agg_i;
-                ns[o] += 1;
-                setSlotF64(&slots[o], slotF64(slots[o]) + @as(f64, @floatCast(s[r])));
+            var r: usize = 0;
+            while (r < gids.len) {
+                const gid = gids[r];
+                var acc: f64 = 0;
+                var cnt: u64 = 0;
+                var rr = r;
+                while (rr < gids.len and gids[rr] == gid) : (rr += 1) {
+                    if (!view.isValid(rr)) continue;
+                    acc += @as(f64, @floatCast(s[rr]));
+                    cnt += 1;
+                }
+                if (cnt != 0) {
+                    const o = @as(usize, gid) * stride + agg_i;
+                    ns[o] += cnt;
+                    setSlotF64(&slots[o], slotF64(slots[o]) + acc);
+                }
+                r = rr;
             }
         },
         else => {},
@@ -668,13 +706,26 @@ fn foldSumFloat(view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, s
 fn foldExtremeInt(comptime is_min: bool, view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     switch (view.data) {
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
-            for (gids, 0..) |gid, r| {
-                if (!view.isValid(r)) continue;
-                const o = @as(usize, gid) * stride + agg_i;
-                ns[o] += 1;
-                const v: i128 = s[r];
-                const better = if (is_min) v < slots[o] else v > slots[o];
-                if (ns[o] == 1 or better) slots[o] = v;
+            var r: usize = 0;
+            while (r < gids.len) {
+                const gid = gids[r];
+                var best: i128 = 0;
+                var cnt: u64 = 0;
+                var rr = r;
+                while (rr < gids.len and gids[rr] == gid) : (rr += 1) {
+                    if (!view.isValid(rr)) continue;
+                    const v: i128 = s[rr];
+                    if (cnt == 0 or (if (is_min) v < best else v > best)) best = v;
+                    cnt += 1;
+                }
+                if (cnt != 0) {
+                    const o = @as(usize, gid) * stride + agg_i;
+                    const was_empty = ns[o] == 0;
+                    ns[o] += cnt;
+                    const better = if (is_min) best < slots[o] else best > slots[o];
+                    if (was_empty or better) slots[o] = best;
+                }
+                r = rr;
             }
         },
         else => {},
@@ -684,13 +735,26 @@ fn foldExtremeInt(comptime is_min: bool, view: ColumnView, gids: []const u32, ns
 fn foldExtremeFloat(comptime is_min: bool, view: ColumnView, gids: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     switch (view.data) {
         inline .float, .double => |s| {
-            for (gids, 0..) |gid, r| {
-                if (!view.isValid(r)) continue;
-                const o = @as(usize, gid) * stride + agg_i;
-                ns[o] += 1;
-                const v: f64 = @floatCast(s[r]);
-                const better = if (is_min) v < slotF64(slots[o]) else v > slotF64(slots[o]);
-                if (ns[o] == 1 or better) setSlotF64(&slots[o], v);
+            var r: usize = 0;
+            while (r < gids.len) {
+                const gid = gids[r];
+                var best: f64 = 0;
+                var cnt: u64 = 0;
+                var rr = r;
+                while (rr < gids.len and gids[rr] == gid) : (rr += 1) {
+                    if (!view.isValid(rr)) continue;
+                    const v: f64 = @floatCast(s[rr]);
+                    if (cnt == 0 or (if (is_min) v < best else v > best)) best = v;
+                    cnt += 1;
+                }
+                if (cnt != 0) {
+                    const o = @as(usize, gid) * stride + agg_i;
+                    const was_empty = ns[o] == 0;
+                    ns[o] += cnt;
+                    const better = if (is_min) best < slotF64(slots[o]) else best > slotF64(slots[o]);
+                    if (was_empty or better) setSlotF64(&slots[o], best);
+                }
+                r = rr;
             }
         },
         else => {},
@@ -714,6 +778,8 @@ fn foldDistinctKernel(
     switch (view.data) {
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
             const n = keys.len;
+            var prev_comp: u128 = 0;
+            var have_prev = false;
             var r: usize = 0;
             while (r < n) : (r += 1) {
                 if (!view.isValid(r)) continue;
@@ -723,6 +789,12 @@ fn foldDistinctKernel(
                     dsets[distinctPartition(tier, c_pf, parts_n)].prefetchKey(c_pf);
                 }
                 const comp = compositeOf(keys[r], @as(i64, s[r]), value_bits);
+                // Physical order clusters repeated (key, value) pairs into
+                // adjacent runs; an identical composite can't be new — skip
+                // the cache-missing set probe.
+                if (have_prev and comp == prev_comp) continue;
+                prev_comp = comp;
+                have_prev = true;
                 _ = try dsets[distinctPartition(tier, comp, parts_n)].insertIsNew(allocator, comp);
             }
         },
