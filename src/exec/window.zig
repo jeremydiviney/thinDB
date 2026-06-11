@@ -434,7 +434,11 @@ pub const Window = struct {
                     if (ord == .lt) return !ctx.desc[i];
                     if (ord == .gt) return ctx.desc[i];
                 }
-                return false;
+                // Tied (partition, order) keys fall back to arrival order:
+                // pdq is unstable, and without this LAG/FIRST_VALUE across a
+                // tie would be free to differ run-to-run. SQL permits that,
+                // but deterministic output is worth one comparison on ties.
+                return a < b;
             }
         };
 

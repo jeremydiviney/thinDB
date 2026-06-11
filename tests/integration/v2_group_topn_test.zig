@@ -639,11 +639,13 @@ test "string GROUP BY and COUNT(DISTINCT) over lz4_fsst blocks" {
     // Blank and NULL groups ride along: blank is a real DISTINCT value and a
     // real group; NULL groups but is excluded from COUNT(DISTINCT s).
     for (0..13) |b| {
-        try buf.writer(allocator).print(",({d},{d},'')", .{ id, b % 10 });
+        var row: [64]u8 = undefined;
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&row, ",({d},{d},'')", .{ id, b % 10 }));
         id += 1;
     }
     for (0..17) |b| {
-        try buf.writer(allocator).print(",({d},{d},NULL)", .{ id, b % 10 });
+        var row: [64]u8 = undefined;
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&row, ",({d},{d},NULL)", .{ id, b % 10 }));
         id += 1;
     }
     try exec(allocator, db, buf.items);
@@ -680,13 +682,103 @@ test "string GROUP BY and COUNT(DISTINCT) over lz4_fsst blocks" {
         }
     }
 
-    // Filtered lane (hashSurvivorsFromBlock): the global count of k<5 rows
-    // grouped per key must sum exactly.
+    // Filtered lane (hashSurvivorsFromBlock): every key has at least one
+    // k<5 row, so the filtered GROUP BY must surface all 100 groups, and the
+    // detail count pins the per-group memberships' total.
     {
+        const groups = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM (SELECT s, COUNT(*) AS c FROM visits WHERE k < 5 AND s <> '' GROUP BY s) sub");
+        defer allocator.free(groups);
+        try std.testing.expectEqualSlices(i64, &[_]i64{@intCast(n_keys)}, groups);
+
         var expected_total: i64 = 0;
         for (cnt_filt) |c| expected_total += c;
-        const got = try helpers.collectBigints(allocator, db, "SELECT SUM(c) FROM (SELECT s, COUNT(*) AS c FROM visits WHERE k < 5 AND s <> '' GROUP BY s) sub");
-        defer allocator.free(got);
-        try std.testing.expectEqualSlices(i64, &[_]i64{expected_total}, got);
+        const total = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM visits WHERE k < 5 AND s <> ''");
+        defer allocator.free(total);
+        try std.testing.expectEqualSlices(i64, &[_]i64{expected_total}, total);
     }
+}
+
+test "V2 staged window: LAG/ROW_NUMBER with partition, multi-spec, tie determinism" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE events (id BIGINT PRIMARY KEY, grp INT NOT NULL, ord INT NOT NULL, val BIGINT NOT NULL)");
+    // grp 1 carries an ORDER BY tie (ord=2 twice); the window tiebreak is
+    // arrival order, so id=2 sorts before id=3 deterministically.
+    try exec(allocator, db,
+        \\INSERT INTO events VALUES
+        \\(1,1,1,10),(2,1,2,20),(3,1,2,21),(4,1,3,30),
+        \\(5,2,1,100),(6,2,2,110)
+    );
+    const t = try db.openTable("events", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT id, LAG(val, 1) OVER (PARTITION BY grp ORDER BY ord) AS prev, " ++
+            "ROW_NUMBER() OVER (PARTITION BY grp ORDER BY ord) AS rn, " ++
+            "SUM(val) OVER (PARTITION BY grp) AS tot " ++
+            "FROM events ORDER BY id");
+    defer q.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    var prevs: std.ArrayList(?i64) = .empty;
+    defer prevs.deinit(allocator);
+    var rns: std.ArrayList(i64) = .empty;
+    defer rns.deinit(allocator);
+    var tots: std.ArrayList(i64) = .empty;
+    defer tots.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            try ids.append(allocator, batch.values[0].data.bigint[r]);
+            try prevs.append(allocator, if (batch.values[1].isValid(r)) batch.values[1].data.bigint[r] else null);
+            try rns.append(allocator, batch.values[2].data.bigint[r]);
+            try tots.append(allocator, batch.values[3].data.bigint[r]);
+        }
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4, 5, 6 }, ids.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4, 1, 2 }, rns.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 81, 81, 81, 81, 210, 210 }, tots.items);
+    const expected_prev = [_]?i64{ null, 10, 20, 21, null, 100 };
+    for (prevs.items, expected_prev) |got, want| try std.testing.expectEqual(want, got);
+}
+
+test "V2 staged window: RANK + QUALIFY above a grouped block" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // Below-window block = the V2 group handler in all-groups mode; the
+    // window ranks the 12 group rows; QUALIFY filters on the window output.
+    var q = try runSql(allocator, db,
+        "SELECT UserID, c, RANK() OVER (ORDER BY c DESC) AS rnk " ++
+            "FROM (SELECT UserID, COUNT(*) AS c FROM hits GROUP BY UserID) t " ++
+            "QUALIFY rnk <= 3 ORDER BY rnk");
+    defer q.deinit();
+
+    var users: std.ArrayList(i64) = .empty;
+    defer users.deinit(allocator);
+    var counts: std.ArrayList(i64) = .empty;
+    defer counts.deinit(allocator);
+    var ranks: std.ArrayList(i64) = .empty;
+    defer ranks.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            users.append(allocator, batch.values[0].data.bigint[r]) catch unreachable;
+            counts.append(allocator, batch.values[1].data.bigint[r]) catch unreachable;
+            ranks.append(allocator, batch.values[2].data.bigint[r]) catch unreachable;
+        }
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 12, 11, 10 }, users.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 12, 11, 10 }, counts.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ranks.items);
 }

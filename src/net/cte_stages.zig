@@ -31,10 +31,10 @@ const local = @import("local.zig");
 const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
 
 /// True when the plan needs the staged compiler: any materialize boundary
-/// (CTE / FROM-subquery) or any join node anywhere in the tree.
+/// (CTE / FROM-subquery), join, or window node anywhere in the tree.
 pub fn needsStaging(op: *const ir.Op) bool {
     return switch (op.*) {
-        .materialize, .join => true,
+        .materialize, .join, .window => true,
         .select => |p| needsStaging(p.upstream),
         .exclude => |p| needsStaging(p.upstream),
         .filter => |f| needsStaging(f.upstream),
@@ -43,7 +43,6 @@ pub fn needsStaging(op: *const ir.Op) bool {
         .compute => |c| needsStaging(c.upstream),
         .alias => |a| needsStaging(a.upstream),
         .limit => |l| needsStaging(l.upstream),
-        .window => |w| needsStaging(w.upstream),
         .set_union => |u| needsStaging(u.left) or needsStaging(u.right),
         else => false,
     };
@@ -96,10 +95,14 @@ fn collectStages(
     }
 }
 
-const BlockSource = enum { table, mat, join, unsupported };
+const BlockSource = enum { table, mat, join, window, unsupported };
 
 /// A query block is a linear pipeline; its source is whatever the upstream
-/// chain bottoms out at.
+/// chain bottoms out at. A window node is a block boundary like a join:
+/// everything below it compiles as its own block (a table-backed input gets
+/// the full parallel V2 handlers — with no top-end fused, since the window
+/// must see every row), and the operators above it run generically over the
+/// window's output.
 fn blockSource(op: *const ir.Op) BlockSource {
     var cur = op;
     while (true) {
@@ -107,6 +110,7 @@ fn blockSource(op: *const ir.Op) BlockSource {
             .scan, .file_scan, .single_row => return .table,
             .materialize => return .mat,
             .join => return .join,
+            .window => return .window,
             .select => |p| cur = p.upstream,
             .exclude => |p| cur = p.upstream,
             .filter => |f| cur = f.upstream,
@@ -124,10 +128,11 @@ fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap)
     return switch (blockSource(op)) {
         // Table-backed block: the regular V2 handlers, full parallelism.
         .table => engine_v2.compileSelectBlock(input, op),
-        // Stage- or join-backed block: generic operators over MatScan / Join
-        // leaves. The heavy inputs were already produced by upstream stage
-        // handlers or stream in from table-backed child blocks.
-        .mat, .join => buildGenericBlock(input, op, map),
+        // Stage-, join-, or window-backed block: generic operators over
+        // MatScan / Join / Window leaves. The heavy inputs were already
+        // produced by upstream stage handlers or stream in from table-backed
+        // child blocks.
+        .mat, .join, .window => buildGenericBlock(input, op, map),
         .unsupported => error.UnsupportedQueryShape,
     };
 }
@@ -211,6 +216,18 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 g.emit_limit,
                 input.db.config.query_memory_budget,
             );
+        },
+        .window => |w| {
+            // The below-window input compiles as its own block: table-backed
+            // inputs route through the regular V2 handlers (full parallelism,
+            // all-rows/all-groups emission — the window is a barrier and must
+            // see everything), stage/join inputs build their generic
+            // pipelines. The blocking Window operator accumulates that
+            // block's output, evaluates, and emits in input order with the
+            // call columns appended.
+            var up = try compileBlock(input, w.upstream, map);
+            errdefer up.deinit();
+            return up.window(w.specs, w.calls);
         },
         .join => |j| {
             var left = try compileJoinChild(input, j.left, map);
