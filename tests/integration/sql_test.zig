@@ -805,7 +805,7 @@ test "sql: mixed star and expression projection preserves source columns first" 
     try std.testing.expectEqual(@as(i32, 11), b.values[4].data.int[0]);
 }
 
-test "sql: alias star strips the alias prefix and rejects duplicate output names" {
+test "sql: alias star strips the alias prefix and qualifies colliding names" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -823,12 +823,20 @@ test "sql: alias star strips the alias prefix and rejects duplicate output names
     try std.testing.expectEqualStrings("qty", schema[2].name);
     try std.testing.expectEqualStrings("tag", schema[3].name);
 
-    try helpers.expectRunError(
-        allocator,
-        db,
-        "SELECT a.*, b.* FROM t AS a JOIN t AS b ON a.id = b.id",
-        thindb.exec.Error.ComputeNameCollision,
-    );
+    // Stripping both stars bare would collide; colliding names keep their
+    // qualified form instead. The right join key (b.id) is dropped from the
+    // join output (USING semantics), so a.id's bare `id` is unique.
+    var star_q = try runSql(allocator, db, "SELECT a.*, b.* FROM t AS a JOIN t AS b ON a.id = b.id");
+    defer star_q.deinit();
+    const star_schema = star_q.outputSchema();
+    try std.testing.expectEqual(@as(usize, 7), star_schema.len);
+    try std.testing.expectEqualStrings("id", star_schema[0].name);
+    try std.testing.expectEqualStrings("a.k", star_schema[1].name);
+    try std.testing.expectEqualStrings("a.qty", star_schema[2].name);
+    try std.testing.expectEqualStrings("a.tag", star_schema[3].name);
+    try std.testing.expectEqualStrings("b.k", star_schema[4].name);
+    try std.testing.expectEqualStrings("b.qty", star_schema[5].name);
+    try std.testing.expectEqualStrings("b.tag", star_schema[6].name);
 
     var cte_q = try runSql(allocator, db,
         \\WITH left_rows AS (SELECT id, qty FROM t),

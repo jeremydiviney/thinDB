@@ -2292,7 +2292,7 @@ pub fn compileWithSession(
     };
     // CTE / FROM-subquery boundaries compile as a chain of materialized
     // stages (each block its own V2 pipeline) rather than one block.
-    if (engine_v2.v2Enabled() and engine_v2.isSelectQuery(root) and cte_stages.containsMaterialize(root)) {
+    if (engine_v2.v2Enabled() and engine_v2.isSelectQuery(root) and cte_stages.needsStaging(root)) {
         const q = try cte_stages.compileStaged(v2_input, root);
         return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }
@@ -3103,6 +3103,7 @@ fn appendExpandedProjectItem(
     allocator: Allocator,
     sources: *std.ArrayListUnmanaged([]const u8),
     outputs: *std.ArrayListUnmanaged([]const u8),
+    stripped: *std.ArrayListUnmanaged(bool),
     schema: []const types.Column,
     item: []const u8,
     output: ?[]const u8,
@@ -3111,6 +3112,7 @@ fn appendExpandedProjectItem(
         for (schema) |c| {
             try sources.append(allocator, c.name);
             try outputs.append(allocator, c.name);
+            try stripped.append(allocator, false);
         }
         return;
     }
@@ -3121,6 +3123,7 @@ fn appendExpandedProjectItem(
                 matched = true;
                 try sources.append(allocator, c.name);
                 try outputs.append(allocator, bare);
+                try stripped.append(allocator, true);
             }
         }
         if (!matched) return Error.ColumnNotFound;
@@ -3135,6 +3138,7 @@ fn appendExpandedProjectItem(
     // upstream schema spells it (AliasRename qualifies every column).
     const bare = if (std.mem.lastIndexOfScalar(u8, item, '.')) |dot| item[dot + 1 ..] else item;
     try outputs.append(allocator, output orelse bare);
+    try stripped.append(allocator, output == null and bare.ptr != item.ptr);
 }
 
 pub fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Project) !Query {
@@ -3146,11 +3150,42 @@ pub fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Proj
     defer sources.deinit(allocator);
     var outputs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer outputs.deinit(allocator);
+    var stripped: std.ArrayListUnmanaged(bool) = .empty;
+    defer stripped.deinit(allocator);
 
     for (p.columns, 0..) |item, i| {
         const explicit_output: ?[]const u8 = if (p.outputs) |outs| outs[i] else null;
         const expansion_schema = if (std.mem.eql(u8, item, "*") or aliasStarSource(item) != null) star_schema else schema;
-        try appendExpandedProjectItem(allocator, &sources, &outputs, expansion_schema, item, explicit_output);
+        try appendExpandedProjectItem(allocator, &sources, &outputs, &stripped, expansion_schema, item, explicit_output);
+    }
+
+    // Unqualifying two references from different join sides can collide
+    // (`SELECT e.name, m.name`). Keep the qualified name for every stripped
+    // item whose bare name another output also claims — deterministic and
+    // resolvable, where SQL's duplicate result names wouldn't be. Collisions
+    // are detected against the pre-rename names so every duplicate reverts.
+    var any_collision = false;
+    detect: for (outputs.items, 0..) |out, i| {
+        if (!stripped.items[i]) continue;
+        for (outputs.items, 0..) |other, j| {
+            if (j != i and types.columnNameEql(out, other)) {
+                any_collision = true;
+                break :detect;
+            }
+        }
+    }
+    if (any_collision) {
+        const original = try allocator.dupe([]const u8, outputs.items);
+        defer allocator.free(original);
+        for (original, 0..) |out, i| {
+            if (!stripped.items[i]) continue;
+            for (original, 0..) |other, j| {
+                if (j != i and types.columnNameEql(out, other)) {
+                    outputs.items[i] = sources.items[i];
+                    break;
+                }
+            }
+        }
     }
 
     const source_slice = try sources.toOwnedSlice(allocator);

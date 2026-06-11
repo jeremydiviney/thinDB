@@ -327,3 +327,223 @@ test "V2 staged subquery: FROM-clause subquery with alias qualification" {
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 4, 3 }, ids.items);
 }
+
+fn openJoinDb(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, io, dir, .{});
+    errdefer db.close();
+    try exec(allocator, db, "CREATE TABLE parts (id BIGINT PRIMARY KEY, name TEXT NOT NULL, cat_id BIGINT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO parts VALUES (1,'bolt',1),(2,'nut',1),(3,'washer',2)");
+    try exec(allocator, db, "CREATE TABLE orders (id BIGINT PRIMARY KEY, part_id BIGINT NOT NULL, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO orders VALUES (1,1,10),(2,1,20),(3,2,5),(4,9,7)");
+    return db;
+}
+
+const JoinRow = struct {
+    qty: ?i32,
+    name: ?[]const u8,
+};
+
+fn collectQtyName(allocator: std.mem.Allocator, name_arena: std.mem.Allocator, db: *thindb.Database, sql: []const u8) !std.ArrayList(JoinRow) {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var rows: std.ArrayList(JoinRow) = .empty;
+    errdefer rows.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            try rows.append(allocator, .{
+                .qty = if (batch.values[0].isValid(r)) batch.values[0].data.int[r] else null,
+                .name = if (batch.values[1].isValid(r))
+                    try name_arena.dupe(u8, batch.values[1].data.string.rowBytes(r))
+                else
+                    null,
+            });
+        }
+    }
+    return rows;
+}
+
+test "V2 staged joins: INNER preserves matches only" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openJoinDb(allocator, io, tmp.dir);
+    defer db.close();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var rows = try collectQtyName(allocator, arena.allocator(), db, "SELECT o.qty, p.name FROM orders o JOIN parts p ON o.part_id = p.id ORDER BY o.qty");
+    defer rows.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), rows.items.len);
+    try std.testing.expectEqual(@as(?i32, 5), rows.items[0].qty);
+    try std.testing.expectEqualStrings("nut", rows.items[0].name.?);
+    try std.testing.expectEqual(@as(?i32, 10), rows.items[1].qty);
+    try std.testing.expectEqualStrings("bolt", rows.items[1].name.?);
+    try std.testing.expectEqual(@as(?i32, 20), rows.items[2].qty);
+    try std.testing.expectEqualStrings("bolt", rows.items[2].name.?);
+}
+
+test "V2 staged joins: LEFT null-extends unmatched probe rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openJoinDb(allocator, io, tmp.dir);
+    defer db.close();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var rows = try collectQtyName(allocator, arena.allocator(), db, "SELECT o.qty, p.name FROM orders o LEFT JOIN parts p ON o.part_id = p.id ORDER BY o.qty");
+    defer rows.deinit(allocator);
+
+    // Order 4 (part_id 9) survives with a NULL part name.
+    try std.testing.expectEqual(@as(usize, 4), rows.items.len);
+    try std.testing.expectEqual(@as(?i32, 5), rows.items[0].qty);
+    try std.testing.expectEqualStrings("nut", rows.items[0].name.?);
+    try std.testing.expectEqual(@as(?i32, 7), rows.items[1].qty);
+    try std.testing.expect(rows.items[1].name == null);
+    try std.testing.expectEqualStrings("bolt", rows.items[2].name.?);
+    try std.testing.expectEqualStrings("bolt", rows.items[3].name.?);
+}
+
+test "V2 staged joins: RIGHT null-extends unmatched build rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openJoinDb(allocator, io, tmp.dir);
+    defer db.close();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var rows = try collectQtyName(allocator, arena.allocator(), db, "SELECT o.qty, p.name FROM orders o RIGHT JOIN parts p ON o.part_id = p.id ORDER BY p.name, o.qty");
+    defer rows.deinit(allocator);
+
+    // Part 3 (washer) has no orders: NULL qty.
+    try std.testing.expectEqual(@as(usize, 4), rows.items.len);
+    try std.testing.expectEqual(@as(?i32, 10), rows.items[0].qty);
+    try std.testing.expectEqualStrings("bolt", rows.items[0].name.?);
+    try std.testing.expectEqual(@as(?i32, 20), rows.items[1].qty);
+    try std.testing.expectEqualStrings("bolt", rows.items[1].name.?);
+    try std.testing.expectEqual(@as(?i32, 5), rows.items[2].qty);
+    try std.testing.expectEqualStrings("nut", rows.items[2].name.?);
+    try std.testing.expectEqual(@as(?i32, null), rows.items[3].qty);
+    try std.testing.expectEqualStrings("washer", rows.items[3].name.?);
+}
+
+test "V2 staged joins: FULL preserves both sides" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openJoinDb(allocator, io, tmp.dir);
+    defer db.close();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var rows = try collectQtyName(allocator, arena.allocator(), db, "SELECT o.qty, p.name FROM orders o FULL JOIN parts p ON o.part_id = p.id");
+    defer rows.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), rows.items.len);
+    var null_qty: usize = 0;
+    var null_name: usize = 0;
+    var qty_sum: i64 = 0;
+    var saw_washer = false;
+    for (rows.items) |row| {
+        if (row.qty) |v| qty_sum += v else null_qty += 1;
+        if (row.name) |n| {
+            if (std.mem.eql(u8, n, "washer")) saw_washer = true;
+        } else null_name += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), null_qty);
+    try std.testing.expectEqual(@as(usize, 1), null_name);
+    try std.testing.expectEqual(@as(i64, 42), qty_sum);
+    try std.testing.expect(saw_washer);
+}
+
+test "V2 staged joins: three-table chain + WHERE + GROUP BY + ORDER BY" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openJoinDb(allocator, io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE cats (id BIGINT PRIMARY KEY, label TEXT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO cats VALUES (1,'metal'),(2,'rubber')");
+
+    var q = try runSql(allocator, db, "SELECT c.label, SUM(o.qty) AS total " ++
+        "FROM orders o JOIN parts p ON o.part_id = p.id JOIN cats c ON p.cat_id = c.id " ++
+        "WHERE o.qty >= 5 GROUP BY c.label ORDER BY total DESC");
+    defer q.deinit();
+
+    var labels: std.ArrayList(u8) = .empty;
+    defer labels.deinit(allocator);
+    var totals: std.ArrayList(i64) = .empty;
+    defer totals.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            try labels.appendSlice(allocator, batch.values[0].data.string.rowBytes(r));
+            try totals.append(allocator, batch.values[1].data.bigint[r]);
+        }
+    }
+    // Orders 1/2/3 match parts 1/1/2, all cat 'metal' (35); order 4 matches nothing.
+    try std.testing.expectEqualStrings("metal", labels.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{35}, totals.items);
+}
+
+test "V2 staged joins: self-join via aliases" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE emp (id BIGINT PRIMARY KEY, mgr_id BIGINT NOT NULL, name TEXT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO emp VALUES (1,1,'ada'),(2,1,'bob'),(3,2,'cyd')");
+
+    var q = try runSql(allocator, db, "SELECT e.name, m.name FROM emp e JOIN emp m ON e.mgr_id = m.id ORDER BY e.id");
+    defer q.deinit();
+
+    var pairs: std.ArrayList(u8) = .empty;
+    defer pairs.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            try pairs.appendSlice(allocator, batch.values[0].data.string.rowBytes(r));
+            try pairs.appendSlice(allocator, "->");
+            try pairs.appendSlice(allocator, batch.values[1].data.string.rowBytes(r));
+            try pairs.appendSlice(allocator, " ");
+        }
+    }
+    try std.testing.expectEqualStrings("ada->ada bob->ada cyd->bob ", pairs.items);
+}
+
+test "V2 staged joins: CTE joined to itself shares one stage" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openJoinDb(allocator, io, tmp.dir);
+    defer db.close();
+
+    var q = try runSql(allocator, db, "WITH totals AS (SELECT part_id, SUM(qty) AS total FROM orders GROUP BY part_id) " ++
+        "SELECT a.part_id, b.total FROM totals a JOIN totals b ON a.part_id = b.part_id ORDER BY a.part_id");
+    defer q.deinit();
+
+    var part_ids: std.ArrayList(i64) = .empty;
+    defer part_ids.deinit(allocator);
+    var totals: std.ArrayList(i64) = .empty;
+    defer totals.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            try part_ids.append(allocator, batch.values[0].data.bigint[r]);
+            try totals.append(allocator, batch.values[1].data.bigint[r]);
+        }
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 9 }, part_ids.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 30, 5, 7 }, totals.items);
+}
