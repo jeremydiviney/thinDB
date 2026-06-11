@@ -1173,6 +1173,9 @@ pub fn expandFsstPooled(
     var o: usize = 0;
     offsets[0] = 0;
     for (0..n) |r| {
+        // Prefetch a few rows ahead: row starts hop unpredictably enough that
+        // the hardware prefetcher misses them (+~10% measured in the micro).
+        if (r + 8 < n) @prefetch(fv.block.rowComp(r + 8).ptr, .{ .rw = .read, .locality = 2 });
         o += fv.block.table.decodeInto(fv.block.rowComp(r), bytes[o..]);
         offsets[r + 1] = @intCast(o);
     }
@@ -1223,6 +1226,7 @@ pub fn decodeFsstColumn(
     offsets[0] = 0;
     var row: usize = 0;
     while (row < row_count) : (row += 1) {
+        if (row + 8 < row_count) @prefetch(fb.rowComp(row + 8).ptr, .{ .rw = .read, .locality = 2 });
         o += fb.table.decodeInto(fb.rowComp(row), bytes[o..]);
         offsets[row + 1] = @intCast(o);
     }

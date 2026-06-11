@@ -1411,6 +1411,7 @@ pub const Scan = struct {
             defer scratch.deinit(self.allocator);
             var decoded_bytes: u64 = 0;
             for (0..rg_count) |i| {
+                if (i + 8 < rg_count) @prefetch(fv.block.rowComp(i + 8).ptr, .{ .rw = .read, .locality = 2 });
                 const comp = fv.block.rowComp(i);
                 try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
                 const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
