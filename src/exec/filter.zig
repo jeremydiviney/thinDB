@@ -215,6 +215,16 @@ pub const Filter = struct {
     /// Forward a projection-Compute fusion to the upstream, but only when this
     /// Filter is itself fused (a pass-through). A non-fused Filter still
     /// evaluates rows here, so a Compute above it must stay a separate operator.
+    /// A fused Filter is a pass-through, so a join-probe offer continues to
+    /// the scan (the batches this Filter forwards become joined batches —
+    /// its own predicate already runs inside the scan). An UNFUSED Filter
+    /// must decline: its mask evaluates against the probe-side schema and
+    /// would be applied to already-joined rows.
+    pub fn tryFuseProbe(self: *Filter, sink: exec.ProbeSink) !bool {
+        if (!self.fused) return false;
+        return self.upstream.tryFuseProbe(sink);
+    }
+
     pub fn tryFuseCompute(self: *Filter, derived: []const @import("compute.zig").Derived) !bool {
         if (!self.fused) return false;
         const ok = try self.upstream.tryFuseCompute(derived);

@@ -752,6 +752,7 @@ pub const Join = struct {
                         const probe = if (self.build_is_left) self.right else self.left;
                         self.probe_fused = probe.tryFuseProbe(.{
                             .ctx = self,
+                            .out_schema = self.output_schema,
                             .bind = sinkBind,
                             .process = sinkProcess,
                         }) catch false;

@@ -437,14 +437,19 @@ pub const ParallelScan = struct {
     /// to bump a fixed per-source usize counter — benign undercounting under
     /// concurrency; the materialize step does the real byte reservation. TODO:
     /// null the partial accountant before enabling this path by default.)
-    /// Accept a join-probe sink when nothing else has claimed the workers and
-    /// no filter fused (a fused filter forces materialize mode, whose drain
-    /// loop doesn't run the sink — the Join keeps its own serial probe there).
+    /// Accept a join-probe sink when nothing else has claimed the workers'
+    /// output. Works in both modes: round workers stage the sink's joined
+    /// batches directly; materialize-mode (fused-filter) workers drain their
+    /// chunks through the sink and deep-copy the joined output — so the
+    /// buffers, emission views, and budget charge re-type to the JOIN's
+    /// schema (`out_schema` swap below).
     pub fn tryFuseProbe(self: *ParallelScan, sink: exec.ProbeSink) !bool {
         if (self.mode != .unset) return false;
-        if (self.agg_fused or self.compute_fused or self.workers[0].fusedActive()) return false;
+        if (self.agg_fused or self.compute_fused) return false;
+        if (self.emit_keep != null or self.owns_out_schema) return false;
         try sink.bind(sink.ctx, self.workers.len, self.table.allocator);
         self.probe_sink = sink;
+        self.out_schema = sink.out_schema;
         return true;
     }
 
@@ -961,7 +966,7 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
             lease = sched.acquire();
             leased = true;
         }
-        drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, &self.wbufs[i], &self.werr[i]);
+        drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, self.probe_sink, i, &self.wbufs[i], &self.werr[i]);
     }
 }
 
@@ -972,7 +977,7 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
 /// be thread-safe (the table allocator) — workers run concurrently and never
 /// touch the query accountant. `drainable` is `*Scan` or `Query`; both expose
 /// `.next()`, so this is monomorphized per call site.
-fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, keep: ?[]const usize, wb: *WorkerBuf, out_err: *?anyerror) void {
+fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, keep: ?[]const usize, sink: ?exec.ProbeSink, chunk: usize, wb: *WorkerBuf, out_err: *?anyerror) void {
     var d = drainable;
     const cols = alloc.alloc(ColumnStore, schema.len) catch |e| {
         out_err.* = e;
@@ -1003,6 +1008,26 @@ fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, kee
         if (timing) scan_ticks += @intCast(exec.prof.nowTicks() - s0);
         const batch = mb orelse break;
         const c0 = if (timing) exec.prof.nowTicks() else 0;
+        if (sink) |s| {
+            // Probe-fused drain: the sink turns the scanned batch into a
+            // joined batch (aliasing its per-chunk staging, schema =
+            // `out_schema` = the join's) which we deep-copy like any other.
+            const joined = s.process(s.ctx, chunk, batch) catch |e| {
+                out_err.* = e;
+                break :outer;
+            };
+            if (joined) |jb| {
+                for (cols, jb.values) |*store, v| {
+                    transform.appendAllColumn(alloc, v, store) catch |e| {
+                        out_err.* = e;
+                        break :outer;
+                    };
+                }
+                rc += @intCast(jb.row_count);
+            }
+            if (timing) copy_ticks += @intCast(exec.prof.nowTicks() - c0);
+            continue;
+        }
         // `keep[j]` maps projected output column j to its batch index; without a
         // projection the mapping is the identity (copy every column).
         for (cols, 0..) |*store, j| {

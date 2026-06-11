@@ -189,6 +189,9 @@ pub const Batch = struct {
 /// chunk count and the thread-safe allocator `process` must allocate from.
 pub const ProbeSink = struct {
     ctx: *anyopaque,
+    /// The join's output schema — what `process`-returned batches carry.
+    /// A materialize-mode acceptor re-types its drain buffers with this.
+    out_schema: []const Column,
     bind: *const fn (ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void,
     /// Returns null when this probe batch produced no output rows (the
     /// worker pulls the next scan batch); never called on an exhausted chunk.
