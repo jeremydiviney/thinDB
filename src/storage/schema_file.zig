@@ -17,7 +17,7 @@
 //!   For each order_key name:
 //!     name_len u32, name bytes
 //!   unique u8
-//!   compression u8  (v5: types.TableCompression — 0 none, 1 zstd, 2 lz4)
+//!   compression u8  (v5: types.TableCompression — 0 none, 1 zstd, 2 lz4, 3 lz4_fsst)
 //!   "tDBC" (4)
 
 const std = @import("std");
@@ -246,7 +246,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
     cursor += 1;
     const compression_byte = bytes[cursor];
     cursor += 1;
-    if (compression_byte > @intFromEnum(types.TableCompression.lz4)) return Error.SchemaCorrupt;
+    if (compression_byte > @intFromEnum(types.TableCompression.lz4_fsst)) return Error.SchemaCorrupt;
     const compression: types.TableCompression = @enumFromInt(compression_byte);
     if (!std.mem.eql(u8, bytes[cursor .. cursor + 4], &schema_magic)) {
         return Error.SchemaBadTrailerMagic;

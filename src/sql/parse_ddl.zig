@@ -181,6 +181,8 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
                     .zstd
                 else if (std.ascii.eqlIgnoreCase(value, "lz4"))
                     .lz4
+                else if (std.ascii.eqlIgnoreCase(value, "lz4_fsst"))
+                    .lz4_fsst
                 else
                     return PE.SqlInvalidProjection;
             } else {

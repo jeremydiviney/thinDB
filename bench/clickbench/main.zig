@@ -27,6 +27,7 @@ pub fn main(init: std.process.Init) !u8 {
     var database_name: []const u8 = "clickbench";
     var wipe: bool = true;
     var threads: usize = 0;
+    var compression: thindb.types.TableCompression = thindb.types.default_table_compression;
 
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();
@@ -44,6 +45,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, arg, "--threads")) {
             const v = args_iter.next() orelse return error.MissingFlagValue;
             threads = std.fmt.parseInt(usize, v, 10) catch return error.BadFlagValue;
+        } else if (std.mem.eql(u8, arg, "--compression")) {
+            const v = args_iter.next() orelse return error.MissingFlagValue;
+            compression = std.meta.stringToEnum(thindb.types.TableCompression, v) orelse return error.BadFlagValue;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("clickbench: unknown flag '{s}'\n", .{arg});
             return 1;
@@ -72,6 +76,7 @@ pub fn main(init: std.process.Init) !u8 {
     const n_threads = thindb.api.resolveCompactThreads(allocator, threads);
     std.debug.print("  Wipe data dir: {}\n", .{wipe});
     std.debug.print("  Threads      : {d} (parse workers + flush encode)\n", .{n_threads});
+    std.debug.print("  Compression  : {t}\n", .{compression});
     if (max_rows > 0) std.debug.print("  Max rows     : {d}\n", .{max_rows});
 
     const cwd = std.Io.Dir.cwd();
@@ -84,7 +89,9 @@ pub fn main(init: std.process.Init) !u8 {
     });
     defer catalog.close();
     const db = try catalog.createOrOpenDatabase(database_name);
-    const t = try db.table("hits", schema_mod.table_schema, schema_mod.table_options);
+    var tbl_schema = schema_mod.table_schema;
+    tbl_schema.compression = compression;
+    const t = try db.table("hits", tbl_schema, schema_mod.table_options);
 
     std.debug.print("\nSchema    : {d} columns, order key on ({s}, {s}, {s}, {s}, {s})\n", .{
         schema_mod.columns.len,

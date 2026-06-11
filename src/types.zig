@@ -360,6 +360,11 @@ pub const TableCompression = enum(u8) {
     /// additionally stay compressed IN CACHE and decompress per access into
     /// recycled scratch — a much smaller resident set for string-heavy data.
     lz4 = 2,
+    /// `.lz4` everywhere, except large string blocks are FSST-encoded
+    /// instead of LZ4-at-rest: the cache holds the FSST form (per-string
+    /// random access — kernels with per-row lanes decode only the rows they
+    /// touch), and the FSST bytes are themselves LZ4'd on disk.
+    lz4_fsst = 3,
 };
 
 pub const default_table_compression: TableCompression = .lz4;
