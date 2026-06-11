@@ -206,88 +206,6 @@ pub var g_fsst_digest_ticks = std.atomic.Value(u64).init(0);
 pub var g_fsst_digest_rows = std.atomic.Value(u64).init(0);
 pub var g_fsst_digest_bytes = std.atomic.Value(u64).init(0);
 
-/// Block-local memo mapping FSST compressed key bytes → a per-value u128
-/// payload (plaintext key digest, or a global dict code). Within one block
-/// the symbol table is fixed and the encoder is deterministic, so equal
-/// compressed bytes ⇔ equal plaintext — the expensive decode+digest/intern
-/// then runs once per DISTINCT value per block while the per-row path is a
-/// hash + probe over the (smaller) compressed bytes. Entries never cross a
-/// block boundary (`beginBlock` generation-bumps), so the table-dependence
-/// of the compressed domain can't leak: anything block-external still sees
-/// only the plaintext-derived payload.
-///
-/// Open addressing at ≤0.5 load. A slot stores the first row index that
-/// produced its key; probes re-derive the bytes via `FsstBlock.rowComp`, so
-/// no key bytes are copied.
-///
-/// The memo only pays when values actually repeat within the block (probe +
-/// verify costs about what a decode saves, breakeven ≈ 65-75% hit rate; URL
-/// blocks measure ~47% distinct-heavy). Callers sample the first
-/// `sample_probes` rows and abandon the memo for the rest of the block when
-/// hits land under `min_hit_permille` — see `keepGoing`.
-const FsstKeyMemo = struct {
-    const Slot = struct { gen: u32 = 0, tag: u32 = 0, row: u32 = 0, value: u128 = 0 };
-    const Ref = struct { value_ptr: *u128, found: bool };
-
-    const sample_probes: u32 = 4096;
-    const min_hit_permille: u32 = 700;
-
-    slots: []Slot = &.{},
-    gen: u32 = 0,
-
-    fn deinit(self: *FsstKeyMemo, allocator: Allocator) void {
-        if (self.slots.len > 0) allocator.free(self.slots);
-        self.* = .{};
-    }
-
-    fn beginBlock(self: *FsstKeyMemo, allocator: Allocator, rg_count: u32) !void {
-        const want = std.math.ceilPowerOfTwoAssert(usize, @max(@as(usize, 64), @as(usize, rg_count) * 2));
-        if (self.slots.len < want) {
-            if (self.slots.len > 0) allocator.free(self.slots);
-            self.slots = try allocator.alloc(Slot, want);
-            @memset(self.slots, Slot{});
-            self.gen = 0;
-        }
-        self.gen +%= 1;
-        if (self.gen == 0) {
-            // u32 generation wrapped: a stale slot could alias the new
-            // generation — hard-clear once every ~4B blocks.
-            @memset(self.slots, Slot{});
-            self.gen = 1;
-        }
-    }
-
-    /// Find `comp`'s slot or claim a fresh one. On `found == false` the
-    /// caller must store the computed payload through `value_ptr` before the
-    /// next `intern` call (a later probe of the same key returns that slot).
-    fn intern(self: *FsstKeyMemo, fb: *const storage.segment_reader.FsstBlock, row: u32, comp: []const u8) Ref {
-        const h = std.hash.Wyhash.hash(0x517cc1b727220a95, comp);
-        const tag: u32 = @truncate(h >> 32);
-        const mask = self.slots.len - 1;
-        var idx: usize = @as(usize, @truncate(h)) & mask;
-        while (true) : (idx = (idx + 1) & mask) {
-            const slot = &self.slots[idx];
-            if (slot.gen != self.gen) {
-                slot.* = .{ .gen = self.gen, .tag = tag, .row = row, .value = 0 };
-                return .{ .value_ptr = &slot.value, .found = false };
-            }
-            if (slot.tag == tag and std.mem.eql(u8, fb.rowComp(slot.row), comp)) {
-                return .{ .value_ptr = &slot.value, .found = true };
-            }
-        }
-    }
-
-    /// Sampling verdict for the adaptive bailout: true while the memo should
-    /// keep running. Callers feed it their probe/hit tallies; once the sample
-    /// window fills, a hit rate under the threshold means the block is
-    /// distinct-heavy and plain per-row decode is cheaper. Tallies stay under
-    /// 64K rows × 1000, far inside u32.
-    fn keepGoing(probes: u32, hits: u32) bool {
-        if (probes < sample_probes) return true;
-        return hits * 1000 >= probes * min_hit_permille;
-    }
-};
-
 pub const Scan = struct {
     allocator: Allocator,
     io: Io,
@@ -525,9 +443,6 @@ pub const Scan = struct {
     runs_v_bufs: []std.ArrayListUnmanaged(i64) = &.{},
     runs_l_bufs: []std.ArrayListUnmanaged(u32) = &.{},
     runs_slots: []?exec.RunsColumn = &.{},
-    /// Block-local FSST key memo shared by the digest/code fill lanes —
-    /// see `FsstKeyMemo`. Lazily sized, reused across row groups.
-    fsst_memo: FsstKeyMemo = .{},
 
     const Phase = enum { segments, memtable, done };
 
@@ -1009,7 +924,6 @@ pub const Scan = struct {
         for (self.runs_l_bufs) |*b| b.deinit(self.allocator);
         if (self.runs_l_bufs.len > 0) self.allocator.free(self.runs_l_bufs);
         if (self.runs_slots.len > 0) self.allocator.free(self.runs_slots);
-        self.fsst_memo.deinit(self.allocator);
         self.prunes.deinit(self.allocator);
         for (self.in_prunes.items) |hint| self.allocator.free(hint.values);
         self.in_prunes.deinit(self.allocator);
@@ -1452,46 +1366,26 @@ pub const Scan = struct {
             defer self.allocator.free(lut);
             for (0..rg_count) |i| codes[i] = lut[db.rowCode(i)];
         } else if (block.encoding == .fsst) {
-            // Decode + intern once per distinct compressed key, translate
-            // rows through the memo — no full-column expansion, and the
-            // spinlocked global dict sees per-distinct traffic, not per-row.
+            // Per-row decode into a one-value scratch with the adjacent-run
+            // shortcut — no full-column expansion, and runs hit the
+            // spinlocked global dict once instead of per row.
             const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-            defer if (exec.prof.enabled) exec.prof.add("dict-code (fsst memo intern)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
+            defer if (exec.prof.enabled) exec.prof.add("dict-code (fsst run intern)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
             const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
-            try self.fsst_memo.beginBlock(self.allocator, rg_count);
             var scratch: std.ArrayListUnmanaged(u8) = .empty;
             defer scratch.deinit(self.allocator);
-            var probes: u32 = 0;
-            var hits: u32 = 0;
-            var memo_live = true;
             var prev_comp: []const u8 = &.{};
             var prev_code: u32 = 0;
             for (0..rg_count) |i| {
                 if (i + 8 < rg_count) @prefetch(fv.block.rowComp(i + 8).ptr, .{ .rw = .read, .locality = 2 });
                 const comp = fv.block.rowComp(i);
-                var code: u32 = undefined;
-                if (i > 0 and std.mem.eql(u8, prev_comp, comp)) {
-                    code = prev_code;
-                } else if (memo_live) {
-                    const ref = self.fsst_memo.intern(&fv.block, @intCast(i), comp);
-                    probes += 1;
-                    if (ref.found) {
-                        hits += 1;
-                    } else {
-                        try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
-                        const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
-                        ref.value_ptr.* = try gdict.intern(self.allocator, scratch.items[0..n]);
-                    }
-                    code = @intCast(ref.value_ptr.*);
-                    memo_live = FsstKeyMemo.keepGoing(probes, hits);
-                } else {
+                if (i == 0 or !std.mem.eql(u8, prev_comp, comp)) {
                     try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
                     const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
-                    code = try gdict.intern(self.allocator, scratch.items[0..n]);
+                    prev_code = try gdict.intern(self.allocator, scratch.items[0..n]);
+                    prev_comp = comp;
                 }
-                codes[i] = code;
-                prev_comp = comp;
-                prev_code = code;
+                codes[i] = prev_code;
             }
         } else {
             const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
@@ -1530,49 +1424,30 @@ pub const Scan = struct {
             for (lut, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
             for (0..rg_count) |i| digests[i] = lut[db.rowCode(i)];
         } else if (block.encoding == .fsst) {
-            // Plaintext digests off the compressed block: hash + memo-probe
-            // the compressed bytes per row, decode + digest once per distinct
-            // value (see hashSurvivorsFromBlock for why the digest itself
-            // can't be over compressed bytes).
+            // Plaintext digests off the compressed block via a one-value
+            // scratch, with an adjacent-run shortcut: equal compressed bytes
+            // within one block mean equal plaintext (fixed symbol table,
+            // deterministic encoder), so a repeat of the previous row reuses
+            // its digest without decoding. (See hashSurvivorsFromBlock for
+            // why the digest itself can't be over compressed bytes.)
             const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
-            try self.fsst_memo.beginBlock(self.allocator, rg_count);
             var scratch: std.ArrayListUnmanaged(u8) = .empty;
             defer scratch.deinit(self.allocator);
             var decoded_bytes: u64 = 0;
-            var probes: u32 = 0;
-            var hits: u32 = 0;
-            var memo_live = true;
             var prev_comp: []const u8 = &.{};
             var prev_val: u128 = 0;
             for (0..rg_count) |i| {
                 if (i + 8 < rg_count) @prefetch(fv.block.rowComp(i + 8).ptr, .{ .rw = .read, .locality = 2 });
                 const comp = fv.block.rowComp(i);
-                var val: u128 = undefined;
-                if (i > 0 and std.mem.eql(u8, prev_comp, comp)) {
-                    val = prev_val;
-                } else if (memo_live) {
-                    const ref = self.fsst_memo.intern(&fv.block, @intCast(i), comp);
-                    probes += 1;
-                    if (ref.found) {
-                        hits += 1;
-                    } else {
-                        try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
-                        const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
-                        decoded_bytes += n;
-                        ref.value_ptr.* = exec.stringKeyDigest(scratch.items[0..n]);
-                    }
-                    val = ref.value_ptr.*;
-                    memo_live = FsstKeyMemo.keepGoing(probes, hits);
-                } else {
+                if (i == 0 or !std.mem.eql(u8, prev_comp, comp)) {
                     try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
                     const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
                     decoded_bytes += n;
-                    val = exec.stringKeyDigest(scratch.items[0..n]);
+                    prev_val = exec.stringKeyDigest(scratch.items[0..n]);
+                    prev_comp = comp;
                 }
-                digests[i] = val;
-                prev_comp = comp;
-                prev_val = val;
+                digests[i] = prev_val;
             }
             if (exec.prof.enabled) {
                 _ = g_fsst_digest_ticks.fetchAdd(@intCast(@max(0, exec.prof.nowTicks() - _pt)), .monotonic);
@@ -2944,47 +2819,28 @@ pub const Scan = struct {
                 k += 1;
             };
         } else if (block.encoding == .fsst) {
-            // Digest straight off the compressed rows: memo-probe each
-            // survivor's compressed bytes, decode into a one-value scratch
-            // only per distinct value — no full-column expansion, no offsets
-            // rebuild. The digest is over PLAINTEXT bytes (it must be a
-            // cross-segment/memtable identity; compressed bytes are only
+            // Digest straight off the compressed rows: decode each survivor
+            // into a one-value scratch — no full-column expansion, no offsets
+            // rebuild — with the adjacent-run shortcut (equal compressed
+            // bytes within one block ⇔ equal plaintext) reusing the previous
+            // survivor's digest. The digest is over PLAINTEXT bytes (it must
+            // be a cross-segment/memtable identity; compressed bytes are only
             // comparable within one block's table).
             const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
-            try self.fsst_memo.beginBlock(self.allocator, rg_count);
             var scratch: std.ArrayListUnmanaged(u8) = .empty;
             defer scratch.deinit(self.allocator);
-            var probes: u32 = 0;
-            var hits: u32 = 0;
-            var memo_live = true;
             var prev_comp: []const u8 = &.{};
             var prev_val: u128 = 0;
             var k: usize = 0;
             for (mask, 0..) |m, row| if (m) {
                 const comp = fv.block.rowComp(row);
-                var val: u128 = undefined;
-                if (k > 0 and std.mem.eql(u8, prev_comp, comp)) {
-                    val = prev_val;
-                } else if (memo_live) {
-                    const ref = self.fsst_memo.intern(&fv.block, @intCast(row), comp);
-                    probes += 1;
-                    if (ref.found) {
-                        hits += 1;
-                    } else {
-                        try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
-                        const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
-                        ref.value_ptr.* = exec.stringKeyDigest(scratch.items[0..n]);
-                    }
-                    val = ref.value_ptr.*;
-                    memo_live = FsstKeyMemo.keepGoing(probes, hits);
-                } else {
+                if (k == 0 or !std.mem.eql(u8, prev_comp, comp)) {
                     try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
                     const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
-                    val = exec.stringKeyDigest(scratch.items[0..n]);
+                    prev_val = exec.stringKeyDigest(scratch.items[0..n]);
+                    prev_comp = comp;
                 }
-                digests[k] = val;
-                prev_comp = comp;
-                prev_val = val;
+                digests[k] = prev_val;
                 k += 1;
             };
         } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
