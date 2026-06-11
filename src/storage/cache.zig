@@ -106,10 +106,24 @@ pub const Cache = struct {
     /// bookkeeping; never across a decompress or decode.
     mutex: SpinLock = .{},
 
+    /// Reusable LZ4-decompress scratch buffers. LZ4-at-rest entries decompress
+    /// on EVERY access into a transient multi-MB buffer; a fresh heap alloc per
+    /// access hands back freshly-zeroed pages each time (the Windows soft-fault
+    /// storm the huge-page pool exists to kill for resident entries). A small
+    /// pool of recycled buffers pays the page-commit cost once and amortizes it
+    /// across every later access.
+    scratch: [scratch_slots]?[]align(16) u8 = @splat(null),
+    scratch_lock: SpinLock = .{},
+
     /// Stats (read under `mutex`, for benches and debugging).
     hits: u64 = 0,
     misses: u64 = 0,
     evictions: u64 = 0,
+
+    /// 32 ≈ max-dop workers × a few concurrently-borrowed string columns; the
+    /// pool self-bounds at the 32 largest hot block sizes (~5 MB each on the
+    /// 100M ClickBench table → ~160 MB worst case, outside the cache budget).
+    const scratch_slots = 32;
 
     pub const Entry = struct {
         key: Key,
@@ -123,6 +137,13 @@ pub const Cache = struct {
         /// the decode path needs it to interpret `bytes` (raw vs FOR). Defaults
         /// to `.raw` so callers that don't set it (and tests) behave as before.
         encoding: format.Encoding = .raw,
+        /// `.lz4` ⟺ `bytes` is the still-compressed on-disk payload (large raw
+        /// string blocks stay compressed at rest in the cache — see
+        /// `format.Compression.lz4`); accessors must decompress to
+        /// `uncompressed_size` per use. `.none` ⟺ `bytes` is directly usable.
+        /// `.zstd` never appears here (zstd blocks are decompressed at fill).
+        compression: format.Compression = .none,
+        uncompressed_size: u32 = 0,
     };
 
     pub fn init(allocator: Allocator, capacity_bytes: usize) Cache {
@@ -151,8 +172,59 @@ pub const Cache = struct {
             cur = nxt;
         }
         self.map.deinit(self.allocator);
+        for (self.scratch) |s| {
+            if (s) |buf| self.allocator.free(buf);
+        }
         self.pool.deinit();
         self.* = undefined;
+    }
+
+    /// Check out a scratch buffer of at least `min_len` bytes for a transient
+    /// LZ4 decompress. Best-fit from the pool; on a dry pool, allocates rounded
+    /// up to 1 MiB granularity so blocks of similar size reuse it later. Return
+    /// the FULL slice via `releaseScratch` (callers slice to their length).
+    pub fn acquireScratch(self: *Cache, min_len: usize) ![]align(16) u8 {
+        self.scratch_lock.lock();
+        var best: ?usize = null;
+        for (self.scratch, 0..) |s, i| {
+            const buf = s orelse continue;
+            if (buf.len < min_len) continue;
+            if (best == null or buf.len < self.scratch[best.?].?.len) best = i;
+        }
+        if (best) |i| {
+            const buf = self.scratch[i].?;
+            self.scratch[i] = null;
+            self.scratch_lock.unlock();
+            return buf;
+        }
+        self.scratch_lock.unlock();
+        const rounded = std.mem.alignForward(usize, @max(min_len, 1), 1 << 20);
+        return self.allocator.alignedAlloc(u8, .@"16", rounded);
+    }
+
+    /// Return a buffer from `acquireScratch` to the pool. Fills an empty slot,
+    /// else displaces the smallest pooled buffer if this one is larger, else
+    /// frees — the pool converges on the `scratch_slots` largest hot sizes.
+    pub fn releaseScratch(self: *Cache, buf: []align(16) u8) void {
+        self.scratch_lock.lock();
+        var smallest: ?usize = null;
+        for (self.scratch, 0..) |s, i| {
+            const existing = s orelse {
+                self.scratch[i] = buf;
+                self.scratch_lock.unlock();
+                return;
+            };
+            if (smallest == null or existing.len < self.scratch[smallest.?].?.len) smallest = i;
+        }
+        if (smallest != null and self.scratch[smallest.?].?.len < buf.len) {
+            const evicted = self.scratch[smallest.?].?;
+            self.scratch[smallest.?] = buf;
+            self.scratch_lock.unlock();
+            self.allocator.free(evicted);
+            return;
+        }
+        self.scratch_lock.unlock();
+        self.allocator.free(buf);
     }
 
     /// Acquire a pinned reference to the block for `key`, or null on miss. On
@@ -181,6 +253,13 @@ pub const Cache = struct {
     /// instead. On allocation failure the entry is not stored and `bytes` is left
     /// for the caller to free. Caller MUST `release`.
     pub fn insertPinned(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !*Entry {
+        return self.insertPinnedCompressed(key, bytes, encoding, .none, 0);
+    }
+
+    /// `insertPinned` variant for blocks cached at rest in compressed form
+    /// (`compression == .lz4`): `bytes` is the on-disk payload and
+    /// `uncompressed_size` its decompressed length.
+    pub fn insertPinnedCompressed(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding, compression: format.Compression, uncompressed_size: u32) !*Entry {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -194,7 +273,16 @@ pub const Cache = struct {
 
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
-        entry.* = .{ .key = key, .bytes = bytes, .prev = null, .next = null, .pins = 1, .encoding = encoding };
+        entry.* = .{
+            .key = key,
+            .bytes = bytes,
+            .prev = null,
+            .next = null,
+            .pins = 1,
+            .encoding = encoding,
+            .compression = compression,
+            .uncompressed_size = uncompressed_size,
+        };
 
         try self.map.put(self.allocator, key, entry);
 

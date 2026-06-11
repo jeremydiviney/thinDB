@@ -25,8 +25,9 @@
 //!       leading_key_min i128  (16)
 //!       leading_key_max i128  (16)
 //!       per_column_stats      (stats_slot_size * column_count — i128 min +
-//!                              i128 max each, encoded per column type; {0,0}
-//!                              for columns whose type has no stats)
+//!                              i128 max + i128 sum + u64 null_count each,
+//!                              encoded per column type (see `format.Stats`);
+//!                              all-zero for columns whose type has no stats)
 //!       per_column_sketches   (sketch_slot_size * column_count — one
 //!                              HyperLogLog sketch per column, mergeable
 //!                              across segments for cardinality-based GROUP BY
@@ -44,15 +45,16 @@ const Allocator = std.mem.Allocator;
 
 const format = @import("format.zig");
 const hll = @import("../util/hll.zig");
+const types = @import("../types.zig");
 
 pub const manifest_magic: [4]u8 = .{ 't', 'D', 'B', 'M' };
-pub const manifest_version: u16 = 7;
+pub const manifest_version: u16 = 8;
 pub const manifest_filename = "manifest";
 pub const manifest_tmp_filename = "manifest.tmp";
 pub const header_size: usize = 32;
 /// Per-entry fixed prefix (excluding the per-column stats tail).
 pub const entry_prefix_size: usize = 64;
-pub const stats_slot_size: usize = 32; // i128 min + i128 max
+pub const stats_slot_size: usize = 56; // i128 min + i128 max + i128 sum + u64 null_count
 pub const sketch_slot_size: usize = hll.m; // one HyperLogLog sketch per column
 pub const trailer_size: usize = 4;
 
@@ -180,6 +182,8 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
                 .{ .min = 0, .max = 0 };
             try appendI128(m.allocator, &buf, cs.min);
             try appendI128(m.allocator, &buf, cs.max);
+            try appendI128(m.allocator, &buf, cs.sum);
+            try appendU64(m.allocator, &buf, cs.null_count);
         }
 
         // Per-column HyperLogLog sketches: `column_count * hll.m` bytes.
@@ -282,6 +286,10 @@ pub fn readManifest(
                 off += 16;
                 s.max = format.readI128(bytes[off .. off + 16]);
                 off += 16;
+                s.sum = format.readI128(bytes[off .. off + 16]);
+                off += 16;
+                s.null_count = format.readU64(bytes[off .. off + 8]);
+                off += 8;
             }
             entry.column_stats = stats;
 
@@ -313,15 +321,15 @@ pub fn readManifest(
 ///     Allocated in `allocator`; Manifest takes ownership and frees
 ///     in `Manifest.deinit`.
 ///
-/// `column_has_stats[i]` indicates whether column `i`'s `Stats` slot
-/// in the row-group footer carries meaningful values (per
-/// `format.typeHasStats`). Columns flagged `false` get `{0, 0}` in
-/// the manifest entry.
+/// `columns` is the segment's schema columns — the per-type fold of the
+/// `Stats.sum` slot (integer add / f64 add / string min, see
+/// `format.foldStats`) needs each column's type. Columns whose type carries
+/// no stats (per `format.typeHasStats`) get an all-zero slot.
 pub fn entryFromSegmentInfo(
     allocator: Allocator,
     info: format.SegmentInfo,
     leading_key_idx: ?usize,
-    column_has_stats: []const bool,
+    columns: []const types.Column,
 ) !ManifestEntry {
     var entry: ManifestEntry = .{
         .segment_id = info.segment_id,
@@ -334,21 +342,24 @@ pub fn entryFromSegmentInfo(
         if (entry.column_sketches.len > 0) allocator.free(entry.column_sketches);
     }
 
-    if (column_has_stats.len > 0 and info.row_groups.len > 0) {
-        const stats = try allocator.alloc(format.Stats, column_has_stats.len);
-        for (column_has_stats, 0..) |has, ci| {
-            if (!has) {
+    if (columns.len > 0 and info.row_groups.len > 0) {
+        const stats = try allocator.alloc(format.Stats, columns.len);
+        for (columns, 0..) |col, ci| {
+            if (!format.typeHasStats(col.type)) {
                 stats[ci] = .{ .min = 0, .max = 0 };
                 continue;
             }
-            var lo: i128 = std.math.maxInt(i128);
-            var hi: i128 = std.math.minInt(i128);
+            const kind = format.sumKindOf(col.type);
+            var acc: format.Stats = .{
+                .min = std.math.maxInt(i128),
+                .max = std.math.minInt(i128),
+                .sum = format.sumIdentity(kind),
+                .null_count = 0,
+            };
             for (info.row_groups) |rg| {
-                const s = rg.stats[ci];
-                if (s.min < lo) lo = s.min;
-                if (s.max > hi) hi = s.max;
+                format.foldStats(&acc, rg.stats[ci], kind);
             }
-            stats[ci] = .{ .min = lo, .max = hi };
+            stats[ci] = acc;
         }
         entry.column_stats = stats;
     }
@@ -361,7 +372,7 @@ pub fn entryFromSegmentInfo(
     }
 
     if (leading_key_idx) |idx| {
-        if (idx < column_has_stats.len and column_has_stats[idx]) {
+        if (idx < columns.len and format.typeHasStats(columns[idx].type)) {
             entry.leading_key_stats = entry.column_stats[idx];
         }
     }

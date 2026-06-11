@@ -13,6 +13,7 @@ const TableSchema = types.TableSchema;
 const format = @import("format.zig");
 const column = @import("column.zig");
 const compression_mod = @import("compression.zig");
+const fsst = @import("fsst.zig");
 const hll = @import("../util/hll.zig");
 const ColumnView = column.ColumnView;
 const StringView = column.StringView;
@@ -143,7 +144,7 @@ pub fn writeSegment(
         errdefer allocator.free(col_offsets);
         for (columns, schema.columns, 0..) |view, schema_col, ci| {
             col_offsets[ci] = @intCast(buf.items.len);
-            try writeColumnBlock(allocator, &compressor, &buf, view, schema_col.nullable, dict_eligible[ci], row_offset, row_offset + rows_in_group);
+            try writeColumnBlock(allocator, &compressor, &buf, view, schema_col.nullable, dict_eligible[ci], schema.compression, row_offset, row_offset + rows_in_group);
         }
 
         const rg_length: u32 = @intCast(buf.items.len - rg_file_offset);
@@ -175,6 +176,8 @@ pub fn writeSegment(
         for (rg.stats) |s| {
             try appendI128(allocator, &buf, s.min);
             try appendI128(allocator, &buf, s.max);
+            try appendI128(allocator, &buf, s.sum);
+            try appendU64(allocator, &buf, s.null_count);
         }
         for (rg.col_offsets) |co| {
             try appendU64(allocator, &buf, co);
@@ -246,9 +249,11 @@ pub const MergedSegmentWriter = struct {
     row_group_size: usize,
     dict_eligible: []const bool,
     column_sketches: []const u8,
+    /// Worker threads for per-column block encode+compress inside
+    /// `writeRowGroup`. 1 = serial (encode on the calling thread).
+    encode_threads: usize,
 
     buf: std.ArrayList(u8),
-    compressor: compression_mod.Compressor,
     row_groups: std.ArrayList(RowGroupMeta),
     row_count: u64,
 
@@ -263,12 +268,10 @@ pub const MergedSegmentWriter = struct {
         /// `SegmentInfo.column_sketches`). Ownership transfers to `finish`'s
         /// `SegmentInfo`; freed by `deinit` if the writer is torn down first.
         column_sketches: []const u8,
+        encode_threads: usize,
     ) !MergedSegmentWriter {
         if (row_group_size == 0) return format.Error.InvalidRowGroupSize;
         if (dict_eligible.len != schema.columns.len) return format.Error.SchemaMismatch;
-
-        var compressor = try compression_mod.Compressor.init();
-        errdefer compressor.deinit();
 
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -289,8 +292,8 @@ pub const MergedSegmentWriter = struct {
             .row_group_size = row_group_size,
             .dict_eligible = dict_eligible,
             .column_sketches = column_sketches,
+            .encode_threads = @max(1, encode_threads),
             .buf = buf,
-            .compressor = compressor,
             .row_groups = .empty,
             .row_count = 0,
         };
@@ -300,6 +303,12 @@ pub const MergedSegmentWriter = struct {
     /// each holding the same `rows` (≤ `row_group_size`) rows. Encodes every
     /// column block (raw / FOR / dict per `dict_eligible`) and records the
     /// row-group's stats + offsets — the same per-block path `writeSegment` runs.
+    ///
+    /// Column blocks encode in parallel across `encode_threads` workers (each
+    /// block into its own buffer, concatenated in column order afterward — the
+    /// output is byte-identical to the serial path regardless of thread count).
+    /// Block compression (LZ4HC for large string blocks, zstd otherwise)
+    /// dominates merge cost, and the per-column grain parallelizes it cleanly.
     pub fn writeRowGroup(self: *MergedSegmentWriter, columns: []const ColumnView) !void {
         if (columns.len != self.schema.columns.len) return format.Error.SchemaMismatch;
         const rows: usize = if (columns.len == 0) 0 else columns[0].rowCount();
@@ -309,6 +318,28 @@ pub const MergedSegmentWriter = struct {
         }
         if (rows > self.row_group_size) return format.Error.InvalidRowGroupSize;
 
+        const blocks = try self.allocator.alloc(std.ArrayList(u8), columns.len);
+        defer {
+            for (blocks) |*b| b.deinit(self.allocator);
+            self.allocator.free(blocks);
+        }
+        for (blocks) |*b| b.* = .empty;
+
+        const stats = try self.allocator.alloc(format.Stats, columns.len);
+        errdefer self.allocator.free(stats);
+
+        var job = BlockEncodeJob{
+            .allocator = self.allocator,
+            .columns = columns,
+            .schema = self.schema,
+            .dict_eligible = self.dict_eligible,
+            .row_start = 0,
+            .row_end = rows,
+            .blocks = blocks,
+            .stats = stats,
+        };
+        try job.run(self.encode_threads);
+
         const rg_file_offset: u64 = @intCast(self.buf.items.len);
 
         try appendU32(self.allocator, &self.buf, @intCast(rows));
@@ -316,18 +347,15 @@ pub const MergedSegmentWriter = struct {
 
         const col_offsets = try self.allocator.alloc(u64, columns.len);
         errdefer self.allocator.free(col_offsets);
-        for (columns, self.schema.columns, 0..) |view, schema_col, ci| {
+        var total: usize = 0;
+        for (blocks) |b| total += b.items.len;
+        try self.buf.ensureUnusedCapacity(self.allocator, total);
+        for (blocks, 0..) |b, ci| {
             col_offsets[ci] = @intCast(self.buf.items.len);
-            try writeColumnBlock(self.allocator, &self.compressor, &self.buf, view, schema_col.nullable, self.dict_eligible[ci], 0, rows);
+            self.buf.appendSliceAssumeCapacity(b.items);
         }
 
         const rg_length: u32 = @intCast(self.buf.items.len - rg_file_offset);
-
-        const stats = try self.allocator.alloc(format.Stats, columns.len);
-        errdefer self.allocator.free(stats);
-        for (columns, 0..) |view, ci| {
-            stats[ci] = computeStats(view, 0, rows);
-        }
 
         try self.row_groups.append(self.allocator, .{
             .offset = rg_file_offset,
@@ -341,8 +369,8 @@ pub const MergedSegmentWriter = struct {
 
     /// Write the footer, patch the header's row_count, flush to disk, and return
     /// the `SegmentInfo` (which takes ownership of `column_sketches` and the
-    /// row-group metadata). After a successful `finish` the writer's `buf` /
-    /// `compressor` are released; do not call `deinit` (it becomes a no-op).
+    /// row-group metadata). After a successful `finish` the writer's `buf` is
+    /// released; do not call `deinit` (it becomes a no-op).
     pub fn finish(self: *MergedSegmentWriter, io: Io, dir: Io.Dir, file_name: []const u8, sync_on_close: bool) !SegmentInfo {
         format.writeU64(self.buf.items[24..32], self.row_count);
 
@@ -355,6 +383,8 @@ pub const MergedSegmentWriter = struct {
             for (rg.stats) |s| {
                 try appendI128(self.allocator, &self.buf, s.min);
                 try appendI128(self.allocator, &self.buf, s.max);
+                try appendI128(self.allocator, &self.buf, s.sum);
+                try appendU64(self.allocator, &self.buf, s.null_count);
             }
             for (rg.col_offsets) |co| {
                 try appendU64(self.allocator, &self.buf, co);
@@ -377,7 +407,6 @@ pub const MergedSegmentWriter = struct {
         };
 
         self.buf.deinit(self.allocator);
-        self.compressor.deinit();
         self.* = undefined;
         return info;
     }
@@ -392,9 +421,81 @@ pub const MergedSegmentWriter = struct {
         }
         self.row_groups.deinit(self.allocator);
         self.buf.deinit(self.allocator);
-        self.compressor.deinit();
         if (self.column_sketches.len > 0) self.allocator.free(@constCast(self.column_sketches));
         self.* = undefined;
+    }
+};
+
+/// One row-group's parallel block-encode: workers claim columns off an atomic
+/// cursor and write column `ci`'s complete on-disk block (header + payload)
+/// into `blocks[ci]`, plus its `stats[ci]`. Each worker owns a private zstd
+/// context (the shared `Compressor` is not thread-safe); LZ4HC is stateless.
+/// The expensive part per column is the compress call, so the column grain
+/// load-balances well even when a few string columns dwarf the rest.
+const BlockEncodeJob = struct {
+    allocator: Allocator,
+    columns: []const ColumnView,
+    schema: TableSchema,
+    dict_eligible: []const bool,
+    row_start: usize,
+    row_end: usize,
+    blocks: []std.ArrayList(u8),
+    stats: []format.Stats,
+
+    next: std.atomic.Value(usize) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    err_mutex: std.atomic.Mutex = .unlocked,
+    err: ?anyerror = null,
+
+    fn run(self: *BlockEncodeJob, threads: usize) !void {
+        const n = @min(@max(1, threads), self.columns.len);
+        if (n > 1) {
+            const handles = self.allocator.alloc(std.Thread, n - 1) catch null;
+            if (handles) |hs| {
+                var spawned: usize = 0;
+                for (hs) |*h| {
+                    h.* = std.Thread.spawn(.{}, worker, .{self}) catch break;
+                    spawned += 1;
+                }
+                worker(self);
+                for (hs[0..spawned]) |h| h.join();
+                self.allocator.free(hs);
+            } else {
+                worker(self);
+            }
+        } else {
+            worker(self);
+        }
+        if (self.err) |e| return e;
+    }
+
+    fn worker(self: *BlockEncodeJob) void {
+        var compressor = compression_mod.Compressor.init() catch |e| return self.fail(e);
+        defer compressor.deinit();
+        while (!self.failed.load(.acquire)) {
+            const ci = self.next.fetchAdd(1, .monotonic);
+            if (ci >= self.columns.len) return;
+            const view = self.columns[ci];
+            writeColumnBlock(
+                self.allocator,
+                &compressor,
+                &self.blocks[ci],
+                view,
+                self.schema.columns[ci].nullable,
+                self.dict_eligible[ci],
+                self.schema.compression,
+                self.row_start,
+                self.row_end,
+            ) catch |e| return self.fail(e);
+            self.stats[ci] = computeStats(view, self.row_start, self.row_end);
+        }
+    }
+
+    fn fail(self: *BlockEncodeJob, e: anyerror) void {
+        while (!self.err_mutex.tryLock()) std.atomic.spinLoopHint();
+        if (self.err == null) self.err = e;
+        self.err_mutex.unlock();
+        self.failed.store(true, .release);
     }
 };
 
@@ -423,6 +524,7 @@ fn writeColumnBlock(
     view: ColumnView,
     nullable: bool,
     dict_eligible: bool,
+    table_compression: types.TableCompression,
     row_start: usize,
     row_end: usize,
 ) !void {
@@ -449,6 +551,8 @@ fn writeColumnBlock(
         .for_
     else if (dict_eligible and try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
         .dict
+    else if (fsst_enabled and try tryEncodeFsst(allocator, &scratch, view, row_start, row_end))
+        .fsst
     else blk: {
         try writeRawColumnBlock(allocator, &scratch, view, row_start, row_end);
         break :blk .raw;
@@ -456,18 +560,40 @@ fn writeColumnBlock(
 
     const raw_size: u32 = @intCast(scratch.items.len);
 
-    // Try compressing. If the result is smaller, use it; otherwise keep raw.
-    const compressed = try compressor.compress(allocator, scratch.items);
-    defer allocator.free(compressed);
+    // Block compression per the table's `compression` option (a kept block is
+    // only compressed when that actually shrinks it). Under `.lz4`, large raw
+    // string blocks are additionally flagged `at_rest`: the cache keeps them
+    // compressed and pays a whole-block decompress per access (LZ4 decodes at
+    // multi-GB/s), trading CPU for a much smaller resident set. Every other
+    // block — any algorithm — decompresses once at cache fill.
+    const want_at_rest = table_compression == .lz4 and encoding == .raw and
+        isStringView(view) and scratch.items.len >= lz4_string_min_block_bytes;
 
-    const use_compressed = compressed.len < scratch.items.len;
-    const kind: format.Compression = if (use_compressed) .zstd else .none;
+    var compressed: ?[]u8 = null;
+    defer if (compressed) |c| allocator.free(c);
+    var kind: format.Compression = .none;
+    switch (table_compression) {
+        .none => {},
+        .zstd => {
+            compressed = try compressor.compress(allocator, scratch.items);
+            kind = if (compressed.?.len < scratch.items.len) .zstd else .none;
+        },
+        .lz4 => {
+            compressed = try compression_mod.lz4CompressHC(allocator, scratch.items);
+            kind = if (compressed.?.len < scratch.items.len) .lz4 else .none;
+        },
+    }
+
+    const use_compressed = kind != .none;
     const payload_size: u32 = if (use_compressed)
-        @intCast(compressed.len)
+        @intCast(compressed.?.len)
     else
         raw_size;
 
-    const flags = format.ColumnBlockFlags{ .has_nulls = has_nulls };
+    const flags = format.ColumnBlockFlags{
+        .has_nulls = has_nulls,
+        .at_rest = want_at_rest and kind == .lz4,
+    };
 
     // Header: kind (u8) + flags (u8) + encoding (u8) + 1 reserved + uncompressed_size (u32) + compressed_size (u32)
     try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + payload_size);
@@ -482,7 +608,7 @@ fn writeColumnBlock(
     buf.appendSliceAssumeCapacity(&b4);
 
     if (use_compressed) {
-        buf.appendSliceAssumeCapacity(compressed);
+        buf.appendSliceAssumeCapacity(compressed.?);
     } else {
         buf.appendSliceAssumeCapacity(scratch.items);
     }
@@ -829,6 +955,121 @@ fn tryEncodeDict(
     return true;
 }
 
+/// FSST is currently switched off in favor of LZ4-cached raw string blocks
+/// (whole-block decompress restores the zero-copy raw consumer paths; FSST's
+/// per-row decode cost dominated string GROUP BYs on low-ratio URLs). The
+/// encoder, kernels, and exec consumers stay — flip this to re-enable.
+const fsst_enabled = false;
+
+/// Raw string blocks at least this large compress with LZ4HC and stay
+/// compressed in the block cache. Below it, the per-access decompress isn't
+/// worth the bookkeeping and zstd's ratio wins.
+const lz4_string_min_block_bytes: usize = 64 * 1024;
+
+/// True when the view is a string-family column (the LZ4 cache policy is
+/// strings-only: that's where the resident bytes live).
+fn isStringView(view: ColumnView) bool {
+    return switch (view.data) {
+        .varchar, .string, .char => true,
+        else => false,
+    };
+}
+
+/// Minimum raw string bytes before FSST is attempted — tiny blocks can't
+/// amortize the symbol table.
+const fsst_min_total_bytes: usize = 4096;
+/// Minimum average value length. Below this the per-row offset overhead
+/// dominates and symbols rarely cover enough to pay.
+const fsst_min_avg_len: usize = 4;
+/// Sampling budget for the symbol-table build: spread across the block,
+/// capped in both string count and total bytes.
+const fsst_sample_max_strings: usize = 1024;
+const fsst_sample_max_bytes: usize = 16 * 1024;
+/// Commit only when the FSST body is at most 7/8 of the raw body.
+const fsst_accept_num: usize = 7;
+const fsst_accept_den: usize = 8;
+
+/// FSST body for a high-NDV string block, appended after the (already-
+/// written) validity bitmap. Layout documented on `format.Encoding.fsst`.
+/// Returns false (leaving `scratch` untouched past the bitmap) when the
+/// column is not a string, the block is too small/short-valued, or the
+/// encoding doesn't clear the acceptance ratio — the caller then writes a
+/// raw string block. Runs after the dict attempt, so it sees exactly the
+/// blocks dict declined (high NDV / blob-like / poor savings).
+fn tryEncodeFsst(
+    allocator: Allocator,
+    scratch: *std.ArrayList(u8),
+    view: ColumnView,
+    row_start: usize,
+    row_end: usize,
+) !bool {
+    const sv: StringView = switch (view.data) {
+        .varchar, .string, .char => |s| s,
+        else => return false,
+    };
+    const n = row_end - row_start;
+    if (n == 0) return false;
+
+    const total_bytes: usize = sv.offsets[row_end] - sv.offsets[row_start];
+    if (total_bytes < fsst_min_total_bytes) return false;
+    if (total_bytes / n < fsst_min_avg_len) return false;
+
+    // Sample rows spread across the block (stride keeps the sample
+    // representative when values cluster).
+    var sample: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer sample.deinit(allocator);
+    const stride = @max(@as(usize, 1), n / fsst_sample_max_strings);
+    var sampled_bytes: usize = 0;
+    var r = row_start;
+    while (r < row_end and sampled_bytes < fsst_sample_max_bytes) : (r += stride) {
+        const s = sv.rowBytes(r);
+        if (s.len == 0) continue;
+        try sample.append(allocator, s);
+        sampled_bytes += s.len;
+    }
+    if (sample.items.len == 0) return false;
+
+    const table = try fsst.buildTable(allocator, sample.items);
+
+    // Encode every row, building the per-row offsets as we go.
+    var comp: std.ArrayListUnmanaged(u8) = .empty;
+    defer comp.deinit(allocator);
+    const offsets = try allocator.alloc(u32, n + 1);
+    defer allocator.free(offsets);
+    offsets[0] = 0;
+    r = row_start;
+    while (r < row_end) : (r += 1) {
+        const s = sv.rowBytes(r);
+        try comp.ensureUnusedCapacity(allocator, fsst.encodedSizeBound(s.len));
+        table.encodeAppend(s, &comp);
+        offsets[r - row_start + 1] = @intCast(comp.items.len);
+    }
+
+    var table_buf: [fsst.max_serialized_size]u8 = undefined;
+    const table_len = table.serialize(&table_buf);
+
+    const fsst_body = 4 + table_len + 4 + 4 + (n + 1) * 4 + comp.items.len;
+    // Raw string body, per `writeStringBlock`: [u32 byte_count][(n+1) u32][bytes].
+    const raw_body = 4 + (n + 1) * 4 + total_bytes;
+    if (fsst_body * fsst_accept_den > raw_body * fsst_accept_num) return false;
+
+    try scratch.ensureUnusedCapacity(allocator, fsst_body);
+    var b4: [4]u8 = undefined;
+    format.writeU32(&b4, @intCast(table_len));
+    scratch.appendSliceAssumeCapacity(&b4);
+    scratch.appendSliceAssumeCapacity(table_buf[0..table_len]);
+    format.writeU32(&b4, @intCast(total_bytes));
+    scratch.appendSliceAssumeCapacity(&b4);
+    format.writeU32(&b4, @intCast(comp.items.len));
+    scratch.appendSliceAssumeCapacity(&b4);
+    for (offsets) |off| {
+        format.writeU32(&b4, off);
+        scratch.appendSliceAssumeCapacity(&b4);
+    }
+    scratch.appendSliceAssumeCapacity(comp.items);
+    return true;
+}
+
 fn writeValidityBitmap(
     allocator: Allocator,
     buf: *std.ArrayList(u8),
@@ -984,13 +1225,17 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
             // ordering. See `format.encodeUnsignedU128`.
             var lo: i128 = std.math.maxInt(i128);
             var hi: i128 = std.math.minInt(i128);
+            var nulls: u64 = 0;
             for (d[row_start..row_end], row_start..) |v, r| {
-                if (!view.isValid(r)) continue;
+                if (!view.isValid(r)) {
+                    nulls += 1;
+                    continue;
+                }
                 const enc = format.encodeUnsignedU128(v);
                 if (enc < lo) lo = enc;
                 if (enc > hi) hi = enc;
             }
-            break :blk .{ .min = lo, .max = hi };
+            break :blk .{ .min = lo, .max = hi, .null_count = nulls };
         },
         // Strings store the prefix-encoded i128 of the first 16 bytes of each
         // row's value. See `format.encodeStringPrefix`.
@@ -1010,13 +1255,24 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
 fn extentFloat(comptime T: type, view: ColumnView, data: []const T, row_start: usize, row_end: usize) format.Stats {
     var lo: i128 = std.math.maxInt(i128);
     var hi: i128 = std.math.minInt(i128);
+    var sum: f64 = 0;
+    var nulls: u64 = 0;
     for (data[row_start..row_end], row_start..) |v, r| {
-        if (!view.isValid(r)) continue;
+        if (!view.isValid(r)) {
+            nulls += 1;
+            continue;
+        }
         const enc = format.encodeFloatOrder(@as(f64, v));
         if (enc < lo) lo = enc;
         if (enc > hi) hi = enc;
+        sum += @as(f64, v);
     }
-    return .{ .min = lo, .max = hi };
+    return .{
+        .min = lo,
+        .max = hi,
+        .sum = format.sumSlotFromF64(sum),
+        .null_count = nulls,
+    };
 }
 
 /// Min/max over the *non-null* values of an integer-family column, encoded to
@@ -1030,25 +1286,44 @@ fn extentFloat(comptime T: type, view: ColumnView, data: []const T, row_start: u
 fn extentInt(comptime T: type, view: ColumnView, data: []const T, row_start: usize, row_end: usize) format.Stats {
     var lo: T = std.math.maxInt(T);
     var hi: T = std.math.minInt(T);
+    // i128 columns (largeint/decimal128) carry no sum — it could overflow the
+    // i128 slot. Every narrower type sums exactly (≤2^32 rows × i64 < 2^96).
+    const with_sum = @bitSizeOf(T) < 128;
+    var sum: i128 = 0;
+    var nulls: u64 = 0;
     for (data[row_start..row_end], row_start..) |v, r| {
-        if (!view.isValid(r)) continue;
+        if (!view.isValid(r)) {
+            nulls += 1;
+            continue;
+        }
         if (v < lo) lo = v;
         if (v > hi) hi = v;
+        if (with_sum) sum += v;
     }
-    return .{ .min = @intCast(lo), .max = @intCast(hi) };
+    return .{ .min = @intCast(lo), .max = @intCast(hi), .sum = sum, .null_count = nulls };
 }
 
 fn computeStringStats(view: ColumnView, sv: StringView, row_start: usize, row_end: usize) format.Stats {
     var lo: i128 = std.math.maxInt(i128);
     var hi: i128 = std.math.minInt(i128);
+    // The string `sum` slot holds the blank-excluded min prefix: '' is the
+    // global minimum of nearly every string column, so the plain min is
+    // useless for ORDER BY pruning. `maxInt` sentinel when no non-empty value.
+    var lo_nonblank: i128 = std.math.maxInt(i128);
+    var nulls: u64 = 0;
     var i = row_start;
     while (i < row_end) : (i += 1) {
-        if (!view.isValid(i)) continue;
-        const enc = format.encodeStringPrefix(sv.rowBytes(i));
+        if (!view.isValid(i)) {
+            nulls += 1;
+            continue;
+        }
+        const bytes = sv.rowBytes(i);
+        const enc = format.encodeStringPrefix(bytes);
         if (enc < lo) lo = enc;
         if (enc > hi) hi = enc;
+        if (bytes.len > 0 and enc < lo_nonblank) lo_nonblank = enc;
     }
-    return .{ .min = lo, .max = hi };
+    return .{ .min = lo, .max = hi, .sum = lo_nonblank, .null_count = nulls };
 }
 
 fn writeStringBlock(

@@ -243,13 +243,11 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
         new_schema.columnIndex(new_schema.order_key[0]) orelse return api.Error.SchemaMismatch
     else
         null;
-    const new_has_stats = try @import("table.zig").buildColumnHasStats(t.allocator, new_schema);
-    defer t.allocator.free(new_has_stats);
     for (t.manifest.segments.items) |entry| {
         const info = try rewriteSegment(t, &plan, shadow_segs, entry, new_schema, new_fp, sync);
         defer info.deinit(t.allocator);
         try new_manifest.appendSegment(
-            try storage.manifest.entryFromSegmentInfo(t.allocator, info, new_lk_idx, new_has_stats),
+            try storage.manifest.entryFromSegmentInfo(t.allocator, info, new_lk_idx, new_schema.columns),
         );
     }
 

@@ -214,12 +214,15 @@ Each `.dat` file is a self-describing columnar container. Rows within a segment 
 ├─ Row group 2 ─────────────────────────────────────┤
 │ …                                                 │
 ├─ Footer ──────────────────────────────────────────┤
-│ row group offsets, per-row-group per-column min/max│
-│ checksums, footer length, magic "tDBS"            │
+│ row group offsets, per-row-group per-column stats │
+│ (min/max/sum/null_count), checksums, footer       │
+│ length, magic "tDBS"                              │
 └───────────────────────────────────────────────────┘
 ```
 
 Footer is read first (via the trailing length + magic). Row group offsets in the footer let scans skip to the relevant byte ranges without parsing the whole file.
+
+Per-row-group per-column stats are small materialized aggregates: min/max (zone maps, per-type i128 encoding), an exact `null_count`, and a per-type `sum` slot (integer sum; f64 sum for floats; for strings, the blank-excluded min prefix used by ORDER BY pruning). A bare global `SUM` / `AVG` / `COUNT(col)` / `MIN` / `MAX` over a tombstone-free table answers from these without touching data; any tombstone or unflushed memtable row makes the stats-dependent lane fall back to the scan path.
 
 ### 4.4 Column block encodings
 
@@ -231,6 +234,7 @@ Encoding is chosen per row group at flush time based on the column's data charac
 | **RLE** (run-length) | Repetitive low-cardinality data | `(value, run_length)` pairs |
 | **Dictionary** | Strings with < 128 distinct values in the block | Dictionary + integer indexes |
 | **Frame-of-reference** | Integer columns where `max - min` is small | Min value + bit-packed deltas |
+| **FSST** | High-NDV strings dict declines, when it saves ≥ 12.5% | Block-local symbol table + per-row compressed slices (random access preserved; stays compressed in cache, decoded only at materialization) |
 | **Fixed-width** | `CHAR(N)` always | N bytes per row |
 | **Offsets + bytes** | `VARCHAR(N)`/`STRING` when dictionary is not chosen | `u32` offsets + flat byte buffer (Arrow-style) |
 

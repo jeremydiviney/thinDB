@@ -345,10 +345,30 @@ pub const TableSchemaError = error{
     EmptyOrderKey,
 };
 
+/// Per-table block compression for the general (post-encoding) payload bytes.
+/// A storage policy, not part of the table's identity: blocks self-describe
+/// their compression on disk, so it's excluded from the schema fingerprint and
+/// `schemasEqual`. Applied by flush and compaction; changing it on an existing
+/// table re-compresses lazily as segments get rewritten.
+pub const TableCompression = enum(u8) {
+    /// Encodings only; payload bytes stored raw.
+    none = 0,
+    /// zstd-3 on every block; the cache holds decompressed bytes. Fastest hot
+    /// reads, largest resident set, best ratio.
+    zstd = 1,
+    /// LZ4HC on every block (decode ~4 GB/s). Large raw string blocks
+    /// additionally stay compressed IN CACHE and decompress per access into
+    /// recycled scratch — a much smaller resident set for string-heavy data.
+    lz4 = 2,
+};
+
+pub const default_table_compression: TableCompression = .lz4;
+
 pub const TableSchema = struct {
     columns: []const Column,
     order_key: []const []const u8,
     unique: bool,
+    compression: TableCompression = default_table_compression,
 
     /// Validate basic invariants. Does not allocate.
     pub fn validate(self: TableSchema) TableSchemaError!void {

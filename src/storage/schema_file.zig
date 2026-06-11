@@ -1,6 +1,6 @@
 //! Per-table schema persistence (<table>/schema.bin).
 //!
-//! Format (v4, binary, little-endian):
+//! Format (v5, binary, little-endian):
 //!
 //!   "tDBC" (4)
 //!   version u16
@@ -17,6 +17,7 @@
 //!   For each order_key name:
 //!     name_len u32, name bytes
 //!   unique u8
+//!   compression u8  (v5: types.TableCompression — 0 none, 1 zstd, 2 lz4)
 //!   "tDBC" (4)
 
 const std = @import("std");
@@ -37,7 +38,9 @@ pub const schema_magic: [4]u8 = .{ 't', 'D', 'B', 'C' };
 ///   v2 → per-column nullable bit
 ///   v3 → per-column DEFAULT value (optional, see encode/decodeDefault)
 ///   v4 → per-column AUTO_INCREMENT byte
-pub const schema_version: u16 = 4;
+///   v5 → table compression byte (and the version becomes exact-match:
+///        pre-production format policy is reimport, not multi-version readers)
+pub const schema_version: u16 = 5;
 pub const schema_filename = "schema.bin";
 
 pub const Error = error{
@@ -58,12 +61,14 @@ pub const SchemaOwner = struct {
     columns: []Column,
     order_key: [][]const u8,
     unique: bool,
+    compression: types.TableCompression = types.default_table_compression,
 
     pub fn view(self: *const SchemaOwner) TableSchema {
         return .{
             .columns = self.columns,
             .order_key = self.order_key,
             .unique = self.unique,
+            .compression = self.compression,
         };
     }
 
@@ -99,6 +104,7 @@ pub const SchemaOwner = struct {
             .columns = columns,
             .order_key = order_key,
             .unique = src.unique,
+            .compression = src.compression,
         };
     }
 };
@@ -139,6 +145,7 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator)
     }
 
     try buf.append(scratch, @intFromBool(schema.unique));
+    try buf.append(scratch, @intFromEnum(schema.compression));
     try buf.appendSlice(scratch, &schema_magic);
 
     try dir.writeFile(io, .{ .sub_path = schema_filename, .data = buf.items });
@@ -152,10 +159,9 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
     if (!std.mem.eql(u8, bytes[0..4], &schema_magic)) return Error.SchemaBadMagic;
 
     const version = format.readU16(bytes[4..6]);
-    // Accept v2 (no per-column DEFAULT), v3 (DEFAULT appended after
-    // each column's extra field), and v4 (AUTO_INCREMENT byte after
-    // the DEFAULT block). Older versions error.
-    if (version != schema_version and version != 3 and version != 2) {
+    // Exact match only: pre-production the format policy is "bump and
+    // reimport", never multi-version readers.
+    if (version != schema_version) {
         return Error.SchemaUnsupportedVersion;
     }
 
@@ -207,16 +213,10 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .decimal128 => .{ .decimal128 = .{ .p = @intCast((extra >> 8) & 0xff), .s = @intCast(extra & 0xff) } },
             .uuid => .uuid,
         };
-        var default_value: ?types.Value = null;
-        if (version >= 3) {
-            default_value = try decodeDefault(aa, bytes, &cursor);
-        }
-        var auto_increment = false;
-        if (version >= 4) {
-            if (cursor + 1 > bytes.len) return Error.SchemaCorrupt;
-            auto_increment = bytes[cursor] != 0;
-            cursor += 1;
-        }
+        const default_value = try decodeDefault(aa, bytes, &cursor);
+        if (cursor + 1 > bytes.len) return Error.SchemaCorrupt;
+        const auto_increment = bytes[cursor] != 0;
+        cursor += 1;
         columns[i] = .{
             .name = name,
             .type = t,
@@ -241,9 +241,13 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         cursor += name_len;
     }
 
-    if (cursor + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
+    if (cursor + 1 + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
     const unique = bytes[cursor] != 0;
     cursor += 1;
+    const compression_byte = bytes[cursor];
+    cursor += 1;
+    if (compression_byte > @intFromEnum(types.TableCompression.lz4)) return Error.SchemaCorrupt;
+    const compression: types.TableCompression = @enumFromInt(compression_byte);
     if (!std.mem.eql(u8, bytes[cursor .. cursor + 4], &schema_magic)) {
         return Error.SchemaBadTrailerMagic;
     }
@@ -253,11 +257,15 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         .columns = columns,
         .order_key = order_key,
         .unique = unique,
+        .compression = compression,
     };
 }
 
 /// True iff two schemas are structurally identical: same column count, same
 /// column name+type at each position, same order_key, same unique flag.
+/// `compression` is a storage policy, not structure — deliberately excluded,
+/// so reopening a table with a different option in the caller's literal never
+/// errors (the on-disk schema's option wins).
 pub fn schemasEqual(a: TableSchema, b: TableSchema) bool {
     if (a.columns.len != b.columns.len) return false;
     if (a.order_key.len != b.order_key.len) return false;
@@ -487,6 +495,27 @@ test "round-trip schema (simple)" {
     defer owner.deinit();
 
     try std.testing.expect(schemasEqual(schema, owner.view()));
+}
+
+test "round-trip schema preserves compression option" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    inline for (.{ types.TableCompression.none, .zstd, .lz4 }) |comp| {
+        const schema = TableSchema{
+            .columns = &.{.{ .name = "id", .type = .bigint }},
+            .order_key = &.{"id"},
+            .unique = false,
+            .compression = comp,
+        };
+        try writeSchema(io, tmp.dir, schema, allocator);
+        var owner = try readSchema(allocator, io, tmp.dir);
+        defer owner.deinit();
+        try std.testing.expectEqual(comp, owner.view().compression);
+    }
 }
 
 test "round-trip schema (composite order key)" {

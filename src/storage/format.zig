@@ -40,12 +40,22 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// uuid and extended the string prefix from 8 to 16 bytes.
 ///
 /// v9→v10: added the `.rle` block encoding.
-pub const segment_version: u16 = 10;
+///
+/// v10→v11: per-column stats slot widened from 32 to 56 bytes — small
+/// materialized aggregates (`Stats.sum`, per-type interpretation) plus an
+/// exact per-row-group `Stats.null_count`.
+///
+/// v11→v12: `.lz4` block compression for large raw string blocks. These
+/// blocks stay COMPRESSED in the block cache (the cache stores the on-disk
+/// payload; every access decompresses the whole block at LZ4 speed), so the
+/// resident set shrinks while consumers still see plain raw bytes.
+pub const segment_version: u16 = 12;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
     none = 0,
     zstd = 1,
+    lz4 = 2,
 };
 
 /// Per-column-block value encoding, stored in the first of the header's two
@@ -88,18 +98,42 @@ pub const Compression = enum(u8) {
 /// values included), so decode reproduces the exact stream and the validity
 /// bitmap stays orthogonal. The split values/lengths arrays keep both
 /// SIMD-friendly for run-aware kernels that scan without expanding.
+///
+/// `.fsst` (Fast Static Symbol Table, see `fsst.zig`) compresses a
+/// high-NDV string block — the gap dict can't cover — while keeping
+/// per-row random access: every row's value is independently FSST-encoded
+/// against a block-local symbol table, so consumers can decode one row,
+/// stream-decode into a digest, or memcmp compressed bytes for equality
+/// (same block ⇒ same table ⇒ deterministic encoding). The post-bitmap
+/// payload layout is:
+///
+///   [table_size: u32]               serialized symbol table byte length
+///   [table: …]                      see `fsst.SymbolTable.serialize`
+///   [raw_byte_count: u32]           Σ decoded lengths — exact decode sizing
+///   [comp_byte_count: u32]
+///   [comp_offsets: (n+1) × u32]     per-row offsets into comp_bytes, from 0
+///   [comp_bytes: …]                 per-row encodings, concatenated
+///
+/// NULL rows encode whatever placeholder bytes the raw stream held
+/// (normally empty), masked by the validity bitmap as everywhere else.
 pub const Encoding = enum(u8) {
     raw = 0,
     for_ = 1,
     dict = 2,
     rle = 3,
+    fsst = 4,
 };
 
 /// Per-column-block flags (u8). Bit 0 = has_nulls (decompressed payload is
-/// prefixed by a validity bitmap). Remaining bits reserved.
+/// prefixed by a validity bitmap). Bit 1 = at_rest. Remaining bits reserved.
 pub const ColumnBlockFlags = packed struct(u8) {
     has_nulls: bool = false,
-    _reserved: u7 = 0,
+    /// The block cache keeps this block's payload still-compressed and
+    /// decompresses per access (set by the writer for large raw string blocks
+    /// under `TableCompression.lz4`). Without the flag, an LZ4 block is
+    /// decompressed once at cache fill like any zstd block.
+    at_rest: bool = false,
+    _reserved: u6 = 0,
 
     pub fn toByte(self: ColumnBlockFlags) u8 {
         return @bitCast(self);
@@ -140,9 +174,28 @@ pub const footer_trailer_size: usize = 8; // u32 footer_size + 4-byte magic
 ///   - varchar / string / char: prefix encoding (see `encodeStringPrefix`)
 ///   - float / double: order-preserving bit transform (see `encodeFloatOrder`);
 ///     NaN is skipped when computing the extent
+/// On disk each slot is 56 bytes: i128 min + i128 max + i128 sum + u64
+/// null_count, all LE.
+///
+/// `sum` is a small materialized aggregate over the range's NON-NULL rows,
+/// interpreted per column type:
+///   - integer / boolean / date / datetime / decimal64: exact integer sum
+///     (i128 — can't overflow: ≤2^32 rows of i64 fit in 2^96)
+///   - float / double: the f64 running sum, bit-stored in the low 64 bits
+///     (`@bitCast`), NaN included as-is
+///   - varchar / string / char: NOT a sum — the blank-excluded min prefix
+///     (`encodeStringPrefix` folded over non-null, non-empty values;
+///     `maxInt(i128)` when the range has none). Lets ORDER BY pruning skip
+///     ranges whose only "small" value is the ubiquitous empty string.
+///   - largeint / decimal128 / uuid: 0, unused (an i128 sum could overflow)
+///
+/// `null_count` is exact for every type, so `COUNT(col)` over a fully-
+/// selected range is `row_count - null_count` without touching data.
 pub const Stats = struct {
     min: i128,
     max: i128,
+    sum: i128 = 0,
+    null_count: u64 = 0,
 };
 
 /// Encode a 16-byte prefix of `bytes` (zero-padded if shorter) into an
@@ -248,6 +301,54 @@ pub fn typeHasStats(t: @import("../types.zig").Type) bool {
         .varchar, .string, .char => true,
         .float, .double => true,
     };
+}
+
+/// How a column type uses the `Stats.sum` slot — drives both the writer's
+/// accumulation and the cross-row-group/segment fold (integer add vs f64 add
+/// vs min, see `Stats`).
+pub const SumKind = enum { int, float, string_min, none };
+
+pub fn sumKindOf(t: @import("../types.zig").Type) SumKind {
+    return switch (t) {
+        .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => .int,
+        .float, .double => .float,
+        .varchar, .string, .char => .string_min,
+        .largeint, .decimal128, .uuid => .none,
+    };
+}
+
+/// Float columns bit-store their f64 running sum in the low 64 bits of the
+/// i128 `sum` slot.
+pub fn sumSlotFromF64(f: f64) i128 {
+    return @as(i128, @as(u64, @bitCast(f)));
+}
+pub fn f64FromSumSlot(slot: i128) f64 {
+    return @bitCast(@as(u64, @truncate(@as(u128, @bitCast(slot)))));
+}
+
+/// Fold one more `Stats` range into an accumulator, per `sumKindOf` kind.
+/// Identity accumulator: `{ .min = maxInt, .max = minInt, .sum = sumIdentity,
+/// .null_count = 0 }`. All-null ranges keep the inverted min/max sentinel
+/// composing correctly (their min never lowers, max never raises).
+pub fn foldStats(acc: *Stats, s: Stats, kind: SumKind) void {
+    if (s.min < acc.min) acc.min = s.min;
+    if (s.max > acc.max) acc.max = s.max;
+    acc.null_count += s.null_count;
+    switch (kind) {
+        .int => acc.sum += s.sum,
+        .float => acc.sum = sumSlotFromF64(f64FromSumSlot(acc.sum) + f64FromSumSlot(s.sum)),
+        .string_min => {
+            if (s.sum < acc.sum) acc.sum = s.sum;
+        },
+        .none => acc.sum = 0,
+    }
+}
+
+/// The `sum` value of a fold's identity accumulator for the given kind:
+/// `maxInt` for the blank-excluded string min (so any real value lowers it),
+/// 0 for everything else (integer zero == f64 +0.0 bit pattern).
+pub fn sumIdentity(kind: SumKind) i128 {
+    return if (kind == .string_min) std.math.maxInt(i128) else 0;
 }
 
 // ---------- byte helpers -------------------------------------------------

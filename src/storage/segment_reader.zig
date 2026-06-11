@@ -36,6 +36,7 @@ const TableSchema = types.TableSchema;
 const format = @import("format.zig");
 const column = @import("column.zig");
 const compression_mod = @import("compression.zig");
+const fsst = @import("fsst.zig");
 const storage_cache = @import("cache.zig");
 const simd_mod = @import("../util/simd.zig");
 const prof = @import("../util/prof.zig");
@@ -99,33 +100,61 @@ pub const ReadSegment = struct {
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
             };
-            if (cc.acquire(key)) |entry| {
-                defer cc.release(entry);
-                return decodeColumnPayload(allocator, col_type, entry.bytes, rg.row_count, flags, entry.encoding);
-            }
-            // Miss: pread the block, decompress, hand the bytes to the cache.
-            // The errdefer is scoped to the block so it fires only if we fail
-            // before ownership transfers; once `insertPinned` returns the cache
-            // owns the bytes and only the pin needs releasing.
-            var entry_encoding: format.Encoding = .raw;
-            const entry = blk: {
-                const block = try self.readColumnBlock(allocator, rg, column_idx);
-                defer allocator.free(block);
-                entry_encoding = blockEncoding(block, 0);
-                // The persistent payload lives in the cache's huge-page pool, so
-                // it's both allocated and (on eviction) freed there.
-                const block_alloc = cc.blockAllocator();
-                const raw = try getDecompressedBytes(block_alloc, block, 0);
-                errdefer block_alloc.free(raw);
-                break :blk try cc.insertPinned(key, raw, entry_encoding);
-            };
+            const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, rg, column_idx);
             defer cc.release(entry);
+            // LZ4-at-rest entries decompress per use (into recycled scratch —
+            // a fresh alloc per access would re-fault freshly-zeroed pages
+            // every time); plain entries decode in place.
+            if (entry.compression == .lz4) {
+                const scratch = try cc.acquireScratch(entry.uncompressed_size);
+                defer cc.releaseScratch(scratch);
+                const plain = scratch[0..entry.uncompressed_size];
+                try compression_mod.lz4DecompressInto(entry.bytes, plain);
+                return decodeColumnPayload(allocator, col_type, plain, rg.row_count, flags, entry.encoding);
+            }
             return decodeColumnPayload(allocator, col_type, entry.bytes, rg.row_count, flags, entry.encoding);
         }
 
         const block = try self.readColumnBlock(allocator, rg, column_idx);
         defer allocator.free(block);
         return decodeBlock(allocator, block, 0, col_type, rg.row_count, flags);
+    }
+
+    /// Cache-miss fill: pread the block and insert it pinned. Most blocks are
+    /// decompressed at fill (a hit costs only the decode); blocks the writer
+    /// flagged `at_rest` (large raw string blocks under `.lz4` tables) instead
+    /// cache the still-compressed payload — they trade a whole-block LZ4
+    /// decompress per access for a much smaller resident set. The persistent
+    /// payload lives in the cache's huge-page pool, so it's both allocated and
+    /// (on eviction) freed there.
+    fn fillCacheEntry(
+        self: ReadSegment,
+        allocator: Allocator,
+        cc: *storage_cache.Cache,
+        key: storage_cache.Key,
+        rg: RowGroupMeta,
+        column_idx: usize,
+    ) !*storage_cache.Cache.Entry {
+        const block = try self.readColumnBlock(allocator, rg, column_idx);
+        defer allocator.free(block);
+        const encoding = blockEncoding(block, 0);
+        const block_alloc = cc.blockAllocator();
+
+        const kind_byte = block[0];
+        const flags = format.ColumnBlockFlags.fromByte(block[1]);
+        if (kind_byte == @intFromEnum(format.Compression.lz4) and flags.at_rest) {
+            const uncompressed_size = format.readU32(block[4..8]);
+            const compressed_size = format.readU32(block[8..12]);
+            const payload_start = format.column_block_header_size;
+            const copy = try block_alloc.alignedAlloc(u8, .@"16", compressed_size);
+            errdefer block_alloc.free(copy);
+            @memcpy(copy, block[payload_start .. payload_start + compressed_size]);
+            return cc.insertPinnedCompressed(key, copy, encoding, .lz4, uncompressed_size);
+        }
+
+        const raw = try getDecompressedBytes(block_alloc, block, 0);
+        errdefer block_alloc.free(raw);
+        return cc.insertPinned(key, raw, encoding);
     }
 
     /// A pinned, decompressed column block borrowed for the duration of one
@@ -144,6 +173,10 @@ pub const ReadSegment = struct {
         encoding: format.Encoding = .raw,
         entry: ?*storage_cache.Cache.Entry = null,
         owned: ?[]align(16) u8 = null,
+        /// `owned` came from the cache's scratch pool (LZ4-at-rest decompress)
+        /// rather than `allocator` — `release` returns it to the pool. Only set
+        /// alongside a non-null cache.
+        pooled: bool = false,
         /// Native-width expansion of a FOR-encoded block, allocated by the
         /// borrow path so a single FOR column doesn't force the whole row group
         /// onto the owned-decode path. Freed on `release`. Null for raw blocks.
@@ -153,7 +186,9 @@ pub const ReadSegment = struct {
             if (self.entry) |e| {
                 if (c) |cc| cc.release(e);
             }
-            if (self.owned) |b| allocator.free(b);
+            if (self.owned) |b| {
+                if (self.pooled) c.?.releaseScratch(b) else allocator.free(b);
+            }
             if (self.expanded) |*col| col.deinit(allocator);
             self.* = undefined;
         }
@@ -180,16 +215,25 @@ pub const ReadSegment = struct {
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
             };
-            if (cc.acquire(key)) |entry| {
-                return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
+            const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, rg, column_idx);
+            // LZ4-at-rest: decompress the whole block into recycled scratch
+            // and drop the pin immediately — the borrow then behaves exactly
+            // like the cacheless owned path, and every downstream consumer
+            // sees plain decompressed bytes. Scratch (not a fresh alloc): a
+            // per-access alloc re-faults freshly-zeroed pages on every borrow.
+            if (entry.compression == .lz4) {
+                const encoding = entry.encoding;
+                defer cc.release(entry);
+                const scratch = try cc.acquireScratch(entry.uncompressed_size);
+                errdefer cc.releaseScratch(scratch);
+                try compression_mod.lz4DecompressInto(entry.bytes, scratch[0..entry.uncompressed_size]);
+                return .{
+                    .bytes = scratch[0..entry.uncompressed_size],
+                    .encoding = encoding,
+                    .owned = scratch,
+                    .pooled = true,
+                };
             }
-            const block = try self.readColumnBlock(allocator, rg, column_idx);
-            defer allocator.free(block);
-            const encoding = blockEncoding(block, 0);
-            const block_alloc = cc.blockAllocator();
-            const raw = try getDecompressedBytes(block_alloc, block, 0);
-            errdefer block_alloc.free(raw);
-            const entry = try cc.insertPinned(key, raw, encoding);
             return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
         }
         const block = try self.readColumnBlock(allocator, rg, column_idx);
@@ -264,7 +308,7 @@ pub fn readSegment(
 
     const row_group_count = format.readU32(footer[0..4]);
     const ncols = schema.columns.len;
-    const per_rg = 16 + ncols * 32 + ncols * 8; // offset/len/rows + stats + col offsets
+    const per_rg = 16 + ncols * 56 + ncols * 8; // offset/len/rows + stats + col offsets
     const expected_footer = 4 + @as(usize, row_group_count) * per_rg + format.footer_trailer_size;
     if (expected_footer != footer_size) return format.Error.CorruptFooter;
 
@@ -292,6 +336,10 @@ pub fn readSegment(
             off += 16;
             s.max = format.readI128(footer[off .. off + 16]);
             off += 16;
+            s.sum = format.readI128(footer[off .. off + 16]);
+            off += 16;
+            s.null_count = format.readU64(footer[off .. off + 8]);
+            off += 8;
         }
         rg.stats = stats;
 
@@ -329,7 +377,7 @@ fn blockEncoding(bytes: []const u8, offset: usize) format.Encoding {
     // an unknown value would be caught by a downstream decode mismatch, but we
     // keep the reader total here rather than introducing a new error path for a
     // byte the writer fully controls.
-    return if (b <= @intFromEnum(format.Encoding.rle)) @enumFromInt(b) else .raw;
+    return if (b <= @intFromEnum(format.Encoding.fsst)) @enumFromInt(b) else .raw;
 }
 
 fn decodeBlock(
@@ -359,7 +407,7 @@ fn readBlockRaw(
     owned_raw: *?[]u8,
 ) ![]const u8 {
     const kind_byte = bytes[offset];
-    if (kind_byte > @intFromEnum(format.Compression.zstd)) return format.Error.UnknownCompression;
+    if (kind_byte > @intFromEnum(format.Compression.lz4)) return format.Error.UnknownCompression;
     const kind: format.Compression = @enumFromInt(kind_byte);
     const uncompressed_size = format.readU32(bytes[offset + 4 .. offset + 8]);
     const compressed_size = format.readU32(bytes[offset + 8 .. offset + 12]);
@@ -370,6 +418,13 @@ fn readBlockRaw(
         .none => return payload,
         .zstd => {
             const r = try compression_mod.decompress(allocator, payload, uncompressed_size);
+            owned_raw.* = r;
+            return r;
+        },
+        .lz4 => {
+            const r = try allocator.alloc(u8, uncompressed_size);
+            errdefer allocator.free(r);
+            try compression_mod.lz4DecompressInto(payload, r);
             owned_raw.* = r;
             return r;
         },
@@ -385,7 +440,7 @@ fn getDecompressedBytes(
     offset: usize,
 ) ![]align(16) u8 {
     const kind_byte = bytes[offset];
-    if (kind_byte > @intFromEnum(format.Compression.zstd)) return format.Error.UnknownCompression;
+    if (kind_byte > @intFromEnum(format.Compression.lz4)) return format.Error.UnknownCompression;
     const kind: format.Compression = @enumFromInt(kind_byte);
     const uncompressed_size = format.readU32(bytes[offset + 4 .. offset + 8]);
     const compressed_size = format.readU32(bytes[offset + 8 .. offset + 12]);
@@ -399,6 +454,7 @@ fn getDecompressedBytes(
             return dst;
         },
         .zstd => return compression_mod.decompressAligned(allocator, payload, uncompressed_size),
+        .lz4 => return compression_mod.lz4DecompressAligned(allocator, payload, uncompressed_size),
     }
 }
 
@@ -420,6 +476,7 @@ pub fn decodeColumnPayload(
         .for_ => decodeForColumn(allocator, col_type, raw, row_count, flags),
         .dict => decodeDictColumn(allocator, col_type, raw, row_count, flags),
         .rle => decodeRleColumn(allocator, col_type, raw, row_count, flags),
+        .fsst => decodeFsstColumn(allocator, col_type, raw, row_count, flags),
     };
 }
 
@@ -1028,4 +1085,114 @@ fn expandDict(allocator: Allocator, db: DictBlock, row_count: u32) !OwnedStringC
     }
 
     return .{ .offsets = offsets, .bytes = bytes };
+}
+
+/// An FSST block's regions, parsed in place over the decompressed payload
+/// (past any validity bitmap). The symbol table is rebuilt by value (it is a
+/// few KB of plain arrays); the per-row compressed slices alias the payload.
+/// This is the seam compressed-domain consumers use: digest-while-decode via
+/// `table.decodeStream(rowComp(r), sink)`, per-segment equality via
+/// memcmp over `rowComp`, and one-row decode for late materialization.
+pub const FsstBlock = struct {
+    table: fsst.SymbolTable,
+    raw_byte_count: u32,
+    /// (row_count+1) × u32 little-endian, rebased to 0.
+    offsets_region: []const u8,
+    comp_bytes: []const u8,
+
+    pub fn rowComp(self: *const FsstBlock, row: usize) []const u8 {
+        const a = format.readU32(self.offsets_region[row * 4 ..][0..4]);
+        const b = format.readU32(self.offsets_region[(row + 1) * 4 ..][0..4]);
+        return self.comp_bytes[a..b];
+    }
+};
+
+/// Parse the FSST regions out of a decompressed block payload. `values` is the
+/// payload past the validity bitmap. Layout documented on
+/// `format.Encoding.fsst`. Errors on a corrupt symbol table rather than
+/// risking out-of-bounds symbol lengths.
+pub fn fsstBlockOf(values: []const u8, row_count: u32) !FsstBlock {
+    const table_len = format.readU32(values[0..4]);
+    const table = try fsst.SymbolTable.deserialize(values[4 .. 4 + table_len]);
+    var cur: usize = 4 + table_len;
+    const raw_byte_count = format.readU32(values[cur..][0..4]);
+    cur += 4;
+    const comp_byte_count = format.readU32(values[cur..][0..4]);
+    cur += 4;
+    const off_bytes = (@as(usize, row_count) + 1) * 4;
+    const offsets_region = values[cur .. cur + off_bytes];
+    cur += off_bytes;
+    return .{
+        .table = table,
+        .raw_byte_count = raw_byte_count,
+        .offsets_region = offsets_region,
+        .comp_bytes = values[cur .. cur + comp_byte_count],
+    };
+}
+
+/// Split a decompressed FSST block payload into (validity bitmap, FsstBlock),
+/// mirroring `rleViewOf` / `forViewOf`.
+pub const FsstView = struct {
+    nulls: ?[]const u8,
+    block: FsstBlock,
+};
+
+pub fn fsstViewOf(raw: []const u8, row_count: u32, flags: format.ColumnBlockFlags) !FsstView {
+    var nulls: ?[]const u8 = null;
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        nulls = raw[0..bm_len];
+        values = raw[bm_len..];
+    }
+    return .{ .nulls = nulls, .block = try fsstBlockOf(values, row_count) };
+}
+
+/// Expand an FSST block into the owned `[offsets][bytes]` string shape every
+/// consumer expects — identical output to a raw string block.
+pub fn decodeFsstColumn(
+    allocator: Allocator,
+    col_type: Type,
+    raw: []const u8,
+    row_count: u32,
+    flags: format.ColumnBlockFlags,
+) !OwnedColumn {
+    const _pt = if (prof.enabled) prof.nowTicks() else 0;
+    defer if (prof.enabled) prof.add("fsst-decode (expand→strings)", @intCast(@max(0, prof.nowTicks() - _pt)));
+
+    var nulls: ?[]u8 = null;
+    errdefer if (nulls) |n| allocator.free(n);
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        const bm_copy = try allocator.alloc(u8, bm_len);
+        @memcpy(bm_copy, raw[0..bm_len]);
+        nulls = bm_copy;
+        values = raw[bm_len..];
+    }
+
+    const fb = try fsstBlockOf(values, row_count);
+
+    const offsets = try allocator.alloc(u32, @as(usize, row_count) + 1);
+    errdefer allocator.free(offsets);
+    const bytes = try allocator.alloc(u8, fb.raw_byte_count);
+    errdefer allocator.free(bytes);
+
+    var o: usize = 0;
+    offsets[0] = 0;
+    var row: usize = 0;
+    while (row < row_count) : (row += 1) {
+        o += fb.table.decodeInto(fb.rowComp(row), bytes[o..]);
+        offsets[row + 1] = @intCast(o);
+    }
+    if (o != fb.raw_byte_count) return format.Error.CorruptColumnBlockHeader;
+
+    const sc = OwnedStringColumn{ .offsets = offsets, .bytes = bytes };
+    // The writer only ever FSST-encodes string-family columns.
+    return switch (col_type) {
+        .varchar => .{ .data = .{ .varchar = sc }, .nulls = nulls },
+        .string => .{ .data = .{ .string = sc }, .nulls = nulls },
+        .char => .{ .data = .{ .char = sc }, .nulls = nulls },
+        else => unreachable,
+    };
 }

@@ -10,6 +10,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ---- lz4 C library (allyourcodebase/lz4 via build.zig.zon) ----
+    // Always ReleaseFast: the whole point of LZ4-cached string blocks is the
+    // multi-GB/s block decompress on the read path; a Debug lz4 would invert
+    // every measurement (same reasoning as the zstd Debug-server trap).
+    const lz4_dep = b.dependency("lz4", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
     // ---- build options: dev profilers ----
     // `-Dprofiling=true` compiles in the developer-only execution traces
     // (THINDB_V2_PIPELINE_TRACE / _WORKER_PROFILE / _CHUNK_PROFILE and the
@@ -27,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     thindb_mod.linkLibrary(zstd_dep.artifact("zstd"));
+    thindb_mod.linkLibrary(lz4_dep.artifact("lz4"));
     thindb_mod.addOptions("build_options", build_opts);
 
     // ---- Library artifact (so we have something to `zig build`) ----
@@ -125,6 +135,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     thindb_fast.linkLibrary(fast_zstd.artifact("zstd"));
+    thindb_fast.linkLibrary(lz4_dep.artifact("lz4"));
 
     // ---- Benchmarks: bench/main.zig ----------------------------------------
     const bench_mod = b.createModule(.{

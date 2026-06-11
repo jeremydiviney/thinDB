@@ -9,6 +9,11 @@ const c = @cImport({
     @cInclude("zstd.h");
 });
 
+const lz4c = @cImport({
+    @cInclude("lz4.h");
+    @cInclude("lz4hc.h");
+});
+
 /// Default zstd compression level. 3 is the upstream default — Pareto-optimal
 /// speed/ratio for analytics-shaped data. Range is 1 (fastest) to 22.
 pub const default_level: c_int = 3;
@@ -16,6 +21,8 @@ pub const default_level: c_int = 3;
 pub const Error = error{
     ZstdEncodeFailed,
     ZstdDecodeFailed,
+    Lz4EncodeFailed,
+    Lz4DecodeFailed,
     OutOfMemory,
 };
 
@@ -99,6 +106,70 @@ pub fn decompressAligned(allocator: Allocator, input: []const u8, uncompressed_s
     if (written != uncompressed_size) return Error.ZstdDecodeFailed;
 
     return dst;
+}
+
+// ---------- LZ4 ----------------------------------------------------------
+//
+// The `TableCompression.lz4` block compressor. Large raw string blocks stay
+// COMPRESSED in the block cache and pay a whole-block decompress per access,
+// so the algorithm is chosen for decode speed (multi-GB/s, ~4-8× zstd) over
+// ratio. Writes use LZ4HC — same decode speed, meaningfully better ratio than
+// fast-mode LZ4.
+
+/// LZ4HC compression level. Decode speed is level-independent; 3 (the HC
+/// floor) compresses ~3-5× faster than 9 for a few percent ratio loss —
+/// flush and compaction throughput win over the marginal disk savings.
+const lz4hc_level: c_int = 3;
+
+/// Compress `input` with LZ4HC into a freshly-allocated slice. Caller owns
+/// the result.
+pub fn lz4CompressHC(allocator: Allocator, input: []const u8) ![]u8 {
+    const bound: usize = @intCast(lz4c.LZ4_compressBound(@intCast(input.len)));
+    const dst = try allocator.alloc(u8, bound);
+    errdefer allocator.free(dst);
+    const written = lz4c.LZ4_compress_HC(
+        input.ptr,
+        dst.ptr,
+        @intCast(input.len),
+        @intCast(dst.len),
+        lz4hc_level,
+    );
+    if (written <= 0) return Error.Lz4EncodeFailed;
+    return allocator.realloc(dst, @intCast(written)) catch dst[0..@intCast(written)];
+}
+
+/// Decompress an LZ4 block into `dst`, which must be exactly the original
+/// uncompressed length. Errors on any mismatch or malformed input.
+pub fn lz4DecompressInto(input: []const u8, dst: []u8) !void {
+    const written = lz4c.LZ4_decompress_safe(
+        input.ptr,
+        dst.ptr,
+        @intCast(input.len),
+        @intCast(dst.len),
+    );
+    if (written < 0 or @as(usize, @intCast(written)) != dst.len) return Error.Lz4DecodeFailed;
+}
+
+/// Like `decompressAligned` but for LZ4 blocks: 16-byte-aligned result so
+/// zero-copy typed views work over the decompressed bytes.
+pub fn lz4DecompressAligned(allocator: Allocator, input: []const u8, uncompressed_size: usize) ![]align(16) u8 {
+    const dst = try allocator.alignedAlloc(u8, .@"16", uncompressed_size);
+    errdefer allocator.free(dst);
+    try lz4DecompressInto(input, dst);
+    return dst;
+}
+
+test "lz4 round-trips and beats raw on redundant data" {
+    const allocator = std.testing.allocator;
+    const payload = "https://example.com/products/widgets?id=12345&ref=search " ** 64;
+
+    const compressed = try lz4CompressHC(allocator, payload);
+    defer allocator.free(compressed);
+    try std.testing.expect(compressed.len < payload.len / 2);
+
+    const back = try lz4DecompressAligned(allocator, compressed, payload.len);
+    defer allocator.free(back);
+    try std.testing.expectEqualStrings(payload, back);
 }
 
 // ---------- tests --------------------------------------------------------

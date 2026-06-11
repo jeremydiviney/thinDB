@@ -16,6 +16,7 @@ pub const manifest = @import("manifest.zig");
 pub const schema_file = @import("schema_file.zig");
 pub const tombstone = @import("tombstone.zig");
 pub const compression = @import("compression.zig");
+pub const fsst = @import("fsst.zig");
 pub const cache = @import("cache.zig");
 
 pub const ColumnView = column.ColumnView;
@@ -151,6 +152,306 @@ test "round-trip a single row group with all v0.1 types" {
     try std.testing.expectEqualStrings("", note_view.rowBytes(2));
     try std.testing.expectEqualStrings("fourth", note_view.rowBytes(3));
     try std.testing.expectEqualStrings("fifth", note_view.rowBytes(4));
+}
+
+test "footer stats carry sum / null_count / blank-excluded string min" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "v", .type = .bigint, .nullable = true },
+            .{ .name = "f", .type = .double },
+            .{ .name = "s", .type = .string },
+        },
+        .order_key = &.{"f"},
+        .unique = false,
+    };
+    try schema.validate();
+
+    // 6 rows, row_group_size 4 → two row groups (4 + 2).
+    const vs = [_]i64{ 1, 2, 3, 4, 5, 6 };
+    // Rows 1 and 4 are NULL (bit clear).
+    const v_nulls = [_]u8{0b101101};
+    const fs = [_]f64{ 0.5, 1.5, 2.5, 3.5, 4.5, 5.5 };
+    const s_bytes = "" ++ "beta" ++ "alpha" ++ "" ++ "zz" ++ "";
+    const s_offsets = [_]u32{ 0, 0, 4, 9, 9, 11, 11 };
+
+    const columns = [_]ColumnView{
+        .{ .data = .{ .bigint = &vs }, .nulls = &v_nulls },
+        .{ .data = .{ .double = &fs } },
+        .{ .data = .{ .string = .{ .offsets = &s_offsets, .bytes = s_bytes } } },
+    };
+
+    var info = try writeSegment(allocator, io, tmp.dir, "seg.dat", schema, 7, 0xFEED, 4, &columns, &.{}, false);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
+    defer seg.deinit();
+    try std.testing.expectEqual(@as(usize, 2), seg.info.row_groups.len);
+
+    // Row group 0 (rows 0-3): v null at row 1 → sum 1+3+4, one null.
+    const rg0 = seg.info.row_groups[0];
+    try std.testing.expectEqual(@as(i128, 8), rg0.stats[0].sum);
+    try std.testing.expectEqual(@as(u64, 1), rg0.stats[0].null_count);
+    // f: 0.5+1.5+2.5+3.5 = 8.0, bit-stored in the low 64 bits.
+    try std.testing.expectEqual(@as(f64, 8.0), format.f64FromSumSlot(rg0.stats[1].sum));
+    try std.testing.expectEqual(@as(u64, 0), rg0.stats[1].null_count);
+    // s: plain min is '' but the sum slot excludes blanks → "alpha".
+    try std.testing.expectEqual(format.encodeStringPrefix(""), rg0.stats[2].min);
+    try std.testing.expectEqual(format.encodeStringPrefix("alpha"), rg0.stats[2].sum);
+
+    // Row group 1 (rows 4-5): v null at row 4 → sum 6; s nonblank min "zz".
+    const rg1 = seg.info.row_groups[1];
+    try std.testing.expectEqual(@as(i128, 6), rg1.stats[0].sum);
+    try std.testing.expectEqual(@as(u64, 1), rg1.stats[0].null_count);
+    try std.testing.expectEqual(format.encodeStringPrefix("zz"), rg1.stats[2].sum);
+
+    // Segment-level fold into a manifest entry.
+    const entry = try manifest.entryFromSegmentInfo(allocator, seg.info, null, schema.columns);
+    defer allocator.free(entry.column_stats);
+    try std.testing.expectEqual(@as(i128, 14), entry.column_stats[0].sum);
+    try std.testing.expectEqual(@as(u64, 2), entry.column_stats[0].null_count);
+    try std.testing.expectEqual(@as(f64, 18.0), format.f64FromSumSlot(entry.column_stats[1].sum));
+    try std.testing.expectEqual(format.encodeStringPrefix("alpha"), entry.column_stats[2].sum);
+    try std.testing.expectEqual(@as(u64, 0), entry.column_stats[2].null_count);
+}
+
+test "lz4 string blocks: large raw block caches compressed, borrow decompresses" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "url", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    try schema.validate();
+
+    // 2000 distinct ~70B URLs ≈ 140KB raw — over the 64KB LZ4 threshold,
+    // NDV == n so dict declines (and FSST is off).
+    const n: usize = 2000;
+    const ids = try allocator.alloc(i64, n);
+    defer allocator.free(ids);
+    const offsets = try allocator.alloc(u32, n + 1);
+    defer allocator.free(offsets);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    offsets[0] = 0;
+    var buf: [128]u8 = undefined;
+    for (0..n) |i| {
+        ids[i] = @intCast(i);
+        const s = try std.fmt.bufPrint(&buf, "https://example.com/products/category-{d}/item?id={d}&ref=search", .{ i % 13, i });
+        try bytes.appendSlice(allocator, s);
+        offsets[i + 1] = @intCast(bytes.items.len);
+    }
+
+    const columns = [_]ColumnView{
+        .{ .data = .{ .bigint = ids } },
+        .{ .data = .{ .string = .{ .offsets = offsets, .bytes = bytes.items } } },
+    };
+    var info = try writeSegment(allocator, io, tmp.dir, "seg.dat", schema, 3, 0x124, 4096, &columns, &.{}, false);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
+    defer seg.deinit();
+
+    var c = cache.Cache.init(allocator, 1 << 24);
+    defer c.deinit();
+
+    // Borrow through the cache: an LZ4-at-rest block hands back an OWNED
+    // decompressed buffer (entry == null) rather than pinned cache bytes —
+    // that's the signature that the compressed-at-rest path engaged.
+    var bb = try seg.borrowColumnBlock(allocator, 0, 1, &c);
+    try std.testing.expectEqual(format.Encoding.raw, bb.encoding);
+    try std.testing.expect(bb.owned != null);
+    try std.testing.expect(bb.entry == null);
+    bb.release(allocator, &c);
+
+    // The cached entry holds FEWER bytes than the raw payload (compressed at
+    // rest), and a warm re-borrow round-trips the values.
+    const raw_payload = 4 + (n + 1) * 4 + bytes.items.len;
+    try std.testing.expect(c.current_bytes < raw_payload);
+
+    var col = try seg.decodeColumnMaybeCached(allocator, schema, 0, 1, &c);
+    defer col.deinit(allocator);
+    const sv = col.view().data.string;
+    for (0..n) |i| {
+        try std.testing.expectEqualStrings(bytes.items[offsets[i]..offsets[i + 1]], sv.rowBytes(i));
+    }
+
+    // The plain-int sibling block stays on the decompressed-at-fill path.
+    var bb2 = try seg.borrowColumnBlock(allocator, 0, 0, &c);
+    try std.testing.expect(bb2.entry != null);
+    bb2.release(allocator, &c);
+}
+
+test "MergedSegmentWriter: parallel encode output is byte-identical to serial" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "url", .type = .string },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    try schema.validate();
+
+    // Three row groups of 1200 rows: ascending ids (FOR), ~70B distinct URLs
+    // (≈84KB raw per block → the LZ4 string path), pseudo-random ints (raw +
+    // zstd). Same data written with 1 and with 8 encoder threads must produce
+    // identical files — the parallel path only reorders WORK, never bytes.
+    const rg_rows: usize = 1200;
+    const n_rgs: usize = 3;
+    const dict_eligible = [_]bool{ false, false, false };
+
+    const file_names = [_][]const u8{ "serial.dat", "parallel.dat" };
+    const thread_counts = [_]usize{ 1, 8 };
+    for (file_names, thread_counts) |file_name, n_threads| {
+        var w = try MergedSegmentWriter.begin(allocator, schema, 7, 0x99, rg_rows, &dict_eligible, &.{}, n_threads);
+        errdefer w.deinit();
+
+        var prng = std.Random.DefaultPrng.init(42);
+        const rand = prng.random();
+        var sbuf: [128]u8 = undefined;
+        for (0..n_rgs) |rg| {
+            const ids = try allocator.alloc(i64, rg_rows);
+            defer allocator.free(ids);
+            const vals = try allocator.alloc(i32, rg_rows);
+            defer allocator.free(vals);
+            const offsets = try allocator.alloc(u32, rg_rows + 1);
+            defer allocator.free(offsets);
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(allocator);
+            offsets[0] = 0;
+            for (0..rg_rows) |i| {
+                const row = rg * rg_rows + i;
+                ids[i] = @intCast(row);
+                vals[i] = rand.int(i32);
+                const s = try std.fmt.bufPrint(&sbuf, "https://example.com/products/category-{d}/item?id={d}&ref=search", .{ row % 13, row });
+                try bytes.appendSlice(allocator, s);
+                offsets[i + 1] = @intCast(bytes.items.len);
+            }
+            const columns = [_]ColumnView{
+                .{ .data = .{ .bigint = ids } },
+                .{ .data = .{ .string = .{ .offsets = offsets, .bytes = bytes.items } } },
+                .{ .data = .{ .int = vals } },
+            };
+            try w.writeRowGroup(&columns);
+        }
+
+        var info = try w.finish(io, tmp.dir, file_name, false);
+        info.deinit(allocator);
+    }
+
+    const serial_bytes = try tmp.dir.readFileAlloc(io, "serial.dat", allocator, .unlimited);
+    defer allocator.free(serial_bytes);
+    const parallel_bytes = try tmp.dir.readFileAlloc(io, "parallel.dat", allocator, .unlimited);
+    defer allocator.free(parallel_bytes);
+    try std.testing.expectEqualSlices(u8, serial_bytes, parallel_bytes);
+
+    // And the parallel-written file round-trips through the reader.
+    var seg = try readSegment(allocator, io, tmp.dir, "parallel.dat", schema);
+    defer seg.deinit();
+    try std.testing.expectEqual(@as(u64, rg_rows * n_rgs), seg.info.row_count);
+    var col = try seg.decodeColumn(allocator, schema, 2, 1);
+    defer col.deinit(allocator);
+    const sv = col.view().data.string;
+    var expect_buf: [128]u8 = undefined;
+    const row: usize = 2 * rg_rows + 5;
+    const expected = try std.fmt.bufPrint(&expect_buf, "https://example.com/products/category-{d}/item?id={d}&ref=search", .{ row % 13, row });
+    try std.testing.expectEqualStrings(expected, sv.rowBytes(5));
+}
+
+test "fsst encoding: high-NDV string block round-trips, dict-sized stays dict" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "url", .type = .string, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    try schema.validate();
+
+    // 600 distinct URL-ish strings (NDV == n → dict declines via k*2 > n),
+    // sharing long substrings so FSST clears its acceptance ratio. Rows
+    // divisible by 7 are NULL; row 100 is the empty string.
+    const n: usize = 600;
+    var ids = try allocator.alloc(i64, n);
+    defer allocator.free(ids);
+    var offsets = try allocator.alloc(u32, n + 1);
+    defer allocator.free(offsets);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    const nulls = try allocator.alloc(u8, column.bitmapBytes(n));
+    defer allocator.free(nulls);
+    @memset(nulls, 0);
+
+    offsets[0] = 0;
+    var buf: [128]u8 = undefined;
+    for (0..n) |i| {
+        ids[i] = @intCast(i);
+        const valid = i % 7 != 0;
+        column.setValidBit(nulls, i, valid);
+        if (valid and i != 100) {
+            const s = try std.fmt.bufPrint(&buf, "https://example.com/products/category-{d}/item?id={d}&ref=search", .{ i % 13, i });
+            try bytes.appendSlice(allocator, s);
+        }
+        offsets[i + 1] = @intCast(bytes.items.len);
+    }
+
+    const columns = [_]ColumnView{
+        .{ .data = .{ .bigint = ids } },
+        .{ .data = .{ .string = .{ .offsets = offsets, .bytes = bytes.items } }, .nulls = nulls },
+    };
+
+    var info = try writeSegment(allocator, io, tmp.dir, "seg.dat", schema, 9, 0xF557, 1024, &columns, &.{}, false);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
+    defer seg.deinit();
+
+    // FSST is currently disabled (`fsst_enabled = false` in the writer —
+    // LZ4-cached raw blocks won that bake-off), so the high-NDV block falls
+    // through to raw. The kernel + block parser stay covered by fsst.zig's
+    // own tests; flip the writer gate to re-enable end-to-end.
+    var bb = try seg.borrowColumnBlock(allocator, 0, 1, null);
+    defer bb.release(allocator, null);
+    try std.testing.expectEqual(format.Encoding.raw, bb.encoding);
+
+    var col = try seg.decodeColumn(allocator, schema, 0, 1);
+    defer col.deinit(allocator);
+    const sv = col.view().data.string;
+    for (0..n) |i| {
+        try std.testing.expectEqualStrings(
+            bytes.items[offsets[i]..offsets[i + 1]],
+            sv.rowBytes(i),
+        );
+        try std.testing.expectEqual(column.isValidBit(nulls, i), col.view().isValid(i));
+    }
 }
 
 test "round-trip with multiple row groups" {
@@ -509,7 +810,7 @@ test "dict encoding: NULL and empty string are distinct under codes" {
     }
 }
 
-test "dict encoding: blob-like (avg len > 256) stays raw" {
+test "dict encoding: blob-like (avg len > 256) declines dict; stays raw with fsst off" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -543,6 +844,8 @@ test "dict encoding: blob-like (avg len > 256) stays raw" {
     var seg = try readSegment(allocator, io, tmp.dir, "blob.dat", schema);
     defer seg.deinit();
 
+    // The dict avg-len gate still declines; with FSST disabled the block
+    // stays raw (LZ4-compressed at rest above the size threshold).
     try std.testing.expectEqual(format.Encoding.raw, try blockEncodingOf(allocator, &seg, 0, 0));
 
     var c0 = try seg.decodeColumn(allocator, schema, 0, 0);
@@ -551,7 +854,7 @@ test "dict encoding: blob-like (avg len > 256) stays raw" {
     for (0..n) |i| try std.testing.expectEqualStrings(vals[i], v.data.string.rowBytes(i));
 }
 
-test "dict encoding: NDV beyond the cap abandons mid-build → raw, round-trips" {
+test "dict encoding: NDV beyond the cap abandons mid-build → raw fallback, round-trips" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -577,6 +880,8 @@ test "dict encoding: NDV beyond the cap abandons mid-build → raw, round-trips"
     var seg = try readSegment(allocator, io, tmp.dir, "abandon.dat", schema);
     defer seg.deinit();
 
+    // Dict abandons past the cap; with FSST disabled the fall-through is raw
+    // (LZ4-compressed at rest, invisible at this API).
     try std.testing.expectEqual(format.Encoding.raw, try blockEncodingOf(allocator, &seg, 0, 0));
 
     var c0 = try seg.decodeColumn(allocator, schema, 0, 0);
