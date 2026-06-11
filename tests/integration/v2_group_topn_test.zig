@@ -602,3 +602,91 @@ test "guided (NOT) LIKE over lz4_fsst strings with NULLs and a leading conjunct"
     defer allocator.free(got_single);
     try std.testing.expectEqualSlices(i64, &[_]i64{single_like_expected}, got_single);
 }
+
+test "string GROUP BY and COUNT(DISTINCT) over lz4_fsst blocks" {
+    // Exercises the FSST key memo: group digests / dict codes are computed
+    // once per distinct compressed value per block and translated per row.
+    // Group counts are heavy with repeats (key j appears j+1 times) plus
+    // blank-string and NULL groups; unfiltered and filtered lanes both run.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE visits (id BIGINT PRIMARY KEY, k INT NOT NULL, s TEXT) PROPERTIES (\"compression\" = \"lz4_fsst\")");
+
+    const n_keys: usize = 100;
+    var cnt_all = [_]i64{0} ** n_keys;
+    var cnt_filt = [_]i64{0} ** n_keys;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "INSERT INTO visits VALUES ");
+    var id: usize = 0;
+    for (0..n_keys) |j| {
+        for (0..j + 1) |r| {
+            if (id != 0) try buf.appendSlice(allocator, ",");
+            const k = r % 10;
+            var row: [224]u8 = undefined;
+            const line = try std.fmt.bufPrint(&row, "({d},{d},'http://example.com/category/{x}/article-{d:0>3}-with-a-long-shared-suffix-for-fsst')", .{ id, k, j *% 2654435761, j });
+            try buf.appendSlice(allocator, line);
+            cnt_all[j] += 1;
+            if (k < 5) cnt_filt[j] += 1;
+            id += 1;
+        }
+    }
+    // Blank and NULL groups ride along: blank is a real DISTINCT value and a
+    // real group; NULL groups but is excluded from COUNT(DISTINCT s).
+    for (0..13) |b| {
+        try buf.writer(allocator).print(",({d},{d},'')", .{ id, b % 10 });
+        id += 1;
+    }
+    for (0..17) |b| {
+        try buf.writer(allocator).print(",({d},{d},NULL)", .{ id, b % 10 });
+        id += 1;
+    }
+    try exec(allocator, db, buf.items);
+    const t = try db.openTable("visits", .{});
+    try t.flush();
+
+    const got_ndv = try helpers.collectBigints(allocator, db, "SELECT COUNT(DISTINCT s) FROM visits");
+    defer allocator.free(got_ndv);
+    try std.testing.expectEqualSlices(i64, &[_]i64{@intCast(n_keys + 1)}, got_ndv);
+
+    // Top-3 groups by count: keys 99, 98, 97 (counts 100, 99, 98 — unique,
+    // no tie ambiguity; blank=13 and NULL=17 are far below).
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var q = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM visits GROUP BY s ORDER BY c DESC LIMIT 3");
+        defer q.deinit();
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(allocator);
+        var counts: std.ArrayList(i64) = .empty;
+        defer counts.deinit(allocator);
+        while (try q.next()) |batch| {
+            var r: usize = 0;
+            while (r < batch.row_count) : (r += 1) {
+                try keys.append(allocator, try arena.allocator().dupe(u8, batch.values[0].data.string.rowBytes(r)));
+                try counts.append(allocator, batch.values[1].data.bigint[r]);
+            }
+        }
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 99, 98 }, counts.items);
+        for (keys.items, [_]usize{ 99, 98, 97 }) |got, j| {
+            var want: [224]u8 = undefined;
+            const w = try std.fmt.bufPrint(&want, "http://example.com/category/{x}/article-{d:0>3}-with-a-long-shared-suffix-for-fsst", .{ j *% 2654435761, j });
+            try std.testing.expectEqualStrings(w, got);
+        }
+    }
+
+    // Filtered lane (hashSurvivorsFromBlock): the global count of k<5 rows
+    // grouped per key must sum exactly.
+    {
+        var expected_total: i64 = 0;
+        for (cnt_filt) |c| expected_total += c;
+        const got = try helpers.collectBigints(allocator, db, "SELECT SUM(c) FROM (SELECT s, COUNT(*) AS c FROM visits WHERE k < 5 AND s <> '' GROUP BY s) sub");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &[_]i64{expected_total}, got);
+    }
+}
