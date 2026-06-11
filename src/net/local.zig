@@ -2519,6 +2519,77 @@ pub fn routeGroupBy(
     return upstream.groupByTopK(group_cols, aggs, top_k, emit_limit);
 }
 
+/// Two-phase aggregate over a probe-fused join (no env gate — the offer only
+/// lands when the upstream chain bottoms out at a ParallelScan already
+/// running the join probe in its workers; Join forwards iff fused, an
+/// UNFUSED residual Filter swallows it, and table-backed blocks never call
+/// this). Each scan chunk runs scan → probe → partial aggregate on its own
+/// core; the serial combine above re-aggregates the per-chunk partials.
+///
+/// Gated to combinable fixed aggregates (COUNT/SUM/MIN/MAX). A GLOBAL
+/// (no-key) aggregate additionally excludes MIN/MAX: an empty chunk's
+/// global partial emits a zero row (the SUM-over-empty dialect), which
+/// combines safely for COUNT/SUM but would poison MIN/MAX. Grouped partials
+/// emit nothing for empty chunks, so all four are safe there. Cardinality
+/// gate mirrors routeParallelGroupBy: only proven-small key spaces — above
+/// the radix cache line the serial combine over ~unreduced partials loses.
+///
+/// `combine_arena` must outlive the query (the combine Aggregate borrows
+/// its specs); callers pass the statement's node arena. Consumes `upstream`
+/// only on success.
+pub fn routeJoinPartialGroupBy(
+    combine_arena: Allocator,
+    upstream: *Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    top_k: ?ir.Op.TopK,
+    emit_limit: ?u32,
+) !?Query {
+    for (aggs) |a| switch (a.func) {
+        .count, .sum => {},
+        .min, .max => if (group_cols.len == 0) return null,
+        else => return null,
+    };
+
+    if (group_cols.len > 0) {
+        const schema = upstream.outputSchema();
+        const st = upstream.stats();
+        var est: u64 = 1;
+        for (group_cols) |gc| {
+            const idx = types.findColumn(schema, gc) orelse return null;
+            if (idx >= st.column_stats.len) return null;
+            switch (st.column_stats[idx].ndv) {
+                .exact => |nd| est *|= nd,
+                .unknown => return null,
+            }
+        }
+        est = @min(est, @max(st.upper_rows, 1));
+        const per_group = perGroupTableBytes(schema, group_cols, aggs);
+        if (per_group != 0 and est *| per_group > RADIX_CACHE_BYTES) return null;
+    }
+
+    if (!try upstream.tryFuseAggregate(group_cols, aggs)) return null;
+
+    // Combine specs over the partials, read by `.as`, type-forced to the
+    // partial output type (COUNT's bigint must not be widened by SUM).
+    const part_schema = upstream.outputSchema();
+    const combine = try combine_arena.alloc(ir.AggSpec, aggs.len);
+    for (aggs, 0..) |a, i| {
+        combine[i] = .{
+            .func = switch (a.func) {
+                .count, .sum => .sum,
+                .min => .min,
+                .max => .max,
+                else => unreachable,
+            },
+            .col = a.as,
+            .as = a.as,
+            .out_type_override = part_schema[group_cols.len + i].type,
+        };
+    }
+    return try upstream.groupByTopK(group_cols, combine, top_k, emit_limit);
+}
+
 /// Parallel partition+lease high-card GROUP BY (experimental). Same eligibility
 /// as routeRadixGroupBy — int key ≤128 bits, fixed-state aggregates, high-card —
 /// but partitions rows into buckets and aggregates them across `dop` threads.

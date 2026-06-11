@@ -56,49 +56,78 @@ pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op) anyerror
     errdefer set.deinit();
     var map: StageMap = .empty;
     defer map.deinit(input.allocator);
-    var refs: MatRefCounts = .empty;
-    defer refs.deinit(input.allocator);
-    try countMatRefs(input.allocator, root, &refs);
-    try collectStages(input, root, set, &map, &refs);
+
+    var enc_arena = std.heap.ArenaAllocator.init(input.allocator);
+    defer enc_arena.deinit();
+    var cse: MatCse = .{ .enc_arena = enc_arena.allocator() };
+    defer {
+        cse.refs.deinit(input.allocator);
+        cse.canon.deinit(input.allocator);
+    }
+    try countMatRefs(input.allocator, root, &cse);
+    try collectStages(input, root, set, &map, &cse);
     const inner = try compileBlock(input, root, &map);
     return mat_stage.StagedRoot.create(input.allocator, inner, set);
 }
 
 const MatRefCounts = std.AutoHashMapUnmanaged(*const ir.Op, u32);
 
-/// Count how many places in the tree reference each materialize node. A
+/// Reference counting + structural CSE state for materialize nodes.
+/// `canon` maps a duplicate node (a FROM-subquery whose IR encodes
+/// byte-identically to an earlier one) to its representative; `refs`
+/// counts references per CANONICAL node. Encoding scratch and the
+/// bytes→node table live in `enc_arena` (freed after stage collection).
+const MatCse = struct {
+    refs: MatRefCounts = .empty,
+    canon: std.AutoHashMapUnmanaged(*const ir.Op, *const ir.Op) = .empty,
+    bodies: std.StringHashMapUnmanaged(*const ir.Op) = .empty,
+    enc_arena: Allocator,
+};
+
+/// Count how many places in the tree reference each materialize node,
+/// merging structurally identical bodies (byte-equal IR encodings) into
+/// one canonical node first — so two copies of the same FROM-subquery
+/// (a self-join over identical subqueries) count as TWO references to
+/// ONE node and share a stage instead of scanning twice. A canonical
 /// node referenced once gets no stage — its body compiles inline at the
-/// use site (materializing only to re-read once is a pure copy tax; this
-/// is every FROM-subquery and every NOT MATERIALIZED reference). Shared
-/// nodes (a default/MATERIALIZED CTE referenced 2+ times) keep one stage.
+/// use site (materializing only to re-read once is a pure copy tax).
 /// A shared node's subtree is walked once, mirroring collectStages.
-fn countMatRefs(allocator: Allocator, op: *const ir.Op, refs: *MatRefCounts) anyerror!void {
+fn countMatRefs(allocator: Allocator, op: *const ir.Op, cse: *MatCse) anyerror!void {
     switch (op.*) {
         .materialize => |m| {
-            const gop = try refs.getOrPut(allocator, op);
+            const rep: *const ir.Op = blk: {
+                var buf: std.ArrayList(u8) = .empty;
+                ir.encode(cse.enc_arena, &buf, op.*) catch break :blk op; // unencodable: no CSE
+                const gop = try cse.bodies.getOrPut(cse.enc_arena, buf.items);
+                if (gop.found_existing) break :blk gop.value_ptr.*;
+                gop.value_ptr.* = op;
+                break :blk op;
+            };
+            if (rep != op) try cse.canon.put(allocator, op, rep);
+            const gop = try cse.refs.getOrPut(allocator, rep);
             if (gop.found_existing) {
                 gop.value_ptr.* += 1;
                 return;
             }
             gop.value_ptr.* = 1;
-            try countMatRefs(allocator, m.upstream, refs);
+            try countMatRefs(allocator, m.upstream, cse);
         },
-        .select => |p| try countMatRefs(allocator, p.upstream, refs),
-        .exclude => |p| try countMatRefs(allocator, p.upstream, refs),
-        .filter => |f| try countMatRefs(allocator, f.upstream, refs),
-        .order_by => |o| try countMatRefs(allocator, o.upstream, refs),
-        .group_by => |g| try countMatRefs(allocator, g.upstream, refs),
-        .compute => |c| try countMatRefs(allocator, c.upstream, refs),
-        .alias => |a| try countMatRefs(allocator, a.upstream, refs),
-        .limit => |l| try countMatRefs(allocator, l.upstream, refs),
-        .window => |w| try countMatRefs(allocator, w.upstream, refs),
+        .select => |p| try countMatRefs(allocator, p.upstream, cse),
+        .exclude => |p| try countMatRefs(allocator, p.upstream, cse),
+        .filter => |f| try countMatRefs(allocator, f.upstream, cse),
+        .order_by => |o| try countMatRefs(allocator, o.upstream, cse),
+        .group_by => |g| try countMatRefs(allocator, g.upstream, cse),
+        .compute => |c| try countMatRefs(allocator, c.upstream, cse),
+        .alias => |a| try countMatRefs(allocator, a.upstream, cse),
+        .limit => |l| try countMatRefs(allocator, l.upstream, cse),
+        .window => |w| try countMatRefs(allocator, w.upstream, cse),
         .join => |j| {
-            try countMatRefs(allocator, j.left, refs);
-            try countMatRefs(allocator, j.right, refs);
+            try countMatRefs(allocator, j.left, cse);
+            try countMatRefs(allocator, j.right, cse);
         },
         .set_union => |u| {
-            try countMatRefs(allocator, u.left, refs);
-            try countMatRefs(allocator, u.right, refs);
+            try countMatRefs(allocator, u.left, cse);
+            try countMatRefs(allocator, u.right, cse);
         },
         else => {},
     }
@@ -111,36 +140,44 @@ fn collectStages(
     op: *const ir.Op,
     set: *mat_stage.StageSet,
     map: *StageMap,
-    refs: *const MatRefCounts,
+    cse: *const MatCse,
 ) anyerror!void {
     switch (op.*) {
-        .materialize => |m| {
-            if (map.contains(op)) return; // shared CTE: one stage, many readers
-            try collectStages(input, m.upstream, set, map, refs);
+        .materialize => {
+            // Stage decisions run on the CANONICAL node; a structural
+            // duplicate gets an alias entry pointing at the shared stage
+            // so buildGenericBlock resolves either pointer.
+            const rep = cse.canon.get(op) orelse op;
+            if (map.get(rep)) |stage| {
+                if (rep != op) try map.put(input.allocator, op, stage);
+                return; // shared CTE / duplicate: one stage, many readers
+            }
+            try collectStages(input, rep.materialize.upstream, set, map, cse);
             // Single reference → no stage; the body compiles inline at the
             // use site (buildGenericBlock's .materialize arm). Inner shared
             // nodes were still collected by the recursion above.
-            if ((refs.get(op) orelse 1) <= 1) return;
-            const q = try compileBlock(input, m.upstream, map);
+            if ((cse.refs.get(rep) orelse 1) <= 1) return;
+            const q = try compileBlock(input, rep.materialize.upstream, map);
             const stage = try set.addStage(q);
-            try map.put(input.allocator, op, stage);
+            try map.put(input.allocator, rep, stage);
+            if (rep != op) try map.put(input.allocator, op, stage);
         },
-        .select => |p| try collectStages(input, p.upstream, set, map, refs),
-        .exclude => |p| try collectStages(input, p.upstream, set, map, refs),
-        .filter => |f| try collectStages(input, f.upstream, set, map, refs),
-        .order_by => |o| try collectStages(input, o.upstream, set, map, refs),
-        .group_by => |g| try collectStages(input, g.upstream, set, map, refs),
-        .compute => |c| try collectStages(input, c.upstream, set, map, refs),
-        .alias => |a| try collectStages(input, a.upstream, set, map, refs),
-        .limit => |l| try collectStages(input, l.upstream, set, map, refs),
-        .window => |w| try collectStages(input, w.upstream, set, map, refs),
+        .select => |p| try collectStages(input, p.upstream, set, map, cse),
+        .exclude => |p| try collectStages(input, p.upstream, set, map, cse),
+        .filter => |f| try collectStages(input, f.upstream, set, map, cse),
+        .order_by => |o| try collectStages(input, o.upstream, set, map, cse),
+        .group_by => |g| try collectStages(input, g.upstream, set, map, cse),
+        .compute => |c| try collectStages(input, c.upstream, set, map, cse),
+        .alias => |a| try collectStages(input, a.upstream, set, map, cse),
+        .limit => |l| try collectStages(input, l.upstream, set, map, cse),
+        .window => |w| try collectStages(input, w.upstream, set, map, cse),
         .join => |j| {
-            try collectStages(input, j.left, set, map, refs);
-            try collectStages(input, j.right, set, map, refs);
+            try collectStages(input, j.left, set, map, cse);
+            try collectStages(input, j.right, set, map, cse);
         },
         .set_union => |u| {
-            try collectStages(input, u.left, set, map, refs);
-            try collectStages(input, u.right, set, map, refs);
+            try collectStages(input, u.left, set, map, cse);
+            try collectStages(input, u.right, set, map, cse);
         },
         else => {},
     }
@@ -258,6 +295,10 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             for (g.aggs) |a| if (a.func == .udf) return error.UnsupportedQueryShape;
             var up = try buildGenericBlock(input, g.upstream, map, block_root);
             errdefer up.deinit();
+            // Probe-fused join below: aggregate the joined batches inside
+            // the scan workers (partial per chunk, serial combine here)
+            // instead of hashing the full join output on this thread.
+            if (try local.routeJoinPartialGroupBy(input.node_arena, &up, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| return q;
             // The same strategy routing as the table path: a stage that ends
             // sorted on the group keys streams; a proven-over-budget or
             // unknown-cardinality input sorts then streams; only a proven-

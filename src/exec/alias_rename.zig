@@ -76,6 +76,11 @@ pub const AliasRename = struct {
     }
 
     pub fn outputSchema(self: *AliasRename) []const Column {
+        // Probe-fused pass-through: batches carry the upstream's CURRENT
+        // schema (the join's output — or the partial-aggregate schema once
+        // a two-phase GROUP BY fuses below too). Report it live, same as a
+        // fused Filter, so downstream operators compose against reality.
+        if (self.probe_fused) return self.upstream.outputSchema();
         return self.output_schema;
     }
 
@@ -104,6 +109,14 @@ pub const AliasRename = struct {
         const ok = try self.upstream.tryFuseProbe(sink);
         if (ok) self.probe_fused = true;
         return ok;
+    }
+
+    /// Once a probe fused below, batches no longer carry this wrapper's
+    /// schema — forward the partial-aggregate offer too (the group columns
+    /// resolve against the join's output schema downstream of here).
+    pub fn tryFuseAggregate(self: *AliasRename, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
+        if (!self.probe_fused) return false;
+        return self.upstream.tryFuseAggregate(group_cols, aggs);
     }
 
     pub fn stats(self: *AliasRename) exec.PipelineStats {

@@ -206,6 +206,15 @@ const FAST_EMPTY = std.math.maxInt(u32);
 
 const FastKeyKind = enum { int, string };
 
+/// Compile-time mirror of tryBuildFastTable's key-type gate.
+fn fastKindOfType(t: TypeTag) ?FastKeyKind {
+    return switch (t) {
+        .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
+        .varchar, .string, .char => .string,
+        else => null,
+    };
+}
+
 /// Open-addressing hash table over a single build-side join key,
 /// replacing the byte-compound StringHashMap for the probe hot loop.
 /// Int-family keys are widened to 64 bits (exact, no verification);
@@ -631,12 +640,35 @@ pub const Join = struct {
             .output_columns = output_columns,
             .views = views,
         };
+        // Commit the parallel probe at COMPILE time when the shape is
+        // FastTable-eligible — fusion must be settled before any operator
+        // above (a two-phase GROUP BY combine) composes against it. The
+        // FastTable itself is still built after the build phase; by the
+        // time the probe side first pulls (and the sink runs), it exists.
+        if (spec.join_type != .full and resolved_ranges.len == 0 and
+            spec.on.len == 1 and fastKindOfType(build_schema[(if (build_is_left) left_keys else right_keys)[0]].type) != null)
+        {
+            const probe = if (build_is_left) self.right else self.left;
+            self.probe_fused = probe.tryFuseProbe(.{
+                .ctx = self,
+                .out_schema = self.output_schema,
+                .bind = sinkBind,
+                .process = sinkProcess,
+            }) catch false;
+        }
+
         // Skew detector must be constructed AFTER `self.* = ...` so its
         // captured Allocator points to the arena INSIDE `self`, not the
         // local stack value that just got moved. The struct AND its key
         // dupes live in the arena — uniform data otherwise churns
         // malloc/free per sampled observation in the build hot loop.
-        if (spec.skew_ratio_threshold > 0.0) {
+        //
+        // A probe-fused join skips skew detection entirely: rerouting to
+        // SMJ would hand raw probe batches to a scan that's committed to
+        // emitting joined batches, and the FastTable's array-linear chain
+        // walk + parallel probe absorb heavy buckets far better than the
+        // bucket-list walk the reroute was built to escape.
+        if (spec.skew_ratio_threshold > 0.0 and !self.probe_fused) {
             const arena_alloc = self.arena.allocator();
             const det = try arena_alloc.create(@import("skew.zig").MisraGries);
             det.* = @import("skew.zig").MisraGries.init(arena_alloc);
@@ -686,7 +718,27 @@ pub const Join = struct {
     }
 
     pub fn outputSchema(self: *Join) []const Column {
+        // Probe-fused: this operator passes the probe side's batches
+        // through verbatim, so report THAT schema live. It equals
+        // `output_schema` (the sink's out_schema) until a two-phase
+        // GROUP BY fuses below, after which it's the partial-aggregate
+        // schema the serial combine above composes against.
+        if (self.probe_fused) {
+            var probe = if (self.build_is_left) self.right else self.left;
+            return probe.outputSchema();
+        }
         return self.output_schema;
+    }
+
+    /// Forward a partial-aggregate offer to the probe side when the probe
+    /// is fused there: the scan workers then run scan → probe → partial
+    /// aggregate per chunk and this Join passes the partial groups through
+    /// to the serial combine above. Without probe fusion the offer dies
+    /// here — joined batches only exist above this operator.
+    pub fn tryFuseAggregate(self: *Join, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
+        if (!self.probe_fused) return false;
+        var probe = if (self.build_is_left) self.right else self.left;
+        return probe.tryFuseAggregate(group_cols, aggs);
     }
 
     pub fn addPrune(self: *Join, pred: Predicate) !void {
@@ -743,19 +795,6 @@ pub const Join = struct {
                             self.allocator,
                             self.build_rows,
                         );
-                    }
-                    // Offer the probe step to the probe side's parallel
-                    // workers (round-mode ParallelScan; see ProbeSink).
-                    // FastTable path only; FULL keeps the serial probe —
-                    // matched_build writes would race across workers.
-                    if (self.fast_table != null and self.join_type != .full) {
-                        const probe = if (self.build_is_left) self.right else self.left;
-                        self.probe_fused = probe.tryFuseProbe(.{
-                            .ctx = self,
-                            .out_schema = self.output_schema,
-                            .bind = sinkBind,
-                            .process = sinkProcess,
-                        }) catch false;
                     }
                     self.phase = .probing;
                 },

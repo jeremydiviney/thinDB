@@ -489,7 +489,13 @@ pub const ParallelScan = struct {
         const q = try self.allocator.alloc(Query, self.workers.len);
         self.agg_q = q;
         for (self.workers, 0..) |w, i| {
-            const sq = makeQuery(self.table.allocator, w);
+            // With a fused join probe, the per-chunk pipeline aggregates the
+            // JOINED batches: scan → probe (ProbeChunkScan) → partial agg.
+            const sq = if (self.probe_sink != null) blk: {
+                const pcs = try self.table.allocator.create(ProbeChunkScan);
+                pcs.* = .{ .ps = self, .chunk = i };
+                break :blk makeQuery(self.table.allocator, pcs);
+            } else makeQuery(self.table.allocator, w);
             q[i] = try sq.groupBy(group_cols, aggs);
             self.agg_built = i + 1;
         }
@@ -936,6 +942,57 @@ pub const ParallelScan = struct {
     }
 };
 
+/// Per-chunk leaf for composed probe+aggregate fusion: pulls the chunk's
+/// scan, runs each batch through the join's ProbeSink, and emits the joined
+/// batches — the per-chunk partial Aggregate built on top drains this inside
+/// drainWorker, on the worker thread that owns the chunk. Owns the chunk's
+/// Scan, mirroring the bare agg_q ownership convention (pscan.deinit skips
+/// workers[0..agg_built]).
+const ProbeChunkScan = struct {
+    ps: *ParallelScan,
+    chunk: usize,
+
+    pub fn next(self: *ProbeChunkScan) !?Batch {
+        const ps = self.ps;
+        const sink = ps.probe_sink.?;
+        while (true) {
+            const batch = (try ps.workers[self.chunk].next()) orelse return null;
+            const joined = try sink.process(sink.ctx, self.chunk, ps.remapProbeBatch(sink, self.chunk, batch));
+            if (joined) |jb| {
+                if (jb.row_count > 0) return jb;
+            }
+        }
+    }
+
+    pub fn deinit(self: *ProbeChunkScan) void {
+        self.ps.workers[self.chunk].deinit();
+        self.ps.table.allocator.destroy(self);
+    }
+
+    pub fn outputSchema(self: *ProbeChunkScan) []const Column {
+        return self.ps.probe_sink.?.out_schema;
+    }
+
+    pub fn addPrune(self: *ProbeChunkScan, pred: predicate.Predicate) !void {
+        return self.ps.workers[self.chunk].addPrune(pred);
+    }
+
+    /// Join output cardinality is unknowable here; the partial Aggregate
+    /// sizes its table from the data.
+    pub fn stats(_: *ProbeChunkScan) exec.PipelineStats {
+        return .{ .upper_rows = std.math.maxInt(u64) };
+    }
+
+    /// Workers never touch the (non-thread-safe) query accountant.
+    pub fn accountant(_: *ProbeChunkScan) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+
+    pub fn explain(_: *ProbeChunkScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "ProbeChunkScan");
+    }
+};
+
 fn runOne(scan: *Scan, out_batch: *?Batch, out_err: *?anyerror) void {
     const r = scan.next() catch |e| {
         out_err.* = e;
@@ -997,8 +1054,11 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
             lease = sched.acquire();
             leased = true;
         }
-        const remap: ?[]ColumnView = if (self.probe_map_views.len > 0) self.probe_map_views[i] else null;
-        drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, self.probe_sink, i, remap, &self.wbufs[i], &self.werr[i]);
+        // With a composed probe+aggregate fusion, the probing happens inside
+        // each agg_q chunk pipeline (ProbeChunkScan) — drain plain.
+        const sink = if (self.agg_fused) null else self.probe_sink;
+        const remap: ?[]ColumnView = if (sink != null and self.probe_map_views.len > 0) self.probe_map_views[i] else null;
+        drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, sink, i, remap, &self.wbufs[i], &self.werr[i]);
     }
 }
 
