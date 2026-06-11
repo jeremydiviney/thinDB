@@ -547,3 +547,58 @@ test "V2 staged joins: CTE joined to itself shares one stage" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 9 }, part_ids.items);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 30, 5, 7 }, totals.items);
 }
+
+test "guided (NOT) LIKE over lz4_fsst strings with NULLs and a leading conjunct" {
+    // Exercises the block-sourced LIKE path: a cheap comparison conjunct
+    // masks first, then the (NOT) LIKE evaluates only surviving rows —
+    // per-survivor decode when the block lands FSST-encoded, the raw guided
+    // arm otherwise. NULL strings must fail both LIKE and NOT LIKE.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE pages (id BIGINT PRIMARY KEY, k INT NOT NULL, s TEXT) PROPERTIES (\"compression\" = \"lz4_fsst\")");
+
+    const n: usize = 3000;
+    var like_expected: i64 = 0;
+    var notlike_expected: i64 = 0;
+    var single_like_expected: i64 = 0;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "INSERT INTO pages VALUES ");
+    for (0..n) |i| {
+        if (i != 0) try buf.appendSlice(allocator, ",");
+        const k = i % 10;
+        var row: [192]u8 = undefined;
+        if (i % 7 == 0) {
+            const r = try std.fmt.bufPrint(&row, "({d},{d},NULL)", .{ i, k });
+            try buf.appendSlice(allocator, r);
+        } else {
+            const tag: []const u8 = if (i % 3 == 0) "needle" else "plain";
+            const r = try std.fmt.bufPrint(&row, "({d},{d},'http://example.com/site/{s}/page-{x}?session=abcdef{d}')", .{ i, k, tag, i *% 2654435761, i });
+            try buf.appendSlice(allocator, r);
+            if (i % 3 == 0) single_like_expected += 1;
+            if (k < 5) {
+                if (i % 3 == 0) like_expected += 1 else notlike_expected += 1;
+            }
+        }
+    }
+    try exec(allocator, db, buf.items);
+    const t = try db.openTable("pages", .{});
+    try t.flush();
+
+    const got_like = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM pages WHERE k < 5 AND s LIKE '%needle%'");
+    defer allocator.free(got_like);
+    try std.testing.expectEqualSlices(i64, &[_]i64{like_expected}, got_like);
+
+    const got_notlike = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM pages WHERE k < 5 AND s NOT LIKE '%needle%'");
+    defer allocator.free(got_notlike);
+    try std.testing.expectEqualSlices(i64, &[_]i64{notlike_expected}, got_notlike);
+
+    const got_single = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM pages WHERE s LIKE '%needle%'");
+    defer allocator.free(got_single);
+    try std.testing.expectEqualSlices(i64, &[_]i64{single_like_expected}, got_single);
+}

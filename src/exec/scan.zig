@@ -1842,16 +1842,17 @@ pub const Scan = struct {
     ) !?usize {
         const mask = try self.ensureMask(rg_count);
         switch (expr) {
-            .leaf, .like => {
-                if (!try self.buildGuidedChild(seg, rg_idx, rg_count, expr, mask[0..rg_count])) return null;
+            .leaf, .like, .not => {
+                if (!try self.buildGuidedChild(seg, rg_idx, rg_count, expr, null, mask[0..rg_count])) return null;
             },
             .@"and" => |children| {
                 if (children.len == 0) return null;
-                // Every child must be a comparison leaf or a LIKE we can evaluate
-                // narrow; otherwise decline the whole AND (mixed shapes fall back).
-                for (children) |c| if (c != .leaf and c != .like) return null;
+                // Every child must be a comparison leaf or a (NOT) LIKE we can
+                // evaluate block-sourced; otherwise decline the whole AND
+                // (mixed shapes fall back).
+                for (children) |c| if (!guidedChildShape(c)) return null;
 
-                if (!try self.buildGuidedChild(seg, rg_idx, rg_count, children[0], mask[0..rg_count])) return null;
+                if (!try self.buildGuidedChild(seg, rg_idx, rg_count, children[0], null, mask[0..rg_count])) return null;
                 if (children.len > 1) {
                     const scratch = try self.ensureMask2(rg_count);
                     // Empty-mask early exit: conjuncts arrive selectivity-
@@ -1867,7 +1868,10 @@ pub const Scan = struct {
                     };
                     for (children[1..]) |c| {
                         if (!live) break;
-                        if (!try self.buildGuidedChild(seg, rg_idx, rg_count, c, scratch[0..rg_count])) return null;
+                        // Later children receive the accumulated mask: an
+                        // expensive leaf (LIKE over an FSST block) then
+                        // decodes/tests ONLY the rows still alive.
+                        if (!try self.buildGuidedChild(seg, rg_idx, rg_count, c, mask[0..rg_count], scratch[0..rg_count])) return null;
                         var any = false;
                         for (mask[0..rg_count], scratch[0..rg_count]) |*m, s| {
                             m.* = m.* and s;
@@ -2162,32 +2166,52 @@ pub const Scan = struct {
     /// Dispatch one guided-filter child (a comparison `.leaf` or a `.like`) into
     /// `out`. Returns false (declining the whole guided path) for any other shape
     /// or any block the narrow path can't handle.
+    /// True when `c` is a shape `buildGuidedChild` can evaluate block-sourced:
+    /// a comparison leaf, a LIKE, or a NOT directly over a LIKE.
+    fn guidedChildShape(c: PredicateExpr) bool {
+        return switch (c) {
+            .leaf, .like => true,
+            .not => |inner| inner.* == .like,
+            else => false,
+        };
+    }
+
     fn buildGuidedChild(
         self: *Scan,
         seg: *storage.ReadSegment,
         rg_idx: usize,
         rg_count: u32,
         child: PredicateExpr,
+        active: ?[]const bool,
         out: []bool,
     ) !bool {
         return switch (child) {
             .leaf => |leaf| self.buildLeafMask(seg, rg_idx, rg_count, leaf, out),
-            .like => |lp| self.buildLikeMask(seg, rg_idx, rg_count, lp, out),
+            .like => |lp| self.buildLikeMask(seg, rg_idx, rg_count, lp, false, active, out),
+            .not => |inner| switch (inner.*) {
+                .like => |lp| self.buildLikeMask(seg, rg_idx, rg_count, lp, true, active, out),
+                else => false,
+            },
             else => false,
         };
     }
 
-    /// Evaluate a `col LIKE pattern` leaf for the current row group into `out`.
-    /// Pushed down ONLY when the block is dict-encoded: the pattern is matched
-    /// against each distinct dict value once, then mapped per row via the narrow
-    /// code (no expansion). Raw blocks decline (return false) so the general path
-    /// runs LIKE over the materialized strings as before. (Phase 4.4.)
+    /// Evaluate `col [NOT] LIKE pattern` for the current row group into `out`,
+    /// block-sourced. Dict blocks match each distinct value once and map per
+    /// row via the code; FSST blocks decode ONLY the rows still alive in
+    /// `active` (per-survivor decode — the whole point of keeping the block
+    /// compressed); raw blocks match over the zero-copy view. NULL rows clear
+    /// to false under both LIKE and NOT LIKE (SQL: NULL never matches).
+    /// Returns false (no pins held) for shapes it can't evaluate, declining
+    /// the guided path.
     fn buildLikeMask(
         self: *Scan,
         seg: *storage.ReadSegment,
         rg_idx: usize,
         rg_count: u32,
         lp: predicate.LikePred,
+        negate: bool,
+        active: ?[]const bool,
         out: []bool,
     ) !bool {
         const pred_phys = blk: {
@@ -2196,7 +2220,8 @@ pub const Scan = struct {
             }
             return false;
         };
-        switch (self.table.schema.columns[pred_phys].type) {
+        const col_type = self.table.schema.columns[pred_phys].type;
+        switch (col_type) {
             .varchar, .string, .char => {},
             else => return false,
         }
@@ -2205,9 +2230,72 @@ pub const Scan = struct {
         var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, &self.table.cache);
         defer block.release(self.allocator, &self.table.cache);
 
-        if (block.encoding != .dict) return false; // raw → general path
-        evalDictLike(block, rg_count, flags, lp.pattern, out);
-        return true;
+        if (block.encoding == .dict) {
+            evalDictLike(block, rg_count, flags, lp.pattern, negate, out);
+            return true;
+        }
+        if (block.encoding == .fsst) {
+            try evalFsstLike(self.allocator, block.bytes, rg_count, flags, lp.pattern, negate, active, out);
+            return true;
+        }
+        if (block.encoding == .raw) {
+            const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
+            const sv = switch (view.data) {
+                .varchar, .string, .char => |s| s,
+                else => return false,
+            };
+            const plan = predicate.compileLike(lp.pattern);
+            for (0..rg_count) |i| {
+                if (active) |a| {
+                    if (!a[i]) {
+                        out[i] = false;
+                        continue;
+                    }
+                }
+                out[i] = view.isValid(i) and (plan.match(sv.rowBytes(i)) != negate);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// `col [NOT] LIKE pattern` over an FSST block: decode each ACTIVE row
+    /// into a reused scratch and match the compiled plan — rows an earlier
+    /// conjunct already eliminated never decode at all. This is the per-
+    /// survivor decode that whole-block compression (LZ4-at-rest) cannot do.
+    fn evalFsstLike(
+        allocator: Allocator,
+        raw: []const u8,
+        rg_count: u32,
+        flags: storage.format.ColumnBlockFlags,
+        pattern: []const u8,
+        negate: bool,
+        active: ?[]const bool,
+        out: []bool,
+    ) !void {
+        const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        defer if (exec.prof.enabled) exec.prof.add("fsst-filter (LIKE per-survivor)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
+
+        const fv = try storage.segment_reader.fsstViewOf(raw, rg_count, flags);
+        const plan = predicate.compileLike(pattern);
+        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+        defer scratch.deinit(allocator);
+        for (0..rg_count) |i| {
+            if (active) |a| {
+                if (!a[i]) {
+                    out[i] = false;
+                    continue;
+                }
+            }
+            if (!storage.column.isValidBit(fv.nulls, i)) {
+                out[i] = false;
+                continue;
+            }
+            const comp = fv.block.rowComp(i);
+            try scratch.resize(allocator, storage.fsst.decodedSizeBound(comp.len));
+            const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
+            out[i] = plan.match(scratch.items[0..n]) != negate;
+        }
     }
 
     /// `col LIKE pattern` over a DICT-encoded block: compile the pattern once,
@@ -2218,6 +2306,7 @@ pub const Scan = struct {
         rg_count: u32,
         flags: storage.format.ColumnBlockFlags,
         pattern: []const u8,
+        negate: bool,
         out: []bool,
     ) void {
         const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
@@ -2244,7 +2333,8 @@ pub const Scan = struct {
         for (0..rg_count) |i| {
             if (storage.column.isValidBit(nulls, i)) {
                 const code = db.rowCode(i);
-                out[i] = (matched[code >> 3] & (@as(u8, 1) << @intCast(code & 7))) != 0;
+                const hit = (matched[code >> 3] & (@as(u8, 1) << @intCast(code & 7))) != 0;
+                out[i] = hit != negate;
             } else {
                 out[i] = false;
             }
