@@ -50,6 +50,10 @@ pub const Table = struct {
     /// (no tracking). Copied from Config.query_memory_budget at open.
     query_memory_budget: usize,
 
+    /// Encoder threads for compaction merges (resolved from
+    /// Config.compact_threads at open; ≥1).
+    compact_threads: usize,
+
     /// Durability mode (copied from Database.Config at open time).
     sync_mode: SyncMode,
     /// Timestamp at which the current (post-flush) memtable received its
@@ -179,6 +183,7 @@ pub const Table = struct {
             .auto_flush_min_rows = cfg.auto_flush_min_rows,
             .auto_flush_min_bytes = cfg.auto_flush_min_bytes,
             .query_memory_budget = api.autoQueryBudgetBytes(cfg.query_memory_budget),
+            .compact_threads = api.resolveCompactThreads(allocator, cfg.compact_threads),
             .sync_mode = cfg.sync_mode,
             .table_dir = table_dir,
             .segments_dir = segments_dir,
@@ -539,9 +544,7 @@ pub const Table = struct {
     /// `Manifest.deinit`.
     pub fn entryFor(self: Table, info: storage.format.SegmentInfo) !storage.manifest.ManifestEntry {
         const lk_idx: ?usize = if (self.order_key_indices.len > 0) self.order_key_indices[0] else null;
-        const has_stats = try buildColumnHasStats(self.allocator, self.schema);
-        defer self.allocator.free(has_stats);
-        return storage.manifest.entryFromSegmentInfo(self.allocator, info, lk_idx, has_stats);
+        return storage.manifest.entryFromSegmentInfo(self.allocator, info, lk_idx, self.schema.columns);
     }
 
     /// True iff this table is configured for durable writes (Config.sync_mode).
@@ -811,14 +814,6 @@ fn validateUniqueKey(schema: TableSchema) !void {
         _ = idx;
         // All v0.3 column types are supported in compound keys.
     }
-}
-
-/// Build a per-column "has_stats" bitvec under the given schema.
-/// Caller owns the returned slice.
-pub fn buildColumnHasStats(allocator: Allocator, schema: TableSchema) ![]bool {
-    const out = try allocator.alloc(bool, schema.columns.len);
-    for (schema.columns, 0..) |c, i| out[i] = storage.format.typeHasStats(c.type);
-    return out;
 }
 
 /// Return the column index of the (at most one) AUTO_INCREMENT column,

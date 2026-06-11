@@ -402,6 +402,7 @@ fn streamMerge(
         t.row_group_size,
         dict_eligible,
         out_sketches, // ownership transfers to the writer here
+        t.compact_threads,
     );
     sketches_owned_here = false; // writer.deinit / finish now owns out_sketches
     errdefer writer.deinit();

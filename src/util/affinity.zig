@@ -78,6 +78,31 @@ pub fn unpinCurrentThread(all_mask: u64) void {
     }
 }
 
+/// Physical core count, for sizing background work (compaction encoders) —
+/// NOT for pinning, which goes through `detect`. Windows: processor-core
+/// records from `GetLogicalProcessorInformation`. Linux: unique
+/// (physical_package_id, core_id) pairs from sysfs — counts non-SMT parts
+/// (Graviton and other ARM server cores) 1:1. macOS: `sysctl hw.physicalcpu`
+/// (covers Apple Silicon, where there is no SMT). On any detection failure,
+/// falls back to the LOGICAL count — over-counting a hyperthreaded x86 beats
+/// halving a non-SMT machine to half its real size.
+pub fn physicalCoreCount(allocator: std.mem.Allocator) usize {
+    const counted: ?usize = switch (builtin.os.tag) {
+        .windows => blk: {
+            const topo = detectWindows(allocator) catch break :blk null;
+            defer topo.deinit(allocator);
+            break :blk topo.cores.len;
+        },
+        .linux => linuxPhysicalCoreCount(allocator) catch null,
+        .macos => macosPhysicalCoreCount() catch null,
+        else => null,
+    };
+    if (counted) |n| {
+        if (n >= 1) return n;
+    }
+    return @max(1, std.Thread.getCpuCount() catch 1);
+}
+
 fn fallback(allocator: std.mem.Allocator) Topology {
     const n = @min(@as(usize, std.Thread.getCpuCount() catch 1), 64);
     const cores = allocator.alloc(Core, @max(n, 1)) catch {
@@ -106,6 +131,63 @@ fn setLinuxAffinity(mask: u64) void {
         set.len,
         @intFromPtr(&set),
     );
+}
+
+/// Unique (package, core) pairs across all sysfs CPU entries. CPUs are
+/// iterated until the first missing `cpuN` directory (kernel keeps them
+/// contiguous); an entry whose topology files are unreadable (offline CPU)
+/// is skipped rather than treated as the end.
+fn linuxPhysicalCoreCount(allocator: std.mem.Allocator) !usize {
+    if (builtin.os.tag != .linux) return error.QueryFailed;
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(allocator);
+
+    var path_buf: [128]u8 = undefined;
+    var cpu: usize = 0;
+    while (cpu < 4096) : (cpu += 1) {
+        const dir = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}", .{cpu}) catch unreachable;
+        const dir_fd = linuxOpenReadonly(dir, true) orelse break;
+        _ = std.os.linux.close(dir_fd);
+
+        const core_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/core_id", .{cpu}) catch unreachable;
+        const core_id = readSysfsInt(core_path) orelse continue;
+        const pkg_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/physical_package_id", .{cpu}) catch unreachable;
+        const pkg_id = readSysfsInt(pkg_path) orelse 0;
+        try seen.put(allocator, (pkg_id << 32) | (core_id & 0xffff_ffff), {});
+    }
+    if (seen.count() == 0) return error.QueryFailed;
+    return seen.count();
+}
+
+fn linuxOpenReadonly(path: [:0]const u8, directory: bool) ?i32 {
+    if (builtin.os.tag != .linux) return null;
+    const linux = std.os.linux;
+    var flags: linux.O = .{ .ACCMODE = .RDONLY };
+    flags.DIRECTORY = directory;
+    const rc = linux.open(path.ptr, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return @intCast(rc);
+}
+
+fn readSysfsInt(path: [:0]const u8) ?u64 {
+    if (builtin.os.tag != .linux) return null;
+    const linux = std.os.linux;
+    const fd = linuxOpenReadonly(path, false) orelse return null;
+    defer _ = linux.close(fd);
+    var buf: [32]u8 = undefined;
+    const rc = linux.read(fd, &buf, buf.len);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const s = std.mem.trim(u8, buf[0..rc], " \t\r\n");
+    return std.fmt.parseInt(u64, s, 10) catch null;
+}
+
+fn macosPhysicalCoreCount() !usize {
+    if (builtin.os.tag != .macos) return error.QueryFailed;
+    var n: c_int = 0;
+    var len: usize = @sizeOf(c_int);
+    if (std.c.sysctlbyname("hw.physicalcpu", &n, &len, null, 0) != 0) return error.QueryFailed;
+    if (n < 1) return error.QueryFailed;
+    return @intCast(n);
 }
 
 // ---- Windows --------------------------------------------------------------
@@ -155,6 +237,13 @@ fn detectWindows(allocator: std.mem.Allocator) !Topology {
         .smt = smt,
         .real = true,
     };
+}
+
+test "physicalCoreCount is sane" {
+    const n = physicalCoreCount(std.testing.allocator);
+    const logical = std.Thread.getCpuCount() catch 1;
+    try std.testing.expect(n >= 1);
+    try std.testing.expect(n <= logical);
 }
 
 test "detect returns a usable topology" {

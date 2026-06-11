@@ -113,6 +113,13 @@ pub const Config = struct {
     /// reclaimed. Default 0.30. Set to a value > 1.0 to disable.
     compact_tombstone_threshold: f32 = 0.30,
 
+    /// Worker threads for the per-column block encode+compress inside a
+    /// compaction merge (block compression — LZ4HC for large string blocks —
+    /// dominates merge cost). `1` (default) = serial, matching the embedded
+    /// no-surprise-threads contract. `0` = auto: ~25% of the physical cores.
+    /// `thindb-server` passes auto unless `--compact-threads` says otherwise.
+    compact_threads: usize = 1,
+
     /// Durability mode. `.none` (default) returns from flush/delete as
     /// soon as bytes are in the OS page cache — fast but lossy on power
     /// loss. `.per_flush` fsyncs each segment + tombstone file after
@@ -194,6 +201,17 @@ pub const Config = struct {
 /// evicts to this bound, so a large auto budget on a big box costs nothing
 /// until the workload's hot set actually grows into it. Falls back to the
 /// floor if the OS can't report total memory.
+/// Resolve `Config.compact_threads`: non-zero is honored verbatim; `0` means
+/// "auto" — ~25% of the physical cores (cross-OS, SMT-aware: see
+/// `affinity.physicalCoreCount`), so a background merge speeds up
+/// meaningfully without competing with foreground queries for the box.
+pub fn resolveCompactThreads(allocator: std.mem.Allocator, configured: usize) usize {
+    if (configured != 0) return configured;
+    const affinity = @import("../util/affinity.zig");
+    const physical = affinity.physicalCoreCount(allocator);
+    return @max(1, physical / 4);
+}
+
 pub fn autoCacheSizeBytes(configured: usize) usize {
     if (configured != 0) return configured;
     const floor: u64 = 256 * 1024 * 1024;

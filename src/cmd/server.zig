@@ -35,6 +35,8 @@ const usage_text =
     \\  --max-dop N             Max worker threads per query for the parallel scan leaf (default 1 =
     \\                          serial). >1 hands row-group ranges to up to N workers; the per-query
     \\                          count is also bounded by a global ~(cores-1) worker-slot budget.
+    \\  --compact-threads N     Worker threads for block encode+compress inside a compaction merge
+    \\                          (default 0 = auto: ~25% of the physical cores; 1 = serial).
     \\  --query-memory-budget B Per-query memory budget in bytes (default: auto, ~25% of physical
     \\                          RAM, floored at 256 MiB; also gates the hash-vs-sort GROUP BY
     \\                          decision). Separate bucket from --cache-size. 0 disables tracking.
@@ -88,6 +90,7 @@ pub fn main(init: std.process.Init) !u8 {
     var query_memory_budget: ?usize = null;
     var cache_size_bytes: ?usize = null;
     var max_dop: ?u32 = null;
+    var compact_threads: ?u32 = null;
     var file_root: ?[]const u8 = null;
     var mysql_password: ?[]const u8 = null;
     var pg_password: ?[]const u8 = null;
@@ -175,6 +178,10 @@ pub fn main(init: std.process.Init) !u8 {
             max_dop = v;
             continue;
         }
+        if (try takeU32(arg, "--compact-threads", &args_iter, err_w)) |v| {
+            compact_threads = v;
+            continue;
+        }
         if (try takeValue(arg, "--query-memory-budget", &args_iter, err_w)) |v| {
             query_memory_budget = std.fmt.parseInt(usize, v, 10) catch {
                 try err_w.print("thindb-server: invalid --query-memory-budget: {s}\n", .{v});
@@ -235,6 +242,9 @@ pub fn main(init: std.process.Init) !u8 {
         .query_memory_budget = query_memory_budget orelse (thindb.Config{}).query_memory_budget,
         .cache_size_bytes = cache_size_bytes orelse (thindb.Config{}).cache_size_bytes,
         .max_dop = if (max_dop) |v| v else (thindb.Config{}).max_dop,
+        // Server default is auto (half the cores) rather than the embedded
+        // library's serial default — background merges are the server's job.
+        .compact_threads = if (compact_threads) |v| v else 0,
         .file_scan_access = if (file_root) |root| .{ .root = root } else .disabled,
     };
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
