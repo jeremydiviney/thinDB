@@ -89,11 +89,10 @@ pub const Window = struct {
 
     // Batch emit state — emits input + output in original order.
     emit_offset: usize = 0,
-    out_input_columns: []ColumnStore,  // staging for input cols per batch
     out_output_columns: []ColumnStore, // staging for output cols per batch
     views: []ColumnView,               // input + output views, parallel to schema
 
-    const batch_size: usize = 1024;
+    const batch_size: usize = 8192;
 
     /// Resolved column indices for one window spec.
     const SpecIndices = struct {
@@ -218,15 +217,6 @@ pub const Window = struct {
         errdefer allocator.free(string_outputs);
         for (string_outputs) |*s| s.* = &.{};
 
-        const out_input_columns = try allocator.alloc(ColumnStore, input_schema.len);
-        errdefer allocator.free(out_input_columns);
-        var iinit: usize = 0;
-        errdefer for (out_input_columns[0..iinit]) |*c| c.deinit(allocator);
-        for (input_schema, 0..) |col, i| {
-            out_input_columns[i] = try ColumnStore.init(allocator, col.type, col.nullable);
-            iinit = i + 1;
-        }
-
         const out_output_columns = try allocator.alloc(ColumnStore, calls.len);
         errdefer allocator.free(out_output_columns);
         var ooinit: usize = 0;
@@ -255,7 +245,6 @@ pub const Window = struct {
             .accumulated = accumulated,
             .output_columns = output_columns,
             .string_outputs = string_outputs,
-            .out_input_columns = out_input_columns,
             .out_output_columns = out_output_columns,
             .views = views,
             .dop = @max(1, dop),
@@ -274,8 +263,6 @@ pub const Window = struct {
         self.allocator.free(self.output_columns);
         for (self.string_outputs) |s| if (s.len > 0) self.allocator.free(s);
         self.allocator.free(self.string_outputs);
-        for (self.out_input_columns) |*c| c.deinit(self.allocator);
-        self.allocator.free(self.out_input_columns);
         for (self.out_output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.out_output_columns);
         self.allocator.free(self.views);
@@ -318,7 +305,7 @@ pub const Window = struct {
 
     /// Free the accumulated input buffer and release its reserved bytes
     /// once every row has been emitted. Idempotent. The per-batch emit
-    /// buffers (`out_input_columns` / `out_output_columns`) and the window
+/// buffers (`out_output_columns`, string outputs only) and the window
     /// output columns are freed later in `deinit`.
     fn evict(self: *Window) void {
         if (self.evicted) return;
@@ -342,26 +329,24 @@ pub const Window = struct {
         const lo = self.emit_offset;
         const hi = lo + n;
 
-        // Stage rows lo..hi from each input column into out_input_columns.
-        for (self.out_input_columns) |*c| c.clear();
-        for (self.out_input_columns, 0..) |*out, ci| {
-            try appendRangeFromStore(self.allocator, self.accumulated[ci], lo, hi, out);
-        }
-        // Same for output columns — but string outputs materialize from
-        // the `string_outputs[ci]` scratch instead of the (empty)
-        // ColumnStore.
-        for (self.out_output_columns) |*c| c.clear();
-        for (self.out_output_columns, 0..) |*out, ci| {
+        // Zero-copy emit: views slice the accumulated/output columns
+        // directly — `batch_size` is a multiple of 8 so the validity
+        // bitmaps slice on byte boundaries. The buffers stay alive until
+        // `evict()` (the call after the last batch), satisfying the
+        // batch-valid-until-next-call contract. Only string-typed window
+        // outputs materialize through a staging column (their values live
+        // in the per-row scratch, not a StringStore).
+        for (self.accumulated, 0..) |c, i| self.views[i] = subView(c.view(), lo, n);
+        const off = self.input_schema.len;
+        for (self.output_columns, 0..) |c, ci| {
             if (self.string_outputs[ci].len > 0) {
-                try appendStringScratchRange(self.allocator, self.string_outputs[ci], lo, hi, out);
+                self.out_output_columns[ci].clear();
+                try appendStringScratchRange(self.allocator, self.string_outputs[ci], lo, hi, &self.out_output_columns[ci]);
+                self.views[off + ci] = self.out_output_columns[ci].view();
             } else {
-                try appendRangeFromStore(self.allocator, self.output_columns[ci], lo, hi, out);
+                self.views[off + ci] = subView(c.view(), lo, n);
             }
         }
-
-        for (self.out_input_columns, 0..) |c, i| self.views[i] = c.view();
-        const off = self.input_schema.len;
-        for (self.out_output_columns, 0..) |c, i| self.views[off + i] = c.view();
 
         self.emit_offset = hi;
         return Batch{ .schema = self.schema, .values = self.views, .row_count = n };
@@ -369,19 +354,24 @@ pub const Window = struct {
 
     fn drainAndEvaluate(self: *Window) !void {
         // Drain upstream into accumulated.
-        const _dt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         const row_bytes = exec.memory.estimateRowBytes(self.input_schema);
         const acc = self.upstream.accountant();
-        while (try self.upstream.next()) |batch| {
+        while (true) {
+            const _ut = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+            const got = try self.upstream.next();
+            if (exec.prof.enabled) exec.prof.addPhase("window.drain.upstream", @intCast(@max(0, exec.prof.nowTicks() - _ut)));
+            const batch = got orelse break;
+            const _at = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const b = batch.row_count * row_bytes;
             if (acc) |a| try a.reserve(.window, b);
             self.reserved_bytes += b;
             for (batch.values, 0..) |view, ci| {
+                try reserveAggressive(self.allocator, &self.accumulated[ci], batch.row_count);
                 try transform.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
             }
             self.accumulated_rows += batch.row_count;
+            if (exec.prof.enabled) exec.prof.addPhase("window.drain.append", @intCast(@max(0, exec.prof.nowTicks() - _at)));
         }
-        if (exec.prof.enabled) exec.prof.addPhase("window.drain", @intCast(@max(0, exec.prof.nowTicks() - _dt)));
         const n: usize = @intCast(self.accumulated_rows);
         if (n == 0) {
             self.drained = true;
@@ -410,12 +400,19 @@ pub const Window = struct {
         // A partitioned spec over a large input takes the bucket-parallel
         // path: partitions are independent, so hash-scattering them across
         // buckets lets `dop` workers sort and evaluate with no coordination.
+        // An UNpartitioned spec still parallelizes its SORT (samplesort —
+        // range buckets from sampled splitters; bucket concatenation is the
+        // total order); its evaluation stays serial, since rank/frame state
+        // crosses bucket seams (carry fixups are a later phase).
         for (self.spec_indices, 0..) |si, spec_i| {
             if (si.partition_cols.len > 0 and n >= parallel_min_rows and self.dop > 1) {
                 try self.evaluateSpecParallel(si, spec_i, n);
                 continue;
             }
-            const perm = try self.buildPermutation(si);
+            const perm = if (si.partition_cols.len == 0 and n >= parallel_min_rows and self.dop > 1)
+                try self.buildPermutationSamplesort(si, n)
+            else
+                try self.buildPermutation(si);
             defer self.allocator.free(perm);
             const _et = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             for (self.call_plans, 0..) |plan, ci| {
@@ -518,6 +515,14 @@ pub const Window = struct {
         /// into per-worker write cursors for phase C.
         counts: []usize,
         bucket_offsets: []usize,
+        /// Range-bucket splitters for the unpartitioned samplesort mode
+        /// (empty = digest mode). Bucket b holds keys in
+        /// [splitters[b-1], splitters[b]) under the full pairLess order —
+        /// the idx tiebreak makes every key unique, so ranges are clean.
+        splitters: []const KeyIdx = &.{},
+        /// Samplesort only parallelizes the sort: phase D writes the perm
+        /// slices and skips evaluation (rank/frame state crosses seams).
+        sort_only: bool = false,
         next_bucket: std.atomic.Value(usize) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
         err_mutex: std.atomic.Mutex = .unlocked,
@@ -529,20 +534,45 @@ pub const Window = struct {
             return .{ .lo = lo, .hi = @min(lo + chunk, self.n) };
         }
 
+        fn bucketOf(self: *const SpecParJob, kp: KeyIdx) usize {
+            if (self.splitters.len == 0) {
+                return @intCast(kp.hi & @as(u64, @intCast(self.bucket_count - 1)));
+            }
+            const ctx = self.win.sortCtx(self.si);
+            var lo: usize = 0;
+            var hi: usize = self.splitters.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (SpecSortCtx.pairLess(ctx, kp, self.splitters[mid])) hi = mid else lo = mid + 1;
+            }
+            return lo;
+        }
+
         fn phaseKeys(self: *SpecParJob, w: usize) void {
             const r = self.range(w);
             self.win.fillKeys(self.si, self.pairs, r.lo, r.hi);
             const my = self.counts[w * self.bucket_count ..][0..self.bucket_count];
-            const mask: u64 = @intCast(self.bucket_count - 1);
-            for (self.pairs[r.lo..r.hi]) |kp| my[@intCast(kp.hi & mask)] += 1;
+            for (self.pairs[r.lo..r.hi]) |kp| my[self.bucketOf(kp)] += 1;
+        }
+
+        /// Samplesort runs key fill and bucket counting as separate phases —
+        /// the splitters are sampled from the filled keys in between.
+        fn phaseKeysOnly(self: *SpecParJob, w: usize) void {
+            const r = self.range(w);
+            self.win.fillKeys(self.si, self.pairs, r.lo, r.hi);
+        }
+
+        fn phaseCount(self: *SpecParJob, w: usize) void {
+            const r = self.range(w);
+            const my = self.counts[w * self.bucket_count ..][0..self.bucket_count];
+            for (self.pairs[r.lo..r.hi]) |kp| my[self.bucketOf(kp)] += 1;
         }
 
         fn phasePlace(self: *SpecParJob, w: usize) void {
             const r = self.range(w);
             const my = self.counts[w * self.bucket_count ..][0..self.bucket_count];
-            const mask: u64 = @intCast(self.bucket_count - 1);
             for (self.pairs[r.lo..r.hi]) |kp| {
-                const b: usize = @intCast(kp.hi & mask);
+                const b = self.bucketOf(kp);
                 self.placed[my[b]] = kp;
                 my[b] += 1;
             }
@@ -559,6 +589,7 @@ pub const Window = struct {
                 const slice = self.placed[lo..hi];
                 std.sort.pdq(KeyIdx, slice, self.win.sortCtx(self.si), SpecSortCtx.pairLess);
                 for (self.perm[lo..hi], slice) |*p, kp| p.* = kp.idx;
+                if (self.sort_only) continue;
                 var p_start = lo;
                 while (p_start < hi) {
                     const p_end = partitionEnd(self.win.accumulated, self.si.partition_cols, self.perm[0..hi], p_start);
@@ -582,6 +613,89 @@ pub const Window = struct {
             self.failed.store(true, .release);
         }
     };
+
+    /// Parallel samplesort for an UNpartitioned spec: fill keys in
+    /// parallel, sample ~16 keys per bucket and sort the sample to pick
+    /// bucket_count-1 splitters, range-scatter rows (count + prefix +
+    /// place), then workers claim buckets and sort them. Buckets are
+    /// ordered relative to each other, so the concatenated bucket perms
+    /// form the global sorted permutation, which the caller evaluates
+    /// serially. Returns the perm; caller frees.
+    fn buildPermutationSamplesort(self: *Window, si: SpecIndices, n: usize) ![]u32 {
+        const workers: usize = @min(@max(self.dop, 2), 32);
+        const bucket_count: usize = @min(@as(usize, 256), std.math.ceilPowerOfTwoAssert(usize, workers * 4));
+
+        const acc = self.upstream.accountant();
+        const scratch_bytes = n * (2 * @sizeOf(KeyIdx)) + n * @sizeOf(u32);
+        if (acc) |a| try a.reserve(.window, scratch_bytes);
+        defer if (acc) |a| a.release(.window, scratch_bytes);
+
+        const pairs = try self.allocator.alloc(KeyIdx, n);
+        defer self.allocator.free(pairs);
+        const placed = try self.allocator.alloc(KeyIdx, n);
+        defer self.allocator.free(placed);
+        const perm = try self.allocator.alloc(u32, n);
+        errdefer self.allocator.free(perm);
+        const counts = try self.allocator.alloc(usize, workers * bucket_count);
+        defer self.allocator.free(counts);
+        @memset(counts, 0);
+        const bucket_offsets = try self.allocator.alloc(usize, bucket_count + 1);
+        defer self.allocator.free(bucket_offsets);
+
+        var job = SpecParJob{
+            .win = self,
+            .si = si,
+            .spec_i = 0, // unused: sort_only never evaluates
+            .n = n,
+            .workers = workers,
+            .bucket_count = bucket_count,
+            .pairs = pairs,
+            .placed = placed,
+            .perm = perm,
+            .counts = counts,
+            .bucket_offsets = bucket_offsets,
+            .sort_only = true,
+        };
+
+        const _kt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        runRangePhase(&job, SpecParJob.phaseKeysOnly);
+        if (exec.prof.enabled) exec.prof.addPhase("window.par_keys", @intCast(@max(0, exec.prof.nowTicks() - _kt)));
+
+        // Sample evenly, sort the sample, take every (len/bucket_count)th
+        // entry as a splitter. The idx tiebreak in pairLess makes every
+        // key distinct, so heavy duplicates still split into level ranges.
+        const sample_len = @min(n, bucket_count * 16);
+        const sample = try self.allocator.alloc(KeyIdx, sample_len);
+        defer self.allocator.free(sample);
+        const stride = n / sample_len;
+        for (sample, 0..) |*s, i| s.* = pairs[i * stride];
+        std.sort.pdq(KeyIdx, sample, self.sortCtx(si), SpecSortCtx.pairLess);
+        const splitters = try self.allocator.alloc(KeyIdx, bucket_count - 1);
+        defer self.allocator.free(splitters);
+        for (splitters, 1..) |*sp, b| sp.* = sample[b * sample_len / bucket_count];
+        job.splitters = splitters;
+
+        const _ct = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        runRangePhase(&job, SpecParJob.phaseCount);
+        var off: usize = 0;
+        for (0..bucket_count) |b| {
+            bucket_offsets[b] = off;
+            for (0..workers) |w| {
+                const c = counts[w * bucket_count + b];
+                counts[w * bucket_count + b] = off;
+                off += c;
+            }
+        }
+        bucket_offsets[bucket_count] = off;
+        runRangePhase(&job, SpecParJob.phasePlace);
+        const _bt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        if (exec.prof.enabled) exec.prof.addPhase("window.par_place", @intCast(@max(0, _bt - _ct)));
+        runBucketPhase(&job);
+        if (exec.prof.enabled) exec.prof.addPhase("window.par_sort", @intCast(@max(0, exec.prof.nowTicks() - _bt)));
+
+        if (job.err) |e| return e; // errdefer frees perm
+        return perm;
+    }
 
     /// Run a per-worker-range phase on `workers` lanes: spawn workers-1
     /// threads, run the rest inline (covers spawn failure by absorbing the
@@ -1331,19 +1445,6 @@ fn preSizeColumn(allocator: Allocator, out: *ColumnStore, t: Type, n: usize) !vo
     }
 }
 
-fn appendRangeFromStore(
-    allocator: Allocator,
-    src: ColumnStore,
-    lo: usize,
-    hi: usize,
-    out: *ColumnStore,
-) !void {
-    const indices_buf = try allocator.alloc(u32, hi - lo);
-    defer allocator.free(indices_buf);
-    for (indices_buf, 0..) |*p, i| p.* = @intCast(lo + i);
-    try transform.appendByIndices(allocator, src.view(), indices_buf, out);
-}
-
 /// Build a row range of a staged string-output ColumnStore from the
 /// `[N]?[]const u8` scratch. Each scratch entry is either a slice into
 /// an input column's StringStore (lifetime-safe — input columns live
@@ -1373,6 +1474,49 @@ fn isStringType(t: Type) bool {
     return switch (t) {
         .string, .varchar, .char => true,
         else => false,
+    };
+}
+
+/// Quadruple-on-grow capacity reservation for the fixed-width accumulation
+/// columns. ArrayList's doubling re-touches the whole column repeatedly as
+/// tens of millions of rows arrive batch-by-batch — on Windows every fresh
+/// capacity page is demand-zero faulted, which dominated the drain phase.
+/// Quadrupling cuts the realloc copy/fault traffic to a third. StringStore
+/// columns grow internally and are left alone.
+fn reserveAggressive(allocator: Allocator, out: *ColumnStore, add_rows: usize) !void {
+    switch (out.data) {
+        .varchar, .string, .char => {},
+        inline else => |*l| {
+            const need = l.items.len + add_rows;
+            if (need > l.capacity) try l.ensureTotalCapacity(allocator, @max(need, l.capacity * 4));
+        },
+    }
+}
+
+/// Borrowed sub-range view over an emitted column — the zero-copy emit
+/// path. `off` must be a multiple of 8 so the validity bitmap slices on a
+/// byte boundary (the emit batch size guarantees it). String offsets are
+/// absolute into the full bytes buffer, so the offsets window slices
+/// without rebasing.
+fn subView(v: ColumnView, off: usize, n: usize) ColumnView {
+    const nulls: ?[]const u8 = if (v.nulls) |bm| bm[off / 8 ..] else null;
+    return switch (v.data) {
+        .int => |s| .{ .data = .{ .int = s[off..][0..n] }, .nulls = nulls },
+        .bigint => |s| .{ .data = .{ .bigint = s[off..][0..n] }, .nulls = nulls },
+        .boolean => |s| .{ .data = .{ .boolean = s[off..][0..n] }, .nulls = nulls },
+        .tinyint => |s| .{ .data = .{ .tinyint = s[off..][0..n] }, .nulls = nulls },
+        .smallint => |s| .{ .data = .{ .smallint = s[off..][0..n] }, .nulls = nulls },
+        .float => |s| .{ .data = .{ .float = s[off..][0..n] }, .nulls = nulls },
+        .double => |s| .{ .data = .{ .double = s[off..][0..n] }, .nulls = nulls },
+        .date => |s| .{ .data = .{ .date = s[off..][0..n] }, .nulls = nulls },
+        .datetime => |s| .{ .data = .{ .datetime = s[off..][0..n] }, .nulls = nulls },
+        .largeint => |s| .{ .data = .{ .largeint = s[off..][0..n] }, .nulls = nulls },
+        .decimal64 => |s| .{ .data = .{ .decimal64 = s[off..][0..n] }, .nulls = nulls },
+        .decimal128 => |s| .{ .data = .{ .decimal128 = s[off..][0..n] }, .nulls = nulls },
+        .uuid => |s| .{ .data = .{ .uuid = s[off..][0..n] }, .nulls = nulls },
+        .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
     };
 }
 

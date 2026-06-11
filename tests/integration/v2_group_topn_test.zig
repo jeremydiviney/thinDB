@@ -761,7 +761,7 @@ test "V2 staged window: parallel partition buckets match analytic expectations" 
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
     defer db.close();
 
-    try exec(allocator, db, "CREATE TABLE big (id BIGINT PRIMARY KEY, p INT NOT NULL, o BIGINT NOT NULL)");
+    try exec(allocator, db, "CREATE TABLE big (id BIGINT PRIMARY KEY, p BIGINT NOT NULL, o BIGINT NOT NULL)");
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     var first = true;
@@ -798,6 +798,20 @@ test "V2 staged window: parallel partition buckets match analytic expectations" 
         "SELECT COUNT(*) FROM (SELECT o, LAG(id, 1) OVER (PARTITION BY p ORDER BY o) AS prev FROM big) t WHERE prev IS NULL");
     defer allocator.free(lag_nulls);
     try std.testing.expectEqualSlices(i64, &[_]i64{1000}, lag_nulls);
+
+    // Global (no PARTITION BY) spec: the samplesort path. ROW_NUMBER over
+    // id order equals each row's dense position; RANK over the heavily
+    // tied p column equals p*100+1 for every row (tied keys split across
+    // range buckets, serial eval walks the concatenated perm).
+    const grn_bad = try helpers.collectBigints(allocator, db,
+        "SELECT COUNT(*) FROM (SELECT p * 100 + o + 1 AS want, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM big) t WHERE rn <> want");
+    defer allocator.free(grn_bad);
+    try std.testing.expectEqualSlices(i64, &[_]i64{0}, grn_bad);
+
+    const grk_bad = try helpers.collectBigints(allocator, db,
+        "SELECT COUNT(*) FROM (SELECT p * 100 + 1 AS want, RANK() OVER (ORDER BY p) AS rk FROM big) t WHERE rk <> want");
+    defer allocator.free(grk_bad);
+    try std.testing.expectEqualSlices(i64, &[_]i64{0}, grk_bad);
 }
 
 test "V2 staged window: RANK + QUALIFY above a grouped block" {
