@@ -89,6 +89,14 @@ pub const AliasRename = struct {
         return self.upstream.addPrune(rewritten);
     }
 
+    /// Forward fusion offers: the scan resolves qualified `alias.col`
+    /// names against its bare schema via findColumn's tail matching, so
+    /// the expression passes through unchanged. A fused upstream emits
+    /// the same column order/types; only this wrapper's names differ.
+    pub fn tryFuseFilter(self: *AliasRename, expr: predicate.PredicateExpr) !bool {
+        return self.upstream.tryFuseFilter(expr);
+    }
+
     pub fn stats(self: *AliasRename) exec.PipelineStats {
         return self.upstream.stats();
     }

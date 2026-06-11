@@ -27,6 +27,9 @@ const exec = @import("../exec/exec.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
 const mat_stage = @import("../exec/mat_stage.zig");
 const local = @import("local.zig");
+const types = @import("../types.zig");
+
+const PredicateExpr = exec.predicate.PredicateExpr;
 
 const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
 
@@ -168,6 +171,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             return exec.AliasRename.create(input.allocator, up, a.alias);
         },
         .filter => |f| {
+            if (f.upstream.* == .join) return compileFilteredJoin(input, f.predicate, f.upstream, map);
             var up = try buildGenericBlock(input, f.upstream, map, block_root);
             errdefer up.deinit();
             return up.filter(f.predicate);
@@ -255,18 +259,169 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             var left = try compileJoinChild(input, j.left, map);
             errdefer left.deinit();
             const right = try compileJoinChild(input, j.right, map);
-            const spec: ir.JoinSpec = .{
-                .join_type = j.join_type,
-                .algorithm = j.algorithm,
-                .on = j.on,
-                .ranges = j.ranges,
-                .extra_predicate = j.extra_predicate,
-                .skew_ratio_threshold = j.skew_ratio_threshold,
-                .skew_absolute_threshold = j.skew_absolute_threshold,
-                .skew_sample_interval = j.skew_sample_interval,
-            };
-            return left.join(right, spec);
+            return left.join(right, joinSpecOf(j));
         },
         else => return error.UnsupportedQueryShape,
     }
+}
+
+fn joinSpecOf(j: anytype) ir.JoinSpec {
+    return .{
+        .join_type = j.join_type,
+        .algorithm = j.algorithm,
+        .on = j.on,
+        .ranges = j.ranges,
+        .extra_predicate = j.extra_predicate,
+        .skew_ratio_threshold = j.skew_ratio_threshold,
+        .skew_absolute_threshold = j.skew_absolute_threshold,
+        .skew_sample_interval = j.skew_sample_interval,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// WHERE-above-JOIN: basic predicate pushdown into the join inputs.
+// ---------------------------------------------------------------------------
+
+const ConjunctSide = enum { left, right, mixed };
+
+/// Compile `filter(pred) -> join(left, right)` splitting the top-level AND
+/// conjuncts by which join input their columns resolve to. Single-side
+/// conjuncts become filters ON that input — the Filter registers row-group
+/// prune hints and offers itself for scan fusion, so only surviving rows are
+/// materialized (build side) or streamed (probe side). Pushing below the
+/// join is only sound where filtered rows can't resurface as null-extended
+/// output: INNER pushes both sides, LEFT only left-side conjuncts, RIGHT
+/// only right-side, FULL nothing. Cross-side / unresolvable / subquery
+/// conjuncts stay in a residual filter above the join (WHERE semantics).
+fn compileFilteredJoin(
+    input: engine_v2.CompileInput,
+    pred: PredicateExpr,
+    join_op: *const ir.Op,
+    map: *StageMap,
+) anyerror!exec.Query {
+    const j = join_op.join;
+    const allocator = input.allocator;
+
+    var left = try compileJoinChild(input, j.left, map);
+    var left_owned = true;
+    errdefer if (left_owned) left.deinit();
+    var right = try compileJoinChild(input, j.right, map);
+    var right_owned = true;
+    errdefer if (right_owned) right.deinit();
+
+    var conjuncts: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    defer conjuncts.deinit(allocator);
+    try flattenConjuncts(allocator, pred, &conjuncts);
+
+    var left_push: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    defer left_push.deinit(allocator);
+    var right_push: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    defer right_push.deinit(allocator);
+    var residual: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    defer residual.deinit(allocator);
+
+    const can_left = j.join_type == .inner or j.join_type == .left;
+    const can_right = j.join_type == .inner or j.join_type == .right;
+    const left_schema = left.outputSchema();
+    const right_schema = right.outputSchema();
+
+    for (conjuncts.items) |c| {
+        switch (conjunctSide(c, left_schema, right_schema)) {
+            .left => try (if (can_left) &left_push else &residual).append(allocator, c),
+            .right => try (if (can_right) &right_push else &residual).append(allocator, c),
+            .mixed => try residual.append(allocator, c),
+        }
+    }
+
+    if (left_push.items.len > 0)
+        left = try left.filter(try combineConjuncts(input.node_arena, left_push.items));
+    if (right_push.items.len > 0)
+        right = try right.filter(try combineConjuncts(input.node_arena, right_push.items));
+
+    left_owned = false;
+    right_owned = false;
+    var joined = try left.join(right, joinSpecOf(j));
+    if (residual.items.len == 0) return joined;
+    errdefer joined.deinit();
+    return joined.filter(try combineConjuncts(input.node_arena, residual.items));
+}
+
+fn flattenConjuncts(
+    allocator: std.mem.Allocator,
+    e: PredicateExpr,
+    out: *std.ArrayListUnmanaged(PredicateExpr),
+) anyerror!void {
+    switch (e) {
+        .@"and" => |children| for (children) |c| try flattenConjuncts(allocator, c, out),
+        else => try out.append(allocator, e),
+    }
+}
+
+/// Conjuncts pushed below the join outlive the Filter that borrows them, so
+/// the combined AND node's child slice lives in the statement's node arena.
+fn combineConjuncts(arena: Allocator, items: []const PredicateExpr) !PredicateExpr {
+    if (items.len == 1) return items[0];
+    const children = try arena.alloc(PredicateExpr, items.len);
+    @memcpy(children, items);
+    return .{ .@"and" = children };
+}
+
+fn conjunctSide(c: PredicateExpr, left_schema: []const types.Column, right_schema: []const types.Column) ConjunctSide {
+    var side: ?ConjunctSide = null;
+    if (!walkConjunctCols(c, left_schema, right_schema, &side)) return .mixed;
+    return side orelse .mixed;
+}
+
+/// Accumulate the side every column of `e` resolves to. Returns false to
+/// keep the conjunct above the join: subquery / correlated / variable
+/// markers, a column resolving to both or neither side, or sides mixing.
+fn walkConjunctCols(
+    e: PredicateExpr,
+    ls: []const types.Column,
+    rs: []const types.Column,
+    side: *?ConjunctSide,
+) bool {
+    switch (e) {
+        .leaf => |lf| return noteCol(lf.col, ls, rs, side),
+        .leaf_col_col => |lc| return noteCol(lc.left, ls, rs, side) and noteCol(lc.right, ls, rs, side),
+        .is_null, .is_not_null => |col| return noteCol(col, ls, rs, side),
+        .like => |lp| return noteCol(lp.col, ls, rs, side),
+        .in_set => |s| return noteCol(s.col, ls, rs, side),
+        .@"and", .@"or" => |children| {
+            for (children) |ch| if (!walkConjunctCols(ch, ls, rs, side)) return false;
+            return true;
+        },
+        .not => |child| return walkConjunctCols(child.*, ls, rs, side),
+        .always => return true,
+        else => return false,
+    }
+}
+
+fn noteCol(name: []const u8, ls: []const types.Column, rs: []const types.Column, side: *?ConjunctSide) bool {
+    const in_left = types.findColumn(ls, name) != null;
+    const in_right = types.findColumn(rs, name) != null;
+    var s: ConjunctSide = undefined;
+    if (in_left and in_right) {
+        // findColumn's qualified-name tail matching can hit BOTH sides
+        // (`h.RegionID` tail-matches a bare `RegionID` on the other
+        // side). An exact-name match on exactly one side disambiguates;
+        // anything else is genuinely ambiguous — keep above the join.
+        const exact_left = exactCol(ls, name);
+        const exact_right = exactCol(rs, name);
+        if (exact_left == exact_right) return false;
+        s = if (exact_left) .left else .right;
+    } else if (in_left) {
+        s = .left;
+    } else if (in_right) {
+        s = .right;
+    } else return false;
+    if (side.*) |prev| {
+        if (prev != s) return false;
+    } else side.* = s;
+    return true;
+}
+
+fn exactCol(schema: []const types.Column, name: []const u8) bool {
+    for (schema) |c| if (types.columnNameEql(c.name, name)) return true;
+    return false;
 }
