@@ -207,9 +207,15 @@ pub const Config = struct {
 /// meaningfully without competing with foreground queries for the box.
 pub fn resolveCompactThreads(allocator: std.mem.Allocator, configured: usize) usize {
     if (configured != 0) return configured;
-    const affinity = @import("../util/affinity.zig");
-    const physical = affinity.physicalCoreCount(allocator);
+    const physical = physicalCoreCount(allocator);
     return @max(1, physical / 4);
+}
+
+/// Physical (non-SMT) core count, cross-OS. Re-exported for tools that size
+/// their own worker pools (the bulk loader uses every core, unlike the
+/// background compactor's 25% default).
+pub fn physicalCoreCount(allocator: std.mem.Allocator) usize {
+    return @import("../util/affinity.zig").physicalCoreCount(allocator);
 }
 
 pub fn autoCacheSizeBytes(configured: usize) usize {

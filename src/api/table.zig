@@ -398,7 +398,7 @@ pub const Table = struct {
         var name_buf: [32]u8 = undefined;
         const file_name = try std.fmt.bufPrint(&name_buf, "{d:0>20}.dat", .{seg_id});
 
-        var snapshot = try self.memtable.buildSortedSnapshot(self.allocator, self.order_key_indices);
+        var snapshot = try self.memtable.buildSortedSnapshot(self.allocator, self.order_key_indices, self.compact_threads);
         defer snapshot.deinit();
 
         // Allocate the replacement memtable up front. If any of the segment /
@@ -428,6 +428,7 @@ pub const Table = struct {
             snapshot.views,
             prior,
             sync,
+            self.compact_threads,
         );
         defer info.deinit(self.allocator);
 

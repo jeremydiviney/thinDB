@@ -276,6 +276,9 @@ pub const Memtable = struct {
         self: Memtable,
         allocator: Allocator,
         order_key_indices: []const usize,
+        /// Worker threads for the per-column permutation gather (the bulk of
+        /// the cost on wide schemas). 1 = serial.
+        threads: usize,
     ) !SortedSnapshot {
         const n: usize = @intCast(self.row_count);
 
@@ -301,13 +304,21 @@ pub const Memtable = struct {
 
         const sorted_columns = try allocator.alloc(ColumnStore, self.columns.len);
         errdefer allocator.free(sorted_columns);
-        var inited: usize = 0;
-        errdefer for (sorted_columns[0..inited]) |*c| c.deinit(allocator);
 
-        for (self.columns, 0..) |src, ci| {
-            sorted_columns[ci] = try transform.applyPermutation(allocator, src, perm);
-            inited += 1;
-        }
+        var job = GatherJob{
+            .allocator = allocator,
+            .src = self.columns,
+            .perm = perm,
+            .out = sorted_columns,
+            .ok = try allocator.alloc(bool, self.columns.len),
+        };
+        defer allocator.free(job.ok);
+        @memset(job.ok, false);
+        job.run(threads);
+        errdefer for (sorted_columns, job.ok) |*c, ok| {
+            if (ok) c.deinit(allocator);
+        };
+        if (job.err) |e| return e;
 
         const view_buf = try allocator.alloc(ColumnView, sorted_columns.len);
         errdefer allocator.free(view_buf);
@@ -320,6 +331,56 @@ pub const Memtable = struct {
             .row_count = self.row_count,
         };
     }
+
+    /// Per-column permutation gather for `buildSortedSnapshot`: workers claim
+    /// column indices from an atomic cursor (the same grain segment encode
+    /// uses — a few heavy string columns load-balance across the rest).
+    const GatherJob = struct {
+        allocator: Allocator,
+        src: []const ColumnStore,
+        perm: []const u32,
+        out: []ColumnStore,
+        ok: []bool,
+
+        next: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+        err_mutex: std.atomic.Mutex = .unlocked,
+        err: ?anyerror = null,
+
+        fn run(self: *GatherJob, threads: usize) void {
+            const t = @min(@max(1, threads), self.src.len);
+            if (t > 1) {
+                const handles = self.allocator.alloc(std.Thread, t - 1) catch null;
+                if (handles) |hs| {
+                    var spawned: usize = 0;
+                    for (hs) |*h| {
+                        h.* = std.Thread.spawn(.{}, worker, .{self}) catch break;
+                        spawned += 1;
+                    }
+                    worker(self);
+                    for (hs[0..spawned]) |h| h.join();
+                    self.allocator.free(hs);
+                    return;
+                }
+            }
+            worker(self);
+        }
+
+        fn worker(self: *GatherJob) void {
+            while (!self.failed.load(.acquire)) {
+                const ci = self.next.fetchAdd(1, .monotonic);
+                if (ci >= self.src.len) return;
+                self.out[ci] = transform.applyPermutation(self.allocator, self.src[ci], self.perm) catch |e| {
+                    while (!self.err_mutex.tryLock()) std.atomic.spinLoopHint();
+                    if (self.err == null) self.err = e;
+                    self.err_mutex.unlock();
+                    self.failed.store(true, .release);
+                    return;
+                };
+                self.ok[ci] = true;
+            }
+        }
+    };
 
     /// Append a slice/array/tuple of row structs. Each row must have one field
     /// per schema column. Field types are validated against schema column types

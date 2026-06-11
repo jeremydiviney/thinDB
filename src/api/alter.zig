@@ -334,6 +334,7 @@ fn rewriteSegment(
         // only (matches the prior per-block behaviour — no regression).
         &.{},
         sync,
+        t.compact_threads,
     );
 }
 

@@ -66,6 +66,9 @@ pub fn writeSegment(
     /// available (the gate then sees this segment's NDV alone).
     prior_sketches: []const []const u8,
     sync_on_close: bool,
+    /// Worker threads for per-column block encode+compress (same grain as
+    /// `MergedSegmentWriter`). 1 = serial; output is byte-identical either way.
+    encode_threads: usize,
 ) !SegmentInfo {
     if (columns.len != schema.columns.len) return format.Error.SchemaMismatch;
     if (row_group_size == 0) return format.Error.InvalidRowGroupSize;
@@ -106,11 +109,6 @@ pub fn writeSegment(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    // One zstd context, reused for every column block in this segment. Avoids
-    // ~200 µs of CCtx setup/teardown per call (typically 64+ calls per flush).
-    var compressor = try compression_mod.Compressor.init();
-    defer compressor.deinit();
-
     // ---- Header ----
     try buf.appendSlice(allocator, &format.segment_magic);
     try appendU16(allocator, &buf, format.segment_version);
@@ -138,22 +136,45 @@ pub fn writeSegment(
         try appendU32(allocator, &buf, @intCast(rows_in_group));
         try appendU32(allocator, &buf, 0); // padding
 
+        // Encode every column block in parallel (each into its own buffer),
+        // then concatenate in column order — byte-identical to the serial
+        // path regardless of thread count. The job also computes each
+        // column's row-group stats.
+        const blocks = try allocator.alloc(std.ArrayList(u8), columns.len);
+        defer {
+            for (blocks) |*b| b.deinit(allocator);
+            allocator.free(blocks);
+        }
+        for (blocks) |*b| b.* = .empty;
+
+        const stats = try allocator.alloc(format.Stats, columns.len);
+        errdefer allocator.free(stats);
+
+        var job = BlockEncodeJob{
+            .allocator = allocator,
+            .columns = columns,
+            .schema = schema,
+            .dict_eligible = dict_eligible,
+            .row_start = row_offset,
+            .row_end = row_offset + rows_in_group,
+            .blocks = blocks,
+            .stats = stats,
+        };
+        try job.run(encode_threads);
+
         // Record each column block's absolute file offset so the reader can
         // pread individual columns without loading the whole segment.
         const col_offsets = try allocator.alloc(u64, columns.len);
         errdefer allocator.free(col_offsets);
-        for (columns, schema.columns, 0..) |view, schema_col, ci| {
+        var blocks_total: usize = 0;
+        for (blocks) |b| blocks_total += b.items.len;
+        try buf.ensureUnusedCapacity(allocator, blocks_total);
+        for (blocks, 0..) |b, ci| {
             col_offsets[ci] = @intCast(buf.items.len);
-            try writeColumnBlock(allocator, &compressor, &buf, view, schema_col.nullable, dict_eligible[ci], schema.compression, row_offset, row_offset + rows_in_group);
+            buf.appendSliceAssumeCapacity(b.items);
         }
 
         const rg_length: u32 = @intCast(buf.items.len - rg_file_offset);
-
-        const stats = try allocator.alloc(format.Stats, columns.len);
-        errdefer allocator.free(stats);
-        for (columns, 0..) |view, ci| {
-            stats[ci] = computeStats(view, row_offset, row_offset + rows_in_group);
-        }
 
         try row_groups.append(allocator, .{
             .offset = rg_file_offset,

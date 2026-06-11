@@ -20,12 +20,13 @@ pub fn main(init: std.process.Init) !u8 {
     const io = threaded.io();
 
     // Defaults. CLI: first positional = TSV path, second = max rows.
-    // Flags: --data-dir PATH, --database NAME, --wipe / --no-wipe.
+    // Flags: --data-dir PATH, --database NAME, --wipe / --no-wipe, --threads N.
     var tsv_path: []const u8 = "bench/clickbench/data/hits.tsv";
     var max_rows: usize = 0;
     var data_dir_path: []const u8 = ".clickbench-db";
     var database_name: []const u8 = "clickbench";
     var wipe: bool = true;
+    var threads: usize = 0;
 
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();
@@ -40,6 +41,9 @@ pub fn main(init: std.process.Init) !u8 {
             wipe = false;
         } else if (std.mem.eql(u8, arg, "--wipe")) {
             wipe = true;
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            const v = args_iter.next() orelse return error.MissingFlagValue;
+            threads = std.fmt.parseInt(usize, v, 10) catch return error.BadFlagValue;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("clickbench: unknown flag '{s}'\n", .{arg});
             return 1;
@@ -64,7 +68,10 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("  TSV path     : {s}\n", .{tsv_path});
     std.debug.print("  Data dir     : {s}\n", .{data_dir_path});
     std.debug.print("  Target       : {s}.public.hits\n", .{database_name});
+    // Default (--threads 0): ~25% of physical cores, same as the compactor.
+    const n_threads = thindb.api.resolveCompactThreads(allocator, threads);
     std.debug.print("  Wipe data dir: {}\n", .{wipe});
+    std.debug.print("  Threads      : {d} (parse workers + flush encode)\n", .{n_threads});
     if (max_rows > 0) std.debug.print("  Max rows     : {d}\n", .{max_rows});
 
     const cwd = std.Io.Dir.cwd();
@@ -72,7 +79,9 @@ pub fn main(init: std.process.Init) !u8 {
     var data_root = try cwd.createDirPathOpen(io, data_dir_path, .{});
     defer data_root.close(io);
 
-    const catalog = try thindb.Catalog.open(allocator, io, data_root, .{});
+    const catalog = try thindb.Catalog.open(allocator, io, data_root, .{
+        .compact_threads = n_threads,
+    });
     defer catalog.close();
     const db = try catalog.createOrOpenDatabase(database_name);
     const t = try db.table("hits", schema_mod.table_schema, schema_mod.table_options);
@@ -91,6 +100,7 @@ pub fn main(init: std.process.Init) !u8 {
         .max_rows = max_rows,
         .batch_rows = 65_536,
         .progress_every = 500_000,
+        .threads = n_threads,
     }) catch |err| {
         std.debug.print("load error: {t}\n", .{err});
         return err;
