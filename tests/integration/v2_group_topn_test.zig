@@ -258,6 +258,49 @@ test "V2 staged CTEs: chained boundaries materialize, group, filter, sort" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 110, 70 }, totals.items);
 }
 
+test "V2 staged CTEs: stats and sort order cross the materialize boundary" {
+    // The boundary must not be a stats black hole: the outer GROUP BY routes
+    // on the CTE body's propagated bounds. A body sorted on the group key
+    // streams (StreamAggregate) instead of hashing, and the root's row bound
+    // reflects the body's, not maxInt.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE ev4 (id BIGINT PRIMARY KEY, qty INT NOT NULL, tag TEXT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO ev4 VALUES (1,10,'a'),(2,20,'a'),(3,30,'b'),(4,40,'b'),(5,50,'c'),(6,60,'c')");
+
+    var q = try runSql(allocator, db, "WITH ordered AS (SELECT tag, qty FROM ev4 ORDER BY tag) " ++
+        "SELECT tag, SUM(qty) AS total FROM ordered GROUP BY tag");
+    defer q.deinit();
+
+    const st = q.cq.query.stats();
+    try std.testing.expect(st.upper_rows <= 6);
+
+    var plan: std.ArrayList(u8) = .empty;
+    defer plan.deinit(allocator);
+    try q.cq.query.explain(&plan, allocator, 0);
+    try std.testing.expect(std.mem.indexOf(u8, plan.items, "StreamAggregate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.items, "MatScan") != null);
+
+    var tags: std.ArrayList(u8) = .empty;
+    defer tags.deinit(allocator);
+    var totals: std.ArrayList(i64) = .empty;
+    defer totals.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            try tags.appendSlice(allocator, batch.values[0].data.string.rowBytes(r));
+            try totals.append(allocator, batch.values[1].data.bigint[r]);
+        }
+    }
+    try std.testing.expectEqualStrings("abc", tags.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 30, 70, 110 }, totals.items);
+}
+
 test "V2 staged subquery: FROM-clause subquery with alias qualification" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

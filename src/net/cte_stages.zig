@@ -172,7 +172,19 @@ fn buildMatBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap
             for (g.aggs) |a| if (a.func == .udf) return error.UnsupportedQueryShape;
             var up = try buildMatBlock(input, g.upstream, map);
             errdefer up.deinit();
-            return up.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
+            // The same strategy routing as the table path: a stage that ends
+            // sorted on the group keys streams; a proven-over-budget or
+            // unknown-cardinality input sorts then streams; only a proven-
+            // small key space takes the hash aggregate.
+            return local.routeGroupBy(
+                input.allocator,
+                &up,
+                g.group_cols,
+                g.aggs,
+                g.top_k,
+                g.emit_limit,
+                input.db.config.query_memory_budget,
+            );
         },
         else => return error.UnsupportedQueryShape,
     }

@@ -110,6 +110,16 @@ pub const Stage = struct {
     /// pipeline itself is gone after `ensureRun`, but MatScan batches and
     /// the result keep referring to this.
     schema: []const Column,
+    /// The pipeline's compile-time output stats, captured at `addStage`
+    /// before the pipeline can be torn down (column stats and sort keys are
+    /// arena copies). These are provable bounds on the materialized result —
+    /// the result preserves the pipeline's row order, so the sort state
+    /// carries over verbatim. `ensureRun` tightens `upper_rows` to the exact
+    /// materialized count and caps the NDV bounds, so consumers compiled (or
+    /// re-querying stats) after the stage ran see exact figures.
+    stats_upper_rows: u64,
+    sort_state: exec.SortState,
+    col_stats: []exec.ColStat,
     result: ?*MaterializedResult = null,
     /// Consumers bound at compile time / consumers finished. When the last
     /// finishes, the result frees in the background.
@@ -132,6 +142,8 @@ pub const Stage = struct {
         self.query.deinit();
         self.query_alive = false;
         self.result = res;
+        self.stats_upper_rows = res.total_rows;
+        exec.capColStats(self.col_stats, res.total_rows);
     }
 
     /// A consumer finished (fully drained or torn down). On the last one,
@@ -191,9 +203,30 @@ pub const StageSet = struct {
                 .nullable = c.nullable,
             };
         }
+        const src_stats = q.stats();
+        // A per-column array of the wrong length carries no usable mapping —
+        // treat it like "no information" rather than misattribute bounds.
+        const col_stats = try aa.dupe(
+            exec.ColStat,
+            if (src_stats.column_stats.len == src.len) src_stats.column_stats else &.{},
+        );
+        const sort_keys = try aa.alloc([]const u8, src_stats.sort_state.keys.len);
+        for (src_stats.sort_state.keys, sort_keys) |k, *d| d.* = try aa.dupe(u8, k);
+        const sort_state: exec.SortState = .{
+            .keys = sort_keys,
+            .descs = try aa.dupe(bool, src_stats.sort_state.descs),
+            .global = src_stats.sort_state.global,
+        };
         const stage = try self.allocator.create(Stage);
         errdefer self.allocator.destroy(stage);
-        stage.* = .{ .allocator = self.allocator, .query = q, .schema = schema };
+        stage.* = .{
+            .allocator = self.allocator,
+            .query = q,
+            .schema = schema,
+            .stats_upper_rows = src_stats.upper_rows,
+            .sort_state = sort_state,
+            .col_stats = col_stats,
+        };
         try self.stages.append(self.allocator, stage);
         return stage;
     }
@@ -267,8 +300,11 @@ pub const MatScan = struct {
     pub fn addPrune(_: *MatScan, _: exec.Predicate) !void {}
 
     pub fn stats(self: *MatScan) exec.PipelineStats {
-        const rows: u64 = if (self.stage.result) |res| res.total_rows else std.math.maxInt(u64);
-        return .{ .upper_rows = rows };
+        return .{
+            .upper_rows = self.stage.stats_upper_rows,
+            .sort_state = self.stage.sort_state,
+            .column_stats = self.stage.col_stats,
+        };
     }
 
     pub fn accountant(_: *MatScan) ?*exec.memory.MemoryAccountant {
@@ -281,6 +317,66 @@ pub const MatScan = struct {
         try exec.explainLine(out, allocator, depth, line);
     }
 };
+
+test "stage captures pipeline stats and tightens them after the run" {
+    const allocator = std.testing.allocator;
+
+    const Stub = struct {
+        allocator: Allocator,
+        schema: [1]Column = .{.{ .name = "k", .type = .{ .bigint = {} }, .nullable = false }},
+        col_stats: [1]exec.ColStat = .{.{ .ndv = .{ .exact = 7 }, .min = 1, .max = 9 }},
+
+        pub fn next(_: *@This()) !?exec.Batch {
+            return null;
+        }
+        pub fn deinit(self: *@This()) void {
+            self.allocator.destroy(self);
+        }
+        pub fn outputSchema(self: *@This()) []const Column {
+            return &self.schema;
+        }
+        pub fn addPrune(_: *@This(), _: exec.Predicate) !void {}
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{
+                .upper_rows = 42,
+                .sort_state = .{ .keys = &.{"k"}, .global = true },
+                .column_stats = &self.col_stats,
+            };
+        }
+        pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
+            return null;
+        }
+        pub fn explain(_: *@This(), out: *std.ArrayList(u8), a: Allocator, depth: usize) !void {
+            try exec.explainLine(out, a, depth, "Stub");
+        }
+    };
+
+    const stub = try allocator.create(Stub);
+    stub.* = .{ .allocator = allocator };
+    const sq = exec.makeQuery(allocator, stub);
+
+    const set = try StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(sq);
+
+    var scan = try MatScan.create(allocator, stage);
+    defer scan.deinit();
+
+    // Pre-run: the boundary serves the source pipeline's provable bounds.
+    const pre = scan.stats();
+    try std.testing.expectEqual(@as(u64, 42), pre.upper_rows);
+    try std.testing.expectEqual(@as(u32, 7), pre.column_stats[0].ndv.exact);
+    try std.testing.expectEqual(@as(?i128, 1), pre.column_stats[0].min);
+    try std.testing.expectEqualStrings("k", pre.sort_state.keys[0]);
+    try std.testing.expect(pre.sort_state.global);
+
+    // Drain (the stub emits nothing): exact figures replace the bounds.
+    try std.testing.expect((try scan.next()) == null);
+    const post = scan.stats();
+    try std.testing.expectEqual(@as(u64, 0), post.upper_rows);
+    try std.testing.expectEqual(@as(u32, 0), post.column_stats[0].ndv.exact);
+    try std.testing.expectEqualStrings("k", post.sort_state.keys[0]);
+}
 
 /// Root wrapper: forwards everything to the outermost pipeline and tears the
 /// StageSet down after it.

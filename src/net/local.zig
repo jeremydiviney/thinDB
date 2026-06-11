@@ -1961,13 +1961,7 @@ pub fn buildServerQuerySession(
                 const registry = if (catalogFor(db)) |catalog| &catalog.udfs else return Error.UnsupportedOp;
                 break :blk try upstream.udfGroupBy(g.group_cols, g.aggs, registry);
             }
-            if (try routeStreamGroupBy(allocator, &upstream, g.group_cols, g.aggs, db.config.query_memory_budget)) |q| {
-                break :blk q;
-            }
-            if (try routeRadixGroupBy(upstream, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| {
-                break :blk q;
-            }
-            break :blk try upstream.groupByTopK(g.group_cols, g.aggs, g.top_k, g.emit_limit);
+            break :blk try routeGroupBy(allocator, &upstream, g.group_cols, g.aggs, g.top_k, g.emit_limit, db.config.query_memory_budget);
         },
         .compute => |c| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, c.upstream.*);
@@ -2503,6 +2497,26 @@ fn routeRadixGroupBy(
         error.UnsupportedOperatorForType, error.AggregateUnsupportedType => null,
         else => e,
     };
+}
+
+/// The standard GROUP BY routing trio — sorted-stream / radix / hash — shared
+/// by the embedded dispatcher and the staged CTE mat-block compiler. Follows
+/// `routeStreamGroupBy`'s ownership contract: `upstream` is reassigned in
+/// place when the route orders the keys, and the caller's errdefer owns
+/// whatever it points at on error; ownership moves into the returned Query on
+/// success.
+pub fn routeGroupBy(
+    allocator: Allocator,
+    upstream: *Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    top_k: ?ir.Op.TopK,
+    emit_limit: ?u32,
+    budget: usize,
+) !Query {
+    if (try routeStreamGroupBy(allocator, upstream, group_cols, aggs, budget)) |q| return q;
+    if (try routeRadixGroupBy(upstream.*, group_cols, aggs, top_k, emit_limit)) |q| return q;
+    return upstream.groupByTopK(group_cols, aggs, top_k, emit_limit);
 }
 
 /// Parallel partition+lease high-card GROUP BY (experimental). Same eligibility
