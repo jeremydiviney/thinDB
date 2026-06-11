@@ -184,3 +184,40 @@ test "V2 float aggregates: SUM/MIN/MAX over f32 (float output type)" {
     }
     try std.testing.expectEqual(@as(usize, 2), seen);
 }
+
+test "V2 string-key GROUP BY over memtable-only rows (zero segments)" {
+    // Regression: with NO flushed segments, the silo grid's tile claim space
+    // was empty (lo=0 >= total=0), so no worker ever opened the tile that
+    // carries the memtable — a memtable-only string-key GROUP BY silently
+    // returned zero groups while plain scans and int-key groups (which route
+    // through other handlers) worked.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE ev (id BIGINT PRIMARY KEY, qty INT NOT NULL, tag TEXT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO ev VALUES (1,10,'a'),(2,20,'a'),(3,30,'b'),(4,40,'b'),(5,50,'c'),(6,60,'c')");
+    // Deliberately NO flush — every row lives in the memtable.
+
+    var q = try runSql(allocator, db, "SELECT tag, COUNT(*) AS n, SUM(qty) AS total FROM ev GROUP BY tag ORDER BY total DESC");
+    defer q.deinit();
+
+    var tags: std.ArrayList(u8) = .empty;
+    defer tags.deinit(allocator);
+    var totals: std.ArrayList(i64) = .empty;
+    defer totals.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            const sv = batch.values[0].data.string;
+            try tags.appendSlice(allocator, sv.rowBytes(r));
+            try std.testing.expectEqual(@as(i64, 2), batch.values[1].data.bigint[r]);
+            try totals.append(allocator, batch.values[2].data.bigint[r]);
+        }
+    }
+    try std.testing.expectEqualStrings("cba", tags.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 110, 70, 30 }, totals.items);
+}

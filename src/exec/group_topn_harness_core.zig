@@ -4908,6 +4908,14 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         total_rgs += entry.row_group_count;
     }
     seg_start[snap.segment_count] = total_rgs;
+    // The memtable rides whichever scan tile ends at `total_scan_rgs`
+    // (`openGridScanTile` sets scan_memtable on tile.hi == total). With ZERO
+    // segment row groups no tile is ever claimable (lo=0 >= total=0), so a
+    // memtable-only table silently aggregated to nothing — give the claim
+    // space one synthetic unit so exactly one worker opens the empty-range,
+    // memtable-bearing tile. (Mirrors v2_lowcard_group.workerRun's
+    // total_rgs == 0 arm; flatToCoord maps both ends to (0, 0).)
+    const claim_total_rgs = if (total_rgs == 0 and snap.memtable_snap.row_count > 0) 1 else total_rgs;
 
     const scan_columns = cfg.scan_columns orelse &[_][]const u8{};
     var stats_scan = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, false, snap);
@@ -5094,7 +5102,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .group_rows_layout = group_rows_layout,
         .generic_filter_required = cfg.filter_expr != null,
         .scan_threads = n_workers,
-        .total_scan_rgs = total_rgs,
+        .total_scan_rgs = claim_total_rgs,
         .local_reserve_per_bucket = local_reserve_per_bucket,
         .route_block_rows = route_block_rows,
         .direct_final_local = direct_final_local,
