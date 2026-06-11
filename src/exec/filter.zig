@@ -416,6 +416,38 @@ test "shouldCompact gate" {
     try std.testing.expect(!shouldCompact(10000, 2500, 2, 16));
 }
 
+test "orderPredicate flattens parser-nested AND/OR chains" {
+    const allocator = std.testing.allocator;
+    const schema = [_]Column{
+        .{ .name = "s", .type = .{ .varchar = 64 } },
+        .{ .name = "t", .type = .{ .varchar = 64 } },
+    };
+    const stats = [_]exec.ColStat{ .{}, .{} };
+
+    const leaf: PredicateExpr = .{ .leaf = .{ .col = "s", .op = .neq, .val = .{ .text = "" } } };
+    const lk: PredicateExpr = .{ .like = .{ .col = "t", .pattern = "%g%" } };
+    var lk2: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%h%" } };
+    const nlk: PredicateExpr = .{ .not = &lk2 };
+
+    // `a AND b AND c` parses left-nested: AND(AND(a, b), c).
+    const inner = [_]PredicateExpr{ leaf, lk };
+    const outer = [_]PredicateExpr{ .{ .@"and" = &inner }, nlk };
+
+    var rewritten: std.ArrayListUnmanaged([]PredicateExpr) = .empty;
+    defer {
+        for (rewritten.items) |s| allocator.free(s);
+        rewritten.deinit(allocator);
+    }
+    const ordered = try orderPredicate(allocator, &rewritten, .{ .@"and" = &outer }, &schema, &stats);
+    try std.testing.expectEqual(@as(usize, 3), ordered.@"and".len);
+    for (ordered.@"and") |c| try std.testing.expect(c != .@"and");
+
+    const or_outer = [_]PredicateExpr{ .{ .@"or" = &inner }, nlk };
+    const or_ordered = try orderPredicate(allocator, &rewritten, .{ .@"or" = &or_outer }, &schema, &stats);
+    try std.testing.expectEqual(@as(usize, 3), or_ordered.@"or".len);
+    for (or_ordered.@"or") |c| try std.testing.expect(c != .@"or");
+}
+
 /// Tighten the upstream per-column stats with the proven bounds a filter
 /// predicate guarantees. Only top-level AND conjuncts contribute (an OR/NOT
 /// branch proves nothing about any single column). For each contributing
@@ -567,6 +599,12 @@ fn simplifyPredicate(
                         }
                         // always-true conjunct contributes nothing — drop it.
                     },
+                    // Splice a nested AND's conjuncts into this one: the SQL
+                    // parser left-nests `a AND b AND c`, and downstream fast
+                    // paths (the scan's guided filter) only engage on a flat
+                    // conjunct list. The child was simplified recursively, so
+                    // one splice level fully flattens.
+                    .@"and" => |inner| try survivors.appendSlice(allocator, inner),
                     else => try survivors.append(allocator, s),
                 }
             }
@@ -604,6 +642,8 @@ fn simplifyPredicate(
                         }
                         // always-false disjunct contributes nothing — drop it.
                     },
+                    // Mirror of the AND splice: flatten parser-nested ORs.
+                    .@"or" => |inner| try survivors.appendSlice(allocator, inner),
                     else => try survivors.append(allocator, s),
                 }
             }
