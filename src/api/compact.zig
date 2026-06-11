@@ -224,21 +224,49 @@ pub fn pickTier0Group(allocator: std.mem.Allocator, segments: []const SegMeta) !
     return null;
 }
 
+/// One decoded input row-group "generation" for the streaming k-way merge.
+/// The order-key columns decode eagerly at load (the serial merge loop only
+/// compares keys); every other column decodes lazily inside the parallel
+/// gather phase — each column slot is touched by exactly one gather worker,
+/// so the `?OwnedColumn` slots need no synchronization. Refcounted: the
+/// owning cursor holds one ref while the generation is current, and the
+/// in-flight output batch holds one from first reference until its flush —
+/// so steady-state memory stays ~one decoded row-group per input, exactly
+/// like the old design, with at most a boundary generation extra.
+const Gen = struct {
+    seg: *const storage.ReadSegment,
+    rg_idx: usize,
+    rows: usize,
+    base: u32,
+    cols: []?storage.OwnedColumn,
+    refs: u32,
+    /// Set while the current output batch references this generation
+    /// (cleared at batch flush). Guards the once-per-batch ref bump.
+    batch_marked: bool = false,
+
+    fn release(g: *Gen, allocator: std.mem.Allocator) void {
+        g.refs -= 1;
+        if (g.refs > 0) return;
+        for (g.cols) |*mc| {
+            if (mc.*) |*c| c.deinit(allocator);
+        }
+        allocator.free(g.cols);
+        allocator.destroy(g);
+    }
+};
+
 /// One input segment's read cursor for the streaming k-way merge. Owns its
-/// `ReadSegment` + tombstone array, decodes one row-group at a time, and walks
-/// kept (non-tombstoned) rows in order. At most one decoded row-group is held
-/// per cursor, so the merge's memory stays bounded regardless of input size.
+/// `ReadSegment` + tombstone array and walks kept (non-tombstoned) rows in
+/// order, one `Gen` (decoded row-group generation) at a time.
 const MergeCursor = struct {
     allocator: std.mem.Allocator,
     schema: types.TableSchema,
+    key_indices: []const usize,
     seg: storage.ReadSegment,
     tombs: ?[]u32,
 
     rg_idx: usize,
-    /// Decoded columns of the current row-group (one per schema column), or
-    /// empty before the first `loadRowGroup` / after exhaustion.
-    decoded: []storage.OwnedColumn,
-    decoded_live: bool,
+    gen: ?*Gen,
     pos: usize, // local index within the current row-group
     rg_rows: usize, // row count of the current row-group
     rg_base: u32, // segment-absolute offset of row 0 of the current row-group
@@ -253,54 +281,69 @@ const MergeCursor = struct {
         const tombs = try storage.tombstone.read(t.allocator, t.io, t.segments_dir, id);
         errdefer if (tombs) |x| t.allocator.free(x);
 
-        const decoded = try t.allocator.alloc(storage.OwnedColumn, t.schema.columns.len);
-        errdefer t.allocator.free(decoded);
-
-        var self: MergeCursor = .{
+        // NOTE: the cursor is returned by value; generations capture `&seg`,
+        // so the caller must call `advanceToValid` AFTER placing the cursor
+        // in its final location (never on this temporary).
+        return .{
             .allocator = t.allocator,
             .schema = t.schema,
+            .key_indices = t.order_key_indices,
             .seg = seg,
             .tombs = tombs,
             .rg_idx = 0,
-            .decoded = decoded,
-            .decoded_live = false,
+            .gen = null,
             .pos = 0,
             .rg_rows = 0,
             .rg_base = 0,
             .exhausted = false,
         };
-        try self.advanceToValid();
-        return self;
     }
 
     fn deinit(self: *MergeCursor) void {
-        self.freeDecoded();
-        self.allocator.free(self.decoded);
+        self.releaseGen();
         if (self.tombs) |x| self.allocator.free(x);
         self.seg.deinit();
         self.* = undefined;
     }
 
-    fn freeDecoded(self: *MergeCursor) void {
-        if (self.decoded_live) {
-            for (self.decoded) |*c| c.deinit(self.allocator);
-            self.decoded_live = false;
+    fn releaseGen(self: *MergeCursor) void {
+        if (self.gen) |g| {
+            g.release(self.allocator);
+            self.gen = null;
         }
     }
 
-    /// Decode row-group `self.rg_idx` into `self.decoded`. Caller has ensured
-    /// the index is in range and previous decode (if any) is freed.
+    /// Build the generation for row-group `self.rg_idx`, decoding only the
+    /// order-key columns. Caller has ensured the index is in range and the
+    /// previous generation's cursor ref is dropped.
     fn loadRowGroup(self: *MergeCursor) !void {
         const rg = self.seg.info.row_groups[self.rg_idx];
-        var inited: usize = 0;
-        errdefer for (self.decoded[0..inited]) |*c| c.deinit(self.allocator);
-        for (self.schema.columns, 0..) |_, ci| {
-            self.decoded[ci] = try self.seg.decodeColumn(self.allocator, self.schema, self.rg_idx, ci);
-            inited += 1;
+        const g = try self.allocator.create(Gen);
+        const cols = self.allocator.alloc(?storage.OwnedColumn, self.schema.columns.len) catch |e| {
+            self.allocator.destroy(g);
+            return e;
+        };
+        @memset(cols, null);
+        g.* = .{
+            .seg = &self.seg,
+            .rg_idx = self.rg_idx,
+            .rows = rg.row_count,
+            .base = self.rg_base,
+            .cols = cols,
+            .refs = 1,
+        };
+        errdefer g.release(self.allocator);
+        for (self.key_indices) |ci| {
+            g.cols[ci] = try self.seg.decodeColumn(self.allocator, self.schema, self.rg_idx, ci);
         }
-        self.decoded_live = true;
+        self.gen = g;
         self.rg_rows = rg.row_count;
         self.pos = 0;
+    }
+
+    /// Borrow the current generation's decoded view of order-key column `ci`.
+    fn keyView(self: *const MergeCursor, ci: usize) storage.ColumnView {
+        return self.gen.?.cols[ci].?.view();
     }
 
     /// True iff the segment-absolute row at `self.rg_base + local` is tombstoned.
@@ -315,15 +358,15 @@ const MergeCursor = struct {
     /// Sets `self.exhausted` when no further kept row exists.
     fn advanceToValid(self: *MergeCursor) !void {
         while (true) {
-            if (self.decoded_live and self.pos < self.rg_rows) {
+            if (self.gen != null and self.pos < self.rg_rows) {
                 if (!self.isTombstoned(self.pos)) return;
                 self.pos += 1;
                 continue;
             }
             // Current row-group consumed (or none loaded): move to the next.
-            if (self.decoded_live) {
+            if (self.gen != null) {
                 self.rg_base += @intCast(self.rg_rows);
-                self.freeDecoded();
+                self.releaseGen();
                 self.rg_idx += 1;
             }
             if (self.rg_idx >= self.seg.info.row_groups.len) {
@@ -338,6 +381,80 @@ const MergeCursor = struct {
     fn next(self: *MergeCursor) !void {
         self.pos += 1;
         try self.advanceToValid();
+    }
+};
+
+/// One merged output row: a row of a pinned input generation.
+const PickedRow = struct {
+    gen: *Gen,
+    row: u32,
+};
+
+/// Parallel decode+gather of one output row-group: workers claim column
+/// indices from an atomic cursor; per column they lazily decode the column in
+/// every generation the batch references (memoized in `Gen.cols` — the
+/// cursor-current generation keeps its decode for the next batch), then
+/// append the batch's rows in merge order. The serial merge loop above only
+/// ever touched key columns, so this is where the other ~hundred columns'
+/// decode AND gather cost lands — all of it column-parallel.
+const MergeGatherJob = struct {
+    allocator: std.mem.Allocator,
+    schema: types.TableSchema,
+    picks: []const PickedRow,
+    gens: []const *Gen,
+    out_cols: []engine.ColumnStore,
+
+    next: std.atomic.Value(usize) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    err_mutex: std.atomic.Mutex = .unlocked,
+    err: ?anyerror = null,
+
+    fn run(self: *MergeGatherJob, threads: usize) !void {
+        const n = @min(@max(1, threads), self.out_cols.len);
+        if (n > 1) {
+            const handles = self.allocator.alloc(std.Thread, n - 1) catch null;
+            if (handles) |hs| {
+                var spawned: usize = 0;
+                for (hs) |*h| {
+                    h.* = std.Thread.spawn(.{}, worker, .{self}) catch break;
+                    spawned += 1;
+                }
+                worker(self);
+                for (hs[0..spawned]) |h| h.join();
+                self.allocator.free(hs);
+            } else {
+                worker(self);
+            }
+        } else {
+            worker(self);
+        }
+        if (self.err) |e| return e;
+    }
+
+    fn worker(self: *MergeGatherJob) void {
+        while (!self.failed.load(.acquire)) {
+            const ci = self.next.fetchAdd(1, .monotonic);
+            if (ci >= self.out_cols.len) return;
+            self.gatherColumn(ci) catch |e| {
+                while (!self.err_mutex.tryLock()) std.atomic.spinLoopHint();
+                if (self.err == null) self.err = e;
+                self.err_mutex.unlock();
+                self.failed.store(true, .release);
+                return;
+            };
+        }
+    }
+
+    fn gatherColumn(self: *MergeGatherJob, ci: usize) !void {
+        for (self.gens) |g| {
+            if (g.cols[ci] == null) {
+                g.cols[ci] = try g.seg.decodeColumn(self.allocator, self.schema, g.rg_idx, ci);
+            }
+        }
+        const dst = &self.out_cols[ci];
+        for (self.picks) |p| {
+            try engine.transform.appendOneRow(self.allocator, p.gen.cols[ci].?.view(), p.row, dst);
+        }
     }
 };
 
@@ -378,6 +495,7 @@ fn streamMerge(
     for (seg_ids) |id| {
         cursors[opened] = try MergeCursor.open(t, id);
         opened += 1;
+        try cursors[opened - 1].advanceToValid();
     }
 
     // Any kept rows at all? If every input is exhausted, write no segment.
@@ -424,7 +542,18 @@ fn streamMerge(
     const out_views = try t.allocator.alloc(storage.ColumnView, ncols);
     defer t.allocator.free(out_views);
 
-    var acc_rows: usize = 0;
+    // Output batch index: which (generation, row) feeds each output row, in
+    // merge order. The serial loop below only compares order keys and builds
+    // this index; the per-column decode + gather of the other ~hundred
+    // columns happens in the parallel MergeGatherJob at each flush.
+    var picks: std.ArrayList(PickedRow) = .empty;
+    defer picks.deinit(t.allocator);
+    var batch_gens: std.ArrayList(*Gen) = .empty;
+    defer {
+        for (batch_gens.items) |g| g.release(t.allocator);
+        batch_gens.deinit(t.allocator);
+    }
+
     while (true) {
         // Pick the smallest current row across live cursors by the order key,
         // tie-broken by input index for a deterministic total order. k is small,
@@ -441,25 +570,23 @@ fn streamMerge(
         }
         const pick = best orelse break;
 
-        // Emit the picked row into the output accumulator.
         const src = &cursors[pick];
-        for (out_cols, 0..) |*dst, ci| {
-            try engine.transform.appendOneRow(t.allocator, src.decoded[ci].view(), src.pos, dst);
+        const g = src.gen.?;
+        if (!g.batch_marked) {
+            g.batch_marked = true;
+            g.refs += 1;
+            try batch_gens.append(t.allocator, g);
         }
-        acc_rows += 1;
+        try picks.append(t.allocator, .{ .gen = g, .row = @intCast(src.pos) });
         try src.next();
 
-        if (acc_rows == t.row_group_size) {
-            for (out_cols, 0..) |c, ci| out_views[ci] = c.view();
-            try writer.writeRowGroup(out_views);
-            for (out_cols) |*c| c.clear();
-            acc_rows = 0;
+        if (picks.items.len == t.row_group_size) {
+            try flushMergeBatch(t, &picks, &batch_gens, out_cols, out_views, &writer);
         }
     }
 
-    if (acc_rows > 0) {
-        for (out_cols, 0..) |c, ci| out_views[ci] = c.view();
-        try writer.writeRowGroup(out_views);
+    if (picks.items.len > 0) {
+        try flushMergeBatch(t, &picks, &batch_gens, out_cols, out_views, &writer);
     }
 
     for (cursors[0..opened]) |*c| c.deinit();
@@ -468,11 +595,42 @@ fn streamMerge(
     return try writer.finish(t.io, t.segments_dir, file_name, sync);
 }
 
+/// Gather one indexed output batch (parallel per column), hand it to the
+/// writer (parallel per-column encode), and drop the batch's generation pins.
+fn flushMergeBatch(
+    t: *Table,
+    picks: *std.ArrayList(PickedRow),
+    batch_gens: *std.ArrayList(*Gen),
+    out_cols: []engine.ColumnStore,
+    out_views: []storage.ColumnView,
+    writer: *storage.MergedSegmentWriter,
+) !void {
+    var job = MergeGatherJob{
+        .allocator = t.allocator,
+        .schema = t.schema,
+        .picks = picks.items,
+        .gens = batch_gens.items,
+        .out_cols = out_cols,
+    };
+    try job.run(t.compact_threads);
+
+    for (out_cols, 0..) |c, ci| out_views[ci] = c.view();
+    try writer.writeRowGroup(out_views);
+    for (out_cols) |*c| c.clear();
+
+    for (batch_gens.items) |g| {
+        g.batch_marked = false;
+        g.release(t.allocator);
+    }
+    batch_gens.clearRetainingCapacity();
+    picks.clearRetainingCapacity();
+}
+
 /// `a`'s current row sorts strictly before `b`'s under the composite order key.
 /// Mirrors `Memtable.buildSortedSnapshot`'s lexicographic comparator exactly.
 fn lessThanCursor(order_key_indices: []const usize, a: *const MergeCursor, b: *const MergeCursor) bool {
     for (order_key_indices) |ci| {
-        const ord = engine.transform.compareViewRows(a.decoded[ci].view(), a.pos, b.decoded[ci].view(), b.pos);
+        const ord = engine.transform.compareViewRows(a.keyView(ci), a.pos, b.keyView(ci), b.pos);
         if (ord == .lt) return true;
         if (ord == .gt) return false;
     }
