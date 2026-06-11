@@ -1148,6 +1148,47 @@ pub fn fsstViewOf(raw: []const u8, row_count: u32, flags: format.ColumnBlockFlag
     return .{ .nulls = nulls, .block = try fsstBlockOf(values, row_count) };
 }
 
+/// Expand a borrowed FSST block into the cache's recycled scratch pool —
+/// `[offsets (row_count+1 × u32)][bytes]` in one buffer — and return a
+/// borrowed string view over it. A fresh allocation per borrow re-faults
+/// freshly-zeroed pages on every scan `next()` (the same cost class the
+/// LZ4-at-rest scratch pool eliminated). The scratch rides `block.owned` /
+/// `block.pooled` and returns to the pool on `block.release`; the cache pin
+/// stays held (the nulls bitmap aliases the entry's bytes).
+pub fn expandFsstPooled(
+    block: *ReadSegment.BorrowedBlock,
+    cc: *storage_cache.Cache,
+    col_type: Type,
+    row_count: u32,
+    flags: format.ColumnBlockFlags,
+) !ColumnView {
+    const fv = try fsstViewOf(block.bytes, row_count, flags);
+    const n: usize = row_count;
+    const offsets_bytes = (n + 1) * @sizeOf(u32);
+    const scratch = try cc.acquireScratch(offsets_bytes + fv.block.raw_byte_count);
+    errdefer cc.releaseScratch(scratch);
+
+    const offsets: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0..offsets_bytes]));
+    const bytes = scratch[offsets_bytes..][0..fv.block.raw_byte_count];
+    var o: usize = 0;
+    offsets[0] = 0;
+    for (0..n) |r| {
+        o += fv.block.table.decodeInto(fv.block.rowComp(r), bytes[o..]);
+        offsets[r + 1] = @intCast(o);
+    }
+    if (o != fv.block.raw_byte_count) return format.Error.CorruptColumnBlockHeader;
+
+    block.owned = scratch;
+    block.pooled = true;
+    const sc = column.StringView{ .offsets = offsets, .bytes = bytes };
+    return switch (col_type) {
+        .varchar => .{ .data = .{ .varchar = sc }, .nulls = fv.nulls },
+        .string => .{ .data = .{ .string = sc }, .nulls = fv.nulls },
+        .char => .{ .data = .{ .char = sc }, .nulls = fv.nulls },
+        else => format.Error.CorruptColumnBlockHeader,
+    };
+}
+
 /// Expand an FSST block into the owned `[offsets][bytes]` string shape every
 /// consumer expects — identical output to a raw string block.
 pub fn decodeFsstColumn(

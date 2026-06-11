@@ -2913,6 +2913,21 @@ pub const Scan = struct {
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
             var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
 
+            if (block.encoding == .fsst) {
+                // FSST: expand once into the cache's recycled scratch pool
+                // (returned on `block.release`) — a fresh allocation per
+                // borrow re-faults zeroed pages every scan `next()`.
+                const view = storage.segment_reader.expandFsstPooled(&block, &self.table.cache, col_type, rg_count, flags) catch |e| {
+                    block.release(self.allocator, &self.table.cache);
+                    for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
+                    return e;
+                };
+                blocks[j] = block;
+                self.views[j] = view;
+                got += 1;
+                continue;
+            }
+
             if (block.encoding != .raw) {
                 // Narrow-encoded (FOR or dict): expand the codes once into a
                 // native buffer owned by the block; the view aliases that buffer
