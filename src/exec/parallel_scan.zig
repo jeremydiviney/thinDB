@@ -180,6 +180,13 @@ pub const ParallelScan = struct {
     agg_built: usize = 0,
     agg_fused: bool = false,
 
+    // Fused join probe (set via tryFuseProbe; round mode only): each round
+    // worker hands its scanned batch to the sink, which probes the offering
+    // Join's hash table and returns the joined batch to stage instead. The
+    // sink's per-chunk buffers make staged batches round-stable, same as the
+    // bare scans' scratch. Mutually exclusive with every other fusion.
+    probe_sink: ?exec.ProbeSink = null,
+
     /// Build a parallel scan over `table` projecting `needed` (null = all
     /// columns), with up to `max_dop` workers. Always returns a valid operator:
     /// when only one slot is available it runs serially through the same
@@ -430,6 +437,17 @@ pub const ParallelScan = struct {
     /// to bump a fixed per-source usize counter — benign undercounting under
     /// concurrency; the materialize step does the real byte reservation. TODO:
     /// null the partial accountant before enabling this path by default.)
+    /// Accept a join-probe sink when nothing else has claimed the workers and
+    /// no filter fused (a fused filter forces materialize mode, whose drain
+    /// loop doesn't run the sink — the Join keeps its own serial probe there).
+    pub fn tryFuseProbe(self: *ParallelScan, sink: exec.ProbeSink) !bool {
+        if (self.mode != .unset) return false;
+        if (self.agg_fused or self.compute_fused or self.workers[0].fusedActive()) return false;
+        try sink.bind(sink.ctx, self.workers.len, self.table.allocator);
+        self.probe_sink = sink;
+        return true;
+    }
+
     pub fn tryFuseAggregate(self: *ParallelScan, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
         if (self.mode != .unset or self.compute_fused or self.agg_fused) return false;
         const q = try self.allocator.alloc(Query, self.workers.len);
@@ -810,8 +828,38 @@ pub const ParallelScan = struct {
         while (true) {
             const i = self.next_chunk.fetchAdd(1, .acq_rel);
             if (i >= n) break;
-            if (!self.exhausted[i]) runOne(self.workers[i], &self.round[i], &self.werr[i]);
+            if (!self.exhausted[i]) {
+                if (self.probe_sink) |sink| self.runOneProbe(sink, i) else runOne(self.workers[i], &self.round[i], &self.werr[i]);
+            }
             _ = self.round_done.fetchAdd(1, .release);
+        }
+    }
+
+    /// Probe-fused chunk step: keep pulling scan batches until the sink turns
+    /// one into a non-empty joined batch (staged for emission) or the chunk
+    /// exhausts. Looping on empty join output keeps a round from staging
+    /// zero-row batches while still bounding in-flight memory to one staged
+    /// batch per chunk.
+    fn runOneProbe(self: *ParallelScan, sink: exec.ProbeSink, i: usize) void {
+        while (true) {
+            const mb = self.workers[i].next() catch |e| {
+                self.werr[i] = e;
+                return;
+            };
+            const batch = mb orelse {
+                self.round[i] = null;
+                return;
+            };
+            const joined = sink.process(sink.ctx, i, batch) catch |e| {
+                self.werr[i] = e;
+                return;
+            };
+            if (joined) |jb| {
+                if (jb.row_count > 0) {
+                    self.round[i] = jb;
+                    return;
+                }
+            }
         }
     }
 

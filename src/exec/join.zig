@@ -262,6 +262,17 @@ fn stringRowBytes(view: ColumnView, row: u32) []const u8 {
     };
 }
 
+inline fn pushPair(
+    alloc: Allocator,
+    probe_rows: *std.ArrayListUnmanaged(u32),
+    build_rows: *std.ArrayListUnmanaged(u32),
+    probe_row: u32,
+    build_row: u32,
+) !void {
+    try probe_rows.append(alloc, probe_row);
+    try build_rows.append(alloc, build_row);
+}
+
 pub const Join = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -339,6 +350,15 @@ pub const Join = struct {
     /// build entries marking preserved-side miss rows.
     probe_rows_scratch: std.ArrayListUnmanaged(u32) = .empty,
     build_rows_scratch: std.ArrayListUnmanaged(u32) = .empty,
+
+    /// Probe fused into the probe side's parallel-scan workers (the
+    /// tryFuseProbe offer was accepted): upstream batches arrive already
+    /// joined and next() passes them through. `probe_chunks` holds the
+    /// per-chunk pair scratches + output staging the workers write —
+    /// allocated by sinkBind from the scan's thread-safe allocator.
+    probe_fused: bool = false,
+    probe_chunks: []ProbeChunk = &.{},
+    probe_chunk_alloc: Allocator = undefined,
 
     /// Output staging: ColumnStores we append matched rows into,
     /// emitted as a single Batch when full or when probe is exhausted.
@@ -654,6 +674,10 @@ pub const Join = struct {
         self.key_scratch.deinit(self.allocator);
         self.probe_rows_scratch.deinit(self.allocator);
         self.build_rows_scratch.deinit(self.allocator);
+        if (self.probe_chunks.len > 0) {
+            for (self.probe_chunks) |*ch| freeProbeChunk(self.probe_chunk_alloc, ch);
+            self.probe_chunk_alloc.free(self.probe_chunks);
+        }
         if (self.matched_build) |*mb| mb.deinit(self.allocator);
         if (self.skew_detector) |det| det.deinit();
         self.arena.deinit();
@@ -720,9 +744,27 @@ pub const Join = struct {
                             self.build_rows,
                         );
                     }
+                    // Offer the probe step to the probe side's parallel
+                    // workers (round-mode ParallelScan; see ProbeSink).
+                    // FastTable path only; FULL keeps the serial probe —
+                    // matched_build writes would race across workers.
+                    if (self.fast_table != null and self.join_type != .full) {
+                        const probe = if (self.build_is_left) self.right else self.left;
+                        self.probe_fused = probe.tryFuseProbe(.{
+                            .ctx = self,
+                            .bind = sinkBind,
+                            .process = sinkProcess,
+                        }) catch false;
+                    }
                     self.phase = .probing;
                 },
                 .probing => {
+                    if (self.probe_fused) {
+                        var probe = if (self.build_is_left) &self.right else &self.left;
+                        if (try probe.next()) |batch| return batch;
+                        self.phase = .done;
+                        return null;
+                    }
                     const step = if (self.fast_table) |*ft|
                         try self.probeStepFast(ft)
                     else
@@ -948,77 +990,87 @@ pub const Join = struct {
     /// StringHashMap lookup + per-cell appends of the general path.
     fn probeStepFast(self: *Join, ft: *const FastTable) !?Batch {
         var probe = if (self.build_is_left) &self.right else &self.left;
-        const probe_key_idx = if (self.build_is_left) self.right_key_indices[0] else self.left_key_indices[0];
-        const preserved = self.probeSidePreserved();
-
         while (true) {
             const batch = (try probe.next()) orelse return null;
-            const n = batch.row_count;
-            const key_view = batch.values[probe_key_idx];
-
-            self.probe_rows_scratch.clearRetainingCapacity();
-            self.build_rows_scratch.clearRetainingCapacity();
-            try self.probe_rows_scratch.ensureUnusedCapacity(self.allocator, n);
-            try self.build_rows_scratch.ensureUnusedCapacity(self.allocator, n);
-
-            var i: u32 = 0;
-            while (i < n) : (i += 1) {
-                if (!key_view.isValid(i)) {
-                    if (preserved) try self.appendPair(i, FAST_EMPTY);
-                    continue;
-                }
-                var found = false;
-                switch (ft.kind) {
-                    .int => {
-                        const key = fastIntKey(key_view, i);
-                        var slot = fastMix(key) & ft.mask;
-                        while (true) {
-                            const head = ft.heads[slot];
-                            if (head == FAST_EMPTY) break;
-                            if (ft.slot_keys[slot] == key) {
-                                var r = head;
-                                while (r != FAST_EMPTY) : (r = ft.next[r]) {
-                                    found = true;
-                                    try self.appendPair(i, r);
-                                    if (self.matched_build) |*mb| mb.set(r);
-                                }
-                                break;
-                            }
-                            slot = (slot + 1) & ft.mask;
-                        }
-                    },
-                    .string => {
-                        const bytes = stringRowBytes(key_view, i);
-                        const key = std.hash.Wyhash.hash(0, bytes);
-                        var slot = key & ft.mask;
-                        while (true) {
-                            const head = ft.heads[slot];
-                            if (head == FAST_EMPTY) break;
-                            if (ft.slot_keys[slot] == key) {
-                                var r = head;
-                                while (r != FAST_EMPTY) : (r = ft.next[r]) {
-                                    if (!std.mem.eql(u8, stringRowBytes(ft.build_key_view, r), bytes)) continue;
-                                    found = true;
-                                    try self.appendPair(i, r);
-                                    if (self.matched_build) |*mb| mb.set(r);
-                                }
-                                break;
-                            }
-                            slot = (slot + 1) & ft.mask;
-                        }
-                    },
-                }
-                if (!found and preserved) try self.appendPair(i, FAST_EMPTY);
-            }
-
+            try self.collectPairs(ft, batch, self.allocator, &self.probe_rows_scratch, &self.build_rows_scratch);
             if (self.probe_rows_scratch.items.len == 0) continue;
             return try self.emitPairs(batch);
         }
     }
 
-    inline fn appendPair(self: *Join, probe_row: u32, build_row: u32) !void {
-        try self.probe_rows_scratch.append(self.allocator, probe_row);
-        try self.build_rows_scratch.append(self.allocator, build_row);
+    /// Collect every (probe row, build row) match pair for one probe batch
+    /// into the given scratch arrays — FAST_EMPTY build entries marking
+    /// preserved-side miss rows. Reads only build-immutable state plus the
+    /// passed scratches, so concurrent calls with distinct scratches are
+    /// safe (the fused-probe workers rely on this; matched_build is null
+    /// there — FULL never fuses).
+    fn collectPairs(
+        self: *Join,
+        ft: *const FastTable,
+        batch: Batch,
+        alloc: Allocator,
+        probe_rows: *std.ArrayListUnmanaged(u32),
+        build_rows: *std.ArrayListUnmanaged(u32),
+    ) !void {
+        const probe_key_idx = if (self.build_is_left) self.right_key_indices[0] else self.left_key_indices[0];
+        const preserved = self.probeSidePreserved();
+        const n = batch.row_count;
+        const key_view = batch.values[probe_key_idx];
+
+        probe_rows.clearRetainingCapacity();
+        build_rows.clearRetainingCapacity();
+        try probe_rows.ensureUnusedCapacity(alloc, n);
+        try build_rows.ensureUnusedCapacity(alloc, n);
+
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            if (!key_view.isValid(i)) {
+                if (preserved) try pushPair(alloc, probe_rows, build_rows, i, FAST_EMPTY);
+                continue;
+            }
+            var found = false;
+            switch (ft.kind) {
+                .int => {
+                    const key = fastIntKey(key_view, i);
+                    var slot = fastMix(key) & ft.mask;
+                    while (true) {
+                        const head = ft.heads[slot];
+                        if (head == FAST_EMPTY) break;
+                        if (ft.slot_keys[slot] == key) {
+                            var r = head;
+                            while (r != FAST_EMPTY) : (r = ft.next[r]) {
+                                found = true;
+                                try pushPair(alloc, probe_rows, build_rows, i, r);
+                                if (self.matched_build) |*mb| mb.set(r);
+                            }
+                            break;
+                        }
+                        slot = (slot + 1) & ft.mask;
+                    }
+                },
+                .string => {
+                    const bytes = stringRowBytes(key_view, i);
+                    const key = std.hash.Wyhash.hash(0, bytes);
+                    var slot = key & ft.mask;
+                    while (true) {
+                        const head = ft.heads[slot];
+                        if (head == FAST_EMPTY) break;
+                        if (ft.slot_keys[slot] == key) {
+                            var r = head;
+                            while (r != FAST_EMPTY) : (r = ft.next[r]) {
+                                if (!std.mem.eql(u8, stringRowBytes(ft.build_key_view, r), bytes)) continue;
+                                found = true;
+                                try pushPair(alloc, probe_rows, build_rows, i, r);
+                                if (self.matched_build) |*mb| mb.set(r);
+                            }
+                            break;
+                        }
+                        slot = (slot + 1) & ft.mask;
+                    }
+                },
+            }
+            if (!found and preserved) try pushPair(alloc, probe_rows, build_rows, i, FAST_EMPTY);
+        }
     }
 
     /// Bulk-gather the collected pairs into output_columns and flush
@@ -1030,51 +1082,132 @@ pub const Join = struct {
             for (self.output_columns) |*c| c.clear();
             self.pending_clear = false;
         }
-        const probe_rows = self.probe_rows_scratch.items;
-        const build_rows = self.build_rows_scratch.items;
+        try self.gatherPairs(batch, self.probe_rows_scratch.items, self.build_rows_scratch.items, self.output_columns, self.allocator);
+        return try self.flushOutput();
+    }
+
+    /// Bulk-gather collected pairs into `out_cols` (join output column
+    /// order). Probe-side columns gather by probe row; build-side columns
+    /// by build row with FAST_EMPTY miss runs emitting NULLs. Reads only
+    /// build-immutable state — concurrent calls with distinct out_cols are
+    /// safe given a thread-safe `alloc`.
+    fn gatherPairs(
+        self: *Join,
+        batch: Batch,
+        probe_rows: []const u32,
+        build_rows: []const u32,
+        out_cols: []ColumnStore,
+        alloc: Allocator,
+    ) !void {
         const left_count = self.left_col_count;
         var out_idx: usize = 0;
 
         if (self.build_is_left) {
             var i: usize = 0;
             while (i < left_count) : (i += 1) {
-                try self.gatherBuildColumn(self.build_columns[i].view(), build_rows, &self.output_columns[out_idx]);
+                try gatherBuildColumn(alloc, self.build_columns[i].view(), build_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
             for (batch.values, 0..) |v, idx2| {
                 if (!self.right_kept_mask[idx2]) continue;
-                try transform.appendByIndices(self.allocator, v, probe_rows, &self.output_columns[out_idx]);
+                try transform.appendByIndices(alloc, v, probe_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
         } else {
             var i: usize = 0;
             while (i < left_count) : (i += 1) {
-                try transform.appendByIndices(self.allocator, batch.values[i], probe_rows, &self.output_columns[out_idx]);
+                try transform.appendByIndices(alloc, batch.values[i], probe_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
             for (self.build_columns, 0..) |*bc, idx2| {
                 if (!self.right_kept_mask[idx2]) continue;
-                try self.gatherBuildColumn(bc.view(), build_rows, &self.output_columns[out_idx]);
+                try gatherBuildColumn(alloc, bc.view(), build_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
         }
-        return try self.flushOutput();
+    }
+
+    // -----------------------------------------------------------------
+    // Fused parallel probe (ProbeSink implementation): the probe side's
+    // ParallelScan workers call sinkProcess concurrently, one in-flight
+    // call per chunk. Everything read here is immutable after the build
+    // phase; all mutation lands in the chunk's own scratches/stores.
+    // -----------------------------------------------------------------
+
+    const ProbeChunk = struct {
+        probe_rows: std.ArrayListUnmanaged(u32) = .empty,
+        build_rows: std.ArrayListUnmanaged(u32) = .empty,
+        out_cols: []ColumnStore = &.{},
+        views: []ColumnView = &.{},
+    };
+
+    fn sinkBind(ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void {
+        const self: *Join = @ptrCast(@alignCast(ctx));
+        self.probe_chunk_alloc = alloc;
+        const chunks = try alloc.alloc(ProbeChunk, n_chunks);
+        var done: usize = 0;
+        errdefer {
+            for (chunks[0..done]) |*ch| freeProbeChunk(alloc, ch);
+            alloc.free(chunks);
+        }
+        for (chunks) |*ch| {
+            ch.* = .{};
+            const cols = try alloc.alloc(ColumnStore, self.output_schema.len);
+            var inited: usize = 0;
+            errdefer {
+                for (cols[0..inited]) |*c| c.deinit(alloc);
+                alloc.free(cols);
+            }
+            for (self.output_schema, cols) |col, *store| {
+                store.* = try ColumnStore.init(alloc, col.type, col.nullable);
+                inited += 1;
+            }
+            ch.out_cols = cols;
+            done += 1;
+            ch.views = try alloc.alloc(ColumnView, self.output_schema.len);
+        }
+        self.probe_chunks = chunks;
+    }
+
+    fn sinkProcess(ctx: *anyopaque, chunk: usize, batch: Batch) anyerror!?Batch {
+        const self: *Join = @ptrCast(@alignCast(ctx));
+        const ch = &self.probe_chunks[chunk];
+        const alloc = self.probe_chunk_alloc;
+        const ft = &self.fast_table.?;
+        try self.collectPairs(ft, batch, alloc, &ch.probe_rows, &ch.build_rows);
+        if (ch.probe_rows.items.len == 0) return null;
+        for (ch.out_cols) |*c| c.clear();
+        try self.gatherPairs(batch, ch.probe_rows.items, ch.build_rows.items, ch.out_cols, alloc);
+        for (ch.out_cols, ch.views) |*c, *v| v.* = c.view();
+        return Batch{
+            .schema = self.output_schema,
+            .values = ch.views,
+            .row_count = ch.out_cols[0].data.rowCount(),
+        };
+    }
+
+    fn freeProbeChunk(alloc: Allocator, ch: *ProbeChunk) void {
+        ch.probe_rows.deinit(alloc);
+        ch.build_rows.deinit(alloc);
+        for (ch.out_cols) |*c| c.deinit(alloc);
+        if (ch.out_cols.len > 0) alloc.free(ch.out_cols);
+        if (ch.views.len > 0) alloc.free(ch.views);
     }
 
     /// Gather build-side rows into `out`, splitting `rows` into runs of
     /// real indices (bulk appendByIndices) and FAST_EMPTY miss runs
     /// (per-row NULL). Inner joins have no miss runs — one bulk call.
-    fn gatherBuildColumn(self: *Join, view: ColumnView, rows: []const u32, out: *ColumnStore) !void {
+    fn gatherBuildColumn(alloc: Allocator, view: ColumnView, rows: []const u32, out: *ColumnStore) !void {
         var start: usize = 0;
         while (start < rows.len) {
             var end = start;
             if (rows[start] == FAST_EMPTY) {
                 while (end < rows.len and rows[end] == FAST_EMPTY) : (end += 1) {}
                 var j = start;
-                while (j < end) : (j += 1) try appendNullTo(self.allocator, out);
+                while (j < end) : (j += 1) try appendNullTo(alloc, out);
             } else {
                 while (end < rows.len and rows[end] != FAST_EMPTY) : (end += 1) {}
-                try transform.appendByIndices(self.allocator, view, rows[start..end], out);
+                try transform.appendByIndices(alloc, view, rows[start..end], out);
             }
             start = end;
         }

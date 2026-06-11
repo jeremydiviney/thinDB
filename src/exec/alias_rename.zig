@@ -27,6 +27,9 @@ pub const AliasRename = struct {
     upstream: Query,
     output_schema: []Column,
     name_storage: []u8,
+    /// A join probe fused below: upstream batches are already joined (join
+    /// output schema, not this wrapper's), so next() passes them through.
+    probe_fused: bool = false,
 
     pub fn create(allocator: Allocator, upstream: Query, alias: []const u8) !Query {
         const up_schema = upstream.outputSchema();
@@ -97,6 +100,12 @@ pub const AliasRename = struct {
         return self.upstream.tryFuseFilter(expr);
     }
 
+    pub fn tryFuseProbe(self: *AliasRename, sink: exec.ProbeSink) !bool {
+        const ok = try self.upstream.tryFuseProbe(sink);
+        if (ok) self.probe_fused = true;
+        return ok;
+    }
+
     pub fn stats(self: *AliasRename) exec.PipelineStats {
         return self.upstream.stats();
     }
@@ -112,6 +121,7 @@ pub const AliasRename = struct {
 
     pub fn next(self: *AliasRename) !?Batch {
         const batch = (try self.upstream.next()) orelse return null;
+        if (self.probe_fused) return batch;
         return Batch{
             .schema = self.output_schema,
             .values = batch.values,

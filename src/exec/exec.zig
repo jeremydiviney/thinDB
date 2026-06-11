@@ -179,6 +179,22 @@ pub const Batch = struct {
 // Query — type-erased operator handle
 // ---------------------------------------------------------------------------
 
+/// Join-probe fusion handle (offered by Join after its build phase, accepted
+/// by an unfused round-mode ParallelScan): the scan workers call `process`
+/// concurrently — at most one in-flight call per chunk index — turning each
+/// scanned probe batch into a joined batch. The returned batch's views alias
+/// the sink's per-chunk buffers and stay valid until the next `process` call
+/// with the same chunk index (the scan's round barrier guarantees the staged
+/// batch is consumed first). `bind` runs once, single-threaded, with the
+/// chunk count and the thread-safe allocator `process` must allocate from.
+pub const ProbeSink = struct {
+    ctx: *anyopaque,
+    bind: *const fn (ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void,
+    /// Returns null when this probe batch produced no output rows (the
+    /// worker pulls the next scan batch); never called on an exhausted chunk.
+    process: *const fn (ctx: *anyopaque, chunk: usize, batch: Batch) anyerror!?Batch,
+};
+
 pub const VTable = struct {
     next: *const fn (ptr: *anyopaque) anyerror!?Batch,
     deinit: *const fn (ptr: *anyopaque) void,
@@ -204,6 +220,12 @@ pub const VTable = struct {
     /// re-aggregates them. Only ParallelScan accepts (and only for combinable
     /// aggregates); every other operator declines via the `@hasDecl` guard.
     tryFuseAggregate: *const fn (ptr: *anyopaque, group_cols: []const []const u8, aggs: []const AggSpec) anyerror!bool,
+    /// Offer a join-probe sink to run inside this operator's parallel workers
+    /// (see `ProbeSink`). Only an unfused round-mode ParallelScan accepts —
+    /// its workers then emit already-joined batches and the offering Join
+    /// becomes a pass-through. AliasRename forwards (turning pass-through
+    /// itself); every other operator declines via the `@hasDecl` guard.
+    tryFuseProbe: *const fn (ptr: *anyopaque, sink: ProbeSink) anyerror!bool,
     /// Offer a full parallel lease GROUP BY replacement to this operator. Only
     /// a directly-adjacent ParallelScan should accept: it can let its scan
     /// workers build radix partitions directly and return a specialized
@@ -374,6 +396,11 @@ pub const Query = struct {
 
     pub fn addPrune(self: *Query, pred: predicate.Predicate) !void {
         return self.vtable.addPrune(self.ptr, pred);
+    }
+
+    /// Offer a join-probe sink for in-worker probing (see `ProbeSink`).
+    pub fn tryFuseProbe(self: Query, sink: ProbeSink) !bool {
+        return self.vtable.tryFuseProbe(self.ptr, sink);
     }
 
     /// Offer `expr` to this operator for in-place filtering. Returns true if
@@ -652,6 +679,11 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.tryFuseAggregate(group_cols, aggs);
         }
+        fn tryFuseProbeWrap(ptr: *anyopaque, sink: ProbeSink) anyerror!bool {
+            if (!@hasDecl(Op, "tryFuseProbe")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.tryFuseProbe(sink);
+        }
         fn tryLeaseGroupByWrap(ptr: *anyopaque, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK, emit_limit: ?u32, dop: usize) anyerror!?Query {
             if (!@hasDecl(Op, "tryLeaseGroupBy")) return null;
             const o: *Op = @ptrCast(@alignCast(ptr));
@@ -708,6 +740,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .tryFuseFilter = tryFuseFilterWrap,
             .tryFuseCompute = tryFuseComputeWrap,
             .tryFuseAggregate = tryFuseAggregateWrap,
+            .tryFuseProbe = tryFuseProbeWrap,
             .tryLeaseGroupBy = tryLeaseGroupByWrap,
             .stats = statsWrap,
             .accountant = accountantWrap,
