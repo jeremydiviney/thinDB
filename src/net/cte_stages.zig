@@ -56,9 +56,52 @@ pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op) anyerror
     errdefer set.deinit();
     var map: StageMap = .empty;
     defer map.deinit(input.allocator);
-    try collectStages(input, root, set, &map);
+    var refs: MatRefCounts = .empty;
+    defer refs.deinit(input.allocator);
+    try countMatRefs(input.allocator, root, &refs);
+    try collectStages(input, root, set, &map, &refs);
     const inner = try compileBlock(input, root, &map);
     return mat_stage.StagedRoot.create(input.allocator, inner, set);
+}
+
+const MatRefCounts = std.AutoHashMapUnmanaged(*const ir.Op, u32);
+
+/// Count how many places in the tree reference each materialize node. A
+/// node referenced once gets no stage — its body compiles inline at the
+/// use site (materializing only to re-read once is a pure copy tax; this
+/// is every FROM-subquery and every NOT MATERIALIZED reference). Shared
+/// nodes (a default/MATERIALIZED CTE referenced 2+ times) keep one stage.
+/// A shared node's subtree is walked once, mirroring collectStages.
+fn countMatRefs(allocator: Allocator, op: *const ir.Op, refs: *MatRefCounts) anyerror!void {
+    switch (op.*) {
+        .materialize => |m| {
+            const gop = try refs.getOrPut(allocator, op);
+            if (gop.found_existing) {
+                gop.value_ptr.* += 1;
+                return;
+            }
+            gop.value_ptr.* = 1;
+            try countMatRefs(allocator, m.upstream, refs);
+        },
+        .select => |p| try countMatRefs(allocator, p.upstream, refs),
+        .exclude => |p| try countMatRefs(allocator, p.upstream, refs),
+        .filter => |f| try countMatRefs(allocator, f.upstream, refs),
+        .order_by => |o| try countMatRefs(allocator, o.upstream, refs),
+        .group_by => |g| try countMatRefs(allocator, g.upstream, refs),
+        .compute => |c| try countMatRefs(allocator, c.upstream, refs),
+        .alias => |a| try countMatRefs(allocator, a.upstream, refs),
+        .limit => |l| try countMatRefs(allocator, l.upstream, refs),
+        .window => |w| try countMatRefs(allocator, w.upstream, refs),
+        .join => |j| {
+            try countMatRefs(allocator, j.left, refs);
+            try countMatRefs(allocator, j.right, refs);
+        },
+        .set_union => |u| {
+            try countMatRefs(allocator, u.left, refs);
+            try countMatRefs(allocator, u.right, refs);
+        },
+        else => {},
+    }
 }
 
 /// Post-order walk: a stage's own upstream stages exist (and are compiled)
@@ -68,31 +111,36 @@ fn collectStages(
     op: *const ir.Op,
     set: *mat_stage.StageSet,
     map: *StageMap,
+    refs: *const MatRefCounts,
 ) anyerror!void {
     switch (op.*) {
         .materialize => |m| {
             if (map.contains(op)) return; // shared CTE: one stage, many readers
-            try collectStages(input, m.upstream, set, map);
+            try collectStages(input, m.upstream, set, map, refs);
+            // Single reference → no stage; the body compiles inline at the
+            // use site (buildGenericBlock's .materialize arm). Inner shared
+            // nodes were still collected by the recursion above.
+            if ((refs.get(op) orelse 1) <= 1) return;
             const q = try compileBlock(input, m.upstream, map);
             const stage = try set.addStage(q);
             try map.put(input.allocator, op, stage);
         },
-        .select => |p| try collectStages(input, p.upstream, set, map),
-        .exclude => |p| try collectStages(input, p.upstream, set, map),
-        .filter => |f| try collectStages(input, f.upstream, set, map),
-        .order_by => |o| try collectStages(input, o.upstream, set, map),
-        .group_by => |g| try collectStages(input, g.upstream, set, map),
-        .compute => |c| try collectStages(input, c.upstream, set, map),
-        .alias => |a| try collectStages(input, a.upstream, set, map),
-        .limit => |l| try collectStages(input, l.upstream, set, map),
-        .window => |w| try collectStages(input, w.upstream, set, map),
+        .select => |p| try collectStages(input, p.upstream, set, map, refs),
+        .exclude => |p| try collectStages(input, p.upstream, set, map, refs),
+        .filter => |f| try collectStages(input, f.upstream, set, map, refs),
+        .order_by => |o| try collectStages(input, o.upstream, set, map, refs),
+        .group_by => |g| try collectStages(input, g.upstream, set, map, refs),
+        .compute => |c| try collectStages(input, c.upstream, set, map, refs),
+        .alias => |a| try collectStages(input, a.upstream, set, map, refs),
+        .limit => |l| try collectStages(input, l.upstream, set, map, refs),
+        .window => |w| try collectStages(input, w.upstream, set, map, refs),
         .join => |j| {
-            try collectStages(input, j.left, set, map);
-            try collectStages(input, j.right, set, map);
+            try collectStages(input, j.left, set, map, refs);
+            try collectStages(input, j.right, set, map, refs);
         },
         .set_union => |u| {
-            try collectStages(input, u.left, set, map);
-            try collectStages(input, u.right, set, map);
+            try collectStages(input, u.left, set, map, refs);
+            try collectStages(input, u.right, set, map, refs);
         },
         else => {},
     }
@@ -161,9 +209,12 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
 
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
     switch (op.*) {
-        .materialize => {
-            const stage = map.get(op) orelse return error.UnsupportedQueryShape;
-            return mat_stage.MatScan.create(input.allocator, stage);
+        .materialize => |m| {
+            // In the map = shared (staged once, read here). Absent = single
+            // reference: stream the body inline — no stage copy + re-read,
+            // and a table-backed body keeps its full V2 handlers.
+            if (map.get(op)) |stage| return mat_stage.MatScan.create(input.allocator, stage);
+            return compileBlock(input, m.upstream, map);
         },
         .alias => |a| {
             var up = try buildGenericBlock(input, a.upstream, map, block_root);

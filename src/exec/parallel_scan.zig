@@ -186,6 +186,10 @@ pub const ParallelScan = struct {
     // sink's per-chunk buffers make staged batches round-stable, same as the
     // bare scans' scratch. Mutually exclusive with every other fusion.
     probe_sink: ?exec.ProbeSink = null,
+    /// Per-chunk view scratch for sink.probe_map (a narrowing Project on
+    /// the probe side): batch values are remapped into the chunk's slice
+    /// before the sink sees them. Empty when the map is identity.
+    probe_map_views: [][]ColumnView = &.{},
 
     /// Build a parallel scan over `table` projecting `needed` (null = all
     /// columns), with up to `max_dop` workers. Always returns a valid operator:
@@ -343,6 +347,10 @@ pub const ParallelScan = struct {
         }
         if (self.wbufs.len > 0) self.allocator.free(self.wbufs);
         if (self.emit_views.len > 0) self.allocator.free(self.emit_views);
+        if (self.probe_map_views.len > 0) {
+            for (self.probe_map_views) |s| self.allocator.free(s);
+            self.allocator.free(self.probe_map_views);
+        }
 
         // Ownership split (compute-fused path): scans [0..compute_built) are
         // owned by their per-worker Compute (compute_q) and freed by its deinit;
@@ -447,10 +455,33 @@ pub const ParallelScan = struct {
         if (self.mode != .unset) return false;
         if (self.agg_fused or self.compute_fused) return false;
         if (self.emit_keep != null or self.owns_out_schema) return false;
+        if (sink.probe_map) |m| {
+            const slices = try self.allocator.alloc([]ColumnView, self.workers.len);
+            var built: usize = 0;
+            errdefer {
+                for (slices[0..built]) |s| self.allocator.free(s);
+                self.allocator.free(slices);
+            }
+            for (slices) |*s| {
+                s.* = try self.allocator.alloc(ColumnView, m.len);
+                built += 1;
+            }
+            self.probe_map_views = slices;
+        }
         try sink.bind(sink.ctx, self.workers.len, self.table.allocator);
         self.probe_sink = sink;
         self.out_schema = sink.out_schema;
         return true;
+    }
+
+    /// Apply the sink's probe-side column remap (if any) so the sink's
+    /// compiled indices address the batch the way the declining Project
+    /// would have presented it.
+    fn remapProbeBatch(self: *ParallelScan, sink: exec.ProbeSink, chunk: usize, batch: Batch) Batch {
+        const m = sink.probe_map orelse return batch;
+        const vs = self.probe_map_views[chunk];
+        for (m, vs) |src, *v| v.* = batch.values[src];
+        return .{ .schema = batch.schema, .values = vs, .row_count = batch.row_count };
     }
 
     pub fn tryFuseAggregate(self: *ParallelScan, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
@@ -855,7 +886,7 @@ pub const ParallelScan = struct {
                 self.round[i] = null;
                 return;
             };
-            const joined = sink.process(sink.ctx, i, batch) catch |e| {
+            const joined = sink.process(sink.ctx, i, self.remapProbeBatch(sink, i, batch)) catch |e| {
                 self.werr[i] = e;
                 return;
             };
@@ -966,7 +997,8 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
             lease = sched.acquire();
             leased = true;
         }
-        drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, self.probe_sink, i, &self.wbufs[i], &self.werr[i]);
+        const remap: ?[]ColumnView = if (self.probe_map_views.len > 0) self.probe_map_views[i] else null;
+        drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, self.probe_sink, i, remap, &self.wbufs[i], &self.werr[i]);
     }
 }
 
@@ -977,7 +1009,7 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
 /// be thread-safe (the table allocator) — workers run concurrently and never
 /// touch the query accountant. `drainable` is `*Scan` or `Query`; both expose
 /// `.next()`, so this is monomorphized per call site.
-fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, keep: ?[]const usize, sink: ?exec.ProbeSink, chunk: usize, wb: *WorkerBuf, out_err: *?anyerror) void {
+fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, keep: ?[]const usize, sink: ?exec.ProbeSink, chunk: usize, probe_remap: ?[]ColumnView, wb: *WorkerBuf, out_err: *?anyerror) void {
     var d = drainable;
     const cols = alloc.alloc(ColumnStore, schema.len) catch |e| {
         out_err.* = e;
@@ -1012,7 +1044,13 @@ fn drainWorker(drainable: anytype, alloc: Allocator, schema: []const Column, kee
             // Probe-fused drain: the sink turns the scanned batch into a
             // joined batch (aliasing its per-chunk staging, schema =
             // `out_schema` = the join's) which we deep-copy like any other.
-            const joined = s.process(s.ctx, chunk, batch) catch |e| {
+            var pbatch = batch;
+            if (s.probe_map) |m| {
+                const vs = probe_remap.?;
+                for (m, vs) |src, *v| v.* = batch.values[src];
+                pbatch = .{ .schema = batch.schema, .values = vs, .row_count = batch.row_count };
+            }
+            const joined = s.process(s.ctx, chunk, pbatch) catch |e| {
                 out_err.* = e;
                 break :outer;
             };

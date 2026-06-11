@@ -28,6 +28,9 @@ pub const Project = struct {
     owned_names: ?[][]u8 = null,
     column_map: []usize, // output_idx → upstream_idx
     views: []ColumnView,
+    /// Join probe fused below (identity projection only): batches arrive
+    /// already joined; next() passes them through unmapped.
+    probe_fused: bool = false,
     /// Upstream per-column stats remapped to the projected columns (a
     /// passed-through column keeps its ndv + min/max). Empty when the
     /// upstream has none. Cached at create.
@@ -147,8 +150,31 @@ pub const Project = struct {
         try self.upstream.explain(out, allocator, depth + 1);
     }
 
+    /// Forward a join-probe offer downward. The Join resolved its probe
+    /// key/gather indices against OUR output order, so a narrowing or
+    /// reordering projection hands the accepting scan its column_map via
+    /// `sink.probe_map` — the scan remaps each batch's values before the
+    /// sink sees them, replacing the remap next() would have done. Declines
+    /// when a map is already set (chained projections; rare, not composed).
+    pub fn tryFuseProbe(self: *Project, sink: exec.ProbeSink) !bool {
+        var fwd = sink;
+        const identity = blk: {
+            if (self.column_map.len != self.upstream.outputSchema().len) break :blk false;
+            for (self.column_map, 0..) |src, dst| if (src != dst) break :blk false;
+            break :blk true;
+        };
+        if (!identity) {
+            if (sink.probe_map != null) return false;
+            fwd.probe_map = self.column_map;
+        }
+        const ok = try self.upstream.tryFuseProbe(fwd);
+        if (ok) self.probe_fused = true;
+        return ok;
+    }
+
     pub fn next(self: *Project) !?Batch {
         const batch = (try self.upstream.next()) orelse return null;
+        if (self.probe_fused) return batch;
         for (self.column_map, 0..) |src_idx, dst_idx| {
             self.views[dst_idx] = batch.values[src_idx];
         }

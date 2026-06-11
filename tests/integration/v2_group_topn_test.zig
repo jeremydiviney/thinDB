@@ -259,9 +259,10 @@ test "V2 staged CTEs: chained boundaries materialize, group, filter, sort" {
 }
 
 test "V2 staged CTEs: stats and sort order cross the materialize boundary" {
-    // The boundary must not be a stats black hole: the outer GROUP BY routes
-    // on the CTE body's propagated bounds. A body sorted on the group key
-    // streams (StreamAggregate) instead of hashing, and the root's row bound
+    // A single-reference CTE compiles INLINE (no stage/MatScan — the body
+    // streams straight into the outer block), so the outer GROUP BY routes
+    // on the body's native stats: a body sorted on the group key streams
+    // (StreamAggregate) instead of hashing, and the root's row bound
     // reflects the body's, not maxInt.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -284,7 +285,7 @@ test "V2 staged CTEs: stats and sort order cross the materialize boundary" {
     defer plan.deinit(allocator);
     try q.cq.query.explain(&plan, allocator, 0);
     try std.testing.expect(std.mem.indexOf(u8, plan.items, "StreamAggregate") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plan.items, "MatScan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.items, "MatScan") == null);
 
     var tags: std.ArrayList(u8) = .empty;
     defer tags.deinit(allocator);

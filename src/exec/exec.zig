@@ -192,6 +192,11 @@ pub const ProbeSink = struct {
     /// The join's output schema — what `process`-returned batches carry.
     /// A materialize-mode acceptor re-types its drain buffers with this.
     out_schema: []const Column,
+    /// Probe-side column remap (probe-schema idx → scan-batch idx), set by
+    /// a narrowing Project forwarding the offer downward. The accepting
+    /// scan applies it to each batch's values BEFORE calling `process`, so
+    /// the sink's compiled indices stay valid. Null = identity.
+    probe_map: ?[]const usize = null,
     bind: *const fn (ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void,
     /// Returns null when this probe batch produced no output rows (the
     /// worker pulls the next scan batch); never called on an exhausted chunk.
