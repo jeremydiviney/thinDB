@@ -3629,6 +3629,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                 .columns = cols,
                 .order_key = ct.order_key,
                 .unique = true,
+                .compression = ct.compression orelse types.default_table_compression,
             };
             const opts: TableOptions = .{
                 .order_key = ct.order_key,

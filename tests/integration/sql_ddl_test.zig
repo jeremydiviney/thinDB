@@ -746,3 +746,29 @@ test "sql replace: non-unique table appends rows" {
     try std.testing.expectEqual(@as(i32, 10), b.values[0].data.int[0]);
     try std.testing.expectEqual(@as(i32, 99), b.values[0].data.int[1]);
 }
+
+test "sql ddl: CREATE TABLE PROPERTIES sets table compression" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE z (id BIGINT PRIMARY KEY) PROPERTIES (\"compression\" = \"ZSTD\")");
+    try exec(allocator, db, "CREATE TABLE n (id BIGINT PRIMARY KEY) PROPERTIES ('compression' = 'none')");
+    try exec(allocator, db, "CREATE TABLE d (id BIGINT PRIMARY KEY)");
+
+    const tz = try db.openTable("z", .{});
+    try std.testing.expectEqual(thindb.types.TableCompression.zstd, tz.schema.compression);
+    const tn = try db.openTable("n", .{});
+    try std.testing.expectEqual(thindb.types.TableCompression.none, tn.schema.compression);
+    const td = try db.openTable("d", .{});
+    try std.testing.expectEqual(thindb.types.default_table_compression, td.schema.compression);
+
+    var bad = runSql(allocator, db, "CREATE TABLE x (id BIGINT PRIMARY KEY) PROPERTIES ('compression' = 'brotli')");
+    if (bad) |*q| {
+        q.deinit();
+        return error.TestExpectedError;
+    } else |_| {}
+}

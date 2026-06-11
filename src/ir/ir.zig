@@ -54,7 +54,8 @@ const exec_expr = @import("../exec/expr.zig");
 pub const Expr = exec_expr.Expr;
 
 pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
-pub const version: u16 = 4;
+/// v5: create_table carries a table-compression byte.
+pub const version: u16 = 5;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -144,6 +145,8 @@ pub const CreateTable = struct {
     is_temp: bool = false,
     columns: []const ColumnDef,
     order_key: []const []const u8,
+    /// From `PROPERTIES ("compression" = "...")`; null = table default (lz4).
+    compression: ?types.TableCompression = null,
 };
 
 pub const DropTable = struct {
@@ -1183,6 +1186,8 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
                 try appendU32(allocator, out, @intCast(k.len));
                 try out.appendSlice(allocator, k);
             }
+            // 255 = unset (table default); else types.TableCompression.
+            try out.append(allocator, if (ct.compression) |comp| @intFromEnum(comp) else 255);
         },
         .drop_table => |dt| {
             try out.append(allocator, @intFromEnum(DdlTag.drop_table));
@@ -2205,12 +2210,17 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             const keys = try allocator.alloc([]const u8, nkeys);
             errdefer allocator.free(keys);
             for (keys) |*k| k.* = try readString(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const comp_byte = bytes[cursor.*];
+            cursor.* += 1;
+            if (comp_byte != 255 and comp_byte > @intFromEnum(types.TableCompression.lz4)) return Error.IrCorrupt;
             break :blk DdlOp{ .create_table = .{
                 .table = ref,
                 .if_not_exists = ine,
                 .is_temp = is_temp,
                 .columns = cols,
                 .order_key = keys,
+                .compression = if (comp_byte == 255) null else @enumFromInt(comp_byte),
             } };
         },
         .drop_table => blk: {

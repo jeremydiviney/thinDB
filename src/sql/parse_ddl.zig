@@ -163,6 +163,35 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     }
     try p.expect(.rparen);
 
+    // StarRocks-style trailing options: PROPERTIES ("key" = "value", ...).
+    // Recognized keys error on bad values; unknown keys are rejected so a
+    // typo'd option never silently no-ops.
+    var compression: ?types.TableCompression = null;
+    if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "properties")) {
+        try p.advance();
+        try p.expect(.lparen);
+        while (true) {
+            const key = try parsePropertyText(p);
+            try p.expect(.eq);
+            const value = try parsePropertyText(p);
+            if (std.ascii.eqlIgnoreCase(key, "compression")) {
+                compression = if (std.ascii.eqlIgnoreCase(value, "none"))
+                    .none
+                else if (std.ascii.eqlIgnoreCase(value, "zstd"))
+                    .zstd
+                else if (std.ascii.eqlIgnoreCase(value, "lz4"))
+                    .lz4
+                else
+                    return PE.SqlInvalidProjection;
+            } else {
+                return PE.SqlInvalidProjection;
+            }
+            if (p.cur.tag != .comma) break;
+            try p.advance();
+        }
+        try p.expect(.rparen);
+    }
+
     // Tolerate trailing engine-options noise like `ENGINE=...` / `CHARSET=...`
     // by eating any tokens up to EOF or semicolon. Keeps MySQL clients happy.
     while (p.cur.tag != .eof and p.cur.tag != .semicolon) {
@@ -189,7 +218,23 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
         .is_temp = is_temp,
         .columns = owned_cols,
         .order_key = order_key,
+        .compression = compression,
     } } });
+}
+
+/// One PROPERTIES key or value. The MySQL dialect lexes `"compression"` as a
+/// string literal while PG/neutral lexes it as a quoted identifier — accept
+/// both, plus bare identifiers. Returned text borrows the parser arena.
+fn parsePropertyText(p: anytype) ![]const u8 {
+    const PE = @TypeOf(p.*).Err;
+    const text = switch (p.cur.tag) {
+        .string => p.cur.value.string,
+        .identifier => p.cur.text,
+        else => return PE.SqlExpectedIdent,
+    };
+    const owned = try p.arena.dupe(u8, text);
+    try p.advance();
+    return owned;
 }
 
 pub fn parseDropTableBody(p: anytype) !*ir.Op {
