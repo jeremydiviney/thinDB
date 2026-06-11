@@ -227,7 +227,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // call columns appended.
             var up = try compileBlock(input, w.upstream, map);
             errdefer up.deinit();
-            return up.window(w.specs, w.calls);
+            return up.window(w.specs, w.calls, input.db.config.max_dop);
         },
         .join => |j| {
             var left = try compileJoinChild(input, j.left, map);

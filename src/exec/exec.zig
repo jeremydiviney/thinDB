@@ -578,12 +578,15 @@ pub const Query = struct {
     /// specifications referenced by `calls`; `calls` carry a `spec_idx`
     /// into `specs`. Operator sorts the input once per spec and
     /// evaluates all calls sharing that spec in a single sweep.
+    /// `dop` > 1 lets a partitioned spec over a large input sort and
+    /// evaluate its partition buckets on that many worker threads.
     pub fn window(
         self: Query,
         specs: []const @import("../ir/ir.zig").WindowSpec,
         calls: []const @import("../ir/ir.zig").WindowCall,
+        dop: usize,
     ) !Query {
-        return @import("window.zig").Window.create(self.allocator, self, specs, calls);
+        return @import("window.zig").Window.create(self.allocator, self, specs, calls, dop);
     }
 
     /// Inner equi-join with `other`. Output schema is this side's

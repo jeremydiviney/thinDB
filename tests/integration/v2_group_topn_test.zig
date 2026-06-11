@@ -748,6 +748,58 @@ test "V2 staged window: LAG/ROW_NUMBER with partition, multi-spec, tie determini
     for (prevs.items, expected_prev) |got, want| try std.testing.expectEqual(want, got);
 }
 
+test "V2 staged window: parallel partition buckets match analytic expectations" {
+    // 100K rows / 1000 partitions with max_dop=4 crosses the operator's
+    // parallel_min_rows gate, exercising the hash-scatter bucket path:
+    // parallel key fill, bucket sort, per-bucket partition walks, and the
+    // atomic validity writes (every partition's first LAG row is NULL,
+    // scattered across shared bitmap bytes).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE big (id BIGINT PRIMARY KEY, p INT NOT NULL, o BIGINT NOT NULL)");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var first = true;
+    for (0..1000) |p| {
+        buf.clearRetainingCapacity();
+        try buf.appendSlice(allocator, "INSERT INTO big VALUES ");
+        for (0..100) |o| {
+            if (!first) try buf.appendSlice(allocator, ",");
+            first = false;
+            var row: [64]u8 = undefined;
+            try buf.appendSlice(allocator, try std.fmt.bufPrint(&row, "({d},{d},{d})", .{ p * 1000 + o, p, o }));
+        }
+        first = true;
+        try exec(allocator, db, buf.items);
+    }
+    const t = try db.openTable("big", .{});
+    try t.flush();
+
+    // ROW_NUMBER within each partition must equal o+1 for every row.
+    const rn_bad = try helpers.collectBigints(allocator, db,
+        "SELECT COUNT(*) FROM (SELECT o + 1 AS want, ROW_NUMBER() OVER (PARTITION BY p ORDER BY o) AS rn FROM big) t WHERE rn <> want");
+    defer allocator.free(rn_bad);
+    try std.testing.expectEqualSlices(i64, &[_]i64{0}, rn_bad);
+
+    // LAG(id) must be id-1 within a partition and NULL at each partition's
+    // first row — exactly 1000 NULLs.
+    const lag_bad = try helpers.collectBigints(allocator, db,
+        "SELECT COUNT(*) FROM (SELECT o, id - 1 AS idm, LAG(id, 1) OVER (PARTITION BY p ORDER BY o) AS prev FROM big) t " ++
+            "WHERE (o = 0 AND prev IS NOT NULL) OR (o > 0 AND prev <> idm)");
+    defer allocator.free(lag_bad);
+    try std.testing.expectEqualSlices(i64, &[_]i64{0}, lag_bad);
+
+    const lag_nulls = try helpers.collectBigints(allocator, db,
+        "SELECT COUNT(*) FROM (SELECT o, LAG(id, 1) OVER (PARTITION BY p ORDER BY o) AS prev FROM big) t WHERE prev IS NULL");
+    defer allocator.free(lag_nulls);
+    try std.testing.expectEqualSlices(i64, &[_]i64{1000}, lag_nulls);
+}
+
 test "V2 staged window: RANK + QUALIFY above a grouped block" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

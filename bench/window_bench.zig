@@ -108,7 +108,7 @@ fn runWindow(
 ) !u64 {
     const t0 = Io.Clock.awake.now(io);
     var base = try thindb.scan(allocator, t);
-    var q = try base.window(specs, calls);
+    var q = try base.window(specs, calls, 1);
     defer q.deinit();
     var checksum: i64 = 0;
     while (try q.next()) |b| {

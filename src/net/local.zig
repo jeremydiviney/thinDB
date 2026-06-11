@@ -2015,7 +2015,7 @@ pub fn buildServerQuerySession(
         .window => |w| blk: {
             var upstream = try buildServerQuerySession(allocator, db, session, w.upstream.*);
             errdefer upstream.deinit();
-            break :blk try upstream.window(w.specs, w.calls);
+            break :blk try upstream.window(w.specs, w.calls, db.config.max_dop);
         },
         .set_union => |u| blk: {
             const left_q = try buildServerQuerySession(allocator, db, session, u.left.*);
@@ -3504,7 +3504,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .window => |w| blk: {
             var upstream = try compileOp(ctx, w.upstream);
             errdefer upstream.deinit();
-            break :blk try upstream.window(w.specs, w.calls);
+            break :blk try upstream.window(w.specs, w.calls, ctx.db.config.max_dop);
         },
         .set_union => |u| blk: {
             const left_q = try compileOp(ctx, u.left);

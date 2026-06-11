@@ -83,6 +83,10 @@ pub const Window = struct {
     string_outputs: [][]?[]const u8,
     accumulated_rows: u64 = 0,
 
+    /// Worker-thread budget for the partitioned parallel sort/eval path.
+    /// 1 = fully serial (embedded default — no surprise threads).
+    dop: usize = 1,
+
     // Batch emit state — emits input + output in original order.
     emit_offset: usize = 0,
     out_input_columns: []ColumnStore,  // staging for input cols per batch
@@ -137,6 +141,7 @@ pub const Window = struct {
         upstream: Query,
         specs: []const ir.WindowSpec,
         calls: []const ir.WindowCall,
+        dop: usize,
     ) !Query {
         const input_schema = upstream.outputSchema();
 
@@ -253,6 +258,7 @@ pub const Window = struct {
             .out_input_columns = out_input_columns,
             .out_output_columns = out_output_columns,
             .views = views,
+            .dop = @max(1, dop),
         };
         return makeQuery(allocator, self);
     }
@@ -363,6 +369,7 @@ pub const Window = struct {
 
     fn drainAndEvaluate(self: *Window) !void {
         // Drain upstream into accumulated.
+        const _dt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         const row_bytes = exec.memory.estimateRowBytes(self.input_schema);
         const acc = self.upstream.accountant();
         while (try self.upstream.next()) |batch| {
@@ -374,6 +381,7 @@ pub const Window = struct {
             }
             self.accumulated_rows += batch.row_count;
         }
+        if (exec.prof.enabled) exec.prof.addPhase("window.drain", @intCast(@max(0, exec.prof.nowTicks() - _dt)));
         const n: usize = @intCast(self.accumulated_rows);
         if (n == 0) {
             self.drained = true;
@@ -399,55 +407,287 @@ pub const Window = struct {
         }
 
         // For each spec, build a permutation and evaluate all its calls.
+        // A partitioned spec over a large input takes the bucket-parallel
+        // path: partitions are independent, so hash-scattering them across
+        // buckets lets `dop` workers sort and evaluate with no coordination.
         for (self.spec_indices, 0..) |si, spec_i| {
+            if (si.partition_cols.len > 0 and n >= parallel_min_rows and self.dop > 1) {
+                try self.evaluateSpecParallel(si, spec_i, n);
+                continue;
+            }
             const perm = try self.buildPermutation(si);
             defer self.allocator.free(perm);
+            const _et = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             for (self.call_plans, 0..) |plan, ci| {
                 if (plan.spec_idx != spec_i) continue;
                 try self.evaluateCall(plan, ci, perm, si);
             }
+            if (exec.prof.enabled) exec.prof.addPhase("window.eval", @intCast(@max(0, exec.prof.nowTicks() - _et)));
         }
 
         self.drained = true;
+    }
+
+    /// Below this many rows the parallel path's scatter + spawn overhead
+    /// outweighs the sort it splits.
+    const parallel_min_rows: usize = 65536;
+
+    /// Partition-bucket parallel sort + evaluation for one spec:
+    ///   A (parallel) fill composite keys per row range + count rows per
+    ///     (worker, bucket) — bucket = partition-digest low bits, so a
+    ///     partition never spans buckets;
+    ///   B (serial) exclusive prefix over the counts → per-worker write
+    ///     cursors + bucket extents;
+    ///   C (parallel) place pairs bucket-major;
+    ///   D (parallel) workers claim buckets: sort the bucket, write its
+    ///     perm slice, walk its partitions, evaluate every call of the
+    ///     spec. Output cells land at original row indices — disjoint
+    ///     across buckets (validity bit bytes excepted; those writes are
+    ///     atomic RMW in setValid/setNull).
+    fn evaluateSpecParallel(self: *Window, si: SpecIndices, spec_i: usize, n: usize) !void {
+        const workers: usize = @min(@max(self.dop, 2), 32);
+        const bucket_count: usize = @min(@as(usize, 256), std.math.ceilPowerOfTwoAssert(usize, workers * 4));
+
+        const acc = self.upstream.accountant();
+        const scratch_bytes = n * (2 * @sizeOf(KeyIdx) + @sizeOf(u32));
+        if (acc) |a| try a.reserve(.window, scratch_bytes);
+        defer if (acc) |a| a.release(.window, scratch_bytes);
+
+        const pairs = try self.allocator.alloc(KeyIdx, n);
+        defer self.allocator.free(pairs);
+        const placed = try self.allocator.alloc(KeyIdx, n);
+        defer self.allocator.free(placed);
+        const perm = try self.allocator.alloc(u32, n);
+        defer self.allocator.free(perm);
+        const counts = try self.allocator.alloc(usize, workers * bucket_count);
+        defer self.allocator.free(counts);
+        @memset(counts, 0);
+        const bucket_offsets = try self.allocator.alloc(usize, bucket_count + 1);
+        defer self.allocator.free(bucket_offsets);
+
+        var job = SpecParJob{
+            .win = self,
+            .si = si,
+            .spec_i = spec_i,
+            .n = n,
+            .workers = workers,
+            .bucket_count = bucket_count,
+            .pairs = pairs,
+            .placed = placed,
+            .perm = perm,
+            .counts = counts,
+            .bucket_offsets = bucket_offsets,
+        };
+
+        const _kt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        runRangePhase(&job, SpecParJob.phaseKeys);
+        if (exec.prof.enabled) exec.prof.addPhase("window.par_keys", @intCast(@max(0, exec.prof.nowTicks() - _kt)));
+
+        var off: usize = 0;
+        for (0..bucket_count) |b| {
+            bucket_offsets[b] = off;
+            for (0..workers) |w| {
+                const c = counts[w * bucket_count + b];
+                counts[w * bucket_count + b] = off;
+                off += c;
+            }
+        }
+        bucket_offsets[bucket_count] = off;
+
+        const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        runRangePhase(&job, SpecParJob.phasePlace);
+        const _bt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        if (exec.prof.enabled) exec.prof.addPhase("window.par_place", @intCast(@max(0, _bt - _pt)));
+        runBucketPhase(&job);
+        if (exec.prof.enabled) exec.prof.addPhase("window.par_sort_eval", @intCast(@max(0, exec.prof.nowTicks() - _bt)));
+
+        if (job.err) |e| return e;
+    }
+
+    const SpecParJob = struct {
+        win: *Window,
+        si: SpecIndices,
+        spec_i: usize,
+        n: usize,
+        workers: usize,
+        bucket_count: usize,
+        pairs: []KeyIdx,
+        placed: []KeyIdx,
+        perm: []u32,
+        /// Phase A: per-(worker, bucket) row counts; phase B turns them
+        /// into per-worker write cursors for phase C.
+        counts: []usize,
+        bucket_offsets: []usize,
+        next_bucket: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+        err_mutex: std.atomic.Mutex = .unlocked,
+        err: ?anyerror = null,
+
+        fn range(self: *const SpecParJob, w: usize) struct { lo: usize, hi: usize } {
+            const chunk = (self.n + self.workers - 1) / self.workers;
+            const lo = @min(w * chunk, self.n);
+            return .{ .lo = lo, .hi = @min(lo + chunk, self.n) };
+        }
+
+        fn phaseKeys(self: *SpecParJob, w: usize) void {
+            const r = self.range(w);
+            self.win.fillKeys(self.si, self.pairs, r.lo, r.hi);
+            const my = self.counts[w * self.bucket_count ..][0..self.bucket_count];
+            const mask: u64 = @intCast(self.bucket_count - 1);
+            for (self.pairs[r.lo..r.hi]) |kp| my[@intCast(kp.hi & mask)] += 1;
+        }
+
+        fn phasePlace(self: *SpecParJob, w: usize) void {
+            const r = self.range(w);
+            const my = self.counts[w * self.bucket_count ..][0..self.bucket_count];
+            const mask: u64 = @intCast(self.bucket_count - 1);
+            for (self.pairs[r.lo..r.hi]) |kp| {
+                const b: usize = @intCast(kp.hi & mask);
+                self.placed[my[b]] = kp;
+                my[b] += 1;
+            }
+        }
+
+        fn phaseBuckets(self: *SpecParJob) void {
+            const spec = self.win.specs[self.spec_i];
+            while (!self.failed.load(.acquire)) {
+                const b = self.next_bucket.fetchAdd(1, .monotonic);
+                if (b >= self.bucket_count) return;
+                const lo = self.bucket_offsets[b];
+                const hi = self.bucket_offsets[b + 1];
+                if (lo == hi) continue;
+                const slice = self.placed[lo..hi];
+                std.sort.pdq(KeyIdx, slice, self.win.sortCtx(self.si), SpecSortCtx.pairLess);
+                for (self.perm[lo..hi], slice) |*p, kp| p.* = kp.idx;
+                var p_start = lo;
+                while (p_start < hi) {
+                    const p_end = partitionEnd(self.win.accumulated, self.si.partition_cols, self.perm[0..hi], p_start);
+                    for (self.win.call_plans, 0..) |plan, ci| {
+                        if (plan.spec_idx != self.spec_i) continue;
+                        const cell: OutCell = .{
+                            .column = &self.win.output_columns[ci],
+                            .string_scratch = if (self.win.string_outputs[ci].len > 0) self.win.string_outputs[ci] else null,
+                        };
+                        self.win.evaluateOnePartition(plan, spec, self.si, self.perm[0..hi], p_start, p_end, cell) catch |e| return self.fail(e);
+                    }
+                    p_start = p_end;
+                }
+            }
+        }
+
+        fn fail(self: *SpecParJob, e: anyerror) void {
+            while (!self.err_mutex.tryLock()) std.atomic.spinLoopHint();
+            if (self.err == null) self.err = e;
+            self.err_mutex.unlock();
+            self.failed.store(true, .release);
+        }
+    };
+
+    /// Run a per-worker-range phase on `workers` lanes: spawn workers-1
+    /// threads, run the rest inline (covers spawn failure by absorbing the
+    /// unspawned ranges), join.
+    fn runRangePhase(job: *SpecParJob, comptime phase: fn (*SpecParJob, usize) void) void {
+        var threads: [32]std.Thread = undefined;
+        var spawned: usize = 0;
+        while (spawned < job.workers - 1) {
+            threads[spawned] = std.Thread.spawn(.{}, phase, .{ job, spawned }) catch break;
+            spawned += 1;
+        }
+        var w = spawned;
+        while (w < job.workers) : (w += 1) phase(job, w);
+        for (threads[0..spawned]) |t| t.join();
+    }
+
+    fn runBucketPhase(job: *SpecParJob) void {
+        var threads: [32]std.Thread = undefined;
+        var spawned: usize = 0;
+        while (spawned < job.workers - 1) {
+            threads[spawned] = std.Thread.spawn(.{}, SpecParJob.phaseBuckets, .{job}) catch break;
+            spawned += 1;
+        }
+        SpecParJob.phaseBuckets(job);
+        for (threads[0..spawned]) |t| t.join();
+    }
+
+    /// One row's precomputed composite sort key + original row index. The
+    /// key is an order-CONSISTENT prefix of the spec's full (partition,
+    /// order) comparison — it may tie where the real comparator wouldn't,
+    /// but it never contradicts it. `hi` is the partition-key digest (any
+    /// consistent partition order is valid — partitions are independent —
+    /// but a digest tie falls back to comparing the real partition columns
+    /// FIRST, so two digest-colliding partitions can never interleave).
+    /// `lo` is the order-normalized first ORDER BY column. Most comparisons
+    /// resolve on the two integers; ties run the exact column chain with an
+    /// arrival-order tiebreak (deterministic output under unstable pdq).
+    const KeyIdx = struct { hi: u64, lo: u64, idx: u32 };
+
+    const SpecSortCtx = struct {
+        cols: []const ColumnStore,
+        part: []const usize,
+        order: []const usize,
+        desc: []const bool,
+
+        pub fn pairLess(ctx: @This(), a: KeyIdx, b: KeyIdx) bool {
+            if (a.hi != b.hi) return a.hi < b.hi;
+            for (ctx.part) |ci| {
+                const ord = transform.compareInColumn(ctx.cols[ci], a.idx, b.idx);
+                if (ord == .lt) return true;
+                if (ord == .gt) return false;
+            }
+            if (a.lo != b.lo) return a.lo < b.lo;
+            for (ctx.order, 0..) |ci, i| {
+                const ord = transform.compareInColumn(ctx.cols[ci], a.idx, b.idx);
+                if (ord == .lt) return !ctx.desc[i];
+                if (ord == .gt) return ctx.desc[i];
+            }
+            return a.idx < b.idx;
+        }
+    };
+
+    fn sortCtx(self: *Window, si: SpecIndices) SpecSortCtx {
+        return .{
+            .cols = self.accumulated,
+            .part = si.partition_cols,
+            .order = si.order_cols,
+            .desc = si.order_desc,
+        };
+    }
+
+    /// Fill `pairs[lo..hi]` with each row's composite key. Free function of
+    /// row ranges so the parallel path can shard it across workers.
+    fn fillKeys(self: *Window, si: SpecIndices, pairs: []KeyIdx, lo: usize, hi: usize) void {
+        const has_part = si.partition_cols.len > 0;
+        const order0: ?usize = if (si.order_cols.len > 0) si.order_cols[0] else null;
+        var i = lo;
+        while (i < hi) : (i += 1) {
+            const row: u32 = @intCast(i);
+            var khi: u64 = 0;
+            var klo: u64 = 0;
+            if (has_part) {
+                var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+                for (si.partition_cols) |ci| digestCell(&h, self.accumulated[ci], row);
+                khi = h.final();
+                if (order0) |oc| klo = orderPrefix(self.accumulated[oc], row, si.order_desc[0]);
+            } else if (order0) |oc| {
+                khi = orderPrefix(self.accumulated[oc], row, si.order_desc[0]);
+            }
+            pairs[i] = .{ .hi = khi, .lo = klo, .idx = row };
+        }
     }
 
     fn buildPermutation(self: *Window, si: SpecIndices) ![]u32 {
         const n: usize = @intCast(self.accumulated_rows);
         const perm = try self.allocator.alloc(u32, n);
         errdefer self.allocator.free(perm);
-        for (perm, 0..) |*p, i| p.* = @intCast(i);
-
-        const Ctx = struct {
-            cols: []const ColumnStore,
-            part: []const usize,
-            order: []const usize,
-            desc: []const bool,
-
-            pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
-                for (ctx.part) |ci| {
-                    const ord = transform.compareInColumn(ctx.cols[ci], a, b);
-                    if (ord == .lt) return true;
-                    if (ord == .gt) return false;
-                }
-                for (ctx.order, 0..) |ci, i| {
-                    const ord = transform.compareInColumn(ctx.cols[ci], a, b);
-                    if (ord == .lt) return !ctx.desc[i];
-                    if (ord == .gt) return ctx.desc[i];
-                }
-                // Tied (partition, order) keys fall back to arrival order:
-                // pdq is unstable, and without this LAG/FIRST_VALUE across a
-                // tie would be free to differ run-to-run. SQL permits that,
-                // but deterministic output is worth one comparison on ties.
-                return a < b;
-            }
-        };
-
-        std.sort.pdq(u32, perm, Ctx{
-            .cols = self.accumulated,
-            .part = si.partition_cols,
-            .order = si.order_cols,
-            .desc = si.order_desc,
-        }, Ctx.lessThan);
+        const pairs = try self.allocator.alloc(KeyIdx, n);
+        defer self.allocator.free(pairs);
+        const _kt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        self.fillKeys(si, pairs, 0, n);
+        const _st = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        if (exec.prof.enabled) exec.prof.addPhase("window.keys", @intCast(@max(0, _st - _kt)));
+        std.sort.pdq(KeyIdx, pairs, self.sortCtx(si), SpecSortCtx.pairLess);
+        if (exec.prof.enabled) exec.prof.addPhase("window.sort", @intCast(@max(0, exec.prof.nowTicks() - _st)));
+        for (perm, pairs) |*p, kp| p.* = kp.idx;
         return perm;
     }
 
@@ -1515,18 +1755,107 @@ fn isValid(view: ColumnView, row: u32) bool {
     return true;
 }
 
+/// Map row `row` of an ORDER BY column to a u64 whose unsigned order never
+/// CONTRADICTS `transform.compareInColumn` on that column: norm(a) < norm(b)
+/// implies real(a) < real(b). Ties are allowed (string 8-byte prefixes,
+/// i128 high halves) — the caller's fallback comparator resolves them.
+/// Mirrors the comparator exactly: validity is NOT consulted (NULL slots
+/// order by their raw placeholder values), floats use `floatOrder` (every
+/// NaN equal-and-largest, -0 == +0). `desc` inverts the mapping.
+fn orderPrefix(col: ColumnStore, row: u32, desc: bool) u64 {
+    const SIGN64: u64 = 1 << 63;
+    const norm: u64 = switch (col.data) {
+        .int => |l| @as(u64, @bitCast(@as(i64, l.items[row]))) ^ SIGN64,
+        .bigint => |l| @as(u64, @bitCast(l.items[row])) ^ SIGN64,
+        .boolean => |l| @as(u64, l.items[row]),
+        .tinyint => |l| @as(u64, @bitCast(@as(i64, l.items[row]))) ^ SIGN64,
+        .smallint => |l| @as(u64, @bitCast(@as(i64, l.items[row]))) ^ SIGN64,
+        .date => |l| @as(u64, @bitCast(@as(i64, l.items[row]))) ^ SIGN64,
+        .datetime => |l| @as(u64, @bitCast(l.items[row])) ^ SIGN64,
+        .decimal64 => |l| @as(u64, @bitCast(l.items[row])) ^ SIGN64,
+        .largeint => |l| @truncate((@as(u128, @bitCast(l.items[row])) ^ (@as(u128, 1) << 127)) >> 64),
+        .decimal128 => |l| @truncate((@as(u128, @bitCast(l.items[row])) ^ (@as(u128, 1) << 127)) >> 64),
+        .uuid => |l| @truncate(l.items[row] >> 64),
+        .float => |l| floatNorm(@as(f64, l.items[row])),
+        .double => |l| floatNorm(l.items[row]),
+        .varchar, .string, .char => |s| stringPrefix(s.rowBytesWide(row)),
+    };
+    return if (desc) ~norm else norm;
+}
+
+/// IEEE order-normalization matching `types.floatOrder`: every NaN maps to
+/// the single largest code (floatOrder treats all NaNs as equal-largest),
+/// -0.0 canonicalizes to +0.0 (they compare equal), everything else uses
+/// the sign-fold bit trick.
+fn floatNorm(v: f64) u64 {
+    if (std.math.isNan(v)) return std.math.maxInt(u64);
+    const c: f64 = if (v == 0) 0 else v;
+    const bits: u64 = @bitCast(c);
+    return if (bits & (1 << 63) != 0) ~bits else bits | (1 << 63);
+}
+
+/// First 8 bytes big-endian, zero-padded — preserves `std.mem.order` for
+/// everything the prefix can see; equal prefixes fall back.
+fn stringPrefix(bytes: []const u8) u64 {
+    var k: u64 = 0;
+    const n = @min(bytes.len, 8);
+    for (bytes[0..n], 0..) |c, j| k |= @as(u64, c) << @intCast(56 - j * 8);
+    return k;
+}
+
+/// Fold row `row` of a PARTITION BY column into a digest. Requirement is
+/// equality-consistency only (equal values per `compareInColumn` ⇒ equal
+/// digest): canonical widths for the int family, NaN/-0 canonicalized for
+/// floats, length-prefixed bytes for strings (guards multi-column chains).
+fn digestCell(h: *std.hash.Wyhash, col: ColumnStore, row: u32) void {
+    switch (col.data) {
+        .int => |l| hashInt(h, @as(i64, l.items[row])),
+        .bigint => |l| hashInt(h, l.items[row]),
+        .boolean => |l| hashInt(h, @as(i64, l.items[row])),
+        .tinyint => |l| hashInt(h, @as(i64, l.items[row])),
+        .smallint => |l| hashInt(h, @as(i64, l.items[row])),
+        .date => |l| hashInt(h, @as(i64, l.items[row])),
+        .datetime => |l| hashInt(h, l.items[row]),
+        .decimal64 => |l| hashInt(h, l.items[row]),
+        .largeint => |l| hashI128(h, l.items[row]),
+        .decimal128 => |l| hashI128(h, l.items[row]),
+        .uuid => |l| h.update(std.mem.asBytes(&l.items[row])),
+        .float => |l| hashInt(h, @as(i64, @bitCast(floatNorm(@as(f64, l.items[row]))))),
+        .double => |l| hashInt(h, @as(i64, @bitCast(floatNorm(l.items[row])))),
+        .varchar, .string, .char => |s| {
+            const bytes = s.rowBytesWide(row);
+            var len: u64 = bytes.len;
+            h.update(std.mem.asBytes(&len));
+            h.update(bytes);
+        },
+    }
+}
+
+fn hashInt(h: *std.hash.Wyhash, v: i64) void {
+    h.update(std.mem.asBytes(&v));
+}
+
+fn hashI128(h: *std.hash.Wyhash, v: i128) void {
+    h.update(std.mem.asBytes(&v));
+}
+
+// Validity writes are atomic RMW: the parallel eval path has workers from
+// different partition buckets setting bits that share a byte (8 rows/byte,
+// bucket membership is hash-scattered over original row indices). Value
+// slots are per-row distinct memory and need no synchronization. Uncontended
+// lock-or is a few ns — noise next to the cell write it accompanies.
 fn setNull(out: *ColumnStore, row: u32) void {
     const nb = if (out.nulls) |*n| n else return;
     const byte_idx = row >> 3;
     const bit: u3 = @intCast(row & 7);
-    nb.items[byte_idx] &= ~(@as(u8, 1) << bit);
+    _ = @atomicRmw(u8, &nb.items[byte_idx], .And, ~(@as(u8, 1) << bit), .monotonic);
 }
 
 fn setValid(out: *ColumnStore, row: u32) void {
     const nb = if (out.nulls) |*n| n else return;
     const byte_idx = row >> 3;
     const bit: u3 = @intCast(row & 7);
-    nb.items[byte_idx] |= (@as(u8, 1) << bit);
+    _ = @atomicRmw(u8, &nb.items[byte_idx], .Or, @as(u8, 1) << bit, .monotonic);
 }
 
 fn writeBigint(out: *ColumnStore, row: u32, v: i64) !void {
