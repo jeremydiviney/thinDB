@@ -2989,6 +2989,81 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
 
 /// Names a single-scan query references, or null to keep all columns.
 /// The strings are borrowed from the IR; caller owns the outer slice.
+/// Column names a window operator's INPUT must carry: everything the ops
+/// ABOVE `win` reference (window output passes every input column through)
+/// plus the window's own partition/order/argument columns. Used by the
+/// staged compiler to prune the below-window block — without it a fused
+/// filter's column (often a wide string) rides through the blocking
+/// accumulate/sort/emit for nothing. Over-collection is safe (pruning
+/// keeps a superset); returns null when `win` wasn't found on a linear
+/// path or a shape above it wasn't fully accounted for — caller skips
+/// pruning. Caller owns the slice.
+pub fn windowInputNames(allocator: Allocator, root: *const ir.Op, win: *const ir.Op) ?[][]const u8 {
+    var c = ProjScan{};
+    const found = walkAboveWindow(&c, allocator, root, win);
+    if (!found or c.bail) {
+        c.names.deinit(allocator);
+        return null;
+    }
+    return c.names.toOwnedSlice(allocator) catch null;
+}
+
+fn walkAboveWindow(c: *ProjScan, allocator: Allocator, op: *const ir.Op, win: *const ir.Op) bool {
+    if (c.bail) return false;
+    if (op == win) {
+        const w = op.window;
+        for (w.specs) |sp| {
+            for (sp.partition_by) |nm| c.add(allocator, nm);
+            for (sp.order_by) |so| c.add(allocator, so.col);
+        }
+        for (w.calls) |call| {
+            for (call.args) |a| projWalkExpr(c, allocator, a);
+        }
+        return true;
+    }
+    switch (op.*) {
+        .select => |p| {
+            for (p.columns) |nm| {
+                if (std.mem.eql(u8, nm, "*") or aliasStarSource(nm) != null) {
+                    c.bail = true;
+                    return false;
+                }
+                c.add(allocator, nm);
+            }
+            return walkAboveWindow(c, allocator, p.upstream, win);
+        },
+        .filter => |f| {
+            projWalkPredicate(c, allocator, f.predicate);
+            return walkAboveWindow(c, allocator, f.upstream, win);
+        },
+        .order_by => |o| {
+            for (o.specs) |sp| c.add(allocator, sp.col);
+            return walkAboveWindow(c, allocator, o.upstream, win);
+        },
+        .group_by => |g| {
+            for (g.group_cols) |nm| c.add(allocator, nm);
+            for (g.aggs) |a| {
+                if (a.col) |nm| c.add(allocator, nm);
+                for (a.udf_arg_cols) |nm| c.add(allocator, nm);
+            }
+            return walkAboveWindow(c, allocator, g.upstream, win);
+        },
+        .compute => |cmp| {
+            for (cmp.derived) |d| projWalkExpr(c, allocator, d.expr);
+            return walkAboveWindow(c, allocator, cmp.upstream, win);
+        },
+        .alias => |a| return walkAboveWindow(c, allocator, a.upstream, win),
+        .limit => |l| return walkAboveWindow(c, allocator, l.upstream, win),
+        // `exclude` ("all but these") can't be expressed as a keep-set;
+        // anything else above a window is a shape this walker doesn't
+        // understand. Keep every column.
+        else => {
+            c.bail = true;
+            return false;
+        },
+    }
+}
+
 fn analyzeProjection(allocator: Allocator, root: *const ir.Op) ?[][]const u8 {
     var c = ProjScan{};
     projWalkOp(&c, allocator, root);

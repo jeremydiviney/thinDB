@@ -218,11 +218,100 @@ pub const ColumnStore = struct {
         }
     }
 
+    /// Bulk-append `n` validity bits starting at row `dst_start`, copied
+    /// from a packed source bitmap (bit i = source row i) or all-valid when
+    /// `src_nulls` is null. Equivalent to `n` `appendValidBit` calls — the
+    /// per-row loop dominated large accumulations (a window drain appends
+    /// tens of millions of bits). Relies on the bitmap invariant that bits
+    /// at or above the current row count are 0 (append-only growth zeroes
+    /// new bytes and nothing sets bits past the end), so OR-merging shifted
+    /// source bytes is exact: source 0-bits (NULLs) stay 0.
+    pub fn appendValidityRange(
+        self: *ColumnStore,
+        allocator: Allocator,
+        dst_start: usize,
+        src_nulls: ?[]const u8,
+        n: usize,
+    ) !void {
+        const nb = self.nullsPtr() orelse return;
+        if (n == 0) return;
+        const need = (dst_start + n + 7) / 8;
+        if (nb.items.len < need) try nb.appendNTimes(allocator, 0, need - nb.items.len);
+        const dst = nb.items;
+        const src = src_nulls orelse {
+            setBitRangeTrue(dst, dst_start, n);
+            return;
+        };
+        const shift: u3 = @intCast(dst_start & 7);
+        const db = dst_start >> 3;
+        const src_bytes = (n + 7) / 8;
+        var k: usize = 0;
+        while (k < src_bytes) : (k += 1) {
+            var b = src[k];
+            if (k == src_bytes - 1) {
+                const keep: u3 = @intCast(n & 7);
+                if (keep != 0) b &= (@as(u8, 1) << keep) - 1;
+            }
+            dst[db + k] |= b << shift;
+            if (shift != 0 and db + k + 1 < dst.len) {
+                dst[db + k + 1] |= b >> @intCast(8 - @as(u4, shift));
+            }
+        }
+    }
+
     fn nullsPtr(self: *ColumnStore) ?*std.ArrayList(u8) {
         if (self.nulls) |_| return &self.nulls.?;
         return null;
     }
 };
+
+fn setBitRangeTrue(bytes: []u8, start: usize, n: usize) void {
+    var i = start;
+    const end = start + n;
+    while (i < end and (i & 7) != 0) : (i += 1) bytes[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
+    while (i + 8 <= end) : (i += 8) bytes[i >> 3] = 0xFF;
+    while (i < end) : (i += 1) bytes[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
+}
+
+test "appendValidityRange matches per-bit appends across alignments" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xfeedface);
+    const rand = prng.random();
+    inline for (.{ 0, 1, 3, 7, 8, 13 }) |dst_start| {
+        inline for (.{ 1, 5, 8, 9, 64, 200 }) |n| {
+            var src_bits: [32]u8 = undefined;
+            rand.bytes(&src_bits);
+
+            var bulk = try ColumnStore.init(allocator, .{ .bigint = {} }, true);
+            defer bulk.deinit(allocator);
+            var perbit = try ColumnStore.init(allocator, .{ .bigint = {} }, true);
+            defer perbit.deinit(allocator);
+            // Seed dst_start leading bits identically via the per-bit path.
+            for (0..dst_start) |i| {
+                const v = rand.boolean();
+                try bulk.appendValidBit(allocator, i, v);
+                try perbit.appendValidBit(allocator, i, v);
+            }
+
+            try bulk.appendValidityRange(allocator, dst_start, &src_bits, n);
+            for (0..n) |i| {
+                const v = src_bits[i >> 3] & (@as(u8, 1) << @intCast(i & 7)) != 0;
+                try perbit.appendValidBit(allocator, dst_start + i, v);
+            }
+            try std.testing.expectEqualSlices(u8, perbit.nulls.?.items, bulk.nulls.?.items);
+
+            // All-valid source (null bitmap).
+            var bulk2 = try ColumnStore.init(allocator, .{ .bigint = {} }, true);
+            defer bulk2.deinit(allocator);
+            try bulk2.appendValidityRange(allocator, dst_start, null, n);
+            for (0..dst_start + n) |i| {
+                const expected = i >= dst_start;
+                const got = bulk2.nulls.?.items[i >> 3] & (@as(u8, 1) << @intCast(i & 7)) != 0;
+                try std.testing.expectEqual(expected, got);
+            }
+        }
+    }
+}
 
 pub const DataStore = union(TypeTag) {
     int: std.ArrayList(i32),

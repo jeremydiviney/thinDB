@@ -409,7 +409,8 @@ pub const Window = struct {
                 try self.evaluateSpecParallel(si, spec_i, n);
                 continue;
             }
-            const perm = if (si.partition_cols.len == 0 and n >= parallel_min_rows and self.dop > 1)
+            const global_par = si.partition_cols.len == 0 and n >= parallel_min_rows and self.dop > 1;
+            const perm = if (global_par)
                 try self.buildPermutationSamplesort(si, n)
             else
                 try self.buildPermutation(si);
@@ -417,7 +418,16 @@ pub const Window = struct {
             const _et = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             for (self.call_plans, 0..) |plan, ci| {
                 if (plan.spec_idx != spec_i) continue;
-                try self.evaluateCall(plan, ci, perm, si);
+                // Position-pure calls over the single global partition
+                // shard their OUTPUT range across workers (full-perm
+                // visibility makes offsets and rank walk-backs local);
+                // state-carrying calls (dense_rank, running aggregates,
+                // distribution functions) stay serial.
+                if (global_par and globalCallParallel(plan)) {
+                    try self.evaluateCallGlobalParallel(plan, ci, perm, si, n);
+                } else {
+                    try self.evaluateCall(plan, ci, perm, si);
+                }
             }
             if (exec.prof.enabled) exec.prof.addPhase("window.eval", @intCast(@max(0, exec.prof.nowTicks() - _et)));
         }
@@ -697,6 +707,99 @@ pub const Window = struct {
         return perm;
     }
 
+    fn globalCallParallel(plan: CallPlan) bool {
+        return switch (plan.func) {
+            .row_number, .rank, .lag, .lead => true,
+            else => false,
+        };
+    }
+
+    /// Shard one position-pure call's output range over the global (single-
+    /// partition) perm across `dop` workers. ROW_NUMBER is its position;
+    /// RANK walks back from the range start to its peer-run start (worst
+    /// case all-tied keys degenerates to overlapping walks — a degenerate
+    /// query shape, still correct); LAG/LEAD read neighbors through the
+    /// full perm.
+    fn evaluateCallGlobalParallel(self: *Window, plan: CallPlan, out_idx: usize, perm: []const u32, si: SpecIndices, n: usize) !void {
+        const cell: OutCell = .{
+            .column = &self.output_columns[out_idx],
+            .string_scratch = if (self.string_outputs[out_idx].len > 0) self.string_outputs[out_idx] else null,
+        };
+        var job = GlobalEvalJob{
+            .win = self,
+            .si = si,
+            .plan = plan,
+            .cell = cell,
+            .perm = perm,
+            .n = n,
+            .workers = @min(@max(self.dop, 2), 32),
+        };
+        var threads: [32]std.Thread = undefined;
+        var spawned: usize = 0;
+        while (spawned < job.workers - 1) {
+            threads[spawned] = std.Thread.spawn(.{}, GlobalEvalJob.worker, .{ &job, spawned }) catch break;
+            spawned += 1;
+        }
+        var w = spawned;
+        while (w < job.workers) : (w += 1) GlobalEvalJob.worker(&job, w);
+        for (threads[0..spawned]) |t| t.join();
+        if (job.err) |e| return e;
+    }
+
+    const GlobalEvalJob = struct {
+        win: *Window,
+        si: SpecIndices,
+        plan: CallPlan,
+        cell: OutCell,
+        perm: []const u32,
+        n: usize,
+        workers: usize,
+        err_mutex: std.atomic.Mutex = .unlocked,
+        err: ?anyerror = null,
+
+        fn worker(self: *GlobalEvalJob, w: usize) void {
+            const chunk = (self.n + self.workers - 1) / self.workers;
+            const lo = @min(w * chunk, self.n);
+            const hi = @min(lo + chunk, self.n);
+            if (lo >= hi) return;
+            self.run(lo, hi) catch |e| {
+                while (!self.err_mutex.tryLock()) std.atomic.spinLoopHint();
+                if (self.err == null) self.err = e;
+                self.err_mutex.unlock();
+            };
+        }
+
+        fn run(self: *GlobalEvalJob, lo: usize, hi: usize) !void {
+            switch (self.plan.func) {
+                .row_number => {
+                    var i = lo;
+                    while (i < hi) : (i += 1) {
+                        try writeBigint(self.cell.column, self.perm[i], @intCast(i + 1));
+                    }
+                },
+                .rank => {
+                    const cols = self.win.accumulated;
+                    const oc = self.si.order_cols;
+                    var s = lo;
+                    while (s > 0 and orderEquals(cols, oc, self.perm[s - 1], self.perm[s])) s -= 1;
+                    var prev_rank: i64 = @intCast(s + 1);
+                    var i = lo;
+                    while (i < hi) : (i += 1) {
+                        if (i > 0 and !orderEquals(cols, oc, self.perm[i - 1], self.perm[i])) {
+                            prev_rank = @intCast(i + 1);
+                        } else if (i == 0) {
+                            prev_rank = 1;
+                        }
+                        try writeBigint(self.cell.column, self.perm[i], prev_rank);
+                    }
+                },
+                .lag => try self.win.fillLagLeadRange(self.plan, self.perm, 0, self.n, lo, hi, self.cell, true),
+                .lead => try self.win.fillLagLeadRange(self.plan, self.perm, 0, self.n, lo, hi, self.cell, false),
+                else => unreachable,
+            }
+        }
+    };
+
     /// Run a per-worker-range phase on `workers` lanes: spawn workers-1
     /// threads, run the rest inline (covers spawn failure by absorbing the
     /// unspawned ranges), join.
@@ -862,11 +965,29 @@ pub const Window = struct {
         cell: OutCell,
         is_lag: bool,
     ) !void {
+        return self.fillLagLeadRange(plan, perm, p_start, p_end, p_start, p_end, cell, is_lag);
+    }
+
+    /// LAG/LEAD over partition bounds [p_start, p_end) writing only output
+    /// positions [out_lo, out_hi) — the parallel global path shards the
+    /// output range across workers while every worker keeps full-partition
+    /// visibility for the offset lookups.
+    fn fillLagLeadRange(
+        self: *Window,
+        plan: CallPlan,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        out_lo: usize,
+        out_hi: usize,
+        cell: OutCell,
+        is_lag: bool,
+    ) !void {
         const offset: i64 = plan.offset;
         const value_col = self.accumulated[plan.value_col];
         const view = value_col.view();
-        var i: usize = p_start;
-        while (i < p_end) : (i += 1) {
+        var i: usize = out_lo;
+        while (i < out_hi) : (i += 1) {
             const orig = perm[i];
             const target_idx: ?usize = if (plan.ignore_nulls)
                 findNthNonNull(view, perm, i, p_start, p_end, offset, is_lag)

@@ -145,11 +145,7 @@ pub fn appendAllColumn(
         },
     }
     if (out.nulls != null) {
-        const n = view.data.rowCount();
-        for (0..n) |i| {
-            const valid = storage.column.isValidBit(view.nulls, i);
-            try out.appendValidBit(allocator, dst_start + i, valid);
-        }
+        try out.appendValidityRange(allocator, dst_start, view.nulls, view.data.rowCount());
     }
 }
 

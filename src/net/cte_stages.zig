@@ -132,7 +132,7 @@ fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap)
         // MatScan / Join / Window leaves. The heavy inputs were already
         // produced by upstream stage handlers or stream in from table-backed
         // child blocks.
-        .mat, .join, .window => buildGenericBlock(input, op, map),
+        .mat, .join, .window => buildGenericBlock(input, op, map, op),
         .unsupported => error.UnsupportedQueryShape,
     };
 }
@@ -156,52 +156,52 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
     return compileBlock(input, op, map);
 }
 
-fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
+fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
     switch (op.*) {
         .materialize => {
             const stage = map.get(op) orelse return error.UnsupportedQueryShape;
             return mat_stage.MatScan.create(input.allocator, stage);
         },
         .alias => |a| {
-            var up = try buildGenericBlock(input, a.upstream, map);
+            var up = try buildGenericBlock(input, a.upstream, map, block_root);
             errdefer up.deinit();
             return exec.AliasRename.create(input.allocator, up, a.alias);
         },
         .filter => |f| {
-            var up = try buildGenericBlock(input, f.upstream, map);
+            var up = try buildGenericBlock(input, f.upstream, map, block_root);
             errdefer up.deinit();
             return up.filter(f.predicate);
         },
         .select => |s| {
-            var up = try buildGenericBlock(input, s.upstream, map);
+            var up = try buildGenericBlock(input, s.upstream, map, block_root);
             errdefer up.deinit();
             return local.compileSelectProject(input.allocator, up, s);
         },
         .exclude => |e| {
-            var up = try buildGenericBlock(input, e.upstream, map);
+            var up = try buildGenericBlock(input, e.upstream, map, block_root);
             errdefer up.deinit();
             const remaining = try local.complementColumns(input.allocator, up.outputSchema(), e.columns);
             defer input.allocator.free(remaining);
             return up.project(remaining);
         },
         .compute => |c| {
-            var up = try buildGenericBlock(input, c.upstream, map);
+            var up = try buildGenericBlock(input, c.upstream, map, block_root);
             errdefer up.deinit();
             return up.compute(c.derived);
         },
         .order_by => |o| {
-            var up = try buildGenericBlock(input, o.upstream, map);
+            var up = try buildGenericBlock(input, o.upstream, map, block_root);
             errdefer up.deinit();
             return up.orderBy(o.specs);
         },
         .limit => |l| {
-            var up = try buildGenericBlock(input, l.upstream, map);
+            var up = try buildGenericBlock(input, l.upstream, map, block_root);
             errdefer up.deinit();
             return up.limitOffset(@intCast(l.n), @intCast(l.offset));
         },
         .group_by => |g| {
             for (g.aggs) |a| if (a.func == .udf) return error.UnsupportedQueryShape;
-            var up = try buildGenericBlock(input, g.upstream, map);
+            var up = try buildGenericBlock(input, g.upstream, map, block_root);
             errdefer up.deinit();
             // The same strategy routing as the table path: a stage that ends
             // sorted on the group keys streams; a proven-over-budget or
@@ -227,6 +227,28 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // call columns appended.
             var up = try compileBlock(input, w.upstream, map);
             errdefer up.deinit();
+            // Prune the window's input to the columns the window or
+            // anything above it references: the below block otherwise
+            // emits its fused-filter columns too (often a wide string),
+            // which would ride the blocking accumulate/sort/emit for
+            // nothing. Skipped when the shape above isn't fully understood.
+            if (local.windowInputNames(input.allocator, block_root, op)) |names| {
+                defer input.allocator.free(names);
+                const schema = up.outputSchema();
+                var kept = try std.ArrayListUnmanaged([]const u8).initCapacity(input.allocator, schema.len);
+                defer kept.deinit(input.allocator);
+                for (schema) |col| {
+                    for (names) |nm| {
+                        if (@import("../types.zig").columnNameEql(col.name, nm)) {
+                            kept.appendAssumeCapacity(col.name);
+                            break;
+                        }
+                    }
+                }
+                if (kept.items.len > 0 and kept.items.len < schema.len) {
+                    up = try up.project(kept.items);
+                }
+            }
             return up.window(w.specs, w.calls, input.db.config.max_dop);
         },
         .join => |j| {
