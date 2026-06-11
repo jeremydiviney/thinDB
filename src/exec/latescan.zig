@@ -267,6 +267,7 @@ pub const LateScan = struct {
 
             switch (bb.encoding) {
                 .dict => try appendDictRows(self.allocator, bb.bytes, rc, flags, offsets, out),
+                .fsst => try appendFsstRows(self.allocator, bb.bytes, rc, flags, offsets, out),
                 .raw => {
                     if (sr.viewRawColumn(col_type, bb.bytes, rc, flags, .raw)) |view| {
                         try engine.transform.appendByIndices(self.allocator, view, offsets, out);
@@ -328,6 +329,47 @@ fn appendDictRows(
             for (offsets) |off| try ss.appendValue(allocator, db.dictValue(db.rowCode(off)));
         },
         else => unreachable, // the writer only dict-encodes string-family columns
+    }
+    if (out.nulls != null) {
+        for (offsets, 0..) |off, j| {
+            try out.appendValidBit(allocator, dst_start + j, storage.column.isValidBit(nulls, off));
+        }
+    }
+}
+
+/// Gather only `offsets`' rows of an FSST-encoded string block into `out`,
+/// decoding just those rows — the whole point of pairing late
+/// materialization with compressed strings: a LIMIT-k query decodes k
+/// strings, not 65,536.
+fn appendFsstRows(
+    allocator: Allocator,
+    raw: []const u8,
+    row_count: u32,
+    flags: storage.format.ColumnBlockFlags,
+    offsets: []const u32,
+    out: *ColumnStore,
+) !void {
+    var values = raw;
+    var nulls: ?[]const u8 = null;
+    if (flags.has_nulls) {
+        const bm = storage.column.bitmapBytes(row_count);
+        nulls = raw[0..bm];
+        values = raw[bm..];
+    }
+    const fb = try storage.segment_reader.fsstBlockOf(values, row_count);
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(allocator);
+    const dst_start = out.data.rowCount();
+    switch (out.data) {
+        .varchar, .string, .char => |*ss| {
+            for (offsets) |off| {
+                const comp = fb.rowComp(off);
+                try scratch.resize(allocator, storage.fsst.decodedSizeBound(comp.len));
+                const n = fb.table.decodeIntoUnchecked(comp, scratch.items);
+                try ss.appendValue(allocator, scratch.items[0..n]);
+            }
+        },
+        else => unreachable, // the writer only FSST-encodes string-family columns
     }
     if (out.nulls != null) {
         for (offsets, 0..) |off, j| {

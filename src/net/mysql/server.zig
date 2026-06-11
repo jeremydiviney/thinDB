@@ -40,6 +40,7 @@ const conn_registry = @import("../conn_registry.zig");
 const oprof = @import("../../util/prof.zig");
 const counting_allocator = @import("../../util/counting_allocator.zig");
 const rg_cache = @import("../../storage/cache.zig");
+const scan_mod = @import("../../exec/scan.zig");
 
 // Previous process-wide cache counters, per connection thread, so the handler
 // can print this query's hit/miss/evict delta under `--profile-ops`.
@@ -2777,6 +2778,18 @@ fn runSingleStatement(
         const hit_pct: f64 = if (total == 0) 0 else @as(f64, @floatFromInt(dh)) * 100.0 / @as(f64, @floatFromInt(total));
         std.debug.print("[rgcache] query: hits={d} misses={d} hit%={d:.1} evictions={d} miss_decompressed_MB={d:.1} cache_live_GB={d:.2}\n", .{ dh, dm, hit_pct, de, @as(f64, @floatFromInt(dmb)) / (1024.0 * 1024.0), @as(f64, @floatFromInt(cs.cache_bytes)) / (1024.0 * 1024.0 * 1024.0) });
         prev_cache_stats = cs;
+        const fd_ticks = scan_mod.g_fsst_digest_ticks.swap(0, .monotonic);
+        if (fd_ticks > 0) {
+            const fd_rows = scan_mod.g_fsst_digest_rows.swap(0, .monotonic);
+            const fd_bytes = scan_mod.g_fsst_digest_bytes.swap(0, .monotonic);
+            const ms = oprof.ticksToMs(@intCast(fd_ticks));
+            std.debug.print("[fsst-digest] cpu_ms={d:.1} rows={d} decoded_MB={d:.1} ({d:.2} GB/s/core-equiv)\n", .{
+                ms,
+                fd_rows,
+                @as(f64, @floatFromInt(fd_bytes)) / (1024.0 * 1024.0),
+                if (ms > 0) @as(f64, @floatFromInt(fd_bytes)) / (ms * 1_000_000.0) else 0,
+            });
+        }
     }
 
     const new_session = compiled.sessionValue();

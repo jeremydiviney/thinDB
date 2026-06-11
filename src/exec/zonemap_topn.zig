@@ -414,6 +414,19 @@ pub const ZonemapTopN = struct {
         var corners: std.ArrayListUnmanaged(i128) = .empty;
         errdefer corners.deinit(self.allocator);
 
+        // ASC string keys whose predicate excludes '' use the blank-excluded
+        // min (the string `Stats.sum` slot): '' is the plain min of nearly
+        // every string column, which makes all corners tie and kills both the
+        // visit order and the early stop. Surviving rows are provably
+        // non-blank, so the nonblank min still lower-bounds every survivor.
+        const use_nonblank = try self.allocator.alloc(bool, self.prefix_len);
+        defer self.allocator.free(use_nonblank);
+        for (0..self.prefix_len) |k| {
+            const col = self.table.schema.columns[self.key_phys[k]];
+            use_nonblank[k] = !self.key_desc[k] and col.type.isString() and
+                predicateExcludesBlank(self.pred, col.name);
+        }
+
         var seg_idx: usize = 0;
         while (seg_idx < self.segment_count) : (seg_idx += 1) {
             const entry = self.table.manifest.segments.items[seg_idx];
@@ -424,7 +437,13 @@ pub const ZonemapTopN = struct {
                 const off = corners.items.len;
                 for (0..self.prefix_len) |k| {
                     const s = rg.stats[self.key_phys[k]];
-                    try corners.append(self.allocator, if (self.key_desc[k]) s.max else s.min);
+                    const corner = if (self.key_desc[k])
+                        s.max
+                    else if (use_nonblank[k])
+                        s.sum
+                    else
+                        s.min;
+                    try corners.append(self.allocator, corner);
                 }
                 try list.append(self.allocator, .{
                     .seg_idx = seg_idx,
@@ -438,6 +457,24 @@ pub const ZonemapTopN = struct {
         errdefer self.allocator.free(refs);
         self.corners = try corners.toOwnedSlice(self.allocator);
         return refs;
+    }
+
+    /// True when `expr` provably excludes the empty string for `col` — no
+    /// surviving row can carry '' there. Conservative: only a top-level AND
+    /// conjunct qualifying under `predicate.leafExcludesBlank` counts;
+    /// anything else — OR branches, NOT, LIKE — returns false.
+    fn predicateExcludesBlank(expr: PredicateExpr, col: []const u8) bool {
+        return switch (expr) {
+            .leaf => |p| types.columnNameEql(p.col, col) and
+                predicate.leafExcludesBlank(p.op, p.val),
+            .@"and" => |children| blk: {
+                for (children) |c| {
+                    if (predicateExcludesBlank(c, col)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
     }
 
     /// The prefix best-corner tuple stored for a row group.
@@ -879,4 +916,27 @@ fn keyValueI128(col: ColumnStore, r: u32) i128 {
         .float => |l| storage.format.encodeFloatOrder(@as(f64, l.items[r])),
         .double => |l| storage.format.encodeFloatOrder(l.items[r]),
     };
+}
+
+test "predicateExcludesBlank accepts only provable non-blank conjuncts" {
+    const t = std.testing;
+    const blank = predicate.leafExpr("s", .neq, .{ .text = "" });
+    try t.expect(ZonemapTopN.predicateExcludesBlank(blank, "s"));
+    try t.expect(!ZonemapTopN.predicateExcludesBlank(blank, "other"));
+
+    try t.expect(ZonemapTopN.predicateExcludesBlank(predicate.leafExpr("s", .gt, .{ .text = "" }), "s"));
+    try t.expect(ZonemapTopN.predicateExcludesBlank(predicate.leafExpr("s", .gt, .{ .text = "m" }), "s"));
+    try t.expect(ZonemapTopN.predicateExcludesBlank(predicate.leafExpr("s", .eq, .{ .text = "x" }), "s"));
+    try t.expect(ZonemapTopN.predicateExcludesBlank(predicate.leafExpr("s", .gte, .{ .text = "a" }), "s"));
+
+    // '' itself satisfies these — must NOT qualify.
+    try t.expect(!ZonemapTopN.predicateExcludesBlank(predicate.leafExpr("s", .eq, .{ .text = "" }), "s"));
+    try t.expect(!ZonemapTopN.predicateExcludesBlank(predicate.leafExpr("s", .gte, .{ .text = "" }), "s"));
+    try t.expect(!ZonemapTopN.predicateExcludesBlank(predicate.leafExpr("s", .lt, .{ .text = "z" }), "s"));
+    try t.expect(!ZonemapTopN.predicateExcludesBlank(predicate.leafExpr("s", .neq, .{ .text = "x" }), "s"));
+
+    // AND: any qualifying conjunct suffices. OR: never.
+    const conj = [_]PredicateExpr{ predicate.leafExpr("k", .gt, .{ .bigint = 5 }), blank };
+    try t.expect(ZonemapTopN.predicateExcludesBlank(.{ .@"and" = &conj }, "s"));
+    try t.expect(!ZonemapTopN.predicateExcludesBlank(.{ .@"or" = &conj }, "s"));
 }

@@ -156,7 +156,7 @@ pub const MinMaxStats = struct {
 };
 
 pub const MetaSpec = struct {
-    kind: enum { count_star, count_col, min, max },
+    kind: enum { count_star, count_col, min, max, sum, avg },
     /// Column index in the table schema. Unused for `count_star`.
     col_idx: usize = 0,
     /// Output column name (the aggregate's alias). Borrowed from the IR.
@@ -164,18 +164,17 @@ pub const MetaSpec = struct {
 };
 
 /// Metadata-only lane for a bare global aggregate: any mix of COUNT(*),
-/// COUNT(non-nullable col) — identical to COUNT(*) since every row counts —
-/// and MIN/MAX over exact-stats columns, with no WHERE / GROUP BY / HAVING /
-/// derived. Counts are exact for ANY table state (tombstones subtract, the
-/// memtable adds). MIN/MAX folds the manifest's per-segment stats, so the
-/// whole query bails to the scan path (`create` returns null) when any
-/// MIN/MAX is present and:
-///   - any segment has tombstones — a deleted row may have been the extreme,
-///     and immutable segment stats can't reflect that;
+/// COUNT(col), MIN/MAX over exact-stats columns, and SUM/AVG over numeric
+/// columns (the per-segment SMA sums, see `format.Stats`), with no WHERE /
+/// GROUP BY / HAVING / derived. COUNT(*) and COUNT(non-nullable col) are
+/// exact for ANY table state (tombstones subtract, the memtable adds). Every
+/// stats-dependent spec — MIN/MAX, SUM/AVG, COUNT(nullable col) via
+/// null_count — makes the whole query bail to the scan path (`create`
+/// returns null) when:
+///   - any segment has tombstones — immutable segment stats can't reflect a
+///     deleted row's contribution;
 ///   - the memtable holds unflushed rows (not in any segment's stats);
 ///   - the table is empty (the normal path emits the documented default).
-/// COUNT(nullable col) also bails: segment stats carry no per-column null
-/// count, so non-null rows can't be counted from metadata.
 ///
 /// Held under the ddl shared lock so compaction can't retire a captured
 /// segment (and its tombstone file) mid-read; the manifest + memtable pair is
@@ -189,13 +188,19 @@ pub const MetaAggStats = struct {
 
     pub fn create(allocator: Allocator, table: *Table, specs: []const MetaSpec) !?Query {
         const cols = table.schema.columns;
-        var any_minmax = false;
+        var needs_stats = false;
         for (specs) |sp| switch (sp.kind) {
             .min, .max => {
                 if (!exactStatsType(cols[sp.col_idx].type)) return null;
-                any_minmax = true;
+                needs_stats = true;
             },
-            .count_col => if (cols[sp.col_idx].nullable) return null,
+            .sum, .avg => {
+                if (!sumStatsType(cols[sp.col_idx].type)) return null;
+                needs_stats = true;
+            },
+            .count_col => if (cols[sp.col_idx].nullable) {
+                needs_stats = true; // non-null rows counted via stats null_count
+            },
             .count_star => {},
         };
 
@@ -213,20 +218,20 @@ pub const MetaAggStats = struct {
             defer table.mutex.unlock(table.io);
             const segs = table.manifest.segments.items;
             n_segs = segs.len;
-            if (any_minmax) {
+            if (needs_stats) {
                 if (n_segs == 0) return null;
                 if (table.memtable.row_count != 0) return null;
                 for (segs) |entry| {
                     if (entry.column_stats.len < cols.len) return null; // v1 manifest
                 }
-                // Snapshot the stats each MIN/MAX spec folds: seg-major,
-                // specs.len per segment.
+                // Snapshot the stats each stats-dependent spec folds:
+                // seg-major, specs.len per segment.
                 col_stats = try allocator.alloc(storage.format.Stats, n_segs * specs.len);
                 for (segs, 0..) |entry, si| {
                     for (specs, 0..) |sp, i| {
                         col_stats[si * specs.len + i] = switch (sp.kind) {
-                            .min, .max => entry.column_stats[sp.col_idx],
-                            else => .{ .min = 0, .max = 0 },
+                            .min, .max, .sum, .avg, .count_col => entry.column_stats[sp.col_idx],
+                            .count_star => .{ .min = 0, .max = 0 },
                         };
                     }
                 }
@@ -242,7 +247,9 @@ pub const MetaAggStats = struct {
             const tombs = try storage.tombstone.read(allocator, table.io, table.segments_dir, segment_id);
             if (tombs) |t| {
                 allocator.free(t);
-                if (any_minmax) return null; // a deleted row may have been the extreme
+                // A deleted row may have been the extreme / part of the sum /
+                // a null_count contributor.
+                if (needs_stats) return null;
                 total -= t.len;
             }
         }
@@ -257,10 +264,60 @@ pub const MetaAggStats = struct {
         for (specs, 0..) |sp, i| {
             switch (sp.kind) {
                 .count_star, .count_col => {
+                    // Nullable COUNT(col): non-null rows = total − Σ null_count
+                    // (stats path, so no tombstones and an empty memtable).
+                    var cnt: u64 = total;
+                    if (sp.kind == .count_col and cols[sp.col_idx].nullable) {
+                        for (0..n_segs) |si| {
+                            cnt -= col_stats[si * specs.len + i].null_count;
+                        }
+                    }
                     out_schema[i] = .{ .name = sp.out_name, .type = .bigint, .nullable = false };
                     out_cols[i] = try ColumnStore.init(allocator, .bigint, false);
                     inited += 1;
-                    try out_cols[i].data.bigint.append(allocator, @intCast(total));
+                    try out_cols[i].data.bigint.append(allocator, @intCast(cnt));
+                },
+                .sum, .avg => {
+                    const col = cols[sp.col_idx];
+                    const is_float = col.type == .float or col.type == .double;
+                    var isum: i128 = 0;
+                    var fsum: f64 = 0;
+                    var non_null: u64 = total;
+                    for (0..n_segs) |si| {
+                        const s = col_stats[si * specs.len + i];
+                        if (is_float) {
+                            fsum += storage.format.f64FromSumSlot(s.sum);
+                        } else {
+                            isum += s.sum;
+                        }
+                        non_null -= s.null_count;
+                    }
+                    if (sp.kind == .avg) {
+                        // Matches the scan path: AVG over zero non-null rows
+                        // emits 0.0.
+                        const dividend: f64 = if (is_float) fsum else @floatFromInt(isum);
+                        const v: f64 = if (non_null == 0) 0.0 else dividend / @as(f64, @floatFromInt(non_null));
+                        out_schema[i] = .{ .name = sp.out_name, .type = .double, .nullable = false };
+                        out_cols[i] = try ColumnStore.init(allocator, .double, false);
+                        inited += 1;
+                        try out_cols[i].data.double.append(allocator, v);
+                    } else if (is_float) {
+                        out_schema[i] = .{ .name = sp.out_name, .type = .double, .nullable = false };
+                        out_cols[i] = try ColumnStore.init(allocator, .double, false);
+                        inited += 1;
+                        try out_cols[i].data.double.append(allocator, fsum);
+                    } else if (col.type == .bigint) {
+                        // SUM(bigint) widens to largeint (aggOutputType).
+                        out_schema[i] = .{ .name = sp.out_name, .type = .largeint, .nullable = false };
+                        out_cols[i] = try ColumnStore.init(allocator, .largeint, false);
+                        inited += 1;
+                        try out_cols[i].data.largeint.append(allocator, isum);
+                    } else {
+                        out_schema[i] = .{ .name = sp.out_name, .type = .bigint, .nullable = false };
+                        out_cols[i] = try ColumnStore.init(allocator, .bigint, false);
+                        inited += 1;
+                        try out_cols[i].data.bigint.append(allocator, @intCast(isum));
+                    }
                 },
                 .min, .max => {
                     const col = cols[sp.col_idx];
@@ -344,6 +401,16 @@ fn exactStatsType(t: Type) bool {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64, .largeint, .decimal128 => true,
         .uuid, .varchar, .string, .char, .float, .double => false,
+    };
+}
+
+/// Types whose `Stats.sum` slot the SUM/AVG metadata lane consumes. Decimals
+/// are excluded (scale handling lives in the scan path — keep one
+/// implementation of it); largeint has no stored sum (i128 overflow).
+fn sumStatsType(t: Type) bool {
+    return switch (t) {
+        .int, .bigint, .smallint, .tinyint, .boolean, .float, .double => true,
+        else => false,
     };
 }
 

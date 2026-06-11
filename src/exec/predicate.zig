@@ -1565,18 +1565,51 @@ pub fn valueToRangeI128(v: Value) ?i128 {
     };
 }
 
+/// True when a `col OP literal` leaf by itself proves the column non-blank —
+/// no row with `''` can satisfy it. `''` is the global string minimum, so any
+/// `>` bound excludes it, and `=`/`>=` with a non-empty literal do too. Used
+/// for cross-leaf blank-aware pruning (a range hint on a column whose other
+/// conjuncts exclude blanks may use the blank-excluded min) and by the
+/// zonemap top-N corner.
+pub fn leafExcludesBlank(op: PredicateOp, v: Value) bool {
+    const txt = switch (v) {
+        .text => |t| t,
+        else => return false,
+    };
+    return switch (op) {
+        .neq => txt.len == 0,
+        .gt => true,
+        .gte, .eq => txt.len > 0,
+        .lt, .lte => false,
+    };
+}
+
 /// Returns true if the row-group stats could contain rows matching `op val`.
 /// Used by Scan and DELETE to decide whether to skip a row group entirely.
-///
+/// Wrapper over `statsOverlapPredicateBlankAware` with no blank-exclusion
+/// proof — the conservative leaf-local form.
+pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value) bool {
+    return statsOverlapPredicateBlankAware(s, op, v, false);
+}
+
 /// Stats are i128 with per-type encoding (see `format.Stats`). The
 /// predicate value is encoded with the same scheme so signed i128
 /// comparison gives the right answer for every type.
 ///
 /// String predicates use the 16-byte prefix encoding. `eq` and the range ops
 /// (lt/lte/gt/gte) prune via the prefix class, staying conservative on a class
-/// tie (prefix loss beyond 16 bytes), so no match is ever wrongly skipped;
-/// `neq` never prunes (values may differ past the prefix).
-pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value) bool {
+/// tie (prefix loss beyond 16 bytes), so no match is ever wrongly skipped.
+/// Strings additionally consult the blank-excluded min (`Stats.sum`):
+///   - its `maxInt` SENTINEL (the range holds no non-blank value) is exact —
+///     no prefix ambiguity — so any op only non-blank rows can satisfy
+///     (`<> ''`, `> x`, `= x`/`>= x` with non-empty x) prunes outright;
+///   - `= x` (non-empty) also prunes when x's class is strictly below the
+///     non-blank min ('' rows can't equal x, so the plain min is noise);
+///   - `< x`/`<= x` may substitute the non-blank min for the plain min ONLY
+///     when `blanks_excluded` proves another conjunct rules out `''` (a blank
+///     row would otherwise satisfy the upper bound). A `sum` of 0 means "no
+///     info" (vestigial empty stats slot) and disables all of the above.
+pub fn statsOverlapPredicateBlankAware(s: storage.format.Stats, op: PredicateOp, v: Value, blanks_excluded: bool) bool {
     const wanted: i128 = switch (v) {
         .int => |x| x,
         .bigint => |x| x,
@@ -1589,18 +1622,34 @@ pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value)
         .largeint, .decimal128 => |x| x,
         .uuid => |x| storage.format.encodeUnsignedU128(x),
         .text => |x| {
-            // Stats are 16-byte prefix classes. Prune only when the literal's
-            // class is strictly outside the row group's [min,max] prefix range
-            // in the relevant direction; stay conservative on a class tie, where
-            // the true order past 16 bytes is unknown. So `lt`/`gt` use the
-            // non-strict `<=`/`>=` (a tied class might still contain a match),
-            // unlike the strict integer forms below.
             const enc = storage.format.encodeStringPrefix(x);
+            const nb_min = s.sum;
+            const nb_known = nb_min != 0;
+            const all_blank = nb_known and nb_min == std.math.maxInt(i128);
             return switch (op) {
-                .eq => enc >= s.min and enc <= s.max,
-                .neq => true, // values may differ past the prefix; never prune
-                .lt, .lte => s.min <= enc,
-                .gt, .gte => s.max >= enc,
+                .eq => blk: {
+                    if (x.len > 0 and nb_known) {
+                        if (all_blank or enc < nb_min) break :blk false;
+                    }
+                    break :blk enc >= s.min and enc <= s.max;
+                },
+                // Values may differ past the prefix — never prune via the
+                // class range. `<> ''` is the exception: the all-blank
+                // sentinel is exact.
+                .neq => !(x.len == 0 and all_blank),
+                .lt, .lte => blk: {
+                    if (blanks_excluded and nb_known) {
+                        if (all_blank) break :blk false;
+                        break :blk nb_min <= enc;
+                    }
+                    break :blk s.min <= enc;
+                },
+                // Any match is > x ≥ '', hence non-blank: the sentinel prunes.
+                .gt => if (all_blank) false else s.max >= enc,
+                .gte => blk: {
+                    if (x.len > 0 and all_blank) break :blk false;
+                    break :blk s.max >= enc;
+                },
             };
         },
         // Floats: encode the literal with the same order-preserving transform as
@@ -1623,4 +1672,79 @@ pub fn statsOverlapPredicate(s: storage.format.Stats, op: PredicateOp, v: Value)
         .gt => s.max > wanted,
         .gte => s.max >= wanted,
     };
+}
+
+test "statsOverlapPredicateBlankAware: blank-excluded min pruning for strings" {
+    const t = std.testing;
+    const enc = storage.format.encodeStringPrefix;
+    const sentinel = std.math.maxInt(i128);
+
+    // A typical string RG: plain min is '' (blanks present), real values in
+    // ["beta", "delta"], so the blank-excluded min is "beta".
+    const rg: storage.format.Stats = .{
+        .min = enc(""),
+        .max = enc("delta"),
+        .sum = enc("beta"),
+    };
+    // An all-blank RG: every value is '' (or NULL) — exact sentinel.
+    const blank_rg: storage.format.Stats = .{
+        .min = enc(""),
+        .max = enc(""),
+        .sum = sentinel,
+    };
+    // Pre-v11-shaped slot: sum = 0 means "no info", everything conservative.
+    const no_info: storage.format.Stats = .{ .min = enc(""), .max = enc("delta") };
+
+    const txt = struct {
+        fn v(s: []const u8) Value {
+            return .{ .text = s };
+        }
+    }.v;
+
+    // eq: a non-empty literal below the non-blank min can't match.
+    try t.expect(!statsOverlapPredicate(rg, .eq, txt("alpha")));
+    try t.expect(statsOverlapPredicate(rg, .eq, txt("beta")));
+    try t.expect(statsOverlapPredicate(rg, .eq, txt("")));
+    try t.expect(statsOverlapPredicate(no_info, .eq, txt("alpha"))); // conservative
+
+    // The all-blank sentinel prunes every only-non-blank-can-match op.
+    try t.expect(!statsOverlapPredicate(blank_rg, .neq, txt("")));
+    try t.expect(!statsOverlapPredicate(blank_rg, .gt, txt("")));
+    try t.expect(!statsOverlapPredicate(blank_rg, .gte, txt("a")));
+    try t.expect(!statsOverlapPredicate(blank_rg, .eq, txt("a")));
+    // ...but blanks themselves still match where they should.
+    try t.expect(statsOverlapPredicate(blank_rg, .eq, txt("")));
+    try t.expect(statsOverlapPredicate(blank_rg, .gte, txt("")));
+    try t.expect(statsOverlapPredicate(blank_rg, .lt, txt("a")));
+    // neq against a non-empty literal never prunes (prefix ambiguity).
+    try t.expect(statsOverlapPredicate(rg, .neq, txt("beta")));
+
+    // lt/lte: leaf-local stays on the plain min ('' matches any upper bound)…
+    try t.expect(statsOverlapPredicate(rg, .lt, txt("alpha")));
+    // …but a cross-leaf blank-exclusion proof switches to the non-blank min.
+    try t.expect(!statsOverlapPredicateBlankAware(rg, .lt, txt("alpha"), true));
+    try t.expect(statsOverlapPredicateBlankAware(rg, .lt, txt("carrot"), true));
+    // Prefix-class tie stays conservative (non-strict compare).
+    try t.expect(statsOverlapPredicateBlankAware(rg, .lte, txt("beta"), true));
+    try t.expect(!statsOverlapPredicateBlankAware(blank_rg, .lt, txt("zzz"), true));
+    try t.expect(statsOverlapPredicateBlankAware(no_info, .lt, txt("alpha"), true)); // no info → conservative
+
+    // gt: blanks never satisfy it, so the sentinel prunes even leaf-locally;
+    // a real upper bound still works off max.
+    try t.expect(statsOverlapPredicate(rg, .gt, txt("carrot")));
+    try t.expect(!statsOverlapPredicate(rg, .gt, txt("delta1"))); // above max class
+}
+
+test "leafExcludesBlank classifies the provable shapes" {
+    const t = std.testing;
+    try t.expect(leafExcludesBlank(.neq, .{ .text = "" }));
+    try t.expect(leafExcludesBlank(.gt, .{ .text = "" }));
+    try t.expect(leafExcludesBlank(.gt, .{ .text = "m" }));
+    try t.expect(leafExcludesBlank(.eq, .{ .text = "x" }));
+    try t.expect(leafExcludesBlank(.gte, .{ .text = "a" }));
+    try t.expect(!leafExcludesBlank(.eq, .{ .text = "" }));
+    try t.expect(!leafExcludesBlank(.gte, .{ .text = "" }));
+    try t.expect(!leafExcludesBlank(.neq, .{ .text = "x" }));
+    try t.expect(!leafExcludesBlank(.lt, .{ .text = "z" }));
+    try t.expect(!leafExcludesBlank(.gt, .{ .bigint = 5 }));
 }

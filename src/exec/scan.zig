@@ -198,6 +198,14 @@ fn resolveOutPhys(
 /// on the normal materialized path.
 const dict_code_max_ndv: u32 = 65536;
 
+/// Process-wide FSST digest-fill accounting (--profile-ops). The fill runs on
+/// silo-grid worker threads whose thread-local oprof slots never reach the
+/// connection thread's dump, so these aggregate atomically; the MySQL handler
+/// prints + resets them per query alongside the rgcache line.
+pub var g_fsst_digest_ticks = std.atomic.Value(u64).init(0);
+pub var g_fsst_digest_rows = std.atomic.Value(u64).init(0);
+pub var g_fsst_digest_bytes = std.atomic.Value(u64).init(0);
+
 pub const Scan = struct {
     allocator: Allocator,
     io: Io,
@@ -442,6 +450,12 @@ pub const Scan = struct {
         col_idx: usize,
         op: PredicateOp,
         val: Value,
+        /// String range hints (`lt`/`lte`) only: another hint on this column
+        /// proves no `''` row can survive the full conjunct set, so the
+        /// overlap test may use the blank-excluded min instead of the plain
+        /// min (which is `''` for nearly every string column). Maintained by
+        /// `addPrune` as hints arrive.
+        blanks_excluded: bool = false,
     };
 
     /// Set-membership (`col IN (...)`) zone-map hint: a row group can be
@@ -1136,19 +1150,41 @@ pub const Scan = struct {
         // anyway, but skipping the append avoids the per-row-group work.
         if (!storage.format.typeHasStats(self.table.schema.columns[col_idx].type)) return;
 
+        // Cross-leaf blank exclusion: prune hints are exactly the top-level
+        // AND conjuncts, so a sibling hint on the same column that rules out
+        // `''` lets a string range hint compare against the blank-excluded
+        // min. Flags flow both ways since hints arrive one at a time; an
+        // upgraded earlier hint gets a second segment-pruning pass (e.g.
+        // `URL < 'x' AND URL <> ''` — the range hint arrives first).
+        var blanks_excluded = false;
+        const new_excludes = predicate.leafExcludesBlank(pred.op, pred.val);
+        for (self.prunes.items) |*h| {
+            if (h.col_idx != col_idx) continue;
+            if (predicate.leafExcludesBlank(h.op, h.val)) blanks_excluded = true;
+            if (new_excludes and !h.blanks_excluded) {
+                h.blanks_excluded = true;
+                try self.segmentPrunePass(h.col_idx, h.op, h.val, true);
+            }
+        }
+
         try self.prunes.append(self.allocator, .{
             .col_idx = col_idx,
             .op = pred.op,
             .val = pred.val,
+            .blanks_excluded = blanks_excluded,
         });
 
-        // Segment-level pruning. The early-return above already proved
-        // this column's type has stats, so any manifest entry carrying
-        // per-column stats (v4+) has a valid slot at `col_idx`. Older
-        // manifests fall back to `leading_key_stats` when the predicate
-        // is on the leading order-key column.
-        const order_key = self.table.schema.order_key;
-        const is_leading = order_key.len > 0 and std.mem.eql(u8, pred.col, order_key[0]);
+        try self.segmentPrunePass(col_idx, pred.op, pred.val, blanks_excluded);
+    }
+
+    /// Segment-level pruning for one hint: mark segments whose manifest stats
+    /// can't match. The caller already proved this column's type has stats,
+    /// so any manifest entry carrying per-column stats (v4+) has a valid slot
+    /// at `col_idx`. Older manifests fall back to `leading_key_stats` when
+    /// the predicate is on the leading order-key column.
+    fn segmentPrunePass(self: *Scan, col_idx: usize, op: PredicateOp, val: Value, blanks_excluded: bool) !void {
+        const order_key_cols = self.table.order_key_indices;
+        const is_leading = order_key_cols.len > 0 and order_key_cols[0] == col_idx;
         const segs = self.table.manifest.segments.items[0..self.segment_count];
         var any_skipped = false;
         var skipped_buf: ?[]bool = self.seg_skip;
@@ -1159,7 +1195,7 @@ pub const Scan = struct {
                 break :blk null;
             };
             const lk = lk_opt orelse continue;
-            if (!statsOverlapPredicate(lk, pred.op, pred.val)) {
+            if (!predicate.statsOverlapPredicateBlankAware(lk, op, val, blanks_excluded)) {
                 if (skipped_buf == null) {
                     const buf = try self.allocator.alloc(bool, self.segment_count);
                     @memset(buf, false);
@@ -1175,7 +1211,7 @@ pub const Scan = struct {
     pub fn rowGroupCanMatch(self: *const Scan, rg: storage.RowGroupMeta) bool {
         for (self.prunes.items) |hint| {
             const col_stats = rg.stats[hint.col_idx];
-            if (!statsOverlapPredicate(col_stats, hint.op, hint.val)) return false;
+            if (!predicate.statsOverlapPredicateBlankAware(col_stats, hint.op, hint.val, hint.blanks_excluded)) return false;
         }
         for (self.in_prunes.items) |hint| {
             const col_stats = rg.stats[hint.col_idx];
@@ -1365,6 +1401,27 @@ pub const Scan = struct {
             defer self.allocator.free(lut);
             for (lut, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
             for (0..rg_count) |i| digests[i] = lut[db.rowCode(i)];
+        } else if (block.encoding == .fsst) {
+            // Plaintext digests off the compressed block via a one-value
+            // scratch — see hashSurvivorsFromBlock for why the digest can't
+            // be over compressed bytes.
+            const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+            const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
+            var scratch: std.ArrayListUnmanaged(u8) = .empty;
+            defer scratch.deinit(self.allocator);
+            var decoded_bytes: u64 = 0;
+            for (0..rg_count) |i| {
+                const comp = fv.block.rowComp(i);
+                try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
+                const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
+                decoded_bytes += n;
+                digests[i] = exec.stringKeyDigest(scratch.items[0..n]);
+            }
+            if (exec.prof.enabled) {
+                _ = g_fsst_digest_ticks.fetchAdd(@intCast(@max(0, exec.prof.nowTicks() - _pt)), .monotonic);
+                _ = g_fsst_digest_rows.fetchAdd(rg_count, .monotonic);
+                _ = g_fsst_digest_bytes.fetchAdd(decoded_bytes, .monotonic);
+            }
         } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
             const sv = switch (view.data) {
                 .varchar, .string, .char => |s| s,
@@ -1890,6 +1947,9 @@ pub const Scan = struct {
                     .text => |t| t,
                     else => return false,
                 };
+                if (block.encoding == .fsst) {
+                    return try evalFsstStringLeaf(self.allocator, block.bytes, rg_count, flags, leaf.op, lit, out);
+                }
                 if (block.encoding != .raw) return false;
                 evalRawStringLeafBlock(block.bytes, rg_count, flags, leaf.op, lit, out);
                 return true;
@@ -1939,6 +1999,49 @@ pub const Scan = struct {
         const _tc = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         try predicate.evaluateMaskWithPred(view, leaf, rg_count, out);
         if (exec.prof.enabled) exec.prof.add("scan.leaf.compare_raw", @intCast(@max(0, exec.prof.nowTicks() - _tc)));
+        return true;
+    }
+
+    /// Evaluate `col =|<> literal` against an FSST-encoded string block in the
+    /// COMPRESSED domain: encode the literal once with the block's symbol
+    /// table (deterministic greedy encode ⇒ equal plaintext ⇔ equal
+    /// compressed bytes under one table), then memcmp each row's compressed
+    /// slice — no decode at all. The common `<> ''` shape degenerates to a
+    /// per-row length check off the offsets. Ordering ops return false
+    /// (compressed bytes don't preserve lex order) and fall back to the
+    /// owned-decode path. NULL rows clear to false (2-valued logic, same as
+    /// the raw/dict leaf paths).
+    fn evalFsstStringLeaf(
+        allocator: Allocator,
+        raw: []const u8,
+        rg_count: u32,
+        flags: storage.format.ColumnBlockFlags,
+        op: predicate.PredicateOp,
+        literal: []const u8,
+        out: []bool,
+    ) !bool {
+        const want_eq = switch (op) {
+            .eq => true,
+            .neq => false,
+            else => return false,
+        };
+        const fv = try storage.segment_reader.fsstViewOf(raw, rg_count, flags);
+
+        var lit_comp: std.ArrayListUnmanaged(u8) = .empty;
+        defer lit_comp.deinit(allocator);
+        try lit_comp.ensureTotalCapacity(allocator, storage.fsst.encodedSizeBound(literal.len));
+        fv.block.table.encodeAppend(literal, &lit_comp);
+        const want = lit_comp.items;
+
+        for (out[0..rg_count], 0..) |*m, i| {
+            const eq = std.mem.eql(u8, fv.block.rowComp(i), want);
+            m.* = (eq == want_eq);
+        }
+        if (fv.nulls != null) {
+            for (0..rg_count) |i| {
+                if (!storage.column.isValidBit(fv.nulls, i)) out[i] = false;
+            }
+        }
         return true;
     }
 
@@ -2472,6 +2575,12 @@ pub const Scan = struct {
                 continue;
             }
 
+            if (block.encoding == .fsst) {
+                const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
+                try self.appendFsstSurvivors(fv, mask, &filtered_cols[j]);
+                continue;
+            }
+
             // Raw block: borrow a native view in place when possible, else fall
             // back to an owned decode just for this column. Both feed the shared
             // masked-compaction.
@@ -2587,6 +2696,23 @@ pub const Scan = struct {
                 digests[k] = lut[db.rowCode(row)];
                 k += 1;
             };
+        } else if (block.encoding == .fsst) {
+            // Digest straight off the compressed rows: decode each survivor
+            // into a one-value scratch — no full-column expansion, no offsets
+            // rebuild. The digest is over PLAINTEXT bytes (it must be a
+            // cross-segment/memtable identity; compressed bytes are only
+            // comparable within one block's table).
+            const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
+            var scratch: std.ArrayListUnmanaged(u8) = .empty;
+            defer scratch.deinit(self.allocator);
+            var k: usize = 0;
+            for (mask, 0..) |m, row| if (m) {
+                const comp = fv.block.rowComp(row);
+                try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
+                const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
+                digests[k] = exec.stringKeyDigest(scratch.items[0..n]);
+                k += 1;
+            };
         } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
             const sv = switch (view.data) {
                 .varchar, .string, .char => |s| s,
@@ -2697,6 +2823,36 @@ pub const Scan = struct {
             for (mask, 0..) |m, src_row| {
                 if (!m) continue;
                 const valid = storage.column.isValidBit(rv.nulls, src_row);
+                try out.appendValidBit(self.allocator, j, valid);
+                j += 1;
+            }
+        }
+    }
+
+    /// Survivor-only FSST expansion: decode just the masked rows off the
+    /// cached compressed block — the full row-group string column never
+    /// materializes. The scratch holds one decoded value at a time.
+    fn appendFsstSurvivors(self: *Scan, fv: storage.segment_reader.FsstView, mask: []const bool, out: *ColumnStore) !void {
+        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+        defer scratch.deinit(self.allocator);
+        switch (out.data) {
+            .varchar, .string, .char => |*ss| {
+                for (mask, 0..) |m, row| {
+                    if (!m) continue;
+                    const comp = fv.block.rowComp(row);
+                    try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
+                    const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
+                    try ss.appendValue(self.allocator, scratch.items[0..n]);
+                }
+            },
+            else => unreachable, // the writer only FSST-encodes string-family columns
+        }
+
+        if (out.nulls != null) {
+            var j: usize = 0;
+            for (mask, 0..) |m, src_row| {
+                if (!m) continue;
+                const valid = storage.column.isValidBit(fv.nulls, src_row);
                 try out.appendValidBit(self.allocator, j, valid);
                 j += 1;
             }

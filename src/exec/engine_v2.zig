@@ -575,13 +575,13 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
     // Metadata-only lane: a bare global aggregate (no WHERE/HAVING/derived)
-    // mixing COUNT(*) / COUNT(col) / MIN(col) / MAX(col) is answerable from
+    // mixing COUNT(*) / COUNT(col) / MIN / MAX / SUM / AVG is answerable from
     // the manifest — segment row counts (− tombstones + memtable) for the
-    // counts, per-segment column stats for the extremes. MetaAggStats.create
-    // owns the data-side preconditions (exact-stats types, non-nullable
-    // COUNT(col), and for MIN/MAX an empty memtable and zero tombstones — a
-    // deleted row may have been the extreme) and returns null to fall through
-    // to the scan pipeline whenever any fails.
+    // counts, per-segment column stats (min/max/sum/null_count) for the rest.
+    // MetaAggStats.create owns the data-side preconditions (exact-stats
+    // types, and for any stats-dependent spec an empty memtable and zero
+    // tombstones) and returns null to fall through to the scan pipeline
+    // whenever any fails.
     if (plan.where_filter == null and plan.having_filter == null and plan.derived.len == 0) {
         if (try tryMetaAggStats(input.allocator, table, plan.group_by.aggs)) |q| return q;
     }
@@ -612,14 +612,17 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 }
 
 // Shape-side gate for the metadata-only lane: every aggregate must be
-// COUNT(*), COUNT(col), MIN(col), or MAX(col) — COUNT(DISTINCT) is a separate
-// AggFunc and never matches. Data-side preconditions live in
+// COUNT(*), COUNT(col), MIN/MAX(col), or SUM/AVG(col) — COUNT(DISTINCT) is a
+// separate AggFunc and never matches. Data-side preconditions live in
 // MetaAggStats.create.
 fn tryMetaAggStats(allocator: std.mem.Allocator, table: *api.Table, aggs: []const exec.AggSpec) !?exec.Query {
     if (aggs.len == 0) return null;
     const specs = try allocator.alloc(exec.MetaAggSpec, aggs.len);
     defer allocator.free(specs);
     for (aggs, specs) |a, *sp| {
+        // The affine reduction forces output types on its base aggregates;
+        // this lane emits canonical types only.
+        if (a.out_type_override != null) return null;
         switch (a.func) {
             .count => {
                 const col_name = a.col orelse {
@@ -633,6 +636,11 @@ fn tryMetaAggStats(allocator: std.mem.Allocator, table: *api.Table, aggs: []cons
                 const col_name = a.col orelse return null;
                 const idx = types.findColumn(table.schema.columns, col_name) orelse return null;
                 sp.* = .{ .kind = if (a.func == .min) .min else .max, .col_idx = idx, .out_name = a.as };
+            },
+            .sum, .avg => {
+                const col_name = a.col orelse return null;
+                const idx = types.findColumn(table.schema.columns, col_name) orelse return null;
+                sp.* = .{ .kind = if (a.func == .sum) .sum else .avg, .col_idx = idx, .out_name = a.as };
             },
             else => return null,
         }
