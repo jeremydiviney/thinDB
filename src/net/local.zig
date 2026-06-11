@@ -41,6 +41,7 @@ const Value = types.Value;
 
 const exec = @import("../exec/exec.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
+const cte_stages = @import("cte_stages.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
 const PredicateExpr = exec.PredicateExpr;
@@ -2288,13 +2289,20 @@ pub fn compileWithSession(
     // Projection pushdown: after subqueries are resolved to constants,
     // figure out which base columns the (single) scan must produce.
     ctx.prune_names = analyzeProjection(allocator, root);
-    if (try engine_v2.tryCompile(.{
+    const v2_input = engine_v2.CompileInput{
         .allocator = allocator,
         .db = db,
         .session = session_cell.*,
         .prune_names = ctx.prune_names,
         .node_arena = ctx.nodeArena(),
-    }, root)) |q| {
+    };
+    // CTE / FROM-subquery boundaries compile as a chain of materialized
+    // stages (each block its own V2 pipeline) rather than one block.
+    if (engine_v2.v2Enabled() and engine_v2.isSelectQuery(root) and cte_stages.containsMaterialize(root)) {
+        const q = try cte_stages.compileStaged(v2_input, root);
+        return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
+    }
+    if (try engine_v2.tryCompile(v2_input, root)) |q| {
         return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }
     const q = try compileOp(&ctx, root);
@@ -3105,12 +3113,17 @@ fn appendExpandedProjectItem(
         return;
     }
 
-    const idx = types.findColumn(schema, item) orelse return Error.ColumnNotFound;
+    _ = types.findColumn(schema, item) orelse return Error.ColumnNotFound;
     try sources.append(allocator, item);
-    try outputs.append(allocator, output orelse schema[idx].name);
+    // Standard SQL result naming: a bare or qualified column reference
+    // outputs its UNQUALIFIED name (`SELECT sub.id` and `SELECT id` over an
+    // aliased source both yield a column named `id`), regardless of how the
+    // upstream schema spells it (AliasRename qualifies every column).
+    const bare = if (std.mem.lastIndexOfScalar(u8, item, '.')) |dot| item[dot + 1 ..] else item;
+    try outputs.append(allocator, output orelse bare);
 }
 
-fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Project) !Query {
+pub fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Project) !Query {
     const schema = upstream.outputSchema();
     if (p.star_skip_trailing > schema.len) return Error.BadRequest;
     const star_schema = schema[0 .. schema.len - p.star_skip_trailing];
@@ -4790,7 +4803,7 @@ const NamesOp = struct {
 /// Allocator-owned slice of column-name slices. Caller frees via
 /// `allocator.free(out)` once — the inner string slices are borrowed
 /// from `upstream_cols` and don't need separate freeing.
-fn complementColumns(
+pub fn complementColumns(
     allocator: Allocator,
     upstream_cols: []const @import("../types.zig").Column,
     excluded: []const []const u8,

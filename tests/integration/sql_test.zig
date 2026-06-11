@@ -2372,9 +2372,9 @@ test "sql: MATERIALIZED hint forces buffer even on single use" {
     );
     defer q.deinit();
 
-    // Even with one reference, MATERIALIZED forces a buffer entry.
-    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count());
-
+    // MATERIALIZED = a shared buffered boundary — which is also the default
+    // under boundary semantics, so the hint is observable only through
+    // results (the V2 staged path doesn't use the legacy ctx cache).
     var ids: std.ArrayList(i64) = .empty;
     defer ids.deinit(allocator);
     while (try q.next()) |b| {
@@ -2490,7 +2490,7 @@ test "sql: a materialized CTE releases its budget after the last reader drains" 
     try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
 }
 
-test "sql: NOT MATERIALIZED disables auto-materialization on multi-use CTE" {
+test "sql: NOT MATERIALIZED regenerates the CTE per reference" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2505,9 +2505,10 @@ test "sql: NOT MATERIALIZED disables auto-materialization on multi-use CTE" {
     );
     defer q.deinit();
 
-    // NOT MATERIALIZED suppresses the wrap — the IR tree is shared but
-    // the runtime sees no .materialize node, so the ctx cache stays empty.
-    try std.testing.expectEqual(@as(u32, 0), q.cq.ctx.materialized.count());
+    // Every CTE boundary materializes; NOT MATERIALIZED only opts out of
+    // SHARING — each reference gets its own materialize node, so the two
+    // join branches recompute (and buffer) the body independently.
+    try std.testing.expectEqual(@as(u32, 2), q.cq.ctx.materialized.count());
 
     var rows: usize = 0;
     while (try q.next()) |b| rows += b.row_count;
@@ -2540,7 +2541,7 @@ test "sql: auto-materialize wraps a CTE referenced twice (single shared buffer)"
     try std.testing.expectEqual(@as(usize, 5), rows);
 }
 
-test "sql: single-use CTE stays unmaterialized under auto hint" {
+test "sql: single-use CTE materializes (boundary semantics)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2554,9 +2555,6 @@ test "sql: single-use CTE stays unmaterialized under auto hint" {
         \\SELECT id FROM big ORDER BY id ASC
     );
     defer q.deinit();
-
-    // refcount = 1, no hint → stays inlined.
-    try std.testing.expectEqual(@as(u32, 0), q.cq.ctx.materialized.count());
 
     var ids: std.ArrayList(i64) = .empty;
     defer ids.deinit(allocator);

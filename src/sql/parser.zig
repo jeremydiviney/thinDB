@@ -179,14 +179,13 @@ pub fn parseDialectWithUdfs(
 
     while (true) {
         const op = try parser.parseStatement();
-        // Post-parse pass: refcount each *ir.Op reachable from this
-        // statement's root, then wrap CTE roots in Materialize per
-        // their hint. CTE scope is per-statement.
-        try parser.applyAutoMaterialize(op);
+        // Post-parse pass: wrap each shared CTE root in Materialize (every
+        // boundary materializes; see applyAutoMaterialize). CTE scope is
+        // per-statement.
+        try parser.applyAutoMaterialize();
         try statements.append(arena, op);
         // Reset CTE state — each statement parses with a fresh scope.
         parser.ctes.clearRetainingCapacity();
-        parser.cte_roots.clearRetainingCapacity();
 
         // Consume any number of `;` and stop at EOF.
         var saw_sep = false;
@@ -240,10 +239,11 @@ const ProjItem = struct {
     },
 };
 
-/// Per-CTE materialization hint from the SQL surface.
-///   .auto  — refcount-driven: wrap when references ≥ 2.
-///   .force — `MATERIALIZED` keyword: always wrap.
-///   .never — `NOT MATERIALIZED` keyword: always inline.
+/// Per-CTE materialization hint from the SQL surface. Every CTE boundary
+/// materializes (stage-per-block execution); the hint only picks sharing:
+///   .auto / .force — one shared stage, every reference reads its result.
+///   .never — `NOT MATERIALIZED`: regenerate per reference (each gets its
+///            own materialize node, so forked uses recompute independently).
 pub const MaterializeHint = enum { auto, force, never };
 
 const CteEntry = struct {
@@ -270,9 +270,6 @@ pub const Parser = struct {
     /// Flat scope: nested SELECTs can reference outer CTEs but
     /// redefining an existing name errors.
     ctes: std.StringHashMapUnmanaged(CteEntry) = .empty,
-    /// Ordered list of CTE root *Op for the post-parse auto-detect
-    /// refcount pass. Order matches declaration in the WITH clause.
-    cte_roots: std.ArrayListUnmanaged(*ir.Op) = .empty,
     /// Named windows declared in the trailing `WINDOW name AS (...)`
     /// clause of the current SELECT. Populated by `parseWindowClause`
     /// before projection lowering; consumed by `parseWindowSpecOrRef`
@@ -1801,16 +1798,19 @@ pub const Parser = struct {
     /// qualifier resolution.
     fn parseFromTarget(self: *Parser) ParseError!FromTarget {
         if (self.cur.tag == .lparen) {
-            // Anonymous subquery: ( select_stmt ) [AS] alias
+            // Anonymous subquery: ( select_stmt ) [AS] alias. Like every CTE
+            // boundary, it materializes: the subquery runs as its own stage
+            // and the outer block scans the buffered result.
             try self.advance();
             const op = try self.parseStatement();
             try self.expect(.rparen);
+            const wrapped = try self.allocOp(.{ .materialize = .{ .upstream = op } });
             // Optional AS, mandatory alias.
             if (self.cur.tag == .kw_as) try self.advance();
             if (self.cur.tag != .identifier) return ParseError.SqlSubqueryNeedsAlias;
             const alias = try self.arena.dupe(u8, self.cur.text);
             try self.advance();
-            return .{ .name = alias, .op = try self.applyAliasToFromOp(op, alias, false) };
+            return .{ .name = alias, .op = try self.applyAliasToFromOp(wrapped, alias, false) };
         }
         // Plain identifier — first check the CTE map (single-part name
         // only). If it's a CTE, use the stored op. Otherwise parse 1-,
@@ -1835,7 +1835,16 @@ pub const Parser = struct {
             const format = fileFormatForFunction(first) orelse return ParseError.SqlUnsupportedFileFunction;
             op = try self.parseFileTableFunction(format);
         } else if (self.cur.tag != .dot and self.ctes.get(first) != null) {
-            op = self.ctes.get(first).?.op;
+            const entry = self.ctes.get(first).?;
+            // NOT MATERIALIZED = regenerate per use: each reference gets its
+            // OWN materialize node over the shared body subtree, so the
+            // engine builds (and frees) an independent stage per branch.
+            // MATERIALIZED / default share one node — the post-parse pass
+            // wraps the body in place so every reference reads one stage.
+            op = if (entry.hint == .never)
+                try self.allocOp(.{ .materialize = .{ .upstream = entry.op } })
+            else
+                entry.op;
             alias_in_place = false;
         } else {
             var parts_buf: [3][]const u8 = undefined;
@@ -2068,7 +2077,6 @@ pub const Parser = struct {
             const gop = try self.ctes.getOrPut(self.arena, name);
             if (gop.found_existing) return ParseError.SqlCteRedefined;
             gop.value_ptr.* = .{ .op = op, .hint = hint };
-            try self.cte_roots.append(self.arena, op);
 
             if (self.cur.tag != .comma) break;
             try self.advance();
@@ -2603,31 +2611,28 @@ pub const Parser = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Post-parse auto-detect refcount pass: walks the final IR tree, counts
-    // parent references per *ir.Op, then wraps each CTE's stored op in a
-    // Materialize node when the hint says so or when the op has ≥ 2
-    // references and no NOT-MATERIALIZED override. The wrap is in-place
-    // (mutates *cte_op contents); existing references still hold the old
-    // pointer, which now resolves to a Materialize.
+    // Post-parse pass: wraps each shared CTE's stored op in a Materialize
+    // node (.auto / .force — every boundary materializes; NOT MATERIALIZED
+    // bodies were wrapped per-reference at FROM resolution instead). The wrap
+    // is in-place (mutates *cte_op contents); existing references still hold
+    // the old pointer, which now resolves to a Materialize.
     // -----------------------------------------------------------------------
 
-    fn applyAutoMaterialize(self: *Parser, root: *ir.Op) ParseError!void {
+    fn applyAutoMaterialize(self: *Parser) ParseError!void {
         if (self.ctes.count() == 0) return;
-
-        var refs: std.AutoHashMapUnmanaged(*ir.Op, u32) = .empty;
-        defer refs.deinit(self.arena);
-        try countRefs(self.arena, &refs, root);
 
         var it = self.ctes.iterator();
         while (it.next()) |entry| {
-            const cte_op = entry.value_ptr.op;
-            const count = refs.get(cte_op) orelse 0;
+            // Every CTE boundary materializes; the hint only chooses SHARED
+            // (one stage, every reference reads it — .force and .auto) vs
+            // REGENERATED (.never — parseFromTarget already wrapped each
+            // reference in its own node, so the body stays bare here).
             const should_wrap = switch (entry.value_ptr.hint) {
                 .never => false,
-                .force => true,
-                .auto => count >= 2,
+                .force, .auto => true,
             };
             if (!should_wrap) continue;
+            const cte_op = entry.value_ptr.op;
             // In-place wrap: move the existing contents into a new
             // arena-owned Op, then overwrite the original with a
             // Materialize variant pointing at it. All references that
@@ -2639,55 +2644,6 @@ pub const Parser = struct {
         }
     }
 };
-
-fn countRefs(
-    arena: Allocator,
-    refs: *std.AutoHashMapUnmanaged(*ir.Op, u32),
-    op: *ir.Op,
-) ParseError!void {
-    switch (op.*) {
-        .scan, .single_row, .file_scan => {},
-        .alias => |a| try visitChild(arena, refs, a.upstream),
-        .explain => |e| try visitChild(arena, refs, e.inner),
-        .limit => |l| try visitChild(arena, refs, l.upstream),
-        .select => |p| try visitChild(arena, refs, p.upstream),
-        .exclude => |p| try visitChild(arena, refs, p.upstream),
-        .filter => |f| try visitChild(arena, refs, f.upstream),
-        .order_by => |o| try visitChild(arena, refs, o.upstream),
-        .group_by => |g| try visitChild(arena, refs, g.upstream),
-        .compute => |c| try visitChild(arena, refs, c.upstream),
-        .join => |j| {
-            try visitChild(arena, refs, j.left);
-            try visitChild(arena, refs, j.right);
-        },
-        .materialize => |m| try visitChild(arena, refs, m.upstream),
-        .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
-        .batch => |b| for (b.statements) |sub| try visitChild(arena, refs, sub),
-        .window => |w| try visitChild(arena, refs, w.upstream),
-        .set_union => |u| {
-            try visitChild(arena, refs, u.left);
-            try visitChild(arena, refs, u.right);
-        },
-        .create_table_as => |c| try visitChild(arena, refs, c.source),
-        .insert_select => |i| try visitChild(arena, refs, i.source),
-    }
-}
-
-fn visitChild(
-    arena: Allocator,
-    refs: *std.AutoHashMapUnmanaged(*ir.Op, u32),
-    child: *ir.Op,
-) ParseError!void {
-    const gop = try refs.getOrPut(arena, child);
-    if (gop.found_existing) {
-        // Already counted via another parent — bump count but DON'T
-        // re-walk the subtree (would double-count grandchildren).
-        gop.value_ptr.* += 1;
-        return;
-    }
-    gop.value_ptr.* = 1;
-    try countRefs(arena, refs, child);
-}
 
 /// Returns true when the projection's name+order already match the
 /// natural output of a GroupBy: `[group_cols..., agg_aliases...]`.

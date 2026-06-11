@@ -69,12 +69,23 @@ pub const CompileInput = struct {
 pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // Engine V2 is the default path for SELECT-shaped queries. Setting
     // THINDB_ENGINE_V1 reverts the whole compile path to the legacy engine.
-    if (getenv("THINDB_ENGINE_V1") != null) return null;
+    if (!v2Enabled()) return null;
     // Side-effecting statements (DDL/DML/SET/SHOW/EXPLAIN/...) are not the V2
     // engine's concern; the legacy compile path owns them.
     if (!isSelectQuery(root)) return null;
-    // Every SELECT shape is now V2's responsibility: build it or fail. There is
-    // deliberately no fallback to the legacy operator engine for these.
+    return try compileSelectBlock(input, root);
+}
+
+pub fn v2Enabled() bool {
+    return getenv("THINDB_ENGINE_V1") == null;
+}
+
+/// Compile ONE single-source query block (no materialize boundaries inside —
+/// staged plans route each block here or to the materialized-source builder
+/// in net/cte_stages.zig). Every SELECT shape is V2's responsibility: build
+/// it or fail. There is deliberately no fallback to the legacy operator
+/// engine for these.
+pub fn compileSelectBlock(input: CompileInput, root: *const ir.Op) anyerror!exec.Query {
     const spec = classifySimplePipeline(root) orelse return error.UnsupportedQueryShape;
     return switch (spec.shape) {
         // All three grouped shapes share one builder: the group-topN core
@@ -92,7 +103,7 @@ pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
 /// A row-producing SELECT query, as opposed to a side-effecting statement
 /// (DDL/DML/SET/SHOW/EXPLAIN). Distinguished by the root op tag: queries are
 /// rooted in a pipeline operator, statements in their own dedicated op.
-fn isSelectQuery(op: *const ir.Op) bool {
+pub fn isSelectQuery(op: *const ir.Op) bool {
     return switch (op.*) {
         .scan,
         .limit,
@@ -681,6 +692,10 @@ const ScanSelectPlan = struct {
     // SELECT-list columns (whitelist projection). Null = emit the scan's columns
     // as-is (e.g. SELECT *).
     project_columns: ?[]const []const u8 = null,
+    // Optional per-item output aliases (`SELECT qty AS amount`). Null entries
+    // keep the source name. Star expansion is not handled on this path, so a
+    // plan with outputs never contains `*` items.
+    project_outputs: ?[]const ?[]const u8 = null,
 };
 
 fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
@@ -688,15 +703,23 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     // Top decorators — Project (SELECT list), LIMIT, ORDER BY — can nest in any
     // order above the scan body; peel each at most once.
     var project_columns: ?[]const []const u8 = null;
+    var project_outputs: ?[]const ?[]const u8 = null;
     var limit: ?ir.Op.Limit = null;
     var order_by: ?ir.Op.OrderBy = null;
     while (true) {
         switch (op.*) {
             .select => |p| {
                 if (project_columns != null) return null;
-                // Aliased / computed output expressions aren't handled here.
-                if (p.outputs) |outs| for (outs) |o| if (o != null) return null;
+                // Plain column aliases ride along (projectNamed); star items
+                // can't mix with aliases on this path — their expansion lives
+                // in the net-layer projection compiler.
+                if (p.outputs != null) {
+                    for (p.columns) |c| {
+                        if (std.mem.eql(u8, c, "*") or std.mem.endsWith(u8, c, ".*")) return null;
+                    }
+                }
                 project_columns = p.columns;
+                project_outputs = p.outputs;
                 op = p.upstream;
             },
             .limit => |l| {
@@ -740,6 +763,7 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
         .order_by = order_by,
         .limit = limit,
         .project_columns = project_columns,
+        .project_outputs = project_outputs,
     };
 }
 
@@ -889,7 +913,9 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
     if (plan.limit) |l| {
-        if (try tryScanSelectLateMat(input, table, plan, l)) |q| return q;
+        if (plan.project_outputs == null) {
+            if (try tryScanSelectLateMat(input, table, plan, l)) |q| return q;
+        }
     }
 
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
@@ -914,7 +940,16 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     } else if (plan.limit) |l| {
         q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
     }
-    if (plan.project_columns) |cols| q = try q.project(cols);
+    if (plan.project_columns) |cols| {
+        if (plan.project_outputs) |outs| {
+            const names = try allocator.alloc([]const u8, cols.len);
+            defer allocator.free(names);
+            for (cols, 0..) |c, i| names[i] = outs[i] orelse c;
+            q = try q.projectNamed(cols, names);
+        } else {
+            q = try q.project(cols);
+        }
+    }
     return q;
 }
 

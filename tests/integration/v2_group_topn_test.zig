@@ -221,3 +221,66 @@ test "V2 string-key GROUP BY over memtable-only rows (zero segments)" {
     try std.testing.expectEqualStrings("cba", tags.items);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 110, 70, 30 }, totals.items);
 }
+
+test "V2 staged CTEs: chained boundaries materialize, group, filter, sort" {
+    // Three-stage chain over the staged compiler: table-sourced stage (V2
+    // scan handler) → grouped stage over the materialized result → filtered
+    // stage → root ORDER BY. Exercises stage scheduling, the MatScan leaf,
+    // and the drain-triggered background free (leak-checked allocator).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE ev2 (id BIGINT PRIMARY KEY, qty INT NOT NULL, tag TEXT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO ev2 VALUES (1,10,'a'),(2,20,'a'),(3,30,'b'),(4,40,'b'),(5,50,'c'),(6,60,'c')");
+
+    var q = try runSql(allocator, db, "WITH filtered AS (SELECT id, qty, tag FROM ev2 WHERE qty >= 20), " ++
+        "by_tag AS (SELECT tag, SUM(qty) AS total FROM filtered GROUP BY tag), " ++
+        "big AS (SELECT tag, total FROM by_tag WHERE tag <> 'a') " ++
+        "SELECT tag, total FROM big ORDER BY total DESC");
+    defer q.deinit();
+
+    var tags: std.ArrayList(u8) = .empty;
+    defer tags.deinit(allocator);
+    var totals: std.ArrayList(i64) = .empty;
+    defer totals.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            try tags.appendSlice(allocator, batch.values[0].data.string.rowBytes(r));
+            try totals.append(allocator, batch.values[1].data.bigint[r]);
+        }
+    }
+    try std.testing.expectEqualStrings("cb", tags.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 110, 70 }, totals.items);
+}
+
+test "V2 staged subquery: FROM-clause subquery with alias qualification" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE ev3 (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO ev3 VALUES (1,10),(2,20),(3,30),(4,40)");
+
+    var q = try runSql(allocator, db, "SELECT sub.id, qty FROM (SELECT id, qty FROM ev3 WHERE qty >= 20) AS sub ORDER BY sub.id DESC LIMIT 2");
+    defer q.deinit();
+
+    // Output names are UNQUALIFIED regardless of the alias (standard SQL).
+    try std.testing.expectEqualStrings("id", q.outputSchema()[0].name);
+    try std.testing.expectEqualStrings("qty", q.outputSchema()[1].name);
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |batch| {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) try ids.append(allocator, batch.values[0].data.bigint[r]);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 4, 3 }, ids.items);
+}
