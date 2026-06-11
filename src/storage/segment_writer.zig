@@ -467,8 +467,15 @@ const BlockEncodeJob = struct {
     failed: std.atomic.Value(bool) = .init(false),
     err_mutex: std.atomic.Mutex = .unlocked,
     err: ?anyerror = null,
+    fsst_threads: usize = 1,
 
     fn run(self: *BlockEncodeJob, threads: usize) !void {
+        // FSST row-encode lanes nest under the per-column workers: only a
+        // handful of heavy string columns FSST-encode per row group, so the
+        // column grain alone strands cores once the cheap columns finish.
+        // threads/4 lanes per column keeps total concurrency ≈ threads while
+        // those stragglers run.
+        self.fsst_threads = @max(1, threads / 4);
         const n = @min(@max(1, threads), self.columns.len);
         if (n > 1) {
             const handles = self.allocator.alloc(std.Thread, n - 1) catch null;
@@ -507,6 +514,7 @@ const BlockEncodeJob = struct {
                 self.schema.compression,
                 self.row_start,
                 self.row_end,
+                self.fsst_threads,
             ) catch |e| return self.fail(e);
             self.stats[ci] = computeStats(view, self.row_start, self.row_end);
         }
@@ -548,6 +556,9 @@ fn writeColumnBlock(
     table_compression: types.TableCompression,
     row_start: usize,
     row_end: usize,
+    /// Sub-worker lanes for the FSST row encode (the one per-block encoder
+    /// expensive enough to parallelize WITHIN a column). 1 = serial.
+    fsst_threads: usize,
 ) !void {
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
@@ -573,7 +584,7 @@ fn writeColumnBlock(
     else if (dict_eligible and try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
         .dict
     else if (table_compression == .lz4_fsst and
-        try tryEncodeFsst(allocator, &scratch, view, row_start, row_end, lz4_string_min_block_bytes))
+        try tryEncodeFsst(allocator, &scratch, view, row_start, row_end, lz4_string_min_block_bytes, fsst_threads))
         .fsst
     else blk: {
         try writeRawColumnBlock(allocator, &scratch, view, row_start, row_end);
@@ -1024,6 +1035,9 @@ fn tryEncodeFsst(
     /// same threshold that gates LZ4-at-rest — FSST replaces exactly that
     /// tier; smaller blocks can't amortize the symbol table anyway.
     min_total_bytes: usize,
+    /// Row-encode lanes (1 = serial). Lane splits are byte-balanced and
+    /// contiguous, so the output is byte-identical at any lane count.
+    threads: usize,
 ) !bool {
     const sv: StringView = switch (view.data) {
         .varchar, .string, .char => |s| s,
@@ -1059,12 +1073,17 @@ fn tryEncodeFsst(
     const offsets = try allocator.alloc(u32, n + 1);
     defer allocator.free(offsets);
     offsets[0] = 0;
-    r = row_start;
-    while (r < row_end) : (r += 1) {
-        const s = sv.rowBytes(r);
-        try comp.ensureUnusedCapacity(allocator, fsst.encodedSizeBound(s.len));
-        table.encodeAppend(s, &comp);
-        offsets[r - row_start + 1] = @intCast(comp.items.len);
+    const lanes = @max(@as(usize, 1), @min(threads, @min(fsst_max_lanes, n / fsst_min_rows_per_lane)));
+    if (lanes > 1) {
+        try encodeFsstLanes(allocator, &table, sv, row_start, row_end, total_bytes, lanes, offsets, &comp);
+    } else {
+        r = row_start;
+        while (r < row_end) : (r += 1) {
+            const s = sv.rowBytes(r);
+            try comp.ensureUnusedCapacity(allocator, fsst.encodedSizeBound(s.len));
+            table.encodeAppend(s, &comp);
+            offsets[r - row_start + 1] = @intCast(comp.items.len);
+        }
     }
 
     var table_buf: [fsst.max_serialized_size]u8 = undefined;
@@ -1090,6 +1109,112 @@ fn tryEncodeFsst(
     }
     scratch.appendSliceAssumeCapacity(comp.items);
     return true;
+}
+
+/// Beyond ~8 lanes the per-lane stitch/spawn overhead outgrows the win on a
+/// 64K-row block.
+const fsst_max_lanes: usize = 8;
+const fsst_min_rows_per_lane: usize = 1024;
+
+const FsstLane = struct {
+    allocator: Allocator,
+    table: *const fsst.SymbolTable,
+    sv: StringView,
+    block_row_start: usize,
+    lane_begin: usize,
+    lane_end: usize,
+    offsets: []u32,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    err: ?anyerror = null,
+
+    fn run(self: *FsstLane) void {
+        var r = self.lane_begin;
+        while (r < self.lane_end) : (r += 1) {
+            const s = self.sv.rowBytes(r);
+            self.buf.ensureUnusedCapacity(self.allocator, fsst.encodedSizeBound(s.len)) catch |e| {
+                self.err = e;
+                return;
+            };
+            self.table.encodeAppend(s, &self.buf);
+            self.offsets[r - self.block_row_start + 1] = @intCast(self.buf.items.len);
+        }
+    }
+};
+
+/// Lane-parallel FSST row encode. Rows are split into `lanes` contiguous
+/// ranges balanced by raw byte count (binary search on the source offsets);
+/// each lane encodes into a private buffer writing lane-relative offsets,
+/// then the buffers are stitched in lane order and the offsets rebased.
+/// Output is byte-identical to the serial encode.
+fn encodeFsstLanes(
+    allocator: Allocator,
+    table: *const fsst.SymbolTable,
+    sv: StringView,
+    row_start: usize,
+    row_end: usize,
+    total_bytes: usize,
+    lanes: usize,
+    offsets: []u32,
+    comp: *std.ArrayListUnmanaged(u8),
+) !void {
+    var lane_jobs = try allocator.alloc(FsstLane, lanes);
+    defer {
+        for (lane_jobs) |*lj| lj.buf.deinit(allocator);
+        allocator.free(lane_jobs);
+    }
+
+    var begin = row_start;
+    for (lane_jobs, 1..) |*lj, k| {
+        const end = if (k == lanes) row_end else blk: {
+            const target = sv.offsets[row_start] + @as(u32, @intCast(total_bytes * k / lanes));
+            var lo = begin;
+            var hi = row_end;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (sv.offsets[mid] < target) lo = mid + 1 else hi = mid;
+            }
+            break :blk lo;
+        };
+        lj.* = .{
+            .allocator = allocator,
+            .table = table,
+            .sv = sv,
+            .block_row_start = row_start,
+            .lane_begin = begin,
+            .lane_end = end,
+            .offsets = offsets,
+        };
+        begin = end;
+    }
+
+    const handles = allocator.alloc(std.Thread, lanes - 1) catch null;
+    var spawned: usize = 0;
+    if (handles) |hs| {
+        for (hs, lane_jobs[1..]) |*h, *lj| {
+            h.* = std.Thread.spawn(.{}, FsstLane.run, .{lj}) catch break;
+            spawned += 1;
+        }
+    }
+    FsstLane.run(&lane_jobs[0]);
+    for (lane_jobs[1 + spawned ..]) |*lj| FsstLane.run(lj);
+    if (handles) |hs| {
+        for (hs[0..spawned]) |h| h.join();
+        allocator.free(hs);
+    }
+
+    var stitched: usize = 0;
+    for (lane_jobs) |*lj| {
+        if (lj.err) |e| return e;
+        stitched += lj.buf.items.len;
+    }
+    try comp.ensureUnusedCapacity(allocator, stitched);
+    for (lane_jobs) |*lj| {
+        const base: u32 = @intCast(comp.items.len);
+        comp.appendSliceAssumeCapacity(lj.buf.items);
+        for (offsets[lj.lane_begin - row_start + 1 .. lj.lane_end - row_start + 1]) |*off| {
+            off.* += base;
+        }
+    }
 }
 
 fn writeValidityBitmap(
