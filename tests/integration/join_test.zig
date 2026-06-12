@@ -125,6 +125,95 @@ test "join: inner equi-join with single key returns matching rows" {
     try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30 }, qtys.items);
 }
 
+test "join: NULL build-side key mid-stream keeps later rows' identity (multi-key path)" {
+    // Regression: a null-key BUILD row used to bump build_rows inside the
+    // insert loop AND get counted again by the per-batch advance, shifting
+    // every later row's bucket id by one (wrong/out-of-bounds rows emitted).
+    // Two join keys force the general compound-key path — the single-key
+    // FastTable never read the broken map, masking this.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const build_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "bid", .type = .bigint },
+            .{ .name = "k1", .type = .bigint, .nullable = true },
+            .{ .name = "k2", .type = .bigint, .nullable = true },
+        },
+        .order_key = &.{"bid"},
+        .unique = true,
+    };
+    const build_ok = [_][]const u8{"bid"};
+    const build_opts = thindb.TableOptions{ .order_key = &build_ok, .unique = true, .row_group_size = 8 };
+
+    const probe_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "pid", .type = .bigint },
+            .{ .name = "pk1", .type = .bigint },
+            .{ .name = "pk2", .type = .bigint },
+        },
+        .order_key = &.{"pid"},
+        .unique = true,
+    };
+    const probe_ok = [_][]const u8{"pid"};
+    const probe_opts = thindb.TableOptions{ .order_key = &probe_ok, .unique = true, .row_group_size = 8 };
+
+    // Build = smaller side. The NULL row sits BETWEEN two keyed rows so
+    // the row after it exercises the id arithmetic.
+    const bld = try db.table("bld", build_schema, build_opts);
+    try bld.insert(&[_]struct { bid: i64, k1: ?i64, k2: ?i64 }{
+        .{ .bid = 100, .k1 = 1, .k2 = 1 },
+        .{ .bid = 200, .k1 = null, .k2 = 9 },
+        .{ .bid = 300, .k1 = 2, .k2 = 2 },
+    });
+    try bld.flush();
+
+    const prb = try db.table("prb", probe_schema, probe_opts);
+    try prb.insert(&.{
+        .{ .pid = @as(i64, 10), .pk1 = @as(i64, 1), .pk2 = @as(i64, 1) },
+        .{ .pid = @as(i64, 11), .pk1 = @as(i64, 2), .pk2 = @as(i64, 2) },
+        .{ .pid = @as(i64, 12), .pk1 = @as(i64, 3), .pk2 = @as(i64, 3) },
+        .{ .pid = @as(i64, 13), .pk1 = @as(i64, 9), .pk2 = @as(i64, 9) },
+    });
+    try prb.flush();
+
+    const left = try thindb.scan(allocator, prb);
+    const right = try thindb.scan(allocator, bld);
+    var q = try left.join(right, .{
+        .on = &.{
+            .{ .left = "pk1", .right = "k1" },
+            .{ .left = "pk2", .right = "k2" },
+        },
+    });
+    defer q.deinit();
+
+    var pids: std.ArrayList(i64) = .empty;
+    defer pids.deinit(allocator);
+    var bids: std.ArrayList(i64) = .empty;
+    defer bids.deinit(allocator);
+    while (try q.next()) |b| {
+        const pid_idx = b.columnIndex("pid").?;
+        const bid_idx = b.columnIndex("bid").?;
+        var r: u32 = 0;
+        while (r < b.row_count) : (r += 1) {
+            try pids.append(allocator, b.values[pid_idx].data.bigint[r]);
+            try bids.append(allocator, b.values[bid_idx].data.bigint[r]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), pids.items.len);
+    if (pids.items[0] > pids.items[1]) {
+        std.mem.swap(i64, &pids.items[0], &pids.items[1]);
+        std.mem.swap(i64, &bids.items[0], &bids.items[1]);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 11 }, pids.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 300 }, bids.items);
+}
+
 test "join: NULL join key never matches" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

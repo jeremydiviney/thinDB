@@ -350,6 +350,11 @@ pub const Join = struct {
     /// Cleared+reused per row to avoid one alloc per probe.
     key_scratch: std.ArrayList(u8),
 
+    /// Shape qualifies for the FastTable probe (single join key of an
+    /// int/string-family type, no range predicates — decided at create).
+    /// When set, buildPhase skips populating the legacy compound-key
+    /// hash_table entirely; tryBuildFastTable supplies the probe table.
+    fast_eligible: bool = false,
     /// Vectorized single-key probe fast path, built at the end of
     /// buildPhase when the join shape qualifies (see tryBuildFastTable).
     /// Null = the general row-at-a-time probe runs instead.
@@ -640,14 +645,17 @@ pub const Join = struct {
             .output_columns = output_columns,
             .views = views,
         };
+        self.fast_eligible = resolved_ranges.len == 0 and spec.on.len == 1 and
+            fastKindOfType(build_schema[(if (build_is_left) left_keys else right_keys)[0]].type) != null;
+
         // Commit the parallel probe at COMPILE time when the shape is
         // FastTable-eligible — fusion must be settled before any operator
         // above (a two-phase GROUP BY combine) composes against it. The
         // FastTable itself is still built after the build phase; by the
         // time the probe side first pulls (and the sink runs), it exists.
-        if (spec.join_type != .full and resolved_ranges.len == 0 and
-            spec.on.len == 1 and fastKindOfType(build_schema[(if (build_is_left) left_keys else right_keys)[0]].type) != null)
-        {
+        // FULL stays serial (matched_build writes would race) but is still
+        // fast_eligible — its serial probe uses the FastTable too.
+        if (self.fast_eligible and spec.join_type != .full) {
             const probe = if (build_is_left) self.right else self.left;
             self.probe_fused = probe.tryFuseProbe(.{
                 .ctx = self,
@@ -853,15 +861,38 @@ pub const Join = struct {
             for (batch.values, 0..) |v, i| {
                 try transform.appendAllColumn(self.allocator, v, &self.build_columns[i]);
             }
+            if (self.fast_eligible) {
+                // The FastTable (built once after the drain, straight from
+                // build_columns) replaces the compound-key map for this
+                // shape — per-row getOrPut + arena key dupes here would be
+                // pure waste. Only the skew detector still wants compound
+                // keys, and only for its 1-in-N sample.
+                if (self.skew_detector) |det| {
+                    var i: u32 = 0;
+                    while (i < n) : (i += 1) {
+                        if ((self.build_rows + i) % self.skew_sample_interval != 0) continue;
+                        if (anyKeyNull(batch, key_indices, i)) continue;
+                        self.key_scratch.clearRetainingCapacity();
+                        try buildCompoundKey(self.allocator, &self.key_scratch, batch, key_indices, i);
+                        try det.observe(self.key_scratch.items);
+                    }
+                }
+                self.build_rows += @intCast(n);
+                continue;
+            }
+
             // Insert into hash table per row.
             var i: u32 = 0;
             while (i < n) : (i += 1) {
                 // Skip rows where any join key is null — SQL semantic:
-                // NULL never matches anything.
-                if (anyKeyNull(batch, key_indices, i)) {
-                    self.build_rows += 1;
-                    continue;
-                }
+                // NULL never matches anything. The row still occupies its
+                // slot in build_columns (it was appended above), so it
+                // must NOT bump build_rows here — `build_rows + i` is the
+                // row's physical index and the post-loop advance already
+                // counts every batch row. Bumping here shifted every
+                // subsequent id and over-counted the total (OOB reads in
+                // emit and the FULL drain).
+                if (anyKeyNull(batch, key_indices, i)) continue;
                 self.key_scratch.clearRetainingCapacity();
                 try buildCompoundKey(self.allocator, &self.key_scratch, batch, key_indices, i);
 
@@ -923,8 +954,7 @@ pub const Join = struct {
     /// vs compound-key bit-equality is the same, but not worth a lane).
     fn tryBuildFastTable(self: *Join) !void {
         if (self.skew_smj != null) return;
-        if (self.ranges.len > 0) return;
-        if (self.left_key_indices.len != 1) return;
+        if (!self.fast_eligible) return;
         const build_key_idx = if (self.build_is_left) self.left_key_indices[0] else self.right_key_indices[0];
         const key_view = self.build_columns[build_key_idx].view();
         const kind: FastKeyKind = switch (key_view.data) {
