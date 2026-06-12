@@ -206,6 +206,11 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
             .count => {
                 if (agg.col) |col_name| {
                     if (columnType(table, col_name) == null) return declineFree(allocator, aggs);
+                    // The direct kernels are NULL-blind on inputs: COUNT(col)
+                    // would count NULL rows and SUM would fold artifact
+                    // payloads. Nullable inputs decline to the silo, which
+                    // routes them to the validity-aware legacy aggregate.
+                    if (columnNullable(table, col_name)) return declineFree(allocator, aggs);
                     aggs[i] = .{ .op = .count_col, .input_name = col_name, .output_type = .bigint, .name = agg.as };
                 } else {
                     aggs[i] = .{ .op = .count_star, .input_name = null, .output_type = .bigint, .name = agg.as };
@@ -214,6 +219,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
             .sum, .avg, .min, .max => {
                 const col_name = agg.col orelse return declineFree(allocator, aggs);
                 const typ = columnType(table, col_name) orelse return declineFree(allocator, aggs);
+                if (columnNullable(table, col_name)) return declineFree(allocator, aggs);
                 if (keyTypeBits(typ) == null and !isFloatType(typ)) return declineFree(allocator, aggs);
                 const out_type = aggregate.aggOutputTypeFor(agg, typ) catch return declineFree(allocator, aggs);
                 aggs[i] = .{
@@ -233,6 +239,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
             .count_distinct => {
                 const col_name = agg.col orelse return declineFree(allocator, aggs);
                 const typ = columnType(table, col_name) orelse return declineFree(allocator, aggs);
+                if (columnNullable(table, col_name)) return declineFree(allocator, aggs);
                 const vbits = keyTypeBits(typ) orelse return declineFree(allocator, aggs);
                 aggs[i] = .{
                     .op = .count_distinct,

@@ -76,7 +76,10 @@ const KeyPart = struct {
     name: []const u8,
     typ: Type,
     offset_bits: u8,
+    // For a nullable part this includes the validity TOP bit (payload + 1);
+    // a NULL group's slice is all-zero, a valid value sets the top bit.
     width_bits: u8,
+    nullable: bool = false,
 };
 
 const KeyLayout = struct {
@@ -298,7 +301,7 @@ const GroupTopNPipeline = struct {
         const output_schema = try allocator.alloc(Column, request.group_cols.len + request.aggs.len);
         errdefer allocator.free(output_schema);
         for (plan.layout.parts[0..plan.layout.part_count], 0..) |part, i| {
-            output_schema[i] = .{ .name = part.name, .type = part.typ };
+            output_schema[i] = .{ .name = part.name, .type = part.typ, .nullable = part.nullable };
         }
         for (plan.aggregates[0..plan.aggregate_count], 0..) |agg_plan, i| {
             output_schema[plan.layout.part_count + i] = .{ .name = agg_plan.name, .type = agg_plan.output_type };
@@ -458,6 +461,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .source_type = part.typ,
             .offset_bits = part.offset_bits,
             .width_bits = part.width_bits,
+            .nullable = part.nullable,
         };
     }
     // The scan projects the precomputed base columns (keys, aggregate inputs,
@@ -607,6 +611,12 @@ fn finalRowLess(op: *GroupTopNPipeline, a: HarnessCore.TopRow, b: HarnessCore.To
 fn compareOutputValue(op: *GroupTopNPipeline, name: []const u8, a: HarnessCore.TopRow, b: HarnessCore.TopRow) !i8 {
     for (op.plan.layout.parts[0..op.plan.layout.part_count]) |part| {
         if (types.columnNameEql(name, part.name)) {
+            const a_null = keyPartIsNull(part, a.key);
+            const b_null = keyPartIsNull(part, b.key);
+            if (a_null or b_null) {
+                if (a_null and b_null) return 0;
+                return if (a_null) -1 else 1;
+            }
             return compareI128(keyPartValue(part, a.key), keyPartValue(part, b.key));
         }
     }
@@ -661,8 +671,18 @@ fn avgFloatValue(row: HarnessCore.TopRow, state_index: u16) f64 {
     return if (row.count == 0) 0.0 else rowStateFloat(row, state_index) / @as(f64, @floatFromInt(row.count));
 }
 
+fn keyPartIsNull(part: KeyPart, key: u128) bool {
+    if (!part.nullable or part.width_bits == 0) return false;
+    const valid_bit = @as(u128, 1) << @intCast(part.offset_bits + part.width_bits - 1);
+    return (key & valid_bit) == 0;
+}
+
+fn keyPartPayloadBits(part: KeyPart) u8 {
+    return if (part.nullable and part.width_bits > 0) part.width_bits - 1 else part.width_bits;
+}
+
 fn keyPartValue(part: KeyPart, key: u128) i128 {
-    const raw = (key >> @intCast(part.offset_bits)) & ((@as(u128, 1) << @intCast(part.width_bits)) - 1);
+    const raw = (key >> @intCast(part.offset_bits)) & ((@as(u128, 1) << @intCast(keyPartPayloadBits(part))) - 1);
     return switch (part.typ) {
         .boolean, .tinyint => @as(i8, @bitCast(@as(u8, @truncate(raw)))),
         .smallint => @as(i16, @bitCast(@as(u16, @truncate(raw)))),
@@ -810,7 +830,7 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
     }
 }
 
-fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) error{NeedsWideAccumulator}!?ShapePlan {
+fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) error{NeedsLegacyAggregate}!?ShapePlan {
     if (request.group_cols.len == 0 or request.group_cols.len > MAX_GROUP_KEYS) return traceDecline(request, "group key count");
     if (request.aggs.len == 0 or request.aggs.len > MAX_AGGS) return traceDecline(request, "aggregate count");
     // Decide packed vs hashed: integer keys totalling ≤128 bits bit-pack
@@ -822,12 +842,10 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
     var total_bits: u32 = 0;
     for (request.group_cols) |name| {
         const typ = resolveColumnType(table, schema, name) orelse return traceDecline(request, "group key column");
-        // A NULL key slot's decoded payload is an encoding artifact (FOR
-        // base / dict entry 0) — the packed/hashed key lanes carry no
-        // validity, so nullable keys route to the generic NULL-tagged path.
-        if (resolveColumnNullable(table, schema, name)) return traceDecline(request, "nullable group key");
+        const nullable = resolveColumnNullable(table, schema, name);
         if (intTypeBits(typ)) |width| {
-            total_bits += width;
+            // A nullable part packs one extra validity bit above its payload.
+            total_bits += width + @as(u32, @intFromBool(nullable));
         } else if (isStringKeyType(typ)) {
             hashed = true;
         } else {
@@ -846,11 +864,12 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
     var offset: u8 = 0;
     for (request.group_cols, 0..) |name, i| {
         const typ = resolveColumnType(table, schema, name).?;
+        const nullable = resolveColumnNullable(table, schema, name);
         if (hashed) {
-            parts[i] = .{ .name = name, .typ = typ, .offset_bits = 0, .width_bits = 0 };
+            parts[i] = .{ .name = name, .typ = typ, .offset_bits = 0, .width_bits = 0, .nullable = nullable };
         } else {
-            const width = intTypeBits(typ).?;
-            parts[i] = .{ .name = name, .typ = typ, .offset_bits = offset, .width_bits = width };
+            const width = intTypeBits(typ).? + @as(u8, @intFromBool(nullable));
+            parts[i] = .{ .name = name, .typ = typ, .offset_bits = offset, .width_bits = width, .nullable = nullable };
             offset += width;
         }
     }
@@ -868,10 +887,12 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
         if (agg_i >= MAX_AGGS) return traceDecline(request, "aggregate count");
         // The silo's fold kernels are NULL-blind: no validity checks in the
         // staged accumulation and no per-aggregate non-null count for the
-        // empty-input → NULL finalize. A nullable aggregate input routes to the
-        // generic paths, which handle both.
+        // all-NULL-input → NULL finalize. A nullable aggregate input needs the
+        // legacy aggregate operator (the error is caught at the dispatch
+        // layers) until the staged lanes grow input validity — the last
+        // grouped NULL gap (V1_RETIREMENT_PLAN.md Phase 2).
         if (agg.col) |col_name| {
-            if (resolveColumnNullable(table, schema, col_name)) return traceDecline(request, "nullable aggregate input");
+            if (resolveColumnNullable(table, schema, col_name)) return error.NeedsLegacyAggregate;
         }
         switch (agg.func) {
             .count => {
@@ -1052,9 +1073,14 @@ fn havingExprSupported(parts: []const KeyPart, aggregates: []const AggregatePlan
     };
 }
 
+// Null when `name` is a NULL group-key part: any comparison against it is
+// UNKNOWN, so the HAVING leaf excludes the group (SQL 3VL).
 fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.TopRow) ?Num {
     for (plan.layout.parts[0..plan.layout.part_count]) |part| {
-        if (types.columnNameEql(name, part.name)) return .{ .i = keyPartValue(part, row.key) };
+        if (types.columnNameEql(name, part.name)) {
+            if (keyPartIsNull(part, row.key)) return null;
+            return .{ .i = keyPartValue(part, row.key) };
+        }
     }
     for (plan.aggregates[0..plan.aggregate_count]) |agg_plan| {
         if (types.columnNameEql(name, agg_plan.name)) {
@@ -1069,6 +1095,14 @@ fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.To
                 else => null,
             };
         }
+    }
+    return null;
+}
+
+// Null when `name` is not a packed group-key part.
+fn keyPartNullInRow(plan: *const ShapePlan, name: []const u8, row: HarnessCore.TopRow) ?bool {
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
+        if (types.columnNameEql(name, part.name)) return keyPartIsNull(part, row.key);
     }
     return null;
 }
@@ -1088,8 +1122,11 @@ fn havingPasses(plan: *const ShapePlan, expr: PredicateExpr, row: HarnessCore.To
                 .gte => ord != .lt,
             };
         },
-        .is_null => false,
-        .is_not_null => true,
+        // Aggregate outputs are never NULL here (every group has ≥1 row and
+        // nullable aggregate inputs decline the silo); only a nullable packed
+        // key part can be NULL.
+        .is_null => |name| keyPartNullInRow(plan, name, row) orelse false,
+        .is_not_null => |name| !(keyPartNullInRow(plan, name, row) orelse false),
         .not => |child| !havingPasses(plan, child.*, row),
         .@"and" => |children| {
             for (children) |child| if (!havingPasses(plan, child, row)) return false;
@@ -1208,7 +1245,10 @@ fn intTypeBits(t: Type) ?u8 {
 }
 
 fn appendKeyPart(allocator: Allocator, col: *ColumnStore, part: KeyPart, key: u128) !void {
-    const raw = (key >> @intCast(part.offset_bits)) & ((@as(u128, 1) << @intCast(part.width_bits)) - 1);
+    if (part.nullable) {
+        try col.appendValidBit(allocator, col.rowCount(), !keyPartIsNull(part, key));
+    }
+    const raw = (key >> @intCast(part.offset_bits)) & ((@as(u128, 1) << @intCast(keyPartPayloadBits(part))) - 1);
     switch (part.typ) {
         .boolean => try col.data.boolean.append(allocator, @intCast(raw)),
         .tinyint => try col.data.tinyint.append(allocator, @bitCast(@as(u8, @truncate(raw)))),

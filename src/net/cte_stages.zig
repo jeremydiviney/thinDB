@@ -222,10 +222,10 @@ fn blockSource(op: *const ir.Op) BlockSource {
 fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
     return switch (blockSource(op)) {
         // Table-backed block: the regular V2 handlers, full parallelism. A
-        // staged plan has no legacy fallback, so the wide-accumulator sentinel
-        // (grouped 64-bit SUM/AVG) surfaces as the standard shape error here.
+        // staged plan has no legacy fallback, so the nullable-aggregate-input
+        // sentinel surfaces as the standard shape error here.
         .table => engine_v2.compileSelectBlock(input, op) catch |e| switch (e) {
-            error.NeedsWideAccumulator => error.UnsupportedQueryShape,
+            error.NeedsLegacyAggregate => error.UnsupportedQueryShape,
             else => e,
         },
         // Stage-, join-, window-, or union-backed block: generic operators

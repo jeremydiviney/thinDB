@@ -375,6 +375,9 @@ pub const GroupKeyInput = struct {
     source_type: types.Type,
     offset_bits: u8,
     width_bits: u8,
+    // Packed lane: width_bits includes a validity top bit. Hashed lane: the
+    // validity tag joins the digest. See GroupKeyColumnSpec in the harness core.
+    nullable: bool = false,
 };
 
 pub const AggregateOp = enum {
@@ -643,6 +646,7 @@ fn keyColumnsRunStructured(table: *api.Table, key_columns: []const HarnessCore.G
     if (rg_count == 0) return false;
     var composite_runs: u64 = 0;
     for (key_columns) |part| {
+        if (part.nullable) return false;
         const phys = blk: {
             for (table.schema.columns, 0..) |col, i| {
                 if (types.columnNameEql(col.name, part.name)) break :blk i;
@@ -678,6 +682,7 @@ fn runHarness(
             .typ = input.source_type,
             .offset_bits = input.offset_bits,
             .width_bits = input.width_bits,
+            .nullable = input.nullable,
         };
     }
     var group_columns_buf: [16]HarnessCore.GroupColumnSpec = undefined;

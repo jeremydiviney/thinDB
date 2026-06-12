@@ -445,6 +445,13 @@ pub const GroupKeyColumnSpec = struct {
     typ: thindb.types.Type,
     offset_bits: u8,
     width_bits: u8,
+    // Nullable key columns carry a validity bit as the TOP bit of their packed
+    // slice (width_bits includes it: payload bits + 1). A NULL row contributes
+    // all-zero bits — distinct from any valid value, whose validity bit is set.
+    // In the hashed lane the validity tag is mixed into the digest instead and
+    // a NULL row's payload is skipped (its decoded bytes are an encoding
+    // artifact that may differ across batch sources).
+    nullable: bool = false,
 };
 
 pub const GroupAggregateOp = enum {
@@ -761,7 +768,8 @@ fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
             !std.meta.eql(a.key_columns[key_i].typ, b.key_columns[key_i].typ) or
             a.key_columns[key_i].offset_bits != b.key_columns[key_i].offset_bits or
-            a.key_columns[key_i].width_bits != b.key_columns[key_i].width_bits)
+            a.key_columns[key_i].width_bits != b.key_columns[key_i].width_bits or
+            a.key_columns[key_i].nullable != b.key_columns[key_i].nullable)
         {
             return false;
         }
@@ -2614,6 +2622,15 @@ inline fn readGenericKeyBits(view: thindb.storage.ColumnView, typ: thindb.types.
 fn genericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storage.ColumnView, row: usize) !u128 {
     var key: u128 = 0;
     for (layout.key_columns, 0..) |part, i| {
+        if (part.nullable) {
+            // NULL → all-zero slice (validity bit clear); a valid row sets the
+            // top bit above its payload so value 0 and NULL stay distinct.
+            if (!key_views[i].isValid(row)) continue;
+            const raw = try readGenericKeyBits(key_views[i], part.typ, row);
+            const valid_bit = @as(u128, 1) << @intCast(part.width_bits - 1);
+            key |= (raw | valid_bit) << @intCast(part.offset_bits);
+            continue;
+        }
         const raw = try readGenericKeyBits(key_views[i], part.typ, row);
         key |= raw << @intCast(part.offset_bits);
     }
@@ -2643,6 +2660,16 @@ fn hashGenericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.st
     var lo = std.hash.Wyhash.init(0x9E3779B97F4A7C15);
     var hi = std.hash.Wyhash.init(0xD1B54A32D192ED03);
     for (layout.key_columns, 0..) |part, i| {
+        if (part.nullable) {
+            // The validity tag joins the digest; a NULL row's payload is
+            // SKIPPED — its decoded bytes are an encoding artifact (FOR base /
+            // dict entry 0) that may differ across batch sources, and all NULL
+            // rows must land in one group.
+            const tag = [1]u8{@intFromBool(key_views[i].isValid(row))};
+            lo.update(&tag);
+            hi.update(&tag);
+            if (tag[0] == 0) continue;
+        }
         switch (key_views[i].data) {
             .string, .varchar, .char => |sv| {
                 const d: u128 = if (key_digests[i]) |ds| ds[row] else thindb.exec.stringKeyDigest(sv.rowBytes(row));
@@ -2751,7 +2778,14 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     // SPAN, never per row. Any missing sidecar falls through to the per-row
     // weighted paths below (memtable, tombstoned/filtered batches, non-RLE
     // blocks), which produce identical keys and partials.
-    if (layout.has_weight and !layout.has_rowref) runs_blk: {
+    // Nullable key columns take the per-row paths: run sidecars and the
+    // monomorphic key kernels read raw values with no validity lane.
+    var keys_nullable = false;
+    for (layout.key_columns) |part| {
+        if (part.nullable) keys_nullable = true;
+    }
+
+    if (layout.has_weight and !layout.has_rowref and !keys_nullable) runs_blk: {
         const rb = batch.runs orelse break :runs_blk;
         var key_runs_buf: [MAX_GENERIC_GROUP_KEYS]thindb.exec.RunsColumn = undefined;
         for (layout.key_columns, 0..) |part, i| {
@@ -2775,7 +2809,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         return;
     }
 
-    if (!layout.has_rowref) {
+    if (!layout.has_rowref and !keys_nullable) {
         if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], weight_specs, str_views, raw_chunk_rows, profile)) return;
     }
 
