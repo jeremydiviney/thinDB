@@ -543,3 +543,56 @@ test "null basics: arithmetic propagates NULL" {
     try std.testing.expectEqual(@as(usize, 1), batch.row_count);
     try std.testing.expect(!batch.values[0].isValid(0));
 }
+
+test "null agg inputs: all-NULL group emits NULL for SUM/AVG/MIN/MAX, 0 for counts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // grp 'a': v = 10, NULL, 30 / s = 'm', NULL, ''   (mixed)
+    // grp 'b': v = NULL, NULL  / s = NULL, NULL       (all-NULL)
+    try exec(allocator, db,
+        "CREATE TABLE na (id BIGINT PRIMARY KEY, grp VARCHAR(8) NOT NULL, v BIGINT, s VARCHAR(16))",
+    );
+    try exec(allocator, db,
+        "INSERT INTO na (id, grp, v, s) VALUES " ++
+            "(1, 'a', 10, 'm'), (2, 'a', NULL, NULL), (3, 'a', 30, ''), " ++
+            "(4, 'b', NULL, NULL), (5, 'b', NULL, NULL)",
+    );
+    const t = try db.openTable("na", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT grp, SUM(v) AS sv, AVG(v) AS av, MIN(v) AS lo, MAX(v) AS hi, " ++
+            "COUNT(v) AS cv, COUNT(*) AS cs, COUNT(DISTINCT v) AS dv, MIN(s) AS ms " ++
+            "FROM na GROUP BY grp ORDER BY grp",
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), b.row_count);
+
+    // grp 'a': NULLs skipped — SUM 40, AVG 20 (÷2 non-null, not ÷3),
+    // MIN 10, MAX 30, COUNT(v) 2, COUNT(*) 3, MIN(s) = '' (valid, not NULL).
+    try std.testing.expectEqualStrings("a", b.values[0].data.varchar.rowBytes(0));
+    try std.testing.expect(b.values[1].isValid(0));
+    try std.testing.expectEqual(@as(i128, 40), b.values[1].data.largeint[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), b.values[2].data.double[0], 1e-9);
+    try std.testing.expectEqual(@as(i64, 10), b.values[3].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 30), b.values[4].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[5].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 3), b.values[6].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[7].data.bigint[0]);
+    try std.testing.expect(b.values[8].isValid(0));
+    try std.testing.expectEqualStrings("", b.values[8].data.varchar.rowBytes(0));
+
+    // grp 'b': all inputs NULL — SUM/AVG/MIN/MAX/MIN(s) are NULL; the COUNT
+    // family is 0 (and COUNT(*) still 2).
+    try std.testing.expectEqualStrings("b", b.values[0].data.varchar.rowBytes(1));
+    for ([_]usize{ 1, 2, 3, 4, 8 }) |ci| try std.testing.expect(!b.values[ci].isValid(1));
+    try std.testing.expectEqual(@as(i64, 0), b.values[5].data.bigint[1]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[6].data.bigint[1]);
+    try std.testing.expectEqual(@as(i64, 0), b.values[7].data.bigint[1]);
+}

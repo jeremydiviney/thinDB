@@ -90,13 +90,7 @@ pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // Aggregates V2's grouped cores don't host (user-defined aggregates,
     // variable-state string concatenation) run on the legacy operators.
     if (hasLegacyOnlyAggregate(root)) return null;
-    return compileSelectBlock(input, root) catch |e| switch (e) {
-        // Grouped aggregates over a nullable input need the legacy aggregate
-        // operator's validity-aware accumulation — fall back instead of
-        // failing. Dies with V1_RETIREMENT_PLAN.md Phase 2.
-        error.NeedsLegacyAggregate => null,
-        else => e,
-    };
+    return try compileSelectBlock(input, root);
 }
 
 fn hasLegacyOnlyAggregate(op: *const ir.Op) bool {

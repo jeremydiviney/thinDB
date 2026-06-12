@@ -92,6 +92,7 @@ const AggregateInputPlan = struct {
     source_name: []const u8,
     source_type: Type,
     physical_type: GroupTopNEngine.PhysicalType,
+    nullable: bool = false,
 };
 
 const AggregatePlan = struct {
@@ -115,6 +116,13 @@ const AggregatePlan = struct {
     // in the numeric state_index. Output is a bigint count.
     is_distinct: bool = false,
     distinct_state_index: u16 = 0,
+    // The input column is nullable: NULL rows skip the fold. For numeric
+    // SUM/AVG/MIN/MAX the companion slot `valid_count_index` holds the
+    // group's non-null input count (AVG denominator, all-NULL → NULL output);
+    // a nullable COUNT(col) accumulates its own state slot; string MIN/MAX
+    // rides TopRow.str_present.
+    input_nullable: bool = false,
+    valid_count_index: u16 = 0,
 };
 
 const StringAggInputPlan = struct {
@@ -217,7 +225,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         probe_schema = probe_q.?.outputSchema();
     }
 
-    var plan = (try validateShape(table, request, probe_schema)) orelse {
+    var plan = validateShape(table, request, probe_schema) orelse {
         base_cols.deinit(allocator);
         return null;
     };
@@ -304,7 +312,13 @@ const GroupTopNPipeline = struct {
             output_schema[i] = .{ .name = part.name, .type = part.typ, .nullable = part.nullable };
         }
         for (plan.aggregates[0..plan.aggregate_count], 0..) |agg_plan, i| {
-            output_schema[plan.layout.part_count + i] = .{ .name = agg_plan.name, .type = agg_plan.output_type };
+            // SUM/AVG/MIN/MAX over a nullable input emit NULL for an all-NULL
+            // group; the COUNT family is always 0+.
+            const out_nullable = agg_plan.input_nullable and switch (agg_plan.func) {
+                .sum, .avg, .min, .max => true,
+                else => false,
+            };
+            output_schema[plan.layout.part_count + i] = .{ .name = agg_plan.name, .type = agg_plan.output_type, .nullable = out_nullable };
         }
 
         const output_cols = try allocator.alloc(ColumnStore, output_schema.len);
@@ -420,6 +434,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .source_name = input.source_name,
             .source_type = input.source_type,
             .physical_type = input.physical_type,
+            .nullable = input.nullable,
         };
     }
     var string_aggregate_inputs: [MAX_STRING_AGG_INPUTS]GroupTopNEngine.StringAggInput = undefined;
@@ -450,6 +465,8 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .str_state_index = agg_plan.str_state_index,
             .is_distinct = agg_plan.is_distinct,
             .distinct_state_index = agg_plan.distinct_state_index,
+            .nullable = agg_plan.input_nullable,
+            .valid_count_index = agg_plan.valid_count_index,
         };
     }
     var group_key_inputs: [MAX_GROUP_KEYS]GroupTopNEngine.GroupKeyInput = undefined;
@@ -524,7 +541,9 @@ fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
     // keep approaches the group count and the top-set degenerates to a sort.
     if (ctx.request.limit + ctx.request.offset > 65536) return false;
     for (ctx.plan.aggregates[0..ctx.plan.aggregate_count]) |agg| {
-        if (agg.func == .count and types.columnNameEql(agg.name, ctx.request.order_specs[0].col)) return true;
+        // Only counts that mirror the group row count rank via the core's
+        // count-desc heap; a nullable COUNT(col) accumulates its own slot.
+        if (agg.func == .count and agg.state_index == 0 and types.columnNameEql(agg.name, ctx.request.order_specs[0].col)) return true;
     }
     return false;
 }
@@ -629,25 +648,57 @@ fn compareOutputValue(op: *GroupTopNPipeline, name: []const u8, a: HarnessCore.T
 }
 
 fn compareAggregateValue(agg_plan: AggregatePlan, a: HarnessCore.TopRow, b: HarnessCore.TopRow) i8 {
+    // NULL aggregate results (all-NULL input group) order nulls-first,
+    // matching the validity-aware sort convention.
+    const a_null = aggIsNull(a, agg_plan);
+    const b_null = aggIsNull(b, agg_plan);
+    if (a_null or b_null) {
+        if (a_null and b_null) return 0;
+        return if (a_null) -1 else 1;
+    }
     const float_input = isFloatPhysical(agg_plan.input_type);
     return switch (agg_plan.func) {
-        .count => compareU64(a.count, b.count),
+        .count => compareI128(countValue(a, agg_plan), countValue(b, agg_plan)),
         .sum, .min, .max => if (float_input)
             compareF64(rowStateFloat(a, agg_plan.state_index), rowStateFloat(b, agg_plan.state_index))
         else
             compareI128(rowStateValue(a, agg_plan.state_index, agg_plan.wide), rowStateValue(b, agg_plan.state_index, agg_plan.wide)),
         .avg => if (float_input)
-            compareF64(avgFloatValue(a, agg_plan.state_index), avgFloatValue(b, agg_plan.state_index))
+            compareF64(avgFloatValue(a, agg_plan), avgFloatValue(b, agg_plan))
         else
-            compareF64(avgValue(a, agg_plan.state_index, agg_plan.wide), avgValue(b, agg_plan.state_index, agg_plan.wide)),
+            compareF64(avgValue(a, agg_plan), avgValue(b, agg_plan)),
         // The distinct count accumulates in the numeric state slot.
         .count_distinct => compareI128(rowStateValue(a, agg_plan.state_index, agg_plan.wide), rowStateValue(b, agg_plan.state_index, agg_plan.wide)),
         else => 0,
     };
 }
 
-fn avgValue(row: HarnessCore.TopRow, state_index: u16, wide: bool) f64 {
-    return if (row.count == 0) 0.0 else @as(f64, @floatFromInt(rowStateValue(row, state_index, wide))) / @as(f64, @floatFromInt(row.count));
+// COUNT(*) and a non-nullable COUNT(col) mirror the group row count; a
+// nullable COUNT(col) accumulates its own state slot.
+fn countValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) i128 {
+    if (agg_plan.state_index != 0) return rowStateValueNarrow(row, agg_plan.state_index);
+    return @intCast(row.count);
+}
+
+// AVG denominator and the SUM/AVG/MIN/MAX all-NULL signal: the companion
+// valid-count slot when the input is nullable, the group row count otherwise.
+fn aggDenom(row: HarnessCore.TopRow, agg_plan: AggregatePlan) u64 {
+    if (agg_plan.valid_count_index != 0) return @intCast(rowStateValueNarrow(row, agg_plan.valid_count_index));
+    return row.count;
+}
+
+fn aggIsNull(row: HarnessCore.TopRow, agg_plan: AggregatePlan) bool {
+    if (agg_plan.is_string) return !row.str_present[agg_plan.str_state_index];
+    if (!agg_plan.input_nullable) return false;
+    return switch (agg_plan.func) {
+        .sum, .avg, .min, .max => aggDenom(row, agg_plan) == 0,
+        else => false,
+    };
+}
+
+fn avgValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
+    const denom = aggDenom(row, agg_plan);
+    return if (denom == 0) 0.0 else @as(f64, @floatFromInt(rowStateValue(row, agg_plan.state_index, agg_plan.wide))) / @as(f64, @floatFromInt(denom));
 }
 
 fn rowStateValue(row: HarnessCore.TopRow, state_index: u16, wide: bool) i128 {
@@ -667,8 +718,9 @@ fn rowStateFloat(row: HarnessCore.TopRow, state_index: u16) f64 {
     return @bitCast(bits);
 }
 
-fn avgFloatValue(row: HarnessCore.TopRow, state_index: u16) f64 {
-    return if (row.count == 0) 0.0 else rowStateFloat(row, state_index) / @as(f64, @floatFromInt(row.count));
+fn avgFloatValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
+    const denom = aggDenom(row, agg_plan);
+    return if (denom == 0) 0.0 else rowStateFloat(row, agg_plan.state_index) / @as(f64, @floatFromInt(denom));
 }
 
 fn keyPartIsNull(part: KeyPart, key: u128) bool {
@@ -811,26 +863,30 @@ fn appendStringAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type
 }
 
 fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: AggregatePlan, row: HarnessCore.TopRow) !void {
+    // All-NULL-input groups emit NULL (a no-op valid bit on the non-nullable
+    // COUNT-family columns). The data append still runs with a default value
+    // so the column stays rectangular.
+    try col.appendValidBit(allocator, col.rowCount(), !aggIsNull(row, agg_plan));
     if (agg_plan.is_string) {
         return appendStringAggregate(allocator, col, agg_plan.output_type, row.str[agg_plan.str_state_index]);
     }
     const float_input = isFloatPhysical(agg_plan.input_type);
     switch (agg_plan.func) {
-        .count => try col.data.bigint.append(allocator, @intCast(row.count)),
+        .count => try col.data.bigint.append(allocator, @intCast(countValue(row, agg_plan))),
         .sum, .min, .max => if (float_input)
             try appendFloatAggregate(allocator, col, agg_plan.output_type, rowStateFloat(row, agg_plan.state_index))
         else
             try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index, agg_plan.wide)),
         .avg => try col.data.double.append(
             allocator,
-            if (float_input) avgFloatValue(row, agg_plan.state_index) else avgValue(row, agg_plan.state_index, agg_plan.wide),
+            if (float_input) avgFloatValue(row, agg_plan) else avgValue(row, agg_plan),
         ),
         .count_distinct => try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index, agg_plan.wide)),
         else => return error.UnsupportedOperatorForType,
     }
 }
 
-fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) error{NeedsLegacyAggregate}!?ShapePlan {
+fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?ShapePlan {
     if (request.group_cols.len == 0 or request.group_cols.len > MAX_GROUP_KEYS) return traceDecline(request, "group key count");
     if (request.aggs.len == 0 or request.aggs.len > MAX_AGGS) return traceDecline(request, "aggregate count");
     // Decide packed vs hashed: integer keys totalling ≤128 bits bit-pack
@@ -885,28 +941,31 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
     var next_distinct_state_index: u16 = 0;
     for (request.aggs, 0..) |agg, agg_i| {
         if (agg_i >= MAX_AGGS) return traceDecline(request, "aggregate count");
-        // The silo's fold kernels are NULL-blind: no validity checks in the
-        // staged accumulation and no per-aggregate non-null count for the
-        // all-NULL-input → NULL finalize. A nullable aggregate input needs the
-        // legacy aggregate operator (the error is caught at the dispatch
-        // layers) until the staged lanes grow input validity — the last
-        // grouped NULL gap (V1_RETIREMENT_PLAN.md Phase 2).
-        if (agg.col) |col_name| {
-            if (resolveColumnNullable(table, schema, col_name)) return error.NeedsLegacyAggregate;
-        }
+        // Nullable inputs: NULL rows skip the fold via the staged validity
+        // lanes. SUM/AVG/MIN/MAX get a companion valid-count slot (AVG
+        // denominator + all-NULL → NULL finalize); a nullable COUNT(col)
+        // accumulates its own slot instead of mirroring the group row count.
+        const input_nullable = if (agg.col) |col_name| resolveColumnNullable(table, schema, col_name) else false;
         switch (agg.func) {
             .count => {
                 const input_column_index = if (agg.col) |col_name| blk: {
                     const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "count input");
                     break :blk input_idx;
                 } else null;
+                var state_index: u16 = 0;
+                if (input_nullable) {
+                    if (next_numeric_state_index > MAX_AGGS) return traceDecline(request, "aggregate state count");
+                    state_index = next_numeric_state_index;
+                    next_numeric_state_index += 1;
+                }
                 aggregates[agg_i] = .{
                     .name = agg.as,
                     .func = agg.func,
                     .input_column_index = input_column_index,
                     .input_type = .u64,
-                    .state_index = 0,
+                    .state_index = state_index,
                     .output_type = aggregate.aggOutputTypeFor(agg, if (agg.col) |col_name| resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "count input type") else null) catch return null,
+                    .input_nullable = input_nullable,
                 };
             },
             .sum, .avg, .min, .max => {
@@ -925,6 +984,9 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
                         .is_string = true,
                         .str_input_index = str_input_idx,
                         .str_state_index = next_string_state_index,
+                        // NULL strings stage a sentinel ref; an all-NULL group
+                        // keeps str_present == false and emits NULL.
+                        .input_nullable = input_nullable,
                     };
                     next_string_state_index += 1;
                     continue;
@@ -934,7 +996,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
                 // slots (lo, hi) and runs in the generic per-row program.
                 // MIN/MAX over a 64-bit int holds a single value — never wide.
                 const wide = (agg.func == .sum or agg.func == .avg) and physicalTypeFor(input_type) == .i64;
-                const slot_width: u16 = if (wide) 2 else 1;
+                const slot_width: u16 = (if (wide) @as(u16, 2) else 1) + @as(u16, @intFromBool(input_nullable));
                 if (next_numeric_state_index + slot_width - 1 > MAX_AGGS) return traceDecline(request, "aggregate state count");
                 const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
                 const output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null;
@@ -947,6 +1009,8 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
                     .state_index = next_numeric_state_index,
                     .output_type = output_type,
                     .wide = wide,
+                    .input_nullable = input_nullable,
+                    .valid_count_index = if (input_nullable) next_numeric_state_index + slot_width - 1 else 0,
                 };
                 next_numeric_state_index += slot_width;
             },
@@ -1073,8 +1137,9 @@ fn havingExprSupported(parts: []const KeyPart, aggregates: []const AggregatePlan
     };
 }
 
-// Null when `name` is a NULL group-key part: any comparison against it is
-// UNKNOWN, so the HAVING leaf excludes the group (SQL 3VL).
+// Null when `name` is a NULL group-key part or a NULL aggregate result: any
+// comparison against it is UNKNOWN, so the HAVING leaf excludes the group
+// (SQL 3VL).
 fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.TopRow) ?Num {
     for (plan.layout.parts[0..plan.layout.part_count]) |part| {
         if (types.columnNameEql(name, part.name)) {
@@ -1084,14 +1149,15 @@ fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.To
     }
     for (plan.aggregates[0..plan.aggregate_count]) |agg_plan| {
         if (types.columnNameEql(name, agg_plan.name)) {
+            if (aggIsNull(row, agg_plan)) return null;
             const float_input = isFloatPhysical(agg_plan.input_type);
             return switch (agg_plan.func) {
-                .count => .{ .i = @intCast(row.count) },
+                .count => .{ .i = countValue(row, agg_plan) },
                 .sum, .min, .max => if (float_input)
                     Num{ .f = rowStateFloat(row, agg_plan.state_index) }
                 else
                     Num{ .i = rowStateValue(row, agg_plan.state_index, agg_plan.wide) },
-                .avg => .{ .f = if (float_input) avgFloatValue(row, agg_plan.state_index) else avgValue(row, agg_plan.state_index, agg_plan.wide) },
+                .avg => .{ .f = if (float_input) avgFloatValue(row, agg_plan) else avgValue(row, agg_plan) },
                 else => null,
             };
         }
@@ -1099,10 +1165,13 @@ fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.To
     return null;
 }
 
-// Null when `name` is not a packed group-key part.
+// Null when `name` is neither a packed group-key part nor an aggregate.
 fn keyPartNullInRow(plan: *const ShapePlan, name: []const u8, row: HarnessCore.TopRow) ?bool {
     for (plan.layout.parts[0..plan.layout.part_count]) |part| {
         if (types.columnNameEql(name, part.name)) return keyPartIsNull(part, row.key);
+    }
+    for (plan.aggregates[0..plan.aggregate_count]) |agg_plan| {
+        if (types.columnNameEql(name, agg_plan.name)) return aggIsNull(row, agg_plan);
     }
     return null;
 }
@@ -1122,9 +1191,8 @@ fn havingPasses(plan: *const ShapePlan, expr: PredicateExpr, row: HarnessCore.To
                 .gte => ord != .lt,
             };
         },
-        // Aggregate outputs are never NULL here (every group has ≥1 row and
-        // nullable aggregate inputs decline the silo); only a nullable packed
-        // key part can be NULL.
+        // A nullable packed key part or an all-NULL-input aggregate result
+        // can be NULL; everything else never is.
         .is_null => |name| keyPartNullInRow(plan, name, row) orelse false,
         .is_not_null => |name| !(keyPartNullInRow(plan, name, row) orelse false),
         .not => |child| !havingPasses(plan, child.*, row),
@@ -1180,6 +1248,7 @@ fn addAggregateInput(
         .source_name = name,
         .source_type = typ,
         .physical_type = physical_type,
+        .nullable = resolveColumnNullable(table, schema, name),
     };
     input_count.* = idx + 1;
     return @intCast(idx);

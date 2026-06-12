@@ -368,6 +368,9 @@ pub const AggregateInput = struct {
     source_name: []const u8,
     source_type: types.Type,
     physical_type: PhysicalType,
+    // Nullable inputs stage a per-row validity byte alongside the value
+    // column (see GroupColumnSpec in the harness core).
+    nullable: bool = false,
 };
 
 pub const GroupKeyInput = struct {
@@ -395,7 +398,11 @@ pub const AggregateSpec = struct {
     input_column_index: ?u16,
     input_type: PhysicalType,
     state_index: u16,
+    // The input column is nullable: NULL rows skip the fold; the companion
+    // slot `valid_count_index` (0 = none) holds the group's non-null input
+    // count for the AVG denominator and the all-NULL → NULL finalize.
     nullable: bool = false,
+    valid_count_index: u16 = 0,
     // String MIN/MAX: reads `Shape.string_aggregate_inputs[str_input_index]` and
     // keeps its result in string state slot `str_state_index` (not the numeric
     // slots). False/0 for every numeric aggregate.
@@ -687,6 +694,7 @@ fn runHarness(
     }
     var group_columns_buf: [16]HarnessCore.GroupColumnSpec = undefined;
     if (shape.aggregate_inputs.len > group_columns_buf.len) return error.UnsupportedOperatorForType;
+    var n_valid_lanes: u16 = 0;
     for (shape.aggregate_inputs, 0..) |input, i| {
         group_columns_buf[i] = .{ .physical_type = switch (input.physical_type) {
             .i8 => .i8,
@@ -696,7 +704,8 @@ fn runHarness(
             .f32 => .f32,
             .f64 => .f64,
             else => return error.UnsupportedOperatorForType,
-        }, .source = try harnessColumnSource(input.source_name), .source_name = input.source_name };
+        }, .source = try harnessColumnSource(input.source_name), .source_name = input.source_name, .nullable = input.nullable, .valid_index = n_valid_lanes };
+        if (input.nullable) n_valid_lanes += 1;
     }
     var group_str_columns_buf: [4]HarnessCore.GroupStrColumnSpec = undefined;
     if (shape.string_aggregate_inputs.len > group_str_columns_buf.len) return error.UnsupportedOperatorForType;
@@ -726,6 +735,8 @@ fn runHarness(
             .is_distinct = agg.is_distinct,
             .distinct_state_index = agg.distinct_state_index,
             .wide = agg.wide,
+            .nullable = agg.nullable,
+            .valid_count_index = agg.valid_count_index,
         };
     }
     // shape.hashed comes from the shape gate (string / >128-bit keys). The env
@@ -752,8 +763,9 @@ fn runHarness(
                 .sum, .avg, .min, .max => {
                     if (agg.state_index == 0) break :blk false;
                     // Wide (i128) state folds per row in the generic program;
-                    // run partials are single i64 cells.
-                    if (agg.wide) break :blk false;
+                    // run partials are single i64 cells — and NULL-blind, so
+                    // nullable inputs decline too.
+                    if (agg.wide or agg.nullable) break :blk false;
                     const ic = agg.input_column_index orelse break :blk false;
                     if (ic >= shape.aggregate_inputs.len or input_used[ic]) break :blk false;
                     input_used[ic] = true;

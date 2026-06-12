@@ -249,11 +249,34 @@ const RawRows = struct {
             bytes = alignForward(bytes, @alignOf(u32));
             bytes += @sizeOf(u32) * capacity_rows;
         }
+        bytes += nullableInputCount(layout) * capacity_rows;
         return bytes;
     }
 
     inline fn keyOffset(_: RawRows) usize {
         return 0;
+    }
+
+    // Must mirror slabBytes exactly (see weightOffset).
+    fn validOffset(self: RawRows) usize {
+        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
+        for (self.layout.columns) |column| {
+            offset = alignForward(offset, groupColumnAlign(column.physical_type));
+            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
+        }
+        if (self.layout.has_rowref) {
+            offset = alignForward(offset, @alignOf(i64));
+            offset += @sizeOf(i64) * self.capacity_rows;
+        }
+        if (self.layout.has_weight) {
+            offset = alignForward(offset, @alignOf(u32));
+            offset += @sizeOf(u32) * self.capacity_rows;
+        }
+        return offset;
+    }
+
+    inline fn validAll(self: RawRows, valid_index: usize) []u8 {
+        return (self.slab.ptr + self.validOffset() + valid_index * self.capacity_rows)[0..self.capacity_rows];
     }
 
     fn rowrefOffset(self: RawRows) usize {
@@ -353,6 +376,9 @@ const RawRows = struct {
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
             if (layout.has_weight) @memcpy(next.weightAll()[0..self.len_rows], self.weightAll()[0..self.len_rows]);
+            var vi: usize = 0;
+            const nv = nullableInputCount(layout);
+            while (vi < nv) : (vi += 1) @memcpy(next.validAll(vi)[0..self.len_rows], self.validAll(vi)[0..self.len_rows]);
         }
         // The string side store lives outside the slab; grow its ref array in
         // place (preserving the live prefix), then move it into `next`.
@@ -438,6 +464,11 @@ pub const GroupColumnSpec = struct {
     physical_type: GroupColumnType,
     source: GroupColumnSource = .is_refresh,
     source_name: []const u8 = "",
+    // Nullable agg-input columns carry a per-row validity byte in the staged
+    // slab's validity region (one byte-per-row lane per nullable column, after
+    // the weight region). `valid_index` is this column's lane ordinal.
+    nullable: bool = false,
+    valid_index: u16 = 0,
 };
 
 pub const GroupKeyColumnSpec = struct {
@@ -486,6 +517,14 @@ pub const GroupAggregateSpec = struct {
     // at `state_index`. Only the generic per-row program supports wide state;
     // the fused count/sum/avg and weight-fold kernels decline it.
     wide: bool = false,
+    // The input column is nullable: NULL rows are skipped in the fold (a
+    // nullable COUNT(col) accumulates its own slot instead of mirroring the
+    // group row count). `valid_count_index` (0 = none) is the companion slot
+    // holding the group's non-null input count — the AVG denominator and the
+    // all-NULL → NULL finalize signal for SUM/AVG/MIN/MAX. Generic per-row
+    // program only, like wide.
+    nullable: bool = false,
+    valid_count_index: u16 = 0,
 };
 
 // Per-group numeric accumulators are stored in a runtime variable-stride slab
@@ -706,14 +745,27 @@ const StrStore = struct {
         self.refs = next;
     }
 
+    // A NULL string value is a sentinel ref (no bytes appended): distinct from
+    // a valid empty string, whose ref has a real offset and len 0.
+    const NULL_OFF: u32 = std.math.maxInt(u32);
+
     fn append(self: *StrStore, allocator: Allocator, str_cols: usize, row: usize, col: usize, b: []const u8) !void {
         const off: u32 = @intCast(self.bytes.items.len);
         try self.bytes.appendSlice(allocator, b);
         self.refs[row * str_cols + col] = .{ .off = off, .len = @intCast(b.len) };
     }
 
+    fn appendNull(self: *StrStore, str_cols: usize, row: usize, col: usize) void {
+        self.refs[row * str_cols + col] = .{ .off = NULL_OFF, .len = 0 };
+    }
+
+    fn isNull(self: StrStore, str_cols: usize, row: usize, col: usize) bool {
+        return self.refs[row * str_cols + col].off == NULL_OFF;
+    }
+
     fn get(self: StrStore, str_cols: usize, row: usize, col: usize) []const u8 {
         const ref = self.refs[row * str_cols + col];
+        if (ref.off == NULL_OFF) return &.{};
         return self.bytes.items[ref.off..][0..ref.len];
     }
 };
@@ -778,6 +830,8 @@ fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
     while (i < a.columns.len) : (i += 1) {
         if (a.columns[i].physical_type != b.columns[i].physical_type or
             a.columns[i].source != b.columns[i].source or
+            a.columns[i].nullable != b.columns[i].nullable or
+            a.columns[i].valid_index != b.columns[i].valid_index or
             !std.mem.eql(u8, a.columns[i].source_name, b.columns[i].source_name))
         {
             return false;
@@ -791,7 +845,9 @@ fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
             a.aggregates[i].is_string != b.aggregates[i].is_string or
             a.aggregates[i].str_input_index != b.aggregates[i].str_input_index or
             a.aggregates[i].str_state_index != b.aggregates[i].str_state_index or
-            a.aggregates[i].wide != b.aggregates[i].wide)
+            a.aggregates[i].wide != b.aggregates[i].wide or
+            a.aggregates[i].nullable != b.aggregates[i].nullable or
+            a.aggregates[i].valid_count_index != b.aggregates[i].valid_count_index)
         {
             return false;
         }
@@ -807,6 +863,17 @@ fn alignForward(value: usize, alignment: usize) usize {
     std.debug.assert(alignment != 0);
     std.debug.assert((alignment & (alignment - 1)) == 0);
     return (value + alignment - 1) & ~(alignment - 1);
+}
+
+// Number of byte-per-row validity lanes the staged slab carries — one per
+// nullable agg-input column. 0 for the common all-non-nullable case, in which
+// case the validity region is absent and every layout/offset is unchanged.
+fn nullableInputCount(layout: GroupRowsLayout) usize {
+    var n: usize = 0;
+    for (layout.columns) |c| {
+        if (c.nullable) n += 1;
+    }
+    return n;
 }
 
 fn groupKeySize(width: GroupKeyWidth) usize {
@@ -881,11 +948,34 @@ const GroupRows = struct {
             bytes = alignForward(bytes, @alignOf(u32));
             bytes += @sizeOf(u32) * capacity_rows;
         }
+        bytes += nullableInputCount(layout) * capacity_rows;
         return bytes;
     }
 
     inline fn keyOffset(_: GroupRows) usize {
         return 0;
+    }
+
+    // Must mirror slabBytes exactly (see RawRows.validOffset).
+    fn validOffset(self: GroupRows) usize {
+        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
+        for (self.layout.columns) |column| {
+            offset = alignForward(offset, groupColumnAlign(column.physical_type));
+            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
+        }
+        if (self.layout.has_rowref) {
+            offset = alignForward(offset, @alignOf(i64));
+            offset += @sizeOf(i64) * self.capacity_rows;
+        }
+        if (self.layout.has_weight) {
+            offset = alignForward(offset, @alignOf(u32));
+            offset += @sizeOf(u32) * self.capacity_rows;
+        }
+        return offset;
+    }
+
+    inline fn validAll(self: GroupRows, valid_index: usize) []u8 {
+        return (self.slab.ptr + self.validOffset() + valid_index * self.capacity_rows)[0..self.capacity_rows];
     }
 
     fn rowrefOffset(self: GroupRows) usize {
@@ -1014,6 +1104,9 @@ const GroupRows = struct {
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
             if (layout.has_weight) @memcpy(next.weightAll()[0..self.len_rows], self.weightAll()[0..self.len_rows]);
+            var vi: usize = 0;
+            const nv = nullableInputCount(layout);
+            while (vi < nv) : (vi += 1) @memcpy(next.validAll(vi)[0..self.len_rows], self.validAll(vi)[0..self.len_rows]);
         }
         if (layout.has_str_payload) try self.str.ensure(allocator, layout.str_columns.len, capacity_rows, self.len_rows);
         next.str = self.str;
@@ -1059,6 +1152,11 @@ const GroupRows = struct {
         }
         if (self.layout.has_rowref) @memcpy(self.rowrefAll()[old_len..new_len], rows.rowrefAll()[start .. start + count]);
         if (self.layout.has_weight) @memcpy(self.weightAll()[old_len..new_len], rows.weightAll()[start .. start + count]);
+        {
+            var vi: usize = 0;
+            const nv = nullableInputCount(self.layout);
+            while (vi < nv) : (vi += 1) @memcpy(self.validAll(vi)[old_len..new_len], rows.validAll(vi)[start .. start + count]);
+        }
         // Variable-length string payload: copy each scattered row's string
         // values from the source RawRows store into this bucket's store. Owned
         // bytes, so the bucket survives the source chunk's recycle.
@@ -1068,7 +1166,11 @@ const GroupRows = struct {
             while (i < count) : (i += 1) {
                 var c: usize = 0;
                 while (c < k) : (c += 1) {
-                    try self.str.append(allocator, k, old_len + i, c, rows.str.get(k, start + i, c));
+                    if (rows.str.isNull(k, start + i, c)) {
+                        self.str.appendNull(k, old_len + i, c);
+                    } else {
+                        try self.str.append(allocator, k, old_len + i, c, rows.str.get(k, start + i, c));
+                    }
                 }
             }
         }
@@ -2467,6 +2569,9 @@ pub const TopRow = struct {
     // for numeric queries. Borrows the bucket's str_states bytes during the
     // top-N merge, then re-dup'd into the result allocator at the final emit.
     str: [MAX_GROUP_STR_SLOTS][]const u8 = [_][]const u8{&.{}} ** MAX_GROUP_STR_SLOTS,
+    // False when the group's string inputs were all NULL (the accumulator
+    // never saw a value) — the emit outputs NULL, distinct from a valid ''.
+    str_present: [MAX_GROUP_STR_SLOTS]bool = [_]bool{true} ** MAX_GROUP_STR_SLOTS,
 };
 
 // Optional per-group predicate applied during the all-groups emit (a HAVING
@@ -2492,7 +2597,10 @@ inline fn topRowFromState(ref: StateRef) TopRow {
 // bucket's str_states; re-dup'd into the result allocator at final emit).
 inline fn topRowFromStateStr(ref: StateRef, str_row: StrAccRow) TopRow {
     var row = topRowFromState(ref);
-    for (str_row, 0..) |acc, i| row.str[i] = acc.bytes;
+    for (str_row, 0..) |acc, i| {
+        row.str[i] = acc.bytes;
+        row.str_present[i] = acc.present;
+    }
     return row;
 }
 
@@ -2739,6 +2847,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     // so the source view is read typed and reduced, never byte-copied.
     var payload_bytes: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
     var payload_elt: [MAX_GROUP_PAYLOAD_COLUMNS]usize = undefined;
+    var payload_valid: [MAX_GROUP_PAYLOAD_COLUMNS]?[]const u8 = undefined;
+    var inputs_nullable = false;
     var weight_specs_buf: [MAX_GROUP_PAYLOAD_COLUMNS]WeightFoldSpec = undefined;
     var weight_specs: []const WeightFoldSpec = &.{};
     if (layout.has_weight) {
@@ -2750,6 +2860,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             const view = batch.columnView(column.source_name) orelse return error.ColumnNotFound;
             payload_bytes[i] = aggInputViewBytes(view, column.physical_type) orelse return error.TypeMismatch;
             payload_elt[i] = groupColumnSize(column.physical_type);
+            payload_valid[i] = view.nulls;
+            if (column.nullable) inputs_nullable = true;
         }
     }
 
@@ -2757,7 +2869,9 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     // active chunk's StrStore per row. Empty for numeric-only queries, so every
     // append path's `if (str_views.len != 0)` guard is a free no-op there.
     var str_views_buf: [MAX_GROUP_STR_COLUMNS]StringView = undefined;
+    var str_nulls_buf: [MAX_GROUP_STR_COLUMNS]?[]const u8 = undefined;
     var str_views: []const StringView = &.{};
+    var str_nulls: []const ?[]const u8 = &.{};
     if (layout.has_str_payload) {
         if (layout.str_columns.len > MAX_GROUP_STR_COLUMNS) return error.UnsupportedOperatorForType;
         for (layout.str_columns, 0..) |sc, i| {
@@ -2766,8 +2880,10 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 .varchar, .string, .char => |sv| sv,
                 else => return error.TypeMismatch,
             };
+            str_nulls_buf[i] = view.nulls;
         }
         str_views = str_views_buf[0..layout.str_columns.len];
+        str_nulls = str_nulls_buf[0..layout.str_columns.len];
     }
 
     // Key-shape fast variants (no hashed key). Payload is type-generic; the
@@ -2809,8 +2925,10 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         return;
     }
 
-    if (!layout.has_rowref and !keys_nullable) {
-        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], weight_specs, str_views, raw_chunk_rows, profile)) return;
+    // Nullable numeric inputs also stay per-row: the fast key kernels append
+    // payload bytes with no validity-lane write.
+    if (!layout.has_rowref and !keys_nullable and !inputs_nullable) {
+        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], weight_specs, str_views, str_nulls, raw_chunk_rows, profile)) return;
     }
 
     const rowref_col: []const i64 = if (layout.has_rowref) blk: {
@@ -2854,7 +2972,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             active.setKey(idx, key);
             if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
             appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
-            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, idx, r);
+            if (inputs_nullable) appendPayloadValidity(active, layout, payload_valid[0..layout.columns.len], idx, r);
+            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -2969,6 +3088,7 @@ fn appendBatchRawChunksGenericFast(
     payload_elt: []const usize,
     weight_specs: []const WeightFoldSpec,
     str_views: []const StringView,
+    str_nulls: []const ?[]const u8,
     raw_chunk_rows: usize,
     profile: bool,
 ) !bool {
@@ -2979,7 +3099,7 @@ fn appendBatchRawChunksGenericFast(
                 .bigint => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_bytes, payload_elt, weight_specs, str_views, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_bytes, payload_elt, weight_specs, str_views, str_nulls, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -2999,7 +3119,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_views, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_views, str_nulls, raw_chunk_rows, profile);
             return true;
         }
 
@@ -3017,7 +3137,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_views, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_views, str_nulls, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -3034,6 +3154,7 @@ fn appendBatchRawChunksGenericKey1I64(
     payload_elt: []const usize,
     weight_specs: []const WeightFoldSpec,
     str_views: []const StringView,
+    str_nulls: []const ?[]const u8,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -3081,7 +3202,7 @@ fn appendBatchRawChunksGenericKey1I64(
             const idx = active.len();
             keys[idx] = @as(u64, @bitCast(key0[r]));
             appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
-            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, idx, r);
+            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -3102,6 +3223,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
     payload_elt: []const usize,
     weight_specs: []const WeightFoldSpec,
     str_views: []const StringView,
+    str_nulls: []const ?[]const u8,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -3148,7 +3270,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
             keys[idx] = @as(u16, @bitCast(key0[r])) |
                 (@as(u64, @as(u32, @bitCast(key1[r]))) << 16);
             appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
-            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, idx, r);
+            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -3169,6 +3291,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
     payload_elt: []const usize,
     weight_specs: []const WeightFoldSpec,
     str_views: []const StringView,
+    str_nulls: []const ?[]const u8,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -3218,7 +3341,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
             key_lo[idx] = @as(u64, @bitCast(key0[r]));
             key_hi[idx] = @as(u32, @bitCast(key1[r]));
             appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
-            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, idx, r);
+            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -3250,6 +3373,16 @@ inline fn appendGenericPayload(active: *RawRows, payload_bytes: []const []const 
     }
 }
 
+// Stage the source row's validity bits into the chunk's validity lanes — one
+// byte per nullable payload column. Only called when the layout has nullable
+// inputs (the caller's `inputs_nullable` guard keeps it off the hot path).
+inline fn appendPayloadValidity(active: *RawRows, layout: GroupRowsLayout, payload_valid: []const ?[]const u8, dst: usize, src: usize) void {
+    for (layout.columns, 0..) |column, col| {
+        if (!column.nullable) continue;
+        active.validAll(column.valid_index)[dst] = @intFromBool(thindb.storage.column.isValidBit(payload_valid[col], src));
+    }
+}
+
 // Weighted-collapse payload folding: each staged column belongs to exactly
 // one SUM/AVG/MIN/MAX aggregate (the engine's weight gate), is pre-widened to
 // i64/f64, and carries the RUN'S PARTIAL (sum or extreme), not a row value.
@@ -3268,6 +3401,9 @@ const WeightFoldSpec = struct {
 fn buildWeightFoldSpecs(layout: GroupRowsLayout, batch: thindb.Batch, out: []WeightFoldSpec) !void {
     for (layout.columns, 0..) |column, c| {
         if (column.source_name.len == 0) return error.UnsupportedOperatorForType;
+        // Run partials are NULL-blind; the engine's weight gate already
+        // declines nullable inputs.
+        if (column.nullable) return error.UnsupportedOperatorForType;
         const view = batch.columnView(column.source_name) orelse return error.ColumnNotFound;
         var op: ?WeightFoldOp = null;
         for (layout.aggregates) |agg| {
@@ -3444,8 +3580,12 @@ fn weightFoldSpan(
 // every append path (generic + fast key kernels) calls it identically. A no-op
 // for numeric queries (`str_views.len == 0`), so the caller's guard keeps it off
 // the hot path entirely.
-inline fn appendStrPayload(active: *RawRows, allocator: Allocator, str_views: []const StringView, dst: usize, src: usize) !void {
+inline fn appendStrPayload(active: *RawRows, allocator: Allocator, str_views: []const StringView, str_nulls: []const ?[]const u8, dst: usize, src: usize) !void {
     for (str_views, 0..) |sv, col| {
+        if (!thindb.storage.column.isValidBit(str_nulls[col], src)) {
+            active.str.appendNull(str_views.len, dst, col);
+            continue;
+        }
         try active.str.append(allocator, str_views.len, dst, col, sv.rowBytes(src));
     }
 }
@@ -3503,15 +3643,26 @@ fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec
         if (agg.is_string or agg.is_distinct) continue;
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         const state_index: usize = agg.state_index;
+        // NULL inputs don't fold (SQL: aggregates skip NULLs). The companion
+        // valid-count slot carries the group's non-null input count — the AVG
+        // denominator, the MIN/MAX first-value test, and the all-NULL → NULL
+        // finalize signal at emit.
+        const input_ok = aggInputValid(rows, agg, row_idx);
         switch (agg.op) {
             .count_star => {
                 if (state_index != 0) try setAggregateStateValue(ref, state_index, ref.head.count);
             },
             .count_col => {
                 _ = aggregateInputValue(agg, rows, row_idx) catch return error.UnsupportedOperatorForType;
-                if (state_index != 0) try setAggregateStateValue(ref, state_index, ref.head.count);
+                if (agg.nullable) {
+                    if (state_index == 0) return error.UnsupportedOperatorForType;
+                    if (input_ok) try addAggregateStateValue(ref, state_index, 1);
+                } else if (state_index != 0) {
+                    try setAggregateStateValue(ref, state_index, ref.head.count);
+                }
             },
             .sum, .avg => {
+                if (!input_ok) continue;
                 if (aggInputIsFloat(rows, agg)) {
                     const value = try aggregateInputFloat(agg, rows, row_idx);
                     try addFloatStateValue(ref, state_index, value);
@@ -3522,30 +3673,51 @@ fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec
                     const value = try aggregateInputValue(agg, rows, row_idx);
                     try addAggregateStateValue(ref, state_index, value);
                 }
+                if (agg.valid_count_index != 0) try addAggregateStateValue(ref, agg.valid_count_index, 1);
             },
             .min => {
+                if (!input_ok) continue;
+                const first = if (agg.valid_count_index != 0)
+                    aggregateStateValue(ref, agg.valid_count_index) == 0
+                else
+                    ref.head.count == 1;
                 if (aggInputIsFloat(rows, agg)) {
                     const value = try aggregateInputFloat(agg, rows, row_idx);
-                    if (ref.head.count == 1 or value < floatStateValue(ref, state_index)) try setFloatStateValue(ref, state_index, value);
+                    if (first or value < floatStateValue(ref, state_index)) try setFloatStateValue(ref, state_index, value);
                 } else {
                     const value = try aggregateInputValue(agg, rows, row_idx);
-                    if (ref.head.count == 1 or value < aggregateStateValue(ref, state_index)) try setAggregateStateValue(ref, state_index, value);
+                    if (first or value < aggregateStateValue(ref, state_index)) try setAggregateStateValue(ref, state_index, value);
                 }
+                if (agg.valid_count_index != 0) try addAggregateStateValue(ref, agg.valid_count_index, 1);
             },
             .max => {
+                if (!input_ok) continue;
+                const first = if (agg.valid_count_index != 0)
+                    aggregateStateValue(ref, agg.valid_count_index) == 0
+                else
+                    ref.head.count == 1;
                 if (aggInputIsFloat(rows, agg)) {
                     const value = try aggregateInputFloat(agg, rows, row_idx);
-                    if (ref.head.count == 1 or value > floatStateValue(ref, state_index)) try setFloatStateValue(ref, state_index, value);
+                    if (first or value > floatStateValue(ref, state_index)) try setFloatStateValue(ref, state_index, value);
                 } else {
                     const value = try aggregateInputValue(agg, rows, row_idx);
-                    if (ref.head.count == 1 or value > aggregateStateValue(ref, state_index)) try setAggregateStateValue(ref, state_index, value);
+                    if (first or value > aggregateStateValue(ref, state_index)) try setAggregateStateValue(ref, state_index, value);
                 }
+                if (agg.valid_count_index != 0) try addAggregateStateValue(ref, agg.valid_count_index, 1);
             },
             // Folded into the side distinct_sets by foldGroupDistinct; the
             // `is_distinct` guard above means control never reaches here.
             .count_distinct => unreachable,
         }
     }
+}
+
+inline fn aggInputValid(rows: GroupRows, agg: GroupAggregateSpec, row_idx: usize) bool {
+    if (!agg.nullable) return true;
+    const ic = agg.input_column_index orelse return true;
+    const spec = rows.layout.columns[ic];
+    if (!spec.nullable) return true;
+    return rows.validAll(spec.valid_index)[row_idx] != 0;
 }
 
 fn aggregateInputValue(agg: GroupAggregateSpec, rows: GroupRows, row_idx: usize) !i128 {
@@ -3634,6 +3806,7 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
         // A wide aggregate's hi half occupies the NEXT slot too.
         if (agg.state_index + @as(u16, @intFromBool(agg.wide)) >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         if (agg.wide and (agg.state_index == 0 or (agg.op != .sum and agg.op != .avg))) return error.UnsupportedOperatorForType;
+        if (agg.valid_count_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         if (agg.is_distinct and agg.distinct_state_index >= MAX_GROUP_DISTINCT_SLOTS) return error.UnsupportedOperatorForType;
         switch (agg.op) {
             .count_star => {},
@@ -3647,9 +3820,9 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
 
 fn countSumAvgProgram(aggregates: []const GroupAggregateSpec, column_count: usize) ?CountSumAvgProgram {
     if (aggregates.len != 3) return null;
-    // The fused kernel accumulates in single i64 slots — wide state stays on
-    // the generic per-row program.
-    for (aggregates) |a| if (a.wide) return null;
+    // The fused kernel accumulates in single i64 slots with no validity
+    // checks — wide and nullable state stay on the generic per-row program.
+    for (aggregates) |a| if (a.wide or a.nullable) return null;
     if (aggregates[0].op != .count_star or aggregates[0].state_index != 0 or aggregates[0].input_column_index != null) return null;
     if (aggregates[1].op != .sum or aggregates[1].state_index != 1) return null;
     if (aggregates[2].op != .avg or aggregates[2].state_index != 2) return null;
@@ -3668,6 +3841,7 @@ fn aggSlotCount(layout: GroupRowsLayout) usize {
         if (agg.is_string) continue;
         const top = agg.state_index + @as(u16, @intFromBool(agg.wide));
         if (top > n) n = top;
+        if (agg.valid_count_index > n) n = agg.valid_count_index;
     }
     return n;
 }
@@ -3722,6 +3896,9 @@ fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), str_arena: Alloc
     const k = rows.layout.str_columns.len;
     for (aggregates) |agg| {
         if (!agg.is_string) continue;
+        // NULL string inputs don't fold; a group whose inputs were all NULL
+        // keeps `present == false` and emits NULL.
+        if (rows.str.isNull(k, row_idx, agg.str_input_index)) continue;
         const b = rows.str.get(k, row_idx, agg.str_input_index);
         const acc = &str_states.items[gid][agg.str_state_index];
         if (!acc.present) {
@@ -3828,14 +4005,18 @@ fn groupChunkRowsDirectKeys(
         switch (agg.op) {
             .count_star, .count_col => {
                 if (agg.state_index != 0) has_mirror = true;
+                // A nullable COUNT(col) accumulates its own slot (it is NOT a
+                // mirror of the group row count); per-row program only.
+                if (agg.nullable) kernelizable = false;
             },
             .sum, .avg, .min, .max => {
                 needs_kernels = true;
                 if (agg.op == .min or agg.op == .max) has_extreme = true;
                 if (agg.state_index == 0) kernelizable = false;
                 // Wide (two-slot i128) state — the monomorphic kernels do
-                // single-slot i64 math; keep the per-row program.
-                if (agg.wide) kernelizable = false;
+                // single-slot i64 math; keep the per-row program. Nullable
+                // inputs need per-row validity checks the kernels don't do.
+                if (agg.wide or agg.nullable) kernelizable = false;
             },
             .count_distinct => unreachable,
         }
@@ -4179,9 +4360,13 @@ fn foldGroupDistinctChunk(
         try dset.ensureForBatch(allocator, n);
         const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
         if (input_index >= rows.layout.columns.len) return error.UnsupportedOperatorForType;
+        // COUNT(DISTINCT) over a nullable input counts distinct NON-NULL
+        // values: NULL rows skip the set probe entirely.
+        const col_spec = rows.layout.columns[input_index];
+        const valid: ?[]const u8 = if (col_spec.nullable) rows.validAll(col_spec.valid_index) else null;
         // Hoist the physical-type switch out of the row loop: the kernel runs
         // over the staged column's typed slice directly.
-        switch (rows.layout.columns[input_index].physical_type) {
+        switch (col_spec.physical_type) {
             inline .i8, .i16, .i32, .i64 => |pt| {
                 const T = switch (pt) {
                     .i8 => i8,
@@ -4190,7 +4375,7 @@ fn foldGroupDistinctChunk(
                     .i64 => i64,
                     else => unreachable,
                 };
-                try foldGroupDistinctTyped(T, dset, states, gids, rows.columnTypedAll(T, input_index), agg.state_index);
+                try foldGroupDistinctTyped(T, dset, states, gids, rows.columnTypedAll(T, input_index), valid, agg.state_index);
             },
             // The planner scopes distinct inputs to the integer family.
             .f32, .f64 => return error.UnsupportedOperatorForType,
@@ -4204,6 +4389,7 @@ fn foldGroupDistinctTyped(
     states: *StateSlab,
     gids: []const u32,
     vals: []const T,
+    valid: ?[]const u8,
     state_index: u16,
 ) !void {
     const n = gids.len;
@@ -4214,11 +4400,16 @@ fn foldGroupDistinctTyped(
             const v_pf: i64 = vals[pf];
             dset.prefetchKey(DistinctSet.key(gids[pf], @bitCast(v_pf)));
         }
+        if (valid) |vb| {
+            if (vb[r] == 0) continue;
+        }
         const v: i64 = vals[r];
         // The table's physical order clusters repeated values (UserID etc.)
         // into adjacent runs: an identical (gid, value) pair can't be new, so
-        // skip the cache-missing set probe entirely.
-        if (r > 0 and gids[r] == gids[r - 1] and v == @as(i64, vals[r - 1])) continue;
+        // skip the cache-missing set probe entirely. With a validity lane the
+        // previous row may have been a skipped NULL carrying an artifact value
+        // equal to this one — disable the shortcut there.
+        if (valid == null and r > 0 and gids[r] == gids[r - 1] and v == @as(i64, vals[r - 1])) continue;
         const composite = DistinctSet.key(gids[r], @bitCast(v));
         if (dset.insertNewBatch(composite)) {
             try addAggregateStateValue(states.ref(gids[r]), state_index, 1);
@@ -4473,6 +4664,9 @@ fn drainRawDedicatedStageSharedBuilders(
         const has_weight = shared.group_rows_layout.has_weight;
         const flat_rowref: []i64 = if (has_rowref) local.flat_raw_rows.rowrefAll() else &.{};
         const flat_weight: []u32 = if (has_weight) local.flat_raw_rows.weightAll() else &.{};
+        const n_valid = nullableInputCount(shared.group_rows_layout);
+        var flat_valid: [MAX_GROUP_PAYLOAD_COLUMNS][]u8 = undefined;
+        for (0..n_valid) |v| flat_valid[v] = local.flat_raw_rows.validAll(v);
         switch (local.flat_raw_rows.layout.key_width) {
             inline else => |kw| {
                 const flat = local.flat_raw_rows;
@@ -4483,6 +4677,8 @@ fn drainRawDedicatedStageSharedBuilders(
                     for (0..ncols) |c| src_slabs[c] = src.columnByteSlab(c);
                     const src_rowref: []const i64 = if (has_rowref) src.rowrefAll() else &.{};
                     const src_weight: []const u32 = if (has_weight) src.weightAll() else &.{};
+                    var src_valid: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
+                    for (0..n_valid) |v| src_valid[v] = src.validAll(v);
                     const chunk_rows_n = src.len();
                     var r: usize = 0;
                     while (r < chunk_rows_n) : (r += 1) {
@@ -4493,10 +4689,16 @@ fn drainRawDedicatedStageSharedBuilders(
                         while (c < ncols) : (c += 1) copyElem(flat_slabs[c], src_slabs[c], col_elt[c], pos, r);
                         if (has_rowref) flat_rowref[pos] = src_rowref[r];
                         if (has_weight) flat_weight[pos] = src_weight[r];
+                        for (0..n_valid) |v| flat_valid[v][pos] = src_valid[v][r];
                         if (flat_has_str) {
                             var sc: usize = 0;
-                            while (sc < flat_str_cols) : (sc += 1)
-                                try local.flat_raw_rows.str.append(allocator, flat_str_cols, pos, sc, src.str.get(flat_str_cols, r, sc));
+                            while (sc < flat_str_cols) : (sc += 1) {
+                                if (src.str.isNull(flat_str_cols, r, sc)) {
+                                    local.flat_raw_rows.str.appendNull(flat_str_cols, pos, sc);
+                                } else {
+                                    try local.flat_raw_rows.str.append(allocator, flat_str_cols, pos, sc, src.str.get(flat_str_cols, r, sc));
+                                }
+                            }
                         }
                         local.flat_next[bucket_idx] = pos + 1;
                         row_idx += 1;

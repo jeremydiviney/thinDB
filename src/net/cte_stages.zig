@@ -221,13 +221,8 @@ fn blockSource(op: *const ir.Op) BlockSource {
 
 fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
     return switch (blockSource(op)) {
-        // Table-backed block: the regular V2 handlers, full parallelism. A
-        // staged plan has no legacy fallback, so the nullable-aggregate-input
-        // sentinel surfaces as the standard shape error here.
-        .table => engine_v2.compileSelectBlock(input, op) catch |e| switch (e) {
-            error.NeedsLegacyAggregate => error.UnsupportedQueryShape,
-            else => e,
-        },
+        // Table-backed block: the regular V2 handlers, full parallelism.
+        .table => engine_v2.compileSelectBlock(input, op),
         // Stage-, join-, window-, or union-backed block: generic operators
         // over MatScan / Join / Window / SetUnion leaves. The heavy inputs
         // were already produced by upstream stage handlers or stream in from
