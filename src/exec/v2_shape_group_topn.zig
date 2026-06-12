@@ -313,9 +313,12 @@ const GroupTopNPipeline = struct {
         }
         for (plan.aggregates[0..plan.aggregate_count], 0..) |agg_plan, i| {
             // SUM/AVG/MIN/MAX over a nullable input emit NULL for an all-NULL
-            // group; the COUNT family is always 0+.
-            const out_nullable = agg_plan.input_nullable and switch (agg_plan.func) {
-                .sum, .avg, .min, .max => true,
+            // group; sample variance/stddev are NULL below 2 inputs even over
+            // a non-nullable column; the COUNT family is always 0+.
+            const out_nullable = switch (agg_plan.func) {
+                .sum, .avg, .min, .max => agg_plan.input_nullable,
+                .var_samp, .stddev_samp => true,
+                .var_pop, .stddev_pop => agg_plan.input_nullable,
                 else => false,
             };
             output_schema[plan.layout.part_count + i] = .{ .name = agg_plan.name, .type = agg_plan.output_type, .nullable = out_nullable };
@@ -454,6 +457,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
                 .min => .min,
                 .max => .max,
                 .count_distinct => .count_distinct,
+                .stddev_pop, .stddev_samp, .var_pop, .var_samp => .welford,
                 else => return error.UnsupportedOperatorForType,
             },
             .input_column_index = agg_plan.input_column_index,
@@ -669,6 +673,7 @@ fn compareAggregateValue(agg_plan: AggregatePlan, a: HarnessCore.TopRow, b: Harn
             compareF64(avgValue(a, agg_plan), avgValue(b, agg_plan)),
         // The distinct count accumulates in the numeric state slot.
         .count_distinct => compareI128(rowStateValue(a, agg_plan.state_index, agg_plan.wide), rowStateValue(b, agg_plan.state_index, agg_plan.wide)),
+        .stddev_pop, .stddev_samp, .var_pop, .var_samp => compareF64(welfordValue(a, agg_plan), welfordValue(b, agg_plan)),
         else => 0,
     };
 }
@@ -689,11 +694,31 @@ fn aggDenom(row: HarnessCore.TopRow, agg_plan: AggregatePlan) u64 {
 
 fn aggIsNull(row: HarnessCore.TopRow, agg_plan: AggregatePlan) bool {
     if (agg_plan.is_string) return !row.str_present[agg_plan.str_state_index];
-    if (!agg_plan.input_nullable) return false;
     return switch (agg_plan.func) {
-        .sum, .avg, .min, .max => aggDenom(row, agg_plan) == 0,
+        .sum, .avg, .min, .max => agg_plan.input_nullable and aggDenom(row, agg_plan) == 0,
+        // Sample variants need ≥2 inputs even over a non-nullable column.
+        .stddev_pop, .stddev_samp, .var_pop, .var_samp => !welfordDefined(row, agg_plan),
         else => false,
     };
+}
+
+fn welfordDefined(row: HarnessCore.TopRow, agg_plan: AggregatePlan) bool {
+    const n = rowStateValueNarrow(row, agg_plan.state_index);
+    return switch (agg_plan.func) {
+        .var_pop, .stddev_pop => n >= 1,
+        else => n >= 2,
+    };
+}
+
+fn welfordValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
+    if (!welfordDefined(row, agg_plan)) return 0.0;
+    const n: f64 = @floatFromInt(@as(i64, @intCast(rowStateValueNarrow(row, agg_plan.state_index))));
+    const m2 = rowStateFloat(row, agg_plan.state_index + 2);
+    const variance: f64 = switch (agg_plan.func) {
+        .var_pop, .stddev_pop => m2 / n,
+        else => m2 / (n - 1.0),
+    };
+    return if (agg_plan.func == .stddev_pop or agg_plan.func == .stddev_samp) @sqrt(variance) else variance;
 }
 
 fn avgValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
@@ -882,6 +907,7 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
             if (float_input) avgFloatValue(row, agg_plan) else avgValue(row, agg_plan),
         ),
         .count_distinct => try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index, agg_plan.wide)),
+        .stddev_pop, .stddev_samp, .var_pop, .var_samp => try col.data.double.append(allocator, welfordValue(row, agg_plan)),
         else => return error.UnsupportedOperatorForType,
     }
 }
@@ -1013,6 +1039,25 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     .valid_count_index = if (input_nullable) next_numeric_state_index + slot_width - 1 else 0,
                 };
                 next_numeric_state_index += slot_width;
+            },
+            .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
+                const col_name = agg.col orelse return traceDecline(request, "aggregate column");
+                const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "aggregate type");
+                // Welford state: non-null count + mean + M2, three slots.
+                if (next_numeric_state_index + 2 > MAX_AGGS) return traceDecline(request, "aggregate state count");
+                const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
+                const output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null;
+                if (output_type != .double) return traceDecline(request, "variance output type");
+                aggregates[agg_i] = .{
+                    .name = agg.as,
+                    .func = agg.func,
+                    .input_column_index = input_idx,
+                    .input_type = physicalTypeFor(input_type),
+                    .state_index = next_numeric_state_index,
+                    .output_type = output_type,
+                    .input_nullable = input_nullable,
+                };
+                next_numeric_state_index += 3;
             },
             .count_distinct => {
                 const col_name = agg.col orelse return traceDecline(request, "count distinct column");
@@ -1158,6 +1203,7 @@ fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.To
                 else
                     Num{ .i = rowStateValue(row, agg_plan.state_index, agg_plan.wide) },
                 .avg => .{ .f = if (float_input) avgFloatValue(row, agg_plan) else avgValue(row, agg_plan) },
+                .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .f = welfordValue(row, agg_plan) },
                 else => null,
             };
         }

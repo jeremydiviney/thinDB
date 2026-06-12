@@ -596,3 +596,50 @@ test "null agg inputs: all-NULL group emits NULL for SUM/AVG/MIN/MAX, 0 for coun
     try std.testing.expectEqual(@as(i64, 2), b.values[6].data.bigint[1]);
     try std.testing.expectEqual(@as(i64, 0), b.values[7].data.bigint[1]);
 }
+
+test "grouped variance/stddev: welford per group, NULL skips, 1-row samp is NULL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // grp 'a': x = 1..5         → var_pop 2.0, var_samp 2.5
+    // grp 'b': x = 42           → var_pop 0, var_samp NULL (n < 2)
+    // grp 'c': x = NULL, 10, 20 → NULL skipped: var_pop 25, var_samp 50
+    try exec(allocator, db,
+        "CREATE TABLE wv (id BIGINT PRIMARY KEY, grp VARCHAR(8) NOT NULL, x DOUBLE)",
+    );
+    try exec(allocator, db,
+        "INSERT INTO wv (id, grp, x) VALUES " ++
+            "(1,'a',1), (2,'a',2), (3,'a',3), (4,'a',4), (5,'a',5), " ++
+            "(6,'b',42), (7,'c',NULL), (8,'c',10), (9,'c',20)",
+    );
+    const t = try db.openTable("wv", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT grp, VAR_POP(x) AS vp, VAR_SAMP(x) AS vs, STDDEV_POP(x) AS sp, STDDEV_SAMP(x) AS ss " ++
+            "FROM wv GROUP BY grp ORDER BY grp",
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+
+    try std.testing.expectEqualStrings("a", b.values[0].data.varchar.rowBytes(0));
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), b.values[1].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), b.values[2].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f64, 2.0)), b.values[3].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f64, 2.5)), b.values[4].data.double[0], 1e-9);
+
+    try std.testing.expectEqualStrings("b", b.values[0].data.varchar.rowBytes(1));
+    try std.testing.expect(b.values[1].isValid(1));
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), b.values[1].data.double[1], 1e-9);
+    try std.testing.expect(!b.values[2].isValid(1));
+    try std.testing.expect(!b.values[4].isValid(1));
+
+    try std.testing.expectEqualStrings("c", b.values[0].data.varchar.rowBytes(2));
+    try std.testing.expectApproxEqAbs(@as(f64, 25.0), b.values[1].data.double[2], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0), b.values[2].data.double[2], 1e-9);
+}

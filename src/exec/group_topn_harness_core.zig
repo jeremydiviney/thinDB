@@ -493,6 +493,11 @@ pub const GroupAggregateOp = enum {
     min,
     max,
     count_distinct,
+    // Variance/stddev family (all four SQL variants share one fold): Welford's
+    // online algorithm over THREE consecutive slots — non-null count (i64) at
+    // `state_index`, running mean (f64 bits) at +1, M2 (f64 bits) at +2. The
+    // emit layer picks the pop/samp divisor and the optional sqrt.
+    welford,
 };
 
 pub const GroupAggregateSpec = struct {
@@ -3705,6 +3710,20 @@ fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec
                 }
                 if (agg.valid_count_index != 0) try addAggregateStateValue(ref, agg.valid_count_index, 1);
             },
+            .welford => {
+                if (!input_ok) continue;
+                const x: f64 = if (aggInputIsFloat(rows, agg))
+                    try aggregateInputFloat(agg, rows, row_idx)
+                else
+                    @floatFromInt(try aggregateInputValue(agg, rows, row_idx));
+                const n = aggregateStateValue(ref, state_index) + 1;
+                try setAggregateStateValue(ref, state_index, n);
+                const mean_prev = floatStateValue(ref, state_index + 1);
+                const delta = x - mean_prev;
+                const mean = mean_prev + delta / @as(f64, @floatFromInt(@as(i64, @intCast(n))));
+                try setFloatStateValue(ref, state_index + 1, mean);
+                try setFloatStateValue(ref, state_index + 2, floatStateValue(ref, state_index + 2) + delta * (x - mean));
+            },
             // Folded into the side distinct_sets by foldGroupDistinct; the
             // `is_distinct` guard above means control never reaches here.
             .count_distinct => unreachable,
@@ -3814,6 +3833,11 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
                 const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
                 if (input_index >= column_count) return error.UnsupportedOperatorForType;
             },
+            .welford => {
+                const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
+                if (input_index >= column_count) return error.UnsupportedOperatorForType;
+                if (agg.state_index == 0 or agg.state_index + 2 >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
+            },
         }
     }
 }
@@ -3839,7 +3863,8 @@ fn aggSlotCount(layout: GroupRowsLayout) usize {
     var n: usize = 0;
     for (layout.aggregates) |agg| {
         if (agg.is_string) continue;
-        const top = agg.state_index + @as(u16, @intFromBool(agg.wide));
+        var top = agg.state_index + @as(u16, @intFromBool(agg.wide));
+        if (agg.op == .welford) top = agg.state_index + 2;
         if (top > n) n = top;
         if (agg.valid_count_index > n) n = agg.valid_count_index;
     }
@@ -4018,6 +4043,8 @@ fn groupChunkRowsDirectKeys(
                 // inputs need per-row validity checks the kernels don't do.
                 if (agg.wide or agg.nullable) kernelizable = false;
             },
+            // Welford's three-slot sequential update has no kernel form.
+            .welford => kernelizable = false,
             .count_distinct => unreachable,
         }
     }
@@ -4104,7 +4131,8 @@ fn groupChunkRowsDirectKeys(
                     foldKernelExtremeFloat(false, states, gids, rows, agg)
                 else
                     foldKernelExtremeInt(false, states, gids, rows, agg),
-                .count_distinct => unreachable,
+                // Both force the per-row program (`kernelizable = false`).
+                .count_distinct, .welford => unreachable,
             }
         }
     }

@@ -391,6 +391,9 @@ pub const AggregateOp = enum {
     min,
     max,
     count_distinct,
+    // Variance/stddev family — Welford over three slots (see the harness
+    // core's GroupAggregateOp).
+    welford,
 };
 
 pub const AggregateSpec = struct {
@@ -726,6 +729,7 @@ fn runHarness(
                 .min => .min,
                 .max => .max,
                 .count_distinct => .count_distinct,
+                .welford => .welford,
             },
             .input_column_index = agg.input_column_index,
             .state_index = agg.state_index,
@@ -770,7 +774,7 @@ fn runHarness(
                     if (ic >= shape.aggregate_inputs.len or input_used[ic]) break :blk false;
                     input_used[ic] = true;
                 },
-                .count_col, .count_distinct => break :blk false,
+                .count_col, .count_distinct, .welford => break :blk false,
             }
         }
         // Every staged column must belong to exactly one folding aggregate.
