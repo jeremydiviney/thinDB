@@ -2055,6 +2055,9 @@ pub const CompileCtx = struct {
     /// same Session. Borrowed; caller owns the value.
     session: *Session,
     materialized: std.AutoHashMapUnmanaged(*const ir.Op, *@import("../exec/materialize.zig").MaterializedBuffer) = .empty,
+    /// Number of shared V2 stages the staged compiler produced (the V2
+    /// analogue of `materialized.count()`). Tests assert the sum of both.
+    stage_count: u32 = 0,
     /// Strings duplicated into `allocator` to back Session updates from
     /// `USE` statements. Freed at `deinit`.
     session_strings: std.ArrayListUnmanaged([]u8) = .empty,
@@ -2149,14 +2152,16 @@ pub const CompileCtx = struct {
     }
 
     /// The query-scoped accountant, created on first use from the
-    /// Database's configured per-query budget. Returns null when the
-    /// budget is 0 (tracking disabled).
+    /// Database's resolved per-query budget and the Catalog's shared
+    /// cross-query pool. Returns null only when both are disabled
+    /// (budget 0, no pool).
     pub fn queryAccountant(self: *CompileCtx) !?*exec.memory.MemoryAccountant {
         if (self.accountant) |a| return a;
-        const budget = self.db.config.query_memory_budget;
-        if (budget == 0) return null;
+        const budget = thindb_api.autoQueryBudgetBytes(self.db.config.query_memory_budget);
+        const pool = self.db.config.memory_pool;
+        if (budget == 0 and pool == null) return null;
         const acc = try self.allocator.create(exec.memory.MemoryAccountant);
-        acc.* = exec.memory.MemoryAccountant.init(budget);
+        acc.* = exec.memory.MemoryAccountant.initWithPool(budget, pool);
         self.accountant = acc;
         return acc;
     }
@@ -2290,6 +2295,7 @@ pub fn compileWithSession(
         .prune_names = ctx.prune_names,
         .udf_registry = ctx.udf_registry,
         .node_arena = ctx.nodeArena(),
+        .accountant = try ctx.queryAccountant(),
     };
     // pg_catalog virtual tables (incl. JOINs across them) are metadata
     // reads with zero scan-performance relevance — the legacy engine owns
@@ -2298,7 +2304,7 @@ pub fn compileWithSession(
     // CTE / FROM-subquery boundaries compile as a chain of materialized
     // stages (each block its own V2 pipeline) rather than one block.
     if (!legacy_only and engine_v2.v2Enabled() and engine_v2.isSelectQuery(root) and cte_stages.needsStaging(root)) {
-        const q = try cte_stages.compileStaged(v2_input, root);
+        const q = try cte_stages.compileStaged(v2_input, root, &ctx.stage_count);
         return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }
     if (!legacy_only) {

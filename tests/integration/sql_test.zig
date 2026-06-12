@@ -11,6 +11,10 @@ const thindb = @import("thindb");
 const helpers = @import("sql_helpers.zig");
 const runSql = helpers.runSql;
 
+// Engine pin probe (same libc getenv the engine dispatcher uses): a few
+// structural asserts differ between the legacy and V2 staged compilers.
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 const schema_t = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
@@ -2447,7 +2451,7 @@ test "sql: ORDER BY releases its sort buffer budget once the result is drained" 
     // DAG-aware eviction: the sort buffer is freed + its budget released
     // on the final (null) batch, so the query-scoped accountant is back
     // to zero once the result has been drained.
-    if (q.cq.ctx.accountant) |acct| try std.testing.expectEqual(@as(usize, 0), acct.current_bytes);
+    try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
 }
 
 test "sql: GROUP BY releases its hash table budget after emitting" {
@@ -2469,7 +2473,7 @@ test "sql: GROUP BY releases its hash table budget after emitting" {
     try std.testing.expectEqual(@as(usize, 200), rows);
     // The group accumulator arena is dropped + its budget released as
     // soon as the single result batch is built.
-    if (q.cq.ctx.accountant) |acct| try std.testing.expectEqual(@as(usize, 0), acct.current_bytes);
+    try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
 }
 
 test "sql: a materialized CTE releases its budget after the last reader drains" {
@@ -2489,13 +2493,15 @@ test "sql: a materialized CTE releases its budget after the last reader drains" 
         \\SELECT id FROM m
     );
     defer q.deinit();
-    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count());
+    // Legacy buffers count in ctx.materialized, V2 shared stages in
+    // ctx.stage_count; the explicit MATERIALIZED yields ONE buffer either way.
+    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
     var rows: usize = 0;
     while (try q.next()) |b| rows += b.row_count;
     try std.testing.expectEqual(@as(usize, 200), rows);
     // Refcount eviction: with the single reader drained, the buffered
     // columns are freed and the budget handed back.
-    if (q.cq.ctx.accountant) |acct| try std.testing.expectEqual(@as(usize, 0), acct.current_bytes);
+    try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
 }
 
 test "sql: NOT MATERIALIZED regenerates the CTE per reference" {
@@ -2513,10 +2519,13 @@ test "sql: NOT MATERIALIZED regenerates the CTE per reference" {
     );
     defer q.deinit();
 
-    // Every CTE boundary materializes; NOT MATERIALIZED only opts out of
-    // SHARING — each reference gets its own materialize node, so the two
-    // join branches recompute (and buffer) the body independently.
-    try std.testing.expectEqual(@as(u32, 2), q.cq.ctx.materialized.count());
+    // NOT MATERIALIZED waives the materialization fence (PG semantics: the
+    // planner may fold/optimize freely). The legacy engine takes it
+    // literally — each reference gets its own buffer (2). V2's structural
+    // CSE spots the byte-identical bodies and shares ONE stage between the
+    // join branches (1) — same results, half the buffering.
+    const expected_bufs: u32 = if (getenv("THINDB_ENGINE_V1") != null) 2 else 1;
+    try std.testing.expectEqual(expected_bufs, q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
 
     var rows: usize = 0;
     while (try q.next()) |b| rows += b.row_count;
@@ -2542,7 +2551,7 @@ test "sql: auto-materialize wraps a CTE referenced twice (single shared buffer)"
     );
     defer q.deinit();
 
-    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count());
+    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
 
     var rows: usize = 0;
     while (try q.next()) |b| rows += b.row_count;

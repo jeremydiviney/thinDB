@@ -2640,7 +2640,12 @@ pub const Parser = struct {
             // Materialize wrapper.
             const inner = try self.arena.create(ir.Op);
             inner.* = cte_op.*;
-            cte_op.* = .{ .materialize = .{ .upstream = inner } };
+            cte_op.* = .{ .materialize = .{
+                .upstream = inner,
+                // Explicit AS MATERIALIZED: the staged compiler must buffer
+                // even a single-reference body it would otherwise inline.
+                .forced = entry.value_ptr.hint == .force,
+            } };
         }
     }
 };

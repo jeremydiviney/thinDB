@@ -240,9 +240,9 @@ pub const ParallelScan = struct {
         // race-free) so they don't each mint their own.
         var acct: ?*exec.memory.MemoryAccountant = injected_acct;
         var owns_acct = false;
-        if (injected_acct == null and table.query_memory_budget > 0) {
+        if (injected_acct == null and (table.query_memory_budget > 0 or table.memory_pool != null)) {
             const a = try allocator.create(exec.memory.MemoryAccountant);
-            a.* = exec.memory.MemoryAccountant.init(table.query_memory_budget);
+            a.* = exec.memory.MemoryAccountant.initWithPool(table.query_memory_budget, table.memory_pool);
             acct = a;
             owns_acct = true;
         }

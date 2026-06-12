@@ -63,6 +63,12 @@ pub const CompileInput = struct {
     /// Serial Computes resolve user-defined functions through it — same as
     /// the legacy path's CompileCtx.udf_registry.
     udf_registry: ?*const @import("../udf.zig").UdfRegistry = null,
+    /// Query-scoped memory accountant (CompileCtx-owned), injected into the
+    /// scans and stages this compile creates so the whole query shares one
+    /// budget. Leaves created without it (silo-internal scans) self-mint
+    /// from the table's budget + shared pool, so enforcement still holds —
+    /// only the per-query attribution fragments.
+    accountant: ?*exec.memory.MemoryAccountant = null,
 };
 
 /// Try to compile a whole query block into Engine V2.
@@ -1078,7 +1084,7 @@ fn tryScanSelectLateMat(
     // and is byte-identical to the full scan regardless of projection width or
     // a WHERE — so try it first whenever there's an ORDER BY.
     if (plan.order_by) |o| {
-        if (try exec.zonemapTopN(allocator, table, null, probe.items, predicateOrAlways(plan.where_filter), o.specs, output_names, n, offset, input.db.config.max_dop)) |q| {
+        if (try exec.zonemapTopN(allocator, table, input.accountant, probe.items, predicateOrAlways(plan.where_filter), o.specs, output_names, n, offset, input.db.config.max_dop)) |q| {
             return q;
         }
     }
@@ -1089,7 +1095,7 @@ fn tryScanSelectLateMat(
     if (!outputWiderThanProbe(table, output_names, probe.items)) return null;
 
     const specs: ?[]const exec.SortSpec = if (plan.order_by) |o| o.specs else null;
-    return try exec.lateScan(allocator, table, null, probe.items, plan.where_filter.?.predicate, specs, output_names, n, offset);
+    return try exec.lateScan(allocator, table, input.accountant, probe.items, plan.where_filter.?.predicate, specs, output_names, n, offset);
 }
 
 fn predicateOrAlways(filter: ?ir.Op.Filter) exec.PredicateExpr {
@@ -1119,9 +1125,9 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const max_dop = input.db.config.max_dop;
 
     var q = if (max_dop > 1)
-        try exec.ParallelScan.create(allocator, table, null, needed, max_dop)
+        try exec.ParallelScan.create(allocator, table, input.accountant, needed, max_dop)
     else
-        try exec.scanWithProjection(allocator, table, null, needed);
+        try exec.scanWithProjection(allocator, table, input.accountant, needed);
     errdefer q.deinit();
 
     if (plan.where_filter) |f| q = try q.filter(f.predicate);

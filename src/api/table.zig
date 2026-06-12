@@ -50,6 +50,11 @@ pub const Table = struct {
     /// (no tracking). Copied from Config.query_memory_budget at open.
     query_memory_budget: usize,
 
+    /// The Catalog's shared cross-query memory pool (null = none). Self-
+    /// minted scan accountants draw from it so raw-builder pipelines are
+    /// pool-constrained like SQL-compiled ones. Copied from Config at open.
+    memory_pool: ?*exec.memory.MemoryPool,
+
     /// Encoder threads for compaction merges (resolved from
     /// Config.compact_threads at open; ≥1).
     compact_threads: usize,
@@ -183,6 +188,7 @@ pub const Table = struct {
             .auto_flush_min_rows = cfg.auto_flush_min_rows,
             .auto_flush_min_bytes = cfg.auto_flush_min_bytes,
             .query_memory_budget = api.autoQueryBudgetBytes(cfg.query_memory_budget),
+            .memory_pool = cfg.memory_pool,
             .compact_threads = api.resolveCompactThreads(allocator, cfg.compact_threads),
             .sync_mode = cfg.sync_mode,
             .table_dir = table_dir,

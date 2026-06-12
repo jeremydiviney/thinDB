@@ -16,6 +16,7 @@ const Database = DatabaseMod.Database;
 
 const snapshot = @import("../util/snapshot.zig");
 const udf_mod = @import("../udf.zig");
+const memory = @import("../memory.zig");
 
 pub const Catalog = struct {
     allocator: Allocator,
@@ -24,6 +25,11 @@ pub const Catalog = struct {
     config: Config,
     udfs: udf_mod.UdfRegistry,
     databases: std.StringHashMap(*Database),
+    /// The shared cross-query memory pool, when this Catalog minted it from
+    /// `Config.memory_budget` (vs. adopting a caller-provided one, which the
+    /// caller owns). Destroyed last in `close` — every query's accountant
+    /// holds a pointer into it.
+    owned_pool: ?*memory.MemoryPool = null,
     /// True when the Catalog allocator-owns its struct (the user called
     /// `Catalog.open` and gets a `*Catalog`). False when the Catalog is
     /// nested inside another owner (currently unused; reserved).
@@ -52,13 +58,31 @@ pub const Catalog = struct {
         // is gone.
         @import("temp_namespace.zig").sweepStaleTempDirs(io, root_dir);
 
+        // The shared cross-query memory pool. A caller-provided pool (multi-
+        // Catalog processes sharing one budget) is adopted as-is; otherwise
+        // one is minted from the resolved budget and owned here. The pointer
+        // rides in the Config copy handed to every Database and Table below.
+        var cfg = config;
+        var owned_pool: ?*memory.MemoryPool = null;
+        if (cfg.memory_pool == null) {
+            const pool_budget = api.autoMemoryBudgetBytes(cfg.memory_budget);
+            if (pool_budget > 0) {
+                const pool = try allocator.create(memory.MemoryPool);
+                pool.* = memory.MemoryPool.init(pool_budget);
+                owned_pool = pool;
+                cfg.memory_pool = pool;
+            }
+        }
+        errdefer if (owned_pool) |p| allocator.destroy(p);
+
         const self = try allocator.create(Catalog);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .io = io,
             .root_dir = root_dir,
-            .config = config,
+            .config = cfg,
+            .owned_pool = owned_pool,
             .udfs = udf_mod.UdfRegistry.init(allocator),
             .databases = .init(allocator),
         };
@@ -68,7 +92,7 @@ pub const Catalog = struct {
             self.udfs.deinit();
             self.databases.deinit();
         }
-        try discoverDatabasesOnDisk(allocator, io, root_dir, config, &self.databases);
+        try discoverDatabasesOnDisk(allocator, io, root_dir, cfg, &self.databases);
         var it = self.databases.iterator();
         while (it.next()) |entry| entry.value_ptr.*.catalog = self;
         return self;
@@ -126,6 +150,7 @@ pub const Catalog = struct {
         self.udfs.deinit();
         self.databases.deinit();
         const allocator = self.allocator;
+        if (self.owned_pool) |p| allocator.destroy(p);
         allocator.destroy(self);
     }
 

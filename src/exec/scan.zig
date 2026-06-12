@@ -640,9 +640,9 @@ pub const Scan = struct {
         // its lifetime.
         var owned_accountant: ?*exec.memory.MemoryAccountant = injected;
         var owns_accountant = false;
-        if (injected == null and table.query_memory_budget > 0) {
+        if (injected == null and (table.query_memory_budget > 0 or table.memory_pool != null)) {
             const acc = try allocator.create(exec.memory.MemoryAccountant);
-            acc.* = exec.memory.MemoryAccountant.init(table.query_memory_budget);
+            acc.* = exec.memory.MemoryAccountant.initWithPool(table.query_memory_budget, table.memory_pool);
             owned_accountant = acc;
             owns_accountant = true;
         }

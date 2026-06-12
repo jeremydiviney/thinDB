@@ -17,15 +17,15 @@
 //! the sum of sequential phases. Spilling to disk is a future enhancement;
 //! today an over-budget query simply fails with `MemoryBudgetExceeded`.
 //!
-//! Future: a process-global memory pool. Each query would acquire its
-//! per-query budget from the pool at admission (today the grant == the
-//! configured per-query max, always granted) and not start until the
-//! reservation is available. The single seam for that is where the query
-//! root creates the accountant (acquire) and frees it (release) — keep
-//! budget acquisition centralized there rather than scattered.
-//!
-//! Threading: single-threaded by construction (our pull-based execution
-//! drives one operator at a time within a query). No mutex.
+//! Two layers:
+//!   - `MemoryPool` — process-shared (Catalog-owned), thread-safe. One
+//!     budget all queries draw from, so concurrent queries can't sum past
+//!     the box even when each is individually under its per-query ceiling.
+//!   - `MemoryAccountant` — per-query, single-threaded by construction
+//!     (our pull-based execution drives one operator at a time within a
+//!     query; parallel-scan workers never touch it). Carries the per-query
+//!     ceiling and the per-source attribution, and forwards every
+//!     reserve/release to the pool when one is attached.
 
 const std = @import("std");
 
@@ -54,27 +54,83 @@ pub const Source = enum {
 
 const source_count = std.meta.fields(Source).len;
 
+/// Process-shared memory pool: one budget every query's accountant draws
+/// from, so CONCURRENT queries can't sum past the box even when each is
+/// individually under its per-query ceiling. Owned by the Catalog (one per
+/// server process / embedded Catalog); thread-safe — queries reserve from
+/// their own connection threads.
+pub const MemoryPool = struct {
+    budget: usize,
+    used: std.atomic.Value(usize) = .init(0),
+
+    pub fn init(budget: usize) MemoryPool {
+        return .{ .budget = budget };
+    }
+
+    /// Atomically grab `bytes` from the pool; false when the pool can't
+    /// cover it (no partial state). CAS loop — contention is per blocking-
+    /// operator allocation, not per row, so it's never hot.
+    pub fn tryReserve(self: *MemoryPool, bytes: usize) bool {
+        var cur = self.used.load(.monotonic);
+        while (true) {
+            const new = cur + bytes;
+            if (new > self.budget) return false;
+            cur = self.used.cmpxchgWeak(cur, new, .monotonic, .monotonic) orelse return true;
+        }
+    }
+
+    pub fn release(self: *MemoryPool, bytes: usize) void {
+        const prev = self.used.fetchSub(bytes, .monotonic);
+        std.debug.assert(prev >= bytes);
+    }
+
+    pub fn inUse(self: *const MemoryPool) usize {
+        return self.used.load(.monotonic);
+    }
+};
+
 pub const MemoryAccountant = struct {
     budget: usize,
     current_bytes: usize = 0,
     /// Live bytes attributed to each `Source`, indexed by `@intFromEnum`.
     by_source: [source_count]usize = [_]usize{0} ** source_count,
+    /// Shared cross-query pool this accountant draws from (null = per-query
+    /// budget only). Every reserve must also fit the pool; every release
+    /// hands the bytes back.
+    pool: ?*MemoryPool = null,
 
     pub fn init(budget: usize) MemoryAccountant {
         return .{ .budget = budget };
     }
 
+    /// Per-query accountant drawing from a shared pool. `budget` of 0 means
+    /// "no per-query ceiling" (pool-constrained only).
+    pub fn initWithPool(budget: usize, pool: ?*MemoryPool) MemoryAccountant {
+        return .{ .budget = if (budget == 0) std.math.maxInt(usize) else budget, .pool = pool };
+    }
+
     /// Reserve `bytes` from the budget, attributing them to `source`.
     /// Returns `MemoryBudgetExceeded` when the reservation would exceed
-    /// the budget; does NOT update state in that case (no partial state),
-    /// but dumps a per-source breakdown to stderr first so the failure is
-    /// auditable. A failed reservation propagates terminally (no operator
-    /// retries it), so this fires at most once per over-budget query.
+    /// the per-query budget OR the shared pool; does NOT update state in
+    /// that case (no partial state), but dumps a per-source breakdown to
+    /// stderr first so the failure is auditable. A failed reservation
+    /// propagates terminally (no operator retries it), so this fires at
+    /// most once per over-budget query.
     pub fn reserve(self: *MemoryAccountant, source: Source, bytes: usize) Error!void {
         const new_total = self.current_bytes + bytes;
         if (new_total > self.budget) {
             self.dumpBreakdown(source, bytes);
             return Error.MemoryBudgetExceeded;
+        }
+        if (self.pool) |p| {
+            if (!p.tryReserve(bytes)) {
+                self.dumpBreakdown(source, bytes);
+                std.debug.print(
+                    "[mem-audit]   shared pool: {d} MiB in use of {d} MiB (other queries hold the rest)\n",
+                    .{ p.inUse() / (1024 * 1024), p.budget / (1024 * 1024) },
+                );
+                return Error.MemoryBudgetExceeded;
+            }
         }
         self.current_bytes = new_total;
         self.by_source[@intFromEnum(source)] += bytes;
@@ -88,6 +144,7 @@ pub const MemoryAccountant = struct {
         std.debug.assert(self.by_source[@intFromEnum(source)] >= bytes);
         self.current_bytes -= bytes;
         self.by_source[@intFromEnum(source)] -= bytes;
+        if (self.pool) |p| p.release(bytes);
     }
 
     /// Bytes still available for additional reservations.
@@ -133,6 +190,31 @@ pub fn estimateColumnBytes(t: types.Type) usize {
         .largeint, .decimal128, .uuid => 16,
         .varchar, .string, .char => 32,
     };
+}
+
+test "memory: shared pool constrains accountants across queries" {
+    var pool = MemoryPool.init(1000);
+    var q1 = MemoryAccountant.initWithPool(0, &pool);
+    var q2 = MemoryAccountant.initWithPool(0, &pool);
+    // Each query alone is unconstrained (no per-query ceiling), but the
+    // pool caps their SUM.
+    try q1.reserve(.sort, 600);
+    try std.testing.expectError(Error.MemoryBudgetExceeded, q2.reserve(.hash_aggregate, 600));
+    try q2.reserve(.hash_aggregate, 400);
+    try std.testing.expectEqual(@as(usize, 1000), pool.inUse());
+    q1.release(.sort, 600);
+    try std.testing.expectEqual(@as(usize, 400), pool.inUse());
+    try q2.reserve(.hash_aggregate, 600);
+    q2.release(.hash_aggregate, 1000);
+    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+}
+
+test "memory: per-query ceiling trips before the pool and reserves nothing" {
+    var pool = MemoryPool.init(1000);
+    var q = MemoryAccountant.initWithPool(100, &pool);
+    try std.testing.expectError(Error.MemoryBudgetExceeded, q.reserve(.sort, 200));
+    // The failed per-query check must not leak a pool reservation.
+    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
 }
 
 test "memory: reserve then release returns budget" {

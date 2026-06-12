@@ -40,6 +40,10 @@ const usage_text =
     \\  --query-memory-budget B Per-query memory budget in bytes (default: auto, ~25% of physical
     \\                          RAM, floored at 256 MiB; also gates the hash-vs-sort GROUP BY
     \\                          decision). Separate bucket from --cache-size. 0 disables tracking.
+    \\  --memory-budget B       Process-shared query-memory pool ALL queries draw from, so
+    \\                          concurrent queries can't sum past the box (default: auto, ~50% of
+    \\                          physical RAM, floored at 256 MiB). Accepts raw bytes or a K/M/G
+    \\                          suffix. 0 disables the shared pool (per-query budgets still apply).
     \\  --cache-size B          Per-table decompressed-block buffer-pool budget (default: auto,
     \\                          ~50% of physical RAM, floored at 256 MiB). Accepts raw bytes or a
     \\                          K/M/G suffix (e.g. 8G). Shared across all queries against a table;
@@ -88,6 +92,7 @@ pub fn main(init: std.process.Init) !u8 {
     var max_connections: u32 = 256;
     var idle_timeout_secs: u32 = 0;
     var query_memory_budget: ?usize = null;
+    var memory_budget: ?usize = null;
     var cache_size_bytes: ?usize = null;
     var max_dop: ?u32 = null;
     var compact_threads: ?u32 = null;
@@ -190,6 +195,14 @@ pub fn main(init: std.process.Init) !u8 {
             };
             continue;
         }
+        if (try takeValue(arg, "--memory-budget", &args_iter, err_w)) |v| {
+            memory_budget = parseSize(v) catch {
+                try err_w.print("thindb-server: invalid --memory-budget: {s} (use bytes, or a K/M/G suffix)\n", .{v});
+                try err_w.flush();
+                return 1;
+            };
+            continue;
+        }
         if (try takeValue(arg, "--cache-size", &args_iter, err_w)) |v| {
             cache_size_bytes = parseSize(v) catch {
                 try err_w.print("thindb-server: invalid --cache-size: {s} (use bytes, or a K/M/G suffix)\n", .{v});
@@ -240,6 +253,7 @@ pub fn main(init: std.process.Init) !u8 {
         .max_connections = max_connections,
         .idle_timeout_secs = idle_timeout_secs,
         .query_memory_budget = query_memory_budget orelse (thindb.Config{}).query_memory_budget,
+        .memory_budget = memory_budget orelse (thindb.Config{}).memory_budget,
         .cache_size_bytes = cache_size_bytes orelse (thindb.Config{}).cache_size_bytes,
         .max_dop = if (max_dop) |v| v else (thindb.Config{}).max_dop,
         // Server default is auto (half the cores) rather than the embedded

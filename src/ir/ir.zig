@@ -654,6 +654,10 @@ pub const Op = union(OpTag) {
         /// node — compile() detects that and routes them to one
         /// buffer with multiple reader cursors.
         upstream: *Op,
+        /// `true` for an explicit `AS MATERIALIZED` CTE: the user demanded a
+        /// real buffer, so the staged compiler materializes even a single-
+        /// reference node it would otherwise inline-stream.
+        forced: bool = false,
     };
 
     pub const Alias = struct {
@@ -849,7 +853,10 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .group_by => |g| try encodeGroupBy(allocator, out, g),
         .compute => |c| try encodeCompute(allocator, out, c),
         .join => |j| try encodeJoin(allocator, out, j),
-        .materialize => |m| try encodeOp(allocator, out, m.upstream.*),
+        .materialize => |m| {
+            try out.append(allocator, @intFromBool(m.forced));
+            try encodeOp(allocator, out, m.upstream.*);
+        },
         .ddl => |d| try encodeDdl(allocator, out, d),
         .show => |s| try encodeShow(allocator, out, s),
         .insert => |i| try encodeInsert(allocator, out, i),
@@ -1832,10 +1839,13 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             } };
         },
         .materialize => blk: {
+            if (cursor.* >= bytes.len) return Error.IrCorrupt;
+            const forced = bytes[cursor.*] != 0;
+            cursor.* += 1;
             const upstream = try allocator.create(Op);
             errdefer allocator.destroy(upstream);
             upstream.* = try decodeOp(allocator, bytes, cursor);
-            break :blk Op{ .materialize = .{ .upstream = upstream } };
+            break :blk Op{ .materialize = .{ .upstream = upstream, .forced = forced } };
         },
         .ddl => Op{ .ddl = try decodeDdl(allocator, bytes, cursor) },
         .show => Op{ .show = try decodeShow(bytes, cursor) },

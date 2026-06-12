@@ -51,7 +51,10 @@ pub fn needsStaging(op: *const ir.Op) bool {
     };
 }
 
-pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op) anyerror!exec.Query {
+/// `stage_count_out` (optional) receives the number of shared stages the
+/// plan compiled to — the V2 analogue of the legacy `ctx.materialized`
+/// count, used by introspection-style tests.
+pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op, stage_count_out: ?*u32) anyerror!exec.Query {
     const set = try mat_stage.StageSet.create(input.allocator);
     errdefer set.deinit();
     var map: StageMap = .empty;
@@ -66,6 +69,7 @@ pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op) anyerror
     }
     try countMatRefs(input.allocator, root, &cse);
     try collectStages(input, root, set, &map, &cse);
+    if (stage_count_out) |out| out.* = @intCast(set.stages.items.len);
     const inner = try compileBlock(input, root, &map);
     return mat_stage.StagedRoot.create(input.allocator, inner, set);
 }
@@ -155,10 +159,12 @@ fn collectStages(
             try collectStages(input, rep.materialize.upstream, set, map, cse);
             // Single reference → no stage; the body compiles inline at the
             // use site (buildGenericBlock's .materialize arm). Inner shared
-            // nodes were still collected by the recursion above.
-            if ((cse.refs.get(rep) orelse 1) <= 1) return;
+            // nodes were still collected by the recursion above. An explicit
+            // `AS MATERIALIZED` CTE stages regardless — the user demanded a
+            // real buffer (and the budget charge that comes with it).
+            if ((cse.refs.get(rep) orelse 1) <= 1 and !rep.materialize.forced) return;
             const q = try compileBlock(input, rep.materialize.upstream, map);
-            const stage = try set.addStage(q);
+            const stage = try set.addStage(q, input.accountant);
             try map.put(input.allocator, rep, stage);
             if (rep != op) try map.put(input.allocator, op, stage);
         },

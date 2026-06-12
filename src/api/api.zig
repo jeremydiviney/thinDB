@@ -167,6 +167,23 @@ pub const Config = struct {
     /// GROUP BY ceiling (spill-to-disk) is future work.
     query_memory_budget: usize = auto_query_budget,
 
+    /// Process-shared query-memory budget: ONE pool every query's blocking-
+    /// operator reservations draw from, so concurrent queries can't sum past
+    /// the box even when each is under its per-query ceiling. Resolved at
+    /// Catalog open by `autoMemoryBudgetBytes`: the `auto_memory_budget`
+    /// default → ~50% of physical RAM (floored at 256 MiB); an explicit
+    /// value pins it; `0` disables the shared pool (per-query ceilings still
+    /// apply). Independent of the decoded-block cache bucket.
+    memory_budget: usize = auto_memory_budget,
+
+    /// The shared pool itself. Normally null in user-built Configs — the
+    /// Catalog creates one from `memory_budget` at open and threads the
+    /// pointer through this field to every Database and Table it owns. An
+    /// embedding application that opens MULTIPLE Catalogs in one process can
+    /// pass its own pool here to make them share one budget; the Catalog
+    /// then uses it as-is and does not own it.
+    memory_pool: ?*@import("../memory.zig").MemoryPool = null,
+
     /// Maximum intra-query degree of parallelism (worker threads per query for
     /// the parallel scan/filter leaf). `1` (default) = fully serial, byte-
     /// identical to the single-threaded engine — the canonical result and the
@@ -244,6 +261,21 @@ pub fn autoQueryBudgetBytes(configured: usize) usize {
     const floor: u64 = 256 * 1024 * 1024;
     const total = std.process.totalSystemMemory() catch return @intCast(floor);
     return @intCast(@max(total / 4, floor));
+}
+
+/// Auto-resolve sentinel for `Config.memory_budget` (the shared pool):
+/// distinct from `0` so "disable the pool" survives.
+pub const auto_memory_budget: usize = std.math.maxInt(usize);
+
+/// Resolve the process-shared memory-pool budget. The sentinel default →
+/// ~50% of physical RAM, floored at 256 MiB; `0` = no shared pool; any
+/// other value verbatim. Sits alongside the ~35% block cache: together
+/// they bound the process's two growth buckets below the box.
+pub fn autoMemoryBudgetBytes(configured: usize) usize {
+    if (configured != auto_memory_budget) return configured;
+    const floor: u64 = 256 * 1024 * 1024;
+    const total = std.process.totalSystemMemory() catch return @intCast(floor);
+    return @intCast(@max(total / 2, floor));
 }
 
 pub const TableOptions = struct {

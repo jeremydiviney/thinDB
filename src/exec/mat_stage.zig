@@ -126,6 +126,12 @@ pub const Stage = struct {
     uses_total: usize = 0,
     uses_done: usize = 0,
     free_thread: ?std.Thread = null,
+    /// Query-scoped accountant the buffered result is charged against
+    /// (null = no tracking). All reserve/release calls happen on the
+    /// driving connection thread — the background free thread only frees
+    /// memory, never touches accounting.
+    accountant: ?*exec.memory.MemoryAccountant = null,
+    reserved_bytes: usize = 0,
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;
@@ -134,7 +140,14 @@ pub const Stage = struct {
         errdefer self.allocator.destroy(res);
         res.* = .{ .allocator = self.allocator, .schema = self.schema };
         errdefer res.deinitChunks();
+        errdefer self.releaseReserved();
+        const row_bytes = exec.memory.estimateRowBytes(self.schema);
         while (try self.query.next()) |batch| {
+            if (self.accountant) |acct| {
+                const bytes = row_bytes * batch.row_count;
+                try acct.reserve(.materialize, bytes);
+                self.reserved_bytes += bytes;
+            }
             try res.appendBatch(batch);
         }
         // Release the pipeline's operator buffers right away — the stage's
@@ -146,14 +159,23 @@ pub const Stage = struct {
         exec.capColStats(self.col_stats, res.total_rows);
     }
 
+    fn releaseReserved(self: *Stage) void {
+        if (self.reserved_bytes == 0) return;
+        if (self.accountant) |acct| acct.release(.materialize, self.reserved_bytes);
+        self.reserved_bytes = 0;
+    }
+
     /// A consumer finished (fully drained or torn down). On the last one,
     /// hand the chunks to a background free so the teardown overlaps the
-    /// next stage; the thread is joined in `deinit`.
+    /// next stage; the thread is joined in `deinit`. The budget is handed
+    /// back HERE (driving thread, before the async free) so accounting
+    /// stays deterministic for the caller.
     fn releaseUse(self: *Stage) void {
         self.uses_done += 1;
         if (self.uses_done < self.uses_total) return;
         const res = self.result orelse return;
         self.result = null;
+        self.releaseReserved();
         if (std.Thread.spawn(.{}, freeResultThread, .{res})) |th| {
             self.free_thread = th;
         } else |_| {
@@ -164,6 +186,7 @@ pub const Stage = struct {
     fn deinit(self: *Stage) void {
         if (self.free_thread) |th| th.join();
         if (self.result) |res| freeResultThread(res);
+        self.releaseReserved();
         if (self.query_alive) self.query.deinit();
         self.allocator.destroy(self);
     }
@@ -189,8 +212,11 @@ pub const StageSet = struct {
     }
 
     /// Wrap a compiled stage pipeline. Takes ownership of `query` (even on
-    /// error). The schema is deep-copied into the set's arena.
-    pub fn addStage(self: *StageSet, query: exec.Query) !*Stage {
+    /// error). The schema is deep-copied into the set's arena. `accountant`
+    /// (null = no tracking) is charged for the buffered result while it
+    /// lives — reserved as the stage drains, released when the last reader
+    /// finishes.
+    pub fn addStage(self: *StageSet, query: exec.Query, accountant: ?*exec.memory.MemoryAccountant) !*Stage {
         var q = query;
         errdefer q.deinit();
         const aa = self.arena.allocator();
@@ -226,6 +252,7 @@ pub const StageSet = struct {
             .stats_upper_rows = src_stats.upper_rows,
             .sort_state = sort_state,
             .col_stats = col_stats,
+            .accountant = accountant,
         };
         try self.stages.append(self.allocator, stage);
         return stage;
@@ -357,7 +384,7 @@ test "stage captures pipeline stats and tightens them after the run" {
 
     const set = try StageSet.create(allocator);
     defer set.deinit();
-    const stage = try set.addStage(sq);
+    const stage = try set.addStage(sq, null);
 
     var scan = try MatScan.create(allocator, stage);
     defer scan.deinit();
