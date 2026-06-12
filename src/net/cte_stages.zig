@@ -25,6 +25,7 @@ const Allocator = std.mem.Allocator;
 const ir = @import("../ir/ir.zig");
 const exec = @import("../exec/exec.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
+const group_route = @import("../exec/group_route.zig");
 const mat_stage = @import("../exec/mat_stage.zig");
 const local = @import("local.zig");
 const types = @import("../types.zig");
@@ -305,12 +306,12 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // Probe-fused join below: aggregate the joined batches inside
             // the scan workers (partial per chunk, serial combine here)
             // instead of hashing the full join output on this thread.
-            if (try local.routeJoinPartialGroupBy(input.node_arena, &up, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| return q;
+            if (try group_route.routeJoinPartialGroupBy(input.node_arena, &up, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| return q;
             // The same strategy routing as the table path: a stage that ends
             // sorted on the group keys streams; a proven-over-budget or
             // unknown-cardinality input sorts then streams; only a proven-
             // small key space takes the hash aggregate.
-            return local.routeGroupBy(
+            return group_route.routeGroupBy(
                 input.allocator,
                 &up,
                 g.group_cols,
