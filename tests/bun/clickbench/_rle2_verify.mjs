@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const DUCKDB = "C:/Users/jerem/AppData/Local/Microsoft/WinGet/Packages/DuckDB.cli_Microsoft.Winget.Source_8wekyb3d8bbwe/duckdb.exe";
-const DUCK_DB = resolve(here, "../../../bench/clickbench/duckdb/hits_full.duckdb");
+const DUCK_DB = resolve(here, "../../../bench/clickbench/duckdb/hits_full_v2.duckdb");
 const DB = process.env.THINDB_DB ?? "clickbench_rle__public";
 const ONLY = process.env.ONLY ? new Set(process.env.ONLY.split(",").map(Number)) : null;
 

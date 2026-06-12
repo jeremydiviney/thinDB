@@ -3,7 +3,7 @@
 set -u
 MYSQL="C:/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe"
 DUCK="C:/Users/jerem/AppData/Local/Microsoft/WinGet/Packages/DuckDB.cli_Microsoft.Winget.Source_8wekyb3d8bbwe/duckdb.exe"
-DUCKDB="bench/clickbench/duckdb/hits_full.duckdb"
+DUCKDB="bench/clickbench/duckdb/hits_full_v2.duckdb"
 QF="bench/clickbench/queries.sql"
 
 printf "%-3s | %10s | %10s | %7s | %-7s | %s\n" "Q" "thinDB_ms" "duck_ms" "ratio" "status" "rows"
