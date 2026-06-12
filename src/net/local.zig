@@ -441,8 +441,9 @@ pub const ClientQuery = struct {
     };
 
     pub const InProcessState = struct {
-        /// Server-side operator tree we drive via `q.next()`.
-        server_query: Query,
+        /// Server-side compiled query (operator tree + CompileCtx) we
+        /// drive via `next()`.
+        server_query: CompiledQuery,
         /// Encoded IR bytes kept alive: the decoded operator tree borrows
         /// string slices (column names, text values) from these bytes.
         /// ArrayList rather than raw slice so we own a stable address —
@@ -647,15 +648,15 @@ pub const ClientQuery = struct {
 
         switch (self.conn.transport) {
             .in_process => |db| {
-                // In-process: decode the IR back, build the server-side
+                // In-process: decode the IR back, compile the server-side
                 // query, hold both. The decoded tree's children allocs
                 // land in the arena (ClientQuery-lifetime); string slices
                 // borrow from encoded.items, which we keep alive in
                 // the InProcessState.
-                const decoded = try ir.decode(self.arena.allocator(), encoded.items);
-                const sq = try buildServerQuery(self.allocator, db, decoded);
+                var decoded = try ir.decode(self.arena.allocator(), encoded.items);
+                const cq = try compileWithSession(self.allocator, db, .{}, &decoded);
                 self.state = .{ .in_process = .{
-                    .server_query = sq,
+                    .server_query = cq,
                     .encoded_buffer = encoded,
                 } };
             },
@@ -1847,205 +1848,14 @@ fn buildLateMat(
     );
 }
 
-/// Server-side IR dispatcher. Recursively walks the decoded IR tree and
-/// builds the corresponding exec.Query operator chain using existing
-/// in-process operators. Uses a default Session — call sites needing
-/// a non-default `current_db` / `current_schema` should go through
-/// `compile()` instead.
-pub fn buildServerQuery(allocator: Allocator, db: *Database, op: ir.Op) !Query {
-    const session: Session = .{};
-    return buildServerQuerySession(allocator, db, session, op);
-}
-
-pub fn buildServerQuerySession(
-    allocator: Allocator,
-    db: *Database,
-    session: Session,
-    op: ir.Op,
-) !Query {
-    return switch (op) {
-        .scan => |s| blk: {
-            const catalog = catalogFor(db) orelse return Error.DatabaseNotFound;
-            const t = try resolveTable(catalog, session, s.table);
-            const base = try exec.scan(allocator, t);
-            if (s.alias) |alias| {
-                errdefer @constCast(&base).deinit();
-                break :blk try exec.AliasRename.create(allocator, base, alias);
-            }
-            break :blk base;
-        },
-        .file_scan => |f| blk: {
-            const base = try exec.fileScan(allocator, db.io, db.config.file_scan_access, f, null);
-            if (f.alias) |alias| {
-                errdefer @constCast(&base).deinit();
-                break :blk try exec.AliasRename.create(allocator, base, alias);
-            }
-            break :blk base;
-        },
-        .alias => |a| blk: {
-            var upstream = try buildServerQuerySession(allocator, db, session, a.upstream.*);
-            errdefer upstream.deinit();
-            break :blk try exec.AliasRename.create(allocator, upstream, a.alias);
-        },
-        .limit => |l| blk: {
-            // Late materialization (see compileOp for the rationale + the
-            // shape-detection helpers). Bails to Top-N / Limit otherwise.
-            if (catalogFor(db)) |catalog| {
-                if (lateMatBaseTable(catalog, session, l)) |t| {
-                    if (try lateMatShape(allocator, t, l)) |shape| {
-                        var sh = shape;
-                        defer sh.deinit(allocator);
-                        if (try buildLateMat(allocator, t, null, sh, l, db.config.max_dop)) |q| break :blk q;
-                    }
-                }
-            }
-            // Fuse ORDER BY ... LIMIT into a bounded Top-N: keep only the
-            // limit+offset rows we might emit instead of materializing the
-            // whole sorted input. The non-aggregate pipeline is
-            // limit{ [select] order_by{X} } — peek through an optional
-            // Project (which sits above OrderBy) and re-apply it on top.
-            if (topNFusion(l.upstream)) |f| {
-                applyTopKFusion(f, l);
-                const inner = try buildServerQuerySession(allocator, db, session, f.order_by.upstream.*);
-                var topn = try inner.topN(f.order_by.specs, @intCast(l.n), @intCast(l.offset));
-                if (f.project) |p| {
-                    errdefer topn.deinit();
-                    topn = try compileSelectProject(allocator, topn, p);
-                }
-                break :blk topn;
-            }
-            // No ORDER BY: cap a directly-underlying GROUP BY's emit at the
-            // limit so it stops after `n+offset` groups instead of building
-            // every group for the Limit to discard.
-            applyGroupByLimitFusion(l);
-            const upstream = try buildServerQuerySession(allocator, db, session, l.upstream.*);
-            break :blk try upstream.limitOffset(@intCast(l.n), @intCast(l.offset));
-        },
-        .select => |s| blk: {
-            var upstream = try buildServerQuerySession(allocator, db, session, s.upstream.*);
-            errdefer upstream.deinit();
-            break :blk try compileSelectProject(allocator, upstream, s);
-        },
-        .exclude => |e| blk: {
-            var upstream = try buildServerQuerySession(allocator, db, session, e.upstream.*);
-            errdefer upstream.deinit();
-            const upstream_cols = upstream.outputSchema();
-            const remaining = try complementColumns(allocator, upstream_cols, e.columns);
-            defer allocator.free(remaining);
-            break :blk try upstream.project(remaining);
-        },
-        .filter => |f| blk: {
-            var upstream = try buildServerQuerySession(allocator, db, session, f.upstream.*);
-            errdefer upstream.deinit();
-            break :blk try upstream.filter(f.predicate);
-        },
-        .order_by => |o| blk: {
-            var upstream = try buildServerQuerySession(allocator, db, session, o.upstream.*);
-            errdefer upstream.deinit();
-            break :blk try upstream.orderBy(o.specs);
-        },
-        .group_by => |g| blk: {
-            // Metadata-only MIN/MAX over a bare table scan — answer from the
-            // manifest stats without building (or draining) a scan at all.
-            if (!hasUdfAgg(g.aggs) and g.group_cols.len == 0) switch (g.upstream.*) {
-                .scan => |s| {
-                    if (catalogFor(db)) |catalog| {
-                        if (resolveTable(catalog, session, s.table)) |t| {
-                            if (try tryMinMaxStats(allocator, t, g.aggs)) |q| break :blk q;
-                        } else |_| {}
-                    }
-                },
-                else => {},
-            };
-            var upstream = try buildServerQuerySession(allocator, db, session, g.upstream.*);
-            errdefer upstream.deinit();
-            if (hasUdfAgg(g.aggs)) {
-                const registry = if (catalogFor(db)) |catalog| &catalog.udfs else return Error.UnsupportedOp;
-                break :blk try upstream.udfGroupBy(g.group_cols, g.aggs, registry);
-            }
-            break :blk try group_route.routeGroupBy(allocator, &upstream, g.group_cols, g.aggs, g.top_k, g.emit_limit, db.config.query_memory_budget);
-        },
-        .compute => |c| blk: {
-            var upstream = try buildServerQuerySession(allocator, db, session, c.upstream.*);
-            errdefer upstream.deinit();
-            const udfs = if (catalogFor(db)) |catalog| &catalog.udfs else null;
-            // Try fusing row-local derived into the parallel scan workers; a UDF
-            // (not fusable) declines, falling back to the UDF-aware compute.
-            if (try upstream.tryFuseCompute(c.derived)) break :blk upstream;
-            break :blk try upstream.computeWithRegistry(c.derived, udfs);
-        },
-        .join => |j| blk: {
-            var left = try buildServerQuerySession(allocator, db, session, j.left.*);
-            errdefer left.deinit();
-            const right = try buildServerQuerySession(allocator, db, session, j.right.*);
-            const spec: ir.JoinSpec = .{
-                .join_type = j.join_type,
-                .algorithm = j.algorithm,
-                .on = j.on,
-                .ranges = j.ranges,
-                .extra_predicate = j.extra_predicate,
-                .skew_ratio_threshold = j.skew_ratio_threshold,
-                .skew_absolute_threshold = j.skew_absolute_threshold,
-                .skew_sample_interval = j.skew_sample_interval,
-            };
-            break :blk try left.join(right, spec);
-        },
-        .materialize => {
-            // Plans containing Materialize nodes must go through
-            // `compile()` instead — it threads a CompileCtx that
-            // shares buffers across multi-references.
-            return Error.UnsupportedOp;
-        },
-        .ddl, .show, .insert => {
-            // Side-effect / introspection ops aren't recursive — they
-            // can't appear as the upstream of another op. The top-level
-            // compile() routes them straight to their dedicated builder.
-            return Error.UnsupportedOp;
-        },
-        .batch => {
-            // Multi-statement batches aren't a single pipeline. Wire
-            // layers iterate sub-statements and compile each one
-            // separately.
-            return Error.UnsupportedOp;
-        },
-        .copy => {
-            // COPY interleaves with the wire (CopyData frames) so it
-            // can only run from the PG dispatcher, never through the
-            // generic compile path.
-            return Error.UnsupportedOp;
-        },
-        .window => |w| blk: {
-            var upstream = try buildServerQuerySession(allocator, db, session, w.upstream.*);
-            errdefer upstream.deinit();
-            break :blk try upstream.window(w.specs, w.calls, db.config.max_dop);
-        },
-        .set_union => |u| blk: {
-            const left_q = try buildServerQuerySession(allocator, db, session, u.left.*);
-            errdefer @constCast(&left_q).deinit();
-            const right_q = try buildServerQuerySession(allocator, db, session, u.right.*);
-            errdefer @constCast(&right_q).deinit();
-            break :blk try exec.SetUnion.create(allocator, left_q, right_q, u.all);
-        },
-        // CTAS / INSERT-SELECT come from SQL parsing and only go
-        // through the CompileCtx path. The plan-builder + wire path
-        // doesn't construct these.
-        .single_row => return SingleRowSource.create(allocator),
-        .create_table_as, .insert_select, .set_var, .delete_op, .update_op, .explain => return Error.UnsupportedOp,
-    };
-}
-
 // ---------------------------------------------------------------------------
-// Compile path with materialization support.
+// Compile path.
 //
 // Threads a CompileCtx through the recursion so a `*ir.Op.materialize`
 // referenced from multiple parents resolves to ONE drained buffer with
 // multiple Reader cursors (instead of N independent drains). The ctx
 // owns the buffers; CompiledQuery bundles the resulting Query with the
 // ctx so deinit tears down both in order.
-//
-// Plans that contain no `.materialize` nodes route exactly like
-// buildServerQuery (the recursive cases are duplicated for now;
-// could be unified later via an internal context-taking helper).
 // ---------------------------------------------------------------------------
 
 pub const CompileCtx = struct {
@@ -2398,34 +2208,6 @@ fn tryMinMaxStats(allocator: Allocator, table: *ApiTable, aggs: []const exec.Agg
     }
     return exec.minMaxStats(allocator, table, specs);
 }
-
-/// Does a hash GROUP BY on these keys fit the memory budget? The hash path is
-/// O(n) (one pass) vs the sort path's O(n log n) comparisons, so it's preferred
-/// whenever the group hash table provably fits. The sort fallback only protects
-/// memory, so the breakpoint is budget-derived: hash is chosen when the
-/// estimated table (groups × per-group footprint) stays under half the budget.
-///
-/// Group-count estimate: the product of per-key NDVs assumes the keys are
-/// independent and *overestimates* badly when they're correlated (e.g. a unique
-/// key makes the product explode while the real combo count is just the row
-/// count). The true combined count can never exceed the number of input rows,
-/// so we clamp the product to `st.upper_rows`. A key with unknown cardinality
-/// (post-filter, derived/computed, or no on-disk stat) contributes no usable
-/// factor — but the row-count ceiling still bounds the whole combo, so we fall
-/// back to that ceiling rather than giving up and sorting. `schema` is the
-/// group-by input's output schema (column_stats is indexed by it).
-///
-/// TODO(FD): tighten further with functional-dependency detection — a key that
-/// is a deterministic function of another key (e.g. `ClientIP - 1`) adds zero
-/// groups and could drop out of the estimate. Not needed at current scale (the
-/// row-count clamp already routes the correlated cases correctly).
-/// Shared GROUP BY strategy routing for both compile dispatchers
-/// (`buildServerQuerySession` and `compileOp`). When a sort-based streaming
-/// aggregate is the right call — forced via `--force-group-by sort`, the keys
-/// are an already-sorted prefix, or the hash table is proven over the memory
-/// budget — order the keys and stream, returning the streamed Query. Returns
-/// null to fall through to the hash `groupByTopK`. `upstream` is reassigned in
-/// place when it orders the keys (the caller's errdefer then owns the wrapper).
 
 /// Parallel partition+lease high-card GROUP BY (experimental). Same eligibility
 /// as routeRadixGroupBy — int key ≤128 bits, fixed-state aggregates, high-card —

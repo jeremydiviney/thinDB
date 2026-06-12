@@ -923,7 +923,14 @@ const ScanSelectPlan = struct {
     // keep the source name. Star expansion is not handled on this path, so a
     // plan with outputs never contains `*` items.
     project_outputs: ?[]const ?[]const u8 = null,
+    // Stacked `.exclude` ops in the scan body (plan-builder API), outermost
+    // first. Applied as complement-projections after the body's Compute so a
+    // later SELECT of an excluded name fails with ColumnNotFound.
+    excludes: [MAX_SCAN_EXCLUDES][]const []const u8 = undefined,
+    exclude_count: usize = 0,
 };
+
+const MAX_SCAN_EXCLUDES = 4;
 
 fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     var op = root;
@@ -962,10 +969,13 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
             else => break,
         }
     }
-    // The scan body: an optional row-local Compute and an optional WHERE, in
-    // either order, down to the table scan.
+    // The scan body: an optional row-local Compute, an optional WHERE, and
+    // any `.exclude` decorators (plan-builder API), in any order, down to
+    // the table scan.
     var where_filter: ?ir.Op.Filter = null;
     var derived: []const ir.Derived = &.{};
+    var excludes: [MAX_SCAN_EXCLUDES][]const []const u8 = undefined;
+    var exclude_count: usize = 0;
     while (true) {
         switch (op.*) {
             .compute => |c| {
@@ -977,6 +987,12 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
                 if (where_filter != null) return null;
                 where_filter = f;
                 op = f.upstream;
+            },
+            .exclude => |p| {
+                if (exclude_count == MAX_SCAN_EXCLUDES) return null;
+                excludes[exclude_count] = p.columns;
+                exclude_count += 1;
+                op = p.upstream;
             },
             else => break,
         }
@@ -990,6 +1006,8 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
         .limit = limit,
         .project_columns = project_columns,
         .project_outputs = project_outputs,
+        .excludes = excludes,
+        .exclude_count = exclude_count,
     };
 }
 
@@ -1139,7 +1157,7 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
     if (plan.limit) |l| {
-        if (plan.project_outputs == null) {
+        if (plan.project_outputs == null and plan.exclude_count == 0) {
             if (try tryScanSelectLateMat(input, table, plan, l)) |q| return q;
         }
     }
@@ -1157,6 +1175,22 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
     if (plan.where_filter) |f| q = try q.filter(f.predicate);
     if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    // Innermost exclude first (they were collected outermost-first walking
+    // down). Each is a complement-projection over the current schema, so a
+    // later SELECT of an excluded name fails with ColumnNotFound.
+    var ei: usize = plan.exclude_count;
+    while (ei > 0) {
+        ei -= 1;
+        var remaining: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer remaining.deinit(allocator);
+        keep: for (q.outputSchema()) |col| {
+            for (plan.excludes[ei]) |ex| {
+                if (types.columnNameEql(col.name, ex)) continue :keep;
+            }
+            try remaining.append(allocator, col.name);
+        }
+        q = try q.project(remaining.items);
+    }
     if (plan.order_by) |o| {
         if (plan.limit) |l| {
             q = try q.topN(o.specs, @intCast(l.n), @intCast(l.offset));

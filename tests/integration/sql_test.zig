@@ -2,7 +2,7 @@
 //!
 //! Each test seeds a small table, parses a SQL string into an IR Op
 //! tree, compiles that tree into an executable Query (via the existing
-//! local.buildServerQuery path), drains the result, and asserts the
+//! local.compileWithSession path), drains the result, and asserts the
 //! output. Same architecture future tooling (EXPLAIN, network server)
 //! will use.
 

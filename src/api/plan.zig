@@ -207,13 +207,15 @@ pub const PlanBuilder = struct {
     // Compile — turn a built plan into an executable Query.
     // -----------------------------------------------------------------------
 
-    /// Compile `root` into an executable Query against `db`. The
-    /// returned Query owns its own state; callers `q.deinit()` it
-    /// independently of `pb.deinit()`. Safe to call multiple times on
-    /// the same plan to produce parallel Queries.
-    pub fn compile(self: *PlanBuilder, query_allocator: Allocator, db: *Database, root: *ir.Op) !Query {
+    /// Compile `root` into an executable CompiledQuery against `db` —
+    /// the same V2-first dispatch the SQL frontends use. The returned
+    /// CompiledQuery owns its own state (operator tree + compile
+    /// context); callers `cq.deinit()` it independently of
+    /// `pb.deinit()`. Safe to call multiple times on the same plan to
+    /// produce parallel queries.
+    pub fn compile(self: *PlanBuilder, query_allocator: Allocator, db: *Database, root: *ir.Op) !local.CompiledQuery {
         _ = self;
-        return local.buildServerQuery(query_allocator, db, root.*);
+        return local.compileWithSession(query_allocator, db, .{}, root);
     }
 
     /// Render `root` as indented text. The returned slice lives in

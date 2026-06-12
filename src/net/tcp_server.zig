@@ -1,5 +1,5 @@
 //! TCP server. `thindb.serveTcp(...)` returns a Server that accepts
-//! connections on a TCP port and handles them via the same buildServerQuery
+//! connections on a TCP port and handles them via the same compileWithSession
 //! path the in-process Connection uses. One query per connection (stateless
 //! RPC); the connection closes after the resp_end frame is written.
 //!
@@ -379,10 +379,10 @@ fn handleQuery(
     // Decode the operator tree.
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const op = try ir.decode(arena.allocator(), ir_bytes);
+    var op = try ir.decode(arena.allocator(), ir_bytes);
 
-    // Build the server-side query.
-    var server_query = try local.buildServerQuery(allocator, db, op);
+    // Compile the server-side query (V2-first, same as the SQL frontends).
+    var server_query = try local.compileWithSession(allocator, db, .{}, &op);
     defer server_query.deinit();
 
     // Stream batches — resp_batch payloads are typically large

@@ -11,7 +11,7 @@
 //!
 //! The returned *ir.Op tree lives in the supplied arena. Pass it
 //! straight to the existing IR→Query compile path (e.g. via
-//! PlanBuilder.compile or local.buildServerQuery).
+//! PlanBuilder.compile or local.compileWithSession).
 
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
