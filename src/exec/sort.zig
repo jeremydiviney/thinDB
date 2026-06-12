@@ -138,6 +138,38 @@ fn emitColumn(allocator: Allocator, src: ColumnStore, idxs: []const u32, out: *C
 /// once, so each comparison avoids the tagged-union dispatch and view
 /// reconstruction the generic multi-key comparator pays per call.
 fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) void {
+    // NULL rows order first ascending / last descending (dialect convention).
+    // A NULL slot's payload bytes are encoding artifacts, so the typed
+    // kernels below must only ever see the valid rows: partition the NULLs
+    // out to their end of the permutation, sort the valid remainder.
+    var valid = perm;
+    if (col.nulls != null) {
+        if (desc) {
+            var w: usize = perm.len;
+            var i: usize = perm.len;
+            while (i > 0) {
+                i -= 1;
+                if (!engine.transform.rowIsValid(col, perm[i])) {
+                    w -= 1;
+                    std.mem.swap(u32, &perm[i], &perm[w]);
+                }
+            }
+            valid = perm[0..w];
+        } else {
+            var w: usize = 0;
+            for (0..perm.len) |i| {
+                if (!engine.transform.rowIsValid(col, perm[i])) {
+                    std.mem.swap(u32, &perm[i], &perm[w]);
+                    w += 1;
+                }
+            }
+            valid = perm[w..];
+        }
+    }
+    sortSingleKeyValid(allocator, valid, col, desc);
+}
+
+fn sortSingleKeyValid(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) void {
     switch (col.data) {
         inline .varchar, .string, .char => |s| {
             // A column past 4 GiB carries u64 offsets (StringStore.wide_offsets);
@@ -412,7 +444,7 @@ pub const Sort = struct {
 
             pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
                 for (ctx.indices, 0..) |ci, i| {
-                    const ord = engine.memtable.compareInColumn(ctx.accumulated[ci], a, b);
+                    const ord = engine.transform.compareInColumnNullsFirst(ctx.accumulated[ci], a, b);
                     if (ord == .lt) return !ctx.desc[i];
                     if (ord == .gt) return ctx.desc[i];
                 }

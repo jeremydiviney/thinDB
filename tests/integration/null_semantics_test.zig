@@ -455,6 +455,52 @@ test "null group keys: NULL-keyed group aggregates its values normally" {
     try std.testing.expectEqual(@as(i64, 4), b.values[3].data.bigint[0]);
 }
 
+test "null ordering: NULLs first ascending, last descending, through Sort and TopN" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    var q = try runSql(allocator, db, "SELECT id FROM nt ORDER BY v DESC, id");
+    defer q.deinit();
+    var ids = try collectIds(allocator, &q);
+    defer ids.deinit(allocator);
+    // 30, 20, 10, then the NULL rows (2,4,5) last, id-tiebroken.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 6, 3, 1, 2, 4, 5 }, ids.items);
+
+    // LIMIT routes through TopN — NULLs are the smallest ascending keys.
+    var qt = try runSql(allocator, db, "SELECT id FROM nt ORDER BY v, id LIMIT 4");
+    defer qt.deinit();
+    var tids = try collectIds(allocator, &qt);
+    defer tids.deinit(allocator);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 4, 5, 1 }, tids.items);
+}
+
+test "null window: PARTITION BY nullable key — NULLs form one partition" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // v partitions: {1}(v=10), {2,4,5}(NULL), {3}(20), {6}(30).
+    var q = try runSql(allocator, db,
+        "SELECT id, COUNT(*) OVER (PARTITION BY v) AS c, SUM(id) OVER (PARTITION BY v) AS si FROM nt ORDER BY id",
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 6), b.row_count);
+    const expect_c = [_]i64{ 1, 3, 1, 3, 3, 1 };
+    const expect_si = [_]i64{ 1, 11, 3, 11, 11, 6 };
+    for (expect_c, expect_si, 0..) |ec, es, row| {
+        try std.testing.expectEqual(ec, b.values[1].data.bigint[row]);
+        try std.testing.expectEqual(es, b.values[2].data.bigint[row]);
+    }
+}
+
 test "null basics: arithmetic propagates NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -14,8 +14,38 @@ const ColumnStore = store.ColumnStore;
 const DataStore = store.DataStore;
 const StringStore = store.StringStore;
 
+/// True when `row`'s validity bit is set (or the column is non-nullable /
+/// the bitmap was never written that far — both mean "no NULL recorded").
+pub fn rowIsValid(col: ColumnStore, row: u32) bool {
+    const nb = col.nulls orelse return true;
+    const byte_idx = row >> 3;
+    if (byte_idx >= nb.items.len) return true;
+    return (nb.items[byte_idx] & (@as(u8, 1) << @intCast(row & 7))) != 0;
+}
+
+/// Validity-aware variant of `compareInColumn` for QUERY-side consumers
+/// (Sort, TopN, Window): NULL orders before every value (the dialect's
+/// NULLs-first-ASC convention; DESC handling in the callers puts it last),
+/// two NULLs compare equal. A NULL slot's payload bytes are encoding
+/// artifacts (FOR base, dict entry 0), so the raw comparator must not see
+/// them. The raw `compareInColumn` keeps the storage-side contract (the
+/// segment k-way merge deliberately ignores validity).
+pub fn compareInColumnNullsFirst(col: ColumnStore, a: u32, b: u32) std.math.Order {
+    if (col.nulls != null) {
+        const av = rowIsValid(col, a);
+        const bv = rowIsValid(col, b);
+        if (!av or !bv) {
+            if (av == bv) return .eq;
+            return if (av) .gt else .lt;
+        }
+    }
+    return compareInColumn(col, a, b);
+}
+
 /// Compare row `a` vs row `b` within a single column. Lexicographic order
 /// for strings, numeric order for everything else. Used by sort kernels.
+/// Raw value order — validity is NOT consulted (storage merge contract);
+/// query-side ordering goes through `compareInColumnNullsFirst`.
 pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
     return switch (col.data) {
         .int => |l| std.math.order(l.items[a], l.items[b]),

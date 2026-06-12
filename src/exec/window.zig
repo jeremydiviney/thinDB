@@ -146,7 +146,9 @@ pub const Window = struct {
 
         // Resolve every WindowSpec's column refs to indices.
         const spec_indices = try allocator.alloc(SpecIndices, specs.len);
-        errdefer freeSpecIndices(allocator, spec_indices, 0);
+        // Single errdefer: `sinit` is read at unwind time, so this also covers
+        // the nothing-initialized case (a second errdefer would double-free
+        // the outer slice).
         var sinit: usize = 0;
         errdefer freeSpecIndices(allocator, spec_indices, sinit);
         for (specs, 0..) |sp, si| {
@@ -847,13 +849,13 @@ pub const Window = struct {
         pub fn pairLess(ctx: @This(), a: KeyIdx, b: KeyIdx) bool {
             if (a.hi != b.hi) return a.hi < b.hi;
             for (ctx.part) |ci| {
-                const ord = transform.compareInColumn(ctx.cols[ci], a.idx, b.idx);
+                const ord = transform.compareInColumnNullsFirst(ctx.cols[ci], a.idx, b.idx);
                 if (ord == .lt) return true;
                 if (ord == .gt) return false;
             }
             if (a.lo != b.lo) return a.lo < b.lo;
             for (ctx.order, 0..) |ci, i| {
-                const ord = transform.compareInColumn(ctx.cols[ci], a.idx, b.idx);
+                const ord = transform.compareInColumnNullsFirst(ctx.cols[ci], a.idx, b.idx);
                 if (ord == .lt) return !ctx.desc[i];
                 if (ord == .gt) return ctx.desc[i];
             }
@@ -1714,7 +1716,10 @@ fn partitionEnd(
     const ref = perm[start];
     while (e < perm.len) : (e += 1) {
         for (part_cols) |ci| {
-            if (transform.compareInColumn(cols[ci], ref, perm[e]) != .eq) return e;
+            // NULL keys form ONE partition (NULLs are "not distinct"), so the
+            // boundary check must be validity-aware — a NULL slot's payload
+            // bytes would otherwise split or merge partitions arbitrarily.
+            if (transform.compareInColumnNullsFirst(cols[ci], ref, perm[e]) != .eq) return e;
         }
     }
     return e;
@@ -1767,7 +1772,7 @@ fn orderEquals(
     b: u32,
 ) bool {
     for (order_cols) |ci| {
-        if (transform.compareInColumn(cols[ci], a, b) != .eq) return false;
+        if (transform.compareInColumnNullsFirst(cols[ci], a, b) != .eq) return false;
     }
     return true;
 }
@@ -2029,6 +2034,10 @@ fn isValid(view: ColumnView, row: u32) bool {
 /// NaN equal-and-largest, -0 == +0). `desc` inverts the mapping.
 fn orderPrefix(col: ColumnStore, row: u32, desc: bool) u64 {
     const SIGN64: u64 = 1 << 63;
+    // NULL normalizes below every value (prefix 0 pre-flip): it can only TIE
+    // with a real minimum's prefix, and ties resolve through the exact
+    // validity-aware comparator — the prefix stays order-consistent.
+    if (!transform.rowIsValid(col, row)) return if (desc) ~@as(u64, 0) else 0;
     const norm: u64 = switch (col.data) {
         .int => |l| @as(u64, @bitCast(@as(i64, l.items[row]))) ^ SIGN64,
         .bigint => |l| @as(u64, @bitCast(l.items[row])) ^ SIGN64,
@@ -2073,6 +2082,14 @@ fn stringPrefix(bytes: []const u8) u64 {
 /// digest): canonical widths for the int family, NaN/-0 canonicalized for
 /// floats, length-prefixed bytes for strings (guards multi-column chains).
 fn digestCell(h: *std.hash.Wyhash, col: ColumnStore, row: u32) void {
+    // A NULL slot's payload bytes are encoding artifacts — digest a sentinel
+    // instead so every NULL key lands in the same partition bucket and never
+    // shares one with a real value (digest ties fall back to the validity-
+    // aware comparator, so a sentinel collision stays correct).
+    if (!transform.rowIsValid(col, row)) {
+        hashInt(h, @bitCast(@as(u64, 0x6e756c6c_6b657921))); // "nullkey!"
+        return;
+    }
     switch (col.data) {
         .int => |l| hashInt(h, @as(i64, l.items[row])),
         .bigint => |l| hashInt(h, l.items[row]),

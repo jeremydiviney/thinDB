@@ -239,7 +239,7 @@ pub const TopN = struct {
 
         pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
             for (ctx.indices, 0..) |ci, i| {
-                const ord = engine.memtable.compareInColumn(ctx.accumulated[ci], a, b);
+                const ord = engine.transform.compareInColumnNullsFirst(ctx.accumulated[ci], a, b);
                 if (ord == .lt) return !ctx.desc[i];
                 if (ord == .gt) return ctx.desc[i];
             }
