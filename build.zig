@@ -95,11 +95,12 @@ pub fn build(b: *std.Build) void {
     const integration_client_tests = b.addTest(.{ .root_module = integration_client_mod });
     const run_integration_client_tests = b.addRunArtifact(integration_client_tests);
 
-    // The suites default to the legacy V1 engine until V2 reaches parity on
-    // every asserted SELECT shape (`-Dtest-engine-v1=false` runs them against
-    // the runtime default — V2 — to measure the remaining gap; see the V2
-    // reintegration tasks for the current failure inventory).
-    const test_engine_v1 = b.option(bool, "test-engine-v1", "Pin tests to the legacy V1 engine (default true until V2 parity)") orelse true;
+    // The suites run against the runtime default engine — V2 — now that it
+    // holds parity on every asserted SELECT shape (634/634 as of 2026-06-12).
+    // `-Dtest-engine-v1=true` pins them back to the legacy engine, which must
+    // stay green too (it serves the documented fallback shapes: UDAF /
+    // GROUP_CONCAT, wide-accumulator grouped SUM/AVG, file scans, pg_catalog).
+    const test_engine_v1 = b.option(bool, "test-engine-v1", "Pin tests to the legacy V1 engine (default false: V2 is the engine under test)") orelse false;
     if (test_engine_v1) {
         run_lib_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
         run_integration_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
