@@ -404,6 +404,10 @@ pub const AggregateSpec = struct {
     // the running count slot. False/0 for every other aggregate.
     is_distinct: bool = false,
     distinct_state_index: u16 = 0,
+    // SUM/AVG over a 64-bit integer input: i128 accumulation across two
+    // consecutive slots (lo at state_index-1, hi at state_index). Generic
+    // per-row program only; fused/weighted kernels decline.
+    wide: bool = false,
 };
 
 pub const StringAggInput = struct {
@@ -716,6 +720,7 @@ fn runHarness(
             .str_state_index = agg.str_state_index,
             .is_distinct = agg.is_distinct,
             .distinct_state_index = agg.distinct_state_index,
+            .wide = agg.wide,
         };
     }
     // shape.hashed comes from the shape gate (string / >128-bit keys). The env
@@ -741,6 +746,9 @@ fn runHarness(
                 .count_star => {},
                 .sum, .avg, .min, .max => {
                     if (agg.state_index == 0) break :blk false;
+                    // Wide (i128) state folds per row in the generic program;
+                    // run partials are single i64 cells.
+                    if (agg.wide) break :blk false;
                     const ic = agg.input_column_index orelse break :blk false;
                     if (ic >= shape.aggregate_inputs.len or input_used[ic]) break :blk false;
                     input_used[ic] = true;

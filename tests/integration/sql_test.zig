@@ -1194,6 +1194,65 @@ test "sql: GROUP BY with count(*) and sum(qty)" {
     try std.testing.expect(seen_a and seen_b and seen_c);
 }
 
+test "sql: grouped SUM/AVG over BIGINT accumulate in i128 (wide two-slot state)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema_w = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "tag", .type = .string },
+            .{ .name = "v", .type = .bigint, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok_w = [_][]const u8{"id"};
+    const t = try db.table("w", schema_w, .{ .order_key = &ok_w, .unique = true, .row_group_size = 4 });
+    const big: i64 = 4_000_000_000_000_000_000; // three of these overflow i64
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .tag = "a", .v = @as(?i64, big) },
+        .{ .id = @as(i64, 2), .tag = "a", .v = @as(?i64, big) },
+        .{ .id = @as(i64, 3), .tag = "a", .v = @as(?i64, big) },
+        .{ .id = @as(i64, 4), .tag = "a", .v = @as(?i64, null) },
+        .{ .id = @as(i64, 5), .tag = "b", .v = @as(?i64, -big) },
+        .{ .id = @as(i64, 6), .tag = "b", .v = @as(?i64, -big) },
+        .{ .id = @as(i64, 7), .tag = "b", .v = @as(?i64, -big) },
+    });
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        \\SELECT tag, sum(v) AS s, avg(v) AS a, count(v) AS c FROM w GROUP BY tag
+    );
+    defer q.deinit();
+    var seen_a = false;
+    var seen_b = false;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            const tag = b.values[0].data.string.rowBytes(i);
+            const s = b.values[1].data.largeint[i];
+            const a = b.values[2].data.double[i];
+            const c = b.values[3].data.bigint[i];
+            if (std.mem.eql(u8, tag, "a")) {
+                seen_a = true;
+                try std.testing.expectEqual(@as(i128, 3) * big, s);
+                try std.testing.expectApproxEqRel(@as(f64, @floatFromInt(big)), a, 1e-12);
+                try std.testing.expectEqual(@as(i64, 3), c);
+            } else if (std.mem.eql(u8, tag, "b")) {
+                seen_b = true;
+                try std.testing.expectEqual(@as(i128, -3) * big, s);
+                try std.testing.expectApproxEqRel(@as(f64, @floatFromInt(-big)), a, 1e-12);
+                try std.testing.expectEqual(@as(i64, 3), c);
+            } else return error.UnexpectedTag;
+        }
+    }
+    try std.testing.expect(seen_a and seen_b);
+}
+
 test "sql: global aggregate (no GROUP BY) — count(*), avg, min, max" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

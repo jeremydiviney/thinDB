@@ -474,6 +474,11 @@ pub const GroupAggregateSpec = struct {
     // every other aggregate.
     is_distinct: bool = false,
     distinct_state_index: u16 = 0,
+    // SUM/AVG over a 64-bit integer input accumulates in i128: the aggregate
+    // owns TWO consecutive slots — lo u64 bits at `state_index - 1`, hi i64
+    // at `state_index`. Only the generic per-row program supports wide state;
+    // the fused count/sum/avg and weight-fold kernels decline it.
+    wide: bool = false,
 };
 
 // Per-group numeric accumulators are stored in a runtime variable-stride slab
@@ -777,7 +782,8 @@ fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
             a.aggregates[i].state_index != b.aggregates[i].state_index or
             a.aggregates[i].is_string != b.aggregates[i].is_string or
             a.aggregates[i].str_input_index != b.aggregates[i].str_input_index or
-            a.aggregates[i].str_state_index != b.aggregates[i].str_state_index)
+            a.aggregates[i].str_state_index != b.aggregates[i].str_state_index or
+            a.aggregates[i].wide != b.aggregates[i].wide)
         {
             return false;
         }
@@ -3232,6 +3238,9 @@ fn buildWeightFoldSpecs(layout: GroupRowsLayout, batch: thindb.Batch, out: []Wei
         var op: ?WeightFoldOp = null;
         for (layout.aggregates) |agg| {
             if (agg.is_string or agg.is_distinct) continue;
+            // Weight folds accumulate in single i64 cells — a wide aggregate
+            // disqualifies the whole run-collapse program.
+            if (agg.wide) return error.UnsupportedOperatorForType;
             const ic = agg.input_column_index orelse continue;
             if (ic != c or op != null) continue;
             op = switch (agg.op) {
@@ -3472,6 +3481,9 @@ fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec
                 if (aggInputIsFloat(rows, agg)) {
                     const value = try aggregateInputFloat(agg, rows, row_idx);
                     try addFloatStateValue(ref, state_index, value);
+                } else if (agg.wide) {
+                    const value = try aggregateInputValue(agg, rows, row_idx);
+                    try addWideStateValue(ref, state_index, value);
                 } else {
                     const value = try aggregateInputValue(agg, rows, row_idx);
                     try addAggregateStateValue(ref, state_index, value);
@@ -3545,6 +3557,22 @@ inline fn aggregateStateValue(ref: StateRef, state_index: usize) i128 {
     return ref.slots[state_index - 1];
 }
 
+/// Wide (i128) accumulator spanning two slots: lo u64 bits at
+/// `state_index - 1`, hi i64 at `state_index`. Reassembly is the inverse of
+/// `addWideStateValue`'s split.
+pub inline fn wideStateValue(slots: []const i64, state_index: usize) i128 {
+    const lo: u64 = @bitCast(slots[state_index - 1]);
+    const hi: i64 = slots[state_index];
+    return (@as(i128, hi) << 64) | @as(i128, lo);
+}
+
+inline fn addWideStateValue(ref: StateRef, state_index: usize, value: i128) !void {
+    if (state_index == 0 or state_index >= ref.slots.len) return error.UnsupportedOperatorForType;
+    const nv = wideStateValue(ref.slots, state_index) + value;
+    ref.slots[state_index - 1] = @bitCast(@as(u64, @truncate(@as(u128, @bitCast(nv)))));
+    ref.slots[state_index] = @intCast(nv >> 64);
+}
+
 inline fn addAggregateStateValue(ref: StateRef, state_index: usize, value: i128) !void {
     if (state_index == 0) {
         ref.head.count += @intCast(value);
@@ -3569,7 +3597,9 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
         // String MIN/MAX has no numeric slot/payload column; its input is a
         // str_columns entry validated by the layout, not here.
         if (agg.is_string) continue;
-        if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
+        // A wide aggregate's hi half occupies the NEXT slot too.
+        if (agg.state_index + @as(u16, @intFromBool(agg.wide)) >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
+        if (agg.wide and (agg.state_index == 0 or (agg.op != .sum and agg.op != .avg))) return error.UnsupportedOperatorForType;
         if (agg.is_distinct and agg.distinct_state_index >= MAX_GROUP_DISTINCT_SLOTS) return error.UnsupportedOperatorForType;
         switch (agg.op) {
             .count_star => {},
@@ -3583,6 +3613,9 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
 
 fn countSumAvgProgram(aggregates: []const GroupAggregateSpec, column_count: usize) ?CountSumAvgProgram {
     if (aggregates.len != 3) return null;
+    // The fused kernel accumulates in single i64 slots — wide state stays on
+    // the generic per-row program.
+    for (aggregates) |a| if (a.wide) return null;
     if (aggregates[0].op != .count_star or aggregates[0].state_index != 0 or aggregates[0].input_column_index != null) return null;
     if (aggregates[1].op != .sum or aggregates[1].state_index != 1) return null;
     if (aggregates[2].op != .avg or aggregates[2].state_index != 2) return null;
@@ -3594,11 +3627,13 @@ fn countSumAvgProgram(aggregates: []const GroupAggregateSpec, column_count: usiz
 
 // The number of runtime accumulator slots the program needs: the max numeric
 // state_index (slot `state_index - 1`), so count-only is 0, count+sum+avg is 2.
+// A wide aggregate's hi half lives at slot `state_index`, one past its lo.
 fn aggSlotCount(layout: GroupRowsLayout) usize {
     var n: usize = 0;
     for (layout.aggregates) |agg| {
         if (agg.is_string) continue;
-        if (agg.state_index > n) n = agg.state_index;
+        const top = agg.state_index + @as(u16, @intFromBool(agg.wide));
+        if (top > n) n = top;
     }
     return n;
 }
@@ -3764,6 +3799,9 @@ fn groupChunkRowsDirectKeys(
                 needs_kernels = true;
                 if (agg.op == .min or agg.op == .max) has_extreme = true;
                 if (agg.state_index == 0) kernelizable = false;
+                // Wide (two-slot i128) state — the monomorphic kernels do
+                // single-slot i64 math; keep the per-row program.
+                if (agg.wide) kernelizable = false;
             },
             .count_distinct => unreachable,
         }

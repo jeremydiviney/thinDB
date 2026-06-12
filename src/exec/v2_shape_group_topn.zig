@@ -104,6 +104,9 @@ const AggregatePlan = struct {
     is_string: bool = false,
     str_input_index: u16 = 0,
     str_state_index: u16 = 0,
+    // SUM/AVG over a 64-bit integer input: i128 accumulation across two
+    // consecutive slots (lo at state_index-1, hi at state_index).
+    wide: bool = false,
     // COUNT(DISTINCT col): the carried integer input is input_column_index, the
     // combined membership set is distinct_state_index, and the running count lives
     // in the numeric state_index. Output is a bigint count.
@@ -438,6 +441,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .input_column_index = agg_plan.input_column_index,
             .input_type = agg_plan.input_type,
             .state_index = agg_plan.state_index,
+            .wide = agg_plan.wide,
             .is_string = agg_plan.is_string,
             .str_input_index = agg_plan.str_input_index,
             .str_state_index = agg_plan.str_state_index,
@@ -621,22 +625,27 @@ fn compareAggregateValue(agg_plan: AggregatePlan, a: HarnessCore.TopRow, b: Harn
         .sum, .min, .max => if (float_input)
             compareF64(rowStateFloat(a, agg_plan.state_index), rowStateFloat(b, agg_plan.state_index))
         else
-            compareI128(rowStateValue(a, agg_plan.state_index), rowStateValue(b, agg_plan.state_index)),
+            compareI128(rowStateValue(a, agg_plan.state_index, agg_plan.wide), rowStateValue(b, agg_plan.state_index, agg_plan.wide)),
         .avg => if (float_input)
             compareF64(avgFloatValue(a, agg_plan.state_index), avgFloatValue(b, agg_plan.state_index))
         else
-            compareF64(avgValue(a, agg_plan.state_index), avgValue(b, agg_plan.state_index)),
+            compareF64(avgValue(a, agg_plan.state_index, agg_plan.wide), avgValue(b, agg_plan.state_index, agg_plan.wide)),
         // The distinct count accumulates in the numeric state slot.
-        .count_distinct => compareI128(rowStateValue(a, agg_plan.state_index), rowStateValue(b, agg_plan.state_index)),
+        .count_distinct => compareI128(rowStateValue(a, agg_plan.state_index, agg_plan.wide), rowStateValue(b, agg_plan.state_index, agg_plan.wide)),
         else => 0,
     };
 }
 
-fn avgValue(row: HarnessCore.TopRow, state_index: u16) f64 {
-    return if (row.count == 0) 0.0 else @as(f64, @floatFromInt(rowStateValue(row, state_index))) / @as(f64, @floatFromInt(row.count));
+fn avgValue(row: HarnessCore.TopRow, state_index: u16, wide: bool) f64 {
+    return if (row.count == 0) 0.0 else @as(f64, @floatFromInt(rowStateValue(row, state_index, wide))) / @as(f64, @floatFromInt(row.count));
 }
 
-fn rowStateValue(row: HarnessCore.TopRow, state_index: u16) i128 {
+fn rowStateValue(row: HarnessCore.TopRow, state_index: u16, wide: bool) i128 {
+    if (wide) return HarnessCore.wideStateValue(&row.slots, state_index);
+    return rowStateValueNarrow(row, state_index);
+}
+
+fn rowStateValueNarrow(row: HarnessCore.TopRow, state_index: u16) i128 {
     if (state_index == 0) return @intCast(row.count);
     if (state_index - 1 >= row.slots.len) return 0;
     return row.slots[state_index - 1];
@@ -791,12 +800,12 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
         .sum, .min, .max => if (float_input)
             try appendFloatAggregate(allocator, col, agg_plan.output_type, rowStateFloat(row, agg_plan.state_index))
         else
-            try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index)),
+            try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index, agg_plan.wide)),
         .avg => try col.data.double.append(
             allocator,
-            if (float_input) avgFloatValue(row, agg_plan.state_index) else avgValue(row, agg_plan.state_index),
+            if (float_input) avgFloatValue(row, agg_plan.state_index) else avgValue(row, agg_plan.state_index, agg_plan.wide),
         ),
-        .count_distinct => try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index)),
+        .count_distinct => try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index, agg_plan.wide)),
         else => return error.UnsupportedOperatorForType,
     }
 }
@@ -899,19 +908,13 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
                     next_string_state_index += 1;
                     continue;
                 }
-                // SUM/AVG over a 64-bit integer accumulates into i128 (the result
-                // widens to LARGEINT). The silo's per-group slots are i64, so
-                // route these to the generic i128 accumulator path instead of
-                // overflowing here. MIN/MAX over a 64-bit int is fine — it holds a
-                // single value, never grows. Float SUM/AVG (f64) is also fine.
-                // A distinguished error (not a plain decline) so the engine
-                // dispatcher falls back to the legacy i128 pipeline instead of
-                // raising UnsupportedQueryShape.
-                if ((agg.func == .sum or agg.func == .avg) and physicalTypeFor(input_type) == .i64) {
-                    _ = traceDecline(request, "64-bit sum/avg needs i128 accumulator");
-                    return error.NeedsWideAccumulator;
-                }
-                if (next_numeric_state_index > MAX_AGGS) return traceDecline(request, "aggregate state count");
+                // SUM/AVG over a 64-bit integer accumulates into i128 (the
+                // result widens to LARGEINT): the aggregate takes TWO state
+                // slots (lo, hi) and runs in the generic per-row program.
+                // MIN/MAX over a 64-bit int holds a single value — never wide.
+                const wide = (agg.func == .sum or agg.func == .avg) and physicalTypeFor(input_type) == .i64;
+                const slot_width: u16 = if (wide) 2 else 1;
+                if (next_numeric_state_index + slot_width - 1 > MAX_AGGS) return traceDecline(request, "aggregate state count");
                 const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");
                 const output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null;
                 if (agg.func == .avg and output_type != .double) return traceDecline(request, "avg output type");
@@ -922,8 +925,9 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
                     .input_type = physicalTypeFor(input_type),
                     .state_index = next_numeric_state_index,
                     .output_type = output_type,
+                    .wide = wide,
                 };
-                next_numeric_state_index += 1;
+                next_numeric_state_index += slot_width;
             },
             .count_distinct => {
                 const col_name = agg.col orelse return traceDecline(request, "count distinct column");
@@ -1060,8 +1064,8 @@ fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.To
                 .sum, .min, .max => if (float_input)
                     Num{ .f = rowStateFloat(row, agg_plan.state_index) }
                 else
-                    Num{ .i = rowStateValue(row, agg_plan.state_index) },
-                .avg => .{ .f = if (float_input) avgFloatValue(row, agg_plan.state_index) else avgValue(row, agg_plan.state_index) },
+                    Num{ .i = rowStateValue(row, agg_plan.state_index, agg_plan.wide) },
+                .avg => .{ .f = if (float_input) avgFloatValue(row, agg_plan.state_index) else avgValue(row, agg_plan.state_index, agg_plan.wide) },
                 else => null,
             };
         }
