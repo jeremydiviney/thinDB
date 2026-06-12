@@ -634,6 +634,12 @@ pub fn encodePredicateExpr(allocator: Allocator, out: *std.ArrayList(u8), expr: 
             try out.append(allocator, @intFromEnum(PredTagWal.always));
             try out.append(allocator, if (b) @as(u8, 1) else 0);
         },
+        // UNKNOWN matches no rows, and no negation happens after parse — a
+        // replayed DELETE evaluates it identically to always-false.
+        .unknown => {
+            try out.append(allocator, @intFromEnum(PredTagWal.always));
+            try out.append(allocator, 0);
+        },
         .in_set => |s| {
             try out.append(allocator, @intFromEnum(PredTagWal.in_set));
             format.writeU32(&b4, @intCast(s.col.len));

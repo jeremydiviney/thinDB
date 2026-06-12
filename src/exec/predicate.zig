@@ -115,6 +115,11 @@ pub const PredicateExpr = union(enum) {
     /// vars and rewrites this into a `.leaf` with the resolved Value.
     /// Operators never see this variant.
     leaf_var: VarPred,
+    /// Three-valued UNKNOWN for every row — the lowered form of a
+    /// comparison against a NULL literal (`v = NULL`, `v > NULL`).
+    /// Evaluates to no-match like `.always = false`, but its NEGATION is
+    /// itself (NOT UNKNOWN is UNKNOWN), which `.always` can't express.
+    unknown,
 };
 
 pub const VarPred = struct {
@@ -349,6 +354,7 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
             .op = v.op,
             .var_name = try out_arena.dupe(u8, v.var_name),
         } },
+        .unknown => .unknown,
     };
 }
 
@@ -456,6 +462,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // `.leaf_var` must have been resolved by the pre-compile
         // pass. Reaching here means the resolver missed a node.
         .leaf_var => return Error.PredicateTypeMismatch,
+        .unknown => {},
     }
 }
 
@@ -786,6 +793,7 @@ pub fn evaluatePredicate(
         .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out),
         .correlated_range => |s| try evaluateCorrelatedRangeMask(s, schema, batch, out),
         .leaf_var => return Error.PredicateTypeMismatch,
+        .unknown => @memset(out, false),
     }
 }
 
@@ -885,6 +893,7 @@ pub fn evaluateExprGuided(
         .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out),
         .correlated_range => |s| try evaluateCorrelatedRangeMask(s, schema, batch, out),
         .leaf_var => return Error.PredicateTypeMismatch,
+        .unknown => @memset(out, false),
     }
 }
 

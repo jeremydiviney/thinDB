@@ -773,6 +773,7 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
         } },
         .exists_subquery => |src| PredicateExpr{ .exists_subquery = src },
         .always => |b| PredicateExpr{ .always = b },
+        .unknown => .unknown,
         .in_subquery => |s| PredicateExpr{ .in_subquery = .{
             .col = try aa.dupe(u8, s.col),
             .source = s.source,
@@ -2985,7 +2986,7 @@ fn projWalkPredicate(c: *ProjScan, allocator: Allocator, p: exec.predicate.Predi
         .in_set => |s| c.add(allocator, s.col),
         .@"and", .@"or" => |children| for (children) |ch| projWalkPredicate(c, allocator, ch),
         .not => |child| projWalkPredicate(c, allocator, child.*),
-        .always => {},
+        .always, .unknown => {},
         .correlated_set => |s| for (s.outer_cols) |nm| c.add(allocator, nm),
         .correlated_scalar => |s| {
             c.add(allocator, s.outer_compared);

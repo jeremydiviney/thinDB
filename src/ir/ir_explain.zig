@@ -551,6 +551,7 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
         },
         .exists_subquery => try out.appendSlice(allocator, "EXISTS (SELECT …)"),
         .always => |b| try out.appendSlice(allocator, if (b) "TRUE" else "FALSE"),
+        .unknown => try out.appendSlice(allocator, "UNKNOWN"),
         .in_subquery => |s| {
             try out.appendSlice(allocator, s.col);
             try out.appendSlice(allocator, if (s.negate) " NOT IN (SELECT …)" else " IN (SELECT …)");

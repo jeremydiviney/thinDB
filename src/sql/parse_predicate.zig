@@ -95,6 +95,8 @@ fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateExpr 
         .is_null => |c| return .{ .is_not_null = c },
         .is_not_null => |c| return .{ .is_null = c },
         .always => |b| return .{ .always = !b },
+        // NOT UNKNOWN is UNKNOWN.
+        .unknown => return .unknown,
         .not => |child| return child.*,
         .@"and" => |kids| {
             const out = try p.arena.alloc(PredicateExpr, kids.len);
@@ -248,14 +250,32 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         }
         var values: std.ArrayList(Value) = .empty;
         defer values.deinit(p.arena);
+        var saw_value = false;
         while (true) {
-            const v = try p.parseValue();
-            try values.append(p.arena, v);
+            // NULL literals are dropped from the set in both IN and NOT IN
+            // (the thinDB dialect — same treatment the subquery resolver
+            // gives NULLs it drains; see thindb-not-in-nonstandard).
+            if (p.cur.tag == .kw_null) {
+                try p.advance();
+                saw_value = true;
+            } else {
+                const v = try p.parseValue();
+                try values.append(p.arena, v);
+                saw_value = true;
+            }
             if (p.cur.tag != .comma) break;
             try p.advance();
         }
         try p.expect(.rparen);
-        if (values.items.len == 0) return PE.SqlExpectedValue;
+        if (!saw_value) return PE.SqlExpectedValue;
+        // Every entry was NULL: nothing can match IN (); the negated form
+        // is vacuously true under the drop-NULLs dialect (negatePredicate
+        // flips the .always).
+        if (values.items.len == 0) {
+            var pe: PredicateExpr = .{ .always = false };
+            if (negate_predicate) pe = try negatePredicate(p, pe);
+            return pe;
+        }
 
         const kids = try p.arena.alloc(PredicateExpr, values.items.len);
         for (values.items, kids) |v, *kid| {
@@ -320,6 +340,14 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         const var_name = try p.arena.dupe(u8, p.cur.text);
         try p.advance();
         return .{ .leaf_var = .{ .col = col_dup, .op = op, .var_name = var_name } };
+    }
+
+    // Comparison against a NULL literal is UNKNOWN for every row (use
+    // IS [NOT] NULL to test for NULLs). `.unknown` rather than
+    // `.always = false` so NOT (v = NULL) stays UNKNOWN too.
+    if (p.cur.tag == .kw_null) {
+        try p.advance();
+        return .unknown;
     }
 
     const val = try p.parseValue();

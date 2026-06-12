@@ -1522,7 +1522,7 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
         // `.always` / `.in_set` / `.correlated_set` are post-resolution
         // forms that also shouldn't appear in wire IR (callers re-emit
         // via SQL).
-        .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var => return EncodeError.OutOfMemory,
+        .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var, .unknown => return EncodeError.OutOfMemory,
         .@"and" => |children| {
             try out.append(allocator, @intFromEnum(PredTag.p_and));
             try appendU32(allocator, out, @intCast(children.len));
@@ -2553,7 +2553,7 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
 
 pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     switch (expr) {
-        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var => {},
+        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var, .unknown => {},
         .@"and", .@"or" => |children| {
             for (children) |c| freeDecodedPredicate(c, allocator);
             allocator.free(children);

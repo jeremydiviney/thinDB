@@ -767,6 +767,7 @@ fn conjunctKey(expr: PredicateExpr, schema: []const Column, stats: []const exec.
         },
         .scalar_subquery, .exists_subquery, .in_subquery, .correlated_set, .correlated_scalar, .correlated_range => .{ .cost = 3, .sel = 0.5 },
         .always => |b| .{ .cost = 0, .sel = if (b) 1.0 else 0.0 },
+        .unknown => .{ .cost = 0, .sel = 0.0 },
         .leaf_var => .{ .cost = 0, .sel = 0.10 },
     };
 }
