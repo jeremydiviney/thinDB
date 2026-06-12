@@ -1094,9 +1094,12 @@ const GlobalAggregate = struct {
         return .{ .upper_rows = 1 };
     }
 
-    pub fn explain(_: *GlobalAggregate, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        try exec.explainIndent(out, allocator, depth);
-        try out.appendSlice(allocator, "V2Pipeline(global-aggregate: scan/filter/reduce)\n");
+    pub fn explain(self: *GlobalAggregate, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "Aggregate (V2 global: parallel reduce)");
+        try exec.explainIndent(out, allocator, depth + 1);
+        try out.appendSlice(allocator, "Scan ");
+        try out.appendSlice(allocator, self.table.name);
+        try out.appendSlice(allocator, " (parallel)\n");
     }
 
     pub fn next(self: *GlobalAggregate) !?Batch {

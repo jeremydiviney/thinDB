@@ -203,7 +203,7 @@ fn runExistsSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !bool {
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
     try resolveSubqueriesInOp(ctx, inner);
 
-    var q = try local.compileOp(ctx, inner);
+    var q = try local.compileSubplan(ctx, inner);
     defer q.deinit();
 
     while (try q.next()) |batch| {
@@ -221,7 +221,7 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
     try resolveSubqueriesInOp(ctx, inner);
 
-    var q = try local.compileOp(ctx, inner);
+    var q = try local.compileSubplan(ctx, inner);
     defer q.deinit();
 
     const schema = q.outputSchema();
@@ -261,7 +261,7 @@ fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !Value {
     // Resolve any further-nested subqueries first.
     try resolveSubqueriesInOp(ctx, inner);
 
-    var q = try local.compileOp(ctx, inner);
+    var q = try local.compileSubplan(ctx, inner);
     defer q.deinit();
 
     const schema = q.outputSchema();
@@ -581,7 +581,7 @@ fn maybeResolveCorrelatedExists(
     const rewritten = try buildRewrittenInner(ctx, inner, info, null);
 
     // Drain.
-    var q = try local.compileOp(ctx, rewritten);
+    var q = try local.compileSubplan(ctx, rewritten);
     defer q.deinit();
 
     const aa = ctx.subqueryArena();
@@ -665,7 +665,7 @@ fn resolveCorrelatedExistsRange(
     // equi_inner_cols...). We'll un-permute on drain.
     const rewritten = try buildRewrittenInner(ctx, undefined, info, range.inner_col);
 
-    var q = try local.compileOp(ctx, rewritten);
+    var q = try local.compileSubplan(ctx, rewritten);
     defer q.deinit();
 
     const n_keys = info.inner_cols.items.len;
@@ -792,7 +792,7 @@ fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) 
     // `s.col` matches against it), then the correlation keys.
     const rewritten = try buildRewrittenInner(ctx, inner, info, s.col);
 
-    var q = try local.compileOp(ctx, rewritten);
+    var q = try local.compileSubplan(ctx, rewritten);
     defer q.deinit();
 
     const aa = ctx.subqueryArena();
@@ -921,7 +921,7 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
     } };
 
     // Drain. Output schema is [inner_correlation_keys..., agg_value].
-    var q = try local.compileOp(ctx, gb_new);
+    var q = try local.compileSubplan(ctx, gb_new);
     defer q.deinit();
 
     const schema = q.outputSchema();

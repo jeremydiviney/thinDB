@@ -2318,6 +2318,30 @@ pub fn compileWithSession(
     return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
 }
 
+/// V2-first compile of a nested plan — subquery inners, CTAS / INSERT-SELECT
+/// sources, EXPLAIN inners — from an already-open CompileCtx. Mirrors
+/// `compileWithSession`'s dispatch exactly: staged blocks → cte_stages,
+/// single SELECT blocks → engine_v2 (V2-or-error, same as top level),
+/// statements / pg_catalog / legacy leaves → legacy compileOp.
+pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
+    if (!referencesPgCatalog(op, ctx.session.*) and engine_v2.v2Enabled() and engine_v2.isSelectQuery(op)) {
+        const v2_input = engine_v2.CompileInput{
+            .allocator = ctx.allocator,
+            .db = ctx.db,
+            .session = ctx.session.*,
+            .prune_names = ctx.prune_names,
+            .udf_registry = ctx.udf_registry,
+            .node_arena = ctx.nodeArena(),
+            .accountant = try ctx.queryAccountant(),
+        };
+        if (cte_stages.needsStaging(op)) {
+            return try cte_stages.compileStaged(v2_input, op, &ctx.stage_count);
+        }
+        if (try engine_v2.tryCompile(v2_input, op)) |q| return q;
+    }
+    return try compileOp(ctx, op);
+}
+
 /// True when any scan in the plan resolves to a pg_catalog virtual table
 /// (PG/neutral dialects only — MySQL has no such schema, mirroring the
 /// compileOp gate). Such plans compile on the legacy path wholesale.
@@ -3338,7 +3362,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             // return the plan as a one-column result. The inner query is
             // never executed. Column name follows the connecting wire's
             // convention; JSON renders the whole tree into a single row.
-            var inner = try compileOp(ctx, e.inner);
+            var inner = try compileSubplan(ctx, e.inner);
             const plan = inner.explainPlan(ctx.allocator) catch |err| {
                 inner.deinit();
                 return err;
@@ -3606,7 +3630,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
 fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
 
-    var source = try compileOp(ctx, op.source);
+    var source = try compileSubplan(ctx, op.source);
     defer source.deinit();
 
     const src_schema = source.outputSchema();
@@ -3677,7 +3701,7 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const t = try resolveTable(catalog, ctx.session.*, op.table);
     const tbl_schema = t.schema;
 
-    var source = try compileOp(ctx, op.source);
+    var source = try compileSubplan(ctx, op.source);
     defer source.deinit();
 
     const src_schema = source.outputSchema();

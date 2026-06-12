@@ -604,9 +604,9 @@ pub const ParallelScan = struct {
     }
 
     pub fn explain(self: *ParallelScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        var buf: [64]u8 = undefined;
+        var buf: [192]u8 = undefined;
         const tag = if (self.agg_fused) "materialize+partial-agg" else if (self.compute_fused) "materialize+compute" else if (self.workers[0].fusedActive()) "materialize" else "stream";
-        const line = std.fmt.bufPrint(&buf, "ParallelScan (DOP={d}, {s})", .{ self.n_threads, tag }) catch "ParallelScan";
+        const line = std.fmt.bufPrint(&buf, "ParallelScan {s} (DOP={d}, {s})", .{ self.table.name, self.n_threads, tag }) catch "ParallelScan";
         try exec.explainLine(out, allocator, depth, line);
         if (self.agg_fused) {
             try self.agg_q[0].explain(out, allocator, depth + 1);

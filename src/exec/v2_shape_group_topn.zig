@@ -383,9 +383,12 @@ const GroupTopNPipeline = struct {
         return null;
     }
 
-    pub fn explain(_: *GroupTopNPipeline, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        try exec.explainIndent(out, allocator, depth);
-        try out.appendSlice(allocator, "V2Pipeline(group-topN: scan/filter/group/order/limit)\n");
+    pub fn explain(self: *GroupTopNPipeline, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "HashAggregate (V2 group-topN: route/fold/order/limit)");
+        try exec.explainIndent(out, allocator, depth + 1);
+        try out.appendSlice(allocator, "Scan ");
+        try out.appendSlice(allocator, self.table.name);
+        try out.appendSlice(allocator, " (parallel)\n");
     }
 
     pub fn next(self: *GroupTopNPipeline) !?Batch {

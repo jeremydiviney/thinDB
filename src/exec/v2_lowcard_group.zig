@@ -1050,9 +1050,12 @@ const LowCardGroup = struct {
         return .{ .upper_rows = self.est_groups };
     }
 
-    pub fn explain(_: *LowCardGroup, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        try exec.explainIndent(out, allocator, depth);
-        try out.appendSlice(allocator, "V2Pipeline(lowcard-group: scan/private-fold/partition-merge)\n");
+    pub fn explain(self: *LowCardGroup, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "HashAggregate (V2 lowcard direct: private-fold/partition-merge)");
+        try exec.explainIndent(out, allocator, depth + 1);
+        try out.appendSlice(allocator, "Scan ");
+        try out.appendSlice(allocator, self.table.name);
+        try out.appendSlice(allocator, " (parallel)\n");
     }
 
     pub fn next(self: *LowCardGroup) !?Batch {
