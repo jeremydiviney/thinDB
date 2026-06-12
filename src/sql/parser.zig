@@ -407,10 +407,15 @@ pub const Parser = struct {
         if (self.cur.tag != .kw_select) return ParseError.SqlExpectedSelect;
         try self.advance();
 
-        // Optional DISTINCT — recorded but not yet plumbed through
-        // (would need a dedicated operator). Reject for now to avoid
-        // silent incorrect results.
-        if (self.cur.tag == .kw_distinct) return ParseError.SqlInvalidProjection;
+        // Optional DISTINCT — desugars to grouping on every projected item
+        // (resolved after the projection list is parsed). DISTINCT combined
+        // with aggregates / GROUP BY / HAVING / window functions / `*` is
+        // rejected: those need a second dedup layer above the aggregate.
+        var distinct = false;
+        if (self.cur.tag == .kw_distinct) {
+            distinct = true;
+            try self.advance();
+        }
 
         // Projection list.
         const proj = try self.parseProjection();
@@ -506,7 +511,21 @@ pub const Parser = struct {
         // this is empty and the scalar-only path below runs unchanged.
         var group_cols: []const []const u8 = &.{};
         var grouping_key: []bool = &.{};
-        if (has_agg or has_group) {
+        if (distinct) {
+            // SELECT DISTINCT a, b, expr ≡ SELECT a, b, expr GROUP BY 1, 2, 3:
+            // every projected item becomes a grouping key (markGroupKey
+            // rejects `*`, aggregates, and window items). The grouped path
+            // below then adds a hidden COUNT(*) — the engines need at least
+            // one aggregate — and a final Project drops it.
+            if (has_agg or has_group or pending_having != null) return ParseError.SqlInvalidProjection;
+            var dcols: std.ArrayList([]const u8) = .empty;
+            defer dcols.deinit(self.arena);
+            const dgk = try self.arena.alloc(bool, proj.len);
+            @memset(dgk, false);
+            for (proj, 0..) |_, i| try self.markGroupKey(proj, dgk, i, &dcols);
+            group_cols = try dcols.toOwnedSlice(self.arena);
+            grouping_key = dgk;
+        } else if (has_agg or has_group) {
             const res = try self.resolveGroupBy(proj, group_exprs);
             group_cols = res.cols;
             grouping_key = res.gk;
@@ -575,7 +594,7 @@ pub const Parser = struct {
             try self.parseFetchOffset(&pending_limit, &pending_offset);
         }
 
-        if (has_agg or has_group) {
+        if (has_agg or has_group or distinct) {
             // Functional-dependency group-key collapse (pre-execution
             // rewrite). A computed grouping key that is a pure, deterministic
             // function of other *retained* group keys — or a constant — adds
@@ -704,6 +723,13 @@ pub const Parser = struct {
                 break :blk try kept.toOwnedSlice(self.arena);
             };
 
+            // DISTINCT contributes no aggregates of its own, but the grouped
+            // cores require at least one — add a hidden COUNT(*); the forced
+            // Project below drops it from the output.
+            if (distinct) {
+                try aggs_buf.append(self.arena, .{ .func = .count, .col = null, .as = "__distinct_count" });
+            }
+
             const aggs_slice = try aggs_buf.toOwnedSlice(self.arena);
             root = try self.allocOp(.{ .group_by = .{
                 .group_cols = retained_group_cols,
@@ -737,8 +763,9 @@ pub const Parser = struct {
 
             // Reorder output to match the SELECT list if necessary. The
             // GroupBy emits group_cols first then aggs in registered order;
-            // a Project on top reorders/keeps only the SELECT items.
-            if (!projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+            // a Project on top reorders/keeps only the SELECT items. DISTINCT
+            // always projects — its hidden COUNT(*) must not reach the output.
+            if (distinct or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
         } else {

@@ -61,6 +61,96 @@ fn seedBig(db: anytype, rows: i64) !void {
     try t.flush();
 }
 
+test "sql: SELECT DISTINCT dedups single and multi-column projections" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT DISTINCT k FROM t ORDER BY k");
+    defer q.deinit();
+    var ks: std.ArrayList(i32) = .empty;
+    defer ks.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| try ks.append(allocator, b.values[0].data.int[i]);
+    }
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 100, 200, 300 }, ks.items);
+
+    // (k, tag) pairs: (100,a)(100,b)(200,a)(200,b)(300,c) — all distinct,
+    // 5 rows survive; single-column dedup above proved collapsing works.
+    var q2 = try runSql(allocator, db, "SELECT DISTINCT k, tag FROM t ORDER BY k, tag");
+    defer q2.deinit();
+    var n: usize = 0;
+    while (try q2.next()) |b| n += b.row_count;
+    try std.testing.expectEqual(@as(usize, 5), n);
+}
+
+test "sql: SELECT DISTINCT with WHERE / LIMIT / expression projections" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT DISTINCT tag FROM t WHERE k < 300 ORDER BY tag");
+    defer q.deinit();
+    var tags: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (tags.items) |s| allocator.free(s);
+        tags.deinit(allocator);
+    }
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            try tags.append(allocator, try allocator.dupe(u8, b.values[0].data.string.rowBytes(@intCast(i))));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), tags.items.len);
+    try std.testing.expectEqualStrings("a", tags.items[0]);
+    try std.testing.expectEqualStrings("b", tags.items[1]);
+
+    var q2 = try runSql(allocator, db, "SELECT DISTINCT k FROM t ORDER BY k LIMIT 2");
+    defer q2.deinit();
+    var ks: std.ArrayList(i32) = .empty;
+    defer ks.deinit(allocator);
+    while (try q2.next()) |b| {
+        for (0..b.row_count) |i| try ks.append(allocator, b.values[0].data.int[i]);
+    }
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 100, 200 }, ks.items);
+
+    // Expression projection: k / 100 collapses 5 rows to 3 distinct values.
+    var q3 = try runSql(allocator, db, "SELECT DISTINCT k / 100 AS h FROM t ORDER BY h");
+    defer q3.deinit();
+    var n: usize = 0;
+    while (try q3.next()) |b| n += b.row_count;
+    try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "sql: SELECT DISTINCT rejects star, aggregates, GROUP BY, HAVING" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const cases = [_][]const u8{
+        "SELECT DISTINCT * FROM t",
+        "SELECT DISTINCT COUNT(*) FROM t",
+        "SELECT DISTINCT k FROM t GROUP BY k",
+        "SELECT DISTINCT k FROM t HAVING k > 1",
+    };
+    for (cases) |sql| {
+        const res = runSql(allocator, db, sql);
+        try std.testing.expectError(thindb.sql.ParseError.SqlInvalidProjection, res);
+    }
+}
+
 test "sql: GROUP BY on the sorted order key streams and aggregates correctly" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

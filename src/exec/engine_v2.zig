@@ -319,6 +319,33 @@ const GroupTopNPlan = struct {
     output_names: ?[]const ?[]const u8 = null,
 };
 
+/// Conservative nullable-output check for a derived expression: true when any
+/// column it reads is nullable (compute kernels propagate NULL) or it is a
+/// CASE with no ELSE (an unmatched row yields NULL). IFNULL/COALESCE could
+/// prove non-null but the false positive only costs a legacy-engine routing.
+fn exprReadsNullable(table: *api.Table, e: ir.Expr) bool {
+    return switch (e) {
+        .col_ref => |nm| blk: {
+            const idx = types.findColumn(table.schema.columns, nm) orelse break :blk false;
+            break :blk table.schema.columns[idx].nullable;
+        },
+        .call => |c| blk: {
+            for (c.args) |arg| {
+                if (exprReadsNullable(table, arg)) break :blk true;
+            }
+            break :blk false;
+        },
+        .case => |cs| blk: {
+            if (cs.else_branch == null) break :blk true;
+            for (cs.branches) |b| {
+                if (exprReadsNullable(table, b.then)) break :blk true;
+            }
+            break :blk if (cs.else_branch) |eb| exprReadsNullable(table, eb.*) else true;
+        },
+        else => false,
+    };
+}
+
 fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
     var op = root;
     // The reordering Project, LIMIT, and ORDER BY decorators can nest in either
@@ -378,7 +405,21 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
             output_columns = p.columns;
             output_names = p.outputs;
         } else if (!projectMatchesGroupOutput(p, group_by)) {
-            return null;
+            // A strict SUBSET / reorder of the group output (SELECT DISTINCT's
+            // hidden COUNT(*) is grouped but never projected) rides the same
+            // applyOutputProjection seam as the post-agg-compute case. Any
+            // column outside the group output stays unsupported.
+            for (p.columns) |c| {
+                if (!nameInList(group_by.group_cols, c)) {
+                    var is_agg = false;
+                    for (group_by.aggs) |agg| {
+                        if (types.columnNameEql(agg.as, c)) is_agg = true;
+                    }
+                    if (!is_agg) return null;
+                }
+            }
+            output_columns = p.columns;
+            output_names = p.outputs;
         } else if (p.outputs != null) {
             // Pure rename passthrough of the group output (`SELECT col AS x`):
             // columns already match the group output order, only names change.
@@ -581,10 +622,16 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // V2 grouped cores pack/hash raw key payloads, and a NULL slot's decoded
     // payload is an encoding artifact (FOR base / dict entry 0) that merges
     // NULL rows into a real value's group. Same fallback lane as the wide
-    // accumulator.
+    // accumulator. A derived key counts as nullable when any column its
+    // expression reads is nullable (compute kernels propagate NULL).
     for (plan.group_by.group_cols) |name| {
-        const idx = types.findColumn(table.schema.columns, name) orelse continue;
-        if (table.schema.columns[idx].nullable) return error.NeedsWideAccumulator;
+        if (types.findColumn(table.schema.columns, name)) |idx| {
+            if (table.schema.columns[idx].nullable) return error.NeedsWideAccumulator;
+        } else for (plan.derived) |d| {
+            if (types.columnNameEql(d.name, name) and exprReadsNullable(table, d.expr)) {
+                return error.NeedsWideAccumulator;
+            }
+        }
     }
 
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);

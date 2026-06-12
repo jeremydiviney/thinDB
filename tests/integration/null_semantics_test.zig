@@ -501,6 +501,34 @@ test "null window: PARTITION BY nullable key — NULLs form one partition" {
     }
 }
 
+test "null distinct: SELECT DISTINCT collapses NULLs into one row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // v = 10, NULL, 20, NULL, NULL, 30 → DISTINCT yields NULL, 10, 20, 30.
+    var q = try runSql(allocator, db, "SELECT DISTINCT v FROM nt ORDER BY v");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 4), b.row_count);
+    try std.testing.expect(!b.values[0].isValid(0));
+    try std.testing.expectEqual(@as(i64, 10), b.values[0].data.bigint[1]);
+    try std.testing.expectEqual(@as(i64, 20), b.values[0].data.bigint[2]);
+    try std.testing.expectEqual(@as(i64, 30), b.values[0].data.bigint[3]);
+
+    // s = 'a', NULL, 'b', NULL, NULL, NULL → DISTINCT yields NULL, a, b.
+    var qs = try runSql(allocator, db, "SELECT DISTINCT s FROM nt ORDER BY s");
+    defer qs.deinit();
+    const bs = (try qs.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), bs.row_count);
+    try std.testing.expect(!bs.values[0].isValid(0));
+    try std.testing.expectEqualStrings("a", bs.values[0].data.varchar.rowBytes(1));
+    try std.testing.expectEqualStrings("b", bs.values[0].data.varchar.rowBytes(2));
+}
+
 test "null basics: arithmetic propagates NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
