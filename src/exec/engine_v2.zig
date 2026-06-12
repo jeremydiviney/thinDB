@@ -475,6 +475,18 @@ fn nameInList(list: []const []const u8, name: []const u8) bool {
     return false;
 }
 
+// Whether the group columns are exactly the table's leading order-key columns
+// (as a set — the stream groups on the prefix whatever order GROUP BY lists
+// them in), i.e. the shape the legacy router streams in key order.
+fn groupColsAreOrderKeyPrefix(table: *api.Table, group_cols: []const []const u8) bool {
+    const ok = table.schema.order_key;
+    if (group_cols.len == 0 or group_cols.len > ok.len) return false;
+    for (ok[0..group_cols.len]) |k| {
+        if (!nameInList(group_cols, k)) return false;
+    }
+    return true;
+}
+
 // A HAVING conjunct whose every referenced column is a group-key BASE column
 // (not a derived key — those don't exist at scan time under every scan mode)
 // admits the per-group ≡ per-row equivalence: all rows of a group share its
@@ -578,7 +590,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // neither is lexicographic. When ORDER BY names a string-typed group key,
     // run the core unordered over ALL groups and sort (+ limit) the small
     // grouped output with the generic sort operator instead.
-    const order_specs: []const exec.SortSpec = if (plan.order_by) |o| o.specs else &.{};
+    var order_specs: []const exec.SortSpec = if (plan.order_by) |o| o.specs else &.{};
     var post_sort = false;
     for (order_specs) |s| {
         if (!nameInList(plan.group_by.group_cols, s.col)) continue;
@@ -587,6 +599,20 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
             post_sort = true;
             break;
         }
+    }
+    // No explicit ORDER BY, group columns = a prefix of the table's order key:
+    // the legacy engine streams the sorted scan and emits groups in ascending
+    // key order — an observable contract tests rely on. The silo emits hash
+    // order; restore the streamed order by sorting the (small) grouped output.
+    // Always legal: where the legacy router instead hashed (unsorted input),
+    // any emission order was permitted.
+    if (order_specs.len == 0 and groupColsAreOrderKeyPrefix(table, plan.group_by.group_cols)) {
+        const synth = try input.node_arena.alloc(exec.SortSpec, plan.group_by.group_cols.len);
+        for (table.schema.order_key[0..plan.group_by.group_cols.len], synth) |k, *s| {
+            s.* = .{ .col = k, .desc = false };
+        }
+        order_specs = synth;
+        post_sort = true;
     }
 
     // Algebraic reduction for the grouped core, same as the global path:
