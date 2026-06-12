@@ -143,6 +143,11 @@ fn columnType(table: *api.Table, name: []const u8) ?Type {
     return table.schema.columns[idx].type;
 }
 
+fn columnNullable(table: *api.Table, name: []const u8) bool {
+    const idx = types.findColumn(table.schema.columns, name) orelse return false;
+    return table.schema.columns[idx].nullable;
+}
+
 inline fn truncBits(x: u64, bits: u8) u64 {
     if (bits >= 64) return x;
     return x & ((@as(u64, 1) << @intCast(bits)) - 1);
@@ -177,6 +182,10 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     var n_coded: usize = 0;
     for (request.group_cols, 0..) |name, i| {
         const typ = columnType(table, name) orelse return null;
+        // A NULL key slot's batch value is an encoding artifact (FOR base /
+        // dict entry 0); the packed key carries no validity bit, so nullable
+        // keys decline to the NULL-tagged generic path.
+        if (columnNullable(table, name)) return null;
         if (isStringType(typ)) {
             parts[i] = .{ .name = name, .typ = typ, .offset = @intCast(key_bits), .width = 32, .coded = true };
             key_bits += 32;

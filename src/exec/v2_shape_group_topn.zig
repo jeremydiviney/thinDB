@@ -813,6 +813,10 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
     var total_bits: u32 = 0;
     for (request.group_cols) |name| {
         const typ = resolveColumnType(table, schema, name) orelse return traceDecline(request, "group key column");
+        // A NULL key slot's decoded payload is an encoding artifact (FOR
+        // base / dict entry 0) — the packed/hashed key lanes carry no
+        // validity, so nullable keys route to the generic NULL-tagged path.
+        if (resolveColumnNullable(table, schema, name)) return traceDecline(request, "nullable group key");
         if (intTypeBits(typ)) |width| {
             total_bits += width;
         } else if (isStringKeyType(typ)) {

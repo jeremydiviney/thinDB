@@ -576,6 +576,17 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     if (hasUdfAgg(plan.group_by.aggs)) return null;
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
+
+    // Nullable group keys need the legacy engine's NULL-tagged byte keys: the
+    // V2 grouped cores pack/hash raw key payloads, and a NULL slot's decoded
+    // payload is an encoding artifact (FOR base / dict entry 0) that merges
+    // NULL rows into a real value's group. Same fallback lane as the wide
+    // accumulator.
+    for (plan.group_by.group_cols) |name| {
+        const idx = types.findColumn(table.schema.columns, name) orelse continue;
+        if (table.schema.columns[idx].nullable) return error.NeedsWideAccumulator;
+    }
+
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
     defer if (needed) |n| input.allocator.free(n);
 

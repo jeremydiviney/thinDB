@@ -324,6 +324,137 @@ test "null aggregates: metadata lane (bare global, flushed, no WHERE) emits NULL
     try std.testing.expectEqual(@as(i64, 3), b.values[5].data.bigint[0]);
 }
 
+test "null group keys: int-key NULLs form one group, emitted as NULL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // v = 10, NULL, 20, NULL, NULL, 30 → groups NULL(3), 10, 20, 30.
+    // NULLs sort first ascending (MySQL convention).
+    var q = try runSql(allocator, db, "SELECT v, COUNT(*) AS c FROM nt GROUP BY v ORDER BY v");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 4), b.row_count);
+    try std.testing.expect(!b.values[0].isValid(0));
+    try std.testing.expectEqual(@as(i64, 3), b.values[1].data.bigint[0]);
+    inline for (.{ .{ 1, 10 }, .{ 2, 20 }, .{ 3, 30 } }) |row| {
+        try std.testing.expect(b.values[0].isValid(row[0]));
+        try std.testing.expectEqual(@as(i64, row[1]), b.values[0].data.bigint[row[0]]);
+        try std.testing.expectEqual(@as(i64, 1), b.values[1].data.bigint[row[0]]);
+    }
+}
+
+test "null group keys: string-key NULL group stays distinct from every value (incl. '')" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // s = 'a', NULL, 'b', NULL, NULL, NULL → groups NULL(4), a(1), b(1).
+    var q = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM nt GROUP BY s ORDER BY s");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+    try std.testing.expect(!b.values[0].isValid(0));
+    try std.testing.expectEqual(@as(i64, 4), b.values[1].data.bigint[0]);
+    try std.testing.expect(b.values[0].isValid(1));
+    try std.testing.expectEqualStrings("a", b.values[0].data.varchar.rowBytes(1));
+    try std.testing.expectEqual(@as(i64, 1), b.values[1].data.bigint[1]);
+    try std.testing.expect(b.values[0].isValid(2));
+    try std.testing.expectEqualStrings("b", b.values[0].data.varchar.rowBytes(2));
+    try std.testing.expectEqual(@as(i64, 1), b.values[1].data.bigint[2]);
+}
+
+test "null group keys: multi-key combos with per-column NULLs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // (v, s): (10,'a'), (NULL,NULL)×3, (20,'b'), (30,NULL)
+    // → groups (NULL,NULL,3), (10,a,1), (20,b,1), (30,NULL,1).
+    var q = try runSql(allocator, db, "SELECT v, s, COUNT(*) AS c FROM nt GROUP BY v, s ORDER BY v, s");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 4), b.row_count);
+    try std.testing.expect(!b.values[0].isValid(0));
+    try std.testing.expect(!b.values[1].isValid(0));
+    try std.testing.expectEqual(@as(i64, 3), b.values[2].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 10), b.values[0].data.bigint[1]);
+    try std.testing.expectEqualStrings("a", b.values[1].data.varchar.rowBytes(1));
+    try std.testing.expectEqual(@as(i64, 20), b.values[0].data.bigint[2]);
+    try std.testing.expectEqualStrings("b", b.values[1].data.varchar.rowBytes(2));
+    try std.testing.expectEqual(@as(i64, 30), b.values[0].data.bigint[3]);
+    try std.testing.expect(!b.values[1].isValid(3));
+    try std.testing.expectEqual(@as(i64, 1), b.values[2].data.bigint[3]);
+}
+
+test "null group keys: memtable-only rows (unflushed) group correctly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // Same fixture, never flushed — the V1 legacy hash path segfaulted on
+    // exactly this shape (memtable string-key GROUP BY with NULL rows).
+    try exec(allocator, db,
+        "CREATE TABLE mt (id BIGINT PRIMARY KEY, v BIGINT, s VARCHAR(16))",
+    );
+    try exec(allocator, db,
+        "INSERT INTO mt (id, v, s) VALUES (1, 10, 'a'), (2, NULL, NULL), (3, 20, 'b'), (4, NULL, NULL)",
+    );
+
+    var q = try runSql(allocator, db, "SELECT v, COUNT(*) AS c FROM mt GROUP BY v ORDER BY v");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+    try std.testing.expect(!b.values[0].isValid(0));
+    try std.testing.expectEqual(@as(i64, 2), b.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 10), b.values[0].data.bigint[1]);
+    try std.testing.expectEqual(@as(i64, 20), b.values[0].data.bigint[2]);
+
+    var qs = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM mt GROUP BY s ORDER BY s");
+    defer qs.deinit();
+    const bs = (try qs.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), bs.row_count);
+    try std.testing.expect(!bs.values[0].isValid(0));
+    try std.testing.expectEqual(@as(i64, 2), bs.values[1].data.bigint[0]);
+    try std.testing.expectEqualStrings("a", bs.values[0].data.varchar.rowBytes(1));
+    try std.testing.expectEqualStrings("b", bs.values[0].data.varchar.rowBytes(2));
+}
+
+test "null group keys: NULL-keyed group aggregates its values normally" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // GROUP BY s: the NULL group holds ids {2,4,5,6} with v = NULL,NULL,NULL,30
+    // → SUM(v)=30, COUNT(v)=1, COUNT(*)=4.
+    var q = try runSql(allocator, db,
+        "SELECT s, SUM(v) AS sv, COUNT(v) AS cv, COUNT(*) AS cs FROM nt GROUP BY s ORDER BY s",
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+    try std.testing.expect(!b.values[0].isValid(0));
+    // SUM(BIGINT) widens to LARGEINT (DESIGN.md §3.4).
+    try std.testing.expectEqual(@as(i128, 30), b.values[1].data.largeint[0]);
+    try std.testing.expectEqual(@as(i64, 1), b.values[2].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 4), b.values[3].data.bigint[0]);
+}
+
 test "null basics: arithmetic propagates NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -691,10 +691,17 @@ pub const Aggregate = struct {
             .cd = cd,
             .int_layout = int_layout,
             .key_scratch = .empty,
-            .single_str_key = group_col_indices.len == 1 and switch (up_schema[group_col_indices[0]].type) {
-                .string, .varchar, .char => true,
-                else => false,
-            },
+            // Raw-bytes single-string-key shortcut: a NULL key has no raw-byte
+            // representation distinct from '' (and the raw emit writes no
+            // validity bits), so nullable keys stay on the tagged compound
+            // path. The coded (dict) upgrade keys off this flag, so it is
+            // gated too.
+            .single_str_key = group_col_indices.len == 1 and
+                !up_schema[group_col_indices[0]].nullable and
+                switch (up_schema[group_col_indices[0]].type) {
+                    .string, .varchar, .char => true,
+                    else => false,
+                },
             .top_k = resolved_top_k,
             // Only the hash-grouped emit honors the cap; a global aggregate is
             // one row already, and the top-k path owns its own bounded emit.
@@ -3615,6 +3622,10 @@ pub fn planIntKey(
     if (group_col_indices.len == 0) return null;
     var total: u16 = 0;
     for (group_col_indices, 0..) |ci, i| {
+        // A nullable key has no slot in the packed layout for its validity (a
+        // NULL slot's decoded payload is an encoding artifact that collides
+        // with a real value) — such keys take the tagged byte path.
+        if (up_schema[ci].nullable) return null;
         const coded = coded_mask != null and coded_mask.?[i];
         const b: u16 = if (coded) 32 else (intKeyBits(up_schema[ci].type) orelse return null);
         total += b;
@@ -3953,6 +3964,17 @@ fn buildCompoundGroupKey(
 ) !void {
     for (group_col_indices) |ci| {
         const view = batch.values[ci];
+        // A nullable key column carries a leading validity tag: a NULL slot's
+        // decoded payload bytes are encoding artifacts (FOR base, dict entry
+        // 0), so without the tag NULL rows silently merge into a real value's
+        // group. NULL writes the tag alone — all NULL keys form one group
+        // (SQL standard). Keyed on the schema flag, not `view.nulls`, so the
+        // layout is stable across batches that happen to have no NULLs.
+        if (batch.schema[ci].nullable) {
+            const valid = view.isValid(row);
+            try out.append(allocator, @intFromBool(valid));
+            if (!valid) continue;
+        }
         switch (view.data) {
             .int => |s| try storage.format.appendI32(allocator, out, s[row]),
             .bigint => |s| try storage.format.appendI64(allocator, out, s[row]),
@@ -4021,6 +4043,19 @@ fn appendGroupKey(
 ) !void {
     var cursor: usize = 0;
     for (group_col_indices, 0..) |src_idx, i| {
+        // Mirror of the validity tag in `buildCompoundGroupKey`. A nullable
+        // output column's bitmap defaults to 0 (= NULL), so valid rows must
+        // set their bit explicitly too.
+        if (up_schema[src_idx].nullable) {
+            const row = out_cols[i].data.rowCount();
+            const valid = key_bytes[cursor] != 0;
+            cursor += 1;
+            try out_cols[i].appendValidBit(allocator, row, valid);
+            if (!valid) {
+                try out_cols[i].data.appendNullPlaceholder(allocator);
+                continue;
+            }
+        }
         const t = up_schema[src_idx].type;
         switch (t) {
             .int => {
