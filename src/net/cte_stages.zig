@@ -34,10 +34,11 @@ const PredicateExpr = exec.predicate.PredicateExpr;
 const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
 
 /// True when the plan needs the staged compiler: any materialize boundary
-/// (CTE / FROM-subquery), join, or window node anywhere in the tree.
+/// (CTE / FROM-subquery), join, window, or set-union node anywhere in the
+/// tree (each union side compiles as its own block).
 pub fn needsStaging(op: *const ir.Op) bool {
     return switch (op.*) {
-        .materialize, .join, .window => true,
+        .materialize, .join, .window, .set_union => true,
         .select => |p| needsStaging(p.upstream),
         .exclude => |p| needsStaging(p.upstream),
         .filter => |f| needsStaging(f.upstream),
@@ -46,7 +47,6 @@ pub fn needsStaging(op: *const ir.Op) bool {
         .compute => |c| needsStaging(c.upstream),
         .alias => |a| needsStaging(a.upstream),
         .limit => |l| needsStaging(l.upstream),
-        .set_union => |u| needsStaging(u.left) or needsStaging(u.right),
         else => false,
     };
 }
@@ -183,7 +183,7 @@ fn collectStages(
     }
 }
 
-const BlockSource = enum { table, mat, join, window, unsupported };
+const BlockSource = enum { table, mat, join, window, set_union, unsupported };
 
 /// A query block is a linear pipeline; its source is whatever the upstream
 /// chain bottoms out at. A window node is a block boundary like a join:
@@ -199,6 +199,7 @@ fn blockSource(op: *const ir.Op) BlockSource {
             .materialize => return .mat,
             .join => return .join,
             .window => return .window,
+            .set_union => return .set_union,
             .select => |p| cur = p.upstream,
             .exclude => |p| cur = p.upstream,
             .filter => |f| cur = f.upstream,
@@ -216,11 +217,11 @@ fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap)
     return switch (blockSource(op)) {
         // Table-backed block: the regular V2 handlers, full parallelism.
         .table => engine_v2.compileSelectBlock(input, op),
-        // Stage-, join-, or window-backed block: generic operators over
-        // MatScan / Join / Window leaves. The heavy inputs were already
-        // produced by upstream stage handlers or stream in from table-backed
-        // child blocks.
-        .mat, .join, .window => buildGenericBlock(input, op, map, op),
+        // Stage-, join-, window-, or union-backed block: generic operators
+        // over MatScan / Join / Window / SetUnion leaves. The heavy inputs
+        // were already produced by upstream stage handlers or stream in from
+        // table-backed child blocks.
+        .mat, .join, .window, .set_union => buildGenericBlock(input, op, map, op),
         .unsupported => error.UnsupportedQueryShape,
     };
 }
@@ -352,6 +353,16 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             errdefer left.deinit();
             const right = try compileJoinChild(input, j.right, map);
             return left.join(right, joinSpecOf(j));
+        },
+        .set_union => |u| {
+            // SetUnion.create validates schema compatibility and does NOT
+            // consume its inputs on error — both sides need errdefers (the
+            // width-mismatch path is exercised by tests).
+            var left = try compileBlock(input, u.left, map);
+            errdefer left.deinit();
+            var right = try compileBlock(input, u.right, map);
+            errdefer right.deinit();
+            return exec.SetUnion.create(input.allocator, left, right, u.all);
         },
         else => return error.UnsupportedQueryShape,
     }

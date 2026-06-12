@@ -73,7 +73,31 @@ pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // Side-effecting statements (DDL/DML/SET/SHOW/EXPLAIN/...) are not the V2
     // engine's concern; the legacy compile path owns them.
     if (!isSelectQuery(root)) return null;
+    // FROM-less SELECTs (one synthetic row) and CSV/JSON file scans are
+    // legacy-owned too: neither is a columnar-scan performance shape, so
+    // the V2-or-error policy doesn't apply — fall back instead of failing.
+    if (legacyLeaf(root)) return null;
     return try compileSelectBlock(input, root);
+}
+
+/// True when the block's source is a leaf the legacy engine owns
+/// (single_row / file_scan). Mirrors cte_stages.blockSource's walk.
+fn legacyLeaf(op: *const ir.Op) bool {
+    var cur = op;
+    while (true) {
+        switch (cur.*) {
+            .single_row, .file_scan => return true,
+            .select => |p| cur = p.upstream,
+            .exclude => |p| cur = p.upstream,
+            .filter => |f| cur = f.upstream,
+            .order_by => |o| cur = o.upstream,
+            .group_by => |g| cur = g.upstream,
+            .compute => |c| cur = c.upstream,
+            .alias => |a| cur = a.upstream,
+            .limit => |l| cur = l.upstream,
+            else => return false,
+        }
+    }
 }
 
 pub fn v2Enabled() bool {
