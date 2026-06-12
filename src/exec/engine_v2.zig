@@ -99,7 +99,10 @@ fn hasLegacyOnlyAggregate(op: *const ir.Op) bool {
         switch (cur.*) {
             .group_by => |g| {
                 for (g.aggs) |a| switch (a.func) {
-                    .udf, .group_concat => return true,
+                    .udf => return true,
+                    // Grouped GROUP_CONCAT runs in the V2 silo (side-collected
+                    // per group); the GLOBAL aggregate path doesn't host it yet.
+                    .group_concat => if (g.group_cols.len == 0) return true,
                     else => {},
                 };
                 cur = g.upstream;

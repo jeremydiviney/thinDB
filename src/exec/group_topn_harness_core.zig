@@ -498,6 +498,8 @@ pub const GroupAggregateOp = enum {
     // `state_index`, running mean (f64 bits) at +1, M2 (f64 bits) at +2. The
     // emit layer picks the pop/samp divisor and the optional sqrt.
     welford,
+    // GROUP_CONCAT — folded into the side concat_states (see is_concat).
+    concat,
 };
 
 pub const GroupAggregateSpec = struct {
@@ -530,6 +532,13 @@ pub const GroupAggregateSpec = struct {
     // program only, like wide.
     nullable: bool = false,
     valid_count_index: u16 = 0,
+    // GROUP_CONCAT: reads `str_columns[str_input_index]` (like string MIN/MAX)
+    // and collects (rowloc, bytes) items in side cell `concat_state_index`;
+    // the emit sorts + joins with `separator` into the TopRow.str slot
+    // `str_state_index`. No numeric slots; forces the rowref region.
+    is_concat: bool = false,
+    concat_state_index: u16 = 0,
+    separator: []const u8 = ",",
 };
 
 // Per-group numeric accumulators are stored in a runtime variable-stride slab
@@ -800,12 +809,18 @@ pub const GroupRowsLayout = struct {
     // distinct aggregate). 0 for the common case, in which case no distinct path
     // runs and the buckets allocate no sets.
     distinct_slot_count: u16 = 0,
-    // When the group key is a hash (string / >128-bit keys), each staged row
-    // also carries the source row's packed __rowloc (see rowloc.zig) in a
-    // dedicated i64 region after the payload columns, captured into the group
-    // State on first insert so the actual key values can be late-materialized
-    // at emit. Dormant (region absent) for the integer-packed-key queries.
+    // Each staged row also carries the source row's packed __rowloc (see
+    // rowloc.zig) in a dedicated i64 region after the payload columns. Set
+    // for hashed keys (captured into the group State on first insert so the
+    // key values can be late-materialized at emit) and for GROUP_CONCAT
+    // (per-item emission order). Dormant (region absent) otherwise.
     has_rowref: bool = false,
+    // The staged key is a 128-bit hash of the key columns rather than a
+    // lossless bit-pack (string / >128-bit keys). Implies has_rowref; the
+    // reverse does not hold (concat carries rowrefs under packed keys).
+    hashed_key: bool = false,
+    // The program has GROUP_CONCAT aggregates: buckets maintain concat_states.
+    has_concat: bool = false,
     // COUNT-only programs (no payload/str columns, no distinct): each staged
     // row carries a u32 weight, and the scan emitter collapses a run of
     // adjacent-equal keys into ONE weighted row — route/stage/lane traffic
@@ -819,7 +834,7 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.hashed_key != b.hashed_key or a.has_concat != b.has_concat or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
     var key_i: usize = 0;
     while (key_i < a.key_columns.len) : (key_i += 1) {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
@@ -1490,6 +1505,18 @@ const StateSlab = struct {
 const StrAcc = struct { bytes: []const u8 = &.{}, present: bool = false };
 const StrAccRow = [MAX_GROUP_STR_SLOTS]StrAcc;
 
+// Per-group GROUP_CONCAT collection: each non-null input row appends one
+// (order, bytes) item; the emit sorts by `order` (the row's __rowloc, so the
+// joined string follows physical row order — deterministic despite parallel
+// staging, matching the legacy scan-order fold) and joins with the
+// aggregate's separator into the str_arena. Item bytes and list growth both
+// live in the bucket's str_arena (freed wholesale at teardown); the outer
+// per-gid array uses the bucket allocator like str_states.
+const ConcatItem = struct { order: i64, bytes: []const u8 };
+const ConcatCell = std.ArrayListUnmanaged(ConcatItem);
+const MAX_GROUP_CONCAT_SLOTS: usize = 2;
+const ConcatRow = [MAX_GROUP_CONCAT_SLOTS]ConcatCell;
+
 const GroupScratch = struct {
     gids: std.ArrayListUnmanaged(u32) = .empty,
     row_idxs: std.ArrayListUnmanaged(u32) = .empty,
@@ -1579,6 +1606,9 @@ const PipeBucket = struct {
     // Parallel to `states` (gid-indexed); populated only for string MIN/MAX
     // queries. Empty for the numeric common case.
     str_states: std.ArrayListUnmanaged(StrAccRow) = .empty,
+    // Parallel to `states` (gid-indexed); populated only for GROUP_CONCAT
+    // queries. Cell item lists grow in the str_arena (no per-cell deinit).
+    concat_states: std.ArrayListUnmanaged(ConcatRow) = .empty,
     // Bump arena for the running-MIN/MAX bytes. A per-improvement `dupe` from a
     // shared allocator scatters each group's current value across the heap, so
     // reading it back for the next row's compare is a main-memory miss — the
@@ -1607,6 +1637,7 @@ const PipeBucket = struct {
     fn deinit(self: *PipeBucket, allocator: Allocator) void {
         self.str_arena.deinit();
         self.str_states.deinit(allocator);
+        self.concat_states.deinit(allocator);
         for (&self.distinct_sets) |*d| d.deinit(allocator);
         self.chunks.deinit(allocator);
         self.table.deinit(allocator);
@@ -2204,6 +2235,7 @@ fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
     bucket.states.clearRetainingCapacity();
     bucket.freeStrBytes();
     bucket.str_states.clearRetainingCapacity();
+    bucket.concat_states.clearRetainingCapacity();
     for (&bucket.distinct_sets) |*d| d.clear(allocator);
 }
 
@@ -2950,7 +2982,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     while (r < batch.row_count) {
         var active = &parts.raw_active_rows;
         while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
-            const key = if (layout.has_rowref)
+            const key = if (layout.hashed_key)
                 hashGenericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], key_digests_buf[0..layout.key_columns.len], r)
             else
                 try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
@@ -3642,10 +3674,10 @@ fn initGroupStateProgram(
 fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
     ref.head.count += 1;
     for (aggregates) |agg| {
-        // String MIN/MAX is folded separately into the side str_states array, and
-        // COUNT(DISTINCT) into the side distinct_sets (its count slot is bumped
-        // there, not here).
-        if (agg.is_string or agg.is_distinct) continue;
+        // String MIN/MAX is folded separately into the side str_states array,
+        // GROUP_CONCAT into the side concat_states, and COUNT(DISTINCT) into
+        // the side distinct_sets (its count slot is bumped there, not here).
+        if (agg.is_string or agg.is_distinct or agg.is_concat) continue;
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         const state_index: usize = agg.state_index;
         // NULL inputs don't fold (SQL: aggregates skip NULLs). The companion
@@ -3724,9 +3756,9 @@ fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec
                 try setFloatStateValue(ref, state_index + 1, mean);
                 try setFloatStateValue(ref, state_index + 2, floatStateValue(ref, state_index + 2) + delta * (x - mean));
             },
-            // Folded into the side distinct_sets by foldGroupDistinct; the
-            // `is_distinct` guard above means control never reaches here.
-            .count_distinct => unreachable,
+            // Folded into the side distinct_sets / concat_states; the guards
+            // above mean control never reaches here.
+            .count_distinct, .concat => unreachable,
         }
     }
 }
@@ -3819,9 +3851,9 @@ inline fn setAggregateStateValue(ref: StateRef, state_index: usize, value: i128)
 fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_count: usize) !void {
     if (aggregates.len == 0) return error.UnsupportedOperatorForType;
     for (aggregates) |agg| {
-        // String MIN/MAX has no numeric slot/payload column; its input is a
-        // str_columns entry validated by the layout, not here.
-        if (agg.is_string) continue;
+        // String MIN/MAX and GROUP_CONCAT have no numeric slot/payload column;
+        // their inputs are str_columns entries validated by the layout.
+        if (agg.is_string or agg.is_concat) continue;
         // A wide aggregate's hi half occupies the NEXT slot too.
         if (agg.state_index + @as(u16, @intFromBool(agg.wide)) >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         if (agg.wide and (agg.state_index == 0 or (agg.op != .sum and agg.op != .avg))) return error.UnsupportedOperatorForType;
@@ -3838,6 +3870,7 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
                 if (input_index >= column_count) return error.UnsupportedOperatorForType;
                 if (agg.state_index == 0 or agg.state_index + 2 >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
             },
+            .concat => unreachable,
         }
     }
 }
@@ -3862,7 +3895,7 @@ fn countSumAvgProgram(aggregates: []const GroupAggregateSpec, column_count: usiz
 fn aggSlotCount(layout: GroupRowsLayout) usize {
     var n: usize = 0;
     for (layout.aggregates) |agg| {
-        if (agg.is_string) continue;
+        if (agg.is_string or agg.is_concat) continue;
         var top = agg.state_index + @as(u16, @intFromBool(agg.wide));
         if (agg.op == .welford) top = agg.state_index + 2;
         if (top > n) n = top;
@@ -3875,6 +3908,7 @@ fn groupChunkRowsDirect(
     table: *GroupTable,
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
+    concat_states: *std.ArrayListUnmanaged(ConcatRow),
     distinct_sets: []DistinctSet,
     scratch: *GroupScratch,
     allocator: Allocator,
@@ -3887,6 +3921,7 @@ fn groupChunkRowsDirect(
     try states.prepare(allocator, aggSlotCount(rows.layout));
     try states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_str_payload) try str_states.ensureUnusedCapacity(allocator, n);
+    if (rows.layout.has_concat) try concat_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.distinct_slot_count > distinct_sets.len) return error.UnsupportedOperatorForType;
 
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
@@ -3906,10 +3941,10 @@ fn groupChunkRowsDirect(
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, concat_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, concat_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, concat_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, concat_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
     }
 }
 
@@ -3934,6 +3969,21 @@ fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), str_arena: Alloc
             const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
             if (is_better) acc.bytes = try str_arena.dupe(u8, b);
         }
+    }
+}
+
+// Collect one row's GROUP_CONCAT inputs into group `gid`'s side cells: NULL
+// inputs skip; a kept value records (rowloc, arena-dup'd bytes) so the emit
+// can join in physical row order. Called only when the layout has concat aggs.
+fn foldGroupConcat(concat_states: *std.ArrayListUnmanaged(ConcatRow), str_arena: Allocator, gid: usize, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
+    const k = rows.layout.str_columns.len;
+    const rowrefs = rows.rowrefAll();
+    for (aggregates) |agg| {
+        if (!agg.is_concat) continue;
+        if (rows.str.isNull(k, row_idx, agg.str_input_index)) continue;
+        const b = rows.str.get(k, row_idx, agg.str_input_index);
+        const cell = &concat_states.items[gid][agg.concat_state_index];
+        try cell.append(str_arena, .{ .order = rowrefs[row_idx], .bytes = try str_arena.dupe(u8, b) });
     }
 }
 
@@ -3998,6 +4048,7 @@ fn groupChunkRowsDirectKeys(
     table: *GroupTable,
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
+    concat_states: *std.ArrayListUnmanaged(ConcatRow),
     str_arena: Allocator,
     distinct_sets: []DistinctSet,
     gids_buf: *std.ArrayListUnmanaged(u32),
@@ -4010,6 +4061,7 @@ fn groupChunkRowsDirectKeys(
     rowrefs: []const i64,
 ) !void {
     const has_str = rows.layout.has_str_payload;
+    const has_concat = rows.layout.has_concat;
     const has_distinct = rows.layout.distinct_slot_count > 0;
     const n = row_count;
 
@@ -4025,7 +4077,7 @@ fn groupChunkRowsDirectKeys(
     var has_extreme = false;
     var has_mirror = false;
     for (aggregates) |agg| {
-        if (agg.is_string or agg.is_distinct) continue;
+        if (agg.is_string or agg.is_distinct or agg.is_concat) continue;
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         switch (agg.op) {
             .count_star, .count_col => {
@@ -4045,11 +4097,11 @@ fn groupChunkRowsDirectKeys(
             },
             // Welford's three-slot sequential update has no kernel form.
             .welford => kernelizable = false,
-            .count_distinct => unreachable,
+            .count_distinct, .concat => unreachable,
         }
     }
     if (!kernelizable) {
-        return groupChunkRowsDirectKeysProgram(key_width, table, states, str_states, str_arena, distinct_sets, gids_buf, allocator, keys, key_hi, n, aggregates, rows, rowrefs);
+        return groupChunkRowsDirectKeysProgram(key_width, table, states, str_states, concat_states, str_arena, distinct_sets, gids_buf, allocator, keys, key_hi, n, aggregates, rows, rowrefs);
     }
 
     // The gid array feeds the aggregate kernels and the COUNT(DISTINCT) pass 2
@@ -4098,6 +4150,9 @@ fn groupChunkRowsDirectKeys(
             if (has_str) {
                 str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
             }
+            if (has_concat) {
+                concat_states.appendAssumeCapacity([_]ConcatCell{.empty} ** MAX_GROUP_CONCAT_SLOTS);
+            }
             tagged = if (mark_new) gid | NEW_GID_BIT else gid;
         } else {
             states.head(gid).count += run_len;
@@ -4105,6 +4160,10 @@ fn groupChunkRowsDirectKeys(
         if (has_str) {
             var rr = r;
             while (rr < run_end) : (rr += 1) try foldGroupStr(str_states, str_arena, gid, aggregates, rows, rr);
+        }
+        if (has_concat) {
+            var rr = r;
+            while (rr < run_end) : (rr += 1) try foldGroupConcat(concat_states, str_arena, gid, aggregates, rows, rr);
         }
         if (has_mirror) mirrorCountSlots(states, gid, aggregates);
         if (want_gids) {
@@ -4116,7 +4175,7 @@ fn groupChunkRowsDirectKeys(
 
     if (needs_kernels) {
         for (aggregates) |agg| {
-            if (agg.is_string or agg.is_distinct) continue;
+            if (agg.is_string or agg.is_distinct or agg.is_concat) continue;
             switch (agg.op) {
                 .count_star, .count_col => {},
                 .sum, .avg => if (aggInputIsFloat(rows, agg))
@@ -4131,8 +4190,8 @@ fn groupChunkRowsDirectKeys(
                     foldKernelExtremeFloat(false, states, gids, rows, agg)
                 else
                     foldKernelExtremeInt(false, states, gids, rows, agg),
-                // Both force the per-row program (`kernelizable = false`).
-                .count_distinct, .welford => unreachable,
+                // All force or skip the kernel pass.
+                .count_distinct, .welford, .concat => unreachable,
             }
         }
     }
@@ -4152,6 +4211,7 @@ fn groupChunkRowsDirectKeysProgram(
     table: *GroupTable,
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
+    concat_states: *std.ArrayListUnmanaged(ConcatRow),
     str_arena: Allocator,
     distinct_sets: []DistinctSet,
     gids_buf: *std.ArrayListUnmanaged(u32),
@@ -4167,6 +4227,7 @@ fn groupChunkRowsDirectKeysProgram(
     // COUNT-only weight gate guarantees this path never sees them.
     std.debug.assert(!rows.layout.has_weight);
     const has_str = rows.layout.has_str_payload;
+    const has_concat = rows.layout.has_concat;
     const has_distinct = rows.layout.distinct_slot_count > 0;
     const n = row_count;
     if (has_distinct) try gids_buf.resize(allocator, n);
@@ -4190,6 +4251,7 @@ fn groupChunkRowsDirectKeysProgram(
         if (have_prev and key == prev_key) {
             try updateGroupStateProgram(states.ref(prev_gid), aggregates, rows, r);
             if (has_str) try foldGroupStr(str_states, str_arena, prev_gid, aggregates, rows, r);
+            if (has_concat) try foldGroupConcat(concat_states, str_arena, prev_gid, aggregates, rows, r);
             if (has_distinct) gids[r] = prev_gid;
             continue;
         }
@@ -4202,6 +4264,10 @@ fn groupChunkRowsDirectKeysProgram(
                 str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
                 try foldGroupStr(str_states, str_arena, new_gid, aggregates, rows, r);
             }
+            if (has_concat) {
+                concat_states.appendAssumeCapacity([_]ConcatCell{.empty} ** MAX_GROUP_CONCAT_SLOTS);
+                try foldGroupConcat(concat_states, str_arena, new_gid, aggregates, rows, r);
+            }
             if (has_distinct) gids[r] = new_gid;
             prev_key = key;
             prev_gid = new_gid;
@@ -4210,6 +4276,7 @@ fn groupChunkRowsDirectKeysProgram(
         }
         try updateGroupStateProgram(states.ref(probe.gid), aggregates, rows, r);
         if (has_str) try foldGroupStr(str_states, str_arena, probe.gid, aggregates, rows, r);
+        if (has_concat) try foldGroupConcat(concat_states, str_arena, probe.gid, aggregates, rows, r);
         if (has_distinct) gids[r] = probe.gid;
         prev_key = key;
         prev_gid = probe.gid;
@@ -4788,7 +4855,7 @@ fn drainRawDedicatedGroupLane(
         lockSpin(&bucket.agg_lock);
         if (profile) local.raw_agg_lock_ticks += nowTicks() - lock_t0;
         const g0 = if (profile) nowTicks() else 0;
-        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), rows);
+        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, &bucket.concat_states, &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), rows);
         bucket.row_count += rows.len();
         if (profile) group_ticks.* += nowTicks() - g0;
         bucket.agg_lock.unlock();
@@ -4800,22 +4867,62 @@ fn drainRawDedicatedGroupLane(
     return true;
 }
 
-fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize, top_out: *TopSet, top_ticks: *i64, profile: bool) void {
+fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize, top_out: *TopSet, top_ticks: *i64, profile: bool) !void {
     const top_t0 = if (profile) nowTicks() else 0;
     if (top_out.items.len == 0) return;
     var b = worker_index;
     const has_str = shared.group_rows_layout.has_str_payload;
+    const has_concat = shared.group_rows_layout.has_concat;
     while (b < shared.buckets.len) : (b += worker_count) {
         const bkt = &shared.buckets[b];
         if (has_str) {
             var gid: usize = 0;
-            while (gid < bkt.states.len) : (gid += 1) top_out.consider(topRowFromStateStr(bkt.states.ref(gid), bkt.str_states.items[gid]));
+            while (gid < bkt.states.len) : (gid += 1) {
+                var row = topRowFromStateStr(bkt.states.ref(gid), bkt.str_states.items[gid]);
+                if (has_concat) try finalizeConcatIntoRow(&row, shared.group_rows_layout.aggregates, &bkt.concat_states.items[gid], bkt.str_arena.allocator());
+                top_out.consider(row);
+            }
         } else {
             var gid: usize = 0;
             while (gid < bkt.states.len) : (gid += 1) top_out.consider(topRowFromState(bkt.states.ref(gid)));
         }
     }
     if (profile) top_ticks.* += nowTicks() - top_t0;
+}
+
+// Join group `gid`'s collected GROUP_CONCAT items into the TopRow's str slot:
+// sorted by rowloc (physical row order — the legacy fold's scan order), values
+// separated by the aggregate's separator, built in the bucket's str_arena (the
+// emit re-dups survivors via ownTopRowStr). No items → NULL (str_present off).
+fn finalizeConcatIntoRow(row: *TopRow, aggregates: []const GroupAggregateSpec, cells: *ConcatRow, str_arena: Allocator) !void {
+    for (aggregates) |agg| {
+        if (!agg.is_concat) continue;
+        const cell = &cells[agg.concat_state_index];
+        if (cell.items.len == 0) {
+            row.str[agg.str_state_index] = &.{};
+            row.str_present[agg.str_state_index] = false;
+            continue;
+        }
+        std.mem.sort(ConcatItem, cell.items, {}, concatItemLess);
+        var total: usize = agg.separator.len * (cell.items.len - 1);
+        for (cell.items) |it| total += it.bytes.len;
+        const buf = try str_arena.alloc(u8, total);
+        var off: usize = 0;
+        for (cell.items, 0..) |it, i| {
+            if (i != 0) {
+                @memcpy(buf[off..][0..agg.separator.len], agg.separator);
+                off += agg.separator.len;
+            }
+            @memcpy(buf[off..][0..it.bytes.len], it.bytes);
+            off += it.bytes.len;
+        }
+        row.str[agg.str_state_index] = buf;
+        row.str_present[agg.str_state_index] = true;
+    }
+}
+
+fn concatItemLess(_: void, a: ConcatItem, b: ConcatItem) bool {
+    return a.order < b.order;
 }
 
 fn claimScanTile(job: SiloGridJob) ?ScanTile {
@@ -5030,7 +5137,7 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
     if (!marked_scan_done) {
         try markGridScanDone(job, &marked_scan_done);
     }
-    collectOwnedTop(job.shared, job.worker_index, job.worker_count, job.top, job.top_ticks, job.profile);
+    try collectOwnedTop(job.shared, job.worker_index, job.worker_count, job.top, job.top_ticks, job.profile);
 }
 
 pub const RunConfig = struct {
@@ -5640,10 +5747,12 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             emit_all: for (buckets) |*bucket| {
                 if (cap != 0 and out.items.len >= cap) break;
                 if (has_str_out) {
+                    const has_concat_out = cfg.group_rows_layout.has_concat;
                     var gid: usize = 0;
                     while (gid < bucket.states.len) : (gid += 1) {
                         if (cap != 0 and out.items.len >= cap) break :emit_all;
                         var row = topRowFromStateStr(bucket.states.ref(gid), bucket.str_states.items[gid]);
+                        if (has_concat_out) try finalizeConcatIntoRow(&row, cfg.group_rows_layout.aggregates, &bucket.concat_states.items[gid], bucket.str_arena.allocator());
                         if (filter) |f| if (!f.pass(f.ctx, row)) continue;
                         try ownTopRowStr(&row, allocator);
                         try out.append(allocator, row);

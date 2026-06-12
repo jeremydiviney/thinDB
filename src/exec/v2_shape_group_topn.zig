@@ -52,6 +52,8 @@ const MAX_AGGS: usize = 16;
 const MAX_AGG_INPUTS: usize = 16;
 const MAX_STRING_AGG_INPUTS: usize = 2;
 const MAX_STRING_AGG_SLOTS: usize = 2;
+// Mirrors the harness core's MAX_GROUP_CONCAT_SLOTS.
+const MAX_CONCAT_SLOTS: usize = 2;
 // Must match HarnessCore.MAX_GROUP_DISTINCT_SLOTS (one combined set per field).
 const MAX_DISTINCT_AGG_SLOTS: usize = 8;
 
@@ -123,6 +125,13 @@ const AggregatePlan = struct {
     // rides TopRow.str_present.
     input_nullable: bool = false,
     valid_count_index: u16 = 0,
+    // GROUP_CONCAT: input staged via str_input_index (like string MIN/MAX),
+    // collected in side cell concat_state_index, joined with `separator` into
+    // TopRow.str[str_state_index] at emit. Output handling rides the string
+    // lane (str_present for NULL).
+    is_concat: bool = false,
+    concat_state_index: u16 = 0,
+    separator: []const u8 = ",",
 };
 
 const StringAggInputPlan = struct {
@@ -319,6 +328,7 @@ const GroupTopNPipeline = struct {
                 .sum, .avg, .min, .max => agg_plan.input_nullable,
                 .var_samp, .stddev_samp => true,
                 .var_pop, .stddev_pop => agg_plan.input_nullable,
+                .group_concat => agg_plan.input_nullable,
                 else => false,
             };
             output_schema[plan.layout.part_count + i] = .{ .name = agg_plan.name, .type = agg_plan.output_type, .nullable = out_nullable };
@@ -458,6 +468,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
                 .max => .max,
                 .count_distinct => .count_distinct,
                 .stddev_pop, .stddev_samp, .var_pop, .var_samp => .welford,
+                .group_concat => .concat,
                 else => return error.UnsupportedOperatorForType,
             },
             .input_column_index = agg_plan.input_column_index,
@@ -471,6 +482,9 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .distinct_state_index = agg_plan.distinct_state_index,
             .nullable = agg_plan.input_nullable,
             .valid_count_index = agg_plan.valid_count_index,
+            .is_concat = agg_plan.is_concat,
+            .concat_state_index = agg_plan.concat_state_index,
+            .separator = agg_plan.separator,
         };
     }
     var group_key_inputs: [MAX_GROUP_KEYS]GroupTopNEngine.GroupKeyInput = undefined;
@@ -693,7 +707,7 @@ fn aggDenom(row: HarnessCore.TopRow, agg_plan: AggregatePlan) u64 {
 }
 
 fn aggIsNull(row: HarnessCore.TopRow, agg_plan: AggregatePlan) bool {
-    if (agg_plan.is_string) return !row.str_present[agg_plan.str_state_index];
+    if (agg_plan.is_string or agg_plan.is_concat) return !row.str_present[agg_plan.str_state_index];
     return switch (agg_plan.func) {
         .sum, .avg, .min, .max => agg_plan.input_nullable and aggDenom(row, agg_plan) == 0,
         // Sample variants need ≥2 inputs even over a non-nullable column.
@@ -892,7 +906,7 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
     // COUNT-family columns). The data append still runs with a default value
     // so the column stays rectangular.
     try col.appendValidBit(allocator, col.rowCount(), !aggIsNull(row, agg_plan));
-    if (agg_plan.is_string) {
+    if (agg_plan.is_string or agg_plan.is_concat) {
         return appendStringAggregate(allocator, col, agg_plan.output_type, row.str[agg_plan.str_state_index]);
     }
     const float_input = isFloatPhysical(agg_plan.input_type);
@@ -965,6 +979,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
     var next_numeric_state_index: u16 = 1;
     var next_string_state_index: u16 = 0;
     var next_distinct_state_index: u16 = 0;
+    var next_concat_state_index: u16 = 0;
     for (request.aggs, 0..) |agg, agg_i| {
         if (agg_i >= MAX_AGGS) return traceDecline(request, "aggregate count");
         // Nullable inputs: NULL rows skip the fold via the staged validity
@@ -1040,6 +1055,33 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 };
                 next_numeric_state_index += slot_width;
             },
+            .group_concat => {
+                const col_name = agg.col orelse return traceDecline(request, "aggregate column");
+                const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "aggregate type");
+                if (!isStringKeyType(input_type)) return traceDecline(request, "group_concat input type");
+                if (next_string_state_index >= MAX_STRING_AGG_SLOTS) return traceDecline(request, "string aggregate slot count");
+                if (next_concat_state_index >= MAX_CONCAT_SLOTS) return traceDecline(request, "concat slot count");
+                const str_input_idx = addStringAggInput(&string_aggregate_inputs, &string_aggregate_input_count, col_name) orelse return traceDecline(request, "string aggregate input");
+                aggregates[agg_i] = .{
+                    .name = agg.as,
+                    .func = agg.func,
+                    .input_column_index = null,
+                    .input_type = .i64,
+                    .state_index = 0,
+                    .output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null,
+                    .str_input_index = str_input_idx,
+                    .str_state_index = next_string_state_index,
+                    .input_nullable = input_nullable,
+                    .is_concat = true,
+                    .concat_state_index = next_concat_state_index,
+                    .separator = switch (agg.params) {
+                        .separator => |s| s,
+                        else => ",",
+                    },
+                };
+                next_string_state_index += 1;
+                next_concat_state_index += 1;
+            },
             .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
                 const col_name = agg.col orelse return traceDecline(request, "aggregate column");
                 const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "aggregate type");
@@ -1090,10 +1132,11 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
         if (!outputColumnExists(parts[0..request.group_cols.len], aggregates[0..request.aggs.len], spec.col)) {
             return traceDecline(request, "order key");
         }
-        // Sorting on a string MIN/MAX result isn't wired through the final
-        // top-N comparator yet; such queries order by COUNT in practice.
+        // Sorting on a string MIN/MAX or GROUP_CONCAT result isn't wired
+        // through the final top-N comparator yet; such queries order by COUNT
+        // in practice.
         for (aggregates[0..request.aggs.len]) |agg_plan| {
-            if (agg_plan.is_string and types.columnNameEql(agg_plan.name, spec.col)) {
+            if ((agg_plan.is_string or agg_plan.is_concat) and types.columnNameEql(agg_plan.name, spec.col)) {
                 return traceDecline(request, "order by string aggregate");
             }
         }

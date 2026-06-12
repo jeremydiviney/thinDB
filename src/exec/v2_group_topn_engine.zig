@@ -394,6 +394,8 @@ pub const AggregateOp = enum {
     // Variance/stddev family — Welford over three slots (see the harness
     // core's GroupAggregateOp).
     welford,
+    // GROUP_CONCAT — side-collected per group, joined at emit.
+    concat,
 };
 
 pub const AggregateSpec = struct {
@@ -406,6 +408,12 @@ pub const AggregateSpec = struct {
     // count for the AVG denominator and the all-NULL → NULL finalize.
     nullable: bool = false,
     valid_count_index: u16 = 0,
+    // GROUP_CONCAT: input via `string_aggregate_inputs[str_input_index]`,
+    // collection cell `concat_state_index`, joined with `separator` into the
+    // TopRow.str slot `str_state_index` at emit.
+    is_concat: bool = false,
+    concat_state_index: u16 = 0,
+    separator: []const u8 = ",",
     // String MIN/MAX: reads `Shape.string_aggregate_inputs[str_input_index]` and
     // keeps its result in string state slot `str_state_index` (not the numeric
     // slots). False/0 for every numeric aggregate.
@@ -730,6 +738,7 @@ fn runHarness(
                 .max => .max,
                 .count_distinct => .count_distinct,
                 .welford => .welford,
+                .concat => .concat,
             },
             .input_column_index = agg.input_column_index,
             .state_index = agg.state_index,
@@ -741,6 +750,9 @@ fn runHarness(
             .wide = agg.wide,
             .nullable = agg.nullable,
             .valid_count_index = agg.valid_count_index,
+            .is_concat = agg.is_concat,
+            .concat_state_index = agg.concat_state_index,
+            .separator = agg.separator,
         };
     }
     // shape.hashed comes from the shape gate (string / >128-bit keys). The env
@@ -774,7 +786,7 @@ fn runHarness(
                     if (ic >= shape.aggregate_inputs.len or input_used[ic]) break :blk false;
                     input_used[ic] = true;
                 },
-                .count_col, .count_distinct, .welford => break :blk false,
+                .count_col, .count_distinct, .welford, .concat => break :blk false,
             }
         }
         // Every staged column must belong to exactly one folding aggregate.
@@ -801,6 +813,10 @@ fn runHarness(
             };
         }
     }
+    var has_concat = false;
+    for (shape.aggregate_program) |agg| {
+        if (agg.is_concat) has_concat = true;
+    }
     const group_rows_layout = HarnessCore.GroupRowsLayout{
         .key_width = if (force_hash) .u128 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
@@ -809,7 +825,11 @@ fn runHarness(
         .str_columns = group_str_columns_buf[0..shape.string_aggregate_inputs.len],
         .has_str_payload = shape.string_aggregate_inputs.len > 0,
         .distinct_slot_count = distinct_slot_count,
-        .has_rowref = force_hash,
+        // GROUP_CONCAT carries per-row rowrefs (emission order) even under
+        // packed keys; only force_hash makes the key itself a hash.
+        .has_rowref = force_hash or has_concat,
+        .hashed_key = force_hash,
+        .has_concat = has_concat,
         .has_weight = weight_mode,
     };
 

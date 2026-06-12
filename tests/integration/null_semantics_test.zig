@@ -643,3 +643,39 @@ test "grouped variance/stddev: welford per group, NULL skips, 1-row samp is NULL
     try std.testing.expectApproxEqAbs(@as(f64, 25.0), b.values[1].data.double[2], 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 50.0), b.values[2].data.double[2], 1e-9);
 }
+
+test "group_concat: skips NULLs, all-NULL group emits NULL, custom separator, row order" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db,
+        "CREATE TABLE gc (id BIGINT PRIMARY KEY, grp VARCHAR(8) NOT NULL, s VARCHAR(16))",
+    );
+    try exec(allocator, db,
+        "INSERT INTO gc (id, grp, s) VALUES " ++
+            "(1,'a','x'), (2,'a',NULL), (3,'a','y'), (4,'a',''), " ++
+            "(5,'b',NULL), (6,'b',NULL)",
+    );
+    const t = try db.openTable("gc", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT grp, GROUP_CONCAT(s, '|') AS cs, COUNT(*) AS c FROM gc GROUP BY grp ORDER BY grp",
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), b.row_count);
+    // grp 'a': NULL skipped, '' kept, physical row order → "x|y|"
+    try std.testing.expectEqualStrings("a", b.values[0].data.varchar.rowBytes(0));
+    try std.testing.expect(b.values[1].isValid(0));
+    try std.testing.expectEqualStrings("x|y|", b.values[1].data.string.rowBytes(0));
+    try std.testing.expectEqual(@as(i64, 4), b.values[2].data.bigint[0]);
+    // grp 'b': all inputs NULL → NULL
+    try std.testing.expectEqualStrings("b", b.values[0].data.varchar.rowBytes(1));
+    try std.testing.expect(!b.values[1].isValid(1));
+    try std.testing.expectEqual(@as(i64, 2), b.values[2].data.bigint[1]);
+}
