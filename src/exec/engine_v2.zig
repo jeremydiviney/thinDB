@@ -59,6 +59,10 @@ pub const CompileInput = struct {
     // by the CompileCtx after the operator tree is torn down, so the borrows
     // outlive the operators that hold them.
     node_arena: std.mem.Allocator,
+    /// Process-local scalar UDF registry (null when the db has no catalog).
+    /// Serial Computes resolve user-defined functions through it — same as
+    /// the legacy path's CompileCtx.udf_registry.
+    udf_registry: ?*const @import("../udf.zig").UdfRegistry = null,
 };
 
 /// Try to compile a whole query block into Engine V2.
@@ -77,7 +81,38 @@ pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // legacy-owned too: neither is a columnar-scan performance shape, so
     // the V2-or-error policy doesn't apply — fall back instead of failing.
     if (legacyLeaf(root)) return null;
-    return try compileSelectBlock(input, root);
+    // Aggregates V2's grouped cores don't host (user-defined aggregates,
+    // variable-state string concatenation) run on the legacy operators.
+    if (hasLegacyOnlyAggregate(root)) return null;
+    return compileSelectBlock(input, root) catch |e| switch (e) {
+        // Grouped SUM/AVG over a 64-bit integer needs the legacy engine's
+        // i128 accumulator — fall back instead of failing.
+        error.NeedsWideAccumulator => null,
+        else => e,
+    };
+}
+
+fn hasLegacyOnlyAggregate(op: *const ir.Op) bool {
+    var cur = op;
+    while (true) {
+        switch (cur.*) {
+            .group_by => |g| {
+                for (g.aggs) |a| switch (a.func) {
+                    .udf, .group_concat => return true,
+                    else => {},
+                };
+                cur = g.upstream;
+            },
+            .select => |p| cur = p.upstream,
+            .exclude => |p| cur = p.upstream,
+            .filter => |f| cur = f.upstream,
+            .order_by => |o| cur = o.upstream,
+            .compute => |c| cur = c.upstream,
+            .alias => |a| cur = a.upstream,
+            .limit => |l| cur = l.upstream,
+            else => return false,
+        }
+    }
 }
 
 /// True when the block's source is a leaf the legacy engine owns
@@ -435,6 +470,79 @@ fn collectPredicateNames(allocator: std.mem.Allocator, set: *std.ArrayListUnmana
     }
 }
 
+fn nameInList(list: []const []const u8, name: []const u8) bool {
+    for (list) |n| if (types.columnNameEql(n, name)) return true;
+    return false;
+}
+
+// A HAVING conjunct whose every referenced column is a group-key BASE column
+// (not a derived key — those don't exist at scan time under every scan mode)
+// admits the per-group ≡ per-row equivalence: all rows of a group share its
+// key, so filtering the rows filters exactly the failing groups.
+fn havingConjunctPushable(input: CompileInput, table: *api.Table, group_cols: []const []const u8, conjunct: exec.PredicateExpr) !bool {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer names.deinit(input.allocator);
+    try collectPredicateNames(input.allocator, &names, conjunct);
+    if (names.items.len == 0) return false;
+    for (names.items) |nm| {
+        if (!nameInList(group_cols, nm)) return false;
+        if (types.findColumn(table.schema.columns, nm) == null) return false;
+    }
+    return true;
+}
+
+const HavingSplit = struct { where: ?exec.PredicateExpr, having: ?exec.PredicateExpr };
+
+// Pre-execution rewrite: move key-only HAVING conjuncts into the WHERE filter.
+// Splits only a top-level AND (or the whole predicate); a key/aggregate mix
+// under OR stays as HAVING. New predicate nodes live in the query's node arena.
+fn pushKeyOnlyHavingIntoWhere(
+    input: CompileInput,
+    table: *api.Table,
+    group_cols: []const []const u8,
+    having: exec.PredicateExpr,
+    where: ?exec.PredicateExpr,
+) !HavingSplit {
+    const arena = input.node_arena;
+    const conjuncts: []const exec.PredicateExpr = switch (having) {
+        .@"and" => |kids| kids,
+        else => blk: {
+            const one = try arena.alloc(exec.PredicateExpr, 1);
+            one[0] = having;
+            break :blk one;
+        },
+    };
+
+    var pushed: std.ArrayListUnmanaged(exec.PredicateExpr) = .empty;
+    defer pushed.deinit(input.allocator);
+    var kept: std.ArrayListUnmanaged(exec.PredicateExpr) = .empty;
+    defer kept.deinit(input.allocator);
+    for (conjuncts) |c| {
+        if (try havingConjunctPushable(input, table, group_cols, c)) {
+            try pushed.append(input.allocator, c);
+        } else {
+            try kept.append(input.allocator, c);
+        }
+    }
+    if (pushed.items.len == 0) return .{ .where = where, .having = having };
+
+    var where_parts: std.ArrayListUnmanaged(exec.PredicateExpr) = .empty;
+    defer where_parts.deinit(input.allocator);
+    if (where) |w| try where_parts.append(input.allocator, w);
+    try where_parts.appendSlice(input.allocator, pushed.items);
+    const new_where: exec.PredicateExpr = if (where_parts.items.len == 1)
+        where_parts.items[0]
+    else
+        .{ .@"and" = try arena.dupe(exec.PredicateExpr, where_parts.items) };
+
+    const new_having: ?exec.PredicateExpr = switch (kept.items.len) {
+        0 => null,
+        1 => kept.items[0],
+        else => .{ .@"and" = try arena.dupe(exec.PredicateExpr, kept.items) },
+    };
+    return .{ .where = new_where, .having = new_having };
+}
+
 // Output aliases the grouped core must keep direct (computed in-core, not
 // derived afterward) because ORDER BY / HAVING ranks or filters on them.
 fn collectProtectedAggNames(allocator: std.mem.Allocator, plan: GroupTopNPlan) ![]const []const u8 {
@@ -452,6 +560,34 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const table = try resolveTable(input.db, input.session, plan.scan.table);
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
     defer if (needed) |n| input.allocator.free(n);
+
+    // HAVING conjuncts that reference only group-key base columns filter the
+    // same rows whether applied per row (WHERE) or per group (every row of a
+    // group shares its key), so push them below the aggregate. The grouped
+    // core's HAVING evaluator is numeric-only; this rewrite is what lets
+    // `HAVING string_key = '...'` run at all — and it prunes rows earlier.
+    var eff_where: ?exec.PredicateExpr = if (plan.where_filter) |f| f.predicate else null;
+    var eff_having: ?exec.PredicateExpr = if (plan.having_filter) |f| f.predicate else null;
+    if (eff_having) |h| {
+        const split = try pushKeyOnlyHavingIntoWhere(input, table, plan.group_by.group_cols, h, eff_where);
+        eff_where = split.where;
+        eff_having = split.having;
+    }
+
+    // The grouped core orders string keys by their dict code / 128-bit digest —
+    // neither is lexicographic. When ORDER BY names a string-typed group key,
+    // run the core unordered over ALL groups and sort (+ limit) the small
+    // grouped output with the generic sort operator instead.
+    const order_specs: []const exec.SortSpec = if (plan.order_by) |o| o.specs else &.{};
+    var post_sort = false;
+    for (order_specs) |s| {
+        if (!nameInList(plan.group_by.group_cols, s.col)) continue;
+        const idx = types.findColumn(table.schema.columns, s.col) orelse continue;
+        if (table.schema.columns[idx].type.isString()) {
+            post_sort = true;
+            break;
+        }
+    }
 
     // Algebraic reduction for the grouped core, same as the global path:
     // collapse affine aggregates (SUM/MIN/MAX of a·col+b) onto a shared base set,
@@ -480,18 +616,22 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const request = v2_pipeline.GroupTopNRequest{
         .group_cols = plan.group_by.group_cols,
         .aggs = eff_aggs,
-        .order_specs = if (plan.order_by) |o| o.specs else &.{},
-        .limit = if (plan.limit) |l| @intCast(l.n) else 0,
-        .offset = if (plan.limit) |l| @intCast(l.offset) else 0,
-        .where_filter = if (plan.where_filter) |f| f.predicate else null,
-        .having_filter = if (plan.having_filter) |f| f.predicate else null,
+        .order_specs = if (post_sort) &.{} else order_specs,
+        .limit = if (post_sort) 0 else if (plan.limit) |l| @intCast(l.n) else 0,
+        .offset = if (post_sort) 0 else if (plan.limit) |l| @intCast(l.offset) else 0,
+        .where_filter = eff_where,
+        .having_filter = eff_having,
         .needed = needed,
         .derived = eff_derived,
         .dop = input.db.config.max_dop,
     };
 
     // Provably-low-cardinality group keys take the direct (scatter-free)
-    // private-table handler; everything else runs the silo grid.
+    // private-table handler; everything else runs the silo grid. SUM/AVG over a
+    // 64-bit integer needs an i128 accumulator the silo's i64 slots can't hold
+    // (and the lowcard handler declined or it would have run) — the silo raises
+    // NeedsWideAccumulator, which the dispatch layers map to a legacy fallback
+    // (its accumulator is already i128) rather than UnsupportedQueryShape.
     const built_q = (try v2_pipeline.tryBuildLowCardGroup(input.allocator, table, request)) orelse
         (try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request));
     if (built_q) |silo_q| {
@@ -500,10 +640,15 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         // count-/order-ranked order. The affine late-materialization (reduced
         // aggregates) and the collapsed-key recompute are independent Computes
         // over that small output; then reorder to the SELECT list. ORDER BY/LIMIT
-        // already ran inside the pipeline on the grouped columns.
+        // already ran inside the pipeline on the grouped columns — except in the
+        // string-key-order case, which sorts the grouped output here.
         errdefer q.deinit();
-        if (affine_post.len > 0) q = try q.compute(affine_post);
-        if (plan.post_agg_derived.len > 0) q = try q.compute(plan.post_agg_derived);
+        if (post_sort) {
+            q = try q.orderBy(order_specs);
+            if (plan.limit) |l| q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
+        }
+        if (affine_post.len > 0) q = try q.computeWithRegistry(affine_post, input.udf_registry);
+        if (plan.post_agg_derived.len > 0) q = try q.computeWithRegistry(plan.post_agg_derived, input.udf_registry);
         q = try applyOutputProjection(input.allocator, q, eff_out_cols, plan.output_names);
         return q;
     }
@@ -522,7 +667,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
 // row at a time (the Q29 40s trap). Any non-fusable remainder (CASE, subqueries)
 // is layered as a serial Compute referencing the fused cols. Mirrors
 // net/local.zig's fusion split.
-fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived: []const ir.Derived) !exec.Query {
+fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived: []const ir.Derived, udf_registry: ?*const @import("../udf.zig").UdfRegistry) !exec.Query {
     var result = q;
     const scan_cols = result.outputSchema();
     var fusable: std.ArrayListUnmanaged(ir.Derived) = .empty;
@@ -532,10 +677,10 @@ fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived: []c
     for (derived) |d| {
         if (exec.derivedFusable(d, scan_cols)) try fusable.append(allocator, d) else try serial.append(allocator, d);
     }
-    if (fusable.items.len == 0) return result.compute(derived);
-    if (!try result.tryFuseCompute(fusable.items)) return result.compute(derived);
+    if (fusable.items.len == 0) return result.computeWithRegistry(derived, udf_registry);
+    if (!try result.tryFuseCompute(fusable.items)) return result.computeWithRegistry(derived, udf_registry);
     if (serial.items.len == 0) return result;
-    return result.compute(serial.items);
+    return result.computeWithRegistry(serial.items, udf_registry);
 }
 
 const GlobalAggregatePlan = struct {
@@ -607,6 +752,20 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
+    // Algebraic reduction: collapse SUM/MIN/MAX(affine(col)) onto a shared base
+    // set computed once, then derive every original output. Q29's 90
+    // SUM(ResolutionWidth+k) become SUM+COUNT + a post-agg Compute. Only when
+    // there's no HAVING (it would bind to the original aliases the base set
+    // replaces; global+HAVING is declined regardless). Tried BEFORE the
+    // metadata lane: a reduced integer SUM narrows through `__narrow_bigint`'s
+    // i64 range check (the documented overflow dialect), which the metadata
+    // lane's canonical-type emit would silently skip.
+    if (plan.having_filter == null) {
+        if (try affine_agg.reduce(input.node_arena, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived, &.{})) |red| {
+            return try buildGlobalAggregateReduced(input, table, plan, red);
+        }
+    }
+
     // Metadata-only lane: a bare global aggregate (no WHERE/HAVING/derived)
     // mixing COUNT(*) / COUNT(col) / MIN / MAX / SUM / AVG is answerable from
     // the manifest — segment row counts (− tombstones + memtable) for the
@@ -617,17 +776,6 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // whenever any fails.
     if (plan.where_filter == null and plan.having_filter == null and plan.derived.len == 0) {
         if (try tryMetaAggStats(input.allocator, table, plan.group_by.aggs)) |q| return q;
-    }
-
-    // Algebraic reduction: collapse SUM/MIN/MAX(affine(col)) onto a shared base
-    // set computed once, then derive every original output. Q29's 90
-    // SUM(ResolutionWidth+k) become SUM+COUNT + a post-agg Compute. Only when
-    // there's no HAVING (it would bind to the original aliases the base set
-    // replaces; global+HAVING is declined regardless).
-    if (plan.having_filter == null) {
-        if (try affine_agg.reduce(input.node_arena, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived, &.{})) |red| {
-            return try buildGlobalAggregateReduced(input, table, plan, red);
-        }
     }
 
     // No serial fallback. The parallel reducer (v2_global_aggregate) is the only
@@ -698,7 +846,7 @@ fn buildGlobalAggregateReduced(
         .dop = input.db.config.max_dop,
     })) orelse return error.UnsupportedQueryShape;
     errdefer q.deinit();
-    if (red.post_derived.len > 0) q = try q.compute(red.post_derived);
+    if (red.post_derived.len > 0) q = try q.computeWithRegistry(red.post_derived, input.udf_registry);
     return try q.project(red.output_names);
 }
 
@@ -951,7 +1099,7 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     errdefer q.deinit();
 
     if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived);
+    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
     if (plan.order_by) |o| {
         if (plan.limit) |l| {
             q = try q.topN(o.specs, @intCast(l.n), @intCast(l.offset));

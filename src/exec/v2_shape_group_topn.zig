@@ -211,7 +211,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         probe_schema = probe_q.?.outputSchema();
     }
 
-    var plan = validateShape(table, request, probe_schema) orelse {
+    var plan = (try validateShape(table, request, probe_schema)) orelse {
         base_cols.deinit(allocator);
         return null;
     };
@@ -795,7 +795,7 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
     }
 }
 
-fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?ShapePlan {
+fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) error{NeedsWideAccumulator}!?ShapePlan {
     if (request.group_cols.len == 0 or request.group_cols.len > MAX_GROUP_KEYS) return traceDecline(request, "group key count");
     if (request.aggs.len == 0 or request.aggs.len > MAX_AGGS) return traceDecline(request, "aggregate count");
     // Decide packed vs hashed: integer keys totalling ≤128 bits bit-pack
@@ -887,8 +887,12 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 // route these to the generic i128 accumulator path instead of
                 // overflowing here. MIN/MAX over a 64-bit int is fine — it holds a
                 // single value, never grows. Float SUM/AVG (f64) is also fine.
+                // A distinguished error (not a plain decline) so the engine
+                // dispatcher falls back to the legacy i128 pipeline instead of
+                // raising UnsupportedQueryShape.
                 if ((agg.func == .sum or agg.func == .avg) and physicalTypeFor(input_type) == .i64) {
-                    return traceDecline(request, "64-bit sum/avg needs i128 accumulator");
+                    _ = traceDecline(request, "64-bit sum/avg needs i128 accumulator");
+                    return error.NeedsWideAccumulator;
                 }
                 if (next_numeric_state_index > MAX_AGGS) return traceDecline(request, "aggregate state count");
                 const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");

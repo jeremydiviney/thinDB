@@ -791,7 +791,7 @@ fn runHarness(
     // derived expression (those need real bytes in the batch).
     var hash_key_cols_buf: [8][]const u8 = undefined;
     var n_hash_keys: usize = 0;
-    if (force_hash) {
+    if (force_hash and derived.len == 0) {
         outer: for (shape.group_key_inputs) |input| {
             switch (input.source_type) {
                 .varchar, .string, .char => {},

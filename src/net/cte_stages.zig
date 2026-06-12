@@ -215,8 +215,13 @@ fn blockSource(op: *const ir.Op) BlockSource {
 
 fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
     return switch (blockSource(op)) {
-        // Table-backed block: the regular V2 handlers, full parallelism.
-        .table => engine_v2.compileSelectBlock(input, op),
+        // Table-backed block: the regular V2 handlers, full parallelism. A
+        // staged plan has no legacy fallback, so the wide-accumulator sentinel
+        // (grouped 64-bit SUM/AVG) surfaces as the standard shape error here.
+        .table => engine_v2.compileSelectBlock(input, op) catch |e| switch (e) {
+            error.NeedsWideAccumulator => error.UnsupportedQueryShape,
+            else => e,
+        },
         // Stage-, join-, window-, or union-backed block: generic operators
         // over MatScan / Join / Window / SetUnion leaves. The heavy inputs
         // were already produced by upstream stage handlers or stream in from
@@ -280,7 +285,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         .compute => |c| {
             var up = try buildGenericBlock(input, c.upstream, map, block_root);
             errdefer up.deinit();
-            return up.compute(c.derived);
+            return up.computeWithRegistry(c.derived, input.udf_registry);
         },
         .order_by => |o| {
             var up = try buildGenericBlock(input, o.upstream, map, block_root);

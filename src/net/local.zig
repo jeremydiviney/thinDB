@@ -2288,6 +2288,7 @@ pub fn compileWithSession(
         .db = db,
         .session = session_cell.*,
         .prune_names = ctx.prune_names,
+        .udf_registry = ctx.udf_registry,
         .node_arena = ctx.nodeArena(),
     };
     // pg_catalog virtual tables (incl. JOINs across them) are metadata
