@@ -81,6 +81,19 @@ fn collectPredicateColumns(
         .is_null, .is_not_null => |col_name| try addPredicateColumn(allocator, out, t.findColumn(schema, col_name)),
         .like => |lp| try addPredicateColumn(allocator, out, t.findColumn(schema, lp.col)),
         .in_set => |s| try addPredicateColumn(allocator, out, t.findColumn(schema, s.col)),
+        // Correlated leaves evaluate against the materialized batch, so every
+        // outer-side column they read must be sourced for the eval schema even
+        // when the projection doesn't carry it.
+        .correlated_set => |s| for (s.outer_cols) |nm| try addPredicateColumn(allocator, out, t.findColumn(schema, nm)),
+        .correlated_scalar => |s| {
+            try addPredicateColumn(allocator, out, t.findColumn(schema, s.outer_compared));
+            for (s.outer_keys) |nm| try addPredicateColumn(allocator, out, t.findColumn(schema, nm));
+        },
+        .correlated_range => |r| {
+            for (r.outer_keys) |nm| try addPredicateColumn(allocator, out, t.findColumn(schema, nm));
+            try addPredicateColumn(allocator, out, t.findColumn(schema, r.outer_range_col));
+            if (r.outer_range_col_upper) |up| try addPredicateColumn(allocator, out, t.findColumn(schema, up));
+        },
         .@"and", .@"or" => |children| for (children) |child| try collectPredicateColumns(allocator, child, schema, out),
         .not => |child| try collectPredicateColumns(allocator, child.*, schema, out),
         else => {},
