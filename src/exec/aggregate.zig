@@ -202,8 +202,8 @@ const DistinctStr = struct {
 /// declared output column type.
 const AccState = union(enum) {
     count: u64,
-    sum_int: i128,
-    sum_float: f64,
+    sum_int: SumIntAcc,
+    sum_float: SumFloatAcc,
     min_int: ?i64,
     max_int: ?i64,
     min_float: ?f64,
@@ -262,8 +262,8 @@ const AccState = union(enum) {
 /// `*AccState` unchanged.
 const AggCol = union(enum) {
     count: []u64,
-    sum_int: []i128,
-    sum_float: []f64,
+    sum_int: []SumIntAcc,
+    sum_float: []SumFloatAcc,
     avg: []AvgAcc,
     min_int: []?i64,
     max_int: []?i64,
@@ -310,8 +310,8 @@ fn aggColKind(func: AggFunc, in: ?Type) AggColKind {
 pub fn aggStateWidth(func: AggFunc, in: ?Type) usize {
     return switch (aggColKind(func, in)) {
         .count => @sizeOf(u64),
-        .sum_int => @sizeOf(i128),
-        .sum_float => @sizeOf(f64),
+        .sum_int => @sizeOf(SumIntAcc),
+        .sum_float => @sizeOf(SumFloatAcc),
         .avg => @sizeOf(AvgAcc),
         .min_int, .max_int => @sizeOf(?i64),
         .min_float, .max_float => @sizeOf(?f64),
@@ -322,6 +322,12 @@ pub fn aggStateWidth(func: AggFunc, in: ?Type) usize {
 /// Inline MIN/MAX accumulator for 128-bit inputs. `align(8)` on the i128 keeps
 /// the enclosing `AccState` union 8-aligned (32 B) rather than 16-aligned.
 const LargeAcc = struct { v: i128 align(8) = 0, present: bool = false };
+
+/// SUM accumulators carry a `seen` flag so a group (or global input) whose
+/// every value was NULL finalizes to SQL NULL rather than the 0 identity.
+/// Same align(8) trick as LargeAcc to keep AccState at 32 B.
+const SumIntAcc = struct { v: i128 align(8) = 0, seen: bool = false };
+const SumFloatAcc = struct { v: f64 = 0, seen: bool = false };
 
 const AvgAcc = struct {
     sum: f64,
@@ -616,6 +622,9 @@ pub const Aggregate = struct {
             output_schema[group_cols.len + i] = .{
                 .name = a.as,
                 .type = try aggOutputTypeFor(a, if (agg_col_indices[i]) |idx| up_schema[idx].type else null),
+                // Every aggregate but the COUNT family finalizes to NULL over
+                // zero qualifying inputs.
+                .nullable = aggOutputNullable(a.func),
             };
         }
 
@@ -1260,10 +1269,14 @@ pub const Aggregate = struct {
                 if (has_nulls) {
                     for (gids, 0..) |g, r| {
                         if (!view.isValid(r)) continue;
-                        sums[g] += sl[r];
+                        sums[g].v += sl[r];
+                        sums[g].seen = true;
                     }
                 } else {
-                    for (gids, 0..) |g, r| sums[g] += sl[r];
+                    for (gids, 0..) |g, r| {
+                        sums[g].v += sl[r];
+                        sums[g].seen = true;
+                    }
                 }
             },
             inline .float, .double => |sl| {
@@ -1271,10 +1284,14 @@ pub const Aggregate = struct {
                 if (has_nulls) {
                     for (gids, 0..) |g, r| {
                         if (!view.isValid(r)) continue;
-                        sums[g] += sl[r];
+                        sums[g].v += sl[r];
+                        sums[g].seen = true;
                     }
                 } else {
-                    for (gids, 0..) |g, r| sums[g] += sl[r];
+                    for (gids, 0..) |g, r| {
+                        sums[g].v += sl[r];
+                        sums[g].seen = true;
+                    }
                 }
             },
             else => unreachable,
@@ -1599,8 +1616,8 @@ pub const Aggregate = struct {
     /// it into the single-column u128 key exactly as `orKeyColumn` would (so
     /// `appendIntGroupKey` decodes it identically), and lowers the i64 state into
     /// the matching narrow column (`.sum_int` / `.min_int` / `.max_int`,
-    /// mirroring `initialState`). A group whose value column was all-NULL keeps
-    /// the fold identity, matching the canonical path's empty-set MIN/MAX/SUM.
+    /// mirroring `initialState`). Both columns are non-nullable (`planInlineFor`
+    /// gates), so every occupied slot folded at least one real value.
     fn lowerInlineFor(self: *Aggregate, aa: Allocator) !void {
         const plan = self.inline_for.?;
         const layout = self.int_layout.?;
@@ -1627,7 +1644,7 @@ pub const Aggregate = struct {
                     const value: i64 = @intCast(@as(i128, plan.base) + @as(i128, s.key));
                     self.gkeys_int.appendAssumeCapacity(packSingleIntField(field, value));
                     switch (plan.kind) {
-                        .sum => col.sum_int[gid] = @as(i128, s.state),
+                        .sum => col.sum_int[gid] = .{ .v = @as(i128, s.state), .seen = true },
                         .min => col.min_int[gid] = s.state,
                         .max => col.max_int[gid] = s.state,
                     }
@@ -2109,6 +2126,9 @@ pub const SortedAggregate = struct {
             output_schema[group_cols.len + i] = .{
                 .name = a.as,
                 .type = try aggOutputTypeFor(a, if (agg_col_indices[i]) |idx| up_schema[idx].type else null),
+                // Every aggregate but the COUNT family finalizes to NULL over
+                // zero qualifying inputs.
+                .nullable = aggOutputNullable(a.func),
             };
         }
         for (aggs, agg_col_indices) |a, maybe_idx| {
@@ -2334,8 +2354,8 @@ fn topkOrderable(func: AggFunc, out_t: Type) bool {
 fn aggOrderValue(s: AccState) OrderVal {
     return switch (s) {
         .count => |c| .{ .int = @intCast(c) },
-        .sum_int => |v| .{ .int = v },
-        .sum_float => |v| .{ .float = v },
+        .sum_int => |v| .{ .int = v.v },
+        .sum_float => |v| .{ .float = v.v },
         .min_int, .max_int => |m| .{ .int = m orelse 0 },
         .min_large, .max_large => |m| .{ .int = if (m.present) m.v else 0 },
         .min_float, .max_float => |m| .{ .float = m orelse 0.0 },
@@ -2445,13 +2465,13 @@ fn initAggCol(aa: Allocator, func: AggFunc, in: ?Type, capacity: usize) !AggCol 
             break :blk .{ .count = s };
         },
         .sum_int => blk: {
-            const s = try aa.alloc(i128, capacity);
-            @memset(s, 0);
+            const s = try aa.alloc(SumIntAcc, capacity);
+            @memset(s, .{});
             break :blk .{ .sum_int = s };
         },
         .sum_float => blk: {
-            const s = try aa.alloc(f64, capacity);
-            @memset(s, 0.0);
+            const s = try aa.alloc(SumFloatAcc, capacity);
+            @memset(s, .{});
             break :blk .{ .sum_float = s };
         },
         .avg => blk: {
@@ -2500,12 +2520,12 @@ fn growAggCol(aa: Allocator, col: *AggCol, func: AggFunc, in: ?Type, new_capacit
         .sum_int => |*s| {
             const old = s.len;
             s.* = try aa.realloc(s.*, new_capacity);
-            @memset(s.*[old..], 0);
+            @memset(s.*[old..], .{});
         },
         .sum_float => |*s| {
             const old = s.len;
             s.* = try aa.realloc(s.*, new_capacity);
-            @memset(s.*[old..], 0.0);
+            @memset(s.*[old..], .{});
         },
         .avg => |*s| {
             const old = s.len;
@@ -2534,10 +2554,10 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
     return switch (func) {
         .count => .{ .count = 0 },
         .sum => if (in != null and in.?.isFloat())
-            .{ .sum_float = 0.0 }
+            .{ .sum_float = .{} }
         else
             // i128 accumulator covers BIGINT, LARGEINT, DECIMAL64, DECIMAL128.
-            .{ .sum_int = 0 },
+            .{ .sum_int = .{} },
         .min => if (in != null and in.?.isFloat())
             .{ .min_float = null }
         else if (in != null and in.?.isString())
@@ -2578,6 +2598,15 @@ fn initialState(func: AggFunc, in: ?Type) AccState {
 pub fn aggOutputTypeFor(a: AggSpec, in: ?Type) !Type {
     if (a.out_type_override) |t| return t;
     return aggOutputType(a.func, in);
+}
+
+/// Whether an aggregate's output column can hold NULL: everything except the
+/// COUNT family (which finalizes to 0 over zero qualifying inputs).
+pub fn aggOutputNullable(func: AggFunc) bool {
+    return switch (func) {
+        .count, .count_distinct => false,
+        else => true,
+    };
 }
 
 /// True for output types that carry a usable i128 min/max range (matches
@@ -2707,16 +2736,25 @@ fn updateStateRow(aa: Allocator, s: *AccState, spec: AggSpec, batch: Batch, col_
             const view = batch.values[col_idx.?];
             if (!view.isValid(row)) return;
             switch (view.data) {
-                .int => |sl| s.sum_int += sl[row],
-                .smallint => |sl| s.sum_int += sl[row],
-                .tinyint => |sl| s.sum_int += sl[row],
-                .boolean => |sl| s.sum_int += sl[row],
-                .bigint, .decimal64 => |sl| s.sum_int += sl[row],
-                .largeint, .decimal128 => |sl| s.sum_int += sl[row],
-                .float => |sl| s.sum_float += sl[row],
-                .double => |sl| s.sum_float += sl[row],
+                .int => |sl| s.sum_int.v += sl[row],
+                .smallint => |sl| s.sum_int.v += sl[row],
+                .tinyint => |sl| s.sum_int.v += sl[row],
+                .boolean => |sl| s.sum_int.v += sl[row],
+                .bigint, .decimal64 => |sl| s.sum_int.v += sl[row],
+                .largeint, .decimal128 => |sl| s.sum_int.v += sl[row],
+                .float => |sl| {
+                    s.sum_float.v += sl[row];
+                    s.sum_float.seen = true;
+                    return;
+                },
+                .double => |sl| {
+                    s.sum_float.v += sl[row];
+                    s.sum_float.seen = true;
+                    return;
+                },
                 else => unreachable,
             }
+            s.sum_int.seen = true;
         },
         .udf => return Error.AggregateUnsupportedType,
         else => try updateState(aa, s, spec, batch, col_idx, row, row + 1),
@@ -2762,62 +2800,76 @@ fn updateState(
                 // (i64-lane overflow / i128 isn't a SIMD win) but lose the
                 // per-row branch.
                 switch (view.data) {
-                    .int => |sl| s.sum_int += simd.sumWiden(i32, sl[lo..hi]),
-                    .smallint => |sl| s.sum_int += simd.sumWiden(i16, sl[lo..hi]),
-                    .tinyint => |sl| s.sum_int += simd.sumWiden(i8, sl[lo..hi]),
-                    .boolean => |sl| s.sum_int += simd.sumWiden(u8, sl[lo..hi]),
-                    .float => |sl| s.sum_float += simd.sumFloat(f32, sl[lo..hi]),
-                    .double => |sl| s.sum_float += simd.sumFloat(f64, sl[lo..hi]),
+                    .int => |sl| s.sum_int.v += simd.sumWiden(i32, sl[lo..hi]),
+                    .smallint => |sl| s.sum_int.v += simd.sumWiden(i16, sl[lo..hi]),
+                    .tinyint => |sl| s.sum_int.v += simd.sumWiden(i8, sl[lo..hi]),
+                    .boolean => |sl| s.sum_int.v += simd.sumWiden(u8, sl[lo..hi]),
+                    .float => |sl| s.sum_float.v += simd.sumFloat(f32, sl[lo..hi]),
+                    .double => |sl| s.sum_float.v += simd.sumFloat(f64, sl[lo..hi]),
                     .bigint, .decimal64 => |sl| for (sl[lo..hi]) |v| {
-                        s.sum_int += v;
+                        s.sum_int.v += v;
                     },
                     .largeint, .decimal128 => |sl| for (sl[lo..hi]) |v| {
-                        s.sum_int += v;
+                        s.sum_int.v += v;
                     },
                     else => unreachable,
                 }
+                if (hi > lo) switch (view.data) {
+                    .float, .double => s.sum_float.seen = true,
+                    else => s.sum_int.seen = true,
+                };
                 return;
             }
             switch (view.data) {
                 .int => |s_int| for (s_int[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_int += v;
+                    s.sum_int.v += v;
+                    s.sum_int.seen = true;
                 },
                 .bigint => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_int += v;
+                    s.sum_int.v += v;
+                    s.sum_int.seen = true;
                 },
                 .boolean => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_int += v;
+                    s.sum_int.v += v;
+                    s.sum_int.seen = true;
                 },
                 .tinyint => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_int += v;
+                    s.sum_int.v += v;
+                    s.sum_int.seen = true;
                 },
                 .smallint => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_int += v;
+                    s.sum_int.v += v;
+                    s.sum_int.seen = true;
                 },
                 .largeint => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_int += v;
+                    s.sum_int.v += v;
+                    s.sum_int.seen = true;
                 },
                 .decimal64 => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_int += v;
+                    s.sum_int.v += v;
+                    s.sum_int.seen = true;
                 },
                 .decimal128 => |s_b| for (s_b[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_int += v;
+                    s.sum_int.v += v;
+                    s.sum_int.seen = true;
                 },
                 .float => |s_f| for (s_f[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_float += v;
+                    s.sum_float.v += v;
+                    s.sum_float.seen = true;
                 },
                 .double => |s_d| for (s_d[lo..hi], lo..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.sum_float += v;
+                    s.sum_float.v += v;
+                    s.sum_float.seen = true;
                 },
                 else => unreachable,
             }
@@ -3326,31 +3378,42 @@ fn appendAccToColumn(
     cd_count: ?u64,
 ) !void {
     const func = spec.func;
+    const row = col.data.rowCount();
+    var is_null = false;
     switch (func) {
         .count => {
             try col.data.bigint.append(allocator, @intCast(state.count));
         },
+        // SQL: every aggregate except COUNT over zero qualifying (non-NULL)
+        // inputs finalizes to NULL. The placeholder + cleared validity bit
+        // pattern matches the V2 lanes (`v2_global_aggregate.emitRow`).
         .sum => switch (state) {
-            .sum_int => |total| switch (out_type) {
-                .largeint => try col.data.largeint.append(allocator, total),
+            .sum_int => |total| if (!total.seen) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else switch (out_type) {
+                .largeint => try col.data.largeint.append(allocator, total.v),
                 // DESIGN.md §3.4: SUM(DECIMAL) -> DECIMAL128(38, s). i128
                 // overflow is impossible here because total is already i128;
                 // any further widening would only occur in row-level arithmetic.
-                .decimal128 => try col.data.decimal128.append(allocator, total),
+                .decimal128 => try col.data.decimal128.append(allocator, total.v),
                 else => {
-                    if (total > std.math.maxInt(i64) or total < std.math.minInt(i64)) {
+                    if (total.v > std.math.maxInt(i64) or total.v < std.math.minInt(i64)) {
                         return Error.ArithmeticOverflow;
                     }
-                    try col.data.bigint.append(allocator, @intCast(total));
+                    try col.data.bigint.append(allocator, @intCast(total.v));
                 },
             },
-            .sum_float => |total| try col.data.double.append(allocator, total),
+            .sum_float => |total| if (!total.seen) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else try col.data.double.append(allocator, total.v),
             else => unreachable,
         },
         .min, .max => switch (state) {
             .min_int, .max_int => {
-                const v: i64 = if (func == .min) (state.min_int orelse 0) else (state.max_int orelse 0);
-                switch (out_type) {
+                const m: ?i64 = if (func == .min) state.min_int else state.max_int;
+                if (m) |v| switch (out_type) {
                     .int => try col.data.int.append(allocator, @intCast(v)),
                     .bigint => try col.data.bigint.append(allocator, v),
                     .boolean => try col.data.boolean.append(allocator, @intCast(v)),
@@ -3360,63 +3423,74 @@ fn appendAccToColumn(
                     .smallint => try col.data.smallint.append(allocator, @intCast(v)),
                     .decimal64 => try col.data.decimal64.append(allocator, v),
                     else => unreachable,
+                } else {
+                    try col.data.appendNullPlaceholder(allocator);
+                    is_null = true;
                 }
             },
             .min_large, .max_large => {
-                const v: i128 = if (func == .min)
-                    (if (state.min_large.present) state.min_large.v else 0)
-                else
-                    (if (state.max_large.present) state.max_large.v else 0);
-                switch (out_type) {
-                    .largeint => try col.data.largeint.append(allocator, v),
-                    .decimal128 => try col.data.decimal128.append(allocator, v),
+                const acc = if (func == .min) state.min_large else state.max_large;
+                if (acc.present) switch (out_type) {
+                    .largeint => try col.data.largeint.append(allocator, acc.v),
+                    .decimal128 => try col.data.decimal128.append(allocator, acc.v),
                     else => unreachable,
+                } else {
+                    try col.data.appendNullPlaceholder(allocator);
+                    is_null = true;
                 }
             },
             .min_float, .max_float => {
-                const v: f64 = if (func == .min) (state.min_float orelse 0.0) else (state.max_float orelse 0.0);
-                switch (out_type) {
+                const m: ?f64 = if (func == .min) state.min_float else state.max_float;
+                if (m) |v| switch (out_type) {
                     .float => try col.data.float.append(allocator, @floatCast(v)),
                     .double => try col.data.double.append(allocator, v),
                     else => unreachable,
+                } else {
+                    try col.data.appendNullPlaceholder(allocator);
+                    is_null = true;
                 }
             },
             .min_str, .max_str => {
-                // Empty-set MIN/MAX over strings yields "" (we don't surface
-                // aggregate-result NULLs yet), matching the numeric path's
-                // 0-default.
-                const v: []const u8 = if (func == .min) (state.min_str orelse "") else (state.max_str orelse "");
-                switch (out_type) {
+                const m: ?[]const u8 = if (func == .min) state.min_str else state.max_str;
+                if (m) |v| switch (out_type) {
                     .varchar => try col.data.varchar.appendValue(allocator, v),
                     .string => try col.data.string.appendValue(allocator, v),
                     .char => try col.data.char.appendValue(allocator, v),
                     else => unreachable,
+                } else {
+                    try col.data.appendNullPlaceholder(allocator);
+                    is_null = true;
                 }
             },
             else => unreachable,
         },
         .avg => {
             const a = state.avg;
-            // AVG over an empty set → 0.0 (we don't surface aggregate-result
-            // NULLs yet). Guard against div-by-zero.
-            const v: f64 = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count));
-            try col.data.double.append(allocator, v);
+            if (a.count == 0) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else {
+                try col.data.double.append(allocator, a.sum / @as(f64, @floatFromInt(a.count)));
+            }
         },
         .var_pop, .var_samp, .stddev_pop, .stddev_samp => {
             const w = state.welford;
-            const variance: f64 = blk: {
-                if (w.count == 0) break :blk 0.0;
-                switch (func) {
-                    .var_pop, .stddev_pop => break :blk w.m2 / @as(f64, @floatFromInt(w.count)),
-                    .var_samp, .stddev_samp => {
-                        if (w.count < 2) break :blk 0.0;
-                        break :blk w.m2 / @as(f64, @floatFromInt(w.count - 1));
-                    },
-                    else => unreachable,
-                }
+            // Sample variants additionally need ≥2 inputs (n−1 divisor).
+            const defined = switch (func) {
+                .var_pop, .stddev_pop => w.count >= 1,
+                else => w.count >= 2,
             };
-            const out: f64 = if (func == .stddev_pop or func == .stddev_samp) @sqrt(variance) else variance;
-            try col.data.double.append(allocator, out);
+            if (!defined) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else {
+                const variance: f64 = switch (func) {
+                    .var_pop, .stddev_pop => w.m2 / @as(f64, @floatFromInt(w.count)),
+                    else => w.m2 / @as(f64, @floatFromInt(w.count - 1)),
+                };
+                const out: f64 = if (func == .stddev_pop or func == .stddev_samp) @sqrt(variance) else variance;
+                try col.data.double.append(allocator, out);
+            }
         },
         .count_distinct => {
             const n: u64 = if (cd_count) |cnt| cnt else switch (state) {
@@ -3435,7 +3509,8 @@ fn appendAccToColumn(
             };
             const vals = state.percentile_values.items;
             if (vals.len == 0) {
-                try col.data.double.append(allocator, 0.0);
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
             } else {
                 // Sort in place — arena owns the backing slice; nothing
                 // outside this aggregate observes the buffer.
@@ -3452,11 +3527,16 @@ fn appendAccToColumn(
             }
         },
         .group_concat => {
-            const items: []const u8 = if (state.concat) |c| c.buf.items else "";
-            try col.data.string.appendValue(allocator, items);
+            if (state.concat) |c| {
+                try col.data.string.appendValue(allocator, c.buf.items);
+            } else {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            }
         },
         .udf => return Error.AggregateUnsupportedType,
     }
+    try col.appendValidBit(allocator, row, !is_null);
 }
 
 /// Pack the group-by columns of the current batch row into `out`. Layout
@@ -3593,6 +3673,10 @@ fn planInlineFor(
         else => return null,
     };
     const aci = agg_col_indices[0] orelse return null;
+    // Nullable value column ⇒ canonical path: the inline loop skips NULL rows
+    // before group creation, which would drop all-NULL groups instead of
+    // emitting them with a NULL aggregate.
+    if (up_schema[aci].nullable) return null;
     const vt = up_schema[aci].type;
     // i64 accumulator only: integer family ≤64 bits. 128-bit families
     // (largeint/decimal128) and float/string take the canonical path.
@@ -3769,7 +3853,8 @@ inline fn inlineForTier(
 /// Prefetch-pipelined: the table is grown for the whole batch up front so slot
 /// addresses stay stable across the look-ahead window. The group column is
 /// non-nullable (`planInlineFor` gate), so the key read needs no validity
-/// branch; the value column's NULLs are skipped (SQL excludes them).
+/// branch; the value column is also gated non-nullable, but the validity check
+/// stays as a cheap belt-and-suspenders skip.
 inline fn inlineForLoop(
     aa: Allocator,
     base: i64,

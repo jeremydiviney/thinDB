@@ -1035,7 +1035,12 @@ const GlobalAggregate = struct {
         const output_schema = try allocator.alloc(Column, plans.len);
         errdefer allocator.free(output_schema);
         for (plans, 0..) |p, i| {
-            output_schema[i] = .{ .name = p.name, .type = p.output_type, .nullable = false };
+            // SUM/AVG/MIN/MAX over zero qualifying values is SQL NULL, so
+            // those outputs are nullable; the COUNT family is always 0+.
+            output_schema[i] = .{ .name = p.name, .type = p.output_type, .nullable = switch (p.op) {
+                .sum, .avg, .min, .max => true,
+                .count_star, .count_col, .count_distinct => false,
+            } };
         }
 
         const output_cols = try allocator.alloc(ColumnStore, output_schema.len);
@@ -1293,12 +1298,19 @@ const GlobalAggregate = struct {
         const a = self.allocator;
         for (self.plans, 0..) |p, i| {
             const col = &self.output_cols[i];
+            const row = col.data.rowCount();
+            // SUM/AVG/MIN/MAX over zero qualifying (non-NULL) inputs is SQL
+            // NULL — empty scan and all-NULL column alike. COUNTs stay 0.
+            var is_null = false;
             switch (p.op) {
                 .count_star => try col.data.bigint.append(a, @intCast(lane.count)),
                 .count_col => try col.data.bigint.append(a, @intCast(lane.ns[i])),
                 .count_distinct => try col.data.bigint.append(a, @intCast(lane.distinct_counts[i])),
                 .sum => {
-                    if (p.is_float) {
+                    if (lane.ns[i] == 0) {
+                        try col.data.appendNullPlaceholder(a);
+                        is_null = true;
+                    } else if (p.is_float) {
                         try appendFloat(a, col, p.output_type, lane.fsum[i]);
                     } else {
                         try appendInt(a, col, p.output_type, lane.isum[i]);
@@ -1306,26 +1318,28 @@ const GlobalAggregate = struct {
                 },
                 .avg => {
                     const n = lane.ns[i];
-                    const avg: f64 = if (n == 0) 0.0 else if (p.is_float)
-                        lane.fsum[i] / @as(f64, @floatFromInt(n))
-                    else
-                        @as(f64, @floatFromInt(lane.isum[i])) / @as(f64, @floatFromInt(n));
-                    try col.data.double.append(a, avg);
+                    if (n == 0) {
+                        try col.data.appendNullPlaceholder(a);
+                        is_null = true;
+                    } else {
+                        const avg: f64 = if (p.is_float)
+                            lane.fsum[i] / @as(f64, @floatFromInt(n))
+                        else
+                            @as(f64, @floatFromInt(lane.isum[i])) / @as(f64, @floatFromInt(n));
+                        try col.data.double.append(a, avg);
+                    }
                 },
                 .min, .max => {
-                    // MIN/MAX over an empty input is SQL NULL; this cut emits 0
-                    // (numeric) / "" (string) for that (no ClickBench query hits
-                    // it). Non-empty is exact.
-                    if (p.is_string) {
-                        const v: []const u8 = if (lane.ns[i] == 0) "" else lane.sstr[i];
+                    if (lane.ns[i] == 0) {
+                        try col.data.appendNullPlaceholder(a);
+                        is_null = true;
+                    } else if (p.is_string) {
                         switch (p.output_type) {
-                            .varchar => try col.data.varchar.appendValue(a, v),
-                            .string => try col.data.string.appendValue(a, v),
-                            .char => try col.data.char.appendValue(a, v),
+                            .varchar => try col.data.varchar.appendValue(a, lane.sstr[i]),
+                            .string => try col.data.string.appendValue(a, lane.sstr[i]),
+                            .char => try col.data.char.appendValue(a, lane.sstr[i]),
                             else => return error.TypeMismatch,
                         }
-                    } else if (lane.ns[i] == 0) {
-                        if (p.is_float) try appendFloat(a, col, p.output_type, 0) else try appendInt(a, col, p.output_type, 0);
                     } else if (p.is_float) {
                         try appendFloat(a, col, p.output_type, lane.fsum[i]);
                     } else {
@@ -1333,6 +1347,7 @@ const GlobalAggregate = struct {
                     }
                 },
             }
+            try col.appendValidBit(a, row, !is_null);
         }
     }
 };

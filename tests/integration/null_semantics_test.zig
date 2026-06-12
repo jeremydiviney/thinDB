@@ -215,6 +215,115 @@ test "null basics: COUNT variants, aggregate NULL skipping, DISTINCT exclusion" 
     try std.testing.expectEqual(@as(i64, 3), batch.values[3].data.bigint[0]);
 }
 
+test "null aggregates: zero qualifying rows finalize to NULL (COUNT stays 0)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // Empty input: SUM/AVG/MIN/MAX are NULL, COUNTs are 0.
+    var q = try runSql(allocator, db,
+        "SELECT SUM(v) AS s, AVG(v) AS a, MIN(v) AS lo, MAX(v) AS hi, COUNT(v) AS cv, COUNT(*) AS cs FROM nt WHERE id > 100",
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expect(!b.values[0].isValid(0));
+    try std.testing.expect(!b.values[1].isValid(0));
+    try std.testing.expect(!b.values[2].isValid(0));
+    try std.testing.expect(!b.values[3].isValid(0));
+    try std.testing.expectEqual(@as(i64, 0), b.values[4].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 0), b.values[5].data.bigint[0]);
+}
+
+test "null aggregates: an all-NULL input column finalizes to NULL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // Rows EXIST (4 and 5) but every v is NULL.
+    var q = try runSql(allocator, db,
+        "SELECT SUM(v) AS s, AVG(v) AS a, MIN(v) AS lo, MAX(v) AS hi, COUNT(v) AS cv, COUNT(*) AS cs FROM nt WHERE grp = 'y'",
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expect(!b.values[0].isValid(0));
+    try std.testing.expect(!b.values[1].isValid(0));
+    try std.testing.expect(!b.values[2].isValid(0));
+    try std.testing.expect(!b.values[3].isValid(0));
+    try std.testing.expectEqual(@as(i64, 0), b.values[4].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[5].data.bigint[0]);
+}
+
+test "null aggregates: grouped all-NULL group emits NULL aggregates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // grp y = two rows, both v NULL → SUM/AVG/MIN/MAX NULL, COUNT(v) 0,
+    // COUNT(*) 2. grp x mixes (10, NULL, 20) → SUM 30, AVG 15 (non-NULL
+    // denominator), COUNT(v) 2, COUNT(*) 3.
+    var q = try runSql(allocator, db,
+        "SELECT grp, SUM(v) AS s, AVG(v) AS a, MIN(v) AS lo, MAX(v) AS hi, COUNT(v) AS cv, COUNT(*) AS cs " ++
+            "FROM nt GROUP BY grp ORDER BY grp",
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+    // row 0 = x
+    try std.testing.expectEqualStrings("x", b.values[0].data.varchar.rowBytes(0));
+    try std.testing.expect(b.values[1].isValid(0));
+    try std.testing.expectEqual(@as(f64, 15.0), b.values[2].data.double[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[5].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 3), b.values[6].data.bigint[0]);
+    // row 1 = y: all aggregates NULL, counts 0 / 2
+    try std.testing.expectEqualStrings("y", b.values[0].data.varchar.rowBytes(1));
+    try std.testing.expect(!b.values[1].isValid(1));
+    try std.testing.expect(!b.values[2].isValid(1));
+    try std.testing.expect(!b.values[3].isValid(1));
+    try std.testing.expect(!b.values[4].isValid(1));
+    try std.testing.expectEqual(@as(i64, 0), b.values[5].data.bigint[1]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[6].data.bigint[1]);
+}
+
+test "null aggregates: metadata lane (bare global, flushed, no WHERE) emits NULL for all-NULL column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // A flushed table whose nullable column is entirely NULL, queried with no
+    // WHERE / GROUP BY — the stats-only MetaAggStats lane answers this from
+    // segment footers and must surface NULL, not the 0 fold identity.
+    try exec(allocator, db, "CREATE TABLE allnull (id BIGINT PRIMARY KEY, v BIGINT)");
+    try exec(allocator, db, "INSERT INTO allnull (id, v) VALUES (1, NULL), (2, NULL), (3, NULL)");
+    const t = try db.openTable("allnull", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        "SELECT SUM(v) AS s, AVG(v) AS a, MIN(v) AS lo, MAX(v) AS hi, COUNT(v) AS cv, COUNT(*) AS cs FROM allnull",
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expect(!b.values[0].isValid(0));
+    try std.testing.expect(!b.values[1].isValid(0));
+    try std.testing.expect(!b.values[2].isValid(0));
+    try std.testing.expect(!b.values[3].isValid(0));
+    try std.testing.expectEqual(@as(i64, 0), b.values[4].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 3), b.values[5].data.bigint[0]);
+}
+
 test "null basics: arithmetic propagates NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

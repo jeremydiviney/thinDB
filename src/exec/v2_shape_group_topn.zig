@@ -266,6 +266,12 @@ fn resolveColumnType(table: *api.Table, schema: ?[]const Column, name: []const u
     return null;
 }
 
+fn resolveColumnNullable(table: *api.Table, schema: ?[]const Column, name: []const u8) bool {
+    if (types.findColumn(table.schema.columns, name)) |idx| return table.schema.columns[idx].nullable;
+    if (schema) |s| for (s) |c| if (types.columnNameEql(c.name, name)) return c.nullable;
+    return false;
+}
+
 const GroupTopNPipeline = struct {
     allocator: Allocator,
     table: *api.Table,
@@ -847,6 +853,13 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) e
     var next_distinct_state_index: u16 = 0;
     for (request.aggs, 0..) |agg, agg_i| {
         if (agg_i >= MAX_AGGS) return traceDecline(request, "aggregate count");
+        // The silo's fold kernels are NULL-blind: no validity checks in the
+        // staged accumulation and no per-aggregate non-null count for the
+        // empty-input → NULL finalize. A nullable aggregate input routes to the
+        // generic paths, which handle both.
+        if (agg.col) |col_name| {
+            if (resolveColumnNullable(table, schema, col_name)) return traceDecline(request, "nullable aggregate input");
+        }
         switch (agg.func) {
             .count => {
                 const input_column_index = if (agg.col) |col_name| blk: {

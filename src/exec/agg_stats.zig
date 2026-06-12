@@ -15,7 +15,7 @@
 //!   - any tombstone: a deleted row could have been the extreme, leaving the
 //!     stored min/max stale.
 //!   - a v1 manifest with no per-column stats, or an empty table (the normal
-//!     path emits the documented 0/empty default).
+//!     path emits the SQL-standard NULL).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -37,6 +37,7 @@ const exec = @import("exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
 const predicate = @import("predicate.zig");
+const cell_io = @import("cell_io.zig");
 
 pub const Spec = struct {
     /// Column index in the table schema.
@@ -97,13 +98,16 @@ pub const MinMaxStats = struct {
                     if (v > acc) acc = v;
                 }
             }
-            // No non-null value anywhere → MIN/MAX is NULL; thindb emits the
-            // type's 0 default, matching the normal scan path.
-            const folded: i128 = if (seen) acc else 0;
-            out_schema[i] = .{ .name = sp.out_name, .type = col.type, .nullable = false };
-            out_cols[i] = try ColumnStore.init(allocator, col.type, false);
+            out_schema[i] = .{ .name = sp.out_name, .type = col.type, .nullable = true };
+            out_cols[i] = try ColumnStore.init(allocator, col.type, true);
             inited += 1;
-            try appendStatValue(allocator, &out_cols[i], col.type, folded);
+            if (seen) {
+                try appendStatValue(allocator, &out_cols[i], col.type, acc);
+                try out_cols[i].appendValidBit(allocator, 0, true);
+            } else {
+                // No non-null value anywhere → MIN/MAX is NULL.
+                try cell_io.appendNullTo(allocator, &out_cols[i]);
+            }
         }
 
         const views = try allocator.alloc(ColumnView, specs.len);
@@ -292,31 +296,49 @@ pub const MetaAggStats = struct {
                         }
                         non_null -= s.null_count;
                     }
+                    // SQL: SUM/AVG over zero non-null inputs finalize to NULL.
                     if (sp.kind == .avg) {
-                        // Matches the scan path: AVG over zero non-null rows
-                        // emits 0.0.
-                        const dividend: f64 = if (is_float) fsum else @floatFromInt(isum);
-                        const v: f64 = if (non_null == 0) 0.0 else dividend / @as(f64, @floatFromInt(non_null));
-                        out_schema[i] = .{ .name = sp.out_name, .type = .double, .nullable = false };
-                        out_cols[i] = try ColumnStore.init(allocator, .double, false);
+                        out_schema[i] = .{ .name = sp.out_name, .type = .double, .nullable = true };
+                        out_cols[i] = try ColumnStore.init(allocator, .double, true);
                         inited += 1;
-                        try out_cols[i].data.double.append(allocator, v);
+                        if (non_null == 0) {
+                            try cell_io.appendNullTo(allocator, &out_cols[i]);
+                        } else {
+                            const dividend: f64 = if (is_float) fsum else @floatFromInt(isum);
+                            try out_cols[i].data.double.append(allocator, dividend / @as(f64, @floatFromInt(non_null)));
+                            try out_cols[i].appendValidBit(allocator, 0, true);
+                        }
                     } else if (is_float) {
-                        out_schema[i] = .{ .name = sp.out_name, .type = .double, .nullable = false };
-                        out_cols[i] = try ColumnStore.init(allocator, .double, false);
+                        out_schema[i] = .{ .name = sp.out_name, .type = .double, .nullable = true };
+                        out_cols[i] = try ColumnStore.init(allocator, .double, true);
                         inited += 1;
-                        try out_cols[i].data.double.append(allocator, fsum);
+                        if (non_null == 0) {
+                            try cell_io.appendNullTo(allocator, &out_cols[i]);
+                        } else {
+                            try out_cols[i].data.double.append(allocator, fsum);
+                            try out_cols[i].appendValidBit(allocator, 0, true);
+                        }
                     } else if (col.type == .bigint) {
                         // SUM(bigint) widens to largeint (aggOutputType).
-                        out_schema[i] = .{ .name = sp.out_name, .type = .largeint, .nullable = false };
-                        out_cols[i] = try ColumnStore.init(allocator, .largeint, false);
+                        out_schema[i] = .{ .name = sp.out_name, .type = .largeint, .nullable = true };
+                        out_cols[i] = try ColumnStore.init(allocator, .largeint, true);
                         inited += 1;
-                        try out_cols[i].data.largeint.append(allocator, isum);
+                        if (non_null == 0) {
+                            try cell_io.appendNullTo(allocator, &out_cols[i]);
+                        } else {
+                            try out_cols[i].data.largeint.append(allocator, isum);
+                            try out_cols[i].appendValidBit(allocator, 0, true);
+                        }
                     } else {
-                        out_schema[i] = .{ .name = sp.out_name, .type = .bigint, .nullable = false };
-                        out_cols[i] = try ColumnStore.init(allocator, .bigint, false);
+                        out_schema[i] = .{ .name = sp.out_name, .type = .bigint, .nullable = true };
+                        out_cols[i] = try ColumnStore.init(allocator, .bigint, true);
                         inited += 1;
-                        try out_cols[i].data.bigint.append(allocator, @intCast(isum));
+                        if (non_null == 0) {
+                            try cell_io.appendNullTo(allocator, &out_cols[i]);
+                        } else {
+                            try out_cols[i].data.bigint.append(allocator, @intCast(isum));
+                            try out_cols[i].appendValidBit(allocator, 0, true);
+                        }
                     }
                 },
                 .min, .max => {
@@ -335,13 +357,16 @@ pub const MetaAggStats = struct {
                             if (v > acc) acc = v;
                         }
                     }
-                    // No non-null value anywhere → thindb emits the type's 0
-                    // default, matching the normal scan path.
-                    const folded: i128 = if (seen) acc else 0;
-                    out_schema[i] = .{ .name = sp.out_name, .type = col.type, .nullable = false };
-                    out_cols[i] = try ColumnStore.init(allocator, col.type, false);
+                    out_schema[i] = .{ .name = sp.out_name, .type = col.type, .nullable = true };
+                    out_cols[i] = try ColumnStore.init(allocator, col.type, true);
                     inited += 1;
-                    try appendStatValue(allocator, &out_cols[i], col.type, folded);
+                    if (seen) {
+                        try appendStatValue(allocator, &out_cols[i], col.type, acc);
+                        try out_cols[i].appendValidBit(allocator, 0, true);
+                    } else {
+                        // No non-null value anywhere → MIN/MAX is NULL.
+                        try cell_io.appendNullTo(allocator, &out_cols[i]);
+                    }
                 },
             }
         }

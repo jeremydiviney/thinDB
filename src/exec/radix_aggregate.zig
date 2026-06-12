@@ -60,12 +60,18 @@ pub const CompactKind = enum {
     min_float, // 2 words: f64 value, u64 present-flag
     max_float, // 2 words: f64 value, u64 present-flag
     welford, // 3 words: f64 mean, f64 m2, u64 count
+    // Nullable-input SUM variants carry a trailing seen-flag word so an
+    // all-NULL group finalizes to NULL. Non-nullable inputs keep the lean
+    // layout: a group only exists because ≥1 row hit it, so it always saw a
+    // value.
+    sum_int_null, // 3 words: i128 + u64 seen-flag
+    sum_float_null, // 2 words: f64 + u64 seen-flag
 
     fn words(self: CompactKind) usize {
         return switch (self) {
             .count, .sum_float => 1,
-            .sum_int, .avg, .min_int, .max_int, .min_float, .max_float => 2,
-            .welford => 3,
+            .sum_int, .avg, .min_int, .max_int, .min_float, .max_float, .sum_float_null => 2,
+            .welford, .sum_int_null => 3,
         };
     }
 };
@@ -129,7 +135,11 @@ pub fn planCompact(
         const in_t: ?Type = if (idx) |i| up_schema[i].type else null;
         const kind: CompactKind = switch (a.func) {
             .count => .count,
-            .sum => if (in_t.?.isFloat()) .sum_float else .sum_int,
+            .sum => blk: {
+                const nullable = up_schema[idx.?].nullable;
+                if (in_t.?.isFloat()) break :blk if (nullable) .sum_float_null else .sum_float;
+                break :blk if (nullable) .sum_int_null else .sum_int;
+            },
             .avg => .avg,
             .min, .max => blk: {
                 const t = in_t.?;
@@ -171,8 +181,10 @@ pub fn scatter(layout: CompactLayout, state: []u64, gids: []const u32, batch: Ba
                     for (gids) |g| state[@as(usize, g) * stride + base] += 1;
                 }
             },
-            .sum_int => scatterSumInt(state, stride, base, gids, batch.values[ca.col_idx.?]),
-            .sum_float => scatterSumFloat(state, stride, base, gids, batch.values[ca.col_idx.?]),
+            .sum_int => scatterSumInt(state, stride, base, gids, batch.values[ca.col_idx.?], false),
+            .sum_float => scatterSumFloat(state, stride, base, gids, batch.values[ca.col_idx.?], false),
+            .sum_int_null => scatterSumInt(state, stride, base, gids, batch.values[ca.col_idx.?], true),
+            .sum_float_null => scatterSumFloat(state, stride, base, gids, batch.values[ca.col_idx.?], true),
             .avg => scatterAvg(state, stride, base, gids, batch.values[ca.col_idx.?]),
             .min_int => scatterMinMaxInt(state, stride, base, gids, batch.values[ca.col_idx.?], true),
             .max_int => scatterMinMaxInt(state, stride, base, gids, batch.values[ca.col_idx.?], false),
@@ -190,24 +202,30 @@ inline fn addI128(state: []u64, slot: usize, v: i128) void {
     state[slot + 1] = nv[1];
 }
 
-fn scatterSumInt(state: []u64, stride: usize, base: usize, gids: []const u32, view: ColumnView) void {
+fn scatterSumInt(state: []u64, stride: usize, base: usize, gids: []const u32, view: ColumnView, comptime track_seen: bool) void {
     const has_nulls = view.nulls != null;
     switch (view.data) {
         inline .int, .smallint, .tinyint, .boolean, .bigint, .decimal64, .largeint, .decimal128 => |sl| {
             if (has_nulls) {
                 for (gids, 0..) |g, r| {
                     if (!view.isValid(r)) continue;
-                    addI128(state, @as(usize, g) * stride + base, sl[r]);
+                    const slot = @as(usize, g) * stride + base;
+                    addI128(state, slot, sl[r]);
+                    if (track_seen) state[slot + 2] = 1;
                 }
             } else {
-                for (gids, 0..) |g, r| addI128(state, @as(usize, g) * stride + base, sl[r]);
+                for (gids, 0..) |g, r| {
+                    const slot = @as(usize, g) * stride + base;
+                    addI128(state, slot, sl[r]);
+                    if (track_seen) state[slot + 2] = 1;
+                }
             }
         },
         else => unreachable,
     }
 }
 
-fn scatterSumFloat(state: []u64, stride: usize, base: usize, gids: []const u32, view: ColumnView) void {
+fn scatterSumFloat(state: []u64, stride: usize, base: usize, gids: []const u32, view: ColumnView, comptime track_seen: bool) void {
     const has_nulls = view.nulls != null;
     switch (view.data) {
         inline .float, .double => |sl| {
@@ -217,6 +235,7 @@ fn scatterSumFloat(state: []u64, stride: usize, base: usize, gids: []const u32, 
                 var cur: f64 = @bitCast(state[slot]);
                 cur += sl[r];
                 state[slot] = @bitCast(cur);
+                if (track_seen) state[slot + 1] = 1;
             }
         },
         else => unreachable,
@@ -335,10 +354,10 @@ fn scatterWelford(state: []u64, stride: usize, base: usize, gids: []const u32, v
 /// in the emit phase, which mirrors `aggregate.appendAccToColumn`; this returns
 /// the raw accumulator result for correctness testing and as that phase's input.
 pub const Finalized = union(enum) {
-    int: u64, // COUNT
-    sum_int: i128, // SUM over integers
-    signed: i64, // MIN/MAX over integers (empty → 0)
-    float: f64, // SUM over floats, AVG, MIN/MAX over floats, STDDEV/VAR
+    int: u64, // COUNT (never NULL)
+    sum_int: ?i128, // SUM over integers (zero non-NULL inputs → null)
+    signed: ?i64, // MIN/MAX over integers (zero non-NULL inputs → null)
+    float: ?f64, // SUM over floats, AVG, MIN/MAX over floats, STDDEV/VAR
 };
 
 pub fn finalize(layout: CompactLayout, state: []const u64, g: usize, ai: usize) Finalized {
@@ -346,24 +365,29 @@ pub fn finalize(layout: CompactLayout, state: []const u64, g: usize, ai: usize) 
     const slot = g * layout.words + ca.off;
     return switch (ca.kind) {
         .count => .{ .int = state[slot] },
-        .sum_int => .{ .sum_int = @bitCast([2]u64{ state[slot], state[slot + 1] }) },
-        .sum_float => .{ .float = @bitCast(state[slot]) },
+        .sum_int => .{ .sum_int = @as(i128, @bitCast([2]u64{ state[slot], state[slot + 1] })) },
+        .sum_float => .{ .float = @as(f64, @bitCast(state[slot])) },
+        .sum_int_null => .{ .sum_int = if (state[slot + 2] == 0) null else @as(i128, @bitCast([2]u64{ state[slot], state[slot + 1] })) },
+        .sum_float_null => .{ .float = if (state[slot + 1] == 0) null else @as(f64, @bitCast(state[slot])) },
         .avg => blk: {
             const sum: f64 = @bitCast(state[slot]);
             const cnt = state[slot + 1];
-            break :blk .{ .float = if (cnt == 0) 0.0 else sum / @as(f64, @floatFromInt(cnt)) };
+            break :blk .{ .float = if (cnt == 0) null else sum / @as(f64, @floatFromInt(cnt)) };
         },
-        // Empty MIN/MAX (no non-null value seen) → 0 / 0.0, matching the generic
-        // operator's default (it doesn't surface aggregate-result NULLs yet).
-        .min_int, .max_int => .{ .signed = if (state[slot + 1] == 0) 0 else @bitCast(state[slot]) },
-        .min_float, .max_float => .{ .float = if (state[slot + 1] == 0) 0.0 else @bitCast(state[slot]) },
+        .min_int, .max_int => .{ .signed = if (state[slot + 1] == 0) null else @as(i64, @bitCast(state[slot])) },
+        .min_float, .max_float => .{ .float = if (state[slot + 1] == 0) null else @as(f64, @bitCast(state[slot])) },
         .welford => blk: {
             const m2: f64 = @bitCast(state[slot + 1]);
             const cnt = state[slot + 2];
-            var variance: f64 = 0.0;
-            if (cnt != 0) variance = switch (ca.func) {
+            // Sample variants need ≥2 inputs (n−1 divisor); zero inputs → NULL.
+            const defined = switch (ca.func) {
+                .var_pop, .stddev_pop => cnt >= 1,
+                else => cnt >= 2,
+            };
+            if (!defined) break :blk .{ .float = null };
+            const variance: f64 = switch (ca.func) {
                 .var_pop, .stddev_pop => m2 / @as(f64, @floatFromInt(cnt)),
-                .var_samp, .stddev_samp => if (cnt < 2) 0.0 else m2 / @as(f64, @floatFromInt(cnt - 1)),
+                .var_samp, .stddev_samp => m2 / @as(f64, @floatFromInt(cnt - 1)),
                 else => unreachable,
             };
             const out: f64 = if (ca.func == .stddev_pop or ca.func == .stddev_samp) @sqrt(variance) else variance;
@@ -376,17 +400,22 @@ pub fn finalize(layout: CompactLayout, state: []const u64, g: usize, ai: usize) 
 /// type coercion — mirrors `aggregate.appendAccToColumn` for the fixed-state
 /// aggregates.
 fn appendFinalized(allocator: Allocator, f: Finalized, col: *ColumnStore, out_type: Type) !void {
+    const row = col.data.rowCount();
+    var is_null = false;
     switch (f) {
         .int => |c| try col.data.bigint.append(allocator, @intCast(c)), // COUNT
-        .sum_int => |total| switch (out_type) {
+        .sum_int => |maybe| if (maybe) |total| switch (out_type) {
             .largeint => try col.data.largeint.append(allocator, total),
             .decimal128 => try col.data.decimal128.append(allocator, total),
             else => {
                 if (total > std.math.maxInt(i64) or total < std.math.minInt(i64)) return Error.ArithmeticOverflow;
                 try col.data.bigint.append(allocator, @intCast(total));
             },
+        } else {
+            try col.data.appendNullPlaceholder(allocator);
+            is_null = true;
         },
-        .signed => |v| switch (out_type) { // MIN/MAX over integers → input type
+        .signed => |maybe| if (maybe) |v| switch (out_type) { // MIN/MAX over integers → input type
             .int => try col.data.int.append(allocator, @intCast(v)),
             .bigint => try col.data.bigint.append(allocator, v),
             .boolean => try col.data.boolean.append(allocator, @intCast(v)),
@@ -396,13 +425,20 @@ fn appendFinalized(allocator: Allocator, f: Finalized, col: *ColumnStore, out_ty
             .smallint => try col.data.smallint.append(allocator, @intCast(v)),
             .decimal64 => try col.data.decimal64.append(allocator, v),
             else => unreachable,
+        } else {
+            try col.data.appendNullPlaceholder(allocator);
+            is_null = true;
         },
-        .float => |v| switch (out_type) { // SUM(float), AVG, MIN/MAX(float), STDDEV/VAR
+        .float => |maybe| if (maybe) |v| switch (out_type) { // SUM(float), AVG, MIN/MAX(float), STDDEV/VAR
             .double => try col.data.double.append(allocator, v),
             .float => try col.data.float.append(allocator, @floatCast(v)),
             else => unreachable,
+        } else {
+            try col.data.appendNullPlaceholder(allocator);
+            is_null = true;
         },
     }
+    try col.appendValidBit(allocator, row, !is_null);
 }
 
 /// A top-k hint for the operator: emit only the `k` groups most-preferred by a
@@ -429,11 +465,13 @@ const OrderVal = union(enum) {
 };
 
 fn orderValOf(layout: CompactLayout, state: []const u64, g: usize, ai: usize) OrderVal {
+    // NULL results order as 0 — matches the generic operator's `aggOrderValue`
+    // heap defaults.
     return switch (finalize(layout, state, g, ai)) {
         .int => |c| .{ .i = @intCast(c) },
-        .sum_int => |v| .{ .i = v },
-        .signed => |v| .{ .i = v },
-        .float => |v| .{ .f = v },
+        .sum_int => |v| .{ .i = v orelse 0 },
+        .signed => |v| .{ .i = v orelse 0 },
+        .float => |v| .{ .f = v orelse 0.0 },
     };
 }
 
@@ -512,7 +550,7 @@ pub const RadixAggregate = struct {
         for (gci, 0..) |ci, i| out_schema[i] = up_schema[ci];
         for (aggs, aci, 0..) |a, idx, i| {
             const in_t: ?Type = if (idx) |x| up_schema[x].type else null;
-            out_schema[group_cols.len + i] = .{ .name = a.as, .type = try agg.aggOutputTypeFor(a, in_t) };
+            out_schema[group_cols.len + i] = .{ .name = a.as, .type = try agg.aggOutputTypeFor(a, in_t), .nullable = agg.aggOutputNullable(a.func) };
         }
 
         const out_cols = try allocator.alloc(ColumnStore, out_schema.len);
@@ -992,7 +1030,7 @@ pub const RadixLeaseAggregate = struct {
         for (gci, 0..) |ci, i| out_schema[i] = up_schema[ci];
         for (aggs, aci, 0..) |a, idx, i| {
             const in_t: ?Type = if (idx) |x| up_schema[x].type else null;
-            out_schema[group_cols.len + i] = .{ .name = a.as, .type = try agg.aggOutputTypeFor(a, in_t) };
+            out_schema[group_cols.len + i] = .{ .name = a.as, .type = try agg.aggOutputTypeFor(a, in_t), .nullable = agg.aggOutputNullable(a.func) };
         }
 
         const out_cols = try allocator.alloc(ColumnStore, out_schema.len);
@@ -2301,11 +2339,11 @@ test "compact core: COUNT(*) / SUM(int) / AVG(int) over grouped batches" {
     scatter(layout, state, &gids, batch);
 
     try std.testing.expectEqual(@as(u64, 3), finalize(layout, state, 0, 0).int);
-    try std.testing.expectEqual(@as(i128, 45), finalize(layout, state, 0, 1).sum_int);
-    try std.testing.expectEqual(@as(f64, 15.0), finalize(layout, state, 0, 2).float);
+    try std.testing.expectEqual(@as(i128, 45), finalize(layout, state, 0, 1).sum_int.?);
+    try std.testing.expectEqual(@as(f64, 15.0), finalize(layout, state, 0, 2).float.?);
     try std.testing.expectEqual(@as(u64, 2), finalize(layout, state, 1, 0).int);
-    try std.testing.expectEqual(@as(i128, 60), finalize(layout, state, 1, 1).sum_int);
-    try std.testing.expectEqual(@as(f64, 30.0), finalize(layout, state, 1, 2).float);
+    try std.testing.expectEqual(@as(i128, 60), finalize(layout, state, 1, 1).sum_int.?);
+    try std.testing.expectEqual(@as(f64, 30.0), finalize(layout, state, 1, 2).float.?);
 }
 
 test "compact core: MIN / MAX (int) + STDDEV_POP over grouped batches" {
@@ -2335,10 +2373,10 @@ test "compact core: MIN / MAX (int) + STDDEV_POP over grouped batches" {
     };
     scatter(layout, state, &gids, batch);
 
-    try std.testing.expectEqual(@as(i64, 5), finalize(layout, state, 0, 0).signed);
-    try std.testing.expectEqual(@as(i64, 30), finalize(layout, state, 0, 1).signed);
+    try std.testing.expectEqual(@as(i64, 5), finalize(layout, state, 0, 0).signed.?);
+    try std.testing.expectEqual(@as(i64, 30), finalize(layout, state, 0, 1).signed.?);
     const expected_sd = @sqrt((25.0 + 225.0 + 100.0) / 3.0);
-    try std.testing.expectApproxEqAbs(expected_sd, finalize(layout, state, 0, 2).float, 1e-9);
+    try std.testing.expectApproxEqAbs(expected_sd, finalize(layout, state, 0, 2).float.?, 1e-9);
 }
 
 test "planCompact declines variable-state and string/large MIN/MAX" {

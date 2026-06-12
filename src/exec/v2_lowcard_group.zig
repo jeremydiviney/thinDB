@@ -964,7 +964,12 @@ const LowCardGroup = struct {
             output_schema[i] = .{ .name = p.name, .type = p.typ, .nullable = false };
         }
         for (aggs, 0..) |a, i| {
-            output_schema[request.group_cols.len + i] = .{ .name = a.name, .type = a.output_type, .nullable = false };
+            // SUM/AVG/MIN/MAX over a group whose every input is NULL is SQL
+            // NULL, so those outputs are nullable; the COUNT family is 0+.
+            output_schema[request.group_cols.len + i] = .{ .name = a.name, .type = a.output_type, .nullable = switch (a.op) {
+                .sum, .avg, .min, .max => true,
+                .count_star, .count_col, .count_distinct => false,
+            } };
         }
 
         const output_cols = try allocator.alloc(ColumnStore, n_out);
@@ -1310,29 +1315,42 @@ const LowCardGroup = struct {
         }
         for (self.aggs, 0..) |agg, i| {
             const col = &self.output_cols[self.part_count + i];
+            const row = col.data.rowCount();
             const ns = merged.ns.items[@as(usize, gid) * n_aggs + i];
             const slot = merged.slots.items[@as(usize, gid) * n_aggs + i];
+            // SUM/AVG/MIN/MAX over a group with zero non-NULL inputs is SQL
+            // NULL (the group exists via COUNT(*); its values were all NULL).
+            var is_null = false;
             switch (agg.op) {
                 .count_star => try col.data.bigint.append(a, @intCast(merged.counts.items[gid])),
                 .count_col => try col.data.bigint.append(a, @intCast(ns)),
                 .count_distinct => try col.data.bigint.append(a, @intCast(merged.dcounts[@as(usize, gid) * self.n_distinct + agg.distinct_index])),
                 .sum => {
-                    if (agg.is_float) {
+                    if (ns == 0) {
+                        try col.data.appendNullPlaceholder(a);
+                        is_null = true;
+                    } else if (agg.is_float) {
                         try appendFloat(a, col, agg.output_type, slotF64(slot));
                     } else {
                         try appendInt(a, col, agg.output_type, slot);
                     }
                 },
                 .avg => {
-                    const avg: f64 = if (ns == 0) 0.0 else if (agg.is_float)
-                        slotF64(slot) / @as(f64, @floatFromInt(ns))
-                    else
-                        @as(f64, @floatFromInt(slot)) / @as(f64, @floatFromInt(ns));
-                    try col.data.double.append(a, avg);
+                    if (ns == 0) {
+                        try col.data.appendNullPlaceholder(a);
+                        is_null = true;
+                    } else {
+                        const avg: f64 = if (agg.is_float)
+                            slotF64(slot) / @as(f64, @floatFromInt(ns))
+                        else
+                            @as(f64, @floatFromInt(slot)) / @as(f64, @floatFromInt(ns));
+                        try col.data.double.append(a, avg);
+                    }
                 },
                 .min, .max => {
                     if (ns == 0) {
-                        if (agg.is_float) try appendFloat(a, col, agg.output_type, 0) else try appendInt(a, col, agg.output_type, 0);
+                        try col.data.appendNullPlaceholder(a);
+                        is_null = true;
                     } else if (agg.is_float) {
                         try appendFloat(a, col, agg.output_type, slotF64(slot));
                     } else {
@@ -1340,6 +1358,7 @@ const LowCardGroup = struct {
                     }
                 },
             }
+            try col.appendValidBit(a, row, !is_null);
         }
     }
 };
