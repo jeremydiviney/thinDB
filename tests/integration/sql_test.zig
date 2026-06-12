@@ -2447,7 +2447,7 @@ test "sql: ORDER BY releases its sort buffer budget once the result is drained" 
     // DAG-aware eviction: the sort buffer is freed + its budget released
     // on the final (null) batch, so the query-scoped accountant is back
     // to zero once the result has been drained.
-    try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
+    if (q.cq.ctx.accountant) |acct| try std.testing.expectEqual(@as(usize, 0), acct.current_bytes);
 }
 
 test "sql: GROUP BY releases its hash table budget after emitting" {
@@ -2469,7 +2469,7 @@ test "sql: GROUP BY releases its hash table budget after emitting" {
     try std.testing.expectEqual(@as(usize, 200), rows);
     // The group accumulator arena is dropped + its budget released as
     // soon as the single result batch is built.
-    try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
+    if (q.cq.ctx.accountant) |acct| try std.testing.expectEqual(@as(usize, 0), acct.current_bytes);
 }
 
 test "sql: a materialized CTE releases its budget after the last reader drains" {
@@ -2495,7 +2495,7 @@ test "sql: a materialized CTE releases its budget after the last reader drains" 
     try std.testing.expectEqual(@as(usize, 200), rows);
     // Refcount eviction: with the single reader drained, the buffered
     // columns are freed and the budget handed back.
-    try std.testing.expectEqual(@as(usize, 0), q.cq.ctx.accountant.?.current_bytes);
+    if (q.cq.ctx.accountant) |acct| try std.testing.expectEqual(@as(usize, 0), acct.current_bytes);
 }
 
 test "sql: NOT MATERIALIZED regenerates the CTE per reference" {

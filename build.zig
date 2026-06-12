@@ -95,13 +95,16 @@ pub fn build(b: *std.Build) void {
     const integration_client_tests = b.addTest(.{ .root_module = integration_client_mod });
     const run_integration_client_tests = b.addRunArtifact(integration_client_tests);
 
-    // Engine V2 is the runtime default, but it currently only builds the
-    // group-topN SELECT shape and errors on every other SELECT shape (no
-    // legacy fallback). The existing suites assert full legacy semantics, so
-    // run them against V1 until V2 grows to cover their shapes.
-    run_lib_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
-    run_integration_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
-    run_integration_client_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
+    // The suites default to the legacy V1 engine until V2 reaches parity on
+    // every asserted SELECT shape (`-Dtest-engine-v1=false` runs them against
+    // the runtime default — V2 — to measure the remaining gap; see the V2
+    // reintegration tasks for the current failure inventory).
+    const test_engine_v1 = b.option(bool, "test-engine-v1", "Pin tests to the legacy V1 engine (default true until V2 parity)") orelse true;
+    if (test_engine_v1) {
+        run_lib_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
+        run_integration_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
+        run_integration_client_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
+    }
 
     const test_step = b.step("test", "Run unit + integration tests");
     test_step.dependOn(&run_lib_tests.step);
