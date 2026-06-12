@@ -87,37 +87,7 @@ pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // legacy-owned too: neither is a columnar-scan performance shape, so
     // the V2-or-error policy doesn't apply — fall back instead of failing.
     if (legacyLeaf(root)) return null;
-    // Aggregates V2's grouped cores don't host (user-defined aggregates,
-    // variable-state string concatenation) run on the legacy operators.
-    if (hasLegacyOnlyAggregate(root)) return null;
     return try compileSelectBlock(input, root);
-}
-
-fn hasLegacyOnlyAggregate(op: *const ir.Op) bool {
-    var cur = op;
-    while (true) {
-        switch (cur.*) {
-            .group_by => |g| {
-                for (g.aggs) |a| switch (a.func) {
-                    // Grouped UDAFs route onto UdfAggregate behind a V2 scan
-                    // (buildUdafGroupBy); grouped GROUP_CONCAT runs in the V2
-                    // silo. The GLOBAL (no GROUP BY) aggregate path hosts
-                    // neither yet — those stay legacy.
-                    .udf, .group_concat => if (g.group_cols.len == 0) return true,
-                    else => {},
-                };
-                cur = g.upstream;
-            },
-            .select => |p| cur = p.upstream,
-            .exclude => |p| cur = p.upstream,
-            .filter => |f| cur = f.upstream,
-            .order_by => |o| cur = o.upstream,
-            .compute => |c| cur = c.upstream,
-            .alias => |a| cur = a.upstream,
-            .limit => |l| cur = l.upstream,
-            else => return false,
-        }
-    }
 }
 
 /// True when the block's source is a leaf the legacy engine owns
@@ -827,9 +797,17 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
 
 fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const plan = matchGlobalAggregate(root) orelse return null;
-    if (hasUdfAgg(plan.group_by.aggs)) return null;
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
+
+    // Global UDAF / GROUP_CONCAT: variable-state aggregates the parallel
+    // reducer doesn't host. Route onto the engine-neutral operators behind a
+    // V2-built scan — UdfAggregate when any UDAF is present (it evaluates the
+    // built-ins alongside, the legacy contract), the generic hash Aggregate
+    // for GROUP_CONCAT-only programs.
+    if (hasUdfAgg(plan.group_by.aggs) or hasConcatAgg(plan.group_by.aggs)) {
+        return try buildGlobalOperatorAggregate(input, table, plan);
+    }
 
     // Algebraic reduction: collapse SUM/MIN/MAX(affine(col)) onto a shared base
     // set computed once, then derive every original output. Q29's 90
@@ -1247,6 +1225,38 @@ fn projectedBaseColumns(
 fn hasUdfAgg(aggs: []const exec.AggSpec) bool {
     for (aggs) |a| if (a.func == .udf) return true;
     return false;
+}
+
+fn hasConcatAgg(aggs: []const exec.AggSpec) bool {
+    for (aggs) |a| if (a.func == .group_concat) return true;
+    return false;
+}
+
+// Global (no GROUP BY) UDAF / GROUP_CONCAT: V2-built scan feeding the
+// engine-neutral aggregate operators. ORDER BY / LIMIT over the one-row
+// result are no-ops the matcher already discarded.
+fn buildGlobalOperatorAggregate(input: CompileInput, table: *api.Table, plan: GlobalAggregatePlan) !exec.Query {
+    const allocator = input.allocator;
+    const needed = try projectedBaseColumns(allocator, table, input.prune_names);
+    defer if (needed) |n| allocator.free(n);
+    const max_dop = input.db.config.max_dop;
+
+    var q = if (max_dop > 1)
+        try exec.ParallelScan.create(allocator, table, input.accountant, needed, max_dop)
+    else
+        try exec.scanWithProjection(allocator, table, input.accountant, needed);
+    errdefer q.deinit();
+
+    if (plan.where_filter) |f| q = try q.filter(f.predicate);
+    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    if (hasUdfAgg(plan.group_by.aggs)) {
+        const registry = input.udf_registry orelse return error.UnsupportedQueryShape;
+        q = try q.udfGroupBy(&.{}, plan.group_by.aggs, registry);
+    } else {
+        q = try q.aggregate(plan.group_by.aggs);
+    }
+    if (plan.having_filter) |f| q = try q.filter(f.predicate);
+    return q;
 }
 
 fn resolveTable(db: *api.Database, session: api.Session, ref: ir.TableRef) !*api.Table {
