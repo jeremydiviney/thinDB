@@ -99,10 +99,11 @@ fn hasLegacyOnlyAggregate(op: *const ir.Op) bool {
         switch (cur.*) {
             .group_by => |g| {
                 for (g.aggs) |a| switch (a.func) {
-                    .udf => return true,
-                    // Grouped GROUP_CONCAT runs in the V2 silo (side-collected
-                    // per group); the GLOBAL aggregate path doesn't host it yet.
-                    .group_concat => if (g.group_cols.len == 0) return true,
+                    // Grouped UDAFs route onto UdfAggregate behind a V2 scan
+                    // (buildUdafGroupBy); grouped GROUP_CONCAT runs in the V2
+                    // silo. The GLOBAL (no GROUP BY) aggregate path hosts
+                    // neither yet — those stay legacy.
+                    .udf, .group_concat => if (g.group_cols.len == 0) return true,
                     else => {},
                 };
                 cur = g.upstream;
@@ -575,6 +576,38 @@ fn pushKeyOnlyHavingIntoWhere(
 
 // Output aliases the grouped core must keep direct (computed in-core, not
 // derived afterward) because ORDER BY / HAVING ranks or filters on them.
+fn buildUdafGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan) !exec.Query {
+    const registry = input.udf_registry orelse return error.UnsupportedQueryShape;
+    const allocator = input.allocator;
+    const needed = try projectedBaseColumns(allocator, table, input.prune_names);
+    defer if (needed) |n| allocator.free(n);
+    const max_dop = input.db.config.max_dop;
+
+    var q = if (max_dop > 1)
+        try exec.ParallelScan.create(allocator, table, input.accountant, needed, max_dop)
+    else
+        try exec.scanWithProjection(allocator, table, input.accountant, needed);
+    errdefer q.deinit();
+
+    if (plan.where_filter) |f| q = try q.filter(f.predicate);
+    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    q = try q.udfGroupBy(plan.group_by.group_cols, plan.group_by.aggs, registry);
+    // HAVING runs as a generic filter over the (small) grouped output.
+    if (plan.having_filter) |f| q = try q.filter(f.predicate);
+    if (plan.order_by) |o| {
+        if (plan.limit) |l| {
+            q = try q.topN(o.specs, @intCast(l.n), @intCast(l.offset));
+        } else {
+            q = try q.orderBy(o.specs);
+        }
+    } else if (plan.limit) |l| {
+        q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
+    }
+    if (plan.post_agg_derived.len > 0) q = try q.computeWithRegistry(plan.post_agg_derived, input.udf_registry);
+    q = try applyOutputProjection(allocator, q, plan.output_columns, plan.output_names);
+    return q;
+}
+
 fn collectProtectedAggNames(allocator: std.mem.Allocator, plan: GroupTopNPlan) ![]const []const u8 {
     var set: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer set.deinit(allocator);
@@ -585,9 +618,14 @@ fn collectProtectedAggNames(allocator: std.mem.Allocator, plan: GroupTopNPlan) !
 
 fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const plan = matchGroupTopN(root) orelse return null;
-    if (hasUdfAgg(plan.group_by.aggs)) return null;
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
+
+    // UDAF aggregates hold opaque registry-driven per-group state the silo
+    // grid can't host; route them onto the engine-neutral UdfAggregate
+    // operator behind a V2-built (parallel) scan instead. Its `combine` hook
+    // leaves the door open to a parallel fold later.
+    if (hasUdfAgg(plan.group_by.aggs)) return try buildUdafGroupBy(input, table, plan);
 
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
     defer if (needed) |n| input.allocator.free(n);
