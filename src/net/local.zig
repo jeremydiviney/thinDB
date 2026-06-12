@@ -2290,17 +2290,50 @@ pub fn compileWithSession(
         .prune_names = ctx.prune_names,
         .node_arena = ctx.nodeArena(),
     };
+    // pg_catalog virtual tables (incl. JOINs across them) are metadata
+    // reads with zero scan-performance relevance — the legacy engine owns
+    // them outright (it builds the in-memory PgCatalogSource batches).
+    const legacy_only = referencesPgCatalog(root, session_cell.*);
     // CTE / FROM-subquery boundaries compile as a chain of materialized
     // stages (each block its own V2 pipeline) rather than one block.
-    if (engine_v2.v2Enabled() and engine_v2.isSelectQuery(root) and cte_stages.needsStaging(root)) {
+    if (!legacy_only and engine_v2.v2Enabled() and engine_v2.isSelectQuery(root) and cte_stages.needsStaging(root)) {
         const q = try cte_stages.compileStaged(v2_input, root);
         return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }
-    if (try engine_v2.tryCompile(v2_input, root)) |q| {
-        return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
+    if (!legacy_only) {
+        if (try engine_v2.tryCompile(v2_input, root)) |q| {
+            return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
+        }
     }
     const q = try compileOp(&ctx, root);
     return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
+}
+
+/// True when any scan in the plan resolves to a pg_catalog virtual table
+/// (PG/neutral dialects only — MySQL has no such schema, mirroring the
+/// compileOp gate). Such plans compile on the legacy path wholesale.
+fn referencesPgCatalog(op: *const ir.Op, session: Session) bool {
+    if (session.dialect == .mysql) return false;
+    return scanMatchesPgCatalog(op);
+}
+
+fn scanMatchesPgCatalog(op: *const ir.Op) bool {
+    return switch (op.*) {
+        .scan => |s| pgcat.match(s.table) != null,
+        .select => |p| scanMatchesPgCatalog(p.upstream),
+        .exclude => |p| scanMatchesPgCatalog(p.upstream),
+        .filter => |f| scanMatchesPgCatalog(f.upstream),
+        .order_by => |o| scanMatchesPgCatalog(o.upstream),
+        .group_by => |g| scanMatchesPgCatalog(g.upstream),
+        .compute => |c| scanMatchesPgCatalog(c.upstream),
+        .alias => |a| scanMatchesPgCatalog(a.upstream),
+        .limit => |l| scanMatchesPgCatalog(l.upstream),
+        .window => |w| scanMatchesPgCatalog(w.upstream),
+        .materialize => |m| scanMatchesPgCatalog(m.upstream),
+        .join => |j| scanMatchesPgCatalog(j.left) or scanMatchesPgCatalog(j.right),
+        .set_union => |u| scanMatchesPgCatalog(u.left) or scanMatchesPgCatalog(u.right),
+        else => false,
+    };
 }
 
 /// True when the group-by keys are already a globally-sorted prefix of the
