@@ -675,6 +675,19 @@ fn simplifyPredicate(
             try rewritten.append(allocator, owned);
             return .{ .@"or" = owned };
         },
+        // A non-nullable column provably holds no NULLs, so its IS [NOT] NULL
+        // resolves to a constant. This matters beyond cycle-shaving: the
+        // parser's NOT LIKE 3VL guard (`col IS NOT NULL AND NOT col LIKE ...`)
+        // would otherwise add a vacuous conjunct that knocks the guided-AND
+        // filter off its fused LIKE path (the Q22 regression).
+        .is_not_null => |col| {
+            const idx = types.findColumn(schema, col) orelse return expr;
+            return if (!schema[idx].nullable) .{ .always = true } else expr;
+        },
+        .is_null => |col| {
+            const idx = types.findColumn(schema, col) orelse return expr;
+            return if (!schema[idx].nullable) .{ .always = false } else expr;
+        },
         else => return expr,
     }
 }
