@@ -28,6 +28,7 @@ test {
     _ = @import("auto_increment_test.zig");
     _ = @import("case_when_test.zig");
     _ = @import("between_test.zig");
+    _ = @import("null_semantics_test.zig");
     _ = @import("like_test.zig");
     _ = @import("in_list_test.zig");
     _ = @import("extract_test.zig");

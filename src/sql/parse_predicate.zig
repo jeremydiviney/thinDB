@@ -63,11 +63,68 @@ pub fn parseNot(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag == .kw_not) {
         try p.advance();
         const inner = try parseNot(p);
-        const child = try p.arena.create(PredicateExpr);
-        child.* = inner;
-        return .{ .not = child };
+        return try negatePredicate(p, inner);
     }
     return try parseAtom(p);
+}
+
+fn flipOp(op: PredicateOp) PredicateOp {
+    return switch (op) {
+        .eq => .neq,
+        .neq => .eq,
+        .lt => .gte,
+        .gte => .lt,
+        .gt => .lte,
+        .lte => .gt,
+    };
+}
+
+/// 3VL-correct negation, applied at parse time by pushing NOT down to the
+/// leaves. The mask evaluators collapse UNKNOWN to false, so a mask-level
+/// `.not` flip would turn every NULL row TRUE — `NOT (v > 15)` must keep
+/// excluding NULL v. Comparisons flip their operator instead (every leaf
+/// kernel excludes NULL rows regardless of op), AND/OR De Morgan, IS [NOT]
+/// NULL swaps, and the negatable subquery markers flip their own flag. LIKE
+/// has no negated form, so it keeps the `.not` wrapper behind an IS NOT NULL
+/// guard. EXISTS stays wrapped — subquery_resolve pattern-matches
+/// `.not(.exists_subquery)` to thread the negation into the correlated set.
+fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateExpr {
+    switch (e) {
+        .leaf => |l| return .{ .leaf = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
+        .leaf_col_col => |c| return .{ .leaf_col_col = .{ .left = c.left, .op = flipOp(c.op), .right = c.right } },
+        .is_null => |c| return .{ .is_not_null = c },
+        .is_not_null => |c| return .{ .is_null = c },
+        .always => |b| return .{ .always = !b },
+        .not => |child| return child.*,
+        .@"and" => |kids| {
+            const out = try p.arena.alloc(PredicateExpr, kids.len);
+            for (kids, out) |k, *o| o.* = try negatePredicate(p, k);
+            return .{ .@"or" = out };
+        },
+        .@"or" => |kids| {
+            const out = try p.arena.alloc(PredicateExpr, kids.len);
+            for (kids, out) |k, *o| o.* = try negatePredicate(p, k);
+            return .{ .@"and" = out };
+        },
+        .in_set => |s| return .{ .in_set = .{ .col = s.col, .values = s.values, .negate = !s.negate } },
+        .in_subquery => |s| return .{ .in_subquery = .{ .col = s.col, .source = s.source, .negate = !s.negate } },
+        .scalar_subquery => |sq| return .{ .scalar_subquery = .{ .col = sq.col, .op = flipOp(sq.op), .source = sq.source } },
+        .like => |l| {
+            const child = try p.arena.create(PredicateExpr);
+            child.* = e;
+            const kids = try p.arena.alloc(PredicateExpr, 2);
+            kids[0] = .{ .is_not_null = l.col };
+            kids[1] = .{ .not = child };
+            return .{ .@"and" = kids };
+        },
+        // exists_subquery (resolver matches `.not(.exists)`), correlated_* /
+        // leaf_var (never parser-built): keep the wrapper.
+        else => {
+            const child = try p.arena.create(PredicateExpr);
+            child.* = e;
+            return .{ .not = child };
+        },
+    }
 }
 
 pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
@@ -167,11 +224,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         const pattern = try p.arena.dupe(u8, p.cur.value.string);
         try p.advance();
         var pe: PredicateExpr = .{ .like = .{ .col = col_dup, .pattern = pattern } };
-        if (negate_predicate) {
-            const child = try p.arena.create(PredicateExpr);
-            child.* = pe;
-            pe = .{ .not = child };
-        }
+        if (negate_predicate) pe = try negatePredicate(p, pe);
         return pe;
     }
 
@@ -209,11 +262,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
             kid.* = .{ .leaf = .{ .col = col_dup, .op = .eq, .val = v } };
         }
         var pe: PredicateExpr = if (kids.len == 1) kids[0] else .{ .@"or" = kids };
-        if (negate_predicate) {
-            const child = try p.arena.create(PredicateExpr);
-            child.* = pe;
-            pe = .{ .not = child };
-        }
+        if (negate_predicate) pe = try negatePredicate(p, pe);
         return pe;
     }
 
