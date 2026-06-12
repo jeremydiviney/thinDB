@@ -369,7 +369,6 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
         }
     }
     if (source.* != .scan) return null;
-    if (source.scan.alias != null) return null;
 
     return .{
         .scan = source.scan,
@@ -592,7 +591,6 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
         }
     }
     if (source.* != .scan) return null;
-    if (source.scan.alias != null) return null;
 
     return .{
         .scan = source.scan,
@@ -779,7 +777,6 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
         }
     }
     if (op.* != .scan) return null;
-    if (op.scan.alias != null) return null;
     return .{
         .scan = op.scan,
         .where_filter = where_filter,
@@ -965,7 +962,34 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
         q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
     }
     if (plan.project_columns) |cols| {
-        if (plan.project_outputs) |outs| {
+        var has_star = false;
+        for (cols) |c| {
+            if (std.mem.eql(u8, c, "*") or std.mem.endsWith(u8, c, ".*")) has_star = true;
+        }
+        if (has_star) {
+            // `*` / `alias.*` over a single-table block expands to the SOURCE
+            // columns — every upstream column except the block's own derived
+            // ones, which the SELECT list names explicitly (V1 semantics:
+            // star is the table's columns). The alias qualifies nothing in a
+            // single-source block, so expansion uses the bare names.
+            var names: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer names.deinit(allocator);
+            for (cols) |c| {
+                if (std.mem.eql(u8, c, "*") or std.mem.endsWith(u8, c, ".*")) {
+                    expand: for (q.outputSchema()) |col| {
+                        for (plan.derived) |d| {
+                            if (types.columnNameEql(d.name, col.name)) continue :expand;
+                        }
+                        try names.append(allocator, col.name);
+                    }
+                } else {
+                    // matchScanSelect declines star lists with output
+                    // aliases, so non-star items here carry no rename.
+                    try names.append(allocator, c);
+                }
+            }
+            q = try q.project(names.items);
+        } else if (plan.project_outputs) |outs| {
             const names = try allocator.alloc([]const u8, cols.len);
             defer allocator.free(names);
             for (cols, 0..) |c, i| names[i] = outs[i] orelse c;
