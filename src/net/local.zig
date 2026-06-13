@@ -2109,20 +2109,19 @@ pub fn compileWithSession(
         .node_arena = ctx.nodeArena(),
         .accountant = try ctx.queryAccountant(),
     };
-    // pg_catalog virtual tables (incl. JOINs across them) are metadata
-    // reads with zero scan-performance relevance — the legacy engine owns
-    // them outright (it builds the in-memory PgCatalogSource batches).
-    const legacy_only = referencesPgCatalog(root, session_cell.*);
     // CTE / FROM-subquery boundaries compile as a chain of materialized
     // stages (each block its own V2 pipeline) rather than one block.
-    if (!legacy_only and engine_v2.v2Enabled() and engine_v2.isSelectQuery(root) and cte_stages.needsStaging(root)) {
+    // pg_catalog virtual tables (incl. JOINs across them) are metadata
+    // reads with zero scan-performance relevance — they compile as generic
+    // staged blocks over the in-memory PgCatalogSource batches.
+    if (engine_v2.v2Enabled() and engine_v2.isSelectQuery(root) and
+        (cte_stages.needsStaging(root) or referencesPgCatalog(root, session_cell.*)))
+    {
         const q = try cte_stages.compileStaged(v2_input, root, &ctx.stage_count);
         return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }
-    if (!legacy_only) {
-        if (try engine_v2.tryCompile(v2_input, root)) |q| {
-            return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
-        }
+    if (try engine_v2.tryCompile(v2_input, root)) |q| {
+        return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }
     const q = try compileOp(&ctx, root);
     return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
@@ -2130,11 +2129,11 @@ pub fn compileWithSession(
 
 /// V2-first compile of a nested plan — subquery inners, CTAS / INSERT-SELECT
 /// sources, EXPLAIN inners — from an already-open CompileCtx. Mirrors
-/// `compileWithSession`'s dispatch exactly: staged blocks → cte_stages,
-/// single SELECT blocks → engine_v2 (V2-or-error, same as top level),
-/// statements / pg_catalog / legacy leaves → legacy compileOp.
+/// `compileWithSession`'s dispatch exactly: staged / pg_catalog / non-table-
+/// leaf blocks → cte_stages, single SELECT blocks → engine_v2 (V2-or-error,
+/// same as top level), statements → legacy compileOp.
 pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
-    if (!referencesPgCatalog(op, ctx.session.*) and engine_v2.v2Enabled() and engine_v2.isSelectQuery(op)) {
+    if (engine_v2.v2Enabled() and engine_v2.isSelectQuery(op)) {
         const v2_input = engine_v2.CompileInput{
             .allocator = ctx.allocator,
             .db = ctx.db,
@@ -2144,7 +2143,7 @@ pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
             .node_arena = ctx.nodeArena(),
             .accountant = try ctx.queryAccountant(),
         };
-        if (cte_stages.needsStaging(op)) {
+        if (cte_stages.needsStaging(op) or referencesPgCatalog(op, ctx.session.*)) {
             return try cte_stages.compileStaged(v2_input, op, &ctx.stage_count);
         }
         if (try engine_v2.tryCompile(v2_input, op)) |q| return q;
@@ -2154,7 +2153,8 @@ pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
 
 /// True when any scan in the plan resolves to a pg_catalog virtual table
 /// (PG/neutral dialects only — MySQL has no such schema, mirroring the
-/// compileOp gate). Such plans compile on the legacy path wholesale.
+/// compileOp gate). Such plans compile as generic staged blocks over the
+/// PgCatalogSource batches (cte_stages).
 fn referencesPgCatalog(op: *const ir.Op, session: Session) bool {
     if (session.dialect == .mysql) return false;
     return scanMatchesPgCatalog(op);
@@ -4226,11 +4226,11 @@ fn unionSchemaAndTempTables(
 /// FROM-less SELECT source: emits exactly one row with zero columns.
 /// A Compute/Project on top turns the projected expressions into the
 /// result (`SELECT 1+1`, `SELECT now()`).
-const SingleRowSource = struct {
+pub const SingleRowSource = struct {
     allocator: Allocator,
     emitted: bool = false,
 
-    fn create(allocator: Allocator) !Query {
+    pub fn create(allocator: Allocator) !Query {
         const self = try allocator.create(SingleRowSource);
         self.* = .{ .allocator = allocator };
         return exec.makeQuery(allocator, self);

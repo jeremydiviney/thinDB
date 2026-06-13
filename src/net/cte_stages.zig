@@ -28,6 +28,7 @@ const engine_v2 = @import("../exec/engine_v2.zig");
 const group_route = @import("../exec/group_route.zig");
 const mat_stage = @import("../exec/mat_stage.zig");
 const local = @import("local.zig");
+const pgcat = @import("pg_catalog.zig");
 const types = @import("../types.zig");
 
 const PredicateExpr = exec.predicate.PredicateExpr;
@@ -36,10 +37,12 @@ const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
 
 /// True when the plan needs the staged compiler: any materialize boundary
 /// (CTE / FROM-subquery), join, window, or set-union node anywhere in the
-/// tree (each union side compiles as its own block).
+/// tree (each union side compiles as its own block). Non-table leaves
+/// (FROM-less SELECT, CSV/JSON file scans) also compile here — generic
+/// operators over the leaf, no table-backed V2 handler applies.
 pub fn needsStaging(op: *const ir.Op) bool {
     return switch (op.*) {
-        .materialize, .join, .window, .set_union => true,
+        .materialize, .join, .window, .set_union, .single_row, .file_scan => true,
         .select => |p| needsStaging(p.upstream),
         .exclude => |p| needsStaging(p.upstream),
         .filter => |f| needsStaging(f.upstream),
@@ -190,7 +193,7 @@ fn collectStages(
     }
 }
 
-const BlockSource = enum { table, mat, join, window, set_union, unsupported };
+const BlockSource = enum { table, leaf, mat, join, window, set_union, unsupported };
 
 /// A query block is a linear pipeline; its source is whatever the upstream
 /// chain bottoms out at. A window node is a block boundary like a join:
@@ -202,7 +205,8 @@ fn blockSource(op: *const ir.Op) BlockSource {
     var cur = op;
     while (true) {
         switch (cur.*) {
-            .scan, .file_scan, .single_row => return .table,
+            .scan => return .table,
+            .file_scan, .single_row => return .leaf,
             .materialize => return .mat,
             .join => return .join,
             .window => return .window,
@@ -223,12 +227,18 @@ fn blockSource(op: *const ir.Op) BlockSource {
 fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
     return switch (blockSource(op)) {
         // Table-backed block: the regular V2 handlers, full parallelism.
-        .table => engine_v2.compileSelectBlock(input, op),
-        // Stage-, join-, window-, or union-backed block: generic operators
-        // over MatScan / Join / Window / SetUnion leaves. The heavy inputs
-        // were already produced by upstream stage handlers or stream in from
-        // table-backed child blocks.
-        .mat, .join, .window, .set_union => buildGenericBlock(input, op, map, op),
+        // pg_catalog virtual tables are in-memory metadata batches, not
+        // columnar scans — they build generically like the other leaves.
+        .table => if (blockScanIsPgCatalog(input, op))
+            buildGenericBlock(input, op, map, op)
+        else
+            engine_v2.compileSelectBlock(input, op),
+        // Stage-, join-, window-, union- or non-table-leaf-backed block:
+        // generic operators over MatScan / Join / Window / SetUnion /
+        // SingleRow / FileScan leaves. The heavy inputs were already produced
+        // by upstream stage handlers or stream in from table-backed child
+        // blocks; single-row and file leaves are not perf shapes.
+        .leaf, .mat, .join, .window, .set_union => buildGenericBlock(input, op, map, op),
         .unsupported => error.UnsupportedQueryShape,
     };
 }
@@ -240,6 +250,7 @@ fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap)
 /// self-joins disambiguate — the same shape the legacy engine builds.
 fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
     if (op.* == .scan) {
+        if (try tryPgCatalogLeaf(input, op.scan)) |q| return q;
         if (op.scan.alias) |alias| {
             const stripped = try input.node_arena.create(ir.Op);
             stripped.* = op.*;
@@ -252,8 +263,59 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
     return compileBlock(input, op, map);
 }
 
+/// Build the in-memory PgCatalogSource leaf (alias-renamed if the scan is
+/// aliased) when `s` names a pg_catalog virtual table — PG/neutral dialects
+/// only, MySQL resolves the same name as a real table. Null = real scan.
+fn tryPgCatalogLeaf(input: engine_v2.CompileInput, s: anytype) !?exec.Query {
+    if (input.session.dialect == .mysql) return null;
+    const vt = pgcat.match(s.table) orelse return null;
+    const catalog = local.catalogFor(input.db) orelse return local.Error.DatabaseNotFound;
+    const base = try pgcat.build(input.allocator, catalog, input.session, vt);
+    if (s.alias) |alias| {
+        errdefer @constCast(&base).deinit();
+        return try exec.AliasRename.create(input.allocator, base, alias);
+    }
+    return base;
+}
+
+/// Whether the block's bottom scan is a pg_catalog virtual table (the walk
+/// mirrors blockSource; only called for `.table`-sourced blocks).
+fn blockScanIsPgCatalog(input: engine_v2.CompileInput, op: *const ir.Op) bool {
+    if (input.session.dialect == .mysql) return false;
+    var cur = op;
+    while (true) {
+        switch (cur.*) {
+            .scan => |s| return pgcat.match(s.table) != null,
+            .select => |p| cur = p.upstream,
+            .exclude => |p| cur = p.upstream,
+            .filter => |f| cur = f.upstream,
+            .order_by => |o| cur = o.upstream,
+            .group_by => |g| cur = g.upstream,
+            .compute => |c| cur = c.upstream,
+            .alias => |a| cur = a.upstream,
+            .limit => |l| cur = l.upstream,
+            else => return false,
+        }
+    }
+}
+
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
     switch (op.*) {
+        .scan => |s| {
+            // Only pg_catalog virtual scans route here; real-table blocks
+            // compile through the V2 handlers in compileBlock /
+            // compileJoinChild.
+            return (try tryPgCatalogLeaf(input, s)) orelse error.UnsupportedQueryShape;
+        },
+        .single_row => return local.SingleRowSource.create(input.allocator),
+        .file_scan => |f| {
+            const base = try exec.fileScan(input.allocator, input.db.io, input.db.config.file_scan_access, f, null);
+            if (f.alias) |alias| {
+                errdefer @constCast(&base).deinit();
+                return exec.AliasRename.create(input.allocator, base, alias);
+            }
+            return base;
+        },
         .materialize => |m| {
             // In the map = shared (staged once, read here). Absent = single
             // reference: stream the body inline — no stage copy + re-read,
