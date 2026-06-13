@@ -1028,61 +1028,6 @@ pub const Aggregate = struct {
         try self.upstream.explain(out, allocator, depth + 1);
     }
 
-    /// Phase 4.2 gate: accept a single string group key delivered as dict codes.
-    /// Only valid for the single-string-key shape (which takes the byte path,
-    /// where the code-byte keying + emit decode live). Returns false otherwise.
-    pub fn setCodedKey(self: *Aggregate, dict: *exec.GlobalDict) bool {
-        if (!self.single_str_key) return false;
-        self.coded_key = .{ .dict = dict };
-        return true;
-    }
-
-    /// Reconfigure the group key onto the int-key path, packing the columns
-    /// marked in `coded_mask` as 32-bit dict CODES (a low-card string keyed on
-    /// its global code, decoded at emit) alongside any native int columns.
-    /// Called by the GROUP BY gate AFTER the scan is set to emit those columns
-    /// as codes; the gate pre-checks codeability + that the packed key fits the
-    /// 128-bit budget, so this normally succeeds. Returns false only if the
-    /// layout unexpectedly doesn't fit (caller then resets the scan + keeps the
-    /// string/byte path). Rebuilds `int_layout` and allocates the matching int
-    /// table (string keys have neither at construction — they default to the
-    /// byte path, whose now-unused table stays in the arena).
-    pub fn configureCodedKeys(self: *Aggregate, coded_mask: []const bool, dicts: []const ?*exec.GlobalDict) !bool {
-        const up_schema = self.upstream.outputSchema();
-        const layout = (try planIntKey(self.allocator, self.group_col_indices, up_schema, coded_mask, dicts)) orelse return false;
-        if (self.int_layout) |old| old.deinit(self.allocator);
-        self.int_layout = layout;
-
-        const aa = self.arena.allocator();
-        const init_cap: usize = if (self.group_cap > 0) @min(self.group_cap, ADAPTIVE_INITIAL) else 0;
-        const slots: usize = switch (layout.tier) {
-            .bits32 => blk: {
-                self.int_table_32 = try IntTable32.init(aa, init_cap);
-                if (self.group_cap > 0) self.int_table_32.?.grow_target = group_table.capacityFor(self.group_cap);
-                break :blk self.int_table_32.?.slots.len;
-            },
-            .bits96 => blk: {
-                self.int_table_96 = try IntTable96.init(aa, init_cap);
-                if (self.group_cap > 0) self.int_table_96.?.grow_target = group_table.capacityFor(self.group_cap);
-                break :blk self.int_table_96.?.slots.len;
-            },
-            .bits128 => blk: {
-                self.int_table_128 = try IntTable128.init(aa, init_cap);
-                if (self.group_cap > 0) self.int_table_128.?.grow_target = group_table.capacityFor(self.group_cap);
-                break :blk self.int_table_128.?.slots.len;
-            },
-        };
-        if (init_cap > 0) {
-            // No groups have been assigned yet (configure runs before any
-            // accumulate), so re-allocating the columns fresh to the int
-            // table's slot count is safe — any byte-path columns become arena
-            // garbage, freed wholesale on evict.
-            try self.allocAggCols(aa, slots);
-            self.gkeys_int.ensureTotalCapacity(aa, init_cap) catch {};
-        }
-        return true;
-    }
-
     pub fn next(self: *Aggregate) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;

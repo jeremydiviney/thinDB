@@ -95,27 +95,14 @@ pub fn build(b: *std.Build) void {
     const integration_client_tests = b.addTest(.{ .root_module = integration_client_mod });
     const run_integration_client_tests = b.addRunArtifact(integration_client_tests);
 
-    // The suites run against the runtime default engine — V2 — now that it
-    // holds parity on every asserted SELECT shape (634/634 as of 2026-06-12).
-    // `-Dtest-engine-v1=true` pins them back to the legacy engine, which must
-    // stay green too (it serves the documented fallback shapes: UDAF /
-    // GROUP_CONCAT, wide-accumulator grouped SUM/AVG, file scans, pg_catalog).
-    const test_engine_v1 = b.option(bool, "test-engine-v1", "Pin tests to the legacy V1 engine (default false: V2 is the engine under test)") orelse false;
-    if (test_engine_v1) {
-        run_lib_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
-        run_integration_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
-        run_integration_client_tests.setEnvironmentVariable("THINDB_ENGINE_V1", "1");
-    }
-
     const test_step = b.step("test", "Run unit + integration tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_integration_client_tests.step);
 
     // ---- V2-engine integration tests: tests/integration/v2_group_topn_test.zig ----
-    // These exercise group-topN SELECT shapes that the V2 engine fully owns, so
-    // they run against the DEFAULT engine (no THINDB_ENGINE_V1) — the broad
-    // suite above is pinned to V1 only because it asserts legacy-only shapes.
+    // A focused battery for the grouped V2 handlers, kept as its own step so
+    // `zig build test-v2` iterates on them without the full suite.
     const v2_integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration/v2_group_topn_test.zig"),
         .target = target,

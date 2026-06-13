@@ -11,10 +11,6 @@ const thindb = @import("thindb");
 const helpers = @import("sql_helpers.zig");
 const runSql = helpers.runSql;
 
-// Engine pin probe (same libc getenv the engine dispatcher uses): a few
-// structural asserts differ between the legacy and V2 staged compilers.
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-
 const schema_t = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
@@ -2669,12 +2665,10 @@ test "sql: NOT MATERIALIZED regenerates the CTE per reference" {
     defer q.deinit();
 
     // NOT MATERIALIZED waives the materialization fence (PG semantics: the
-    // planner may fold/optimize freely). The legacy engine takes it
-    // literally — each reference gets its own buffer (2). V2's structural
-    // CSE spots the byte-identical bodies and shares ONE stage between the
-    // join branches (1) — same results, half the buffering.
-    const expected_bufs: u32 = if (getenv("THINDB_ENGINE_V1") != null) 2 else 1;
-    try std.testing.expectEqual(expected_bufs, q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
+    // planner may fold/optimize freely). The structural CSE spots the
+    // byte-identical bodies and shares ONE stage between the join branches —
+    // same results, half the buffering of a per-reference copy.
+    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
 
     var rows: usize = 0;
     while (try q.next()) |b| rows += b.row_count;

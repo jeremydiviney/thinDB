@@ -1,5 +1,4 @@
-//! Scratch reproduction for the V2 generic group-topN engine (Q15 shape).
-//! Run with THINDB_ENGINE_V2=1 to route through engine_v2.tryCompile.
+//! Focused battery for the V2 generic group-topN engine (Q15 shape).
 
 const std = @import("std");
 const thindb = @import("thindb");

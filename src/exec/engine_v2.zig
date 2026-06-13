@@ -71,27 +71,6 @@ pub const CompileInput = struct {
     accountant: ?*exec.memory.MemoryAccountant = null,
 };
 
-/// Try to compile a whole query block into Engine V2.
-///
-/// The current implementation is intentionally a no-behavior-change scaffold:
-/// it classifies supported simple shapes, then declines until the concrete V2
-/// builders are introduced for those shapes.
-pub fn tryCompile(input: CompileInput, root: *const ir.Op) !?exec.Query {
-    // Engine V2 is the default path for SELECT-shaped queries. Setting
-    // THINDB_ENGINE_V1 reverts the whole compile path to the legacy engine.
-    if (!v2Enabled()) return null;
-    // Side-effecting statements (DDL/DML/SET/SHOW/EXPLAIN/...) are not the V2
-    // engine's concern; the legacy compile path owns them. Non-table leaves
-    // (single_row / file_scan) never reach here: both dispatchers route them
-    // through cte_stages (needsStaging) before trying this entry.
-    if (!isSelectQuery(root)) return null;
-    return try compileSelectBlock(input, root);
-}
-
-pub fn v2Enabled() bool {
-    return getenv("THINDB_ENGINE_V1") == null;
-}
-
 /// Compile ONE single-source query block (no materialize boundaries inside —
 /// staged plans route each block here or to the materialized-source builder
 /// in net/cte_stages.zig). Every SELECT shape is V2's responsibility: build
@@ -1309,7 +1288,6 @@ fn splitDoubleUnderscore(s: []const u8) ?struct { db: []const u8, schema: []cons
     return .{ .db = s[0..pos], .schema = s[pos + 2 ..] };
 }
 
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 test "engine v2 classifies scan filter group order limit as grouped topn" {
     var scan: ir.Op = .{ .scan = .{ .table = .{ .name = "hits" } } };

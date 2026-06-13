@@ -1,5 +1,15 @@
 # V1 SELECT-Engine Retirement Plan
 
+**STATUS: COMPLETE (2026-06-13).** All six phases shipped. `compileOp` is a
+statement-only router (its SELECT arms return `UnsupportedOp`); the V2 dispatch
+(`compileWithSession` / `compileSubplan` → engine_v2 / cte_stages) owns every
+SELECT shape; the `THINDB_ENGINE_V1` pin, `-Dtest-engine-v1` suite variant, the
+legacy affine-reduction / late-mat / coded-key-glue / env-gated-route code in
+`local.zig`, and `buildServerQuerySession` are deleted. Engine-neutral exec
+operators (hash/sorted/radix Aggregate, RadixLeaseAggregate, udfGroupBy,
+MinMaxStats) survive — they serve `group_route.zig`, the UDAF reroute, and the
+embedded builder API. The rest of this document is the historical inventory.
+
 Survey date: 2026-06-12, branch `engineV2`. Goal: `src/exec/engine_v2.zig` + `v2_*` silos own ALL
 record-producing (SELECT) execution; the legacy compile path in `src/net/local.zig` keeps only
 non-record-producing statements.

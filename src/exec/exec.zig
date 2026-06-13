@@ -259,17 +259,9 @@ pub const VTable = struct {
     /// Returns true iff the operator is an eligible Scan that accepted. Every
     /// other operator (via `makeQuery`'s `@hasDecl` guard) returns false.
     setDictCodeColumn: *const fn (ptr: *anyopaque, name: []const u8, dict: *global_dict.GlobalDict) bool,
-    /// Phase 4.2: tell an Aggregate its single string group key arrives as dict
-    /// codes — it groups on the narrow code and decodes via `dict` at emit.
-    /// Returns true iff accepted (an Aggregate with a single string key).
-    setCodedKey: *const fn (ptr: *anyopaque, dict: *global_dict.GlobalDict) bool,
     /// Phase 4.2 multi-key: non-committing pre-check — can the underlying Scan
     /// emit `name` as dict codes? The gate validates all keys before committing.
     canCodeColumn: *const fn (ptr: *anyopaque, name: []const u8) bool,
-    /// Phase 4.2 multi-key: reconfigure an Aggregate's group key to pack the
-    /// columns marked in `coded_mask` as dict codes (+ native ints) into the
-    /// int-key path. Returns false if the packed key won't fit the 128-bit budget.
-    configureCodedKeys: *const fn (ptr: *anyopaque, coded_mask: []const bool, dicts: []const ?*global_dict.GlobalDict) anyerror!bool,
     /// Phase 4.2 multi-key: roll back a Scan's coded-column setup (gate undo).
     clearDictCodeColumns: *const fn (ptr: *anyopaque) void,
     /// Restrict this operator's MATERIALIZED output to the named columns — the
@@ -468,12 +460,6 @@ pub const Query = struct {
         return self.vtable.setDictCodeColumn(self.ptr, name, dict);
     }
 
-    /// Phase 4.2: tell the underlying Aggregate its single string key is coded.
-    /// Returns true iff an eligible Aggregate accepted.
-    pub fn setCodedKey(self: Query, dict: *global_dict.GlobalDict) bool {
-        return self.vtable.setCodedKey(self.ptr, dict);
-    }
-
     /// Tell the underlying parallel scan that the consumer above only reads
     /// `keep` — so its materialize can drop dead columns (decoded for a fused
     /// filter/compute, never read above). See `VTable.setEmitProjection`.
@@ -484,11 +470,6 @@ pub const Query = struct {
     /// Phase 4.2 multi-key: can the underlying Scan emit `name` as codes?
     pub fn canCodeColumn(self: Query, name: []const u8) bool {
         return self.vtable.canCodeColumn(self.ptr, name);
-    }
-
-    /// Phase 4.2 multi-key: pack the coded columns into the Aggregate's int key.
-    pub fn configureCodedKeys(self: Query, coded_mask: []const bool, dicts: []const ?*global_dict.GlobalDict) !bool {
-        return self.vtable.configureCodedKeys(self.ptr, coded_mask, dicts);
     }
 
     /// Phase 4.2 multi-key: roll back the underlying Scan's coded-column setup.
@@ -714,20 +695,10 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.setDictCodeColumn(name, dict);
         }
-        fn setCodedKeyWrap(ptr: *anyopaque, dict: *global_dict.GlobalDict) bool {
-            if (!@hasDecl(Op, "setCodedKey")) return false;
-            const o: *Op = @ptrCast(@alignCast(ptr));
-            return o.setCodedKey(dict);
-        }
         fn canCodeColumnWrap(ptr: *anyopaque, name: []const u8) bool {
             if (!@hasDecl(Op, "canCodeColumn")) return false;
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.canCodeColumn(name);
-        }
-        fn configureCodedKeysWrap(ptr: *anyopaque, coded_mask: []const bool, dicts: []const ?*global_dict.GlobalDict) anyerror!bool {
-            if (!@hasDecl(Op, "configureCodedKeys")) return false;
-            const o: *Op = @ptrCast(@alignCast(ptr));
-            return o.configureCodedKeys(coded_mask, dicts);
         }
         fn clearDictCodeColumnsWrap(ptr: *anyopaque) void {
             if (!@hasDecl(Op, "clearDictCodeColumns")) return;
@@ -754,9 +725,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .accountant = accountantWrap,
             .explain = explainWrap,
             .setDictCodeColumn = setDictCodeColumnWrap,
-            .setCodedKey = setCodedKeyWrap,
             .canCodeColumn = canCodeColumnWrap,
-            .configureCodedKeys = configureCodedKeysWrap,
             .clearDictCodeColumns = clearDictCodeColumnsWrap,
             .setEmitProjection = setEmitProjectionWrap,
         };
