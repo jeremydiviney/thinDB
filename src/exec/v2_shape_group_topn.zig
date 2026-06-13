@@ -21,6 +21,7 @@ const ColumnStore = store.ColumnStore;
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
 const compute = @import("compute.zig");
+const udf_mod = @import("../udf.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
@@ -72,6 +73,9 @@ pub const Request = struct {
     // appears in each batch by name. Empty for plain column shapes.
     derived: []const compute.Derived = &.{},
     dop: usize,
+    // Resolves UDAF aggregate names → callback entries. Null when the query has
+    // no UDAFs (the silo declines any `.udf` agg it sees in that case).
+    udf_registry: ?*const udf_mod.UdfRegistry = null,
 };
 
 const KeyPart = struct {
@@ -132,6 +136,15 @@ const AggregatePlan = struct {
     is_concat: bool = false,
     concat_state_index: u16 = 0,
     separator: []const u8 = ",",
+    // User-defined aggregate. The opaque per-group state lives in the side
+    // udf_states lane at `udf_state_index`; args stage as numeric aggregate
+    // inputs `udf_arg_input_indices[0..udf_arg_count]`; the finalized scalar
+    // lands in value slot `state_index`, presence in slot `state_index + 1`.
+    is_udf: bool = false,
+    udf_entry: ?udf_mod.AggregateEntry = null,
+    udf_state_index: u16 = 0,
+    udf_arg_count: u8 = 0,
+    udf_arg_input_indices: [HarnessCore.MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** HarnessCore.MAX_GROUP_UDF_ARGS,
 };
 
 const StringAggInputPlan = struct {
@@ -273,6 +286,18 @@ fn collectScanBaseColumns(allocator: Allocator, out: *std.ArrayListUnmanaged([]c
         } else return false;
     }
     for (request.aggs) |agg| {
+        // A UDAF's inputs are its explicit arg columns (which may differ from,
+        // or outnumber, `agg.col`); project each so the scan stages them.
+        if (agg.func == .udf and agg.udf_arg_cols.len > 0) {
+            for (agg.udf_arg_cols) |name| {
+                if (types.findColumn(table.schema.columns, name) != null) {
+                    try appendUniqueCol(allocator, out, name);
+                } else if (findDerived(request.derived, name)) |d| {
+                    try compute.collectColumnRefs(allocator, out, d.expr);
+                } else return false;
+            }
+            continue;
+        }
         const name = agg.col orelse continue;
         if (types.findColumn(table.schema.columns, name) != null) {
             try appendUniqueCol(allocator, out, name);
@@ -472,6 +497,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
                 .count_distinct => .count_distinct,
                 .stddev_pop, .stddev_samp, .var_pop, .var_samp => .welford,
                 .group_concat => .concat,
+                .udf => .udf,
                 else => return error.UnsupportedOperatorForType,
             },
             .input_column_index = agg_plan.input_column_index,
@@ -488,6 +514,11 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .is_concat = agg_plan.is_concat,
             .concat_state_index = agg_plan.concat_state_index,
             .separator = agg_plan.separator,
+            .is_udf = agg_plan.is_udf,
+            .udf_entry = agg_plan.udf_entry,
+            .udf_state_index = agg_plan.udf_state_index,
+            .udf_arg_count = agg_plan.udf_arg_count,
+            .udf_arg_input_indices = agg_plan.udf_arg_input_indices,
         };
     }
     var group_key_inputs: [MAX_GROUP_KEYS]GroupTopNEngine.GroupKeyInput = undefined;
@@ -711,6 +742,9 @@ fn aggDenom(row: HarnessCore.TopRow, agg_plan: AggregatePlan) u64 {
 
 fn aggIsNull(row: HarnessCore.TopRow, agg_plan: AggregatePlan) bool {
     if (agg_plan.is_string or agg_plan.is_concat) return !row.str_present[agg_plan.str_state_index];
+    // The UDAF's present bit rides the slot one past its value slot; finalize
+    // sets it to 1 for a value, 0 for a NULL (or an all-skipped fold).
+    if (agg_plan.is_udf) return row.slots[agg_plan.state_index] == 0;
     return switch (agg_plan.func) {
         .sum, .avg, .min, .max => agg_plan.input_nullable and aggDenom(row, agg_plan) == 0,
         // Sample variants need ≥2 inputs even over a non-nullable column.
@@ -925,6 +959,12 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
         ),
         .count_distinct => try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index, agg_plan.wide)),
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => try col.data.double.append(allocator, welfordValue(row, agg_plan)),
+        // The finalized UDAF scalar sits in value slot `state_index`; float
+        // outputs are bit-cast through f64, integer outputs sign-extended.
+        .udf => if (agg_plan.output_type == .float or agg_plan.output_type == .double)
+            try appendFloatAggregate(allocator, col, agg_plan.output_type, rowStateFloat(row, agg_plan.state_index))
+        else
+            try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValueNarrow(row, agg_plan.state_index)),
         else => return error.UnsupportedOperatorForType,
     }
 }
@@ -983,6 +1023,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
     var next_string_state_index: u16 = 0;
     var next_distinct_state_index: u16 = 0;
     var next_concat_state_index: u16 = 0;
+    var next_udf_state_index: u16 = 0;
     for (request.aggs, 0..) |agg, agg_i| {
         if (agg_i >= MAX_AGGS) return traceDecline(request, "aggregate count");
         // Nullable inputs: NULL rows skip the fold via the staged validity
@@ -1128,6 +1169,52 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 next_numeric_state_index += 1;
                 next_distinct_state_index += 1;
             },
+            .udf => {
+                // The silo hosts a UDAF natively only when every arg is a
+                // non-null fixed-width numeric (the fold reconstructs a
+                // validity-free ColumnView over the staged slab) and the return
+                // type fits one value slot. Anything else declines to the
+                // UdfAggregate operator fallback.
+                const registry = request.udf_registry orelse return traceDecline(request, "udf no registry");
+                const udf_name = agg.udf_name orelse return traceDecline(request, "udf no name");
+                const arg_cols = if (agg.udf_arg_cols.len > 0)
+                    agg.udf_arg_cols
+                else if (agg.col) |c|
+                    &[_][]const u8{c}
+                else
+                    &.{};
+                if (arg_cols.len > HarnessCore.MAX_GROUP_UDF_ARGS) return traceDecline(request, "udf arg count");
+                if (next_udf_state_index >= HarnessCore.MAX_GROUP_UDF_SLOTS) return traceDecline(request, "udf slot count");
+                // value slot + present slot (one past) must both fit.
+                if (next_numeric_state_index + 1 > MAX_AGGS) return traceDecline(request, "udf state count");
+                var arg_input_indices = [_]u16{0} ** HarnessCore.MAX_GROUP_UDF_ARGS;
+                var arg_types_buf: [HarnessCore.MAX_GROUP_UDF_ARGS]Type = undefined;
+                for (arg_cols, 0..) |col_name, k| {
+                    const arg_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "udf arg type");
+                    if (!udfSiloArgSupported(arg_type)) return traceDecline(request, "udf arg unsupported");
+                    if (resolveColumnNullable(table, schema, col_name)) return traceDecline(request, "udf nullable arg");
+                    const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "udf input");
+                    arg_input_indices[k] = input_idx;
+                    arg_types_buf[k] = arg_type;
+                }
+                const entry = registry.resolveAggregateExact(udf_name, arg_types_buf[0..arg_cols.len]) orelse return traceDecline(request, "udf no overload");
+                if (!udfSiloReturnSupported(entry.return_type)) return traceDecline(request, "udf return unsupported");
+                aggregates[agg_i] = .{
+                    .name = agg.as,
+                    .func = agg.func,
+                    .input_column_index = null,
+                    .input_type = .i64,
+                    .state_index = next_numeric_state_index,
+                    .output_type = entry.return_type,
+                    .is_udf = true,
+                    .udf_entry = entry,
+                    .udf_state_index = next_udf_state_index,
+                    .udf_arg_count = @intCast(arg_cols.len),
+                    .udf_arg_input_indices = arg_input_indices,
+                };
+                next_numeric_state_index += 2;
+                next_udf_state_index += 1;
+            },
             else => return traceDecline(request, "aggregate func"),
         }
     }
@@ -1135,12 +1222,13 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
         if (!outputColumnExists(parts[0..request.group_cols.len], aggregates[0..request.aggs.len], spec.col)) {
             return traceDecline(request, "order key");
         }
-        // Sorting on a string MIN/MAX or GROUP_CONCAT result isn't wired
+        // Sorting on a string MIN/MAX, GROUP_CONCAT, or UDAF result isn't wired
         // through the final top-N comparator yet; such queries order by COUNT
-        // in practice.
+        // in practice (a UDAF query ordered on its own output declines to the
+        // UdfAggregate operator, which sorts the grouped output generically).
         for (aggregates[0..request.aggs.len]) |agg_plan| {
-            if ((agg_plan.is_string or agg_plan.is_concat) and types.columnNameEql(agg_plan.name, spec.col)) {
-                return traceDecline(request, "order by string aggregate");
+            if ((agg_plan.is_string or agg_plan.is_concat or agg_plan.is_udf) and types.columnNameEql(agg_plan.name, spec.col)) {
+                return traceDecline(request, "order by string/udf aggregate");
             }
         }
     }
@@ -1373,6 +1461,26 @@ fn isSearchPhraseNotEmpty(pred: PredicateExpr) bool {
 }
 
 fn aggInputSupported(typ: Type) bool {
+    return switch (typ) {
+        .boolean, .tinyint, .smallint, .int, .bigint, .float, .double => true,
+        else => false,
+    };
+}
+
+// A silo-hosted UDAF arg must be a non-null fixed-width numeric — the fold
+// reconstructs a validity-free ColumnView over the staged slab whose union tag
+// is one of these. Other arg types route to the UdfAggregate operator instead.
+fn udfSiloArgSupported(typ: Type) bool {
+    return switch (typ) {
+        .boolean, .tinyint, .smallint, .int, .bigint, .float, .double, .date, .datetime, .decimal64 => true,
+        else => false,
+    };
+}
+
+// A silo-hosted UDAF return must fit one i64 value slot (its bit pattern is
+// read back at emit) AND be a type the numeric emit can append. String /
+// 128-bit / temporal returns route to UdfAggregate.
+fn udfSiloReturnSupported(typ: Type) bool {
     return switch (typ) {
         .boolean, .tinyint, .smallint, .int, .bigint, .float, .double => true,
         else => false,

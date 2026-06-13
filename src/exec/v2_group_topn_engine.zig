@@ -16,6 +16,7 @@ const exec = @import("exec.zig");
 const storage = @import("../storage/storage.zig");
 
 const HarnessCore = exec.group_topn_harness_core;
+const udf_mod = @import("../udf.zig");
 
 const DEFAULT_DOP: usize = 12;
 const DEFAULT_BUCKET_COUNT: usize = 256;
@@ -396,6 +397,9 @@ pub const AggregateOp = enum {
     welford,
     // GROUP_CONCAT — side-collected per group, joined at emit.
     concat,
+    // User-defined aggregate — opaque per-group state, folded by registry
+    // callbacks (see the harness core's GroupAggregateOp).
+    udf,
 };
 
 pub const AggregateSpec = struct {
@@ -429,6 +433,15 @@ pub const AggregateSpec = struct {
     // consecutive slots (lo at state_index-1, hi at state_index). Generic
     // per-row program only; fused/weighted kernels decline.
     wide: bool = false,
+    // User-defined aggregate. Opaque per-group state in the side udf_states lane
+    // at `udf_state_index`; args are staged numeric aggregate-input columns
+    // `udf_arg_input_indices[0..udf_arg_count]`; the finalized scalar lands in
+    // value slot `state_index`. `udf_entry` is null for non-UDAF aggregates.
+    is_udf: bool = false,
+    udf_entry: ?udf_mod.AggregateEntry = null,
+    udf_state_index: u16 = 0,
+    udf_arg_count: u8 = 0,
+    udf_arg_input_indices: [HarnessCore.MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** HarnessCore.MAX_GROUP_UDF_ARGS,
 };
 
 pub const StringAggInput = struct {
@@ -726,8 +739,10 @@ fn runHarness(
     var group_aggregates_buf: [16]HarnessCore.GroupAggregateSpec = undefined;
     if (shape.aggregate_program.len > group_aggregates_buf.len) return error.UnsupportedOperatorForType;
     var distinct_slot_count: u16 = 0;
+    var has_udf = false;
     for (shape.aggregate_program, 0..) |agg, i| {
         if (agg.is_distinct) distinct_slot_count = @max(distinct_slot_count, agg.distinct_state_index + 1);
+        if (agg.is_udf) has_udf = true;
         group_aggregates_buf[i] = .{
             .op = switch (agg.op) {
                 .count_star => .count_star,
@@ -739,6 +754,7 @@ fn runHarness(
                 .count_distinct => .count_distinct,
                 .welford => .welford,
                 .concat => .concat,
+                .udf => .udf,
             },
             .input_column_index = agg.input_column_index,
             .state_index = agg.state_index,
@@ -753,6 +769,11 @@ fn runHarness(
             .is_concat = agg.is_concat,
             .concat_state_index = agg.concat_state_index,
             .separator = agg.separator,
+            .is_udf = agg.is_udf,
+            .udf_entry = agg.udf_entry,
+            .udf_state_index = agg.udf_state_index,
+            .udf_arg_count = agg.udf_arg_count,
+            .udf_arg_input_indices = agg.udf_arg_input_indices,
         };
     }
     // shape.hashed comes from the shape gate (string / >128-bit keys). The env
@@ -773,7 +794,7 @@ fn runHarness(
         if (shape.string_aggregate_inputs.len != 0 or distinct_slot_count != 0) break :blk false;
         var input_used = [_]bool{false} ** 16;
         for (shape.aggregate_program) |agg| {
-            if (agg.is_distinct or agg.is_string) break :blk false;
+            if (agg.is_distinct or agg.is_string or agg.is_udf) break :blk false;
             switch (agg.op) {
                 .count_star => {},
                 .sum, .avg, .min, .max => {
@@ -786,7 +807,7 @@ fn runHarness(
                     if (ic >= shape.aggregate_inputs.len or input_used[ic]) break :blk false;
                     input_used[ic] = true;
                 },
-                .count_col, .count_distinct, .welford, .concat => break :blk false,
+                .count_col, .count_distinct, .welford, .concat, .udf => break :blk false,
             }
         }
         // Every staged column must belong to exactly one folding aggregate.
@@ -831,6 +852,7 @@ fn runHarness(
         .hashed_key = force_hash,
         .has_concat = has_concat,
         .has_weight = weight_mode,
+        .has_udf = has_udf,
     };
 
     // Scan-side key digests: a string group key consumed only as hashed

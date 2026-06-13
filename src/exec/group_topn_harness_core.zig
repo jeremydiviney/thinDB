@@ -18,6 +18,9 @@ const storage_mod = @import("../storage/storage.zig");
 const types_mod = @import("../types.zig");
 const rowloc = @import("rowloc.zig");
 const build_options = @import("build_options");
+const udf_mod = @import("../udf.zig");
+const ColumnView = storage_mod.ColumnView;
+const ColumnStore = @import("../engine/store.zig").ColumnStore;
 
 // Comptime master switch for the developer execution-trace profilers. False in
 // every production build (default), which makes every `PROFILING and …` gate
@@ -500,7 +503,19 @@ pub const GroupAggregateOp = enum {
     welford,
     // GROUP_CONCAT — folded into the side concat_states (see is_concat).
     concat,
+    // User-defined aggregate — opaque per-group state in the side udf_states
+    // lane (see is_udf). Folded by the registry callbacks over reconstructed
+    // arg ColumnViews; the finalized scalar lands in the numeric value slot.
+    udf,
 };
+
+// A grouped query may carry up to this many UDAF aggregates; each gets one
+// gid-indexed opaque-state cell per bucket. 0/unused for the common case.
+pub const MAX_GROUP_UDF_SLOTS: usize = 4;
+// Maximum numeric arg columns a silo-hosted UDAF accepts (its args stage as
+// ordinary numeric aggregate-input columns). String/exotic-arg UDAFs decline
+// to the UdfAggregate operator instead.
+pub const MAX_GROUP_UDF_ARGS: usize = 8;
 
 pub const GroupAggregateSpec = struct {
     op: GroupAggregateOp,
@@ -539,6 +554,19 @@ pub const GroupAggregateSpec = struct {
     is_concat: bool = false,
     concat_state_index: u16 = 0,
     separator: []const u8 = ",",
+    // User-defined aggregate. The opaque per-group state lives in the bucket's
+    // side `udf_states` lane at `udf_state_index`; the fold reconstructs
+    // ColumnViews over the staged arg columns `udf_arg_input_indices[0..
+    // udf_arg_count]` and drives `udf_entry`'s callbacks. The finalized scalar
+    // lands in numeric value slot `state_index` (slot `state_index - 1`); its
+    // presence (non-NULL) rides the companion slot at `state_index` (one past
+    // the value), so a UDAF reserves two numeric slots. `udf_entry` is null for
+    // every non-UDAF aggregate.
+    is_udf: bool = false,
+    udf_entry: ?udf_mod.AggregateEntry = null,
+    udf_state_index: u16 = 0,
+    udf_arg_count: u8 = 0,
+    udf_arg_input_indices: [MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** MAX_GROUP_UDF_ARGS,
 };
 
 // Per-group numeric accumulators are stored in a runtime variable-stride slab
@@ -826,6 +854,9 @@ pub const GroupRowsLayout = struct {
     // adjacent-equal keys into ONE weighted row — route/stage/lane traffic
     // shrinks by the run factor. The lane folds `count += weight`.
     has_weight: bool = false,
+    // The program has UDAF aggregates: buckets maintain a gid-indexed
+    // udf_states lane and the fold runs the per-row registry callbacks.
+    has_udf: bool = false,
 
     const DEFAULT_GROUP_COLUMNS = [_]GroupColumnSpec{
         .{ .physical_type = .i16, .source = .is_refresh },
@@ -834,7 +865,7 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.hashed_key != b.hashed_key or a.has_concat != b.has_concat or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.hashed_key != b.hashed_key or a.has_concat != b.has_concat or a.has_udf != b.has_udf or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
     var key_i: usize = 0;
     while (key_i < a.key_columns.len) : (key_i += 1) {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
@@ -1517,6 +1548,13 @@ const ConcatCell = std.ArrayListUnmanaged(ConcatItem);
 const MAX_GROUP_CONCAT_SLOTS: usize = 2;
 const ConcatRow = [MAX_GROUP_CONCAT_SLOTS]ConcatCell;
 
+// Per-group opaque UDAF state. `bytes` (16-aligned, sized to the UDAF's
+// state_size) is bump-allocated from the bucket's udf_arena; `initialized`
+// gates the matching `destroy` at teardown (the arena reclaims the bytes,
+// `destroy` releases any heap the UDAF's state itself owns).
+const UdfCell = struct { bytes: []align(16) u8 = &.{}, initialized: bool = false };
+const UdfStateRow = [MAX_GROUP_UDF_SLOTS]UdfCell;
+
 const GroupScratch = struct {
     gids: std.ArrayListUnmanaged(u32) = .empty,
     row_idxs: std.ArrayListUnmanaged(u32) = .empty,
@@ -1609,6 +1647,12 @@ const PipeBucket = struct {
     // Parallel to `states` (gid-indexed); populated only for GROUP_CONCAT
     // queries. Cell item lists grow in the str_arena (no per-cell deinit).
     concat_states: std.ArrayListUnmanaged(ConcatRow) = .empty,
+    // Parallel to `states` (gid-indexed); populated only for UDAF queries.
+    // Each cell's opaque state blob is bump-allocated from `udf_arena`.
+    udf_states: std.ArrayListUnmanaged(UdfStateRow) = .empty,
+    // Bump arena for the per-group UDAF state blobs (freed wholesale at
+    // reset/teardown; `destroyUdfStates` runs the UDAFs' own `destroy` first).
+    udf_arena: std.heap.ArenaAllocator,
     // Bump arena for the running-MIN/MAX bytes. A per-improvement `dupe` from a
     // shared allocator scatters each group's current value across the heap, so
     // reading it back for the next row's compare is a main-memory miss — the
@@ -1627,6 +1671,7 @@ const PipeBucket = struct {
         return .{
             .table = try GroupTable.init(allocator, expected_groups),
             .str_arena = std.heap.ArenaAllocator.init(allocator),
+            .udf_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
@@ -1634,10 +1679,33 @@ const PipeBucket = struct {
         _ = self.str_arena.reset(.free_all);
     }
 
+    // Run each initialized UDAF state's `destroy` (releasing heap the state
+    // owns) before the udf_arena reclaims the blobs. Idempotent: clears the
+    // initialized flag so a later reset/teardown can't double-destroy.
+    fn destroyUdfStates(self: *PipeBucket, aggregates: []const GroupAggregateSpec) void {
+        if (self.udf_states.items.len == 0) return;
+        for (self.udf_states.items) |*row| {
+            for (aggregates) |agg| {
+                if (!agg.is_udf) continue;
+                const cell = &row[agg.udf_state_index];
+                if (!cell.initialized) continue;
+                if (agg.udf_entry) |entry| {
+                    if (entry.destroy) |destroy| {
+                        const ctx = udf_mod.AggregateContext{ .allocator = self.udf_arena.allocator(), .user_data = entry.user_data };
+                        destroy(&ctx, @ptrCast(cell.bytes.ptr));
+                    }
+                }
+                cell.initialized = false;
+            }
+        }
+    }
+
     fn deinit(self: *PipeBucket, allocator: Allocator) void {
         self.str_arena.deinit();
+        self.udf_arena.deinit();
         self.str_states.deinit(allocator);
         self.concat_states.deinit(allocator);
+        self.udf_states.deinit(allocator);
         for (&self.distinct_sets) |*d| d.deinit(allocator);
         self.chunks.deinit(allocator);
         self.table.deinit(allocator);
@@ -2236,6 +2304,10 @@ fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
     bucket.freeStrBytes();
     bucket.str_states.clearRetainingCapacity();
     bucket.concat_states.clearRetainingCapacity();
+    // UDAF states are destroyed synchronously after emit (while the layout is
+    // live); here the blobs are stale, so just drop them and reclaim the arena.
+    bucket.udf_states.clearRetainingCapacity();
+    _ = bucket.udf_arena.reset(.retain_capacity);
     for (&bucket.distinct_sets) |*d| d.clear(allocator);
 }
 
@@ -3697,9 +3769,10 @@ fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec
     ref.head.count += 1;
     for (aggregates) |agg| {
         // String MIN/MAX is folded separately into the side str_states array,
-        // GROUP_CONCAT into the side concat_states, and COUNT(DISTINCT) into
-        // the side distinct_sets (its count slot is bumped there, not here).
-        if (agg.is_string or agg.is_distinct or agg.is_concat) continue;
+        // GROUP_CONCAT into the side concat_states, COUNT(DISTINCT) into the
+        // side distinct_sets, and UDAFs into the side udf_states (the numeric
+        // value/present slots are written at finalize, not here).
+        if (agg.is_string or agg.is_distinct or agg.is_concat or agg.is_udf) continue;
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         const state_index: usize = agg.state_index;
         // NULL inputs don't fold (SQL: aggregates skip NULLs). The companion
@@ -3778,9 +3851,9 @@ fn updateGroupStateProgram(ref: StateRef, aggregates: []const GroupAggregateSpec
                 try setFloatStateValue(ref, state_index + 1, mean);
                 try setFloatStateValue(ref, state_index + 2, floatStateValue(ref, state_index + 2) + delta * (x - mean));
             },
-            // Folded into the side distinct_sets / concat_states; the guards
-            // above mean control never reaches here.
-            .count_distinct, .concat => unreachable,
+            // Folded into the side distinct_sets / concat_states / udf_states;
+            // the guards above mean control never reaches here.
+            .count_distinct, .concat, .udf => unreachable,
         }
     }
 }
@@ -3874,8 +3947,9 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
     if (aggregates.len == 0) return error.UnsupportedOperatorForType;
     for (aggregates) |agg| {
         // String MIN/MAX and GROUP_CONCAT have no numeric slot/payload column;
-        // their inputs are str_columns entries validated by the layout.
-        if (agg.is_string or agg.is_concat) continue;
+        // their inputs are str_columns entries validated by the layout. UDAF
+        // args/slots are validated by the planner (the silo just folds them).
+        if (agg.is_string or agg.is_concat or agg.is_udf) continue;
         // A wide aggregate's hi half occupies the NEXT slot too.
         if (agg.state_index + @as(u16, @intFromBool(agg.wide)) >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         if (agg.wide and (agg.state_index == 0 or (agg.op != .sum and agg.op != .avg))) return error.UnsupportedOperatorForType;
@@ -3892,7 +3966,7 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
                 if (input_index >= column_count) return error.UnsupportedOperatorForType;
                 if (agg.state_index == 0 or agg.state_index + 2 >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
             },
-            .concat => unreachable,
+            .concat, .udf => unreachable,
         }
     }
 }
@@ -3920,6 +3994,9 @@ fn aggSlotCount(layout: GroupRowsLayout) usize {
         if (agg.is_string or agg.is_concat) continue;
         var top = agg.state_index + @as(u16, @intFromBool(agg.wide));
         if (agg.op == .welford) top = agg.state_index + 2;
+        // A UDAF writes its finalized value at slot `state_index - 1` and a
+        // companion present bit at slot `state_index` (the next one).
+        if (agg.is_udf) top = agg.state_index + 1;
         if (top > n) n = top;
         if (agg.valid_count_index > n) n = agg.valid_count_index;
     }
@@ -3931,6 +4008,8 @@ fn groupChunkRowsDirect(
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     concat_states: *std.ArrayListUnmanaged(ConcatRow),
+    udf_states: *std.ArrayListUnmanaged(UdfStateRow),
+    udf_arena: Allocator,
     distinct_sets: []DistinctSet,
     scratch: *GroupScratch,
     allocator: Allocator,
@@ -3944,6 +4023,7 @@ fn groupChunkRowsDirect(
     try states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_str_payload) try str_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_concat) try concat_states.ensureUnusedCapacity(allocator, n);
+    if (rows.layout.has_udf) try udf_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.distinct_slot_count > distinct_sets.len) return error.UnsupportedOperatorForType;
 
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
@@ -3963,10 +4043,10 @@ fn groupChunkRowsDirect(
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, concat_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, concat_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, concat_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, concat_states, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
     }
 }
 
@@ -4006,6 +4086,76 @@ fn foldGroupConcat(concat_states: *std.ArrayListUnmanaged(ConcatRow), str_arena:
         const b = rows.str.get(k, row_idx, agg.str_input_index);
         const cell = &concat_states.items[gid][agg.concat_state_index];
         try cell.append(str_arena, .{ .order = rowrefs[row_idx], .bytes = try str_arena.dupe(u8, b) });
+    }
+}
+
+// Build a ColumnView over staged aggregate-input column `ic`'s slab for the
+// whole chunk. The arg is a non-nullable numeric (gated in the planner), so the
+// view carries no validity bitmap and the union tag follows the UDAF's declared
+// arg type. `update_one` indexes it by the chunk-relative row.
+fn reconstructUdfArgView(rows: GroupRows, ic: u16, arg_type: types_mod.Type, n: usize) ColumnView {
+    const data: storage_mod.column.ValueView = switch (arg_type) {
+        .double => .{ .double = rows.columnTypedAll(f64, ic)[0..n] },
+        .float => .{ .float = rows.columnTypedAll(f32, ic)[0..n] },
+        .bigint => .{ .bigint = rows.columnTypedAll(i64, ic)[0..n] },
+        .int => .{ .int = rows.columnTypedAll(i32, ic)[0..n] },
+        .smallint => .{ .smallint = rows.columnTypedAll(i16, ic)[0..n] },
+        .tinyint => .{ .tinyint = rows.columnTypedAll(i8, ic)[0..n] },
+        .boolean => .{ .boolean = @ptrCast(rows.columnTypedAll(i8, ic)[0..n]) },
+        .date => .{ .date = rows.columnTypedAll(i32, ic)[0..n] },
+        .datetime => .{ .datetime = rows.columnTypedAll(i64, ic)[0..n] },
+        .decimal64 => .{ .decimal64 = rows.columnTypedAll(i64, ic)[0..n] },
+        // Unreachable: the planner declines any UDAF arg whose type isn't one
+        // of the above before this layout is ever built.
+        else => unreachable,
+    };
+    return .{ .data = data, .nulls = null };
+}
+
+// Initialize group `gid`'s opaque UDAF state cells: bump a state_size blob from
+// the bucket's udf_arena and run the UDAF's `init`. Called when a new group is
+// created. The freshly-appended UdfStateRow starts all-uninitialized.
+fn initUdfStatesRow(
+    udf_states: *std.ArrayListUnmanaged(UdfStateRow),
+    udf_arena: Allocator,
+    gid: usize,
+    aggregates: []const GroupAggregateSpec,
+) !void {
+    const row = &udf_states.items[gid];
+    for (aggregates) |agg| {
+        if (!agg.is_udf) continue;
+        const entry = agg.udf_entry orelse return error.UnsupportedOperatorForType;
+        const cell = &row[agg.udf_state_index];
+        const bytes = try udf_arena.alignedAlloc(u8, .@"16", entry.state_size);
+        const ctx = udf_mod.AggregateContext{ .allocator = udf_arena, .user_data = entry.user_data };
+        try entry.init(&ctx, @ptrCast(bytes.ptr));
+        cell.bytes = bytes;
+        cell.initialized = true;
+    }
+}
+
+// Fold one staged row into group `gid`'s UDAF states. Reconstructs each arg's
+// ColumnView over the chunk slab and drives `update_one` at the row index.
+fn foldGroupUdf(
+    udf_states: *std.ArrayListUnmanaged(UdfStateRow),
+    udf_arena: Allocator,
+    gid: usize,
+    aggregates: []const GroupAggregateSpec,
+    rows: GroupRows,
+    row_idx: usize,
+    chunk_rows: usize,
+) !void {
+    const cells = &udf_states.items[gid];
+    for (aggregates) |agg| {
+        if (!agg.is_udf) continue;
+        const entry = agg.udf_entry orelse return error.UnsupportedOperatorForType;
+        var arg_buf: [MAX_GROUP_UDF_ARGS]ColumnView = undefined;
+        const args = arg_buf[0..agg.udf_arg_count];
+        for (0..agg.udf_arg_count) |k| {
+            args[k] = reconstructUdfArgView(rows, agg.udf_arg_input_indices[k], entry.arg_types[k], chunk_rows);
+        }
+        const ctx = udf_mod.AggregateContext{ .allocator = udf_arena, .user_data = entry.user_data };
+        try entry.update_one(&ctx, @ptrCast(cells[agg.udf_state_index].bytes.ptr), args, row_idx);
     }
 }
 
@@ -4071,6 +4221,8 @@ fn groupChunkRowsDirectKeys(
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     concat_states: *std.ArrayListUnmanaged(ConcatRow),
+    udf_states: *std.ArrayListUnmanaged(UdfStateRow),
+    udf_arena: Allocator,
     str_arena: Allocator,
     distinct_sets: []DistinctSet,
     gids_buf: *std.ArrayListUnmanaged(u32),
@@ -4098,8 +4250,11 @@ fn groupChunkRowsDirectKeys(
     var needs_kernels = false;
     var has_extreme = false;
     var has_mirror = false;
+    // UDAFs fold their opaque state per row in the generic program; the
+    // monomorphic kernels have no form for it.
+    if (rows.layout.has_udf) kernelizable = false;
     for (aggregates) |agg| {
-        if (agg.is_string or agg.is_distinct or agg.is_concat) continue;
+        if (agg.is_string or agg.is_distinct or agg.is_concat or agg.is_udf) continue;
         if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
         switch (agg.op) {
             .count_star, .count_col => {
@@ -4119,11 +4274,11 @@ fn groupChunkRowsDirectKeys(
             },
             // Welford's three-slot sequential update has no kernel form.
             .welford => kernelizable = false,
-            .count_distinct, .concat => unreachable,
+            .count_distinct, .concat, .udf => unreachable,
         }
     }
     if (!kernelizable) {
-        return groupChunkRowsDirectKeysProgram(key_width, table, states, str_states, concat_states, str_arena, distinct_sets, gids_buf, allocator, keys, key_hi, n, aggregates, rows, rowrefs);
+        return groupChunkRowsDirectKeysProgram(key_width, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, gids_buf, allocator, keys, key_hi, n, aggregates, rows, rowrefs);
     }
 
     // The gid array feeds the aggregate kernels and the COUNT(DISTINCT) pass 2
@@ -4197,7 +4352,7 @@ fn groupChunkRowsDirectKeys(
 
     if (needs_kernels) {
         for (aggregates) |agg| {
-            if (agg.is_string or agg.is_distinct or agg.is_concat) continue;
+            if (agg.is_string or agg.is_distinct or agg.is_concat or agg.is_udf) continue;
             switch (agg.op) {
                 .count_star, .count_col => {},
                 .sum, .avg => if (aggInputIsFloat(rows, agg))
@@ -4213,7 +4368,7 @@ fn groupChunkRowsDirectKeys(
                 else
                     foldKernelExtremeInt(false, states, gids, rows, agg),
                 // All force or skip the kernel pass.
-                .count_distinct, .welford, .concat => unreachable,
+                .count_distinct, .welford, .concat, .udf => unreachable,
             }
         }
     }
@@ -4234,6 +4389,8 @@ fn groupChunkRowsDirectKeysProgram(
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     concat_states: *std.ArrayListUnmanaged(ConcatRow),
+    udf_states: *std.ArrayListUnmanaged(UdfStateRow),
+    udf_arena: Allocator,
     str_arena: Allocator,
     distinct_sets: []DistinctSet,
     gids_buf: *std.ArrayListUnmanaged(u32),
@@ -4250,6 +4407,7 @@ fn groupChunkRowsDirectKeysProgram(
     std.debug.assert(!rows.layout.has_weight);
     const has_str = rows.layout.has_str_payload;
     const has_concat = rows.layout.has_concat;
+    const has_udf = rows.layout.has_udf;
     const has_distinct = rows.layout.distinct_slot_count > 0;
     const n = row_count;
     if (has_distinct) try gids_buf.resize(allocator, n);
@@ -4274,6 +4432,7 @@ fn groupChunkRowsDirectKeysProgram(
             try updateGroupStateProgram(states.ref(prev_gid), aggregates, rows, r);
             if (has_str) try foldGroupStr(str_states, str_arena, prev_gid, aggregates, rows, r);
             if (has_concat) try foldGroupConcat(concat_states, str_arena, prev_gid, aggregates, rows, r);
+            if (has_udf) try foldGroupUdf(udf_states, udf_arena, prev_gid, aggregates, rows, r, n);
             if (has_distinct) gids[r] = prev_gid;
             continue;
         }
@@ -4290,6 +4449,11 @@ fn groupChunkRowsDirectKeysProgram(
                 concat_states.appendAssumeCapacity([_]ConcatCell{.empty} ** MAX_GROUP_CONCAT_SLOTS);
                 try foldGroupConcat(concat_states, str_arena, new_gid, aggregates, rows, r);
             }
+            if (has_udf) {
+                udf_states.appendAssumeCapacity([_]UdfCell{.{}} ** MAX_GROUP_UDF_SLOTS);
+                try initUdfStatesRow(udf_states, udf_arena, new_gid, aggregates);
+                try foldGroupUdf(udf_states, udf_arena, new_gid, aggregates, rows, r, n);
+            }
             if (has_distinct) gids[r] = new_gid;
             prev_key = key;
             prev_gid = new_gid;
@@ -4299,6 +4463,7 @@ fn groupChunkRowsDirectKeysProgram(
         try updateGroupStateProgram(states.ref(probe.gid), aggregates, rows, r);
         if (has_str) try foldGroupStr(str_states, str_arena, probe.gid, aggregates, rows, r);
         if (has_concat) try foldGroupConcat(concat_states, str_arena, probe.gid, aggregates, rows, r);
+        if (has_udf) try foldGroupUdf(udf_states, udf_arena, probe.gid, aggregates, rows, r, n);
         if (has_distinct) gids[r] = probe.gid;
         prev_key = key;
         prev_gid = probe.gid;
@@ -4921,7 +5086,7 @@ fn drainRawDedicatedGroupLane(
         lockSpin(&bucket.agg_lock);
         if (profile) local.raw_agg_lock_ticks += nowTicks() - lock_t0;
         const g0 = if (profile) nowTicks() else 0;
-        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, &bucket.concat_states, &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), rows);
+        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, &bucket.concat_states, &bucket.udf_states, bucket.udf_arena.allocator(), &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), rows);
         bucket.row_count += rows.len();
         if (profile) group_ticks.* += nowTicks() - g0;
         bucket.agg_lock.unlock();
@@ -4939,13 +5104,17 @@ fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize
     var b = worker_index;
     const has_str = shared.group_rows_layout.has_str_payload;
     const has_concat = shared.group_rows_layout.has_concat;
+    const has_udf = shared.group_rows_layout.has_udf;
+    var udf_scratch = UdfEmitScratch{ .allocator = shared.allocator };
+    defer udf_scratch.deinit();
     while (b < shared.buckets.len) : (b += worker_count) {
         const bkt = &shared.buckets[b];
-        if (has_str) {
+        if (has_str or has_udf) {
             var gid: usize = 0;
             while (gid < bkt.states.len) : (gid += 1) {
-                var row = topRowFromStateStr(bkt.states.ref(gid), bkt.str_states.items[gid]);
+                var row = if (has_str) topRowFromStateStr(bkt.states.ref(gid), bkt.str_states.items[gid]) else topRowFromState(bkt.states.ref(gid));
                 if (has_concat) try finalizeConcatIntoRow(&row, shared.group_rows_layout.aggregates, &bkt.concat_states.items[gid], bkt.str_arena.allocator());
+                if (has_udf) try finalizeUdfIntoRow(&udf_scratch, &row, bkt, gid, shared.group_rows_layout.aggregates);
                 top_out.consider(row);
             }
         } else {
@@ -4989,6 +5158,71 @@ fn finalizeConcatIntoRow(row: *TopRow, aggregates: []const GroupAggregateSpec, c
 
 fn concatItemLess(_: void, a: ConcatItem, b: ConcatItem) bool {
     return a.order < b.order;
+}
+
+// Reusable per-UDAF scratch ColumnStores for the emit's finalize calls. One
+// store per udf_state_index, created lazily and cleared between groups so a
+// million-group emit doesn't allocate a store per group.
+const UdfEmitScratch = struct {
+    allocator: Allocator,
+    stores: [MAX_GROUP_UDF_SLOTS]?ColumnStore = [_]?ColumnStore{null} ** MAX_GROUP_UDF_SLOTS,
+
+    fn deinit(self: *UdfEmitScratch) void {
+        for (&self.stores) |*s| if (s.*) |*cs| cs.deinit(self.allocator);
+    }
+
+    fn store(self: *UdfEmitScratch, slot: usize, return_type: types_mod.Type) !*ColumnStore {
+        if (self.stores[slot] == null) self.stores[slot] = try ColumnStore.init(self.allocator, return_type, true);
+        return &self.stores[slot].?;
+    }
+};
+
+// Decode the single value a UDAF's finalize appended to its scratch store into
+// the i64 bit pattern the value slot carries (float results bit-cast through
+// f64, integer results sign-extended) — the inverse the v2 emit reads back.
+fn udfResultBits(view: ColumnView, return_type: types_mod.Type) i64 {
+    return switch (return_type) {
+        .double => @bitCast(view.data.double[0]),
+        .float => @bitCast(@as(f64, view.data.float[0])),
+        .bigint => view.data.bigint[0],
+        .int => @as(i64, view.data.int[0]),
+        .smallint => @as(i64, view.data.smallint[0]),
+        .tinyint => @as(i64, view.data.tinyint[0]),
+        .boolean => @as(i64, view.data.boolean[0]),
+        .date => @as(i64, view.data.date[0]),
+        .datetime => view.data.datetime[0],
+        .decimal64 => view.data.decimal64[0],
+        // Unreachable: the planner declines any UDAF whose return type isn't one
+        // of the above (no value slot can hold a string / 128-bit result).
+        else => 0,
+    };
+}
+
+// Finalize group `gid`'s UDAF states into `row`: each UDAF's scalar lands in
+// value slot `state_index - 1` and its presence (non-NULL) in the companion
+// slot `state_index`. The v2 emit reads those back via aggIsNull + the .udf
+// branch of appendAggregateValue.
+fn finalizeUdfIntoRow(scratch: *UdfEmitScratch, row: *TopRow, bucket: *PipeBucket, gid: usize, aggregates: []const GroupAggregateSpec) !void {
+    for (aggregates) |agg| {
+        if (!agg.is_udf) continue;
+        const entry = agg.udf_entry orelse return error.UnsupportedOperatorForType;
+        const present_slot: usize = agg.state_index;
+        const cell = &bucket.udf_states.items[gid][agg.udf_state_index];
+        if (!cell.initialized) {
+            row.slots[present_slot] = 0;
+            continue;
+        }
+        const cs = try scratch.store(agg.udf_state_index, entry.return_type);
+        cs.clear();
+        const ctx = udf_mod.AggregateContext{ .allocator = scratch.allocator, .user_data = entry.user_data };
+        try entry.finalize(&ctx, @ptrCast(cell.bytes.ptr), cs);
+        if (cs.rowCount() == 0 or !cs.view().isValid(0)) {
+            row.slots[present_slot] = 0;
+            continue;
+        }
+        row.slots[agg.state_index - 1] = udfResultBits(cs.view(), entry.return_type);
+        row.slots[present_slot] = 1;
+    }
 }
 
 fn claimScanTile(job: SiloGridJob) ?ScanTile {
@@ -5807,20 +6041,24 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const function_ticks = nowTicks() - function_t0;
     if (cfg.result_out) |out| {
         const has_str_out = cfg.group_rows_layout.has_str_payload;
+        const has_udf_out = cfg.group_rows_layout.has_udf;
+        var udf_scratch = UdfEmitScratch{ .allocator = allocator };
+        defer udf_scratch.deinit();
         if (cfg.result_all_groups) {
             const cap = cfg.result_all_groups_cap;
             const filter = cfg.result_emit_filter;
             emit_all: for (buckets) |*bucket| {
                 if (cap != 0 and out.items.len >= cap) break;
-                if (has_str_out) {
+                if (has_str_out or has_udf_out) {
                     const has_concat_out = cfg.group_rows_layout.has_concat;
                     var gid: usize = 0;
                     while (gid < bucket.states.len) : (gid += 1) {
                         if (cap != 0 and out.items.len >= cap) break :emit_all;
-                        var row = topRowFromStateStr(bucket.states.ref(gid), bucket.str_states.items[gid]);
+                        var row = if (has_str_out) topRowFromStateStr(bucket.states.ref(gid), bucket.str_states.items[gid]) else topRowFromState(bucket.states.ref(gid));
                         if (has_concat_out) try finalizeConcatIntoRow(&row, cfg.group_rows_layout.aggregates, &bucket.concat_states.items[gid], bucket.str_arena.allocator());
+                        if (has_udf_out) try finalizeUdfIntoRow(&udf_scratch, &row, bucket, gid, cfg.group_rows_layout.aggregates);
                         if (filter) |f| if (!f.pass(f.ctx, row)) continue;
-                        try ownTopRowStr(&row, allocator);
+                        if (has_str_out) try ownTopRowStr(&row, allocator);
                         try out.append(allocator, row);
                     }
                 } else {
@@ -5834,14 +6072,21 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 }
             }
         } else {
-            // The merged top-N rows borrow each survivor's bucket str bytes;
-            // re-dup into the result allocator so they survive bucket teardown.
+            // The merged top-N rows borrow each survivor's bucket str bytes (and
+            // already carry finalized UDAF slots from collectOwnedTop); re-dup
+            // the str bytes into the result allocator so they survive teardown.
             for (top.items[0..top.len]) |cand| {
                 var row = cand;
                 if (has_str_out) try ownTopRowStr(&row, allocator);
                 try out.append(allocator, row);
             }
         }
+    }
+    // Run each UDAF's `destroy` while the layout (the agg specs) is still live —
+    // bucket teardown may be deferred to another thread, where the stack-built
+    // spec slice would dangle.
+    if (cfg.group_rows_layout.has_udf) {
+        for (buckets) |*bucket| bucket.destroyUdfStates(cfg.group_rows_layout.aggregates);
     }
     if ((PROFILING and cfg.trace_timing)) {
         std.debug.print(

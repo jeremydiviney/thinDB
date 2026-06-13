@@ -548,12 +548,6 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
-    // UDAF aggregates hold opaque registry-driven per-group state the silo
-    // grid can't host; route them onto the engine-neutral UdfAggregate
-    // operator behind a V2-built (parallel) scan instead. Its `combine` hook
-    // leaves the door open to a parallel fold later.
-    if (hasUdfAgg(plan.group_by.aggs)) return try buildUdafGroupBy(input, table, plan);
-
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
     defer if (needed) |n| input.allocator.free(n);
 
@@ -634,6 +628,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .needed = needed,
         .derived = eff_derived,
         .dop = input.db.config.max_dop,
+        .udf_registry = input.udf_registry,
     };
 
     // Provably-low-cardinality group keys take the direct (scatter-free)
@@ -658,6 +653,14 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         q = try applyOutputProjection(input.allocator, q, eff_out_cols, plan.output_names);
         return q;
     }
+
+    // UDAF aggregates hold opaque registry-driven per-group state. The silo grid
+    // hosts them natively when every arg is a non-null fixed-width numeric (the
+    // fold reconstructs ColumnViews over the staged slabs); shapes it declines —
+    // string/nullable args, or a low-card route that hasn't taught the lowcard
+    // handler to combine opaque state yet — fall to the engine-neutral
+    // UdfAggregate operator behind the same V2-built (parallel) scan.
+    if (hasUdfAgg(plan.group_by.aggs)) return try buildUdafGroupBy(input, table, plan);
 
     // The silo-grid core carries fixed numeric state slots and string MIN/MAX,
     // but declines variable-state aggregates it can't hold in the group table —
