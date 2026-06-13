@@ -2981,7 +2981,28 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     var r: usize = 0;
     while (r < batch.row_count) {
         var active = &parts.raw_active_rows;
-        while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
+        // The row loop is duplicated on the (per-batch constant) validity
+        // flag so the non-nullable copy carries zero per-row validity code —
+        // this loop runs once per scanned row on every staged GROUP BY.
+        if (inputs_nullable) {
+            // The weight gate (buildWeightFoldSpecs) declines nullable inputs,
+            // so the weighted-collapse branch lives only in the other copy.
+            std.debug.assert(!layout.has_weight);
+            while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
+                const key = if (layout.hashed_key)
+                    hashGenericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], key_digests_buf[0..layout.key_columns.len], r)
+                else
+                    try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
+                const idx = active.len();
+                active.setKey(idx, key);
+                if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
+                appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
+                appendPayloadValidity(active, layout, payload_valid[0..layout.columns.len], idx, r);
+                if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
+                active.len_rows = idx + 1;
+                accepted += 1;
+            }
+        } else while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
             const key = if (layout.hashed_key)
                 hashGenericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], key_digests_buf[0..layout.key_columns.len], r)
             else
@@ -2991,6 +3012,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             // folds into the last staged row instead of appending — the run
             // ships as ONE (key, weight, partials) row. The creating row's
             // rowref is kept (any row of the run has the same key values).
+            // (The weight gate declines nullable inputs, so this branch only
+            // lives in the non-nullable copy.)
             if (layout.has_weight) {
                 if (idx > 0 and active.keyAt(idx - 1) == key) {
                     active.weightAll()[idx - 1] += 1;
@@ -3009,7 +3032,6 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             active.setKey(idx, key);
             if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
             appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
-            if (inputs_nullable) appendPayloadValidity(active, layout, payload_valid[0..layout.columns.len], idx, r);
             if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
@@ -4487,6 +4509,24 @@ fn foldGroupDistinctTyped(
     valid: ?[]const u8,
     state_index: u16,
 ) !void {
+    // Monomorphize on the validity lane: the non-nullable loop carries zero
+    // per-row validity branches.
+    if (valid) |vb| {
+        return foldGroupDistinctTypedImpl(T, true, dset, states, gids, vals, vb, state_index);
+    }
+    return foldGroupDistinctTypedImpl(T, false, dset, states, gids, vals, &.{}, state_index);
+}
+
+fn foldGroupDistinctTypedImpl(
+    comptime T: type,
+    comptime has_valid: bool,
+    dset: *DistinctSet,
+    states: *StateSlab,
+    gids: []const u32,
+    vals: []const T,
+    vb: []const u8,
+    state_index: u16,
+) !void {
     const n = gids.len;
     var r: usize = 0;
     while (r < n) : (r += 1) {
@@ -4495,7 +4535,7 @@ fn foldGroupDistinctTyped(
             const v_pf: i64 = vals[pf];
             dset.prefetchKey(DistinctSet.key(gids[pf], @bitCast(v_pf)));
         }
-        if (valid) |vb| {
+        if (has_valid) {
             if (vb[r] == 0) continue;
         }
         const v: i64 = vals[r];
@@ -4504,7 +4544,7 @@ fn foldGroupDistinctTyped(
         // skip the cache-missing set probe entirely. With a validity lane the
         // previous row may have been a skipped NULL carrying an artifact value
         // equal to this one — disable the shortcut there.
-        if (valid == null and r > 0 and gids[r] == gids[r - 1] and v == @as(i64, vals[r - 1])) continue;
+        if (!has_valid and r > 0 and gids[r] == gids[r - 1] and v == @as(i64, vals[r - 1])) continue;
         const composite = DistinctSet.key(gids[r], @bitCast(v));
         if (dset.insertNewBatch(composite)) {
             try addAggregateStateValue(states.ref(gids[r]), state_index, 1);
@@ -4776,7 +4816,33 @@ fn drainRawDedicatedStageSharedBuilders(
                     for (0..n_valid) |v| src_valid[v] = src.validAll(v);
                     const chunk_rows_n = src.len();
                     var r: usize = 0;
-                    while (r < chunk_rows_n) : (r += 1) {
+                    // Scatter loop duplicated on the (per-drain constant)
+                    // validity count: the no-validity copy — every row of
+                    // every staged chunk passes through here — carries zero
+                    // per-row validity code.
+                    if (n_valid == 0) {
+                        while (r < chunk_rows_n) : (r += 1) {
+                            const bucket_idx: usize = local.flat_bucket_ids.items[row_idx];
+                            const pos = local.flat_next[bucket_idx];
+                            flat.copyKeyFrom(kw, pos, src, r);
+                            var c: usize = 0;
+                            while (c < ncols) : (c += 1) copyElem(flat_slabs[c], src_slabs[c], col_elt[c], pos, r);
+                            if (has_rowref) flat_rowref[pos] = src_rowref[r];
+                            if (has_weight) flat_weight[pos] = src_weight[r];
+                            if (flat_has_str) {
+                                var sc: usize = 0;
+                                while (sc < flat_str_cols) : (sc += 1) {
+                                    if (src.str.isNull(flat_str_cols, r, sc)) {
+                                        local.flat_raw_rows.str.appendNull(flat_str_cols, pos, sc);
+                                    } else {
+                                        try local.flat_raw_rows.str.append(allocator, flat_str_cols, pos, sc, src.str.get(flat_str_cols, r, sc));
+                                    }
+                                }
+                            }
+                            local.flat_next[bucket_idx] = pos + 1;
+                            row_idx += 1;
+                        }
+                    } else while (r < chunk_rows_n) : (r += 1) {
                         const bucket_idx: usize = local.flat_bucket_ids.items[row_idx];
                         const pos = local.flat_next[bucket_idx];
                         flat.copyKeyFrom(kw, pos, src, r);
