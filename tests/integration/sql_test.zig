@@ -2423,6 +2423,129 @@ test "sql: JOIN feeds into WHERE + ORDER BY + LIMIT downstream" {
     try std.testing.expectEqual(@as(i32, 5), b.values[1].data.int[0]);
 }
 
+test "sql: inner JOIN supports pure range ON predicates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT r.id AS rid
+        \\FROM t AS l JOIN t AS r ON l.k < r.k
+        \\WHERE l.id = 1
+        \\ORDER BY r.id
+    );
+    defer q.deinit();
+
+    var got: std.ArrayList(i64) = .empty;
+    defer got.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try got.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &.{ 3, 4, 5 }, got.items);
+}
+
+test "sql: inner JOIN supports equi plus range ON predicates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT r.id AS rid
+        \\FROM t AS l JOIN t AS r ON l.tag = r.tag AND l.qty < r.qty
+        \\WHERE l.id = 1
+        \\ORDER BY r.id
+    );
+    defer q.deinit();
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqualSlices(i64, &.{3}, b.values[0].data.bigint[0..b.row_count]);
+}
+
+test "sql: JOIN ON equality can use side-local scalar expressions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT r.id AS rid
+        \\FROM t AS l JOIN t AS r ON lower(l.tag) = lower(r.tag)
+        \\WHERE l.id = 1
+        \\ORDER BY r.id
+    );
+    defer q.deinit();
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, b.values[0].data.bigint[0..b.row_count]);
+}
+
+test "sql: JOIN ON equality can use date arithmetic expressions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema_calendar = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "d", .type = .date },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok_calendar = [_][]const u8{"id"};
+    const cal = try db.table("calendar", schema_calendar, .{ .order_key = &ok_calendar, .unique = true, .row_group_size = 8 });
+    try cal.insert(&.{
+        .{ .id = @as(i64, 1), .d = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .d = @as(i32, 11) },
+        .{ .id = @as(i64, 3), .d = @as(i32, 15) },
+    });
+    try cal.flush();
+
+    var q = try runSql(allocator, db,
+        \\SELECT r.id AS rid
+        \\FROM calendar AS l JOIN calendar AS r ON date_add(l.d, 1) = r.d
+        \\WHERE l.id = 1
+    );
+    defer q.deinit();
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqualSlices(i64, &.{2}, b.values[0].data.bigint[0..b.row_count]);
+}
+
+test "sql: unsupported JOIN ON predicates fail clearly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(
+        thindb.sql.ParseError.SqlOnNonEquiUnsupported,
+        thindb.sql.parseDialect(arena.allocator(), "SELECT * FROM t AS a JOIN t AS b ON a.id = b.id OR a.k = b.k", .neutral),
+    );
+
+    try std.testing.expectError(
+        thindb.sql.ParseError.SqlOnNonEquiUnsupported,
+        thindb.sql.parseDialect(arena.allocator(), "SELECT * FROM t AS a JOIN t AS b ON a.k > 1", .neutral),
+    );
+
+    try std.testing.expectError(
+        thindb.sql.ParseError.SqlOnNonEquiUnsupported,
+        thindb.sql.parseDialect(arena.allocator(), "SELECT * FROM t AS a LEFT JOIN t AS b ON a.k < b.k", .neutral),
+    );
+}
+
 test "sql: three-table JOIN (A JOIN B ON ... JOIN C ON ...)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

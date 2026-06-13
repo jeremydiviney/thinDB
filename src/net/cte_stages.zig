@@ -260,7 +260,49 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
             return exec.AliasRename.create(input.allocator, q, alias);
         }
     }
+    // A single-table child whose aliased scan is wrapped (e.g. a derived ON
+    // key `lower(l.tag)` puts a Compute above the scan): the alias is no
+    // longer the direct child, so strip it from the bottom scan, compile the
+    // whole block bare, and re-qualify its output through one AliasRename.
+    // A multi-table (join-bottomed) child returns null here — its leaf scans
+    // qualify themselves through their own compileJoinChild calls.
+    if (singleAliasedScanAlias(op)) |alias| {
+        const stripped = try cloneStrippedScanAlias(input.node_arena, op);
+        var q = try compileBlock(input, stripped, map);
+        errdefer q.deinit();
+        return exec.AliasRename.create(input.allocator, q, alias);
+    }
     return compileBlock(input, op, map);
+}
+
+/// If `op` is a single-table block whose bottom is an aliased scan, return
+/// that alias; null when it bottoms out in a join (multi-table) or an
+/// unaliased / non-scan leaf.
+fn singleAliasedScanAlias(op: *const ir.Op) ?[]const u8 {
+    var cur = op;
+    while (true) {
+        switch (cur.*) {
+            .scan => |s| return s.alias,
+            .compute => |c| cur = c.upstream,
+            .filter => |f| cur = f.upstream,
+            else => return null,
+        }
+    }
+}
+
+/// Clone the single-upstream wrapper chain above an aliased scan, nulling the
+/// scan's alias so the block compiles bare; the caller re-qualifies the whole
+/// output through one AliasRename. Never mutates the shared IR node.
+fn cloneStrippedScanAlias(arena: std.mem.Allocator, op: *const ir.Op) !*ir.Op {
+    const out = try arena.create(ir.Op);
+    out.* = op.*;
+    switch (op.*) {
+        .scan => out.scan.alias = null,
+        .compute => |c| out.compute.upstream = try cloneStrippedScanAlias(arena, c.upstream),
+        .filter => |f| out.filter.upstream = try cloneStrippedScanAlias(arena, f.upstream),
+        else => unreachable,
+    }
+    return out;
 }
 
 /// Build the in-memory PgCatalogSource leaf (alias-renamed if the scan is

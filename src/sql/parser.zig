@@ -256,6 +256,21 @@ const FromTarget = struct {
     op: *ir.Op,
 };
 
+const JoinExprSide = enum { none, left, right, mixed };
+
+const JoinOnPlan = struct {
+    on: []const ir.JoinKeyPair,
+    ranges: []const ir.JoinRangePredicate,
+    left_derived: []const ir.Derived,
+    right_derived: []const ir.Derived,
+    hidden_left: []const []const u8,
+};
+
+const QualifiedJoinCol = struct {
+    side: JoinExprSide,
+    name: []const u8,
+};
+
 pub const Parser = struct {
     /// Exported so `parse_window.zig` (which takes the parser via `anytype`
     /// to avoid a circular import) can name our error set via
@@ -1836,20 +1851,35 @@ pub const Parser = struct {
 
             if (self.cur.tag != .kw_on) return ParseError.SqlExpectedJoinOn;
             try self.advance();
-            const pairs = try self.parseOnEquiJoin(left_names.items, right.name);
+            const on_plan = try self.parseOnJoin(left_names.items, right.name, jtype);
+
+            var left_op = root;
+            var right_op = right.op;
+            if (on_plan.left_derived.len > 0) {
+                left_op = try self.allocOp(.{ .compute = .{ .derived = on_plan.left_derived, .upstream = left_op } });
+            }
+            if (on_plan.right_derived.len > 0) {
+                right_op = try self.allocOp(.{ .compute = .{ .derived = on_plan.right_derived, .upstream = right_op } });
+            }
 
             root = try self.allocOp(.{ .join = .{
                 .algorithm = .auto,
                 .join_type = jtype,
-                .on = pairs,
-                .ranges = &.{},
+                .on = on_plan.on,
+                .ranges = on_plan.ranges,
                 .extra_predicate = null,
                 .skew_ratio_threshold = 0.3,
                 .skew_absolute_threshold = 20_000,
                 .skew_sample_interval = 10,
-                .left = root,
-                .right = right.op,
+                .left = left_op,
+                .right = right_op,
             } });
+            // A synthetic left-side ON expression (e.g. `ON upper(l.k) = r.k`)
+            // stages a hidden `__join_on_left_*` column the join key reads; drop
+            // it from the join output so it can't leak into `SELECT *`.
+            if (on_plan.hidden_left.len > 0) {
+                root = try self.allocOp(.{ .exclude = .{ .columns = on_plan.hidden_left, .upstream = root } });
+            }
             try left_names.append(self.arena, right.name);
         }
         return root;
@@ -2184,45 +2214,204 @@ pub const Parser = struct {
         return jtype;
     }
 
-    fn parseOnEquiJoin(
+    fn parseOnJoin(
         self: *Parser,
         left_table_names: []const []const u8,
         right_table_name: []const u8,
-    ) ParseError![]const ir.JoinKeyPair {
+        jtype: ir.JoinType,
+    ) ParseError!JoinOnPlan {
         var pairs: std.ArrayList(ir.JoinKeyPair) = .empty;
+        var ranges: std.ArrayList(ir.JoinRangePredicate) = .empty;
+        var left_derived: std.ArrayList(ir.Derived) = .empty;
+        var right_derived: std.ArrayList(ir.Derived) = .empty;
+        var hidden_left: std.ArrayList([]const u8) = .empty;
+        var synth_counter: usize = 0;
+
         while (true) {
-            // One condition: qualified.col '=' qualified.col
-            const a_tbl = try self.expectIdent();
-            try self.expect(.dot);
-            const a_col = try self.expectIdent();
-            if (self.cur.tag != .eq) return ParseError.SqlOnNonEquiUnsupported;
+            const lhs = try self.parseCallArg();
+            const op = try self.parseJoinComparisonOp();
             try self.advance();
-            const b_tbl = try self.expectIdent();
-            try self.expect(.dot);
-            const b_col = try self.expectIdent();
+            const rhs = try self.parseCallArg();
 
-            // Resolve which side each column belongs to.
-            const a_is_left = nameIn(a_tbl, left_table_names);
-            const a_is_right = std.mem.eql(u8, a_tbl, right_table_name);
-            const b_is_left = nameIn(b_tbl, left_table_names);
-            const b_is_right = std.mem.eql(u8, b_tbl, right_table_name);
-
-            const left_col_dup = try self.arena.dupe(u8, a_col);
-            const right_col_dup = try self.arena.dupe(u8, b_col);
-
-            if (a_is_left and b_is_right) {
-                try pairs.append(self.arena, .{ .left = left_col_dup, .right = right_col_dup });
-            } else if (a_is_right and b_is_left) {
-                // Swap so canonical (left, right) ordering is preserved.
-                try pairs.append(self.arena, .{ .left = right_col_dup, .right = left_col_dup });
-            } else {
-                return ParseError.SqlOnRefsUnknownTable;
-            }
+            try self.addJoinCondition(
+                lhs,
+                op,
+                rhs,
+                left_table_names,
+                right_table_name,
+                &pairs,
+                &ranges,
+                &left_derived,
+                &right_derived,
+                &hidden_left,
+                &synth_counter,
+            );
 
             if (self.cur.tag != .kw_and) break;
             try self.advance();
         }
-        return try pairs.toOwnedSlice(self.arena);
+        // OR / general boolean ON predicates aren't join keys; reject rather
+        // than silently mis-join.
+        if (self.cur.tag == .kw_or or (self.cur.tag == .pipe_pipe and self.lex.dialect == .mysql)) {
+            return ParseError.SqlOnNonEquiUnsupported;
+        }
+        // A column range join (`l.a < r.b`) only has well-defined semantics for
+        // an inner join; outer joins would need true ON-extra-predicate support.
+        if (jtype != .inner and ranges.items.len > 0) return ParseError.SqlOnNonEquiUnsupported;
+        return .{
+            .on = try pairs.toOwnedSlice(self.arena),
+            .ranges = try ranges.toOwnedSlice(self.arena),
+            .left_derived = try left_derived.toOwnedSlice(self.arena),
+            .right_derived = try right_derived.toOwnedSlice(self.arena),
+            .hidden_left = try hidden_left.toOwnedSlice(self.arena),
+        };
+    }
+
+    fn parseJoinComparisonOp(self: *Parser) ParseError!PredicateOp {
+        return switch (self.cur.tag) {
+            .eq => .eq,
+            .lt => .lt,
+            .lte => .lte,
+            .gt => .gt,
+            .gte => .gte,
+            .neq => ParseError.SqlOnNonEquiUnsupported,
+            else => ParseError.SqlExpectedToken,
+        };
+    }
+
+    fn addJoinCondition(
+        self: *Parser,
+        lhs: ir.Expr,
+        op: PredicateOp,
+        rhs: ir.Expr,
+        left_table_names: []const []const u8,
+        right_table_name: []const u8,
+        pairs: *std.ArrayList(ir.JoinKeyPair),
+        ranges: *std.ArrayList(ir.JoinRangePredicate),
+        left_derived: *std.ArrayList(ir.Derived),
+        right_derived: *std.ArrayList(ir.Derived),
+        hidden_left: *std.ArrayList([]const u8),
+        synth_counter: *usize,
+    ) ParseError!void {
+        const lhs_side = try self.joinExprSide(lhs, left_table_names, right_table_name);
+        const rhs_side = try self.joinExprSide(rhs, left_table_names, right_table_name);
+        if (lhs_side == .mixed or rhs_side == .mixed) return ParseError.SqlOnRefsUnknownTable;
+        if (lhs_side == .none or rhs_side == .none) return ParseError.SqlOnNonEquiUnsupported;
+
+        if (op == .eq) {
+            if (lhs_side == .left and rhs_side == .right) {
+                const left_name = try self.materializeJoinOperand(lhs, .left, left_derived, right_derived, hidden_left, synth_counter);
+                const right_name = try self.materializeJoinOperand(rhs, .right, left_derived, right_derived, hidden_left, synth_counter);
+                try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
+                return;
+            }
+            if (lhs_side == .right and rhs_side == .left) {
+                const left_name = try self.materializeJoinOperand(rhs, .left, left_derived, right_derived, hidden_left, synth_counter);
+                const right_name = try self.materializeJoinOperand(lhs, .right, left_derived, right_derived, hidden_left, synth_counter);
+                try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
+                return;
+            }
+            return ParseError.SqlOnRefsUnknownTable;
+        }
+
+        if (!isRangeJoinOp(op)) return ParseError.SqlOnNonEquiUnsupported;
+        if (lhs_side == .left and rhs_side == .right) {
+            try ranges.append(self.arena, .{
+                .left = try self.joinColName(lhs),
+                .op = op,
+                .right = try self.joinColName(rhs),
+            });
+            return;
+        }
+        if (lhs_side == .right and rhs_side == .left) {
+            try ranges.append(self.arena, .{
+                .left = try self.joinColName(rhs),
+                .op = reverseRangeOp(op),
+                .right = try self.joinColName(lhs),
+            });
+            return;
+        }
+        return ParseError.SqlOnRefsUnknownTable;
+    }
+
+    fn materializeJoinOperand(
+        self: *Parser,
+        expr: ir.Expr,
+        side: JoinExprSide,
+        left_derived: *std.ArrayList(ir.Derived),
+        right_derived: *std.ArrayList(ir.Derived),
+        hidden_left: *std.ArrayList([]const u8),
+        synth_counter: *usize,
+    ) ParseError![]const u8 {
+        if (expr == .col_ref) return try self.joinColName(expr);
+        const prefix: []const u8 = if (side == .left) "__join_on_left" else "__join_on_right";
+        const name = try std.fmt.allocPrint(self.arena, "{s}_{d}", .{ prefix, synth_counter.* });
+        synth_counter.* += 1;
+        const derived = ir.Derived{ .name = name, .expr = expr };
+        if (side == .left) {
+            try left_derived.append(self.arena, derived);
+            try hidden_left.append(self.arena, name);
+        } else if (side == .right) {
+            try right_derived.append(self.arena, derived);
+        } else {
+            return ParseError.SqlOnRefsUnknownTable;
+        }
+        return name;
+    }
+
+    fn joinColName(self: *Parser, expr: ir.Expr) ParseError![]const u8 {
+        if (expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
+        const q = try self.splitJoinCol(expr.col_ref, &.{}, "");
+        return try self.arena.dupe(u8, q.name);
+    }
+
+    fn joinExprSide(
+        self: *Parser,
+        expr: ir.Expr,
+        left_table_names: []const []const u8,
+        right_table_name: []const u8,
+    ) ParseError!JoinExprSide {
+        return switch (expr) {
+            .col_ref => |name| (try self.splitJoinCol(name, left_table_names, right_table_name)).side,
+            .lit, .null_lit => .none,
+            .call => |c| blk: {
+                if (!try self.joinScalarAllowed(c.fn_name)) return ParseError.SqlOnNonEquiUnsupported;
+                var side: JoinExprSide = .none;
+                for (c.args) |arg| {
+                    side = combineJoinSides(side, try self.joinExprSide(arg, left_table_names, right_table_name));
+                    if (side == .mixed) break :blk .mixed;
+                }
+                break :blk side;
+            },
+            .case, .scalar_subquery, .exists_subquery, .var_ref => ParseError.SqlOnNonEquiUnsupported,
+        };
+    }
+
+    fn splitJoinCol(
+        self: *Parser,
+        name: []const u8,
+        left_table_names: []const []const u8,
+        right_table_name: []const u8,
+    ) ParseError!QualifiedJoinCol {
+        _ = self;
+        const dot = std.mem.indexOfScalar(u8, name, '.') orelse return ParseError.SqlOnRefsUnknownTable;
+        const qualifier = name[0..dot];
+        const col = name[dot + 1 ..];
+        if (nameIn(qualifier, left_table_names)) return .{ .side = .left, .name = col };
+        if (types.columnNameEql(qualifier, right_table_name)) return .{ .side = .right, .name = col };
+        if (left_table_names.len == 0 and right_table_name.len == 0) return .{ .side = .none, .name = col };
+        return ParseError.SqlOnRefsUnknownTable;
+    }
+
+    fn joinScalarAllowed(self: *Parser, name: []const u8) ParseError!bool {
+        if (isNondeterministicFn(name)) return false;
+        if (self.udf_registry) |registry| {
+            for (registry.scalarEntries()) |entry| {
+                if (!std.ascii.eqlIgnoreCase(entry.name, name)) continue;
+                if (entry.volatility == .@"volatile") return false;
+            }
+        }
+        return true;
     }
 
     /// Parse `DELETE FROM <table> [WHERE <bool_expr>]`. The
@@ -2963,6 +3152,30 @@ fn buildWindowOp(
 }
 
 fn nameIn(needle: []const u8, names: []const []const u8) bool {
-    for (names) |n| if (std.mem.eql(u8, n, needle)) return true;
+    for (names) |n| if (types.columnNameEql(n, needle)) return true;
     return false;
+}
+
+fn combineJoinSides(a: JoinExprSide, b: JoinExprSide) JoinExprSide {
+    if (a == .mixed or b == .mixed) return .mixed;
+    if (a == .none) return b;
+    if (b == .none) return a;
+    return if (a == b) a else .mixed;
+}
+
+fn isRangeJoinOp(op: PredicateOp) bool {
+    return switch (op) {
+        .lt, .lte, .gt, .gte => true,
+        else => false,
+    };
+}
+
+fn reverseRangeOp(op: PredicateOp) PredicateOp {
+    return switch (op) {
+        .lt => .gt,
+        .lte => .gte,
+        .gt => .lt,
+        .gte => .lte,
+        else => op,
+    };
 }
