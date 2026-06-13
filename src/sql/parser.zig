@@ -871,15 +871,20 @@ pub const Parser = struct {
     ) ParseError!*ir.Op {
         const cols = try self.arena.alloc([]const u8, proj.len);
         const outputs = try self.arena.alloc(?[]const u8, proj.len);
+        const replace_on_collision = try self.arena.alloc(bool, proj.len);
         var any_output = false;
+        var any_replace = false;
         for (proj, 0..) |p, i| {
             cols[i] = try self.projectSourceName(p);
             outputs[i] = projectOutputName(p);
             if (outputs[i] != null) any_output = true;
+            replace_on_collision[i] = projectMayReplaceOutput(p);
+            if (replace_on_collision[i]) any_replace = true;
         }
         return try self.allocOp(.{ .select = .{
             .columns = cols,
             .outputs = if (any_output) outputs else null,
+            .replace_on_collision = if (any_replace) replace_on_collision else null,
             .star_skip_trailing = star_skip_trailing,
             .upstream = upstream,
         } });
@@ -900,6 +905,14 @@ pub const Parser = struct {
         return switch (p.kind) {
             .col => |c| if (types.columnNameEql(c, p.name)) null else p.name,
             else => null,
+        };
+    }
+
+    fn projectMayReplaceOutput(p: ProjItem) bool {
+        return switch (p.kind) {
+            .expr, .window => true,
+            .col => projectOutputName(p) != null,
+            else => false,
         };
     }
 

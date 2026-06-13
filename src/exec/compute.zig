@@ -244,9 +244,12 @@ pub const Compute = struct {
     /// One ColumnStore per derived column. Cleared + refilled each
     /// `next()` from the upstream batch.
     derived_cols: []ColumnStore,
+    /// For each derived column, the output slot it writes into (append
+    /// position for fresh names, the matched upstream index for renames).
+    derived_output_indices: []usize,
 
-    /// Combined output schema: upstream schema followed by derived
-    /// columns. Allocated once at create.
+    /// Combined output schema. Fresh derived names append; derived names
+    /// matching an upstream column replace that upstream output slot.
     output_schema: []Column,
     /// Reusable views slice (upstream views + derived views), sized at
     /// create. Rewired per batch.
@@ -276,29 +279,38 @@ pub const Compute = struct {
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
         for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema, udf_registry);
 
-        // Validate no duplicate derived names AND no collision with
-        // upstream column names (downstream wouldn't be able to
-        // disambiguate).
+        // Validate no duplicate derived names. Matching an upstream column
+        // name is allowed and means "replace that output slot".
         for (resolved, 0..) |r, i| {
-            for (up_schema) |uc| {
-                if (@import("../types.zig").columnNameEql(uc.name, r.name)) return Error.ComputeNameCollision;
-            }
             for (resolved[0..i]) |prior| {
                 if (@import("../types.zig").columnNameEql(prior.name, r.name)) return Error.ComputeNameCollision;
             }
         }
 
-        // Output schema = upstream + derived
-        const output_schema = try allocator.alloc(Column, up_schema.len + resolved.len);
+        // Map each derived column to its output slot: a name matching an
+        // upstream column replaces that slot; a fresh name appends.
+        const derived_output_indices = try allocator.alloc(usize, resolved.len);
+        errdefer allocator.free(derived_output_indices);
+        var append_count: usize = 0;
+        for (resolved, derived_output_indices) |r, *out_idx| {
+            if (columnIndex(up_schema, r.name)) |idx| {
+                out_idx.* = idx;
+            } else {
+                out_idx.* = up_schema.len + append_count;
+                append_count += 1;
+            }
+        }
+
+        const output_schema = try allocator.alloc(Column, up_schema.len + append_count);
         errdefer allocator.free(output_schema);
         for (up_schema, 0..) |c, i| output_schema[i] = c;
-        for (resolved, up_schema.len..) |r, i| {
+        for (resolved, derived_output_indices) |r, out_idx| {
             // Nullable: if propagates AND any input column is nullable
             // → derived is nullable. If absorbs → also nullable (the
             // function can still produce null if all inputs are null).
             // Renames inherit nullability from the source.
             const nullable = derivedNullable(r, up_schema);
-            output_schema[i] = .{ .name = r.name, .type = r.output_type, .nullable = nullable };
+            output_schema[out_idx] = .{ .name = r.name, .type = r.output_type, .nullable = nullable };
         }
 
         // One ColumnStore per derived column. Re-initialized each batch
@@ -309,7 +321,7 @@ pub const Compute = struct {
         var inited: usize = 0;
         errdefer for (derived_cols[0..inited]) |*c| c.deinit(allocator);
         for (resolved, derived_cols, 0..) |r, *col, idx| {
-            const out_col = output_schema[up_schema.len + idx];
+            const out_col = output_schema[derived_output_indices[idx]];
             col.* = try ColumnStore.init(allocator, r.output_type, out_col.nullable);
             inited += 1;
         }
@@ -325,6 +337,7 @@ pub const Compute = struct {
             .upstream = upstream,
             .derived = resolved,
             .derived_cols = derived_cols,
+            .derived_output_indices = derived_output_indices,
             .output_schema = output_schema,
             .views = views,
         };
@@ -336,6 +349,7 @@ pub const Compute = struct {
         up.deinit();
         for (self.derived_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.derived_cols);
+        self.allocator.free(self.derived_output_indices);
         for (self.derived) |r| {
             switch (r.kind) {
                 .call => |plan| freeCallPlan(self.allocator, plan),
@@ -393,7 +407,7 @@ pub const Compute = struct {
     pub fn stats(self: *Compute) exec.PipelineStats {
         var up = self.upstream.stats();
         const up_n = self.upstream.outputSchema().len;
-        const out_stats = self.arena.allocator().alloc(exec.ColStat, up_n + self.derived.len) catch return up;
+        const out_stats = self.arena.allocator().alloc(exec.ColStat, self.output_schema.len) catch return up;
         // Align to the OUTPUT schema: copy the upstream stats we have, padding
         // any the upstream didn't report (a short/empty array) with unknown so
         // indices line up. Then extend with the derived columns. Bailing here
@@ -403,8 +417,11 @@ pub const Compute = struct {
         for (out_stats[0..up_n], 0..) |*s, i| {
             s.* = if (i < up.column_stats.len) up.column_stats[i] else .{ .ndv = .unknown };
         }
-        for (self.derived, 0..) |d, i| {
-            out_stats[up_n + i] = derivedColStat(d, out_stats[0..up_n]);
+        if (out_stats.len > up_n) {
+            for (out_stats[up_n..]) |*s| s.* = .{ .ndv = .unknown };
+        }
+        for (self.derived, self.derived_output_indices) |d, out_idx| {
+            out_stats[out_idx] = derivedColStat(d, out_stats[0..up_n]);
         }
         exec.capColStats(out_stats, up.upper_rows);
         up.column_stats = out_stats;
@@ -449,7 +466,7 @@ pub const Compute = struct {
         }
 
         for (in.values, 0..) |v, i| self.views[i] = v;
-        for (self.derived_cols, in.values.len..) |c, i| self.views[i] = c.view();
+        for (self.derived_cols, self.derived_output_indices) |c, out_idx| self.views[out_idx] = c.view();
 
         return Batch{
             .schema = self.output_schema,

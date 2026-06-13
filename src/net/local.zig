@@ -1659,6 +1659,7 @@ fn appendExpandedProjectItem(
     schema: []const types.Column,
     item: []const u8,
     output: ?[]const u8,
+    replace_on_collision: bool,
 ) !void {
     if (std.mem.eql(u8, item, "*")) {
         for (schema) |c| {
@@ -1683,20 +1684,69 @@ fn appendExpandedProjectItem(
     }
 
     _ = types.findColumn(schema, item) orelse return Error.ColumnNotFound;
-    try sources.append(allocator, item);
     // Standard SQL result naming: a bare or qualified column reference
     // outputs its UNQUALIFIED name (`SELECT sub.id` and `SELECT id` over an
     // aliased source both yield a column named `id`), regardless of how the
     // upstream schema spells it (AliasRename qualifies every column).
     const bare = if (std.mem.lastIndexOfScalar(u8, item, '.')) |dot| item[dot + 1 ..] else item;
-    try outputs.append(allocator, output orelse bare);
-    try stripped.append(allocator, output == null and bare.ptr != item.ptr);
+    const output_name = output orelse bare;
+    const is_stripped = output == null and bare.ptr != item.ptr;
+    // Replace-on-collision: a derived/aliased item whose final name already
+    // exists in the partial output overwrites that slot (`SELECT *, f(x) AS x`).
+    if (replace_on_collision) {
+        for (outputs.items, 0..) |existing, out_idx| {
+            if (types.columnNameEql(existing, output_name)) {
+                sources.items[out_idx] = item;
+                outputs.items[out_idx] = output_name;
+                stripped.items[out_idx] = is_stripped;
+                return;
+            }
+        }
+    }
+    try sources.append(allocator, item);
+    try outputs.append(allocator, output_name);
+    try stripped.append(allocator, is_stripped);
+}
+
+fn projectReplaceFlag(p: ir.Op.Project, index: usize) bool {
+    if (p.replace_on_collision) |flags| {
+        if (index < flags.len) return flags[index];
+    }
+    return false;
+}
+
+fn projectTargetName(p: ir.Op.Project, index: usize) []const u8 {
+    if (p.outputs) |outs| {
+        if (outs[index]) |out| return out;
+    }
+    return p.columns[index];
+}
+
+fn projectHasReplaceTarget(p: ir.Op.Project, name: []const u8) bool {
+    for (p.columns, 0..) |_, i| {
+        if (!projectReplaceFlag(p, i)) continue;
+        if (types.columnNameEql(projectTargetName(p, i), name)) return true;
+    }
+    return false;
+}
+
+/// A trailing derived column the `*` would normally skip stays in the star
+/// expansion when a later projection item replaces it by name — otherwise the
+/// replacement would have no slot to overwrite.
+fn effectiveStarSkip(schema: []const types.Column, p: ir.Op.Project) u32 {
+    var skip: u32 = 0;
+    while (skip < p.star_skip_trailing and skip < schema.len) : (skip += 1) {
+        const idx = schema.len - 1 - skip;
+        if (!projectHasReplaceTarget(p, schema[idx].name)) break;
+    }
+    return skip;
 }
 
 pub fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Project) !Query {
     const schema = upstream.outputSchema();
     if (p.star_skip_trailing > schema.len) return Error.BadRequest;
-    const star_schema = schema[0 .. schema.len - p.star_skip_trailing];
+    const star_skip = effectiveStarSkip(schema, p);
+    const star_schema = schema[0 .. schema.len - star_skip];
 
     var sources: std.ArrayListUnmanaged([]const u8) = .empty;
     defer sources.deinit(allocator);
@@ -1708,7 +1758,7 @@ pub fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Proj
     for (p.columns, 0..) |item, i| {
         const explicit_output: ?[]const u8 = if (p.outputs) |outs| outs[i] else null;
         const expansion_schema = if (std.mem.eql(u8, item, "*") or aliasStarSource(item) != null) star_schema else schema;
-        try appendExpandedProjectItem(allocator, &sources, &outputs, &stripped, expansion_schema, item, explicit_output);
+        try appendExpandedProjectItem(allocator, &sources, &outputs, &stripped, expansion_schema, item, explicit_output, projectReplaceFlag(p, i));
     }
 
     // Unqualifying two references from different join sides can collide

@@ -895,6 +895,29 @@ test "sql: mixed star and expression projection preserves source columns first" 
     try std.testing.expectEqual(@as(i32, 11), b.values[4].data.int[0]);
 }
 
+test "sql: computed projection can replace a star-expanded source column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT *, qty + 1 AS qty FROM t ORDER BY id ASC");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(@as(usize, 4), schema.len);
+    try std.testing.expectEqualStrings("id", schema[0].name);
+    try std.testing.expectEqualStrings("k", schema[1].name);
+    try std.testing.expectEqualStrings("qty", schema[2].name);
+    try std.testing.expectEqualStrings("tag", schema[3].name);
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i32, 11), b.values[2].data.int[0]);
+    try std.testing.expectEqualStrings("a", b.values[3].data.string.rowBytes(0));
+}
+
 test "sql: alias star strips the alias prefix and qualifies colliding names" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

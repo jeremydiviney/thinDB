@@ -87,8 +87,7 @@ pub const Error = error{
     ArithmeticOverflow,
     /// Compute operator: no derived columns provided.
     ComputeNoColumns,
-    /// Compute operator: derived column name collides with an upstream
-    /// column or another derived column.
+    /// Compute/projection operator: duplicate derived/final output name.
     ComputeNameCollision,
     /// Compute operator: an expression shape not yet supported in v1
     /// (nested calls, literal-only derived).

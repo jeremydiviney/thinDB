@@ -589,6 +589,11 @@ pub const Op = union(OpTag) {
         /// Optional output names for .select. Null entries keep the
         /// resolved upstream column name. Ignored by .exclude.
         outputs: ?[]const ?[]const u8 = null,
+        /// Optional per-item replacement policy for .select. When true,
+        /// a projected item whose final name is already present in the
+        /// partial output replaces that earlier output slot. Plain duplicate
+        /// column selections leave this false and are still rejected.
+        replace_on_collision: ?[]const bool = null,
         /// Star projections expand against the upstream schema before
         /// SELECT-derived columns appended by Compute/Window. This count
         /// records how many trailing derived columns to exclude from `*`
@@ -811,6 +816,7 @@ fn freeProject(p: Op.Project, allocator: Allocator) void {
     // Only free the outer slice.
     allocator.free(p.columns);
     if (p.outputs) |outs| allocator.free(outs);
+    if (p.replace_on_collision) |flags| allocator.free(flags);
     p.upstream.deinitDecoded(allocator);
     allocator.destroy(p.upstream);
 }
@@ -1340,6 +1346,12 @@ fn encodeProject(allocator: Allocator, out: *std.ArrayList(u8), p: Op.Project) E
                 try out.append(allocator, 0);
             }
         }
+    } else {
+        try out.append(allocator, 0);
+    }
+    if (p.replace_on_collision) |flags| {
+        try out.append(allocator, 1);
+        for (flags) |flag| try out.append(allocator, if (flag) @as(u8, 1) else 0);
     } else {
         try out.append(allocator, 0);
     }
@@ -2604,12 +2616,29 @@ fn decodeProject(allocator: Allocator, bytes: []const u8, cursor: *usize) Decode
     }
     errdefer if (outputs) |outs| allocator.free(outs);
 
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const has_replace_flags = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    var replace_on_collision: ?[]const bool = null;
+    if (has_replace_flags) {
+        const flags = try allocator.alloc(bool, n_cols);
+        errdefer allocator.free(flags);
+        for (flags) |*flag| {
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            flag.* = bytes[cursor.*] != 0;
+            cursor.* += 1;
+        }
+        replace_on_collision = flags;
+    }
+    errdefer if (replace_on_collision) |flags| allocator.free(flags);
+
     const upstream = try allocator.create(Op);
     errdefer allocator.destroy(upstream);
     upstream.* = try decodeOp(allocator, bytes, cursor);
     return .{
         .columns = cols,
         .outputs = outputs,
+        .replace_on_collision = replace_on_collision,
         .star_skip_trailing = star_skip_trailing,
         .upstream = upstream,
     };

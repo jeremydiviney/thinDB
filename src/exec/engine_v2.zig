@@ -880,6 +880,10 @@ const ScanSelectPlan = struct {
     // keep the source name. Star expansion is not handled on this path, so a
     // plan with outputs never contains `*` items.
     project_outputs: ?[]const ?[]const u8 = null,
+    // Optional per-item replace-on-collision policy: a flagged item whose
+    // final name matches a star-expanded column replaces it in place instead
+    // of appending (`SELECT *, qty + 1 AS qty`).
+    project_replace: ?[]const bool = null,
     // Stacked `.exclude` ops in the scan body (plan-builder API), outermost
     // first. Applied as complement-projections after the body's Compute so a
     // later SELECT of an excluded name fails with ColumnNotFound.
@@ -895,6 +899,7 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     // order above the scan body; peel each at most once.
     var project_columns: ?[]const []const u8 = null;
     var project_outputs: ?[]const ?[]const u8 = null;
+    var project_replace: ?[]const bool = null;
     var limit: ?ir.Op.Limit = null;
     var order_by: ?ir.Op.OrderBy = null;
     while (true) {
@@ -911,6 +916,7 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
                 }
                 project_columns = p.columns;
                 project_outputs = p.outputs;
+                project_replace = p.replace_on_collision;
                 op = p.upstream;
             },
             .limit => |l| {
@@ -963,6 +969,7 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
         .limit = limit,
         .project_columns = project_columns,
         .project_outputs = project_outputs,
+        .project_replace = project_replace,
         .excludes = excludes,
         .exclude_count = exclude_count,
     };
@@ -1170,17 +1177,27 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
             // single-source block, so expansion uses the bare names.
             var names: std.ArrayListUnmanaged([]const u8) = .empty;
             defer names.deinit(allocator);
-            for (cols) |c| {
+            for (cols, 0..) |c, ci| {
                 if (std.mem.eql(u8, c, "*") or std.mem.endsWith(u8, c, ".*")) {
                     expand: for (q.outputSchema()) |col| {
+                        // A derived column appended by the block is named
+                        // explicitly by the SELECT list, so the star skips it
+                        // — UNLESS it REPLACES a source column of the same
+                        // name (Compute merged it in place), in which case it
+                        // stays at its source position and the explicit item
+                        // below is dropped.
                         for (plan.derived) |d| {
-                            if (types.columnNameEql(d.name, col.name)) continue :expand;
+                            if (types.columnNameEql(d.name, col.name) and
+                                !planReplacesName(plan, d.name)) continue :expand;
                         }
                         try names.append(allocator, col.name);
                     }
                 } else {
                     // matchScanSelect declines star lists with output
-                    // aliases, so non-star items here carry no rename.
+                    // aliases, so non-star items here carry no rename. A
+                    // replacement item whose name the star already emitted
+                    // in place is redundant — drop it.
+                    if (planItemReplaces(plan, ci) and nameAppended(names.items, c)) continue;
                     try names.append(allocator, c);
                 }
             }
@@ -1195,6 +1212,29 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
         }
     }
     return q;
+}
+
+/// Whether projection item `index` is flagged replace-on-collision.
+fn planItemReplaces(plan: ScanSelectPlan, index: usize) bool {
+    const flags = plan.project_replace orelse return false;
+    return index < flags.len and flags[index];
+}
+
+/// Whether any replace-flagged projection item targets the output name
+/// `name` (its alias, or its source column when unaliased).
+fn planReplacesName(plan: ScanSelectPlan, name: []const u8) bool {
+    const cols = plan.project_columns orelse return false;
+    for (cols, 0..) |c, i| {
+        if (!planItemReplaces(plan, i)) continue;
+        const target = if (plan.project_outputs) |outs| (outs[i] orelse c) else c;
+        if (types.columnNameEql(target, name)) return true;
+    }
+    return false;
+}
+
+fn nameAppended(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (types.columnNameEql(n, name)) return true;
+    return false;
 }
 
 fn projectedBaseColumns(
