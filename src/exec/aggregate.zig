@@ -200,7 +200,7 @@ const DistinctStr = struct {
 /// (MIN/MAX) or i128 (SUM); float/double types accumulate into f64; LARGEINT
 /// gets dedicated i128 min/max variants. The final value is cast back to the
 /// declared output column type.
-const AccState = union(enum) {
+pub const AccState = union(enum) {
     count: u64,
     sum_int: SumIntAcc,
     sum_float: SumFloatAcc,
@@ -2502,7 +2502,7 @@ fn growAggCol(aa: Allocator, col: *AggCol, func: AggFunc, in: ?Type, new_capacit
     }
 }
 
-fn initialState(func: AggFunc, in: ?Type) AccState {
+pub fn initialState(func: AggFunc, in: ?Type) AccState {
     return switch (func) {
         .count => .{ .count = 0 },
         .sum => if (in != null and in.?.isFloat())
@@ -2629,7 +2629,7 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
     };
 }
 
-fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams) !void {
+pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams) !void {
     switch (func) {
         .count => return,
         .sum, .avg, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
@@ -2713,7 +2713,7 @@ fn updateStateRow(aa: Allocator, s: *AccState, spec: AggSpec, batch: Batch, col_
     }
 }
 
-fn updateState(
+pub fn updateState(
     aa: Allocator,
     s: *AccState,
     spec: AggSpec,
@@ -3317,7 +3317,7 @@ fn avgUpdateInt(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) vo
     }
 }
 
-fn appendAccToColumn(
+pub fn appendAccToColumn(
     allocator: Allocator,
     spec: AggSpec,
     state: AccState,

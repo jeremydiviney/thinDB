@@ -216,6 +216,86 @@ test "aggregate UDF accepts multiple column arguments" {
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), batch.values[0].data.double[0], 1e-9);
 }
 
+test "aggregate UDF can mix with grouped built-in aggregates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try registerTestUdfs(db);
+    try seed(db);
+
+    var q = try runSqlWithUdfs(allocator, db,
+        \\SELECT g, sum(x) AS sx, sum_squares(x) AS ss, count(*) AS n
+        \\FROM t
+        \\GROUP BY g
+        \\ORDER BY g
+    );
+    defer q.deinit();
+
+    const batch = (try q.next()).?;
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, batch.values[0].data.int[0..batch.row_count]);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), batch.values[1].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), batch.values[1].data.double[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 13.0), batch.values[2].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 16.0), batch.values[2].data.double[1], 1e-9);
+    try std.testing.expectEqual(@as(i64, 2), batch.values[3].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 1), batch.values[3].data.bigint[1]);
+}
+
+test "aggregate UDF can mix with global built-in aggregates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try registerTestUdfs(db);
+    try seed(db);
+
+    var q = try runSqlWithUdfs(allocator, db, "SELECT count(*) AS n, weighted_avg(x, w) AS wa FROM t");
+    defer q.deinit();
+
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), batch.row_count);
+    try std.testing.expectEqual(@as(i64, 3), batch.values[0].data.bigint[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), batch.values[1].data.double[0], 1e-9);
+}
+
+test "multiple aggregate UDFs can mix with multiple built-ins" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try registerTestUdfs(db);
+    try seed(db);
+
+    var q = try runSqlWithUdfs(allocator, db,
+        \\SELECT g, max(x) AS mx, sum_squares(x) AS ss, weighted_avg(x, w) AS wa, count(*) AS n
+        \\FROM t
+        \\GROUP BY g
+        \\ORDER BY g
+    );
+    defer q.deinit();
+
+    const batch = (try q.next()).?;
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, batch.values[0].data.int[0..batch.row_count]);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), batch.values[1].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), batch.values[1].data.double[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 13.0), batch.values[2].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 16.0), batch.values[2].data.double[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 8.0 / 3.0), batch.values[3].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), batch.values[3].data.double[1], 1e-9);
+    try std.testing.expectEqual(@as(i64, 2), batch.values[4].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 1), batch.values[4].data.bigint[1]);
+}
+
 test "UDF definitions are process-local and not persisted" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -19,23 +19,43 @@ const exec = @import("exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
 const Error = exec.Error;
-const AggSpec = @import("aggregate.zig").AggSpec;
+const aggregate_mod = @import("aggregate.zig");
+const AggSpec = aggregate_mod.AggSpec;
+const AccState = aggregate_mod.AccState;
 const makeQuery = exec.makeQuery;
 
-const AggPlan = struct {
+const UdfAggPlan = struct {
     spec: AggSpec,
     entry: udf_mod.AggregateEntry,
     arg_indices: []const usize,
 };
 
-const StateSlot = struct {
+const BuiltinAggPlan = struct {
+    spec: AggSpec,
+    col_index: ?usize,
+    input_type: ?Type,
+    output_type: Type,
+};
+
+const AggPlan = union(enum) {
+    udf: UdfAggPlan,
+    builtin: BuiltinAggPlan,
+};
+
+const UdfStateSlot = struct {
     bytes: []align(16) u8,
     entry: udf_mod.AggregateEntry,
     initialized: bool = false,
 };
 
+const StateSlot = union(enum) {
+    udf: UdfStateSlot,
+    builtin: AccState,
+};
+
 pub const UdfAggregate = struct {
     allocator: Allocator,
+    state_arena: std.heap.ArenaAllocator,
     upstream: Query,
     registry: *const udf_mod.UdfRegistry,
 
@@ -71,34 +91,51 @@ pub const UdfAggregate = struct {
         const plans = try allocator.alloc(AggPlan, aggs.len);
         var plans_inited: usize = 0;
         errdefer {
-            for (plans[0..plans_inited]) |p| allocator.free(p.arg_indices);
+            for (plans[0..plans_inited]) |p| switch (p) {
+                .udf => |u| allocator.free(u.arg_indices),
+                .builtin => {},
+            };
             allocator.free(plans);
         }
         for (aggs, plans) |a, *plan| {
-            if (a.func != .udf) return Error.AggregateUnsupportedType;
-            const name = a.udf_name orelse return Error.AggregateUnsupportedType;
-            const arg_cols = if (a.udf_arg_cols.len > 0)
-                a.udf_arg_cols
-            else if (a.col) |c|
-                &[_][]const u8{c}
-            else
-                &.{};
+            if (a.func == .udf) {
+                const name = a.udf_name orelse return Error.AggregateUnsupportedType;
+                const arg_cols = if (a.udf_arg_cols.len > 0)
+                    a.udf_arg_cols
+                else if (a.col) |c|
+                    &[_][]const u8{c}
+                else
+                    &.{};
 
-            const arg_indices = try allocator.alloc(usize, arg_cols.len);
-            errdefer allocator.free(arg_indices);
-            var arg_types = try allocator.alloc(Type, arg_cols.len);
-            defer allocator.free(arg_types);
-            for (arg_cols, 0..) |col, i| {
-                const idx = types.findColumn(up_schema, col) orelse return Error.ColumnNotFound;
-                arg_indices[i] = idx;
-                arg_types[i] = up_schema[idx].type;
+                const arg_indices = try allocator.alloc(usize, arg_cols.len);
+                errdefer allocator.free(arg_indices);
+                var arg_types = try allocator.alloc(Type, arg_cols.len);
+                defer allocator.free(arg_types);
+                for (arg_cols, 0..) |col, i| {
+                    const idx = types.findColumn(up_schema, col) orelse return Error.ColumnNotFound;
+                    arg_indices[i] = idx;
+                    arg_types[i] = up_schema[idx].type;
+                }
+                const entry = registry.resolveAggregateExact(name, arg_types) orelse return Error.AggregateUnsupportedType;
+                plan.* = .{ .udf = .{
+                    .spec = a,
+                    .entry = entry,
+                    .arg_indices = arg_indices,
+                } };
+            } else {
+                const col_index: ?usize = if (a.col) |name|
+                    (types.findColumn(up_schema, name) orelse return Error.ColumnNotFound)
+                else
+                    null;
+                const input_type: ?Type = if (col_index) |idx| up_schema[idx].type else null;
+                try aggregate_mod.validateAggFn(a.func, input_type, a.params);
+                plan.* = .{ .builtin = .{
+                    .spec = a,
+                    .col_index = col_index,
+                    .input_type = input_type,
+                    .output_type = try aggregate_mod.aggOutputTypeFor(a, input_type),
+                } };
             }
-            const entry = registry.resolveAggregateExact(name, arg_types) orelse return Error.AggregateUnsupportedType;
-            plan.* = .{
-                .spec = a,
-                .entry = entry,
-                .arg_indices = arg_indices,
-            };
             plans_inited += 1;
         }
 
@@ -106,10 +143,16 @@ pub const UdfAggregate = struct {
         errdefer allocator.free(output_schema);
         for (group_col_indices, 0..) |src_idx, i| output_schema[i] = up_schema[src_idx];
         for (plans, 0..) |p, i| {
-            output_schema[group_cols.len + i] = .{
-                .name = p.spec.as,
-                .type = p.entry.return_type,
-                .nullable = true,
+            output_schema[group_cols.len + i] = switch (p) {
+                .udf => |u| .{
+                    .name = u.spec.as,
+                    .type = u.entry.return_type,
+                    .nullable = true,
+                },
+                .builtin => |b| .{
+                    .name = b.spec.as,
+                    .type = b.output_type,
+                },
             };
         }
 
@@ -129,6 +172,7 @@ pub const UdfAggregate = struct {
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
+            .state_arena = std.heap.ArenaAllocator.init(allocator),
             .upstream = upstream,
             .registry = registry,
             .group_col_indices = group_col_indices,
@@ -145,18 +189,27 @@ pub const UdfAggregate = struct {
 
     pub fn deinit(self: *UdfAggregate) void {
         for (self.states.items) |*slot| {
-            if (slot.initialized) {
-                const ctx = udf_mod.AggregateContext{ .allocator = self.allocator, .user_data = slot.entry.user_data };
-                if (slot.entry.destroy) |destroy| destroy(&ctx, @ptrCast(slot.bytes.ptr));
+            switch (slot.*) {
+                .udf => |*u| {
+                    if (u.initialized) {
+                        const ctx = udf_mod.AggregateContext{ .allocator = self.allocator, .user_data = u.entry.user_data };
+                        if (u.entry.destroy) |destroy| destroy(&ctx, @ptrCast(u.bytes.ptr));
+                    }
+                    self.allocator.free(u.bytes);
+                },
+                .builtin => {},
             }
-            self.allocator.free(slot.bytes);
         }
         self.states.deinit(self.allocator);
+        self.state_arena.deinit();
         for (self.group_keys.items) |k| self.allocator.free(k);
         self.group_keys.deinit(self.allocator);
         self.group_map.deinit(self.allocator);
         self.key_scratch.deinit(self.allocator);
-        for (self.plans) |p| self.allocator.free(p.arg_indices);
+        for (self.plans) |p| switch (p) {
+            .udf => |u| self.allocator.free(u.arg_indices),
+            .builtin => {},
+        };
         self.allocator.free(self.plans);
         self.allocator.free(self.group_col_indices);
         for (self.output_columns) |*c| c.deinit(self.allocator);
@@ -221,18 +274,25 @@ pub const UdfAggregate = struct {
         }
 
         for (self.plans) |p| {
-            const bytes = try self.allocator.alignedAlloc(u8, .@"16", p.entry.state_size);
-            errdefer self.allocator.free(bytes);
-            var slot = StateSlot{ .bytes = bytes, .entry = p.entry };
-            const ctx = udf_mod.AggregateContext{ .allocator = self.allocator, .user_data = p.entry.user_data };
-            try p.entry.init(&ctx, @ptrCast(bytes.ptr));
-            slot.initialized = true;
-            var appended = false;
-            errdefer if (!appended and slot.initialized) {
-                if (slot.entry.destroy) |destroy| destroy(&ctx, @ptrCast(slot.bytes.ptr));
-            };
-            try self.states.append(self.allocator, slot);
-            appended = true;
+            switch (p) {
+                .udf => |u| {
+                    const bytes = try self.allocator.alignedAlloc(u8, .@"16", u.entry.state_size);
+                    errdefer self.allocator.free(bytes);
+                    var slot = UdfStateSlot{ .bytes = bytes, .entry = u.entry };
+                    const ctx = udf_mod.AggregateContext{ .allocator = self.allocator, .user_data = u.entry.user_data };
+                    try u.entry.init(&ctx, @ptrCast(bytes.ptr));
+                    slot.initialized = true;
+                    var appended = false;
+                    errdefer if (!appended and slot.initialized) {
+                        if (slot.entry.destroy) |destroy| destroy(&ctx, @ptrCast(slot.bytes.ptr));
+                    };
+                    try self.states.append(self.allocator, .{ .udf = slot });
+                    appended = true;
+                },
+                .builtin => |b| {
+                    try self.states.append(self.allocator, .{ .builtin = aggregate_mod.initialState(b.spec.func, b.input_type) });
+                },
+            }
         }
         return gid;
     }
@@ -260,21 +320,44 @@ pub const UdfAggregate = struct {
 
     fn updateGroupRows(self: *UdfAggregate, gid: u32, batch: Batch, start: usize, end: usize) !void {
         for (self.plans, 0..) |p, ai| {
-            var arg_buf: [16]ColumnView = undefined;
-            if (p.arg_indices.len > arg_buf.len) return Error.AggregateUnsupportedType;
-            const args = arg_buf[0..p.arg_indices.len];
-            for (p.arg_indices, args) |idx, *v| v.* = batch.values[idx];
             const slot = &self.states.items[@as(usize, gid) * self.plans.len + ai];
-            const ctx = udf_mod.AggregateContext{ .allocator = self.allocator, .user_data = p.entry.user_data };
-            if (start == 0 and end == batch.row_count) {
-                if (p.entry.update_batch) |update_batch| {
-                    try update_batch(&ctx, @ptrCast(slot.bytes.ptr), args, batch.row_count);
-                    continue;
-                }
-            }
-            var row = start;
-            while (row < end) : (row += 1) {
-                try p.entry.update_one(&ctx, @ptrCast(slot.bytes.ptr), args, row);
+            switch (p) {
+                .udf => |u| {
+                    var arg_buf: [16]ColumnView = undefined;
+                    if (u.arg_indices.len > arg_buf.len) return Error.AggregateUnsupportedType;
+                    const args = arg_buf[0..u.arg_indices.len];
+                    for (u.arg_indices, args) |idx, *v| v.* = batch.values[idx];
+                    const udf_slot = switch (slot.*) {
+                        .udf => |*s| s,
+                        .builtin => return Error.AggregateUnsupportedType,
+                    };
+                    const ctx = udf_mod.AggregateContext{ .allocator = self.allocator, .user_data = u.entry.user_data };
+                    if (start == 0 and end == batch.row_count) {
+                        if (u.entry.update_batch) |update_batch| {
+                            try update_batch(&ctx, @ptrCast(udf_slot.bytes.ptr), args, batch.row_count);
+                            continue;
+                        }
+                    }
+                    var row = start;
+                    while (row < end) : (row += 1) {
+                        try u.entry.update_one(&ctx, @ptrCast(udf_slot.bytes.ptr), args, row);
+                    }
+                },
+                .builtin => |b| {
+                    const builtin_slot = switch (slot.*) {
+                        .builtin => |*s| s,
+                        .udf => return Error.AggregateUnsupportedType,
+                    };
+                    try aggregate_mod.updateState(
+                        self.state_arena.allocator(),
+                        builtin_slot,
+                        b.spec,
+                        batch,
+                        b.col_index,
+                        @intCast(start),
+                        @intCast(end),
+                    );
+                },
             }
         }
     }
@@ -291,10 +374,25 @@ pub const UdfAggregate = struct {
                 const out = &self.output_columns[self.group_col_indices.len + ai];
                 const before = out.rowCount();
                 const slot = &self.states.items[gid * self.plans.len + ai];
-                const ctx = udf_mod.AggregateContext{ .allocator = self.allocator, .user_data = p.entry.user_data };
-                try p.entry.finalize(&ctx, @ptrCast(slot.bytes.ptr), out);
+                switch (p) {
+                    .udf => |u| {
+                        const udf_slot = switch (slot.*) {
+                            .udf => |*s| s,
+                            .builtin => return Error.AggregateUnsupportedType,
+                        };
+                        const ctx = udf_mod.AggregateContext{ .allocator = self.allocator, .user_data = u.entry.user_data };
+                        try u.entry.finalize(&ctx, @ptrCast(udf_slot.bytes.ptr), out);
+                        try ensureFinalizeValidity(self.allocator, out, before);
+                    },
+                    .builtin => |b| {
+                        const builtin_slot = switch (slot.*) {
+                            .builtin => |s| s,
+                            .udf => return Error.AggregateUnsupportedType,
+                        };
+                        try aggregate_mod.appendAccToColumn(self.allocator, b.spec, builtin_slot, out, b.output_type, null);
+                    },
+                }
                 if (out.rowCount() != before + 1) return Error.AggregateUnsupportedType;
-                try ensureFinalizeValidity(self.allocator, out, before);
             }
         }
     }
