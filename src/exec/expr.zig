@@ -36,8 +36,8 @@ pub const Expr = union(enum) {
     /// SQL searched CASE expression. Branches evaluated in order;
     /// first branch whose `cond` is true contributes its `then`
     /// expression to the row. When no branch matches the optional
-    /// `else_branch` wins (NULL if absent). All branch `then` results
-    /// must resolve to the same type.
+    /// `else_branch` wins (NULL if absent). Branch `then` results must
+    /// resolve to one common type through implicit widening.
     case: Case,
     /// Uncorrelated scalar subquery — `(SELECT single_col FROM ...)`.
     /// The pointer is `*const ir.Op`; opaqued here to break the

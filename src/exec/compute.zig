@@ -204,6 +204,8 @@ const ResolvedDerived = struct {
 const CaseBranch = struct {
     cond: PredicateExpr,
     then_src: BranchSrc,
+    cast_kernel: ?CastKernel = null,
+    cast_buf: ?*ColumnStore = null,
 };
 
 /// Materialization source for a CASE branch's THEN (and ELSE) clause.
@@ -219,6 +221,8 @@ const BranchSrc = union(enum) {
 const CasePlan = struct {
     branches: []const CaseBranch,
     else_src: ?BranchSrc,
+    else_cast_kernel: ?CastKernel = null,
+    else_cast_buf: ?*ColumnStore = null,
     output: *ColumnStore,
     output_owned: bool,
     output_type: Type,
@@ -540,10 +544,10 @@ pub const Compute = struct {
         if (plan.branches.len > branch_views_buf.len) return Error.ComputeTooManyArgs;
         const branch_views = branch_views_buf[0..plan.branches.len];
         for (plan.branches, branch_views) |br, *bv| {
-            bv.* = try self.materializeBranchSrc(br.then_src, in_values, n);
+            bv.* = try self.materializeCaseSrc(br.then_src, br.cast_kernel, br.cast_buf, in_values, n);
         }
         var else_view: ?ColumnView = null;
-        if (plan.else_src) |es| else_view = try self.materializeBranchSrc(es, in_values, n);
+        if (plan.else_src) |es| else_view = try self.materializeCaseSrc(es, plan.else_cast_kernel, plan.else_cast_buf, in_values, n);
 
         const cond_buf = try self.allocator.alloc(bool, n);
         defer self.allocator.free(cond_buf);
@@ -581,6 +585,23 @@ pub const Compute = struct {
                 try appendCellFromView(self.allocator, plan.output, branch_views[@intCast(w)], i);
             }
         }
+    }
+
+    fn materializeCaseSrc(
+        self: *Compute,
+        s: BranchSrc,
+        cast_kernel: ?CastKernel,
+        cast_buf: ?*ColumnStore,
+        in_values: []const ColumnView,
+        n: usize,
+    ) !ColumnView {
+        const raw = try self.materializeBranchSrc(s, in_values, n);
+        const k = cast_kernel orelse return raw;
+        const buf = cast_buf.?;
+        buf.clear();
+        var one_arg = [_]ColumnView{raw};
+        try k(self.allocator, &one_arg, buf, n);
+        return buf.view();
     }
 
     fn materializeBranchSrc(self: *Compute, s: BranchSrc, in_values: []const ColumnView, n: usize) !ColumnView {
@@ -1089,10 +1110,42 @@ fn resolveDerived(
     }
 }
 
+/// CASE result branches use the scalar implicit-cast lattice to find a common
+/// output type. Branches that cannot widen to a shared type are rejected.
+fn commonCaseType(current: ?Type, next: Type) ?Type {
+    const cur = current orelse return next;
+    const cur_tag: types.TypeTag = std.meta.activeTag(cur);
+    const next_tag: types.TypeTag = std.meta.activeTag(next);
+    if (cur_tag == next_tag) return cur;
+    if (cast.castCost(cur_tag, next_tag) != null) return next;
+    if (cast.castCost(next_tag, cur_tag) != null) return cur;
+    return null;
+}
+
+fn attachCaseCast(
+    runtime_allocator: Allocator,
+    src: BranchSrc,
+    up_schema: []const Column,
+    out_type: Type,
+    cast_kernel: *?CastKernel,
+    cast_buf: *?*ColumnStore,
+) !void {
+    const src_type = branchSrcType(src, up_schema);
+    const src_tag: types.TypeTag = std.meta.activeTag(src_type);
+    const out_tag: types.TypeTag = std.meta.activeTag(out_type);
+    if (src_tag == out_tag) return;
+    const k = cast.kernelFor(src_tag, out_tag) orelse return Error.ComputeUnsupportedExpr;
+    const buf = try runtime_allocator.create(ColumnStore);
+    errdefer runtime_allocator.destroy(buf);
+    buf.* = try ColumnStore.init(runtime_allocator, out_type, branchSrcNullable(src, up_schema));
+    cast_kernel.* = k;
+    cast_buf.* = buf;
+}
+
 /// Resolve a parsed CASE expression to a CasePlan. All branches' THEN
-/// (and ELSE) results must unify to a single output type — v1 picks
-/// the first branch's type and rejects mismatches. Nested CASE in a
-/// branch's THEN is also rejected.
+/// (and ELSE) results unify to one output type via the implicit-cast
+/// lattice (`commonCaseType`); branches that can't widen to a shared type
+/// are rejected. Nested CASE in a branch's THEN is also rejected.
 fn buildCasePlan(
     runtime_allocator: Allocator,
     aa: Allocator,
@@ -1106,7 +1159,7 @@ fn buildCasePlan(
     var built: usize = 0;
     errdefer {
         var i: usize = 0;
-        while (i < built) : (i += 1) freeBranchSrc(runtime_allocator, branches[i].then_src);
+        while (i < built) : (i += 1) freeCaseBranch(runtime_allocator, branches[i]);
     }
 
     var inferred_type: ?Type = null;
@@ -1114,12 +1167,10 @@ fn buildCasePlan(
     for (cs.branches, branches) |src, *dst| {
         const then_src = try buildBranchSrc(runtime_allocator, aa, src.then, up_schema, udf_registry);
         const t = branchSrcType(then_src, up_schema);
-        if (inferred_type) |it| {
-            if (std.meta.activeTag(it) != std.meta.activeTag(t)) {
-                freeBranchSrc(runtime_allocator, then_src);
-                return Error.ComputeUnsupportedExpr;
-            }
-        } else inferred_type = t;
+        inferred_type = commonCaseType(inferred_type, t) orelse {
+            freeBranchSrc(runtime_allocator, then_src);
+            return Error.ComputeUnsupportedExpr;
+        };
         if (branchSrcNullable(then_src, up_schema)) may_null = true;
         dst.* = .{ .cond = src.cond, .then_src = then_src };
         built += 1;
@@ -1132,18 +1183,33 @@ fn buildCasePlan(
     }
 
     var else_src: ?BranchSrc = null;
+    var else_cast_kernel: ?CastKernel = null;
+    var else_cast_buf: ?*ColumnStore = null;
+    errdefer {
+        if (else_src) |es| freeBranchSrc(runtime_allocator, es);
+        if (else_cast_buf) |buf| {
+            buf.deinit(runtime_allocator);
+            runtime_allocator.destroy(buf);
+        }
+    }
     if (cs.else_branch) |eb| {
         const es = try buildBranchSrc(runtime_allocator, aa, eb.*, up_schema, udf_registry);
-        errdefer freeBranchSrc(runtime_allocator, es);
         const t = branchSrcType(es, up_schema);
-        if (inferred_type) |it| {
-            if (std.meta.activeTag(it) != std.meta.activeTag(t)) return Error.ComputeUnsupportedExpr;
-        }
+        inferred_type = commonCaseType(inferred_type, t) orelse {
+            freeBranchSrc(runtime_allocator, es);
+            return Error.ComputeUnsupportedExpr;
+        };
         if (branchSrcNullable(es, up_schema)) may_null = true;
         else_src = es;
     }
 
     const out_type = inferred_type orelse return Error.ComputeUnsupportedExpr;
+    for (branches[0..built]) |*br| {
+        try attachCaseCast(runtime_allocator, br.then_src, up_schema, out_type, &br.cast_kernel, &br.cast_buf);
+    }
+    if (else_src) |es| {
+        try attachCaseCast(runtime_allocator, es, up_schema, out_type, &else_cast_kernel, &else_cast_buf);
+    }
 
     const out_buf = try runtime_allocator.create(ColumnStore);
     errdefer runtime_allocator.destroy(out_buf);
@@ -1153,6 +1219,8 @@ fn buildCasePlan(
     plan.* = .{
         .branches = branches,
         .else_src = else_src,
+        .else_cast_kernel = else_cast_kernel,
+        .else_cast_buf = else_cast_buf,
         .output = out_buf,
         .output_owned = true,
         .output_type = out_type,
@@ -1226,9 +1294,21 @@ fn freeBranchSrc(allocator: Allocator, s: BranchSrc) void {
     }
 }
 
+fn freeCaseBranch(allocator: Allocator, branch: CaseBranch) void {
+    freeBranchSrc(allocator, branch.then_src);
+    if (branch.cast_buf) |buf| {
+        buf.deinit(allocator);
+        allocator.destroy(buf);
+    }
+}
+
 fn freeCasePlan(allocator: Allocator, plan: *CasePlan) void {
-    for (plan.branches) |br| freeBranchSrc(allocator, br.then_src);
+    for (plan.branches) |br| freeCaseBranch(allocator, br);
     if (plan.else_src) |es| freeBranchSrc(allocator, es);
+    if (plan.else_cast_buf) |buf| {
+        buf.deinit(allocator);
+        allocator.destroy(buf);
+    }
     if (plan.output_owned) {
         plan.output.deinit(allocator);
         allocator.destroy(plan.output);

@@ -1712,6 +1712,40 @@ test "sql: predicate coercion — int literal narrows to smallint inside CASE WH
     try std.testing.expectEqual(@as(i64, 2), b.values[0].data.bigint[0]);
 }
 
+test "sql: CASE result branches coerce numeric widths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    {
+        var q = try runSql(allocator, db,
+            \\SELECT CASE WHEN id = 1 THEN id ELSE 0 END AS picked FROM t ORDER BY id ASC
+        );
+        defer q.deinit();
+        const schema = q.outputSchema();
+        try std.testing.expectEqual(thindb.Type.bigint, schema[0].type);
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 5), b.row_count);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 0, 0, 0, 0 }, b.values[0].data.bigint[0..b.row_count]);
+        try std.testing.expect((try q.next()) == null);
+    }
+
+    {
+        // SUM over a bigint CASE widens to LARGEINT (i128) on this engine
+        // (overflow-safe SUM), unlike the bare bigint the branch type implies.
+        var q = try runSql(allocator, db,
+            \\SELECT SUM(CASE WHEN tag = 'a' THEN id ELSE 0 END) AS total FROM t
+        );
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(i128, 4), b.values[0].data.largeint[0]);
+    }
+}
+
 test "sql: predicate coercion — string literal parses to DATE column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
