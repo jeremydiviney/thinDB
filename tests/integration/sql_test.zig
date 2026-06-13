@@ -1695,6 +1695,34 @@ test "sql: GROUP BY an aliased plain column" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2, 1 }, counts.items);
 }
 
+test "sql: scalar expression over grouped key in aggregate projection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT concat(tag, '') AS tag_name, count(*) AS n FROM t GROUP BY tag ORDER BY tag_name ASC
+    );
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqualStrings("tag_name", schema[0].name);
+    try std.testing.expectEqualStrings("n", schema[1].name);
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+    try std.testing.expectEqualStrings("a", b.values[0].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("b", b.values[0].data.string.rowBytes(1));
+    try std.testing.expectEqualStrings("c", b.values[0].data.string.rowBytes(2));
+    try std.testing.expectEqual(@as(i64, 2), b.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[1].data.bigint[1]);
+    try std.testing.expectEqual(@as(i64, 1), b.values[1].data.bigint[2]);
+    try std.testing.expect((try q.next()) == null);
+}
+
 test "sql: non-grouped scalar expr alongside aggregate is still rejected" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1704,10 +1732,10 @@ test "sql: non-grouped scalar expr alongside aggregate is still rejected" {
     defer db.close();
     _ = try seedT(db);
 
-    // k + 1 is neither aggregated nor grouped → ambiguous.
+    // qty + 1 reads qty, which is neither aggregated nor grouped.
     try std.testing.expectError(
         error.SqlMixedAggAndPlainProjection,
-        runSql(allocator, db, "SELECT k + 1, count(*) FROM t GROUP BY k"),
+        runSql(allocator, db, "SELECT qty + 1, count(*) FROM t GROUP BY k"),
     );
 }
 
@@ -2243,7 +2271,7 @@ test "sql: nested aggregate-inside-scalar rejected" {
     try std.testing.expectError(thindb.sql.ParseError.SqlInvalidProjection, res);
 }
 
-test "sql: scalar functions disallowed alongside aggregates (v1 limit)" {
+test "sql: scalar functions over grouped keys are allowed alongside aggregates" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2252,12 +2280,20 @@ test "sql: scalar functions disallowed alongside aggregates (v1 limit)" {
     defer db.close();
     _ = try seedT(db);
 
-    // The parser currently errors when a scalar expression sits in
-    // the same SELECT list as an aggregate or a GROUP BY query.
-    const res = runSql(allocator, db,
-        \\SELECT upper(tag), count(*) FROM t GROUP BY tag
+    var q = try runSql(allocator, db,
+        \\SELECT upper(tag) AS u, count(*) AS n FROM t GROUP BY tag ORDER BY u ASC
     );
-    try std.testing.expectError(thindb.sql.ParseError.SqlMixedAggAndPlainProjection, res);
+    defer q.deinit();
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+    try std.testing.expectEqualStrings("A", b.values[0].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("B", b.values[0].data.string.rowBytes(1));
+    try std.testing.expectEqualStrings("C", b.values[0].data.string.rowBytes(2));
+    try std.testing.expectEqual(@as(i64, 2), b.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[1].data.bigint[1]);
+    try std.testing.expectEqual(@as(i64, 1), b.values[1].data.bigint[2]);
+    try std.testing.expect((try q.next()) == null);
 }
 
 // ---------------------------------------------------------------------------

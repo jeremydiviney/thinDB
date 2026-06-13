@@ -592,6 +592,26 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         order_specs = synth;
         post_sort = true;
     }
+    // ORDER BY a post-aggregate output that the core can't rank on — a
+    // collapsed/derived column (`k + 1`, `concat(tag,'')`) computed above the
+    // aggregate, not a group key or an aggregate alias. Run the core unordered
+    // and sort the (small) grouped output after the post-agg Compute builds it.
+    if (!post_sort) {
+        for (order_specs) |s| {
+            if (nameInList(plan.group_by.group_cols, s.col)) continue;
+            var is_agg = false;
+            for (plan.group_by.aggs) |a| {
+                if (types.columnNameEql(a.as, s.col)) {
+                    is_agg = true;
+                    break;
+                }
+            }
+            if (!is_agg) {
+                post_sort = true;
+                break;
+            }
+        }
+    }
 
     // Algebraic reduction for the grouped core, same as the global path:
     // collapse affine aggregates (SUM/MIN/MAX of a·col+b) onto a shared base set,
@@ -644,12 +664,16 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         // already ran inside the pipeline on the grouped columns — except in the
         // string-key-order case, which sorts the grouped output here.
         errdefer q.deinit();
+        // The post-agg Computes (affine late-materialization, collapsed/derived
+        // keys) must run BEFORE the post-sort: ORDER BY may name a column they
+        // produce. For the string-group-key post-sort the key is already in the
+        // grouped output, so sorting after the Computes is equally correct.
+        if (affine_post.len > 0) q = try q.computeWithRegistry(affine_post, input.udf_registry);
+        if (plan.post_agg_derived.len > 0) q = try q.computeWithRegistry(plan.post_agg_derived, input.udf_registry);
         if (post_sort) {
             q = try q.orderBy(order_specs);
             if (plan.limit) |l| q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
         }
-        if (affine_post.len > 0) q = try q.computeWithRegistry(affine_post, input.udf_registry);
-        if (plan.post_agg_derived.len > 0) q = try q.computeWithRegistry(plan.post_agg_derived, input.udf_registry);
         q = try applyOutputProjection(input.allocator, q, eff_out_cols, plan.output_names);
         return q;
     }

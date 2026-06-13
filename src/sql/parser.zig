@@ -511,6 +511,10 @@ pub const Parser = struct {
         // this is empty and the scalar-only path below runs unchanged.
         var group_cols: []const []const u8 = &.{};
         var grouping_key: []bool = &.{};
+        // Per-projection flag: a deterministic scalar expression over grouped
+        // output columns (e.g. `k + 1` under `GROUP BY k`) that isn't itself a
+        // grouping key — computed once per group ABOVE the aggregate.
+        var post_group_expr: []bool = &.{};
         if (distinct) {
             // SELECT DISTINCT a, b, expr ≡ SELECT a, b, expr GROUP BY 1, 2, 3:
             // every projected item becomes a grouping key (markGroupKey
@@ -529,12 +533,20 @@ pub const Parser = struct {
             const res = try self.resolveGroupBy(proj, group_exprs);
             group_cols = res.cols;
             grouping_key = res.gk;
-            // Every projection must be an aggregate or a grouping key —
-            // a plain column or scalar expression that isn't grouped is
-            // ambiguous under aggregation.
+            post_group_expr = try self.arena.alloc(bool, proj.len);
+            @memset(post_group_expr, false);
+            // Every projection must be an aggregate, a grouping key, or a
+            // deterministic scalar expression over grouped output columns.
+            // Anything that reads a non-grouped source column is ambiguous.
             for (proj, 0..) |p, i| switch (p.kind) {
                 .agg => {},
-                .col, .expr => if (!grouping_key[i]) return ParseError.SqlMixedAggAndPlainProjection,
+                .col => |c| if (!grouping_key[i] and !nameInList(c, group_cols)) return ParseError.SqlMixedAggAndPlainProjection,
+                .expr => |e| {
+                    if (!grouping_key[i]) {
+                        if (!exprAvailableAfterGroup(e, group_cols)) return ParseError.SqlMixedAggAndPlainProjection;
+                        post_group_expr[i] = true;
+                    }
+                },
                 .star, .window => return ParseError.SqlMixedAggAndPlainProjection,
             };
         }
@@ -703,6 +715,17 @@ pub const Parser = struct {
                         try collapsed_names.append(self.arena, p.name);
                         try collapsed_exprs.append(self.arena, .{ .name = p.name, .expr = e });
                     },
+                    else => {},
+                }
+            }
+            // Post-group scalar expressions (e.g. `k + 1` under `GROUP BY k`)
+            // are computed once per group above the aggregate too, but they are
+            // NOT grouping keys — they read the retained group columns and are
+            // never dropped from the group set.
+            for (proj, 0..) |p, i| {
+                if (i >= post_group_expr.len or !post_group_expr[i]) continue;
+                switch (p.kind) {
+                    .expr => |e| try collapsed_exprs.append(self.arena, .{ .name = p.name, .expr = e }),
                     else => {},
                 }
             }
@@ -2771,6 +2794,34 @@ fn isNondeterministicFn(name: []const u8) bool {
 /// deliberately narrow: `base_col OP literal`, nested arithmetic over
 /// anchors, and pure constants. The anchor set is the plain-column grouping
 /// keys (those are always retained, never collapsed onto each other).
+fn nameInList(name: []const u8, cols: []const []const u8) bool {
+    for (cols) |c| {
+        if (types.columnNameEql(name, c)) return true;
+    }
+    return false;
+}
+
+/// True when `e` is a deterministic scalar expression every column reference of
+/// which names a GROUP BY column — so it can be evaluated once per output group
+/// (above the aggregate) rather than per input row. Mirrors `exprCollapsesOnto`
+/// but keys on the GROUP BY column names directly (the expression itself is not
+/// a grouping key). CASE / subquery / var_ref bail conservatively.
+fn exprAvailableAfterGroup(e: ir.Expr, group_cols: []const []const u8) bool {
+    return switch (e) {
+        .lit => true,
+        .null_lit => true,
+        .col_ref => |name| nameInList(name, group_cols),
+        .call => |c| blk: {
+            if (isNondeterministicFn(c.fn_name)) break :blk false;
+            for (c.args) |arg| {
+                if (!exprAvailableAfterGroup(arg, group_cols)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
 fn exprCollapsesOnto(proj: []const ProjItem, grouping_key: []const bool, e: ir.Expr) bool {
     return switch (e) {
         .lit => true,
