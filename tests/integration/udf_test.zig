@@ -78,6 +78,17 @@ fn sumSquaresUpdate(
     s.total += x * x;
 }
 
+fn sumSquaresCombine(
+    ctx: *const thindb.udf.AggregateContext,
+    dst: *anyopaque,
+    src: *const anyopaque,
+) !void {
+    _ = ctx;
+    const d: *SumSquaresState = @ptrCast(@alignCast(dst));
+    const s: *const SumSquaresState = @ptrCast(@alignCast(src));
+    d.total += s.total;
+}
+
 fn sumSquaresFinalize(
     ctx: *const thindb.udf.AggregateContext,
     state: *anyopaque,
@@ -114,6 +125,18 @@ fn weightedAvgUpdate(
     s.weight_sum += w;
 }
 
+fn weightedAvgCombine(
+    ctx: *const thindb.udf.AggregateContext,
+    dst: *anyopaque,
+    src: *const anyopaque,
+) !void {
+    _ = ctx;
+    const d: *WeightedAvgState = @ptrCast(@alignCast(dst));
+    const s: *const WeightedAvgState = @ptrCast(@alignCast(src));
+    d.weighted_sum += s.weighted_sum;
+    d.weight_sum += s.weight_sum;
+}
+
 fn weightedAvgFinalize(
     ctx: *const thindb.udf.AggregateContext,
     state: *anyopaque,
@@ -122,6 +145,38 @@ fn weightedAvgFinalize(
     const s: *WeightedAvgState = @ptrCast(@alignCast(state));
     const value = if (s.weight_sum == 0.0) 0.0 else s.weighted_sum / s.weight_sum;
     try out.data.double.append(ctx.allocator, value);
+    try out.appendValidBit(ctx.allocator, out.rowCount() - 1, true);
+}
+
+// A deliberately NON-combinable UDAF (no `combine` callback): the parallel
+// reducer must decline it and route to the serial UdfAggregate fallback.
+const SumAbsState = struct { total: f64 = 0.0 };
+
+fn sumAbsInit(ctx: *const thindb.udf.AggregateContext, state: *anyopaque) !void {
+    _ = ctx;
+    const s: *SumAbsState = @ptrCast(@alignCast(state));
+    s.* = .{};
+}
+
+fn sumAbsUpdate(
+    ctx: *const thindb.udf.AggregateContext,
+    state: *anyopaque,
+    args: []const thindb.storage.ColumnView,
+    row: usize,
+) !void {
+    _ = ctx;
+    if (!args[0].isValid(row)) return;
+    const s: *SumAbsState = @ptrCast(@alignCast(state));
+    s.total += @abs(args[0].data.double[row]);
+}
+
+fn sumAbsFinalize(
+    ctx: *const thindb.udf.AggregateContext,
+    state: *anyopaque,
+    out: *thindb.engine.ColumnStore,
+) !void {
+    const s: *SumAbsState = @ptrCast(@alignCast(state));
+    try out.data.double.append(ctx.allocator, s.total);
     try out.appendValidBit(ctx.allocator, out.rowCount() - 1, true);
 }
 
@@ -141,6 +196,7 @@ fn registerTestUdfs(db: *thindb.Database) !void {
         .state_align = @alignOf(SumSquaresState),
         .init = sumSquaresInit,
         .update_one = sumSquaresUpdate,
+        .combine = sumSquaresCombine,
         .finalize = sumSquaresFinalize,
     });
     try db.registerAggregateUdf(.{
@@ -151,7 +207,19 @@ fn registerTestUdfs(db: *thindb.Database) !void {
         .state_align = @alignOf(WeightedAvgState),
         .init = weightedAvgInit,
         .update_one = weightedAvgUpdate,
+        .combine = weightedAvgCombine,
         .finalize = weightedAvgFinalize,
+    });
+    try db.registerAggregateUdf(.{
+        .name = "sum_abs",
+        .arg_types = &.{.double},
+        .return_type = .double,
+        .state_size = @sizeOf(SumAbsState),
+        .state_align = @alignOf(SumAbsState),
+        .init = sumAbsInit,
+        .update_one = sumAbsUpdate,
+        // no combine — exercises the serial fallback
+        .finalize = sumAbsFinalize,
     });
 }
 
@@ -263,6 +331,72 @@ test "aggregate UDF can mix with global built-in aggregates" {
     try std.testing.expectEqual(@as(usize, 1), batch.row_count);
     try std.testing.expectEqual(@as(i64, 3), batch.values[0].data.bigint[0]);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), batch.values[1].data.double[0], 1e-9);
+}
+
+test "global aggregate UDF folds per-lane and combines under parallelism" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // max_dop > 1 + enough flushed row-groups (row_group_size 8) routes the
+    // global UDAF through the parallel reducer's reduceParallel → mergeFrom,
+    // exercising the combine path the serial (dop=1) path never touches.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try registerTestUdfs(db);
+
+    const t = try db.table("t", schema, opts);
+    var expected_ss: f64 = 0.0;
+    var expected_wsum: f64 = 0.0;
+    var expected_w: f64 = 0.0;
+    var i: i64 = 1;
+    while (i <= 64) : (i += 1) {
+        const xf: f64 = @floatFromInt(i);
+        const wf: f64 = @floatFromInt(@mod(i, 3) + 1);
+        try t.insert(&.{.{ .id = i, .g = @as(i32, @intCast(@mod(i, 4))), .x = xf, .w = wf }});
+        expected_ss += xf * xf;
+        expected_wsum += xf * wf;
+        expected_w += wf;
+    }
+    try t.flush();
+
+    var q = try runSqlWithUdfs(allocator, db, "SELECT sum_squares(x) AS ss, weighted_avg(x, w) AS wa, count(*) AS n FROM t");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), batch.row_count);
+    try std.testing.expectApproxEqAbs(expected_ss, batch.values[0].data.double[0], 1e-6);
+    try std.testing.expectApproxEqAbs(expected_wsum / expected_w, batch.values[1].data.double[0], 1e-9);
+    try std.testing.expectEqual(@as(i64, 64), batch.values[2].data.bigint[0]);
+}
+
+test "non-combinable global UDF routes to the serial fallback and is correct" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // sum_abs has no combine; even under max_dop>1 the parallel reducer declines
+    // it (can't merge partials) and the serial UdfAggregate (parallel scan,
+    // serial fold) must produce the right answer.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try registerTestUdfs(db);
+
+    const t = try db.table("t", schema, opts);
+    var expected: f64 = 0.0;
+    var i: i64 = 1;
+    while (i <= 40) : (i += 1) {
+        const xf: f64 = if (@mod(i, 2) == 0) @floatFromInt(i) else -@as(f64, @floatFromInt(i));
+        try t.insert(&.{.{ .id = i, .g = @as(i32, 0), .x = xf, .w = @as(f64, 1.0) }});
+        expected += @abs(xf);
+    }
+    try t.flush();
+
+    var q = try runSqlWithUdfs(allocator, db, "SELECT sum_abs(x) AS sa FROM t");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectApproxEqAbs(expected, batch.values[0].data.double[0], 1e-6);
 }
 
 test "multiple aggregate UDFs can mix with multiple built-ins" {

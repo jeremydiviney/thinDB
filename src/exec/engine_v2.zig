@@ -760,12 +760,24 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
-    // Global UDAF / GROUP_CONCAT: variable-state aggregates the parallel
-    // reducer doesn't host. Route onto the engine-neutral operators behind a
-    // V2-built scan — UdfAggregate when any UDAF is present (it evaluates the
-    // built-ins alongside, the legacy contract), the generic hash Aggregate
-    // for GROUP_CONCAT-only programs.
-    if (hasUdfAgg(plan.group_by.aggs) or hasConcatAgg(plan.group_by.aggs)) {
+    // GROUP_CONCAT (no UDAF): a variable-state aggregate the parallel reducer
+    // doesn't host — route onto the engine-neutral hash Aggregate operator.
+    if (hasConcatAgg(plan.group_by.aggs) and !hasUdfAgg(plan.group_by.aggs)) {
+        return try buildGlobalOperatorAggregate(input, table, plan);
+    }
+    // Global UDAF: the parallel reducer folds each UDAF per-lane and merges them
+    // with `combine`. A non-combinable UDAF (or a UDAF mixed with GROUP_CONCAT)
+    // declines there → the serial UdfAggregate operator (parallel scan, serial
+    // fold) is the correct home, since states that can't merge can't parallelize.
+    if (hasUdfAgg(plan.group_by.aggs)) {
+        if (try v2_global_aggregate.tryBuild(input.allocator, table, .{
+            .aggs = plan.group_by.aggs,
+            .where_filter = if (plan.where_filter) |f| f.predicate else null,
+            .having_filter = if (plan.having_filter) |f| f.predicate else null,
+            .derived = plan.derived,
+            .dop = input.db.config.max_dop,
+            .udf_registry = input.udf_registry,
+        })) |q| return q;
         return try buildGlobalOperatorAggregate(input, table, plan);
     }
 

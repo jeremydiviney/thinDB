@@ -32,6 +32,7 @@ const ColumnStore = store.ColumnStore;
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
 const compute = @import("compute.zig");
+const udf_mod = @import("../udf.zig");
 const expr = @import("expr.zig");
 const Scan = @import("scan.zig").Scan;
 const HarnessCore = exec.group_topn_harness_core;
@@ -72,6 +73,10 @@ pub const Request = struct {
     // for plain column aggregates.
     derived: []const compute.Derived,
     dop: usize,
+    // Resolves UDAF aggregate names → callback entries. Null when the query has
+    // no UDAFs; a UDAF without a `combine` callback declines (it can't merge
+    // per-lane partials) and routes to the serial UdfAggregate fallback.
+    udf_registry: ?*const udf_mod.UdfRegistry = null,
 };
 
 // A scan wrapped in an optional Compute layer (for aggregate-over-expression
@@ -123,7 +128,10 @@ fn openScanSource(
     return .{ .scan = scan, .drive = drive };
 }
 
-const AggOp = enum { count_star, count_col, sum, avg, min, max, count_distinct };
+const AggOp = enum { count_star, count_col, sum, avg, min, max, count_distinct, udf };
+
+// Max numeric/typed arg columns a global-reducer UDAF accepts.
+const MAX_GLOBAL_UDF_ARGS: usize = 16;
 
 // COUNT(DISTINCT col): reuse the silo core's membership set. With a single global
 // group there's no key to partition on, so each lane builds a partial set over
@@ -166,6 +174,14 @@ const AggPlan = struct {
     dkind: DistinctKind = .int,
     output_type: Type,
     name: []const u8,
+    // User-defined aggregate. Each lane folds its row share into a private
+    // opaque state blob (`Lane.udf_states[i]`); the single-threaded merge
+    // calls `combine` to reduce the lanes (so the entry MUST provide combine —
+    // resolution declines otherwise). `finalize` writes straight into the
+    // output column. Args resolve by name from each batch's real ColumnViews.
+    is_udf: bool = false,
+    udf_entry: ?udf_mod.AggregateEntry = null,
+    udf_arg_names: []const []const u8 = &.{},
 };
 
 // A per-lane partial accumulator. Aggregate i uses `isum[i]` (integer
@@ -199,6 +215,12 @@ const Lane = struct {
     // so the fold short-circuits them on a `len == 0` check — no hash, no set
     // probe — and the one `''` value re-enters the count as +1 at finalize.
     has_blank: []bool,
+    // Per-aggregate opaque UDAF state blob (16-aligned, sized to the entry's
+    // state_size). Empty slice for non-UDAF aggregates. Each lane folds into its
+    // own; the merge reduces them via the entry's `combine`.
+    udf_states: [][]align(16) u8,
+    // Borrowed plan slice — `deinit` reads it to `destroy` the UDAF states.
+    plans: []const AggPlan = &.{},
     allocator: Allocator,
 
     fn init(allocator: Allocator, plans: []const AggPlan, parts: usize) !Lane {
@@ -215,6 +237,13 @@ const Lane = struct {
         errdefer allocator.free(distinct_counts);
         const has_blank = try allocator.alloc(bool, n);
         errdefer allocator.free(has_blank);
+        const udf_states = try allocator.alloc([]align(16) u8, n);
+        errdefer allocator.free(udf_states);
+        @memset(udf_states, &.{});
+        // Free any UDAF blobs already allocated if a later init fails. Frees
+        // only (a failed-init state has no `destroy` contract); the success path
+        // destroys them in `deinit`.
+        errdefer for (udf_states) |st| if (st.len > 0) allocator.free(st);
         const dsets = try allocator.alloc(DistinctSet, n * parts);
         @memset(isum, 0);
         @memset(fsum, 0);
@@ -229,10 +258,28 @@ const Lane = struct {
             if (p.op != .count_distinct) continue;
             for (dsets[i * parts ..][0..parts]) |*d| d.configure(distinctTier(p.dkind));
         }
-        return .{ .isum = isum, .fsum = fsum, .ns = ns, .sstr = sstr, .dsets = dsets, .parts = parts, .distinct_counts = distinct_counts, .has_blank = has_blank, .allocator = allocator };
+        // Allocate + init each UDAF's per-lane state.
+        for (plans, 0..) |p, i| {
+            if (!p.is_udf) continue;
+            const entry = p.udf_entry.?;
+            const blob = try allocator.alignedAlloc(u8, .@"16", entry.state_size);
+            udf_states[i] = blob;
+            const ctx = udf_mod.AggregateContext{ .allocator = allocator, .user_data = entry.user_data };
+            try entry.init(&ctx, @ptrCast(blob.ptr));
+        }
+        return .{ .isum = isum, .fsum = fsum, .ns = ns, .sstr = sstr, .dsets = dsets, .parts = parts, .distinct_counts = distinct_counts, .has_blank = has_blank, .udf_states = udf_states, .plans = plans, .allocator = allocator };
     }
 
     fn deinit(self: *Lane, allocator: Allocator) void {
+        for (self.plans, self.udf_states) |p, st| {
+            if (!p.is_udf or st.len == 0) continue;
+            if (p.udf_entry) |entry| if (entry.destroy) |destroy| {
+                const ctx = udf_mod.AggregateContext{ .allocator = allocator, .user_data = entry.user_data };
+                destroy(&ctx, @ptrCast(st.ptr));
+            };
+            allocator.free(st);
+        }
+        allocator.free(self.udf_states);
         for (self.sstr) |s| if (s.len > 0) allocator.free(s);
         for (self.dsets) |*d| d.deinit(allocator);
         allocator.free(self.dsets);
@@ -266,6 +313,15 @@ const Lane = struct {
     fn mergeFrom(self: *Lane, other: Lane, plans: []const AggPlan) !void {
         self.count += other.count;
         for (plans, 0..) |p, i| {
+            if (p.is_udf) {
+                // UDAFs don't track `ns`; their per-lane state always merges
+                // (an empty lane's state is the init'd identity). combine is
+                // guaranteed present — resolution declines a UDAF without it.
+                const entry = p.udf_entry.?;
+                const ctx = udf_mod.AggregateContext{ .allocator = self.allocator, .user_data = entry.user_data };
+                try entry.combine.?(&ctx, @ptrCast(self.udf_states[i].ptr), @ptrCast(other.udf_states[i].ptr));
+                continue;
+            }
             if (other.ns[i] == 0) continue;
             if (p.is_string) {
                 if (self.ns[i] == 0) {
@@ -288,8 +344,8 @@ const Lane = struct {
             const had = self.ns[i];
             self.ns[i] += other.ns[i];
             switch (p.op) {
-                // Unioned above via DistinctSet.mergeInto before this switch.
-                .count_distinct => unreachable,
+                // Distinct unioned above; UDAF combined above — both continue'd.
+                .count_distinct, .udf => unreachable,
                 .count_star, .count_col => {},
                 .sum, .avg => {
                     if (p.is_float) self.fsum[i] += other.fsum[i] else self.isum[i] += other.isum[i];
@@ -330,10 +386,33 @@ inline fn read128(v: ValueView, row: usize) u128 {
 // Each plan dispatches ONCE to a specialized kernel — the op switch and the
 // ValueView tag switch are hoisted out of the row loops, which accumulate into
 // locals and fold back at the end.
+fn foldUdfBatch(lane: *Lane, p: AggPlan, i: usize, batch: Batch) !void {
+    const entry = p.udf_entry.?;
+    var arg_buf: [MAX_GLOBAL_UDF_ARGS]ColumnView = undefined;
+    if (p.udf_arg_names.len > arg_buf.len) return error.UnsupportedQueryShape;
+    for (p.udf_arg_names, 0..) |nm, k| {
+        const ai = batch.columnIndex(nm) orelse return error.UnsupportedQueryShape;
+        arg_buf[k] = batch.values[ai];
+    }
+    const args = arg_buf[0..p.udf_arg_names.len];
+    const ctx = udf_mod.AggregateContext{ .allocator = lane.allocator, .user_data = entry.user_data };
+    const state: *anyopaque = @ptrCast(lane.udf_states[i].ptr);
+    if (entry.update_batch) |update_batch| {
+        try update_batch(&ctx, state, args, batch.row_count);
+    } else {
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) try entry.update_one(&ctx, state, args, r);
+    }
+}
+
 fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batch: Batch) !void {
     lane.count += batch.row_count;
     const n = batch.row_count;
     for (plans, 0..) |p, i| {
+        if (p.is_udf) {
+            try foldUdfBatch(lane, p, i, batch);
+            continue;
+        }
         const idx = resolved[i] orelse continue;
         const view = batch.values[idx];
         if (p.op == .count_distinct) {
@@ -365,9 +444,9 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
             continue;
         }
         switch (p.op) {
-            // count_star never resolves an input column; count_distinct and
-            // string MIN/MAX took their own paths above.
-            .count_star, .count_distinct => unreachable,
+            // count_star never resolves an input column; count_distinct, string
+            // MIN/MAX, and UDAF took their own paths above.
+            .count_star, .count_distinct, .udf => unreachable,
             .count_col => foldCountColGlobal(view, n, &lane.ns[i]),
             .sum, .avg => if (p.is_float)
                 foldSumFloatGlobal(view, n, &lane.ns[i], &lane.fsum[i])
@@ -872,6 +951,23 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                 }
                 plans[i] = .{ .op = .count_distinct, .input_name = col_name, .is_float = false, .output_type = .bigint, .name = agg.as };
             },
+            .udf => {
+                // Parallel global UDAF: each lane folds a partial, merged via
+                // `combine`. Decline (→ serial UdfAggregate) without a registry,
+                // name, or args; the combine requirement is checked in pass 2.
+                if (request.udf_registry == null) return declineFree(allocator, plans, &needed);
+                if (agg.udf_name == null or agg.udf_arg_cols.len == 0 or agg.udf_arg_cols.len > MAX_GLOBAL_UDF_ARGS) {
+                    return declineFree(allocator, plans, &needed);
+                }
+                for (agg.udf_arg_cols) |cn| {
+                    if (columnType(table, cn) != null) {
+                        _ = (try addNeeded(allocator, &needed, table, cn)) orelse return declineFree(allocator, plans, &needed);
+                    } else if (!isDerivedName(request.derived, cn)) {
+                        return declineFree(allocator, plans, &needed);
+                    }
+                }
+                plans[i] = .{ .op = .udf, .is_udf = true, .input_name = null, .is_float = false, .output_type = .bigint, .name = agg.as, .udf_arg_names = agg.udf_arg_cols };
+            },
             else => return declineFree(allocator, plans, &needed),
         }
     }
@@ -925,6 +1021,19 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                 .count_distinct => {
                     const ctyp = resolveAggInputType(table, probe_schema, agg.col.?) orelse return declineFree(allocator, plans, &needed);
                     p.dkind = distinctKindFor(ctyp);
+                },
+                .udf => {
+                    const registry = request.udf_registry.?;
+                    var arg_types: [MAX_GLOBAL_UDF_ARGS]Type = undefined;
+                    for (p.udf_arg_names, 0..) |cn, k| {
+                        arg_types[k] = resolveAggInputType(table, probe_schema, cn) orelse return declineFree(allocator, plans, &needed);
+                    }
+                    const entry = registry.resolveAggregateExact(agg.udf_name.?, arg_types[0..p.udf_arg_names.len]) orelse return declineFree(allocator, plans, &needed);
+                    // No `combine` → can't merge per-lane partials → decline to
+                    // the serial UdfAggregate fallback.
+                    if (entry.combine == null) return declineFree(allocator, plans, &needed);
+                    p.udf_entry = entry;
+                    p.output_type = entry.return_type;
                 },
                 else => {},
             }
@@ -1038,7 +1147,7 @@ const GlobalAggregate = struct {
             // SUM/AVG/MIN/MAX over zero qualifying values is SQL NULL, so
             // those outputs are nullable; the COUNT family is always 0+.
             output_schema[i] = .{ .name = p.name, .type = p.output_type, .nullable = switch (p.op) {
-                .sum, .avg, .min, .max => true,
+                .sum, .avg, .min, .max, .udf => true,
                 .count_star, .count_col, .count_distinct => false,
             } };
         }
@@ -1301,11 +1410,22 @@ const GlobalAggregate = struct {
         const a = self.allocator;
         for (self.plans, 0..) |p, i| {
             const col = &self.output_cols[i];
+            // A UDAF's finalize appends its own value (and may append its own
+            // validity bit) straight into the typed output column.
+            if (p.is_udf) {
+                const before = col.data.rowCount();
+                const entry = p.udf_entry.?;
+                const ctx = udf_mod.AggregateContext{ .allocator = a, .user_data = entry.user_data };
+                try entry.finalize(&ctx, @ptrCast(lane.udf_states[i].ptr), col);
+                try ensureFinalizeValidity(a, col, before);
+                continue;
+            }
             const row = col.data.rowCount();
             // SUM/AVG/MIN/MAX over zero qualifying (non-NULL) inputs is SQL
             // NULL — empty scan and all-NULL column alike. COUNTs stay 0.
             var is_null = false;
             switch (p.op) {
+                .udf => unreachable,
                 .count_star => try col.data.bigint.append(a, @intCast(lane.count)),
                 .count_col => try col.data.bigint.append(a, @intCast(lane.ns[i])),
                 .count_distinct => try col.data.bigint.append(a, @intCast(lane.distinct_counts[i])),
@@ -1354,6 +1474,13 @@ const GlobalAggregate = struct {
         }
     }
 };
+
+// A UDAF's finalize may or may not append its own validity bit; if it didn't,
+// backfill a `true` so the column's nulls bitmap stays rectangular.
+fn ensureFinalizeValidity(allocator: Allocator, col: *ColumnStore, row: usize) !void {
+    const nulls = col.nulls orelse return;
+    if (nulls.items.len * 8 <= row) try col.appendValidBit(allocator, row, true);
+}
 
 fn appendInt(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i128) !void {
     switch (out_type) {
