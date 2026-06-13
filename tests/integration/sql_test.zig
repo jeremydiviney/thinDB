@@ -1272,6 +1272,51 @@ test "sql: grouped SUM/AVG over BIGINT accumulate in i128 (wide two-slot state)"
     try std.testing.expect(seen_a and seen_b);
 }
 
+test "sql: ORDER BY grouped nullable string key preserves validity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "tag", .type = .string, .nullable = true },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 8 };
+    const t = try db.table("nullable_tags", schema, opts);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .tag = @as(?[]const u8, "b"), .qty = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .tag = @as(?[]const u8, "a"), .qty = @as(i32, 20) },
+        .{ .id = @as(i64, 3), .tag = @as(?[]const u8, "b"), .qty = @as(i32, 30) },
+    });
+    try t.flush();
+
+    var q = try runSql(allocator, db,
+        \\SELECT tag, count(*) AS n FROM nullable_tags GROUP BY tag ORDER BY tag ASC
+    );
+    defer q.deinit();
+    const out_schema = q.outputSchema();
+    try std.testing.expect(out_schema[0].nullable);
+
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), b.row_count);
+    try std.testing.expect(b.values[0].isValid(0));
+    try std.testing.expect(b.values[0].isValid(1));
+    try std.testing.expectEqualStrings("a", b.values[0].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("b", b.values[0].data.string.rowBytes(1));
+    try std.testing.expectEqual(@as(i64, 1), b.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[1].data.bigint[1]);
+    try std.testing.expect((try q.next()) == null);
+}
+
 test "sql: global aggregate (no GROUP BY) — count(*), avg, min, max" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
