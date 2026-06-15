@@ -297,6 +297,87 @@ pub fn crc32Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnS
     }
 }
 
+pub fn sha2Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const bits = args[1].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        switch (bits[i]) {
+            224 => {
+                var digest: [28]u8 = undefined;
+                std.crypto.hash.sha2.Sha224.hash(sv.rowBytes(i), &digest, .{});
+                const hex_str = std.fmt.bytesToHex(digest, .lower);
+                try ss.appendValue(allocator, &hex_str);
+            },
+            256, 0 => {
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(sv.rowBytes(i), &digest, .{});
+                const hex_str = std.fmt.bytesToHex(digest, .lower);
+                try ss.appendValue(allocator, &hex_str);
+            },
+            384 => {
+                var digest: [48]u8 = undefined;
+                std.crypto.hash.sha2.Sha384.hash(sv.rowBytes(i), &digest, .{});
+                const hex_str = std.fmt.bytesToHex(digest, .lower);
+                try ss.appendValue(allocator, &hex_str);
+            },
+            512 => {
+                var digest: [64]u8 = undefined;
+                std.crypto.hash.sha2.Sha512.hash(sv.rowBytes(i), &digest, .{});
+                const hex_str = std.fmt.bytesToHex(digest, .lower);
+                try ss.appendValue(allocator, &hex_str);
+            },
+            else => try ss.appendValue(allocator, ""),
+        }
+    }
+}
+
+pub fn md5sumKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    var digest: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        scratch.clearRetainingCapacity();
+        for (args) |arg| try scratch.appendSlice(allocator, stringViewOf(arg).rowBytes(i));
+        std.crypto.hash.Md5.hash(scratch.items, &digest, .{});
+        const hex_str = std.fmt.bytesToHex(digest, .lower);
+        try ss.appendValue(allocator, &hex_str);
+    }
+}
+
+pub fn murmurHash3_32Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, @intCast(std.hash.Murmur3_32.hash(sv.rowBytes(i))));
+}
+
+pub fn xxHash3_64Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const bits = std.hash.XxHash3.hash(0, sv.rowBytes(i));
+        try out.data.bigint.append(allocator, @bitCast(bits));
+    }
+}
+
+pub fn xxHash3_128Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var digest: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const lo = std.hash.XxHash3.hash(0, sv.rowBytes(i));
+        const hi = std.hash.XxHash3.hash(1, sv.rowBytes(i));
+        std.mem.writeInt(u64, digest[0..8], hi, .big);
+        std.mem.writeInt(u64, digest[8..16], lo, .big);
+        const hex_str = std.fmt.bytesToHex(digest, .lower);
+        try ss.appendValue(allocator, &hex_str);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encoding kernels — hex / base64 round-trips on string columns.
 // ---------------------------------------------------------------------------
@@ -389,6 +470,284 @@ pub fn base64DecodeKernel(allocator: Allocator, args: []const ColumnView, out: *
             continue;
         };
         try ss.appendValue(allocator, dst);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Additional string parity functions.
+// ---------------------------------------------------------------------------
+
+pub fn concatWsKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sep_sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        if (!args[0].isValid(i)) {
+            try ss.appendValue(allocator, "");
+            try out.appendValidBit(allocator, base + i, false);
+            continue;
+        }
+        const sep = sep_sv.rowBytes(i);
+        scratch.clearRetainingCapacity();
+        var appended = false;
+        for (args[1..]) |arg| {
+            if (!arg.isValid(i)) continue;
+            if (appended) try scratch.appendSlice(allocator, sep);
+            try scratch.appendSlice(allocator, stringViewOf(arg).rowBytes(i));
+            appended = true;
+        }
+        try ss.appendValue(allocator, scratch.items);
+        try out.appendValidBit(allocator, base + i, true);
+    }
+}
+
+pub fn leftKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ns = args[1].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const n: usize = if (ns[i] <= 0) 0 else @intCast(ns[i]);
+        try ss.appendValue(allocator, src[0..@min(src.len, n)]);
+    }
+}
+
+pub fn rightKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ns = args[1].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const n: usize = if (ns[i] <= 0) 0 else @intCast(ns[i]);
+        const take = @min(src.len, n);
+        try ss.appendValue(allocator, src[src.len - take ..]);
+    }
+}
+
+pub fn startsWithKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const prefix_sv = stringViewOf(args[1]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        try out.data.boolean.append(allocator, if (std.mem.startsWith(u8, sv.rowBytes(i), prefix_sv.rowBytes(i))) 1 else 0);
+    }
+}
+
+pub fn endsWithKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const suffix_sv = stringViewOf(args[1]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        try out.data.boolean.append(allocator, if (std.mem.endsWith(u8, sv.rowBytes(i), suffix_sv.rowBytes(i))) 1 else 0);
+    }
+}
+
+pub fn splitPartKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const delim_sv = stringViewOf(args[1]);
+    const idxs = args[2].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const delim = delim_sv.rowBytes(i);
+        const idx = idxs[i];
+        if (idx == 0 or delim.len == 0) {
+            try ss.appendValue(allocator, "");
+            continue;
+        }
+        if (idx > 0) {
+            var part: i32 = 1;
+            var start: usize = 0;
+            while (true) {
+                const end = std.mem.indexOfPos(u8, src, start, delim) orelse src.len;
+                if (part == idx) {
+                    try ss.appendValue(allocator, src[start..end]);
+                    break;
+                }
+                if (end == src.len) {
+                    try ss.appendValue(allocator, "");
+                    break;
+                }
+                start = end + delim.len;
+                part += 1;
+            }
+        } else {
+            var part: i32 = -1;
+            var end: usize = src.len;
+            while (true) {
+                const start = std.mem.lastIndexOf(u8, src[0..end], delim) orelse 0;
+                if (part == idx) {
+                    const lo = if (start == 0) 0 else start + delim.len;
+                    try ss.appendValue(allocator, src[lo..end]);
+                    break;
+                }
+                if (start == 0) {
+                    try ss.appendValue(allocator, "");
+                    break;
+                }
+                end = start;
+                part -= 1;
+            }
+        }
+    }
+}
+
+pub fn regexpLikeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const pattern = stringViewOf(args[1]).rowBytes(0);
+    var re = try regex.Regex.compile(allocator, pattern);
+    defer re.deinit();
+    var scratch = regex.Scratch.init(allocator);
+    defer scratch.deinit();
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const ok = try re.matchesWith(&scratch, sv.rowBytes(i), 0);
+        try out.data.boolean.append(allocator, if (ok) 1 else 0);
+    }
+}
+
+pub fn regexpSubstrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    if (row_count == 0) return;
+    if (!args[1].isValid(0)) {
+        var row: usize = 0;
+        while (row < row_count) : (row += 1) {
+            try ss.appendValue(allocator, "");
+            try out.appendValidBit(allocator, base + row, false);
+        }
+        return;
+    }
+    const pattern = stringViewOf(args[1]).rowBytes(0);
+    var re = try regex.Regex.compile(allocator, pattern);
+    defer re.deinit();
+    var scratch = regex.Scratch.init(allocator);
+    defer scratch.deinit();
+    const slots = try allocator.alloc(?usize, re.n_slots);
+    defer allocator.free(slots);
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        if (!args[0].isValid(i)) {
+            try ss.appendValue(allocator, "");
+            try out.appendValidBit(allocator, base + i, false);
+            continue;
+        }
+        @memset(slots, null);
+        const src = sv.rowBytes(i);
+        if (try re.findWith(&scratch, src, 0, slots)) {
+            const lo = slots[0] orelse 0;
+            const hi = slots[1] orelse lo;
+            try ss.appendValue(allocator, src[lo..hi]);
+            try out.appendValidBit(allocator, base + i, true);
+        } else {
+            try ss.appendValue(allocator, "");
+            try out.appendValidBit(allocator, base + i, false);
+        }
+    }
+}
+
+pub fn bitLengthKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, @intCast(sv.rowBytes(i).len * 8));
+}
+
+pub fn ordKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    return asciiKernel(allocator, args, out, row_count);
+}
+
+pub fn fieldKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const probe_sv = stringViewOf(args[0]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        var found: i32 = 0;
+        if (args[0].isValid(i)) {
+            const probe = probe_sv.rowBytes(i);
+            for (args[1..], 1..) |arg, pos| {
+                if (arg.isValid(i) and std.mem.eql(u8, probe, stringViewOf(arg).rowBytes(i))) {
+                    found = @intCast(pos);
+                    break;
+                }
+            }
+        }
+        try out.data.int.append(allocator, found);
+    }
+}
+
+pub fn findInSetKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const needle_sv = stringViewOf(args[0]);
+    const set_sv = stringViewOf(args[1]);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const needle = needle_sv.rowBytes(i);
+        const set = set_sv.rowBytes(i);
+        var idx: i32 = 1;
+        var cursor: usize = 0;
+        var found: i32 = 0;
+        while (cursor <= set.len) : (idx += 1) {
+            const end = std.mem.indexOfScalarPos(u8, set, cursor, ',') orelse set.len;
+            if (std.mem.eql(u8, needle, set[cursor..end])) {
+                found = idx;
+                break;
+            }
+            if (end == set.len) break;
+            cursor = end + 1;
+        }
+        try out.data.int.append(allocator, found);
+    }
+}
+
+pub fn initcapKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const dst = try allocator.alloc(u8, src.len);
+        defer allocator.free(dst);
+        var new_word = true;
+        for (src, dst) |b, *d| {
+            if (std.ascii.isAlphanumeric(b)) {
+                d.* = if (new_word) std.ascii.toUpper(b) else std.ascii.toLower(b);
+                new_word = false;
+            } else {
+                d.* = b;
+                new_word = true;
+            }
+        }
+        try ss.appendValue(allocator, dst);
+    }
+}
+
+pub fn translateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const from_sv = stringViewOf(args[1]);
+    const to_sv = stringViewOf(args[2]);
+    const ss = stringStoreOf(out);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const src = sv.rowBytes(i);
+        const from = from_sv.rowBytes(i);
+        const to = to_sv.rowBytes(i);
+        scratch.clearRetainingCapacity();
+        for (src) |b| {
+            if (std.mem.indexOfScalar(u8, from, b)) |idx| {
+                if (idx < to.len) try scratch.append(allocator, to[idx]);
+            } else {
+                try scratch.append(allocator, b);
+            }
+        }
+        try ss.appendValue(allocator, scratch.items);
     }
 }
 
