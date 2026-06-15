@@ -8,11 +8,16 @@
 const std = @import("std");
 const thindb = @import("thindb");
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 const CUTS = [_]i64{ 3922, 3968, 46626, 99171, 117946, 132069, 170852, 194561, 206805, 229578, 245449 };
 const N: usize = CUTS.len + 1; // 12 shards
 
-const BASE = "SELECT CounterID, AVG(length(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> ''";
-const TAIL = "GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25";
+// Int-only variant: no URL/length() → no FSST string decode, no per-block string
+// allocs. Isolates whether the concurrent serialization is in the string-decode
+// path. WHERE CounterID >= 0 is always true (keeps buildSql's `AND` append valid).
+const BASE = "SELECT CounterID, COUNT(*) AS c FROM hits WHERE CounterID >= 0";
+const TAIL = "GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY c DESC LIMIT 25";
 
 const Shard = struct {
     db: *thindb.Database,
@@ -63,7 +68,11 @@ pub fn main(init: std.process.Init) !u8 {
 
     var data_root = try std.Io.Dir.cwd().createDirPathOpen(io, ".clickbench-db", .{});
     defer data_root.close(io);
-    const catalog = try thindb.Catalog.open(gpa, io, data_root, .{ .max_dop = 1 });
+    // max_dop from env SEP_DOP (default 1). With SEP_DOP=12 the "full" line is
+    // the silo running in THIS process (apples-to-apples vs the shards).
+    var dop: usize = 1;
+    if (getenv("SEP_DOP")) |p| dop = std.fmt.parseInt(usize, std.mem.span(p), 10) catch 1;
+    const catalog = try thindb.Catalog.open(gpa, io, data_root, .{ .max_dop = dop, .memory_budget = 0, .query_memory_budget = 0 });
     defer catalog.close();
     const db = catalog.database("clickbench_fsst") orelse {
         std.debug.print("clickbench_fsst not found\n", .{});
