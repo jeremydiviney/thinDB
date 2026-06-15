@@ -12,6 +12,8 @@ const simd = @import("../util/simd.zig");
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
 
+var random_seed_counter = std.atomic.Value(u64).init(0);
+
 // ---------------------------------------------------------------------------
 // Core math: abs / ceil / floor / round / sign / mod / pow / sqrt / exp /
 // ln / log10 / log2 / greatest / least.
@@ -310,6 +312,234 @@ pub fn leastDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *C
     const b = args[1].data.double;
     var i: usize = 0;
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, @min(a[i], b[i]));
+}
+
+// ---------------------------------------------------------------------------
+// Expanded math parity: trig, log(base,x), nullary constants/random, round
+// with scale, positive modulo, bit helpers, binary/base conversion.
+// ---------------------------------------------------------------------------
+
+pub fn sinKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @sin(s[i]));
+}
+
+pub fn cosKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @cos(s[i]));
+}
+
+pub fn tanKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @tan(s[i]));
+}
+
+pub fn asinKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.asin(s[i]));
+}
+
+pub fn acosKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.acos(s[i]));
+}
+
+pub fn atanKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.atan(s[i]));
+}
+
+pub fn cotKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, 1.0 / @tan(s[i]));
+}
+
+pub fn cbrtKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.cbrt(s[i]));
+}
+
+pub fn piKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    _ = args;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.pi);
+}
+
+pub fn randomKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    _ = args;
+    var prng = std.Random.DefaultPrng.init(random_seed_counter.fetchAdd(1, .monotonic) +% 1);
+    const random = prng.random();
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, random.float(f64));
+}
+
+pub fn logBaseKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = args[0].data.double;
+    const x = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @log(x[i]) / @log(base[i]));
+}
+
+pub fn roundScaleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const x = args[0].data.double;
+    const d = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const scale = std.math.pow(f64, 10.0, @floatFromInt(d[i]));
+        try out.data.double.append(allocator, @round(x[i] * scale) / scale);
+    }
+}
+
+pub fn fmodKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.double;
+    const b = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @mod(a[i], b[i]));
+}
+
+pub fn pmodIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.int;
+    const b = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const r: i32 = if (b[i] == 0) 0 else @mod(a[i], b[i]);
+        try out.data.int.append(allocator, r);
+    }
+}
+
+pub fn pmodBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.bigint;
+    const b = args[1].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const r: i64 = if (b[i] == 0) 0 else @mod(a[i], b[i]);
+        try out.data.bigint.append(allocator, r);
+    }
+}
+
+pub fn squareKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, s[i] * s[i]);
+}
+
+pub fn bitCountIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, @intCast(@popCount(@as(u32, @bitCast(s[i])))));
+}
+
+pub fn bitCountBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, @intCast(@popCount(@as(u64, @bitCast(s[i])))));
+}
+
+fn appendUnsignedBase(allocator: Allocator, ss: anytype, value: u128, base: u8) !void {
+    const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    var v = value;
+    if (v == 0) {
+        buf[buf.len - 1] = '0';
+        n = 1;
+    } else {
+        while (v != 0) : (n += 1) {
+            const b128: u128 = base;
+            const rem: usize = @intCast(v % b128);
+            buf[buf.len - 1 - n] = digits[rem];
+            v /= b128;
+        }
+    }
+    try ss.appendValue(allocator, buf[buf.len - n ..]);
+}
+
+pub fn binIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const value: u128 = if (s[i] < 0) @as(u128, @as(u32, @bitCast(s[i]))) else @intCast(s[i]);
+        try appendUnsignedBase(allocator, ss, value, 2);
+    }
+}
+
+pub fn binBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const value: u128 = if (s[i] < 0) @as(u128, @as(u64, @bitCast(s[i]))) else @intCast(s[i]);
+        try appendUnsignedBase(allocator, ss, value, 2);
+    }
+}
+
+fn digitValue(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'z' => 10 + (c - 'a'),
+        'A'...'Z' => 10 + (c - 'A'),
+        else => null,
+    };
+}
+
+fn parseUnsignedBase(bytes: []const u8, base: u8) ?u128 {
+    if (base < 2 or base > 36) return null;
+    var v: u128 = 0;
+    var saw = false;
+    for (bytes) |c| {
+        const d = digitValue(c) orelse return null;
+        if (d >= base) return null;
+        v = v * @as(u128, base) + @as(u128, d);
+        saw = true;
+    }
+    return if (saw) v else null;
+}
+
+pub fn convStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const from_bases = args[1].data.int;
+    const to_bases = args[2].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const fb = from_bases[i];
+        const tb = to_bases[i];
+        if (fb < 2 or fb > 36 or tb < 2 or tb > 36) {
+            try ss.appendValue(allocator, "");
+            continue;
+        }
+        const v = parseUnsignedBase(sv.rowBytes(i), @intCast(fb)) orelse {
+            try ss.appendValue(allocator, "");
+            continue;
+        };
+        try appendUnsignedBase(allocator, ss, v, @intCast(tb));
+    }
+}
+
+pub fn convBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const values = args[0].data.bigint;
+    const _from_bases = args[1].data.int;
+    const to_bases = args[2].data.int;
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        _ = _from_bases[i];
+        const tb = to_bases[i];
+        if (tb < 2 or tb > 36 or values[i] < 0) {
+            try ss.appendValue(allocator, "");
+            continue;
+        }
+        try appendUnsignedBase(allocator, ss, @intCast(values[i]), @intCast(tb));
+    }
 }
 
 // ---------------------------------------------------------------------------
