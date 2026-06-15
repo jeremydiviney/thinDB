@@ -876,6 +876,39 @@ fn handleChangeUser(
     try handshake.sendOkPacketStatus(allocator, w, 1, 0, 0, session.transactionStatus());
 }
 
+extern "c" fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+fn setProcessEnv(allocator: Allocator, name: []const u8, value: []const u8) !void {
+    const name_z = try allocator.dupeZ(u8, name);
+    defer allocator.free(name_z);
+    const value_z = try allocator.dupeZ(u8, value);
+    defer allocator.free(value_z);
+    if (@import("builtin").os.tag == .windows) {
+        _ = _putenv_s(name_z.ptr, value_z.ptr);
+    } else {
+        _ = setenv(name_z.ptr, value_z.ptr, 1);
+    }
+}
+
+/// Bench-only hot-switch: `SET THINDB_<NAME> = <value>` mutates the server
+/// PROCESS env in place, so the next query's `paramsFromEnv` (`getenv`, read
+/// per query) sees the new tunable without a restart — the config sweep cycles
+/// values on one warm server. Scoped to the `THINDB_` prefix so it never
+/// shadows a real session `SET`.
+fn trySetThindbEnvVar(allocator: Allocator, payload: []const u8) !bool {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n;");
+    if (trimmed.len < 4 or !std.ascii.eqlIgnoreCase(trimmed[0..4], "SET ")) return false;
+    const rest = std.mem.trimStart(u8, trimmed[4..], " \t");
+    if (rest.len < 7 or !std.ascii.eqlIgnoreCase(rest[0..7], "THINDB_")) return false;
+    const eq = std.mem.indexOfScalar(u8, rest, '=') orelse return false;
+    const name = std.mem.trim(u8, rest[0..eq], " \t");
+    const value = std.mem.trim(u8, rest[eq + 1 ..], " \t'\"");
+    if (name.len == 0 or value.len == 0) return false;
+    try setProcessEnv(allocator, name, value);
+    return true;
+}
+
 fn handleQuery(
     allocator: Allocator,
     w: *std.Io.Writer,
@@ -886,6 +919,11 @@ fn handleQuery(
 ) !void {
     var seq_id: u8 = 1;
     const caps = session.client_caps;
+
+    if (try trySetThindbEnvVar(allocator, payload)) {
+        try handshake.sendOkPacketStatus(allocator, w, seq_id, 0, 0, session.transactionStatus());
+        return;
+    }
 
     // Transaction verbs are handled before the canned matcher so the
     // OK packet carries the freshly-flipped SERVER_STATUS_IN_TRANS bit.
