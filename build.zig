@@ -127,6 +127,7 @@ pub fn build(b: *std.Build) void {
     });
     thindb_fast.linkLibrary(fast_zstd.artifact("zstd"));
     thindb_fast.linkLibrary(lz4_dep.artifact("lz4"));
+    thindb_fast.addOptions("build_options", build_opts);
 
     // ---- Benchmarks: bench/main.zig ----------------------------------------
     const bench_mod = b.createModule(.{
@@ -237,6 +238,19 @@ pub fn build(b: *std.Build) void {
     run_probe.step.dependOn(b.getInstallStep());
     const probe_step = b.step("probe", "Open .clickbench-db and dump discovered databases/schemas");
     probe_step.dependOn(&run_probe.step);
+
+    // ---- ClickBench separability harness: bench/clickbench/sep_harness.zig --
+    const sep_mod = b.createModule(.{
+        .root_source_file = b.path("bench/clickbench/sep_harness.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    sep_mod.addImport("thindb", thindb_fast);
+    const sep_exe = b.addExecutable(.{ .name = "thindb_sep_harness", .root_module = sep_mod });
+    const run_sep = b.addRunArtifact(sep_exe);
+    if (b.args) |args| run_sep.addArgs(args);
+    const sep_step = b.step("sep-harness", "Range-separability harness: 12 DOP1 CounterID-range shards, sequential vs concurrent");
+    sep_step.dependOn(&run_sep.step);
 
     // ---- thindb-server executable: standalone multi-wire server -------------
     const server_mod = b.createModule(.{
