@@ -87,11 +87,30 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
     .{ .name = "min", .func = .min },
     .{ .name = "max", .func = .max },
     .{ .name = "avg", .func = .avg },
+    .{ .name = "count_if", .func = .count_if },
+    .{ .name = "countif", .func = .count_if },
+    .{ .name = "bool_and", .func = .bool_and },
+    .{ .name = "bool_or", .func = .bool_or },
+    .{ .name = "any_value", .func = .any_value },
+    .{ .name = "first", .func = .first },
+    .{ .name = "last", .func = .last },
+    .{ .name = "bit_and", .func = .bit_and },
+    .{ .name = "bit_or", .func = .bit_or },
+    .{ .name = "bit_xor", .func = .bit_xor },
+    .{ .name = "std", .func = .stddev_samp },
+    .{ .name = "stddev", .func = .stddev_samp },
     .{ .name = "stddev_pop", .func = .stddev_pop },
     .{ .name = "stddev_samp", .func = .stddev_samp },
     .{ .name = "var_pop", .func = .var_pop },
     .{ .name = "var_samp", .func = .var_samp },
+    .{ .name = "variance", .func = .var_samp },
+    .{ .name = "variance_pop", .func = .var_pop },
+    .{ .name = "variance_samp", .func = .var_samp },
     .{ .name = "count_distinct", .func = .count_distinct },
+    .{ .name = "approx_count_distinct", .func = .count_distinct },
+    .{ .name = "percentile_cont", .func = .percentile },
+    .{ .name = "percentile", .func = .percentile },
+    .{ .name = "median", .func = .percentile },
     .{ .name = "group_concat", .func = .group_concat },
     .{ .name = "string_agg", .func = .group_concat },
 };
@@ -113,6 +132,17 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .min => "min",
         .max => "max",
         .avg => "avg",
+        .count_if => "count_if",
+        .bool_and => "bool_and",
+        .bool_or => "bool_or",
+        .any_value => "any_value",
+        .first => "first",
+        .last => "last",
+        .bit_and => "bit_and",
+        .bit_or => "bit_or",
+        .bit_xor => "bit_xor",
+        .sum_distinct => "sum",
+        .avg_distinct => "avg",
         .stddev_pop => "stddev_pop",
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
@@ -132,8 +162,31 @@ fn explainFormatFromName(name: []const u8) ir.ExplainFormat {
 /// wall-clock instead of treating them as column references.
 fn bareTemporalFn(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "current_timestamp")) return "current_timestamp";
+    if (std.ascii.eqlIgnoreCase(name, "localtimestamp")) return "localtimestamp";
+    if (std.ascii.eqlIgnoreCase(name, "utc_timestamp")) return "utc_timestamp";
+    if (std.ascii.eqlIgnoreCase(name, "current_time")) return "current_time";
+    if (std.ascii.eqlIgnoreCase(name, "curtime")) return "curtime";
+    if (std.ascii.eqlIgnoreCase(name, "localtime")) return "localtime";
     if (std.ascii.eqlIgnoreCase(name, "current_date")) return "current_date";
+    if (std.ascii.eqlIgnoreCase(name, "curdate")) return "curdate";
+    if (std.ascii.eqlIgnoreCase(name, "utc_date")) return "utc_date";
     return null;
+}
+
+fn keywordScalarName(tag: TokenTag) ?[]const u8 {
+    return switch (tag) {
+        .kw_replace => "replace",
+        .kw_if => "if",
+        .kw_left => "left",
+        .kw_right => "right",
+        else => null,
+    };
+}
+
+fn unitFirstArgCall(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "date_diff") or
+        std.ascii.eqlIgnoreCase(name, "timestampdiff") or
+        std.ascii.eqlIgnoreCase(name, "timestampadd");
 }
 
 fn fileFormatForFunction(name: []const u8) ?ir.FileFormat {
@@ -226,6 +279,7 @@ const ProjItem = struct {
             col: ?[]const u8,
             arg_expr: ?ir.Expr = null,
             separator: ?[]const u8 = null,
+            params: ir.AggParams = .none,
         },
         /// Scalar function call expression. Lowered to a Compute step
         /// before the final projection.
@@ -707,9 +761,12 @@ pub const Parser = struct {
                         .col = agg_cols.items[agg_i],
                         .as = p.name,
                         .params = if (a.func == .group_concat)
-                            .{ .separator = a.separator orelse "," }
+                            switch (a.params) {
+                                .separator => a.params,
+                                else => .{ .separator = a.separator orelse "," },
+                            }
                         else
-                            .none,
+                            a.params,
                     });
                     agg_i += 1;
                 },
@@ -1062,8 +1119,7 @@ pub const Parser = struct {
 
         // Identifier or function call. Look ahead: `(` after an identifier
         // means a call.
-        if (self.cur.tag == .kw_replace) {
-            const first = "replace";
+        if (keywordScalarName(self.cur.tag)) |first| {
             try self.advance();
             if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
             const scalar_atom = try self.parseScalarCallAfterName(first);
@@ -1128,11 +1184,13 @@ pub const Parser = struct {
             // column-ref arg (or `*` for COUNT(*)); reject anything else.
             if (self.aggregateFuncForName(first)) |func| {
                 if (saw_distinct) {
-                    // Only COUNT(DISTINCT col) is supported today (the
-                    // count_distinct kernel). SUM/AVG/etc. DISTINCT would
-                    // need their own dedup accumulators.
-                    if (func != .count) return ParseError.SqlInvalidProjection;
-                    return try self.aggCallFromArgs(first, .count_distinct, args);
+                    const distinct_func: ir.AggFunc = switch (func) {
+                        .count => .count_distinct,
+                        .sum => .sum_distinct,
+                        .avg => .avg_distinct,
+                        else => return ParseError.SqlInvalidProjection,
+                    };
+                    return try self.aggCallFromArgs(first, distinct_func, args);
                 }
                 return try self.aggCallFromArgs(first, func, args);
             }
@@ -1145,7 +1203,7 @@ pub const Parser = struct {
             // whole thing is a binary expression with the call as the
             // leftmost operand — lift into a .expr ProjItem. Otherwise
             // stay as a bare scalar call.
-            const scalar_atom = ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args } };
+            const scalar_atom = ir.Expr{ .call = .{ .fn_name = fname_dup, .args = try self.normalizeScalarCallArgs(first, args) } };
             const expr = try self.continueBinaryFrom(scalar_atom);
             const default_name = try self.exprDefaultName(expr);
             const alias = try self.maybeAlias(default_name);
@@ -1209,7 +1267,20 @@ pub const Parser = struct {
     fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
         const args = try self.parseCallArgList(null);
         const fname_dup = try self.arena.dupe(u8, name);
-        return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = args } };
+        return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = try self.normalizeScalarCallArgs(name, args) } };
+    }
+
+    fn normalizeScalarCallArgs(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError![]const ir.Expr {
+        if (!unitFirstArgCall(name) or args.len == 0) return args;
+        const unit = switch (args[0]) {
+            .col_ref => |c| c,
+            else => return args,
+        };
+        if (std.mem.eql(u8, unit, "*")) return args;
+        const normalized = try self.arena.alloc(ir.Expr, args.len);
+        @memcpy(normalized, args);
+        normalized[0] = .{ .lit = .{ .text = try self.arena.dupe(u8, unit) } };
+        return normalized;
     }
 
     /// True when `tag` is one of the binary arithmetic operators we
@@ -1384,11 +1455,10 @@ pub const Parser = struct {
         }
 
         // GROUP_CONCAT / STRING_AGG take an optional second positional arg:
-        // the delimiter string literal (STRING_AGG requires it, MySQL's
-        // GROUP_CONCAT spells it `SEPARATOR x` and is not parsed here, so a
-        // bare GROUP_CONCAT(x) defaults to ","). The delimiter is a param,
-        // not an aggregated value, so it doesn't count toward the 1-arg rule.
+        // the delimiter string literal. PERCENTILE_CONT(x, p) stores p as
+        // an aggregate param; MEDIAN(x) is percentile_cont(x, 0.5).
         var separator: ?[]const u8 = null;
+        var params: ir.AggParams = .none;
         var value_args = args;
         if (func == .group_concat and args.len == 2) {
             separator = switch (args[1]) {
@@ -1398,7 +1468,27 @@ pub const Parser = struct {
                 },
                 else => return ParseError.SqlInvalidProjection,
             };
+            params = .{ .separator = separator.? };
             value_args = args[0..1];
+        } else if (func == .percentile) {
+            if (std.ascii.eqlIgnoreCase(func_name, "median")) {
+                if (args.len != 1) return ParseError.SqlInvalidProjection;
+                params = .{ .percentile = 0.5 };
+                value_args = args[0..1];
+            } else {
+                if (args.len != 2) return ParseError.SqlInvalidProjection;
+                params = .{ .percentile = switch (args[1]) {
+                    .lit => |v| switch (v) {
+                        .double => |x| x,
+                        .float => |x| x,
+                        .int => |x| @floatFromInt(x),
+                        .bigint => |x| @floatFromInt(x),
+                        else => return ParseError.SqlInvalidProjection,
+                    },
+                    else => return ParseError.SqlInvalidProjection,
+                } };
+                value_args = args[0..1];
+            }
         }
         if (value_args.len != 1) return ParseError.SqlInvalidProjection;
         var arg_col: ?[]const u8 = null;
@@ -1440,6 +1530,7 @@ pub const Parser = struct {
             .col = arg_col,
             .arg_expr = arg_expr,
             .separator = separator,
+            .params = params,
         } } };
     }
 
@@ -1661,8 +1752,8 @@ pub const Parser = struct {
             return ir.Expr{ .col_ref = col };
         }
         switch (self.cur.tag) {
-            .kw_replace => {
-                const name = "replace";
+            .kw_replace, .kw_if, .kw_left, .kw_right => {
+                const name = keywordScalarName(self.cur.tag).?;
                 try self.advance();
                 if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
                 return try self.parseScalarCallAfterName(name);
@@ -1675,7 +1766,7 @@ pub const Parser = struct {
                     if (ir.windowFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
                     const fname_dup = try self.arena.dupe(u8, name);
                     const nested_args = try self.parseCallArgList(null);
-                    return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = nested_args } };
+                    return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = try self.normalizeScalarCallArgs(name, nested_args) } };
                 }
                 // Bare CURRENT_TIMESTAMP / CURRENT_DATE → nullary call.
                 if (self.cur.tag != .dot) {
@@ -2892,12 +2983,14 @@ pub const Parser = struct {
             // Materialize wrapper.
             const inner = try self.arena.create(ir.Op);
             inner.* = cte_op.*;
-            cte_op.* = .{ .materialize = .{
-                .upstream = inner,
-                // Explicit AS MATERIALIZED: the staged compiler must buffer
-                // even a single-reference body it would otherwise inline.
-                .forced = entry.value_ptr.hint == .force,
-            } };
+            cte_op.* = .{
+                .materialize = .{
+                    .upstream = inner,
+                    // Explicit AS MATERIALIZED: the staged compiler must buffer
+                    // even a single-reference body it would otherwise inline.
+                    .forced = entry.value_ptr.hint == .force,
+                },
+            };
         }
     }
 };
