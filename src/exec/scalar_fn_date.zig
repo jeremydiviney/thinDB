@@ -148,6 +148,21 @@ pub fn dateAddYearsKernel(allocator: Allocator, args: []const ColumnView, out: *
     }
 }
 
+pub fn makedateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const years = args[0].data.int;
+    const day_of_years = args[1].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const day_of_year = day_of_years[i];
+        if (day_of_year <= 0) {
+            try out.data.date.append(allocator, 0);
+            continue;
+        }
+        const first_day = common.ymdToDays(years[i], 1, 1);
+        try out.data.date.append(allocator, first_day + day_of_year - 1);
+    }
+}
+
 fn addMonths(days: i32, n_months: i32) i32 {
     const ymd = daysToYmd(days) orelse return days;
     // Compute (year, month_0_indexed) zero-based math, then re-bias.
@@ -172,6 +187,18 @@ pub fn fromUnixtimeKernel(allocator: Allocator, args: []const ColumnView, out: *
 }
 
 /// CAST(datetime AS date) — drop the time-of-day (floor to the day).
+pub fn dateIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.date;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.date.append(allocator, s[i]);
+}
+
+pub fn datetimeIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.datetime;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.datetime.append(allocator, s[i]);
+}
+
 pub fn datetimeToDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const s = args[0].data.datetime;
     var i: usize = 0;

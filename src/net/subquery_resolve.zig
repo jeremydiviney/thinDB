@@ -102,7 +102,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
     switch (pred.*) {
-        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .unknown => {},
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .unknown => {},
         .leaf_var => |v| {
             const resolved = try lookupSessionVar(ctx, v.var_name);
             pred.* = .{ .leaf = .{ .col = v.col, .op = v.op, .val = resolved } };

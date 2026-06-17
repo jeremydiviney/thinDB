@@ -263,9 +263,9 @@ fn lowerName(allocator: Allocator, name: []const u8) ![]u8 {
 
 fn isReservedAggregateName(name: []const u8) bool {
     const names = [_][]const u8{
-        "count", "sum", "min", "max", "avg",
-        "stddev_pop", "stddev_samp", "var_pop", "var_samp",
-        "count_distinct", "group_concat", "string_agg", "percentile",
+        "count",        "sum",         "min",        "max",      "avg",
+        "stddev_pop",   "stddev_samp", "var_pop",    "var_samp", "count_distinct",
+        "group_concat", "string_agg",  "percentile", "max_by",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     return false;
@@ -273,23 +273,22 @@ fn isReservedAggregateName(name: []const u8) bool {
 
 fn isReservedScalarName(name: []const u8) bool {
     const names = [_][]const u8{
-        "upper", "lower", "ltrim", "rtrim", "trim", "reverse",
-        "length", "octet_length", "char_length", "concat", "substring",
-        "replace", "regexp_replace", "coalesce", "ifnull", "nullif",
-        "abs", "ceil", "floor", "round", "sign", "mod", "add", "sub",
-        "mul", "div", "__narrow_bigint", "pow", "sqrt", "exp", "ln", "log10", "log2",
-        "greatest", "least", "truncate", "degrees", "radians", "atan2",
-        "dayofweek", "dayofyear", "quarter", "last_day", "date_add",
-        "date_sub", "date_add_months", "date_add_years", "extract", "date_trunc",
-        "year", "month", "day", "hour", "minute", "second", "datediff",
-        "unix_timestamp", "from_unixtime", "date_format",
-        "now", "current_timestamp", "current_date",
-        "to_bigint", "to_double", "to_int", "to_smallint", "to_tinyint",
-        "to_largeint", "to_boolean", "to_date", "to_datetime", "to_string",
-        "md5", "sha1", "sha256", "crc32", "hex", "unhex",
-        "to_base64", "from_base64", "lpad", "rpad", "repeat", "space",
-        "ascii", "position", "instr", "substring_index", "strcmp",
-        "lcase", "ucase", "power", "ceiling", "chr",
+        "upper",          "lower",             "ltrim",           "rtrim",           "trim",            "reverse",
+        "length",         "octet_length",      "char_length",     "concat",          "substring",       "replace",
+        "regexp_replace", "coalesce",          "ifnull",          "nullif",          "abs",             "ceil",
+        "floor",          "round",             "sign",            "mod",             "add",             "sub",
+        "mul",            "div",               "__narrow_bigint", "pow",             "sqrt",            "exp",
+        "ln",             "log10",             "log2",            "greatest",        "least",           "truncate",
+        "degrees",        "radians",           "atan2",           "dayofweek",       "dayofyear",       "quarter",
+        "last_day",       "date_add",          "date_sub",        "date_add_months", "date_add_years",  "extract",
+        "date_trunc",     "year",              "month",           "day",             "makedate",        "hour",
+        "minute",         "second",            "datediff",        "unix_timestamp",  "from_unixtime",   "date_format",
+        "now",            "current_timestamp", "current_date",    "to_bigint",       "to_double",       "to_int",
+        "to_smallint",    "to_tinyint",        "to_largeint",     "to_boolean",      "to_date",         "to_datetime",
+        "to_string",      "md5",               "sha1",            "sha256",          "crc32",           "hex",
+        "unhex",          "to_base64",         "from_base64",     "lpad",            "rpad",            "repeat",
+        "space",          "ascii",             "position",        "instr",           "substring_index", "strcmp",
+        "lcase",          "ucase",             "power",           "ceiling",         "chr",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     return false;

@@ -438,9 +438,7 @@ pub const Join = struct {
         const chosen = if (spec.opaque_predicate != null)
             .nested_loop
         else if (spec.algorithm == .auto)
-            (if (canUseRangeSweep(spec)) .range_sweep
-                else if (spec.on.len == 0) .nested_loop
-                else chooseAlgorithm(left, right, spec.on))
+            (if (canUseRangeSweep(spec)) .range_sweep else if (spec.on.len == 0) .nested_loop else chooseAlgorithm(left, right, spec.on))
         else
             spec.algorithm;
 
@@ -533,6 +531,15 @@ pub const Join = struct {
         const right_kept_mask = try aa.alloc(bool, right_schema.len);
         for (right_kept_mask) |*m| m.* = true;
         for (right_keys) |idx| right_kept_mask[idx] = false;
+        for (right_schema, 0..) |rc, ri| {
+            if (!right_kept_mask[ri]) continue;
+            for (left_schema) |lc| {
+                if (types.columnNameEql(lc.name, rc.name)) {
+                    right_kept_mask[ri] = false;
+                    break;
+                }
+            }
+        }
 
         var right_kept_count: usize = 0;
         for (right_kept_mask) |m| {
@@ -555,6 +562,9 @@ pub const Join = struct {
         // join keys. Refuse if any NON-KEY column name collides — the
         // user must explicitly rename via .compute() / .exclude() in
         // that case.
+        // Duplicate right-side names were already removed from
+        // right_kept_mask above; this final collision check protects
+        // against duplicates within the kept right-side schema.
         const output_schema = try allocator.alloc(Column, left_schema.len + right_kept_count);
         errdefer allocator.free(output_schema);
         for (left_schema, 0..) |c, i| {
@@ -1788,4 +1798,3 @@ fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
         .gte => ord != .lt,
     };
 }
-

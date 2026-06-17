@@ -19,6 +19,7 @@ const ColumnView = storage.ColumnView;
 const exec = @import("exec.zig");
 const simd = @import("../util/simd.zig");
 const Error = exec.Error;
+const scalar_fn_common = @import("scalar_fn_common.zig");
 
 pub const PredicateOp = enum { eq, neq, lt, lte, gt, gte };
 
@@ -38,6 +39,7 @@ pub const Predicate = struct {
 ///   - `.not`        — child must NOT match
 pub const PredicateExpr = union(enum) {
     leaf: Predicate,
+    day_leaf: Predicate,
     /// `col1 op col2` — both sides are column refs. Required for
     /// TPC-H queries (Q12's `l_commitdate < l_receiptdate`) and for
     /// detecting correlated subqueries (`l_orderkey = o_orderkey`
@@ -249,6 +251,11 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
             .op = lf.op,
             .val = try cloneValue(out_arena, lf.val),
         } },
+        .day_leaf => |lf| .{ .day_leaf = .{
+            .col = try out_arena.dupe(u8, lf.col),
+            .op = lf.op,
+            .val = try cloneValue(out_arena, lf.val),
+        } },
         .leaf_col_col => |lc| .{ .leaf_col_col = .{
             .left = try out_arena.dupe(u8, lc.left),
             .op = lc.op,
@@ -382,6 +389,14 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             const val_tag = std.meta.activeTag(p.val);
             if (col_tag != val_tag) {
                 tryWidenLiteral(&p.val, col_tag) catch return Error.PredicateTypeMismatch;
+            }
+        },
+        .day_leaf => |*p| {
+            const col_idx = types.findColumn(schema, p.col) orelse return Error.ColumnNotFound;
+            const col_type = schema[col_idx].type;
+            if (col_type != .date and col_type != .datetime) return Error.PredicateTypeMismatch;
+            if (std.meta.activeTag(p.val) != .int) {
+                tryWidenLiteral(&p.val, .int) catch return Error.PredicateTypeMismatch;
             }
         },
         .leaf_col_col => |lc| {
@@ -730,6 +745,10 @@ pub fn evaluatePredicate(
                 }
             }
         },
+        .day_leaf => |p| {
+            const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
+            try evaluateDayMask(batch.values[col_idx], p, batch.row_count, out);
+        },
         .leaf_col_col => |lc| {
             const li = findCol(schema, lc.left) orelse return Error.ColumnNotFound;
             const ri = findCol(schema, lc.right) orelse return Error.ColumnNotFound;
@@ -821,6 +840,10 @@ pub fn evaluateExprGuided(
                     out[i] = false;
                 };
             }
+        },
+        .day_leaf => |p| {
+            const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
+            try evaluateDayMask(batch.values[col_idx], p, batch.row_count, out);
         },
         .leaf_col_col => |lc| {
             const li = findCol(schema, lc.left) orelse return Error.ColumnNotFound;
@@ -972,6 +995,31 @@ fn compareCellToValue(view: ColumnView, idx: usize, op: PredicateOp, ref: Value)
         .string => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
         .char => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
     };
+}
+
+fn evaluateDayMask(view: ColumnView, p: Predicate, n: usize, out: []bool) !void {
+    if (p.val != .int) return Error.PredicateTypeMismatch;
+    const want = p.val.int;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (!view.isValid(i)) {
+            out[i] = false;
+            continue;
+        }
+        const day: i32 = switch (view.data) {
+            .date => |s| blk: {
+                const ymd = scalar_fn_common.daysToYmd(s[i]) orelse return Error.PredicateTypeMismatch;
+                break :blk ymd.day;
+            },
+            .datetime => |s| blk: {
+                const days = scalar_fn_common.daysFromDatetime(s[i]);
+                const ymd = scalar_fn_common.daysToYmd(days) orelse return Error.PredicateTypeMismatch;
+                break :blk ymd.day;
+            },
+            else => return Error.PredicateTypeMismatch,
+        };
+        out[i] = cmp(i32, day, want, p.op);
+    }
 }
 
 /// Lexicographic byte comparison of `a` against `b` under `op` (used for string

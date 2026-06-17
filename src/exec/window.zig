@@ -72,8 +72,8 @@ pub const Window = struct {
     /// rows have been emitted (the input is no longer a dependency).
     reserved_bytes: usize = 0,
     evicted: bool = false,
-    accumulated: []ColumnStore,        // input columns
-    output_columns: []ColumnStore,     // window outputs (fixed-width types)
+    accumulated: []ColumnStore, // input columns
+    output_columns: []ColumnStore, // window outputs (fixed-width types)
     /// Parallel scratch for string-typed outputs. `string_outputs[ci]`
     /// is `&.{}` when the call's output isn't a string type; otherwise
     /// it's a `[N]?[]const u8` indexed by original row position
@@ -90,7 +90,7 @@ pub const Window = struct {
     // Batch emit state — emits input + output in original order.
     emit_offset: usize = 0,
     out_output_columns: []ColumnStore, // staging for output cols per batch
-    views: []ColumnView,               // input + output views, parallel to schema
+    views: []ColumnView, // input + output views, parallel to schema
 
     const batch_size: usize = 8192;
 
@@ -307,7 +307,7 @@ pub const Window = struct {
 
     /// Free the accumulated input buffer and release its reserved bytes
     /// once every row has been emitted. Idempotent. The per-batch emit
-/// buffers (`out_output_columns`, string outputs only) and the window
+    /// buffers (`out_output_columns`, string outputs only) and the window
     /// output columns are freed later in `deinit`.
     fn evict(self: *Window) void {
         if (self.evicted) return;

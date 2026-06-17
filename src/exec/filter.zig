@@ -749,6 +749,7 @@ const ConjunctKey = struct { cost: u8, sel: f64 };
 fn conjunctKey(expr: PredicateExpr, schema: []const Column, stats: []const exec.ColStat) ConjunctKey {
     return switch (expr) {
         .leaf => |p| leafKey(p, schema, stats),
+        .day_leaf => |p| leafKey(p, schema, stats),
         .is_null => .{ .cost = 0, .sel = 0.05 },
         .is_not_null => .{ .cost = 0, .sel = 0.95 },
         .leaf_col_col => .{ .cost = 1, .sel = 0.5 },

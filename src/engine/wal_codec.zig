@@ -583,6 +583,7 @@ pub fn encodePredicateExpr(allocator: Allocator, out: *std.ArrayList(u8), expr: 
             try out.append(allocator, @intFromEnum(@as(ValueTag, lf.val)));
             try encodeValue(allocator, out, lf.val);
         },
+        .day_leaf => return Error.WalPredicateUnsupported,
         .leaf_col_col => |lc| {
             try out.append(allocator, @intFromEnum(PredTagWal.leaf_col_col));
             try out.append(allocator, @intFromEnum(lc.op));

@@ -73,6 +73,8 @@ pub const AggFunc = enum {
     any_value,
     first,
     last,
+    /// Return the value from the row whose second argument is maximal.
+    max_by,
     /// Bitwise aggregates over integer-family inputs.
     bit_and,
     bit_or,
@@ -108,7 +110,7 @@ pub const AggFunc = enum {
 fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
-        .any_value, .first, .last, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .group_concat, .udf => return false,
+        .any_value, .first, .last, .max_by, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .group_concat, .udf => return false,
     };
     return true;
 }
@@ -131,6 +133,8 @@ pub const AggSpec = struct {
     udf_arg_cols: []const []const u8 = &.{},
     /// Column to aggregate. `null` is only valid for `COUNT(*)`.
     col: ?[]const u8 = null,
+    /// Secondary key column for MAX_BY(value, key).
+    arg2_col: ?[]const u8 = null,
     /// Output column name.
     as: []const u8,
     /// Per-function payload. Defaults to `.none` so existing call
@@ -237,6 +241,7 @@ pub const AccState = union(enum) {
     avg: AvgAcc,
     bool_acc: BoolAcc,
     value_acc: ValueAcc,
+    max_by: MaxByAcc,
     bitwise: BitwiseAcc,
     distinct_numeric: std.ArrayListUnmanaged(f64),
 
@@ -288,7 +293,7 @@ fn boolUpdate(s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, row
     }
 }
 
-fn valueFromRow(aa: Allocator, view: ColumnView, row: usize) !types.Value {
+fn valueFromRow(aa: Allocator, view: ColumnView, row: u32) !types.Value {
     return switch (view.data) {
         .int => |v| .{ .int = v[row] },
         .bigint => |v| .{ .bigint = v[row] },
@@ -316,6 +321,19 @@ fn valueUpdate(aa: Allocator, s: *AccState, func: AggFunc, view: ColumnView, row
             s.value_acc.seen = true;
         }
         if (func == .any_value or func == .first) break;
+    }
+}
+
+fn maxByUpdate(aa: Allocator, s: *AccState, value_view: ColumnView, key_view: ColumnView, row_start: u32, row_end: u32) !void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!value_view.isValid(r) or !key_view.isValid(r)) continue;
+        const key = try valueFromRow(aa, key_view, r);
+        if (!s.max_by.seen or key.compare(s.max_by.key) == .gt) {
+            s.max_by.key = key;
+            s.max_by.value = try valueFromRow(aa, value_view, r);
+            s.max_by.seen = true;
+        }
     }
 }
 
@@ -481,6 +499,12 @@ const BoolAcc = struct {
 
 const ValueAcc = struct {
     seen: bool = false,
+    value: types.Value = .{ .int = 0 },
+};
+
+const MaxByAcc = struct {
+    seen: bool = false,
+    key: types.Value = .{ .int = 0 },
     value: types.Value = .{ .int = 0 },
 };
 
@@ -785,7 +809,11 @@ pub const Aggregate = struct {
 
         for (aggs, agg_col_indices) |a, maybe_idx| {
             const t = if (maybe_idx) |idx| up_schema[idx].type else null;
-            try validateAggFn(a.func, t, a.params);
+            const arg2_t: ?Type = if (a.arg2_col) |name| blk: {
+                const idx = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
+                break :blk up_schema[idx].type;
+            } else null;
+            try validateAggFn(a.func, t, a.params, arg2_t);
         }
 
         const output_columns = try allocator.alloc(ColumnStore, output_schema.len);
@@ -2240,7 +2268,11 @@ pub const SortedAggregate = struct {
         }
         for (aggs, agg_col_indices) |a, maybe_idx| {
             const t = if (maybe_idx) |idx| up_schema[idx].type else null;
-            try validateAggFn(a.func, t, a.params);
+            const arg2_t: ?Type = if (a.arg2_col) |name| blk: {
+                const idx = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
+                break :blk up_schema[idx].type;
+            } else null;
+            try validateAggFn(a.func, t, a.params, arg2_t);
         }
 
         const output_columns = try allocator.alloc(ColumnStore, output_schema.len);
@@ -2686,6 +2718,7 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .bool_and => .{ .bool_acc = .{ .value = true } },
         .bool_or => .{ .bool_acc = .{ .value = false } },
         .any_value, .first, .last => .{ .value_acc = .{} },
+        .max_by => .{ .max_by = .{} },
         .bit_and, .bit_or, .bit_xor => .{ .bitwise = .{} },
         .sum_distinct, .avg_distinct => .{ .distinct_numeric = .empty },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
@@ -2786,14 +2819,14 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         .min, .max => in orelse return Error.AggregateNoSpecs,
         .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile => .double,
         .bool_and, .bool_or => .boolean,
-        .any_value, .first, .last => in orelse return Error.AggregateColumnRequired,
+        .any_value, .first, .last, .max_by => in orelse return Error.AggregateColumnRequired,
         .bit_and, .bit_or, .bit_xor => .bigint,
         .group_concat => .string,
         .udf => Error.AggregateUnsupportedType,
     };
 }
 
-pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams) !void {
+pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type) !void {
     switch (func) {
         .count => return,
         .sum, .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
@@ -2808,6 +2841,10 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams) !void {
         },
         .any_value, .first, .last => {
             _ = in orelse return Error.AggregateColumnRequired;
+        },
+        .max_by => {
+            _ = in orelse return Error.AggregateColumnRequired;
+            _ = arg2_in orelse return Error.AggregateColumnRequired;
         },
         .bit_and, .bit_or, .bit_xor => {
             const t = in orelse return Error.AggregateColumnRequired;
@@ -3230,6 +3267,11 @@ pub fn updateState(
         .any_value, .first, .last => {
             try valueUpdate(aa, s, func, batch.values[col_idx.?], row_start, row_end);
         },
+        .max_by => {
+            const key_name = spec.arg2_col orelse return Error.AggregateColumnRequired;
+            const key_idx = types.findColumn(batch.schema, key_name) orelse return Error.ColumnNotFound;
+            try maxByUpdate(aa, s, batch.values[col_idx.?], batch.values[key_idx], row_start, row_end);
+        },
         .bit_and, .bit_or, .bit_xor => {
             try bitwiseUpdate(s, func, batch.values[col_idx.?], row_start, row_end);
         },
@@ -3638,6 +3680,13 @@ pub fn appendAccToColumn(
         },
         .any_value, .first, .last => {
             const v = state.value_acc;
+            if (!v.seen) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else try appendValueToColumn(allocator, col, out_type, v.value);
+        },
+        .max_by => {
+            const v = state.max_by;
             if (!v.seen) {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;

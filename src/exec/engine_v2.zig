@@ -403,6 +403,7 @@ fn appendNameUnique(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([
 fn collectPredicateNames(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([]const u8), p: exec.PredicateExpr) !void {
     switch (p) {
         .leaf => |l| try appendNameUnique(allocator, set, l.col),
+        .day_leaf => |l| try appendNameUnique(allocator, set, l.col),
         .leaf_col_col => |c| {
             try appendNameUnique(allocator, set, c.left);
             try appendNameUnique(allocator, set, c.right);
@@ -520,6 +521,36 @@ fn buildUdafGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan)
     if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
     q = try q.udfGroupBy(plan.group_by.group_cols, plan.group_by.aggs, registry);
     // HAVING runs as a generic filter over the (small) grouped output.
+    if (plan.having_filter) |f| q = try q.filter(f.predicate);
+    if (plan.order_by) |o| {
+        if (plan.limit) |l| {
+            q = try q.topN(o.specs, @intCast(l.n), @intCast(l.offset));
+        } else {
+            q = try q.orderBy(o.specs);
+        }
+    } else if (plan.limit) |l| {
+        q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
+    }
+    if (plan.post_agg_derived.len > 0) q = try q.computeWithRegistry(plan.post_agg_derived, input.udf_registry);
+    q = try applyOutputProjection(allocator, q, plan.output_columns, plan.output_names);
+    return q;
+}
+
+fn buildOperatorGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan) !exec.Query {
+    const allocator = input.allocator;
+    const needed = try projectedBaseColumns(allocator, table, input.prune_names);
+    defer if (needed) |n| allocator.free(n);
+    const max_dop = input.db.config.max_dop;
+
+    var q = if (max_dop > 1)
+        try exec.ParallelScan.create(allocator, table, input.accountant, needed, max_dop)
+    else
+        try exec.scanWithProjection(allocator, table, input.accountant, needed);
+    errdefer q.deinit();
+
+    if (plan.where_filter) |f| q = try q.filter(f.predicate);
+    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    q = try q.groupBy(plan.group_by.group_cols, plan.group_by.aggs);
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
     if (plan.order_by) |o| {
         if (plan.limit) |l| {
@@ -685,6 +716,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // handler to combine opaque state yet — fall to the engine-neutral
     // UdfAggregate operator behind the same V2-built (parallel) scan.
     if (hasUdfAgg(plan.group_by.aggs)) return try buildUdafGroupBy(input, table, plan);
+    if (hasMaxByAgg(plan.group_by.aggs)) return try buildOperatorGroupBy(input, table, plan);
 
     // The silo-grid core carries fixed numeric state slots and string MIN/MAX,
     // but declines variable-state aggregates it can't hold in the group table —
@@ -786,7 +818,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
     // GROUP_CONCAT (no UDAF): a variable-state aggregate the parallel reducer
     // doesn't host — route onto the engine-neutral hash Aggregate operator.
-    if (hasConcatAgg(plan.group_by.aggs) and !hasUdfAgg(plan.group_by.aggs)) {
+    if ((hasConcatAgg(plan.group_by.aggs) or hasMaxByAgg(plan.group_by.aggs)) and !hasUdfAgg(plan.group_by.aggs)) {
         return try buildGlobalOperatorAggregate(input, table, plan);
     }
     // Global UDAF: the parallel reducer folds each UDAF per-lane and merges them
@@ -1030,6 +1062,7 @@ fn collectPredicateColumns(
 ) !void {
     switch (p) {
         .leaf => |lf| try addColumnUnique(allocator, set, lf.col),
+        .day_leaf => |lf| try addColumnUnique(allocator, set, lf.col),
         .leaf_col_col => |lc| {
             try addColumnUnique(allocator, set, lc.left);
             try addColumnUnique(allocator, set, lc.right);
@@ -1305,6 +1338,11 @@ fn hasConcatAgg(aggs: []const exec.AggSpec) bool {
     return false;
 }
 
+fn hasMaxByAgg(aggs: []const exec.AggSpec) bool {
+    for (aggs) |a| if (a.func == .max_by) return true;
+    return false;
+}
+
 // Global (no GROUP BY) UDAF / GROUP_CONCAT: V2-built scan feeding the
 // engine-neutral aggregate operators. ORDER BY / LIMIT over the one-row
 // result are no-ops the matcher already discarded.
@@ -1369,7 +1407,6 @@ fn splitDoubleUnderscore(s: []const u8) ?struct { db: []const u8, schema: []cons
     if (pos == 0 or pos + 2 >= s.len) return null;
     return .{ .db = s[0..pos], .schema = s[pos + 2 ..] };
 }
-
 
 test "engine v2 classifies scan filter group order limit as grouped topn" {
     var scan: ir.Op = .{ .scan = .{ .table = .{ .name = "hits" } } };

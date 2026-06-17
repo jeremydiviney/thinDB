@@ -194,7 +194,7 @@ pub fn parseWindowSpec(p: anytype) !ir.WindowSpec {
     if (p.cur.tag == .kw_partition) {
         try p.advance();
         try p.expect(.kw_by);
-        partition_by = try p.parseIdentList();
+        partition_by = try p.parseQualifiedIdentList();
     }
 
     var order_by: []const SortSpec = &.{};

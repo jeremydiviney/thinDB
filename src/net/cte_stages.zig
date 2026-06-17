@@ -447,7 +447,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 defer kept.deinit(input.allocator);
                 for (schema) |col| {
                     for (names) |nm| {
-                        if (@import("../types.zig").columnNameEql(col.name, nm)) {
+                        if (columnRefMatchesName(col.name, nm)) {
                             kept.appendAssumeCapacity(col.name);
                             break;
                         }
@@ -477,6 +477,17 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         else => return error.UnsupportedQueryShape,
     }
+}
+
+fn columnRefMatchesName(column_name: []const u8, ref_name: []const u8) bool {
+    if (types.columnNameEql(column_name, ref_name)) return true;
+    if (std.mem.lastIndexOfScalar(u8, ref_name, '.')) |dot| {
+        if (types.columnNameEql(column_name, ref_name[dot + 1 ..])) return true;
+    }
+    if (std.mem.lastIndexOfScalar(u8, column_name, '.')) |dot| {
+        if (types.columnNameEql(column_name[dot + 1 ..], ref_name)) return true;
+    }
+    return false;
 }
 
 fn joinSpecOf(j: anytype) ir.JoinSpec {

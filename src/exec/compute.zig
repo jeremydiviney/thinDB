@@ -87,6 +87,7 @@ pub fn collectColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]co
 pub fn collectPredicateColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), p: PredicateExpr) !void {
     switch (p) {
         .leaf => |l| try appendUniqueName(allocator, out, l.col),
+        .day_leaf => |l| try appendUniqueName(allocator, out, l.col),
         .leaf_col_col => |c| {
             try appendUniqueName(allocator, out, c.left);
             try appendUniqueName(allocator, out, c.right);

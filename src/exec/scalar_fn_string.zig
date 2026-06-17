@@ -48,6 +48,13 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
     }
 }
 
+pub fn stringIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try ss.appendValue(allocator, sv.rowBytes(i));
+}
+
 pub fn upperKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     var i: usize = 0;

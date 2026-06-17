@@ -128,7 +128,7 @@ pub const UdfAggregate = struct {
                 else
                     null;
                 const input_type: ?Type = if (col_index) |idx| up_schema[idx].type else null;
-                try aggregate_mod.validateAggFn(a.func, input_type, a.params);
+                try aggregate_mod.validateAggFn(a.func, input_type, a.params, null);
                 plan.* = .{ .builtin = .{
                     .spec = a,
                     .col_index = col_index,
