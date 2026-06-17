@@ -133,6 +133,28 @@ pub const CoreScheduler = struct {
         }
     }
 
+    /// Non-blocking `acquire`: take a core slot if one is free RIGHT NOW, else
+    /// return a non-owning (unpinned) lease instead of waiting. For callers whose
+    /// threads coordinate at intra-query barriers — a worker that blocked here
+    /// waiting for a slot could deadlock against a peer barrier-waiting while
+    /// holding the only free slots. Best-effort pinning, never an admission gate.
+    pub fn tryAcquire(self: *CoreScheduler) Lease {
+        if (self.disabled or thread_holds_core or self.cores.len == 0) {
+            return .{ .sched = self, .core_index = -1, .owns = false };
+        }
+        self.lock.lock();
+        if (self.leastLoaded()) |idx| {
+            self.cores[idx].leased += 1;
+            const mask = self.cores[idx].mask;
+            self.lock.unlock();
+            thread_holds_core = true;
+            affinity.pinCurrentThread(mask);
+            return .{ .sched = self, .core_index = @intCast(idx), .owns = true };
+        }
+        self.lock.unlock();
+        return .{ .sched = self, .core_index = -1, .owns = false };
+    }
+
     pub fn release(self: *CoreScheduler, lease: *Lease) void {
         if (!lease.owns) return;
         lease.owns = false;

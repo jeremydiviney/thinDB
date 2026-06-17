@@ -72,6 +72,7 @@ const rowloc = @import("rowloc.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const HarnessCore = exec.group_topn_harness_core;
+const core_scheduler = @import("../util/core_scheduler.zig");
 
 /// One row group's identity + the offset of its best-corner prefix tuple in the
 /// flat `corners` buffer (`prefix_len` consecutive i128s).
@@ -549,7 +550,13 @@ const ZWorker = struct {
 };
 
 fn zWorkerMain(w: *ZWorker) void {
-    if (w.cpu) |cpu| HarnessCore.pinToCpu(cpu);
+    // Lease a core from the process-global scheduler (round-robins distinct
+    // cores across ALL in-flight queries, global per-core cap) rather than
+    // pinning to a per-query `cpus[worker_index]`, which would serialize N
+    // concurrent single-worker queries on one core. tryAcquire (non-blocking):
+    // workers coordinate, so none may block on a full bucket.
+    var lease = core_scheduler.global().tryAcquire();
+    defer lease.release();
     zWorkerRun(w) catch |e| {
         w.err = e;
     };

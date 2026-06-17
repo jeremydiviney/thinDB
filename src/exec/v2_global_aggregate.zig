@@ -36,6 +36,7 @@ const udf_mod = @import("../udf.zig");
 const expr = @import("expr.zig");
 const Scan = @import("scan.zig").Scan;
 const HarnessCore = exec.group_topn_harness_core;
+const core_scheduler = @import("../util/core_scheduler.zig");
 const group_table = exec.group_table;
 
 // Partition a distinct key into one of `parts` buckets via Lemire's multiply-
@@ -711,7 +712,13 @@ const Worker = struct {
 };
 
 fn workerMain(w: *Worker) void {
-    if (w.cpu) |cpu| HarnessCore.pinToCpu(cpu);
+    // Lease a core from the process-global scheduler (round-robins distinct
+    // cores across ALL in-flight queries, global per-core cap) rather than
+    // pinning to a per-query `cpus[worker_index]`, which would serialize N
+    // concurrent single-worker queries on one core. tryAcquire (non-blocking):
+    // workers coordinate, so none may block on a full bucket.
+    var lease = core_scheduler.global().tryAcquire();
+    defer lease.release();
     workerRun(w) catch |e| {
         w.err = e;
     };
@@ -732,7 +739,9 @@ const PartMergeJob = struct {
 };
 
 fn partMergeMain(job: *PartMergeJob) void {
-    if (job.cpu) |cpu| HarnessCore.pinToCpu(cpu);
+    // Global core lease (non-blocking) instead of a per-query pin — see workerMain.
+    var lease = core_scheduler.global().tryAcquire();
+    defer lease.release();
     partMergeRun(job) catch |e| {
         job.err = e;
     };
