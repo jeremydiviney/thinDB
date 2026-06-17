@@ -3006,3 +3006,111 @@ test "sql: case-insensitive keywords + line comments + trailing semicolon" {
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 4, 5 }, ids.items);
 }
+
+test "sql: expanded scalar function spellings execute" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT
+        \\  if(starts_with(tag, 'a'), tag, 'x') AS chosen,
+        \\  left(tag, 1) AS l,
+        \\  right(tag, 1) AS r,
+        \\  concat_ws('-', tag, 'z') AS joined,
+        \\  starts_with(tag, 'a') AS sw,
+        \\  ends_with(tag, 'a') AS ew,
+        \\  split_part('a,b,c', ',', 2) AS part,
+        \\  regexp_like(tag, 'a') AS rx,
+        \\  regexp_substr('abc123', '[0-9]+') AS rs,
+        \\  field(tag, 'x', tag) AS fld,
+        \\  find_in_set(tag, 'x,a,b') AS fis,
+        \\  initcap('hello world') AS cap,
+        \\  translate(tag, 'abc', 'ABC') AS tr,
+        \\  bit_length(tag) AS bits,
+        \\  ord(tag) AS ordv,
+        \\  char(65) AS ch,
+        \\  bin(qty) AS binv,
+        \\  conv('ff', 16, 10) AS convv,
+        \\  sha2(tag, 256) AS sha
+        \\FROM t WHERE id = 1
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqualStrings("a", b.values[0].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("a", b.values[1].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("a", b.values[2].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("a-z", b.values[3].data.string.rowBytes(0));
+    try std.testing.expectEqual(@as(u8, 1), b.values[4].data.boolean[0]);
+    try std.testing.expectEqual(@as(u8, 1), b.values[5].data.boolean[0]);
+    try std.testing.expectEqualStrings("b", b.values[6].data.string.rowBytes(0));
+    try std.testing.expectEqual(@as(u8, 1), b.values[7].data.boolean[0]);
+    try std.testing.expectEqualStrings("123", b.values[8].data.string.rowBytes(0));
+    try std.testing.expectEqual(@as(i32, 2), b.values[9].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 2), b.values[10].data.int[0]);
+    try std.testing.expectEqualStrings("Hello World", b.values[11].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("A", b.values[12].data.string.rowBytes(0));
+    try std.testing.expectEqual(@as(i32, 8), b.values[13].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 'a'), b.values[14].data.int[0]);
+    try std.testing.expectEqualStrings("A", b.values[15].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("1010", b.values[16].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("255", b.values[17].data.string.rowBytes(0));
+    try std.testing.expectEqual(@as(usize, 64), b.values[18].data.string.rowBytes(0).len);
+}
+
+test "sql: unit-first date functions and aggregate aliases execute" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    {
+        var q = try runSql(allocator, db, "SELECT date_diff(day, current_date, timestampadd(day, 1, current_date)) AS dd FROM t LIMIT 1");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(i32, 1), b.values[0].data.int[0]);
+    }
+
+    try helpers.exec(allocator, db, "CREATE TABLE agg_new (id BIGINT PRIMARY KEY, x INT, flag BOOLEAN, bits INT, tag TEXT)");
+    try helpers.exec(allocator, db, "INSERT INTO agg_new VALUES (1, 1, true, 7, 'a'), (2, 2, false, 3, 'b'), (3, 2, true, 1, 'b'), (4, 4, true, 0, 'c')");
+
+    var q = try runSql(allocator, db,
+        \\SELECT
+        \\  count_if(flag) AS ct,
+        \\  bool_and(flag) AS ba,
+        \\  bool_or(flag) AS bo,
+        \\  bit_or(bits) AS bor,
+        \\  sum(distinct x) AS sd,
+        \\  avg(distinct x) AS ad,
+        \\  approx_count_distinct(tag) AS acd,
+        \\  median(x) AS med,
+        \\  percentile_cont(x, 0.5) AS pc,
+        \\  std(x) AS st,
+        \\  variance(x) AS varv,
+        \\  first(tag) AS first_tag,
+        \\  last(tag) AS last_tag
+        \\FROM agg_new
+    );
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 3), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(u8, 0), b.values[1].data.boolean[0]);
+    try std.testing.expectEqual(@as(u8, 1), b.values[2].data.boolean[0]);
+    try std.testing.expectEqual(@as(i64, 7), b.values[3].data.bigint[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.0), b.values[4].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.0 / 3.0), b.values[5].data.double[0], 1e-9);
+    try std.testing.expectEqual(@as(i64, 3), b.values[6].data.bigint[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), b.values[7].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), b.values[8].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f64, 19.0 / 12.0)), b.values[9].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 19.0 / 12.0), b.values[10].data.double[0], 1e-9);
+    try std.testing.expectEqualStrings("a", b.values[11].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("c", b.values[12].data.string.rowBytes(0));
+}

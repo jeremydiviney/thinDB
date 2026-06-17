@@ -404,3 +404,109 @@ test "scalar: ascii on first byte" {
     // (id, s, n) + derived a → index 3
     try std.testing.expectEqualSlices(i32, &[_]i32{ 65, 90, 0 }, b.values[3].data.int[0..3]);
 }
+
+test "scalar: expanded missing-function kernels through Compute" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "s", .type = .string },
+            .{ .name = "needle", .type = .string },
+            .{ .name = "setv", .type = .string },
+            .{ .name = "n", .type = .int },
+            .{ .name = "x", .type = .double },
+            .{ .name = "flag", .type = .boolean },
+            .{ .name = "d", .type = .date },
+            .{ .name = "ts", .type = .datetime },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("t", schema, .{ .order_key = &ok, .unique = true, .row_group_size = 8 });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .s = "hello", .needle = "he", .setv = "aa,hello,zz", .n = @as(i32, 2), .x = @as(f64, 0.0), .flag = true, .d = @as(i32, 0), .ts = @as(i64, 0) },
+        .{ .id = @as(i64, 2), .s = "world", .needle = "or", .setv = "world,aa", .n = @as(i32, 3), .x = @as(f64, 8.0), .flag = false, .d = @as(i32, 31), .ts = @as(i64, 31 * std.time.us_per_day) },
+    });
+    try t.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const F = thindb.exec.scalar_fn;
+    const E = thindb.exec.expr_mod;
+    const lit_dash = E.lit(.{ .text = "-" });
+    const lit_lo = E.lit(.{ .text = "lo" });
+    const lit_vowels = E.lit(.{ .text = "[aeiou]+" });
+    const lit_x = E.lit(.{ .text = "x" });
+    const lit_day = E.lit(.{ .text = "day" });
+    const lit_256 = E.lit(.{ .int = 256 });
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.compute(&.{
+        .{ .name = "joined", .expr = try F.concatWs(aa, &.{ lit_dash, E.col("s"), E.col("needle") }) },
+        .{ .name = "l", .expr = try F.left(aa, E.col("s"), E.col("n")) },
+        .{ .name = "r", .expr = try F.right(aa, E.col("s"), E.col("n")) },
+        .{ .name = "sw", .expr = try F.startsWith(aa, E.col("s"), E.col("needle")) },
+        .{ .name = "ew", .expr = try F.endsWith(aa, E.col("s"), lit_lo) },
+        .{ .name = "rx", .expr = try F.regexpLike(aa, E.col("s"), lit_vowels) },
+        .{ .name = "rs", .expr = try F.regexpSubstr(aa, E.col("s"), lit_vowels) },
+        .{ .name = "bits", .expr = try F.bitLength(aa, E.col("s")) },
+        .{ .name = "ordv", .expr = try F.ord(aa, E.col("s")) },
+        .{ .name = "fld", .expr = try F.field(aa, &.{ E.col("s"), lit_x, E.col("s") }) },
+        .{ .name = "fis", .expr = try F.findInSet(aa, E.col("s"), E.col("setv")) },
+        .{ .name = "cap", .expr = try F.initcap(aa, E.col("s")) },
+        .{ .name = "tr", .expr = try F.translate(aa, E.col("s"), lit_lo, E.lit(.{ .text = "12" })) },
+        .{ .name = "chosen", .expr = try F.ifThenElse(aa, E.col("flag"), E.col("s"), E.col("needle")) },
+        .{ .name = "cbr", .expr = try F.cbrt(aa, E.col("x")) },
+        .{ .name = "sq", .expr = try F.square(aa, E.col("x")) },
+        .{ .name = "bc", .expr = try F.bitCount(aa, E.col("n")) },
+        .{ .name = "dn", .expr = try F.dayname(aa, E.col("d")) },
+        .{ .name = "mn", .expr = try F.monthname(aa, E.col("d")) },
+        .{ .name = "added", .expr = try F.timestampAdd(aa, lit_day, E.col("n"), E.col("d")) },
+        .{ .name = "dd", .expr = try F.dateDiffUnit(aa, lit_day, E.col("d"), try F.timestampAdd(aa, lit_day, E.col("n"), E.col("d"))) },
+        .{ .name = "sha", .expr = try F.sha2(aa, E.col("s"), lit_256) },
+        .{ .name = "md", .expr = try F.md5sum(aa, &.{ E.col("s"), E.col("needle") }) },
+        .{ .name = "xx", .expr = try F.xxHash3_128(aa, E.col("s")) },
+        .{ .name = "binv", .expr = try F.bin(aa, E.col("n")) },
+        .{ .name = "convv", .expr = try F.conv(aa, E.lit(.{ .text = "ff" }), E.lit(.{ .int = 16 }), E.lit(.{ .int = 10 })) },
+    });
+    defer q.deinit();
+
+    const b = (try q.next()).?;
+    const base_cols = 9;
+    try std.testing.expectEqualStrings("hello-he", b.values[base_cols + 0].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("he", b.values[base_cols + 1].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("rld", b.values[base_cols + 2].data.string.rowBytes(1));
+    try std.testing.expectEqual(@as(u8, 1), b.values[base_cols + 3].data.boolean[0]);
+    try std.testing.expectEqual(@as(u8, 0), b.values[base_cols + 3].data.boolean[1]);
+    try std.testing.expectEqual(@as(u8, 1), b.values[base_cols + 4].data.boolean[0]);
+    try std.testing.expectEqual(@as(u8, 1), b.values[base_cols + 5].data.boolean[0]);
+    try std.testing.expectEqualStrings("e", b.values[base_cols + 6].data.string.rowBytes(0));
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 40, 40 }, b.values[base_cols + 7].data.int[0..2]);
+    try std.testing.expectEqual(@as(i32, 'h'), b.values[base_cols + 8].data.int[0]);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 2 }, b.values[base_cols + 9].data.int[0..2]);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 1 }, b.values[base_cols + 10].data.int[0..2]);
+    try std.testing.expectEqualStrings("Hello", b.values[base_cols + 11].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("he112", b.values[base_cols + 12].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("hello", b.values[base_cols + 13].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("or", b.values[base_cols + 13].data.string.rowBytes(1));
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), b.values[base_cols + 14].data.double[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 64.0), b.values[base_cols + 15].data.double[1], 1e-9);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2 }, b.values[base_cols + 16].data.int[0..2]);
+    try std.testing.expectEqualStrings("Thursday", b.values[base_cols + 17].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("January", b.values[base_cols + 18].data.string.rowBytes(0));
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 34 }, b.values[base_cols + 19].data.date[0..2]);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 3 }, b.values[base_cols + 20].data.int[0..2]);
+    try std.testing.expectEqual(@as(usize, 64), b.values[base_cols + 21].data.string.rowBytes(0).len);
+    try std.testing.expectEqual(@as(usize, 32), b.values[base_cols + 22].data.string.rowBytes(0).len);
+    try std.testing.expectEqual(@as(usize, 32), b.values[base_cols + 23].data.string.rowBytes(0).len);
+    try std.testing.expectEqualStrings("10", b.values[base_cols + 24].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("255", b.values[base_cols + 25].data.string.rowBytes(0));
+}

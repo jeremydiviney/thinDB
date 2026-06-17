@@ -64,6 +64,22 @@ pub const AggFunc = enum {
     min,
     max,
     avg,
+    /// Count rows where a boolean predicate is true.
+    count_if,
+    /// Boolean conjunction/disjunction over non-null inputs.
+    bool_and,
+    bool_or,
+    /// Return an arbitrary/first/last non-null value.
+    any_value,
+    first,
+    last,
+    /// Bitwise aggregates over integer-family inputs.
+    bit_and,
+    bit_or,
+    bit_xor,
+    /// DISTINCT numeric SUM/AVG; keeps observed values and dedupes at finalize.
+    sum_distinct,
+    avg_distinct,
     /// Population stddev. sqrt(sum((x-mean)^2) / n). 0 when n=0.
     stddev_pop,
     /// Sample stddev. sqrt(sum((x-mean)^2) / (n-1)). 0 when n<2.
@@ -91,8 +107,8 @@ pub const AggFunc = enum {
 /// excluded; count/sum/min/max/avg/stddev/variance all keep fixed-size state.
 fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
-        .count, .sum, .min, .max, .avg, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
-        .count_distinct, .percentile, .group_concat, .udf => return false,
+        .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
+        .any_value, .first, .last, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .group_concat, .udf => return false,
     };
     return true;
 }
@@ -219,6 +235,11 @@ pub const AccState = union(enum) {
     min_str: ?[]const u8,
     max_str: ?[]const u8,
     avg: AvgAcc,
+    bool_acc: BoolAcc,
+    value_acc: ValueAcc,
+    bitwise: BitwiseAcc,
+    distinct_numeric: std.ArrayListUnmanaged(f64),
+
     /// Welford's online algorithm: numerically stable variance/stddev.
     /// Covers stddev_pop, stddev_samp, var_pop, var_samp.
     welford: WelfordAcc,
@@ -249,6 +270,125 @@ pub const AccState = union(enum) {
     /// lives behind a pointer, null until the first value is appended).
     concat: ?*ConcatAcc,
 };
+
+fn boolUpdate(s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, row_end: u32) !void {
+    const vals = view.data.boolean;
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!view.isValid(r)) continue;
+        const v = vals[r] != 0;
+        if (!s.bool_acc.seen) {
+            s.bool_acc.seen = true;
+            s.bool_acc.value = v;
+        } else if (func == .bool_and) {
+            s.bool_acc.value = s.bool_acc.value and v;
+        } else {
+            s.bool_acc.value = s.bool_acc.value or v;
+        }
+    }
+}
+
+fn valueFromRow(aa: Allocator, view: ColumnView, row: usize) !types.Value {
+    return switch (view.data) {
+        .int => |v| .{ .int = v[row] },
+        .bigint => |v| .{ .bigint = v[row] },
+        .boolean => |v| .{ .boolean = v[row] != 0 },
+        .float => |v| .{ .float = v[row] },
+        .double => |v| .{ .double = v[row] },
+        .date => |v| .{ .date = v[row] },
+        .datetime => |v| .{ .datetime = v[row] },
+        .tinyint => |v| .{ .tinyint = v[row] },
+        .smallint => |v| .{ .smallint = v[row] },
+        .largeint => |v| .{ .largeint = v[row] },
+        .decimal64 => |v| .{ .decimal64 = v[row] },
+        .decimal128 => |v| .{ .decimal128 = v[row] },
+        .uuid => |v| .{ .uuid = v[row] },
+        .varchar, .string, .char => .{ .text = try aa.dupe(u8, stringRowBytes(view, row)) },
+    };
+}
+
+fn valueUpdate(aa: Allocator, s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, row_end: u32) !void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!view.isValid(r)) continue;
+        if (func == .last or !s.value_acc.seen) {
+            s.value_acc.value = try valueFromRow(aa, view, r);
+            s.value_acc.seen = true;
+        }
+        if (func == .any_value or func == .first) break;
+    }
+}
+
+fn appendValueToColumn(allocator: Allocator, col: *ColumnStore, out_type: Type, value: types.Value) !void {
+    switch (out_type) {
+        .int => try col.data.int.append(allocator, value.int),
+        .bigint => try col.data.bigint.append(allocator, value.bigint),
+        .boolean => try col.data.boolean.append(allocator, if (value.boolean) 1 else 0),
+        .float => try col.data.float.append(allocator, value.float),
+        .double => try col.data.double.append(allocator, value.double),
+        .date => try col.data.date.append(allocator, value.date),
+        .datetime => try col.data.datetime.append(allocator, value.datetime),
+        .tinyint => try col.data.tinyint.append(allocator, value.tinyint),
+        .smallint => try col.data.smallint.append(allocator, value.smallint),
+        .largeint => try col.data.largeint.append(allocator, value.largeint),
+        .decimal64 => try col.data.decimal64.append(allocator, value.decimal64),
+        .decimal128 => try col.data.decimal128.append(allocator, value.decimal128),
+        .uuid => try col.data.uuid.append(allocator, value.uuid),
+        .varchar => try col.data.varchar.appendValue(allocator, value.text),
+        .string => try col.data.string.appendValue(allocator, value.text),
+        .char => try col.data.char.appendValue(allocator, value.text),
+    }
+}
+
+fn rowI64(view: ColumnView, row: usize) i64 {
+    return switch (view.data) {
+        .boolean => |v| v[row],
+        .tinyint => |v| v[row],
+        .smallint => |v| v[row],
+        .int => |v| v[row],
+        .bigint => |v| v[row],
+        else => unreachable,
+    };
+}
+
+fn bitwiseUpdate(s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, row_end: u32) !void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!view.isValid(r)) continue;
+        const v = rowI64(view, r);
+        if (!s.bitwise.seen) {
+            s.bitwise.seen = true;
+            s.bitwise.value = v;
+        } else switch (func) {
+            .bit_and => s.bitwise.value &= v,
+            .bit_or => s.bitwise.value |= v,
+            .bit_xor => s.bitwise.value ^= v,
+            else => unreachable,
+        }
+    }
+}
+
+fn rowF64(view: ColumnView, row: usize) f64 {
+    return switch (view.data) {
+        .boolean => |v| @floatFromInt(v[row]),
+        .tinyint => |v| @floatFromInt(v[row]),
+        .smallint => |v| @floatFromInt(v[row]),
+        .int => |v| @floatFromInt(v[row]),
+        .bigint, .decimal64 => |v| @floatFromInt(v[row]),
+        .largeint, .decimal128 => |v| @floatFromInt(v[row]),
+        .float => |v| v[row],
+        .double => |v| v[row],
+        else => unreachable,
+    };
+}
+
+fn distinctNumericUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!view.isValid(r)) continue;
+        try s.distinct_numeric.append(aa, rowF64(view, r));
+    }
+}
 
 /// Per-aggregate accumulator storage, one entry per aggregate. The hybrid
 /// Struct-of-Arrays replacement for the old flat `[]AccState gstate`: each
@@ -283,7 +423,7 @@ const AggColKind = enum { count, sum_int, sum_float, avg, min_int, max_int, min_
 
 fn aggColKind(func: AggFunc, in: ?Type) AggColKind {
     return switch (func) {
-        .count => .count,
+        .count, .count_if => .count,
         .sum => if (in != null and in.?.isFloat()) .sum_float else .sum_int,
         .avg => .avg,
         .min => if (in != null and in.?.isFloat())
@@ -332,6 +472,21 @@ const SumFloatAcc = struct { v: f64 = 0, seen: bool = false };
 const AvgAcc = struct {
     sum: f64,
     count: u64,
+};
+
+const BoolAcc = struct {
+    seen: bool = false,
+    value: bool = false,
+};
+
+const ValueAcc = struct {
+    seen: bool = false,
+    value: types.Value = .{ .int = 0 },
+};
+
+const BitwiseAcc = struct {
+    seen: bool = false,
+    value: i64 = 0,
 };
 
 const WelfordAcc = struct {
@@ -2293,7 +2448,7 @@ fn findAggByName(aggs: []const AggSpec, name: []const u8) ?usize {
 /// `aggOrderValue` is always defined for an orderable key.
 fn topkOrderable(func: AggFunc, out_t: Type) bool {
     return switch (func) {
-        .count, .count_distinct, .sum, .avg => true,
+        .count, .count_if, .count_distinct, .sum, .avg => true,
         .min, .max => !out_t.isString(),
         else => false,
     };
@@ -2527,6 +2682,12 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         else
             .{ .max_int = null },
         .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
+        .count_if => .{ .count = 0 },
+        .bool_and => .{ .bool_acc = .{ .value = true } },
+        .bool_or => .{ .bool_acc = .{ .value = false } },
+        .any_value, .first, .last => .{ .value_acc = .{} },
+        .bit_and, .bit_or, .bit_xor => .{ .bitwise = .{} },
+        .sum_distinct, .avg_distinct => .{ .distinct_numeric = .empty },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
         .count_distinct => blk: {
             if (in) |t| if (intKeyBits(t)) |vb| break :blk if (vb <= 32)
@@ -2556,7 +2717,7 @@ pub fn aggOutputTypeFor(a: AggSpec, in: ?Type) !Type {
 /// COUNT family (which finalizes to 0 over zero qualifying inputs).
 pub fn aggOutputNullable(func: AggFunc) bool {
     return switch (func) {
-        .count, .count_distinct => false,
+        .count, .count_if, .count_distinct => false,
         else => true,
     };
 }
@@ -2576,7 +2737,7 @@ fn intFamilyOutput(t: Type) bool {
 fn aggColStat(a: AggSpec, out_type: Type, src: ?exec.ColStat, upper_rows: u64) exec.ColStat {
     const n: i128 = @intCast(upper_rows);
     switch (a.func) {
-        .count, .count_distinct => return .{ .min = 0, .max = n },
+        .count, .count_if, .count_distinct => return .{ .min = 0, .max = n },
         .min, .max => {
             if (!intFamilyOutput(out_type)) return .{};
             const s = src orelse return .{};
@@ -2609,7 +2770,7 @@ fn aggColStat(a: AggSpec, out_type: Type, src: ?exec.ColStat, upper_rows: u64) e
 
 fn aggOutputType(func: AggFunc, in: ?Type) !Type {
     return switch (func) {
-        .count, .count_distinct => .bigint,
+        .count, .count_if, .count_distinct => .bigint,
         .sum => blk: {
             const t = in orelse return Error.AggregateColumnRequired;
             // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s).
@@ -2623,7 +2784,10 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
             break :blk .bigint;
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
-        .avg, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile => .double,
+        .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile => .double,
+        .bool_and, .bool_or => .boolean,
+        .any_value, .first, .last => in orelse return Error.AggregateColumnRequired,
+        .bit_and, .bit_or, .bit_xor => .bigint,
         .group_concat => .string,
         .udf => Error.AggregateUnsupportedType,
     };
@@ -2632,11 +2796,22 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
 pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams) !void {
     switch (func) {
         .count => return,
-        .sum, .avg, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
+        .sum, .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
             const t = in orelse return Error.AggregateColumnRequired;
             if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double)) {
                 return Error.AggregateUnsupportedType;
             }
+        },
+        .count_if, .bool_and, .bool_or => {
+            const t = in orelse return Error.AggregateColumnRequired;
+            if (t != .boolean) return Error.AggregateUnsupportedType;
+        },
+        .any_value, .first, .last => {
+            _ = in orelse return Error.AggregateColumnRequired;
+        },
+        .bit_and, .bit_or, .bit_xor => {
+            const t = in orelse return Error.AggregateColumnRequired;
+            if (!(t == .boolean or t == .tinyint or t == .smallint or t == .int or t == .bigint)) return Error.AggregateUnsupportedType;
         },
         .min, .max => {
             const t = in orelse return Error.AggregateColumnRequired;
@@ -2683,6 +2858,10 @@ fn updateStateRow(aa: Allocator, s: *AccState, spec: AggSpec, batch: Batch, col_
             if (col_idx) |idx| {
                 if (batch.values[idx].isValid(row)) s.count += 1;
             } else s.count += 1;
+        },
+        .count_if => {
+            const view = batch.values[col_idx.?];
+            if (view.isValid(row) and view.data.boolean[row] != 0) s.count += 1;
         },
         .sum => {
             const view = batch.values[col_idx.?];
@@ -3036,6 +3215,26 @@ pub fn updateState(
                 },
                 else => unreachable,
             }
+        },
+        .count_if => {
+            const view = batch.values[col_idx.?];
+            const vals = view.data.boolean;
+            var r: u32 = row_start;
+            while (r < row_end) : (r += 1) {
+                if (view.isValid(r) and vals[r] != 0) s.count += 1;
+            }
+        },
+        .bool_and, .bool_or => {
+            try boolUpdate(s, func, batch.values[col_idx.?], row_start, row_end);
+        },
+        .any_value, .first, .last => {
+            try valueUpdate(aa, s, func, batch.values[col_idx.?], row_start, row_end);
+        },
+        .bit_and, .bit_or, .bit_xor => {
+            try bitwiseUpdate(s, func, batch.values[col_idx.?], row_start, row_end);
+        },
+        .sum_distinct, .avg_distinct => {
+            try distinctNumericUpdate(aa, s, batch.values[col_idx.?], row_start, row_end);
         },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
             try welfordUpdate(s, batch.values[col_idx.?], row_start, row_end);
@@ -3423,6 +3622,54 @@ pub fn appendAccToColumn(
                 is_null = true;
             } else {
                 try col.data.double.append(allocator, a.sum / @as(f64, @floatFromInt(a.count)));
+            }
+        },
+        .count_if => {
+            try col.data.bigint.append(allocator, @intCast(state.count));
+        },
+        .bool_and, .bool_or => {
+            const b = state.bool_acc;
+            if (!b.seen) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else {
+                try col.data.boolean.append(allocator, if (b.value) 1 else 0);
+            }
+        },
+        .any_value, .first, .last => {
+            const v = state.value_acc;
+            if (!v.seen) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else try appendValueToColumn(allocator, col, out_type, v.value);
+        },
+        .bit_and, .bit_or, .bit_xor => {
+            const b = state.bitwise;
+            if (!b.seen) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else {
+                try col.data.bigint.append(allocator, b.value);
+            }
+        },
+        .sum_distinct, .avg_distinct => {
+            const vals = state.distinct_numeric.items;
+            if (vals.len == 0) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else {
+                std.mem.sortUnstable(f64, @constCast(vals), {}, std.sort.asc(f64));
+                var sum: f64 = 0.0;
+                var count: u64 = 0;
+                var prev: ?f64 = null;
+                for (vals) |v| {
+                    if (prev == null or v != prev.?) {
+                        sum += v;
+                        count += 1;
+                        prev = v;
+                    }
+                }
+                try col.data.double.append(allocator, if (func == .avg_distinct) sum / @as(f64, @floatFromInt(count)) else sum);
             }
         },
         .var_pop, .var_samp, .stddev_pop, .stddev_samp => {

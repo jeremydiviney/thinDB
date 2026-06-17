@@ -163,3 +163,49 @@ test "scalar_fn: truncate routes via int → double coercion for bigint arg" {
     try std.testing.expect(casts[0] != null);
     try std.testing.expect(casts[1] == null);
 }
+
+test "scalar_fn: variadic conditional and string additions resolve" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const co = (try resolve(aa, "coalesce", &.{ .int, .int, .int })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .int), @as(TypeTag, co.func.return_type));
+    try std.testing.expectEqual(@as(usize, 3), co.func.arg_types.len);
+    try std.testing.expect(co.arg_casts == null);
+
+    const iff = (try resolve(aa, "if", &.{ .boolean, .string, .string })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .string), @as(TypeTag, iff.func.return_type));
+
+    const cws = (try resolve(aa, "concat_ws", &.{ .string, .string, .string, .string })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .string), @as(TypeTag, cws.func.return_type));
+    try std.testing.expectEqual(@as(usize, 4), cws.func.arg_types.len);
+
+    const fld = (try resolve(aa, "field", &.{ .string, .string, .string })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .int), @as(TypeTag, fld.func.return_type));
+}
+
+test "scalar_fn: expanded math date and hash additions resolve" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    inline for (&.{ "sin", "cos", "tan", "asin", "acos", "atan", "cot", "cbrt", "square" }) |name| {
+        const r = (try resolve(aa, name, &.{.double})) orelse return error.NotFound;
+        try std.testing.expectEqual(@as(TypeTag, .double), @as(TypeTag, r.func.return_type));
+    }
+    try std.testing.expect((try resolve(aa, "pi", &.{})) != null);
+    try std.testing.expect((try resolve(aa, "rand", &.{})) != null);
+    try std.testing.expect((try resolve(aa, "log", &.{ .double, .double })) != null);
+    try std.testing.expect((try resolve(aa, "round", &.{ .double, .int })) != null);
+    try std.testing.expect((try resolve(aa, "conv", &.{ .string, .int, .int })) != null);
+
+    try std.testing.expect((try resolve(aa, "dayname", &.{.date})) != null);
+    try std.testing.expect((try resolve(aa, "monthname", &.{.datetime})) != null);
+    try std.testing.expect((try resolve(aa, "timestampadd", &.{ .string, .int, .date })) != null);
+
+    const sha2 = (try resolve(aa, "sha2", &.{ .string, .int })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .string), @as(TypeTag, sha2.func.return_type));
+    try std.testing.expect((try resolve(aa, "md5sum", &.{ .string, .string })) != null);
+    try std.testing.expect((try resolve(aa, "xx_hash3_128", &.{.string})) != null);
+}

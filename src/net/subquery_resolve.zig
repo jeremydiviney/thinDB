@@ -161,12 +161,20 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
             // per statement).
             if (c.args.len == 0) {
                 if (std.ascii.eqlIgnoreCase(c.fn_name, "now") or
-                    std.ascii.eqlIgnoreCase(c.fn_name, "current_timestamp"))
+                    std.ascii.eqlIgnoreCase(c.fn_name, "current_timestamp") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "localtimestamp") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "utc_timestamp") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "current_time") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "curtime") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "localtime"))
                 {
                     e.* = .{ .lit = .{ .datetime = ctx.now_micros } };
                     return;
                 }
-                if (std.ascii.eqlIgnoreCase(c.fn_name, "current_date")) {
+                if (std.ascii.eqlIgnoreCase(c.fn_name, "current_date") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "curdate") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "utc_date"))
+                {
                     e.* = .{ .lit = .{ .date = @intCast(@divFloor(ctx.now_micros, std.time.us_per_day)) } };
                     return;
                 }

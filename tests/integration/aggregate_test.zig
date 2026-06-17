@@ -792,3 +792,107 @@ test "aggregate: genuinely high-card group-by overflows the initial size and jum
     try std.testing.expectEqual(n_keys, groups_seen);
     try std.testing.expectEqual(@as(u64, n_keys * 2), count_sum);
 }
+
+test "aggregate: count_if bool bit value and distinct numeric additions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "x", .type = .int, .nullable = true },
+            .{ .name = "flag", .type = .boolean, .nullable = true },
+            .{ .name = "bits", .type = .int, .nullable = true },
+            .{ .name = "tag", .type = .string, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &ok, .unique = true, .row_group_size = 8 });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .x = @as(?i32, 1), .flag = @as(?bool, true), .bits = @as(?i32, 7), .tag = @as(?[]const u8, "a") },
+        .{ .id = @as(i64, 2), .x = @as(?i32, 2), .flag = @as(?bool, false), .bits = @as(?i32, 3), .tag = @as(?[]const u8, null) },
+        .{ .id = @as(i64, 3), .x = @as(?i32, 2), .flag = @as(?bool, null), .bits = @as(?i32, null), .tag = @as(?[]const u8, "b") },
+        .{ .id = @as(i64, 4), .x = @as(?i32, null), .flag = @as(?bool, true), .bits = @as(?i32, 1), .tag = @as(?[]const u8, "c") },
+    });
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.aggregate(&.{
+        .{ .func = .count_if, .col = "flag", .as = "ct" },
+        .{ .func = .bool_and, .col = "flag", .as = "ba" },
+        .{ .func = .bool_or, .col = "flag", .as = "bo" },
+        .{ .func = .bit_and, .col = "bits", .as = "band" },
+        .{ .func = .bit_or, .col = "bits", .as = "bor" },
+        .{ .func = .bit_xor, .col = "bits", .as = "bxor" },
+        .{ .func = .sum_distinct, .col = "x", .as = "sd" },
+        .{ .func = .avg_distinct, .col = "x", .as = "ad" },
+        .{ .func = .any_value, .col = "tag", .as = "any" },
+        .{ .func = .first, .col = "tag", .as = "first" },
+        .{ .func = .last, .col = "tag", .as = "last" },
+    });
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 2), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(u8, 0), b.values[1].data.boolean[0]);
+    try std.testing.expectEqual(@as(u8, 1), b.values[2].data.boolean[0]);
+    try std.testing.expectEqual(@as(i64, 1), b.values[3].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 7), b.values[4].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 5), b.values[5].data.bigint[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), b.values[6].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), b.values[7].data.double[0], 1e-9);
+    try std.testing.expectEqualStrings("a", b.values[8].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("a", b.values[9].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("c", b.values[10].data.string.rowBytes(0));
+}
+
+test "aggregate: new aggregates honor all-NULL inputs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "x", .type = .int, .nullable = true },
+            .{ .name = "flag", .type = .boolean, .nullable = true },
+            .{ .name = "bits", .type = .int, .nullable = true },
+            .{ .name = "tag", .type = .string, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &ok, .unique = true, .row_group_size = 8 });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .x = @as(?i32, null), .flag = @as(?bool, null), .bits = @as(?i32, null), .tag = @as(?[]const u8, null) },
+        .{ .id = @as(i64, 2), .x = @as(?i32, null), .flag = @as(?bool, null), .bits = @as(?i32, null), .tag = @as(?[]const u8, null) },
+    });
+    try t.flush();
+
+    var base = try thindb.scan(allocator, t);
+    var q = try base.aggregate(&.{
+        .{ .func = .count_if, .col = "flag", .as = "ct" },
+        .{ .func = .bool_and, .col = "flag", .as = "ba" },
+        .{ .func = .bit_or, .col = "bits", .as = "bor" },
+        .{ .func = .sum_distinct, .col = "x", .as = "sd" },
+        .{ .func = .avg_distinct, .col = "x", .as = "ad" },
+        .{ .func = .first, .col = "tag", .as = "first" },
+    });
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 0), b.values[0].data.bigint[0]);
+    try std.testing.expect(!b.values[1].isValid(0));
+    try std.testing.expect(!b.values[2].isValid(0));
+    try std.testing.expect(!b.values[3].isValid(0));
+    try std.testing.expect(!b.values[4].isValid(0));
+    try std.testing.expect(!b.values[5].isValid(0));
+}
