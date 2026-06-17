@@ -39,6 +39,7 @@ pub const SortSpec = exec_sort.SortSpec;
 const exec_aggregate = @import("../exec/aggregate.zig");
 pub const AggFunc = exec_aggregate.AggFunc;
 pub const AggSpec = exec_aggregate.AggSpec;
+pub const AggParams = exec_aggregate.AggParams;
 
 const exec_compute = @import("../exec/compute.zig");
 pub const Derived = exec_compute.Derived;

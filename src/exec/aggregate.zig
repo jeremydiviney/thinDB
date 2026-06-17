@@ -303,7 +303,7 @@ fn valueFromRow(aa: Allocator, view: ColumnView, row: usize) !types.Value {
         .decimal64 => |v| .{ .decimal64 = v[row] },
         .decimal128 => |v| .{ .decimal128 = v[row] },
         .uuid => |v| .{ .uuid = v[row] },
-        .varchar, .string, .char => .{ .text = try aa.dupe(u8, stringRowBytes(view, row)) },
+        .varchar, .string, .char => .{ .text = try aa.dupe(u8, stringRowBytes(view, @intCast(row))) },
     };
 }
 

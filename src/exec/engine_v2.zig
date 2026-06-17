@@ -831,18 +831,21 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
         if (try tryMetaAggStats(input.allocator, table, plan.group_by.aggs)) |q| return q;
     }
 
-    // No serial fallback. The parallel reducer (v2_global_aggregate) is the only
-    // path for a no-GROUP-BY aggregate: every aggregate — COUNT(DISTINCT) of any
-    // type included — folds per-lane and merges. A shape it declines surfaces as
-    // UnsupportedQueryShape (the caller maps null → error) so it gets fixed in
-    // the parallel handler rather than silently run single-threaded.
-    return try v2_global_aggregate.tryBuild(input.allocator, table, .{
+    // The parallel reducer (v2_global_aggregate) hosts the combinable aggregates —
+    // COUNT/SUM/AVG/MIN/MAX and COUNT(DISTINCT) of any type — folding per-lane and
+    // merging. It declines the rest (count_if, bool_and/or, bit_or, distinct
+    // SUM/AVG, approx_count_distinct, median, percentile, std/variance, first/last):
+    // non-combinable or order-dependent states that can't merge across lanes. Those
+    // run on the engine-neutral hash Aggregate operator (serial fold over a parallel
+    // scan), the same home GROUP_CONCAT and non-combinable UDAFs decline to above.
+    if (try v2_global_aggregate.tryBuild(input.allocator, table, .{
         .aggs = plan.group_by.aggs,
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .having_filter = if (plan.having_filter) |f| f.predicate else null,
         .derived = plan.derived,
         .dop = input.db.config.max_dop,
-    });
+    })) |q| return q;
+    return try buildGlobalOperatorAggregate(input, table, plan);
 }
 
 // Shape-side gate for the metadata-only lane: every aggregate must be
