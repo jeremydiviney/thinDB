@@ -189,13 +189,27 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // output-column name; a post-parse pass rewrites it to the matching
     // SELECT aggregate's alias.
     if (p.cur.tag == .lparen) {
-        const args = try p.parseCallArgList(null);
-        if (p.aggregateFuncForName(col_dup) != null) {
-            col_dup = try p.aggSortName(col_dup, args);
+        var saw_distinct = false;
+        const args = try p.parseCallArgList(&saw_distinct);
+        if (p.aggregateFuncForName(col_dup)) |func| {
+            if (p.aggregateExprRefsEnabled()) {
+                col_dup = try p.materializeAggregateExpr(col_dup, func, args, saw_distinct);
+            } else {
+                if (saw_distinct) return PE.SqlInvalidProjection;
+                col_dup = try p.aggSortName(col_dup, args);
+            }
+        } else if (saw_distinct) {
+            return PE.SqlInvalidProjection;
         } else if (std.ascii.eqlIgnoreCase(col_dup, "day") and args.len == 1 and args[0] == .col_ref) {
             return try makeDayComparison(p, args[0].col_ref);
         } else {
-            return PE.SqlInvalidProjection;
+            const lhs = ir.Expr{ .call = .{
+                .fn_name = try p.arena.dupe(u8, col_dup),
+                .args = args,
+            } };
+            const op = try parseComparisonToken(p);
+            const rhs = try p.parseAddSub();
+            return try makeExprComparisonPredicate(p, lhs, op, rhs);
         }
     }
 
@@ -488,8 +502,19 @@ fn makeDayComparison(p: anytype, col: []const u8) @TypeOf(p.*).Err!PredicateExpr
         else => return PE.SqlExpectedToken,
     };
     try p.advance();
-    const val = try p.parseValue();
-    return .{ .day_leaf = .{ .col = try p.arena.dupe(u8, col), .op = op, .val = val } };
+    const rhs = try p.parseAddSub();
+    return switch (rhs) {
+        .lit => |val| .{ .day_leaf = .{ .col = try p.arena.dupe(u8, col), .op = op, .val = val } },
+        else => blk: {
+            const args = try p.arena.alloc(ir.Expr, 1);
+            args[0] = ir.Expr{ .col_ref = try p.arena.dupe(u8, col) };
+            const lhs = ir.Expr{ .call = .{
+                .fn_name = try p.arena.dupe(u8, "day"),
+                .args = args,
+            } };
+            break :blk try makeExprComparisonPredicate(p, lhs, op, rhs);
+        },
+    };
 }
 
 /// Parse an `identifier (. identifier)?` column reference at the

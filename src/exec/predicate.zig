@@ -540,6 +540,14 @@ fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
         .int => val.* = .{ .int = fitInt(i32, iv) catch return error.NoWidening },
         .bigint => val.* = .{ .bigint = fitInt(i64, iv) catch return error.NoWidening },
         .largeint => val.* = .{ .largeint = iv },
+        .float => {
+            if (iv < -(@as(i128, 1) << 24) or iv > (@as(i128, 1) << 24)) return error.NoWidening;
+            val.* = .{ .float = @floatFromInt(iv) };
+        },
+        .double => {
+            if (iv < -(@as(i128, 1) << 53) or iv > (@as(i128, 1) << 53)) return error.NoWidening;
+            val.* = .{ .double = @floatFromInt(iv) };
+        },
         .boolean => {
             if (iv != 0 and iv != 1) return error.NoWidening;
             val.* = .{ .boolean = iv == 1 };

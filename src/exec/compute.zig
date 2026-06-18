@@ -50,6 +50,14 @@ const Predicate = exec.Predicate;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
+fn traceUnsupportedExpr(context: []const u8, e: Expr) Error {
+    switch (e) {
+        .call => |c| std.debug.print("compute unsupported expr in {s}: call {s}\n", .{ context, c.fn_name }),
+        else => std.debug.print("compute unsupported expr in {s}: {s}\n", .{ context, @tagName(e) }),
+    }
+    return Error.ComputeUnsupportedExpr;
+}
+
 /// One derived column on a Compute operator.
 pub const Derived = struct {
     name: []const u8,
@@ -110,6 +118,7 @@ const ArgPlan = union(enum) {
     lit: *LitSlot,
     null_lit: *NullSlot,
     call: *CallPlan,
+    case: *CasePlan,
 };
 
 /// Per-literal scratch — typed ColumnStore refilled each batch with
@@ -124,6 +133,8 @@ const NullSlot = struct {
     ty: Type,
     buf: ColumnStore,
 };
+
+const PlanError = Allocator.Error || Error;
 
 /// Resolved call node: ScalarFn + per-arg evaluation plan + optional
 /// coercion machinery + output buffer. Roots of derived columns
@@ -217,6 +228,7 @@ const BranchSrc = union(enum) {
     lit: *LitSlot,
     null_lit: *NullSlot,
     call: *CallPlan,
+    case: *CasePlan,
 };
 
 const CasePlan = struct {
@@ -480,7 +492,7 @@ pub const Compute = struct {
     /// Post-order: literals refill, sub-calls evaluate first; then args
     /// are coerced and the kernel runs. Null bookkeeping fires at every
     /// level so `length(upper(tag))` with a NULL tag produces NULL.
-    fn evalCall(self: *Compute, plan: *CallPlan, in_values: []const ColumnView, n: usize) !void {
+    fn evalCall(self: *Compute, plan: *CallPlan, in_values: []const ColumnView, n: usize) anyerror!void {
         // Output buffer is cleared by the caller for the root; for
         // internal nodes we clear before refilling here.
         if (plan.output_owned) plan.output.clear();
@@ -504,6 +516,10 @@ pub const Compute = struct {
                 },
                 .call => |sub| {
                     try self.evalCall(sub, in_values, n);
+                    view.* = sub.output.view();
+                },
+                .case => |sub| {
+                    try self.evalCase(sub, in_values, n);
                     view.* = sub.output.view();
                 },
             }
@@ -555,7 +571,7 @@ pub const Compute = struct {
     ///   3. Walk rows in order, copying the winner's cell into the
     ///      output ColumnStore (or appending NULL when no branch
     ///      matches and there's no ELSE).
-    fn evalCase(self: *Compute, plan: *CasePlan, in_values: []const ColumnView, n: usize) !void {
+    fn evalCase(self: *Compute, plan: *CasePlan, in_values: []const ColumnView, n: usize) anyerror!void {
         plan.output.clear();
 
         var branch_views_buf: [16]ColumnView = undefined;
@@ -612,7 +628,7 @@ pub const Compute = struct {
         cast_buf: ?*ColumnStore,
         in_values: []const ColumnView,
         n: usize,
-    ) !ColumnView {
+    ) anyerror!ColumnView {
         const raw = try self.materializeBranchSrc(s, in_values, n);
         const k = cast_kernel orelse return raw;
         const buf = cast_buf.?;
@@ -622,7 +638,7 @@ pub const Compute = struct {
         return buf.view();
     }
 
-    fn materializeBranchSrc(self: *Compute, s: BranchSrc, in_values: []const ColumnView, n: usize) !ColumnView {
+    fn materializeBranchSrc(self: *Compute, s: BranchSrc, in_values: []const ColumnView, n: usize) anyerror!ColumnView {
         return switch (s) {
             .col => |idx| in_values[idx],
             .lit => |slot| blk: {
@@ -637,6 +653,10 @@ pub const Compute = struct {
             },
             .call => |sub| blk: {
                 try self.evalCall(sub, in_values, n);
+                break :blk sub.output.view();
+            },
+            .case => |sub| blk: {
+                try self.evalCase(sub, in_values, n);
                 break :blk sub.output.view();
             },
         };
@@ -1124,7 +1144,7 @@ fn resolveDerived(
         },
         // Subqueries and var_refs must be resolved (rewritten to `.lit`)
         // by the pre-compile pass before this resolver runs.
-        .scalar_subquery, .exists_subquery, .var_ref => return Error.ComputeUnsupportedExpr,
+        .scalar_subquery, .exists_subquery, .var_ref => return traceUnsupportedExpr("resolveDerived", d.expr),
     }
 }
 
@@ -1170,7 +1190,7 @@ fn buildCasePlan(
     cs: Expr.Case,
     up_schema: []const Column,
     udf_registry: ?*const udf_mod.UdfRegistry,
-) !*CasePlan {
+) PlanError!*CasePlan {
     if (cs.branches.len == 0) return Error.ComputeUnsupportedExpr;
 
     const branches = try aa.alloc(CaseBranch, cs.branches.len);
@@ -1254,7 +1274,7 @@ fn buildBranchSrc(
     e: Expr,
     up_schema: []const Column,
     udf_registry: ?*const udf_mod.UdfRegistry,
-) !BranchSrc {
+) PlanError!BranchSrc {
     return switch (e) {
         .col_ref => |name| blk: {
             const idx = columnIndex(up_schema, name) orelse return Error.ColumnNotFound;
@@ -1280,8 +1300,11 @@ fn buildBranchSrc(
             const sub = try buildCallPlan(runtime_allocator, aa, e, up_schema, udf_registry);
             break :blk BranchSrc{ .call = sub };
         },
-        .case => return Error.ComputeUnsupportedExpr,
-        .scalar_subquery, .exists_subquery, .var_ref => return Error.ComputeUnsupportedExpr,
+        .case => blk: {
+            const sub = try buildCasePlan(runtime_allocator, aa, e.case, up_schema, udf_registry);
+            break :blk BranchSrc{ .case = sub };
+        },
+        .scalar_subquery, .exists_subquery, .var_ref => return traceUnsupportedExpr("buildBranchSrc", e),
     };
 }
 
@@ -1291,6 +1314,7 @@ fn branchSrcType(s: BranchSrc, up_schema: []const Column) Type {
         .lit => |slot| literalType(slot.value),
         .null_lit => |slot| slot.ty,
         .call => |plan| plan.output_type,
+        .case => |plan| plan.output_type,
     };
 }
 
@@ -1300,6 +1324,7 @@ fn branchSrcNullable(s: BranchSrc, up_schema: []const Column) bool {
         .lit => false,
         .null_lit => true,
         .call => |plan| callPlanNullable(plan, up_schema),
+        .case => |plan| plan.may_produce_null,
     };
 }
 
@@ -1309,6 +1334,7 @@ fn freeBranchSrc(allocator: Allocator, s: BranchSrc) void {
         .lit => |slot| slot.buf.deinit(allocator),
         .null_lit => |slot| slot.buf.deinit(allocator),
         .call => |sub| freeCallPlan(allocator, sub),
+        .case => |sub| freeCasePlan(allocator, sub),
     }
 }
 
@@ -1348,10 +1374,10 @@ fn buildCallPlan(
     expr: Expr,
     up_schema: []const Column,
     udf_registry: ?*const udf_mod.UdfRegistry,
-) !*CallPlan {
+) PlanError!*CallPlan {
     const c = switch (expr) {
         .call => |x| x,
-        else => return Error.ComputeUnsupportedExpr,
+        else => return traceUnsupportedExpr("buildCallPlan root", expr),
     };
 
     const arg_plans = try aa.alloc(ArgPlan, c.args.len);
@@ -1386,8 +1412,12 @@ fn buildCallPlan(
                 arg_plans[i] = .{ .call = sub };
                 arg_types[i] = sub.output_type;
             },
-            .case => return Error.ComputeUnsupportedExpr,
-            .scalar_subquery, .exists_subquery, .var_ref => return Error.ComputeUnsupportedExpr,
+            .case => {
+                const sub = try buildCasePlan(runtime_allocator, aa, arg.case, up_schema, udf_registry);
+                arg_plans[i] = .{ .case = sub };
+                arg_types[i] = sub.output_type;
+            },
+            .scalar_subquery, .exists_subquery, .var_ref => return traceUnsupportedExpr("buildCallPlan arg", arg),
         }
     }
 
@@ -1408,6 +1438,7 @@ fn buildCallPlan(
                 .null_lit => true,
                 // Sub-call outputs are nullable (allocated below).
                 .call => true,
+                .case => |sub| sub.may_produce_null,
             };
             slot.* = try ColumnStore.init(runtime_allocator, declared, src_nullable);
         }
@@ -1442,6 +1473,7 @@ fn freeCallPlan(runtime_allocator: Allocator, plan: *CallPlan) void {
         .lit => |slot| slot.buf.deinit(runtime_allocator),
         .null_lit => |slot| slot.buf.deinit(runtime_allocator),
         .call => |sub| freeCallPlan(runtime_allocator, sub),
+        .case => |sub| freeCasePlan(runtime_allocator, sub),
     };
     if (plan.cast_buffers) |buffers| {
         for (buffers) |*slot| if (slot.*) |*cs| cs.deinit(runtime_allocator);
@@ -1567,6 +1599,7 @@ fn callPlanNullable(plan: *CallPlan, up_schema: []const Column) bool {
         .lit => {},
         .null_lit => return true,
         .call => |sub| if (callPlanNullable(sub, up_schema)) return true,
+        .case => |sub| if (sub.may_produce_null) return true,
     };
     return false;
 }
