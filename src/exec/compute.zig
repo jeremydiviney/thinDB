@@ -50,14 +50,6 @@ const Predicate = exec.Predicate;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
-fn traceUnsupportedExpr(context: []const u8, e: Expr) Error {
-    switch (e) {
-        .call => |c| std.debug.print("compute unsupported expr in {s}: call {s}\n", .{ context, c.fn_name }),
-        else => std.debug.print("compute unsupported expr in {s}: {s}\n", .{ context, @tagName(e) }),
-    }
-    return Error.ComputeUnsupportedExpr;
-}
-
 /// One derived column on a Compute operator.
 pub const Derived = struct {
     name: []const u8,
@@ -1144,7 +1136,7 @@ fn resolveDerived(
         },
         // Subqueries and var_refs must be resolved (rewritten to `.lit`)
         // by the pre-compile pass before this resolver runs.
-        .scalar_subquery, .exists_subquery, .var_ref => return traceUnsupportedExpr("resolveDerived", d.expr),
+        .scalar_subquery, .exists_subquery, .var_ref => return Error.ComputeUnsupportedExpr,
     }
 }
 
@@ -1304,7 +1296,7 @@ fn buildBranchSrc(
             const sub = try buildCasePlan(runtime_allocator, aa, e.case, up_schema, udf_registry);
             break :blk BranchSrc{ .case = sub };
         },
-        .scalar_subquery, .exists_subquery, .var_ref => return traceUnsupportedExpr("buildBranchSrc", e),
+        .scalar_subquery, .exists_subquery, .var_ref => return Error.ComputeUnsupportedExpr,
     };
 }
 
@@ -1377,7 +1369,7 @@ fn buildCallPlan(
 ) PlanError!*CallPlan {
     const c = switch (expr) {
         .call => |x| x,
-        else => return traceUnsupportedExpr("buildCallPlan root", expr),
+        else => return Error.ComputeUnsupportedExpr,
     };
 
     const arg_plans = try aa.alloc(ArgPlan, c.args.len);
@@ -1417,7 +1409,7 @@ fn buildCallPlan(
                 arg_plans[i] = .{ .case = sub };
                 arg_types[i] = sub.output_type;
             },
-            .scalar_subquery, .exists_subquery, .var_ref => return traceUnsupportedExpr("buildCallPlan arg", arg),
+            .scalar_subquery, .exists_subquery, .var_ref => return Error.ComputeUnsupportedExpr,
         }
     }
 

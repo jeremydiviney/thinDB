@@ -207,6 +207,14 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
                 .fn_name = try p.arena.dupe(u8, col_dup),
                 .args = args,
             } };
+            if (!isComparisonToken(p.cur.tag)) {
+                return try makeExprComparisonPredicate(
+                    p,
+                    lhs,
+                    .eq,
+                    .{ .lit = .{ .boolean = true } },
+                );
+            }
             const op = try parseComparisonToken(p);
             const rhs = try p.parseAddSub();
             return try makeExprComparisonPredicate(p, lhs, op, rhs);
@@ -333,12 +341,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // `TIMESTAMP`, which `parseValue` claims (see below).
     if (p.cur.tag == .identifier and !isTypedLiteralKeyword(p.cur.text)) {
         const rhs_expr = try p.parseCallArg();
-        return switch (rhs_expr) {
-            .col_ref => |rhs_dup| .{ .leaf_col_col = .{ .left = col_dup, .op = op, .right = rhs_dup } },
-            .lit => |val| .{ .leaf = .{ .col = col_dup, .op = op, .val = val } },
-            .null_lit => .unknown,
-            else => try makeScalarExprPredicate(p, col_dup, op, rhs_expr),
-        };
+        return try makeComparisonExprPredicate(p, col_dup, op, rhs_expr);
     }
 
     // Scalar subquery on the RHS: `col cmp (SELECT ...)`. The parser
@@ -362,12 +365,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         const rhs_expr = try p.parseAddSub();
         try p.expect(.rparen);
         _ = saved;
-        return switch (rhs_expr) {
-            .col_ref => |rhs_dup| .{ .leaf_col_col = .{ .left = col_dup, .op = op, .right = rhs_dup } },
-            .lit => |val| .{ .leaf = .{ .col = col_dup, .op = op, .val = val } },
-            .null_lit => .unknown,
-            else => try makeScalarExprPredicate(p, col_dup, op, rhs_expr),
-        };
+        return try makeComparisonExprPredicate(p, col_dup, op, rhs_expr);
     }
 
     // Session var on the RHS: `col op @name`. Build a leaf_var
@@ -415,7 +413,50 @@ fn makeComparisonExprPredicate(p: anytype, col: []const u8, op: PredicateOp, exp
         .col_ref => |rhs_dup| .{ .leaf_col_col = .{ .left = col, .op = op, .right = rhs_dup } },
         .lit => |val| .{ .leaf = .{ .col = col, .op = op, .val = val } },
         .null_lit => .unknown,
-        else => try makeScalarExprPredicate(p, col, op, expr),
+        else => blk: {
+            if (p.predicateDerivedEnabled() and exprHasColumnRef(expr)) {
+                const rhs_col = try p.materializePredicateExpr(expr);
+                break :blk PredicateExpr{ .leaf_col_col = .{ .left = col, .op = op, .right = rhs_col } };
+            }
+            break :blk try makeScalarExprPredicate(p, col, op, expr);
+        },
+    };
+}
+
+fn exprHasColumnRef(expr: ir.Expr) bool {
+    return switch (expr) {
+        .col_ref => true,
+        .call => |c| blk: {
+            for (c.args) |arg| {
+                if (exprHasColumnRef(arg)) break :blk true;
+            }
+            break :blk false;
+        },
+        .case => |c| blk: {
+            for (c.branches) |branch| {
+                if (predicateHasColumnRef(branch.cond)) break :blk true;
+                if (exprHasColumnRef(branch.then)) break :blk true;
+            }
+            if (c.else_branch) |else_branch| {
+                if (exprHasColumnRef(else_branch.*)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn predicateHasColumnRef(pred: PredicateExpr) bool {
+    return switch (pred) {
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .leaf_var => true,
+        .@"and", .@"or" => |children| blk: {
+            for (children) |child| {
+                if (predicateHasColumnRef(child)) break :blk true;
+            }
+            break :blk false;
+        },
+        .not => |child| predicateHasColumnRef(child.*),
+        else => false,
     };
 }
 

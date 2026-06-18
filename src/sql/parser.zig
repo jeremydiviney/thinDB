@@ -388,6 +388,8 @@ pub const Parser = struct {
     aggregate_expr_refs_enabled: bool = false,
     window_expr_refs: std.ArrayList(WindowExprRef) = .empty,
     window_expr_counter: usize = 0,
+    window_partition_expr_refs: std.ArrayList(ir.Derived) = .empty,
+    window_partition_expr_counter: usize = 0,
 
     pub fn advance(self: *Parser) ParseError!void {
         self.cur = try self.lex.next();
@@ -530,6 +532,7 @@ pub const Parser = struct {
         // scalar wrapper can run above GROUP BY.
         const agg_ref_mark = self.aggregate_expr_refs.items.len;
         const window_ref_mark = self.window_expr_refs.items.len;
+        const window_partition_ref_mark = self.window_partition_expr_refs.items.len;
         const projection_pred_mark = self.predicate_derived.items.len;
         const old_aggregate_expr_refs_enabled = self.aggregate_expr_refs_enabled;
         const old_predicate_derived_enabled = self.predicate_derived_enabled;
@@ -539,6 +542,7 @@ pub const Parser = struct {
         errdefer self.predicate_derived_enabled = old_predicate_derived_enabled;
         errdefer self.aggregate_expr_refs.shrinkRetainingCapacity(agg_ref_mark);
         errdefer self.window_expr_refs.shrinkRetainingCapacity(window_ref_mark);
+        errdefer self.window_partition_expr_refs.shrinkRetainingCapacity(window_partition_ref_mark);
         errdefer self.predicate_derived.shrinkRetainingCapacity(projection_pred_mark);
         const proj = try self.parseProjection();
         self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
@@ -605,6 +609,8 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_window) {
             try parse_window.parseWindowClause(self);
         }
+        const window_partition_expr_refs = try self.arena.dupe(ir.Derived, self.window_partition_expr_refs.items[window_partition_ref_mark..]);
+        self.window_partition_expr_refs.shrinkRetainingCapacity(window_partition_ref_mark);
 
         // Optional QUALIFY <bool_expr> — Snowflake/BigQuery/DuckDB-style
         // post-window filter. Per the SQL extension, comes after WINDOW
@@ -644,6 +650,7 @@ pub const Parser = struct {
             break :blk false;
         };
         const has_group = group_exprs.len > 0;
+        if (aggregate_expr_refs.len > 0 and !has_group) return ParseError.SqlInvalidProjection;
         var hidden_agg_cols: []const []const u8 = &.{};
         if (aggregate_expr_refs.len > 0) {
             const cols = try self.arena.alloc([]const u8, aggregate_expr_refs.len);
@@ -929,7 +936,7 @@ pub const Parser = struct {
             }
 
             if (has_window) {
-                if (try buildWindowOp(self.arena, proj, window_expr_refs, root, &self.named_windows)) |win| {
+                if (try buildWindowOp(self.arena, proj, window_expr_refs, window_partition_expr_refs, root, &self.named_windows)) |win| {
                     root = win;
                 }
             }
@@ -991,7 +998,7 @@ pub const Parser = struct {
                 }
             }
             if (has_window) {
-                if (try buildWindowOp(self.arena, proj, window_expr_refs, root, &self.named_windows)) |win| {
+                if (try buildWindowOp(self.arena, proj, window_expr_refs, window_partition_expr_refs, root, &self.named_windows)) |win| {
                     root = win;
                 }
             }
@@ -1929,6 +1936,13 @@ pub const Parser = struct {
         return name;
     }
 
+    pub fn materializeWindowPartitionExpr(self: *Parser, expr: ir.Expr) ParseError![]const u8 {
+        const name = std.fmt.allocPrint(self.arena, "__window_part_{d}", .{self.window_partition_expr_counter}) catch return ParseError.OutOfMemory;
+        self.window_partition_expr_counter += 1;
+        try self.window_partition_expr_refs.append(self.arena, .{ .name = name, .expr = expr });
+        return name;
+    }
+
     fn windowNullCheckExpr(self: *Parser, col_name: []const u8, negated: bool) ParseError!ir.Expr {
         const branches = try self.arena.alloc(ir.Expr.Branch, 1);
         branches[0] = .{
@@ -2808,7 +2822,24 @@ pub const Parser = struct {
 
         while (true) {
             const lhs = try self.parseCallArg();
-            if (self.cur.tag == .kw_between) {
+            if (self.cur.tag == .kw_is) {
+                try self.advance();
+                var negated = false;
+                if (self.cur.tag == .kw_not) {
+                    negated = true;
+                    try self.advance();
+                }
+                if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
+                try self.advance();
+                try self.addJoinNullCondition(
+                    lhs,
+                    negated,
+                    left_table_names,
+                    right_table_name,
+                    &left_filters,
+                    &right_filters,
+                );
+            } else if (self.cur.tag == .kw_between) {
                 try self.advance();
                 const lower = try self.parseCallArg();
                 if (self.cur.tag != .kw_and) return ParseError.SqlExpectedKeyword;
@@ -2863,6 +2894,7 @@ pub const Parser = struct {
         // A column range join (`l.a < r.b`) only has well-defined semantics for
         // an inner join; outer joins would need true ON-extra-predicate support.
         if (jtype != .inner and ranges.items.len > 0) return ParseError.SqlOnNonEquiUnsupported;
+        if (pairs.items.len == 0 and ranges.items.len == 0) return ParseError.SqlOnNonEquiUnsupported;
         return .{
             .on = try pairs.toOwnedSlice(self.arena),
             .ranges = try ranges.toOwnedSlice(self.arena),
@@ -2872,6 +2904,30 @@ pub const Parser = struct {
             .right_filter = try self.joinFilterFromParts(&right_filters),
             .hidden_left = try hidden_left.toOwnedSlice(self.arena),
         };
+    }
+
+    fn addJoinNullCondition(
+        self: *Parser,
+        expr: ir.Expr,
+        negated: bool,
+        left_table_names: []const []const u8,
+        right_table_name: []const u8,
+        left_filters: *std.ArrayList(PredicateExpr),
+        right_filters: *std.ArrayList(PredicateExpr),
+    ) ParseError!void {
+        const side = try self.joinExprSide(expr, left_table_names, right_table_name);
+        if (side != .left and side != .right) return ParseError.SqlOnNonEquiUnsupported;
+        if (expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
+        const col = try self.joinColName(expr);
+        const pred = if (negated)
+            PredicateExpr{ .is_not_null = col }
+        else
+            PredicateExpr{ .is_null = col };
+        if (side == .left) {
+            try left_filters.append(self.arena, pred);
+        } else {
+            try right_filters.append(self.arena, pred);
+        }
     }
 
     fn parseJoinComparisonOp(self: *Parser) ParseError!PredicateOp {
@@ -3060,7 +3116,7 @@ pub const Parser = struct {
         hidden_left: *std.ArrayList([]const u8),
         synth_counter: *usize,
     ) ParseError![]const u8 {
-        if (expr == .col_ref) return try self.joinColName(expr);
+        if (expr == .col_ref and side != .right) return try self.joinColName(expr);
         const prefix: []const u8 = if (side == .left) "__join_on_left" else "__join_on_right";
         const name = try std.fmt.allocPrint(self.arena, "{s}_{d}", .{ prefix, synth_counter.* });
         synth_counter.* += 1;
@@ -3078,8 +3134,7 @@ pub const Parser = struct {
 
     fn joinColName(self: *Parser, expr: ir.Expr) ParseError![]const u8 {
         if (expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
-        const q = try self.splitJoinCol(expr.col_ref, &.{}, "");
-        return try self.arena.dupe(u8, q.name);
+        return try self.arena.dupe(u8, expr.col_ref);
     }
 
     fn joinExprSide(
@@ -3600,6 +3655,10 @@ pub const Parser = struct {
         return name;
     }
 
+    pub fn predicateDerivedEnabled(self: *const Parser) bool {
+        return self.predicate_derived_enabled;
+    }
+
     // -----------------------------------------------------------------------
     // Post-parse pass: wraps each shared CTE's stored op in a Materialize
     // node (.auto / .force — every boundary materializes; NOT MATERIALIZED
@@ -3929,6 +3988,7 @@ fn buildWindowOp(
     arena: Allocator,
     proj: []const ProjItem,
     hidden_windows: []const WindowExprRef,
+    hidden_partition_exprs: []const ir.Derived,
     upstream: *ir.Op,
     named_windows: *const std.StringHashMapUnmanaged(ir.WindowSpec),
 ) ParseError!?*ir.Op {
@@ -3946,6 +4006,9 @@ fn buildWindowOp(
     defer calls_buf.deinit(arena);
     var pre_window_buf: std.ArrayList(ir.Derived) = .empty;
     defer pre_window_buf.deinit(arena);
+    for (hidden_partition_exprs) |derived| {
+        try pre_window_buf.append(arena, derived);
+    }
     var window_arg_counter: usize = 0;
 
     for (proj) |p| switch (p.kind) {

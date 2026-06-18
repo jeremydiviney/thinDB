@@ -194,7 +194,7 @@ pub fn parseWindowSpec(p: anytype) !ir.WindowSpec {
     if (p.cur.tag == .kw_partition) {
         try p.advance();
         try p.expect(.kw_by);
-        partition_by = try p.parseQualifiedIdentList();
+        partition_by = try parsePartitionByList(p);
     }
 
     var order_by: []const SortSpec = &.{};
@@ -220,6 +220,23 @@ pub fn parseWindowSpec(p: anytype) !ir.WindowSpec {
 
     try p.expect(.rparen);
     return .{ .partition_by = partition_by, .order_by = order_by, .frame = frame };
+}
+
+fn parsePartitionByList(p: anytype) ![]const []const u8 {
+    var items: std.ArrayList([]const u8) = .empty;
+    defer items.deinit(p.arena);
+
+    while (true) {
+        const expr = try p.parseAddSub();
+        const name = switch (expr) {
+            .col_ref => |c| c,
+            else => try p.materializeWindowPartitionExpr(expr),
+        };
+        try items.append(p.arena, name);
+        if (p.cur.tag != .comma) break;
+        try p.advance();
+    }
+    return try items.toOwnedSlice(p.arena);
 }
 
 /// Parse `ROWS|RANGE|GROUPS [BETWEEN start AND end | bound]`. Without

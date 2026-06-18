@@ -944,7 +944,8 @@ fn buildGlobalAggregateReduced(
 const ScanSelectPlan = struct {
     scan: ir.Op.Scan,
     where_filter: ?ir.Op.Filter = null,
-    derived: []const ir.Derived = &.{},
+    compute_layers: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined,
+    compute_layer_count: usize = 0,
     order_by: ?ir.Op.OrderBy = null,
     limit: ?ir.Op.Limit = null,
     // SELECT-list columns (whitelist projection). Null = emit the scan's columns
@@ -965,6 +966,7 @@ const ScanSelectPlan = struct {
     exclude_count: usize = 0,
 };
 
+const MAX_SCAN_COMPUTES = 4;
 const MAX_SCAN_EXCLUDES = 4;
 
 fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
@@ -1010,14 +1012,16 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     // any `.exclude` decorators (plan-builder API), in any order, down to
     // the table scan.
     var where_filter: ?ir.Op.Filter = null;
-    var derived: []const ir.Derived = &.{};
+    var compute_layers: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined;
+    var compute_layer_count: usize = 0;
     var excludes: [MAX_SCAN_EXCLUDES][]const []const u8 = undefined;
     var exclude_count: usize = 0;
     while (true) {
         switch (op.*) {
             .compute => |c| {
-                if (derived.len != 0) return null;
-                derived = c.derived;
+                if (compute_layer_count == MAX_SCAN_COMPUTES) return null;
+                compute_layers[compute_layer_count] = c.derived;
+                compute_layer_count += 1;
                 op = c.upstream;
             },
             .filter => |f| {
@@ -1038,7 +1042,8 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     return .{
         .scan = op.scan,
         .where_filter = where_filter,
-        .derived = derived,
+        .compute_layers = compute_layers,
+        .compute_layer_count = compute_layer_count,
         .order_by = order_by,
         .limit = limit,
         .project_columns = project_columns,
@@ -1126,7 +1131,7 @@ fn tryScanSelectLateMat(
 ) !?exec.Query {
     // Derived output/probe columns aren't base columns the late-mat fetch can
     // resolve by location — leave those to the naive path.
-    if (plan.derived.len > 0) return null;
+    if (plan.compute_layer_count > 0) return null;
 
     const allocator = input.allocator;
 
@@ -1213,7 +1218,12 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     errdefer q.deinit();
 
     if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    var compute_i = plan.compute_layer_count;
+    while (compute_i > 0) {
+        compute_i -= 1;
+        const derived = plan.compute_layers[compute_i];
+        if (derived.len > 0) q = try computeDerivedFused(allocator, q, derived, input.udf_registry);
+    }
     // Innermost exclude first (they were collected outermost-first walking
     // down). Each is a complement-projection over the current schema, so a
     // later SELECT of an excluded name fails with ColumnNotFound.
@@ -1261,9 +1271,11 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
                         // name (Compute merged it in place), in which case it
                         // stays at its source position and the explicit item
                         // below is dropped.
-                        for (plan.derived) |d| {
-                            if (types.columnNameEql(d.name, col.name) and
-                                !planReplacesName(plan, d.name)) continue :expand;
+                        for (plan.compute_layers[0..plan.compute_layer_count]) |layer| {
+                            for (layer) |d| {
+                                if (types.columnNameEql(d.name, col.name) and
+                                    !planReplacesName(plan, d.name)) continue :expand;
+                            }
                         }
                         try names.append(allocator, col.name);
                     }

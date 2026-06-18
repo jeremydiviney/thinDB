@@ -521,6 +521,14 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
             try out.append(allocator, ' ');
             try writeValue(allocator, out, l.val);
         },
+        .day_leaf => |l| {
+            try out.appendSlice(allocator, "DAY(");
+            try out.appendSlice(allocator, l.col);
+            try out.appendSlice(allocator, ") ");
+            try out.appendSlice(allocator, opSymbol(l.op));
+            try out.append(allocator, ' ');
+            try writeValue(allocator, out, l.val);
+        },
         .leaf_col_col => |lc| {
             try out.appendSlice(allocator, lc.left);
             try out.append(allocator, ' ');
