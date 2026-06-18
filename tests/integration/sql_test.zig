@@ -937,19 +937,19 @@ test "sql: alias star strips the alias prefix and qualifies colliding names" {
     try std.testing.expectEqualStrings("tag", schema[3].name);
 
     // Stripping both stars bare would collide; colliding names keep their
-    // qualified form instead. The right join key (b.id) is dropped from the
-    // join output (USING semantics), so a.id's bare `id` is unique.
+    // qualified form instead. Explicit ON joins preserve both join keys.
     var star_q = try runSql(allocator, db, "SELECT a.*, b.* FROM t AS a JOIN t AS b ON a.id = b.id");
     defer star_q.deinit();
     const star_schema = star_q.outputSchema();
-    try std.testing.expectEqual(@as(usize, 7), star_schema.len);
-    try std.testing.expectEqualStrings("id", star_schema[0].name);
+    try std.testing.expectEqual(@as(usize, 8), star_schema.len);
+    try std.testing.expectEqualStrings("a.id", star_schema[0].name);
     try std.testing.expectEqualStrings("a.k", star_schema[1].name);
     try std.testing.expectEqualStrings("a.qty", star_schema[2].name);
     try std.testing.expectEqualStrings("a.tag", star_schema[3].name);
-    try std.testing.expectEqualStrings("b.k", star_schema[4].name);
-    try std.testing.expectEqualStrings("b.qty", star_schema[5].name);
-    try std.testing.expectEqualStrings("b.tag", star_schema[6].name);
+    try std.testing.expectEqualStrings("b.id", star_schema[4].name);
+    try std.testing.expectEqualStrings("b.k", star_schema[5].name);
+    try std.testing.expectEqualStrings("b.qty", star_schema[6].name);
+    try std.testing.expectEqualStrings("b.tag", star_schema[7].name);
 
     var cte_q = try runSql(allocator, db,
         \\WITH left_rows AS (SELECT id, qty FROM t),

@@ -403,6 +403,7 @@ fn appendNameUnique(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([
 fn collectPredicateNames(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([]const u8), p: exec.PredicateExpr) !void {
     switch (p) {
         .leaf => |l| try appendNameUnique(allocator, set, l.col),
+        .day_leaf => |l| try appendNameUnique(allocator, set, l.col),
         .leaf_col_col => |c| {
             try appendNameUnique(allocator, set, c.left);
             try appendNameUnique(allocator, set, c.right);
@@ -520,6 +521,36 @@ fn buildUdafGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan)
     if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
     q = try q.udfGroupBy(plan.group_by.group_cols, plan.group_by.aggs, registry);
     // HAVING runs as a generic filter over the (small) grouped output.
+    if (plan.having_filter) |f| q = try q.filter(f.predicate);
+    if (plan.order_by) |o| {
+        if (plan.limit) |l| {
+            q = try q.topN(o.specs, @intCast(l.n), @intCast(l.offset));
+        } else {
+            q = try q.orderBy(o.specs);
+        }
+    } else if (plan.limit) |l| {
+        q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
+    }
+    if (plan.post_agg_derived.len > 0) q = try q.computeWithRegistry(plan.post_agg_derived, input.udf_registry);
+    q = try applyOutputProjection(allocator, q, plan.output_columns, plan.output_names);
+    return q;
+}
+
+fn buildOperatorGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan) !exec.Query {
+    const allocator = input.allocator;
+    const needed = try projectedBaseColumns(allocator, table, input.prune_names);
+    defer if (needed) |n| allocator.free(n);
+    const max_dop = input.db.config.max_dop;
+
+    var q = if (max_dop > 1)
+        try exec.ParallelScan.create(allocator, table, input.accountant, needed, max_dop)
+    else
+        try exec.scanWithProjection(allocator, table, input.accountant, needed);
+    errdefer q.deinit();
+
+    if (plan.where_filter) |f| q = try q.filter(f.predicate);
+    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    q = try q.groupBy(plan.group_by.group_cols, plan.group_by.aggs);
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
     if (plan.order_by) |o| {
         if (plan.limit) |l| {
@@ -685,6 +716,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // handler to combine opaque state yet — fall to the engine-neutral
     // UdfAggregate operator behind the same V2-built (parallel) scan.
     if (hasUdfAgg(plan.group_by.aggs)) return try buildUdafGroupBy(input, table, plan);
+    if (hasMaxByAgg(plan.group_by.aggs)) return try buildOperatorGroupBy(input, table, plan);
 
     // The silo-grid core carries fixed numeric state slots and string MIN/MAX,
     // but declines variable-state aggregates it can't hold in the group table —
@@ -786,7 +818,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
     // GROUP_CONCAT (no UDAF): a variable-state aggregate the parallel reducer
     // doesn't host — route onto the engine-neutral hash Aggregate operator.
-    if (hasConcatAgg(plan.group_by.aggs) and !hasUdfAgg(plan.group_by.aggs)) {
+    if ((hasConcatAgg(plan.group_by.aggs) or hasMaxByAgg(plan.group_by.aggs)) and !hasUdfAgg(plan.group_by.aggs)) {
         return try buildGlobalOperatorAggregate(input, table, plan);
     }
     // Global UDAF: the parallel reducer folds each UDAF per-lane and merges them
@@ -912,7 +944,8 @@ fn buildGlobalAggregateReduced(
 const ScanSelectPlan = struct {
     scan: ir.Op.Scan,
     where_filter: ?ir.Op.Filter = null,
-    derived: []const ir.Derived = &.{},
+    compute_layers: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined,
+    compute_layer_count: usize = 0,
     order_by: ?ir.Op.OrderBy = null,
     limit: ?ir.Op.Limit = null,
     // SELECT-list columns (whitelist projection). Null = emit the scan's columns
@@ -933,6 +966,7 @@ const ScanSelectPlan = struct {
     exclude_count: usize = 0,
 };
 
+const MAX_SCAN_COMPUTES = 4;
 const MAX_SCAN_EXCLUDES = 4;
 
 fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
@@ -978,14 +1012,16 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     // any `.exclude` decorators (plan-builder API), in any order, down to
     // the table scan.
     var where_filter: ?ir.Op.Filter = null;
-    var derived: []const ir.Derived = &.{};
+    var compute_layers: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined;
+    var compute_layer_count: usize = 0;
     var excludes: [MAX_SCAN_EXCLUDES][]const []const u8 = undefined;
     var exclude_count: usize = 0;
     while (true) {
         switch (op.*) {
             .compute => |c| {
-                if (derived.len != 0) return null;
-                derived = c.derived;
+                if (compute_layer_count == MAX_SCAN_COMPUTES) return null;
+                compute_layers[compute_layer_count] = c.derived;
+                compute_layer_count += 1;
                 op = c.upstream;
             },
             .filter => |f| {
@@ -1006,7 +1042,8 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     return .{
         .scan = op.scan,
         .where_filter = where_filter,
-        .derived = derived,
+        .compute_layers = compute_layers,
+        .compute_layer_count = compute_layer_count,
         .order_by = order_by,
         .limit = limit,
         .project_columns = project_columns,
@@ -1030,6 +1067,7 @@ fn collectPredicateColumns(
 ) !void {
     switch (p) {
         .leaf => |lf| try addColumnUnique(allocator, set, lf.col),
+        .day_leaf => |lf| try addColumnUnique(allocator, set, lf.col),
         .leaf_col_col => |lc| {
             try addColumnUnique(allocator, set, lc.left);
             try addColumnUnique(allocator, set, lc.right);
@@ -1093,7 +1131,7 @@ fn tryScanSelectLateMat(
 ) !?exec.Query {
     // Derived output/probe columns aren't base columns the late-mat fetch can
     // resolve by location — leave those to the naive path.
-    if (plan.derived.len > 0) return null;
+    if (plan.compute_layer_count > 0) return null;
 
     const allocator = input.allocator;
 
@@ -1180,7 +1218,12 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     errdefer q.deinit();
 
     if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    var compute_i = plan.compute_layer_count;
+    while (compute_i > 0) {
+        compute_i -= 1;
+        const derived = plan.compute_layers[compute_i];
+        if (derived.len > 0) q = try computeDerivedFused(allocator, q, derived, input.udf_registry);
+    }
     // Innermost exclude first (they were collected outermost-first walking
     // down). Each is a complement-projection over the current schema, so a
     // later SELECT of an excluded name fails with ColumnNotFound.
@@ -1228,9 +1271,11 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
                         // name (Compute merged it in place), in which case it
                         // stays at its source position and the explicit item
                         // below is dropped.
-                        for (plan.derived) |d| {
-                            if (types.columnNameEql(d.name, col.name) and
-                                !planReplacesName(plan, d.name)) continue :expand;
+                        for (plan.compute_layers[0..plan.compute_layer_count]) |layer| {
+                            for (layer) |d| {
+                                if (types.columnNameEql(d.name, col.name) and
+                                    !planReplacesName(plan, d.name)) continue :expand;
+                            }
                         }
                         try names.append(allocator, col.name);
                     }
@@ -1305,6 +1350,11 @@ fn hasConcatAgg(aggs: []const exec.AggSpec) bool {
     return false;
 }
 
+fn hasMaxByAgg(aggs: []const exec.AggSpec) bool {
+    for (aggs) |a| if (a.func == .max_by) return true;
+    return false;
+}
+
 // Global (no GROUP BY) UDAF / GROUP_CONCAT: V2-built scan feeding the
 // engine-neutral aggregate operators. ORDER BY / LIMIT over the one-row
 // result are no-ops the matcher already discarded.
@@ -1369,7 +1419,6 @@ fn splitDoubleUnderscore(s: []const u8) ?struct { db: []const u8, schema: []cons
     if (pos == 0 or pos + 2 >= s.len) return null;
     return .{ .db = s[0..pos], .schema = s[pos + 2 ..] };
 }
-
 
 test "engine v2 classifies scan filter group order limit as grouped topn" {
     var scan: ir.Op = .{ .scan = .{ .table = .{ .name = "hits" } } };

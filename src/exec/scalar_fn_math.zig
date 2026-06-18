@@ -548,6 +548,48 @@ pub fn convBigintKernel(allocator: Allocator, args: []const ColumnView, out: *Co
 // caller wants narrowing (which never happens implicitly) or string parsing.
 // ---------------------------------------------------------------------------
 
+pub fn intIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.int;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.int.append(allocator, s[i]);
+}
+
+pub fn bigintIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.bigint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, s[i]);
+}
+
+pub fn smallintIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.smallint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.smallint.append(allocator, s[i]);
+}
+
+pub fn tinyintIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.tinyint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.tinyint.append(allocator, s[i]);
+}
+
+pub fn largeintIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.largeint;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.largeint.append(allocator, s[i]);
+}
+
+pub fn doubleIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.double.append(allocator, s[i]);
+}
+
+pub fn booleanIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const s = args[0].data.boolean;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) try out.data.boolean.append(allocator, s[i]);
+}
+
 pub fn intToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const s = args[0].data.int;
     var i: usize = 0;

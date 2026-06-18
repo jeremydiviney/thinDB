@@ -1307,6 +1307,13 @@ fn encodeGroupBy(allocator: Allocator, out: *std.ArrayList(u8), g: Op.GroupBy) E
             try out.append(allocator, 0);
         }
         // alias (always present — server enforces this on the existing API)
+        if (a.arg2_col) |c| {
+            try out.append(allocator, 1);
+            try appendU32(allocator, out, @intCast(c.len));
+            try out.appendSlice(allocator, c);
+        } else {
+            try out.append(allocator, 0);
+        }
         try appendU32(allocator, out, @intCast(a.as.len));
         try out.appendSlice(allocator, a.as);
         // params tag (u8) + payload (matches decoder)
@@ -1494,12 +1501,20 @@ const PredTag = enum(u8) {
     p_not = 5,
     like = 6,
     leaf_col_col = 7,
+    day_leaf = 8,
 };
 
 pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: PredicateExpr) EncodeError!void {
     switch (expr) {
         .leaf => |p| {
             try out.append(allocator, @intFromEnum(PredTag.leaf));
+            try out.append(allocator, @intFromEnum(p.op));
+            try appendU32(allocator, out, @intCast(p.col.len));
+            try out.appendSlice(allocator, p.col);
+            try encodeValue(allocator, out, p.val);
+        },
+        .day_leaf => |p| {
+            try out.append(allocator, @intFromEnum(PredTag.day_leaf));
             try out.append(allocator, @intFromEnum(p.op));
             try appendU32(allocator, out, @intCast(p.col.len));
             try out.appendSlice(allocator, p.col);
@@ -1723,6 +1738,10 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 const has_col = bytes[cursor.*];
                 cursor.* += 1;
                 const col: ?[]const u8 = if (has_col != 0) try readString(bytes, cursor) else null;
+                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+                const has_arg2_col = bytes[cursor.*];
+                cursor.* += 1;
+                const arg2_col: ?[]const u8 = if (has_arg2_col != 0) try readString(bytes, cursor) else null;
                 const as = try readString(bytes, cursor);
                 // AggParams tag: 0=none, 1=percentile (f64 payload),
                 // 2=separator (string payload). Older encoders omit
@@ -1742,7 +1761,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                     2 => .{ .separator = try readString(bytes, cursor) },
                     else => return Error.IrCorrupt,
                 };
-                a.* = .{ .func = func, .udf_name = udf_name, .udf_arg_cols = udf_arg_cols, .col = col, .as = as, .params = params };
+                a.* = .{ .func = func, .udf_name = udf_name, .udf_arg_cols = udf_arg_cols, .col = col, .arg2_col = arg2_col, .as = as, .params = params };
             }
 
             const upstream = try allocator.create(Op);
@@ -2402,7 +2421,7 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(PredTag.leaf_col_col)) return Error.IrCorrupt;
+    if (tag_byte > @intFromEnum(PredTag.day_leaf)) return Error.IrCorrupt;
     const tag: PredTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -2415,6 +2434,16 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
             const col = try readString(bytes, cursor);
             const val = try decodeValue(bytes, cursor);
             break :blk PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = val } };
+        },
+        .day_leaf => blk: {
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const op_byte = bytes[cursor.*];
+            cursor.* += 1;
+            if (op_byte > @intFromEnum(PredicateOp.gte)) return Error.IrCorrupt;
+            const op: PredicateOp = @enumFromInt(op_byte);
+            const col = try readString(bytes, cursor);
+            const val = try decodeValue(bytes, cursor);
+            break :blk PredicateExpr{ .day_leaf = .{ .col = col, .op = op, .val = val } };
         },
         .is_null => blk: {
             const col = try readString(bytes, cursor);
@@ -2566,7 +2595,7 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
 
 pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     switch (expr) {
-        .leaf, .leaf_col_col, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var, .unknown => {},
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var, .unknown => {},
         .@"and", .@"or" => |children| {
             for (children) |c| freeDecodedPredicate(c, allocator);
             allocator.free(children);

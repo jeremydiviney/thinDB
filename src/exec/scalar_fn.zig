@@ -389,6 +389,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "day", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.dayFromDatetimeKernel },
     .{ .name = "dayofmonth", .arg_types = &.{.date}, .return_type = .int, .kernel = date.dayFromDateKernel },
     .{ .name = "dayofmonth", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.dayFromDatetimeKernel },
+    .{ .name = "makedate", .arg_types = &.{ .int, .int }, .return_type = .date, .kernel = date.makedateKernel },
     .{ .name = "hour", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.hourKernel },
     .{ .name = "minute", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.minuteKernel },
     .{ .name = "second", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.secondKernel },
@@ -427,6 +428,18 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "date_format", .arg_types = &.{ .date, .string }, .return_type = .string, .kernel = date.dateFormatDateKernel },
     // --- conversion ---
     // Numeric widening (int → bigint → double): always succeeds.
+    .{ .name = "to_int", .arg_types = &.{.int}, .return_type = .int, .kernel = math.intIdentityKernel },
+    .{ .name = "to_bigint", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = math.bigintIdentityKernel },
+    .{ .name = "to_smallint", .arg_types = &.{.smallint}, .return_type = .smallint, .kernel = math.smallintIdentityKernel },
+    .{ .name = "to_tinyint", .arg_types = &.{.tinyint}, .return_type = .tinyint, .kernel = math.tinyintIdentityKernel },
+    .{ .name = "to_largeint", .arg_types = &.{.largeint}, .return_type = .largeint, .kernel = math.largeintIdentityKernel },
+    .{ .name = "to_double", .arg_types = &.{.double}, .return_type = .double, .kernel = math.doubleIdentityKernel },
+    .{ .name = "to_boolean", .arg_types = &.{.boolean}, .return_type = .boolean, .kernel = math.booleanIdentityKernel },
+    .{ .name = "to_date", .arg_types = &.{.date}, .return_type = .date, .kernel = date.dateIdentityKernel },
+    .{ .name = "to_datetime", .arg_types = &.{.datetime}, .return_type = .datetime, .kernel = date.datetimeIdentityKernel },
+    .{ .name = "to_string", .arg_types = &.{.string}, .return_type = .string, .kernel = string.stringIdentityKernel },
+    .{ .name = "to_string", .arg_types = &.{.{ .varchar = 0 }}, .return_type = .string, .kernel = string.stringIdentityKernel },
+    .{ .name = "to_string", .arg_types = &.{.{ .char = 0 }}, .return_type = .string, .kernel = string.stringIdentityKernel },
     .{ .name = "to_bigint", .arg_types = &.{.int}, .return_type = .bigint, .kernel = math.intToBigintKernel },
     .{ .name = "to_double", .arg_types = &.{.int}, .return_type = .double, .kernel = math.intToDoubleKernel },
     .{ .name = "to_double", .arg_types = &.{.bigint}, .return_type = .double, .kernel = math.bigintToDoubleKernel },
@@ -751,6 +764,9 @@ pub fn dateAdd(arena: Allocator, d: Expr, n: Expr) !Expr {
 }
 pub fn dateSub(arena: Allocator, d: Expr, n: Expr) !Expr {
     return expr_mod.call(arena, "date_sub", &.{ d, n });
+}
+pub fn makedate(arena: Allocator, year_expr: Expr, day_of_year: Expr) !Expr {
+    return expr_mod.call(arena, "makedate", &.{ year_expr, day_of_year });
 }
 pub fn unixTimestamp(arena: Allocator, arg: Expr) !Expr {
     return expr_mod.call(arena, "unix_timestamp", &.{arg});

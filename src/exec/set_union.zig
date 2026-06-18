@@ -13,15 +13,21 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 const Column = types.Column;
+const Type = types.Type;
+const TypeTag = types.TypeTag;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
+const store = @import("../engine/store.zig");
+const ColumnStore = store.ColumnStore;
 
 const exec = @import("exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
+const cast = @import("cast.zig");
+const CastKernel = cast.CastKernel;
 
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
@@ -34,6 +40,11 @@ pub const SetUnion = struct {
     /// calls drain from the right.
     left_exhausted: bool,
     output_schema: []Column,
+    left_casts: []?CastKernel,
+    right_casts: []?CastKernel,
+    left_cast_cols: []ColumnStore,
+    right_cast_cols: []ColumnStore,
+    views: []ColumnView,
     /// True for UNION ALL; reserved for the future distinct variant.
     /// v1 only constructs `all = true`.
     all: bool,
@@ -42,14 +53,42 @@ pub const SetUnion = struct {
         const left_schema = left.outputSchema();
         const right_schema = right.outputSchema();
         if (left_schema.len != right_schema.len) return Error.TypeMismatch;
-        for (left_schema, right_schema) |l, r| {
-            if (std.meta.activeTag(l.type) != std.meta.activeTag(r.type)) return Error.TypeMismatch;
-        }
 
         const out_schema = try allocator.alloc(Column, left_schema.len);
         errdefer allocator.free(out_schema);
-        for (left_schema, right_schema, out_schema) |l, r, *o| {
-            o.* = .{ .name = l.name, .type = l.type, .nullable = l.nullable or r.nullable };
+
+        const left_casts = try allocator.alloc(?CastKernel, left_schema.len);
+        errdefer allocator.free(left_casts);
+        const right_casts = try allocator.alloc(?CastKernel, right_schema.len);
+        errdefer allocator.free(right_casts);
+
+        const left_cast_cols = try allocator.alloc(ColumnStore, left_schema.len);
+        errdefer allocator.free(left_cast_cols);
+        var left_cols_inited: usize = 0;
+        errdefer for (left_cast_cols[0..left_cols_inited]) |*c| c.deinit(allocator);
+
+        const right_cast_cols = try allocator.alloc(ColumnStore, right_schema.len);
+        errdefer allocator.free(right_cast_cols);
+        var right_cols_inited: usize = 0;
+        errdefer for (right_cast_cols[0..right_cols_inited]) |*c| c.deinit(allocator);
+
+        const views = try allocator.alloc(ColumnView, left_schema.len);
+        errdefer allocator.free(views);
+
+        for (left_schema, right_schema, out_schema, left_casts, right_casts, left_cast_cols, right_cast_cols) |l, r, *o, *lk, *rk, *lc, *rc| {
+            const out_type = commonUnionType(l.type, r.type) orelse return Error.TypeMismatch;
+            const out_nullable = l.nullable or r.nullable;
+            o.* = .{ .name = l.name, .type = out_type, .nullable = out_nullable };
+
+            lk.* = castFor(l.type, out_type);
+            if (lk.* == null and typeTag(l.type) != typeTag(out_type)) return Error.TypeMismatch;
+            rk.* = castFor(r.type, out_type);
+            if (rk.* == null and typeTag(r.type) != typeTag(out_type)) return Error.TypeMismatch;
+
+            lc.* = try ColumnStore.init(allocator, out_type, out_nullable);
+            left_cols_inited += 1;
+            rc.* = try ColumnStore.init(allocator, out_type, out_nullable);
+            right_cols_inited += 1;
         }
 
         const self = try allocator.create(SetUnion);
@@ -60,6 +99,11 @@ pub const SetUnion = struct {
             .right = right,
             .left_exhausted = false,
             .output_schema = out_schema,
+            .left_casts = left_casts,
+            .right_casts = right_casts,
+            .left_cast_cols = left_cast_cols,
+            .right_cast_cols = right_cast_cols,
+            .views = views,
             .all = all,
         };
         return makeQuery(allocator, self);
@@ -70,7 +114,14 @@ pub const SetUnion = struct {
         l.deinit();
         var r = self.right;
         r.deinit();
+        for (self.left_cast_cols) |*c| c.deinit(self.allocator);
+        for (self.right_cast_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_schema);
+        self.allocator.free(self.left_casts);
+        self.allocator.free(self.right_casts);
+        self.allocator.free(self.left_cast_cols);
+        self.allocator.free(self.right_cast_cols);
+        self.allocator.free(self.views);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -106,21 +157,51 @@ pub const SetUnion = struct {
     pub fn next(self: *SetUnion) !?Batch {
         if (!self.left_exhausted) {
             if (try self.left.next()) |b| {
-                return rebatched(self, b);
+                return try rebatched(self, b, self.left_casts, self.left_cast_cols);
             }
             self.left_exhausted = true;
         }
         if (try self.right.next()) |b| {
-            return rebatched(self, b);
+            return try rebatched(self, b, self.right_casts, self.right_cast_cols);
         }
         return null;
     }
 
-    fn rebatched(self: *SetUnion, src: Batch) Batch {
+    fn rebatched(self: *SetUnion, src: Batch, kernels: []const ?CastKernel, cast_cols: []ColumnStore) !Batch {
+        for (src.values, kernels, cast_cols, self.views) |v, k, *cast_col, *out| {
+            if (k) |kernel| {
+                cast_col.clear();
+                const args = [_]ColumnView{v};
+                try kernel(self.allocator, &args, cast_col, src.row_count);
+                out.* = cast_col.view();
+            } else {
+                out.* = v;
+            }
+        }
         return .{
             .schema = self.output_schema,
-            .values = src.values,
+            .values = self.views,
             .row_count = src.row_count,
         };
     }
 };
+
+fn typeTag(t: Type) TypeTag {
+    return std.meta.activeTag(t);
+}
+
+fn commonUnionType(left: Type, right: Type) ?Type {
+    const lt = typeTag(left);
+    const rt = typeTag(right);
+    if (lt == rt) return left;
+    if (cast.castCost(lt, rt) != null) return right;
+    if (cast.castCost(rt, lt) != null) return left;
+    return null;
+}
+
+fn castFor(from: Type, to: Type) ?CastKernel {
+    const ft = typeTag(from);
+    const tt = typeTag(to);
+    if (ft == tt) return null;
+    return cast.kernelFor(ft, tt);
+}

@@ -757,6 +757,11 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             .op = p.op,
             .val = try cloneValue(aa, p.val),
         } },
+        .day_leaf => |p| PredicateExpr{ .day_leaf = .{
+            .col = try aa.dupe(u8, p.col),
+            .op = p.op,
+            .val = try cloneValue(aa, p.val),
+        } },
         .leaf_col_col => |lc| PredicateExpr{ .leaf_col_col = .{
             .left = try aa.dupe(u8, lc.left),
             .op = lc.op,
@@ -978,7 +983,6 @@ fn splitDoubleUnderscore(name: []const u8) ?NameParts {
     const sep = std.mem.indexOf(u8, name, "__") orelse return null;
     return .{ .db = name[0..sep], .schema = name[sep + 2 ..] };
 }
-
 
 // ---------------------------------------------------------------------------
 // Compile path.
@@ -1342,6 +1346,7 @@ fn projWalkPredicate(c: *ProjScan, allocator: Allocator, p: exec.predicate.Predi
     if (c.bail) return;
     switch (p) {
         .leaf => |lf| c.add(allocator, lf.col),
+        .day_leaf => |lf| c.add(allocator, lf.col),
         .leaf_col_col => |lc| {
             c.add(allocator, lc.left);
             c.add(allocator, lc.right);
@@ -1416,6 +1421,7 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
             for (g.group_cols) |nm| c.add(allocator, nm);
             for (g.aggs) |a| {
                 if (a.col) |nm| c.add(allocator, nm);
+                if (a.arg2_col) |nm| c.add(allocator, nm);
                 for (a.udf_arg_cols) |nm| c.add(allocator, nm);
             }
             projWalkOp(c, allocator, g.upstream);
@@ -1521,6 +1527,7 @@ fn walkAboveWindow(c: *ProjScan, allocator: Allocator, op: *const ir.Op, win: *c
             for (g.group_cols) |nm| c.add(allocator, nm);
             for (g.aggs) |a| {
                 if (a.col) |nm| c.add(allocator, nm);
+                if (a.arg2_col) |nm| c.add(allocator, nm);
                 for (a.udf_arg_cols) |nm| c.add(allocator, nm);
             }
             return walkAboveWindow(c, allocator, g.upstream, win);

@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 const Column = types.Column;
+const Type = types.Type;
 const TypeTag = types.TypeTag;
 
 const storage = @import("../storage/storage.zig");
@@ -36,6 +37,7 @@ const Query = exec.Query;
 const Batch = exec.Batch;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
+const cast = @import("cast.zig");
 
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
@@ -194,6 +196,129 @@ pub const OpaquePredicate = struct {
     ) bool,
     ctx: ?*anyopaque = null,
 };
+
+const NormalizedJoinInputs = struct {
+    left: Query,
+    right: Query,
+};
+
+fn normalizeJoinKeyTypes(
+    aa: Allocator,
+    left: Query,
+    right: Query,
+    spec: Spec,
+) !NormalizedJoinInputs {
+    const left_schema = left.outputSchema();
+    const right_schema = right.outputSchema();
+    var left_casts: std.ArrayList(exec.Derived) = .empty;
+    var right_casts: std.ArrayList(exec.Derived) = .empty;
+
+    for (spec.on) |pair| {
+        const left_idx = columnIndex(left_schema, pair.left) orelse return Error.ColumnNotFound;
+        const right_idx = columnIndex(right_schema, pair.right) orelse return Error.ColumnNotFound;
+        try appendJoinKeyCasts(
+            aa,
+            &left_casts,
+            &right_casts,
+            pair.left,
+            left_schema[left_idx].type,
+            pair.right,
+            right_schema[right_idx].type,
+        );
+    }
+
+    for (spec.ranges) |rp| {
+        const left_idx = columnIndex(left_schema, rp.left) orelse return Error.ColumnNotFound;
+        const right_idx = columnIndex(right_schema, rp.right) orelse return Error.ColumnNotFound;
+        try appendJoinKeyCasts(
+            aa,
+            &left_casts,
+            &right_casts,
+            rp.left,
+            left_schema[left_idx].type,
+            rp.right,
+            right_schema[right_idx].type,
+        );
+    }
+
+    var left_out = left;
+    var right_out = right;
+    if (left_casts.items.len > 0) {
+        left_out = try left_out.compute(try left_casts.toOwnedSlice(aa));
+    }
+    if (right_casts.items.len > 0) {
+        right_out = try right_out.compute(try right_casts.toOwnedSlice(aa));
+    }
+    return .{ .left = left_out, .right = right_out };
+}
+
+fn appendJoinKeyCasts(
+    aa: Allocator,
+    left_casts: *std.ArrayList(exec.Derived),
+    right_casts: *std.ArrayList(exec.Derived),
+    left_name: []const u8,
+    left_type: Type,
+    right_name: []const u8,
+    right_type: Type,
+) !void {
+    if (!joinKeyCoercionEligible(left_name) and !joinKeyCoercionEligible(right_name)) return;
+    const lt = typeTag(left_type);
+    const rt = typeTag(right_type);
+    if (lt == rt or (isStringTag(lt) and isStringTag(rt))) return;
+    const target = commonJoinKeyTag(lt, rt) orelse return;
+    if (lt != target) try appendCastDerived(aa, left_casts, left_name, target);
+    if (rt != target) try appendCastDerived(aa, right_casts, right_name, target);
+}
+
+fn joinKeyCoercionEligible(name: []const u8) bool {
+    return std.mem.indexOfScalar(u8, name, '.') != null or
+        std.mem.startsWith(u8, name, "__join_on_");
+}
+
+fn appendCastDerived(
+    aa: Allocator,
+    casts: *std.ArrayList(exec.Derived),
+    name: []const u8,
+    target: TypeTag,
+) !void {
+    for (casts.items) |existing| {
+        if (types.columnNameEql(existing.name, name)) return;
+    }
+    const fn_name = castFunctionName(target) orelse return;
+    const args = try aa.alloc(exec.Expr, 1);
+    args[0] = .{ .col_ref = try aa.dupe(u8, name) };
+    try casts.append(aa, .{
+        .name = try aa.dupe(u8, name),
+        .expr = .{ .call = .{
+            .fn_name = try aa.dupe(u8, fn_name),
+            .args = args,
+        } },
+    });
+}
+
+fn commonJoinKeyTag(left: TypeTag, right: TypeTag) ?TypeTag {
+    if (cast.castCost(left, right) != null and castFunctionName(right) != null) return right;
+    if (cast.castCost(right, left) != null and castFunctionName(left) != null) return left;
+    return null;
+}
+
+fn castFunctionName(tag: TypeTag) ?[]const u8 {
+    return switch (tag) {
+        .tinyint => "to_tinyint",
+        .smallint => "to_smallint",
+        .int => "to_int",
+        .bigint => "to_bigint",
+        .largeint => "to_largeint",
+        .double => "to_double",
+        .date => "to_date",
+        .datetime => "to_datetime",
+        else => null,
+    };
+}
+
+fn typeTag(t: Type) TypeTag {
+    return std.meta.activeTag(t);
+}
 
 /// Number of rows emitted per output batch. Bounded so emission stays
 /// streaming even when one probe row matches many build rows.
@@ -430,6 +555,13 @@ pub const Join = struct {
         right: Query,
         spec: Spec,
     ) !Query {
+        var coerce_arena = std.heap.ArenaAllocator.init(allocator);
+        defer coerce_arena.deinit();
+        const coerce_aa = coerce_arena.allocator();
+        const normalized = try normalizeJoinKeyTypes(coerce_aa, left, right, spec);
+        const left_in = normalized.left;
+        const right_in = normalized.right;
+
         // Resolve algorithm. Opaque predicate forces NLJ (the only
         // algorithm that evaluates per-pair callbacks). Otherwise
         // .auto picks range_sweep for the specialized pure-single-
@@ -438,9 +570,7 @@ pub const Join = struct {
         const chosen = if (spec.opaque_predicate != null)
             .nested_loop
         else if (spec.algorithm == .auto)
-            (if (canUseRangeSweep(spec)) .range_sweep
-                else if (spec.on.len == 0) .nested_loop
-                else chooseAlgorithm(left, right, spec.on))
+            (if (canUseRangeSweep(spec)) .range_sweep else if (spec.on.len == 0) .nested_loop else chooseAlgorithm(left_in, right_in, spec.on))
         else
             spec.algorithm;
 
@@ -458,7 +588,7 @@ pub const Join = struct {
                 .extra_predicate = spec.extra_predicate,
                 .ranges = spec.ranges,
             };
-            return @import("range_sweep.zig").RangeSweepJoin.create(allocator, left, right, rs_spec);
+            return @import("range_sweep.zig").RangeSweepJoin.create(allocator, left_in, right_in, rs_spec);
         }
 
         if (chosen == .nested_loop) {
@@ -470,7 +600,7 @@ pub const Join = struct {
                 .ranges = spec.ranges,
                 .opaque_predicate = spec.opaque_predicate,
             };
-            return @import("nlj.zig").NestedLoopJoin.create(allocator, left, right, nl_spec);
+            return @import("nlj.zig").NestedLoopJoin.create(allocator, left_in, right_in, nl_spec);
         }
 
         if (chosen == .sort_merge) {
@@ -483,15 +613,15 @@ pub const Join = struct {
                 .extra_predicate = spec.extra_predicate,
                 .ranges = spec.ranges,
             };
-            return @import("smj.zig").SortMergeJoin.create(allocator, left, right, sm_spec);
+            return @import("smj.zig").SortMergeJoin.create(allocator, left_in, right_in, sm_spec);
         }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const aa = arena.allocator();
 
-        const left_schema = left.outputSchema();
-        const right_schema = right.outputSchema();
+        const left_schema = left_in.outputSchema();
+        const right_schema = right_in.outputSchema();
 
         // Resolve key column indices on each side.
         const left_keys = try aa.alloc(usize, spec.on.len);
@@ -533,6 +663,15 @@ pub const Join = struct {
         const right_kept_mask = try aa.alloc(bool, right_schema.len);
         for (right_kept_mask) |*m| m.* = true;
         for (right_keys) |idx| right_kept_mask[idx] = false;
+        for (right_schema, 0..) |rc, ri| {
+            if (!right_kept_mask[ri]) continue;
+            for (left_schema) |lc| {
+                if (types.columnNameEql(lc.name, rc.name)) {
+                    right_kept_mask[ri] = false;
+                    break;
+                }
+            }
+        }
 
         var right_kept_count: usize = 0;
         for (right_kept_mask) |m| {
@@ -555,6 +694,9 @@ pub const Join = struct {
         // join keys. Refuse if any NON-KEY column name collides — the
         // user must explicitly rename via .compute() / .exclude() in
         // that case.
+        // Duplicate right-side names were already removed from
+        // right_kept_mask above; this final collision check protects
+        // against duplicates within the kept right-side schema.
         const output_schema = try allocator.alloc(Column, left_schema.len + right_kept_count);
         errdefer allocator.free(output_schema);
         for (left_schema, 0..) |c, i| {
@@ -624,8 +766,8 @@ pub const Join = struct {
         self.* = .{
             .allocator = allocator,
             .arena = arena,
-            .left = left,
-            .right = right,
+            .left = left_in,
+            .right = right_in,
             .join_type = spec.join_type,
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
@@ -1788,4 +1930,3 @@ fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
         .gte => ord != .lt,
     };
 }
-

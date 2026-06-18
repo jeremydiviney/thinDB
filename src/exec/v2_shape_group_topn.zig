@@ -273,37 +273,40 @@ fn appendUniqueCol(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8
     try out.append(allocator, name);
 }
 
+fn collectScanInputName(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), table: *api.Table, request: Request, name: []const u8) !bool {
+    if (types.findColumn(table.schema.columns, name) != null) {
+        try appendUniqueCol(allocator, out, name);
+    } else if (findDerived(request.derived, name)) |d| {
+        try compute.collectColumnRefs(allocator, out, d.expr);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 // Project the base columns that back every group key and aggregate input: a
 // real table column is projected as-is; a derived name expands to the base
 // columns its expression reads. Returns false (decline) on a name that is
 // neither a table column nor a known derived column.
 fn collectScanBaseColumns(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), table: *api.Table, request: Request) !bool {
     for (request.group_cols) |name| {
-        if (types.findColumn(table.schema.columns, name) != null) {
-            try appendUniqueCol(allocator, out, name);
-        } else if (findDerived(request.derived, name)) |d| {
-            try compute.collectColumnRefs(allocator, out, d.expr);
-        } else return false;
+        if (!try collectScanInputName(allocator, out, table, request, name)) return false;
     }
     for (request.aggs) |agg| {
         // A UDAF's inputs are its explicit arg columns (which may differ from,
         // or outnumber, `agg.col`); project each so the scan stages them.
         if (agg.func == .udf and agg.udf_arg_cols.len > 0) {
             for (agg.udf_arg_cols) |name| {
-                if (types.findColumn(table.schema.columns, name) != null) {
-                    try appendUniqueCol(allocator, out, name);
-                } else if (findDerived(request.derived, name)) |d| {
-                    try compute.collectColumnRefs(allocator, out, d.expr);
-                } else return false;
+                if (!try collectScanInputName(allocator, out, table, request, name)) return false;
             }
             continue;
         }
-        const name = agg.col orelse continue;
-        if (types.findColumn(table.schema.columns, name) != null) {
-            try appendUniqueCol(allocator, out, name);
-        } else if (findDerived(request.derived, name)) |d| {
-            try compute.collectColumnRefs(allocator, out, d.expr);
-        } else return false;
+        if (agg.col) |name| {
+            if (!try collectScanInputName(allocator, out, table, request, name)) return false;
+        }
+        if (agg.arg2_col) |name| {
+            if (!try collectScanInputName(allocator, out, table, request, name)) return false;
+        }
     }
     return true;
 }

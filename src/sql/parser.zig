@@ -94,6 +94,7 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
     .{ .name = "any_value", .func = .any_value },
     .{ .name = "first", .func = .first },
     .{ .name = "last", .func = .last },
+    .{ .name = "max_by", .func = .max_by },
     .{ .name = "bit_and", .func = .bit_and },
     .{ .name = "bit_or", .func = .bit_or },
     .{ .name = "bit_xor", .func = .bit_xor },
@@ -138,6 +139,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .any_value => "any_value",
         .first => "first",
         .last => "last",
+        .max_by => "max_by",
         .bit_and => "bit_and",
         .bit_or => "bit_or",
         .bit_xor => "bit_xor",
@@ -187,6 +189,14 @@ fn unitFirstArgCall(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "date_diff") or
         std.ascii.eqlIgnoreCase(name, "timestampdiff") or
         std.ascii.eqlIgnoreCase(name, "timestampadd");
+}
+
+const DateAddSubKind = enum { add, sub };
+
+fn dateAddSubName(name: []const u8) ?DateAddSubKind {
+    if (std.ascii.eqlIgnoreCase(name, "date_add")) return .add;
+    if (std.ascii.eqlIgnoreCase(name, "date_sub")) return .sub;
+    return null;
 }
 
 fn fileFormatForFunction(name: []const u8) ?ir.FileFormat {
@@ -257,6 +267,33 @@ pub fn parseDialectWithUdfs(
     return try parser.allocOp(.{ .batch = .{ .statements = owned } });
 }
 
+const ParsedAgg = struct {
+    func: ir.AggFunc,
+    udf_name: ?[]const u8 = null,
+    udf_arg_cols: []const []const u8 = &.{},
+    col: ?[]const u8,
+    arg_expr: ?ir.Expr = null,
+    arg2_col: ?[]const u8 = null,
+    arg2_expr: ?ir.Expr = null,
+    separator: ?[]const u8 = null,
+    params: ir.AggParams = .none,
+};
+
+const AggExprRef = struct {
+    name: []const u8,
+    agg: ParsedAgg,
+};
+
+const ParsedAggCall = struct {
+    default_name: []const u8,
+    agg: ParsedAgg,
+};
+
+const WindowExprRef = struct {
+    name: []const u8,
+    call: ParsedWindowCall,
+};
+
 const ProjItem = struct {
     /// Output name for this projected column (post-alias).
     name: []const u8,
@@ -272,15 +309,7 @@ const ProjItem = struct {
         /// the user wrote `SUM(a * b)` or similar — the parser
         /// hoists it into a synthetic Compute column whose name then
         /// fills in `col` before the GroupBy is built.
-        agg: struct {
-            func: ir.AggFunc,
-            udf_name: ?[]const u8 = null,
-            udf_arg_cols: []const []const u8 = &.{},
-            col: ?[]const u8,
-            arg_expr: ?ir.Expr = null,
-            separator: ?[]const u8 = null,
-            params: ir.AggParams = .none,
-        },
+        agg: ParsedAgg,
         /// Scalar function call expression. Lowered to a Compute step
         /// before the final projection.
         expr: ir.Expr,
@@ -317,6 +346,8 @@ const JoinOnPlan = struct {
     ranges: []const ir.JoinRangePredicate,
     left_derived: []const ir.Derived,
     right_derived: []const ir.Derived,
+    left_filter: ?PredicateExpr,
+    right_filter: ?PredicateExpr,
     hidden_left: []const []const u8,
 };
 
@@ -349,12 +380,22 @@ pub const Parser = struct {
     /// Optional catalog-owned registry used only to classify aggregate UDF
     /// names during parse. Scalar UDFs stay normal Expr.call nodes.
     udf_registry: ?*const udf_mod.UdfRegistry = null,
+    predicate_derived: std.ArrayList(ir.Derived) = .empty,
+    predicate_derived_counter: usize = 0,
+    predicate_derived_enabled: bool = false,
+    aggregate_expr_refs: std.ArrayList(AggExprRef) = .empty,
+    aggregate_expr_counter: usize = 0,
+    aggregate_expr_refs_enabled: bool = false,
+    window_expr_refs: std.ArrayList(WindowExprRef) = .empty,
+    window_expr_counter: usize = 0,
+    window_partition_expr_refs: std.ArrayList(ir.Derived) = .empty,
+    window_partition_expr_counter: usize = 0,
 
     pub fn advance(self: *Parser) ParseError!void {
         self.cur = try self.lex.next();
     }
 
-    fn aggregateFuncForName(self: *const Parser, name: []const u8) ?ir.AggFunc {
+    pub fn aggregateFuncForName(self: *const Parser, name: []const u8) ?ir.AggFunc {
         if (aggForName(name)) |func| return func;
         if (self.udf_registry) |registry| {
             if (registry.hasAggregateName(name)) return .udf;
@@ -486,8 +527,32 @@ pub const Parser = struct {
             try self.advance();
         }
 
-        // Projection list.
+        // Projection list. Scalar projection expressions may contain
+        // aggregate calls; collect those as hidden aggregate outputs so the
+        // scalar wrapper can run above GROUP BY.
+        const agg_ref_mark = self.aggregate_expr_refs.items.len;
+        const window_ref_mark = self.window_expr_refs.items.len;
+        const window_partition_ref_mark = self.window_partition_expr_refs.items.len;
+        const projection_pred_mark = self.predicate_derived.items.len;
+        const old_aggregate_expr_refs_enabled = self.aggregate_expr_refs_enabled;
+        const old_predicate_derived_enabled = self.predicate_derived_enabled;
+        self.aggregate_expr_refs_enabled = true;
+        self.predicate_derived_enabled = true;
+        errdefer self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
+        errdefer self.predicate_derived_enabled = old_predicate_derived_enabled;
+        errdefer self.aggregate_expr_refs.shrinkRetainingCapacity(agg_ref_mark);
+        errdefer self.window_expr_refs.shrinkRetainingCapacity(window_ref_mark);
+        errdefer self.window_partition_expr_refs.shrinkRetainingCapacity(window_partition_ref_mark);
+        errdefer self.predicate_derived.shrinkRetainingCapacity(projection_pred_mark);
         const proj = try self.parseProjection();
+        self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
+        self.predicate_derived_enabled = old_predicate_derived_enabled;
+        const aggregate_expr_refs = try self.arena.dupe(AggExprRef, self.aggregate_expr_refs.items[agg_ref_mark..]);
+        self.aggregate_expr_refs.shrinkRetainingCapacity(agg_ref_mark);
+        const window_expr_refs = try self.arena.dupe(WindowExprRef, self.window_expr_refs.items[window_ref_mark..]);
+        self.window_expr_refs.shrinkRetainingCapacity(window_ref_mark);
+        const projection_predicate_derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[projection_pred_mark..]);
+        self.predicate_derived.shrinkRetainingCapacity(projection_pred_mark);
 
         // FROM clause — supports a single table or chained JOINs. A
         // missing FROM is a FROM-less SELECT (`SELECT 1+1`, `SELECT now()`):
@@ -503,7 +568,16 @@ pub const Parser = struct {
         // Optional WHERE.
         if (self.cur.tag == .kw_where) {
             try self.advance();
+            const derived_mark = self.predicate_derived.items.len;
+            const old_enabled = self.predicate_derived_enabled;
+            self.predicate_derived_enabled = true;
+            defer self.predicate_derived_enabled = old_enabled;
             const pred = try self.parseBoolExpr();
+            if (self.predicate_derived.items.len > derived_mark) {
+                const derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[derived_mark..]);
+                self.predicate_derived.shrinkRetainingCapacity(derived_mark);
+                root = try self.allocOp(.{ .compute = .{ .derived = derived, .upstream = root } });
+            }
             root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
         }
 
@@ -535,6 +609,8 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_window) {
             try parse_window.parseWindowClause(self);
         }
+        const window_partition_expr_refs = try self.arena.dupe(ir.Derived, self.window_partition_expr_refs.items[window_partition_ref_mark..]);
+        self.window_partition_expr_refs.shrinkRetainingCapacity(window_partition_ref_mark);
 
         // Optional QUALIFY <bool_expr> — Snowflake/BigQuery/DuckDB-style
         // post-window filter. Per the SQL extension, comes after WINDOW
@@ -551,6 +627,7 @@ pub const Parser = struct {
         // Decide between a Project, a Group-by, or a Group-by + Project
         // based on the projection list shape.
         const has_agg = blk: {
+            if (aggregate_expr_refs.len > 0) break :blk true;
             for (proj) |p| switch (p.kind) {
                 .agg => break :blk true,
                 else => {},
@@ -565,6 +642,7 @@ pub const Parser = struct {
             break :blk false;
         };
         const has_window = blk: {
+            if (window_expr_refs.len > 0) break :blk true;
             for (proj) |p| switch (p.kind) {
                 .window => break :blk true,
                 else => {},
@@ -572,6 +650,30 @@ pub const Parser = struct {
             break :blk false;
         };
         const has_group = group_exprs.len > 0;
+        if (aggregate_expr_refs.len > 0 and !has_group) return ParseError.SqlInvalidProjection;
+        var hidden_agg_cols: []const []const u8 = &.{};
+        if (aggregate_expr_refs.len > 0) {
+            const cols = try self.arena.alloc([]const u8, aggregate_expr_refs.len);
+            for (aggregate_expr_refs, cols) |ref, *dst| dst.* = ref.name;
+            hidden_agg_cols = cols;
+        }
+        var hidden_window_cols: []const []const u8 = &.{};
+        if (window_expr_refs.len > 0) {
+            const cols = try self.arena.alloc([]const u8, window_expr_refs.len);
+            for (window_expr_refs, cols) |ref, *dst| dst.* = ref.name;
+            hidden_window_cols = cols;
+        }
+        var post_window_expr: []bool = &.{};
+        if (hidden_window_cols.len > 0) {
+            post_window_expr = try self.arena.alloc(bool, proj.len);
+            @memset(post_window_expr, false);
+            for (proj, 0..) |p, i| switch (p.kind) {
+                .expr => |e| {
+                    if (exprReferencesAnyColumn(e, hidden_window_cols)) post_window_expr[i] = true;
+                },
+                else => {},
+            };
+        }
         // Resolve GROUP BY items against the projection. Produces the
         // grouping key column names and a per-projection flag marking
         // which items are grouping keys (so a computed grouping key like
@@ -612,17 +714,13 @@ pub const Parser = struct {
                 .col => |c| if (!grouping_key[i] and !nameInList(c, group_cols)) return ParseError.SqlMixedAggAndPlainProjection,
                 .expr => |e| {
                     if (!grouping_key[i]) {
-                        if (!exprAvailableAfterGroup(e, group_cols)) return ParseError.SqlMixedAggAndPlainProjection;
+                        if (!exprAvailableAfterGroup(e, group_cols, hidden_agg_cols)) return ParseError.SqlMixedAggAndPlainProjection;
                         post_group_expr[i] = true;
                     }
                 },
-                .star, .window => return ParseError.SqlMixedAggAndPlainProjection,
+                .window => {},
+                .star => return ParseError.SqlMixedAggAndPlainProjection,
             };
-        }
-        if (has_window and (has_agg or has_group)) {
-            // Window functions on top of GROUP BY need an inner-subquery
-            // shape that the parser doesn't yet emit. Reject explicitly.
-            return ParseError.SqlMixedAggAndPlainProjection;
         }
 
         // Parse-time peek for ORDER BY and LIMIT clauses — we need to
@@ -676,6 +774,9 @@ pub const Parser = struct {
         }
 
         if (has_agg or has_group or distinct) {
+            if (projection_predicate_derived.len > 0) {
+                root = try self.allocOp(.{ .compute = .{ .derived = projection_predicate_derived, .upstream = root } });
+            }
             // Functional-dependency group-key collapse (pre-execution
             // rewrite). A computed grouping key that is a pure, deterministic
             // function of other *retained* group keys — or a constant — adds
@@ -731,19 +832,15 @@ pub const Parser = struct {
             var synth_counter: usize = 0;
             var agg_cols: std.ArrayList(?[]const u8) = .empty;
             defer agg_cols.deinit(self.arena);
+            var agg_arg2_cols: std.ArrayList(?[]const u8) = .empty;
+            defer agg_arg2_cols.deinit(self.arena);
             for (proj) |p| switch (p.kind) {
-                .agg => |a| {
-                    if (a.arg_expr) |e| {
-                        const owned_name = std.fmt.allocPrint(self.arena, "__agg_arg_{d}", .{synth_counter}) catch return ParseError.OutOfMemory;
-                        synth_counter += 1;
-                        try derived_buf.append(self.arena, .{ .name = owned_name, .expr = e });
-                        try agg_cols.append(self.arena, owned_name);
-                    } else {
-                        try agg_cols.append(self.arena, a.col);
-                    }
-                },
+                .agg => |a| try self.appendAggInputs(a, &derived_buf, &agg_cols, &agg_arg2_cols, &synth_counter),
                 else => {},
             };
+            for (aggregate_expr_refs) |ref| {
+                try self.appendAggInputs(ref.agg, &derived_buf, &agg_cols, &agg_arg2_cols, &synth_counter);
+            }
             if (derived_buf.items.len > 0) {
                 const derived_slice = try derived_buf.toOwnedSlice(self.arena);
                 root = try self.allocOp(.{ .compute = .{ .derived = derived_slice, .upstream = root } });
@@ -753,25 +850,12 @@ pub const Parser = struct {
             var aggs_buf: std.ArrayList(ir.AggSpec) = .empty;
             var agg_i: usize = 0;
             for (proj) |p| switch (p.kind) {
-                .agg => |a| {
-                    try aggs_buf.append(self.arena, .{
-                        .func = a.func,
-                        .udf_name = a.udf_name,
-                        .udf_arg_cols = a.udf_arg_cols,
-                        .col = agg_cols.items[agg_i],
-                        .as = p.name,
-                        .params = if (a.func == .group_concat)
-                            switch (a.params) {
-                                .separator => a.params,
-                                else => .{ .separator = a.separator orelse "," },
-                            }
-                        else
-                            a.params,
-                    });
-                    agg_i += 1;
-                },
+                .agg => |a| try self.appendAggSpec(&aggs_buf, a, p.name, agg_cols.items, agg_arg2_cols.items, &agg_i),
                 else => {},
             };
+            for (aggregate_expr_refs) |ref| {
+                try self.appendAggSpec(&aggs_buf, ref.agg, ref.name, agg_cols.items, agg_arg2_cols.items, &agg_i);
+            }
             // Drop collapsed keys from the grouping columns. Collapsed `.expr`
             // keys live in `group_cols` under their projection name; build the
             // reduced list (and remember the dropped names so we recompute
@@ -851,6 +935,30 @@ pub const Parser = struct {
                 root = try self.allocOp(.{ .filter = .{ .predicate = pred.*, .upstream = root } });
             }
 
+            if (has_window) {
+                if (try buildWindowOp(self.arena, proj, window_expr_refs, window_partition_expr_refs, root, &self.named_windows)) |win| {
+                    root = win;
+                }
+            }
+            if (post_window_expr.len > 0) {
+                var post_window_buf: std.ArrayList(ir.Derived) = .empty;
+                for (proj, 0..) |p, i| {
+                    if (!post_window_expr[i]) continue;
+                    switch (p.kind) {
+                        .expr => |e| try post_window_buf.append(self.arena, .{ .name = p.name, .expr = e }),
+                        else => {},
+                    }
+                }
+                if (post_window_buf.items.len > 0) {
+                    const derived_slice = try post_window_buf.toOwnedSlice(self.arena);
+                    root = try self.allocOp(.{ .compute = .{ .derived = derived_slice, .upstream = root } });
+                }
+            }
+            if (pending_qualify) |pred| {
+                if (!has_window) return ParseError.SqlInvalidProjection;
+                root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
+            }
+
             // Apply ORDER BY on the grouped schema.
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
@@ -860,7 +968,7 @@ pub const Parser = struct {
             // GroupBy emits group_cols first then aggs in registered order;
             // a Project on top reorders/keeps only the SELECT items. DISTINCT
             // always projects — its hidden COUNT(*) must not reach the output.
-            if (distinct or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+            if (distinct or has_window or aggregate_expr_refs.len > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
         } else {
@@ -872,18 +980,40 @@ pub const Parser = struct {
             // Compute first so window args can reference computed columns;
             // Window before OrderBy so ORDER BY can reference window outputs;
             // Project last so it selects from the union of input + derived.
+            if (projection_predicate_derived.len > 0) {
+                root = try self.allocOp(.{ .compute = .{ .derived = projection_predicate_derived, .upstream = root } });
+            }
             if (has_expr) {
                 var derived_buf: std.ArrayList(ir.Derived) = .empty;
-                for (proj) |p| switch (p.kind) {
-                    .expr => |e| try derived_buf.append(self.arena, .{ .name = p.name, .expr = e }),
+                for (proj, 0..) |p, i| switch (p.kind) {
+                    .expr => |e| {
+                        if (i < post_window_expr.len and post_window_expr[i]) continue;
+                        try derived_buf.append(self.arena, .{ .name = p.name, .expr = e });
+                    },
                     else => {},
                 };
-                const derived_slice = try derived_buf.toOwnedSlice(self.arena);
-                root = try self.allocOp(.{ .compute = .{ .derived = derived_slice, .upstream = root } });
+                if (derived_buf.items.len > 0) {
+                    const derived_slice = try derived_buf.toOwnedSlice(self.arena);
+                    root = try self.allocOp(.{ .compute = .{ .derived = derived_slice, .upstream = root } });
+                }
             }
             if (has_window) {
-                if (try buildWindowOp(self.arena, proj, root, &self.named_windows)) |win| {
+                if (try buildWindowOp(self.arena, proj, window_expr_refs, window_partition_expr_refs, root, &self.named_windows)) |win| {
                     root = win;
+                }
+            }
+            if (post_window_expr.len > 0) {
+                var post_window_buf: std.ArrayList(ir.Derived) = .empty;
+                for (proj, 0..) |p, i| {
+                    if (!post_window_expr[i]) continue;
+                    switch (p.kind) {
+                        .expr => |e| try post_window_buf.append(self.arena, .{ .name = p.name, .expr = e }),
+                        else => {},
+                    }
+                }
+                if (post_window_buf.items.len > 0) {
+                    const derived_slice = try post_window_buf.toOwnedSlice(self.arena);
+                    root = try self.allocOp(.{ .compute = .{ .derived = derived_slice, .upstream = root } });
                 }
             }
             if (pending_qualify) |pred| {
@@ -1064,7 +1194,7 @@ pub const Parser = struct {
         // operators and aliasing work. (`GROUP BY 1` then references it
         // as ordinal 1.)
         switch (self.cur.tag) {
-            .integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
+            .plus, .minus, .integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
                 const expr = try self.parseAddSub();
                 const default_name = try self.exprDefaultName(expr);
                 const alias = try self.maybeAlias(default_name);
@@ -1098,6 +1228,7 @@ pub const Parser = struct {
             try self.advance();
             if (self.cur.tag == .lparen) {
                 try self.advance();
+                if (try self.tryParseCastWrappedAggregate()) |agg| return agg;
                 const inner = try self.parseCallArg();
                 if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
                 try self.advance();
@@ -1132,15 +1263,28 @@ pub const Parser = struct {
         const first = self.cur.text;
         try self.advance();
 
+        if (try self.typedTemporalLiteralAfterName(first)) |lit| {
+            var expr = lit;
+            expr = try self.continueBinaryFrom(expr);
+            const default_name = try self.exprDefaultName(expr);
+            const alias = try self.maybeAlias(default_name);
+            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+        }
+
         // Function call?
         if (self.cur.tag == .lparen) {
+            if (dateAddSubName(first)) |_| {
+                const scalar_atom = try self.parseDateAddSubCallAfterName(first);
+                const expr = try self.continueBinaryFrom(scalar_atom);
+                const default_name = try self.exprDefaultName(expr);
+                const alias = try self.maybeAlias(default_name);
+                return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            }
             // Parse the call shape (name + paren-wrapped args) once. Then
             // decide between aggregate / scalar / window based on what
             // follows.
             var saw_distinct = false;
             const args = try self.parseCallArgList(&saw_distinct);
-            const fname_dup = try self.arena.dupe(u8, first);
-
             // Optional [IGNORE | RESPECT] NULLS between `)` and `OVER`.
             const ignore_nulls = try parse_window.parseIgnoreNulls(self);
 
@@ -1161,6 +1305,21 @@ pub const Parser = struct {
                     .ignore_nulls = ignore_nulls,
                     .spec_kind = spec_kind,
                 };
+                if (self.cur.tag == .kw_is) {
+                    try self.advance();
+                    var negated = false;
+                    if (self.cur.tag == .kw_not) {
+                        negated = true;
+                        try self.advance();
+                    }
+                    if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
+                    try self.advance();
+                    const hidden_name = try self.materializeWindowExpr(call);
+                    const expr = try self.windowNullCheckExpr(hidden_name, negated);
+                    const default_name: []const u8 = if (negated) "is_not_null" else "is_null";
+                    const alias = try self.maybeAlias(default_name);
+                    return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+                }
                 const default_name = try parse_window.defaultName(self.arena, first, args);
                 const alias = try self.maybeAlias(default_name);
                 return ProjItem{ .name = alias, .kind = .{ .window = call } };
@@ -1203,7 +1362,7 @@ pub const Parser = struct {
             // whole thing is a binary expression with the call as the
             // leftmost operand — lift into a .expr ProjItem. Otherwise
             // stay as a bare scalar call.
-            const scalar_atom = ir.Expr{ .call = .{ .fn_name = fname_dup, .args = try self.normalizeScalarCallArgs(first, args) } };
+            const scalar_atom = try self.makeScalarCallExpr(first, args);
             const expr = try self.continueBinaryFrom(scalar_atom);
             const default_name = try self.exprDefaultName(expr);
             const alias = try self.maybeAlias(default_name);
@@ -1265,9 +1424,25 @@ pub const Parser = struct {
     }
 
     fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
+        if (dateAddSubName(name)) |_| return try self.parseDateAddSubCallAfterName(name);
+        if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
         const args = try self.parseCallArgList(null);
-        const fname_dup = try self.arena.dupe(u8, name);
-        return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = try self.normalizeScalarCallArgs(name, args) } };
+        return try self.makeScalarCallExpr(name, args);
+    }
+
+    fn parseIfCallAfterName(self: *Parser) ParseError!ir.Expr {
+        try self.expect(.lparen);
+        const cond = try self.parseBoolExpr();
+        try self.expect(.comma);
+        const then_expr = try self.parseCallArg();
+        try self.expect(.comma);
+        const else_expr = try self.arena.create(ir.Expr);
+        else_expr.* = try self.parseCallArg();
+        try self.expect(.rparen);
+
+        const branches = try self.arena.alloc(ir.Expr.Branch, 1);
+        branches[0] = .{ .cond = cond, .then = then_expr };
+        return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_expr } };
     }
 
     fn normalizeScalarCallArgs(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError![]const ir.Expr {
@@ -1281,6 +1456,31 @@ pub const Parser = struct {
         @memcpy(normalized, args);
         normalized[0] = .{ .lit = .{ .text = try self.arena.dupe(u8, unit) } };
         return normalized;
+    }
+
+    fn makeScalarCallExpr(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
+        if (std.ascii.eqlIgnoreCase(name, "months_add")) {
+            if (args.len != 2) return ParseError.SqlInvalidProjection;
+            return ir.Expr{ .call = .{
+                .fn_name = try self.arena.dupe(u8, "date_add_months"),
+                .args = args,
+            } };
+        }
+        if (std.ascii.eqlIgnoreCase(name, "months_diff")) {
+            if (args.len != 2) return ParseError.SqlInvalidProjection;
+            const normalized = try self.arena.alloc(ir.Expr, 3);
+            normalized[0] = .{ .lit = .{ .text = try self.arena.dupe(u8, "month") } };
+            normalized[1] = args[1];
+            normalized[2] = args[0];
+            return ir.Expr{ .call = .{
+                .fn_name = try self.arena.dupe(u8, "date_diff"),
+                .args = normalized,
+            } };
+        }
+        return ir.Expr{ .call = .{
+            .fn_name = try self.arena.dupe(u8, name),
+            .args = try self.normalizeScalarCallArgs(name, args),
+        } };
     }
 
     /// True when `tag` is one of the binary arithmetic operators we
@@ -1347,36 +1547,112 @@ pub const Parser = struct {
         try self.expect(.kw_interval);
         // Accept both `'90'` (string) and bare integer for the
         // quantity — MySQL / DuckDB use string, PG uses bare integer.
-        var n: i64 = 0;
-        if (self.cur.tag == .string) {
-            const s = self.cur.value.string;
-            n = std.fmt.parseInt(i64, s, 10) catch return ParseError.SqlExpectedValue;
-            try self.advance();
-        } else if (self.cur.tag == .integer) {
-            n = self.cur.value.integer;
-            try self.advance();
-        } else return ParseError.SqlExpectedValue;
-        if (negate) n = -n;
+        var amount = try self.parseAddSub();
+        amount = try self.normalizeIntervalAmount(amount, negate);
 
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const unit_word = self.cur.text;
-        const fn_name: []const u8 = if (std.ascii.eqlIgnoreCase(unit_word, "day") or std.ascii.eqlIgnoreCase(unit_word, "days"))
-            "date_add"
-        else if (std.ascii.eqlIgnoreCase(unit_word, "month") or std.ascii.eqlIgnoreCase(unit_word, "months"))
-            "date_add_months"
-        else if (std.ascii.eqlIgnoreCase(unit_word, "year") or std.ascii.eqlIgnoreCase(unit_word, "years"))
-            "date_add_years"
-        else
-            return ParseError.SqlExpectedKeyword;
+        const fn_name = try self.intervalFunctionName(unit_word);
         try self.advance();
 
         // Build a 2-arg call: fn(date_expr, n).
         const args = try self.arena.alloc(ir.Expr, 2);
         args[0] = lhs;
-        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ParseError.SqlExpectedValue;
-        args[1] = ir.Expr{ .lit = .{ .int = @intCast(n) } };
+        args[1] = amount;
         const name_dup = try self.arena.dupe(u8, fn_name);
         return ir.Expr{ .call = .{ .fn_name = name_dup, .args = args } };
+    }
+
+    fn intervalFunctionName(_: *Parser, unit_word: []const u8) ParseError![]const u8 {
+        if (std.ascii.eqlIgnoreCase(unit_word, "day") or std.ascii.eqlIgnoreCase(unit_word, "days")) return "date_add";
+        if (std.ascii.eqlIgnoreCase(unit_word, "month") or std.ascii.eqlIgnoreCase(unit_word, "months")) return "date_add_months";
+        if (std.ascii.eqlIgnoreCase(unit_word, "year") or std.ascii.eqlIgnoreCase(unit_word, "years")) return "date_add_years";
+        return ParseError.SqlExpectedKeyword;
+    }
+
+    fn normalizeIntervalAmount(self: *Parser, amount: ir.Expr, negate: bool) ParseError!ir.Expr {
+        var out = switch (amount) {
+            .lit => |v| switch (v) {
+                .text => |s| blk: {
+                    const n = std.fmt.parseInt(i64, s, 10) catch return ParseError.SqlExpectedValue;
+                    if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ParseError.SqlExpectedValue;
+                    break :blk ir.Expr{ .lit = .{ .int = @intCast(n) } };
+                },
+                else => amount,
+            },
+            else => amount,
+        };
+        if (negate) out = try self.negateExpr(out);
+        return out;
+    }
+
+    fn negateExpr(self: *Parser, expr: ir.Expr) ParseError!ir.Expr {
+        switch (expr) {
+            .lit => |v| switch (v) {
+                .int => |x| return ir.Expr{ .lit = .{ .int = -x } },
+                .bigint => |x| return ir.Expr{ .lit = .{ .bigint = -x } },
+                .smallint => |x| return ir.Expr{ .lit = .{ .smallint = -x } },
+                .tinyint => |x| return ir.Expr{ .lit = .{ .tinyint = -x } },
+                .float => |x| return ir.Expr{ .lit = .{ .float = -x } },
+                .double => |x| return ir.Expr{ .lit = .{ .double = -x } },
+                else => {},
+            },
+            else => {},
+        }
+        return try self.makeBinary("sub", ir.Expr{ .lit = .{ .int = 0 } }, expr);
+    }
+
+    fn parseDateAddSubCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
+        const kind = dateAddSubName(name) orelse return ParseError.SqlInvalidProjection;
+        try self.expect(.lparen);
+        const base = try self.parseCallArg();
+        try self.expect(.comma);
+
+        if (self.cur.tag == .kw_interval) {
+            try self.advance();
+            var amount = try self.parseAddSub();
+            amount = try self.normalizeIntervalAmount(amount, kind == .sub);
+            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+            const fn_name = try self.intervalFunctionName(self.cur.text);
+            try self.advance();
+            try self.expect(.rparen);
+            const args = try self.arena.alloc(ir.Expr, 2);
+            args[0] = base;
+            args[1] = amount;
+            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
+        }
+
+        const amount = try self.parseCallArg();
+        try self.expect(.rparen);
+        const args = try self.arena.alloc(ir.Expr, 2);
+        args[0] = base;
+        args[1] = amount;
+        const fn_name: []const u8 = if (kind == .sub) "date_sub" else "date_add";
+        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
+    }
+
+    fn tryParseCastWrappedAggregate(self: *Parser) ParseError!?ProjItem {
+        if (self.cur.tag != .identifier) return null;
+        const first = self.cur.text;
+        const func = self.aggregateFuncForName(first) orelse return null;
+        try self.advance();
+        if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
+        var saw_distinct = false;
+        const args = try self.parseCallArgList(&saw_distinct);
+        if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
+        try self.advance();
+        _ = try parse_ddl.parseColumnType(self);
+        try self.expect(.rparen);
+        if (saw_distinct) {
+            const distinct_func: ir.AggFunc = switch (func) {
+                .count => .count_distinct,
+                .sum => .sum_distinct,
+                .avg => .avg_distinct,
+                else => return ParseError.SqlInvalidProjection,
+            };
+            return try self.aggCallFromArgs(first, distinct_func, args);
+        }
+        return try self.aggCallFromArgs(first, func, args);
     }
 
     /// Parse `(arg, arg, ...)`. Cursor is on `(` going in, on the token
@@ -1411,16 +1687,69 @@ pub const Parser = struct {
         return try args.toOwnedSlice(self.arena);
     }
 
-    /// Build a ProjItem.agg from a pre-parsed args slice. Aggregates
+    fn appendAggInputs(
+        self: *Parser,
+        a: ParsedAgg,
+        derived_buf: *std.ArrayList(ir.Derived),
+        agg_cols: *std.ArrayList(?[]const u8),
+        agg_arg2_cols: *std.ArrayList(?[]const u8),
+        synth_counter: *usize,
+    ) ParseError!void {
+        if (a.arg_expr) |e| {
+            const owned_name = std.fmt.allocPrint(self.arena, "__agg_arg_{d}", .{synth_counter.*}) catch return ParseError.OutOfMemory;
+            synth_counter.* += 1;
+            try derived_buf.append(self.arena, .{ .name = owned_name, .expr = e });
+            try agg_cols.append(self.arena, owned_name);
+        } else {
+            try agg_cols.append(self.arena, a.col);
+        }
+        if (a.arg2_expr) |e| {
+            const owned_name = std.fmt.allocPrint(self.arena, "__agg_arg_{d}", .{synth_counter.*}) catch return ParseError.OutOfMemory;
+            synth_counter.* += 1;
+            try derived_buf.append(self.arena, .{ .name = owned_name, .expr = e });
+            try agg_arg2_cols.append(self.arena, owned_name);
+        } else {
+            try agg_arg2_cols.append(self.arena, a.arg2_col);
+        }
+    }
+
+    fn appendAggSpec(
+        self: *Parser,
+        aggs_buf: *std.ArrayList(ir.AggSpec),
+        a: ParsedAgg,
+        out_name: []const u8,
+        agg_cols: []const ?[]const u8,
+        agg_arg2_cols: []const ?[]const u8,
+        agg_i: *usize,
+    ) ParseError!void {
+        try aggs_buf.append(self.arena, .{
+            .func = a.func,
+            .udf_name = a.udf_name,
+            .udf_arg_cols = a.udf_arg_cols,
+            .col = agg_cols[agg_i.*],
+            .arg2_col = agg_arg2_cols[agg_i.*],
+            .as = out_name,
+            .params = if (a.func == .group_concat)
+                switch (a.params) {
+                    .separator => a.params,
+                    else => .{ .separator = a.separator orelse "," },
+                }
+            else
+                a.params,
+        });
+        agg_i.* += 1;
+    }
+
+    /// Build a ParsedAgg from a pre-parsed args slice. Aggregates
     /// accept either a single column-ref arg or `*` (COUNT only). The
     /// args have already been parsed via the generic call-args path
     /// (which leaves *-as-col_ref `"*"`).
-    fn aggCallFromArgs(
+    fn parsedAggFromArgs(
         self: *Parser,
         func_name: []const u8,
         func: ir.AggFunc,
         args: []const ir.Expr,
-    ) ParseError!ProjItem {
+    ) ParseError!ParsedAggCall {
         if (func == .udf) {
             if (args.len == 0) return ParseError.SqlInvalidProjection;
             const arg_cols = try self.arena.alloc([]const u8, args.len);
@@ -1445,18 +1774,49 @@ pub const Parser = struct {
                 try buf.append(self.arena, ')');
                 break :blk try buf.toOwnedSlice(self.arena);
             };
-            const alias = try self.maybeAlias(default_name);
-            return ProjItem{ .name = alias, .kind = .{ .agg = .{
+            return .{ .default_name = default_name, .agg = .{
                 .func = .udf,
                 .udf_name = try self.arena.dupe(u8, func_name),
                 .udf_arg_cols = arg_cols,
                 .col = arg_cols[0],
-            } } };
+            } };
         }
 
         // GROUP_CONCAT / STRING_AGG take an optional second positional arg:
         // the delimiter string literal. PERCENTILE_CONT(x, p) stores p as
         // an aggregate param; MEDIAN(x) is percentile_cont(x, 0.5).
+        if (func == .max_by) {
+            if (args.len != 2) return ParseError.SqlInvalidProjection;
+            var value_col: ?[]const u8 = null;
+            var value_expr: ?ir.Expr = null;
+            switch (args[0]) {
+                .col_ref => |c| {
+                    if (std.mem.eql(u8, c, "*")) return ParseError.SqlInvalidProjection;
+                    value_col = try self.arena.dupe(u8, c);
+                },
+                .call, .case, .lit => value_expr = args[0],
+                else => return ParseError.SqlInvalidProjection,
+            }
+            var key_col: ?[]const u8 = null;
+            var key_expr: ?ir.Expr = null;
+            switch (args[1]) {
+                .col_ref => |c| {
+                    if (std.mem.eql(u8, c, "*")) return ParseError.SqlInvalidProjection;
+                    key_col = try self.arena.dupe(u8, c);
+                },
+                .call, .case, .lit => key_expr = args[1],
+                else => return ParseError.SqlInvalidProjection,
+            }
+            const default_name = try self.arena.dupe(u8, "max_by(expr)");
+            return .{ .default_name = default_name, .agg = .{
+                .func = func,
+                .col = value_col,
+                .arg_expr = value_expr,
+                .arg2_col = key_col,
+                .arg2_expr = key_expr,
+            } };
+        }
+
         var separator: ?[]const u8 = null;
         var params: ir.AggParams = .none;
         var value_args = args;
@@ -1523,15 +1883,78 @@ pub const Parser = struct {
             try buf.append(self.arena, ')');
             break :blk try buf.toOwnedSlice(self.arena);
         };
-        const alias = try self.maybeAlias(default_name);
-        return ProjItem{ .name = alias, .kind = .{ .agg = .{
+        return .{ .default_name = default_name, .agg = .{
             .func = func,
             .udf_name = if (func == .udf) try self.arena.dupe(u8, func_name) else null,
             .col = arg_col,
             .arg_expr = arg_expr,
             .separator = separator,
             .params = params,
-        } } };
+        } };
+    }
+
+    fn aggCallFromArgs(
+        self: *Parser,
+        func_name: []const u8,
+        func: ir.AggFunc,
+        args: []const ir.Expr,
+    ) ParseError!ProjItem {
+        const parsed = try self.parsedAggFromArgs(func_name, func, args);
+        const alias = try self.maybeAlias(parsed.default_name);
+        return ProjItem{ .name = alias, .kind = .{ .agg = parsed.agg } };
+    }
+
+    pub fn aggregateExprRefsEnabled(self: *const Parser) bool {
+        return self.aggregate_expr_refs_enabled;
+    }
+
+    pub fn materializeAggregateExpr(
+        self: *Parser,
+        func_name: []const u8,
+        func: ir.AggFunc,
+        args: []const ir.Expr,
+        saw_distinct: bool,
+    ) ParseError![]const u8 {
+        if (!self.aggregate_expr_refs_enabled) return ParseError.SqlInvalidProjection;
+        const actual_func: ir.AggFunc = if (saw_distinct) switch (func) {
+            .count => .count_distinct,
+            .sum => .sum_distinct,
+            .avg => .avg_distinct,
+            else => return ParseError.SqlInvalidProjection,
+        } else func;
+        const parsed = try self.parsedAggFromArgs(func_name, actual_func, args);
+        const name = std.fmt.allocPrint(self.arena, "__agg_expr_{d}", .{self.aggregate_expr_counter}) catch return ParseError.OutOfMemory;
+        self.aggregate_expr_counter += 1;
+        try self.aggregate_expr_refs.append(self.arena, .{ .name = name, .agg = parsed.agg });
+        return name;
+    }
+
+    fn materializeWindowExpr(self: *Parser, call: ParsedWindowCall) ParseError![]const u8 {
+        const name = std.fmt.allocPrint(self.arena, "__window_expr_{d}", .{self.window_expr_counter}) catch return ParseError.OutOfMemory;
+        self.window_expr_counter += 1;
+        try self.window_expr_refs.append(self.arena, .{ .name = name, .call = call });
+        return name;
+    }
+
+    pub fn materializeWindowPartitionExpr(self: *Parser, expr: ir.Expr) ParseError![]const u8 {
+        const name = std.fmt.allocPrint(self.arena, "__window_part_{d}", .{self.window_partition_expr_counter}) catch return ParseError.OutOfMemory;
+        self.window_partition_expr_counter += 1;
+        try self.window_partition_expr_refs.append(self.arena, .{ .name = name, .expr = expr });
+        return name;
+    }
+
+    fn windowNullCheckExpr(self: *Parser, col_name: []const u8, negated: bool) ParseError!ir.Expr {
+        const branches = try self.arena.alloc(ir.Expr.Branch, 1);
+        branches[0] = .{
+            .cond = if (negated)
+                PredicateExpr{ .is_not_null = col_name }
+            else
+                PredicateExpr{ .is_null = col_name },
+            .then = ir.Expr{ .lit = .{ .boolean = true } },
+        };
+        const else_branch = try self.arena.create(ir.Expr);
+        else_branch.* = ir.Expr{ .lit = .{ .boolean = false } };
+        return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch } };
     }
 
     /// One argument to a scalar function call. Entry point for the
@@ -1542,13 +1965,13 @@ pub const Parser = struct {
     ///                → parseCallAtom (leaf: ident / call / literal)
     /// Aggregates and window functions are rejected inside this
     /// sub-language (atom layer enforces it).
-    fn parseCallArg(self: *Parser) ParseError!ir.Expr {
+    pub fn parseCallArg(self: *Parser) ParseError!ir.Expr {
         return try self.parseAddSub();
     }
 
     /// `+` / `-` binary operators, lowest precedence in the expr
     /// sub-language. Left-associative.
-    fn parseAddSub(self: *Parser) ParseError!ir.Expr {
+    pub fn parseAddSub(self: *Parser) ParseError!ir.Expr {
         var lhs = try self.parseMulDiv();
         while (self.cur.tag == .plus or self.cur.tag == .minus or self.concatOpHere()) {
             if (self.concatOpHere()) {
@@ -1693,16 +2116,36 @@ pub const Parser = struct {
         };
     }
 
+    fn castExprToType(self: *Parser, inner: ir.Expr, ty: types.Type) ParseError!ir.Expr {
+        if (inner == .null_lit) return ir.Expr{ .null_lit = ty };
+        if (inner == .case) {
+            const branches = try self.arena.alloc(ir.Expr.Branch, inner.case.branches.len);
+            for (inner.case.branches, branches) |src, *dst| {
+                dst.* = .{
+                    .cond = src.cond,
+                    .then = try self.castExprToType(src.then, ty),
+                };
+            }
+            var else_branch: ?*const ir.Expr = null;
+            if (inner.case.else_branch) |eb| {
+                const owned = try self.arena.create(ir.Expr);
+                owned.* = try self.castExprToType(eb.*, ty);
+                else_branch = owned;
+            }
+            return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch } };
+        }
+        const fn_name = castFnName(ty) orelse return ParseError.SqlInvalidProjection;
+        const args = try self.arena.alloc(ir.Expr, 1);
+        args[0] = inner;
+        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
+    }
+
     /// Parse the target type (cursor on the type name) and wrap `inner`
     /// in a `cast_as_<T>(inner)` scalar call. Used by both CAST(... AS T)
     /// and the `inner::T` postfix.
     fn parseCastTarget(self: *Parser, inner: ir.Expr) ParseError!ir.Expr {
         const ty = try parse_ddl.parseColumnType(self);
-        if (inner == .null_lit) return ir.Expr{ .null_lit = ty };
-        const fn_name = castFnName(ty) orelse return ParseError.SqlInvalidProjection;
-        const args = try self.arena.alloc(ir.Expr, 1);
-        args[0] = inner;
-        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
+        return try self.castExprToType(inner, ty);
     }
 
     fn parseCallAtomBase(self: *Parser) ParseError!ir.Expr {
@@ -1761,12 +2204,36 @@ pub const Parser = struct {
             .identifier => {
                 const name = self.cur.text;
                 try self.advance();
+                if (try self.typedTemporalLiteralAfterName(name)) |lit| return lit;
                 if (self.cur.tag == .lparen) {
-                    if (self.aggregateFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
+                    if (dateAddSubName(name)) |_| return try self.parseDateAddSubCallAfterName(name);
+                    var saw_distinct = false;
+                    const nested_args = try self.parseCallArgList(&saw_distinct);
+                    const ignore_nulls = try parse_window.parseIgnoreNulls(self);
+                    if (self.cur.tag == .kw_over) {
+                        if (saw_distinct) return ParseError.SqlInvalidProjection;
+                        try self.advance();
+                        const spec_kind = try parse_window.parseWindowSpecOrRef(self);
+                        const wfunc = ir.windowFuncForName(name) orelse
+                            return ParseError.SqlInvalidProjection;
+                        parse_window.validateWindowCall(wfunc, nested_args, ignore_nulls) catch
+                            return ParseError.SqlInvalidProjection;
+                        const hidden_name = try self.materializeWindowExpr(.{
+                            .func = wfunc,
+                            .args = nested_args,
+                            .ignore_nulls = ignore_nulls,
+                            .spec_kind = spec_kind,
+                        });
+                        return ir.Expr{ .col_ref = hidden_name };
+                    }
+                    if (ignore_nulls) return ParseError.SqlInvalidProjection;
+                    if (self.aggregateFuncForName(name)) |func| {
+                        const agg_name = try self.materializeAggregateExpr(name, func, nested_args, saw_distinct);
+                        return ir.Expr{ .col_ref = agg_name };
+                    }
                     if (ir.windowFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
-                    const fname_dup = try self.arena.dupe(u8, name);
-                    const nested_args = try self.parseCallArgList(null);
-                    return ir.Expr{ .call = .{ .fn_name = fname_dup, .args = try self.normalizeScalarCallArgs(name, nested_args) } };
+                    if (saw_distinct) return ParseError.SqlInvalidProjection;
+                    return try self.makeScalarCallExpr(name, nested_args);
                 }
                 // Bare CURRENT_TIMESTAMP / CURRENT_DATE → nullary call.
                 if (self.cur.tag != .dot) {
@@ -1780,7 +2247,16 @@ pub const Parser = struct {
                 try self.advance();
                 return ir.Expr{ .null_lit = .string };
             },
-            .plus, .minus, .integer, .floating, .string, .kw_true, .kw_false => {
+            .plus => {
+                try self.advance();
+                return try self.parseCallAtom();
+            },
+            .minus => {
+                try self.advance();
+                const rhs = try self.parseCallAtom();
+                return try self.negateExpr(rhs);
+            },
+            .integer, .floating, .string, .kw_true, .kw_false => {
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
             },
@@ -1806,6 +2282,24 @@ pub const Parser = struct {
             },
             else => return ParseError.SqlExpectedValue,
         }
+    }
+
+    fn typedTemporalLiteralAfterName(self: *Parser, name: []const u8) ParseError!?ir.Expr {
+        if (self.cur.tag != .string) return null;
+        const s = self.cur.value.string;
+        if (std.ascii.eqlIgnoreCase(name, "date")) {
+            const days = parseDateString(s) catch return ParseError.SqlExpectedValue;
+            try self.advance();
+            return ir.Expr{ .lit = .{ .date = days } };
+        }
+        if (std.ascii.eqlIgnoreCase(name, "datetime") or
+            std.ascii.eqlIgnoreCase(name, "timestamp"))
+        {
+            const micros = parseDateTimeString(s) catch return ParseError.SqlExpectedValue;
+            try self.advance();
+            return ir.Expr{ .lit = .{ .datetime = micros } };
+        }
+        return null;
     }
 
     fn makeBinary(self: *Parser, fn_name: []const u8, lhs: ir.Expr, rhs: ir.Expr) ParseError!ir.Expr {
@@ -1951,6 +2445,12 @@ pub const Parser = struct {
             }
             if (on_plan.right_derived.len > 0) {
                 right_op = try self.allocOp(.{ .compute = .{ .derived = on_plan.right_derived, .upstream = right_op } });
+            }
+            if (on_plan.left_filter) |pred| {
+                left_op = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = left_op } });
+            }
+            if (on_plan.right_filter) |pred| {
+                right_op = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = right_op } });
             }
 
             root = try self.allocOp(.{ .join = .{
@@ -2315,28 +2815,73 @@ pub const Parser = struct {
         var ranges: std.ArrayList(ir.JoinRangePredicate) = .empty;
         var left_derived: std.ArrayList(ir.Derived) = .empty;
         var right_derived: std.ArrayList(ir.Derived) = .empty;
+        var left_filters: std.ArrayList(PredicateExpr) = .empty;
+        var right_filters: std.ArrayList(PredicateExpr) = .empty;
         var hidden_left: std.ArrayList([]const u8) = .empty;
         var synth_counter: usize = 0;
 
         while (true) {
             const lhs = try self.parseCallArg();
-            const op = try self.parseJoinComparisonOp();
-            try self.advance();
-            const rhs = try self.parseCallArg();
+            if (self.cur.tag == .kw_is) {
+                try self.advance();
+                var negated = false;
+                if (self.cur.tag == .kw_not) {
+                    negated = true;
+                    try self.advance();
+                }
+                if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
+                try self.advance();
+                try self.addJoinNullCondition(
+                    lhs,
+                    negated,
+                    left_table_names,
+                    right_table_name,
+                    &left_filters,
+                    &right_filters,
+                );
+            } else if (self.cur.tag == .kw_between) {
+                try self.advance();
+                const lower = try self.parseCallArg();
+                if (self.cur.tag != .kw_and) return ParseError.SqlExpectedKeyword;
+                try self.advance();
+                const upper = try self.parseCallArg();
 
-            try self.addJoinCondition(
-                lhs,
-                op,
-                rhs,
-                left_table_names,
-                right_table_name,
-                &pairs,
-                &ranges,
-                &left_derived,
-                &right_derived,
-                &hidden_left,
-                &synth_counter,
-            );
+                try self.addJoinBetweenCondition(
+                    lhs,
+                    lower,
+                    upper,
+                    left_table_names,
+                    right_table_name,
+                    &pairs,
+                    &ranges,
+                    &left_derived,
+                    &right_derived,
+                    &left_filters,
+                    &right_filters,
+                    &hidden_left,
+                    &synth_counter,
+                );
+            } else {
+                const op = try self.parseJoinComparisonOp();
+                try self.advance();
+                const rhs = try self.parseCallArg();
+
+                try self.addJoinCondition(
+                    lhs,
+                    op,
+                    rhs,
+                    left_table_names,
+                    right_table_name,
+                    &pairs,
+                    &ranges,
+                    &left_derived,
+                    &right_derived,
+                    &left_filters,
+                    &right_filters,
+                    &hidden_left,
+                    &synth_counter,
+                );
+            }
 
             if (self.cur.tag != .kw_and) break;
             try self.advance();
@@ -2349,13 +2894,40 @@ pub const Parser = struct {
         // A column range join (`l.a < r.b`) only has well-defined semantics for
         // an inner join; outer joins would need true ON-extra-predicate support.
         if (jtype != .inner and ranges.items.len > 0) return ParseError.SqlOnNonEquiUnsupported;
+        if (pairs.items.len == 0 and ranges.items.len == 0) return ParseError.SqlOnNonEquiUnsupported;
         return .{
             .on = try pairs.toOwnedSlice(self.arena),
             .ranges = try ranges.toOwnedSlice(self.arena),
             .left_derived = try left_derived.toOwnedSlice(self.arena),
             .right_derived = try right_derived.toOwnedSlice(self.arena),
+            .left_filter = try self.joinFilterFromParts(&left_filters),
+            .right_filter = try self.joinFilterFromParts(&right_filters),
             .hidden_left = try hidden_left.toOwnedSlice(self.arena),
         };
+    }
+
+    fn addJoinNullCondition(
+        self: *Parser,
+        expr: ir.Expr,
+        negated: bool,
+        left_table_names: []const []const u8,
+        right_table_name: []const u8,
+        left_filters: *std.ArrayList(PredicateExpr),
+        right_filters: *std.ArrayList(PredicateExpr),
+    ) ParseError!void {
+        const side = try self.joinExprSide(expr, left_table_names, right_table_name);
+        if (side != .left and side != .right) return ParseError.SqlOnNonEquiUnsupported;
+        if (expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
+        const col = try self.joinColName(expr);
+        const pred = if (negated)
+            PredicateExpr{ .is_not_null = col }
+        else
+            PredicateExpr{ .is_null = col };
+        if (side == .left) {
+            try left_filters.append(self.arena, pred);
+        } else {
+            try right_filters.append(self.arena, pred);
+        }
     }
 
     fn parseJoinComparisonOp(self: *Parser) ParseError!PredicateOp {
@@ -2370,6 +2942,54 @@ pub const Parser = struct {
         };
     }
 
+    fn addJoinBetweenCondition(
+        self: *Parser,
+        lhs: ir.Expr,
+        lower: ir.Expr,
+        upper: ir.Expr,
+        left_table_names: []const []const u8,
+        right_table_name: []const u8,
+        pairs: *std.ArrayList(ir.JoinKeyPair),
+        ranges: *std.ArrayList(ir.JoinRangePredicate),
+        left_derived: *std.ArrayList(ir.Derived),
+        right_derived: *std.ArrayList(ir.Derived),
+        left_filters: *std.ArrayList(PredicateExpr),
+        right_filters: *std.ArrayList(PredicateExpr),
+        hidden_left: *std.ArrayList([]const u8),
+        synth_counter: *usize,
+    ) ParseError!void {
+        try self.addJoinCondition(
+            lhs,
+            .gte,
+            lower,
+            left_table_names,
+            right_table_name,
+            pairs,
+            ranges,
+            left_derived,
+            right_derived,
+            left_filters,
+            right_filters,
+            hidden_left,
+            synth_counter,
+        );
+        try self.addJoinCondition(
+            lhs,
+            .lte,
+            upper,
+            left_table_names,
+            right_table_name,
+            pairs,
+            ranges,
+            left_derived,
+            right_derived,
+            left_filters,
+            right_filters,
+            hidden_left,
+            synth_counter,
+        );
+    }
+
     fn addJoinCondition(
         self: *Parser,
         lhs: ir.Expr,
@@ -2381,12 +3001,16 @@ pub const Parser = struct {
         ranges: *std.ArrayList(ir.JoinRangePredicate),
         left_derived: *std.ArrayList(ir.Derived),
         right_derived: *std.ArrayList(ir.Derived),
+        left_filters: *std.ArrayList(PredicateExpr),
+        right_filters: *std.ArrayList(PredicateExpr),
         hidden_left: *std.ArrayList([]const u8),
         synth_counter: *usize,
     ) ParseError!void {
         const lhs_side = try self.joinExprSide(lhs, left_table_names, right_table_name);
         const rhs_side = try self.joinExprSide(rhs, left_table_names, right_table_name);
         if (lhs_side == .mixed or rhs_side == .mixed) return ParseError.SqlOnRefsUnknownTable;
+        if (try self.addJoinSideFilter(lhs, lhs_side, op, rhs, rhs_side, left_filters, right_filters)) return;
+        if (try self.addJoinSideFilter(rhs, rhs_side, reverseRangeOp(op), lhs, lhs_side, left_filters, right_filters)) return;
         if (lhs_side == .none or rhs_side == .none) return ParseError.SqlOnNonEquiUnsupported;
 
         if (op == .eq) {
@@ -2408,21 +3032,79 @@ pub const Parser = struct {
         if (!isRangeJoinOp(op)) return ParseError.SqlOnNonEquiUnsupported;
         if (lhs_side == .left and rhs_side == .right) {
             try ranges.append(self.arena, .{
-                .left = try self.joinColName(lhs),
+                .left = try self.materializeJoinOperand(lhs, .left, left_derived, right_derived, hidden_left, synth_counter),
                 .op = op,
-                .right = try self.joinColName(rhs),
+                .right = try self.materializeJoinOperand(rhs, .right, left_derived, right_derived, hidden_left, synth_counter),
             });
             return;
         }
         if (lhs_side == .right and rhs_side == .left) {
             try ranges.append(self.arena, .{
-                .left = try self.joinColName(rhs),
+                .left = try self.materializeJoinOperand(rhs, .left, left_derived, right_derived, hidden_left, synth_counter),
                 .op = reverseRangeOp(op),
-                .right = try self.joinColName(lhs),
+                .right = try self.materializeJoinOperand(lhs, .right, left_derived, right_derived, hidden_left, synth_counter),
             });
             return;
         }
         return ParseError.SqlOnRefsUnknownTable;
+    }
+
+    fn addJoinSideFilter(
+        self: *Parser,
+        side_expr: ir.Expr,
+        side: JoinExprSide,
+        op: PredicateOp,
+        literal_expr: ir.Expr,
+        literal_side: JoinExprSide,
+        left_filters: *std.ArrayList(PredicateExpr),
+        right_filters: *std.ArrayList(PredicateExpr),
+    ) ParseError!bool {
+        if (literal_side != .none) return false;
+        if (side != .left and side != .right) return false;
+        if (side_expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
+        const col = try self.joinColName(side_expr);
+        const pred = switch (literal_expr) {
+            .lit => |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } },
+            .null_lit => PredicateExpr.unknown,
+            .call => try self.makeJoinScalarFilter(col, op, literal_expr),
+            else => return ParseError.SqlOnNonEquiUnsupported,
+        };
+        if (side == .left) {
+            try left_filters.append(self.arena, pred);
+        } else {
+            try right_filters.append(self.arena, pred);
+        }
+        return true;
+    }
+
+    fn makeJoinScalarFilter(self: *Parser, col: []const u8, op: PredicateOp, expr: ir.Expr) ParseError!PredicateExpr {
+        const value_name = try self.arena.dupe(u8, "__join_filter_value");
+        const single = try self.allocOp(.{ .single_row = {} });
+
+        const derived = try self.arena.alloc(ir.Derived, 1);
+        derived[0] = .{ .name = value_name, .expr = expr };
+        const compute = try self.allocOp(.{ .compute = .{ .derived = derived, .upstream = single } });
+
+        const cols = try self.arena.alloc([]const u8, 1);
+        cols[0] = value_name;
+        const select = try self.allocOp(.{ .select = .{ .columns = cols, .upstream = compute } });
+
+        return .{ .scalar_subquery = .{
+            .col = col,
+            .op = op,
+            .source = @ptrCast(select),
+        } };
+    }
+
+    fn joinFilterFromParts(self: *Parser, parts: *std.ArrayList(PredicateExpr)) ParseError!?PredicateExpr {
+        return switch (parts.items.len) {
+            0 => null,
+            1 => parts.items[0],
+            else => blk: {
+                const children = try self.arena.dupe(PredicateExpr, parts.items);
+                break :blk PredicateExpr{ .@"and" = children };
+            },
+        };
     }
 
     fn materializeJoinOperand(
@@ -2434,7 +3116,7 @@ pub const Parser = struct {
         hidden_left: *std.ArrayList([]const u8),
         synth_counter: *usize,
     ) ParseError![]const u8 {
-        if (expr == .col_ref) return try self.joinColName(expr);
+        if (expr == .col_ref and side != .right) return try self.joinColName(expr);
         const prefix: []const u8 = if (side == .left) "__join_on_left" else "__join_on_right";
         const name = try std.fmt.allocPrint(self.arena, "{s}_{d}", .{ prefix, synth_counter.* });
         synth_counter.* += 1;
@@ -2452,8 +3134,7 @@ pub const Parser = struct {
 
     fn joinColName(self: *Parser, expr: ir.Expr) ParseError![]const u8 {
         if (expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
-        const q = try self.splitJoinCol(expr.col_ref, &.{}, "");
-        return try self.arena.dupe(u8, q.name);
+        return try self.arena.dupe(u8, expr.col_ref);
     }
 
     fn joinExprSide(
@@ -2699,6 +3380,19 @@ pub const Parser = struct {
         return try items.toOwnedSlice(self.arena);
     }
 
+    pub fn parseQualifiedIdentList(self: *Parser) ParseError![]const []const u8 {
+        var items: std.ArrayList([]const u8) = .empty;
+        defer items.deinit(self.arena);
+        while (true) {
+            const first = try self.expectIdent();
+            const name = try self.dupQualifiedColRef(first);
+            try items.append(self.arena, name);
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        return try items.toOwnedSlice(self.arena);
+    }
+
     /// Parse the comma-separated GROUP BY item list as general
     /// expressions (covers ordinals, aliases, columns, and computed keys).
     pub fn parseGroupByExprs(self: *Parser) ParseError![]const ir.Expr {
@@ -2796,7 +3490,7 @@ pub const Parser = struct {
                 // Else bind to an aliased plain column by its underlying name,
                 // so `GROUP BY URL` matches a `URL AS Dst` projection item.
                 for (proj, 0..) |p, i| switch (p.kind) {
-                    .col => |c| if (std.ascii.eqlIgnoreCase(c, name)) return i,
+                    .col => |c| if (groupColumnNameEql(c, name)) return i,
                     else => {},
                 };
                 return null;
@@ -2953,6 +3647,18 @@ pub const Parser = struct {
         return out;
     }
 
+    pub fn materializePredicateExpr(self: *Parser, expr: ir.Expr) ParseError![]const u8 {
+        if (!self.predicate_derived_enabled) return ParseError.SqlInvalidProjection;
+        const name = std.fmt.allocPrint(self.arena, "__pred_expr_{d}", .{self.predicate_derived_counter}) catch return ParseError.OutOfMemory;
+        self.predicate_derived_counter += 1;
+        try self.predicate_derived.append(self.arena, .{ .name = name, .expr = expr });
+        return name;
+    }
+
+    pub fn predicateDerivedEnabled(self: *const Parser) bool {
+        return self.predicate_derived_enabled;
+    }
+
     // -----------------------------------------------------------------------
     // Post-parse pass: wraps each shared CTE's stored op in a Materialize
     // node (.auto / .force — every boundary materializes; NOT MATERIALIZED
@@ -3028,7 +3734,7 @@ fn projMatchesGroupByOrder(proj: []const ProjItem, group_cols: []const []const u
     // Group cols must come first, in order.
     while (i < group_cols.len) : (i += 1) {
         switch (proj[i].kind) {
-            .col => |c| if (!std.mem.eql(u8, c, group_cols[i])) return false,
+            .col => |c| if (!groupColumnNameEql(c, group_cols[i])) return false,
             else => return false,
         }
     }
@@ -3078,7 +3784,18 @@ fn isNondeterministicFn(name: []const u8) bool {
 /// keys (those are always retained, never collapsed onto each other).
 fn nameInList(name: []const u8, cols: []const []const u8) bool {
     for (cols) |c| {
-        if (types.columnNameEql(name, c)) return true;
+        if (groupColumnNameEql(name, c)) return true;
+    }
+    return false;
+}
+
+fn groupColumnNameEql(a: []const u8, b: []const u8) bool {
+    if (types.columnNameEql(a, b)) return true;
+    if (std.mem.lastIndexOfScalar(u8, a, '.')) |dot| {
+        if (std.mem.indexOfScalar(u8, b, '.') == null and types.columnNameEql(a[dot + 1 ..], b)) return true;
+    }
+    if (std.mem.lastIndexOfScalar(u8, b, '.')) |dot| {
+        if (std.mem.indexOfScalar(u8, a, '.') == null and types.columnNameEql(a, b[dot + 1 ..])) return true;
     }
     return false;
 }
@@ -3088,18 +3805,99 @@ fn nameInList(name: []const u8, cols: []const []const u8) bool {
 /// (above the aggregate) rather than per input row. Mirrors `exprCollapsesOnto`
 /// but keys on the GROUP BY column names directly (the expression itself is not
 /// a grouping key). CASE / subquery / var_ref bail conservatively.
-fn exprAvailableAfterGroup(e: ir.Expr, group_cols: []const []const u8) bool {
+fn groupedOutputNameAvailable(name: []const u8, group_cols: []const []const u8, extra_cols: []const []const u8) bool {
+    return nameInList(name, group_cols) or nameInList(name, extra_cols);
+}
+
+fn exprAvailableAfterGroup(e: ir.Expr, group_cols: []const []const u8, extra_cols: []const []const u8) bool {
     return switch (e) {
         .lit => true,
         .null_lit => true,
-        .col_ref => |name| nameInList(name, group_cols),
+        .col_ref => |name| groupedOutputNameAvailable(name, group_cols, extra_cols),
         .call => |c| blk: {
             if (isNondeterministicFn(c.fn_name)) break :blk false;
             for (c.args) |arg| {
-                if (!exprAvailableAfterGroup(arg, group_cols)) break :blk false;
+                if (!exprAvailableAfterGroup(arg, group_cols, extra_cols)) break :blk false;
             }
             break :blk true;
         },
+        .case => |c| blk: {
+            for (c.branches) |branch| {
+                if (!predicateAvailableAfterGroup(branch.cond, group_cols, extra_cols)) break :blk false;
+                if (!exprAvailableAfterGroup(branch.then, group_cols, extra_cols)) break :blk false;
+            }
+            if (c.else_branch) |else_branch| {
+                if (!exprAvailableAfterGroup(else_branch.*, group_cols, extra_cols)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn predicateAvailableAfterGroup(p: PredicateExpr, group_cols: []const []const u8, extra_cols: []const []const u8) bool {
+    return switch (p) {
+        .leaf => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
+        .day_leaf => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
+        .leaf_col_col => |lc| groupedOutputNameAvailable(lc.left, group_cols, extra_cols) and
+            groupedOutputNameAvailable(lc.right, group_cols, extra_cols),
+        .is_null => |c| groupedOutputNameAvailable(c, group_cols, extra_cols),
+        .is_not_null => |c| groupedOutputNameAvailable(c, group_cols, extra_cols),
+        .like => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
+        .in_set => |s| groupedOutputNameAvailable(s.col, group_cols, extra_cols),
+        .leaf_var => |v| groupedOutputNameAvailable(v.col, group_cols, extra_cols),
+        .@"and", .@"or" => |children| blk: {
+            for (children) |child| {
+                if (!predicateAvailableAfterGroup(child, group_cols, extra_cols)) break :blk false;
+            }
+            break :blk true;
+        },
+        .not => |child| predicateAvailableAfterGroup(child.*, group_cols, extra_cols),
+        .always, .unknown => true,
+        else => false,
+    };
+}
+
+fn exprReferencesAnyColumn(e: ir.Expr, cols: []const []const u8) bool {
+    return switch (e) {
+        .col_ref => |name| nameInList(name, cols),
+        .call => |c| blk: {
+            for (c.args) |arg| {
+                if (exprReferencesAnyColumn(arg, cols)) break :blk true;
+            }
+            break :blk false;
+        },
+        .case => |c| blk: {
+            for (c.branches) |branch| {
+                if (predicateReferencesAnyColumn(branch.cond, cols)) break :blk true;
+                if (exprReferencesAnyColumn(branch.then, cols)) break :blk true;
+            }
+            if (c.else_branch) |else_branch| {
+                if (exprReferencesAnyColumn(else_branch.*, cols)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn predicateReferencesAnyColumn(p: PredicateExpr, cols: []const []const u8) bool {
+    return switch (p) {
+        .leaf => |l| nameInList(l.col, cols),
+        .day_leaf => |l| nameInList(l.col, cols),
+        .leaf_col_col => |lc| nameInList(lc.left, cols) or nameInList(lc.right, cols),
+        .is_null => |c| nameInList(c, cols),
+        .is_not_null => |c| nameInList(c, cols),
+        .like => |l| nameInList(l.col, cols),
+        .in_set => |s| nameInList(s.col, cols),
+        .leaf_var => |v| nameInList(v.col, cols),
+        .@"and", .@"or" => |children| blk: {
+            for (children) |child| {
+                if (predicateReferencesAnyColumn(child, cols)) break :blk true;
+            }
+            break :blk false;
+        },
+        .not => |child| predicateReferencesAnyColumn(child.*, cols),
         else => false,
     };
 }
@@ -3127,7 +3925,7 @@ fn isPlainGroupKey(proj: []const ProjItem, grouping_key: []const bool, name: []c
     for (proj, 0..) |p, i| {
         if (!grouping_key[i]) continue;
         switch (p.kind) {
-            .col => |c| if (types.columnNameEql(c, name)) return true,
+            .col => |c| if (groupColumnNameEql(c, name)) return true,
             else => {},
         }
     }
@@ -3189,6 +3987,8 @@ fn valueEqual(a: @import("../types.zig").Value, b: @import("../types.zig").Value
 fn buildWindowOp(
     arena: Allocator,
     proj: []const ProjItem,
+    hidden_windows: []const WindowExprRef,
+    hidden_partition_exprs: []const ir.Derived,
     upstream: *ir.Op,
     named_windows: *const std.StringHashMapUnmanaged(ir.WindowSpec),
 ) ParseError!?*ir.Op {
@@ -3197,16 +3997,24 @@ fn buildWindowOp(
         .window => count += 1,
         else => {},
     };
+    count += hidden_windows.len;
     if (count == 0) return null;
 
     var specs_buf: std.ArrayList(ir.WindowSpec) = .empty;
     defer specs_buf.deinit(arena);
     var calls_buf: std.ArrayList(ir.WindowCall) = .empty;
     defer calls_buf.deinit(arena);
+    var pre_window_buf: std.ArrayList(ir.Derived) = .empty;
+    defer pre_window_buf.deinit(arena);
+    for (hidden_partition_exprs) |derived| {
+        try pre_window_buf.append(arena, derived);
+    }
+    var window_arg_counter: usize = 0;
 
     for (proj) |p| switch (p.kind) {
         .window => |w| {
-            const resolved_spec: ir.WindowSpec = switch (w.spec_kind) {
+            const normalized = try normalizeWindowCallArgs(arena, w, &pre_window_buf, &window_arg_counter);
+            var resolved_spec: ir.WindowSpec = switch (normalized.spec_kind) {
                 .inline_spec => |s| s,
                 .named => |name| blk: {
                     const stored = named_windows.get(name) orelse
@@ -3215,6 +4023,7 @@ fn buildWindowOp(
                         return ParseError.OutOfMemory;
                 },
             };
+            try rewriteWindowAggRefs(arena, proj, &resolved_spec);
             const spec_idx = blk: {
                 for (specs_buf.items, 0..) |existing, i| {
                     if (parse_window.windowSpecsEqual(existing, resolved_spec)) break :blk i;
@@ -3224,14 +4033,49 @@ fn buildWindowOp(
             };
             try calls_buf.append(arena, .{
                 .spec_idx = @intCast(spec_idx),
-                .func = w.func,
-                .args = w.args,
-                .ignore_nulls = w.ignore_nulls,
+                .func = normalized.func,
+                .args = normalized.args,
+                .ignore_nulls = normalized.ignore_nulls,
                 .output_name = p.name,
             });
         },
         else => {},
     };
+    for (hidden_windows) |ref| {
+        const normalized = try normalizeWindowCallArgs(arena, ref.call, &pre_window_buf, &window_arg_counter);
+        var resolved_spec: ir.WindowSpec = switch (normalized.spec_kind) {
+            .inline_spec => |s| s,
+            .named => |name| blk: {
+                const stored = named_windows.get(name) orelse
+                    return ParseError.SqlInvalidProjection;
+                break :blk parse_window.cloneWindowSpec(arena, stored) catch
+                    return ParseError.OutOfMemory;
+            },
+        };
+        try rewriteWindowAggRefs(arena, proj, &resolved_spec);
+        const spec_idx = blk: {
+            for (specs_buf.items, 0..) |existing, i| {
+                if (parse_window.windowSpecsEqual(existing, resolved_spec)) break :blk i;
+            }
+            try specs_buf.append(arena, resolved_spec);
+            break :blk specs_buf.items.len - 1;
+        };
+        try calls_buf.append(arena, .{
+            .spec_idx = @intCast(spec_idx),
+            .func = normalized.func,
+            .args = normalized.args,
+            .ignore_nulls = normalized.ignore_nulls,
+            .output_name = ref.name,
+        });
+    }
+
+    var window_upstream = upstream;
+    if (pre_window_buf.items.len > 0) {
+        const derived_slice = try pre_window_buf.toOwnedSlice(arena);
+        const compute_op = try arena.create(ir.Op);
+        compute_op.* = .{ .compute = .{ .derived = derived_slice, .upstream = upstream } };
+        window_upstream = compute_op;
+    }
 
     const specs_slice = try specs_buf.toOwnedSlice(arena);
     const calls_slice = try calls_buf.toOwnedSlice(arena);
@@ -3239,9 +4083,110 @@ fn buildWindowOp(
     op.* = .{ .window = .{
         .specs = specs_slice,
         .calls = calls_slice,
-        .upstream = upstream,
+        .upstream = window_upstream,
     } };
     return op;
+}
+
+fn normalizeWindowCallArgs(
+    arena: Allocator,
+    call: ParsedWindowCall,
+    pre_window_buf: *std.ArrayList(ir.Derived),
+    window_arg_counter: *usize,
+) ParseError!ParsedWindowCall {
+    if (call.args.len == 0) return call;
+    var changed = false;
+    const args = try arena.alloc(ir.Expr, call.args.len);
+    for (call.args, args, 0..) |arg, *dst, i| {
+        if (windowArgNeedsPrecompute(call.func, i, arg)) {
+            const owned_name = std.fmt.allocPrint(arena, "__window_arg_{d}", .{window_arg_counter.*}) catch return ParseError.OutOfMemory;
+            window_arg_counter.* += 1;
+            try pre_window_buf.append(arena, .{ .name = owned_name, .expr = arg });
+            dst.* = ir.Expr{ .col_ref = owned_name };
+            changed = true;
+        } else {
+            dst.* = arg;
+        }
+    }
+    if (!changed) return call;
+    return .{
+        .func = call.func,
+        .args = args,
+        .ignore_nulls = call.ignore_nulls,
+        .spec_kind = call.spec_kind,
+    };
+}
+
+fn windowArgNeedsPrecompute(func: ir.WindowFunc, arg_idx: usize, arg: ir.Expr) bool {
+    return switch (func) {
+        .sum, .avg, .count, .min, .max => switch (arg) {
+            .col_ref => false,
+            else => true,
+        },
+        .lag, .lead, .first_value, .last_value => arg_idx == 0 and switch (arg) {
+            .col_ref => false,
+            else => true,
+        },
+        .nth_value => arg_idx == 0 and switch (arg) {
+            .col_ref => false,
+            else => true,
+        },
+        else => false,
+    };
+}
+
+fn rewriteWindowAggRefs(arena: Allocator, proj: []const ProjItem, spec: *ir.WindowSpec) ParseError!void {
+    var partition_changed = false;
+    var new_partition: []const []const u8 = spec.partition_by;
+    for (spec.partition_by) |col| {
+        if (try aggAliasForProjection(arena, proj, col)) |_| {
+            partition_changed = true;
+            break;
+        }
+    }
+    if (partition_changed) {
+        const out = try arena.alloc([]const u8, spec.partition_by.len);
+        for (spec.partition_by, out) |col, *dst| {
+            dst.* = (try aggAliasForProjection(arena, proj, col)) orelse col;
+        }
+        new_partition = out;
+    }
+    spec.partition_by = new_partition;
+
+    var order_changed = false;
+    var new_order: []const @import("../exec/sort.zig").SortSpec = spec.order_by;
+    for (spec.order_by) |s| {
+        if (try aggAliasForProjection(arena, proj, s.col)) |_| {
+            order_changed = true;
+            break;
+        }
+    }
+    if (order_changed) {
+        const out = try arena.alloc(@import("../exec/sort.zig").SortSpec, spec.order_by.len);
+        for (spec.order_by, out) |s, *dst| {
+            dst.* = s;
+            if (try aggAliasForProjection(arena, proj, s.col)) |alias| dst.col = alias;
+        }
+        new_order = out;
+    }
+    spec.order_by = new_order;
+}
+
+fn aggAliasForProjection(arena: Allocator, proj: []const ProjItem, name: []const u8) ParseError!?[]const u8 {
+    for (proj) |p| switch (p.kind) {
+        .agg => |a| {
+            if (a.arg_expr != null) continue;
+            const fname = if (a.func == .udf)
+                (a.udf_name orelse continue)
+            else
+                (aggFuncName(a.func) orelse continue);
+            const arg = a.col orelse "*";
+            const cname = std.fmt.allocPrint(arena, "{s}({s})", .{ fname, arg }) catch return ParseError.OutOfMemory;
+            if (std.ascii.eqlIgnoreCase(cname, name)) return p.name;
+        },
+        else => {},
+    };
+    return null;
 }
 
 fn nameIn(needle: []const u8, names: []const []const u8) bool {

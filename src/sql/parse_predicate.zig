@@ -23,6 +23,7 @@ const PredicateOp = exec_predicate.PredicateOp;
 
 const types = @import("../types.zig");
 const Value = types.Value;
+const ir = @import("../ir/ir.zig");
 
 pub fn parseBoolExpr(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     return try parseOr(p);
@@ -91,6 +92,7 @@ fn flipOp(op: PredicateOp) PredicateOp {
 fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateExpr {
     switch (e) {
         .leaf => |l| return .{ .leaf = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
+        .day_leaf => |l| return .{ .day_leaf = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
         .leaf_col_col => |c| return .{ .leaf_col_col = .{ .left = c.left, .op = flipOp(c.op), .right = c.right } },
         .is_null => |c| return .{ .is_not_null = c },
         .is_not_null => |c| return .{ .is_null = c },
@@ -132,6 +134,9 @@ fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateExpr 
 pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     const PE = @TypeOf(p.*).Err;
     if (p.cur.tag == .lparen) {
+        if (try parenthesizedScalarComparisonAhead(p)) {
+            return try parseParenthesizedScalarComparison(p);
+        }
         try p.advance();
         const inner = try parseOr(p);
         try p.expect(.rparen);
@@ -153,7 +158,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     //   - lit op lit   → evaluated at parse time, emitted as `.always`
     // Subquery on either side of a literal-LHS comparison is rejected
     // — workaround is to write the column on the LHS.
-    if (isLiteralTokenStart(p.cur.tag, p.cur.text)) {
+    if (isLiteralLhsTokenStart(p.cur.tag)) {
         const lhs_val = try p.parseValue();
         const op_lhs: PredicateOp = switch (p.cur.tag) {
             .eq => .eq,
@@ -184,8 +189,36 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // output-column name; a post-parse pass rewrites it to the matching
     // SELECT aggregate's alias.
     if (p.cur.tag == .lparen) {
-        const args = try p.parseCallArgList(null);
-        col_dup = try p.aggSortName(col_dup, args);
+        var saw_distinct = false;
+        const args = try p.parseCallArgList(&saw_distinct);
+        if (p.aggregateFuncForName(col_dup)) |func| {
+            if (p.aggregateExprRefsEnabled()) {
+                col_dup = try p.materializeAggregateExpr(col_dup, func, args, saw_distinct);
+            } else {
+                if (saw_distinct) return PE.SqlInvalidProjection;
+                col_dup = try p.aggSortName(col_dup, args);
+            }
+        } else if (saw_distinct) {
+            return PE.SqlInvalidProjection;
+        } else if (std.ascii.eqlIgnoreCase(col_dup, "day") and args.len == 1 and args[0] == .col_ref) {
+            return try makeDayComparison(p, args[0].col_ref);
+        } else {
+            const lhs = ir.Expr{ .call = .{
+                .fn_name = try p.arena.dupe(u8, col_dup),
+                .args = args,
+            } };
+            if (!isComparisonToken(p.cur.tag)) {
+                return try makeExprComparisonPredicate(
+                    p,
+                    lhs,
+                    .eq,
+                    .{ .lit = .{ .boolean = true } },
+                );
+            }
+            const op = try parseComparisonToken(p);
+            const rhs = try p.parseAddSub();
+            return try makeExprComparisonPredicate(p, lhs, op, rhs);
+        }
     }
 
     // IS NULL / IS NOT NULL.
@@ -212,11 +245,11 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // NOT BETWEEN        →  (col <  lo) OR  (col >  hi)
     if (p.cur.tag == .kw_between) {
         try p.advance();
-        const lo = try p.parseValue();
+        const lo = try p.parseAddSub();
         if (p.cur.tag != .kw_and) return PE.SqlExpectedKeyword;
         try p.advance();
-        const hi = try p.parseValue();
-        return try makeBetween(p, col_dup, lo, hi, negate_predicate);
+        const hi = try p.parseAddSub();
+        return try makeBetweenExpr(p, col_dup, lo, hi, negate_predicate);
     }
 
     // LIKE 'pattern'  /  NOT LIKE 'pattern'
@@ -307,8 +340,8 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // EXCEPT for the temporal-literal keywords `DATE` / `DATETIME` /
     // `TIMESTAMP`, which `parseValue` claims (see below).
     if (p.cur.tag == .identifier and !isTypedLiteralKeyword(p.cur.text)) {
-        const rhs_dup = try parseQualifiedColRef(p);
-        return .{ .leaf_col_col = .{ .left = col_dup, .op = op, .right = rhs_dup } };
+        const rhs_expr = try p.parseCallArg();
+        return try makeComparisonExprPredicate(p, col_dup, op, rhs_expr);
     }
 
     // Scalar subquery on the RHS: `col cmp (SELECT ...)`. The parser
@@ -329,8 +362,10 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         // Not a subquery — restore the `(` token so parseValue sees a
         // parenthesized literal. parseValue doesn't accept that today
         // (literals are bare); surface the same error parseValue would.
+        const rhs_expr = try p.parseAddSub();
+        try p.expect(.rparen);
         _ = saved;
-        return PE.SqlExpectedValue;
+        return try makeComparisonExprPredicate(p, col_dup, op, rhs_expr);
     }
 
     // Session var on the RHS: `col op @name`. Build a leaf_var
@@ -352,6 +387,175 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
 
     const val = try p.parseValue();
     return .{ .leaf = .{ .col = col_dup, .op = op, .val = val } };
+}
+
+fn makeScalarExprPredicate(p: anytype, col: []const u8, op: PredicateOp, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const value_name = try p.arena.dupe(u8, "__predicate_value");
+    const single = try p.allocOp(.{ .single_row = {} });
+
+    const derived = try p.arena.alloc(ir.Derived, 1);
+    derived[0] = .{ .name = value_name, .expr = expr };
+    const compute = try p.allocOp(.{ .compute = .{ .derived = derived, .upstream = single } });
+
+    const cols = try p.arena.alloc([]const u8, 1);
+    cols[0] = value_name;
+    const select = try p.allocOp(.{ .select = .{ .columns = cols, .upstream = compute } });
+
+    return .{ .scalar_subquery = .{
+        .col = col,
+        .op = op,
+        .source = @ptrCast(select),
+    } };
+}
+
+fn makeComparisonExprPredicate(p: anytype, col: []const u8, op: PredicateOp, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    return switch (expr) {
+        .col_ref => |rhs_dup| .{ .leaf_col_col = .{ .left = col, .op = op, .right = rhs_dup } },
+        .lit => |val| .{ .leaf = .{ .col = col, .op = op, .val = val } },
+        .null_lit => .unknown,
+        else => blk: {
+            if (p.predicateDerivedEnabled() and exprHasColumnRef(expr)) {
+                const rhs_col = try p.materializePredicateExpr(expr);
+                break :blk PredicateExpr{ .leaf_col_col = .{ .left = col, .op = op, .right = rhs_col } };
+            }
+            break :blk try makeScalarExprPredicate(p, col, op, expr);
+        },
+    };
+}
+
+fn exprHasColumnRef(expr: ir.Expr) bool {
+    return switch (expr) {
+        .col_ref => true,
+        .call => |c| blk: {
+            for (c.args) |arg| {
+                if (exprHasColumnRef(arg)) break :blk true;
+            }
+            break :blk false;
+        },
+        .case => |c| blk: {
+            for (c.branches) |branch| {
+                if (predicateHasColumnRef(branch.cond)) break :blk true;
+                if (exprHasColumnRef(branch.then)) break :blk true;
+            }
+            if (c.else_branch) |else_branch| {
+                if (exprHasColumnRef(else_branch.*)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn predicateHasColumnRef(pred: PredicateExpr) bool {
+    return switch (pred) {
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .leaf_var => true,
+        .@"and", .@"or" => |children| blk: {
+            for (children) |child| {
+                if (predicateHasColumnRef(child)) break :blk true;
+            }
+            break :blk false;
+        },
+        .not => |child| predicateHasColumnRef(child.*),
+        else => false,
+    };
+}
+
+fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
+    var look = p.lex.*;
+    var depth: usize = 1;
+    var saw_arithmetic = false;
+    while (true) {
+        const tok = try look.next();
+        switch (tok.tag) {
+            .eof => return false,
+            .lparen => depth += 1,
+            .rparen => {
+                depth -= 1;
+                if (depth == 0) break;
+            },
+            .plus, .minus, .star, .slash, .percent => {
+                if (depth == 1) saw_arithmetic = true;
+            },
+            else => {},
+        }
+    }
+    if (!saw_arithmetic) return false;
+    const op_tok = try look.next();
+    return isComparisonToken(op_tok.tag);
+}
+
+fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
+    try p.expect(.lparen);
+    const lhs = try p.parseAddSub();
+    try p.expect(.rparen);
+    const op = try parseComparisonToken(p);
+    const rhs = try p.parseAddSub();
+    return try makeExprComparisonPredicate(p, lhs, op, rhs);
+}
+
+fn makeExprComparisonPredicate(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const lhs_col = switch (lhs) {
+        .col_ref => |c| c,
+        else => try p.materializePredicateExpr(lhs),
+    };
+    return switch (rhs) {
+        .col_ref => |rhs_col| .{ .leaf_col_col = .{ .left = lhs_col, .op = op, .right = rhs_col } },
+        .lit => |val| .{ .leaf = .{ .col = lhs_col, .op = op, .val = val } },
+        .null_lit => .unknown,
+        else => blk: {
+            const rhs_col = try p.materializePredicateExpr(rhs);
+            break :blk PredicateExpr{ .leaf_col_col = .{ .left = lhs_col, .op = op, .right = rhs_col } };
+        },
+    };
+}
+
+fn isComparisonToken(tag: anytype) bool {
+    return switch (tag) {
+        .eq, .neq, .lt, .lte, .gt, .gte => true,
+        else => false,
+    };
+}
+
+fn parseComparisonToken(p: anytype) @TypeOf(p.*).Err!PredicateOp {
+    const PE = @TypeOf(p.*).Err;
+    const op: PredicateOp = switch (p.cur.tag) {
+        .eq => .eq,
+        .neq => .neq,
+        .lt => .lt,
+        .lte => .lte,
+        .gt => .gt,
+        .gte => .gte,
+        else => return PE.SqlExpectedToken,
+    };
+    try p.advance();
+    return op;
+}
+
+fn makeDayComparison(p: anytype, col: []const u8) @TypeOf(p.*).Err!PredicateExpr {
+    const PE = @TypeOf(p.*).Err;
+    const op: PredicateOp = switch (p.cur.tag) {
+        .eq => .eq,
+        .neq => .neq,
+        .lt => .lt,
+        .lte => .lte,
+        .gt => .gt,
+        .gte => .gte,
+        else => return PE.SqlExpectedToken,
+    };
+    try p.advance();
+    const rhs = try p.parseAddSub();
+    return switch (rhs) {
+        .lit => |val| .{ .day_leaf = .{ .col = try p.arena.dupe(u8, col), .op = op, .val = val } },
+        else => blk: {
+            const args = try p.arena.alloc(ir.Expr, 1);
+            args[0] = ir.Expr{ .col_ref = try p.arena.dupe(u8, col) };
+            const lhs = ir.Expr{ .call = .{
+                .fn_name = try p.arena.dupe(u8, "day"),
+                .args = args,
+            } };
+            break :blk try makeExprComparisonPredicate(p, lhs, op, rhs);
+        },
+    };
 }
 
 /// Parse an `identifier (. identifier)?` column reference at the
@@ -392,6 +596,13 @@ fn isLiteralTokenStart(tag: anytype, text: []const u8) bool {
     };
 }
 
+fn isLiteralLhsTokenStart(tag: anytype) bool {
+    return switch (tag) {
+        .integer, .floating, .string, .kw_true, .kw_false => true,
+        else => false,
+    };
+}
+
 fn reverseOp(op: PredicateOp) PredicateOp {
     return switch (op) {
         .eq => .eq,
@@ -428,5 +639,17 @@ fn makeBetween(p: anytype, col: []const u8, lo: Value, hi: Value, negate: bool) 
     }
     kids[0] = .{ .leaf = .{ .col = col, .op = .gte, .val = lo } };
     kids[1] = .{ .leaf = .{ .col = col, .op = .lte, .val = hi } };
+    return .{ .@"and" = kids };
+}
+
+fn makeBetweenExpr(p: anytype, col: []const u8, lo: ir.Expr, hi: ir.Expr, negate: bool) @TypeOf(p.*).Err!PredicateExpr {
+    const kids = try p.arena.alloc(PredicateExpr, 2);
+    if (negate) {
+        kids[0] = try makeComparisonExprPredicate(p, col, .lt, lo);
+        kids[1] = try makeComparisonExprPredicate(p, col, .gt, hi);
+        return .{ .@"or" = kids };
+    }
+    kids[0] = try makeComparisonExprPredicate(p, col, .gte, lo);
+    kids[1] = try makeComparisonExprPredicate(p, col, .lte, hi);
     return .{ .@"and" = kids };
 }
