@@ -12,6 +12,7 @@ test {
     _ = @import("uuid_test.zig");
     _ = @import("compute_test.zig");
     _ = @import("compute_scalar_test.zig");
+    _ = @import("decimal_test.zig");
     _ = @import("join_test.zig");
     _ = @import("aggregate_test.zig");
     _ = @import("plan_test.zig");

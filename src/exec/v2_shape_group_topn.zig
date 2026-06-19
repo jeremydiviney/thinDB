@@ -1476,7 +1476,11 @@ fn isSearchPhraseNotEmpty(pred: PredicateExpr) bool {
 
 fn aggInputSupported(typ: Type) bool {
     return switch (typ) {
-        .boolean, .tinyint, .smallint, .int, .bigint, .float, .double => true,
+        // decimal64 folds through the i64 physical slot like a 64-bit int
+        // (the mantissa); SUM widens to i128 and AVG recovers the scale at
+        // emit. decimal128 (i128 mantissa) is declined earlier — it can't be
+        // read through the i64 slot.
+        .boolean, .tinyint, .smallint, .int, .bigint, .float, .double, .decimal64 => true,
         else => false,
     };
 }
