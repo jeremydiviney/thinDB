@@ -119,7 +119,7 @@ pub fn resolveWithRegistry(
         if (!scalarArityMatches(f, arg_types.len)) continue;
         var all_match = true;
         for (arg_types, 0..) |given, i| {
-            if (@as(TypeTag, scalarDeclaredTypeAt(f, i)) != @as(TypeTag, given)) {
+            if (canonScalarTag(@as(TypeTag, scalarDeclaredTypeAt(f, i))) != canonScalarTag(@as(TypeTag, given))) {
                 all_match = false;
                 break;
             }
@@ -187,6 +187,16 @@ fn scalarArityMatches(f: ScalarFn, actual: usize) bool {
 
 fn scalarDeclaredTypeAt(f: ScalarFn, i: usize) Type {
     return if (f.variadic_min_args != null) f.arg_types[i % f.arg_types.len] else f.arg_types[i];
+}
+
+/// `.varchar`/`.char` share the physical StringView representation of `.string`
+/// (see `stringViewOf`), so for scalar-overload matching they are the same type.
+/// Folding them lets a `VARCHAR(n)` column resolve string builtins with no cast.
+fn canonScalarTag(t: TypeTag) TypeTag {
+    return switch (t) {
+        .varchar, .char => .string,
+        else => t,
+    };
 }
 
 fn scalarCastCost(f: ScalarFn, arg_types: []const Type) ?u64 {
