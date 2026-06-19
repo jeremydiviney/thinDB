@@ -92,7 +92,12 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         },
         .materialize => |m| try resolveSubqueriesInOp(ctx, @constCast(m.upstream)),
         .batch => |b| for (b.statements) |sub| try resolveSubqueriesInOp(ctx, @constCast(sub)),
-        .window => |w| try resolveSubqueriesInOp(ctx, @constCast(w.upstream)),
+        .window => |w| {
+            // Window-call args carry `@var` offsets/defaults (`LAG(x, @n, 0)`);
+            // resolve them to literals before the operator reads them.
+            for (w.calls) |c| for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg));
+            try resolveSubqueriesInOp(ctx, @constCast(w.upstream));
+        },
         .set_union => |u| {
             try resolveSubqueriesInOp(ctx, @constCast(u.left));
             try resolveSubqueriesInOp(ctx, @constCast(u.right));
