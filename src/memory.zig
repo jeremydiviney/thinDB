@@ -147,6 +147,19 @@ pub const MemoryAccountant = struct {
         if (self.pool) |p| p.release(bytes);
     }
 
+    /// Hand every byte this accountant still holds back to the shared pool and
+    /// zero its local counters. Backstop invoked once at query teardown: a
+    /// blocking operator that releases only on eviction (e.g. a materialized
+    /// CTE never fully drained because of a LIMIT) — or any operator unwinding
+    /// an error mid-query — would otherwise leave its reservation stranded in
+    /// the cross-query pool forever, eroding the budget until later queries
+    /// spuriously fail `MemoryBudgetExceeded`. Idempotent.
+    pub fn drainToPool(self: *MemoryAccountant) void {
+        if (self.pool) |p| p.release(self.current_bytes);
+        self.current_bytes = 0;
+        self.by_source = [_]usize{0} ** source_count;
+    }
+
     /// Bytes still available for additional reservations.
     pub fn available(self: MemoryAccountant) usize {
         return self.budget - self.current_bytes;
@@ -233,6 +246,24 @@ test "memory: reserve fails when budget would be exceeded" {
     try std.testing.expectError(Error.MemoryBudgetExceeded, a.reserve(.sort, 1));
     // The failed reservation does not consume any budget.
     try std.testing.expectEqual(@as(usize, 1024), a.current_bytes);
+}
+
+test "memory: drainToPool hands a stranded reservation back to the pool" {
+    var pool = MemoryPool.init(1000);
+    // Query 1 reserves but (simulating a non-evicted materialize / error
+    // unwind) never calls release before the accountant is torn down.
+    var q1 = MemoryAccountant.initWithPool(0, &pool);
+    try q1.reserve(.materialize, 600);
+    try std.testing.expectEqual(@as(usize, 600), pool.inUse());
+    q1.drainToPool(); // teardown backstop
+    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+    try std.testing.expectEqual(@as(usize, 0), q1.current_bytes);
+
+    // Query 2 now sees the full pool again — no permanent erosion.
+    var q2 = MemoryAccountant.initWithPool(0, &pool);
+    try q2.reserve(.sort, 1000);
+    q2.release(.sort, 1000);
+    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
 }
 
 test "memory: multiple operators sharing one accountant" {

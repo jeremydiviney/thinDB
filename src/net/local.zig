@@ -1064,7 +1064,14 @@ pub const CompileCtx = struct {
         self.session_strings.deinit(self.allocator);
         if (self.subquery_arena) |*ar| ar.deinit();
         if (self.node_arena) |*ar| ar.deinit();
-        if (self.accountant) |a| self.allocator.destroy(a);
+        if (self.accountant) |a| {
+            // Release any reservation still outstanding (non-evicted materialize
+            // buffers freed just above, error-path remnants) back to the shared
+            // pool before the accountant is gone — otherwise the cross-query
+            // pool leaks and later queries fail MemoryBudgetExceeded.
+            a.drainToPool();
+            self.allocator.destroy(a);
+        }
         if (self.global_dict) |g| {
             g.deinit(self.allocator);
             self.allocator.destroy(g);
