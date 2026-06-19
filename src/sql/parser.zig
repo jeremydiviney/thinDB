@@ -2895,6 +2895,7 @@ pub const Parser = struct {
         // an inner join; outer joins would need true ON-extra-predicate support.
         if (jtype != .inner and ranges.items.len > 0) return ParseError.SqlOnNonEquiUnsupported;
         if (pairs.items.len == 0 and ranges.items.len == 0) return ParseError.SqlOnNonEquiUnsupported;
+        self.dropRedundantOuterJoinNotNullFilters(jtype, &left_filters, &right_filters, pairs.items, ranges.items);
         return .{
             .on = try pairs.toOwnedSlice(self.arena),
             .ranges = try ranges.toOwnedSlice(self.arena),
@@ -2904,6 +2905,63 @@ pub const Parser = struct {
             .right_filter = try self.joinFilterFromParts(&right_filters),
             .hidden_left = try hidden_left.toOwnedSlice(self.arena),
         };
+    }
+
+    fn dropRedundantOuterJoinNotNullFilters(
+        self: *Parser,
+        jtype: ir.JoinType,
+        left_filters: *std.ArrayList(PredicateExpr),
+        right_filters: *std.ArrayList(PredicateExpr),
+        pairs: []const ir.JoinKeyPair,
+        ranges: []const ir.JoinRangePredicate,
+    ) void {
+        _ = self;
+        switch (jtype) {
+            .inner => {},
+            .left => dropRedundantJoinKeyNotNullFilters(left_filters, true, pairs, ranges),
+            .right => dropRedundantJoinKeyNotNullFilters(right_filters, false, pairs, ranges),
+            .full => {
+                dropRedundantJoinKeyNotNullFilters(left_filters, true, pairs, ranges);
+                dropRedundantJoinKeyNotNullFilters(right_filters, false, pairs, ranges);
+            },
+        }
+    }
+
+    fn dropRedundantJoinKeyNotNullFilters(
+        filters: *std.ArrayList(PredicateExpr),
+        comptime left_side: bool,
+        pairs: []const ir.JoinKeyPair,
+        ranges: []const ir.JoinRangePredicate,
+    ) void {
+        var i: usize = 0;
+        while (i < filters.items.len) {
+            const redundant = switch (filters.items[i]) {
+                .is_not_null => |col| joinKeyContainsColumn(left_side, pairs, ranges, col),
+                else => false,
+            };
+            if (redundant) {
+                _ = filters.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn joinKeyContainsColumn(
+        comptime left_side: bool,
+        pairs: []const ir.JoinKeyPair,
+        ranges: []const ir.JoinRangePredicate,
+        col: []const u8,
+    ) bool {
+        for (pairs) |pair| {
+            const key = if (left_side) pair.left else pair.right;
+            if (types.columnNameEql(key, col)) return true;
+        }
+        for (ranges) |range| {
+            const key = if (left_side) range.left else range.right;
+            if (types.columnNameEql(key, col)) return true;
+        }
+        return false;
     }
 
     fn addJoinNullCondition(

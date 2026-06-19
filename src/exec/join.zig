@@ -297,9 +297,19 @@ fn appendCastDerived(
 }
 
 fn commonJoinKeyTag(left: TypeTag, right: TypeTag) ?TypeTag {
+    if (isStringTag(left) and canStringifyJoinKey(right)) return .string;
+    if (isStringTag(right) and canStringifyJoinKey(left)) return .string;
     if (cast.castCost(left, right) != null and castFunctionName(right) != null) return right;
     if (cast.castCost(right, left) != null and castFunctionName(left) != null) return left;
     return null;
+}
+
+fn canStringifyJoinKey(tag: TypeTag) bool {
+    return switch (tag) {
+        .int, .bigint, .double, .boolean => true,
+        .string, .varchar, .char => true,
+        else => false,
+    };
 }
 
 fn castFunctionName(tag: TypeTag) ?[]const u8 {
@@ -312,6 +322,7 @@ fn castFunctionName(tag: TypeTag) ?[]const u8 {
         .double => "to_double",
         .date => "to_date",
         .datetime => "to_datetime",
+        .string => "to_string",
         else => null,
     };
 }

@@ -259,7 +259,11 @@ pub const StageSet = struct {
     }
 
     pub fn deinit(self: *StageSet) void {
-        for (self.stages.items) |stage| stage.deinit();
+        var i = self.stages.items.len;
+        while (i > 0) {
+            i -= 1;
+            self.stages.items[i].deinit();
+        }
         self.stages.deinit(self.allocator);
         self.arena.deinit();
         self.allocator.destroy(self);
