@@ -54,38 +54,47 @@ def prefix_sql(k, tail):
     pref = ctes[:k]
     return preamble + 'WITH ' + ',\n'.join(f'{n} AS (\n{b}\n)' for n, b in pref) + '\n' + tail
 
-def run_time(sql, reps=2):
-    best, out = 1e9, ''
+def run_time(sql, reps=3):
+    times, out = [], ''
     for _ in range(reps):
         t = time.perf_counter()
         p = subprocess.run([MYSQL] + ARGS, input=sql, capture_output=True, text=True, timeout=300)
         dt = time.perf_counter() - t
         if p.returncode != 0 or 'ERROR' in (p.stderr or ''):
             return None, (p.stderr or '').strip().split('\n')[0]
-        best = min(best, dt); out = p.stdout
-    return best, out
+        times.append(dt); out = p.stdout
+    times.sort()
+    return times[len(times)//2], out  # median
+
+
+def count_rows(out):
+    for ln in (out or '').split('\n'):
+        ln = ln.strip()
+        if ln.isdigit():
+            return ln
+    return ''
+
 
 # Warm the cache: one full pass first.
 print('warming...', file=sys.stderr)
 run_time(prefix_sql(len(ctes), f'SELECT COUNT(*) FROM {ctes[-1][0]}'), reps=1)
 
-print(f'{"#":>3} {"cte":42} {"rows":>9} {"cum_s":>8} {"delta_s":>8}')
+# `cum_s` = median wall time to build this CTE *and its dependency subtree*
+# from scratch. `delta_s` = cum_s - previous cum_s ≈ marginal cost of this CTE
+# (noisy / negative when CTE k sits on a smaller sibling branch than k-1).
+# `rows` = rows the CTE produces.
+print(f'{"#":>3} {"cte":46} {"rows":>9} {"cum_s":>8} {"delta_s":>8}')
 prev = 0.0
 for k in range(1, len(ctes) + 1):
     name = ctes[k-1][0]
     t, out = run_time(prefix_sql(k, f'SELECT COUNT(*) FROM {name}'))
     if t is None:
-        print(f'{k:>3} {name:42} FAIL {out}')
+        print(f'{k:>3} {name:46} FAIL {out}')
         continue
-    rows = ''
-    for ln in (out or '').split('\n'):
-        ln = ln.strip()
-        if ln.isdigit(): rows = ln
     delta = t - prev
     flag = '  <<<' if delta > 0.2 else ''
-    print(f'{k:>3} {name:42} {rows:>9} {t:8.3f} {delta:8.3f}{flag}')
+    print(f'{k:>3} {name:46} {count_rows(out):>9} {t:8.3f} {delta:8.3f}{flag}')
     prev = t
 
-# Final SELECT (whole query, full result).
 tf, _ = run_time(preamble + body)
 print(f'\nFULL query (final SELECT): {tf:.3f}s')
