@@ -188,6 +188,21 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         }
         return PE.SqlExpectedValue;
     }
+    // `@var op X` — a session var on the LHS (constant guard, e.g.
+    // `@comparisonMonths > 1`). Symmetric to the literal-LHS form above: the
+    // var resolves to a literal pre-compile, so both sides materialize as
+    // constant columns. A bare `@var` is truthiness (`@var <> 0`).
+    if (p.cur.tag == .at_identifier) {
+        const var_name = try p.arena.dupe(u8, p.cur.text);
+        try p.advance();
+        const lhs_expr = ir.Expr{ .var_ref = var_name };
+        if (isComparisonToken(p.cur.tag)) {
+            const op = try parseComparisonToken(p);
+            const rhs = try p.parseAddSub();
+            return try makeExprComparisonPredicate(p, lhs_expr, op, rhs);
+        }
+        return try makeExprComparisonPredicate(p, lhs_expr, .neq, .{ .lit = .{ .int = 0 } });
+    }
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
     var col_dup = try parseQualifiedColRef(p);
 
