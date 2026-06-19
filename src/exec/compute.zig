@@ -1155,6 +1155,9 @@ fn commonCaseType(current: ?Type, next: Type) ?Type {
     const cur_tag: types.TypeTag = std.meta.activeTag(cur);
     const next_tag: types.TypeTag = std.meta.activeTag(next);
     if (cur_tag == next_tag) return cur;
+    // `.string`/`.varchar`/`.char` share one StringView representation, so a
+    // CASE mixing a string literal with a VARCHAR column reconciles to string.
+    if (foldStringTag(cur_tag) == .string and foldStringTag(next_tag) == .string) return Type{ .string = {} };
     if (cast.castCost(cur_tag, next_tag) != null) return next;
     if (cast.castCost(next_tag, cur_tag) != null) return cur;
     return null;
@@ -1172,6 +1175,8 @@ fn attachCaseCast(
     const src_tag: types.TypeTag = std.meta.activeTag(src_type);
     const out_tag: types.TypeTag = std.meta.activeTag(out_type);
     if (src_tag == out_tag) return;
+    // Same StringView representation across the string family — pass through.
+    if (foldStringTag(src_tag) == .string and foldStringTag(out_tag) == .string) return;
     const k = cast.kernelFor(src_tag, out_tag) orelse return Error.ComputeUnsupportedExpr;
     const buf = try runtime_allocator.create(ColumnStore);
     errdefer runtime_allocator.destroy(buf);
