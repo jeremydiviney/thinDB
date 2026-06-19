@@ -1129,6 +1129,81 @@ test "mysql wire: COM_RESET_CONNECTION (0x1F) clears session state" {
     if (sctx.err) |e| return e;
 }
 
+test "mysql wire: user variables persist across statements and clear on RESET" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const t = try sc.table("orders", schema_orders, opts_orders);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 30), .tag = "c" },
+    });
+    try t.flush();
+
+    const port: u16 = test_port_base + 21;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const th = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer th.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("main__public");
+
+    // SET a user variable on this connection.
+    try client.sendQuery("SET @c = 15");
+    {
+        const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // A LATER statement on the same connection sees @c = 15:
+    // qty > 15 selects rows 2 and 3.
+    try client.sendQuery("SELECT id FROM orders WHERE qty > @c ORDER BY id ASC");
+    {
+        const rows = try client.readResultSet(arena.allocator());
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expectEqualStrings("2", rows[0][0].?);
+        try std.testing.expectEqualStrings("3", rows[1][0].?);
+    }
+
+    // RESET CONNECTION is what a connection pool sends on release. It must
+    // wipe user variables so the next borrower never sees stale state.
+    try client.sendResetConnection();
+    {
+        const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(pkt.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+    }
+
+    // @c is now unset → resolves to NULL → `qty > NULL` is UNKNOWN under 3VL,
+    // which excludes every row. (Was previously an UnsupportedOp error.)
+    try client.sendQuery("SELECT id FROM orders WHERE qty > @c ORDER BY id ASC");
+    {
+        const rows = try client.readResultSet(arena.allocator());
+        try std.testing.expectEqual(@as(usize, 0), rows.len);
+    }
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
 test "mysql wire: RESET CONNECTION returns OK" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

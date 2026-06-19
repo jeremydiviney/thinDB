@@ -46,14 +46,14 @@ const local = @import("local.zig");
 const CompileCtx = local.CompileCtx;
 const Error = local.Error;
 
-/// Look up a session variable by name. Returns the resolved Value or
-/// errors with `Error.UnknownSessionVar` (mapped to `UnsupportedOp`
-/// at the public boundary for now) when the var isn't set.
-/// Inner optional: the variable's value, or `null` if it was `SET @x = NULL`.
-/// Errors when the variable is undefined (never set).
+/// Look up a session variable by name. An undefined variable — one never set,
+/// or cleared when the connection was reset/returned to a pool — resolves to
+/// SQL NULL, matching MySQL's user-variable semantics (referencing `@x` before
+/// assigning it yields NULL, not an error). The optional `null` therefore covers
+/// both "never set" and "explicitly `SET @x = NULL`"; callers treat both as NULL.
 fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !?@import("../types.zig").Value {
-    const vars = ctx.session.vars orelse return Error.UnsupportedOp;
-    return vars.get(name) orelse Error.UnsupportedOp;
+    const vars = ctx.session.vars orelse return null;
+    return vars.get(name) orelse null;
 }
 
 // =============================================================================

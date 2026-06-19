@@ -980,6 +980,7 @@ fn handleQuery(
             ),
             .reset_connection => {
                 session.dropTempNamespace();
+                session.resetVars();
                 session.in_transaction = false;
                 try session.replace("main", "public");
                 try handshake.sendOkPacketStatus(
@@ -2863,7 +2864,7 @@ fn runSingleStatement(
 
 fn isSideEffectOp(op: ir.Op) bool {
     return switch (op) {
-        .ddl, .insert, .insert_select => true,
+        .ddl, .insert, .insert_select, .set_var => true,
         else => false,
     };
 }

@@ -105,7 +105,7 @@ test "session var: var in SELECT expression position" {
     try std.testing.expectEqual(@as(i32, 110), batch.values[1].data.int[0]);
 }
 
-test "session var: undefined var errors" {
+test "session var: undefined var resolves to NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -113,13 +113,14 @@ test "session var: undefined var errors" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    // @undefined was never SET; resolution should fail.
-    try helpers.expectRunError(
-        allocator,
-        db,
+    // @undefined was never SET. MySQL treats a reference to an unset user
+    // variable as SQL NULL (not an error), so `qty > @undefined` is UNKNOWN
+    // under 3VL and excludes every row.
+    const ids = try collectBigints(allocator, db,
         "SELECT id FROM t WHERE qty > @undefined",
-        error.UnsupportedOp,
     );
+    defer allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 0), ids.len);
 }
 
 test "session var: scalar subquery as RHS of SET" {
