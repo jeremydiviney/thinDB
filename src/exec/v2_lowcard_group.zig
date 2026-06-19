@@ -101,6 +101,9 @@ const AggPlan = struct {
     input_name: ?[]const u8,
     is_float: bool = false,
     output_type: Type,
+    // DECIMAL input scale: SUM folds raw mantissas (correct at this scale, so
+    // emit is unchanged), AVG divides the mean by 10^input_scale. 0 otherwise.
+    input_scale: u8 = 0,
     name: []const u8,
     // count_distinct only: which distinct slot this aggregate owns, the bit
     // width of its value (composite = key << value_bits | value), and the
@@ -221,6 +224,11 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                 const typ = columnType(table, col_name) orelse return declineFree(allocator, aggs);
                 if (columnNullable(table, col_name)) return declineFree(allocator, aggs);
                 if (keyTypeBits(typ) == null and !isFloatType(typ)) return declineFree(allocator, aggs);
+                // decimal128 (i128 mantissa) can't fit this path's i64 slots;
+                // decline so the shape surfaces an error rather than truncating.
+                // decimal64 is fine: SUM/MIN/MAX fold in i64 and widen at emit,
+                // AVG divides out the scale (see input_scale below).
+                if (typ == .decimal128) return declineFree(allocator, aggs);
                 const out_type = aggregate.aggOutputTypeFor(agg, typ) catch return declineFree(allocator, aggs);
                 aggs[i] = .{
                     .op = switch (agg.func) {
@@ -233,6 +241,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                     .input_name = col_name,
                     .is_float = isFloatType(typ),
                     .output_type = out_type,
+                    .input_scale = if (typ.decimalSpec()) |sp| sp.s else 0,
                     .name = agg.as,
                 };
             },
@@ -1362,7 +1371,7 @@ const LowCardGroup = struct {
                         const avg: f64 = if (agg.is_float)
                             slotF64(slot) / @as(f64, @floatFromInt(ns))
                         else
-                            @as(f64, @floatFromInt(slot)) / @as(f64, @floatFromInt(ns));
+                            @as(f64, @floatFromInt(slot)) / @as(f64, @floatFromInt(ns)) / std.math.pow(f64, 10.0, @floatFromInt(agg.input_scale));
                         try col.data.double.append(a, avg);
                     }
                 },
@@ -1470,6 +1479,7 @@ fn appendInt(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i12
         .bigint => try col.data.bigint.append(allocator, @intCast(value)),
         .datetime => try col.data.datetime.append(allocator, @intCast(value)),
         .decimal64 => try col.data.decimal64.append(allocator, @intCast(value)),
+        .decimal128 => try col.data.decimal128.append(allocator, value),
         .largeint => try col.data.largeint.append(allocator, value),
         .double => try col.data.double.append(allocator, @floatFromInt(value)),
         else => return error.TypeMismatch,

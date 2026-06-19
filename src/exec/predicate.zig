@@ -388,7 +388,13 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             const col_tag = ValueTag.fromType(col_type);
             const val_tag = std.meta.activeTag(p.val);
             if (col_tag != val_tag) {
-                tryWidenLiteral(&p.val, col_tag) catch return Error.PredicateTypeMismatch;
+                // Decimal needs the column scale (which `tryWidenLiteral` can't
+                // see from the tag) to align the literal mantissa to the column.
+                if (col_type.decimalSpec()) |spec| {
+                    coerceLiteralToDecimal(&p.val, spec, col_type == .decimal128) catch return Error.PredicateTypeMismatch;
+                } else {
+                    tryWidenLiteral(&p.val, col_tag) catch return Error.PredicateTypeMismatch;
+                }
             }
         },
         .day_leaf => |*p| {
@@ -559,6 +565,45 @@ fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
 fn fitInt(comptime T: type, v: i128) error{OutOfRange}!T {
     if (v < std.math.minInt(T) or v > std.math.maxInt(T)) return error.OutOfRange;
     return @intCast(v);
+}
+
+/// Scale a numeric/text literal to a decimal column's mantissa (value × 10^s),
+/// so the comparison kernel — which compares raw mantissas — sees both operands
+/// at the same scale. A literal beyond the column precision still coerces (the
+/// comparison just resolves to a constant); only an i128 overflow is rejected.
+fn coerceLiteralToDecimal(val: *Value, spec: types.DecimalSpec, is128: bool) error{NoWidening}!void {
+    const m: i128 = switch (val.*) {
+        .tinyint => |v| try intToDecimalMantissa(v, spec.s),
+        .smallint => |v| try intToDecimalMantissa(v, spec.s),
+        .int => |v| try intToDecimalMantissa(v, spec.s),
+        .bigint => |v| try intToDecimalMantissa(v, spec.s),
+        .largeint => |v| try intToDecimalMantissa(v, spec.s),
+        .boolean => |v| try intToDecimalMantissa(@intFromBool(v), spec.s),
+        .float => |v| try floatToDecimalMantissa(v, spec.s),
+        .double => |v| try floatToDecimalMantissa(v, spec.s),
+        .decimal64 => |v| v,
+        .decimal128 => |v| v,
+        else => return error.NoWidening,
+    };
+    if (is128) {
+        val.* = .{ .decimal128 = m };
+    } else {
+        val.* = .{ .decimal64 = std.math.cast(i64, m) orelse return error.NoWidening };
+    }
+}
+
+fn intToDecimalMantissa(iv: i128, scale: u8) error{NoWidening}!i128 {
+    var m = iv;
+    var i: u8 = 0;
+    while (i < scale) : (i += 1) m = std.math.mul(i128, m, 10) catch return error.NoWidening;
+    return m;
+}
+
+fn floatToDecimalMantissa(v: f64, scale: u8) error{NoWidening}!i128 {
+    const factor = std.math.pow(f64, 10.0, @floatFromInt(scale));
+    const scaled = @round(v * factor);
+    if (!std.math.isFinite(scaled) or @abs(scaled) >= std.math.pow(f64, 2.0, 127.0)) return error.NoWidening;
+    return @intFromFloat(scaled);
 }
 
 fn parseDateString(s: []const u8) !i32 {

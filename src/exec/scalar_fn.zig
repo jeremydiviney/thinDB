@@ -47,8 +47,11 @@ const string = @import("scalar_fn_string.zig");
 const math = @import("scalar_fn_math.zig");
 const date = @import("scalar_fn_date.zig");
 const cond = @import("scalar_fn_cond.zig");
+const dec = @import("scalar_fn_decimal.zig");
+const common = @import("scalar_fn_common.zig");
 
 pub const NullStrategy = udf_mod.NullStrategy;
+pub const TypedKernel = common.TypedKernelFn;
 
 pub const Kernel = *const fn (
     allocator: Allocator,
@@ -68,6 +71,10 @@ pub const ScalarFn = struct {
     null_strategy: NullStrategy = .propagates,
     volatility: udf_mod.Volatility = .immutable,
     kernel: ?Kernel = null,
+    /// Decimal (scale-aware) kernel. Takes precedence over `kernel`; receives
+    /// the call's arg `Type`s and the resolved output `Type` so it can read and
+    /// produce the correct scale. Set only by `resolveDecimal`.
+    typed_kernel: ?TypedKernel = null,
     udf_kernel: ?udf_mod.ScalarKernel = null,
     user_data: ?*anyopaque = null,
 };
@@ -113,6 +120,11 @@ pub fn resolveWithRegistry(
     name: []const u8,
     arg_types: []const Type,
 ) !?ResolvedOverload {
+    // Decimal-involving calls resolve to scale-aware typed kernels (the static
+    // builtins table can't express a dynamic output scale). Checked first so a
+    // decimal operand never falls into an int/double overload that ignores scale.
+    if (try resolveDecimal(aa, name, arg_types)) |ov| return ov;
+
     // Fast path: exact TypeTag match. No allocation, no cost calc.
     for (builtins) |f| {
         if (!std.mem.eql(u8, f.name, name)) continue;
@@ -178,6 +190,174 @@ pub fn resolveWithRegistry(
         slot.* = if (ft == tt) null else cast.kernelFor(ft, tt);
     }
     return ResolvedOverload{ .func = chosen, .arg_casts = arg_casts };
+}
+
+// ---------------------------------------------------------------------------
+// Decimal resolution
+//
+// Decimal operations need the operand scales, which the static `builtins` table
+// can't carry (its `return_type` is fixed, and a plain `Kernel` never sees the
+// arg `Type`s). `resolveDecimal` builds a synthetic overload on demand: it
+// computes the DESIGN.md §3.4 result type from the call's arg types and points
+// at a `typed_kernel` in `scalar_fn_decimal.zig`. No casts are attached
+// (`arg_casts = null`) — the typed kernel reads each operand's declared scale
+// and aligns internally, so integer operands flow through unmangled.
+// ---------------------------------------------------------------------------
+
+fn anyDecimal(arg_types: []const Type) bool {
+    for (arg_types) |t| if (t.isDecimal()) return true;
+    return false;
+}
+
+/// An operand a decimal op can absorb without a string cast.
+fn numericLike(t: Type) bool {
+    return t.isInteger() or t.isFloat() or t.isDecimal() or t == .boolean;
+}
+
+fn allNumericLike(arg_types: []const Type) bool {
+    for (arg_types) |t| if (!numericLike(t)) return false;
+    return true;
+}
+
+/// Decimal/int-only (no float) — the operands COALESCE/IF/GREATEST/LEAST can
+/// fold into a decimal result.
+fn allDecimalOrInt(arg_types: []const Type) bool {
+    for (arg_types) |t| if (!(t.isInteger() or t.isDecimal() or t == .boolean)) return false;
+    return true;
+}
+
+fn arithOp(name: []const u8) ?dec.Op {
+    if (std.mem.eql(u8, name, "add")) return .add;
+    if (std.mem.eql(u8, name, "sub")) return .sub;
+    if (std.mem.eql(u8, name, "mul")) return .mul;
+    if (std.mem.eql(u8, name, "div")) return .div;
+    if (std.mem.eql(u8, name, "mod")) return .mod;
+    return null;
+}
+
+fn arithKernelFor(op: dec.Op) TypedKernel {
+    return switch (op) {
+        .add => dec.addKernel,
+        .sub => dec.subKernel,
+        .mul => dec.mulKernel,
+        .div => dec.divKernel,
+        .mod => dec.modKernel,
+    };
+}
+
+fn buildDecFn(
+    aa: Allocator,
+    name: []const u8,
+    arg_types: []const Type,
+    return_type: Type,
+    kernel: TypedKernel,
+    null_strategy: NullStrategy,
+) !ResolvedOverload {
+    return ResolvedOverload{
+        .func = .{
+            .name = name,
+            .arg_types = try aa.dupe(Type, arg_types),
+            .return_type = return_type,
+            .typed_kernel = kernel,
+            .null_strategy = null_strategy,
+        },
+        .arg_casts = null,
+    };
+}
+
+fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    // CAST(x AS DECIMAL(p,s)) lowers to a name-encoded `to_decimal:<p>:<s>`
+    // (the target p/s ride in the name since the resolver sees types, not the
+    // literal values the generic call form would pass).
+    if (std.mem.startsWith(u8, name, "to_decimal")) return resolveToDecimal(aa, name, arg_types);
+
+    if (!anyDecimal(arg_types)) return null;
+
+    // Binary arithmetic.
+    if (arg_types.len == 2) {
+        if (arithOp(name)) |op| {
+            if (!allNumericLike(arg_types)) return null;
+            const rt = dec.arithResultType(op, arg_types[0], arg_types[1]);
+            return try buildDecFn(aa, name, arg_types, rt, arithKernelFor(op), .propagates);
+        }
+    }
+
+    // Unary decimal functions (source must be decimal).
+    if (arg_types.len == 1 and arg_types[0].isDecimal()) {
+        const sp = arg_types[0].decimalSpec().?;
+        if (std.mem.eql(u8, name, "to_double") or std.mem.eql(u8, name, "to_float"))
+            return try buildDecFn(aa, name, arg_types, .double, dec.toDoubleKernel, .propagates);
+        if (intCastTarget(name)) |it|
+            return try buildDecFn(aa, name, arg_types, it, dec.toIntKernel, .propagates);
+        if (std.mem.eql(u8, name, "to_string"))
+            return try buildDecFn(aa, name, arg_types, .string, dec.toStringKernel, .propagates);
+        if (std.mem.eql(u8, name, "abs"))
+            return try buildDecFn(aa, name, arg_types, arg_types[0], dec.absKernel, .propagates);
+        if (std.mem.eql(u8, name, "round"))
+            return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.roundKernel, .propagates);
+        if (std.mem.eql(u8, name, "floor"))
+            return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.floorKernel, .propagates);
+        if (std.mem.eql(u8, name, "ceil") or std.mem.eql(u8, name, "ceiling"))
+            return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.ceilKernel, .propagates);
+        if (std.mem.eql(u8, name, "truncate"))
+            return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.truncateKernel, .propagates);
+        return null;
+    }
+
+    // ROUND/TRUNCATE(decimal, n) — keeps the source scale, rounds the value.
+    if (arg_types.len == 2 and arg_types[0].isDecimal() and arg_types[1].isInteger()) {
+        if (std.mem.eql(u8, name, "round"))
+            return try buildDecFn(aa, name, arg_types, arg_types[0], dec.roundNKernel, .propagates);
+        if (std.mem.eql(u8, name, "truncate"))
+            return try buildDecFn(aa, name, arg_types, arg_types[0], dec.truncateNKernel, .propagates);
+    }
+
+    // COALESCE / IFNULL — first non-null, all operands decimal/int.
+    if ((std.mem.eql(u8, name, "coalesce") or std.mem.eql(u8, name, "ifnull")) and allDecimalOrInt(arg_types)) {
+        const spec = dec.commonSpec(arg_types) orelse return null;
+        return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), dec.coalesceKernel, .absorbs);
+    }
+
+    if (std.mem.eql(u8, name, "nullif") and arg_types.len == 2 and allDecimalOrInt(arg_types)) {
+        const spec = dec.commonSpec(arg_types) orelse return null;
+        return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), dec.nullifKernel, .kernel_managed);
+    }
+
+    if (std.mem.eql(u8, name, "if") and arg_types.len == 3 and arg_types[0] == .boolean and allDecimalOrInt(arg_types[1..])) {
+        const spec = dec.commonSpec(arg_types[1..]) orelse return null;
+        return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), dec.ifKernel, .kernel_managed);
+    }
+
+    if ((std.mem.eql(u8, name, "greatest") or std.mem.eql(u8, name, "least")) and allDecimalOrInt(arg_types)) {
+        const spec = dec.commonSpec(arg_types) orelse return null;
+        const k = if (std.mem.eql(u8, name, "greatest")) dec.greatestKernel else dec.leastKernel;
+        return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), k, .propagates);
+    }
+
+    return null;
+}
+
+fn intCastTarget(name: []const u8) ?Type {
+    if (std.mem.eql(u8, name, "to_int")) return .int;
+    if (std.mem.eql(u8, name, "to_bigint")) return .bigint;
+    if (std.mem.eql(u8, name, "to_smallint")) return .smallint;
+    if (std.mem.eql(u8, name, "to_tinyint")) return .tinyint;
+    if (std.mem.eql(u8, name, "to_largeint")) return .largeint;
+    return null;
+}
+
+/// Resolve a name-encoded `to_decimal:<p>:<s>` cast. Source may be any numeric
+/// or string type.
+fn resolveToDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (arg_types.len != 1) return null;
+    var it = std.mem.splitScalar(u8, name, ':');
+    const head = it.next() orelse return null;
+    if (!std.mem.eql(u8, head, "to_decimal")) return null;
+    const p = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+    const s = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+    const src = arg_types[0];
+    if (!(numericLike(src) or src.isString())) return null;
+    return try buildDecFn(aa, name, arg_types, dec.decTypeFor(p, s), dec.toDecimalKernel, .propagates);
 }
 
 fn scalarArityMatches(f: ScalarFn, actual: usize) bool {

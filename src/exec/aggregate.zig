@@ -490,7 +490,16 @@ const SumFloatAcc = struct { v: f64 = 0, seen: bool = false };
 const AvgAcc = struct {
     sum: f64,
     count: u64,
+    /// 10^input_scale for a DECIMAL input. AVG sums raw mantissas, so the final
+    /// mean is divided by this to recover the true value; 1.0 for int/float.
+    scale_div: f64 = 1.0,
 };
+
+/// AVG denominator factor for the input's decimal scale (1.0 for non-decimal).
+fn avgScaleDiv(in: ?Type) f64 {
+    if (in) |t| if (t.decimalSpec()) |sp| return std.math.pow(f64, 10.0, @floatFromInt(sp.s));
+    return 1.0;
+}
 
 const BoolAcc = struct {
     seen: bool = false,
@@ -2498,7 +2507,7 @@ fn aggOrderValue(s: AccState) OrderVal {
         .min_int, .max_int => |m| .{ .int = m orelse 0 },
         .min_large, .max_large => |m| .{ .int = if (m.present) m.v else 0 },
         .min_float, .max_float => |m| .{ .float = m orelse 0.0 },
-        .avg => |a| .{ .float = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count)) },
+        .avg => |a| .{ .float = if (a.count == 0) 0.0 else a.sum / @as(f64, @floatFromInt(a.count)) / a.scale_div },
         .distinct => |d| .{ .int = @intCast(d.set.count() + @as(u32, @intFromBool(d.seen_empty))) },
         .distinct_int => |set| .{ .int = @intCast(set.count()) },
         .distinct_int64 => |set| .{ .int = @intCast(set.count()) },
@@ -2615,7 +2624,7 @@ fn initAggCol(aa: Allocator, func: AggFunc, in: ?Type, capacity: usize) !AggCol 
         },
         .avg => blk: {
             const s = try aa.alloc(AvgAcc, capacity);
-            @memset(s, .{ .sum = 0.0, .count = 0 });
+            @memset(s, .{ .sum = 0.0, .count = 0, .scale_div = avgScaleDiv(in) });
             break :blk .{ .avg = s };
         },
         .min_int => blk: {
@@ -2669,7 +2678,7 @@ fn growAggCol(aa: Allocator, col: *AggCol, func: AggFunc, in: ?Type, new_capacit
         .avg => |*s| {
             const old = s.len;
             s.* = try aa.realloc(s.*, new_capacity);
-            @memset(s.*[old..], .{ .sum = 0.0, .count = 0 });
+            @memset(s.*[old..], .{ .sum = 0.0, .count = 0, .scale_div = avgScaleDiv(in) });
         },
         .min_int, .max_int => |*s| {
             const old = s.len;
@@ -2713,7 +2722,7 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
             .{ .max_large = .{} }
         else
             .{ .max_int = null },
-        .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
+        .avg => .{ .avg = .{ .sum = 0.0, .count = 0, .scale_div = avgScaleDiv(in) } },
         .count_if => .{ .count = 0 },
         .bool_and => .{ .bool_acc = .{ .value = true } },
         .bool_or => .{ .bool_acc = .{ .value = false } },
@@ -3663,7 +3672,7 @@ pub fn appendAccToColumn(
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             } else {
-                try col.data.double.append(allocator, a.sum / @as(f64, @floatFromInt(a.count)));
+                try col.data.double.append(allocator, a.sum / @as(f64, @floatFromInt(a.count)) / a.scale_div);
             }
         },
         .count_if => {

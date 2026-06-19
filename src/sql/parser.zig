@@ -2134,6 +2134,15 @@ pub const Parser = struct {
             }
             return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch } };
         }
+        // DECIMAL target: the (p,s) ride in the function name so the scalar
+        // resolver (which sees types, not the would-be literal values) can
+        // build the right scale-aware cast kernel. See scalar_fn.resolveToDecimal.
+        if (ty.decimalSpec()) |sp| {
+            const fn_name = try std.fmt.allocPrint(self.arena, "to_decimal:{d}:{d}", .{ sp.p, sp.s });
+            const dargs = try self.arena.alloc(ir.Expr, 1);
+            dargs[0] = inner;
+            return ir.Expr{ .call = .{ .fn_name = fn_name, .args = dargs } };
+        }
         const fn_name = castFnName(ty) orelse return ParseError.SqlInvalidProjection;
         const args = try self.arena.alloc(ir.Expr, 1);
         args[0] = inner;

@@ -1075,11 +1075,11 @@ test "error: filter predicate type mismatch on each new type" {
     try std.testing.expectError(error.PredicateTypeMismatch, q);
     base.deinit();
 
-    // DECIMAL column with a BIGINT literal — type mismatch.
+    // DECIMAL column with an integer literal now coerces: the literal scales to
+    // the column's mantissa so the comparison runs (see the decimal kernels).
     base = try thindb.scan(allocator, t);
-    q = base.filter(thindb.leafExpr("amt", .eq, .{ .bigint = 100 }));
-    try std.testing.expectError(error.PredicateTypeMismatch, q);
-    base.deinit();
+    var decq = try base.filter(thindb.leafExpr("amt", .eq, .{ .bigint = 100 }));
+    decq.deinit();
 }
 
 test "error: filter on unknown column" {

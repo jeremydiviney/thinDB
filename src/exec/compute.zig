@@ -135,6 +135,10 @@ const PlanError = Allocator.Error || Error;
 const CallPlan = struct {
     func: ScalarFn,
     args: []ArgPlan,
+    /// The runtime arg `Type`s (with `DecimalSpec`), captured at resolve. Only
+    /// read by the `typed_kernel` path — decimal kernels need the operand
+    /// scales the bare `ColumnView`s don't carry.
+    arg_runtime_types: []const Type,
     arg_casts: ?[]const ?CastKernel,
     cast_buffers: ?[]?ColumnStore,
     /// Where this call writes its result. Aliased to a parent slot
@@ -531,8 +535,11 @@ pub const Compute = struct {
             }
         }
 
-        // 3. Run the kernel.
-        if (plan.func.kernel) |k| {
+        // 3. Run the kernel. Decimal (typed) kernels take precedence and get
+        // the arg/out Types so they can align scales.
+        if (plan.func.typed_kernel) |tk| {
+            try tk(self.allocator, plan.arg_runtime_types, plan.output_type, arg_views, plan.output, n);
+        } else if (plan.func.kernel) |k| {
             try k(self.allocator, arg_views, plan.output, n);
         } else if (plan.func.udf_kernel) |k| {
             const ctx: udf_mod.ScalarContext = .{ .allocator = self.allocator, .user_data = plan.func.user_data };
@@ -1446,6 +1453,7 @@ fn buildCallPlan(
     plan.* = .{
         .func = r.func,
         .args = arg_plans,
+        .arg_runtime_types = arg_types,
         .arg_casts = r.arg_casts,
         .cast_buffers = cast_buffers,
         .output = output_buf,

@@ -10,6 +10,21 @@ pub const ColumnView = storage.ColumnView;
 const store = @import("../engine/store.zig");
 pub const ColumnStore = store.ColumnStore;
 
+const types = @import("../types.zig");
+
+/// Kernel variant that receives the call's argument `Type`s (with any
+/// `DecimalSpec`) and the computed output `Type`. Plain `Kernel`s see only
+/// `ColumnView`s, which carry no scale — decimal kernels need the scale, so
+/// they run on this signature instead. See `scalar_fn_decimal.zig`.
+pub const TypedKernelFn = *const fn (
+    allocator: std.mem.Allocator,
+    arg_types: []const types.Type,
+    out_type: types.Type,
+    args: []const ColumnView,
+    out: *ColumnStore,
+    row_count: usize,
+) anyerror!void;
+
 pub inline fn stringViewOf(v: ColumnView) storage.StringView {
     return switch (v.data) {
         .varchar => |sv| sv,

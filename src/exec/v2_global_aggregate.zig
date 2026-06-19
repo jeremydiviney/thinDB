@@ -170,6 +170,10 @@ const AggPlan = struct {
     // MIN/MAX over a string column: the accumulator is the running extreme
     // bytes (`Lane.sstr`), not a numeric slot. Only ever set for .min/.max.
     is_string: bool = false,
+    // Decimal input scale (digits after the point). SUM accumulates raw
+    // mantissas — already correct at this scale — but AVG must divide the
+    // mantissa-sum by 10^input_scale to recover the true mean. 0 for non-decimal.
+    input_scale: u8 = 0,
     // Distinct-key derivation; meaningful only for .count_distinct.
     dkind: DistinctKind = .int,
     output_type: Type,
@@ -1012,6 +1016,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                         if (!aggInputSupported(ctyp)) return declineFree(allocator, plans, &needed);
                         const out_type = aggregate.aggOutputTypeFor(agg, ctyp) catch return declineFree(allocator, plans, &needed);
                         p.is_float = isFloatType(ctyp);
+                        if (ctyp.decimalSpec()) |sp| p.input_scale = sp.s;
                         // The affine-aggregate reduction pins a base SUM to
                         // largeint so the post-agg `a·SUM + b·COUNT` derivation
                         // runs in i128 without an intermediate narrow.
@@ -1448,7 +1453,9 @@ const GlobalAggregate = struct {
                         const avg: f64 = if (p.is_float)
                             lane.fsum[i] / @as(f64, @floatFromInt(n))
                         else
-                            @as(f64, @floatFromInt(lane.isum[i])) / @as(f64, @floatFromInt(n));
+                            // Decimal: isum is the mantissa-sum, so divide by the
+                            // scale factor too. input_scale 0 for plain integers.
+                            @as(f64, @floatFromInt(lane.isum[i])) / (@as(f64, @floatFromInt(n)) * std.math.pow(f64, 10.0, @floatFromInt(p.input_scale)));
                         try col.data.double.append(a, avg);
                     }
                 },
@@ -1492,6 +1499,7 @@ fn appendInt(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i12
         .bigint => try col.data.bigint.append(allocator, @intCast(value)),
         .datetime => try col.data.datetime.append(allocator, @intCast(value)),
         .decimal64 => try col.data.decimal64.append(allocator, @intCast(value)),
+        .decimal128 => try col.data.decimal128.append(allocator, value),
         .largeint => try col.data.largeint.append(allocator, value),
         .double => try col.data.double.append(allocator, @floatFromInt(value)),
         else => return error.TypeMismatch,

@@ -2710,6 +2710,8 @@ fn coerceToDecimal64(v: Value, spec: @import("../types.zig").DecimalSpec) !i64 {
         .decimal64 => |d| d,
         .int => |x| try scaleIntToDecimal(i64, x, spec.s),
         .bigint => |x| try scaleIntToDecimal(i64, x, spec.s),
+        .float => |x| try scaleFloatToDecimal(i64, x, spec),
+        .double => |x| try scaleFloatToDecimal(i64, x, spec),
         .text => |s| try parseDecimalLiteral(i64, s, spec),
         else => Error.TypeMismatch,
     };
@@ -2721,9 +2723,23 @@ fn coerceToDecimal128(v: Value, spec: @import("../types.zig").DecimalSpec) !i128
         .decimal128 => |d| d,
         .int => |x| try scaleIntToDecimal(i128, x, spec.s),
         .bigint => |x| try scaleIntToDecimal(i128, x, spec.s),
+        .float => |x| try scaleFloatToDecimal(i128, x, spec),
+        .double => |x| try scaleFloatToDecimal(i128, x, spec),
         .text => |s| try parseDecimalLiteral(i128, s, spec),
         else => Error.TypeMismatch,
     };
+}
+
+/// Floating literal → decimal mantissa. The lexer parses `1.50` to f64 before
+/// the column type is known, so a decimal-pointed literal inserted into a
+/// DECIMAL column arrives here; round to the column scale. Precision is bounded
+/// by f64 (~15 sig digits) — exact for the scales seen in practice.
+fn scaleFloatToDecimal(comptime T: type, x: f64, spec: @import("../types.zig").DecimalSpec) !T {
+    const factor = std.math.pow(f64, 10.0, @floatFromInt(spec.s));
+    const scaled = @round(x * factor);
+    const limit = std.math.pow(f64, 10.0, @floatFromInt(spec.p));
+    if (scaled >= limit or scaled <= -limit) return Error.TypeMismatch;
+    return @intFromFloat(scaled);
 }
 
 fn scaleIntToDecimal(comptime T: type, x: anytype, scale: u8) !T {

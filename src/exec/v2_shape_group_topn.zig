@@ -117,6 +117,9 @@ const AggregatePlan = struct {
     // SUM/AVG over a 64-bit integer input: i128 accumulation across two
     // consecutive slots (lo at state_index-1, hi at state_index).
     wide: bool = false,
+    // DECIMAL input scale: AVG divides the mantissa-mean by 10^input_scale to
+    // recover the true value. SUM/MIN/MAX fold mantissas (correct at this scale).
+    input_scale: u8 = 0,
     // COUNT(DISTINCT col): the carried integer input is input_column_index, the
     // combined membership set is distinct_state_index, and the running count lives
     // in the numeric state_index. Output is a bigint count.
@@ -777,7 +780,10 @@ fn welfordValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
 
 fn avgValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
     const denom = aggDenom(row, agg_plan);
-    return if (denom == 0) 0.0 else @as(f64, @floatFromInt(rowStateValue(row, agg_plan.state_index, agg_plan.wide))) / @as(f64, @floatFromInt(denom));
+    if (denom == 0) return 0.0;
+    // DECIMAL: the accumulated value is a mantissa-sum, so divide by 10^scale too.
+    const scale_div = std.math.pow(f64, 10.0, @floatFromInt(agg_plan.input_scale));
+    return @as(f64, @floatFromInt(rowStateValue(row, agg_plan.state_index, agg_plan.wide))) / @as(f64, @floatFromInt(denom)) / scale_div;
 }
 
 fn rowStateValue(row: HarnessCore.TopRow, state_index: u16, wide: bool) i128 {
@@ -1079,6 +1085,10 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     next_string_state_index += 1;
                     continue;
                 }
+                // decimal128 (i128 mantissa) can't be read through the i64
+                // physical slot — decline rather than truncate. decimal64 folds
+                // like a 64-bit int (mantissa) and recovers scale at emit.
+                if (input_type == .decimal128) return traceDecline(request, "decimal128 aggregate");
                 // SUM/AVG over a 64-bit integer accumulates into i128 (the
                 // result widens to LARGEINT): the aggregate takes TWO state
                 // slots (lo, hi) and runs in the generic per-row program.
@@ -1097,6 +1107,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     .state_index = next_numeric_state_index,
                     .output_type = output_type,
                     .wide = wide,
+                    .input_scale = if (input_type.decimalSpec()) |sp| sp.s else 0,
                     .input_nullable = input_nullable,
                     .valid_count_index = if (input_nullable) next_numeric_state_index + slot_width - 1 else 0,
                 };
@@ -1550,6 +1561,8 @@ fn appendIntegerAggregate(allocator: Allocator, col: *ColumnStore, out_type: Typ
         .int => try col.data.int.append(allocator, @intCast(value)),
         .bigint => try col.data.bigint.append(allocator, @intCast(value)),
         .largeint => try col.data.largeint.append(allocator, value),
+        .decimal64 => try col.data.decimal64.append(allocator, @intCast(value)),
+        .decimal128 => try col.data.decimal128.append(allocator, value),
         .double => try col.data.double.append(allocator, @floatFromInt(value)),
         else => return error.TypeMismatch,
     }
