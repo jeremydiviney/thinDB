@@ -337,7 +337,9 @@ pub const Session = struct {
 /// that defined them.
 pub const SessionVars = struct {
     arena: std.heap.ArenaAllocator,
-    map: std.StringHashMapUnmanaged(@import("../types.zig").Value) = .empty,
+    /// `null` map value = a variable explicitly `SET @x = NULL` (SQL NULL),
+    /// distinct from an absent key (undefined variable).
+    map: std.StringHashMapUnmanaged(?@import("../types.zig").Value) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) SessionVars {
         return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
@@ -349,20 +351,21 @@ pub const SessionVars = struct {
         self.arena.deinit();
     }
 
-    pub fn get(self: *const SessionVars, name: []const u8) ?@import("../types.zig").Value {
+    /// Outer optional: present iff the variable was set. Inner optional: the
+    /// value, or `null` for a variable set to SQL NULL.
+    pub fn get(self: *const SessionVars, name: []const u8) ??@import("../types.zig").Value {
         return self.map.get(name);
     }
 
-    /// Set / overwrite a variable. String values are dup'd into the
-    /// arena so the caller's backing storage can go away. Numeric
-    /// values are value-typed and stored inline.
-    pub fn set(self: *SessionVars, name: []const u8, value: @import("../types.zig").Value) !void {
+    /// Set / overwrite a variable. `null` stores SQL NULL. String values are
+    /// dup'd into the arena so the caller's backing storage can go away.
+    pub fn set(self: *SessionVars, name: []const u8, value: ?@import("../types.zig").Value) !void {
         const arena_alloc = self.arena.allocator();
         const owned_name = try arena_alloc.dupe(u8, name);
-        const owned_value: @import("../types.zig").Value = switch (value) {
+        const owned_value: ?@import("../types.zig").Value = if (value) |v| switch (v) {
             .text => |s| .{ .text = try arena_alloc.dupe(u8, s) },
-            else => value,
-        };
+            else => v,
+        } else null;
         try self.map.put(self.arena.child_allocator, owned_name, owned_value);
     }
 };

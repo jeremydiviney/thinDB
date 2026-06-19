@@ -1915,8 +1915,9 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
 /// statements. Errors if the Expr didn't constant-fold to a single
 /// literal.
 fn compileSetVar(ctx: *CompileCtx, sv: ir.SetVar) !Query {
-    const value: Value = switch (sv.value) {
+    const value: ?Value = switch (sv.value) {
         .lit => |v| v,
+        .null_lit => null,
         else => return Error.UnsupportedOp,
     };
 

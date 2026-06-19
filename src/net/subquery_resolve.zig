@@ -49,7 +49,9 @@ const Error = local.Error;
 /// Look up a session variable by name. Returns the resolved Value or
 /// errors with `Error.UnknownSessionVar` (mapped to `UnsupportedOp`
 /// at the public boundary for now) when the var isn't set.
-fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !@import("../types.zig").Value {
+/// Inner optional: the variable's value, or `null` if it was `SET @x = NULL`.
+/// Errors when the variable is undefined (never set).
+fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !?@import("../types.zig").Value {
     const vars = ctx.session.vars orelse return Error.UnsupportedOp;
     return vars.get(name) orelse Error.UnsupportedOp;
 }
@@ -104,8 +106,12 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
     switch (pred.*) {
         .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .unknown => {},
         .leaf_var => |v| {
-            const resolved = try lookupSessionVar(ctx, v.var_name);
-            pred.* = .{ .leaf = .{ .col = v.col, .op = v.op, .val = resolved } };
+            // `col <op> @x` where @x is SQL NULL is UNKNOWN under 3VL (matches a
+            // null literal on the RHS); otherwise compare against the value.
+            pred.* = if (try lookupSessionVar(ctx, v.var_name)) |resolved|
+                .{ .leaf = .{ .col = v.col, .op = v.op, .val = resolved } }
+            else
+                .unknown;
         },
         .scalar_subquery => |sq| {
             if (try maybeResolveCorrelatedScalar(ctx, pred, sq)) return;
@@ -151,8 +157,10 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
     switch (e.*) {
         .col_ref, .lit, .null_lit => {},
         .var_ref => |name| {
-            const resolved = try lookupSessionVar(ctx, name);
-            e.* = .{ .lit = resolved };
+            // A variable set to SQL NULL resolves to a NULL literal; the type
+            // is unknown at this point (MySQL user vars are dynamically typed),
+            // so a permissive `.int` placeholder rides the null bit.
+            e.* = if (try lookupSessionVar(ctx, name)) |v| .{ .lit = v } else .{ .null_lit = .int };
         },
         .call => |c| {
             // Nullary temporal functions resolve to a statement-stable

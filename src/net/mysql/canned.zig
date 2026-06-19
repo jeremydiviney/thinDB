@@ -57,6 +57,16 @@ pub const EmptyResultKind = enum {
 
 /// Returns null if `sql` is not a probe query we recognize.
 /// `current_schema` (possibly empty) is the value reported by DATABASE().
+/// True for `SET @name = ...` (a MySQL user-defined variable), false for
+/// system/session vars (`SET names ...`, `SET @@global.x`, `SET autocommit`).
+/// `lc` is the normalized-lowercased statement. A single leading `@` after the
+/// `SET ` keyword marks a user variable; `@@` marks a system variable.
+fn isUserVarSet(lc: []const u8) bool {
+    if (!std.mem.startsWith(u8, lc, "set ")) return false;
+    const rest = std.mem.trimStart(u8, lc[4..], " \t");
+    return rest.len >= 1 and rest[0] == '@' and !(rest.len >= 2 and rest[1] == '@');
+}
+
 pub fn match(
     allocator: Allocator,
     sql: []const u8,
@@ -67,7 +77,11 @@ pub fn match(
 
     if (lc.len == 0) return Outcome{ .ok_packet = {} };
 
-    if (std.mem.startsWith(u8, lc, "set ") or std.mem.eql(u8, lc, "set")) {
+    // System-variable / session SETs (`SET names`, `SET autocommit=1`,
+    // `SET @@session.x=y`) are no-ops we ack with OK. But `SET @user_var = ...`
+    // is a real user-defined variable the engine must store — let it through to
+    // the compile path so the value persists for later statements.
+    if ((std.mem.startsWith(u8, lc, "set ") or std.mem.eql(u8, lc, "set")) and !isUserVarSet(lc)) {
         return Outcome{ .ok_packet = {} };
     }
 
@@ -232,6 +246,17 @@ test "canned accepts arbitrary SET as OK" {
     const m = try match(allocator, "SET autocommit=1", "");
     try std.testing.expect(m != null);
     try std.testing.expectEqual(@as(std.meta.Tag(Outcome), .ok_packet), std.meta.activeTag(m.?));
+}
+
+test "canned lets user-variable SET through to the engine, swallows system vars" {
+    const allocator = std.testing.allocator;
+    // `SET @x = ...` is a real user variable — must NOT be swallowed (null →
+    // flows to the compile path so the value persists for later statements).
+    try std.testing.expect((try match(allocator, "SET @projectId = 1000054", "")) == null);
+    try std.testing.expect((try match(allocator, "SET @x=1, @y=2", "")) == null);
+    // System/session vars stay canned-OK.
+    try std.testing.expect((try match(allocator, "SET NAMES utf8mb4", "")) != null);
+    try std.testing.expect((try match(allocator, "SET @@session.sql_mode = ''", "")) != null);
 }
 
 test "canned accepts Workbench SHOW SESSION VARIABLES probe" {

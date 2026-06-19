@@ -17,6 +17,7 @@ pub const default_port: u16 = 3306;
 const thindb_api = @import("../../api/api.zig");
 const Catalog = thindb_api.Catalog;
 const Session = thindb_api.Session;
+const SessionVars = thindb_api.SessionVars;
 const TempNamespace = thindb_api.TempNamespace;
 const ApiError = thindb_api.Error;
 const Schema = thindb_api.Schema;
@@ -278,6 +279,13 @@ const SessionState = struct {
     /// Next stmt id to hand out. MySQL drivers don't care about the
     /// numbering scheme; just needs to be stable per-connection.
     next_stmt_id: u32 = 1,
+    /// MySQL user-defined variables (`SET @x = ...`). Persisted across
+    /// statements on this connection so a `SET` is visible to a later
+    /// query. Lazily allocated by the first SET (inside compileWithSession);
+    /// the connection owns the lifetime (freed in `deinit`, reset on
+    /// COM_RESET_CONNECTION / COM_CHANGE_USER). `captureVars` copies the
+    /// pointer back after each statement compiles.
+    vars: ?*SessionVars = null,
 
     fn init(allocator: Allocator, catalog: *Catalog, backend_id: u32) !SessionState {
         return .{
@@ -291,11 +299,25 @@ const SessionState = struct {
 
     fn deinit(self: *SessionState) void {
         self.dropTempNamespace();
+        self.resetVars();
         self.allocator.free(self.current_db);
         self.allocator.free(self.current_schema);
         var it = self.prepared_statements.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit();
         self.prepared_statements.deinit(self.allocator);
+    }
+
+    /// Persist the user-variable map a just-compiled statement produced (the
+    /// pointer is stable — `CompiledQuery.deinit` deliberately doesn't free it),
+    /// so the next statement's `asSession` threads it back in.
+    fn captureVars(self: *SessionState, s: Session) void {
+        self.vars = s.vars;
+    }
+
+    /// Drop the connection's user variables (end of connection, or a reset).
+    fn resetVars(self: *SessionState) void {
+        local.CompiledQuery.freeSessionVars(self.allocator, self.vars);
+        self.vars = null;
     }
 
     /// Open the per-session temp namespace if it hasn't been opened yet.
@@ -338,6 +360,7 @@ const SessionState = struct {
             .current_schema = self.current_schema,
             .dialect = .mysql,
             .temp_namespace = self.temp_namespace,
+            .vars = self.vars,
         };
     }
 
@@ -739,6 +762,7 @@ fn handleConnection(
             // tables (drops + deletes the per-session _temp dir).
             0x1F => {
                 session.dropTempNamespace();
+                session.resetVars();
                 session.in_transaction = false;
                 try session.replace("main", "public");
                 try handshake.sendOkPacketStatus(allocator, w, 1, 0, 0, session.transactionStatus());
@@ -863,6 +887,7 @@ fn handleChangeUser(
     // optionally switches DB. Reset = drop temp namespace, clear txn,
     // reapply default schema, honor whatever schema the client passed.
     session.dropTempNamespace();
+    session.resetVars();
     session.in_transaction = false;
     try session.replace("main", "public");
     if (schema_name.len > 0) {
@@ -2775,6 +2800,7 @@ fn runSingleStatement(
         profiler.recordSince(.query_execute, exec_start);
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
+        session.captureVars(new_session);
         const affected_rows = compiled.affectedRows();
         profiler.addRowsAffected(affected_rows);
         const write_start = profiler.start();
@@ -2832,6 +2858,7 @@ fn runSingleStatement(
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
+    session.captureVars(new_session);
 }
 
 fn isSideEffectOp(op: ir.Op) bool {
@@ -3090,6 +3117,7 @@ fn handleStmtExecute(
         profiler.recordSince(.stmt_execute_engine, exec_start);
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
+        session.captureVars(new_session);
         const affected_rows = compiled.affectedRows();
         profiler.addRowsAffected(affected_rows);
         const write_start = profiler.start();
@@ -3167,6 +3195,7 @@ fn handleStmtExecute(
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
+    session.captureVars(new_session);
 }
 
 /// COM_STMT_CLOSE — destroy the prepared statement. No response.
