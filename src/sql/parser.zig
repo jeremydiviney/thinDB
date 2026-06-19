@@ -3133,6 +3133,9 @@ pub const Parser = struct {
         const pred = switch (literal_expr) {
             .lit => |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } },
             .null_lit => PredicateExpr.unknown,
+            // `col <op> @var`: the pre-compile pass rewrites leaf_var to a
+            // literal leaf once the session value is known.
+            .var_ref => |vn| PredicateExpr{ .leaf_var = .{ .col = col, .op = op, .var_name = try self.arena.dupe(u8, vn) } },
             .call => try self.makeJoinScalarFilter(col, op, literal_expr),
             else => return ParseError.SqlOnNonEquiUnsupported,
         };
@@ -3212,7 +3215,9 @@ pub const Parser = struct {
     ) ParseError!JoinExprSide {
         return switch (expr) {
             .col_ref => |name| (try self.splitJoinCol(name, left_table_names, right_table_name)).side,
-            .lit, .null_lit => .none,
+            // A session `@var` is a per-statement constant (resolved once at
+            // compile time), so it sides like a literal — never a join key.
+            .lit, .null_lit, .var_ref => .none,
             .call => |c| blk: {
                 if (!try self.joinScalarAllowed(c.fn_name)) return ParseError.SqlOnNonEquiUnsupported;
                 var side: JoinExprSide = .none;
@@ -3222,7 +3227,7 @@ pub const Parser = struct {
                 }
                 break :blk side;
             },
-            .case, .scalar_subquery, .exists_subquery, .var_ref => ParseError.SqlOnNonEquiUnsupported,
+            .case, .scalar_subquery, .exists_subquery => ParseError.SqlOnNonEquiUnsupported,
         };
     }
 

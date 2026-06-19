@@ -95,6 +95,38 @@ pub fn ymdToDays(year: i32, month: u32, day: u32) i32 {
     return @as(i32, era * 146097) + @as(i32, @intCast(doe)) - 719468;
 }
 
+/// Parse a `YYYY-MM-DD` date string to days-since-epoch. Accepts a trailing
+/// time component (so a datetime string parses as its date part). Errors on a
+/// malformed prefix — callers use that to fall back / reject.
+pub fn parseDateString(s: []const u8) !i32 {
+    if (s.len < 10) return error.Invalid;
+    if (s[4] != '-' or s[7] != '-') return error.Invalid;
+    const year = try std.fmt.parseInt(i32, s[0..4], 10);
+    const month = try std.fmt.parseInt(u32, s[5..7], 10);
+    const day = try std.fmt.parseInt(u32, s[8..10], 10);
+    if (month < 1 or month > 12 or day < 1 or day > 31) return error.Invalid;
+    return ymdToDays(year, month, day);
+}
+
+/// Parse a `YYYY-MM-DD[ T]HH:MM:SS` datetime string to micros-since-epoch.
+pub fn parseDateTimeString(s: []const u8) !i64 {
+    if (s.len < 19) return error.Invalid;
+    if (s[4] != '-' or s[7] != '-') return error.Invalid;
+    const sep = s[10];
+    if (sep != ' ' and sep != 'T') return error.Invalid;
+    if (s[13] != ':' or s[16] != ':') return error.Invalid;
+    const year = try std.fmt.parseInt(i32, s[0..4], 10);
+    const month = try std.fmt.parseInt(u32, s[5..7], 10);
+    const day = try std.fmt.parseInt(u32, s[8..10], 10);
+    const hour = try std.fmt.parseInt(u32, s[11..13], 10);
+    const minute = try std.fmt.parseInt(u32, s[14..16], 10);
+    const second = try std.fmt.parseInt(u32, s[17..19], 10);
+    if (hour > 23 or minute > 59 or second > 59) return error.Invalid;
+    const days = ymdToDays(year, month, day);
+    const day_secs: i64 = @as(i64, days) * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+    return day_secs * 1_000_000;
+}
+
 /// Days in month for a given (year, 1-indexed month). Handles Feb leap-year.
 pub fn lastDayOfMonth(year: i32, month: u32) u32 {
     return switch (month) {

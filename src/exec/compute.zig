@@ -35,6 +35,7 @@ const Expr = expr_mod.Expr;
 const predicate_mod = @import("predicate.zig");
 const PredicateExpr = predicate_mod.PredicateExpr;
 const scalar_fn = @import("scalar_fn.zig");
+const scalar_common = @import("scalar_fn_common.zig");
 const ScalarFn = scalar_fn.ScalarFn;
 const simd = @import("../util/simd.zig");
 const NullStrategy = scalar_fn.NullStrategy;
@@ -1420,13 +1421,17 @@ fn buildCallPlan(
         }
     }
 
-    const r = (try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types)) orelse return Error.ComputeNoSuchOverload;
+    var r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
+    if (r == null and try coerceTemporalStringLiterals(runtime_allocator, c.fn_name, arg_plans, arg_types)) {
+        r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
+    }
+    const rr = r orelse return Error.ComputeNoSuchOverload;
 
     // Cast scratch buffers (one per coerced arg).
     var cast_buffers: ?[]?ColumnStore = null;
-    if (r.arg_casts) |casts| {
+    if (rr.arg_casts) |casts| {
         const buffers = try runtime_allocator.alloc(?ColumnStore, casts.len);
-        for (casts, r.func.arg_types, arg_plans, buffers) |k, declared, ap, *slot| {
+        for (casts, rr.func.arg_types, arg_plans, buffers) |k, declared, ap, *slot| {
             if (k == null) {
                 slot.* = null;
                 continue;
@@ -1447,20 +1452,97 @@ fn buildCallPlan(
     // Own a nullable output ColumnStore so the next level up's null
     // propagation can see the correct validity bits.
     const output_buf = try runtime_allocator.create(ColumnStore);
-    output_buf.* = try ColumnStore.init(runtime_allocator, r.func.return_type, true);
+    output_buf.* = try ColumnStore.init(runtime_allocator, rr.func.return_type, true);
 
     const plan = try aa.create(CallPlan);
     plan.* = .{
-        .func = r.func,
+        .func = rr.func,
         .args = arg_plans,
         .arg_runtime_types = arg_types,
-        .arg_casts = r.arg_casts,
+        .arg_casts = rr.arg_casts,
         .cast_buffers = cast_buffers,
         .output = output_buf,
         .output_owned = true,
-        .output_type = r.func.return_type,
+        .output_type = rr.func.return_type,
     };
     return plan;
+}
+
+/// MySQL/StarRocks coerce string LITERALS to temporal types in temporal
+/// contexts (`DATE_ADD('2026-05-01', INTERVAL -1 MONTH)`, `LAST_DAY('2026-05-01')`).
+/// The implicit cast ladder deliberately refuses string→date for COLUMNS — a
+/// format-dependent footgun — so we special-case literals: when no overload
+/// resolves, look for one reachable by reinterpreting a string-literal arg as
+/// date/datetime, parse it, and rewrite the slot in place. Returns true when it
+/// coerced at least one argument (caller re-resolves). The literal is validated
+/// during the feasibility scan, so the commit pass never mutates partially.
+fn coerceTemporalStringLiterals(
+    runtime_allocator: Allocator,
+    fn_name: []const u8,
+    arg_plans: []ArgPlan,
+    arg_types: []Type,
+) !bool {
+    for (scalar_fn.overloadsOf(fn_name)) |f| {
+        if (f.variadic_min_args != null or f.arg_types.len != arg_types.len) continue;
+        var feasible = true;
+        var any_coerce = false;
+        for (arg_types, 0..) |given, i| {
+            const declared = f.arg_types[i];
+            if (foldStringTag(@as(types.TypeTag, declared)) == foldStringTag(@as(types.TypeTag, given))) continue;
+            if (cast.castCost(@as(types.TypeTag, given), @as(types.TypeTag, declared)) != null) continue;
+            // The only otherwise-unreachable mismatch we repair: a string
+            // LITERAL where the overload wants a temporal type, and the literal
+            // actually parses as that type.
+            if ((declared == .date or declared == .datetime) and litTemporalValue(arg_plans[i], declared) != null) {
+                any_coerce = true;
+                continue;
+            }
+            feasible = false;
+            break;
+        }
+        if (!feasible or !any_coerce) continue;
+
+        for (arg_types, 0..) |*at, i| {
+            const declared = f.arg_types[i];
+            if (declared != .date and declared != .datetime) continue;
+            const new_val = litTemporalValue(arg_plans[i], declared) orelse continue;
+            const slot = arg_plans[i].lit;
+            slot.value = new_val;
+            slot.buf.deinit(runtime_allocator);
+            slot.buf = try ColumnStore.init(runtime_allocator, literalType(new_val), false);
+            at.* = literalType(new_val);
+        }
+        return true;
+    }
+    return false;
+}
+
+/// `.varchar`/`.char` share `.string`'s representation; fold them for matching.
+fn foldStringTag(t: types.TypeTag) types.TypeTag {
+    return switch (t) {
+        .varchar, .char => .string,
+        else => t,
+    };
+}
+
+/// If `ap` is a string literal that parses as `target` (`.date`/`.datetime`),
+/// return the coerced Value; otherwise null. A datetime target accepts a plain
+/// date string (midnight). Pure — used both to test feasibility and to commit.
+fn litTemporalValue(ap: ArgPlan, target: types.TypeTag) ?types.Value {
+    const slot = switch (ap) {
+        .lit => |s| s,
+        else => return null,
+    };
+    const text = switch (slot.value) {
+        .text => |s| s,
+        else => return null,
+    };
+    return switch (target) {
+        .date => .{ .date = scalar_common.parseDateString(text) catch return null },
+        .datetime => .{ .datetime = scalar_common.parseDateTimeString(text) catch
+            (@as(i64, scalar_common.parseDateString(text) catch return null) * std.time.us_per_day) },
+        else => null,
+    };
 }
 
 /// Walk a CallPlan and release every runtime-allocated buffer

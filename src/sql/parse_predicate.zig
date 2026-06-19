@@ -179,6 +179,13 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
             const result = compareLiterals(lhs_val, op_lhs, rhs_val) catch return PE.SqlExpectedValue;
             return .{ .always = result };
         }
+        // `lit op @var` (e.g. `1 = @includeEstimates`): a constant guard. Both
+        // sides materialize as constant columns — the var resolves to a literal
+        // in the pre-compile pass — so the comparison keeps or drops every row.
+        if (p.cur.tag == .at_identifier) {
+            const rhs_expr = try p.parseAddSub();
+            return try makeExprComparisonPredicate(p, .{ .lit = lhs_val }, op_lhs, rhs_expr);
+        }
         return PE.SqlExpectedValue;
     }
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
