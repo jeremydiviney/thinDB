@@ -60,6 +60,15 @@ pub const MaterializedBuffer = struct {
     live_readers: u32 = 0,
     /// True once the column data has been freed + budget released.
     evicted: bool = false,
+    /// Per-column NDV/min-max snapshot taken from the upstream at build time
+    /// (while it's still alive) so cardinality stats survive the materialize
+    /// boundary instead of resetting to "unknown". Owned copy — the upstream's
+    /// slice dies with it after `fill()`. Capped at the realized row count once
+    /// drained. We do NOT rescan the buffer to recompute these.
+    column_stats: []exec.ColStat = &.{},
+    /// Upstream's row upper-bound, captured at build time. Reported until the
+    /// buffer is filled, after which the exact `row_count` is known.
+    upper_rows_hint: u64 = 0,
 
     pub fn init(
         allocator: Allocator,
@@ -85,12 +94,21 @@ pub const MaterializedBuffer = struct {
             inited += 1;
         }
 
+        // Snapshot the upstream's propagated stats now — it's released after
+        // fill(), so this is the only point its column_stats are reachable.
+        const up_stats = upstream.stats();
+        const cs = try allocator.alloc(exec.ColStat, up_stats.column_stats.len);
+        errdefer allocator.free(cs);
+        @memcpy(cs, up_stats.column_stats);
+
         buf.* = .{
             .allocator = allocator,
             .schema = schema_dup,
             .columns = columns,
             .upstream = upstream,
             .acct = acct,
+            .column_stats = cs,
+            .upper_rows_hint = up_stats.upper_rows,
         };
         return buf;
     }
@@ -107,6 +125,7 @@ pub const MaterializedBuffer = struct {
             self.allocator.free(self.columns);
         }
         self.allocator.free(self.schema);
+        self.allocator.free(self.column_stats);
         self.allocator.destroy(self);
     }
 
@@ -166,6 +185,10 @@ pub const MaterializedBuffer = struct {
         u.deinit();
         self.upstream = null;
         self.filled = true;
+        // Tighten the snapshot NDV bounds to the realized row count (a column
+        // can't hold more distinct values than there are rows). min/max are
+        // untouched — no rescan.
+        exec.capColStats(self.column_stats, self.row_count);
     }
 };
 
@@ -238,7 +261,10 @@ pub const Reader = struct {
     }
 
     pub fn stats(self: *Reader) exec.PipelineStats {
-        return .{ .upper_rows = self.buffer.row_count };
+        // Before fill() the realized row_count is 0 (meaningless as a bound),
+        // so report the upstream's snapshot until the buffer is drained.
+        const ur = if (self.buffer.filled) self.buffer.row_count else self.buffer.upper_rows_hint;
+        return .{ .upper_rows = ur, .column_stats = self.buffer.column_stats };
     }
 
     pub fn accountant(self: *Reader) ?*exec.memory.MemoryAccountant {
@@ -252,3 +278,46 @@ pub const Reader = struct {
         if (self.buffer.upstream) |*u| try u.explain(out, allocator, depth + 1);
     }
 };
+
+test "materialized reader forwards column stats across the boundary" {
+    const a = std.testing.allocator;
+    const schema = try a.alloc(Column, 1);
+    schema[0] = .{ .name = "x", .type = .int, .nullable = false };
+    const columns = try a.alloc(ColumnStore, 1);
+    columns[0] = try ColumnStore.init(a, .int, false);
+    const cs = try a.alloc(exec.ColStat, 1);
+    cs[0] = .{ .ndv = .{ .exact = 3 }, .min = 1, .max = 9 };
+
+    const buf = try a.create(MaterializedBuffer);
+    buf.* = .{
+        .allocator = a,
+        .schema = schema,
+        .columns = columns,
+        .upstream = null,
+        .acct = null,
+        .column_stats = cs,
+        .upper_rows_hint = 10,
+    };
+    defer buf.deinit();
+
+    var q = try Reader.create(a, buf);
+    defer q.deinit();
+
+    // Pre-fill: report the upstream's row hint, but the column stats already flow.
+    {
+        const st = q.stats();
+        try std.testing.expectEqual(@as(u64, 10), st.upper_rows);
+        try std.testing.expectEqual(@as(usize, 1), st.column_stats.len);
+        try std.testing.expectEqual(@as(u32, 3), st.column_stats[0].ndv.exact);
+        try std.testing.expectEqual(@as(?i128, 1), st.column_stats[0].min);
+        try std.testing.expectEqual(@as(?i128, 9), st.column_stats[0].max);
+    }
+    // Post-fill: exact realized row count, stats preserved.
+    buf.filled = true;
+    buf.row_count = 5;
+    {
+        const st = q.stats();
+        try std.testing.expectEqual(@as(u64, 5), st.upper_rows);
+        try std.testing.expectEqual(@as(u32, 3), st.column_stats[0].ndv.exact);
+    }
+}
