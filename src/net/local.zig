@@ -55,6 +55,7 @@ const ir = @import("../ir/ir.zig");
 const wire = @import("wire.zig");
 const wire_format = @import("wire_format.zig");
 const subquery_resolve = @import("subquery_resolve.zig");
+const predicate_pushdown = @import("predicate_pushdown.zig");
 const pgcat = @import("pg_catalog.zig");
 
 pub const Error = error{
@@ -1240,6 +1241,10 @@ pub fn compileWithSession(
     // concrete `.leaf` / `.lit`. After this pass operators never see
     // subquery nodes — they're a parse-time-only construct.
     try subquery_resolve.resolveSubqueriesInOp(&ctx, @constCast(root));
+    // Predicate pushdown: relocate single-side WHERE conjuncts below their join
+    // so the source is narrowed before the join runs. Pure plan rewrite shared
+    // by every handler. Runs on resolved predicates (concrete leaves).
+    try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
     // Projection pushdown: after subqueries are resolved to constants,
     // figure out which base columns the (single) scan must produce.
     ctx.prune_names = analyzeProjection(allocator, root);
