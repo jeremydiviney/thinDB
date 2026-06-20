@@ -898,6 +898,48 @@ pub fn concatJoinStats(
     return cc;
 }
 
+/// Merge two same-position column stats across a UNION ALL (vertical row
+/// concatenation). NDV: the union holds at most `l + r` distinct values, so a
+/// known sum saturating-adds; an unknown on either side stays unknown. Range:
+/// the union spans both, so min/max widen to the outer bounds — but only when
+/// BOTH sides bound that end (a null on either side means that end is unbounded).
+pub fn mergeUnionColStat(l: ColStat, r: ColStat) ColStat {
+    const ndv: ColCard = switch (l.ndv) {
+        .unknown => .unknown,
+        .exact => |ln| switch (r.ndv) {
+            .unknown => .unknown,
+            .exact => |rn| .{ .exact = ln +| rn },
+        },
+    };
+    const min: ?i128 = if (l.min) |lm| (if (r.min) |rm| @min(lm, rm) else null) else null;
+    const max: ?i128 = if (l.max) |lm| (if (r.max) |rm| @max(lm, rm) else null) else null;
+    return .{ .ndv = ndv, .min = min, .max = max };
+}
+
+/// Build the per-column stats for a UNION ALL over two arms whose schemas align
+/// position-for-position. NDV is re-capped at the summed row ceiling. Returns
+/// empty when neither arm carries stats (no information to merge).
+pub fn unionColStats(
+    allocator: Allocator,
+    left: Query,
+    right: Query,
+    output_len: usize,
+) ![]const ColStat {
+    const ls = left.stats().column_stats;
+    const rs = right.stats().column_stats;
+    if (ls.len == 0 and rs.len == 0) return &.{};
+    const lr = left.stats().upper_rows;
+    const rr = right.stats().upper_rows;
+    const ceiling = lr +| rr;
+    const cc = try allocator.alloc(ColStat, output_len);
+    for (cc, 0..) |*out, i| {
+        const lstat: ColStat = if (i < ls.len) ls[i] else .{};
+        const rstat: ColStat = if (i < rs.len) rs[i] else .{};
+        out.* = capColStat(mergeUnionColStat(lstat, rstat), ceiling);
+    }
+    return cc;
+}
+
 // ---------------------------------------------------------------------------
 // Re-exports — callers @import("exec.zig") for everything operator-related
 // ---------------------------------------------------------------------------

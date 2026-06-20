@@ -48,6 +48,9 @@ pub const SetUnion = struct {
     /// True for UNION ALL; reserved for the future distinct variant.
     /// v1 only constructs `all = true`.
     all: bool,
+    /// Per-output-column stats merged from both arms at create. Empty when
+    /// neither arm carried information. See `exec.unionColStats`.
+    cached_stats: []const exec.ColStat = &.{},
 
     pub fn create(allocator: Allocator, left: Query, right: Query, all: bool) !Query {
         const left_schema = left.outputSchema();
@@ -91,6 +94,9 @@ pub const SetUnion = struct {
             right_cols_inited += 1;
         }
 
+        const cached_stats = try exec.unionColStats(allocator, left, right, out_schema.len);
+        errdefer if (cached_stats.len > 0) allocator.free(@constCast(cached_stats));
+
         const self = try allocator.create(SetUnion);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -105,6 +111,7 @@ pub const SetUnion = struct {
             .right_cast_cols = right_cast_cols,
             .views = views,
             .all = all,
+            .cached_stats = cached_stats,
         };
         return makeQuery(allocator, self);
     }
@@ -122,6 +129,7 @@ pub const SetUnion = struct {
         self.allocator.free(self.left_cast_cols);
         self.allocator.free(self.right_cast_cols);
         self.allocator.free(self.views);
+        if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -141,6 +149,7 @@ pub const SetUnion = struct {
         return .{
             .upper_rows = l.upper_rows +| r.upper_rows,
             .sort_state = .{ .keys = &.{}, .global = false },
+            .column_stats = self.cached_stats,
         };
     }
 

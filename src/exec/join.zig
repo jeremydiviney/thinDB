@@ -935,8 +935,72 @@ pub const Join = struct {
     pub fn stats(self: *Join) exec.PipelineStats {
         const l = self.left.stats();
         const r = self.right.stats();
-        const product = std.math.mul(u64, l.upper_rows, r.upper_rows) catch std.math.maxInt(u64);
-        return .{ .upper_rows = product, .column_stats = self.cached_stats };
+        const ur = self.estimateUpperRows(l, r);
+        // A column's distinct count can never exceed the row count — re-cap the
+        // concatenated per-side NDVs at this join's output ceiling (idempotent).
+        exec.capColStats(@constCast(self.cached_stats), ur);
+        return .{ .upper_rows = ur, .column_stats = self.cached_stats };
+    }
+
+    /// Row-count ceiling for the join output. With no equi key the honest bound
+    /// is the cartesian product. With equi keys, the System-R estimate
+    /// |L⋈R| ≈ |L|·|R| / ∏ max(V(L,kᵢ),V(R,kᵢ)) — computed in u128 so the
+    /// |L|·|R| product can't overflow and saturate to maxInt, which used to
+    /// blind every GROUP BY router downstream of a join (the deep-CTE-chain
+    /// `est_groups=maxInt → SORT` misroute).
+    ///
+    /// `reduced` tracks whether ANY key gave a real selectivity signal. An
+    /// OUTER join with no signal is overwhelmingly an FK/dimension lookup
+    /// (~1 match per preserved row), so its realistic estimate is the
+    /// preserved side's row count, NOT the cartesian product — the product
+    /// is the pathological worst case and inflating to it cascades into a
+    /// runaway ceiling down a deep chain. (The shared MemoryPool admission
+    /// is the true OOM backstop, so a realistic-not-worst-case estimate is
+    /// the right call for routing.)
+    fn estimateUpperRows(self: *Join, l: exec.PipelineStats, r: exec.PipelineStats) u64 {
+        const lr = l.upper_rows;
+        const rr = r.upper_rows;
+        if (self.left_key_indices.len == 0) {
+            return std.math.mul(u64, lr, rr) catch std.math.maxInt(u64);
+        }
+        var divisor: u128 = 1;
+        var reduced = false;
+        for (self.left_key_indices, self.right_key_indices) |li, ri| {
+            const lv: ?u64 = if (li < l.column_stats.len) switch (l.column_stats[li].ndv) {
+                .exact => |n| n,
+                .unknown => null,
+            } else null;
+            const rv: ?u64 = if (ri < r.column_stats.len) switch (r.column_stats[ri].ndv) {
+                .exact => |n| n,
+                .unknown => null,
+            } else null;
+            if (lv == null and rv == null) continue;
+            reduced = true;
+            const d: u64 = if (lv) |a| (if (rv) |b| @max(a, b) else a) else rv.?;
+            if (d > 1) divisor *|= d;
+        }
+        const prod: u128 = @as(u128, lr) * @as(u128, rr);
+        const est128: u128 = prod / divisor;
+        const est: u64 = if (est128 > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(est128);
+        // An OUTER join preserves every row of its preserved side and, being a
+        // lookup, matches ~1 row on the other — so its row count is the
+        // preserved side's, NOT the cartesian product (System-R over a deep
+        // chain of correlated keys compounds into a runaway ceiling; the
+        // preserved-side count is the bound the data actually guarantees as a
+        // floor and the FK case hits as the exact value). INNER has no
+        // preserved side, so it keeps the System-R estimate (product when no
+        // key gives a selectivity signal).
+        // An equi-join with a selectivity signal is FK-like: its output can't
+        // exceed the larger input (the fact side; the smaller is the ~unique
+        // dimension). Capping the System-R estimate at max(lr,rr) absorbs the
+        // composite-key-uniqueness it can't see from per-column NDVs. With NO
+        // signal we keep the honest cartesian product.
+        return switch (self.join_type) {
+            .inner => if (reduced) @min(est, @max(lr, rr)) else (std.math.mul(u64, lr, rr) catch std.math.maxInt(u64)),
+            .left => lr,
+            .right => rr,
+            .full => lr +| rr,
+        };
     }
 
     pub fn next(self: *Join) !?Batch {

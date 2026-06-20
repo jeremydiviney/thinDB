@@ -923,6 +923,138 @@ test "recursive simplify: WHERE s LIKE '%a%' OR y = 1 (cheap disjunct short-circ
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, ids);
 }
 
+// ---------------------------------------------------------------------------
+// UNION ALL + JOIN cardinality propagation. The deep-CTE-chain regression:
+// a UNION used to DROP all column stats (everything downstream → unknown), and
+// a JOIN reported the cartesian product as its row ceiling (saturating to
+// maxInt over a chain), blinding the GROUP BY router. Both must now propagate.
+// ---------------------------------------------------------------------------
+
+const u2_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "a", .type = .int },
+        .{ .name = "b", .type = .int },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const u2_ok = [_][]const u8{"id"};
+const u2_opts = thindb.TableOptions{ .order_key = &u2_ok, .unique = true };
+
+test "stats: UNION ALL merges per-arm ndv + widens min/max, capped at summed rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const t = try seed(db); // sp: id 1..6, a {10,20,30}, b {100..600}
+    const t2 = try db.table("sp2", u2_schema, u2_opts);
+    try t2.insert(&.{
+        .{ .id = @as(i64, 7), .a = @as(i32, 40), .b = @as(i32, 700) },
+        .{ .id = @as(i64, 8), .a = @as(i32, 50), .b = @as(i32, 800) },
+    });
+    try t2.flush();
+
+    const left = try thindb.scan(allocator, t);
+    const right = try thindb.scan(allocator, t2);
+    var q = try thindb.exec.SetUnion.create(allocator, left, right, true);
+    defer q.deinit();
+    const s = q.stats();
+
+    try std.testing.expectEqual(@as(u64, 8), s.upper_rows); // 6 + 2
+
+    // The bug: the union dropped column_stats entirely → every downstream NDV
+    // read as unknown. Now it must carry a known, finite bound per column.
+    try std.testing.expectEqual(@as(usize, 3), s.column_stats.len);
+    switch (s.column_stats[0].ndv) {
+        .exact => |n| try std.testing.expect(n >= 6 and n <= 8), // ndv(id) ∈ [6, rows]
+        .unknown => return error.TestUnexpectedResult,
+    }
+    // Range widens to span both arms; ndv stays capped at the summed row count.
+    try std.testing.expectEqual(@as(?i128, 1), s.column_stats[0].min); // id [1,6]∪[7,8]
+    try std.testing.expectEqual(@as(?i128, 8), s.column_stats[0].max);
+    try std.testing.expectEqual(@as(?i128, 10), s.column_stats[1].min); // a [10,30]∪[40,50]
+    try std.testing.expectEqual(@as(?i128, 50), s.column_stats[1].max);
+}
+
+const dim_schema = thindb.TableSchema{
+    .columns = &.{ .{ .name = "k", .type = .bigint }, .{ .name = "v", .type = .int } },
+    .order_key = &.{"k"},
+    .unique = true,
+};
+const dim_ok = [_][]const u8{"k"};
+const dim_opts = thindb.TableOptions{ .order_key = &dim_ok, .unique = true };
+const fact_schema = thindb.TableSchema{
+    .columns = &.{ .{ .name = "fid", .type = .bigint }, .{ .name = "fk", .type = .bigint }, .{ .name = "m", .type = .int } },
+    .order_key = &.{"fid"},
+    .unique = true,
+};
+const fact_ok = [_][]const u8{"fid"};
+const fact_opts = thindb.TableOptions{ .order_key = &fact_ok, .unique = true };
+
+fn seedJoin(db: *thindb.Database) !struct { dim: *thindb.Table, fact: *thindb.Table } {
+    const dim = try db.table("dim", dim_schema, dim_opts);
+    try dim.insert(&.{
+        .{ .k = @as(i64, 1), .v = @as(i32, 10) },
+        .{ .k = @as(i64, 2), .v = @as(i32, 20) },
+        .{ .k = @as(i64, 3), .v = @as(i32, 30) },
+    });
+    try dim.flush();
+    const fact = try db.table("fact", fact_schema, fact_opts);
+    try fact.insert(&.{
+        .{ .fid = @as(i64, 100), .fk = @as(i64, 1), .m = @as(i32, 1) },
+        .{ .fid = @as(i64, 101), .fk = @as(i64, 1), .m = @as(i32, 2) },
+        .{ .fid = @as(i64, 102), .fk = @as(i64, 2), .m = @as(i32, 3) },
+        .{ .fid = @as(i64, 103), .fk = @as(i64, 3), .m = @as(i32, 4) },
+    });
+    try fact.flush();
+    return .{ .dim = dim, .fact = fact };
+}
+
+test "stats: equi-join ceiling is bounded by the larger side, never the cartesian product" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const ts = try seedJoin(db);
+
+    const l = try thindb.scan(allocator, ts.fact); // 4 rows
+    const r = try thindb.scan(allocator, ts.dim); // 3 rows
+    var q = try l.join(r, .{ .join_type = .inner, .on = &.{.{ .left = "fk", .right = "k" }} });
+    defer q.deinit();
+    const s = q.stats();
+
+    // System-R: 4·3 / max(V(fk),V(k)) capped at max(4,3). The provable result
+    // is 4 rows — NOT the cartesian 12 that used to (and saturated maxInt down
+    // a chain of joins).
+    try std.testing.expect(s.upper_rows >= 1 and s.upper_rows <= 4);
+}
+
+test "stats: LEFT join ceiling equals the preserved (left) side row count" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const ts = try seedJoin(db);
+
+    const l = try thindb.scan(allocator, ts.fact); // 4 preserved rows
+    const r = try thindb.scan(allocator, ts.dim);
+    var q = try l.join(r, .{ .join_type = .left, .on = &.{.{ .left = "fk", .right = "k" }} });
+    defer q.deinit();
+    const s = q.stats();
+
+    // A LEFT join is a lookup: it preserves every left row and matches ~1 — so
+    // the estimate is the left row count, not the cartesian product.
+    try std.testing.expectEqual(@as(u64, 4), s.upper_rows);
+}
+
 test "stats: grouped SUM(b) carries provable bounds per output" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
