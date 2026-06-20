@@ -166,7 +166,15 @@ fn collectStages(
             // nodes were still collected by the recursion above. An explicit
             // `AS MATERIALIZED` CTE stages regardless — the user demanded a
             // real buffer (and the budget charge that comes with it).
-            if ((cse.refs.get(rep) orelse 1) <= 1 and !rep.materialize.forced) return;
+            //
+            // Exception: a CTE whose body bottoms at a UNION stages even when
+            // single-referenced. A set operation is a natural buffer point, and
+            // materializing it hands every downstream CTE the EXACT
+            // passed-through row count instead of a summed-input estimate that
+            // compounds (and over-counts) down a deep chain.
+            const single_ref = (cse.refs.get(rep) orelse 1) <= 1;
+            const body_is_union = blockSource(rep.materialize.upstream) == .set_union;
+            if (single_ref and !rep.materialize.forced and !body_is_union) return;
             const q = try compileBlock(input, rep.materialize.upstream, map);
             const stage = try set.addStage(q, input.accountant);
             try map.put(input.allocator, rep, stage);
