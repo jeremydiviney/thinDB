@@ -57,6 +57,7 @@ const transform = @import("../engine/transform.zig");
 const Derived = @import("compute.zig").Derived;
 const core_scheduler = @import("../util/core_scheduler.zig");
 const Expr = @import("expr.zig").Expr;
+const ChunkRangeScan = @import("mat_stage.zig").ChunkRangeScan;
 
 /// A (segment, row_group) coordinate over the flat row-group list.
 const Coord = struct { seg: usize, rg: usize };
@@ -96,6 +97,73 @@ const WorkerBuf = struct {
     copy_ticks: u64 = 0,
 };
 
+/// A parallel-scan worker leaf — either a range-restricted segment `Scan`
+/// (table source) or a `ChunkRangeScan` over a materialized-stage stripe
+/// (buffer source). The orchestrator above this — steal loop, fusion, merge,
+/// DOP clamp — is source-agnostic; only worker creation, the snapshot/lock,
+/// the row-group profiling counters, and zone-map pruning are segment-specific.
+/// The `.chunk` arm reports "no fused filter / no surviving-unit prune", so a
+/// buffer scan runs the full-DOP streaming/materialize path unchanged.
+const Leaf = union(enum) {
+    segment: *Scan,
+    chunk: *ChunkRangeScan,
+
+    pub fn next(self: Leaf) !?Batch {
+        return switch (self) {
+            inline else => |s| s.next(),
+        };
+    }
+    fn deinit(self: Leaf) void {
+        switch (self) {
+            inline else => |s| s.deinit(),
+        }
+    }
+    fn outputSchema(self: Leaf) []const Column {
+        return switch (self) {
+            inline else => |s| s.outputSchema(),
+        };
+    }
+    fn stats(self: Leaf) exec.PipelineStats {
+        return switch (self) {
+            inline else => |s| s.stats(),
+        };
+    }
+    fn addPrune(self: Leaf, pred: predicate.Predicate) !void {
+        return switch (self) {
+            inline else => |s| s.addPrune(pred),
+        };
+    }
+    fn explain(self: Leaf, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        return switch (self) {
+            inline else => |s| s.explain(out, allocator, depth),
+        };
+    }
+    /// Segment-only: whether a WHERE was fused into the leaf (decides
+    /// materialize vs round mode). A buffer leaf never fuses a filter.
+    fn fusedActive(self: Leaf) bool {
+        return switch (self) {
+            .segment => |s| s.fusedActive(),
+            .chunk => false,
+        };
+    }
+    /// Segment-only: zone-map-surviving row groups for the DOP clamp. A buffer
+    /// has no zone maps → null → the clamp keeps the full configured DOP.
+    fn survivingWorkUnits(self: Leaf) ?usize {
+        return switch (self) {
+            .segment => |s| s.survivingWorkUnits(),
+            .chunk => null,
+        };
+    }
+    /// Segment-only: a buffer leaf declines filter fusion (any WHERE in a CTE
+    /// block was already applied by the producer stage).
+    fn tryFuseFilter(self: Leaf, expr: predicate.PredicateExpr) !bool {
+        return switch (self) {
+            .segment => |s| s.tryFuseFilter(expr),
+            .chunk => false,
+        };
+    }
+};
+
 pub const ParallelScan = struct {
     allocator: Allocator,
     table: *Table,
@@ -104,7 +172,7 @@ pub const ParallelScan = struct {
     /// CHUNK_FACTOR` byte-balanced chunks; round mode uses one per thread). In
     /// materialize mode `n_threads` worker threads steal these via `next_chunk`;
     /// in round mode it's one batch per chunk per fork-join round.
-    workers: []*Scan,
+    workers: []Leaf,
     /// Worker thread count (the effective DOP). ≤ `workers.len`; in materialize
     /// mode `n_threads` threads steal `workers.len` chunks.
     n_threads: usize,
@@ -267,7 +335,7 @@ pub const ParallelScan = struct {
         exec.prof.addPhase("pscan.create.byte_partition(footers)", @intCast(exec.prof.nowTicks() - t_part));
 
         const t_workers = exec.prof.nowTicks();
-        const workers = try allocator.alloc(*Scan, n_chunks);
+        const workers = try allocator.alloc(Leaf, n_chunks);
         var built: usize = 0;
         errdefer {
             for (workers[0..built]) |w| w.deinit();
@@ -279,7 +347,7 @@ pub const ParallelScan = struct {
             const start = flatToCoord(lo, seg_start, snap.segment_count, total_rgs);
             const end = flatToCoord(hi, seg_start, snap.segment_count, total_rgs);
             const w = try Scan.allocWithProjectionLoc(table.allocator, table, acct, needed, false, snap);
-            workers[i] = w;
+            workers[i] = .{ .segment = w };
             built += 1;
             // The last chunk also drains the memtable (ordered last).
             w.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
@@ -427,7 +495,9 @@ pub const ParallelScan = struct {
         const q = try self.allocator.alloc(Query, self.workers.len);
         self.compute_q = q;
         for (self.workers, 0..) |w, i| {
-            const sq = makeQuery(self.table.allocator, w);
+            const sq = switch (w) {
+                inline else => |p| makeQuery(self.table.allocator, p),
+            };
             q[i] = try sq.compute(derived);
             self.compute_built = i + 1;
         }
@@ -495,7 +565,9 @@ pub const ParallelScan = struct {
                 const pcs = try self.table.allocator.create(ProbeChunkScan);
                 pcs.* = .{ .ps = self, .chunk = i };
                 break :blk makeQuery(self.table.allocator, pcs);
-            } else makeQuery(self.table.allocator, w);
+            } else switch (w) {
+                inline else => |p| makeQuery(self.table.allocator, p),
+            };
             q[i] = try sq.groupBy(group_cols, aggs);
             self.agg_built = i + 1;
         }
@@ -746,12 +818,15 @@ pub const ParallelScan = struct {
         var scanned: u64 = 0;
         var rows_in: u64 = 0;
         var max_rgs: u64 = 0;
-        for (self.workers) |w| {
-            considered += w.rgs_considered;
-            scanned += w.rgs_scanned;
-            rows_in += w.rows_scanned;
-            max_rgs = @max(max_rgs, w.rgs_scanned);
-        }
+        for (self.workers) |w| switch (w) {
+            .segment => |s| {
+                considered += s.rgs_considered;
+                scanned += s.rgs_scanned;
+                rows_in += s.rows_scanned;
+                max_rgs = @max(max_rgs, s.rgs_scanned);
+            },
+            .chunk => {},
+        };
         std.debug.print("[pscan] threads={d}(eff={d}) chunks={d} drain_wall={d:.1}ms survivors={d} chunk_ms[min={d:.1} max={d:.1} mean={d:.1}]\n", .{
             self.n_threads,                       self.eff_threads,                     self.workers.len,                                        drain_wall_ms,                        rows,
             exec.prof.ticksToMs(@intCast(min_t)), exec.prof.ticksToMs(@intCast(max_t)), exec.prof.ticksToMs(@intCast(sum_t / self.workers.len)),
@@ -761,10 +836,12 @@ pub const ParallelScan = struct {
             if (considered > 0) @as(f64, @floatFromInt(considered - scanned)) * 100.0 / @as(f64, @floatFromInt(considered)) else 0.0,
             rows_in,                     max_rgs,
         });
-        const w0 = self.workers[0];
-        std.debug.print("[pscan] prune hints on worker0: leaf={d} in_set={d} seg_skip={}\n", .{
-            w0.prunes.items.len, w0.in_prunes.items.len, w0.seg_skip != null,
-        });
+        switch (self.workers[0]) {
+            .segment => |w0| std.debug.print("[pscan] prune hints on worker0: leaf={d} in_set={d} seg_skip={}\n", .{
+                w0.prunes.items.len, w0.in_prunes.items.len, w0.seg_skip != null,
+            }),
+            .chunk => {},
+        }
 
         // Tight scan-kernel time: summed ACROSS workers (so it exceeds drain_wall
         // when DOP>1 — it's total core-time in the inner loop, not wall). Borrow =
@@ -772,10 +849,13 @@ pub const ParallelScan = struct {
         // bytes. Everything else in drain_wall is loop/decision/farm-out overhead.
         var borrow_ticks: u64 = 0;
         var kernel_ticks: u64 = 0;
-        for (self.workers) |w| {
-            borrow_ticks +%= w.scan_borrow_ticks;
-            kernel_ticks +%= w.scan_kernel_ticks;
-        }
+        for (self.workers) |w| switch (w) {
+            .segment => |s| {
+                borrow_ticks +%= s.scan_borrow_ticks;
+                kernel_ticks +%= s.scan_kernel_ticks;
+            },
+            .chunk => {},
+        };
         std.debug.print("[pscan] scan-kernel core-time (summed over workers): borrow={d:.2}ms kernel(compare/gather)={d:.2}ms  rows_decoded={d} → {d:.1} M rows/core-sec in kernel\n", .{
             exec.prof.ticksToMs(@intCast(borrow_ticks)),
             exec.prof.ticksToMs(@intCast(kernel_ticks)),
@@ -791,9 +871,13 @@ pub const ParallelScan = struct {
         var sum_s: u64 = 0;
         var n_empty: usize = 0;
         for (self.workers) |w| {
-            min_s = @min(min_s, w.rgs_scanned);
-            sum_s += w.rgs_scanned;
-            if (w.rgs_scanned == 0) n_empty += 1;
+            const rgs = switch (w) {
+                .segment => |s| s.rgs_scanned,
+                .chunk => 0,
+            };
+            min_s = @min(min_s, rgs);
+            sum_s += rgs;
+            if (rgs == 0) n_empty += 1;
         }
         const mean_s = if (self.workers.len > 0) sum_s / self.workers.len else 0;
         const skew = if (mean_s > 0) @as(f64, @floatFromInt(max_rgs)) / @as(f64, @floatFromInt(mean_s)) else 0.0;
@@ -801,9 +885,10 @@ pub const ParallelScan = struct {
             min_s, max_rgs, mean_s, n_empty, self.workers.len, skew,
         });
         std.debug.print("[pscan] per-chunk scanned: ", .{});
-        for (self.workers, 0..) |w, i| {
-            std.debug.print("{d}:{d}/{d} ", .{ i, w.rgs_scanned, w.rgs_considered });
-        }
+        for (self.workers, 0..) |w, i| switch (w) {
+            .segment => |s| std.debug.print("{d}:{d}/{d} ", .{ i, s.rgs_scanned, s.rgs_considered }),
+            .chunk => std.debug.print("{d}:-/- ", .{i}),
+        };
         std.debug.print("\n", .{});
     }
 
@@ -993,7 +1078,7 @@ const ProbeChunkScan = struct {
     }
 };
 
-fn runOne(scan: *Scan, out_batch: *?Batch, out_err: *?anyerror) void {
+fn runOne(scan: anytype, out_batch: *?Batch, out_err: *?anyerror) void {
     const r = scan.next() catch |e| {
         out_err.* = e;
         return;
