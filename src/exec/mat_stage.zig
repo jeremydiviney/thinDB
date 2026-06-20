@@ -132,10 +132,17 @@ pub const Stage = struct {
     /// memory, never touches accounting.
     accountant: ?*exec.memory.MemoryAccountant = null,
     reserved_bytes: usize = 0,
+    /// Compile-order index in the StageSet — a stable label for `--profile-ops`
+    /// per-CTE timing (`[cte]` lines), nothing more.
+    id: usize = 0,
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;
         if (!self.query_alive) return error.UnsupportedQueryShape; // re-run after teardown: can't happen via MatScan
+        const prof_on = exec.prof.enabled;
+        const w0 = if (prof_on) exec.prof.nowTicks() else 0;
+        const child0 = if (prof_on) exec.prof.cteChildTicks() else 0;
+        const snap = if (prof_on) exec.prof.snapSlots() else undefined;
         const res = try self.allocator.create(MaterializedResult);
         errdefer self.allocator.destroy(res);
         res.* = .{ .allocator = self.allocator, .schema = self.schema };
@@ -157,6 +164,14 @@ pub const Stage = struct {
         self.result = res;
         self.stats_upper_rows = res.total_rows;
         exec.capColStats(self.col_stats, res.total_rows);
+        if (prof_on) {
+            const wall = exec.prof.nowTicks() - w0;
+            // Nested upstream stages triggered lazily during this drain charge
+            // their own wall to cte_child_ticks; subtract so this line is SELF.
+            const children: i64 = @intCast(exec.prof.cteChildTicks() - child0);
+            exec.prof.dumpStageDelta(self.id, res.total_rows, wall - children, wall, snap);
+            exec.prof.addCteChildTicks(@intCast(@max(wall, 0)));
+        }
     }
 
     fn releaseReserved(self: *Stage) void {
@@ -261,6 +276,7 @@ pub const StageSet = struct {
             .sort_state = sort_state,
             .col_stats = col_stats,
             .accountant = accountant,
+            .id = self.stages.items.len,
         };
         try self.stages.append(self.allocator, stage);
         return stage;

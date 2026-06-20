@@ -61,6 +61,76 @@ pub inline fn add(name: []const u8, ticks: u64) void {
 
 pub fn reset() void {
     count = 0;
+    cte_child_ticks = 0;
+}
+
+// Per-CTE-stage profiling. Each `Stage.ensureRun` drains one CTE block serially
+// on the calling thread; we snapshot the per-operator slots around that drain to
+// attribute layer time (scan / filter / aggregate / sort / window) to that one
+// stage, and net out any nested upstream stage it triggered lazily so each line
+// reports SELF cost. `cte_child_ticks` is the running sum a child contributes to
+// its parent's subtraction.
+threadlocal var cte_child_ticks: u64 = 0;
+
+pub fn cteChildTicks() u64 {
+    return cte_child_ticks;
+}
+
+pub fn addCteChildTicks(ticks: u64) void {
+    cte_child_ticks +%= ticks;
+}
+
+const SlotSnap = struct {
+    names: [48][]const u8 = undefined,
+    ticks: [48]u64 = undefined,
+    n: usize = 0,
+};
+
+pub fn snapSlots() SlotSnap {
+    var s: SlotSnap = .{ .n = count };
+    for (0..count) |i| {
+        s.names[i] = slots[i].name;
+        s.ticks[i] = slots[i].ticks;
+    }
+    return s;
+}
+
+/// Print one CTE stage's drain: SELF wall (net of nested stages), full wall
+/// (incl. nested), realized rows, and the per-operator-type time that accrued
+/// during this stage only (current slots minus the pre-drain snapshot).
+pub fn dumpStageDelta(stage_id: usize, rows: u64, self_ticks: i64, wall_ticks: i64, before: SlotSnap) void {
+    if (!enabled) return;
+    const hz: f64 = @floatFromInt(freq());
+    const self_ms = @as(f64, @floatFromInt(@max(self_ticks, 0))) * 1000.0 / hz;
+    const wall_ms = @as(f64, @floatFromInt(@max(wall_ticks, 0))) * 1000.0 / hz;
+    std.debug.print("[cte] stage#{d: <3} rows={d: <9} self={d: >8.2}ms wall={d: >8.2}ms\n", .{ stage_id, rows, self_ms, wall_ms });
+    for (slots[0..count]) |s| {
+        var prev: u64 = 0;
+        for (0..before.n) |j| {
+            if (before.names[j].ptr == s.name.ptr) {
+                prev = before.ticks[j];
+                break;
+            }
+        }
+        if (s.ticks <= prev) continue;
+        const ms = @as(f64, @floatFromInt(s.ticks - prev)) * 1000.0 / hz;
+        if (ms < 0.01) continue;
+        // The per-type counters are INCLUSIVE and global; a delta exceeding this
+        // stage's own wall is overlap leaked from a nested stage's drain, not
+        // real work in this one. A single layer can't out-cost its stage's wall.
+        if (ms > wall_ms * 1.05) continue;
+        std.debug.print("[cte]      {s: <46} {d: >8.2} ms\n", .{ shortOpName(s.name), ms });
+    }
+}
+
+/// Trim the long `exec.foo.Bar` operator type name to its leaf for the per-CTE
+/// breakdown (the full names already appear in the global `[oprof]` dump).
+fn shortOpName(name: []const u8) []const u8 {
+    var i = name.len;
+    while (i > 0) : (i -= 1) {
+        if (name[i - 1] == '.') return name[i..];
+    }
+    return name;
 }
 
 // Separate "phase" namespace for handler sub-step breakdowns (operator
