@@ -135,6 +135,9 @@ pub const Stage = struct {
     /// Compile-order index in the StageSet — a stable label for `--profile-ops`
     /// per-CTE timing (`[cte]` lines), nothing more.
     id: usize = 0,
+    /// `--profile-ops` only: ticks spent compiling this block's body (setup),
+    /// recorded by the staged compiler before the drain runs.
+    setup_ticks: i64 = 0,
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;
@@ -159,7 +162,9 @@ pub const Stage = struct {
         }
         // Release the pipeline's operator buffers right away — the stage's
         // working memory drops to just the chunked result.
+        const td0 = if (prof_on) exec.prof.nowTicks() else 0;
         self.query.deinit();
+        const teardown = if (prof_on) exec.prof.nowTicks() - td0 else 0;
         self.query_alive = false;
         self.result = res;
         self.stats_upper_rows = res.total_rows;
@@ -169,7 +174,7 @@ pub const Stage = struct {
             // Nested upstream stages triggered lazily during this drain charge
             // their own wall to cte_child_ticks; subtract so this line is SELF.
             const children: i64 = @intCast(exec.prof.cteChildTicks() - child0);
-            exec.prof.dumpStageDelta(self.id, res.total_rows, wall - children, wall, snap);
+            exec.prof.dumpStageDelta(self.id, res.total_rows, wall - children, wall, self.setup_ticks, teardown, snap);
             exec.prof.addCteChildTicks(@intCast(@max(wall, 0)));
         }
     }

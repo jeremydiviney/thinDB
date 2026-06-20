@@ -175,8 +175,10 @@ fn collectStages(
             const single_ref = (cse.refs.get(rep) orelse 1) <= 1;
             const body_is_union = blockSource(rep.materialize.upstream) == .set_union;
             if (single_ref and !rep.materialize.forced and !body_is_union) return;
+            const c0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const q = try compileBlock(input, rep.materialize.upstream, map);
             const stage = try set.addStage(q, input.accountant);
+            if (exec.prof.enabled) stage.setup_ticks = exec.prof.nowTicks() - c0;
             try map.put(input.allocator, rep, stage);
             if (rep != op) try map.put(input.allocator, op, stage);
         },
