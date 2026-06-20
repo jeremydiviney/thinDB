@@ -107,7 +107,7 @@ pub fn dumpStageDelta(stage_id: usize, rows: u64, self_ticks: i64, wall_ticks: i
     const wall_ms = @as(f64, @floatFromInt(@max(wall_ticks, 0))) * 1000.0 / hz;
     const setup_ms = @as(f64, @floatFromInt(@max(setup_ticks, 0))) * 1000.0 / hz;
     const teardown_ms = @as(f64, @floatFromInt(@max(teardown_ticks, 0))) * 1000.0 / hz;
-    std.debug.print("[cte] stage#{d: <3} rows={d: <9} setup={d: >7.2} execute={d: >8.2} teardown={d: >6.2}  (wall={d: >8.2}ms)\n", .{ stage_id, rows, setup_ms, self_ms, teardown_ms, wall_ms });
+    std.debug.print("[cte] stage#{d: <3} rows={d: <9} setup={d: >7.2}ms execute={d: >8.2}ms teardown={d: >6.2}ms  (wall={d: >8.2}ms, all wall-clock)\n", .{ stage_id, rows, setup_ms, self_ms, teardown_ms, wall_ms });
     for (slots[0..count]) |s| {
         var prev: u64 = 0;
         for (0..before.n) |j| {
