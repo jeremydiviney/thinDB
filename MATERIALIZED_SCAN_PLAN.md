@@ -70,13 +70,33 @@ Future: chunk-level min/max at `appendBatch` re-enables pruning + meta-agg.
 
 ## Phasing
 
-- **Phase 1** — extract `ScanSource`/`WorkerLeaf`, refactor table path onto
-  `TableSource`. ZERO behavior change. Gate: full suite + ClickBench identical.
-- **Phase 2** — `ChunkSource` + `ChunkRangeScan` leaf + `ensureRun` barrier.
-- **Phase 3** — wire handlers in `cte_stages` to use `ChunkSource` for
-  single-stage-input blocks; serial fallback for uncovered shapes.
+- **Phase 1 — DONE (`d6ea6ba`).** Worker leaf is a `Leaf` union
+  `{ segment: *Scan, chunk: *ChunkRangeScan }`; orchestrator (steal loop,
+  fusion, merge, DOP clamp, profiling) source-agnostic. Table path
+  behavior-preserving; full suite green; wayroll perf-neutral (~1.96s).
+- **Phase 2 — DONE (`a55503b`).** `ChunkRangeScan` leaf (`4984795`) +
+  `ParallelScan.createOverStage`: runs the stage once (barrier), shards chunks
+  into stripes, `.chunk` workers steal them. `table` now `?*Table`; new
+  `worker_alloc` (thread-safe) field; one `Stage` use registered/released.
+  Test drives it at DOP=3, multiset preserved. Full suite 410/0fail, leak-clean.
+- **Phase 3 — NEXT (the query-visible payoff).** Wire `createOverStage` into
+  the compile path so a CTE block reading one materialized stage runs parallel:
+  - **3a (smaller):** in `AdaptiveGroupBy`/`cte_stages`, when a group-by block
+    reads exactly one stage, build `createOverStage(db.allocator, …)` and try
+    `routeJoinPartialGroupBy` (offers `tryFuseAggregate` → partial aggregate
+    fused into the stripe workers = parallel). Covers count/sum/min/max; serial
+    fallback otherwise. Also wire plain scan/filter/compute blocks over a single
+    stage to `createOverStage` (parallel per-row compute — the upstream pipeline
+    CTEs). Needs: db (thread-safe) allocator + accountant threaded to the buffer
+    scan; keep single-ref inlining intact; don't double-count the stage use
+    (replace the MatScan use, don't add).
+  - **3b (the marquee win):** parameterize the **silo grid**
+    (`v2_shape_group_topn`) + `engine_v2` builders on a `ScanSource` so
+    arbitrary-aggregate grouped CTEs (`customer_agg_by_month`: MAX_BY/ANY_VALUE)
+    parallelize. This is the bigger refactor.
 - **Phase 4** — validate (suite + StarRocks parity) + measure (wayroll
-  `customer_agg_by_month` + tail parallelize; no ClickBench regression).
+  aggregate + tail parallelize; **ClickBench warm A/B** — still owed from
+  Phase 1, the table hot path is unchanged but confirm).
 
 ## Open decisions
 
