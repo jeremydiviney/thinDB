@@ -349,6 +349,91 @@ pub const MatScan = struct {
     }
 };
 
+/// A ranged, lock-free reader over a `[chunk_lo, chunk_hi)` stripe of a stage's
+/// already-materialized result — the buffer-side analogue of a range-restricted
+/// `Scan` worker. The parallel buffer scan hands each worker a disjoint stripe;
+/// they read concurrently with no locks because the `MaterializedResult` is
+/// immutable once `ensureRun` completes and every emitted `ColumnView` borrows
+/// `[]const` chunk storage.
+///
+/// Unlike `MatScan`, `next` does NOT call `ensureRun` — the orchestrator runs
+/// the stage ONCE (its barrier) before spawning workers, so a per-worker
+/// `ensureRun` would race. `stats` reports the whole stage's stats (not just the
+/// stripe), mirroring how a ranged table `Scan` reports whole-table stats — so
+/// `workers[0].stats()` yields the full-result figures the routing layer needs.
+///
+/// Ownership: a ChunkRangeScan borrows the result; it never registers a stage
+/// `use` (the single parent parallel-scan counts as one use and releases it).
+pub const ChunkRangeScan = struct {
+    allocator: Allocator,
+    stage: *Stage,
+    result: *const MaterializedResult,
+    views: []ColumnView,
+    chunk_lo: usize,
+    chunk_hi: usize,
+    cursor: usize,
+
+    pub fn create(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, chunk_lo: usize, chunk_hi: usize) !exec.Query {
+        const views = try allocator.alloc(ColumnView, stage.schema.len);
+        errdefer allocator.free(views);
+        const self = try allocator.create(ChunkRangeScan);
+        self.* = .{
+            .allocator = allocator,
+            .stage = stage,
+            .result = result,
+            .views = views,
+            .chunk_lo = chunk_lo,
+            .chunk_hi = chunk_hi,
+            .cursor = chunk_lo,
+        };
+        return exec.makeQuery(allocator, self);
+    }
+
+    pub fn next(self: *ChunkRangeScan) !?exec.Batch {
+        while (self.cursor < self.chunk_hi) {
+            const chunk = self.result.chunks.items[self.cursor];
+            self.cursor += 1;
+            if (chunk.rows == 0) continue;
+            for (chunk.cols, 0..) |*col, i| self.views[i] = col.view();
+            return exec.Batch{
+                .schema = self.stage.schema,
+                .values = self.views,
+                .row_count = chunk.rows,
+            };
+        }
+        return null;
+    }
+
+    pub fn outputSchema(self: *ChunkRangeScan) []const Column {
+        return self.stage.schema;
+    }
+
+    pub fn stats(self: *ChunkRangeScan) exec.PipelineStats {
+        return .{
+            .upper_rows = self.stage.stats_upper_rows,
+            .sort_state = self.stage.sort_state,
+            .column_stats = self.stage.col_stats,
+        };
+    }
+
+    pub fn addPrune(_: *ChunkRangeScan, _: exec.Predicate) !void {}
+
+    pub fn accountant(_: *ChunkRangeScan) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+
+    pub fn deinit(self: *ChunkRangeScan) void {
+        self.allocator.free(self.views);
+        self.allocator.destroy(self);
+    }
+
+    pub fn explain(self: *ChunkRangeScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        var buf: [80]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "ChunkRangeScan cols={d} chunks=[{d},{d})", .{ self.stage.schema.len, self.chunk_lo, self.chunk_hi }) catch "ChunkRangeScan";
+        try exec.explainLine(out, allocator, depth, line);
+    }
+};
+
 test "stage captures pipeline stats and tightens them after the run" {
     const allocator = std.testing.allocator;
 
@@ -407,6 +492,84 @@ test "stage captures pipeline stats and tightens them after the run" {
     try std.testing.expectEqual(@as(u64, 0), post.upper_rows);
     try std.testing.expectEqual(@as(u32, 0), post.column_stats[0].ndv.exact);
     try std.testing.expectEqualStrings("k", post.sort_state.keys[0]);
+}
+
+test "ChunkRangeScan: disjoint stripes cover every row exactly once" {
+    const allocator = std.testing.allocator;
+
+    // A stub that emits all `n` rows of a single bigint column in one batch,
+    // then null — the stage chunks them at `chunk_rows`.
+    const EmitStub = struct {
+        allocator: Allocator,
+        schema: [1]Column = .{.{ .name = "v", .type = .{ .bigint = {} }, .nullable = false }},
+        data: []i64,
+        views: [1]ColumnView = undefined,
+        emitted: bool = false,
+
+        pub fn next(self: *@This()) !?exec.Batch {
+            if (self.emitted) return null;
+            self.emitted = true;
+            self.views[0] = .{ .data = .{ .bigint = self.data }, .nulls = null };
+            return exec.Batch{ .schema = &self.schema, .values = &self.views, .row_count = self.data.len };
+        }
+        pub fn deinit(self: *@This()) void {
+            self.allocator.destroy(self);
+        }
+        pub fn outputSchema(self: *@This()) []const Column {
+            return &self.schema;
+        }
+        pub fn addPrune(_: *@This(), _: exec.Predicate) !void {}
+        pub fn stats(_: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        }
+        pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
+            return null;
+        }
+        pub fn explain(_: *@This(), out: *std.ArrayList(u8), a: Allocator, depth: usize) !void {
+            try exec.explainLine(out, a, depth, "EmitStub");
+        }
+    };
+
+    // One chunk (3 rows) and a multi-chunk result (> chunk_rows) exercise both
+    // the in-range and the stripe-boundary paths.
+    const row_counts = [_]usize{ 3, chunk_rows + 100 };
+    for (row_counts) |n| {
+        const data = try allocator.alloc(i64, n);
+        defer allocator.free(data);
+        for (data, 0..) |*d, i| d.* = @intCast(i);
+
+        const stub = try allocator.create(EmitStub);
+        stub.* = .{ .allocator = allocator, .data = data };
+        const sq = exec.makeQuery(allocator, stub);
+
+        const set = try StageSet.create(allocator);
+        defer set.deinit();
+        const stage = try set.addStage(sq, null);
+        try stage.ensureRun();
+        const res = stage.result.?;
+        try std.testing.expectEqual(@as(u64, n), res.total_rows);
+
+        // Split the chunk list into two disjoint stripes and confirm together
+        // they read every row exactly once, in order.
+        const n_chunks = res.chunks.items.len;
+        const mid = n_chunks / 2;
+        var seen: u64 = 0;
+        var expect_val: i64 = 0;
+        const ranges = [_][2]usize{ .{ 0, mid }, .{ mid, n_chunks } };
+        for (ranges) |r| {
+            var leaf = try ChunkRangeScan.create(allocator, stage, res, r[0], r[1]);
+            defer leaf.deinit();
+            while (try leaf.next()) |batch| {
+                const vals = batch.values[0].data.bigint;
+                for (vals) |v| {
+                    try std.testing.expectEqual(expect_val, v);
+                    expect_val += 1;
+                    seen += 1;
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(u64, n), seen);
+    }
 }
 
 /// Root wrapper: forwards everything to the outermost pipeline and tears the
