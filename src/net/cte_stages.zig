@@ -174,11 +174,17 @@ fn collectStages(
             // compounds (and over-counts) down a deep chain.
             const single_ref = (cse.refs.get(rep) orelse 1) <= 1;
             const body_is_union = blockSource(rep.materialize.upstream) == .set_union;
-            // THINDB_PROFILE_FORCE_STAGE materializes EVERY CTE (even single-ref
-            // ones that would normally inline) so `--profile-ops` emits a distinct
-            // `[cte]` line per CTE block. Correctness-neutral; adds the copy tax
-            // single-ref inlining exists to avoid — a profiling aid, not a default.
-            if (single_ref and !rep.materialize.forced and !body_is_union and !forceStageAll()) return;
+            // Profiling overrides that stage normally-inlined single-ref CTEs so
+            // `--profile-ops` emits a distinct `[cte]` line per block (both
+            // correctness-neutral, both add the copy tax inlining avoids):
+            //   THINDB_PROFILE_FORCE_STAGE   — EVERY CTE (incl. pure streaming).
+            //   THINDB_PROFILE_STAGE_BARRIERS — only CTEs whose own operations
+            //     already form a barrier (GROUP BY / ORDER BY / WINDOW / JOIN /
+            //     UNION) — those buffer internally anyway, so staging them is
+            //     close to the real execution; thin streaming CTEs stay fused.
+            const prof_stage = forceStageAll() or
+                (stageBarriersOnly() and bodyFormsBarrier(rep.materialize.upstream));
+            if (single_ref and !rep.materialize.forced and !body_is_union and !prof_stage) return;
             const c0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const q = try compileBlock(input, rep.materialize.upstream, map);
             const stage = try set.addStage(q, input.accountant);
@@ -847,4 +853,31 @@ extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 /// every CTE (disable single-ref inlining) so each one shows as its own stage.
 fn forceStageAll() bool {
     return getenv("THINDB_PROFILE_FORCE_STAGE") != null;
+}
+
+/// Profiling override: when `THINDB_PROFILE_STAGE_BARRIERS` is set, materialize
+/// only single-ref CTEs whose own operations already form a barrier.
+fn stageBarriersOnly() bool {
+    return getenv("THINDB_PROFILE_STAGE_BARRIERS") != null;
+}
+
+/// True when this CTE body's top-level operations include a blocking
+/// (pipeline-breaking) operator — GROUP BY, ORDER BY, WINDOW, JOIN, or a set
+/// op — which buffers its whole input before emitting. Peels streaming wrappers
+/// (select/filter/compute/…); stops at a leaf or a nested materialize boundary
+/// (that's a different CTE's barrier, not this one's).
+fn bodyFormsBarrier(op: *const ir.Op) bool {
+    var cur = op;
+    while (true) {
+        switch (cur.*) {
+            .group_by, .order_by, .window, .join, .set_union => return true,
+            .select => |p| cur = p.upstream,
+            .exclude => |p| cur = p.upstream,
+            .filter => |f| cur = f.upstream,
+            .compute => |c| cur = c.upstream,
+            .alias => |a| cur = a.upstream,
+            .limit => |l| cur = l.upstream,
+            else => return false,
+        }
+    }
 }
