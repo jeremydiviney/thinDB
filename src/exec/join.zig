@@ -517,6 +517,14 @@ pub const Join = struct {
 
     /// State machine.
     phase: Phase = .building,
+    /// Empty-probe short-circuit: the first probe batch is peeked before
+    /// the build phase. If the probe is empty, a non-FULL join produces
+    /// nothing, so we skip building the (potentially huge) build side
+    /// entirely. When the probe is non-empty the peeked batch is stashed
+    /// here and replayed first by `nextProbe`, so the probe side is never
+    /// double-pulled. Gated off when a skew hand-off could transfer the
+    /// probe side to an SMJ that wouldn't see this stashed batch.
+    peeked_probe: ?Batch = null,
     /// While probing: current probe batch + position within it. We
     /// can't fully consume a probe row in one .next() call if it
     /// matches many build rows; we resume from where we left off.
@@ -1011,6 +1019,23 @@ pub const Join = struct {
         while (true) {
             switch (self.phase) {
                 .building => {
+                    // Empty-probe short-circuit: a non-FULL join whose
+                    // probe (preserved) side is empty produces nothing, so
+                    // skip building the other side entirely. Gated off when
+                    // a skew hand-off could fire (INNER only) and transfer
+                    // the probe side to an SMJ that wouldn't see the peek.
+                    if (self.peeked_probe == null and
+                        self.join_type != .full and
+                        !self.probe_fused and
+                        !(self.join_type == .inner and self.skew_detector != null))
+                    {
+                        if (try self.nextProbe()) |first| {
+                            self.peeked_probe = first;
+                        } else {
+                            self.phase = .done;
+                            return null;
+                        }
+                    }
                     try self.buildPhase();
                     if (self.skew_smj) |*sm| return sm.next();
                     // FULL OUTER needs a matched-row bitmap so we can
@@ -1025,8 +1050,7 @@ pub const Join = struct {
                 },
                 .probing => {
                     if (self.probe_fused) {
-                        var probe = if (self.build_is_left) &self.right else &self.left;
-                        if (try probe.next()) |batch| return batch;
+                        if (try self.nextProbe()) |batch| return batch;
                         self.phase = .done;
                         return null;
                     }
@@ -1270,15 +1294,27 @@ pub const Join = struct {
     // hash table, emit matched output rows.
     // -----------------------------------------------------------------
 
+    /// Probe-side `.next()` with a one-batch replay buffer. The
+    /// empty-probe short-circuit peeks the first probe batch before the
+    /// build phase; `nextProbe` returns that stashed batch first so the
+    /// build side is never drained when the probe is non-empty.
+    fn nextProbe(self: *Join) !?Batch {
+        if (self.peeked_probe) |b| {
+            self.peeked_probe = null;
+            return b;
+        }
+        var probe = if (self.build_is_left) &self.right else &self.left;
+        return probe.next();
+    }
+
     /// Vectorized probe: consume whole probe batches, collect all
     /// (probe row, build row) match pairs into the scratch arrays,
     /// then bulk-gather every output column and emit one batch per
     /// probe batch. Replaces the per-row compound-key build +
     /// StringHashMap lookup + per-cell appends of the general path.
     fn probeStepFast(self: *Join, ft: *const FastTable) !?Batch {
-        var probe = if (self.build_is_left) &self.right else &self.left;
         while (true) {
-            const batch = (try probe.next()) orelse return null;
+            const batch = (try self.nextProbe()) orelse return null;
             try self.collectPairs(ft, batch, self.allocator, &self.probe_rows_scratch, &self.build_rows_scratch);
             if (self.probe_rows_scratch.items.len == 0) continue;
             return try self.emitPairs(batch);
@@ -1501,7 +1537,6 @@ pub const Join = struct {
     }
 
     fn probeStep(self: *Join) !?Batch {
-        var probe = if (self.build_is_left) &self.right else &self.left;
         const probe_key_indices = if (self.build_is_left) self.right_key_indices else self.left_key_indices;
 
         while (true) {
@@ -1556,7 +1591,7 @@ pub const Join = struct {
             }
 
             // Need a new probe batch.
-            const next_batch = (try probe.next()) orelse {
+            const next_batch = (try self.nextProbe()) orelse {
                 return null; // probe exhausted
             };
             self.cur_probe_batch = next_batch;
