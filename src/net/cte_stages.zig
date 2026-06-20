@@ -174,7 +174,11 @@ fn collectStages(
             // compounds (and over-counts) down a deep chain.
             const single_ref = (cse.refs.get(rep) orelse 1) <= 1;
             const body_is_union = blockSource(rep.materialize.upstream) == .set_union;
-            if (single_ref and !rep.materialize.forced and !body_is_union) return;
+            // THINDB_PROFILE_FORCE_STAGE materializes EVERY CTE (even single-ref
+            // ones that would normally inline) so `--profile-ops` emits a distinct
+            // `[cte]` line per CTE block. Correctness-neutral; adds the copy tax
+            // single-ref inlining exists to avoid — a profiling aid, not a default.
+            if (single_ref and !rep.materialize.forced and !body_is_union and !forceStageAll()) return;
             const c0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const q = try compileBlock(input, rep.materialize.upstream, map);
             const stage = try set.addStage(q, input.accountant);
@@ -835,4 +839,12 @@ fn noteCol(name: []const u8, ls: []const types.Column, rs: []const types.Column,
 fn exactCol(schema: []const types.Column, name: []const u8) bool {
     for (schema) |c| if (types.columnNameEql(c.name, name)) return true;
     return false;
+}
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// Profiling override: when `THINDB_PROFILE_FORCE_STAGE` is set, materialize
+/// every CTE (disable single-ref inlining) so each one shows as its own stage.
+fn forceStageAll() bool {
+    return getenv("THINDB_PROFILE_FORCE_STAGE") != null;
 }
