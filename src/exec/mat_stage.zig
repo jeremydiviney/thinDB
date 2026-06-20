@@ -165,12 +165,20 @@ pub const Stage = struct {
         self.reserved_bytes = 0;
     }
 
+    /// Register a consumer at compile time — parity with `MatScan.create`'s
+    /// `uses_total` bump. A parallel buffer scan (which fans out to N workers
+    /// over the one immutable result) counts as ONE use; it registers here and
+    /// releases once at its own deinit.
+    pub fn registerUse(self: *Stage) void {
+        self.uses_total += 1;
+    }
+
     /// A consumer finished (fully drained or torn down). On the last one,
     /// hand the chunks to a background free so the teardown overlaps the
     /// next stage; the thread is joined in `deinit`. The budget is handed
     /// back HERE (driving thread, before the async free) so accounting
     /// stays deterministic for the caller.
-    fn releaseUse(self: *Stage) void {
+    pub fn releaseUse(self: *Stage) void {
         self.uses_done += 1;
         if (self.uses_done < self.uses_total) return;
         const res = self.result orelse return;
@@ -373,7 +381,9 @@ pub const ChunkRangeScan = struct {
     chunk_hi: usize,
     cursor: usize,
 
-    pub fn create(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, chunk_lo: usize, chunk_hi: usize) !exec.Query {
+    /// Raw constructor returning the concrete pointer — the parallel buffer
+    /// scan stores these in its worker array (parity with `Scan`'s raw alloc).
+    pub fn alloc(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, chunk_lo: usize, chunk_hi: usize) !*ChunkRangeScan {
         const views = try allocator.alloc(ColumnView, stage.schema.len);
         errdefer allocator.free(views);
         const self = try allocator.create(ChunkRangeScan);
@@ -386,7 +396,11 @@ pub const ChunkRangeScan = struct {
             .chunk_hi = chunk_hi,
             .cursor = chunk_lo,
         };
-        return exec.makeQuery(allocator, self);
+        return self;
+    }
+
+    pub fn create(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, chunk_lo: usize, chunk_hi: usize) !exec.Query {
+        return exec.makeQuery(allocator, try alloc(allocator, stage, result, chunk_lo, chunk_hi));
     }
 
     pub fn next(self: *ChunkRangeScan) !?exec.Batch {
