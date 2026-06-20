@@ -341,6 +341,139 @@ fn blockScanIsPgCatalog(input: engine_v2.CompileInput, op: *const ir.Op) bool {
     }
 }
 
+/// Collect the materialized stages a generic block reads from (directly or
+/// through inline joins/unions/single-ref bodies). Filling these before the
+/// block's GROUP BY routes gives the router EXACT realized row counts instead
+/// of pre-run estimates. Deduplicated; `out` is caller-owned.
+fn collectBlockStages(
+    allocator: Allocator,
+    op: *const ir.Op,
+    map: *StageMap,
+    out: *std.ArrayListUnmanaged(*mat_stage.Stage),
+) anyerror!void {
+    switch (op.*) {
+        .materialize => |m| {
+            if (map.get(op)) |stage| {
+                for (out.items) |s| if (s == stage) return;
+                try out.append(allocator, stage);
+            } else try collectBlockStages(allocator, m.upstream, map, out);
+        },
+        .select => |p| try collectBlockStages(allocator, p.upstream, map, out),
+        .exclude => |p| try collectBlockStages(allocator, p.upstream, map, out),
+        .filter => |f| try collectBlockStages(allocator, f.upstream, map, out),
+        .order_by => |o| try collectBlockStages(allocator, o.upstream, map, out),
+        .group_by => |g| try collectBlockStages(allocator, g.upstream, map, out),
+        .compute => |c| try collectBlockStages(allocator, c.upstream, map, out),
+        .alias => |a| try collectBlockStages(allocator, a.upstream, map, out),
+        .limit => |l| try collectBlockStages(allocator, l.upstream, map, out),
+        .window => |w| try collectBlockStages(allocator, w.upstream, map, out),
+        .join => |j| {
+            try collectBlockStages(allocator, j.left, map, out);
+            try collectBlockStages(allocator, j.right, map, out);
+        },
+        .set_union => |u| {
+            try collectBlockStages(allocator, u.left, map, out);
+            try collectBlockStages(allocator, u.right, map, out);
+        },
+        else => {},
+    }
+}
+
+/// Defers the GROUP BY hash-vs-sort decision to first `next()`: it `ensureRun`s
+/// the materialized stages its input reads, so `routeGroupBy` sees the realized
+/// row count (not a pre-run estimate) — the right call for deep CTE chains
+/// where an estimate compounds badly. EXPLAIN never calls `next()`, so the plan
+/// stays cheap to print and the stages aren't run.
+const AdaptiveGroupBy = struct {
+    allocator: Allocator,
+    up: exec.Query,
+    stages: []*mat_stage.Stage,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    top_k: ?ir.Op.TopK,
+    emit_limit: ?u32,
+    budget: usize,
+    output_schema: []types.Column,
+    chosen: ?exec.Query = null,
+    routed: bool = false,
+
+    fn create(
+        allocator: Allocator,
+        up: exec.Query,
+        stages: []*mat_stage.Stage,
+        group_cols: []const []const u8,
+        aggs: []const ir.AggSpec,
+        top_k: ?ir.Op.TopK,
+        emit_limit: ?u32,
+        budget: usize,
+    ) !exec.Query {
+        const schema = try exec.aggregate_op.outputSchemaFor(allocator, up.outputSchema(), group_cols, aggs);
+        errdefer allocator.free(schema);
+        const self = try allocator.create(AdaptiveGroupBy);
+        self.* = .{
+            .allocator = allocator,
+            .up = up,
+            .stages = stages,
+            .group_cols = group_cols,
+            .aggs = aggs,
+            .top_k = top_k,
+            .emit_limit = emit_limit,
+            .budget = budget,
+            .output_schema = schema,
+        };
+        return exec.makeQuery(allocator, self);
+    }
+
+    fn ensureRouted(self: *AdaptiveGroupBy) !void {
+        if (self.routed) return;
+        self.routed = true;
+        for (self.stages) |s| try s.ensureRun();
+        self.chosen = try group_route.routeGroupBy(
+            self.allocator,
+            &self.up,
+            self.group_cols,
+            self.aggs,
+            self.top_k,
+            self.emit_limit,
+            self.budget,
+        );
+    }
+
+    pub fn next(self: *AdaptiveGroupBy) !?exec.Batch {
+        try self.ensureRouted();
+        return self.chosen.?.next();
+    }
+
+    pub fn outputSchema(self: *AdaptiveGroupBy) []const types.Column {
+        return self.output_schema;
+    }
+
+    pub fn addPrune(_: *AdaptiveGroupBy, _: exec.Predicate) !void {}
+
+    pub fn stats(self: *AdaptiveGroupBy) exec.PipelineStats {
+        if (self.chosen) |c| return c.stats();
+        return .{ .upper_rows = self.up.stats().upper_rows };
+    }
+
+    pub fn accountant(self: *AdaptiveGroupBy) ?*exec.memory.MemoryAccountant {
+        if (self.chosen) |c| return c.accountant();
+        return self.up.accountant();
+    }
+
+    pub fn explain(self: *AdaptiveGroupBy, out: *std.ArrayList(u8), alloc: Allocator, depth: usize) anyerror!void {
+        if (self.chosen) |c| return c.explain(out, alloc, depth);
+        try exec.explainLine(out, alloc, depth, "AdaptiveGroupBy (routes at runtime)");
+        try self.up.explain(out, alloc, depth + 1);
+    }
+
+    pub fn deinit(self: *AdaptiveGroupBy) void {
+        if (self.chosen) |*c| c.deinit() else self.up.deinit();
+        self.allocator.free(self.stages);
+        self.allocator.free(self.output_schema);
+        self.allocator.destroy(self);
+    }
+};
+
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
     switch (op.*) {
         .scan => |s| {
@@ -411,10 +544,30 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // the scan workers (partial per chunk, serial combine here)
             // instead of hashing the full join output on this thread.
             if (try group_route.routeJoinPartialGroupBy(input.node_arena, &up, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| return q;
-            // The same strategy routing as the table path: a stage that ends
-            // sorted on the group keys streams; a proven-over-budget or
-            // unknown-cardinality input sorts then streams; only a proven-
-            // small key space takes the hash aggregate.
+            // When the input reads materialized stages, defer the hash-vs-sort
+            // decision to runtime: priming those stages yields exact realized
+            // row counts, which beat compile-time estimates down a deep CTE
+            // chain. With no stages to prime, route now on the (already good)
+            // estimate. A stage that ends sorted on the group keys streams; a
+            // proven-over-budget / unknown-cardinality input sorts then
+            // streams; only a proven-small key space takes the hash aggregate.
+            var stages: std.ArrayListUnmanaged(*mat_stage.Stage) = .empty;
+            defer stages.deinit(input.allocator);
+            try collectBlockStages(input.allocator, g.upstream, map, &stages);
+            if (stages.items.len > 0) {
+                const owned = try input.allocator.dupe(*mat_stage.Stage, stages.items);
+                errdefer input.allocator.free(owned);
+                return AdaptiveGroupBy.create(
+                    input.allocator,
+                    up,
+                    owned,
+                    g.group_cols,
+                    g.aggs,
+                    g.top_k,
+                    g.emit_limit,
+                    input.db.config.query_memory_budget,
+                );
+            }
             return group_route.routeGroupBy(
                 input.allocator,
                 &up,

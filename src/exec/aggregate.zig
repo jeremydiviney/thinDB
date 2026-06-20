@@ -2746,6 +2746,37 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
     };
 }
 
+/// Pure GROUP BY output schema: the group-key columns (carried from the input
+/// schema) then one column per aggregate (name = `as`, type from the func +
+/// input column type). Shared by `Aggregate.create` and the adaptive router so
+/// a deferred GROUP BY can report its schema before it has picked a strategy.
+/// Caller owns the returned slice.
+pub fn outputSchemaFor(
+    allocator: Allocator,
+    up_schema: []const Column,
+    group_cols: []const []const u8,
+    aggs: []const AggSpec,
+) ![]Column {
+    const out = try allocator.alloc(Column, group_cols.len + aggs.len);
+    errdefer allocator.free(out);
+    for (group_cols, 0..) |name, i| {
+        const idx = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
+        out[i] = up_schema[idx];
+    }
+    for (aggs, 0..) |a, i| {
+        const in_t: ?Type = if (a.col) |name| blk: {
+            const idx = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
+            break :blk up_schema[idx].type;
+        } else null;
+        out[group_cols.len + i] = .{
+            .name = a.as,
+            .type = try aggOutputTypeFor(a, in_t),
+            .nullable = aggOutputNullable(a.func),
+        };
+    }
+    return out;
+}
+
 /// Output type for an AggSpec, honoring an explicit override (used by the
 /// affine-aggregate reduction to pin an int SUM base to i128). The override
 /// is only ever a wider-or-equal type than the canonical one, so finalize /

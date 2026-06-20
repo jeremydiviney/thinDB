@@ -1014,6 +1014,10 @@ pub const Derived = compute_op.Derived;
 
 pub const SetUnion = @import("set_union.zig").SetUnion;
 
+pub const mat_stage = @import("mat_stage.zig");
+pub const StageSet = mat_stage.StageSet;
+pub const MatScan = mat_stage.MatScan;
+
 pub const AliasRename = @import("alias_rename.zig").AliasRename;
 
 pub const join_op = @import("join.zig");

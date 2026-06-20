@@ -980,6 +980,66 @@ test "stats: UNION ALL merges per-arm ndv + widens min/max, capped at summed row
     try std.testing.expectEqual(@as(?i128, 50), s.column_stats[1].max);
 }
 
+test "CTE boundary: a materialized UNION stage reports the EXACT passed-through count, not the loose estimate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // Two CTE source tables, 5 rows each (id 1..5).
+    const t1 = try db.table("c1", u2_schema, u2_opts);
+    try t1.insert(&.{
+        .{ .id = @as(i64, 1), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 2), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 3), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 4), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 5), .a = @as(i32, 0), .b = @as(i32, 0) },
+    });
+    try t1.flush();
+    const t2 = try db.table("c2", u2_schema, u2_opts);
+    try t2.insert(&.{
+        .{ .id = @as(i64, 1), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 2), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 3), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 4), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 5), .a = @as(i32, 0), .b = @as(i32, 0) },
+    });
+    try t2.flush();
+
+    // CTE a = (c1 WHERE id > 3), CTE b = (c2 WHERE id > 3), each keeps exactly
+    // 2 rows — but a Filter can't know its selectivity up front, so its
+    // upper_rows estimate stays at the input count (5). The union of the two
+    // therefore *estimates* 5 + 5 = 10.
+    const s1 = try thindb.scan(allocator, t1);
+    const f1 = try s1.filter(thindb.leafExpr("id", .gt, .{ .bigint = 3 }));
+    const s2 = try thindb.scan(allocator, t2);
+    const f2 = try s2.filter(thindb.leafExpr("id", .gt, .{ .bigint = 3 }));
+    const u = try thindb.exec.SetUnion.create(allocator, f1, f2, true);
+
+    // Stage the union = the next CTE's materialization boundary. `addStage`
+    // takes ownership of `u` (freed by `set.deinit`).
+    const set = try thindb.exec.StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(u, null);
+
+    // Before the stage runs, the boundary only has the loose estimate.
+    try std.testing.expectEqual(@as(u64, 10), stage.stats_upper_rows);
+
+    // Draining the next CTE's MatScan runs the stage, materializing the union.
+    var reader = try thindb.exec.MatScan.create(allocator, stage);
+    defer reader.deinit();
+    var rows: u64 = 0;
+    while (try reader.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(u64, 4), rows); // 2 + 2 actually flowed through
+
+    // The boundary — and the next CTE reading it — now know the EXACT count.
+    // No loose guess: the materialized result is counted, not estimated.
+    try std.testing.expectEqual(@as(u64, 4), stage.stats_upper_rows);
+    try std.testing.expectEqual(@as(u64, 4), reader.stats().upper_rows);
+}
+
 const dim_schema = thindb.TableSchema{
     .columns = &.{ .{ .name = "k", .type = .bigint }, .{ .name = "v", .type = .int } },
     .order_key = &.{"k"},
