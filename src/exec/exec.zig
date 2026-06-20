@@ -634,10 +634,13 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
         fn nextWrap(ptr: *anyopaque) anyerror!?Batch {
             const o: *Op = @ptrCast(@alignCast(ptr));
             if (!prof.enabled) return o.next();
+            const saved = prof.selfEnter();
             const t0 = prof.nowTicks();
             const r = o.next();
             const d = prof.nowTicks() - t0;
-            prof.add(@typeName(Op), if (d > 0) @intCast(d) else 0);
+            const incl: u64 = if (d > 0) @intCast(d) else 0;
+            prof.add(@typeName(Op), incl);
+            prof.selfLeave(@typeName(Op), incl, saved);
             return r;
         }
         fn deinitWrap(ptr: *anyopaque) void {

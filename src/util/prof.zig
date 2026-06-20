@@ -62,6 +62,70 @@ pub inline fn add(name: []const u8, ticks: u64) void {
 pub fn reset() void {
     count = 0;
     cte_child_ticks = 0;
+    self_count = 0;
+    op_child_acc = 0;
+}
+
+// Exclusive (self) per-operator time. The inclusive `slots` above double-count
+// nested operators (a parent's time includes its children's), so they sum to
+// far more than the query wall. These SELF slots subtract each operator's
+// children, so summing them across all types ≈ the connection thread's wall —
+// a clean "where did the ~Nms go" allocation. The next() wrapper brackets each
+// call with selfEnter/selfLeave; `op_child_acc` carries a callee's inclusive
+// time up to its caller for the subtraction (stack-disciplined save/restore).
+threadlocal var self_slots: [48]Slot = undefined;
+threadlocal var self_count: usize = 0;
+threadlocal var op_child_acc: u64 = 0;
+
+pub inline fn selfEnter() u64 {
+    const saved = op_child_acc;
+    op_child_acc = 0;
+    return saved;
+}
+
+pub inline fn selfLeave(name: []const u8, incl: u64, saved_parent: u64) void {
+    const children = op_child_acc;
+    const self_t: u64 = if (incl > children) incl - children else 0;
+    var i: usize = 0;
+    while (i < self_count) : (i += 1) {
+        if (self_slots[i].name.ptr == name.ptr) {
+            self_slots[i].ticks += self_t;
+            self_slots[i].calls += 1;
+            break;
+        }
+    } else if (self_count < self_slots.len) {
+        self_slots[self_count] = .{ .name = name, .ticks = self_t, .calls = 1 };
+        self_count += 1;
+    }
+    op_child_acc = saved_parent +% incl;
+}
+
+pub fn dumpSelf(label: []const u8) void {
+    if (!enabled or self_count == 0) return;
+    const hz: f64 = @floatFromInt(freq());
+    var order: [48]usize = undefined;
+    for (0..self_count) |i| order[i] = i;
+    var a: usize = 0;
+    while (a < self_count) : (a += 1) {
+        var b = a + 1;
+        while (b < self_count) : (b += 1) {
+            if (self_slots[order[b]].ticks > self_slots[order[a]].ticks) {
+                const t = order[a];
+                order[a] = order[b];
+                order[b] = t;
+            }
+        }
+    }
+    var total: u64 = 0;
+    for (self_slots[0..self_count]) |s| total +%= s.ticks;
+    std.debug.print("[self] {s} — per-operator EXCLUSIVE wall (sums to query wall):\n", .{label});
+    for (order[0..self_count]) |idx| {
+        const s = self_slots[idx];
+        const ms = @as(f64, @floatFromInt(s.ticks)) * 1000.0 / hz;
+        const pct = if (total > 0) @as(f64, @floatFromInt(s.ticks)) * 100.0 / @as(f64, @floatFromInt(total)) else 0.0;
+        std.debug.print("[self]   {s: <44} {d: >9.2} ms  {d: >5.1}%  ({d} calls)\n", .{ shortOpName(s.name), ms, pct, s.calls });
+    }
+    std.debug.print("[self]   {s: <44} {d: >9.2} ms  100.0%\n", .{ "TOTAL (connection-thread wall)", @as(f64, @floatFromInt(total)) * 1000.0 / hz });
 }
 
 // Per-CTE-stage profiling. Each `Stage.ensureRun` drains one CTE block serially

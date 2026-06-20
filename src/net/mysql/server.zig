@@ -2831,6 +2831,7 @@ fn runSingleStatement(
         extra_status,
     );
     profiler.recordSince(.query_execute_write, write_start);
+    oprof.dumpSelf("query");
     oprof.dump("query");
     if (oprof.enabled) {
         const cs = rg_cache.globalStats();
