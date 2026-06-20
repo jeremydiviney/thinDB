@@ -128,4 +128,5 @@ test {
     _ = @import("util/huge_page.zig");
     _ = @import("exec/affine_agg.zig");
     _ = @import("exec/mat_stage.zig");
+    _ = @import("exec/parallel_scan.zig");
 }

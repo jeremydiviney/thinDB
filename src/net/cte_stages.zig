@@ -482,6 +482,28 @@ const AdaptiveGroupBy = struct {
     }
 };
 
+/// When a GROUP BY reads exactly one materialized stage with nothing between
+/// (a bare `FROM <cte>`), build the input as a parallel buffer scan instead of
+/// the serial MatScan so `routeJoinPartialGroupBy` can fuse the partial
+/// aggregate into the stripe workers. The ParallelScan counts as ONE stage use
+/// (parity with MatScan.create's bump), so it cleanly REPLACES the serial leaf
+/// — never built alongside it. Returns null for any other shape (the caller
+/// falls back to the serial `buildGenericBlock`).
+fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!?exec.Query {
+    if (input.db.config.max_dop <= 1) return null;
+    const stage = switch (op.*) {
+        .materialize => map.get(op) orelse return null,
+        else => return null,
+    };
+    return try exec.ParallelScan.createOverStage(
+        input.allocator,
+        input.db.allocator,
+        stage,
+        input.accountant,
+        input.db.config.max_dop,
+    );
+}
+
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
     switch (op.*) {
         .scan => |s| {
@@ -546,7 +568,8 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         .group_by => |g| {
             for (g.aggs) |a| if (a.func == .udf) return error.UnsupportedQueryShape;
-            var up = try buildGenericBlock(input, g.upstream, map, block_root);
+            var up = (try tryStageParallelScan(input, g.upstream, map)) orelse
+                try buildGenericBlock(input, g.upstream, map, block_root);
             errdefer up.deinit();
             // Probe-fused join below: aggregate the joined batches inside
             // the scan workers (partial per chunk, serial combine here)

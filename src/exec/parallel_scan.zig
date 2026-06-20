@@ -169,6 +169,94 @@ test "createOverStage: parallel buffer scan preserves the row multiset" {
     for (seen) |s| try std.testing.expect(s); // every row exactly once
 }
 
+test "createOverStage + fused partial aggregate drains without corruption" {
+    const allocator = std.testing.allocator;
+    const mat_stage = @import("mat_stage.zig");
+    // Workers deep-copy partials concurrently → needs a thread-safe allocator
+    // (the real server path uses the db allocator; testing.allocator is not
+    // thread-safe). c_allocator mirrors the production thread-safety.
+    const worker_alloc = std.heap.c_allocator;
+
+    const EmitStub2 = struct {
+        allocator: Allocator,
+        schema: [2]Column = .{
+            .{ .name = "k", .type = .{ .bigint = {} }, .nullable = false },
+            .{ .name = "v", .type = .{ .bigint = {} }, .nullable = false },
+        },
+        kdata: []i64,
+        vdata: []i64,
+        views: [2]ColumnView = undefined,
+        emitted: bool = false,
+
+        pub fn next(self: *@This()) !?Batch {
+            if (self.emitted) return null;
+            self.emitted = true;
+            self.views[0] = .{ .data = .{ .bigint = self.kdata }, .nulls = null };
+            self.views[1] = .{ .data = .{ .bigint = self.vdata }, .nulls = null };
+            return Batch{ .schema = &self.schema, .values = &self.views, .row_count = self.kdata.len };
+        }
+        pub fn deinit(self: *@This()) void {
+            self.allocator.destroy(self);
+        }
+        pub fn outputSchema(self: *@This()) []const Column {
+            return &self.schema;
+        }
+        pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
+        pub fn stats(_: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        }
+        pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
+            return null;
+        }
+        pub fn explain(_: *@This(), out: *std.ArrayList(u8), a: Allocator, depth: usize) !void {
+            try exec.explainLine(out, a, depth, "EmitStub2");
+        }
+    };
+
+    // Span several 65536-row chunks so DOP>1 actually stripes them across
+    // workers — each builds a partial aggregate over its own stripe.
+    const n: usize = 200_000;
+    const kdata = try allocator.alloc(i64, n);
+    defer allocator.free(kdata);
+    const vdata = try allocator.alloc(i64, n);
+    defer allocator.free(vdata);
+    for (kdata, vdata, 0..) |*k, *v, i| {
+        k.* = @intCast(i % 4); // 4 groups (low cardinality)
+        v.* = 1;
+    }
+
+    const stub = try allocator.create(EmitStub2);
+    stub.* = .{ .allocator = allocator, .kdata = kdata, .vdata = vdata };
+    const sq = exec.makeQuery(allocator, stub);
+
+    const set = try mat_stage.StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(sq, null);
+
+    var up = try ParallelScan.createOverStage(allocator, worker_alloc, stage, null, 4);
+    defer up.deinit();
+
+    const group_cols = [_][]const u8{"k"};
+    const aggs = [_]exec.AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .sum, .col = "v", .as = "sv" },
+    };
+    try std.testing.expect(try up.tryFuseAggregate(&group_cols, &aggs));
+
+    // Each stripe worker emits partial groups; summed across every partial row
+    // the count column (and the SUM(v=1) column) must each equal n — every row
+    // counted exactly once across the parallel stripes, none dropped/doubled.
+    // COUNT(*) stays bigint; SUM(bigint) widens to a largeint (i128) accumulator.
+    var total_count: i64 = 0;
+    var total_sum: i128 = 0;
+    while (try up.next()) |b| {
+        for (b.values[1].data.bigint) |c| total_count += c;
+        for (b.values[2].data.largeint) |s| total_sum += s;
+    }
+    try std.testing.expectEqual(@as(i64, @intCast(n)), total_count);
+    try std.testing.expectEqual(@as(i128, @intCast(n)), total_sum);
+}
+
 /// A parallel-scan worker leaf — either a range-restricted segment `Scan`
 /// (table source) or a `ChunkRangeScan` over a materialized-stage stripe
 /// (buffer source). The orchestrator above this — steal loop, fusion, merge,
