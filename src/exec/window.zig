@@ -1189,13 +1189,14 @@ pub const Window = struct {
         const col = self.accumulated[plan.value_col];
         const view = col.view();
         switch (col.data) {
-            .int, .bigint, .tinyint, .smallint, .largeint => {
+            inline .int, .bigint, .tinyint, .smallint, .largeint => |l| {
+                const items = l.items;
                 var sum: i128 = 0;
                 var saw_any = false;
                 var i: usize = p_start;
                 while (i < p_end) : (i += 1) {
                     if (isValid(view, perm[i])) {
-                        sum += readIntAsI128(col, perm[i]);
+                        sum += @intCast(items[perm[i]]);
                         saw_any = true;
                     }
                     if (saw_any) {
@@ -1207,13 +1208,14 @@ pub const Window = struct {
                     } else setNull(out, perm[i]);
                 }
             },
-            .float, .double => {
+            inline .float, .double => |l| {
+                const items = l.items;
                 var sum: f64 = 0;
                 var saw_any = false;
                 var i: usize = p_start;
                 while (i < p_end) : (i += 1) {
                     if (isValid(view, perm[i])) {
-                        sum += readFloatAsF64(col, perm[i]);
+                        sum += @floatCast(items[perm[i]]);
                         saw_any = true;
                     }
                     if (saw_any) try writeDouble(out, perm[i], sum) else setNull(out, perm[i]);
@@ -1235,13 +1237,20 @@ pub const Window = struct {
         const view = col.view();
         var sum: f64 = 0;
         var n: i64 = 0;
-        var i: usize = p_start;
-        while (i < p_end) : (i += 1) {
-            if (isValid(view, perm[i])) {
-                sum += readNumericAsF64(col, perm[i]);
-                n += 1;
-            }
-            if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], sum / @as(f64, @floatFromInt(n)));
+        switch (col.data) {
+            inline .int, .bigint, .tinyint, .smallint, .largeint, .float, .double => |l| {
+                const items = l.items;
+                const is_float = @typeInfo(@TypeOf(items[0])) == .float;
+                var i: usize = p_start;
+                while (i < p_end) : (i += 1) {
+                    if (isValid(view, perm[i])) {
+                        sum += if (is_float) @floatCast(items[perm[i]]) else @floatFromInt(items[perm[i]]);
+                        n += 1;
+                    }
+                    if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], sum / @as(f64, @floatFromInt(n)));
+                }
+            },
+            else => return Error.WindowUnsupported,
         }
     }
 
@@ -1323,15 +1332,18 @@ pub const Window = struct {
         const col = self.accumulated[plan.value_col];
         const view = col.view();
         var saw_value = false;
+        // Bind the typed slice ONCE (inline switch), then index it in the row
+        // loop — no per-element data-union dispatch.
         switch (col.data) {
-            .int, .bigint, .tinyint, .smallint, .largeint => {
+            inline .int, .bigint, .tinyint, .smallint, .largeint => |l| {
+                const items = l.items;
                 var sum: i128 = 0;
                 var k: usize = lo;
                 while (k <= hi) : (k += 1) {
                     const r = perm[k];
                     if (!isValid(view, r)) continue;
                     saw_value = true;
-                    sum += readIntAsI128(col, r);
+                    sum += @intCast(items[r]);
                 }
                 if (!saw_value) {
                     setNull(out, out_idx);
@@ -1345,14 +1357,15 @@ pub const Window = struct {
                     }
                 }
             },
-            .float, .double => {
+            inline .float, .double => |l| {
+                const items = l.items;
                 var sum: f64 = 0;
                 var k: usize = lo;
                 while (k <= hi) : (k += 1) {
                     const r = perm[k];
                     if (!isValid(view, r)) continue;
                     saw_value = true;
-                    sum += readFloatAsF64(col, r);
+                    sum += @floatCast(items[r]);
                 }
                 if (!saw_value) setNull(out, out_idx) else try writeDouble(out, out_idx, sum);
             },
@@ -1374,12 +1387,23 @@ pub const Window = struct {
         var sum: f64 = 0;
         var n: i64 = 0;
         switch (col.data) {
-            .int, .bigint, .tinyint, .smallint, .largeint, .float, .double => {
+            inline .int, .bigint, .tinyint, .smallint, .largeint => |l| {
+                const items = l.items;
                 var k: usize = lo;
                 while (k <= hi) : (k += 1) {
                     const r = perm[k];
                     if (!isValid(view, r)) continue;
-                    sum += readNumericAsF64(col, r);
+                    sum += @floatFromInt(items[r]);
+                    n += 1;
+                }
+            },
+            inline .float, .double => |l| {
+                const items = l.items;
+                var k: usize = lo;
+                while (k <= hi) : (k += 1) {
+                    const r = perm[k];
+                    if (!isValid(view, r)) continue;
+                    sum += @floatCast(items[r]);
                     n += 1;
                 }
             },
@@ -2270,34 +2294,3 @@ fn copyCell(src: ColumnStore, src_row: u32, out: *ColumnStore, out_row: u32) !vo
     setValid(out, out_row);
 }
 
-fn readIntAsI128(col: ColumnStore, row: u32) i128 {
-    return switch (col.data) {
-        .int => |l| @intCast(l.items[row]),
-        .bigint => |l| @intCast(l.items[row]),
-        .tinyint => |l| @intCast(l.items[row]),
-        .smallint => |l| @intCast(l.items[row]),
-        .largeint => |l| l.items[row],
-        else => 0,
-    };
-}
-
-fn readFloatAsF64(col: ColumnStore, row: u32) f64 {
-    return switch (col.data) {
-        .float => |l| @floatCast(l.items[row]),
-        .double => |l| l.items[row],
-        else => 0,
-    };
-}
-
-fn readNumericAsF64(col: ColumnStore, row: u32) f64 {
-    return switch (col.data) {
-        .int => |l| @floatFromInt(l.items[row]),
-        .bigint => |l| @floatFromInt(l.items[row]),
-        .tinyint => |l| @floatFromInt(l.items[row]),
-        .smallint => |l| @floatFromInt(l.items[row]),
-        .largeint => |l| @floatFromInt(l.items[row]),
-        .float => |l| @floatCast(l.items[row]),
-        .double => |l| l.items[row],
-        else => 0,
-    };
-}
