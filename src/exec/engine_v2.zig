@@ -732,7 +732,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
 // row at a time (the Q29 40s trap). Any non-fusable remainder (CASE, subqueries)
 // is layered as a serial Compute referencing the fused cols. Mirrors
 // net/local.zig's fusion split.
-fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived: []const ir.Derived, udf_registry: ?*const @import("../udf.zig").UdfRegistry) !exec.Query {
+pub fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived: []const ir.Derived, udf_registry: ?*const @import("../udf.zig").UdfRegistry) !exec.Query {
     var result = q;
     const scan_cols = result.outputSchema();
     var fusable: std.ArrayListUnmanaged(ir.Derived) = .empty;

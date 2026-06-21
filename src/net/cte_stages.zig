@@ -516,7 +516,79 @@ fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *S
     );
 }
 
+/// A pure row-streaming chain — compute / filter / select / exclude / alias —
+/// crossing CTE boundaries with NO blocking op, bottoming at exactly one
+/// materialized stage, carrying real per-row work (a compute or filter). Such a
+/// chain fuses end-to-end into a parallel BUFFER scan that streams (round mode,
+/// no full-result copy): the derived columns / predicates evaluate on `max_dop`
+/// cores instead of the serial MatScan drain. Gated to multi-chunk stages so
+/// the round-pool overhead is amortized.
+fn streamingChainOverStage(op: *const ir.Op, map: *StageMap) bool {
+    var has_work = false;
+    var cur = op;
+    while (true) {
+        switch (cur.*) {
+            .materialize => {
+                const stage = map.get(cur) orelse return false;
+                return has_work and stage.stats_upper_rows > mat_stage.chunk_rows;
+            },
+            .compute => |c| {
+                has_work = true;
+                cur = c.upstream;
+            },
+            .filter => |f| {
+                has_work = true;
+                cur = f.upstream;
+            },
+            .select => |p| cur = p.upstream,
+            .exclude => |e| cur = e.upstream,
+            .alias => |a| cur = a.upstream,
+            else => return false,
+        }
+    }
+}
+
+/// Build a streaming chain over one materialized stage as a streaming PARALLEL
+/// buffer scan: `createOverStage` at the leaf, filter/compute fused into the
+/// stripe workers (round mode emits batch-at-a-time, no full-result copy).
+/// Mirrors `buildGenericBlock`'s streaming arms but pushes the fusable compute
+/// down via `computeDerivedFused`. Precondition: `streamingChainOverStage`.
+fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
+    switch (op.*) {
+        .materialize => return (try tryStageParallelScan(input, op, map)) orelse error.UnsupportedQueryShape,
+        .compute => |c| {
+            var up = try buildFusedStreamOverStage(input, c.upstream, map);
+            errdefer up.deinit();
+            return engine_v2.computeDerivedFused(input.allocator, up, c.derived, input.udf_registry);
+        },
+        .filter => |f| {
+            var up = try buildFusedStreamOverStage(input, f.upstream, map);
+            errdefer up.deinit();
+            return up.filter(f.predicate);
+        },
+        .select => |s| {
+            var up = try buildFusedStreamOverStage(input, s.upstream, map);
+            errdefer up.deinit();
+            return local.compileSelectProject(input.allocator, up, s);
+        },
+        .exclude => |e| {
+            var up = try buildFusedStreamOverStage(input, e.upstream, map);
+            errdefer up.deinit();
+            const remaining = try local.complementColumns(input.allocator, up.outputSchema(), e.columns);
+            defer input.allocator.free(remaining);
+            return up.project(remaining);
+        },
+        .alias => |a| {
+            var up = try buildFusedStreamOverStage(input, a.upstream, map);
+            errdefer up.deinit();
+            return exec.AliasRename.create(input.allocator, up, a.alias);
+        },
+        else => unreachable,
+    }
+}
+
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
+    if (input.db.config.max_dop > 1 and streamingChainOverStage(op, map)) return buildFusedStreamOverStage(input, op, map);
     switch (op.*) {
         .scan => |s| {
             // Only pg_catalog virtual scans route here; real-table blocks

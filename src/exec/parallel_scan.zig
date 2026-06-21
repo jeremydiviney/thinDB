@@ -949,10 +949,16 @@ pub const ParallelScan = struct {
         if (self.mode == .unset) {
             // Fusion happens after create() (the wrapping Filter/Compute fuse on
             // their way up), so the strategy is settled by the first pull. A
-            // fused filter (bounded survivors) OR a fused compute (we run the
-            // derived columns in the workers) ⇒ materialize + concat; otherwise
-            // survivors would be the whole table, so stream via fork-join rounds.
-            self.mode = if (self.agg_fused or self.workers[0].fusedActive() or self.compute_fused) .materialize else .round;
+            // fused filter (bounded survivors) ⇒ materialize + concat. A fused
+            // compute over a BUFFER source streams (round mode): the workers run
+            // the derived columns per stripe and emit batch-at-a-time, so a
+            // streaming CTE chain crosses the stage boundary parallel with NO
+            // full-result copy. (Table-source compute still materializes — the
+            // table hot path is unchanged.)
+            const compute_streams = self.compute_fused and self.table == null;
+            const force_mat = self.agg_fused or self.workers[0].fusedActive() or
+                (self.compute_fused and !compute_streams);
+            self.mode = if (force_mat) .materialize else .round;
             if (self.mode == .materialize) try self.runMaterialize();
         }
         return switch (self.mode) {
@@ -1212,7 +1218,14 @@ pub const ParallelScan = struct {
             const i = self.next_chunk.fetchAdd(1, .acq_rel);
             if (i >= n) break;
             if (!self.exhausted[i]) {
-                if (self.probe_sink) |sink| self.runOneProbe(sink, i) else runOne(self.workers[i], &self.round[i], &self.werr[i]);
+                if (self.probe_sink) |sink|
+                    self.runOneProbe(sink, i)
+                else if (self.compute_fused)
+                    // Streaming compute: each stripe runs its fused Compute chain
+                    // and stages the derived batch (round mode = no full copy).
+                    runOne(&self.compute_q[i], &self.round[i], &self.werr[i])
+                else
+                    runOne(self.workers[i], &self.round[i], &self.werr[i]);
             }
             _ = self.round_done.fetchAdd(1, .release);
         }
