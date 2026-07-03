@@ -689,12 +689,53 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // Fuse ORDER BY + LIMIT into a bounded top-k (keep limit+offset rows
             // in a heap) instead of a full Sort then Limit — the same fusion the
             // table path already does. Over a multi-million-row buffer a full
-            // sort for a small LIMIT is the dominant cost.
-            if (l.upstream.* == .order_by) {
-                const o = l.upstream.order_by;
+            // sort for a small LIMIT is the dominant cost. Row-wise layers
+            // (projection / rename / compute) between the LIMIT and the ORDER
+            // BY commute with the bound: look through them, fuse the top-k
+            // below, and re-apply them above — they then run on `n` rows
+            // instead of the full sorted input.
+            var layers: std.ArrayListUnmanaged(*const ir.Op) = .empty;
+            defer layers.deinit(input.allocator);
+            var cur: *const ir.Op = l.upstream;
+            while (true) {
+                switch (cur.*) {
+                    .select, .exclude => |p| {
+                        try layers.append(input.allocator, cur);
+                        cur = p.upstream;
+                    },
+                    .compute => |c2| {
+                        try layers.append(input.allocator, cur);
+                        cur = c2.upstream;
+                    },
+                    .alias => |a| {
+                        try layers.append(input.allocator, cur);
+                        cur = a.upstream;
+                    },
+                    else => break,
+                }
+            }
+            if (cur.* == .order_by) {
+                const o = cur.order_by;
                 var up = try buildGenericBlock(input, o.upstream, map, block_root);
                 errdefer up.deinit();
-                return up.topN(o.specs, @intCast(l.n), @intCast(l.offset));
+                up = try up.topN(o.specs, @intCast(l.n), @intCast(l.offset));
+                // Re-apply the looked-through layers innermost-first.
+                var i = layers.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    up = switch (layers.items[i].*) {
+                        .select => |s| try local.compileSelectProject(input.allocator, up, s),
+                        .exclude => |e| blk: {
+                            const remaining = try local.complementColumns(input.allocator, up.outputSchema(), e.columns);
+                            defer input.allocator.free(remaining);
+                            break :blk try up.project(remaining);
+                        },
+                        .compute => |c2| try up.computeWithRegistry(c2.derived, input.udf_registry),
+                        .alias => |a| try exec.AliasRename.create(input.allocator, up, a.alias),
+                        else => unreachable,
+                    };
+                }
+                return up;
             }
             var up = try buildGenericBlock(input, l.upstream, map, block_root);
             errdefer up.deinit();
