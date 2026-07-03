@@ -2435,3 +2435,316 @@ test "join: type mismatch on join key errors" {
     left.deinit();
     right.deinit();
 }
+
+// ---------------------------------------------------------------------------
+// Pass-through probe (LEFT/RIGHT + unique or empty build): probe columns are
+// borrowed views, build columns gathered or bulk-NULLed. These pin the mode's
+// row alignment, NULL handling, and its refusal to engage on duplicate keys.
+// ---------------------------------------------------------------------------
+
+test "join: LEFT pass-through — unique build keys emit every probe row in order" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    // orders LEFT JOIN users: build = users (uid 1,2,3 — unique) → the
+    // pass-through probe runs. oid=103 (uid=99) misses → NULL user name.
+    const left = try thindb.scan(allocator, f.orders);
+    const right = try thindb.scan(allocator, f.users);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    // Schema: oid, uid, qty, name (right uid dropped).
+    var oids: std.ArrayList(i64) = .empty;
+    defer oids.deinit(allocator);
+    var qtys: std.ArrayList(i32) = .empty;
+    defer qtys.deinit(allocator);
+    var name_null_oid: i64 = 0;
+    var names_seen: usize = 0;
+    while (try q.next()) |b| {
+        try oids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+        try qtys.appendSlice(allocator, b.values[2].data.int[0..b.row_count]);
+        for (0..b.row_count) |i| {
+            if (b.values[3].isValid(i)) {
+                names_seen += 1;
+            } else {
+                name_null_oid = b.values[0].data.bigint[i];
+            }
+        }
+    }
+    // Every probe row emits exactly once, in probe order.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 101, 102, 103 }, oids.items);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30, 40 }, qtys.items);
+    try std.testing.expectEqual(@as(usize, 3), names_seen);
+    try std.testing.expectEqual(@as(i64, 103), name_null_oid);
+}
+
+test "join: LEFT pass-through — multi-key unique build (general probe path)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dim_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "k1", .type = .bigint },
+            .{ .name = "k2", .type = .int },
+            .{ .name = "label", .type = .string },
+        },
+        .order_key = &.{"k1"},
+        .unique = false,
+    };
+    const fact_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "fid", .type = .bigint },
+            .{ .name = "k1", .type = .bigint },
+            .{ .name = "k2", .type = .int },
+            .{ .name = "note", .type = .string },
+        },
+        .order_key = &.{"fid"},
+        .unique = true,
+    };
+    const dim_ok = [_][]const u8{"k1"};
+    const fact_ok = [_][]const u8{"fid"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const dim = try db.table("dim", dim_schema, .{ .order_key = &dim_ok, .row_group_size = 4 });
+    try dim.insert(&.{
+        .{ .k1 = @as(i64, 1), .k2 = @as(i32, 10), .label = "a" },
+        .{ .k1 = @as(i64, 1), .k2 = @as(i32, 20), .label = "b" }, // same k1, unique (k1,k2)
+        .{ .k1 = @as(i64, 2), .k2 = @as(i32, 10), .label = "c" },
+    });
+    try dim.flush();
+
+    const fact = try db.table("fact", fact_schema, .{ .order_key = &fact_ok, .unique = true, .row_group_size = 4 });
+    try fact.insert(&.{
+        .{ .fid = @as(i64, 1), .k1 = @as(i64, 1), .k2 = @as(i32, 10), .note = "n1" },
+        .{ .fid = @as(i64, 2), .k1 = @as(i64, 1), .k2 = @as(i32, 20), .note = "n2" },
+        .{ .fid = @as(i64, 3), .k1 = @as(i64, 2), .k2 = @as(i32, 10), .note = "n3" },
+        .{ .fid = @as(i64, 4), .k1 = @as(i64, 9), .k2 = @as(i32, 99), .note = "n4" }, // miss
+    });
+    try fact.flush();
+
+    const left = try thindb.scan(allocator, fact);
+    const right = try thindb.scan(allocator, dim);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{ .{ .left = "k1", .right = "k1" }, .{ .left = "k2", .right = "k2" } },
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    // Schema: fid, k1, k2, note, label (right k1/k2 dropped).
+    var fids: std.ArrayList(i64) = .empty;
+    defer fids.deinit(allocator);
+    var labels: std.ArrayList(u8) = .empty;
+    defer labels.deinit(allocator);
+    while (try q.next()) |b| {
+        try fids.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+        for (0..b.row_count) |i| {
+            if (b.values[4].isValid(i)) {
+                const sv = b.values[4].data.string;
+                try labels.appendSlice(allocator, sv.rowBytes(i));
+            } else {
+                try labels.append(allocator, '-');
+            }
+        }
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4 }, fids.items);
+    try std.testing.expectEqualStrings("abc-", labels.items);
+}
+
+test "join: LEFT pass-through — empty build side null-extends every probe row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const empty_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "uid", .type = .bigint },
+            .{ .name = "tag", .type = .string },
+            .{ .name = "score", .type = .int },
+        },
+        .order_key = &.{"uid"},
+        .unique = true,
+    };
+    const empty_ok = [_][]const u8{"uid"};
+    const empty = try f.db.table("empty_dim", empty_schema, .{ .order_key = &empty_ok, .unique = true });
+
+    const left = try thindb.scan(allocator, f.orders);
+    const right = try thindb.scan(allocator, empty);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    // Schema: oid, uid, qty, tag, score. All right cols NULL on all 4 rows.
+    var rows: usize = 0;
+    var oid_sum: i64 = 0;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        for (0..b.row_count) |i| {
+            oid_sum += b.values[0].data.bigint[i];
+            try std.testing.expect(!b.values[3].isValid(i));
+            try std.testing.expect(!b.values[4].isValid(i));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), rows);
+    try std.testing.expectEqual(@as(i64, 100 + 101 + 102 + 103), oid_sum);
+}
+
+test "join: INNER with empty build side short-circuits to no output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    const empty_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "uid", .type = .bigint },
+            .{ .name = "tag", .type = .string },
+        },
+        .order_key = &.{"uid"},
+        .unique = true,
+    };
+    const empty_ok = [_][]const u8{"uid"};
+    const empty = try f.db.table("empty_dim2", empty_schema, .{ .order_key = &empty_ok, .unique = true });
+
+    const left = try thindb.scan(allocator, f.orders);
+    const right = try thindb.scan(allocator, empty);
+    var q = try left.join(right, .{
+        .join_type = .inner,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 0), rows);
+}
+
+test "join: LEFT pass-through + range — unique-key candidate rejected null-extends" {
+    // Build keys unique (one candidate per key) so the pass-through probe
+    // runs; the range then rejects some candidates in place.
+    //   k=1, l.x=10 vs r.y=15: passes → real match
+    //   k=2, l.x=20 vs r.y=5:  fails  → null-extend
+    //   k=3: no candidate      → null-extend
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const l_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "x", .type = .int },
+        },
+        .order_key = &.{"k"},
+        .unique = true,
+    };
+    const r_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "y", .type = .int },
+        },
+        .order_key = &.{"k"},
+        .unique = true,
+    };
+    const l_ok = [_][]const u8{"k"};
+    const r_ok = [_][]const u8{"k"};
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const lt = try db.table("pl", l_schema, .{ .order_key = &l_ok, .unique = true });
+    try lt.insert(&.{
+        .{ .k = @as(i64, 1), .x = @as(i32, 10) },
+        .{ .k = @as(i64, 2), .x = @as(i32, 20) },
+        .{ .k = @as(i64, 3), .x = @as(i32, 30) },
+    });
+    try lt.flush();
+
+    const rt = try db.table("pr", r_schema, .{ .order_key = &r_ok, .unique = true });
+    try rt.insert(&.{
+        .{ .k = @as(i64, 1), .y = @as(i32, 15) },
+        .{ .k = @as(i64, 2), .y = @as(i32, 5) },
+    });
+    try rt.flush();
+
+    const left = try thindb.scan(allocator, lt);
+    const right = try thindb.scan(allocator, rt);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "k", .right = "k" }},
+        .ranges = &.{.{ .left = "x", .op = .lt, .right = "y" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    // Schema: k, x, y.
+    var ks: std.ArrayList(i64) = .empty;
+    defer ks.deinit(allocator);
+    var y_valid: std.ArrayList(u8) = .empty;
+    defer y_valid.deinit(allocator);
+    while (try q.next()) |b| {
+        try ks.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+        for (0..b.row_count) |i| {
+            try y_valid.append(allocator, if (b.values[2].isValid(i)) 'v' else '-');
+        }
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ks.items);
+    try std.testing.expectEqualStrings("v--", y_valid.items);
+}
+
+test "join: pass-through declines on duplicate build keys (fallback intact)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try outerFixture(allocator, io, tmp.dir);
+    defer f.db.close();
+
+    // users LEFT JOIN orders: build = orders whose uid has duplicates
+    // (100 and 101 both uid=1) → NOT pass-through. uid=1 must fan out to
+    // TWO rows — exactly what pass-through can't produce.
+    const left = try thindb.scan(allocator, f.users);
+    const right = try thindb.scan(allocator, f.orders);
+    var q = try left.join(right, .{
+        .join_type = .left,
+        .on = &.{.{ .left = "uid", .right = "uid" }},
+        .algorithm = .hash,
+    });
+    defer q.deinit();
+
+    var rows: usize = 0;
+    var uid1_rows: usize = 0;
+    while (try q.next()) |b| {
+        rows += b.row_count;
+        for (0..b.row_count) |i| {
+            if (b.values[0].data.bigint[i] == 1) uid1_rows += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), rows); // 2 + 1 + 1 null-extended
+    try std.testing.expectEqual(@as(usize, 2), uid1_rows);
+}

@@ -340,7 +340,7 @@ const output_batch_rows: usize = 1024;
 /// row index — build sides are capped well below u32 max.
 const FAST_EMPTY = std.math.maxInt(u32);
 
-const FastKeyKind = enum { int, string };
+const FastKeyKind = enum { int, string, compound };
 
 /// Compile-time mirror of tryBuildFastTable's key-type gate.
 fn fastKindOfType(t: TypeTag) ?FastKeyKind {
@@ -349,6 +349,44 @@ fn fastKindOfType(t: TypeTag) ?FastKeyKind {
         .varchar, .string, .char => .string,
         else => null,
     };
+}
+
+/// Most key columns a compound FastTable carries. More falls back to the
+/// general compound-key hash path (never seen in practice).
+const MAX_FAST_KEYS: usize = 8;
+
+/// Digest one key cell for compound-key slotting: int-family values by
+/// their widened 64-bit pattern, strings by wyhash of the bytes. Only used
+/// for slot selection — chain entries verify real equality per cell.
+fn fastCellDigest(view: ColumnView, row: u32) u64 {
+    return switch (view.data) {
+        .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => fastIntKey(view, row),
+        .varchar, .string, .char => std.hash.Wyhash.hash(0, stringRowBytes(view, row)),
+        else => unreachable,
+    };
+}
+
+/// Order-sensitive combine of the per-cell digests of `views` at `row`.
+/// Build and probe use the SAME pair order (each side's key views in
+/// `on`-spec order), so equal key tuples digest identically.
+fn fastCompoundDigest(views: []const ColumnView, row: u32) u64 {
+    var h: u64 = 0x9e3779b97f4a7c15;
+    for (views) |v| h = fastMix(h ^ fastCellDigest(v, row));
+    return h;
+}
+
+fn anyViewNull(views: []const ColumnView, row: u32) bool {
+    for (views) |v| if (!v.isValid(row)) return true;
+    return false;
+}
+
+/// Real per-cell equality between a probe row and a build row across every
+/// key pair — the compound chain's digest-collision guard.
+fn compoundRowsEqual(probe_views: []const ColumnView, probe_row: u32, build_views: []const ColumnView, build_row: u32) bool {
+    for (probe_views, build_views) |pv, bv| {
+        if (!compareCellsOp(pv, probe_row, bv, build_row, .eq)) return false;
+    }
+    return true;
 }
 
 /// Open-addressing hash table over a single build-side join key,
@@ -370,8 +408,11 @@ const FastTable = struct {
     mask: u64,
     next: []u32,
     /// View over the build key column, captured after buildPhase
-    /// (build_columns are immutable from then on).
+    /// (build_columns are immutable from then on). Single-key kinds only.
     build_key_view: ColumnView,
+    /// `.compound` only: one view per key column, in `on`-pair order.
+    /// Arena-owned; empty for single-key kinds.
+    build_key_views: []const ColumnView = &.{},
 };
 
 /// murmur3 finalizer — raw int keys need mixing before masking.
@@ -495,6 +536,19 @@ pub const Join = struct {
     /// buildPhase when the join shape qualifies (see tryBuildFastTable).
     /// Null = the general row-at-a-time probe runs instead.
     fast_table: ?FastTable = null,
+    /// True while every non-NULL build key is distinct — tracked for free
+    /// during buildPhase (compound-key map) / tryBuildFastTable (chains).
+    /// String-digest collisions conservatively clear it. With a preserved
+    /// probe side, uniqueness guarantees exactly one output row per probe
+    /// row, in probe order — the gate for the pass-through probe.
+    build_keys_unique: bool = true,
+    /// Pass-through probe mode, decided once after buildPhase (see
+    /// passThroughEligible): every probe row emits exactly once in order,
+    /// so probe-side output columns are borrowed views straight from the
+    /// probe batch (zero copy) and only build-side columns are gathered
+    /// (or bulk-NULLed when the build is empty). Replaces both the
+    /// per-cell general emit and the pair-gather emit for this shape.
+    passthrough: bool = false,
     /// Whole-batch pair-collection scratch for the fast path: parallel
     /// arrays of (probe row, build row) in probe-row order, FAST_EMPTY
     /// build entries marking preserved-side miss rows.
@@ -806,8 +860,14 @@ pub const Join = struct {
             .output_columns = output_columns,
             .views = views,
         };
-        self.fast_eligible = resolved_ranges.len == 0 and spec.on.len == 1 and
-            fastKindOfType(build_schema[(if (build_is_left) left_keys else right_keys)[0]].type) != null;
+        self.fast_eligible = blk: {
+            if (resolved_ranges.len != 0 or spec.on.len == 0 or spec.on.len > MAX_FAST_KEYS) break :blk false;
+            const bkeys = if (build_is_left) left_keys else right_keys;
+            for (bkeys) |ki| {
+                if (fastKindOfType(build_schema[ki].type) == null) break :blk false;
+            }
+            break :blk true;
+        };
 
         // Commit the parallel probe at COMPILE time when the shape is
         // FastTable-eligible — fusion must be settled before any operator
@@ -1038,6 +1098,13 @@ pub const Join = struct {
                     }
                     try self.buildPhase();
                     if (self.skew_smj) |*sm| return sm.next();
+                    // Empty-build short-circuit: with nothing to match and
+                    // no preserved probe side, the join produces nothing —
+                    // skip streaming the probe entirely.
+                    if (self.build_rows == 0 and !self.probeSidePreserved()) {
+                        self.phase = .done;
+                        return null;
+                    }
                     // FULL OUTER needs a matched-row bitmap so we can
                     // emit the unmatched build rows at the end.
                     if (self.join_type == .full) {
@@ -1046,6 +1113,7 @@ pub const Join = struct {
                             self.build_rows,
                         );
                     }
+                    self.passthrough = self.passThroughEligible();
                     self.phase = .probing;
                 },
                 .probing => {
@@ -1054,7 +1122,9 @@ pub const Join = struct {
                         self.phase = .done;
                         return null;
                     }
-                    const step = if (self.fast_table) |*ft|
+                    const step = if (self.passthrough)
+                        try self.probeStepPass()
+                    else if (self.fast_table) |*ft|
                         try self.probeStepFast(ft)
                     else
                         try self.probeStep();
@@ -1143,6 +1213,8 @@ pub const Join = struct {
                     // Dup the key into the arena — scratch is reused.
                     gop.key_ptr.* = try aa.dupe(u8, self.key_scratch.items);
                     gop.value_ptr.* = .empty;
+                } else {
+                    self.build_keys_unique = false;
                 }
                 try gop.value_ptr.append(aa, self.build_rows + i);
                 // Sampling: observe one in every `skew_sample_interval`
@@ -1196,15 +1268,20 @@ pub const Join = struct {
     fn tryBuildFastTable(self: *Join) !void {
         if (self.skew_smj != null) return;
         if (!self.fast_eligible) return;
-        const build_key_idx = if (self.build_is_left) self.left_key_indices[0] else self.right_key_indices[0];
-        const key_view = self.build_columns[build_key_idx].view();
-        const kind: FastKeyKind = switch (key_view.data) {
+        const aa = self.arena.allocator();
+        const build_key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
+        const key_view = self.build_columns[build_key_indices[0]].view();
+        const kind: FastKeyKind = if (build_key_indices.len > 1) .compound else switch (key_view.data) {
             .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
             .varchar, .string, .char => .string,
             else => return,
         };
+        var key_views: []ColumnView = &.{};
+        if (kind == .compound) {
+            key_views = try aa.alloc(ColumnView, build_key_indices.len);
+            for (build_key_indices, key_views) |ki, *v| v.* = self.build_columns[ki].view();
+        }
 
-        const aa = self.arena.allocator();
         const n: usize = self.build_rows;
         const cap = std.math.ceilPowerOfTwoAssert(usize, @max(16, n * 2));
         const slot_keys = try aa.alloc(u64, cap);
@@ -1216,10 +1293,19 @@ pub const Join = struct {
         var row: u32 = @intCast(n);
         while (row > 0) {
             row -= 1;
-            if (!key_view.isValid(row)) continue;
             const key = switch (kind) {
-                .int => fastIntKey(key_view, row),
-                .string => std.hash.Wyhash.hash(0, stringRowBytes(key_view, row)),
+                .int => blk: {
+                    if (!key_view.isValid(row)) continue;
+                    break :blk fastIntKey(key_view, row);
+                },
+                .string => blk: {
+                    if (!key_view.isValid(row)) continue;
+                    break :blk std.hash.Wyhash.hash(0, stringRowBytes(key_view, row));
+                },
+                .compound => blk: {
+                    if (anyViewNull(key_views, row)) continue;
+                    break :blk fastCompoundDigest(key_views, row);
+                },
             };
             var slot = (if (kind == .int) fastMix(key) else key) & mask;
             while (true) {
@@ -1230,6 +1316,11 @@ pub const Join = struct {
                     break;
                 }
                 if (slot_keys[slot] == key) {
+                    // Same key (or same digest, for string/compound kinds —
+                    // treated as a duplicate conservatively) already
+                    // resident: chains of length > 1 exist, so pass-through
+                    // can't assume one match per probe row.
+                    self.build_keys_unique = false;
                     chain_next[row] = heads[slot];
                     heads[slot] = row;
                     break;
@@ -1245,6 +1336,7 @@ pub const Join = struct {
             .mask = mask,
             .next = chain_next,
             .build_key_view = key_view,
+            .build_key_views = key_views,
         };
     }
 
@@ -1327,6 +1419,14 @@ pub const Join = struct {
     /// passed scratches, so concurrent calls with distinct scratches are
     /// safe (the fused-probe workers rely on this; matched_build is null
     /// there — FULL never fuses).
+    /// The probe side's key views in `on`-pair order (compound kind), into
+    /// caller-provided storage.
+    fn probeKeyViews(self: *const Join, batch: Batch, storage_buf: *[MAX_FAST_KEYS]ColumnView) []const ColumnView {
+        const indices = if (self.build_is_left) self.right_key_indices else self.left_key_indices;
+        for (indices, 0..) |ki, i| storage_buf[i] = batch.values[ki];
+        return storage_buf[0..indices.len];
+    }
+
     fn collectPairs(
         self: *Join,
         ft: *const FastTable,
@@ -1339,6 +1439,8 @@ pub const Join = struct {
         const preserved = self.probeSidePreserved();
         const n = batch.row_count;
         const key_view = batch.values[probe_key_idx];
+        var pkv_buf: [MAX_FAST_KEYS]ColumnView = undefined;
+        const probe_views = if (ft.kind == .compound) self.probeKeyViews(batch, &pkv_buf) else &.{};
 
         probe_rows.clearRetainingCapacity();
         build_rows.clearRetainingCapacity();
@@ -1347,7 +1449,8 @@ pub const Join = struct {
 
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            if (!key_view.isValid(i)) {
+            const key_null = if (ft.kind == .compound) anyViewNull(probe_views, i) else !key_view.isValid(i);
+            if (key_null) {
                 if (preserved) try pushPair(alloc, probe_rows, build_rows, i, FAST_EMPTY);
                 continue;
             }
@@ -1382,6 +1485,25 @@ pub const Join = struct {
                             var r = head;
                             while (r != FAST_EMPTY) : (r = ft.next[r]) {
                                 if (!std.mem.eql(u8, stringRowBytes(ft.build_key_view, r), bytes)) continue;
+                                found = true;
+                                try pushPair(alloc, probe_rows, build_rows, i, r);
+                                if (self.matched_build) |*mb| mb.set(r);
+                            }
+                            break;
+                        }
+                        slot = (slot + 1) & ft.mask;
+                    }
+                },
+                .compound => {
+                    const key = fastCompoundDigest(probe_views, i);
+                    var slot = key & ft.mask;
+                    while (true) {
+                        const head = ft.heads[slot];
+                        if (head == FAST_EMPTY) break;
+                        if (ft.slot_keys[slot] == key) {
+                            var r = head;
+                            while (r != FAST_EMPTY) : (r = ft.next[r]) {
+                                if (!compoundRowsEqual(probe_views, i, ft.build_key_views, r)) continue;
                                 found = true;
                                 try pushPair(alloc, probe_rows, build_rows, i, r);
                                 if (self.matched_build) |*mb| mb.set(r);
@@ -1451,6 +1573,184 @@ pub const Join = struct {
     }
 
     // -----------------------------------------------------------------
+    // Pass-through probe: when the probe side is preserved and the build
+    // guarantees at most one match per probe row (empty, or all keys
+    // unique), every probe row emits exactly once in probe order. The
+    // output batch is then row-aligned with the probe batch, so probe-
+    // side columns are borrowed views (zero copy) and only build-side
+    // columns get gathered — or bulk-NULLed when the build is empty.
+    // Serial probe and fused workers share resolve + emit below.
+    // -----------------------------------------------------------------
+
+    /// Decided once, right after buildPhase.
+    fn passThroughEligible(self: *const Join) bool {
+        if (self.skew_smj != null) return false;
+        if (!self.probeSidePreserved()) return false;
+        // Empty build: every probe row null-extends exactly once; FULL's
+        // drain has nothing to add, so even FULL qualifies here.
+        if (self.build_rows == 0) return true;
+        // Non-empty FULL can't pass through — the drain phase appends
+        // unmatched build rows after the probe.
+        if (self.join_type == .full) return false;
+        return self.build_keys_unique;
+    }
+
+    fn probeStepPass(self: *Join) !?Batch {
+        while (true) {
+            const batch = (try self.nextProbe()) orelse return null;
+            if (batch.row_count == 0) continue;
+            try self.resolvePassMatches(batch, self.allocator, &self.build_rows_scratch);
+            return try self.emitPassThrough(batch, self.build_rows_scratch.items, self.output_columns, self.views, self.allocator);
+        }
+    }
+
+    /// First build row whose key equals probe row `i`'s key, or FAST_EMPTY.
+    /// In pass-through mode chains are length 1 (uniqueness gate), so
+    /// "first" is "only" — the byte/cell verification still guards digest
+    /// equality against genuine mismatches. `probe_views` is read only by
+    /// the compound kind.
+    fn fastLookupFirst(ft: *const FastTable, key_view: ColumnView, probe_views: []const ColumnView, i: u32) u32 {
+        switch (ft.kind) {
+            .int => {
+                const key = fastIntKey(key_view, i);
+                var slot = fastMix(key) & ft.mask;
+                while (true) {
+                    if (ft.heads[slot] == FAST_EMPTY) return FAST_EMPTY;
+                    if (ft.slot_keys[slot] == key) return ft.heads[slot];
+                    slot = (slot + 1) & ft.mask;
+                }
+            },
+            .string => {
+                const bytes = stringRowBytes(key_view, i);
+                const key = std.hash.Wyhash.hash(0, bytes);
+                var slot = key & ft.mask;
+                while (true) {
+                    const head = ft.heads[slot];
+                    if (head == FAST_EMPTY) return FAST_EMPTY;
+                    if (ft.slot_keys[slot] == key) {
+                        var r = head;
+                        while (r != FAST_EMPTY) : (r = ft.next[r]) {
+                            if (std.mem.eql(u8, stringRowBytes(ft.build_key_view, r), bytes)) return r;
+                        }
+                        return FAST_EMPTY;
+                    }
+                    slot = (slot + 1) & ft.mask;
+                }
+            },
+            .compound => {
+                const key = fastCompoundDigest(probe_views, i);
+                var slot = key & ft.mask;
+                while (true) {
+                    const head = ft.heads[slot];
+                    if (head == FAST_EMPTY) return FAST_EMPTY;
+                    if (ft.slot_keys[slot] == key) {
+                        var r = head;
+                        while (r != FAST_EMPTY) : (r = ft.next[r]) {
+                            if (compoundRowsEqual(probe_views, i, ft.build_key_views, r)) return r;
+                        }
+                        return FAST_EMPTY;
+                    }
+                    slot = (slot + 1) & ft.mask;
+                }
+            },
+        }
+    }
+
+    /// Resolve the (at most one) build match per probe row into `out_rows`
+    /// — exactly one entry per probe row, FAST_EMPTY marking a miss. Range
+    /// predicates reject in place (the row null-extends, preserving the
+    /// one-emit-per-probe-row alignment). Thread-safe for fused workers:
+    /// the compound-key branch (which reuses self.key_scratch) is
+    /// unreachable there because fusion is only offered to FastTable
+    /// shapes.
+    fn resolvePassMatches(
+        self: *Join,
+        batch: Batch,
+        alloc: Allocator,
+        out_rows: *std.ArrayListUnmanaged(u32),
+    ) !void {
+        const n = batch.row_count;
+        out_rows.clearRetainingCapacity();
+        if (self.build_rows == 0) {
+            try out_rows.appendNTimes(alloc, FAST_EMPTY, n);
+            return;
+        }
+        try out_rows.ensureUnusedCapacity(alloc, n);
+        const probe_key_indices = if (self.build_is_left) self.right_key_indices else self.left_key_indices;
+        if (self.fast_table) |*ft| {
+            const key_view = batch.values[probe_key_indices[0]];
+            var pkv_buf: [MAX_FAST_KEYS]ColumnView = undefined;
+            const probe_views = if (ft.kind == .compound) self.probeKeyViews(batch, &pkv_buf) else &.{};
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                const key_null = if (ft.kind == .compound) anyViewNull(probe_views, i) else !key_view.isValid(i);
+                var m: u32 = if (!key_null) fastLookupFirst(ft, key_view, probe_views, i) else FAST_EMPTY;
+                if (m != FAST_EMPTY and self.ranges.len > 0 and !self.passesAllRanges(batch, i, m)) m = FAST_EMPTY;
+                out_rows.appendAssumeCapacity(m);
+            }
+        } else {
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                var m: u32 = FAST_EMPTY;
+                if (!anyKeyNull(batch, probe_key_indices, i)) {
+                    self.key_scratch.clearRetainingCapacity();
+                    try buildCompoundKey(self.allocator, &self.key_scratch, batch, probe_key_indices, i);
+                    if (self.hash_table.get(self.key_scratch.items)) |bucket| m = bucket.items[0];
+                }
+                if (m != FAST_EMPTY and self.ranges.len > 0 and !self.passesAllRanges(batch, i, m)) m = FAST_EMPTY;
+                out_rows.appendAssumeCapacity(m);
+            }
+        }
+    }
+
+    /// Emit one output batch row-aligned with `batch`: probe-side output
+    /// columns are the probe batch's own views; build-side columns gather
+    /// by `rows` into this path's staging stores (cleared per emit — the
+    /// previous batch's views die with the consume-before-next() contract,
+    /// same as flushOutput's deferred clear).
+    fn emitPassThrough(
+        self: *Join,
+        batch: Batch,
+        rows: []const u32,
+        out_cols: []ColumnStore,
+        out_views: []ColumnView,
+        alloc: Allocator,
+    ) !Batch {
+        const left_count = self.left_col_count;
+        var out_idx: usize = 0;
+        if (self.build_is_left) {
+            var i: usize = 0;
+            while (i < left_count) : (i += 1) {
+                const store = &out_cols[out_idx];
+                store.clear();
+                try gatherBuildColumn(alloc, self.build_columns[i].view(), rows, store);
+                out_views[out_idx] = store.view();
+                out_idx += 1;
+            }
+            for (batch.values, 0..) |v, idx2| {
+                if (!self.right_kept_mask[idx2]) continue;
+                out_views[out_idx] = v;
+                out_idx += 1;
+            }
+        } else {
+            var i: usize = 0;
+            while (i < left_count) : (i += 1) {
+                out_views[out_idx] = batch.values[i];
+                out_idx += 1;
+            }
+            for (self.build_columns, 0..) |*bc, idx2| {
+                if (!self.right_kept_mask[idx2]) continue;
+                const store = &out_cols[out_idx];
+                store.clear();
+                try gatherBuildColumn(alloc, bc.view(), rows, store);
+                out_views[out_idx] = store.view();
+                out_idx += 1;
+            }
+        }
+        return .{ .schema = self.output_schema, .values = out_views, .row_count = batch.row_count };
+    }
+
+    // -----------------------------------------------------------------
     // Fused parallel probe (ProbeSink implementation): the probe side's
     // ParallelScan workers call sinkProcess concurrently, one in-flight
     // call per chunk. Everything read here is immutable after the build
@@ -1496,6 +1796,11 @@ pub const Join = struct {
         const self: *Join = @ptrCast(@alignCast(ctx));
         const ch = &self.probe_chunks[chunk];
         const alloc = self.probe_chunk_alloc;
+        if (self.passthrough) {
+            if (batch.row_count == 0) return null;
+            try self.resolvePassMatches(batch, alloc, &ch.build_rows);
+            return try self.emitPassThrough(batch, ch.build_rows.items, ch.out_cols, ch.views, alloc);
+        }
         const ft = &self.fast_table.?;
         try self.collectPairs(ft, batch, alloc, &ch.probe_rows, &ch.build_rows);
         if (ch.probe_rows.items.len == 0) return null;
@@ -1526,8 +1831,7 @@ pub const Join = struct {
             var end = start;
             if (rows[start] == FAST_EMPTY) {
                 while (end < rows.len and rows[end] == FAST_EMPTY) : (end += 1) {}
-                var j = start;
-                while (j < end) : (j += 1) try appendNullTo(alloc, out);
+                try out.appendNulls(alloc, end - start);
             } else {
                 while (end < rows.len and rows[end] != FAST_EMPTY) : (end += 1) {}
                 try transform.appendByIndices(alloc, view, rows[start..end], out);
@@ -1717,6 +2021,10 @@ pub const Join = struct {
     }
 
     fn flushOutput(self: *Join) !?Batch {
+        // Pass-through emits whole batches directly and leaves its last
+        // gathered build columns in output_columns (the returned views
+        // borrow them). Flushing those here would re-emit stale rows.
+        if (self.passthrough) return null;
         // pending_clear means the staged rows were already yielded by a
         // previous flush and just haven't been cleared yet (the clear is
         // deferred to the next emit). Without this guard, a probe that
