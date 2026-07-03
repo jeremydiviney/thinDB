@@ -94,6 +94,34 @@ pub fn compareViewRows(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.m
     };
 }
 
+/// Borrowed row-range view over a column — the zero-copy slicing primitive
+/// for splitting one materialized column into chunk/batch windows. `off`
+/// must be a multiple of 8 so the validity bitmap slices on a byte
+/// boundary. String offsets stay absolute into the full bytes buffer, so
+/// the offsets window slices without rebasing.
+pub fn subViewAligned(v: ColumnView, off: usize, n: usize) ColumnView {
+    std.debug.assert(off % 8 == 0);
+    const nulls: ?[]const u8 = if (v.nulls) |bm| bm[off / 8 ..] else null;
+    return switch (v.data) {
+        .int => |s| .{ .data = .{ .int = s[off..][0..n] }, .nulls = nulls },
+        .bigint => |s| .{ .data = .{ .bigint = s[off..][0..n] }, .nulls = nulls },
+        .boolean => |s| .{ .data = .{ .boolean = s[off..][0..n] }, .nulls = nulls },
+        .tinyint => |s| .{ .data = .{ .tinyint = s[off..][0..n] }, .nulls = nulls },
+        .smallint => |s| .{ .data = .{ .smallint = s[off..][0..n] }, .nulls = nulls },
+        .float => |s| .{ .data = .{ .float = s[off..][0..n] }, .nulls = nulls },
+        .double => |s| .{ .data = .{ .double = s[off..][0..n] }, .nulls = nulls },
+        .date => |s| .{ .data = .{ .date = s[off..][0..n] }, .nulls = nulls },
+        .datetime => |s| .{ .data = .{ .datetime = s[off..][0..n] }, .nulls = nulls },
+        .largeint => |s| .{ .data = .{ .largeint = s[off..][0..n] }, .nulls = nulls },
+        .decimal64 => |s| .{ .data = .{ .decimal64 = s[off..][0..n] }, .nulls = nulls },
+        .decimal128 => |s| .{ .data = .{ .decimal128 = s[off..][0..n] }, .nulls = nulls },
+        .uuid => |s| .{ .data = .{ .uuid = s[off..][0..n] }, .nulls = nulls },
+        .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+    };
+}
+
 /// Append every row of `view` (including its validity bits if `view.nulls`
 /// is non-null) to `out`. Types must match.
 pub fn appendAllColumn(
@@ -115,17 +143,12 @@ pub fn appendAllColumn(
             .boolean => |*list| try list.appendSlice(allocator, s),
             else => unreachable,
         },
-        .varchar => |sv| switch (out.data) {
-            .varchar => |*ss| {
-                for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
-            },
-            else => unreachable,
-        },
-        .string => |sv| switch (out.data) {
-            .string => |*ss| {
-                for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
-            },
-            else => unreachable,
+        // String family: dispatch on whichever string store is active — a
+        // union / stage boundary may reconcile varchar/char data under a
+        // `string` schema tag while streaming the arm's views uncast (see
+        // set_union.zig sameRepr), so exact-tag matching would be wrong.
+        .varchar, .string, .char => |sv| {
+            for (0..sv.rowCount()) |i| try appendStrValue(allocator, out, sv.rowBytes(i));
         },
         .float => |s| switch (out.data) {
             .float => |*list| try list.appendSlice(allocator, s),
@@ -153,12 +176,6 @@ pub fn appendAllColumn(
         },
         .largeint => |s| switch (out.data) {
             .largeint => |*list| try list.appendSlice(allocator, s),
-            else => unreachable,
-        },
-        .char => |sv| switch (out.data) {
-            .char => |*ss| {
-                for (0..sv.rowCount()) |i| try ss.appendValue(allocator, sv.rowBytes(i));
-            },
             else => unreachable,
         },
         .decimal64 => |s| switch (out.data) {

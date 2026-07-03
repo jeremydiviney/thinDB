@@ -28,6 +28,7 @@ const engine_v2 = @import("../exec/engine_v2.zig");
 const group_route = @import("../exec/group_route.zig");
 const partitioned_aggregate = @import("../exec/partitioned_aggregate.zig");
 const mat_stage = @import("../exec/mat_stage.zig");
+const window_op = @import("../exec/window.zig");
 const local = @import("local.zig");
 const pgcat = @import("pg_catalog.zig");
 const types = @import("../types.zig");
@@ -73,10 +74,66 @@ pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op, stage_co
         cse.canon.deinit(input.allocator);
     }
     try countMatRefs(input.allocator, root, &cse);
+    wrapWindowsInMaterialize(input.node_arena, @constCast(root), &cse) catch {};
     try collectStages(input, root, set, &map, &cse);
     if (stage_count_out) |out| out.* = @intCast(set.stages.items.len);
     const inner = try compileBlock(input, root, &map);
+    set.releaseCompilePins();
     return mat_stage.StagedRoot.create(input.allocator, inner, set);
+}
+
+/// Pre-execution rewrite (window-output-as-stage): wrap every `.window`
+/// node in a synthetic forced `.materialize` so the staged compiler gives
+/// it a real stage. The stage adopts the window's materialized buffers
+/// zero-copy (Stage.adopt_window), and everything ABOVE the window then
+/// compiles as a chain over a stage — the existing parallel buffer-scan
+/// machinery — instead of pulling the window's emit serially. A window
+/// that is already a materialize body double-wraps harmlessly: the outer
+/// (single-ref) node inlines and reads the inner forced stage.
+fn wrapWindowsInMaterialize(node_arena: Allocator, op: *ir.Op, cse: *const MatCse) anyerror!void {
+    switch (op.*) {
+        .select => |*p| try wrapWindowChild(node_arena, &p.upstream, cse),
+        .exclude => |*p| try wrapWindowChild(node_arena, &p.upstream, cse),
+        .filter => |*f| try wrapWindowChild(node_arena, &f.upstream, cse),
+        .order_by => |*o| try wrapWindowChild(node_arena, &o.upstream, cse),
+        .group_by => |*g| try wrapWindowChild(node_arena, &g.upstream, cse),
+        .compute => |*c| try wrapWindowChild(node_arena, &c.upstream, cse),
+        .alias => |*a| try wrapWindowChild(node_arena, &a.upstream, cse),
+        .limit => |*l| try wrapWindowChild(node_arena, &l.upstream, cse),
+        .window => |*w| try wrapWindowChild(node_arena, &w.upstream, cse),
+        .materialize => |*m| {
+            // A CTE that will stage anyway (multi-ref or AS MATERIALIZED)
+            // and whose body IS the window adopts it directly through its
+            // own stage — an inner wrap would only add a copy layer. A
+            // single-ref (inlining) CTE body still wants the wrap.
+            const rep = cse.canon.get(op) orelse op;
+            const stages_anyway = (cse.refs.get(rep) orelse 1) > 1 or op.materialize.forced;
+            if (stages_anyway and m.upstream.* == .window) {
+                try wrapWindowsInMaterialize(node_arena, m.upstream, cse);
+            } else {
+                try wrapWindowChild(node_arena, &m.upstream, cse);
+            }
+        },
+        .join => |*j| {
+            try wrapWindowChild(node_arena, &j.left, cse);
+            try wrapWindowChild(node_arena, &j.right, cse);
+        },
+        .set_union => |*u| {
+            try wrapWindowChild(node_arena, &u.left, cse);
+            try wrapWindowChild(node_arena, &u.right, cse);
+        },
+        else => {},
+    }
+}
+
+fn wrapWindowChild(node_arena: Allocator, child: **ir.Op, cse: *const MatCse) anyerror!void {
+    const c = child.*;
+    if (c.* == .window) {
+        const wrap = try node_arena.create(ir.Op);
+        wrap.* = .{ .materialize = .{ .upstream = c, .forced = true } };
+        child.* = wrap;
+    }
+    try wrapWindowsInMaterialize(node_arena, c, cse);
 }
 
 const MatRefCounts = std.AutoHashMapUnmanaged(*const ir.Op, u32);
@@ -185,8 +242,14 @@ fn collectStages(
             if ((single_ref or noStage()) and !rep.materialize.forced and !prof_stage) return;
             const c0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             var q = try compileBlock(input, rep.materialize.upstream, map);
-            q = pruneStageColumns(input, q);
+            // A window-rooted body hands its buffers to the stage zero-copy
+            // (Stage.adopt_window); output pruning would wrap a Project over
+            // the window and break the root identity — and with adoption the
+            // copy it would save no longer exists.
+            const win_root = exec.queryAs(window_op.Window, q);
+            if (win_root == null) q = pruneStageColumns(input, q);
             const stage = try set.addStage(q, input.accountant);
+            stage.adopt_window = win_root;
             if (exec.prof.enabled) stage.setup_ticks = exec.prof.nowTicks() - c0;
             try map.put(input.allocator, rep, stage);
             if (rep != op) try map.put(input.allocator, op, stage);
@@ -800,21 +863,36 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // emits its fused-filter columns too (often a wide string),
             // which would ride the blocking accumulate/sort/emit for
             // nothing. Skipped when the shape above isn't fully understood.
+            // A synthetic window stage (block_root == op, the wrap from
+            // wrapWindowsInMaterialize) has its consumers in OTHER blocks;
+            // there the tree-wide referenced-name set stands in for the
+            // invisible layers above (null = unaccountable shape somewhere
+            // → keep everything).
+            const bare_stage_body = block_root == op;
+            const global_refs: ?[]const []const u8 = if (bare_stage_body) input.prune_names else null;
             if (local.windowInputNames(input.allocator, block_root, op)) |names| {
                 defer input.allocator.free(names);
-                const schema = up.outputSchema();
-                var kept = try std.ArrayListUnmanaged([]const u8).initCapacity(input.allocator, schema.len);
-                defer kept.deinit(input.allocator);
-                for (schema) |col| {
-                    for (names) |nm| {
-                        if (columnRefMatchesName(col.name, nm)) {
-                            kept.appendAssumeCapacity(col.name);
-                            break;
+                if (!bare_stage_body or global_refs != null) {
+                    const schema = up.outputSchema();
+                    var kept = try std.ArrayListUnmanaged([]const u8).initCapacity(input.allocator, schema.len);
+                    defer kept.deinit(input.allocator);
+                    outer: for (schema) |col| {
+                        for (names) |nm| {
+                            if (columnRefMatchesName(col.name, nm)) {
+                                kept.appendAssumeCapacity(col.name);
+                                continue :outer;
+                            }
                         }
+                        if (global_refs) |refs| for (refs) |nm| {
+                            if (columnRefMatchesName(col.name, nm)) {
+                                kept.appendAssumeCapacity(col.name);
+                                continue :outer;
+                            }
+                        };
                     }
-                }
-                if (kept.items.len > 0 and kept.items.len < schema.len) {
-                    up = try up.project(kept.items);
+                    if (kept.items.len > 0 and kept.items.len < schema.len) {
+                        up = try up.project(kept.items);
+                    }
                 }
             }
             return up.window(w.specs, w.calls, input.db.config.max_dop);

@@ -28,6 +28,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const exec = @import("exec.zig");
+const window_mod = @import("window.zig");
 const types = @import("../types.zig");
 const engine = @import("../engine/engine.zig");
 const storage = @import("../storage/storage.zig");
@@ -54,11 +55,68 @@ pub const MaterializedResult = struct {
     /// `stats_upper_rows`), used to size a fresh chunk's columns exactly: a
     /// small stage allocates a small chunk instead of a full `chunk_rows`.
     expected_rows: u64 = 0,
+    /// Set when the result was adopted zero-copy from a producer's own
+    /// contiguous buffers (window-output-as-stage) instead of pull-copied.
+    /// The chunks are then borrowed view windows over these stores.
+    adopted: ?Adopted = null,
+
+    /// Ownership record for adopted contiguous columns: entries flagged in
+    /// `arena_backed` are reclaimed wholesale by sweeping `arenas`; the
+    /// rest deinit with the result's allocator.
+    pub const Adopted = struct {
+        stores: []engine.ColumnStore,
+        arenas: []std.heap.ArenaAllocator,
+        arena_backed: []bool,
+    };
 
     pub const Chunk = struct {
-        cols: []engine.ColumnStore,
+        /// Owned column storage (the pull-copy path). Empty for adopted
+        /// results — readers consume `views`.
+        cols: []engine.ColumnStore = &.{},
+        /// Borrowed view windows over adopted contiguous stores. Chunk
+        /// bounds land on 64K-row (byte-aligned) offsets, so the validity
+        /// bitmaps slice cleanly.
+        views: []ColumnView = &.{},
         rows: usize = 0,
     };
+
+    /// Take ownership of a producer's contiguous result columns and expose
+    /// them as `chunk_rows`-sized view chunks — same shape the parallel
+    /// buffer scan partitions, no copy.
+    fn adoptContiguous(self: *MaterializedResult, adopted: Adopted, rows: u64) !void {
+        self.adopted = adopted;
+        const n: usize = @intCast(rows);
+        var lo: usize = 0;
+        while (lo < n) {
+            const take = @min(chunk_rows, n - lo);
+            const views = try self.allocator.alloc(ColumnView, adopted.stores.len);
+            errdefer self.allocator.free(views);
+            for (adopted.stores, self.schema, views) |*st, sc, *v| {
+                v.* = presentAsSchemaType(engine.transform.subViewAligned(st.view(), lo, take), sc.type);
+            }
+            try self.chunks.append(self.allocator, .{ .views = views, .rows = take });
+            lo += take;
+        }
+        self.total_rows = rows;
+    }
+
+    /// The pull-copy path launders physical string-family tags into the
+    /// stage schema's tag (chunk stores are schema-typed); zero-copy
+    /// adoption must present the same tags or consumers compiled against
+    /// the schema hit the wrong union arm. varchar/string/char share one
+    /// physical layout (offsets + bytes), so the retag is free.
+    fn presentAsSchemaType(v: ColumnView, t: types.Type) ColumnView {
+        const sv = switch (v.data) {
+            .varchar, .string, .char => |x| x,
+            else => return v,
+        };
+        return switch (t) {
+            .varchar => .{ .data = .{ .varchar = sv }, .nulls = v.nulls },
+            .string => .{ .data = .{ .string = sv }, .nulls = v.nulls },
+            .char => .{ .data = .{ .char = sv }, .nulls = v.nulls },
+            else => v,
+        };
+    }
 
     fn appendBatch(self: *MaterializedResult, batch: exec.Batch) !void {
         const per_row = getenv("THINDB_MAT_PERROW") != null;
@@ -135,9 +193,20 @@ pub const MaterializedResult = struct {
     fn deinitChunks(self: *MaterializedResult) void {
         for (self.chunks.items) |*c| {
             for (c.cols) |*col| col.deinit(self.allocator);
-            self.allocator.free(c.cols);
+            if (c.cols.len > 0) self.allocator.free(c.cols);
+            if (c.views.len > 0) self.allocator.free(c.views);
         }
         self.chunks.deinit(self.allocator);
+        if (self.adopted) |*ad| {
+            for (ad.stores, ad.arena_backed) |*st, ab| {
+                if (!ab) st.deinit(self.allocator);
+            }
+            for (ad.arenas) |*a| a.deinit();
+            self.allocator.free(ad.stores);
+            self.allocator.free(ad.arenas);
+            self.allocator.free(ad.arena_backed);
+            self.adopted = null;
+        }
     }
 };
 
@@ -182,6 +251,11 @@ pub const Stage = struct {
     /// `--profile-ops` only: ticks spent compiling this block's body (setup),
     /// recorded by the staged compiler before the drain runs.
     setup_ticks: i64 = 0,
+    /// Window-output-as-stage: when the compiled pipeline IS a Window
+    /// operator (set via exec.queryAs by the staged compiler), ensureRun
+    /// adopts its materialized buffers zero-copy instead of pull-copying
+    /// the emit stream.
+    adopt_window: ?*window_mod.Window = null,
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;
@@ -196,7 +270,19 @@ pub const Stage = struct {
         errdefer res.deinitChunks();
         errdefer self.releaseReserved();
         const row_bytes = exec.memory.estimateRowBytes(self.schema);
-        while (try self.query.next()) |batch| {
+        if (self.adopt_window) |win| {
+            try win.ensureDrained();
+            if (self.accountant) |acct| {
+                const bytes = row_bytes * @as(usize, @intCast(win.accumulated_rows));
+                try acct.reserve(.materialize, bytes);
+                self.reserved_bytes += bytes;
+            }
+            const ad = try win.adoptBuffers();
+            try res.adoptContiguous(
+                .{ .stores = ad.stores, .arenas = ad.arenas, .arena_backed = ad.arena_backed },
+                ad.rows,
+            );
+        } else while (try self.query.next()) |batch| {
             if (self.accountant) |acct| {
                 const bytes = row_bytes * batch.row_count;
                 try acct.reserve(.materialize, bytes);
@@ -326,9 +412,25 @@ pub const StageSet = struct {
             .col_stats = col_stats,
             .accountant = accountant,
             .id = self.stages.items.len,
+            // Compile pin: chains over stages run EAGERLY during compilation
+            // (createOverStage's barrier), and such a run can fully drain an
+            // upstream stage whose later consumers haven't compiled (and so
+            // haven't registered) yet — without the pin, the result would
+            // free out from under them. Released by releaseCompilePins once
+            // the whole plan is built.
+            .uses_total = 1,
         };
         try self.stages.append(self.allocator, stage);
         return stage;
+    }
+
+    /// Release every stage's compile pin (see addStage) — call exactly once,
+    /// after the whole plan (all stage bodies + the root block) has compiled
+    /// and every real consumer is registered. A stage fully drained during an
+    /// eager compile-time run frees here; the rest free when their last
+    /// runtime reader finishes.
+    pub fn releaseCompilePins(self: *StageSet) void {
+        for (self.stages.items) |stage| stage.releaseUse();
     }
 
     pub fn deinit(self: *StageSet) void {
@@ -374,6 +476,13 @@ pub const MatScan = struct {
             const chunk = res.chunks.items[self.cursor];
             self.cursor += 1;
             if (chunk.rows == 0) continue;
+            if (chunk.views.len > 0) {
+                return exec.Batch{
+                    .schema = self.stage.schema,
+                    .values = chunk.views,
+                    .row_count = chunk.rows,
+                };
+            }
             for (chunk.cols, 0..) |*col, i| self.views[i] = col.view();
             return exec.Batch{
                 .schema = self.stage.schema,
@@ -473,6 +582,13 @@ pub const ChunkRangeScan = struct {
             const chunk = self.result.chunks.items[self.cursor];
             self.cursor += 1;
             if (chunk.rows == 0) continue;
+            if (chunk.views.len > 0) {
+                return exec.Batch{
+                    .schema = self.stage.schema,
+                    .values = chunk.views,
+                    .row_count = chunk.rows,
+                };
+            }
             for (chunk.cols, 0..) |*col, i| self.views[i] = col.view();
             return exec.Batch{
                 .schema = self.stage.schema,

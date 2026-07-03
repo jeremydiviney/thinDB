@@ -629,8 +629,19 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
         if (info != .pointer) @compileError("makeQuery: expected pointer to operator");
         break :blk info.pointer.child;
     };
+    return .{ .ptr = op, .vtable = &OpWrapper(Op).vt, .allocator = allocator };
+}
 
-    const Wrapper = struct {
+/// Comptime-typed downcast of a type-erased `Query`. The vtable is a
+/// per-operator-type static (`OpWrapper(Op).vt`), so pointer identity is a
+/// proof of the concrete type. Null when `q` wraps a different operator.
+pub fn queryAs(comptime Op: type, q: Query) ?*Op {
+    if (q.vtable != &OpWrapper(Op).vt) return null;
+    return @ptrCast(@alignCast(q.ptr));
+}
+
+fn OpWrapper(comptime Op: type) type {
+    return struct {
         fn nextWrap(ptr: *anyopaque) anyerror!?Batch {
             const o: *Op = @ptrCast(@alignCast(ptr));
             if (!prof.enabled) return o.next();
@@ -732,8 +743,6 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
             .setEmitProjection = setEmitProjectionWrap,
         };
     };
-
-    return .{ .ptr = op, .vtable = &Wrapper.vt, .allocator = allocator };
 }
 
 /// Top-level entry point: build a scan query against a Table.

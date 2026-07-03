@@ -338,6 +338,108 @@ pub const Window = struct {
         self.evicted = true;
     }
 
+    /// Everything a stage takes over when it adopts this window's
+    /// materialized result instead of pull-copying the emit stream
+    /// (mat_stage.Stage.adopt_window). `stores` is one contiguous column
+    /// per schema slot; entries flagged in `arena_backed` are reclaimed by
+    /// sweeping `arenas`, the rest deinit with the window's (= the stage's)
+    /// allocator. All slices are the new owner's to free.
+    pub const AdoptedBuffers = struct {
+        stores: []ColumnStore,
+        arenas: []std.heap.ArenaAllocator,
+        arena_backed: []bool,
+        rows: u64,
+    };
+
+    /// Run the drain + evaluation without emitting (the adopting stage's
+    /// barrier calls this instead of pulling `next()`).
+    pub fn ensureDrained(self: *Window) !void {
+        if (!self.drained) try self.drainAndEvaluate();
+    }
+
+    /// Ownership handover for window-output-as-stage: move the accumulated
+    /// input columns (with their arenas) and the evaluated output columns
+    /// out of the operator. String-typed window outputs materialize once
+    /// here — the same appendStringScratchRange work per-batch emit would
+    /// have done, minus the re-copy into stage chunks. Leaves the window in
+    /// its post-evict state (emits nothing; deinit stays uniform).
+    pub fn adoptBuffers(self: *Window) !AdoptedBuffers {
+        std.debug.assert(self.drained and self.emit_offset == 0 and !self.evicted);
+        const alloc = self.allocator;
+        const nin = self.input_schema.len;
+        const rows: usize = @intCast(self.accumulated_rows);
+
+        const stores = try alloc.alloc(ColumnStore, self.schema.len);
+        errdefer alloc.free(stores);
+        const arena_backed = try alloc.alloc(bool, self.schema.len);
+        errdefer alloc.free(arena_backed);
+        var n_str: usize = 0;
+        for (self.string_outputs) |s| {
+            if (s.len > 0) n_str += 1;
+        }
+        const arenas = try alloc.alloc(std.heap.ArenaAllocator, nin + n_str);
+        errdefer alloc.free(arenas);
+
+        // Fallible work first, so the move below can't half-complete:
+        // 1. String outputs → fresh arena-backed contiguous stores (their
+        //    scratch slices borrow into `accumulated`, still alive here).
+        const arena_backing = if (builtin.is_test) alloc else std.heap.c_allocator;
+        var str_built: usize = 0;
+        errdefer for (arenas[nin .. nin + str_built]) |*a| a.deinit();
+        {
+            var ai: usize = nin;
+            for (self.string_outputs, 0..) |scr, ci| {
+                if (scr.len == 0) continue;
+                arenas[ai] = std.heap.ArenaAllocator.init(arena_backing);
+                str_built += 1;
+                const sa = arenas[ai].allocator();
+                var st = try ColumnStore.init(sa, self.schema[nin + ci].type, true);
+                try appendStringScratchRange(sa, scr, 0, rows, &st);
+                stores[nin + ci] = st;
+                arena_backed[nin + ci] = true;
+                ai += 1;
+            }
+        }
+        // 2. Fresh empty replacements for the fixed-width output columns
+        //    (deinit frees `output_columns` uniformly).
+        const repl = try alloc.alloc(ColumnStore, self.calls.len);
+        defer alloc.free(repl);
+        var repl_built: usize = 0;
+        errdefer for (repl[0..repl_built]) |*c| c.deinit(alloc);
+        for (self.calls, 0..) |_, ci| {
+            repl[ci] = try ColumnStore.init(alloc, self.schema[nin + ci].type, true);
+            repl_built += 1;
+        }
+
+        // Infallible moves.
+        for (self.accumulated, 0..) |c, i| {
+            stores[i] = c;
+            arena_backed[i] = true;
+        }
+        for (self.acc_arenas, 0..) |a, i| arenas[i] = a;
+        for (self.output_columns, 0..) |*c, ci| {
+            if (self.string_outputs[ci].len > 0) {
+                // Scratch-backed: the (empty) placeholder store stays put;
+                // its adopted replacement was materialized above. Free the
+                // unused fresh replacement.
+                repl[ci].deinit(alloc);
+                continue;
+            }
+            stores[nin + ci] = c.*;
+            arena_backed[nin + ci] = false;
+            c.* = repl[ci];
+        }
+        alloc.free(self.acc_arenas);
+        self.acc_arenas = &.{};
+        alloc.free(self.accumulated);
+        self.accumulated = &.{};
+        if (self.upstream.accountant()) |a| a.release(.window, self.reserved_bytes);
+        self.reserved_bytes = 0;
+        self.evicted = true;
+        self.emit_offset = rows;
+        return .{ .stores = stores, .arenas = arenas, .arena_backed = arena_backed, .rows = self.accumulated_rows };
+    }
+
     pub fn next(self: *Window) !?Batch {
         if (!self.drained) try self.drainAndEvaluate();
 
@@ -1860,25 +1962,7 @@ fn reserveAggressive(allocator: Allocator, out: *ColumnStore, add_rows: usize) !
 /// absolute into the full bytes buffer, so the offsets window slices
 /// without rebasing.
 fn subView(v: ColumnView, off: usize, n: usize) ColumnView {
-    const nulls: ?[]const u8 = if (v.nulls) |bm| bm[off / 8 ..] else null;
-    return switch (v.data) {
-        .int => |s| .{ .data = .{ .int = s[off..][0..n] }, .nulls = nulls },
-        .bigint => |s| .{ .data = .{ .bigint = s[off..][0..n] }, .nulls = nulls },
-        .boolean => |s| .{ .data = .{ .boolean = s[off..][0..n] }, .nulls = nulls },
-        .tinyint => |s| .{ .data = .{ .tinyint = s[off..][0..n] }, .nulls = nulls },
-        .smallint => |s| .{ .data = .{ .smallint = s[off..][0..n] }, .nulls = nulls },
-        .float => |s| .{ .data = .{ .float = s[off..][0..n] }, .nulls = nulls },
-        .double => |s| .{ .data = .{ .double = s[off..][0..n] }, .nulls = nulls },
-        .date => |s| .{ .data = .{ .date = s[off..][0..n] }, .nulls = nulls },
-        .datetime => |s| .{ .data = .{ .datetime = s[off..][0..n] }, .nulls = nulls },
-        .largeint => |s| .{ .data = .{ .largeint = s[off..][0..n] }, .nulls = nulls },
-        .decimal64 => |s| .{ .data = .{ .decimal64 = s[off..][0..n] }, .nulls = nulls },
-        .decimal128 => |s| .{ .data = .{ .decimal128 = s[off..][0..n] }, .nulls = nulls },
-        .uuid => |s| .{ .data = .{ .uuid = s[off..][0..n] }, .nulls = nulls },
-        .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
-        .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
-        .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
-    };
+    return transform.subViewAligned(v, off, n);
 }
 
 /// A destination cell for a window-function output row write.
