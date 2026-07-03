@@ -117,6 +117,17 @@ pub const Window = struct {
     /// own spec (a partition-only window riding a (partition, month) source
     /// emits (partition, month) order). Consumers read effectiveEmitKeys.
     inherited_order: ?ir.WindowSpec = null,
+    /// Column borrowing (set by the staged compiler): the input chain is
+    /// row-aligned with `borrow_src`'s adopted contiguous result (serial
+    /// scan + computes/projections, no filters), so pass-through input
+    /// columns take shallow references to its stores instead of being
+    /// re-accumulated. borrow_map[ci] = source store index, null =
+    /// compute-derived / renamed → accumulate normally. The source stage
+    /// is kept alive by this window's own stage (Stage.pinned_upstream).
+    borrow_src: ?*exec.mat_stage.Stage = null,
+    borrow_map: []const ?usize = &.{},
+    /// Runtime: bind succeeded (source ran and adopted contiguous).
+    borrowing: bool = false,
 
     // Batch emit state — emits input + output in original order.
     emit_offset: usize = 0,
@@ -175,6 +186,10 @@ pub const Window = struct {
         }
         if (self.specs.len > 0 and self.singleSortGroup()) return self.specs[0];
         return null;
+    }
+
+    fn isBorrowed(self: *const Window, ci: usize) bool {
+        return self.borrowing and ci < self.borrow_map.len and self.borrow_map[ci] != null;
     }
 
     /// True when every spec shares one resolved sort-key set — the only
@@ -639,6 +654,7 @@ pub const Window = struct {
     /// boundaries so no two writers share a validity byte.
     const ParDrain = struct {
         win: *Window,
+        owned: []const usize = &.{},
         batch: Batch = undefined,
         preps: []transform.PreparedAppend = &.{},
         bounds: []usize = &.{},
@@ -682,13 +698,13 @@ pub const Window = struct {
 
         fn runUnits(pd: *ParDrain) void {
             const w = pd.win;
-            const ncols = w.accumulated.len;
+            const ncols = pd.owned.len;
             while (true) {
                 const u = pd.unit_cursor.fetchAdd(1, .acq_rel);
                 if (u >= pd.n_units) return;
                 switch (pd.mode) {
                     .prepare => {
-                        const ci = u;
+                        const ci = pd.owned[u];
                         pd.preps[ci] = transform.prepareAppend(
                             w.acc_arenas[ci].allocator(),
                             pd.batch.values[ci],
@@ -702,7 +718,7 @@ pub const Window = struct {
                     .write => {
                         // Interleave column-major so concurrent claims walk
                         // different columns (independent memory streams).
-                        const ci = u % ncols;
+                        const ci = pd.owned[u % ncols];
                         const t = u / ncols;
                         if (pd.preps[ci].positional) {
                             transform.writeAppendSlice(
@@ -762,10 +778,41 @@ pub const Window = struct {
         // copies fan out across a small worker pool (see ParDrain); the
         // upstream pull itself stays on this thread (batches are only valid
         // until the next pull, so produce and copy can't overlap).
-        const row_bytes = exec.memory.estimateRowBytes(self.input_schema);
         const acc = self.upstream.accountant();
         const ncols = self.input_schema.len;
-        var pd = ParDrain{ .win = self };
+
+        // Bind borrowed columns: run the source (it runs lazily on first
+        // pull anyway), and take shallow references into its adopted
+        // contiguous stores. Any miss (no result / chunked copy result)
+        // degrades to normal full accumulation.
+        var owned_buf = try self.allocator.alloc(usize, ncols);
+        defer self.allocator.free(owned_buf);
+        var borrow_expect: u64 = 0;
+        if (self.borrow_src) |src| bind: {
+            src.ensureRun() catch break :bind;
+            const res = src.result orelse break :bind;
+            const ad = res.adopted orelse break :bind;
+            for (self.borrow_map, 0..) |m, ci| {
+                if (m) |src_idx| self.accumulated[ci] = ad.stores[src_idx];
+            }
+            self.borrowing = true;
+            borrow_expect = res.total_rows;
+        }
+        var n_owned: usize = 0;
+        for (0..ncols) |ci| {
+            if (!self.isBorrowed(ci)) {
+                owned_buf[n_owned] = ci;
+                n_owned += 1;
+            }
+        }
+        const owned = owned_buf[0..n_owned];
+        const row_bytes = blk: {
+            if (!self.borrowing) break :blk exec.memory.estimateRowBytes(self.input_schema);
+            var b: usize = 0;
+            for (owned) |ci| b += exec.memory.estimateRowBytes(self.input_schema[ci .. ci + 1]);
+            break :blk b;
+        };
+        var pd = ParDrain{ .win = self, .owned = owned };
         var workers: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
         var n_workers: usize = 0;
         var max_tiles: usize = 1;
@@ -797,7 +844,7 @@ pub const Window = struct {
             self.reserved_bytes += b;
             if (n_workers > 0) {
                 pd.batch = batch;
-                pd.runPhase(.prepare, ncols, n_workers);
+                pd.runPhase(.prepare, owned.len, n_workers);
                 if (pd.failed.load(.acquire)) return error.OutOfMemory;
                 // Row tiles on absolute 8-row boundaries: the first bound
                 // absorbs the base misalignment so no two tiles share a
@@ -815,24 +862,27 @@ pub const Window = struct {
                     if (pd.bounds[nt] > n) pd.bounds[nt] = n;
                 }
                 pd.n_tiles = nt;
-                pd.runPhase(.write, ncols * nt, n_workers);
+                pd.runPhase(.write, owned.len * nt, n_workers);
                 // Rare non-positional columns (a wide string store) take
                 // the classic serial append — single caller, own arena.
-                for (pd.preps, 0..) |p, ci| {
-                    if (p.positional) continue;
+                for (owned) |ci| {
+                    if (pd.preps[ci].positional) continue;
                     const aa = self.acc_arenas[ci].allocator();
                     try transform.appendColumnRange(aa, batch.values[ci], 0, n, &self.accumulated[ci]);
                 }
             } else {
-                for (batch.values, 0..) |view, ci| {
+                for (owned) |ci| {
                     const aa = self.acc_arenas[ci].allocator();
                     try reserveAggressive(aa, &self.accumulated[ci], batch.row_count);
-                    try transform.appendAllColumn(aa, view, &self.accumulated[ci]);
+                    try transform.appendAllColumn(aa, batch.values[ci], &self.accumulated[ci]);
                 }
             }
             self.accumulated_rows += batch.row_count;
             if (exec.prof.enabled) exec.prof.addPhase("window.drain.append", @intCast(@max(0, exec.prof.nowTicks() - _at)));
         }
+        // Borrowed stores are row-aligned by the compile-time contract
+        // (no filters in the chain); a mismatch means that contract broke.
+        if (self.borrowing and self.accumulated_rows != borrow_expect) return Error.WindowUnsupported;
         const n: usize = @intCast(self.accumulated_rows);
         if (n == 0) {
             self.drained = true;

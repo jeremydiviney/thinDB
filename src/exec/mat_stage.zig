@@ -256,6 +256,12 @@ pub const Stage = struct {
     /// adopts its materialized buffers zero-copy instead of pull-copying
     /// the emit stream.
     adopt_window: ?*window_mod.Window = null,
+    /// Column borrowing: this stage's adopted result contains shallow
+    /// references into an upstream stage's contiguous buffers (the window
+    /// borrowed its pass-through input columns), so that stage must stay
+    /// alive as long as this result. One use registered at compile,
+    /// released when this stage's result frees. Pins chain transitively.
+    pinned_upstream: ?*Stage = null,
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;
@@ -334,6 +340,10 @@ pub const Stage = struct {
         const res = self.result orelse return;
         self.result = null;
         self.releaseReserved();
+        if (self.pinned_upstream) |src| {
+            self.pinned_upstream = null;
+            src.releaseUse();
+        }
         if (std.Thread.spawn(.{}, freeResultThread, .{res})) |th| {
             self.free_thread = th;
         } else |_| {

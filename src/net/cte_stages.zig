@@ -250,6 +250,12 @@ fn collectStages(
             if (win_root == null) q = pruneStageColumns(input, q);
             const stage = try set.addStage(q, input.accountant);
             stage.adopt_window = win_root;
+            if (win_root) |wr| {
+                if (wr.borrow_src) |src| {
+                    src.registerUse();
+                    stage.pinned_upstream = src;
+                }
+            }
             if (exec.prof.enabled) stage.setup_ticks = exec.prof.nowTicks() - c0;
             try map.put(input.allocator, rep, stage);
             if (rep != op) try map.put(input.allocator, op, stage);
@@ -865,12 +871,20 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             var ride = false;
             var eff_input = input;
             var ride_keys: ir.WindowSpec = undefined;
-            if (input.db.config.max_dop > 1 and sameKeysAllSpecs(w.specs)) {
-                if (rideSource(map, w.upstream, w.specs[0])) |src| {
-                    src.win.emit_sorted = true;
-                    eff_input.force_ordered = true;
-                    ride = true;
-                    ride_keys = src.keys;
+            var borrow_stage: ?*mat_stage.Stage = null;
+            if (input.db.config.max_dop > 1) {
+                const rider_keys: ?ir.WindowSpec = if (sameKeysAllSpecs(w.specs)) w.specs[0] else null;
+                if (rideSource(map, w.upstream, rider_keys)) |src| {
+                    if (src.covered) {
+                        src.win.emit_sorted = true;
+                        ride = true;
+                        ride_keys = src.keys.?;
+                    }
+                    if (!src.has_filter) borrow_stage = src.stage;
+                    // Both riding and borrowing need the chain to deliver
+                    // rows in the source's order (borrowing additionally
+                    // 1:1) — suppress order-scrambling parallel seams.
+                    if (ride or borrow_stage != null) eff_input.force_ordered = true;
                 }
             }
             var up = try compileBlock(eff_input, w.upstream, map);
@@ -913,10 +927,25 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 }
             }
             const wq = try up.window(w.specs, w.calls, input.db.config.max_dop);
-            if (ride) {
+            if (ride or borrow_stage != null) {
                 if (exec.queryAs(window_op.Window, wq)) |win| {
-                    win.assume_sorted = true;
-                    win.inherited_order = ride_keys;
+                    if (ride) {
+                        win.assume_sorted = true;
+                        win.inherited_order = ride_keys;
+                    }
+                    if (borrow_stage) |src_stage| {
+                        const in_schema = win.input_schema;
+                        const bm = try input.node_arena.alloc(?usize, in_schema.len);
+                        var any = false;
+                        for (in_schema, bm) |col, *slot| {
+                            slot.* = borrowIdxFor(map, w.upstream, col.name, src_stage);
+                            if (slot.* != null) any = true;
+                        }
+                        if (any) {
+                            win.borrow_src = src_stage;
+                            win.borrow_map = bm;
+                        }
+                    }
                 }
             }
             return wq;
@@ -970,7 +999,17 @@ fn sameSpecKeys(a: ir.WindowSpec, b: ir.WindowSpec) bool {
 /// through unrenamed, and single-ref (inlined) materialize boundaries.
 /// Everything else — unions, joins, group-bys, sorts, multi-ref stages
 /// (their rematerialization pull isn't order-preserving) — stops the walk.
-const RideSrc = struct { win: *window_op.Window, keys: ir.WindowSpec };
+const RideSrc = struct {
+    win: *window_op.Window,
+    stage: *mat_stage.Stage,
+    /// The source's effective emit order, when it has a single usable one.
+    keys: ?ir.WindowSpec,
+    /// keys covers the rider's spec → the rider can skip its sort.
+    covered: bool,
+    /// A filter sits between source and rider: rows still ordered (riding
+    /// fine) but no longer 1:1 with the source (borrowing impossible).
+    has_filter: bool,
+};
 
 /// Rider coverage: the source's emitted order satisfies the rider when the
 /// partition lists match exactly and the rider's ORDER BY is a (possibly
@@ -988,37 +1027,79 @@ fn riderCoveredBy(src: ir.WindowSpec, rider: ir.WindowSpec) bool {
     return true;
 }
 
-fn rideSource(map: *StageMap, op: *const ir.Op, keys: ir.WindowSpec) ?RideSrc {
+fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {
+    var cur = op;
+    var has_filter = false;
+    while (true) {
+        switch (cur.*) {
+            .filter => |f| {
+                has_filter = true;
+                cur = f.upstream;
+            },
+            .compute => |c| {
+                if (keys) |k| for (c.derived) |d| {
+                    if (nameIsSpecKey(d.name, k)) return null;
+                };
+                cur = c.upstream;
+            },
+            .exclude => |e| {
+                if (keys) |k| for (e.columns) |col| {
+                    if (nameIsSpecKey(col, k)) return null;
+                };
+                cur = e.upstream;
+            },
+            .select => |sel| {
+                if (keys) |k| if (!selectPassesKeys(sel, k)) return null;
+                cur = sel.upstream;
+            },
+            .materialize => |m| {
+                if (map.get(cur)) |stage| {
+                    const win = stage.adopt_window orelse return null;
+                    const src_keys = win.effectiveEmitKeys();
+                    const covered = if (keys) |k|
+                        (if (src_keys) |sk| riderCoveredBy(sk, k) else false)
+                    else
+                        false;
+                    return .{ .win = win, .stage = stage, .keys = src_keys, .covered = covered, .has_filter = has_filter };
+                }
+                // single-ref: the body compiles inline at this use site —
+                // no rematerialization between us and it.
+                cur = m.upstream;
+            },
+            else => return null,
+        }
+    }
+}
+
+/// Second walk of the ride chain for ONE window-input column name: does it
+/// pass through untransformed all the way to the source stage, and at which
+/// source column? Null = compute-derived / renamed / dropped → the window
+/// accumulates it normally.
+fn borrowIdxFor(map: *StageMap, op: *const ir.Op, name: []const u8, src_stage: *mat_stage.Stage) ?usize {
     var cur = op;
     while (true) {
         switch (cur.*) {
             .filter => |f| cur = f.upstream,
             .compute => |c| {
                 for (c.derived) |d| {
-                    if (nameIsSpecKey(d.name, keys)) return null;
+                    if (columnRefMatchesName(d.name, name)) return null;
                 }
                 cur = c.upstream;
             },
-            .exclude => |e| {
-                for (e.columns) |col| {
-                    if (nameIsSpecKey(col, keys)) return null;
-                }
-                cur = e.upstream;
-            },
+            .exclude => |e| cur = e.upstream,
             .select => |sel| {
-                if (!selectPassesKeys(sel, keys)) return null;
+                if (!projectionKeepsName(sel, name)) return null;
                 cur = sel.upstream;
             },
-            .materialize => |m| {
+            .materialize => {
                 if (map.get(cur)) |stage| {
-                    const win = stage.adopt_window orelse return null;
-                    const src_keys = win.effectiveEmitKeys() orelse return null;
-                    if (!riderCoveredBy(src_keys, keys)) return null;
-                    return .{ .win = win, .keys = src_keys };
+                    if (stage != src_stage) return null;
+                    for (stage.schema, 0..) |col, i| {
+                        if (columnRefMatchesName(col.name, name)) return i;
+                    }
+                    return null;
                 }
-                // single-ref: the body compiles inline at this use site —
-                // no rematerialization between us and it.
-                cur = m.upstream;
+                cur = cur.materialize.upstream;
             },
             else => return null,
         }
