@@ -245,6 +245,111 @@ const CasePlan = struct {
     may_produce_null: bool,
 };
 
+/// Schema-only upstream for detached per-chunk Compute clones inside a probe
+/// pipeline (evalBatch is the only entry used; next() is never pulled).
+const SchemaStub = struct {
+    schema: []const Column,
+    pub fn next(_: *SchemaStub) !?Batch {
+        return null;
+    }
+    pub fn deinit(_: *SchemaStub) void {}
+    pub fn outputSchema(self: *SchemaStub) []const Column {
+        return self.schema;
+    }
+    pub fn addPrune(_: *SchemaStub, _: Predicate) !void {}
+    pub fn stats(_: *SchemaStub) exec.PipelineStats {
+        return .{ .upper_rows = std.math.maxInt(u64) };
+    }
+    pub fn accountant(_: *SchemaStub) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *SchemaStub, _: *std.ArrayList(u8), _: std.mem.Allocator, _: usize) !void {}
+};
+
+/// Probe-offer forwarding state: the wrapped sink a chained Compute hands
+/// its upstream. Each chunk evaluates through its own detached clone (own
+/// arena, plans, scratch — expression IR is shared read-only, matching the
+/// thread-safety contract fused computes already rely on) before the inner
+/// (join) sink processes the batch.
+const ChainForward = struct {
+    src: *Compute,
+    inner: exec.ProbeSink,
+    /// Upstream schema snapshotted at offer time — the scan re-types its
+    /// out_schema on accept, so it can't be re-read at bind time.
+    in_schema: []const Column,
+    per_chunk: []Query = &.{},
+    stubs: []*SchemaStub = &.{},
+    /// Per-chunk remap scratch when the inner sink carries a probe_map (a
+    /// Project narrowed this Compute's output before the join compiled
+    /// against it): the derived batch remaps into these views post-eval.
+    map_views: [][]ColumnView = &.{},
+    bind_alloc: Allocator = undefined,
+
+    fn bindHook(ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void {
+        const cf: *ChainForward = @ptrCast(@alignCast(ctx));
+        cf.bind_alloc = alloc;
+        const qs = try alloc.alloc(Query, n_chunks);
+        errdefer alloc.free(qs);
+        const stubs = try alloc.alloc(*SchemaStub, n_chunks);
+        errdefer alloc.free(stubs);
+        var built: usize = 0;
+        errdefer for (qs[0..built], stubs[0..built]) |*q, st| {
+            q.deinit();
+            alloc.destroy(st);
+        };
+        for (qs, stubs) |*q, *st| {
+            const stub = try alloc.create(SchemaStub);
+            errdefer alloc.destroy(stub);
+            stub.* = .{ .schema = cf.in_schema };
+            q.* = try Compute.createWithRegistry(alloc, makeQuery(alloc, stub), cf.src.derived_ir, cf.src.udf_registry);
+            st.* = stub;
+            built += 1;
+        }
+        cf.per_chunk = qs;
+        cf.stubs = stubs;
+        if (cf.inner.probe_map) |m| {
+            const mv = try alloc.alloc([]ColumnView, n_chunks);
+            var mbuilt: usize = 0;
+            errdefer {
+                for (mv[0..mbuilt]) |v| alloc.free(v);
+                alloc.free(mv);
+            }
+            for (mv) |*v| {
+                v.* = try alloc.alloc(ColumnView, m.len);
+                mbuilt += 1;
+            }
+            cf.map_views = mv;
+        }
+        try cf.inner.bind(cf.inner.ctx, n_chunks, alloc);
+    }
+
+    fn processHook(ctx: *anyopaque, chunk: usize, batch: Batch) anyerror!?Batch {
+        const cf: *ChainForward = @ptrCast(@alignCast(ctx));
+        const c = exec.queryAs(Compute, cf.per_chunk[chunk]).?;
+        var out = try c.evalBatch(batch);
+        if (cf.inner.probe_map) |m| {
+            const vs = cf.map_views[chunk];
+            for (m, vs) |src, *v| v.* = out.values[src];
+            out = .{ .schema = out.schema, .values = vs, .row_count = out.row_count };
+        }
+        return try cf.inner.process(cf.inner.ctx, chunk, out);
+    }
+
+    fn deinitAll(cf: *ChainForward, owner_alloc: Allocator) void {
+        for (cf.per_chunk, cf.stubs) |*q, st| {
+            q.deinit();
+            cf.bind_alloc.destroy(st);
+        }
+        if (cf.per_chunk.len > 0) {
+            cf.bind_alloc.free(cf.per_chunk);
+            cf.bind_alloc.free(cf.stubs);
+        }
+        for (cf.map_views) |v| cf.bind_alloc.free(v);
+        if (cf.map_views.len > 0) cf.bind_alloc.free(cf.map_views);
+        owner_alloc.destroy(cf);
+    }
+};
+
 pub const Compute = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -264,6 +369,14 @@ pub const Compute = struct {
     /// Reusable views slice (upstream views + derived views), sized at
     /// create. Rewired per batch.
     views: []ColumnView,
+    /// Raw derived IR (arena copy) + registry, retained so tryFuseProbe can
+    /// build detached per-chunk clones for a probe pipeline.
+    derived_ir: []const Derived,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+    /// Set when this Compute forwarded a probe offer downward: evaluation
+    /// happens in per-chunk clones inside the scan workers, and this
+    /// operator passes the final joined batches through untouched.
+    chain: ?*ChainForward = null,
 
     pub fn create(
         allocator: Allocator,
@@ -285,6 +398,7 @@ pub const Compute = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const aa = arena.allocator();
+        const derived_ir = try aa.dupe(Derived, derived);
 
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
         for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema, udf_registry);
@@ -350,11 +464,14 @@ pub const Compute = struct {
             .derived_output_indices = derived_output_indices,
             .output_schema = output_schema,
             .views = views,
+            .derived_ir = derived_ir,
+            .udf_registry = udf_registry,
         };
         return makeQuery(allocator, self);
     }
 
     pub fn deinit(self: *Compute) void {
+        if (self.chain) |cf| cf.deinitAll(self.allocator);
         var up = self.upstream;
         up.deinit();
         for (self.derived_cols) |*c| c.deinit(self.allocator);
@@ -378,6 +495,9 @@ pub const Compute = struct {
     }
 
     pub fn outputSchema(self: *Compute) []const Column {
+        // Chained: batches passing through are the probe pipeline's final
+        // joined output — report the live schema from below.
+        if (self.chain != null) return self.upstream.outputSchema();
         return self.output_schema;
     }
 
@@ -415,6 +535,9 @@ pub const Compute = struct {
     /// column as unknown and is forced onto the sort path even when `key`
     /// alone fits the budget.
     pub fn stats(self: *Compute) exec.PipelineStats {
+        // Chained: this operator no longer shapes the batches; per-derived
+        // stat extension would mis-index against the re-typed upstream.
+        if (self.chain != null) return self.upstream.stats();
         var up = self.upstream.stats();
         const up_n = self.upstream.outputSchema().len;
         const out_stats = self.arena.allocator().alloc(exec.ColStat, self.output_schema.len) catch return up;
@@ -447,8 +570,45 @@ pub const Compute = struct {
         try self.upstream.explain(out, allocator, depth + 1);
     }
 
+    /// A join above this Compute offers its probe sink. The derived columns
+    /// belong BETWEEN the source's batches and the join, so forward a
+    /// WRAPPED sink downward: each chunk evaluates through a detached clone
+    /// of this Compute before the join's sink processes it. The whole
+    /// chain then runs inside the scan's stripe workers, and this operator
+    /// becomes a pass-through for the final joined batches.
+    pub fn tryFuseProbe(self: *Compute, sink: exec.ProbeSink) !bool {
+        if (self.chain != null) return false;
+        const chain = try self.allocator.create(ChainForward);
+        errdefer self.allocator.destroy(chain);
+        chain.* = .{
+            .src = self,
+            .inner = sink,
+            .in_schema = self.upstream.outputSchema(),
+        };
+        const ok = self.upstream.tryFuseProbe(.{
+            .ctx = chain,
+            .out_schema = sink.out_schema,
+            .bind = ChainForward.bindHook,
+            .process = ChainForward.processHook,
+        }) catch false;
+        if (!ok) {
+            self.allocator.destroy(chain);
+            return false;
+        }
+        self.chain = chain;
+        return true;
+    }
+
     pub fn next(self: *Compute) !?Batch {
         const in = (try self.upstream.next()) orelse return null;
+        if (self.chain != null) return in;
+        return try self.evalBatch(in);
+    }
+
+    /// Push-model entry for probe-pipeline chunk wrappers: evaluate the
+    /// derived columns against a caller-supplied batch. The returned views
+    /// live until the next call on this instance.
+    pub fn evalBatch(self: *Compute, in: Batch) !Batch {
         const n = in.row_count;
 
         for (self.derived, self.derived_cols) |r, *out_col| {
@@ -1841,3 +2001,4 @@ fn fillNullColumn(allocator: Allocator, buf: *ColumnStore, n: usize) !void {
         try buf.appendValidBit(allocator, buf.data.rowCount() - 1, false);
     }
 }
+

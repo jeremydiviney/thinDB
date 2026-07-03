@@ -443,6 +443,15 @@ pub const ParallelScan = struct {
     // sink's per-chunk buffers make staged batches round-stable, same as the
     // bare scans' scratch. Mutually exclusive with every other fusion.
     probe_sink: ?exec.ProbeSink = null,
+    /// Lazy stage barrier (createOverStageDeferred): the stage does NOT run
+    /// at compile time — an eager barrier would materialize it (and its
+    /// whole upstream stage DAG) during compile, pinning buffers that the
+    /// normal execution order would have already freed. Workers build on
+    /// the FIRST pull instead, when execution has reached this point in the
+    /// DAG. Until then `workers` is empty and sinks are bound against the
+    /// planned upper-bound chunk count.
+    stage_deferred: bool = false,
+    deferred_dop: usize = 0,
     /// Per-chunk view scratch for sink.probe_map (a narrowing Project on
     /// the probe side): batch values are remapped into the chunk's slice
     /// before the sink sees them. Empty when the map is identity.
@@ -666,6 +675,106 @@ pub const ParallelScan = struct {
         return makeQuery(allocator, self);
     }
 
+    /// Like createOverStage but with a LAZY barrier: nothing runs here; the
+    /// stage materializes on the first pull. Fusion offers made in between
+    /// (a join's probe sink, chained sinks above it) bind against
+    /// `plannedChunks` — an upper bound the real chunk count never exceeds.
+    /// Compute/aggregate fusion is declined instead (a serial Compute above
+    /// still parallelizes by forwarding the probe offer with per-chunk
+    /// clones), so the only worker pipeline is the bare chunk scan.
+    pub fn createOverStageDeferred(
+        allocator: Allocator,
+        worker_alloc_in: Allocator,
+        stage: *Stage,
+        injected_acct: ?*exec.memory.MemoryAccountant,
+        max_dop: usize,
+    ) !Query {
+        const worker_alloc = workerAlloc(worker_alloc_in);
+        const self = try allocator.create(ParallelScan);
+        errdefer allocator.destroy(self);
+
+        // One consumer; released at deinit. Nothing fails after this point.
+        stage.registerUse();
+
+        self.* = .{
+            .allocator = allocator,
+            .table = null,
+            .worker_alloc = worker_alloc,
+            .stage = stage,
+            .stage_deferred = true,
+            .deferred_dop = @max(@as(usize, 1), max_dop),
+            .workers = &.{},
+            .n_threads = 1,
+            .next_chunk = std.atomic.Value(usize).init(0),
+            .acct = injected_acct,
+            .owns_acct = false,
+            .out_schema = stage.schema,
+            .round = &.{},
+            .werr = &.{},
+            .threads = &.{},
+            .thread_active = &.{},
+            .exhausted = &.{},
+            .round_cursor = 0,
+            .all_done = false,
+        };
+        return makeQuery(allocator, self);
+    }
+
+    /// Sink-bind sizing before the deferred barrier runs: the real chunk
+    /// count is `max(n_threads, min(dop*CHUNK_FACTOR, total))` — always
+    /// ≤ dop*CHUNK_FACTOR, so per-chunk sink state bound at this size
+    /// covers every chunk index the workers will use.
+    fn plannedChunks(self: *const ParallelScan) usize {
+        if (self.stage_deferred and self.workers.len == 0) return self.deferred_dop * CHUNK_FACTOR;
+        return self.workers.len;
+    }
+
+    /// The lazy barrier: run the stage, shard its chunks, build the ranged
+    /// workers + round state. First pull only.
+    fn buildDeferredWorkers(self: *ParallelScan) !void {
+        const stage = self.stage.?;
+        try stage.ensureRun();
+        const result = stage.result orelse return error.UnsupportedQueryShape;
+        const total_chunks = result.chunks.items.len;
+        const dop = self.deferred_dop;
+        const n_threads = @max(@as(usize, 1), @min(dop, @max(total_chunks, 1)));
+        const n_chunks = @max(n_threads, @min(dop * CHUNK_FACTOR, @max(total_chunks, 1)));
+
+        const workers = try self.allocator.alloc(Leaf, n_chunks);
+        var built: usize = 0;
+        errdefer {
+            for (workers[0..built]) |w| w.deinit();
+            self.allocator.free(workers);
+        }
+        for (0..n_chunks) |i| {
+            const lo = i * total_chunks / n_chunks;
+            const hi = if (i == n_chunks - 1) total_chunks else (i + 1) * total_chunks / n_chunks;
+            const w = try ChunkRangeScan.alloc(self.worker_alloc, stage, result, lo, hi);
+            workers[i] = .{ .chunk = w };
+            built += 1;
+        }
+        const round = try self.allocator.alloc(?Batch, n_chunks);
+        errdefer self.allocator.free(round);
+        const werr = try self.allocator.alloc(?anyerror, n_chunks);
+        errdefer self.allocator.free(werr);
+        const threads = try self.allocator.alloc(std.Thread, n_chunks);
+        errdefer self.allocator.free(threads);
+        const thread_active = try self.allocator.alloc(bool, n_chunks);
+        errdefer self.allocator.free(thread_active);
+        const exhausted = try self.allocator.alloc(bool, n_chunks);
+        errdefer self.allocator.free(exhausted);
+        @memset(exhausted, false);
+
+        self.workers = workers;
+        self.n_threads = n_threads;
+        self.round = round;
+        self.werr = werr;
+        self.threads = threads;
+        self.thread_active = thread_active;
+        self.exhausted = exhausted;
+        self.round_cursor = n_chunks;
+    }
+
     pub fn deinit(self: *ParallelScan) void {
         // Round-mode pool may still be parked on the barrier (query abandoned
         // before the stream drained, e.g. an error or early LIMIT). Join first.
@@ -761,6 +870,7 @@ pub const ParallelScan = struct {
     /// `compute_built` tracks construction so deinit's ownership split is correct
     /// even if a mid-build allocation fails.
     pub fn tryFuseCompute(self: *ParallelScan, derived: []const Derived) !bool {
+        if (self.stage_deferred) return false;
         if (self.mode != .unset or self.compute_fused) return false;
         const scan_cols = self.workers[0].outputSchema();
         for (derived) |d| {
@@ -777,6 +887,20 @@ pub const ParallelScan = struct {
         }
         self.out_schema = q[0].outputSchema();
         self.compute_fused = true;
+        return true;
+    }
+
+    /// A probe-fused join ABOVE the current sink's join chains its own sink
+    /// onto this scan's emission: bind it over the same chunk count and
+    /// re-type the emitted schema to its output. The original probe_sink
+    /// stays — the joins feed each other inside sinkProcess per chunk; this
+    /// scan only needs to know the FINAL schema its rounds now carry.
+    /// Compile time only (before the first pull settles a mode).
+    pub fn rechainProbeSink(self: *ParallelScan, sink: exec.ProbeSink) !bool {
+        if (self.mode != .unset) return false;
+        if (self.probe_sink == null or self.agg_fused or self.owns_out_schema) return false;
+        try sink.bind(sink.ctx, self.plannedChunks(), self.worker_alloc);
+        self.out_schema = sink.out_schema;
         return true;
     }
 
@@ -797,10 +921,15 @@ pub const ParallelScan = struct {
     /// schema (`out_schema` swap below).
     pub fn tryFuseProbe(self: *ParallelScan, sink: exec.ProbeSink) !bool {
         if (self.mode != .unset) return false;
-        if (self.agg_fused or self.compute_fused) return false;
+        if (self.agg_fused) return false;
+        // A stage-backed scan with fused per-stripe computes still accepts:
+        // round mode probes each stripe's compute chain, so the sink sees
+        // derived batches. Table-backed compute fusion keeps declining — its
+        // materialize-mode drain composes compute and sink differently.
+        if (self.compute_fused and self.table != null) return false;
         if (self.emit_keep != null or self.owns_out_schema) return false;
         if (sink.probe_map) |m| {
-            const slices = try self.allocator.alloc([]ColumnView, self.workers.len);
+            const slices = try self.allocator.alloc([]ColumnView, self.plannedChunks());
             var built: usize = 0;
             errdefer {
                 for (slices[0..built]) |s| self.allocator.free(s);
@@ -812,7 +941,7 @@ pub const ParallelScan = struct {
             }
             self.probe_map_views = slices;
         }
-        try sink.bind(sink.ctx, self.workers.len, self.worker_alloc);
+        try sink.bind(sink.ctx, self.plannedChunks(), self.worker_alloc);
         self.probe_sink = sink;
         self.out_schema = sink.out_schema;
         return true;
@@ -829,6 +958,7 @@ pub const ParallelScan = struct {
     }
 
     pub fn tryFuseAggregate(self: *ParallelScan, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
+        if (self.stage_deferred and self.workers.len == 0) return false;
         if (self.mode != .unset or self.compute_fused or self.agg_fused) return false;
         const q = try self.allocator.alloc(Query, self.workers.len);
         self.agg_q = q;
@@ -931,6 +1061,7 @@ pub const ParallelScan = struct {
     /// No-op for the round (stream) path — that emits the scan's already-pruned
     /// columns, so there is nothing dead to drop.
     pub fn setEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
+        if (self.stage_deferred and self.workers.len == 0) return; // round path: nothing dead to drop
         if (!(self.workers[0].fusedActive() or self.compute_fused)) return;
         try self.applyEmitProjection(keep);
     }
@@ -938,6 +1069,9 @@ pub const ParallelScan = struct {
     fn baseStats(self: *ParallelScan) exec.PipelineStats {
         if (self.agg_fused) return self.agg_q[0].stats();
         if (self.compute_fused) return self.compute_q[0].stats();
+        if (self.stage_deferred and self.workers.len == 0) {
+            return .{ .upper_rows = self.stage.?.stats_upper_rows };
+        }
         return self.workers[0].stats();
     }
 
@@ -957,7 +1091,7 @@ pub const ParallelScan = struct {
 
     pub fn explain(self: *ParallelScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
         var buf: [192]u8 = undefined;
-        const tag = if (self.agg_fused) "materialize+partial-agg" else if (self.compute_fused) "materialize+compute" else if (self.workers[0].fusedActive()) "materialize" else "stream";
+        const tag = if (self.agg_fused) "materialize+partial-agg" else if (self.compute_fused) "materialize+compute" else if (self.workers.len == 0) "deferred" else if (self.workers[0].fusedActive()) "materialize" else "stream";
         const src_name = if (self.table) |t| t.name else "<buffer>";
         const line = std.fmt.bufPrint(&buf, "ParallelScan {s} (DOP={d}, {s})", .{ src_name, self.n_threads, tag }) catch "ParallelScan";
         try exec.explainLine(out, allocator, depth, line);
@@ -965,12 +1099,13 @@ pub const ParallelScan = struct {
             try self.agg_q[0].explain(out, allocator, depth + 1);
         } else if (self.compute_fused) {
             try self.compute_q[0].explain(out, allocator, depth + 1);
-        } else {
+        } else if (self.workers.len > 0) {
             try self.workers[0].explain(out, allocator, depth + 1);
         }
     }
 
     pub fn next(self: *ParallelScan) !?Batch {
+        if (self.stage_deferred and self.workers.len == 0) try self.buildDeferredWorkers();
         if (self.mode == .unset) {
             // Fusion happens after create() (the wrapping Filter/Compute fuse on
             // their way up), so the strategy is settled by the first pull. A
@@ -1263,7 +1398,7 @@ pub const ParallelScan = struct {
     /// batch per chunk.
     fn runOneProbe(self: *ParallelScan, sink: exec.ProbeSink, i: usize) void {
         while (true) {
-            const mb = self.workers[i].next() catch |e| {
+            const mb = (if (self.compute_fused) self.compute_q[i].next() else self.workers[i].next()) catch |e| {
                 self.werr[i] = e;
                 return;
             };
@@ -1349,7 +1484,7 @@ const ProbeChunkScan = struct {
     }
 
     pub fn outputSchema(self: *ProbeChunkScan) []const Column {
-        return self.ps.probe_sink.?.out_schema;
+        return self.ps.out_schema;
     }
 
     pub fn addPrune(self: *ProbeChunkScan, pred: predicate.Predicate) !void {

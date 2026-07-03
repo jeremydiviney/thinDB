@@ -77,7 +77,9 @@ pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op, stage_co
     wrapWindowsInMaterialize(input.node_arena, @constCast(root), &cse) catch {};
     try collectStages(input, root, set, &map, &cse);
     if (stage_count_out) |out| out.* = @intCast(set.stages.items.len);
-    const inner = try compileBlock(input, root, &map);
+    var tail_input = input;
+    tail_input.parallel_probe_tail = true;
+    const inner = try compileBlock(tail_input, root, &map);
     set.releaseCompilePins();
     return mat_stage.StagedRoot.create(input.allocator, inner, set);
 }
@@ -336,7 +338,7 @@ fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap)
 /// compiles with the alias stripped (the V2 matchers decline aliased scans)
 /// and re-qualifies its output names through AliasRename so ON pairs and
 /// self-joins disambiguate — the same shape the legacy engine builds.
-fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
+fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, is_probe: bool) anyerror!exec.Query {
     if (op.* == .scan) {
         if (try tryPgCatalogLeaf(input, op.scan)) |q| return q;
         if (op.scan.alias) |alias| {
@@ -364,8 +366,10 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
     // per-row work — compiles as a parallel buffer scan: as the probe side
     // it lets the join fuse its probe into the stripe workers instead of
     // probing serially off a MatScan; as the build side it drains faster.
-    if (input.db.config.max_dop > 1 and streamingChainOverStage(op, map, false)) {
-        return buildFusedStreamOverStage(input, op, map);
+    if (input.db.config.max_dop > 1 and is_probe and input.parallel_probe_tail and
+        streamingChainOverStage(op, map, false, true))
+    {
+        return buildFusedStreamOverStage(input, op, map, true);
     }
     return compileBlock(input, op, map);
 }
@@ -605,12 +609,21 @@ const AdaptiveGroupBy = struct {
 /// (parity with MatScan.create's bump), so it cleanly REPLACES the serial leaf
 /// — never built alongside it. Returns null for any other shape (the caller
 /// falls back to the serial `buildGenericBlock`).
-fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!?exec.Query {
+fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, deferred: bool) anyerror!?exec.Query {
     if (input.db.config.max_dop <= 1) return null;
     const stage = switch (op.*) {
         .materialize => map.get(op) orelse return null,
         else => return null,
     };
+    if (deferred) {
+        return try exec.ParallelScan.createOverStageDeferred(
+            input.allocator,
+            input.db.allocator,
+            stage,
+            input.accountant,
+            input.db.config.max_dop,
+        );
+    }
     return try exec.ParallelScan.createOverStage(
         input.allocator,
         input.db.allocator,
@@ -632,14 +645,24 @@ fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *S
 /// the parallel leaf even bare: a round-mode ParallelScan probe side lets the
 /// join fuse its probe into the stripe workers (and a build side drains in
 /// parallel), where a serial MatScan pins the whole probe on one thread.
-fn streamingChainOverStage(op: *const ir.Op, map: *StageMap, require_work: bool) bool {
+fn streamingChainOverStage(op: *const ir.Op, map: *StageMap, require_work: bool, see_through: bool) bool {
     var has_work = false;
     var cur = op;
     while (true) {
         switch (cur.*) {
-            .materialize => {
-                const stage = map.get(cur) orelse return false;
-                return (has_work or !require_work) and stage.stats_upper_rows > mat_stage.chunk_rows;
+            .materialize => |m| {
+                if (map.get(cur)) |stage| {
+                    return (has_work or !require_work) and stage.stats_upper_rows > mat_stage.chunk_rows;
+                }
+                // Single-ref: the body compiles inline at this spot anyway,
+                // so a see-through walk continues into it — a window/forced
+                // stage inside is then reachable as the chain's parallel
+                // source. Only the root join tail opts in: each match is an
+                // EAGER compile-time barrier that pins its stage for the
+                // whole query, so matching broadly runs every stage
+                // simultaneously and blows the memory budget.
+                if (!see_through) return false;
+                cur = m.upstream;
             },
             .compute => |c| {
                 has_work = true;
@@ -662,33 +685,36 @@ fn streamingChainOverStage(op: *const ir.Op, map: *StageMap, require_work: bool)
 /// stripe workers (round mode emits batch-at-a-time, no full-result copy).
 /// Mirrors `buildGenericBlock`'s streaming arms but pushes the fusable compute
 /// down via `computeDerivedFused`. Precondition: `streamingChainOverStage`.
-fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
+fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, deferred: bool) anyerror!exec.Query {
     switch (op.*) {
-        .materialize => return (try tryStageParallelScan(input, op, map)) orelse error.UnsupportedQueryShape,
+        .materialize => |m| {
+            if (map.get(op) != null) return (try tryStageParallelScan(input, op, map, deferred)) orelse error.UnsupportedQueryShape;
+            return buildFusedStreamOverStage(input, m.upstream, map, deferred);
+        },
         .compute => |c| {
-            var up = try buildFusedStreamOverStage(input, c.upstream, map);
+            var up = try buildFusedStreamOverStage(input, c.upstream, map, deferred);
             errdefer up.deinit();
             return engine_v2.computeDerivedFused(input.allocator, up, c.derived, input.udf_registry);
         },
         .filter => |f| {
-            var up = try buildFusedStreamOverStage(input, f.upstream, map);
+            var up = try buildFusedStreamOverStage(input, f.upstream, map, deferred);
             errdefer up.deinit();
             return up.filter(f.predicate);
         },
         .select => |s| {
-            var up = try buildFusedStreamOverStage(input, s.upstream, map);
+            var up = try buildFusedStreamOverStage(input, s.upstream, map, deferred);
             errdefer up.deinit();
             return local.compileSelectProject(input.allocator, up, s);
         },
         .exclude => |e| {
-            var up = try buildFusedStreamOverStage(input, e.upstream, map);
+            var up = try buildFusedStreamOverStage(input, e.upstream, map, deferred);
             errdefer up.deinit();
             const remaining = try local.complementColumns(input.allocator, up.outputSchema(), e.columns);
             defer input.allocator.free(remaining);
             return up.project(remaining);
         },
         .alias => |a| {
-            var up = try buildFusedStreamOverStage(input, a.upstream, map);
+            var up = try buildFusedStreamOverStage(input, a.upstream, map, deferred);
             errdefer up.deinit();
             return exec.AliasRename.create(input.allocator, up, a.alias);
         },
@@ -697,7 +723,7 @@ fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, ma
 }
 
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
-    if (input.db.config.max_dop > 1 and !input.force_ordered and streamingChainOverStage(op, map, true)) return buildFusedStreamOverStage(input, op, map);
+    if (input.db.config.max_dop > 1 and !input.force_ordered and streamingChainOverStage(op, map, true, false)) return buildFusedStreamOverStage(input, op, map, false);
     switch (op.*) {
         .scan => |s| {
             // Only pg_catalog virtual scans route here; real-table blocks
@@ -812,7 +838,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         .group_by => |g| {
             for (g.aggs) |a| if (a.func == .udf) return error.UnsupportedQueryShape;
-            var up = (try tryStageParallelScan(input, g.upstream, map)) orelse
+            var up = (try tryStageParallelScan(input, g.upstream, map, false)) orelse
                 try buildGenericBlock(input, g.upstream, map, block_root);
             errdefer up.deinit();
             // Probe-fused join below: aggregate the joined batches inside
@@ -954,9 +980,9 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             return wq;
         },
         .join => |j| {
-            var left = try compileJoinChild(input, j.left, map);
+            var left = try compileJoinChild(input, j.left, map, j.join_type == .left);
             errdefer left.deinit();
-            const right = try compileJoinChild(input, j.right, map);
+            const right = try compileJoinChild(input, j.right, map, j.join_type == .right);
             return left.join(right, joinSpecOf(j));
         },
         .set_union => |u| {
@@ -1224,10 +1250,10 @@ fn compileFilteredJoin(
     const j = join_op.join;
     const allocator = input.allocator;
 
-    var left = try compileJoinChild(input, j.left, map);
+    var left = try compileJoinChild(input, j.left, map, j.join_type == .left);
     var left_owned = true;
     errdefer if (left_owned) left.deinit();
-    var right = try compileJoinChild(input, j.right, map);
+    var right = try compileJoinChild(input, j.right, map, j.join_type == .right);
     var right_owned = true;
     errdefer if (right_owned) right.deinit();
 

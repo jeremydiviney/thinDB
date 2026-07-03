@@ -34,6 +34,10 @@ const StringStore = engine.StringStore;
 
 const exec = @import("exec.zig");
 const Query = exec.Query;
+const parallel_scan_mod = @import("parallel_scan.zig");
+const compute_mod = @import("compute.zig");
+const alias_mod = @import("alias_rename.zig");
+const project_mod = @import("project_limit.zig");
 const Batch = exec.Batch;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
@@ -563,6 +567,11 @@ pub const Join = struct {
     probe_fused: bool = false,
     probe_chunks: []ProbeChunk = &.{},
     probe_chunk_alloc: Allocator = undefined,
+    /// A probe-fused join ABOVE this one in a left-deep chain: our per-chunk
+    /// joined batches feed straight into its sink (same chunk index, same
+    /// worker thread), so the whole join tail runs inside the scan's stripe
+    /// workers. Set via tryFuseProbe forwarding; not owned.
+    chained_sink: ?exec.ProbeSink = null,
 
     /// Output staging: ColumnStores we append matched rows into,
     /// emitted as a single Batch when full or when probe is exhausted.
@@ -968,6 +977,73 @@ pub const Join = struct {
         if (!self.probe_fused) return false;
         var probe = if (self.build_is_left) self.right else self.left;
         return probe.tryFuseAggregate(group_cols, aggs);
+    }
+
+    /// A join whose probe side is THIS join (a left-deep join tail) offers
+    /// its sink here. When this join is itself probe-fused, chain it: bind
+    /// the upper sink at the bottom scan over the same chunk stripes, then
+    /// have our sinkProcess feed each joined batch straight into it — the
+    /// whole tail becomes one parallel pipeline. Each join still builds its
+    /// own (small) build side serially before its probe first pulls, so the
+    /// natural next() cascade completes every build before workers spawn.
+    pub fn tryFuseProbe(self: *Join, sink: exec.ProbeSink) !bool {
+        if (!self.probe_fused or self.chained_sink != null) return false;
+        if (!(try self.rechainDown(sink))) return false;
+        if (sink.probe_map) |m| {
+            for (self.probe_chunks) |*ch| {
+                ch.chain_views = try self.probe_chunk_alloc.alloc(ColumnView, m.len);
+            }
+        }
+        self.chained_sink = sink;
+        return true;
+    }
+
+    /// Walk the probe-fused chain to the ParallelScan at the bottom and
+    /// rebind + re-type there. Intermediate joins already emit through
+    /// their own chained sinks; the new sink attaches at the CALLER (the
+    /// current chain tail), so they pass through untouched here.
+    fn rechainDown(self: *Join, sink: exec.ProbeSink) anyerror!bool {
+        const probe = if (self.build_is_left) self.right else self.left;
+        return rechainDownQ(probe, sink);
+    }
+
+    /// Descend an already-fused probe pipeline — joins pass through their
+    /// probe side, chained Computes through their upstream — to the
+    /// ParallelScan at the bottom, and rebind + re-type there.
+    fn rechainDownQ(q: Query, sink: exec.ProbeSink) anyerror!bool {
+        if (exec.queryAs(parallel_scan_mod.ParallelScan, q)) |ps| return ps.rechainProbeSink(sink);
+        if (exec.queryAs(Join, q)) |j| {
+            if (!j.probe_fused) return false;
+            return rechainDownQ(if (j.build_is_left) j.right else j.left, sink);
+        }
+        if (exec.queryAs(compute_mod.Compute, q)) |c| {
+            if (c.chain == null) return false;
+            return rechainDownQ(c.upstream, sink);
+        }
+        if (exec.queryAs(alias_mod.AliasRename, q)) |ar| {
+            if (!ar.probe_fused) return false;
+            return rechainDownQ(ar.upstream, sink);
+        }
+        if (exec.queryAs(project_mod.Project, q)) |pr| {
+            if (!pr.probe_fused) return false;
+            return rechainDownQ(pr.upstream, sink);
+        }
+        return false;
+    }
+
+    /// Feed a joined batch into the chained (upper) join's sink, or pass it
+    /// through when this join is the top of the fused pipeline. Null from
+    /// the upper sink (zero output rows) propagates — the scan worker pulls
+    /// the next batch.
+    fn chainEmit(self: *Join, chunk: usize, b: Batch) anyerror!?Batch {
+        const cs = self.chained_sink orelse return b;
+        var out = b;
+        if (cs.probe_map) |m| {
+            const vs = self.probe_chunks[chunk].chain_views;
+            for (m, vs) |src, *v| v.* = b.values[src];
+            out = .{ .schema = b.schema, .values = vs, .row_count = b.row_count };
+        }
+        return try cs.process(cs.ctx, chunk, out);
     }
 
     pub fn addPrune(self: *Join, pred: Predicate) !void {
@@ -1811,6 +1887,11 @@ pub const Join = struct {
         build_rows: std.ArrayListUnmanaged(u32) = .empty,
         out_cols: []ColumnStore = &.{},
         views: []ColumnView = &.{},
+        /// Remap scratch when the chained (upper) sink carries a probe_map
+        /// (a Project narrowed this join's output before the upper join
+        /// compiled against it): our joined batch remaps into these views
+        /// before the upper sink processes it.
+        chain_views: []ColumnView = &.{},
     };
 
     fn sinkBind(ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void {
@@ -1849,18 +1930,18 @@ pub const Join = struct {
             if (batch.row_count == 0) return null;
             try self.resolvePassMatches(batch, alloc, &ch.build_rows);
             if (self.passBatchAllMatched(ch.build_rows.items)) {
-                return try self.emitPassThrough(batch, ch.build_rows.items, ch.out_cols, ch.views, alloc);
+                return try self.chainEmit(chunk, try self.emitPassThrough(batch, ch.build_rows.items, ch.out_cols, ch.views, alloc));
             }
             try compactPassPairs(alloc, &ch.build_rows, &ch.probe_rows);
             if (ch.probe_rows.items.len == 0) return null;
             for (ch.out_cols) |*c| c.clear();
             try self.gatherPairs(batch, ch.probe_rows.items, ch.build_rows.items, ch.out_cols, alloc);
             for (ch.out_cols, ch.views) |*c, *v| v.* = c.view();
-            return Batch{
+            return try self.chainEmit(chunk, Batch{
                 .schema = self.output_schema,
                 .values = ch.views,
                 .row_count = ch.out_cols[0].data.rowCount(),
-            };
+            });
         }
         const ft = &self.fast_table.?;
         try self.collectPairs(ft, batch, alloc, &ch.probe_rows, &ch.build_rows);
@@ -1868,11 +1949,11 @@ pub const Join = struct {
         for (ch.out_cols) |*c| c.clear();
         try self.gatherPairs(batch, ch.probe_rows.items, ch.build_rows.items, ch.out_cols, alloc);
         for (ch.out_cols, ch.views) |*c, *v| v.* = c.view();
-        return Batch{
+        return try self.chainEmit(chunk, Batch{
             .schema = self.output_schema,
             .values = ch.views,
             .row_count = ch.out_cols[0].data.rowCount(),
-        };
+        });
     }
 
     fn freeProbeChunk(alloc: Allocator, ch: *ProbeChunk) void {
@@ -1881,6 +1962,7 @@ pub const Join = struct {
         for (ch.out_cols) |*c| c.deinit(alloc);
         if (ch.out_cols.len > 0) alloc.free(ch.out_cols);
         if (ch.views.len > 0) alloc.free(ch.views);
+        if (ch.chain_views.len > 0) alloc.free(ch.chain_views);
     }
 
     /// Gather build-side rows into `out`, splitting `rows` into runs of
@@ -2409,3 +2491,4 @@ fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
         .gte => ord != .lt,
     };
 }
+

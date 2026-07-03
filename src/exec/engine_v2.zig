@@ -74,6 +74,14 @@ pub const CompileInput = struct {
     /// parallel seams (round buffer scans interleave stripes) are suppressed
     /// for its chains. Scoped: callers set it on a COPY of the input.
     force_ordered: bool = false,
+    /// Parallel probe pipelines: set for the ROOT block only. A probe-side
+    /// join child there may compile as a parallel scan over a materialized
+    /// stage (an eager compile-time barrier that pins the stage for the
+    /// query) so the join tail fuses into the stripe workers. Scoped to the
+    /// root because each such leaf materializes at COMPILE time — doing it
+    /// for every CTE-internal join runs all their stages simultaneously and
+    /// blows the memory budget. Scoped: set on a COPY of the input.
+    parallel_probe_tail: bool = false,
 };
 
 /// Compile ONE single-source query block (no materialize boundaries inside —
