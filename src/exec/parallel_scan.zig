@@ -33,8 +33,10 @@
 //! two of our threads on one core's SMT siblings while another core idles.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
+const buffer_pool = @import("../util/buffer_pool.zig");
 const types = @import("../types.zig");
 const Column = types.Column;
 
@@ -97,6 +99,21 @@ const WorkerBuf = struct {
     scan_ticks: u64 = 0,
     copy_ticks: u64 = 0,
 };
+
+/// The thread-safe allocator the per-worker scans/aggregates/survivor buffers
+/// draw from. In production this is the process-global retaining buffer pool
+/// (recycles the large decode buffers instead of `munmap`-ing them every scan);
+/// `THINDB_NO_BUFPOOL=1` reverts to the raw backing allocator for an A/B without
+/// a rebuild. Tests pass their own (`testing.allocator`/`c_allocator`) so leak
+/// detection observes every free — the pool retains blocks, which a leak
+/// detector would flag.
+fn workerAlloc(base: Allocator) Allocator {
+    if (builtin.is_test) return base;
+    if (getenv("THINDB_NO_BUFPOOL")) |v| {
+        if (v[0] == '1') return base;
+    }
+    return buffer_pool.allocator();
+}
 
 test "createOverStage: parallel buffer scan preserves the row multiset" {
     const allocator = std.testing.allocator;
@@ -506,6 +523,7 @@ pub const ParallelScan = struct {
         defer if (bounds) |b| allocator.free(b);
         exec.prof.addPhase("pscan.create.byte_partition(footers)", @intCast(exec.prof.nowTicks() - t_part));
 
+        const wa = workerAlloc(table.allocator);
         const t_workers = exec.prof.nowTicks();
         const workers = try allocator.alloc(Leaf, n_chunks);
         var built: usize = 0;
@@ -518,7 +536,7 @@ pub const ParallelScan = struct {
             const hi = if (bounds) |b| b[i + 1] else (if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks);
             const start = flatToCoord(lo, seg_start, snap.segment_count, total_rgs);
             const end = flatToCoord(hi, seg_start, snap.segment_count, total_rgs);
-            const w = try Scan.allocWithProjectionLoc(table.allocator, table, acct, needed, false, snap);
+            const w = try Scan.allocWithProjectionLoc(wa, table, acct, needed, false, snap);
             workers[i] = .{ .segment = w };
             built += 1;
             // The last chunk also drains the memtable (ordered last).
@@ -548,7 +566,7 @@ pub const ParallelScan = struct {
         self.* = .{
             .allocator = allocator,
             .table = table,
-            .worker_alloc = table.allocator,
+            .worker_alloc = wa,
             .stage = null,
             .workers = workers,
             .n_threads = n_threads,
@@ -575,11 +593,12 @@ pub const ParallelScan = struct {
     /// workers allocate concurrently (materialize deep-copy, fusion scratch).
     pub fn createOverStage(
         allocator: Allocator,
-        worker_alloc: Allocator,
+        worker_alloc_in: Allocator,
         stage: *Stage,
         injected_acct: ?*exec.memory.MemoryAccountant,
         max_dop: usize,
     ) !Query {
+        const worker_alloc = workerAlloc(worker_alloc_in);
         const dop = @max(@as(usize, 1), max_dop);
 
         // The barrier: drain the producer once. After this the result is frozen
