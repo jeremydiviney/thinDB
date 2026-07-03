@@ -1585,14 +1585,51 @@ pub const Join = struct {
     /// Decided once, right after buildPhase.
     fn passThroughEligible(self: *const Join) bool {
         if (self.skew_smj != null) return false;
-        if (!self.probeSidePreserved()) return false;
-        // Empty build: every probe row null-extends exactly once; FULL's
-        // drain has nothing to add, so even FULL qualifies here.
-        if (self.build_rows == 0) return true;
-        // Non-empty FULL can't pass through — the drain phase appends
-        // unmatched build rows after the probe.
-        if (self.join_type == .full) return false;
-        return self.build_keys_unique;
+        if (self.probeSidePreserved()) {
+            // Empty build: every probe row null-extends exactly once; FULL's
+            // drain has nothing to add, so even FULL qualifies here.
+            if (self.build_rows == 0) return true;
+            // Non-empty FULL can't pass through — the drain phase appends
+            // unmatched build rows after the probe.
+            if (self.join_type == .full) return false;
+            return self.build_keys_unique;
+        }
+        // INNER with a unique-key build emits each probe row 0 or 1 times.
+        // The pass-through emit is row-aligned with the probe batch, so it
+        // applies per BATCH: only when every row matched (the common
+        // FK-lookup case) — a batch with misses falls back to the pair
+        // gather (passBatchAllMatched / compactPassPairs).
+        return self.join_type == .inner and self.build_rows > 0 and self.build_keys_unique;
+    }
+
+    /// Preserved joins pass through unconditionally (misses null-extend);
+    /// INNER pass-through requires the whole batch to have matched.
+    fn passBatchAllMatched(self: *const Join, rows: []const u32) bool {
+        if (self.probeSidePreserved()) return true;
+        for (rows) |r| {
+            if (r == FAST_EMPTY) return false;
+        }
+        return true;
+    }
+
+    /// Fallback for an INNER pass-through batch with misses: compact the
+    /// per-row match slots in place into an aligned (probe, build) pair
+    /// list for the standard gather emit.
+    fn compactPassPairs(
+        alloc: Allocator,
+        build_rows: *std.ArrayListUnmanaged(u32),
+        probe_rows: *std.ArrayListUnmanaged(u32),
+    ) !void {
+        probe_rows.clearRetainingCapacity();
+        try probe_rows.ensureUnusedCapacity(alloc, build_rows.items.len);
+        var w: usize = 0;
+        for (build_rows.items, 0..) |m, i| {
+            if (m == FAST_EMPTY) continue;
+            probe_rows.appendAssumeCapacity(@intCast(i));
+            build_rows.items[w] = m;
+            w += 1;
+        }
+        build_rows.items.len = w;
     }
 
     fn probeStepPass(self: *Join) !?Batch {
@@ -1600,7 +1637,19 @@ pub const Join = struct {
             const batch = (try self.nextProbe()) orelse return null;
             if (batch.row_count == 0) continue;
             try self.resolvePassMatches(batch, self.allocator, &self.build_rows_scratch);
-            return try self.emitPassThrough(batch, self.build_rows_scratch.items, self.output_columns, self.views, self.allocator);
+            if (self.passBatchAllMatched(self.build_rows_scratch.items)) {
+                return try self.emitPassThrough(batch, self.build_rows_scratch.items, self.output_columns, self.views, self.allocator);
+            }
+            try compactPassPairs(self.allocator, &self.build_rows_scratch, &self.probe_rows_scratch);
+            if (self.probe_rows_scratch.items.len == 0) continue;
+            for (self.output_columns) |*c| c.clear();
+            try self.gatherPairs(batch, self.probe_rows_scratch.items, self.build_rows_scratch.items, self.output_columns, self.allocator);
+            for (self.output_columns, self.views) |*c, *v| v.* = c.view();
+            return Batch{
+                .schema = self.output_schema,
+                .values = self.views,
+                .row_count = self.output_columns[0].data.rowCount(),
+            };
         }
     }
 
@@ -1799,7 +1848,19 @@ pub const Join = struct {
         if (self.passthrough) {
             if (batch.row_count == 0) return null;
             try self.resolvePassMatches(batch, alloc, &ch.build_rows);
-            return try self.emitPassThrough(batch, ch.build_rows.items, ch.out_cols, ch.views, alloc);
+            if (self.passBatchAllMatched(ch.build_rows.items)) {
+                return try self.emitPassThrough(batch, ch.build_rows.items, ch.out_cols, ch.views, alloc);
+            }
+            try compactPassPairs(alloc, &ch.build_rows, &ch.probe_rows);
+            if (ch.probe_rows.items.len == 0) return null;
+            for (ch.out_cols) |*c| c.clear();
+            try self.gatherPairs(batch, ch.probe_rows.items, ch.build_rows.items, ch.out_cols, alloc);
+            for (ch.out_cols, ch.views) |*c, *v| v.* = c.view();
+            return Batch{
+                .schema = self.output_schema,
+                .values = ch.views,
+                .row_count = ch.out_cols[0].data.rowCount(),
+            };
         }
         const ft = &self.fast_table.?;
         try self.collectPairs(ft, batch, alloc, &ch.probe_rows, &ch.build_rows);
