@@ -198,35 +198,81 @@ pub const PartitionedAggregate = struct {
         }
     }
 
-    /// Phase A (serial): drain the upstream once, scattering each row into its
-    /// partition's gathered input columns. Runs on the calling thread only.
-    fn scatter(self: *PartitionedAggregate) !void {
-        var idx_lists = try self.allocator.alloc(std.ArrayListUnmanaged(u32), self.n_parts);
-        defer {
-            for (idx_lists) |*l| l.deinit(self.allocator);
-            self.allocator.free(idx_lists);
-        }
-        for (idx_lists) |*l| l.* = .empty;
-        var hashes: std.ArrayListUnmanaged(u64) = .empty;
-        defer hashes.deinit(self.allocator);
+    /// Two-phase worker pool: one worker per partition (its arena stays
+    /// thread-exclusive across both phases).
+    ///
+    ///   .copy      — the conn thread pulled a batch and bucketed its row
+    ///                indices per partition; every worker bulk-copies ITS
+    ///                partition's rows out of the (batch-lifetime) views.
+    ///                Barrier per batch — the views die at the next pull.
+    ///   .aggregate — after the last batch, each worker runs the serial
+    ///                Aggregate over its gathered partition.
+    ///
+    /// The conn thread participates as partition 0's worker in both phases.
+    const Pool = struct {
+        owner: *PartitionedAggregate,
+        batch: Batch = undefined,
+        idx_lists: []std.ArrayListUnmanaged(u32) = &.{},
+        mode: Mode = .copy,
+        gen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        done: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        parked: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-        while (try self.up.next()) |batch| {
-            try hashes.resize(self.allocator, batch.row_count);
-            @memset(hashes.items, 0x9e3779b97f4a7c15);
-            for (self.group_indices) |ci| hashColumnInto(batch.values[ci], hashes.items);
-            for (idx_lists) |*l| l.clearRetainingCapacity();
-            for (hashes.items, 0..) |h, row| {
-                try idx_lists[h % self.n_parts].append(self.allocator, @intCast(row));
-            }
-            for (idx_lists, self.parts) |*l, *part| {
-                if (l.items.len == 0) continue;
-                const aa = part.arena.allocator();
-                for (part.in_cols, 0..) |*store, ci| {
-                    try engine.transform.appendByIndices(aa, batch.values[ci], l.items, store);
+        const Mode = enum { copy, aggregate };
+
+        fn workerMain(pool: *Pool, part_idx: usize) void {
+            var seen: usize = 0;
+            while (true) {
+                var spins: usize = 0;
+                while (pool.gen.load(.acquire) == seen) {
+                    if (pool.stop.load(.acquire)) return;
+                    spins += 1;
+                    if (spins < 4096) std.atomic.spinLoopHint() else std.Thread.yield() catch std.atomic.spinLoopHint();
                 }
-                part.in_rows += l.items.len;
+                seen = pool.gen.load(.acquire);
+                _ = pool.parked.fetchSub(1, .acq_rel);
+                pool.runPhase(part_idx);
+                _ = pool.done.fetchAdd(1, .acq_rel);
+                _ = pool.parked.fetchAdd(1, .acq_rel);
             }
         }
+
+        fn runPhase(pool: *Pool, part_idx: usize) void {
+            const self = pool.owner;
+            const part = &self.parts[part_idx];
+            switch (pool.mode) {
+                .copy => copyPartition(self, part, pool.batch, pool.idx_lists[part_idx].items) catch |e| {
+                    part.err = e;
+                },
+                .aggregate => self.aggregateOne(part),
+            }
+        }
+
+        /// Publish a phase, work partition 0 on this thread, wait for every
+        /// unit done AND every worker re-parked (cycles never overlap).
+        fn runBarrier(pool: *Pool, mode: Mode) void {
+            const self = pool.owner;
+            pool.mode = mode;
+            pool.done.store(0, .release);
+            _ = pool.gen.fetchAdd(1, .release);
+            pool.runPhase(0);
+            const want = self.n_parts - 1;
+            var spins: usize = 0;
+            while (pool.done.load(.acquire) < want or pool.parked.load(.acquire) < want) {
+                spins += 1;
+                if (spins < 4096) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+            }
+        }
+    };
+
+    fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indices: []const u32) !void {
+        if (indices.len == 0) return;
+        const aa = part.arena.allocator();
+        for (part.in_cols, 0..) |*store, ci| {
+            try engine.transform.appendByIndices(aa, batch.values[ci], indices, store);
+        }
+        part.in_rows += indices.len;
     }
 
     /// Phase B (one worker per partition): run the serial Aggregate over the
@@ -255,11 +301,8 @@ pub const PartitionedAggregate = struct {
         }
         var out_rows: usize = 0;
         while (try agg.next()) |b| {
-            var i: usize = 0;
-            while (i < b.row_count) : (i += 1) {
-                for (out_cols, 0..) |*store, ci| {
-                    try engine.transform.appendOneRow(aa, b.values[ci], i, store);
-                }
+            for (out_cols, 0..) |*store, ci| {
+                try engine.transform.appendColumnRange(aa, b.values[ci], 0, b.row_count, store);
             }
             out_rows += b.row_count;
         }
@@ -268,16 +311,66 @@ pub const PartitionedAggregate = struct {
     }
 
     fn run(self: *PartitionedAggregate) !void {
-        try self.scatter();
+        const prof_on = exec.prof.enabled;
+        const t0 = if (prof_on) exec.prof.nowTicks() else 0;
+
+        var pool = Pool{ .owner = self };
+        const idx_lists = try self.allocator.alloc(std.ArrayListUnmanaged(u32), self.n_parts);
+        defer {
+            for (idx_lists) |*l| l.deinit(self.allocator);
+            self.allocator.free(idx_lists);
+        }
+        for (idx_lists) |*l| l.* = .empty;
+        pool.idx_lists = idx_lists;
+        var hashes: std.ArrayListUnmanaged(u64) = .empty;
+        defer hashes.deinit(self.allocator);
 
         var threads: [MAX_PARTS]?std.Thread = .{null} ** MAX_PARTS;
-        var t: usize = 1;
-        while (t < self.n_parts) : (t += 1) {
-            threads[t] = std.Thread.spawn(.{}, aggregateOne, .{ self, &self.parts[t] }) catch null;
-            if (threads[t] == null) aggregateOne(self, &self.parts[t]);
+        var spawned: usize = 0;
+        pool.parked.store(self.n_parts - 1, .release);
+        {
+            var t: usize = 1;
+            while (t < self.n_parts) : (t += 1) {
+                threads[t] = std.Thread.spawn(.{}, Pool.workerMain, .{ &pool, t }) catch null;
+                if (threads[t] != null) spawned += 1;
+            }
         }
-        aggregateOne(self, &self.parts[0]);
-        for (threads[1..self.n_parts]) |maybe| if (maybe) |th| th.join();
+        defer {
+            pool.stop.store(true, .release);
+            for (threads[1..self.n_parts]) |maybe| if (maybe) |th| th.join();
+        }
+        // Spawn failures degrade by folding those partitions into the conn
+        // thread's phase work.
+        const spawn_ok = spawned == self.n_parts - 1;
+
+        while (try self.up.next()) |batch| {
+            try hashes.resize(self.allocator, batch.row_count);
+            @memset(hashes.items, 0x9e3779b97f4a7c15);
+            for (self.group_indices) |ci| hashColumnInto(batch.values[ci], hashes.items);
+            for (idx_lists) |*l| l.clearRetainingCapacity();
+            for (hashes.items, 0..) |h, row| {
+                try idx_lists[h % self.n_parts].append(self.allocator, @intCast(row));
+            }
+            pool.batch = batch;
+            if (spawn_ok) {
+                pool.runBarrier(.copy);
+            } else {
+                for (self.parts, 0..) |*part, pi| try copyPartition(self, part, batch, idx_lists[pi].items);
+            }
+        }
+        const t1 = if (prof_on) exec.prof.nowTicks() else 0;
+
+        if (spawn_ok) {
+            pool.runBarrier(.aggregate);
+        } else {
+            for (self.parts) |*part| self.aggregateOne(part);
+        }
+        if (prof_on) {
+            const t2 = exec.prof.nowTicks();
+            var rows: u64 = 0;
+            for (self.parts) |*p| rows += p.in_rows;
+            std.debug.print("[hprof] pagg.scatter {d:.2} ms  pagg.partitions {d:.2} ms  (parts={d} rows={d})\n", .{ exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), self.n_parts, rows });
+        }
 
         for (self.parts) |*p| if (p.err) |e| return e;
         self.ran = true;
