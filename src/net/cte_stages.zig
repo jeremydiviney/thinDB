@@ -691,7 +691,7 @@ fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, ma
 }
 
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
-    if (input.db.config.max_dop > 1 and streamingChainOverStage(op, map, true)) return buildFusedStreamOverStage(input, op, map);
+    if (input.db.config.max_dop > 1 and !input.force_ordered and streamingChainOverStage(op, map, true)) return buildFusedStreamOverStage(input, op, map);
     switch (op.*) {
         .scan => |s| {
             // Only pg_catalog virtual scans route here; real-table blocks
@@ -856,7 +856,24 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // pipelines. The blocking Window operator accumulates that
             // block's output, evaluates, and emits in input order with the
             // call columns appended.
-            var up = try compileBlock(input, w.upstream, map);
+            // Ride-the-order: when a same-key window stage feeds this one
+            // through an order-preserving row-wise chain, mark the source
+            // to adopt its stage in spec order (must happen BEFORE the
+            // upstream compile — an eager chain-over-stage barrier there
+            // runs the source), compile the chain with parallel seams
+            // suppressed, and skip this window's sort.
+            var ride = false;
+            var eff_input = input;
+            var ride_keys: ir.WindowSpec = undefined;
+            if (input.db.config.max_dop > 1 and sameKeysAllSpecs(w.specs)) {
+                if (rideSource(map, w.upstream, w.specs[0])) |src| {
+                    src.win.emit_sorted = true;
+                    eff_input.force_ordered = true;
+                    ride = true;
+                    ride_keys = src.keys;
+                }
+            }
+            var up = try compileBlock(eff_input, w.upstream, map);
             errdefer up.deinit();
             // Prune the window's input to the columns the window or
             // anything above it references: the below block otherwise
@@ -895,7 +912,14 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     }
                 }
             }
-            return up.window(w.specs, w.calls, input.db.config.max_dop);
+            const wq = try up.window(w.specs, w.calls, input.db.config.max_dop);
+            if (ride) {
+                if (exec.queryAs(window_op.Window, wq)) |win| {
+                    win.assume_sorted = true;
+                    win.inherited_order = ride_keys;
+                }
+            }
+            return wq;
         },
         .join => |j| {
             var left = try compileJoinChild(input, j.left, map);
@@ -915,6 +939,127 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         else => return error.UnsupportedQueryShape,
     }
+}
+
+/// Ride-the-order eligibility: every spec of the (potential rider) window
+/// shares one (PARTITION BY, ORDER BY) key set — a single permutation
+/// describes the op.
+fn sameKeysAllSpecs(specs: []const ir.WindowSpec) bool {
+    if (specs.len == 0) return false;
+    for (specs[1..]) |sp| {
+        if (!sameSpecKeys(specs[0], sp)) return false;
+    }
+    return true;
+}
+
+fn sameSpecKeys(a: ir.WindowSpec, b: ir.WindowSpec) bool {
+    if (a.partition_by.len != b.partition_by.len or a.order_by.len != b.order_by.len) return false;
+    for (a.partition_by, b.partition_by) |x, y| {
+        if (!columnRefMatchesName(x, y)) return false;
+    }
+    for (a.order_by, b.order_by) |x, y| {
+        if (!columnRefMatchesName(x.col, y.col) or x.desc != y.desc) return false;
+    }
+    return true;
+}
+
+/// Walk a rider window's upstream chain looking for a same-key window
+/// stage whose adopted buffers can arrive here order-preserved. Crossable:
+/// filters (drop rows, keep order), computes (append columns — must not
+/// redefine a key name), explicit column projections that pass every key
+/// through unrenamed, and single-ref (inlined) materialize boundaries.
+/// Everything else — unions, joins, group-bys, sorts, multi-ref stages
+/// (their rematerialization pull isn't order-preserving) — stops the walk.
+const RideSrc = struct { win: *window_op.Window, keys: ir.WindowSpec };
+
+/// Rider coverage: the source's emitted order satisfies the rider when the
+/// partition lists match exactly and the rider's ORDER BY is a (possibly
+/// empty) prefix of the source's — partition-only riders need adjacency
+/// only, and full-key riders need the same order.
+fn riderCoveredBy(src: ir.WindowSpec, rider: ir.WindowSpec) bool {
+    if (src.partition_by.len != rider.partition_by.len) return false;
+    for (src.partition_by, rider.partition_by) |x, y| {
+        if (!columnRefMatchesName(x, y)) return false;
+    }
+    if (rider.order_by.len > src.order_by.len) return false;
+    for (rider.order_by, src.order_by[0..rider.order_by.len]) |x, y| {
+        if (!columnRefMatchesName(x.col, y.col) or x.desc != y.desc) return false;
+    }
+    return true;
+}
+
+fn rideSource(map: *StageMap, op: *const ir.Op, keys: ir.WindowSpec) ?RideSrc {
+    var cur = op;
+    while (true) {
+        switch (cur.*) {
+            .filter => |f| cur = f.upstream,
+            .compute => |c| {
+                for (c.derived) |d| {
+                    if (nameIsSpecKey(d.name, keys)) return null;
+                }
+                cur = c.upstream;
+            },
+            .exclude => |e| {
+                for (e.columns) |col| {
+                    if (nameIsSpecKey(col, keys)) return null;
+                }
+                cur = e.upstream;
+            },
+            .select => |sel| {
+                if (!selectPassesKeys(sel, keys)) return null;
+                cur = sel.upstream;
+            },
+            .materialize => |m| {
+                if (map.get(cur)) |stage| {
+                    const win = stage.adopt_window orelse return null;
+                    const src_keys = win.effectiveEmitKeys() orelse return null;
+                    if (!riderCoveredBy(src_keys, keys)) return null;
+                    return .{ .win = win, .keys = src_keys };
+                }
+                // single-ref: the body compiles inline at this use site —
+                // no rematerialization between us and it.
+                cur = m.upstream;
+            },
+            else => return null,
+        }
+    }
+}
+
+fn nameIsSpecKey(name: []const u8, keys: ir.WindowSpec) bool {
+    for (keys.partition_by) |k| {
+        if (columnRefMatchesName(name, k)) return true;
+    }
+    for (keys.order_by) |k| {
+        if (columnRefMatchesName(name, k.col)) return true;
+    }
+    return false;
+}
+
+/// Every spec key must appear in the projection unrenamed (star entries and
+/// key renames bail — over-caution is correctness here).
+fn selectPassesKeys(sel: ir.Op.Project, keys: ir.WindowSpec) bool {
+    for (keys.partition_by) |k| {
+        if (!projectionKeepsName(sel, k)) return false;
+    }
+    for (keys.order_by) |k| {
+        if (!projectionKeepsName(sel, k.col)) return false;
+    }
+    return true;
+}
+
+fn projectionKeepsName(sel: ir.Op.Project, key: []const u8) bool {
+    for (sel.columns, 0..) |col, i| {
+        if (std.mem.eql(u8, col, "*")) return true; // star passes everything through
+        if (!columnRefMatchesName(col, key)) continue;
+        // found the key — renamed?
+        if (sel.outputs) |outs| {
+            if (outs[i]) |alias| {
+                if (!columnRefMatchesName(alias, key)) return false;
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 /// Drop stage output columns no consumer can reference. With a non-null

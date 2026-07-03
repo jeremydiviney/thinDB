@@ -103,6 +103,21 @@ pub const Window = struct {
     /// 1 = fully serial (embedded default — no surprise threads).
     dop: usize = 1,
 
+    /// Ride-the-order (set by the staged compiler, cte_stages.rideSource):
+    /// `assume_sorted` — the input provably arrives sorted on this window's
+    /// (single) sort-key set, so the sort collapses to an identity
+    /// permutation over key runs. `emit_sorted` — a downstream same-key
+    /// consumer wants this window's ADOPTED stage in spec order: the
+    /// canonical permutation is retained and adoption gathers by it.
+    assume_sorted: bool = false,
+    emit_sorted: bool = false,
+    sorted_perm: ?[]u32 = null,
+    /// When riding (assume_sorted), the SOURCE's key set — the order this
+    /// window's output actually preserves, which may be STRONGER than its
+    /// own spec (a partition-only window riding a (partition, month) source
+    /// emits (partition, month) order). Consumers read effectiveEmitKeys.
+    inherited_order: ?ir.WindowSpec = null,
+
     // Batch emit state — emits input + output in original order.
     emit_offset: usize = 0,
     out_output_columns: []ColumnStore, // staging for output cols per batch
@@ -150,6 +165,26 @@ pub const Window = struct {
     };
 
     const DefaultKind = enum { none, literal, col_ref };
+
+    /// The key set this window's ADOPTED output is (or will be) ordered
+    /// by: the inherited source order when riding, else its own single
+    /// sort-key set. Null = no usable order (multiple key groups).
+    pub fn effectiveEmitKeys(self: *const Window) ?ir.WindowSpec {
+        if (self.assume_sorted) {
+            if (self.inherited_order) |k| return k;
+        }
+        if (self.specs.len > 0 and self.singleSortGroup()) return self.specs[0];
+        return null;
+    }
+
+    /// True when every spec shares one resolved sort-key set — the only
+    /// shape ride-the-order handles (one permutation describes the op).
+    pub fn singleSortGroup(self: *const Window) bool {
+        for (self.spec_group) |g| {
+            if (g != 0) return false;
+        }
+        return true;
+    }
 
     fn sameSortKeys(a: SpecIndices, b: SpecIndices) bool {
         return std.mem.eql(usize, a.partition_cols, b.partition_cols) and
@@ -310,6 +345,7 @@ pub const Window = struct {
         for (self.out_output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.out_output_columns);
         self.allocator.free(self.views);
+        if (self.sorted_perm) |perm| self.allocator.free(perm);
         freeSpecIndices(self.allocator, self.spec_indices, self.spec_indices.len);
         self.allocator.free(self.spec_group);
         self.allocator.free(self.call_plans);
@@ -383,6 +419,89 @@ pub const Window = struct {
         if (!self.drained) try self.drainAndEvaluate();
     }
 
+    /// Sorted variant of the handover: gather EVERY adopted column by the
+    /// retained canonical permutation (bucket-major clustered order:
+    /// partitions contiguous, order-sorted within — what a same-key rider
+    /// needs) into fresh per-column arenas, in parallel by column claim.
+    /// The window's original buffers stay put; the adopting stage tears the
+    /// pipeline down right after adoption, freeing them.
+    fn adoptBuffersSorted(self: *Window, perm: []const u32) !AdoptedBuffers {
+        const alloc = self.allocator;
+        const ncols = self.schema.len;
+        const stores = try alloc.alloc(ColumnStore, ncols);
+        errdefer alloc.free(stores);
+        const arena_backed = try alloc.alloc(bool, ncols);
+        errdefer alloc.free(arena_backed);
+        @memset(arena_backed, true);
+        const arenas = try alloc.alloc(std.heap.ArenaAllocator, ncols);
+        errdefer alloc.free(arenas);
+        const arena_backing = if (builtin.is_test) alloc else std.heap.c_allocator;
+        for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
+        errdefer for (arenas) |*a| a.deinit();
+
+        const Gather = struct {
+            win: *Window,
+            perm: []const u32,
+            arenas: []std.heap.ArenaAllocator,
+            stores: []ColumnStore,
+            cursor: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+            failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+            fn run(g: *@This()) void {
+                const total = g.win.schema.len;
+                while (!g.failed.load(.acquire)) {
+                    const ci = g.cursor.fetchAdd(1, .acq_rel);
+                    if (ci >= total) return;
+                    g.gatherOne(ci) catch {
+                        g.failed.store(true, .release);
+                        return;
+                    };
+                }
+            }
+
+            fn gatherOne(g: *@This(), ci: usize) !void {
+                const w = g.win;
+                const nin = w.input_schema.len;
+                const aa = g.arenas[ci].allocator();
+                var st = try ColumnStore.init(aa, w.schema[ci].type, w.schema[ci].nullable);
+                if (ci < nin) {
+                    try transform.appendByIndices(aa, w.accumulated[ci].view(), g.perm, &st);
+                } else if (w.string_outputs[ci - nin].len > 0) {
+                    const scratch = w.string_outputs[ci - nin];
+                    for (g.perm, 0..) |r, out_row| {
+                        const bytes = scratch[r] orelse "";
+                        switch (st.data) {
+                            .varchar, .string, .char => |*ss| try ss.appendValue(aa, bytes),
+                            else => return Error.WindowUnsupported,
+                        }
+                        try st.appendValidBit(aa, @intCast(out_row), scratch[r] != null);
+                    }
+                } else {
+                    try transform.appendByIndices(aa, w.output_columns[ci - nin].view(), g.perm, &st);
+                }
+                g.stores[ci] = st;
+            }
+        };
+        var g = Gather{ .win = self, .perm = perm, .arenas = arenas, .stores = stores };
+        var threads: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
+        var spawned: usize = 0;
+        if (self.dop > 1 and ncols >= 2 and !builtin.is_test) {
+            const want = @min(@min(self.dop - 1, ncols - 1), max_drain_workers);
+            while (spawned < want) {
+                threads[spawned] = std.Thread.spawn(.{}, Gather.run, .{&g}) catch break;
+                spawned += 1;
+            }
+        }
+        Gather.run(&g);
+        for (threads[0..spawned]) |maybe| if (maybe) |t| t.join();
+        if (g.failed.load(.acquire)) return error.OutOfMemory;
+
+        if (self.upstream.accountant()) |a| a.release(.window, self.reserved_bytes);
+        self.reserved_bytes = 0;
+        self.emit_offset = @intCast(self.accumulated_rows);
+        return .{ .stores = stores, .arenas = arenas, .arena_backed = arena_backed, .rows = self.accumulated_rows };
+    }
+
     /// Ownership handover for window-output-as-stage: move the accumulated
     /// input columns (with their arenas) and the evaluated output columns
     /// out of the operator. String-typed window outputs materialize once
@@ -391,6 +510,7 @@ pub const Window = struct {
     /// its post-evict state (emits nothing; deinit stays uniform).
     pub fn adoptBuffers(self: *Window) !AdoptedBuffers {
         std.debug.assert(self.drained and self.emit_offset == 0 and !self.evicted);
+        if (self.sorted_perm) |perm| return self.adoptBuffersSorted(perm);
         const alloc = self.allocator;
         const nin = self.input_schema.len;
         const rows: usize = @intCast(self.accumulated_rows);
@@ -745,8 +865,28 @@ pub const Window = struct {
         // range buckets from sampled splitters; bucket concatenation is the
         // total order); its evaluation stays serial, since rank/frame state
         // crosses bucket seams (carry fixups are a later phase).
+        const ride_single = self.singleSortGroup();
         for (self.spec_indices, 0..) |si, spec_i| {
             if (self.spec_group[spec_i] != spec_i) continue; // shares the canonical spec's pass
+            if (self.assume_sorted and ride_single) {
+                // Input arrives sorted on this window's keys (established at
+                // compile: an upstream same-key window emitted its stage in
+                // spec order and the chain here is order-preserving), so the
+                // permutation is the identity — evaluation walks key runs.
+                const perm = try self.allocator.alloc(u32, n);
+                for (perm, 0..) |*p, i| p.* = @intCast(i);
+                errdefer self.allocator.free(perm);
+                const _et = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+                for (self.call_plans, 0..) |plan, ci| {
+                    if (self.spec_group[plan.spec_idx] != spec_i) continue;
+                    try self.evaluateCall(plan, ci, perm, si);
+                }
+                if (exec.prof.enabled) exec.prof.addPhase("window.eval.sorted", @intCast(@max(0, exec.prof.nowTicks() - _et)));
+                // Identity order: even an emit_sorted adoption stays
+                // zero-copy (null sorted_perm = buffers already in order).
+                self.allocator.free(perm);
+                continue;
+            }
             if (si.partition_cols.len > 0 and n >= parallel_min_rows and self.dop > 1) {
                 try self.evaluateSpecParallel(si, spec_i, n);
                 continue;
@@ -756,7 +896,9 @@ pub const Window = struct {
                 try self.buildPermutationSamplesort(si, n)
             else
                 try self.buildPermutation(si);
-            defer self.allocator.free(perm);
+            const retain = self.emit_sorted and ride_single;
+            defer if (!retain) self.allocator.free(perm);
+            if (retain) self.sorted_perm = perm;
             const _et = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             for (self.call_plans, 0..) |plan, ci| {
                 if (self.spec_group[plan.spec_idx] != spec_i) continue;
@@ -807,7 +949,13 @@ pub const Window = struct {
         const placed = try self.allocator.alloc(KeyIdx, n);
         defer self.allocator.free(placed);
         const perm = try self.allocator.alloc(u32, n);
-        defer self.allocator.free(perm);
+        // Bucket-major clustered order: partitions are contiguous and
+        // order-sorted within — exactly what a same-key rider needs (it
+        // never requires a GLOBAL partition order, and no sort_state is
+        // advertised). Retained for the adoption gather.
+        const retain_perm = self.emit_sorted and self.singleSortGroup();
+        if (retain_perm) self.sorted_perm = perm;
+        defer if (!retain_perm) self.allocator.free(perm);
         const counts = try self.allocator.alloc(usize, workers * bucket_count);
         defer self.allocator.free(counts);
         @memset(counts, 0);

@@ -69,6 +69,11 @@ pub const CompileInput = struct {
     /// from the table's budget + shared pool, so enforcement still holds —
     /// only the per-query attribution fragments.
     accountant: ?*exec.memory.MemoryAccountant = null,
+    /// Ride-the-order: this subtree must preserve its source's row order
+    /// (a sorted window stage feeding a same-key rider), so order-scrambling
+    /// parallel seams (round buffer scans interleave stripes) are suppressed
+    /// for its chains. Scoped: callers set it on a COPY of the input.
+    force_ordered: bool = false,
 };
 
 /// Compile ONE single-source query block (no materialize boundaries inside —

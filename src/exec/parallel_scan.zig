@@ -942,7 +942,13 @@ pub const ParallelScan = struct {
     }
 
     pub fn stats(self: *ParallelScan) exec.PipelineStats {
-        const st = self.baseStats();
+        var st = self.baseStats();
+        // Workers report the SOURCE's sort property, but multi-stripe
+        // emission (round steal / drain merge) interleaves stripes — the
+        // emitted stream is only the same multiset. Claiming the source's
+        // order here would let a downstream sorted-stream GROUP BY consume
+        // scrambled rows as if grouped-adjacent.
+        if (self.n_threads > 1) st.sort_state = .{};
         if (self.out_col_stats.len > 0) {
             return .{ .upper_rows = st.upper_rows, .sort_state = st.sort_state, .column_stats = self.out_col_stats };
         }
