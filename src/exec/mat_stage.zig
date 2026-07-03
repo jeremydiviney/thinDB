@@ -210,6 +210,55 @@ pub const MaterializedResult = struct {
     }
 };
 
+/// Accumulates a stage's pull-copied result as ONE contiguous store per
+/// column (adopted-style; per-column arenas so the sweep-free ownership
+/// story matches window adoption), for stages a downstream window wants to
+/// borrow from. Fixed-width buffers pre-reserve the stage's row bound.
+const ContigSink = struct {
+    allocator: Allocator,
+    stores: []engine.ColumnStore,
+    arenas: []std.heap.ArenaAllocator,
+    arena_backed: []bool,
+    rows: u64 = 0,
+    taken: bool = false,
+
+    fn init(allocator: Allocator, schema: []const Column, expect_rows: usize) !ContigSink {
+        const stores = try allocator.alloc(engine.ColumnStore, schema.len);
+        errdefer allocator.free(stores);
+        const arenas = try allocator.alloc(std.heap.ArenaAllocator, schema.len);
+        errdefer allocator.free(arenas);
+        const arena_backed = try allocator.alloc(bool, schema.len);
+        errdefer allocator.free(arena_backed);
+        @memset(arena_backed, true);
+        for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        errdefer for (arenas) |*a| a.deinit();
+        for (schema, stores, arenas) |sc, *st, *ar| {
+            st.* = try engine.ColumnStore.initCapacity(ar.allocator(), sc.type, sc.nullable, expect_rows, 0);
+        }
+        return .{ .allocator = allocator, .stores = stores, .arenas = arenas, .arena_backed = arena_backed };
+    }
+
+    fn append(self: *ContigSink, batch: exec.Batch) !void {
+        for (self.stores, self.arenas, 0..) |*st, *ar, ci| {
+            try engine.transform.appendAllColumn(ar.allocator(), batch.values[ci], st);
+        }
+        self.rows += batch.row_count;
+    }
+
+    fn take(self: *ContigSink) MaterializedResult.Adopted {
+        self.taken = true;
+        return .{ .stores = self.stores, .arenas = self.arenas, .arena_backed = self.arena_backed };
+    }
+
+    fn deinit(self: *ContigSink) void {
+        if (self.taken) return;
+        for (self.arenas) |*a| a.deinit();
+        self.allocator.free(self.stores);
+        self.allocator.free(self.arenas);
+        self.allocator.free(self.arena_backed);
+    }
+};
+
 /// One materialization boundary: a compiled pipeline, run at most once, and
 /// its result's consumer accounting.
 pub const Stage = struct {
@@ -262,6 +311,13 @@ pub const Stage = struct {
     /// alive as long as this result. One use registered at compile,
     /// released when this stage's result frees. Pins chain transitively.
     pinned_upstream: ?*Stage = null,
+    /// A compile-time borrower exists downstream (a window on a row-aligned
+    /// chain): materialize this stage's result as contiguous columns
+    /// (adopted-style, view chunks) instead of per-chunk stores, so the
+    /// borrower can take shallow references. Set by the staged compiler
+    /// BEFORE any run; a stage that already ran eagerly just misses the
+    /// optimization (the borrower's bind degrades to normal accumulation).
+    want_contiguous: bool = false,
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;
@@ -288,6 +344,18 @@ pub const Stage = struct {
                 .{ .stores = ad.stores, .arenas = ad.arenas, .arena_backed = ad.arena_backed },
                 ad.rows,
             );
+        } else if (self.want_contiguous) {
+            var contig = try ContigSink.init(self.allocator, self.schema, self.expectedRowsHint());
+            errdefer contig.deinit();
+            while (try self.query.next()) |batch| {
+                if (self.accountant) |acct| {
+                    const bytes = row_bytes * batch.row_count;
+                    try acct.reserve(.materialize, bytes);
+                    self.reserved_bytes += bytes;
+                }
+                try contig.append(batch);
+            }
+            try res.adoptContiguous(contig.take(), contig.rows);
         } else while (try self.query.next()) |batch| {
             if (self.accountant) |acct| {
                 const bytes = row_bytes * batch.row_count;
@@ -313,6 +381,11 @@ pub const Stage = struct {
             exec.prof.dumpStageDelta(self.id, res.total_rows, wall - children, wall, self.setup_ticks, teardown, snap);
             exec.prof.addCteChildTicks(@intCast(@max(wall, 0)));
         }
+    }
+
+    fn expectedRowsHint(self: *const Stage) usize {
+        const cap: u64 = 1 << 22; // don't pre-reserve absurd compile-time bounds
+        return @intCast(@min(self.stats_upper_rows, cap));
     }
 
     fn releaseReserved(self: *Stage) void {

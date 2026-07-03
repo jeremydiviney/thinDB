@@ -876,11 +876,14 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 const rider_keys: ?ir.WindowSpec = if (sameKeysAllSpecs(w.specs)) w.specs[0] else null;
                 if (rideSource(map, w.upstream, rider_keys)) |src| {
                     if (src.covered) {
-                        src.win.emit_sorted = true;
+                        src.win.?.emit_sorted = true;
                         ride = true;
                         ride_keys = src.keys.?;
                     }
-                    if (!src.has_filter) borrow_stage = src.stage;
+                    if (!src.has_filter) {
+                        borrow_stage = src.stage;
+                        if (src.win == null) src.stage.want_contiguous = true;
+                    }
                     // Both riding and borrowing need the chain to deliver
                     // rows in the source's order (borrowing additionally
                     // 1:1) — suppress order-scrambling parallel seams.
@@ -1000,7 +1003,7 @@ fn sameSpecKeys(a: ir.WindowSpec, b: ir.WindowSpec) bool {
 /// Everything else — unions, joins, group-bys, sorts, multi-ref stages
 /// (their rematerialization pull isn't order-preserving) — stops the walk.
 const RideSrc = struct {
-    win: *window_op.Window,
+    win: ?*window_op.Window,
     stage: *mat_stage.Stage,
     /// The source's effective emit order, when it has a single usable one.
     keys: ?ir.WindowSpec,
@@ -1054,7 +1057,12 @@ fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {
             },
             .materialize => |m| {
                 if (map.get(cur)) |stage| {
-                    const win = stage.adopt_window orelse return null;
+                    const win = stage.adopt_window orelse {
+                        // Not a window stage — no order to ride, but a
+                        // filterless chain can still BORROW its columns:
+                        // ask it to materialize contiguous.
+                        return .{ .win = null, .stage = stage, .keys = null, .covered = false, .has_filter = has_filter };
+                    };
                     const src_keys = win.effectiveEmitKeys();
                     const covered = if (keys) |k|
                         (if (src_keys) |sk| riderCoveredBy(sk, k) else false)
