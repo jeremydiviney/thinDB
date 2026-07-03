@@ -179,6 +179,126 @@ pub fn appendAllColumn(
     }
 }
 
+/// Append rows `[start, end)` of `view` to `out` in bulk — one `appendSlice`
+/// (memcpy) per fixed-width column and a single byte-range memcpy + offset
+/// rebuild per string column, instead of the per-cell `appendOneRow` dispatch.
+/// This is the chunked-materialization hot path; a batch that straddles a
+/// chunk boundary calls it once per chunk-resident sub-range. Types must match.
+pub fn appendColumnRange(
+    allocator: Allocator,
+    view: ColumnView,
+    start: usize,
+    end: usize,
+    out: *ColumnStore,
+) !void {
+    if (end <= start) return;
+    const n = end - start;
+    const dst_start = out.data.rowCount();
+    switch (view.data) {
+        .int => |s| switch (out.data) {
+            .int => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .bigint => |s| switch (out.data) {
+            .bigint => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .boolean => |s| switch (out.data) {
+            .boolean => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .float => |s| switch (out.data) {
+            .float => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .double => |s| switch (out.data) {
+            .double => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .date => |s| switch (out.data) {
+            .date => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .datetime => |s| switch (out.data) {
+            .datetime => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .tinyint => |s| switch (out.data) {
+            .tinyint => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .smallint => |s| switch (out.data) {
+            .smallint => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .largeint => |s| switch (out.data) {
+            .largeint => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .decimal64 => |s| switch (out.data) {
+            .decimal64 => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .decimal128 => |s| switch (out.data) {
+            .decimal128 => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .uuid => |s| switch (out.data) {
+            .uuid => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .varchar => |sv| try appendStrRange(allocator, out, sv, start, end),
+        .string => |sv| try appendStrRange(allocator, out, sv, start, end),
+        .char => |sv| try appendStrRange(allocator, out, sv, start, end),
+    }
+    if (out.nulls != null) {
+        try out.appendValidityRangeFrom(allocator, dst_start, view.nulls, start, n);
+    }
+}
+
+inline fn appendStrRange(allocator: Allocator, out: *ColumnStore, sv: storage.StringView, start: usize, end: usize) !void {
+    switch (out.data) {
+        .varchar => |*ss| try ss.appendRange(allocator, sv, start, end),
+        .string => |*ss| try ss.appendRange(allocator, sv, start, end),
+        .char => |*ss| try ss.appendRange(allocator, sv, start, end),
+        else => unreachable,
+    }
+}
+
+/// `varchar` / `string` / `char` share one physical `StringStore`; only their
+/// SQL type tag differs. A staged column can arrive viewed as one tag while its
+/// destination store was built from a schema that picked another (e.g. a window
+/// stage whose output schema normalizes to `string` over `varchar` data), so a
+/// string-bytes copy must dispatch on whichever string-family store is active
+/// rather than demanding an exact tag match.
+inline fn appendStrValue(allocator: Allocator, out: *ColumnStore, bytes: []const u8) !void {
+    switch (out.data) {
+        .varchar => |*ss| try ss.appendValue(allocator, bytes),
+        .string => |*ss| try ss.appendValue(allocator, bytes),
+        .char => |*ss| try ss.appendValue(allocator, bytes),
+        else => unreachable,
+    }
+}
+
+/// Bulk string gather: size the destination once (one pass to sum byte
+/// lengths), then append every value capacity-assumed — no per-value
+/// dispatch, capacity check, or realloc. Falls back to per-value appends
+/// only when the column is (or would go) wide.
+fn gatherStrByIndices(allocator: Allocator, sv: storage.StringView, indices: []const u32, out: *ColumnStore) !void {
+    const ss = switch (out.data) {
+        .varchar, .string, .char => |*s| s,
+        else => unreachable,
+    };
+    var total: usize = 0;
+    for (indices) |idx| total += sv.rowBytes(idx).len;
+    if (ss.isWide() or ss.bytes.items.len + total > std.math.maxInt(u32)) {
+        for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
+        return;
+    }
+    try ss.ensureUnusedValueCapacity(allocator, indices.len, total);
+    for (indices) |idx| ss.appendValueAssumeCapacity(sv.rowBytes(idx));
+}
+
 /// Append a single row (`row`) from `view` to `out`, carrying its validity
 /// bit. Used by the bounded Top-N to copy in only the rows that survive its
 /// threshold pre-filter, one candidate at a time, rather than the whole batch.
@@ -202,14 +322,8 @@ pub fn appendOneRow(
             .boolean => |*list| try list.append(allocator, s[row]),
             else => unreachable,
         },
-        .varchar => |sv| switch (out.data) {
-            .varchar => |*ss| try ss.appendValue(allocator, sv.rowBytes(row)),
-            else => unreachable,
-        },
-        .string => |sv| switch (out.data) {
-            .string => |*ss| try ss.appendValue(allocator, sv.rowBytes(row)),
-            else => unreachable,
-        },
+        .varchar => |sv| try appendStrValue(allocator, out, sv.rowBytes(row)),
+        .string => |sv| try appendStrValue(allocator, out, sv.rowBytes(row)),
         .float => |s| switch (out.data) {
             .float => |*list| try list.append(allocator, s[row]),
             else => unreachable,
@@ -238,10 +352,7 @@ pub fn appendOneRow(
             .largeint => |*list| try list.append(allocator, s[row]),
             else => unreachable,
         },
-        .char => |sv| switch (out.data) {
-            .char => |*ss| try ss.appendValue(allocator, sv.rowBytes(row)),
-            else => unreachable,
-        },
+        .char => |sv| try appendStrValue(allocator, out, sv.rowBytes(row)),
         .decimal64 => |s| switch (out.data) {
             .decimal64 => |*list| try list.append(allocator, s[row]),
             else => unreachable,
@@ -293,18 +404,8 @@ pub fn appendByIndices(
             },
             else => unreachable,
         },
-        .varchar => |sv| switch (out.data) {
-            .varchar => |*ss| {
-                for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
-            },
-            else => unreachable,
-        },
-        .string => |sv| switch (out.data) {
-            .string => |*ss| {
-                for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
-            },
-            else => unreachable,
-        },
+        .varchar => |sv| try gatherStrByIndices(allocator, sv, indices, out),
+        .string => |sv| try gatherStrByIndices(allocator, sv, indices, out),
         .float => |s| switch (out.data) {
             .float => |*list| {
                 try list.ensureUnusedCapacity(allocator, indices.len);
@@ -354,12 +455,7 @@ pub fn appendByIndices(
             },
             else => unreachable,
         },
-        .char => |sv| switch (out.data) {
-            .char => |*ss| {
-                for (indices) |idx| try ss.appendValue(allocator, sv.rowBytes(idx));
-            },
-            else => unreachable,
-        },
+        .char => |sv| try gatherStrByIndices(allocator, sv, indices, out),
         .decimal64 => |s| switch (out.data) {
             .decimal64 => |*list| {
                 try list.ensureUnusedCapacity(allocator, indices.len);
@@ -382,10 +478,22 @@ pub fn appendByIndices(
             else => unreachable,
         },
     }
-    if (out.nulls != null) {
-        for (indices, 0..) |src_idx, j| {
-            const valid = storage.column.isValidBit(view.nulls, src_idx);
-            try out.appendValidBit(allocator, dst_start + j, valid);
+    if (out.nulls) |*nb| {
+        // Bulk validity gather: extend the bitmap once (new bytes arrive
+        // zeroed and bits at/above the old row count are 0 by invariant),
+        // then set only the valid bits — no per-row grow checks or clears.
+        const need = (dst_start + indices.len + 7) / 8;
+        if (nb.items.len < need) try nb.appendNTimes(allocator, 0, need - nb.items.len);
+        const dst = nb.items;
+        if (view.nulls) |src_nulls| {
+            for (indices, 0..) |src_idx, j| {
+                if ((src_nulls[src_idx >> 3] >> @intCast(src_idx & 7)) & 1 != 0) {
+                    const bit = dst_start + j;
+                    dst[bit >> 3] |= @as(u8, 1) << @intCast(bit & 7);
+                }
+            }
+        } else {
+            store.setBitRangeTrue(dst, dst_start, indices.len);
         }
     }
 }
@@ -649,6 +757,46 @@ pub fn applyPermutation(
     }
 
     return .{ .data = dst_data, .nulls = nulls };
+}
+
+test "appendColumnRange matches per-row appendOneRow (fixed-width + strings + nulls + straddle)" {
+    const testing = std.testing;
+    // 6 source rows; nulls bitmap: rows 1 and 4 are NULL (bit 0 = valid).
+    var ints = [_]i64{ 10, 20, 30, 40, 50, 60 };
+    const offsets = [_]u32{ 0, 2, 2, 5, 8, 8, 11 }; // "aa","", "bbb","ccc","", "ddd"
+    const bytes = "aabbbccc" ++ "ddd";
+    var nulls = [_]u8{0b0010_1101}; // valid rows: 0,2,3,5 ; null rows: 1,4
+    const int_view = ColumnView{ .data = .{ .bigint = &ints }, .nulls = &nulls };
+    const str_view = ColumnView{ .data = .{ .varchar = .{ .offsets = &offsets, .bytes = bytes } }, .nulls = &nulls };
+
+    // Reference: per-row appendOneRow over [start, end). Test ranges that start
+    // at 0 (aligned fast path) and at 2 (straddle / src offset).
+    const ranges = [_][2]usize{ .{ 0, 6 }, .{ 2, 5 }, .{ 1, 4 } };
+    for (ranges) |rg| {
+        const start = rg[0];
+        const end = rg[1];
+        inline for (.{ "bigint", "varchar" }) |kind| {
+            const view = if (comptime std.mem.eql(u8, kind, "bigint")) int_view else str_view;
+            const ty: types.Type = if (comptime std.mem.eql(u8, kind, "bigint")) .bigint else .{ .varchar = 64 };
+            var bulk = try ColumnStore.init(testing.allocator, ty, true);
+            defer bulk.deinit(testing.allocator);
+            var perrow = try ColumnStore.init(testing.allocator, ty, true);
+            defer perrow.deinit(testing.allocator);
+            try appendColumnRange(testing.allocator, view, start, end, &bulk);
+            var r = start;
+            while (r < end) : (r += 1) try appendOneRow(testing.allocator, view, r, &perrow);
+            try testing.expectEqual(perrow.rowCount(), bulk.rowCount());
+            var i: usize = 0;
+            while (i < perrow.rowCount()) : (i += 1) {
+                try testing.expectEqual(rowIsValid(perrow, @intCast(i)), rowIsValid(bulk, @intCast(i)));
+                if (comptime std.mem.eql(u8, kind, "bigint")) {
+                    try testing.expectEqual(perrow.data.bigint.items[i], bulk.data.bigint.items[i]);
+                } else {
+                    try testing.expectEqualStrings(perrow.data.varchar.view().rowBytes(i), bulk.data.varchar.view().rowBytes(i));
+                }
+            }
+        }
+    }
 }
 
 test "appendMaskedColumn fixed-width: trailing filtered-out row never overruns" {

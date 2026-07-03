@@ -35,6 +35,11 @@ const storage = @import("../storage/storage.zig");
 const Column = types.Column;
 const ColumnView = storage.ColumnView;
 
+/// A/B escape hatch: `THINDB_MAT_PERROW` forces the legacy per-cell
+/// `appendOneRow` materialization loop so the bulk column-major path can be
+/// benchmarked against it in a single running server. Default (unset) = bulk.
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 /// Rows per chunk — mirrors the default segment row-group size so chunk
 /// striping behaves like row-group tiling for future parallel readers.
 pub const chunk_rows: usize = 65_536;
@@ -45,6 +50,10 @@ pub const MaterializedResult = struct {
     schema: []const Column,
     chunks: std.ArrayListUnmanaged(Chunk) = .empty,
     total_rows: u64 = 0,
+    /// Provable upper bound on the final row count (the stage's compile-time
+    /// `stats_upper_rows`), used to size a fresh chunk's columns exactly: a
+    /// small stage allocates a small chunk instead of a full `chunk_rows`.
+    expected_rows: u64 = 0,
 
     pub const Chunk = struct {
         cols: []engine.ColumnStore,
@@ -52,14 +61,21 @@ pub const MaterializedResult = struct {
     };
 
     fn appendBatch(self: *MaterializedResult, batch: exec.Batch) !void {
+        const per_row = getenv("THINDB_MAT_PERROW") != null;
         var row: usize = 0;
         while (row < batch.row_count) {
             const chunk = try self.openChunk();
             const take = @min(chunk_rows - chunk.rows, batch.row_count - row);
-            var r = row;
-            while (r < row + take) : (r += 1) {
+            if (per_row) {
+                var r = row;
+                while (r < row + take) : (r += 1) {
+                    for (chunk.cols, 0..) |*dst, ci| {
+                        try engine.transform.appendOneRow(self.allocator, batch.values[ci], r, dst);
+                    }
+                }
+            } else {
                 for (chunk.cols, 0..) |*dst, ci| {
-                    try engine.transform.appendOneRow(self.allocator, batch.values[ci], r, dst);
+                    try engine.transform.appendColumnRange(self.allocator, batch.values[ci], row, row + take, dst);
                 }
             }
             chunk.rows += take;
@@ -68,12 +84,23 @@ pub const MaterializedResult = struct {
         }
     }
 
-    /// The last chunk if it has room, else a fresh one.
+    /// The last chunk if it has room, else a fresh one — with every row-counted
+    /// buffer (fixed-width data, string offsets, validity bitmap) pre-sized to
+    /// `cap_rows` so the fill loop never reallocates them. `cap_rows` is exact:
+    /// the provable row-count bound caps it below `chunk_rows` for small stages.
+    /// A string column's variable-width byte buffer is reserved from the
+    /// PREVIOUS full chunk's exact bytes/row (+10% slack) — a strong, locally
+    /// adaptive predictor that tracks clustered data without the global-average
+    /// variance that would under-reserve a dense chunk into a geometric realloc
+    /// that then stays bloated. The first chunk has no predecessor, so its byte
+    /// buffer grows naturally (a single chunk's worth of reallocs).
     fn openChunk(self: *MaterializedResult) !*Chunk {
-        if (self.chunks.items.len > 0) {
-            const last = &self.chunks.items[self.chunks.items.len - 1];
+        const prev: ?*Chunk = if (self.chunks.items.len > 0) &self.chunks.items[self.chunks.items.len - 1] else null;
+        if (prev) |last| {
             if (last.rows < chunk_rows) return last;
         }
+        const remaining: u64 = if (self.expected_rows > self.total_rows) self.expected_rows - self.total_rows else 0;
+        const cap_rows: usize = if (remaining == 0) chunk_rows else @intCast(@min(@as(u64, chunk_rows), remaining));
         const cols = try self.allocator.alloc(engine.ColumnStore, self.schema.len);
         var inited: usize = 0;
         errdefer {
@@ -81,11 +108,28 @@ pub const MaterializedResult = struct {
             self.allocator.free(cols);
         }
         for (self.schema, 0..) |sc, i| {
-            cols[i] = try engine.ColumnStore.init(self.allocator, sc.type, sc.nullable);
+            const bytes_cap: usize = switch (sc.type) {
+                .varchar, .string, .char => blk: {
+                    const p = prev orelse break :blk 0;
+                    if (p.rows == 0) break :blk 0;
+                    const bpr = (colStrBytes(&p.cols[i]) + p.rows - 1) / p.rows;
+                    break :blk ((bpr * cap_rows) * 11) / 10;
+                },
+                else => 0,
+            };
+            cols[i] = try engine.ColumnStore.initCapacity(self.allocator, sc.type, sc.nullable, cap_rows, bytes_cap);
             inited += 1;
         }
         try self.chunks.append(self.allocator, .{ .cols = cols });
         return &self.chunks.items[self.chunks.items.len - 1];
+    }
+
+    /// Bytes held by a string-family column store; 0 for fixed-width.
+    fn colStrBytes(col: *const engine.ColumnStore) usize {
+        return switch (col.data) {
+            .varchar, .string, .char => |ss| ss.bytes.items.len,
+            else => 0,
+        };
     }
 
     fn deinitChunks(self: *MaterializedResult) void {
@@ -148,7 +192,7 @@ pub const Stage = struct {
         const snap = if (prof_on) exec.prof.snapSlots() else undefined;
         const res = try self.allocator.create(MaterializedResult);
         errdefer self.allocator.destroy(res);
-        res.* = .{ .allocator = self.allocator, .schema = self.schema };
+        res.* = .{ .allocator = self.allocator, .schema = self.schema, .expected_rows = self.stats_upper_rows };
         errdefer res.deinitChunks();
         errdefer self.releaseReserved();
         const row_bytes = exec.memory.estimateRowBytes(self.schema);

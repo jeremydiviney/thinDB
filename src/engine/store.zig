@@ -123,6 +123,43 @@ pub const StringStore = struct {
         self.offsets.appendAssumeCapacity(@intCast(self.bytes.items.len));
     }
 
+    /// Bulk-append rows `[start, end)` of `sv`: one `appendSlice` (memcpy) for
+    /// the whole contiguous byte segment, then a rebuilt offset per row (cheap
+    /// arithmetic, no per-row memcpy). The per-value `appendValue` path
+    /// dominated chunked materialization. Falls back to per-row only when the
+    /// append would cross the 4 GiB u32-offset ceiling (then `appendValue`
+    /// handles the wide migration).
+    pub fn appendRange(self: *StringStore, allocator: Allocator, sv: StringView, start: usize, end: usize) !void {
+        const n = end - start;
+        if (n == 0) return;
+        const byte_start = sv.offsets[start];
+        const byte_end = sv.offsets[end];
+        const seg_len: usize = byte_end - byte_start;
+        if (self.wide_offsets != null or self.bytes.items.len + seg_len > std.math.maxInt(u32)) {
+            try self.ensureUnusedValueCapacity(allocator, n, seg_len);
+            for (start..end) |i| try self.appendValue(allocator, sv.bytes[sv.offsets[i]..sv.offsets[i + 1]]);
+            return;
+        }
+        const base: u32 = @intCast(self.bytes.items.len);
+        try self.bytes.appendSlice(allocator, sv.bytes[byte_start..byte_end]);
+        try self.offsets.ensureUnusedCapacity(allocator, n);
+        var i = start + 1;
+        while (i <= end) : (i += 1) {
+            self.offsets.appendAssumeCapacity(base + (sv.offsets[i] - byte_start));
+        }
+    }
+
+    /// Append `n` empty values: n more offsets at the current total byte
+    /// length, no byte-buffer growth. Bulk equivalent of `appendValue("")`
+    /// × n — the per-value path dominated wide all-NULL emits.
+    pub fn appendEmptyValues(self: *StringStore, allocator: Allocator, n: usize) !void {
+        if (self.wide_offsets) |*wo| {
+            try wo.appendNTimes(allocator, self.bytes.items.len, n);
+            return;
+        }
+        try self.offsets.appendNTimes(allocator, @intCast(self.bytes.items.len), n);
+    }
+
     pub fn rowCount(self: StringStore) usize {
         if (self.wide_offsets) |wo| return wo.items.len - 1;
         return self.offsets.items.len - 1;
@@ -259,13 +296,61 @@ pub const ColumnStore = struct {
         }
     }
 
+    /// Like `appendValidityRange`, but reads the source bits starting at
+    /// `src_start` (the source row offset) rather than bit 0 — needed when a
+    /// batch straddles a chunk boundary and only its tail rows append here.
+    /// Delegates to the aligned fast path when `src_start` is byte-aligned at
+    /// 0; otherwise copies per-bit (validity is one bit/row — cheap next to the
+    /// data memcpy this rides alongside).
+    pub fn appendValidityRangeFrom(
+        self: *ColumnStore,
+        allocator: Allocator,
+        dst_start: usize,
+        src_nulls: ?[]const u8,
+        src_start: usize,
+        n: usize,
+    ) !void {
+        if (src_start == 0) return self.appendValidityRange(allocator, dst_start, src_nulls, n);
+        const nb = self.nullsPtr() orelse return;
+        if (n == 0) return;
+        const need = (dst_start + n + 7) / 8;
+        if (nb.items.len < need) try nb.appendNTimes(allocator, 0, need - nb.items.len);
+        const dst = nb.items;
+        const src = src_nulls orelse {
+            setBitRangeTrue(dst, dst_start, n);
+            return;
+        };
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sbit = src_start + i;
+            if ((src[sbit >> 3] >> @intCast(sbit & 7)) & 1 != 0) {
+                const dbit = dst_start + i;
+                dst[dbit >> 3] |= @as(u8, 1) << @intCast(dbit & 7);
+            }
+        }
+    }
+
+    /// Bulk-append `n` NULL rows: placeholder data slots + n invalid (0)
+    /// validity bits. The bitmap only needs to grow to cover the new rows —
+    /// fresh bytes arrive zeroed and the append-only invariant keeps bits
+    /// at/above the previous row count 0, so the new rows read as NULL
+    /// without touching any bit.
+    pub fn appendNulls(self: *ColumnStore, allocator: Allocator, n: usize) !void {
+        if (n == 0) return;
+        try self.data.appendNullPlaceholders(allocator, n);
+        if (self.nullsPtr()) |nb| {
+            const need = (self.data.rowCount() + 7) / 8;
+            if (nb.items.len < need) try nb.appendNTimes(allocator, 0, need - nb.items.len);
+        }
+    }
+
     fn nullsPtr(self: *ColumnStore) ?*std.ArrayList(u8) {
         if (self.nulls) |_| return &self.nulls.?;
         return null;
     }
 };
 
-fn setBitRangeTrue(bytes: []u8, start: usize, n: usize) void {
+pub fn setBitRangeTrue(bytes: []u8, start: usize, n: usize) void {
     var i = start;
     const end = start + n;
     while (i < end and (i & 7) != 0) : (i += 1) bytes[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
@@ -473,6 +558,29 @@ pub const DataStore = union(TypeTag) {
             .decimal64 => |*l| try l.append(allocator, 0),
             .decimal128 => |*l| try l.append(allocator, 0),
             .uuid => |*l| try l.append(allocator, 0),
+        }
+    }
+
+    /// Bulk `appendNullPlaceholder` × n — one appendNTimes per column
+    /// instead of n per-value calls.
+    pub fn appendNullPlaceholders(self: *DataStore, allocator: Allocator, n: usize) !void {
+        switch (self.*) {
+            .int => |*l| try l.appendNTimes(allocator, 0, n),
+            .bigint => |*l| try l.appendNTimes(allocator, 0, n),
+            .boolean => |*l| try l.appendNTimes(allocator, 0, n),
+            .varchar => |*s| try s.appendEmptyValues(allocator, n),
+            .string => |*s| try s.appendEmptyValues(allocator, n),
+            .float => |*l| try l.appendNTimes(allocator, 0.0, n),
+            .double => |*l| try l.appendNTimes(allocator, 0.0, n),
+            .date => |*l| try l.appendNTimes(allocator, 0, n),
+            .datetime => |*l| try l.appendNTimes(allocator, 0, n),
+            .tinyint => |*l| try l.appendNTimes(allocator, 0, n),
+            .smallint => |*l| try l.appendNTimes(allocator, 0, n),
+            .largeint => |*l| try l.appendNTimes(allocator, 0, n),
+            .char => |*s| try s.appendEmptyValues(allocator, n),
+            .decimal64 => |*l| try l.appendNTimes(allocator, 0, n),
+            .decimal128 => |*l| try l.appendNTimes(allocator, 0, n),
+            .uuid => |*l| try l.appendNTimes(allocator, 0, n),
         }
     }
 };

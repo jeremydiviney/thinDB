@@ -55,28 +55,53 @@ pub fn stringIdentityKernel(allocator: Allocator, args: []const ColumnView, out:
     while (i < row_count) : (i += 1) try ss.appendValue(allocator, sv.rowBytes(i));
 }
 
-pub fn upperKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const sv = stringViewOf(args[0]);
+/// Vectorized in-place ASCII case-fold over a contiguous byte run. Folding is
+/// per-byte independent, so the whole run is processed in `@Vector` chunks: a
+/// byte in the source-case range gets bit 5 flipped (`|0x20` to lower, `&~0x20`
+/// to upper), all other bytes pass through. Scalar tail handles the remainder.
+inline fn foldBytes(buf: []u8, comptime to_lower: bool) void {
+    const lo: u8 = if (to_lower) 'A' else 'a';
+    const hi: u8 = if (to_lower) 'Z' else 'z';
+    const W = std.simd.suggestVectorLength(u8) orelse 16;
+    const V = @Vector(W, u8);
     var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const src = sv.rowBytes(i);
-        const dst = try allocator.alloc(u8, src.len);
-        defer allocator.free(dst);
-        for (src, dst) |b, *d| d.* = std.ascii.toUpper(b);
-        try store.StringStore.appendValue(stringStoreOf(out), allocator, dst);
+    while (i + W <= buf.len) : (i += W) {
+        const v: V = buf[i..][0..W].*;
+        const in_range = (v >= @as(V, @splat(lo))) & (v <= @as(V, @splat(hi)));
+        const flipped = if (to_lower) v | @as(V, @splat(0x20)) else v & @as(V, @splat(~@as(u8, 0x20)));
+        buf[i..][0..W].* = @select(u8, in_range, flipped, v);
     }
+    while (i < buf.len) : (i += 1) buf[i] = if (to_lower) std.ascii.toLower(buf[i]) else std.ascii.toUpper(buf[i]);
+}
+
+/// ASCII case-fold. Case-folding preserves byte length, so the whole output
+/// byte buffer is reserved once (total = sum of source lengths); each row's
+/// bytes are bulk-appended (one copy, no per-row scratch alloc), then the whole
+/// appended region is folded in a single vectorized pass. The prior code did a
+/// malloc+free and two copies per row plus a scalar byte loop, which dominated
+/// wide string projections like `LOWER(customerNumber)` over millions of rows.
+inline fn caseFoldKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize, comptime to_lower: bool) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) total += sv.rowBytes(i).len;
+    try ss.ensureUnusedValueCapacity(allocator, row_count, total);
+    const base = ss.bytes.items.len;
+    i = 0;
+    while (i < row_count) : (i += 1) {
+        ss.bytes.appendSliceAssumeCapacity(sv.rowBytes(i));
+        ss.offsets.appendAssumeCapacity(@intCast(ss.bytes.items.len));
+    }
+    foldBytes(ss.bytes.items[base..], to_lower);
+}
+
+pub fn upperKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try caseFoldKernel(allocator, args, out, row_count, false);
 }
 
 pub fn lowerKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const sv = stringViewOf(args[0]);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const src = sv.rowBytes(i);
-        const dst = try allocator.alloc(u8, src.len);
-        defer allocator.free(dst);
-        for (src, dst) |b, *d| d.* = std.ascii.toLower(b);
-        try store.StringStore.appendValue(stringStoreOf(out), allocator, dst);
-    }
+    try caseFoldKernel(allocator, args, out, row_count, true);
 }
 
 // octet_length / byte length: raw byte count.
@@ -1006,5 +1031,19 @@ pub fn chrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSto
             const b: [1]u8 = .{@intCast(c)};
             try ss.appendValue(allocator, &b);
         }
+    }
+}
+
+test "foldBytes vectorized case-fold matches scalar across boundaries and non-alpha" {
+    const testing = std.testing;
+    // Length 67 spans multiple vector chunks plus a non-zero scalar tail; mixes
+    // letters, digits, punctuation, and bytes adjacent to the A-Z/a-z range.
+    const sample = "Hello, World! 123 @AZ[`az{ ABCxyz... MixedCASE-9 zZaA__~ payment-Hash99";
+    inline for (.{ true, false }) |to_lower| {
+        var buf = sample.*;
+        foldBytes(&buf, to_lower);
+        var want: [sample.len]u8 = undefined;
+        for (sample, &want) |c, *w| w.* = if (to_lower) std.ascii.toLower(c) else std.ascii.toUpper(c);
+        try testing.expectEqualSlices(u8, &want, &buf);
     }
 }

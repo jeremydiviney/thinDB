@@ -307,11 +307,8 @@ pub fn dayofweekFromDatetimeKernel(allocator: Allocator, args: []const ColumnVie
 }
 
 fn dayofyearFromDays(days: i32) i32 {
-    if (days < 0) return 0;
-    const u_days: u47 = @intCast(days);
-    const epoch_day = std.time.epoch.EpochDay{ .day = u_days };
-    const year_day = epoch_day.calculateYearDay();
-    return @as(i32, year_day.day) + 1;
+    const ymd = daysToYmd(days) orelse return 0;
+    return days - common.ymdToDays(@intCast(ymd.year), 1, 1) + 1;
 }
 
 pub fn dayofyearFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {

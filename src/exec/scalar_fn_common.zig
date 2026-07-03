@@ -45,16 +45,25 @@ pub inline fn stringStoreOf(out: *ColumnStore) *store.StringStore {
 
 /// Extract (year, month1to12, day1to31) from a day-since-epoch i32.
 /// Returns null for pre-1970 dates.
+/// Days-since-epoch → (year, month, day). Hinnant's civil_from_days — the
+/// exact O(1) inverse of `ymdToDays`. The std `EpochDay` path scans year by
+/// year from 1970 (~56 iterations for a 2020s date), which dominates every
+/// date-part kernel (YEAR/MONTH/DAY/quarter/last_day/…) on hot columns.
 pub fn daysToYmd(days: i32) ?struct { year: u16, month: u4, day: u5 } {
     if (days < 0) return null;
-    const u_days: u47 = @intCast(days);
-    const epoch_day = std.time.epoch.EpochDay{ .day = u_days };
-    const year_day = epoch_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
+    const z = days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
+    const doy = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
+    const mp = @divTrunc(5 * doy + 2, 153);
+    const d = doy - @divTrunc(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const y = yoe + era * 400 + @as(i32, if (m <= 2) 1 else 0);
     return .{
-        .year = year_day.year,
-        .month = month_day.month.numeric(),
-        .day = month_day.day_index + 1,
+        .year = @intCast(y),
+        .month = @intCast(m),
+        .day = @intCast(d),
     };
 }
 
@@ -141,4 +150,23 @@ pub fn isLeapYear(year: i32) bool {
     if (@rem(year, 4) != 0) return false;
     if (@rem(year, 100) != 0) return true;
     return @rem(year, 400) == 0;
+}
+
+test "daysToYmd round-trips ymdToDays and matches std decomposition" {
+    // Walk every day from 1970-01-01 through 9999-12-31; daysToYmd must be the
+    // exact inverse of ymdToDays and agree with std's (slow) year-by-year scan.
+    var days: i32 = 0;
+    const last = ymdToDays(9999, 12, 31);
+    while (days <= last) : (days += 1) {
+        const ymd = daysToYmd(days) orelse unreachable;
+        try std.testing.expectEqual(days, ymdToDays(ymd.year, ymd.month, ymd.day));
+
+        const u_days: u47 = @intCast(days);
+        const yd = (std.time.epoch.EpochDay{ .day = u_days }).calculateYearDay();
+        const md = yd.calculateMonthDay();
+        try std.testing.expectEqual(yd.year, ymd.year);
+        try std.testing.expectEqual(md.month.numeric(), ymd.month);
+        try std.testing.expectEqual(md.day_index + 1, ymd.day);
+    }
+    try std.testing.expectEqual(@as(?@TypeOf(daysToYmd(0).?), null), daysToYmd(-1));
 }
