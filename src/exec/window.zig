@@ -60,6 +60,12 @@ pub const Window = struct {
 
     /// One entry per `ir.WindowSpec`, indexes resolved at create time.
     spec_indices: []SpecIndices,
+    /// spec_group[i] = the canonical (first) spec index with the same
+    /// resolved sort keys (partition cols + order cols + directions).
+    /// Specs differing only in FRAME share one sort/permutation: the
+    /// canonical spec's pass evaluates every call of the whole group
+    /// (each call still reads its own spec's frame).
+    spec_group: []usize,
     /// One entry per `ir.WindowCall`: how to evaluate it.
     call_plans: []CallPlan,
 
@@ -145,6 +151,12 @@ pub const Window = struct {
 
     const DefaultKind = enum { none, literal, col_ref };
 
+    fn sameSortKeys(a: SpecIndices, b: SpecIndices) bool {
+        return std.mem.eql(usize, a.partition_cols, b.partition_cols) and
+            std.mem.eql(usize, a.order_cols, b.order_cols) and
+            std.mem.eql(bool, a.order_desc, b.order_desc);
+    }
+
     pub fn create(
         allocator: Allocator,
         upstream: Query,
@@ -181,6 +193,18 @@ pub const Window = struct {
                 .order_desc = odesc,
             };
             sinit = si + 1;
+        }
+
+        const spec_group = try allocator.alloc(usize, specs.len);
+        errdefer allocator.free(spec_group);
+        for (spec_indices, 0..) |si_a, i| {
+            spec_group[i] = i;
+            for (spec_indices[0..i], 0..) |si_b, j| {
+                if (sameSortKeys(si_b, si_a)) {
+                    spec_group[i] = spec_group[j];
+                    break;
+                }
+            }
         }
 
         // Resolve every call's args + frame + default-kind into a plan.
@@ -256,6 +280,7 @@ pub const Window = struct {
             .schema = schema,
             .input_schema = input_schema,
             .spec_indices = spec_indices,
+            .spec_group = spec_group,
             .call_plans = call_plans,
             .specs = specs,
             .calls = calls,
@@ -286,6 +311,7 @@ pub const Window = struct {
         self.allocator.free(self.out_output_columns);
         self.allocator.free(self.views);
         freeSpecIndices(self.allocator, self.spec_indices, self.spec_indices.len);
+        self.allocator.free(self.spec_group);
         self.allocator.free(self.call_plans);
         self.allocator.free(self.schema);
         const allocator = self.allocator;
@@ -720,6 +746,7 @@ pub const Window = struct {
         // total order); its evaluation stays serial, since rank/frame state
         // crosses bucket seams (carry fixups are a later phase).
         for (self.spec_indices, 0..) |si, spec_i| {
+            if (self.spec_group[spec_i] != spec_i) continue; // shares the canonical spec's pass
             if (si.partition_cols.len > 0 and n >= parallel_min_rows and self.dop > 1) {
                 try self.evaluateSpecParallel(si, spec_i, n);
                 continue;
@@ -732,7 +759,7 @@ pub const Window = struct {
             defer self.allocator.free(perm);
             const _et = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             for (self.call_plans, 0..) |plan, ci| {
-                if (plan.spec_idx != spec_i) continue;
+                if (self.spec_group[plan.spec_idx] != spec_i) continue;
                 // Position-pure calls over the single global partition
                 // shard their OUTPUT range across workers (full-perm
                 // visibility makes offsets and rank walk-backs local);
@@ -904,7 +931,6 @@ pub const Window = struct {
         }
 
         fn phaseBuckets(self: *SpecParJob) void {
-            const spec = self.win.specs[self.spec_i];
             while (!self.failed.load(.acquire)) {
                 const b = self.next_bucket.fetchAdd(1, .monotonic);
                 if (b >= self.bucket_count) return;
@@ -919,12 +945,12 @@ pub const Window = struct {
                 while (p_start < hi) {
                     const p_end = partitionEnd(self.win.accumulated, self.si.partition_cols, self.perm[0..hi], p_start);
                     for (self.win.call_plans, 0..) |plan, ci| {
-                        if (plan.spec_idx != self.spec_i) continue;
+                        if (self.win.spec_group[plan.spec_idx] != self.spec_i) continue;
                         const cell: OutCell = .{
                             .column = &self.win.output_columns[ci],
                             .string_scratch = if (self.win.string_outputs[ci].len > 0) self.win.string_outputs[ci] else null,
                         };
-                        self.win.evaluateOnePartition(plan, spec, self.si, self.perm[0..hi], p_start, p_end, cell) catch |e| return self.fail(e);
+                        self.win.evaluateOnePartition(plan, self.win.specs[plan.spec_idx], self.si, self.perm[0..hi], p_start, p_end, cell) catch |e| return self.fail(e);
                     }
                     p_start = p_end;
                 }
