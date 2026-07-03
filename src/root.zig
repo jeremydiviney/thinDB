@@ -126,7 +126,10 @@ test {
     _ = @import("util/affinity.zig");
     _ = @import("util/core_scheduler.zig");
     _ = @import("util/huge_page.zig");
+    _ = @import("util/buffer_pool.zig");
+    _ = @import("net/const_fold.zig");
     _ = @import("exec/affine_agg.zig");
     _ = @import("exec/mat_stage.zig");
     _ = @import("exec/parallel_scan.zig");
+    _ = @import("exec/partitioned_aggregate.zig");
 }

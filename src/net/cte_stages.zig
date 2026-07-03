@@ -26,6 +26,7 @@ const ir = @import("../ir/ir.zig");
 const exec = @import("../exec/exec.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
 const group_route = @import("../exec/group_route.zig");
+const partitioned_aggregate = @import("../exec/partitioned_aggregate.zig");
 const mat_stage = @import("../exec/mat_stage.zig");
 const local = @import("local.zig");
 const pgcat = @import("pg_catalog.zig");
@@ -162,18 +163,15 @@ fn collectStages(
             }
             try collectStages(input, rep.materialize.upstream, set, map, cse);
             // Single reference → no stage; the body compiles inline at the
-            // use site (buildGenericBlock's .materialize arm). Inner shared
-            // nodes were still collected by the recursion above. An explicit
-            // `AS MATERIALIZED` CTE stages regardless — the user demanded a
-            // real buffer (and the budget charge that comes with it).
-            //
-            // Exception: a CTE whose body bottoms at a UNION stages even when
-            // single-referenced. A set operation is a natural buffer point, and
-            // materializing it hands every downstream CTE the EXACT
-            // passed-through row count instead of a summed-input estimate that
-            // compounds (and over-counts) down a deep chain.
+            // use site (buildGenericBlock's .materialize arm) — including
+            // UNION bodies, which stream arm-then-arm through exec.SetUnion
+            // (they previously staged for an exact downstream row count; the
+            // summed-arm estimate proved cheaper than a full buffer copy).
+            // Inner shared nodes were still collected by the recursion above.
+            // An explicit `AS MATERIALIZED` CTE stages regardless — the user
+            // demanded a real buffer (and the budget charge that comes with
+            // it).
             const single_ref = (cse.refs.get(rep) orelse 1) <= 1;
-            const body_is_union = blockSource(rep.materialize.upstream) == .set_union;
             // Profiling overrides that stage normally-inlined single-ref CTEs so
             // `--profile-ops` emits a distinct `[cte]` line per block (both
             // correctness-neutral, both add the copy tax inlining avoids):
@@ -184,9 +182,10 @@ fn collectStages(
             //     close to the real execution; thin streaming CTEs stay fused.
             const prof_stage = forceStageAll() or
                 (stageBarriersOnly() and bodyFormsBarrier(rep.materialize.upstream));
-            if (single_ref and !rep.materialize.forced and !body_is_union and !prof_stage) return;
+            if ((single_ref or noStage()) and !rep.materialize.forced and !prof_stage) return;
             const c0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-            const q = try compileBlock(input, rep.materialize.upstream, map);
+            var q = try compileBlock(input, rep.materialize.upstream, map);
+            q = pruneStageColumns(input, q);
             const stage = try set.addStage(q, input.accountant);
             if (exec.prof.enabled) stage.setup_ticks = exec.prof.nowTicks() - c0;
             try map.put(input.allocator, rep, stage);
@@ -291,6 +290,13 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
         var q = try compileBlock(input, stripped, map);
         errdefer q.deinit();
         return exec.AliasRename.create(input.allocator, q, alias);
+    }
+    // A join child that is a streaming chain over one stage — even with no
+    // per-row work — compiles as a parallel buffer scan: as the probe side
+    // it lets the join fuse its probe into the stripe workers instead of
+    // probing serially off a MatScan; as the build side it drains faster.
+    if (input.db.config.max_dop > 1 and streamingChainOverStage(op, map, false)) {
+        return buildFusedStreamOverStage(input, op, map);
     }
     return compileBlock(input, op, map);
 }
@@ -413,6 +419,7 @@ const AdaptiveGroupBy = struct {
     top_k: ?ir.Op.TopK,
     emit_limit: ?u32,
     budget: usize,
+    max_dop: usize,
     output_schema: []types.Column,
     chosen: ?exec.Query = null,
     routed: bool = false,
@@ -426,6 +433,7 @@ const AdaptiveGroupBy = struct {
         top_k: ?ir.Op.TopK,
         emit_limit: ?u32,
         budget: usize,
+        max_dop: usize,
     ) !exec.Query {
         const schema = try exec.aggregate_op.outputSchemaFor(allocator, up.outputSchema(), group_cols, aggs);
         errdefer allocator.free(schema);
@@ -439,6 +447,7 @@ const AdaptiveGroupBy = struct {
             .top_k = top_k,
             .emit_limit = emit_limit,
             .budget = budget,
+            .max_dop = max_dop,
             .output_schema = schema,
         };
         return exec.makeQuery(allocator, self);
@@ -448,6 +457,32 @@ const AdaptiveGroupBy = struct {
         if (self.routed) return;
         self.routed = true;
         for (self.stages) |s| try s.ensureRun();
+        // A plain (no top-k / no limit) GROUP BY over a buffer with a realized
+        // row count worth threading: try the specialized serial-beating paths
+        // (sorted-stream, radix) first, and if both decline — the string-key /
+        // MAX_BY / ANY_VALUE shapes the radix path can't carry — partition the
+        // input across cores instead of falling to the serial hash aggregate.
+        if (self.group_cols.len > 0 and self.max_dop > 1 and self.top_k == null and self.emit_limit == null and
+            self.up.stats().upper_rows >= partitioned_aggregate.MIN_ROWS_FOR_PARALLEL and
+            getenv("THINDB_NO_PARALLEL_GROUP") == null)
+        {
+            if (try group_route.routeStreamGroupBy(self.allocator, &self.up, self.group_cols, self.aggs, self.budget)) |q| {
+                self.chosen = q;
+                return;
+            }
+            if (try group_route.routeRadixGroupBy(self.up, self.group_cols, self.aggs, self.top_k, self.emit_limit)) |q| {
+                self.chosen = q;
+                return;
+            }
+            self.chosen = try partitioned_aggregate.PartitionedAggregate.create(
+                self.allocator,
+                self.up,
+                self.group_cols,
+                self.aggs,
+                self.max_dop,
+            );
+            return;
+        }
         self.chosen = try group_route.routeGroupBy(
             self.allocator,
             &self.up,
@@ -523,14 +558,19 @@ fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *S
 /// no full-result copy): the derived columns / predicates evaluate on `max_dop`
 /// cores instead of the serial MatScan drain. Gated to multi-chunk stages so
 /// the round-pool overhead is amortized.
-fn streamingChainOverStage(op: *const ir.Op, map: *StageMap) bool {
+///
+/// `require_work = false` accepts a work-free chain too — a JOIN child wants
+/// the parallel leaf even bare: a round-mode ParallelScan probe side lets the
+/// join fuse its probe into the stripe workers (and a build side drains in
+/// parallel), where a serial MatScan pins the whole probe on one thread.
+fn streamingChainOverStage(op: *const ir.Op, map: *StageMap, require_work: bool) bool {
     var has_work = false;
     var cur = op;
     while (true) {
         switch (cur.*) {
             .materialize => {
                 const stage = map.get(cur) orelse return false;
-                return has_work and stage.stats_upper_rows > mat_stage.chunk_rows;
+                return (has_work or !require_work) and stage.stats_upper_rows > mat_stage.chunk_rows;
             },
             .compute => |c| {
                 has_work = true;
@@ -588,7 +628,7 @@ fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, ma
 }
 
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
-    if (input.db.config.max_dop > 1 and streamingChainOverStage(op, map)) return buildFusedStreamOverStage(input, op, map);
+    if (input.db.config.max_dop > 1 and streamingChainOverStage(op, map, true)) return buildFusedStreamOverStage(input, op, map);
     switch (op.*) {
         .scan => |s| {
             // Only pg_catalog virtual scans route here; real-table blocks
@@ -646,6 +686,16 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             return up.orderBy(o.specs);
         },
         .limit => |l| {
+            // Fuse ORDER BY + LIMIT into a bounded top-k (keep limit+offset rows
+            // in a heap) instead of a full Sort then Limit — the same fusion the
+            // table path already does. Over a multi-million-row buffer a full
+            // sort for a small LIMIT is the dominant cost.
+            if (l.upstream.* == .order_by) {
+                const o = l.upstream.order_by;
+                var up = try buildGenericBlock(input, o.upstream, map, block_root);
+                errdefer up.deinit();
+                return up.topN(o.specs, @intCast(l.n), @intCast(l.offset));
+            }
             var up = try buildGenericBlock(input, l.upstream, map, block_root);
             errdefer up.deinit();
             return up.limitOffset(@intCast(l.n), @intCast(l.offset));
@@ -681,6 +731,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     g.top_k,
                     g.emit_limit,
                     input.db.config.query_memory_budget,
+                    input.db.config.max_dop,
                 );
             }
             return group_route.routeGroupBy(
@@ -745,6 +796,31 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         else => return error.UnsupportedQueryShape,
     }
+}
+
+/// Drop stage output columns no consumer can reference. With a non-null
+/// flat referenced-name set (analyzeProjection over the whole tree — null
+/// means an unaccountable shape like `SELECT *` exists somewhere), a stage
+/// column matching no referenced name is dead in EVERY consumer, so
+/// materializing it only burns buffer memory + copy time. Matching is
+/// suffix-aware both ways (qualified stage columns vs qualified refs) —
+/// over-keeping is safe, over-pruning is not. Best-effort: any hiccup
+/// (name collision in the projection, OOM) keeps the unpruned stage.
+fn pruneStageColumns(input: engine_v2.CompileInput, q: exec.Query) exec.Query {
+    const refs = input.prune_names orelse return q;
+    const schema = q.outputSchema();
+    var keep: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keep.deinit(input.allocator);
+    outer: for (schema) |col| {
+        for (refs) |r| {
+            if (columnRefMatchesName(col.name, r)) {
+                keep.append(input.allocator, col.name) catch return q;
+                continue :outer;
+            }
+        }
+    }
+    if (keep.items.len == 0 or keep.items.len == schema.len) return q;
+    return q.project(keep.items) catch q;
 }
 
 fn columnRefMatchesName(column_name: []const u8, ref_name: []const u8) bool {
@@ -931,6 +1007,15 @@ fn forceStageAll() bool {
 /// only single-ref CTEs whose own operations already form a barrier.
 fn stageBarriersOnly() bool {
     return getenv("THINDB_PROFILE_STAGE_BARRIERS") != null;
+}
+
+/// Experiment override: when `THINDB_NO_STAGE` is set, never materialize a
+/// multi-ref CTE — inline (recompute) its body at every use site instead of
+/// staging it once and re-reading. Measures the cost of the barrier
+/// materialize-then-rescan vs. independent streamed recomputation. Forced
+/// (`AS MATERIALIZED`) and union-bodied CTEs still stage (correctness).
+fn noStage() bool {
+    return getenv("THINDB_NO_STAGE") != null;
 }
 
 /// True when this CTE body's top-level operations include a blocking

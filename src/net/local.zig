@@ -56,6 +56,7 @@ const wire = @import("wire.zig");
 const wire_format = @import("wire_format.zig");
 const subquery_resolve = @import("subquery_resolve.zig");
 const predicate_pushdown = @import("predicate_pushdown.zig");
+const const_fold = @import("const_fold.zig");
 const pgcat = @import("pg_catalog.zig");
 
 pub const Error = error{
@@ -1245,6 +1246,11 @@ pub fn compileWithSession(
     // so the source is narrowed before the join runs. Pure plan rewrite shared
     // by every handler. Runs on resolved predicates (concrete leaves).
     try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
+    // Dead-branch elimination: prune UNION arms that provably yield zero rows
+    // (constant-false filters — the parser already folds literal comparisons
+    // to `.always`) and unlink WHERE-TRUE plumbing. Runs before projection
+    // analysis and staging so ref counts see the pruned tree.
+    const_fold.foldDeadBranches(@constCast(root));
     // Projection pushdown: after subqueries are resolved to constants,
     // figure out which base columns the (single) scan must produce.
     ctx.prune_names = analyzeProjection(allocator, root);
