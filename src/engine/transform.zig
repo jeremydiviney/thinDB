@@ -256,6 +256,114 @@ pub fn appendColumnRange(
     }
 }
 
+/// Two-phase, thread-parallel column append.
+///
+/// `prepareAppend` (one caller per column) extends `out` to its final size
+/// for `view`'s `n` rows — data slots undefined, validity bytes zeroed —
+/// and returns the write bases. `writeAppendSlice` then fills DISJOINT row
+/// ranges positionally with no allocation, so concurrent writers can split
+/// one wide batch across threads. Writers must tile on absolute 8-row
+/// validity-byte boundaries (relative to `base_row`) so no two of them
+/// share a bitmap byte; the final tile owns the tail byte exclusively.
+pub const PreparedAppend = struct {
+    /// Destination row where this batch begins.
+    base_row: usize,
+    /// Destination byte offset for string columns; 0 otherwise.
+    byte_base: usize = 0,
+    /// False when the column can't take positional writes (a wide / about-
+    /// to-go-wide string store) — caller falls back to appendColumnRange.
+    positional: bool = true,
+};
+
+pub fn prepareAppend(allocator: Allocator, view: ColumnView, n: usize, out: *ColumnStore) !PreparedAppend {
+    const base_row = out.data.rowCount();
+    var prep = PreparedAppend{ .base_row = base_row };
+    switch (view.data) {
+        .varchar, .string, .char => |sv| {
+            const ss = switch (out.data) {
+                .varchar, .string, .char => |*s| s,
+                else => unreachable,
+            };
+            const total: usize = sv.offsets[n] - sv.offsets[0];
+            if (ss.isWide() or ss.bytes.items.len + total > std.math.maxInt(u32)) {
+                prep.positional = false;
+                return prep;
+            }
+            prep.byte_base = ss.bytes.items.len;
+            try ss.bytes.resize(allocator, prep.byte_base + total);
+            try ss.offsets.resize(allocator, base_row + 1 + n);
+        },
+        else => {
+            switch (out.data) {
+                .varchar, .string, .char => unreachable,
+                inline else => |*list| try list.resize(allocator, base_row + n),
+            }
+        },
+    }
+    if (out.nulls) |*nb| {
+        const need = (base_row + n + 7) / 8;
+        if (nb.items.len < need) try nb.appendNTimes(allocator, 0, need - nb.items.len);
+    }
+    return prep;
+}
+
+/// Fill rows [lo, hi) of the prepared batch. Positional stores only —
+/// no allocation, no length mutation, safe concurrently for disjoint,
+/// byte-aligned tiles.
+pub fn writeAppendSlice(view: ColumnView, lo: usize, hi: usize, out: *ColumnStore, prep: PreparedAppend) void {
+    if (hi <= lo) return;
+    switch (view.data) {
+        .varchar, .string, .char => |sv| {
+            const ss = switch (out.data) {
+                .varchar, .string, .char => |*s| s,
+                else => unreachable,
+            };
+            const src0 = sv.offsets[0];
+            const blo = sv.offsets[lo] - src0;
+            const bhi = sv.offsets[hi] - src0;
+            @memcpy(ss.bytes.items[prep.byte_base + blo ..][0 .. bhi - blo], sv.bytes[sv.offsets[lo]..sv.offsets[hi]]);
+            var r = lo;
+            while (r < hi) : (r += 1) {
+                ss.offsets.items[prep.base_row + 1 + r] = @intCast(prep.byte_base + (sv.offsets[r + 1] - src0));
+            }
+        },
+        inline .int, .date => |s| writeFixedSlice(i32, s, lo, hi, out, prep),
+        inline .bigint, .datetime, .decimal64 => |s| writeFixedSlice(i64, s, lo, hi, out, prep),
+        .boolean => |s| writeFixedSlice(u8, s, lo, hi, out, prep),
+        .float => |s| writeFixedSlice(f32, s, lo, hi, out, prep),
+        .double => |s| writeFixedSlice(f64, s, lo, hi, out, prep),
+        .tinyint => |s| writeFixedSlice(i8, s, lo, hi, out, prep),
+        .smallint => |s| writeFixedSlice(i16, s, lo, hi, out, prep),
+        inline .largeint, .decimal128 => |s| writeFixedSlice(i128, s, lo, hi, out, prep),
+        .uuid => |s| writeFixedSlice(u128, s, lo, hi, out, prep),
+    }
+    if (out.nulls) |nb| {
+        const dst = nb.items;
+        if (view.nulls) |src_nulls| {
+            var r = lo;
+            while (r < hi) : (r += 1) {
+                if ((src_nulls[r >> 3] >> @intCast(r & 7)) & 1 != 0) {
+                    const bit = prep.base_row + r;
+                    dst[bit >> 3] |= @as(u8, 1) << @intCast(bit & 7);
+                }
+            }
+        } else {
+            store.setBitRangeTrue(dst, prep.base_row + lo, hi - lo);
+        }
+    }
+}
+
+fn writeFixedSlice(comptime T: type, s: []const T, lo: usize, hi: usize, out: *ColumnStore, prep: PreparedAppend) void {
+    switch (out.data) {
+        .varchar, .string, .char => unreachable,
+        inline else => |*list| {
+            if (comptime std.meta.Child(@TypeOf(list.items)) == T) {
+                @memcpy(list.items[prep.base_row + lo ..][0 .. hi - lo], s[lo..hi]);
+            } else unreachable;
+        },
+    }
+}
+
 inline fn appendStrRange(allocator: Allocator, out: *ColumnStore, sv: storage.StringView, start: usize, end: usize) !void {
     switch (out.data) {
         .varchar => |*ss| try ss.appendRange(allocator, sv, start, end),

@@ -22,6 +22,7 @@
 //! string outputs from window functions.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
@@ -73,6 +74,15 @@ pub const Window = struct {
     reserved_bytes: usize = 0,
     evicted: bool = false,
     accumulated: []ColumnStore, // input columns
+    /// One arena per accumulated column, backing every allocation that
+    /// column ever makes. Two jobs: (a) the parallel drain's workers append
+    /// different columns concurrently, and per-column arenas make those
+    /// allocations race-free without a shared-allocator lock; (b) evict()
+    /// frees the whole input in one arena sweep per column. Backed by the
+    /// (thread-safe) c_allocator normally; by the operator's own allocator
+    /// under tests so std.testing.allocator still audits the memory (the
+    /// drain is serial there).
+    acc_arenas: []std.heap.ArenaAllocator,
     output_columns: []ColumnStore, // window outputs (fixed-width types)
     /// Parallel scratch for string-typed outputs. `string_outputs[ci]`
     /// is `&.{}` when the call's output isn't a string type; otherwise
@@ -192,13 +202,18 @@ pub const Window = struct {
         }
 
         // Allocate column buffers for input and output (one per schema col).
+        // Every accumulated column's allocations flow through its own arena
+        // (see the field doc); the stores themselves need no per-store
+        // deinit — the arena sweep in evict()/deinit() reclaims everything.
+        const acc_arenas = try allocator.alloc(std.heap.ArenaAllocator, input_schema.len);
+        errdefer allocator.free(acc_arenas);
+        const arena_backing = if (builtin.is_test) allocator else std.heap.c_allocator;
+        for (acc_arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
+        errdefer for (acc_arenas) |*a| a.deinit();
         const accumulated = try allocator.alloc(ColumnStore, input_schema.len);
         errdefer allocator.free(accumulated);
-        var ainit: usize = 0;
-        errdefer for (accumulated[0..ainit]) |*c| c.deinit(allocator);
         for (input_schema, 0..) |col, i| {
-            accumulated[i] = try ColumnStore.init(allocator, col.type, col.nullable);
-            ainit = i + 1;
+            accumulated[i] = try ColumnStore.init(acc_arenas[i].allocator(), col.type, col.nullable);
         }
 
         const output_columns = try allocator.alloc(ColumnStore, calls.len);
@@ -245,6 +260,7 @@ pub const Window = struct {
             .specs = specs,
             .calls = calls,
             .accumulated = accumulated,
+            .acc_arenas = acc_arenas,
             .output_columns = output_columns,
             .string_outputs = string_outputs,
             .out_output_columns = out_output_columns,
@@ -258,7 +274,8 @@ pub const Window = struct {
         var up = self.upstream;
         up.deinit();
         if (!self.evicted) {
-            for (self.accumulated) |*c| c.deinit(self.allocator);
+            for (self.acc_arenas) |*a| a.deinit();
+            self.allocator.free(self.acc_arenas);
             self.allocator.free(self.accumulated);
         }
         for (self.output_columns) |*c| c.deinit(self.allocator);
@@ -311,7 +328,9 @@ pub const Window = struct {
     /// output columns are freed later in `deinit`.
     fn evict(self: *Window) void {
         if (self.evicted) return;
-        for (self.accumulated) |*c| c.deinit(self.allocator);
+        for (self.acc_arenas) |*a| a.deinit();
+        self.allocator.free(self.acc_arenas);
+        self.acc_arenas = &.{};
         self.allocator.free(self.accumulated);
         self.accumulated = &.{};
         if (self.upstream.accountant()) |a| a.release(.window, self.reserved_bytes);
@@ -354,10 +373,171 @@ pub const Window = struct {
         return Batch{ .schema = self.schema, .values = self.views, .row_count = n };
     }
 
+    /// Shared control block for the parallel drain. Each batch runs two
+    /// claim phases over a unique fetchAdd cursor:
+    ///
+    ///   .prepare — units are COLUMNS: extend each store to its final size
+    ///              (transform.prepareAppend; per-column arenas make the
+    ///              concurrent resizes race-free).
+    ///   .write   — units are (column × row-tile): positional, alloc-free
+    ///              fills (transform.writeAppendSlice). Tiling by rows is
+    ///              what beats per-column skew — one fat string column no
+    ///              longer bounds the whole batch.
+    ///
+    /// The conn thread publishes a phase, participates, then waits for
+    /// (a) every unit done and (b) every worker re-parked before mutating
+    /// shared state — claims are unique within a cycle and cycles never
+    /// overlap, so no unit runs twice. Tile bounds land on absolute 8-row
+    /// boundaries so no two writers share a validity byte.
+    const ParDrain = struct {
+        win: *Window,
+        batch: Batch = undefined,
+        preps: []transform.PreparedAppend = &.{},
+        bounds: []usize = &.{},
+        n_tiles: usize = 0,
+        n_units: usize = 0,
+        mode: Mode = .prepare,
+        gen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        unit_cursor: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        units_done: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        parked: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        const Mode = enum { prepare, write };
+
+        fn worker(pd: *ParDrain) void {
+            var seen: usize = 0;
+            while (true) {
+                var spins: usize = 0;
+                while (pd.gen.load(.acquire) == seen) {
+                    if (pd.stop.load(.acquire)) return;
+                    spins += 1;
+                    if (spins < 2048) {
+                        std.atomic.spinLoopHint();
+                    } else if (spins < 4096) {
+                        std.Thread.yield() catch std.atomic.spinLoopHint();
+                    } else {
+                        // Long producer gaps (a nested blocking op below):
+                        // stop burning the core. The conn thread always
+                        // participates, so a late wake only means this
+                        // worker claims fewer units.
+                        sleepBriefly();
+                    }
+                }
+                seen = pd.gen.load(.acquire);
+                _ = pd.parked.fetchSub(1, .acq_rel);
+                pd.runUnits();
+                _ = pd.parked.fetchAdd(1, .acq_rel);
+            }
+        }
+
+        fn runUnits(pd: *ParDrain) void {
+            const w = pd.win;
+            const ncols = w.accumulated.len;
+            while (true) {
+                const u = pd.unit_cursor.fetchAdd(1, .acq_rel);
+                if (u >= pd.n_units) return;
+                switch (pd.mode) {
+                    .prepare => {
+                        const ci = u;
+                        pd.preps[ci] = transform.prepareAppend(
+                            w.acc_arenas[ci].allocator(),
+                            pd.batch.values[ci],
+                            pd.batch.row_count,
+                            &w.accumulated[ci],
+                        ) catch blk: {
+                            pd.failed.store(true, .release);
+                            break :blk .{ .base_row = 0, .positional = false };
+                        };
+                    },
+                    .write => {
+                        // Interleave column-major so concurrent claims walk
+                        // different columns (independent memory streams).
+                        const ci = u % ncols;
+                        const t = u / ncols;
+                        if (pd.preps[ci].positional) {
+                            transform.writeAppendSlice(
+                                pd.batch.values[ci],
+                                pd.bounds[t],
+                                pd.bounds[t + 1],
+                                &w.accumulated[ci],
+                                pd.preps[ci],
+                            );
+                        }
+                    },
+                }
+                _ = pd.units_done.fetchAdd(1, .acq_rel);
+            }
+        }
+
+        /// Publish one phase, participate, and wait for completion + full
+        /// re-park before returning (after which shared state is single-
+        /// owner again).
+        fn runPhase(pd: *ParDrain, mode: Mode, n_units: usize, n_workers: usize) void {
+            pd.mode = mode;
+            pd.n_units = n_units;
+            pd.unit_cursor.store(0, .release);
+            pd.units_done.store(0, .release);
+            _ = pd.gen.fetchAdd(1, .release);
+            pd.runUnits();
+            var spins: usize = 0;
+            while (pd.units_done.load(.acquire) < n_units or
+                pd.parked.load(.acquire) < n_workers)
+            {
+                spins += 1;
+                if (spins < 4096) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+            }
+        }
+    };
+
+    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+
+    fn sleepBriefly() void {
+        switch (builtin.os.tag) {
+            .windows => Sleep(1),
+            .linux => {
+                const ts = [2]isize{ 0, std.time.ns_per_ms };
+                _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
+            },
+            else => std.Thread.yield() catch std.atomic.spinLoopHint(),
+        }
+    }
+
+    /// Most drain-copy threads worth spawning: memcpy saturates memory
+    /// bandwidth well below core count, and each thread only helps while
+    /// there are unclaimed columns.
+    const max_drain_workers: usize = 7;
+
     fn drainAndEvaluate(self: *Window) !void {
-        // Drain upstream into accumulated.
+        // Drain upstream into accumulated. With dop > 1 the per-batch column
+        // copies fan out across a small worker pool (see ParDrain); the
+        // upstream pull itself stays on this thread (batches are only valid
+        // until the next pull, so produce and copy can't overlap).
         const row_bytes = exec.memory.estimateRowBytes(self.input_schema);
         const acc = self.upstream.accountant();
+        const ncols = self.input_schema.len;
+        var pd = ParDrain{ .win = self };
+        var workers: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
+        var n_workers: usize = 0;
+        var max_tiles: usize = 1;
+        if (self.dop > 1 and ncols >= 2 and !builtin.is_test) {
+            const want = @min(@min(self.dop - 1, ncols - 1), max_drain_workers);
+            while (n_workers < want) {
+                workers[n_workers] = std.Thread.spawn(.{}, ParDrain.worker, .{&pd}) catch break;
+                n_workers += 1;
+            }
+            pd.parked.store(n_workers, .release);
+            max_tiles = (n_workers + 1) * 2;
+            pd.preps = try self.allocator.alloc(transform.PreparedAppend, ncols);
+            pd.bounds = try self.allocator.alloc(usize, max_tiles + 1);
+        }
+        defer {
+            pd.stop.store(true, .release);
+            for (workers[0..n_workers]) |maybe| if (maybe) |t| t.join();
+            if (pd.preps.len > 0) self.allocator.free(pd.preps);
+            if (pd.bounds.len > 0) self.allocator.free(pd.bounds);
+        }
         while (true) {
             const _ut = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const got = try self.upstream.next();
@@ -367,9 +547,40 @@ pub const Window = struct {
             const b = batch.row_count * row_bytes;
             if (acc) |a| try a.reserve(.window, b);
             self.reserved_bytes += b;
-            for (batch.values, 0..) |view, ci| {
-                try reserveAggressive(self.allocator, &self.accumulated[ci], batch.row_count);
-                try transform.appendAllColumn(self.allocator, view, &self.accumulated[ci]);
+            if (n_workers > 0) {
+                pd.batch = batch;
+                pd.runPhase(.prepare, ncols, n_workers);
+                if (pd.failed.load(.acquire)) return error.OutOfMemory;
+                // Row tiles on absolute 8-row boundaries: the first bound
+                // absorbs the base misalignment so no two tiles share a
+                // destination validity byte.
+                const n = batch.row_count;
+                const base: usize = @intCast(self.accumulated_rows);
+                const pad = (8 - (base % 8)) % 8;
+                const step = ((n / max_tiles) + 8) & ~@as(usize, 7);
+                var nt: usize = 0;
+                pd.bounds[0] = 0;
+                while (pd.bounds[nt] < n) {
+                    const next_b = @min(n, if (nt == 0) pad + step else pd.bounds[nt] + step);
+                    nt += 1;
+                    pd.bounds[nt] = @max(next_b, pd.bounds[nt - 1] + 1);
+                    if (pd.bounds[nt] > n) pd.bounds[nt] = n;
+                }
+                pd.n_tiles = nt;
+                pd.runPhase(.write, ncols * nt, n_workers);
+                // Rare non-positional columns (a wide string store) take
+                // the classic serial append — single caller, own arena.
+                for (pd.preps, 0..) |p, ci| {
+                    if (p.positional) continue;
+                    const aa = self.acc_arenas[ci].allocator();
+                    try transform.appendColumnRange(aa, batch.values[ci], 0, n, &self.accumulated[ci]);
+                }
+            } else {
+                for (batch.values, 0..) |view, ci| {
+                    const aa = self.acc_arenas[ci].allocator();
+                    try reserveAggressive(aa, &self.accumulated[ci], batch.row_count);
+                    try transform.appendAllColumn(aa, view, &self.accumulated[ci]);
+                }
             }
             self.accumulated_rows += batch.row_count;
             if (exec.prof.enabled) exec.prof.addPhase("window.drain.append", @intCast(@max(0, exec.prof.nowTicks() - _at)));
