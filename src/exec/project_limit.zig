@@ -176,6 +176,11 @@ pub const Project = struct {
         return ok;
     }
 
+    pub fn rechainProbeSink(self: *Project, sink: exec.ProbeSink) !bool {
+        if (!self.probe_fused) return false;
+        return self.upstream.rechainProbeSink(sink);
+    }
+
     /// Same probe-fused passthrough rule as AliasRename: post-fusion the
     /// batches are join-schema'd, so the offer belongs to the scan below.
     pub fn tryFuseAggregate(self: *Project, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {

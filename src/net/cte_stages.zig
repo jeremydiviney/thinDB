@@ -77,9 +77,7 @@ pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op, stage_co
     wrapWindowsInMaterialize(input.node_arena, @constCast(root), &cse) catch {};
     try collectStages(input, root, set, &map, &cse);
     if (stage_count_out) |out| out.* = @intCast(set.stages.items.len);
-    var tail_input = input;
-    tail_input.parallel_probe_tail = true;
-    const inner = try compileBlock(tail_input, root, &map);
+    const inner = try compileBlock(input, root, &map);
     set.releaseCompilePins();
     return mat_stage.StagedRoot.create(input.allocator, inner, set);
 }
@@ -362,11 +360,15 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
         errdefer q.deinit();
         return exec.AliasRename.create(input.allocator, q, alias);
     }
-    // A join child that is a streaming chain over one stage — even with no
-    // per-row work — compiles as a parallel buffer scan: as the probe side
-    // it lets the join fuse its probe into the stripe workers instead of
-    // probing serially off a MatScan; as the build side it drains faster.
-    if (input.db.config.max_dop > 1 and is_probe and input.parallel_probe_tail and
+    // A probe-side join child that is a streaming chain over one stage —
+    // even with no per-row work, and seeing through single-ref inline
+    // materialize wrappers — compiles as a DEFERRED parallel buffer scan:
+    // the join fuses its probe into the stripe workers (and everything
+    // above chains into the same pipeline) instead of probing serially off
+    // a MatScan. The deferred leaf materializes at first pull (normal DAG
+    // order) and releases its stage use at drain exhaustion, so its memory
+    // profile matches the MatScan it replaces.
+    if (input.db.config.max_dop > 1 and is_probe and
         streamingChainOverStage(op, map, false, true))
     {
         return buildFusedStreamOverStage(input, op, map, true);
@@ -773,7 +775,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         .compute => |c| {
             var up = try buildGenericBlock(input, c.upstream, map, block_root);
             errdefer up.deinit();
-            return up.computeWithRegistry(c.derived, input.udf_registry);
+            return engine_v2.computeSelfPushed(up, c.derived, input.udf_registry);
         },
         .order_by => |o| {
             var up = try buildGenericBlock(input, o.upstream, map, block_root);
@@ -825,7 +827,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                             defer input.allocator.free(remaining);
                             break :blk try up.project(remaining);
                         },
-                        .compute => |c2| try up.computeWithRegistry(c2.derived, input.udf_registry),
+                        .compute => |c2| try engine_v2.computeSelfPushed(up, c2.derived, input.udf_registry),
                         .alias => |a| try exec.AliasRename.create(input.allocator, up, a.alias),
                         else => unreachable,
                     };

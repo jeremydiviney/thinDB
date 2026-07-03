@@ -233,6 +233,12 @@ pub const VTable = struct {
     /// becomes a pass-through. AliasRename forwards (turning pass-through
     /// itself); every other operator declines via the `@hasDecl` guard.
     tryFuseProbe: *const fn (ptr: *anyopaque, sink: ProbeSink) anyerror!bool,
+    /// Rebind a NEW sink at the bottom of an already probe-fused pipeline
+    /// (a join tail extending upward): pass-through layers forward to their
+    /// upstream, the bottom ParallelScan binds + re-types. The CALLER (the
+    /// pipeline's current tail) keeps the sink and feeds it per chunk; the
+    /// layers in between are untouched. Declines by default.
+    rechainProbeSink: *const fn (ptr: *anyopaque, sink: ProbeSink) anyerror!bool,
     /// Offer a full parallel lease GROUP BY replacement to this operator. Only
     /// a directly-adjacent ParallelScan should accept: it can let its scan
     /// workers build radix partitions directly and return a specialized
@@ -400,6 +406,11 @@ pub const Query = struct {
     /// Offer a join-probe sink for in-worker probing (see `ProbeSink`).
     pub fn tryFuseProbe(self: Query, sink: ProbeSink) !bool {
         return self.vtable.tryFuseProbe(self.ptr, sink);
+    }
+
+    /// Rebind a new sink at the bottom of an already probe-fused pipeline.
+    pub fn rechainProbeSink(self: Query, sink: ProbeSink) !bool {
+        return self.vtable.rechainProbeSink(self.ptr, sink);
     }
 
     /// Offer `expr` to this operator for in-place filtering. Returns true if
@@ -686,6 +697,11 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.tryFuseProbe(sink);
         }
+        fn rechainProbeSinkWrap(ptr: *anyopaque, sink: ProbeSink) anyerror!bool {
+            if (!@hasDecl(Op, "rechainProbeSink")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.rechainProbeSink(sink);
+        }
         fn tryLeaseGroupByWrap(ptr: *anyopaque, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK, emit_limit: ?u32, dop: usize) anyerror!?Query {
             if (!@hasDecl(Op, "tryLeaseGroupBy")) return null;
             const o: *Op = @ptrCast(@alignCast(ptr));
@@ -733,6 +749,7 @@ fn OpWrapper(comptime Op: type) type {
             .tryFuseCompute = tryFuseComputeWrap,
             .tryFuseAggregate = tryFuseAggregateWrap,
             .tryFuseProbe = tryFuseProbeWrap,
+            .rechainProbeSink = rechainProbeSinkWrap,
             .tryLeaseGroupBy = tryLeaseGroupByWrap,
             .stats = statsWrap,
             .accountant = accountantWrap,

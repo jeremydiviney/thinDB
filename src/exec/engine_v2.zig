@@ -74,14 +74,6 @@ pub const CompileInput = struct {
     /// parallel seams (round buffer scans interleave stripes) are suppressed
     /// for its chains. Scoped: callers set it on a COPY of the input.
     force_ordered: bool = false,
-    /// Parallel probe pipelines: set for the ROOT block only. A probe-side
-    /// join child there may compile as a parallel scan over a materialized
-    /// stage (an eager compile-time barrier that pins the stage for the
-    /// query) so the join tail fuses into the stripe workers. Scoped to the
-    /// root because each such leaf materializes at COMPILE time — doing it
-    /// for every CTE-internal join runs all their stages simultaneously and
-    /// blows the memory budget. Scoped: set on a COPY of the input.
-    parallel_probe_tail: bool = false,
 };
 
 /// Compile ONE single-source query block (no materialize boundaries inside —
@@ -755,10 +747,20 @@ pub fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived:
     for (derived) |d| {
         if (exec.derivedFusable(d, scan_cols)) try fusable.append(allocator, d) else try serial.append(allocator, d);
     }
-    if (fusable.items.len == 0) return result.computeWithRegistry(derived, udf_registry);
-    if (!try result.tryFuseCompute(fusable.items)) return result.computeWithRegistry(derived, udf_registry);
+    if (fusable.items.len == 0) return computeSelfPushed(result, derived, udf_registry);
+    if (!try result.tryFuseCompute(fusable.items)) return computeSelfPushed(result, derived, udf_registry);
     if (serial.items.len == 0) return result;
-    return result.computeWithRegistry(serial.items, udf_registry);
+    return computeSelfPushed(result, serial.items, udf_registry);
+}
+
+/// Layer a Compute, then attempt the TERMINAL push: when the upstream ends
+/// in a probe-fused parallel pipeline, the derived evaluation moves into
+/// its stripe workers as a chained sink and the operator passes the final
+/// batches through. Serial pull semantics are unchanged on decline.
+pub fn computeSelfPushed(up: exec.Query, derived: []const ir.Derived, udf_registry: ?*const @import("../udf.zig").UdfRegistry) !exec.Query {
+    const q = try up.computeWithRegistry(derived, udf_registry);
+    if (exec.queryAs(@import("compute.zig").Compute, q)) |c| _ = c.tryFuseSelf();
+    return q;
 }
 
 const GlobalAggregatePlan = struct {

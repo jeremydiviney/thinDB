@@ -24,6 +24,108 @@ const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 const PredicateExpr = predicate.PredicateExpr;
 
+/// Schema-only upstream for detached per-chunk Filter clones inside a probe
+/// pipeline (evalBatch is the only entry used; next() is never pulled).
+const SchemaStub = struct {
+    schema: []const Column,
+    pub fn next(_: *SchemaStub) !?Batch {
+        return null;
+    }
+    pub fn deinit(_: *SchemaStub) void {}
+    pub fn outputSchema(self: *SchemaStub) []const Column {
+        return self.schema;
+    }
+    pub fn addPrune(_: *SchemaStub, _: Predicate) !void {}
+    pub fn stats(_: *SchemaStub) exec.PipelineStats {
+        return .{ .upper_rows = std.math.maxInt(u64) };
+    }
+    pub fn accountant(_: *SchemaStub) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *SchemaStub, _: *std.ArrayList(u8), _: std.mem.Allocator, _: usize) !void {}
+};
+
+/// Probe-offer forwarding state for an UNFUSED Filter: each chunk applies
+/// the predicate through its own detached clone (own mask scratch and
+/// survivor stores; the expression tree is shared read-only, same contract
+/// as scan-side filter fusion across N workers) before the inner (join)
+/// sink processes the surviving rows.
+const FilterForward = struct {
+    src: *Filter,
+    inner: exec.ProbeSink,
+    /// Upstream schema snapshotted at offer time — the scan re-types its
+    /// out_schema on accept, so it can't be re-read at bind time.
+    in_schema: []const Column,
+    per_chunk: []Query = &.{},
+    stubs: []*SchemaStub = &.{},
+    map_views: [][]ColumnView = &.{},
+    bind_alloc: Allocator = undefined,
+
+    fn bindHook(ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void {
+        const cf: *FilterForward = @ptrCast(@alignCast(ctx));
+        cf.bind_alloc = alloc;
+        const qs = try alloc.alloc(Query, n_chunks);
+        errdefer alloc.free(qs);
+        const stubs = try alloc.alloc(*SchemaStub, n_chunks);
+        errdefer alloc.free(stubs);
+        var built: usize = 0;
+        errdefer for (qs[0..built], stubs[0..built]) |*q, st| {
+            q.deinit();
+            alloc.destroy(st);
+        };
+        for (qs, stubs) |*q, *st| {
+            const stub = try alloc.create(SchemaStub);
+            errdefer alloc.destroy(stub);
+            stub.* = .{ .schema = cf.in_schema };
+            q.* = try Filter.create(alloc, makeQuery(alloc, stub), cf.src.expr);
+            st.* = stub;
+            built += 1;
+        }
+        cf.per_chunk = qs;
+        cf.stubs = stubs;
+        if (cf.inner.probe_map) |m| {
+            const mv = try alloc.alloc([]ColumnView, n_chunks);
+            var mbuilt: usize = 0;
+            errdefer {
+                for (mv[0..mbuilt]) |v| alloc.free(v);
+                alloc.free(mv);
+            }
+            for (mv) |*v| {
+                v.* = try alloc.alloc(ColumnView, m.len);
+                mbuilt += 1;
+            }
+            cf.map_views = mv;
+        }
+        try cf.inner.bind(cf.inner.ctx, n_chunks, alloc);
+    }
+
+    fn processHook(ctx: *anyopaque, chunk: usize, batch: Batch) anyerror!?Batch {
+        const cf: *FilterForward = @ptrCast(@alignCast(ctx));
+        const f = exec.queryAs(Filter, cf.per_chunk[chunk]).?;
+        var out = (try f.evalBatch(batch)) orelse return null;
+        if (cf.inner.probe_map) |m| {
+            const vs = cf.map_views[chunk];
+            for (m, vs) |src, *v| v.* = out.values[src];
+            out = .{ .schema = out.schema, .values = vs, .row_count = out.row_count };
+        }
+        return try cf.inner.process(cf.inner.ctx, chunk, out);
+    }
+
+    fn deinitAll(cf: *FilterForward, owner_alloc: Allocator) void {
+        for (cf.per_chunk, cf.stubs) |*q, st| {
+            q.deinit();
+            cf.bind_alloc.destroy(st);
+        }
+        if (cf.per_chunk.len > 0) {
+            cf.bind_alloc.free(cf.per_chunk);
+            cf.bind_alloc.free(cf.stubs);
+        }
+        for (cf.map_views) |v| cf.bind_alloc.free(v);
+        if (cf.map_views.len > 0) cf.bind_alloc.free(cf.map_views);
+        owner_alloc.destroy(cf);
+    }
+};
+
 pub const Filter = struct {
     allocator: Allocator,
     upstream: Query,
@@ -55,6 +157,11 @@ pub const Filter = struct {
     /// re-evaluation, no copy. The borrow over cache bytes lives entirely
     /// inside the Scan's `next()`, never reaching here.
     fused: bool = false,
+
+    /// Set when this Filter forwarded a probe offer downward: the predicate
+    /// runs in per-chunk clones inside the scan workers, and this operator
+    /// passes the final joined batches through untouched.
+    chain: ?*FilterForward = null,
 
     /// New conjunct slices synthesized by the plan-time simplification pass
     /// (one per AND level that lost a conjunct). Allocated from `allocator`,
@@ -139,6 +246,7 @@ pub const Filter = struct {
     }
 
     pub fn deinit(self: *Filter) void {
+        if (self.chain) |cf| cf.deinitAll(self.allocator);
         var up = self.upstream;
         up.deinit();
         if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
@@ -157,6 +265,9 @@ pub const Filter = struct {
     }
 
     pub fn outputSchema(self: *Filter) []const Column {
+        // Chained: batches passing through are the probe pipeline's final
+        // joined output — report the live schema from below.
+        if (self.chain != null) return self.upstream.outputSchema();
         // A fused Filter is a pass-through and emits its upstream's batches
         // verbatim — so it must report the upstream's CURRENT schema, which may
         // have grown columns if a projection Compute fused down through us after
@@ -221,8 +332,37 @@ pub const Filter = struct {
     /// must decline: its mask evaluates against the probe-side schema and
     /// would be applied to already-joined rows.
     pub fn tryFuseProbe(self: *Filter, sink: exec.ProbeSink) !bool {
-        if (!self.fused) return false;
-        return self.upstream.tryFuseProbe(sink);
+        if (self.fused) return self.upstream.tryFuseProbe(sink);
+        // Unfused: the predicate must run BETWEEN the source's batches and
+        // the join — forward a wrapper whose per-chunk clones filter each
+        // batch before the join's sink sees it. A proven-false predicate
+        // emits nothing either way; keep it on the cheap serial path.
+        if (self.chain != null) return false;
+        if (self.expr == .always and !self.expr.always) return false;
+        const chain = try self.allocator.create(FilterForward);
+        errdefer self.allocator.destroy(chain);
+        chain.* = .{
+            .src = self,
+            .inner = sink,
+            .in_schema = self.upstream.outputSchema(),
+        };
+        const ok = self.upstream.tryFuseProbe(.{
+            .ctx = chain,
+            .out_schema = sink.out_schema,
+            .bind = FilterForward.bindHook,
+            .process = FilterForward.processHook,
+        }) catch false;
+        if (!ok) {
+            self.allocator.destroy(chain);
+            return false;
+        }
+        self.chain = chain;
+        return true;
+    }
+
+    pub fn rechainProbeSink(self: *Filter, sink: exec.ProbeSink) !bool {
+        if (!self.fused and self.chain == null) return false;
+        return self.upstream.rechainProbeSink(sink);
     }
 
     pub fn tryFuseCompute(self: *Filter, derived: []const @import("compute.zig").Derived) !bool {
@@ -248,6 +388,10 @@ pub const Filter = struct {
     /// the predicate's proven bounds (see `tightenStats`), then capped at
     /// `upper_rows`.
     pub fn stats(self: *Filter) exec.PipelineStats {
+        // Chained: this operator no longer shapes the batches; the cached
+        // per-column tightening would mis-index against the re-typed
+        // upstream schema.
+        if (self.chain != null) return self.upstream.stats();
         const up = self.upstream.stats();
         return .{
             .upper_rows = up.upper_rows,
@@ -273,8 +417,10 @@ pub const Filter = struct {
         if (self.expr == .always and !self.expr.always) return null;
 
         // Fused: the Scan already applied the predicate and returns compacted
-        // owned survivors. Forward verbatim.
-        if (self.fused) return self.upstream.next();
+        // owned survivors. Forward verbatim. Chained: the per-chunk clones
+        // already filtered inside the workers; batches arriving here are the
+        // FINAL joined output.
+        if (self.fused or self.chain != null) return self.upstream.next();
 
         // A top-level AND of ≥2 conjuncts can pay to compact survivors mid-way
         // so the remaining conjuncts scan only the survivors. Anything else
@@ -286,26 +432,33 @@ pub const Filter = struct {
 
         while (true) {
             const upstream_batch = (try self.upstream.next()) orelse return null;
-
-            const n = upstream_batch.row_count;
-            const mask = try self.allocator.alloc(bool, n);
-            defer self.allocator.free(mask);
-            try predicate.evaluateExprGuided(self.allocator, self.expr, self.schema, upstream_batch, mask, null);
-
-            var matched: usize = 0;
-            for (mask) |m| if (m) {
-                matched += 1;
-            };
-            if (matched == 0) continue;
-
-            for (self.filtered) |*c| c.clear();
-            for (upstream_batch.values, 0..) |view, ci| {
-                try engine.memtable.appendMaskedColumn(self.allocator, view, mask, &self.filtered[ci]);
-            }
-            for (self.filtered, 0..) |c, ci| self.views[ci] = c.view();
-
-            return Batch{ .schema = self.schema, .values = self.views, .row_count = matched };
+            if (try self.evalBatch(upstream_batch)) |out| return out;
         }
+    }
+
+    /// Push-model entry for probe-pipeline chunk wrappers: apply the
+    /// predicate to a caller-supplied batch; null when no rows survive
+    /// (the worker pulls its next batch). Views live until the next call
+    /// on this instance.
+    pub fn evalBatch(self: *Filter, upstream_batch: Batch) !?Batch {
+        const n = upstream_batch.row_count;
+        const mask = try self.allocator.alloc(bool, n);
+        defer self.allocator.free(mask);
+        try predicate.evaluateExprGuided(self.allocator, self.expr, self.schema, upstream_batch, mask, null);
+
+        var matched: usize = 0;
+        for (mask) |m| if (m) {
+            matched += 1;
+        };
+        if (matched == 0) return null;
+
+        for (self.filtered) |*c| c.clear();
+        for (upstream_batch.values, 0..) |view, ci| {
+            try engine.memtable.appendMaskedColumn(self.allocator, view, mask, &self.filtered[ci]);
+        }
+        for (self.filtered, 0..) |c, ci| self.views[ci] = c.view();
+
+        return Batch{ .schema = self.schema, .values = self.views, .row_count = matched };
     }
 
     /// Compacting evaluation of an ordered AND of conjuncts. Evaluates one

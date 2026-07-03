@@ -111,6 +111,11 @@ pub const AliasRename = struct {
         return ok;
     }
 
+    pub fn rechainProbeSink(self: *AliasRename, sink: exec.ProbeSink) !bool {
+        if (!self.probe_fused) return false;
+        return self.upstream.rechainProbeSink(sink);
+    }
+
     /// Once a probe fused below, batches no longer carry this wrapper's
     /// schema — forward the partial-aggregate offer too (the group columns
     /// resolve against the join's output schema downstream of here).

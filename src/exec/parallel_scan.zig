@@ -452,6 +452,10 @@ pub const ParallelScan = struct {
     /// planned upper-bound chunk count.
     stage_deferred: bool = false,
     deferred_dop: usize = 0,
+    /// Stage use released early (round drain exhausted) — the buffer frees
+    /// as soon as the last consumer finishes, like a MatScan drain, instead
+    /// of pinning until query teardown. deinit skips the second release.
+    stage_released: bool = false,
     /// Per-chunk view scratch for sink.probe_map (a narrowing Project on
     /// the probe side): batch values are remapped into the chunk's slice
     /// before the sink sees them. Empty when the map is identity.
@@ -831,7 +835,9 @@ pub const ParallelScan = struct {
         if (self.owns_out_schema) self.allocator.free(@constCast(self.out_schema));
         if (self.out_col_stats.len > 0) self.allocator.free(self.out_col_stats);
         if (self.table) |t| t.ddl_lock.unlockShared(t.io);
-        if (self.stage) |s| s.releaseUse();
+        if (self.stage) |s| {
+            if (!self.stage_released) s.releaseUse();
+        }
         if (self.owns_acct) {
             if (self.acct) |a| self.allocator.destroy(a);
         }
@@ -1136,8 +1142,24 @@ pub const ParallelScan = struct {
                 self.round_cursor += 1;
                 if (self.round[idx]) |b| return b;
             }
-            if (self.all_done) return null;
+            if (self.all_done) {
+                self.releaseStageUse();
+                return null;
+            }
             try self.runRound();
+        }
+    }
+
+    /// Drop this scan's consumer count on its source stage once the drain
+    /// completes — batches already emitted were consumed before the caller
+    /// pulled the null (standard batch-validity contract), so the buffer
+    /// can free as soon as the remaining consumers finish. Idempotent;
+    /// deinit covers abandoned (never-exhausted) scans.
+    fn releaseStageUse(self: *ParallelScan) void {
+        if (self.stage_released) return;
+        if (self.stage) |st| {
+            self.stage_released = true;
+            st.releaseUse();
         }
     }
 

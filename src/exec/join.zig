@@ -34,10 +34,7 @@ const StringStore = engine.StringStore;
 
 const exec = @import("exec.zig");
 const Query = exec.Query;
-const parallel_scan_mod = @import("parallel_scan.zig");
-const compute_mod = @import("compute.zig");
-const alias_mod = @import("alias_rename.zig");
-const project_mod = @import("project_limit.zig");
+
 const Batch = exec.Batch;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
@@ -988,7 +985,8 @@ pub const Join = struct {
     /// natural next() cascade completes every build before workers spawn.
     pub fn tryFuseProbe(self: *Join, sink: exec.ProbeSink) !bool {
         if (!self.probe_fused or self.chained_sink != null) return false;
-        if (!(try self.rechainDown(sink))) return false;
+        const probe = if (self.build_is_left) self.right else self.left;
+        if (!(try probe.rechainProbeSink(sink))) return false;
         if (sink.probe_map) |m| {
             for (self.probe_chunks) |*ch| {
                 ch.chain_views = try self.probe_chunk_alloc.alloc(ColumnView, m.len);
@@ -998,37 +996,14 @@ pub const Join = struct {
         return true;
     }
 
-    /// Walk the probe-fused chain to the ParallelScan at the bottom and
-    /// rebind + re-type there. Intermediate joins already emit through
-    /// their own chained sinks; the new sink attaches at the CALLER (the
-    /// current chain tail), so they pass through untouched here.
-    fn rechainDown(self: *Join, sink: exec.ProbeSink) anyerror!bool {
+    /// A rechain passing through this join: intermediate joins already emit
+    /// through their own chained sinks, so the new sink (kept by the CALLER,
+    /// the pipeline's current tail) just continues down the probe side to
+    /// the ParallelScan at the bottom.
+    pub fn rechainProbeSink(self: *Join, sink: exec.ProbeSink) anyerror!bool {
+        if (!self.probe_fused) return false;
         const probe = if (self.build_is_left) self.right else self.left;
-        return rechainDownQ(probe, sink);
-    }
-
-    /// Descend an already-fused probe pipeline — joins pass through their
-    /// probe side, chained Computes through their upstream — to the
-    /// ParallelScan at the bottom, and rebind + re-type there.
-    fn rechainDownQ(q: Query, sink: exec.ProbeSink) anyerror!bool {
-        if (exec.queryAs(parallel_scan_mod.ParallelScan, q)) |ps| return ps.rechainProbeSink(sink);
-        if (exec.queryAs(Join, q)) |j| {
-            if (!j.probe_fused) return false;
-            return rechainDownQ(if (j.build_is_left) j.right else j.left, sink);
-        }
-        if (exec.queryAs(compute_mod.Compute, q)) |c| {
-            if (c.chain == null) return false;
-            return rechainDownQ(c.upstream, sink);
-        }
-        if (exec.queryAs(alias_mod.AliasRename, q)) |ar| {
-            if (!ar.probe_fused) return false;
-            return rechainDownQ(ar.upstream, sink);
-        }
-        if (exec.queryAs(project_mod.Project, q)) |pr| {
-            if (!pr.probe_fused) return false;
-            return rechainDownQ(pr.upstream, sink);
-        }
-        return false;
+        return probe.rechainProbeSink(sink);
     }
 
     /// Feed a joined batch into the chained (upper) join's sink, or pass it

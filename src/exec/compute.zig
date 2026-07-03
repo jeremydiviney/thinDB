@@ -273,7 +273,11 @@ const SchemaStub = struct {
 /// (join) sink processes the batch.
 const ChainForward = struct {
     src: *Compute,
-    inner: exec.ProbeSink,
+    /// The sink above (a join's), or null for a TERMINAL push: a compute
+    /// with nothing above it in the pipeline evaluates per chunk and emits
+    /// the derived batch directly. A later upper join UPGRADES a terminal
+    /// push by rechaining its sink through this Compute (tryFuseProbe).
+    inner: ?exec.ProbeSink,
     /// Upstream schema snapshotted at offer time — the scan re-types its
     /// out_schema on accept, so it can't be re-read at bind time.
     in_schema: []const Column,
@@ -307,7 +311,7 @@ const ChainForward = struct {
         }
         cf.per_chunk = qs;
         cf.stubs = stubs;
-        if (cf.inner.probe_map) |m| {
+        if (if (cf.inner) |inner| inner.probe_map else null) |m| {
             const mv = try alloc.alloc([]ColumnView, n_chunks);
             var mbuilt: usize = 0;
             errdefer {
@@ -320,19 +324,20 @@ const ChainForward = struct {
             }
             cf.map_views = mv;
         }
-        try cf.inner.bind(cf.inner.ctx, n_chunks, alloc);
+        if (cf.inner) |inner| try inner.bind(inner.ctx, n_chunks, alloc);
     }
 
     fn processHook(ctx: *anyopaque, chunk: usize, batch: Batch) anyerror!?Batch {
         const cf: *ChainForward = @ptrCast(@alignCast(ctx));
         const c = exec.queryAs(Compute, cf.per_chunk[chunk]).?;
         var out = try c.evalBatch(batch);
-        if (cf.inner.probe_map) |m| {
+        const inner = cf.inner orelse return out;
+        if (inner.probe_map) |m| {
             const vs = cf.map_views[chunk];
             for (m, vs) |src, *v| v.* = out.values[src];
             out = .{ .schema = out.schema, .values = vs, .row_count = out.row_count };
         }
-        return try cf.inner.process(cf.inner.ctx, chunk, out);
+        return try inner.process(inner.ctx, chunk, out);
     }
 
     fn deinitAll(cf: *ChainForward, owner_alloc: Allocator) void {
@@ -577,7 +582,26 @@ pub const Compute = struct {
     /// chain then runs inside the scan's stripe workers, and this operator
     /// becomes a pass-through for the final joined batches.
     pub fn tryFuseProbe(self: *Compute, sink: exec.ProbeSink) !bool {
-        if (self.chain != null) return false;
+        if (self.chain) |cf| {
+            // Upgrade a TERMINAL push: the wrapper is already bound below;
+            // rechain the upper sink to the bottom scan (bind + re-type),
+            // then adopt it so the per-chunk evaluation feeds it.
+            if (cf.inner != null) return false;
+            if (!(try self.upstream.rechainProbeSink(sink))) return false;
+            if (sink.probe_map) |m| {
+                const mv = try cf.bind_alloc.alloc([]ColumnView, cf.per_chunk.len);
+                errdefer cf.bind_alloc.free(mv);
+                var mbuilt: usize = 0;
+                errdefer for (mv[0..mbuilt]) |v| cf.bind_alloc.free(v);
+                for (mv) |*v| {
+                    v.* = try cf.bind_alloc.alloc(ColumnView, m.len);
+                    mbuilt += 1;
+                }
+                cf.map_views = mv;
+            }
+            cf.inner = sink;
+            return true;
+        }
         const chain = try self.allocator.create(ChainForward);
         errdefer self.allocator.destroy(chain);
         chain.* = .{
@@ -588,6 +612,41 @@ pub const Compute = struct {
         const ok = self.upstream.tryFuseProbe(.{
             .ctx = chain,
             .out_schema = sink.out_schema,
+            .bind = ChainForward.bindHook,
+            .process = ChainForward.processHook,
+        }) catch false;
+        if (!ok) {
+            self.allocator.destroy(chain);
+            return false;
+        }
+        self.chain = chain;
+        return true;
+    }
+
+    pub fn rechainProbeSink(self: *Compute, sink: exec.ProbeSink) !bool {
+        // Only a FULLY chained compute (inner sink adopted, or terminal at
+        // the very tail being extended by the caller above) passes through.
+        if (self.chain == null) return false;
+        return self.upstream.rechainProbeSink(sink);
+    }
+
+    /// Terminal self-push: nothing above this Compute offers a probe sink,
+    /// but the pipeline below may be a probe-fused parallel chain — push
+    /// the derived evaluation into it as a terminal chained sink, so the
+    /// stripe workers emit already-computed batches and this operator
+    /// becomes a pass-through. A join created later upgrades the terminal
+    /// wrapper via tryFuseProbe. Safe no-op when the upstream declines.
+    pub fn tryFuseSelf(self: *Compute) bool {
+        if (self.chain != null) return false;
+        const chain = self.allocator.create(ChainForward) catch return false;
+        chain.* = .{
+            .src = self,
+            .inner = null,
+            .in_schema = self.upstream.outputSchema(),
+        };
+        const ok = self.upstream.tryFuseProbe(.{
+            .ctx = chain,
+            .out_schema = self.output_schema,
             .bind = ChainForward.bindHook,
             .process = ChainForward.processHook,
         }) catch false;
