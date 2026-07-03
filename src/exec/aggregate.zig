@@ -324,16 +324,36 @@ fn valueUpdate(aa: Allocator, s: *AccState, func: AggFunc, view: ColumnView, row
     }
 }
 
+/// Compare a view cell against a stored Value of the same underlying type
+/// WITHOUT materializing the cell — for string keys this skips the arena
+/// dupe `valueFromRow` would pay on every row just to compare.
+fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
+    return switch (view.data) {
+        .int => |v| std.math.order(v[row], val.int),
+        .bigint => |v| std.math.order(v[row], val.bigint),
+        .boolean => |v| std.math.order(v[row], @intFromBool(val.boolean)),
+        .float => |v| std.math.order(v[row], val.float),
+        .double => |v| std.math.order(v[row], val.double),
+        .date => |v| std.math.order(v[row], val.date),
+        .datetime => |v| std.math.order(v[row], val.datetime),
+        .tinyint => |v| std.math.order(v[row], val.tinyint),
+        .smallint => |v| std.math.order(v[row], val.smallint),
+        .largeint => |v| std.math.order(v[row], val.largeint),
+        .decimal64 => |v| std.math.order(v[row], val.decimal64),
+        .decimal128 => |v| std.math.order(v[row], val.decimal128),
+        .uuid => |v| std.math.order(v[row], val.uuid),
+        .varchar, .string, .char => std.mem.order(u8, stringRowBytes(view, @intCast(row)), val.text),
+    };
+}
+
 fn maxByUpdate(aa: Allocator, s: *AccState, value_view: ColumnView, key_view: ColumnView, row_start: u32, row_end: u32) !void {
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
         if (!value_view.isValid(r) or !key_view.isValid(r)) continue;
-        const key = try valueFromRow(aa, key_view, r);
-        if (!s.max_by.seen or key.compare(s.max_by.key) == .gt) {
-            s.max_by.key = key;
-            s.max_by.value = try valueFromRow(aa, value_view, r);
-            s.max_by.seen = true;
-        }
+        if (s.max_by.seen and rowVsValue(key_view, r, s.max_by.key) != .gt) continue;
+        s.max_by.key = try valueFromRow(aa, key_view, r);
+        s.max_by.value = try valueFromRow(aa, value_view, r);
+        s.max_by.seen = true;
     }
 }
 
