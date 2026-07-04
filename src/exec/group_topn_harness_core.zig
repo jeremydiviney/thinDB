@@ -17,6 +17,7 @@ const api_mod = @import("../api/api.zig");
 const storage_mod = @import("../storage/storage.zig");
 const types_mod = @import("../types.zig");
 const rowloc = @import("rowloc.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 const build_options = @import("build_options");
 const udf_mod = @import("../udf.zig");
 const ColumnView = storage_mod.ColumnView;
@@ -4769,7 +4770,20 @@ const SiloGridJob = struct {
 };
 
 fn siloGridWorker(job: SiloGridJob) void {
-    pinToCpu(job.cpu);
+    // Lease a core from the process-global CoreScheduler rather than pinning to
+    // a per-query `cpus[worker_index]`. A fixed per-query assignment makes every
+    // query's worker 0 pin to the SAME core (cpus[0]), so N concurrent grouped
+    // queries (e.g. order-key range shards, each a single-worker grid) all
+    // serialize on one core. The scheduler round-robins distinct cores across
+    // ALL in-flight queries and caps at the per-core thread budget globally, so
+    // concurrent grouped queries spread across the machine. NO_PIN / no-cores
+    // makes acquire a no-op (unpinned); a thread already holding a core reuses
+    // it (no-hold-and-wait). tryAcquire (not acquire): the grid's workers
+    // coordinate at barriers, so a worker must NEVER block waiting for a core
+    // slot — under oversubscription (N concurrent grids > core budget) that
+    // would deadlock a barrier-waiting peer. Excess workers run unpinned.
+    var lease = core_scheduler.global().tryAcquire();
+    defer lease.release();
     siloGridWorkerErr(job) catch |e| {
         job.err.* = e;
         // Wake the peers so they stop waiting on coordination counters this
@@ -5910,7 +5924,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
 
     i = 0;
     while (i < n_workers) : (i += 1) {
-        threads[i] = try std.Thread.spawn(.{}, siloGridWorker, .{SiloGridJob{
+        const job = SiloGridJob{
             .scan = scans[i],
             .drive = &drives[i],
             .local = &parts[i],
@@ -5937,7 +5951,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             .chunks = &chunks[i],
             .top = &worker_tops[i],
             .err = &errs[i],
-        }});
+        };
+        threads[i] = try std.Thread.spawn(.{}, siloGridWorker, .{job});
     }
     i = 0;
     while (i < n_workers) : (i += 1) threads[i].join();

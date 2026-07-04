@@ -56,6 +56,7 @@ const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
 const Scan = @import("scan.zig").Scan;
 const HarnessCore = exec.group_topn_harness_core;
+const core_scheduler = @import("../util/core_scheduler.zig");
 const group_table = exec.group_table;
 
 const Batch = exec.Batch;
@@ -488,7 +489,14 @@ const Worker = struct {
 };
 
 fn workerMain(w: *Worker) void {
-    if (w.cpu) |cpu| HarnessCore.pinToCpu(cpu);
+    // Lease a core from the process-global scheduler (round-robins distinct
+    // cores across ALL in-flight queries, global per-core cap) rather than
+    // pinning to a per-query `cpus[worker_index]` — a fixed assignment makes
+    // every single-worker query pin to the same core, serializing N concurrent
+    // ones. tryAcquire (non-blocking): workers coordinate, so none may block on
+    // a full bucket; excess workers run unpinned.
+    var lease = core_scheduler.global().tryAcquire();
+    defer lease.release();
     workerRun(w) catch |e| {
         w.err = e;
     };
@@ -857,7 +865,9 @@ const PartMergeJob = struct {
 };
 
 fn partMergeMain(job: *PartMergeJob) void {
-    if (job.cpu) |cpu| HarnessCore.pinToCpu(cpu);
+    // Global core lease (non-blocking) instead of a per-query pin — see workerMain.
+    var lease = core_scheduler.global().tryAcquire();
+    defer lease.release();
     partMergeRun(job) catch |e| {
         job.err = e;
     };
