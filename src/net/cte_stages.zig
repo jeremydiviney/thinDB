@@ -33,6 +33,7 @@ const local = @import("local.zig");
 const pgcat = @import("pg_catalog.zig");
 const types = @import("../types.zig");
 const storage_column = @import("../storage/column.zig");
+const engine_mod = @import("../engine/engine.zig");
 
 const PredicateExpr = exec.predicate.PredicateExpr;
 
@@ -335,6 +336,14 @@ fn collectStages(
             if (win_root == null) q = pruneStageColumns(input, q);
             const stage = try set.addStage(q, input.accountant);
             stage.slice_local = input.dop_cap != null;
+            if (stage.slice_local and getenv("THINDB_TRACE_SEP") != null and stage.id < 20) {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(input.allocator);
+                var qq = q;
+                qq.explain(&buf, input.allocator, 0) catch {};
+                const first = if (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| buf.items[0..nl] else buf.items;
+                std.debug.print("[sep] slice-stage#{d} = {s}\n", .{ stage.id, first });
+            }
             stage.adopt_window = win_root;
             if (win_root) |wr| {
                 if (wr.borrow_src) |src| {
@@ -1131,6 +1140,63 @@ fn collectPrePartCandidates(
     }
 }
 
+/// Column-strip gather pool for the pre-partition router: the drain thread
+/// publishes one batch at a time (generation counter); each worker copies
+/// its column strip into every slice's sink. All (column, slice) cells and
+/// their per-column arenas are disjoint across workers, so no locks. Spin
+/// waits are fine — a batch's gather is ~ms and the pool lives for one
+/// drain.
+const GatherPool = struct {
+    sinks: []mat_stage.ContigSink,
+    idx_lists: []std.ArrayListUnmanaged(u32),
+    ncols: usize,
+    batch: ?*const exec.Batch = null,
+    gen: std.atomic.Value(usize) = .init(0),
+    done: std.atomic.Value(usize) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+    err: std.atomic.Value(bool) = .init(false),
+
+    fn dispatch(self: *GatherPool, batch: *const exec.Batch) void {
+        self.batch = batch;
+        self.done.store(0, .release);
+        _ = self.gen.fetchAdd(1, .release);
+    }
+
+    fn wait(self: *GatherPool) void {
+        while (self.done.load(.acquire) < self.ncols) std.atomic.spinLoopHint();
+    }
+
+    fn worker(self: *GatherPool, tid: usize, nthreads: usize) void {
+        var seen: usize = 0;
+        while (true) {
+            while (self.gen.load(.acquire) == seen) {
+                if (self.stop.load(.acquire)) return;
+                std.atomic.spinLoopHint();
+            }
+            seen = self.gen.load(.acquire);
+            if (self.stop.load(.acquire)) return;
+            const batch = self.batch.?;
+            var c = tid;
+            while (c < self.ncols) : (c += nthreads) {
+                for (self.sinks, self.idx_lists) |*sk, l| {
+                    if (l.items.len == 0) continue;
+                    engine_mod.transform.appendByIndices(
+                        sk.arenas[c].allocator(),
+                        batch.values[c],
+                        l.items,
+                        &sk.stores[c],
+                    ) catch {
+                        self.err.store(true, .release);
+                    };
+                }
+                _ = self.done.fetchAdd(1, .release);
+            }
+            // Columns not divisible by nthreads: strips cover all of them —
+            // done counts one per column, wait() releases at ncols.
+        }
+    }
+};
+
 /// First boundary >= v wins its slice; NULL keys were routed by the caller.
 fn sliceIndexForValue(v: types.Value, bounds: []const types.Value) usize {
     var lo: usize = 0;
@@ -1201,6 +1267,32 @@ fn prePartition(
         }
         @memset(idx_lists, .empty);
 
+        // Gather pool: the drain stays serial (batch views are only valid
+        // until the next pull), but within a batch the copies parallelize
+        // across COLUMN STRIPS — thread t owns columns [t::T) across every
+        // slice, so all (column, slice) cells (and their per-column arenas)
+        // are disjoint. A per-batch generation counter + done count is the
+        // whole synchronization; workers spin briefly (batches are ~ms).
+        var gather = GatherPool{
+            .sinks = sinks,
+            .idx_lists = idx_lists,
+            .ncols = schema.len,
+        };
+        const n_gather: usize = @min(4, schema.len);
+        var gather_threads: [4]?std.Thread = .{ null, null, null, null };
+        var pool_ok = true;
+        for (0..n_gather) |t| {
+            gather_threads[t] = std.Thread.spawn(.{}, GatherPool.worker, .{ &gather, t, n_gather }) catch {
+                pool_ok = false; // a missing strip would hang wait(): go serial
+                break;
+            };
+        }
+        defer {
+            gather.stop.store(true, .release);
+            _ = gather.gen.fetchAdd(1, .release);
+            for (gather_threads) |gt| if (gt) |th| th.join();
+        }
+
         var route_err: ?anyerror = null;
         while (true) {
             const b = q.next() catch |e| {
@@ -1226,14 +1318,24 @@ fn prePartition(
                 };
             }
             if (route_err != null) break;
-            for (sinks, idx_lists) |*sk, l| {
-                if (l.items.len == 0) continue;
-                sk.appendIndices(batch, l.items) catch |e| {
-                    route_err = e;
+            if (pool_ok) {
+                gather.dispatch(&batch);
+                gather.wait();
+                if (gather.err.load(.acquire)) {
+                    route_err = error.OutOfMemory;
                     break;
-                };
+                }
+                for (sinks, idx_lists) |*sk, l| sk.rows += l.items.len;
+            } else {
+                for (sinks, idx_lists) |*sk, l| {
+                    if (l.items.len == 0) continue;
+                    sk.appendIndices(batch, l.items) catch |e| {
+                        route_err = e;
+                        break;
+                    };
+                }
+                if (route_err != null) break;
             }
-            if (route_err != null) break;
         }
         q.deinit();
         if (route_err != null) {
