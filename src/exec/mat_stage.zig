@@ -318,6 +318,20 @@ pub const Stage = struct {
     /// BEFORE any run; a stage that already ran eagerly just misses the
     /// optimization (the borrower's bind degrades to normal accumulation).
     want_contiguous: bool = false,
+    /// SEPARABLE BY: the stage fills by running N per-key-range slice
+    /// pipelines concurrently and adopting their outputs in slice order,
+    /// instead of draining `query`. Installed by the staged compiler; the
+    /// hook lives in net/cte_stages (it re-enters the block compiler), so
+    /// the coupling stays behind opaque fn pointers — same philosophy as
+    /// `adopt_window`. `query` still compiles normally (it provides the
+    /// schema/stats and is torn down undrained).
+    sliced_fill: ?SlicedFill = null,
+
+    pub const SlicedFill = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque, stage: *Stage, res: *MaterializedResult) anyerror!void,
+        drop: *const fn (ctx: *anyopaque) void,
+    };
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;

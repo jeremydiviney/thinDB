@@ -44,6 +44,13 @@ pub const AggParams = exec_aggregate.AggParams;
 const exec_compute = @import("../exec/compute.zig");
 pub const Derived = exec_compute.Derived;
 
+/// `SEPARABLE BY (cols)` declaration carried on a Materialize node: the
+/// partition key columns as written by the user, resolved against the
+/// block's inputs at stage-fill time.
+pub const SeparableSpec = struct {
+    cols: []const []const u8,
+};
+
 const exec_join = @import("../exec/join.zig");
 pub const JoinSpec = exec_join.Spec;
 pub const JoinKeyPair = exec_join.KeyPair;
@@ -664,7 +671,13 @@ pub const Op = union(OpTag) {
         /// real buffer, so the staged compiler materializes even a single-
         /// reference node it would otherwise inline-stream.
         forced: bool = false,
+        /// `SEPARABLE BY (cols)` on the wrapped block: the author asserts no
+        /// output row depends on rows with a different key, so the stage may
+        /// fill as N disjoint key-range slices run concurrently and
+        /// concatenated — never re-aggregated. Implies `forced`.
+        separable: ?SeparableSpec = null,
     };
+
 
     pub const Alias = struct {
         alias: []const u8,

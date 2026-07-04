@@ -74,6 +74,23 @@ pub const CompileInput = struct {
     /// parallel seams (round buffer scans interleave stripes) are suppressed
     /// for its chains. Scoped: callers set it on a COPY of the input.
     force_ordered: bool = false,
+    /// Cap on parallelism for this compile, below the server's max_dop.
+    /// A SEPARABLE slice pipeline compiles with dop_cap = 1 — the slices
+    /// themselves are the parallelism. Read via `effectiveDop()`.
+    dop_cap: ?usize = null,
+    /// SEPARABLE slice predicate: applied (as a fused Filter) on top of
+    /// every LEAF this compile produces whose schema carries all of
+    /// `slice_cols` — base-table scans and shared-stage reads alike. The
+    /// body IR is shared read-only across slice compiles; the predicate is
+    /// a compile parameter, never an IR mutation.
+    slice_pred: ?exec.predicate.PredicateExpr = null,
+    slice_cols: []const []const u8 = &.{},
+
+    pub fn effectiveDop(self: *const CompileInput) usize {
+        const base = self.db.config.max_dop;
+        if (self.dop_cap) |cap| return @min(base, cap);
+        return base;
+    }
 };
 
 /// Compile ONE single-source query block (no materialize boundaries inside —
@@ -514,7 +531,7 @@ fn buildUdafGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan)
     const allocator = input.allocator;
     const needed = try projectedBaseColumns(allocator, table, input.prune_names);
     defer if (needed) |n| allocator.free(n);
-    const max_dop = input.db.config.max_dop;
+    const max_dop = input.effectiveDop();
 
     var q = if (max_dop > 1)
         try exec.ParallelScan.create(allocator, table, input.accountant, needed, max_dop)
@@ -545,7 +562,7 @@ fn buildOperatorGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNP
     const allocator = input.allocator;
     const needed = try projectedBaseColumns(allocator, table, input.prune_names);
     defer if (needed) |n| allocator.free(n);
-    const max_dop = input.db.config.max_dop;
+    const max_dop = input.effectiveDop();
 
     var q = if (max_dop > 1)
         try exec.ParallelScan.create(allocator, table, input.accountant, needed, max_dop)
@@ -683,7 +700,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .having_filter = eff_having,
         .needed = needed,
         .derived = eff_derived,
-        .dop = input.db.config.max_dop,
+        .dop = input.effectiveDop(),
         .udf_registry = input.udf_registry,
     };
 
@@ -857,7 +874,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
             .where_filter = if (plan.where_filter) |f| f.predicate else null,
             .having_filter = if (plan.having_filter) |f| f.predicate else null,
             .derived = plan.derived,
-            .dop = input.db.config.max_dop,
+            .dop = input.effectiveDop(),
             .udf_registry = input.udf_registry,
         })) |q| return q;
         return try buildGlobalOperatorAggregate(input, table, plan);
@@ -901,7 +918,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .having_filter = if (plan.having_filter) |f| f.predicate else null,
         .derived = plan.derived,
-        .dop = input.db.config.max_dop,
+        .dop = input.effectiveDop(),
     })) |q| return q;
     return try buildGlobalOperatorAggregate(input, table, plan);
 }
@@ -957,7 +974,7 @@ fn buildGlobalAggregateReduced(
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .having_filter = null,
         .derived = red.pre_derived,
-        .dop = input.db.config.max_dop,
+        .dop = input.effectiveDop(),
     })) orelse return error.UnsupportedQueryShape;
     errdefer q.deinit();
     if (red.post_derived.len > 0) q = try q.computeWithRegistry(red.post_derived, input.udf_registry);
@@ -1197,7 +1214,7 @@ fn tryScanSelectLateMat(
     // and is byte-identical to the full scan regardless of projection width or
     // a WHERE — so try it first whenever there's an ORDER BY.
     if (plan.order_by) |o| {
-        if (try exec.zonemapTopN(allocator, table, input.accountant, probe.items, predicateOrAlways(plan.where_filter), o.specs, output_names, n, offset, input.db.config.max_dop)) |q| {
+        if (try exec.zonemapTopN(allocator, table, input.accountant, probe.items, predicateOrAlways(plan.where_filter), o.specs, output_names, n, offset, input.effectiveDop())) |q| {
             return q;
         }
     }
@@ -1235,7 +1252,7 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
     defer if (needed) |n| input.allocator.free(n);
     const allocator = input.allocator;
-    const max_dop = input.db.config.max_dop;
+    const max_dop = input.effectiveDop();
 
     var q = if (max_dop > 1)
         try exec.ParallelScan.create(allocator, table, input.accountant, needed, max_dop)
@@ -1388,7 +1405,7 @@ fn buildGlobalOperatorAggregate(input: CompileInput, table: *api.Table, plan: Gl
     const allocator = input.allocator;
     const needed = try projectedBaseColumns(allocator, table, input.prune_names);
     defer if (needed) |n| allocator.free(n);
-    const max_dop = input.db.config.max_dop;
+    const max_dop = input.effectiveDop();
 
     var q = if (max_dop > 1)
         try exec.ParallelScan.create(allocator, table, input.accountant, needed, max_dop)

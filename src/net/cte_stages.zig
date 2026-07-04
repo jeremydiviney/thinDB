@@ -320,7 +320,7 @@ fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap)
         .table => if (blockScanIsPgCatalog(input, op))
             buildGenericBlock(input, op, map, op)
         else
-            engine_v2.compileSelectBlock(input, op),
+            wrapSlicePred(input, try engine_v2.compileSelectBlock(input, op)),
         // Stage-, join-, window-, union- or non-table-leaf-backed block:
         // generic operators over MatScan / Join / Window / SetUnion /
         // SingleRow / FileScan leaves. The heavy inputs were already produced
@@ -368,7 +368,7 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
     // a MatScan. The deferred leaf materializes at first pull (normal DAG
     // order) and releases its stage use at drain exhaustion, so its memory
     // profile matches the MatScan it replaces.
-    if (input.db.config.max_dop > 1 and is_probe and
+    if (input.effectiveDop() > 1 and is_probe and
         streamingChainOverStage(op, map, false, true))
     {
         return buildFusedStreamOverStage(input, op, map, true);
@@ -612,27 +612,43 @@ const AdaptiveGroupBy = struct {
 /// — never built alongside it. Returns null for any other shape (the caller
 /// falls back to the serial `buildGenericBlock`).
 fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, deferred: bool) anyerror!?exec.Query {
-    if (input.db.config.max_dop <= 1) return null;
+    if (input.effectiveDop() <= 1) return null;
     const stage = switch (op.*) {
         .materialize => map.get(op) orelse return null,
         else => return null,
     };
     if (deferred) {
-        return try exec.ParallelScan.createOverStageDeferred(
+        return try wrapSlicePred(input, try exec.ParallelScan.createOverStageDeferred(
             input.allocator,
             input.db.allocator,
             stage,
             input.accountant,
-            input.db.config.max_dop,
-        );
+            input.effectiveDop(),
+        ));
     }
-    return try exec.ParallelScan.createOverStage(
+    return try wrapSlicePred(input, try exec.ParallelScan.createOverStage(
         input.allocator,
         input.db.allocator,
         stage,
         input.accountant,
-        input.db.config.max_dop,
-    );
+        input.effectiveDop(),
+    ));
+}
+
+/// SEPARABLE slice predicate: wrap a freshly compiled LEAF (a base-table
+/// block or a shared-stage read) in the slice filter when its schema carries
+/// every slice column. The Filter fuses into the scan below where possible
+/// (zone maps on tables); leaves without the key — dimensions — pass through
+/// whole, by design.
+fn wrapSlicePred(input: engine_v2.CompileInput, q: exec.Query) anyerror!exec.Query {
+    const pred = input.slice_pred orelse return q;
+    const schema = q.outputSchema();
+    for (input.slice_cols) |c| {
+        if (types.findColumn(schema, c) == null) return q;
+    }
+    var qq = q;
+    errdefer qq.deinit();
+    return qq.filter(pred);
 }
 
 /// A pure row-streaming chain — compute / filter / select / exclude / alias —
@@ -732,7 +748,7 @@ fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, ma
 /// its inputs, so the deferred leaf's tryFuseAggregate decline can't demote
 /// any consumer (the reason this route is NOT in the generic gate below).
 fn compileUnionArm(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
-    if (input.db.config.max_dop > 1 and !input.force_ordered and
+    if (input.effectiveDop() > 1 and !input.force_ordered and
         !streamingChainOverStage(op, map, true, false) and
         streamingChainOverStage(op, map, true, true))
     {
@@ -742,7 +758,7 @@ fn compileUnionArm(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageM
 }
 
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
-    if (input.db.config.max_dop > 1 and !input.force_ordered and streamingChainOverStage(op, map, true, false)) return buildFusedStreamOverStage(input, op, map, false);
+    if (input.effectiveDop() > 1 and !input.force_ordered and streamingChainOverStage(op, map, true, false)) return buildFusedStreamOverStage(input, op, map, false);
     switch (op.*) {
         .scan => |s| {
             // Only pg_catalog virtual scans route here; real-table blocks
@@ -763,7 +779,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // In the map = shared (staged once, read here). Absent = single
             // reference: stream the body inline — no stage copy + re-read,
             // and a table-backed body keeps its full V2 handlers.
-            if (map.get(op)) |stage| return mat_stage.MatScan.create(input.allocator, stage);
+            if (map.get(op)) |stage| return wrapSlicePred(input, try mat_stage.MatScan.create(input.allocator, stage));
             return compileBlock(input, m.upstream, map);
         },
         .alias => |a| {
@@ -886,7 +902,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     g.top_k,
                     g.emit_limit,
                     input.db.config.query_memory_budget,
-                    input.db.config.max_dop,
+                    input.effectiveDop(),
                 );
             }
             return group_route.routeGroupBy(
@@ -917,7 +933,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             var eff_input = input;
             var ride_keys: ir.WindowSpec = undefined;
             var borrow_stage: ?*mat_stage.Stage = null;
-            if (input.db.config.max_dop > 1) {
+            if (input.effectiveDop() > 1) {
                 const rider_keys: ?ir.WindowSpec = if (sameKeysAllSpecs(w.specs)) w.specs[0] else null;
                 if (rideSource(map, w.upstream, rider_keys)) |src| {
                     if (src.covered) {
@@ -974,7 +990,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     }
                 }
             }
-            const wq = try up.window(w.specs, w.calls, input.db.config.max_dop);
+            const wq = try up.window(w.specs, w.calls, input.effectiveDop());
             if (ride or borrow_stage != null) {
                 if (exec.queryAs(window_op.Window, wq)) |win| {
                     if (ride) {
