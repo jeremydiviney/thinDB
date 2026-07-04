@@ -34,6 +34,7 @@ const pgcat = @import("pg_catalog.zig");
 const types = @import("../types.zig");
 const storage_column = @import("../storage/column.zig");
 const engine_mod = @import("../engine/engine.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 
 const PredicateExpr = exec.predicate.PredicateExpr;
 
@@ -1176,6 +1177,8 @@ const GatherPool = struct {
     }
 
     fn worker(self: *GatherPool, tid: usize, nthreads: usize) void {
+        var lease = core_scheduler.global().tryAcquire();
+        defer lease.release();
         var seen: usize = 0;
         while (true) {
             while (self.gen.load(.acquire) == seen) {
@@ -1299,6 +1302,8 @@ fn groupSliceSink(
 ) void {
     const n: usize = @intCast(sink.rows);
     if (n == 0) return;
+    var lease = core_scheduler.global().tryAcquire();
+    defer lease.release();
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -1776,6 +1781,12 @@ fn sliceWorker(
     defer if (trace) std.debug.print("[sep]   slice stage#{d} rows={d} {d:.0}ms\n", .{
         stage.id, sink.rows, exec.prof.ticksToMs(exec.prof.nowTicks() - t0),
     });
+    // Lease a core from the process-global scheduler so the N single-
+    // threaded slice pipelines land on N DISTINCT physical cores instead of
+    // wherever the OS migrates them (two slices sharing one core's
+    // hyperthreads while others idle). tryAcquire — never block.
+    var lease = core_scheduler.global().tryAcquire();
+    defer lease.release();
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const aa = arena.allocator();
