@@ -1,10 +1,16 @@
-//! Pre-execution predicate pushdown for joins.
+//! Pre-execution pushdown passes: join filters and union computes.
 //!
 //! Rewrites `Filter(pred, Join(L, R))` by moving each top-level WHERE conjunct
 //! that references columns from exactly ONE preserved join input down onto that
 //! input, so the source is narrowed BEFORE the join runs. A conjunct that
 //! empties a side turns the whole join into a no-op; one that merely narrows it
 //! shrinks the build/probe input.
+//!
+//! Also rewrites `Compute(set_union(A, B))` → `set_union(Compute(A),
+//! Compute(B))` (see `pushComputeThroughUnions`): per-row derived columns
+//! commute with UNION ALL's bag concatenation, and a stage-backed arm can then
+//! parallelise the evaluation via the terminal compute push where the union'd
+//! operator cannot.
 //!
 //! This is a plan rewrite (allowed — see DESIGN.md "no RUNTIME optimization"),
 //! run once after subquery resolution and before any handler compiles the tree,
@@ -371,6 +377,158 @@ fn collectPredCols(arena: Allocator, pred: PredicateExpr, out: *std.ArrayListUnm
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Compute push through UNION ALL
+// ---------------------------------------------------------------------------
+
+/// Rewrite `Compute(set_union(A, B))` → `set_union(Compute(A), Compute(B))`,
+/// also through a single-consumer `.materialize` wrapper (the CTE-ref shape
+/// `Compute(materialize(set_union(..)))`). Per-row derived columns commute
+/// with UNION ALL's bag concatenation; after the split each arm's compute can
+/// terminal-push into that arm's parallel pipeline, where the union'd
+/// operator has nothing to fuse into.
+///
+/// Guards:
+///   - UNION ALL only: a distinct union dedups on the union's own columns —
+///     appending derived columns before the dedup would change it.
+///   - Both arms expose IDENTICAL column-name suffix lists (exact, catalog-
+///     resolved, positional): the derived expressions were written against
+///     the union's (= left arm's) names and must resolve identically inside
+///     the right arm.
+///   - The `.materialize` wrapper must have exactly one consumer — rewriting
+///     inside a shared CTE body would leak the derived columns to its other
+///     consumers.
+pub fn pushComputeThroughUnions(arena: Allocator, catalog: ?*api.Catalog, session: api.Session, op: *ir.Op) anyerror!void {
+    trace_push = getenv("THINDB_TRACE_PUSHDOWN") != null;
+    const ctx = Ctx{ .arena = arena, .catalog = catalog, .session = session };
+    var mat_refs: std.AutoHashMapUnmanaged(*const ir.Op, u32) = .empty;
+    try countMatRefs(ctx.arena, op, &mat_refs);
+    var visited: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty;
+    try walkComputeUnions(ctx, op, &mat_refs, &visited);
+}
+
+/// Count how many parent edges reference each `.materialize` node — the same
+/// shared-node convention the staged compiler uses. Each body walks once.
+fn countMatRefs(arena: Allocator, op: *const ir.Op, map: *std.AutoHashMapUnmanaged(*const ir.Op, u32)) anyerror!void {
+    if (op.* == .materialize) {
+        const gop = try map.getOrPut(arena, op);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+            return;
+        }
+        gop.value_ptr.* = 1;
+        return countMatRefs(arena, op.materialize.upstream, map);
+    }
+    switch (op.*) {
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
+        .limit => |l| try countMatRefs(arena, l.upstream, map),
+        .select, .exclude => |p| try countMatRefs(arena, p.upstream, map),
+        .order_by => |o| try countMatRefs(arena, o.upstream, map),
+        .group_by => |g| try countMatRefs(arena, g.upstream, map),
+        .compute => |c| try countMatRefs(arena, c.upstream, map),
+        .window => |w| try countMatRefs(arena, w.upstream, map),
+        .alias => |a| try countMatRefs(arena, a.upstream, map),
+        .filter => |f| try countMatRefs(arena, f.upstream, map),
+        .explain => |e| try countMatRefs(arena, e.inner, map),
+        .create_table_as => |c| try countMatRefs(arena, c.source, map),
+        .insert_select => |i| try countMatRefs(arena, i.source, map),
+        .batch => |b| for (b.statements) |s| try countMatRefs(arena, s, map),
+        .set_union => |u| {
+            try countMatRefs(arena, u.left, map);
+            try countMatRefs(arena, u.right, map);
+        },
+        .join => |j| {
+            try countMatRefs(arena, j.left, map);
+            try countMatRefs(arena, j.right, map);
+        },
+        .materialize => unreachable,
+    }
+}
+
+fn walkComputeUnions(
+    ctx: Ctx,
+    op: *ir.Op,
+    mat_refs: *const std.AutoHashMapUnmanaged(*const ir.Op, u32),
+    visited: *std.AutoHashMapUnmanaged(*const ir.Op, void),
+) anyerror!void {
+    switch (op.*) {
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
+        .limit => |l| try walkComputeUnions(ctx, @constCast(l.upstream), mat_refs, visited),
+        .select, .exclude => |p| try walkComputeUnions(ctx, @constCast(p.upstream), mat_refs, visited),
+        .order_by => |o| try walkComputeUnions(ctx, @constCast(o.upstream), mat_refs, visited),
+        .group_by => |g| try walkComputeUnions(ctx, @constCast(g.upstream), mat_refs, visited),
+        .window => |w| try walkComputeUnions(ctx, @constCast(w.upstream), mat_refs, visited),
+        .alias => |a| try walkComputeUnions(ctx, @constCast(a.upstream), mat_refs, visited),
+        .filter => |f| try walkComputeUnions(ctx, @constCast(f.upstream), mat_refs, visited),
+        .explain => |e| try walkComputeUnions(ctx, e.inner, mat_refs, visited),
+        .create_table_as => |c| try walkComputeUnions(ctx, @constCast(c.source), mat_refs, visited),
+        .insert_select => |i| try walkComputeUnions(ctx, @constCast(i.source), mat_refs, visited),
+        .batch => |b| for (b.statements) |s| try walkComputeUnions(ctx, @constCast(s), mat_refs, visited),
+        .materialize => |m| {
+            // Shared bodies walk once.
+            const gop = try visited.getOrPut(ctx.arena, op);
+            if (!gop.found_existing) try walkComputeUnions(ctx, @constCast(m.upstream), mat_refs, visited);
+        },
+        .set_union => |u| {
+            try walkComputeUnions(ctx, @constCast(u.left), mat_refs, visited);
+            try walkComputeUnions(ctx, @constCast(u.right), mat_refs, visited);
+        },
+        .join => |j| {
+            try walkComputeUnions(ctx, @constCast(j.left), mat_refs, visited);
+            try walkComputeUnions(ctx, @constCast(j.right), mat_refs, visited);
+        },
+        .compute => |c| {
+            try walkComputeUnions(ctx, @constCast(c.upstream), mat_refs, visited);
+            try trySplitComputeOverUnion(ctx, op, mat_refs);
+        },
+    }
+}
+
+fn trySplitComputeOverUnion(
+    ctx: Ctx,
+    op: *ir.Op,
+    mat_refs: *const std.AutoHashMapUnmanaged(*const ir.Op, u32),
+) anyerror!void {
+    const up = @constCast(op.compute.upstream);
+    const union_op: *ir.Op = switch (up.*) {
+        .set_union => up,
+        .materialize => |m| blk: {
+            if ((mat_refs.get(up) orelse 0) != 1) return;
+            if (m.upstream.* != .set_union) return;
+            break :blk @constCast(m.upstream);
+        },
+        else => return,
+    };
+    const u = &union_op.set_union;
+    if (!u.all) return;
+
+    // Both arms must enumerate exactly and expose the same names positionally.
+    var left_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    var right_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    const left_ok = collectColumns(ctx, u.left, &left_cols) catch false;
+    const right_ok = collectColumns(ctx, u.right, &right_cols) catch false;
+    if (!left_ok or !right_ok) return;
+    if (left_cols.items.len != right_cols.items.len) return;
+    for (left_cols.items, right_cols.items) |l, r| {
+        if (!types.columnNameEql(l, r)) return;
+    }
+    if (trace_push) std.debug.print("[ppd]   compute({d} derived) split into union arms\n", .{op.compute.derived.len});
+
+    const lc = try ctx.arena.create(ir.Op);
+    lc.* = .{ .compute = .{ .derived = op.compute.derived, .upstream = u.left } };
+    const rc = try ctx.arena.create(ir.Op);
+    rc.* = .{ .compute = .{ .derived = op.compute.derived, .upstream = u.right } };
+    u.left = lc;
+    u.right = rc;
+    // The parent compute dissolves into whatever it sat on (the union, or
+    // the single-consumer materialize whose body now carries the computes).
+    op.* = up.*;
+
+    // A nested union inside an arm splits further.
+    try trySplitComputeOverUnion(ctx, lc, mat_refs);
+    try trySplitComputeOverUnion(ctx, rc, mat_refs);
+}
+
 const testing = std.testing;
 
 fn testSelect(cols: []const []const u8, upstream: *ir.Op) ir.Op {
@@ -513,6 +671,101 @@ test "predicate pushdown: exclude of a same-suffix column blocks the sink" {
     try testing.expect(op == .filter);
     try testing.expect(op.filter.upstream.* == .exclude);
     try testing.expect(op.filter.upstream.exclude.upstream.* == .join);
+}
+
+test "compute push: splits over UNION ALL with matching arm names" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{ "t.a", "t.b" }, &dummy);
+    var right = testSelect(&.{ "u.a", "u.b" }, &dummy);
+    var un = ir.Op{ .set_union = .{ .left = &left, .right = &right, .all = true } };
+    const derived = [_]ir.Derived{.{ .name = "d", .expr = .{ .col_ref = "a" } }};
+    var op = ir.Op{ .compute = .{ .derived = &derived, .upstream = &un } };
+
+    try pushComputeThroughUnions(a, null, .{}, &op);
+
+    try testing.expect(op == .set_union);
+    try testing.expect(op.set_union.left.* == .compute);
+    try testing.expect(op.set_union.right.* == .compute);
+    try testing.expect(op.set_union.left.compute.upstream.* == .select);
+    try testing.expectEqual(@as(usize, 1), op.set_union.right.compute.derived.len);
+}
+
+test "compute push: splits through a single-consumer materialize wrapper" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{"t.a"}, &dummy);
+    var right = testSelect(&.{"u.a"}, &dummy);
+    var un = ir.Op{ .set_union = .{ .left = &left, .right = &right, .all = true } };
+    var mat = ir.Op{ .materialize = .{ .upstream = &un } };
+    const derived = [_]ir.Derived{.{ .name = "d", .expr = .{ .col_ref = "a" } }};
+    var op = ir.Op{ .compute = .{ .derived = &derived, .upstream = &mat } };
+
+    try pushComputeThroughUnions(a, null, .{}, &op);
+
+    try testing.expect(op == .materialize);
+    try testing.expect(op.materialize.upstream.* == .set_union);
+    try testing.expect(op.materialize.upstream.set_union.left.* == .compute);
+    try testing.expect(op.materialize.upstream.set_union.right.* == .compute);
+}
+
+test "compute push: mismatched arm names block the split" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{ "t.a", "t.b" }, &dummy);
+    var right = testSelect(&.{ "u.a", "u.c" }, &dummy);
+    var un = ir.Op{ .set_union = .{ .left = &left, .right = &right, .all = true } };
+    const derived = [_]ir.Derived{.{ .name = "d", .expr = .{ .col_ref = "a" } }};
+    var op = ir.Op{ .compute = .{ .derived = &derived, .upstream = &un } };
+
+    try pushComputeThroughUnions(a, null, .{}, &op);
+
+    try testing.expect(op == .compute);
+    try testing.expect(op.compute.upstream.* == .set_union);
+    try testing.expect(op.compute.upstream.set_union.left.* == .select);
+}
+
+test "compute push: shared materialize blocks the split" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{"t.a"}, &dummy);
+    var right = testSelect(&.{"u.a"}, &dummy);
+    var un = ir.Op{ .set_union = .{ .left = &left, .right = &right, .all = true } };
+    var mat = ir.Op{ .materialize = .{ .upstream = &un } };
+    const derived = [_]ir.Derived{.{ .name = "d", .expr = .{ .col_ref = "a" } }};
+    var comp = ir.Op{ .compute = .{ .derived = &derived, .upstream = &mat } };
+    // Second consumer of the same materialize node.
+    var other = ir.Op{ .filter = .{ .predicate = .{ .is_not_null = "a" }, .upstream = &mat } };
+    var root = ir.Op{ .join = .{
+        .algorithm = .auto,
+        .join_type = .inner,
+        .on = &.{},
+        .ranges = &.{},
+        .extra_predicate = null,
+        .skew_ratio_threshold = 0,
+        .skew_absolute_threshold = 0,
+        .skew_sample_interval = 0,
+        .left = &comp,
+        .right = &other,
+    } };
+
+    try pushComputeThroughUnions(a, null, .{}, &root);
+
+    try testing.expect(comp == .compute);
+    try testing.expect(mat.materialize.upstream.* == .set_union);
+    try testing.expect(mat.materialize.upstream.set_union.left.* == .select);
 }
 
 test "predicate pushdown: nullable-side predicate never crosses an outer join" {

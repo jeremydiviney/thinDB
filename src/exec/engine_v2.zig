@@ -759,9 +759,20 @@ pub fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived:
 /// batches through. Serial pull semantics are unchanged on decline.
 pub fn computeSelfPushed(up: exec.Query, derived: []const ir.Derived, udf_registry: ?*const @import("../udf.zig").UdfRegistry) !exec.Query {
     const q = try up.computeWithRegistry(derived, udf_registry);
-    if (exec.queryAs(@import("compute.zig").Compute, q)) |c| _ = c.tryFuseSelf();
+    if (exec.queryAs(@import("compute.zig").Compute, q)) |c| {
+        const pushed = c.tryFuseSelf();
+        if (getenv_c("THINDB_TRACE_SELFPUSH") != null and !pushed) {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(std.heap.page_allocator);
+            c.upstream.explain(&buf, std.heap.page_allocator, 0) catch {};
+            const line = if (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| buf.items[0..nl] else buf.items;
+            std.debug.print("[selfpush] DECLINED n_derived={d} upstream={s}\n", .{ derived.len, line });
+        }
+    }
     return q;
 }
+
+const getenv_c = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const u8, .{ .name = "getenv", .library_name = "c" });
 
 const GlobalAggregatePlan = struct {
     scan: ir.Op.Scan,

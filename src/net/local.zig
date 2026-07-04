@@ -1246,6 +1246,10 @@ pub fn compileWithSession(
     // so the source is narrowed before the join runs. Pure plan rewrite shared
     // by every handler. Runs on resolved predicates (concrete leaves).
     try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
+    // Compute-through-union: split a Compute over UNION ALL into per-arm
+    // computes so stage-backed arms parallelise the evaluation (terminal
+    // compute push); the union'd operator itself has nothing to fuse into.
+    try predicate_pushdown.pushComputeThroughUnions(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
     // Dead-branch elimination: prune UNION arms that provably yield zero rows
     // (constant-false filters — the parser already folds literal comparisons
     // to `.always`) and unlink WHERE-TRUE plumbing. Runs before projection

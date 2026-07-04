@@ -1076,7 +1076,15 @@ pub const ParallelScan = struct {
         if (self.agg_fused) return self.agg_q[0].stats();
         if (self.compute_fused) return self.compute_q[0].stats();
         if (self.stage_deferred and self.workers.len == 0) {
-            return .{ .upper_rows = self.stage.?.stats_upper_rows };
+            // Report the stage's column stats too — downstream GROUP BY
+            // routing (NDV products) runs at compile time, before the
+            // deferred workers exist; dropping them here demotes fused
+            // aggregates to the generic path.
+            return .{
+                .upper_rows = self.stage.?.stats_upper_rows,
+                .sort_state = self.stage.?.sort_state,
+                .column_stats = self.stage.?.col_stats,
+            };
         }
         return self.workers[0].stats();
     }

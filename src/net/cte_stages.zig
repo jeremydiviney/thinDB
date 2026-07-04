@@ -724,6 +724,23 @@ fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, ma
     }
 }
 
+/// A UNION ALL arm that is a streaming chain over a stage — even one buried
+/// inside single-ref inline bodies — compiles as a DEFERRED parallel scan:
+/// its chain work (the computes an IR union-split pushed into the arm)
+/// evaluates in the stripe workers via the terminal compute push. Safe to
+/// scope broadly here because SetUnion never forwards aggregate fusion to
+/// its inputs, so the deferred leaf's tryFuseAggregate decline can't demote
+/// any consumer (the reason this route is NOT in the generic gate below).
+fn compileUnionArm(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
+    if (input.db.config.max_dop > 1 and !input.force_ordered and
+        !streamingChainOverStage(op, map, true, false) and
+        streamingChainOverStage(op, map, true, true))
+    {
+        return buildFusedStreamOverStage(input, op, map, true);
+    }
+    return compileBlock(input, op, map);
+}
+
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
     if (input.db.config.max_dop > 1 and !input.force_ordered and streamingChainOverStage(op, map, true, false)) return buildFusedStreamOverStage(input, op, map, false);
     switch (op.*) {
@@ -991,9 +1008,9 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // SetUnion.create validates schema compatibility and does NOT
             // consume its inputs on error — both sides need errdefers (the
             // width-mismatch path is exercised by tests).
-            var left = try compileBlock(input, u.left, map);
+            var left = try compileUnionArm(input, u.left, map);
             errdefer left.deinit();
-            var right = try compileBlock(input, u.right, map);
+            var right = try compileUnionArm(input, u.right, map);
             errdefer right.deinit();
             return exec.SetUnion.create(input.allocator, left, right, u.all);
         },

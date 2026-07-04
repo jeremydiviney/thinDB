@@ -540,9 +540,15 @@ pub const Compute = struct {
     /// column as unknown and is forced onto the sort path even when `key`
     /// alone fits the budget.
     pub fn stats(self: *Compute) exec.PipelineStats {
-        // Chained: this operator no longer shapes the batches; per-derived
-        // stat extension would mis-index against the re-typed upstream.
-        if (self.chain != null) return self.upstream.stats();
+        // Join-chained: batches arriving here are the UPPER join's output —
+        // per-derived stat extension would mis-index against that schema.
+        // Terminal-chained (inner == null at push time): the pipeline was
+        // re-typed to OUR output schema, so the normal extension below is
+        // exactly right — dropping it starves downstream GROUP BY routing
+        // of derived-key NDVs.
+        if (self.chain) |cf| {
+            if (cf.inner != null) return self.upstream.stats();
+        }
         var up = self.upstream.stats();
         const up_n = self.upstream.outputSchema().len;
         const out_stats = self.arena.allocator().alloc(exec.ColStat, self.output_schema.len) catch return up;
