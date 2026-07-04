@@ -1330,6 +1330,96 @@ fn groupSliceSink(
     fresh.rows = sink.rows;
 }
 
+/// Window-chain pairing (SEPARABLE slices): the .window IR node reachable
+/// from `op` through GROUPING-PRESERVING ops only — compute/filter/alias/
+/// exclude keep partitions intact; a select with renames could shadow a
+/// partition name (decline); an in-map materialize is a stage boundary
+/// (decline); everything else (joins, unions, group-bys) reorders.
+fn windowNodeBelow(op: *const ir.Op, map: *const StageMap) ?*const ir.Op {
+    var cur = op;
+    while (true) switch (cur.*) {
+        .compute => |c| cur = c.upstream,
+        .filter => |f| cur = f.upstream,
+        .alias => |a| cur = a.upstream,
+        .exclude => |p| cur = p.upstream,
+        .select => |p| cur = p.upstream, // rename shadowing re-checked per key below
+        .materialize => |m| {
+            if (map.get(cur) != null) return null;
+            cur = m.upstream;
+        },
+        .window => return cur,
+        else => return null,
+    };
+}
+
+/// A select along the pairing chain may rename columns — safe UNLESS a
+/// partition-set name is renamed or shadowed (the rider's name would then
+/// bind a different column than the emitter grouped by).
+fn chainRenamesPartitionKey(op: *const ir.Op, below: *const ir.Op, keys: []const []const u8) bool {
+    var cur = op;
+    while (cur != below) switch (cur.*) {
+        .compute => |c| {
+            // A derived column REPLACING a partition-key name changes its
+            // values — the emitter's grouping no longer describes it.
+            for (c.derived) |d| {
+                for (keys) |k| {
+                    if (types.columnNameEql(d.name, k)) return true;
+                }
+            }
+            cur = c.upstream;
+        },
+        .filter => |f| cur = f.upstream,
+        .alias => |a| cur = a.upstream,
+        .exclude => |p| cur = p.upstream,
+        .select => |p| {
+            if (p.outputs) |outs| {
+                for (p.columns, outs) |src, out_opt| {
+                    const out = out_opt orelse continue;
+                    if (types.columnNameEql(out, src)) continue;
+                    for (keys) |k| {
+                        if (types.columnNameEql(out, k) or types.columnNameEql(src, k)) return true;
+                    }
+                }
+            }
+            cur = p.upstream;
+        },
+        .materialize => |m| cur = m.upstream,
+        else => return true, // unexpected — decline
+    };
+    return false;
+}
+
+fn partitionNameSetsEqual(pa: []const []const u8, pb: []const []const u8) bool {
+    if (pa.len != pb.len or pa.len == 0) return false;
+    for (pa) |ka| {
+        var hit = false;
+        for (pb) |kb| {
+            if (types.columnNameEql(ka, kb)) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) return false;
+    }
+    return true;
+}
+
+fn windowPartitionSetsEqual(a: *const ir.Op, b: *const ir.Op) bool {
+    return partitionNameSetsEqual(a.window.specs[0].partition_by, b.window.specs[0].partition_by);
+}
+
+/// The rider only needs GROUPING, so its specs may differ in ORDER BY —
+/// but every spec must partition by the same set for one op-level
+/// assume_grouped to be valid.
+fn irAllSpecsSamePartition(node: *const ir.Op) bool {
+    const specs = node.window.specs;
+    if (specs.len == 0 or specs[0].partition_by.len == 0) return false;
+    for (specs[1..]) |s| {
+        if (!partitionNameSetsEqual(specs[0].partition_by, s.partition_by)) return false;
+    }
+    return true;
+}
+
 /// First boundary >= v wins its slice; NULL keys were routed by the caller.
 fn sliceIndexForValue(v: types.Value, bounds: []const types.Value) usize {
     var lo: usize = 0;
@@ -1797,6 +1887,8 @@ fn sliceWorker(
     sin.dop_cap = 1;
     sin.slice_pred = pred;
     sin.slice_cols = ctx.spec.cols;
+    var win_registry: std.AutoHashMapUnmanaged(*const anyopaque, *anyopaque) = .empty;
+    sin.win_registry = &win_registry;
     // Two-level staging: shared stages resolve through the outer snapshot
     // (pre-seeded below, so collectStages early-returns on them); the
     // block's PRIVATE closure is absent from it and stages HERE, per slice
@@ -2222,6 +2314,29 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 }
             }
             const wq = try up.window(w.specs, w.calls, input.effectiveDop());
+            // SEPARABLE slice window-chain pairing: when this window's IR
+            // chain reaches an upstream window with the SAME partition set
+            // through grouping-preserving ops, that window emits in its
+            // sorted order (one gather pass) and this one is compile-proven
+            // grouped — skipping its full sort. Chains cascade: a grouped
+            // window retains its own perm and hands the order onward.
+            if (input.win_registry) |reg| pair: {
+                const win = exec.queryAs(window_op.Window, wq) orelse break :pair;
+                reg.put(input.allocator, @ptrCast(op), @ptrCast(win)) catch break :pair;
+                const below = windowNodeBelow(w.upstream, map) orelse break :pair;
+                const prev_opaque = reg.get(@ptrCast(below)) orelse break :pair;
+                const prev: *window_op.Window = @ptrCast(@alignCast(prev_opaque));
+                if (!prev.singleSortGroup()) break :pair; // emitter needs ONE perm
+                if (!irAllSpecsSamePartition(op)) break :pair; // rider: grouping only, orders may differ
+                if (!windowPartitionSetsEqual(below, op)) break :pair;
+                if (chainRenamesPartitionKey(w.upstream, below, op.window.specs[0].partition_by)) break :pair;
+                prev.emit_sorted = true;
+                prev.emit_sorted_stream = true;
+                win.assume_grouped = true;
+                if (getenv("THINDB_TRACE_SEP") != null) {
+                    std.debug.print("[sep] window pair: upstream emits sorted, this one rides grouped\n", .{});
+                }
+            }
             if (ride or borrow_stage != null) {
                 if (exec.queryAs(window_op.Window, wq)) |win| {
                     if (ride) {

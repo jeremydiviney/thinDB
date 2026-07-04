@@ -112,6 +112,18 @@ pub const Window = struct {
     assume_sorted: bool = false,
     emit_sorted: bool = false,
     sorted_perm: ?[]u32 = null,
+    /// Compile-proven grouping: the staged compiler PAIRED this window with
+    /// an upstream same-partition window that emits in its sorted order
+    /// through a grouping-preserving chain, so `groupedByPartition` holds
+    /// without a stats claim. Set only inside SEPARABLE slice compiles.
+    assume_grouped: bool = false,
+    /// Streaming next() emits in `sorted_perm` order (per-batch gather into
+    /// `emit_gather_cols`) instead of the zero-copy original-order views —
+    /// the downstream half of the pairing above. Requires emit_sorted (the
+    /// perm is only retained then). Costs one output copy pass; buys the
+    /// paired consumer its full sort.
+    emit_sorted_stream: bool = false,
+    emit_gather_cols: []ColumnStore = &.{},
     /// When riding (assume_sorted), the SOURCE's key set — the order this
     /// window's output actually preserves, which may be STRONGER than its
     /// own spec (a partition-only window riding a (partition, month) source
@@ -360,6 +372,10 @@ pub const Window = struct {
         for (self.out_output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.out_output_columns);
         self.allocator.free(self.views);
+        if (self.emit_gather_cols.len > 0) {
+            for (self.emit_gather_cols) |*c| c.deinit(self.allocator);
+            self.allocator.free(self.emit_gather_cols);
+        }
         if (self.sorted_perm) |perm| self.allocator.free(perm);
         freeSpecIndices(self.allocator, self.spec_indices, self.spec_indices.len);
         self.allocator.free(self.spec_group);
@@ -382,10 +398,12 @@ pub const Window = struct {
         // Window emits in input order and only appends columns, so the
         // upstream's sort claim and per-column stats carry through. The
         // appended window-output columns sit past the input schema, so the
-        // stats lookup reads them as unknown.
+        // stats lookup reads them as unknown. The sorted-stream emit mode
+        // REORDERS rows — the input claim no longer describes the output
+        // (the paired consumer is compile-proven instead).
         return .{
             .upper_rows = up.upper_rows,
-            .sort_state = up.sort_state,
+            .sort_state = if (self.emit_sorted_stream) .{} else up.sort_state,
             .column_stats = up.column_stats,
         };
     }
@@ -612,6 +630,45 @@ pub const Window = struct {
         const n: usize = @intCast(@min(@as(u64, batch_size), remaining));
         const lo = self.emit_offset;
         const hi = lo + n;
+
+        // Sorted-stream emit (window-chain pairing): gather rows in
+        // sorted_perm order into per-batch staging columns so the paired
+        // downstream window receives partition-grouped input. One copy pass
+        // in exchange for the consumer's full sort.
+        if (self.emit_sorted_stream) {
+            if (self.sorted_perm) |perm| {
+                if (self.emit_gather_cols.len == 0) {
+                    const cols = try self.allocator.alloc(ColumnStore, self.schema.len);
+                    var made: usize = 0;
+                    errdefer {
+                        for (cols[0..made]) |*c| c.deinit(self.allocator);
+                        self.allocator.free(cols);
+                    }
+                    while (made < self.schema.len) : (made += 1) {
+                        cols[made] = try ColumnStore.init(self.allocator, self.schema[made].type, true);
+                    }
+                    self.emit_gather_cols = cols;
+                }
+                const idxs = perm[@intCast(lo)..@intCast(hi)];
+                for (self.accumulated, 0..) |c, i| {
+                    self.emit_gather_cols[i].clear();
+                    try transform.appendByIndices(self.allocator, c.view(), idxs, &self.emit_gather_cols[i]);
+                    self.views[i] = self.emit_gather_cols[i].view();
+                }
+                const goff = self.input_schema.len;
+                for (self.output_columns, 0..) |c, ci| {
+                    self.emit_gather_cols[goff + ci].clear();
+                    if (self.string_outputs[ci].len > 0) {
+                        try appendStringScratchIndices(self.allocator, self.string_outputs[ci], idxs, &self.emit_gather_cols[goff + ci]);
+                    } else {
+                        try transform.appendByIndices(self.allocator, c.view(), idxs, &self.emit_gather_cols[goff + ci]);
+                    }
+                    self.views[goff + ci] = self.emit_gather_cols[goff + ci].view();
+                }
+                self.emit_offset = hi;
+                return Batch{ .schema = self.schema, .values = self.views, .row_count = n };
+            }
+        }
 
         // Zero-copy emit: views slice the accumulated/output columns
         // directly — `batch_size` is a multiple of 8 so the validity
@@ -1473,6 +1530,7 @@ pub const Window = struct {
     /// contiguous in row order and only the within-partition order is open.
     fn groupedByPartition(self: *Window, si: SpecIndices) bool {
         if (si.partition_cols.len == 0) return false;
+        if (self.assume_grouped) return true;
         const ss = self.upstream.stats().sort_state;
         if (!ss.global) return false;
         if (ss.keys.len < si.partition_cols.len) return false;
@@ -2238,6 +2296,26 @@ fn appendStringScratchRange(
             else => return Error.WindowUnsupported,
         }
         try out.appendValidBit(allocator, row, scratch[i] != null);
+    }
+}
+
+/// Indexed variant for the sorted-stream emit: pick scratch entries by
+/// permutation indices instead of a contiguous range.
+fn appendStringScratchIndices(
+    allocator: Allocator,
+    scratch: []const ?[]const u8,
+    indices: []const u32,
+    out: *ColumnStore,
+) !void {
+    for (indices, 0..) |idx, row| {
+        const bytes = scratch[idx] orelse "";
+        switch (out.data) {
+            .string => |*ss| try ss.appendValue(allocator, bytes),
+            .varchar => |*ss| try ss.appendValue(allocator, bytes),
+            .char => |*ss| try ss.appendValue(allocator, bytes),
+            else => return Error.WindowUnsupported,
+        }
+        try out.appendValidBit(allocator, row, scratch[idx] != null);
     }
 }
 
