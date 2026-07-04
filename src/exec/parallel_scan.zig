@@ -964,7 +964,28 @@ pub const ParallelScan = struct {
     }
 
     pub fn tryFuseAggregate(self: *ParallelScan, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
-        if (self.stage_deferred and self.workers.len == 0) return false;
+        if (self.stage_deferred and self.workers.len == 0) {
+            // Deferred leaf: the chunk scans don't exist yet, but with a
+            // fused probe sink the per-chunk aggregate pipelines wrap
+            // ProbeChunkScan, which needs only the chunk INDEX — buildable
+            // now against the planned upper bound (chunks past the realized
+            // worker count yield empty partials). Without a probe sink
+            // there is nothing chunk-shaped to wrap; decline.
+            if (self.probe_sink == null) return false;
+            if (self.mode != .unset or self.compute_fused or self.agg_fused) return false;
+            const n = self.plannedChunks();
+            const q = try self.allocator.alloc(Query, n);
+            self.agg_q = q;
+            for (q, 0..) |*slot, i| {
+                const pcs = try self.worker_alloc.create(ProbeChunkScan);
+                pcs.* = .{ .ps = self, .chunk = i };
+                slot.* = try makeQuery(self.worker_alloc, pcs).groupBy(group_cols, aggs);
+                self.agg_built = i + 1;
+            }
+            self.out_schema = q[0].outputSchema();
+            self.agg_fused = true;
+            return true;
+        }
         if (self.mode != .unset or self.compute_fused or self.agg_fused) return false;
         const q = try self.allocator.alloc(Query, self.workers.len);
         self.agg_q = q;
@@ -1178,7 +1199,9 @@ pub const ParallelScan = struct {
     /// budget after the join (single-threaded — the accountant isn't
     /// thread-safe and workers never touch it).
     fn runMaterialize(self: *ParallelScan) !void {
-        const n = self.workers.len;
+        // Per-drainable buffers: a deferred leaf's agg pipelines were sized
+        // to the PLANNED chunk bound, which can exceed the realized workers.
+        const n = if (self.agg_fused) self.agg_q.len else if (self.compute_fused) self.compute_q.len else self.workers.len;
         const ta = self.worker_alloc;
 
         const wbufs = try self.allocator.alloc(WorkerBuf, n);
@@ -1186,6 +1209,10 @@ pub const ParallelScan = struct {
         self.wbufs = wbufs;
         self.emit_views = try self.allocator.alloc(ColumnView, self.out_schema.len);
 
+        if (self.werr.len < n) {
+            self.allocator.free(self.werr);
+            self.werr = try self.allocator.alloc(?anyerror, n);
+        }
         for (self.werr) |*e| e.* = null;
         @memset(self.thread_active, false);
         self.next_chunk.store(0, .monotonic);
@@ -1499,6 +1526,9 @@ const ProbeChunkScan = struct {
     pub fn next(self: *ProbeChunkScan) !?Batch {
         const ps = self.ps;
         const sink = ps.probe_sink.?;
+        // A deferred leaf plans an upper-bound chunk count; realized workers
+        // can be fewer — the excess chunks are empty.
+        if (self.chunk >= ps.workers.len) return null;
         while (true) {
             const batch = (try ps.workers[self.chunk].next()) orelse return null;
             const joined = try sink.process(sink.ctx, self.chunk, ps.remapProbeBatch(sink, self.chunk, batch));
@@ -1509,7 +1539,7 @@ const ProbeChunkScan = struct {
     }
 
     pub fn deinit(self: *ProbeChunkScan) void {
-        self.ps.workers[self.chunk].deinit();
+        if (self.chunk < self.ps.workers.len) self.ps.workers[self.chunk].deinit();
         self.ps.worker_alloc.destroy(self);
     }
 

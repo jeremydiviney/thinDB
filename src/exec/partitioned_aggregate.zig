@@ -365,7 +365,15 @@ fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indic
         // thread's phase work.
         const spawn_ok = spawned == self.n_parts - 1;
 
-        while (try self.up.next()) |batch| {
+        var pull_ticks: i64 = 0;
+        var hash_ticks: i64 = 0;
+        var copy_ticks: i64 = 0;
+        while (true) {
+            const p0 = if (prof_on) exec.prof.nowTicks() else 0;
+            const maybe = try self.up.next();
+            if (prof_on) pull_ticks += exec.prof.nowTicks() - p0;
+            const batch = maybe orelse break;
+            const h0 = if (prof_on) exec.prof.nowTicks() else 0;
             try hashes.resize(self.allocator, batch.row_count);
             @memset(hashes.items, 0x9e3779b97f4a7c15);
             for (self.group_indices) |ci| hashColumnInto(batch.values[ci], hashes.items);
@@ -373,12 +381,15 @@ fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indic
             for (hashes.items, 0..) |h, row| {
                 try idx_lists[h % self.n_parts].append(self.allocator, @intCast(row));
             }
+            const c0 = if (prof_on) exec.prof.nowTicks() else 0;
+            if (prof_on) hash_ticks += c0 - h0;
             pool.batch = batch;
             if (spawn_ok) {
                 pool.runBarrier(.copy);
             } else {
                 for (self.parts, 0..) |*part, pi| try copyPartition(self, part, batch, idx_lists[pi].items);
             }
+            if (prof_on) copy_ticks += exec.prof.nowTicks() - c0;
         }
         const t1 = if (prof_on) exec.prof.nowTicks() else 0;
 
@@ -391,7 +402,15 @@ fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indic
             const t2 = exec.prof.nowTicks();
             var rows: u64 = 0;
             for (self.parts) |*p| rows += p.in_rows;
-            std.debug.print("[hprof] pagg.scatter {d:.2} ms  pagg.partitions {d:.2} ms  (parts={d} rows={d})\n", .{ exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), self.n_parts, rows });
+            std.debug.print("[hprof] pagg.scatter {d:.2} ms (pull={d:.2} hash+idx={d:.2} copy={d:.2})  pagg.partitions {d:.2} ms  (parts={d} rows={d})\n", .{
+                exec.prof.ticksToMs(t1 - t0),
+                exec.prof.ticksToMs(pull_ticks),
+                exec.prof.ticksToMs(hash_ticks),
+                exec.prof.ticksToMs(copy_ticks),
+                exec.prof.ticksToMs(t2 - t1),
+                self.n_parts,
+                rows,
+            });
         }
 
         for (self.parts) |*p| if (p.err) |e| return e;

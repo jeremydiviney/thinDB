@@ -46,6 +46,8 @@ const Predicate = predicate.Predicate;
 const transform = @import("../engine/transform.zig");
 
 const cell_io = @import("cell_io.zig");
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const appendNullTo = cell_io.appendNullTo;
 const appendOneFromBuild = cell_io.appendOneFromBuild;
 const appendOneFromView = cell_io.appendOneFromView;
@@ -890,6 +892,30 @@ pub const Join = struct {
                 .bind = sinkBind,
                 .process = sinkProcess,
             }) catch false;
+        }
+        if (getenv("THINDB_TRACE_JOINFUSE") != null) {
+            std.debug.print("[jf] create {s} fast={} on={d} ranges={d} extra={} build_left={} out_cols={d} -> probe_fused={}\n", .{
+                @tagName(spec.join_type),
+                self.fast_eligible,
+                spec.on.len,
+                resolved_ranges.len,
+                spec.extra_predicate != null,
+                build_is_left,
+                output_schema.len,
+                self.probe_fused,
+            });
+            if (!self.probe_fused) {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(std.heap.page_allocator);
+                const probe = if (build_is_left) self.right else self.left;
+                probe.explain(&buf, std.heap.page_allocator, 0) catch {};
+                var it = std.mem.splitScalar(u8, buf.items, '\n');
+                var depth: usize = 0;
+                while (it.next()) |line| : (depth += 1) {
+                    if (depth >= 4 or line.len == 0) break;
+                    std.debug.print("[jf]     probe: {s}\n", .{std.mem.trim(u8, line, " ")});
+                }
+            }
         }
 
         // Skew detector must be constructed AFTER `self.* = ...` so its

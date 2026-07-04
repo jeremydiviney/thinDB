@@ -999,9 +999,13 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             return wq;
         },
         .join => |j| {
-            var left = try compileJoinChild(input, j.left, map, j.join_type == .left);
+            // INNER picks its build side from realized stats at exec, so
+            // EITHER child may end up the probe — both take the parallel
+            // probe route (a deferred leaf that becomes the build side just
+            // drains in parallel; small dims decline via the stage row gate).
+            var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner);
             errdefer left.deinit();
-            const right = try compileJoinChild(input, j.right, map, j.join_type == .right);
+            const right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner);
             return left.join(right, joinSpecOf(j));
         },
         .set_union => |u| {
@@ -1269,10 +1273,10 @@ fn compileFilteredJoin(
     const j = join_op.join;
     const allocator = input.allocator;
 
-    var left = try compileJoinChild(input, j.left, map, j.join_type == .left);
+    var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner);
     var left_owned = true;
     errdefer if (left_owned) left.deinit();
-    var right = try compileJoinChild(input, j.right, map, j.join_type == .right);
+    var right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner);
     var right_owned = true;
     errdefer if (right_owned) right.deinit();
 

@@ -311,10 +311,11 @@ pub const Filter = struct {
     }
 
     /// Forward a partial-aggregate fusion upstream only when this Filter is a
-    /// fused pass-through (its predicate already runs in the scan); a non-fused
-    /// Filter must evaluate rows itself, so the aggregate can't push below it.
+    /// pass-through — scan-fused, or probe-CHAINED (its per-chunk clones
+    /// already filter inside the workers); a plain serial Filter must
+    /// evaluate rows itself, so the aggregate can't push below it.
     pub fn tryFuseAggregate(self: *Filter, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
-        if (!self.fused) return false;
+        if (!self.fused and self.chain == null) return false;
         return self.upstream.tryFuseAggregate(group_cols, aggs);
     }
 

@@ -9,6 +9,8 @@
 //!   - proven-small key space → hash aggregate (groupByTopK)
 
 const std = @import("std");
+
+const getenv_gr = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const u8, .{ .name = "getenv", .library_name = "c" });
 const Allocator = std.mem.Allocator;
 const exec = @import("exec.zig");
 const Query = exec.Query;
@@ -184,30 +186,55 @@ pub fn routeJoinPartialGroupBy(
     top_k: ?ir.Op.TopK,
     emit_limit: ?u32,
 ) !?Query {
+    const trace_pa = getenv_gr("THINDB_TRACE_PARTIALAGG") != null;
+    if (trace_pa) std.debug.print("[pagg-route] enter keys={d} aggs={d}\n", .{ group_cols.len, aggs.len });
     for (aggs) |a| switch (a.func) {
         .count, .sum => {},
         .min, .max => if (group_cols.len == 0) return null,
-        else => return null,
+        else => {
+            if (trace_pa) std.debug.print("[pagg-route]   decline agg func={s}\n", .{@tagName(a.func)});
+            return null;
+        },
     };
 
     if (group_cols.len > 0) {
+        // Decline only a PROVEN-large key space. Unknown cardinality takes
+        // the partial route anyway: partials are combinable rows, and the
+        // combine below (`groupByTopK`) self-routes adaptively — worst case
+        // (unreduced partials) costs about one extra hash pass, while the
+        // common deep-CTE case (derived keys with unknowable NDV but few
+        // realized groups, e.g. a monthly roll-up) collapses in the workers.
         const schema = upstream.outputSchema();
         const st = upstream.stats();
         var est: u64 = 1;
+        var known = true;
         for (group_cols) |gc| {
-            const idx = types.findColumn(schema, gc) orelse return null;
-            if (idx >= st.column_stats.len) return null;
+            const idx = types.findColumn(schema, gc) orelse {
+                if (trace_pa) std.debug.print("[pagg-route]   decline key not found: {s}\n", .{gc});
+                return null;
+            };
+            if (idx >= st.column_stats.len) {
+                known = false;
+                break;
+            }
             switch (st.column_stats[idx].ndv) {
                 .exact => |nd| est *|= nd,
-                .unknown => return null,
+                .unknown => {
+                    known = false;
+                    break;
+                },
             }
         }
-        est = @min(est, @max(st.upper_rows, 1));
-        const per_group = perGroupTableBytes(schema, group_cols, aggs);
-        if (per_group != 0 and est *| per_group > RADIX_CACHE_BYTES) return null;
+        if (known) {
+            est = @min(est, @max(st.upper_rows, 1));
+            const per_group = perGroupTableBytes(schema, group_cols, aggs);
+            if (per_group != 0 and est *| per_group > RADIX_CACHE_BYTES) return null;
+        }
     }
 
-    if (!try upstream.tryFuseAggregate(group_cols, aggs)) return null;
+    const fused = try upstream.tryFuseAggregate(group_cols, aggs);
+    if (trace_pa) std.debug.print("[pagg-route]   tryFuseAggregate -> {}\n", .{fused});
+    if (!fused) return null;
 
     // Combine specs over the partials, read by `.as`, type-forced to the
     // partial output type (COUNT's bigint must not be widened by SUM).

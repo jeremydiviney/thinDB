@@ -636,6 +636,14 @@ pub const Compute = struct {
         return self.upstream.rechainProbeSink(sink);
     }
 
+    /// A chained compute is a pass-through — the pipeline below already
+    /// emits the computed batches, so a partial-aggregate offer composes
+    /// against those and belongs to the scan.
+    pub fn tryFuseAggregate(self: *Compute, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
+        if (self.chain == null) return false;
+        return self.upstream.tryFuseAggregate(group_cols, aggs);
+    }
+
     /// Terminal self-push: nothing above this Compute offers a probe sink,
     /// but the pipeline below may be a probe-fused parallel chain — push
     /// the derived evaluation into it as a terminal chained sink, so the
