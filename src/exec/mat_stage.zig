@@ -326,6 +326,7 @@ pub const Stage = struct {
         const w0 = if (prof_on) exec.prof.nowTicks() else 0;
         const child0 = if (prof_on) exec.prof.cteChildTicks() else 0;
         const snap = if (prof_on) exec.prof.snapSlots() else undefined;
+        var append_ticks: i64 = 0;
         const res = try self.allocator.create(MaterializedResult);
         errdefer self.allocator.destroy(res);
         res.* = .{ .allocator = self.allocator, .schema = self.schema, .expected_rows = self.stats_upper_rows };
@@ -353,7 +354,9 @@ pub const Stage = struct {
                     try acct.reserve(.materialize, bytes);
                     self.reserved_bytes += bytes;
                 }
+                const a0 = if (prof_on) exec.prof.nowTicks() else 0;
                 try contig.append(batch);
+                if (prof_on) append_ticks += exec.prof.nowTicks() - a0;
             }
             try res.adoptContiguous(contig.take(), contig.rows);
         } else while (try self.query.next()) |batch| {
@@ -362,7 +365,9 @@ pub const Stage = struct {
                 try acct.reserve(.materialize, bytes);
                 self.reserved_bytes += bytes;
             }
+            const a0 = if (prof_on) exec.prof.nowTicks() else 0;
             try res.appendBatch(batch);
+            if (prof_on) append_ticks += exec.prof.nowTicks() - a0;
         }
         // Release the pipeline's operator buffers right away — the stage's
         // working memory drops to just the chunked result.
@@ -380,6 +385,9 @@ pub const Stage = struct {
             const children: i64 = @intCast(exec.prof.cteChildTicks() - child0);
             exec.prof.dumpStageDelta(self.id, res.total_rows, wall - children, wall, self.setup_ticks, teardown, snap);
             exec.prof.addCteChildTicks(@intCast(@max(wall, 0)));
+            if (append_ticks > 0) std.debug.print("[stage-append] stage#{d} copy={d:.1}ms rows={d} contig={}\n", .{
+                self.id, exec.prof.ticksToMs(append_ticks), res.total_rows, self.want_contiguous,
+            });
         }
     }
 
