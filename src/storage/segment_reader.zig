@@ -8,6 +8,16 @@ const Allocator = std.mem.Allocator;
 
 const native_endian = builtin.cpu.arch.endian();
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// `THINDB_LZ4_CACHE_DECODED=1`: cache at-rest LZ4 string blocks DECODED
+/// (trading resident bytes for skipping the per-borrow whole-block
+/// decompress). A/B lever for concurrent-scan workloads — SEPARABLE slice
+/// pipelines borrow the same blocks N times per query.
+fn cacheDecodedOverride() bool {
+    return getenv("THINDB_LZ4_CACHE_DECODED") != null;
+}
+
 /// Decode a packed fixed-width column block into a typed array. The on-disk
 /// layout is little-endian and contiguous, so on a little-endian host it is
 /// bit-identical to the in-memory `[]T` — one bulk copy at memory-bandwidth
@@ -142,7 +152,7 @@ pub const ReadSegment = struct {
 
         const kind_byte = block[0];
         const flags = format.ColumnBlockFlags.fromByte(block[1]);
-        if (kind_byte == @intFromEnum(format.Compression.lz4) and flags.at_rest) {
+        if (kind_byte == @intFromEnum(format.Compression.lz4) and flags.at_rest and !cacheDecodedOverride()) {
             const uncompressed_size = format.readU32(block[4..8]);
             const compressed_size = format.readU32(block[8..12]);
             const payload_start = format.column_block_header_size;

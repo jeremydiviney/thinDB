@@ -1206,6 +1206,125 @@ const GatherPool = struct {
     }
 };
 
+/// The most common window PARTITION BY column set under the body. Sorting a
+/// pre-partitioned slice buffer by these keys (once, at full parallelism,
+/// before routing — the router is stable) lets every same-partition window
+/// inside the slices take the grouped fast path: no global sort per window,
+/// just tiny within-partition orderings.
+fn commonWindowPartitionSet(
+    ctx: *SlicedFillCtx,
+    op: *const ir.Op,
+    alloc: Allocator,
+    sets: *std.ArrayListUnmanaged([]const []const u8),
+    counts: *std.ArrayListUnmanaged(usize),
+) !void {
+    switch (op.*) {
+        .window => |w| {
+            for (w.specs) |spec| {
+                if (spec.partition_by.len == 0) continue;
+                found: {
+                    for (sets.items, counts.items) |s, *c| {
+                        if (s.len != spec.partition_by.len) continue;
+                        for (spec.partition_by) |p| {
+                            var hit = false;
+                            for (s) |name| {
+                                if (types.columnNameEql(name, p)) {
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            if (!hit) break :found;
+                        }
+                        c.* += 1;
+                        break :found;
+                    }
+                    try sets.append(alloc, spec.partition_by);
+                    try counts.append(alloc, 1);
+                }
+            }
+            try commonWindowPartitionSet(ctx, w.upstream, alloc, sets, counts);
+        },
+        .materialize => |m| {
+            if (ctx.map.get(op) != null) return; // shared: fills elsewhere
+            try commonWindowPartitionSet(ctx, m.upstream, alloc, sets, counts);
+        },
+        .select => |p| try commonWindowPartitionSet(ctx, p.upstream, alloc, sets, counts),
+        .exclude => |p| try commonWindowPartitionSet(ctx, p.upstream, alloc, sets, counts),
+        .filter => |f| try commonWindowPartitionSet(ctx, f.upstream, alloc, sets, counts),
+        .order_by => |o| try commonWindowPartitionSet(ctx, o.upstream, alloc, sets, counts),
+        .group_by => |g| try commonWindowPartitionSet(ctx, g.upstream, alloc, sets, counts),
+        .compute => |c| try commonWindowPartitionSet(ctx, c.upstream, alloc, sets, counts),
+        .alias => |a| try commonWindowPartitionSet(ctx, a.upstream, alloc, sets, counts),
+        .limit => |l| try commonWindowPartitionSet(ctx, l.upstream, alloc, sets, counts),
+        .join => |j| {
+            try commonWindowPartitionSet(ctx, j.left, alloc, sets, counts);
+            try commonWindowPartitionSet(ctx, j.right, alloc, sets, counts);
+        },
+        .set_union => |u| {
+            try commonWindowPartitionSet(ctx, u.left, alloc, sets, counts);
+            try commonWindowPartitionSet(ctx, u.right, alloc, sets, counts);
+        },
+        else => {},
+    }
+}
+
+/// Parallel per-slice partition-grouping pass: sort ONE slice buffer by the
+/// dominant window partition keys (honest ascending value order — the claim
+/// feeds sorted-stream consumers too, not just window grouping). Runs on its
+/// own thread per slice; reads the routed sink non-destructively and gathers
+/// into a fresh conn-thread-created sink, so a failure falls back to the
+/// unsorted buffer.
+const GroupKI = struct { hi: u64, idx: u32 };
+
+const GroupSortCtx = struct {
+    cols: []const engine_mod.ColumnStore,
+    keys: []const usize,
+
+    pub fn less(ctx: @This(), a: GroupKI, b: GroupKI) bool {
+        if (a.hi != b.hi) return a.hi < b.hi;
+        for (ctx.keys) |ci| {
+            const ord = engine_mod.transform.compareInColumnNullsFirst(ctx.cols[ci], a.idx, b.idx);
+            if (ord == .lt) return true;
+            if (ord == .gt) return false;
+        }
+        return a.idx < b.idx;
+    }
+};
+
+fn groupSliceSink(
+    sink: *mat_stage.ContigSink,
+    fresh: *mat_stage.ContigSink,
+    key_idxs: []const usize,
+    err_out: *?anyerror,
+) void {
+    const n: usize = @intCast(sink.rows);
+    if (n == 0) return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const kis = aa.alloc(GroupKI, n) catch |e| {
+        err_out.* = e;
+        return;
+    };
+    for (kis, 0..) |*ki, i| {
+        const row: u32 = @intCast(i);
+        ki.* = .{ .hi = window_op.orderPrefix(sink.stores[key_idxs[0]], row, false), .idx = row };
+    }
+    std.sort.pdq(GroupKI, kis, GroupSortCtx{ .cols = sink.stores, .keys = key_idxs }, GroupSortCtx.less);
+    const perm = aa.alloc(u32, n) catch |e| {
+        err_out.* = e;
+        return;
+    };
+    for (perm, kis) |*p, ki| p.* = ki.idx;
+    for (sink.stores, 0..) |*st, ci| {
+        engine_mod.transform.appendByIndices(fresh.arenas[ci].allocator(), st.view(), perm, &fresh.stores[ci]) catch |e| {
+            err_out.* = e;
+            return;
+        };
+    }
+    fresh.rows = sink.rows;
+}
+
 /// First boundary >= v wins its slice; NULL keys were routed by the caller.
 fn sliceIndexForValue(v: types.Value, bounds: []const types.Value) usize {
     var lo: usize = 0;
@@ -1231,11 +1350,42 @@ fn prePartition(
     defer cands.deinit(alloc);
     try collectPrePartCandidates(ctx, ctx.body, alloc, &cands);
 
+    // The dominant window PARTITION BY set under the body: sorting the
+    // partitioner's output by it (once, full DOP, before the stable router)
+    // delivers every slice buffer partition-grouped, so the windows above
+    // take the grouped fast path instead of one full sort each.
+    var psets: std.ArrayListUnmanaged([]const []const u8) = .empty;
+    defer psets.deinit(alloc);
+    var pcounts: std.ArrayListUnmanaged(usize) = .empty;
+    defer pcounts.deinit(alloc);
+    try commonWindowPartitionSet(ctx, ctx.body, alloc, &psets, &pcounts);
+    var part_set: []const []const u8 = &.{};
+    var part_best: usize = 0;
+    for (psets.items, pcounts.items) |s, c| {
+        if (c > part_best) {
+            part_best = c;
+            part_set = s;
+        }
+    }
+
     var parts: std.ArrayListUnmanaged(PrePart) = .empty;
     errdefer parts.deinit(alloc);
     next_cand: for (cands.items) |node| {
         var q = compileBlock(ctx.input, node.materialize.upstream, @constCast(&ctx.map)) catch continue;
         q = pruneStageColumns(ctx.input, q);
+        // Buffers get partition-GROUPED after routing (a parallel per-slice
+        // pass — grouping only needs digest order, not a semantic sort), so
+        // the windows above take the grouped fast path. Record the keys now;
+        // the group pass + claim happen once the sinks are built.
+        var sorted_keys: []const []const u8 = &.{};
+        if (part_set.len > 0) apply: {
+            for (part_set) |k| {
+                if (types.findColumn(q.outputSchema(), k) == null) break :apply;
+            }
+            const key_names = try aa.alloc([]const u8, part_set.len);
+            for (part_set, key_names) |k, *kn| kn.* = try aa.dupe(u8, k);
+            sorted_keys = key_names;
+        }
         const raw_schema = q.outputSchema();
         var ci: usize = 0;
         const found: bool = blk: {
@@ -1353,6 +1503,54 @@ fn prePartition(
             continue :next_cand;
         }
 
+        // Parallel partition-grouping pass over the routed sinks (one thread
+        // per slice; see groupSliceSink). Any failure falls back to the
+        // ungrouped buffers — the windows then just sort as before.
+        var grouped = false;
+        if (sorted_keys.len > 0) group: {
+            const kidx = try alloc.alloc(usize, sorted_keys.len);
+            defer alloc.free(kidx);
+            for (sorted_keys, kidx) |k, *ki| {
+                ki.* = for (schema, 0..) |sc, i| {
+                    if (types.columnNameEql(sc.name, k)) break i;
+                } else break :group;
+            }
+            const fresh = try alloc.alloc(mat_stage.ContigSink, total);
+            var fmade: usize = 0;
+            errdefer {
+                for (fresh[0..fmade]) |*sk| sk.deinit();
+                alloc.free(fresh);
+            }
+            while (fmade < total) : (fmade += 1) {
+                fresh[fmade] = try mat_stage.ContigSink.init(stage.allocator, schema, 1 << 16);
+            }
+            const gerrs = try alloc.alloc(?anyerror, total);
+            defer alloc.free(gerrs);
+            @memset(gerrs, null);
+            const gthreads = try alloc.alloc(?std.Thread, total);
+            defer alloc.free(gthreads);
+            for (gthreads, 0..) |*gt, i| {
+                gt.* = std.Thread.spawn(.{}, groupSliceSink, .{ &sinks[i], &fresh[i], kidx, &gerrs[i] }) catch null;
+            }
+            var all_ok = true;
+            for (gthreads, 0..) |gt, i| {
+                if (gt) |th| th.join() else all_ok = false;
+                if (gerrs[i] != null) all_ok = false;
+            }
+            if (!all_ok) {
+                for (fresh) |*sk| sk.deinit();
+                alloc.free(fresh);
+                break :group;
+            }
+            for (sinks, fresh) |*old, nw| {
+                old.deinit();
+                old.* = nw;
+            }
+            alloc.free(fresh);
+            grouped = true;
+            if (trace) std.debug.print("[sep] stage#{d} grouped {d} buffers by {d} window partition keys\n", .{ stage.id, total, sorted_keys.len });
+        }
+
         // Wrap each sink as a pre-filled slice_local stage the slice compile
         // resolves through its map — no recompiled scan, no re-filter.
         const stages = try alloc.alloc(*mat_stage.Stage, total);
@@ -1375,7 +1573,14 @@ fn prePartition(
                 .query_alive = false,
                 .schema = schema,
                 .stats_upper_rows = sres.total_rows,
-                .sort_state = .{},
+                // Grouped buffer (honest ascending value order): claim it so
+                // the windows above prove partition-grouping and skip their
+                // full sorts. THINDB_SEP_NOCLAIM suppresses the claim for
+                // layout-vs-routing diagnostics.
+                .sort_state = if (grouped and getenv("THINDB_SEP_NOCLAIM") == null)
+                    .{ .keys = sorted_keys, .descs = &.{}, .global = true }
+                else
+                    .{},
                 .col_stats = &.{},
                 .result = sres,
                 // Guard use: released by the fill AFTER every slice joined,

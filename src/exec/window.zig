@@ -948,6 +948,8 @@ pub const Window = struct {
             const global_par = si.partition_cols.len == 0 and n >= parallel_min_rows and self.dop > 1;
             const perm = if (global_par)
                 try self.buildPermutationSamplesort(si, n)
+            else if (self.groupedByPartition(si))
+                try self.buildPermutationGrouped(si)
             else
                 try self.buildPermutation(si);
             const retain = self.emit_sorted and ride_single;
@@ -1402,6 +1404,20 @@ pub const Window = struct {
             }
             return a.idx < b.idx;
         }
+
+        /// Grouped-path comparator: rows are known to share a partition, so
+        /// skip the digest and the partition VALUE compares entirely — the
+        /// full pairLess re-compares every partition string on every tie,
+        /// which dominates when partitions are tiny and numerous.
+        pub fn pairLessOrderOnly(ctx: @This(), a: KeyIdx, b: KeyIdx) bool {
+            if (a.lo != b.lo) return a.lo < b.lo;
+            for (ctx.order, 0..) |ci, i| {
+                const ord = transform.compareInColumnNullsFirst(ctx.cols[ci], a.idx, b.idx);
+                if (ord == .lt) return !ctx.desc[i];
+                if (ord == .gt) return ctx.desc[i];
+            }
+            return a.idx < b.idx;
+        }
     };
 
     fn sortCtx(self: *Window, si: SpecIndices) SpecSortCtx {
@@ -1447,6 +1463,70 @@ pub const Window = struct {
         if (exec.prof.enabled) exec.prof.addPhase("window.keys", @intCast(@max(0, _st - _kt)));
         std.sort.pdq(KeyIdx, pairs, self.sortCtx(si), SpecSortCtx.pairLess);
         if (exec.prof.enabled) exec.prof.addPhase("window.sort", @intCast(@max(0, exec.prof.nowTicks() - _st)));
+        for (perm, pairs) |*p, kp| p.* = kp.idx;
+        return perm;
+    }
+
+    /// The input arrives GROUPED by this spec's partition columns: the
+    /// upstream's global sort claim LEADS with exactly the partition-column
+    /// set (any order among them, any direction), so partitions are already
+    /// contiguous in row order and only the within-partition order is open.
+    fn groupedByPartition(self: *Window, si: SpecIndices) bool {
+        if (si.partition_cols.len == 0) return false;
+        const ss = self.upstream.stats().sort_state;
+        if (!ss.global) return false;
+        if (ss.keys.len < si.partition_cols.len) return false;
+        for (si.partition_cols) |ci| {
+            const name = self.input_schema[ci].name;
+            var found = false;
+            for (ss.keys[0..si.partition_cols.len]) |key| {
+                if (types.columnNameEql(key, name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /// Grouped fast path (see groupedByPartition): skip the global sort —
+    /// walk partition boundaries over the IDENTITY order and sort only
+    /// WITHIN each partition by the spec keys. Replaces one n·log n sort
+    /// over wide composite keys with an O(n) boundary walk plus tiny
+    /// per-partition sorts (partitions in the target workloads average a
+    /// few dozen rows). The DRAM traffic that a full permutation sort
+    /// generates is what dilates concurrent SEPARABLE slices — this path
+    /// is their window engine.
+    fn buildPermutationGrouped(self: *Window, si: SpecIndices) ![]u32 {
+        const n: usize = @intCast(self.accumulated_rows);
+        const perm = try self.allocator.alloc(u32, n);
+        errdefer self.allocator.free(perm);
+        const pairs = try self.allocator.alloc(KeyIdx, n);
+        defer self.allocator.free(pairs);
+        const _kt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        // Order-only keys: within-partition sorts never cross partitions,
+        // so the per-row partition digest (and the partition value compares
+        // in the comparator) are pure waste here.
+        const order0: ?usize = if (si.order_cols.len > 0) si.order_cols[0] else null;
+        for (pairs, 0..) |*kp, i| {
+            const row: u32 = @intCast(i);
+            kp.* = .{
+                .hi = 0,
+                .lo = if (order0) |oc| orderPrefix(self.accumulated[oc], row, si.order_desc[0]) else 0,
+                .idx = row,
+            };
+        }
+        for (perm, 0..) |*p, i| p.* = @intCast(i);
+        const _st = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        if (exec.prof.enabled) exec.prof.addPhase("window.keys", @intCast(@max(0, _st - _kt)));
+        var lo: usize = 0;
+        while (lo < n) {
+            const hi = partitionEnd(self.accumulated, si.partition_cols, perm, lo);
+            std.sort.pdq(KeyIdx, pairs[lo..hi], self.sortCtx(si), SpecSortCtx.pairLessOrderOnly);
+            lo = hi;
+        }
+        if (exec.prof.enabled) exec.prof.addPhase("window.sort.grouped", @intCast(@max(0, exec.prof.nowTicks() - _st)));
         for (perm, pairs) |*p, kp| p.* = kp.idx;
         return perm;
     }
@@ -2582,7 +2662,7 @@ fn isValid(view: ColumnView, row: u32) bool {
 /// Mirrors the comparator exactly: validity is NOT consulted (NULL slots
 /// order by their raw placeholder values), floats use `floatOrder` (every
 /// NaN equal-and-largest, -0 == +0). `desc` inverts the mapping.
-fn orderPrefix(col: ColumnStore, row: u32, desc: bool) u64 {
+pub fn orderPrefix(col: ColumnStore, row: u32, desc: bool) u64 {
     const SIGN64: u64 = 1 << 63;
     // NULL normalizes below every value (prefix 0 pre-flip): it can only TIE
     // with a real minimum's prefix, and ties resolve through the exact
