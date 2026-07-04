@@ -159,6 +159,28 @@ pub const ColColPred = struct {
     right: []const u8,
 };
 
+/// Whether the predicate references column `name`. CONSERVATIVE: unresolved
+/// or opaque variants (subqueries, correlated sets) answer TRUE — callers
+/// use this to prove a pushdown is safe, so "don't know" must mean "yes".
+pub fn touchesColumn(expr: PredicateExpr, name: []const u8) bool {
+    return switch (expr) {
+        .leaf, .day_leaf => |l| types.columnNameEql(l.col, name),
+        .leaf_col_col => |c| types.columnNameEql(c.left, name) or types.columnNameEql(c.right, name),
+        .is_null, .is_not_null => |c| types.columnNameEql(c, name),
+        .like => |l| types.columnNameEql(l.col, name),
+        .in_set => |s| types.columnNameEql(s.col, name),
+        .@"and", .@"or" => |arms| blk: {
+            for (arms) |a| {
+                if (touchesColumn(a, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .not => |n| touchesColumn(n.*, name),
+        .always => false,
+        else => true,
+    };
+}
+
 pub const CorrelatedScalarRow = struct {
     key: []const Value,
     value: Value,

@@ -188,6 +188,20 @@ pub const Project = struct {
         return self.upstream.tryFuseAggregate(group_cols, aggs);
     }
 
+    /// A projection only keeps/renames columns — a filter commutes with it
+    /// as long as no column the predicate uses was RENAMED here (its source
+    /// exists below, but under the old name). Forward so the scan can
+    /// evaluate (and prune on) the predicate before wider columns decode.
+    pub fn tryFuseFilter(self: *Project, expr: exec.predicate.PredicateExpr) !bool {
+        if (self.probe_fused) return false;
+        const up_schema = self.upstream.outputSchema();
+        for (self.output_schema, self.column_map) |out, src| {
+            if (types.columnNameEql(out.name, up_schema[src].name)) continue;
+            if (exec.predicate.touchesColumn(expr, out.name)) return false;
+        }
+        return self.upstream.tryFuseFilter(expr);
+    }
+
     pub fn next(self: *Project) !?Batch {
         const batch = (try self.upstream.next()) orelse return null;
         if (self.probe_fused) return batch;

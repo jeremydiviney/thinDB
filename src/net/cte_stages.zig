@@ -76,7 +76,7 @@ pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op, stage_co
     }
     try countMatRefs(input.allocator, root, &cse);
     wrapWindowsInMaterialize(input.node_arena, @constCast(root), &cse) catch {};
-    try collectStages(input, root, set, &map, &cse, null);
+    try collectStages(input, root, set, &map, &cse, null, null);
     if (stage_count_out) |out| out.* = @intCast(set.stages.items.len);
     const inner = try compileBlock(input, root, &map);
     set.releaseCompilePins();
@@ -202,6 +202,51 @@ fn countMatRefs(allocator: Allocator, op: *const ir.Op, cse: *MatCse) anyerror!v
 
 /// Post-order walk: a stage's own upstream stages exist (and are compiled)
 /// before the stage's body compiles, so its MatScan leaves can bind.
+const PrivSet = std.AutoHashMapUnmanaged(*const ir.Op, void);
+
+/// Count canonical materialize references WITHIN one subtree (read-only
+/// against the statement-wide CSE). A node whose in-body count equals its
+/// statement-wide count is PRIVATE to that body: no consumer outside the
+/// separable block reads it, so it needn't exist as a shared stage — each
+/// slice computes its own 1/N-sized copy.
+fn countBodyMatRefs(
+    allocator: Allocator,
+    op: *const ir.Op,
+    cse: *const MatCse,
+    out: *MatRefCounts,
+) anyerror!void {
+    switch (op.*) {
+        .materialize => |m| {
+            const rep = cse.canon.get(op) orelse op;
+            const gop = try out.getOrPut(allocator, rep);
+            if (gop.found_existing) {
+                gop.value_ptr.* += 1;
+                return;
+            }
+            gop.value_ptr.* = 1;
+            try countBodyMatRefs(allocator, m.upstream, cse, out);
+        },
+        .select => |p| try countBodyMatRefs(allocator, p.upstream, cse, out),
+        .exclude => |p| try countBodyMatRefs(allocator, p.upstream, cse, out),
+        .filter => |f| try countBodyMatRefs(allocator, f.upstream, cse, out),
+        .order_by => |o| try countBodyMatRefs(allocator, o.upstream, cse, out),
+        .group_by => |g| try countBodyMatRefs(allocator, g.upstream, cse, out),
+        .compute => |c| try countBodyMatRefs(allocator, c.upstream, cse, out),
+        .alias => |a| try countBodyMatRefs(allocator, a.upstream, cse, out),
+        .limit => |l| try countBodyMatRefs(allocator, l.upstream, cse, out),
+        .window => |w| try countBodyMatRefs(allocator, w.upstream, cse, out),
+        .join => |j| {
+            try countBodyMatRefs(allocator, j.left, cse, out);
+            try countBodyMatRefs(allocator, j.right, cse, out);
+        },
+        .set_union => |u| {
+            try countBodyMatRefs(allocator, u.left, cse, out);
+            try countBodyMatRefs(allocator, u.right, cse, out);
+        },
+        else => {},
+    }
+}
+
 fn collectStages(
     input: engine_v2.CompileInput,
     op: *const ir.Op,
@@ -209,6 +254,7 @@ fn collectStages(
     map: *StageMap,
     cse: *const MatCse,
     inherited: ?ir.SeparableSpec,
+    priv: ?*const PrivSet,
 ) anyerror!void {
     switch (op.*) {
         .materialize => {
@@ -220,6 +266,16 @@ fn collectStages(
                 if (rep != op) try map.put(input.allocator, op, stage);
                 return; // shared CTE / duplicate: one stage, many readers
             }
+            // PRIVATE to an enclosing separable block: no shared stage —
+            // each slice pipeline computes its own 1/N-sized copy inside
+            // its per-slice StageSet. Still recurse: a deeper node with
+            // consumers OUTSIDE the block is shared and stages normally.
+            if (priv) |p| {
+                if (p.contains(rep)) {
+                    try collectStages(input, rep.materialize.upstream, set, map, cse, inherited, priv);
+                    return;
+                }
+            }
             // A SEPARABLE declaration covers the block's own internals:
             // synthetic window wraps created inside a marked body inherit
             // the spec (windows partitioned by the key are per-key by the
@@ -227,7 +283,27 @@ fn collectStages(
             // sub-CTE first encountered here may have consumers OUTSIDE the
             // marked block, where no separability was asserted.
             const descend = rep.materialize.separable orelse inherited;
-            try collectStages(input, rep.materialize.upstream, set, map, cse, descend);
+            // A separable block's private upstream closure stays out of the
+            // global stage set entirely — the flow-through shape: each slice
+            // runs the whole private chain end-to-end on its key range.
+            var body_priv: ?PrivSet = null;
+            defer if (body_priv) |*bp| bp.deinit(input.allocator);
+            const child_priv: ?*const PrivSet = blk: {
+                if (rep.materialize.separable == null or input.dop_cap != null) break :blk priv;
+                var body_refs: MatRefCounts = .empty;
+                defer body_refs.deinit(input.allocator);
+                try countBodyMatRefs(input.allocator, rep.materialize.upstream, cse, &body_refs);
+                var bp: PrivSet = .empty;
+                errdefer bp.deinit(input.allocator);
+                var it = body_refs.iterator();
+                while (it.next()) |e| {
+                    const total = cse.refs.get(e.key_ptr.*) orelse 1;
+                    if (e.value_ptr.* >= total) try bp.put(input.allocator, e.key_ptr.*, {});
+                }
+                body_priv = bp;
+                break :blk &body_priv.?;
+            };
+            try collectStages(input, rep.materialize.upstream, set, map, cse, descend, child_priv);
             // Single reference → no stage; the body compiles inline at the
             // use site (buildGenericBlock's .materialize arm) — including
             // UNION bodies, which stream arm-then-arm through exec.SetUnion
@@ -268,8 +344,11 @@ fn collectStages(
             if (exec.prof.enabled) stage.setup_ticks = exec.prof.nowTicks() - c0;
             const eff: ?ir.SeparableSpec = rep.materialize.separable orelse
                 (if (rep.materialize.upstream.* == .window) inherited else null);
-            if (eff) |spec| {
-                stage.sliced_fill = try makeSlicedFill(input, spec, rep.materialize.upstream, map);
+            // dop_cap set = we ARE a slice pipeline's stage collection —
+            // never nest a fan-out inside a slice.
+            if (eff != null and input.dop_cap == null) {
+                const spec = eff.?;
+                stage.sliced_fill = try makeSlicedFill(input, spec, rep.materialize.upstream, map, cse);
                 // Slice concat only preserves order when the leading sort key
                 // IS the slice key; drop the claim otherwise so no downstream
                 // rider trusts an interleaved order.
@@ -280,22 +359,22 @@ fn collectStages(
             try map.put(input.allocator, rep, stage);
             if (rep != op) try map.put(input.allocator, op, stage);
         },
-        .select => |p| try collectStages(input, p.upstream, set, map, cse, inherited),
-        .exclude => |p| try collectStages(input, p.upstream, set, map, cse, inherited),
-        .filter => |f| try collectStages(input, f.upstream, set, map, cse, inherited),
-        .order_by => |o| try collectStages(input, o.upstream, set, map, cse, inherited),
-        .group_by => |g| try collectStages(input, g.upstream, set, map, cse, inherited),
-        .compute => |c| try collectStages(input, c.upstream, set, map, cse, inherited),
-        .alias => |a| try collectStages(input, a.upstream, set, map, cse, inherited),
-        .limit => |l| try collectStages(input, l.upstream, set, map, cse, inherited),
-        .window => |w| try collectStages(input, w.upstream, set, map, cse, inherited),
+        .select => |p| try collectStages(input, p.upstream, set, map, cse, inherited, priv),
+        .exclude => |p| try collectStages(input, p.upstream, set, map, cse, inherited, priv),
+        .filter => |f| try collectStages(input, f.upstream, set, map, cse, inherited, priv),
+        .order_by => |o| try collectStages(input, o.upstream, set, map, cse, inherited, priv),
+        .group_by => |g| try collectStages(input, g.upstream, set, map, cse, inherited, priv),
+        .compute => |c| try collectStages(input, c.upstream, set, map, cse, inherited, priv),
+        .alias => |a| try collectStages(input, a.upstream, set, map, cse, inherited, priv),
+        .limit => |l| try collectStages(input, l.upstream, set, map, cse, inherited, priv),
+        .window => |w| try collectStages(input, w.upstream, set, map, cse, inherited, priv),
         .join => |j| {
-            try collectStages(input, j.left, set, map, cse, inherited);
-            try collectStages(input, j.right, set, map, cse, inherited);
+            try collectStages(input, j.left, set, map, cse, inherited, priv);
+            try collectStages(input, j.right, set, map, cse, inherited, priv);
         },
         .set_union => |u| {
-            try collectStages(input, u.left, set, map, cse, inherited);
-            try collectStages(input, u.right, set, map, cse, inherited);
+            try collectStages(input, u.left, set, map, cse, inherited, priv);
+            try collectStages(input, u.right, set, map, cse, inherited, priv);
         },
         else => {},
     }
@@ -728,10 +807,15 @@ const SlicedFillCtx = struct {
     input: engine_v2.CompileInput,
     spec: ir.SeparableSpec,
     body: *const ir.Op,
-    /// Snapshot of the stage map at collect time (post-order: everything the
-    /// body references is already in it). Backing memory in `arena`. Slice
-    /// compiles only read it.
+    /// Snapshot of the SHARED stage map at collect time (post-order:
+    /// everything shared the body references is already in it; the block's
+    /// private closure is deliberately absent — each slice stages its own
+    /// 1/N-sized copies). Backing memory in `arena`; slices only read it.
     map: StageMap,
+    /// Read-only CSE snapshots so each slice's stage collection makes the
+    /// same canonicalization / single-ref decisions the outer plan did.
+    canon: std.AutoHashMapUnmanaged(*const ir.Op, *const ir.Op),
+    refs: MatRefCounts,
     arena: std.heap.ArenaAllocator,
 };
 
@@ -740,6 +824,7 @@ fn makeSlicedFill(
     spec: ir.SeparableSpec,
     body: *const ir.Op,
     map: *const StageMap,
+    cse: *const MatCse,
 ) !mat_stage.Stage.SlicedFill {
     const ctx = try input.allocator.create(SlicedFillCtx);
     errdefer input.allocator.destroy(ctx);
@@ -748,11 +833,18 @@ fn makeSlicedFill(
         .spec = spec,
         .body = body,
         .map = .empty,
+        .canon = .empty,
+        .refs = .empty,
         .arena = std.heap.ArenaAllocator.init(input.allocator),
     };
     errdefer ctx.arena.deinit();
+    const aa = ctx.arena.allocator();
     var it = @constCast(map).iterator();
-    while (it.next()) |e| try ctx.map.put(ctx.arena.allocator(), e.key_ptr.*, e.value_ptr.*);
+    while (it.next()) |e| try ctx.map.put(aa, e.key_ptr.*, e.value_ptr.*);
+    var cit = @constCast(&cse.canon).iterator();
+    while (cit.next()) |e| try ctx.canon.put(aa, e.key_ptr.*, e.value_ptr.*);
+    var rit = @constCast(&cse.refs).iterator();
+    while (rit.next()) |e| try ctx.refs.put(aa, e.key_ptr.*, e.value_ptr.*);
     return .{ .ctx = ctx, .run = slicedFillRun, .drop = slicedFillDrop };
 }
 
@@ -876,6 +968,103 @@ fn sampleSliceColumn(ctx: *SlicedFillCtx, col: []const u8, inputs: []const *mat_
     return null;
 }
 
+/// Base-table leaves under the body (recursing through private, not-in-map
+/// materialize nodes; shared stages stop the walk — they were already
+/// offered to the stage sampler).
+fn collectScanLeaves(
+    op: *const ir.Op,
+    map: *const StageMap,
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(ir.TableRef),
+) !void {
+    switch (op.*) {
+        .scan => |s| {
+            for (out.items) |ref| {
+                if (std.mem.eql(u8, ref.name, s.table.name)) return;
+            }
+            try out.append(alloc, s.table);
+        },
+        .materialize => |m| {
+            if (map.get(op) != null) return;
+            try collectScanLeaves(m.upstream, map, alloc, out);
+        },
+        .select => |p| try collectScanLeaves(p.upstream, map, alloc, out),
+        .exclude => |p| try collectScanLeaves(p.upstream, map, alloc, out),
+        .filter => |f| try collectScanLeaves(f.upstream, map, alloc, out),
+        .order_by => |o| try collectScanLeaves(o.upstream, map, alloc, out),
+        .group_by => |g| try collectScanLeaves(g.upstream, map, alloc, out),
+        .compute => |c| try collectScanLeaves(c.upstream, map, alloc, out),
+        .alias => |a| try collectScanLeaves(a.upstream, map, alloc, out),
+        .limit => |l| try collectScanLeaves(l.upstream, map, alloc, out),
+        .window => |w| try collectScanLeaves(w.upstream, map, alloc, out),
+        .join => |j| {
+            try collectScanLeaves(j.left, map, alloc, out);
+            try collectScanLeaves(j.right, map, alloc, out);
+        },
+        .set_union => |u| {
+            try collectScanLeaves(u.left, map, alloc, out);
+            try collectScanLeaves(u.right, map, alloc, out);
+        },
+        else => {},
+    }
+}
+
+/// Bounds fallback when no shared stage carries the slice column: stride-
+/// sample it straight off a base table under the body via a synthetic
+/// single-column scan. Tables without the column just fail the compile and
+/// the next candidate is tried. Only physical columns sample this way — a
+/// derived slice key (an expression alias) has no table to sample, and the
+/// fill declines with the physical-column hint in the trace.
+fn sampleTableColumn(ctx: *SlicedFillCtx, col: []const u8) !?[]types.Value {
+    const aa = ctx.arena.allocator();
+    var tables: std.ArrayListUnmanaged(ir.TableRef) = .empty;
+    defer tables.deinit(aa);
+    try collectScanLeaves(ctx.body, &ctx.map, aa, &tables);
+    outer: for (tables.items) |ref| {
+        const scan = try aa.create(ir.Op);
+        scan.* = .{ .scan = .{ .table = ref, .alias = null } };
+        const cols_arr = try aa.alloc([]const u8, 1);
+        cols_arr[0] = col;
+        const sel = try aa.create(ir.Op);
+        sel.* = .{ .select = .{ .columns = cols_arr, .upstream = scan } };
+        var sin = ctx.input;
+        sin.accountant = null;
+        var q = engine_v2.compileSelectBlock(sin, sel) catch continue;
+        const upper = q.stats().upper_rows;
+        if (upper == 0 or upper == std.math.maxInt(u64)) {
+            q.deinit();
+            continue;
+        }
+        const stride: usize = @intCast(@max(1, upper / 4096));
+        var vals: std.ArrayListUnmanaged(types.Value) = .empty;
+        var tick: usize = 0;
+        while (true) {
+            const b = q.next() catch {
+                q.deinit();
+                continue :outer;
+            };
+            const batch = b orelse break;
+            var row: usize = 0;
+            while (row < batch.row_count) : (row += 1) {
+                tick += 1;
+                if (tick % stride != 0) continue;
+                const v = batch.values[0];
+                if (!v.isValid(row)) continue;
+                const val = sliceValueAt(v, row) orelse {
+                    q.deinit();
+                    continue :outer;
+                };
+                try vals.append(aa, try dupeSliceValue(aa, val));
+            }
+        }
+        q.deinit();
+        if (vals.items.len < 2) continue;
+        std.mem.sort(types.Value, vals.items, {}, sliceValueLess);
+        return vals.items;
+    }
+    return null;
+}
+
 fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.MaterializedResult) anyerror!bool {
     const ctx: *SlicedFillCtx = @ptrCast(@alignCast(ctx_op));
     const trace = getenv("THINDB_TRACE_SEP") != null;
@@ -903,8 +1092,10 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     for (inputs.items) |s| s.registerUse();
     defer for (inputs.items) |s| s.releaseUse();
 
-    const samples = (try sampleSliceColumn(ctx, col, inputs.items)) orelse {
-        if (trace) std.debug.print("[sep] stage#{d} decline: no input stage carries '{s}'\n", .{ stage.id, col });
+    const samples = (try sampleSliceColumn(ctx, col, inputs.items)) orelse
+        (try sampleTableColumn(ctx, col)) orelse
+    {
+        if (trace) std.debug.print("[sep] stage#{d} decline: no input stage or base table carries '{s}' (derived keys need a physical column, e.g. a stored hash)\n", .{ stage.id, col });
         return false;
     };
 
@@ -1011,17 +1202,59 @@ fn sliceWorker(
     sink: *mat_stage.ContigSink,
     err_out: *?anyerror,
 ) void {
+    const trace = getenv("THINDB_TRACE_SEP") != null;
+    const t0 = exec.prof.nowTicks();
+    defer if (trace) std.debug.print("[sep]   slice stage#{d} rows={d} {d:.0}ms\n", .{
+        stage.id, sink.rows, exec.prof.ticksToMs(exec.prof.nowTicks() - t0),
+    });
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
+    const aa = arena.allocator();
     var sin = ctx.input;
-    sin.allocator = arena.allocator();
-    sin.node_arena = arena.allocator();
+    sin.allocator = aa;
+    sin.node_arena = aa;
     sin.accountant = null; // result bytes charged by ensureRun post-join
     sin.dop_cap = 1;
     sin.slice_pred = pred;
     sin.slice_cols = ctx.spec.cols;
-    var q = compileBlock(sin, ctx.body, @constCast(&ctx.map)) catch |e| {
+    // Two-level staging: shared stages resolve through the outer snapshot
+    // (pre-seeded below, so collectStages early-returns on them); the
+    // block's PRIVATE closure is absent from it and stages HERE, per slice
+    // — each slice runs the whole private chain end-to-end on its key
+    // range, 1/N-sized stages included. Same collector, same CSE
+    // decisions, own StageSet.
+    var slice_map: StageMap = .empty;
+    var mit = @constCast(&ctx.map).iterator();
+    while (mit.next()) |e| slice_map.put(aa, e.key_ptr.*, e.value_ptr.*) catch |err| {
+        err_out.* = err;
+        return;
+    };
+    const slice_set = mat_stage.StageSet.create(aa) catch |e| {
         err_out.* = e;
+        return;
+    };
+    const slice_cse: MatCse = .{
+        .enc_arena = aa,
+        .refs = ctx.refs,
+        .canon = ctx.canon,
+        .bodies = .empty,
+    };
+    collectStages(sin, ctx.body, slice_set, &slice_map, &slice_cse, null, null) catch |e| {
+        err_out.* = e;
+        slice_set.deinit();
+        return;
+    };
+    const inner = compileBlock(sin, ctx.body, &slice_map) catch |e| {
+        err_out.* = e;
+        slice_set.deinit();
+        return;
+    };
+    slice_set.releaseCompilePins();
+    var q = mat_stage.StagedRoot.create(aa, inner, slice_set) catch |e| {
+        err_out.* = e;
+        var qq = inner;
+        qq.deinit();
+        slice_set.deinit();
         return;
     };
     // The slice's output must line up with the stage schema the sink was

@@ -644,6 +644,18 @@ pub const Compute = struct {
         return self.upstream.tryFuseAggregate(group_cols, aggs);
     }
 
+    /// A filter that touches no derived column commutes with the compute —
+    /// forward it below so the scan can evaluate (and prune on) it BEFORE
+    /// the derivation work runs. Renames block the forward too: the source
+    /// column still exists below, but under a different name than the
+    /// predicate uses.
+    pub fn tryFuseFilter(self: *Compute, expr: exec.predicate.PredicateExpr) !bool {
+        for (self.derived) |d| {
+            if (exec.predicate.touchesColumn(expr, d.name)) return false;
+        }
+        return self.upstream.tryFuseFilter(expr);
+    }
+
     /// Terminal self-push: nothing above this Compute offers a probe sink,
     /// but the pipeline below may be a probe-fused parallel chain — push
     /// the derived evaluation into it as a terminal chained sink, so the

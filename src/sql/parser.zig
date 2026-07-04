@@ -3818,7 +3818,7 @@ pub const Parser = struct {
             // REGENERATED (.never — parseFromTarget already wrapped each
             // reference in its own node, so the body stays bare here).
             const should_wrap = switch (entry.value_ptr.hint) {
-                .never => false,
+                .never => entry.value_ptr.separable != null,
                 .force, .auto => true,
             };
             if (!should_wrap) continue;
@@ -3835,14 +3835,12 @@ pub const Parser = struct {
                     .upstream = inner,
                     // Explicit AS MATERIALIZED: the staged compiler must buffer
                     // even a single-reference body it would otherwise inline.
-                    .forced = entry.value_ptr.hint == .force,
-                    // SEPARABLE BY does NOT force staging: it activates only
-                    // on blocks that materialize anyway (multi-ref or AS
-                    // MATERIALIZED). A single-ref block inlines into its
-                    // consumer — and rides that block's slicing if any.
-                    // Force-staging every marked CTE measured 14GB+ of
-                    // buffers on a 38-CTE stack; `AS MATERIALIZED ...
-                    // SEPARABLE BY` is the explicit stage-and-slice lever.
+                    // SEPARABLE implies the same demand — the marked block is
+                    // the slice fan-in point, so it must be a real stage. An
+                    // outer mark's private closure swallows inner marks BEFORE
+                    // any staging decision, so blanket-marking a stack still
+                    // creates exactly one fan-in stage, not one per mark.
+                    .forced = entry.value_ptr.hint == .force or entry.value_ptr.separable != null,
                     .separable = entry.value_ptr.separable,
                 },
             };
