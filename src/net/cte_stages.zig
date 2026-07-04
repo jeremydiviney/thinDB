@@ -1285,6 +1285,7 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     const ctx: *SlicedFillCtx = @ptrCast(@alignCast(ctx_op));
     const trace = getenv("THINDB_TRACE_SEP") != null;
     const alloc = ctx.input.allocator;
+    var ph = exec.prof.nowTicks();
     if (ctx.spec.cols.len != 1) {
         if (trace) std.debug.print("[sep] stage#{d} decline: multi-column spec\n", .{stage.id});
         return false;
@@ -1308,6 +1309,10 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     for (inputs.items) |s| s.registerUse();
     defer for (inputs.items) |s| s.releaseUse();
 
+    if (trace) {
+        std.debug.print("[sep] phase inputs: {d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - ph)});
+        ph = exec.prof.nowTicks();
+    }
     const samples = (try sampleSliceColumn(ctx, col, inputs.items)) orelse
         (try sampleTableColumn(ctx, col)) orelse
     {
@@ -1364,7 +1369,15 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
 
     // Scan-once: private table-backed multi-ref blocks fill N per-slice
     // buffers from ONE full-DOP scan instead of being rescanned per slice.
+    if (trace) {
+        std.debug.print("[sep] phase bounds: {d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - ph)});
+        ph = exec.prof.nowTicks();
+    }
     const pre_parts = try prePartition(ctx, stage, col, bounds.items, trace);
+    if (trace) {
+        std.debug.print("[sep] phase pre-partition: {d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - ph)});
+        ph = exec.prof.nowTicks();
+    }
     defer {
         for (pre_parts) |pp| {
             for (pp.stages) |st| {
@@ -1407,6 +1420,10 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
         spawned += 1;
     }
     for (workers[0..spawned]) |th| th.join();
+    if (trace) {
+        std.debug.print("[sep] phase slices: {d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - ph)});
+        ph = exec.prof.nowTicks();
+    }
 
     var first_err: ?anyerror = null;
     for (errs) |e| {
