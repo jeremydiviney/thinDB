@@ -35,6 +35,7 @@ const types = @import("../types.zig");
 const storage_column = @import("../storage/column.zig");
 const engine_mod = @import("../engine/engine.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
+const join_mod = @import("../exec/join.zig");
 
 const PredicateExpr = exec.predicate.PredicateExpr;
 
@@ -1335,7 +1336,14 @@ fn groupSliceSink(
 /// exclude keep partitions intact; a select with renames could shadow a
 /// partition name (decline); an in-map materialize is a stage boundary
 /// (decline); everything else (joins, unions, group-bys) reorders.
-fn windowNodeBelow(op: *const ir.Op, map: *const StageMap) ?*const ir.Op {
+const ChainBelow = struct {
+    win: *const ir.Op,
+    joins: [6]*const ir.Op,
+    n_joins: usize,
+};
+
+fn windowChainBelow(op: *const ir.Op, map: *const StageMap) ?ChainBelow {
+    var res: ChainBelow = .{ .win = undefined, .joins = undefined, .n_joins = 0 };
     var cur = op;
     while (true) switch (cur.*) {
         .compute => |c| cur = c.upstream,
@@ -1347,7 +1355,19 @@ fn windowNodeBelow(op: *const ir.Op, map: *const StageMap) ?*const ir.Op {
             if (map.get(cur) != null) return null;
             cur = m.upstream;
         },
-        .window => return cur,
+        .join => |j| {
+            // Continue through the LEFT side — probe by convention for
+            // LEFT/typical INNER joins; the pairing VERIFIES each join's
+            // compiled build_is_left before trusting the traversal.
+            if (res.n_joins == res.joins.len) return null;
+            res.joins[res.n_joins] = cur;
+            res.n_joins += 1;
+            cur = j.left;
+        },
+        .window => {
+            res.win = cur;
+            return res;
+        },
         else => return null,
     };
 }
@@ -1384,6 +1404,7 @@ fn chainRenamesPartitionKey(op: *const ir.Op, below: *const ir.Op, keys: []const
             cur = p.upstream;
         },
         .materialize => |m| cur = m.upstream,
+        .join => |j| cur = j.left, // right-side shadowing checked at pairing
         else => return true, // unexpected — decline
     };
     return false;
@@ -1406,6 +1427,24 @@ fn partitionNameSetsEqual(pa: []const []const u8, pb: []const []const u8) bool {
 
 fn windowPartitionSetsEqual(a: *const ir.Op, b: *const ir.Op) bool {
     return partitionNameSetsEqual(a.window.specs[0].partition_by, b.window.specs[0].partition_by);
+}
+
+/// Trace helper: the op tag where the pairing chain walk gave up.
+fn windowChainStopTag(op: *const ir.Op, map: *const StageMap) []const u8 {
+    var cur = op;
+    while (true) switch (cur.*) {
+        .compute => |c| cur = c.upstream,
+        .filter => |f| cur = f.upstream,
+        .alias => |a| cur = a.upstream,
+        .exclude => |p| cur = p.upstream,
+        .select => |p| cur = p.upstream,
+        .materialize => |m| {
+            if (map.get(cur) != null) return "materialize(staged)";
+            cur = m.upstream;
+        },
+        .window => return "window",
+        else => return @tagName(cur.*),
+    };
 }
 
 /// The rider only needs GROUPING, so its specs may differ in ORDER BY —
@@ -2321,19 +2360,70 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // grouped — skipping its full sort. Chains cascade: a grouped
             // window retains its own perm and hands the order onward.
             if (input.win_registry) |reg| pair: {
+                const wtrace = getenv("THINDB_TRACE_SEP") != null;
                 const win = exec.queryAs(window_op.Window, wq) orelse break :pair;
                 reg.put(input.allocator, @ptrCast(op), @ptrCast(win)) catch break :pair;
-                const below = windowNodeBelow(w.upstream, map) orelse break :pair;
-                const prev_opaque = reg.get(@ptrCast(below)) orelse break :pair;
+                const chain = windowChainBelow(w.upstream, map) orelse {
+                    if (wtrace) std.debug.print("[sep] pair decline: no window below (stopped at {s})\n", .{windowChainStopTag(w.upstream, map)});
+                    break :pair;
+                };
+                const below = chain.win;
+                const prev_opaque = reg.get(@ptrCast(below)) orelse {
+                    if (wtrace) std.debug.print("[sep] pair decline: below window not in registry\n", .{});
+                    break :pair;
+                };
                 const prev: *window_op.Window = @ptrCast(@alignCast(prev_opaque));
-                if (!prev.singleSortGroup()) break :pair; // emitter needs ONE perm
-                if (!irAllSpecsSamePartition(op)) break :pair; // rider: grouping only, orders may differ
-                if (!windowPartitionSetsEqual(below, op)) break :pair;
-                if (chainRenamesPartitionKey(w.upstream, below, op.window.specs[0].partition_by)) break :pair;
+                if (!prev.singleSortGroup()) {
+                    if (wtrace) std.debug.print("[sep] pair decline: emitter multi-sort-group\n", .{});
+                    break :pair; // emitter needs ONE perm
+                }
+                if (!irAllSpecsSamePartition(op)) {
+                    if (wtrace) std.debug.print("[sep] pair decline: rider specs differ in partition\n", .{});
+                    break :pair; // rider: grouping only, orders may differ
+                }
+                if (!windowPartitionSetsEqual(below, op)) {
+                    if (wtrace) std.debug.print("[sep] pair decline: partition sets differ\n", .{});
+                    break :pair;
+                }
+                if (chainRenamesPartitionKey(w.upstream, below, op.window.specs[0].partition_by)) {
+                    if (wtrace) std.debug.print("[sep] pair decline: chain renames a partition key\n", .{});
+                    break :pair;
+                }
+                // Every join the chain crossed must provably preserve
+                // left-side grouping: probe = left (fixed at create), no
+                // skew handoff (SMJ reorders), INNER/LEFT only, and no
+                // right-side output column shadowing a partition key.
+                for (chain.joins[0..chain.n_joins]) |jn| {
+                    const jopq = reg.get(@ptrCast(jn)) orelse {
+                        if (wtrace) std.debug.print("[sep] pair decline: chain join not registered\n", .{});
+                        break :pair;
+                    };
+                    const jop: *join_mod.Join = @ptrCast(@alignCast(jopq));
+                    if (jop.build_is_left) {
+                        if (wtrace) std.debug.print("[sep] pair decline: join probes right side\n", .{});
+                        break :pair;
+                    }
+                    if (jop.skew_detector != null or jop.skew_smj != null) {
+                        if (wtrace) std.debug.print("[sep] pair decline: join may hand off to skew SMJ\n", .{});
+                        break :pair;
+                    }
+                    if (jop.join_type != .left and jop.join_type != .inner) {
+                        if (wtrace) std.debug.print("[sep] pair decline: join type\n", .{});
+                        break :pair;
+                    }
+                    for (jop.output_schema[jop.left_col_count..]) |c| {
+                        for (op.window.specs[0].partition_by) |k| {
+                            if (types.columnNameEql(c.name, k)) {
+                                if (wtrace) std.debug.print("[sep] pair decline: join right side shadows a partition key\n", .{});
+                                break :pair;
+                            }
+                        }
+                    }
+                }
                 prev.emit_sorted = true;
                 prev.emit_sorted_stream = true;
                 win.assume_grouped = true;
-                if (getenv("THINDB_TRACE_SEP") != null) {
+                if (wtrace) {
                     std.debug.print("[sep] window pair: upstream emits sorted, this one rides grouped\n", .{});
                 }
             }
@@ -2368,7 +2458,17 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner);
             errdefer left.deinit();
             const right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner);
-            return left.join(right, joinSpecOf(j));
+            const jq = try left.join(right, joinSpecOf(j));
+            // Window-chain pairing: register the compiled hash join so a
+            // downstream window can VERIFY (at pairing time) that this
+            // join's probe is the left side — probe-order emission then
+            // preserves left-side grouping through the join.
+            if (input.win_registry) |reg| {
+                if (exec.queryAs(join_mod.Join, jq)) |jop| {
+                    reg.put(input.allocator, @ptrCast(op), @ptrCast(jop)) catch {};
+                }
+            }
+            return jq;
         },
         .set_union => |u| {
             // SetUnion.create validates schema compatibility and does NOT
