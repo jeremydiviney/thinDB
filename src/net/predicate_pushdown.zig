@@ -39,9 +39,14 @@ const Ctx = struct {
     session: api.Session,
 };
 
+var trace_push: bool = false;
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 /// Rewrite the whole op tree in place. `arena` owns any new Filter nodes and
 /// predicate slices (the compile-time node arena).
 pub fn pushJoinFilters(arena: Allocator, catalog: ?*api.Catalog, session: api.Session, op: *ir.Op) anyerror!void {
+    trace_push = getenv("THINDB_TRACE_PUSHDOWN") != null;
     const ctx = Ctx{ .arena = arena, .catalog = catalog, .session = session };
     try walk(ctx, op);
 }
@@ -72,9 +77,88 @@ fn walk(ctx: Ctx, op: *ir.Op) anyerror!void {
         },
         .filter => |f| {
             try walk(ctx, @constCast(f.upstream));
-            if (f.upstream.* == .join) try pushFilterIntoJoin(ctx, op);
+            if (trace_push) std.debug.print("[ppd] filter over {s}\n", .{@tagName(f.upstream.*)});
+            try sinkThroughShapers(ctx, op);
+            if (op.* == .filter and op.filter.upstream.* == .join) try pushFilterIntoJoin(ctx, op);
         },
     }
+}
+
+/// Sink filter conjuncts through row-preserving shaper nodes so they land
+/// directly above the join/scan they belong to — `filter(compute(join))`
+/// becomes `compute(filter(join))` and the join push then fires. A conjunct
+/// may cross a `.compute` only when it references none of the derived names
+/// (below the compute it would read the pre-compute value of a shadowed
+/// column). It may cross an `.exclude` only when its columns are disjoint
+/// from the excluded names (below the exclude a dropped qualified column
+/// could make a suffix reference ambiguous). Rewrites `op` in place, then
+/// cascades on the sunk filter.
+fn sinkThroughShapers(ctx: Ctx, op: *ir.Op) anyerror!void {
+    if (op.* != .filter) return;
+    const up = @constCast(op.filter.upstream);
+    switch (up.*) {
+        .compute, .exclude => {},
+        else => return,
+    }
+
+    var movable: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    var stay: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+
+    const conjuncts = try splitConjuncts(ctx.arena, op.filter.predicate);
+    for (conjuncts) |c| {
+        if (conjunctCrossesShaper(ctx.arena, c, up)) {
+            try movable.append(ctx.arena, c);
+        } else {
+            try stay.append(ctx.arena, c);
+        }
+    }
+    if (movable.items.len == 0) return;
+    if (trace_push) std.debug.print("[ppd]   sink through {s}: moved={d} stayed={d}\n", .{ @tagName(up.*), movable.items.len, stay.items.len });
+
+    const nf = try ctx.arena.create(ir.Op);
+    nf.* = .{ .filter = .{
+        .predicate = try combine(ctx.arena, movable.items),
+        .upstream = switch (up.*) {
+            .compute => |c| c.upstream,
+            .exclude => |p| p.upstream,
+            else => unreachable,
+        },
+    } };
+    switch (up.*) {
+        .compute => up.compute.upstream = nf,
+        .exclude => up.exclude.upstream = nf,
+        else => unreachable,
+    }
+    if (stay.items.len > 0) {
+        op.filter.predicate = try combine(ctx.arena, stay.items);
+    } else {
+        // Every conjunct sank — the parent filter dissolves into the shaper.
+        op.* = up.*;
+    }
+    try sinkThroughShapers(ctx, nf);
+    if (nf.* == .filter and nf.filter.upstream.* == .join) try pushFilterIntoJoin(ctx, nf);
+}
+
+fn conjunctCrossesShaper(arena: Allocator, c: PredicateExpr, shaper: *const ir.Op) bool {
+    var cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (!collectPredCols(arena, c, &cols)) return false;
+    if (cols.items.len == 0) return false; // constant — nothing gained by moving
+    const blocked: []const []const u8 = switch (shaper.*) {
+        .compute => |cp| blk: {
+            var names: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (cp.derived) |d| names.append(arena, d.name) catch return false;
+            break :blk names.items;
+        },
+        .exclude => |p| p.columns,
+        else => return false,
+    };
+    for (cols.items) |col| {
+        const s = suffix(col);
+        for (blocked) |b| {
+            if (types.columnNameEql(suffix(b), s)) return false;
+        }
+    }
+    return true;
 }
 
 fn leftPreserved(jt: ir.JoinType) bool {
@@ -94,6 +178,9 @@ fn pushFilterIntoJoin(ctx: Ctx, op: *ir.Op) anyerror!void {
     var right_cols: std.ArrayListUnmanaged([]const u8) = .empty;
     const left_ok = collectColumns(ctx, join_op.join.left, &left_cols) catch false;
     const right_ok = collectColumns(ctx, join_op.join.right, &right_cols) catch false;
+    if (trace_push) std.debug.print("[ppd]   join jt={s} left_ok={} ({d} cols, child={s}) right_ok={} ({d} cols, child={s})\n", .{
+        @tagName(jt), left_ok, left_cols.items.len, @tagName(join_op.join.left.*), right_ok, right_cols.items.len, @tagName(join_op.join.right.*),
+    });
     if (!left_ok and !right_ok) return; // can't reason about either side
 
     var to_left: std.ArrayListUnmanaged(PredicateExpr) = .empty;
@@ -103,6 +190,7 @@ fn pushFilterIntoJoin(ctx: Ctx, op: *ir.Op) anyerror!void {
     const conjuncts = try splitConjuncts(ctx.arena, op.filter.predicate);
     for (conjuncts) |c| {
         const side = classify(ctx.arena, c, left_cols.items, right_cols.items, left_ok, right_ok, jt);
+        if (trace_push) std.debug.print("[ppd]   conjunct tag={s} -> {s}\n", .{ @tagName(c), @tagName(side) });
         switch (side) {
             .left => try to_left.append(ctx.arena, c),
             .right => try to_right.append(ctx.arena, c),
@@ -353,6 +441,78 @@ test "predicate pushdown: an AND splits per side, cross-side conjunct stays" {
     try testing.expectEqualStrings("l.a", op.filter.upstream.join.left.*.filter.predicate.is_not_null);
     try testing.expect(op.filter.upstream.join.right.* == .filter);
     try testing.expectEqualStrings("r.c", op.filter.upstream.join.right.*.filter.predicate.is_not_null);
+}
+
+test "predicate pushdown: filter sinks through a compute onto the join side" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{ "l.a", "l.b" }, &dummy);
+    var right = testSelect(&.{ "r.c", "r.d" }, &dummy);
+    var join = testJoin(.inner, &left, &right);
+    const derived = [_]ir.Derived{.{ .name = "gap", .expr = .{ .col_ref = "l.a" } }};
+    var comp = ir.Op{ .compute = .{ .derived = &derived, .upstream = &join } };
+    // `l.a IS NOT NULL` references no derived name → sinks below the compute
+    // and then onto the join's left input.
+    var op = ir.Op{ .filter = .{ .predicate = .{ .is_not_null = "l.a" }, .upstream = &comp } };
+
+    try pushJoinFilters(a, null, .{}, &op);
+
+    try testing.expect(op == .compute);
+    try testing.expect(op.compute.upstream.* == .join);
+    try testing.expect(op.compute.upstream.join.left.* == .filter);
+    try testing.expectEqualStrings("l.a", op.compute.upstream.join.left.*.filter.predicate.is_not_null);
+}
+
+test "predicate pushdown: conjunct on a derived column stays above the compute" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{ "l.a", "l.b" }, &dummy);
+    var right = testSelect(&.{ "r.c", "r.d" }, &dummy);
+    var join = testJoin(.inner, &left, &right);
+    const derived = [_]ir.Derived{.{ .name = "gap", .expr = .{ .col_ref = "l.a" } }};
+    var comp = ir.Op{ .compute = .{ .derived = &derived, .upstream = &join } };
+    // `gap IS NOT NULL` (derived) must stay; `l.b IS NOT NULL` sinks.
+    const conjuncts = [_]PredicateExpr{
+        .{ .is_not_null = "gap" },
+        .{ .is_not_null = "l.b" },
+    };
+    var op = ir.Op{ .filter = .{ .predicate = .{ .@"and" = &conjuncts }, .upstream = &comp } };
+
+    try pushJoinFilters(a, null, .{}, &op);
+
+    try testing.expect(op == .filter);
+    try testing.expectEqualStrings("gap", op.filter.predicate.is_not_null);
+    try testing.expect(op.filter.upstream.* == .compute);
+    try testing.expect(op.filter.upstream.compute.upstream.* == .join);
+    try testing.expect(op.filter.upstream.compute.upstream.join.left.* == .filter);
+    try testing.expectEqualStrings("l.b", op.filter.upstream.compute.upstream.join.left.*.filter.predicate.is_not_null);
+}
+
+test "predicate pushdown: exclude of a same-suffix column blocks the sink" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{ "l.a", "l.b" }, &dummy);
+    var right = testSelect(&.{ "r.c", "r.a" }, &dummy);
+    var join = testJoin(.inner, &left, &right);
+    // Below the exclude BOTH `l.a` and `r.a` exist — a bare `a` reference
+    // sunk below could resolve to the wrong one, so it must stay.
+    var excl = ir.Op{ .exclude = .{ .columns = &.{"r.a"}, .upstream = &join } };
+    var op = ir.Op{ .filter = .{ .predicate = .{ .is_not_null = "a" }, .upstream = &excl } };
+
+    try pushJoinFilters(a, null, .{}, &op);
+
+    try testing.expect(op == .filter);
+    try testing.expect(op.filter.upstream.* == .exclude);
+    try testing.expect(op.filter.upstream.exclude.upstream.* == .join);
 }
 
 test "predicate pushdown: nullable-side predicate never crosses an outer join" {

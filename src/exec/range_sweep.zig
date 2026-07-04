@@ -102,6 +102,11 @@ pub const RangeSweepJoin = struct {
 
     phase: Phase = .materializing,
 
+    // `--profile-ops` phase splits (raw perf-counter ticks).
+    prof_mat_ticks: i64 = 0,
+    prof_sort_ticks: i64 = 0,
+    prof_emitted: u64 = 0,
+
     const Phase = enum { materializing, sweeping, done };
 
     pub fn create(
@@ -268,6 +273,15 @@ pub const RangeSweepJoin = struct {
                 .sweeping => {
                     if (try self.sweepStep()) |batch| return batch;
                     self.phase = .done;
+                    if (exec.prof.enabled) {
+                        std.debug.print("[rsweep] left={d} right={d} emitted={d}  mat={d:.1}ms sort={d:.1}ms\n", .{
+                            self.left_rows,
+                            self.right_rows,
+                            self.prof_emitted,
+                            exec.prof.ticksToMs(self.prof_mat_ticks),
+                            exec.prof.ticksToMs(self.prof_sort_ticks),
+                        });
+                    }
                     if (try self.flushOutput()) |batch| return batch;
                     return null;
                 },
@@ -277,6 +291,7 @@ pub const RangeSweepJoin = struct {
     }
 
     fn materializeAndSort(self: *RangeSweepJoin) !void {
+        const t0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         const acc = self.left.accountant();
         const left_row_bytes = exec.memory.estimateRowBytes(self.left.outputSchema());
         const right_row_bytes = exec.memory.estimateRowBytes(self.right.outputSchema());
@@ -314,8 +329,11 @@ pub const RangeSweepJoin = struct {
         }
 
         // Sort each perm by the range column (ASC).
+        const t1 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        if (exec.prof.enabled) self.prof_mat_ticks = t1 - t0;
         sortByColumn(lp.items, lv);
         sortByColumn(rp.items, rv);
+        if (exec.prof.enabled) self.prof_sort_ticks = exec.prof.nowTicks() - t1;
 
         self.left_perm = try lp.toOwnedSlice(self.allocator);
         self.right_perm = try rp.toOwnedSlice(self.allocator);
@@ -428,6 +446,7 @@ pub const RangeSweepJoin = struct {
     }
 
     fn emitOutputRow(self: *RangeSweepJoin, left_row: u32, right_row: u32) !void {
+        self.prof_emitted += 1;
         try cell_io.emitMatchedRow(
             self.allocator,
             self.output_columns,
