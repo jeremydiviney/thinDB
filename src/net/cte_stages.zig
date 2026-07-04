@@ -334,6 +334,7 @@ fn collectStages(
             const win_root = exec.queryAs(window_op.Window, q);
             if (win_root == null) q = pruneStageColumns(input, q);
             const stage = try set.addStage(q, input.accountant);
+            stage.slice_local = input.dop_cap != null;
             stage.adopt_window = win_root;
             if (win_root) |wr| {
                 if (wr.borrow_src) |src| {
@@ -745,6 +746,11 @@ fn wrapSlicePred(input: engine_v2.CompileInput, q: exec.Query) anyerror!exec.Que
     for (input.slice_cols) |c| {
         if (types.findColumn(schema, c) == null) return q;
     }
+    // A per-slice stage's content is already range-restricted; re-filtering
+    // its reads would be a pure serial pass over rows that all survive.
+    if (exec.queryAs(mat_stage.MatScan, q)) |ms| {
+        if (ms.stage.slice_local) return q;
+    }
     // Sliced-result chunk skip: when this leaf reads a stage that was itself
     // slice-adopted, hand the range straight to the scan so it skips
     // disjoint chunks wholesale — the boundary between two sliced stages
@@ -754,7 +760,18 @@ fn wrapSlicePred(input: engine_v2.CompileInput, q: exec.Query) anyerror!exec.Que
     }
     var qq = q;
     errdefer qq.deinit();
-    return qq.filter(pred);
+    const out = try qq.filter(pred);
+    if (getenv("THINDB_TRACE_SEP") != null) {
+        const fused = if (exec.queryAs(exec.Filter, out)) |f| f.fused else false;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(input.allocator);
+        var inner = qq;
+        inner.explain(&buf, input.allocator, 0) catch {};
+        const first = if (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| buf.items[0..nl] else buf.items;
+        std.debug.print("[sep] wrap: fused={} root='{s}'\n", .{ fused, first });
+        if (!fused) std.debug.print("[sep] unfused pipeline:\n{s}\n", .{buf.items});
+    }
+    return out;
 }
 
 /// Recognize exactly the three predicate shapes the sliced fill builds and

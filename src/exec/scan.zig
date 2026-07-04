@@ -1019,7 +1019,6 @@ pub const Scan = struct {
 
     pub fn tryFuseFilter(self: *Scan, expr: PredicateExpr) !bool {
         if (self.out_phys.len == 0) return false;
-        if (self.fused_filter != null) return false;
         // Coerce/validate the predicate's literals against the table schema
         // (e.g. a text date literal `'2013-07-01'` → a date value). The legacy
         // path does this in `Filter.create` before fusing; a directly-fused
@@ -1028,6 +1027,36 @@ pub const Scan = struct {
         // no-op.
         var coerced = expr;
         try predicate.validateExpr(&coerced, self.table.schema.columns);
+        if (self.fused_filter) |existing| {
+            // SECOND fusion (a SEPARABLE slice range, or any filter layered
+            // over a block whose WHERE already fused): conjoin. Only when the
+            // new predicate references projected columns exclusively — the
+            // eval state built for the first filter (its unprojected-column
+            // decode set) then stays valid as-is. The arms slice is owned via
+            // filter_rewritten, freed at deinit like orderPredicate's copies.
+            var refs: std.ArrayListUnmanaged(usize) = .empty;
+            defer refs.deinit(self.allocator);
+            try collectPredicateColumns(self.allocator, coerced, self.table.schema.columns, &refs);
+            for (refs.items) |phys| {
+                var projected = false;
+                for (self.out_phys) |o| {
+                    if (o == phys) {
+                        projected = true;
+                        break;
+                    }
+                }
+                if (!projected) return false;
+            }
+            const arms = try self.allocator.alloc(PredicateExpr, 2);
+            errdefer self.allocator.free(arms);
+            arms[0] = existing;
+            arms[1] = coerced;
+            try self.filter_rewritten.append(self.allocator, arms);
+            self.fused_filter = .{ .@"and" = arms };
+            try self.extractPruneHints(coerced);
+            try self.orderFusedConjuncts();
+            return true;
+        }
         self.fused_filter = coerced;
         try self.setupFilterEval(coerced);
         try self.extractPruneHints(coerced);

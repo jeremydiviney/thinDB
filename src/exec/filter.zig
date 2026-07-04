@@ -282,6 +282,14 @@ pub const Filter = struct {
         return self.upstream.addPrune(pred);
     }
 
+    /// A second filter layered above forwards straight through — two
+    /// restrictions compose as AND regardless of order, so the lower one
+    /// (often a scan-fused WHERE) can absorb the new predicate too and the
+    /// scan prunes on both.
+    pub fn tryFuseFilter(self: *Filter, expr: PredicateExpr) !bool {
+        return self.upstream.tryFuseFilter(expr);
+    }
+
     /// Forward coded-key setup to the upstream Scan — but only when this Filter
     /// FUSED its predicate into the Scan. A fused Filter is a passthrough: the
     /// Scan filters + emits coded survivors itself (its filtered path is

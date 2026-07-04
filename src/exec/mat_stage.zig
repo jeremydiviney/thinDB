@@ -397,6 +397,10 @@ pub const Stage = struct {
     /// `adopt_window`. `query` still compiles normally (it provides the
     /// schema/stats and is torn down undrained).
     sliced_fill: ?SlicedFill = null,
+    /// Created INSIDE a slice pipeline (per-slice StageSet): its content is
+    /// already range-restricted, so the slice compiler must not layer the
+    /// range filter over reads of it again.
+    slice_local: bool = false,
 
     pub const SlicedFill = struct {
         ctx: *anyopaque,
