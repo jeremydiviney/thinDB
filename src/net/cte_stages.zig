@@ -325,6 +325,15 @@ fn collectStages(
             //     close to the real execution; thin streaming CTEs stay fused.
             const prof_stage = forceStageAll() or
                 (stageBarriersOnly() and bodyFormsBarrier(rep.materialize.upstream));
+            // Inside a SEPARABLE slice (dop_cap set), the synthetic window
+            // wraps lose their purpose: they exist so DOP>1 chains can
+            // parallel-scan a window's buffered output, but a slice has ONE
+            // serial consumer — staging just adds a full write + re-read of
+            // memory the 12 concurrent slices then fight over. Inline them:
+            // the Window op streams straight into its consumer.
+            const inline_slice_window = input.dop_cap != null and
+                rep.materialize.upstream.* == .window and single_ref;
+            if (inline_slice_window) return;
             if ((single_ref or noStage()) and !rep.materialize.forced and !prof_stage) return;
             const c0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             var q = try compileBlock(input, rep.materialize.upstream, map);
@@ -1513,6 +1522,9 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
         }
     }
 
+    // Diagnostic: THINDB_SEP_SEQUENTIAL runs slices one at a time —
+    // separates per-slice pipeline cost from concurrency effects.
+    const sequential = getenv("THINDB_SEP_SEQUENTIAL") != null;
     var spawned: usize = 0;
     for (workers, 0..) |*th, i| {
         th.* = std.Thread.spawn(.{}, sliceWorker, .{ ctx, stage, pre_parts, i, preds[i], &sinks[i], &errs[i] }) catch |e| {
@@ -1520,8 +1532,9 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
             break;
         };
         spawned += 1;
+        if (sequential) th.join();
     }
-    for (workers[0..spawned]) |th| th.join();
+    if (!sequential) for (workers[0..spawned]) |th| th.join();
     if (trace) {
         std.debug.print("[sep] phase slices: {d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - ph)});
         ph = exec.prof.nowTicks();
