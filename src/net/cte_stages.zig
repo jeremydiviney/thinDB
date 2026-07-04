@@ -1082,6 +1082,205 @@ fn sampleTableColumn(ctx: *SlicedFillCtx, col: []const u8) !?[]types.Value {
     return null;
 }
 
+/// SCAN-ONCE pre-partition: a private multi-ref TABLE-BACKED block would be
+/// recompiled and rescanned by every slice — instead compile it ONCE at full
+/// parallelism, route its output rows by slice-key range into N per-slice
+/// buffers, and hand each slice a pre-filled slice_local stage for that node.
+/// The table is then touched by exactly one well-behaved parallel scan.
+const PrePart = struct {
+    node: *const ir.Op,
+    stages: []*mat_stage.Stage,
+};
+
+fn collectPrePartCandidates(
+    ctx: *SlicedFillCtx,
+    op: *const ir.Op,
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(*const ir.Op),
+) !void {
+    switch (op.*) {
+        .materialize => |m| {
+            const rep = ctx.canon.get(op) orelse op;
+            if (ctx.map.get(rep) != null) return; // shared: already staged once
+            const multi = (ctx.refs.get(rep) orelse 1) >= 2 or rep.materialize.forced;
+            if (multi and blockSource(rep.materialize.upstream) == .table) {
+                for (out.items) |e| if (e == rep) return;
+                try out.append(alloc, rep);
+                return;
+            }
+            try collectPrePartCandidates(ctx, m.upstream, alloc, out);
+        },
+        .select => |p| try collectPrePartCandidates(ctx, p.upstream, alloc, out),
+        .exclude => |p| try collectPrePartCandidates(ctx, p.upstream, alloc, out),
+        .filter => |f| try collectPrePartCandidates(ctx, f.upstream, alloc, out),
+        .order_by => |o| try collectPrePartCandidates(ctx, o.upstream, alloc, out),
+        .group_by => |g| try collectPrePartCandidates(ctx, g.upstream, alloc, out),
+        .compute => |c| try collectPrePartCandidates(ctx, c.upstream, alloc, out),
+        .alias => |a| try collectPrePartCandidates(ctx, a.upstream, alloc, out),
+        .limit => |l| try collectPrePartCandidates(ctx, l.upstream, alloc, out),
+        .window => |w| try collectPrePartCandidates(ctx, w.upstream, alloc, out),
+        .join => |j| {
+            try collectPrePartCandidates(ctx, j.left, alloc, out);
+            try collectPrePartCandidates(ctx, j.right, alloc, out);
+        },
+        .set_union => |u| {
+            try collectPrePartCandidates(ctx, u.left, alloc, out);
+            try collectPrePartCandidates(ctx, u.right, alloc, out);
+        },
+        else => {},
+    }
+}
+
+/// First boundary >= v wins its slice; NULL keys were routed by the caller.
+fn sliceIndexForValue(v: types.Value, bounds: []const types.Value) usize {
+    var lo: usize = 0;
+    var hi: usize = bounds.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (v.compare(bounds[mid]) == .gt) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+fn prePartition(
+    ctx: *SlicedFillCtx,
+    stage: *mat_stage.Stage,
+    col: []const u8,
+    bounds: []const types.Value,
+    trace: bool,
+) ![]PrePart {
+    const alloc = ctx.input.allocator;
+    const aa = ctx.arena.allocator();
+    const total = bounds.len + 1;
+    var cands: std.ArrayListUnmanaged(*const ir.Op) = .empty;
+    defer cands.deinit(alloc);
+    try collectPrePartCandidates(ctx, ctx.body, alloc, &cands);
+
+    var parts: std.ArrayListUnmanaged(PrePart) = .empty;
+    errdefer parts.deinit(alloc);
+    next_cand: for (cands.items) |node| {
+        var q = compileBlock(ctx.input, node.materialize.upstream, @constCast(&ctx.map)) catch continue;
+        q = pruneStageColumns(ctx.input, q);
+        const raw_schema = q.outputSchema();
+        var ci: usize = 0;
+        const found: bool = blk: {
+            for (raw_schema, 0..) |sc, i| {
+                if (types.columnNameEql(sc.name, col)) {
+                    ci = i;
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        if (!found) {
+            q.deinit();
+            continue;
+        }
+        // Deep-copy the schema (ctx arena) — the compiled pipeline dies after
+        // this drain, but the pre-filled stages' consumers keep referring.
+        const schema = try aa.alloc(types.Column, raw_schema.len);
+        for (raw_schema, schema) |src, *dst| {
+            dst.* = src;
+            dst.name = try aa.dupe(u8, src.name);
+        }
+
+        const sinks = try alloc.alloc(mat_stage.ContigSink, total);
+        var made: usize = 0;
+        errdefer {
+            for (sinks[0..made]) |*sk| sk.deinit();
+            alloc.free(sinks);
+        }
+        while (made < total) : (made += 1) {
+            sinks[made] = try mat_stage.ContigSink.init(stage.allocator, schema, 1 << 16);
+        }
+
+        const idx_lists = try alloc.alloc(std.ArrayListUnmanaged(u32), total);
+        defer {
+            for (idx_lists) |*l| l.deinit(alloc);
+            alloc.free(idx_lists);
+        }
+        @memset(idx_lists, .empty);
+
+        var route_err: ?anyerror = null;
+        while (true) {
+            const b = q.next() catch |e| {
+                route_err = e;
+                break;
+            };
+            const batch = b orelse break;
+            for (idx_lists) |*l| l.clearRetainingCapacity();
+            const v = batch.values[ci];
+            var row: usize = 0;
+            while (row < batch.row_count) : (row += 1) {
+                const si = blk: {
+                    if (!v.isValid(row)) break :blk 0; // NULL keys ride slice 0
+                    const val = sliceValueAt(v, row) orelse {
+                        route_err = error.UnsupportedQueryShape;
+                        break;
+                    };
+                    break :blk sliceIndexForValue(val, bounds);
+                };
+                idx_lists[si].append(alloc, @intCast(row)) catch |e| {
+                    route_err = e;
+                    break;
+                };
+            }
+            if (route_err != null) break;
+            for (sinks, idx_lists) |*sk, l| {
+                if (l.items.len == 0) continue;
+                sk.appendIndices(batch, l.items) catch |e| {
+                    route_err = e;
+                    break;
+                };
+            }
+            if (route_err != null) break;
+        }
+        q.deinit();
+        if (route_err != null) {
+            for (sinks) |*sk| sk.deinit();
+            alloc.free(sinks);
+            continue :next_cand;
+        }
+
+        // Wrap each sink as a pre-filled slice_local stage the slice compile
+        // resolves through its map — no recompiled scan, no re-filter.
+        const stages = try alloc.alloc(*mat_stage.Stage, total);
+        var built: usize = 0;
+        errdefer {
+            for (stages[0..built]) |st| st.deinit();
+            alloc.free(stages);
+        }
+        var rows_total: u64 = 0;
+        while (built < total) : (built += 1) {
+            const sres = try stage.allocator.create(mat_stage.MaterializedResult);
+            errdefer stage.allocator.destroy(sres);
+            sres.* = .{ .allocator = stage.allocator, .schema = schema };
+            try sres.adoptContiguous(sinks[built].take(), sinks[built].rows);
+            rows_total += sres.total_rows;
+            const st = try stage.allocator.create(mat_stage.Stage);
+            st.* = .{
+                .allocator = stage.allocator,
+                .query = undefined,
+                .query_alive = false,
+                .schema = schema,
+                .stats_upper_rows = sres.total_rows,
+                .sort_state = .{},
+                .col_stats = &.{},
+                .result = sres,
+                // Guard use: released by the fill AFTER every slice joined,
+                // so a slice's own release can never free another's input.
+                .uses_total = .init(1),
+                .slice_local = true,
+            };
+            stages[built] = st;
+        }
+        alloc.free(sinks);
+        if (trace) std.debug.print("[sep] stage#{d} pre-partitioned block once: {d} rows -> {d} buffers\n", .{ stage.id, rows_total, total });
+        try parts.append(alloc, .{ .node = node, .stages = stages });
+    }
+    return parts.toOwnedSlice(alloc);
+}
+
 fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.MaterializedResult) anyerror!bool {
     const ctx: *SlicedFillCtx = @ptrCast(@alignCast(ctx_op));
     const trace = getenv("THINDB_TRACE_SEP") != null;
@@ -1163,6 +1362,20 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     }
     if (trace) std.debug.print("[sep] stage#{d} slicing on '{s}': {d} slices ({d} sampled)\n", .{ stage.id, col, total, samples.len });
 
+    // Scan-once: private table-backed multi-ref blocks fill N per-slice
+    // buffers from ONE full-DOP scan instead of being rescanned per slice.
+    const pre_parts = try prePartition(ctx, stage, col, bounds.items, trace);
+    defer {
+        for (pre_parts) |pp| {
+            for (pp.stages) |st| {
+                st.releaseUse(); // drop the guard; frees when slices are done
+                st.deinit();
+            }
+            alloc.free(pp.stages);
+        }
+        alloc.free(pre_parts);
+    }
+
     const workers = try alloc.alloc(std.Thread, total);
     defer alloc.free(workers);
     const errs = try alloc.alloc(?anyerror, total);
@@ -1187,7 +1400,7 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
 
     var spawned: usize = 0;
     for (workers, 0..) |*th, i| {
-        th.* = std.Thread.spawn(.{}, sliceWorker, .{ ctx, stage, preds[i], &sinks[i], &errs[i] }) catch |e| {
+        th.* = std.Thread.spawn(.{}, sliceWorker, .{ ctx, stage, pre_parts, i, preds[i], &sinks[i], &errs[i] }) catch |e| {
             errs[i] = e;
             break;
         };
@@ -1215,6 +1428,8 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
 fn sliceWorker(
     ctx: *SlicedFillCtx,
     stage: *mat_stage.Stage,
+    pre_parts: []const PrePart,
+    slice_idx: usize,
     pred: PredicateExpr,
     sink: *mat_stage.ContigSink,
     err_out: *?anyerror,
@@ -1243,6 +1458,12 @@ fn sliceWorker(
     var slice_map: StageMap = .empty;
     var mit = @constCast(&ctx.map).iterator();
     while (mit.next()) |e| slice_map.put(aa, e.key_ptr.*, e.value_ptr.*) catch |err| {
+        err_out.* = err;
+        return;
+    };
+    // Pre-partitioned blocks resolve to this slice's pre-filled buffer —
+    // the collector early-returns on them, so no recompiled scan.
+    for (pre_parts) |pp| slice_map.put(aa, pp.node, pp.stages[slice_idx]) catch |err| {
         err_out.* = err;
         return;
     };

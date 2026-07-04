@@ -94,7 +94,7 @@ pub const MaterializedResult = struct {
     /// Take ownership of a producer's contiguous result columns and expose
     /// them as `chunk_rows`-sized view chunks — same shape the parallel
     /// buffer scan partitions, no copy.
-    fn adoptContiguous(self: *MaterializedResult, adopted: Adopted, rows: u64) !void {
+    pub fn adoptContiguous(self: *MaterializedResult, adopted: Adopted, rows: u64) !void {
         self.adopted = adopted;
         const n: usize = @intCast(rows);
         var lo: usize = 0;
@@ -311,6 +311,14 @@ pub const ContigSink = struct {
             try engine.transform.appendAllColumn(ar.allocator(), batch.values[ci], st);
         }
         self.rows += batch.row_count;
+    }
+
+    /// Append only the picked rows — the scan-once partition router's gather.
+    pub fn appendIndices(self: *ContigSink, batch: exec.Batch, indices: []const u32) !void {
+        for (self.stores, self.arenas, 0..) |*st, *ar, ci| {
+            try engine.transform.appendByIndices(ar.allocator(), batch.values[ci], indices, st);
+        }
+        self.rows += indices.len;
     }
 
     pub fn take(self: *ContigSink) MaterializedResult.Adopted {
@@ -534,7 +542,7 @@ pub const Stage = struct {
         }
     }
 
-    fn deinit(self: *Stage) void {
+    pub fn deinit(self: *Stage) void {
         if (self.sliced_fill) |sf| sf.drop(sf.ctx);
         if (self.free_thread) |th| th.join();
         if (self.result) |res| freeResultThread(res);
