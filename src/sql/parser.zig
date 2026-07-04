@@ -2455,7 +2455,7 @@ pub const Parser = struct {
         }
         // Implicit alias: `expr alias_ident` (no AS keyword) — common
         // in MySQL/StarRocks. Only if next token is a bare identifier.
-        if (self.cur.tag == .identifier) {
+        if (self.cur.tag == .identifier and !self.identStartsSeparable()) {
             // But we have to be careful — keywords like FROM are NOT
             // identifiers, so the lookahead naturally stops at them.
             const name = self.cur.text;
@@ -2463,6 +2463,18 @@ pub const Parser = struct {
             return try self.arena.dupe(u8, name);
         }
         return fallback;
+    }
+
+    /// The trailing separability clause starts with a bare identifier
+    /// (SEPARABLE / GLOBAL / LOCAL are not keywords), so implicit AS-less
+    /// alias positions must not swallow its lead-in. An alias literally
+    /// named one of these still works with an explicit AS.
+    fn identStartsSeparable(self: *const Parser) bool {
+        if (self.cur.tag != .identifier) return false;
+        const t = self.cur.text;
+        return std.ascii.eqlIgnoreCase(t, "separable") or
+            std.ascii.eqlIgnoreCase(t, "global") or
+            std.ascii.eqlIgnoreCase(t, "local");
     }
 
     // -----------------------------------------------------------------------
@@ -2622,7 +2634,7 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             op = try self.applyAliasToFromOp(op, resolved_name, alias_in_place);
             try self.advance();
-        } else if (self.cur.tag == .identifier) {
+        } else if (self.cur.tag == .identifier and !self.identStartsSeparable()) {
             // Implicit alias: bare identifier after the FROM target.
             // SQL clause keywords (JOIN/WHERE/ON/...) aren't .identifier
             // tokens so they don't trigger this.
@@ -2666,7 +2678,7 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
-        } else if (self.cur.tag == .identifier) {
+        } else if (self.cur.tag == .identifier and !self.identStartsSeparable()) {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
@@ -3806,8 +3818,7 @@ pub const Parser = struct {
             // REGENERATED (.never — parseFromTarget already wrapped each
             // reference in its own node, so the body stays bare here).
             const should_wrap = switch (entry.value_ptr.hint) {
-                // A separable CTE always buffers — the sliced fill IS a stage.
-                .never => entry.value_ptr.separable != null,
+                .never => false,
                 .force, .auto => true,
             };
             if (!should_wrap) continue;
@@ -3824,8 +3835,14 @@ pub const Parser = struct {
                     .upstream = inner,
                     // Explicit AS MATERIALIZED: the staged compiler must buffer
                     // even a single-reference body it would otherwise inline.
-                    // Separable implies the same demand.
-                    .forced = entry.value_ptr.hint == .force or entry.value_ptr.separable != null,
+                    .forced = entry.value_ptr.hint == .force,
+                    // SEPARABLE BY does NOT force staging: it activates only
+                    // on blocks that materialize anyway (multi-ref or AS
+                    // MATERIALIZED). A single-ref block inlines into its
+                    // consumer — and rides that block's slicing if any.
+                    // Force-staging every marked CTE measured 14GB+ of
+                    // buffers on a 38-CTE stack; `AS MATERIALIZED ...
+                    // SEPARABLE BY` is the explicit stage-and-slice lever.
                     .separable = entry.value_ptr.separable,
                 },
             };

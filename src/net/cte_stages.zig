@@ -32,6 +32,7 @@ const window_op = @import("../exec/window.zig");
 const local = @import("local.zig");
 const pgcat = @import("pg_catalog.zig");
 const types = @import("../types.zig");
+const storage_column = @import("../storage/column.zig");
 
 const PredicateExpr = exec.predicate.PredicateExpr;
 
@@ -75,7 +76,7 @@ pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op, stage_co
     }
     try countMatRefs(input.allocator, root, &cse);
     wrapWindowsInMaterialize(input.node_arena, @constCast(root), &cse) catch {};
-    try collectStages(input, root, set, &map, &cse);
+    try collectStages(input, root, set, &map, &cse, null);
     if (stage_count_out) |out| out.* = @intCast(set.stages.items.len);
     const inner = try compileBlock(input, root, &map);
     set.releaseCompilePins();
@@ -207,6 +208,7 @@ fn collectStages(
     set: *mat_stage.StageSet,
     map: *StageMap,
     cse: *const MatCse,
+    inherited: ?ir.SeparableSpec,
 ) anyerror!void {
     switch (op.*) {
         .materialize => {
@@ -218,7 +220,14 @@ fn collectStages(
                 if (rep != op) try map.put(input.allocator, op, stage);
                 return; // shared CTE / duplicate: one stage, many readers
             }
-            try collectStages(input, rep.materialize.upstream, set, map, cse);
+            // A SEPARABLE declaration covers the block's own internals:
+            // synthetic window wraps created inside a marked body inherit
+            // the spec (windows partitioned by the key are per-key by the
+            // author's assertion). Only window wraps inherit — a shared
+            // sub-CTE first encountered here may have consumers OUTSIDE the
+            // marked block, where no separability was asserted.
+            const descend = rep.materialize.separable orelse inherited;
+            try collectStages(input, rep.materialize.upstream, set, map, cse, descend);
             // Single reference → no stage; the body compiles inline at the
             // use site (buildGenericBlock's .materialize arm) — including
             // UNION bodies, which stream arm-then-arm through exec.SetUnion
@@ -257,25 +266,36 @@ fn collectStages(
                 }
             }
             if (exec.prof.enabled) stage.setup_ticks = exec.prof.nowTicks() - c0;
+            const eff: ?ir.SeparableSpec = rep.materialize.separable orelse
+                (if (rep.materialize.upstream.* == .window) inherited else null);
+            if (eff) |spec| {
+                stage.sliced_fill = try makeSlicedFill(input, spec, rep.materialize.upstream, map);
+                // Slice concat only preserves order when the leading sort key
+                // IS the slice key; drop the claim otherwise so no downstream
+                // rider trusts an interleaved order.
+                const keep_sort = spec.cols.len == 1 and stage.sort_state.keys.len > 0 and
+                    types.columnNameEql(stage.sort_state.keys[0], spec.cols[0]);
+                if (!keep_sort) stage.sort_state = .{};
+            }
             try map.put(input.allocator, rep, stage);
             if (rep != op) try map.put(input.allocator, op, stage);
         },
-        .select => |p| try collectStages(input, p.upstream, set, map, cse),
-        .exclude => |p| try collectStages(input, p.upstream, set, map, cse),
-        .filter => |f| try collectStages(input, f.upstream, set, map, cse),
-        .order_by => |o| try collectStages(input, o.upstream, set, map, cse),
-        .group_by => |g| try collectStages(input, g.upstream, set, map, cse),
-        .compute => |c| try collectStages(input, c.upstream, set, map, cse),
-        .alias => |a| try collectStages(input, a.upstream, set, map, cse),
-        .limit => |l| try collectStages(input, l.upstream, set, map, cse),
-        .window => |w| try collectStages(input, w.upstream, set, map, cse),
+        .select => |p| try collectStages(input, p.upstream, set, map, cse, inherited),
+        .exclude => |p| try collectStages(input, p.upstream, set, map, cse, inherited),
+        .filter => |f| try collectStages(input, f.upstream, set, map, cse, inherited),
+        .order_by => |o| try collectStages(input, o.upstream, set, map, cse, inherited),
+        .group_by => |g| try collectStages(input, g.upstream, set, map, cse, inherited),
+        .compute => |c| try collectStages(input, c.upstream, set, map, cse, inherited),
+        .alias => |a| try collectStages(input, a.upstream, set, map, cse, inherited),
+        .limit => |l| try collectStages(input, l.upstream, set, map, cse, inherited),
+        .window => |w| try collectStages(input, w.upstream, set, map, cse, inherited),
         .join => |j| {
-            try collectStages(input, j.left, set, map, cse);
-            try collectStages(input, j.right, set, map, cse);
+            try collectStages(input, j.left, set, map, cse, inherited);
+            try collectStages(input, j.right, set, map, cse, inherited);
         },
         .set_union => |u| {
-            try collectStages(input, u.left, set, map, cse);
-            try collectStages(input, u.right, set, map, cse);
+            try collectStages(input, u.left, set, map, cse, inherited);
+            try collectStages(input, u.right, set, map, cse, inherited);
         },
         else => {},
     }
@@ -646,9 +666,401 @@ fn wrapSlicePred(input: engine_v2.CompileInput, q: exec.Query) anyerror!exec.Que
     for (input.slice_cols) |c| {
         if (types.findColumn(schema, c) == null) return q;
     }
+    // Sliced-result chunk skip: when this leaf reads a stage that was itself
+    // slice-adopted, hand the range straight to the scan so it skips
+    // disjoint chunks wholesale — the boundary between two sliced stages
+    // then costs ~1/N of a buffer scan instead of a full one.
+    if (exec.queryAs(mat_stage.MatScan, q)) |ms| {
+        if (input.slice_cols.len == 1) applySliceSkip(ms, input.slice_cols[0], pred);
+    }
     var qq = q;
     errdefer qq.deinit();
     return qq.filter(pred);
+}
+
+/// Recognize exactly the three predicate shapes the sliced fill builds and
+/// forward them as a chunk-skip hint. Anything else stays hint-less (the
+/// Filter above is always the correctness authority).
+fn applySliceSkip(ms: *mat_stage.MatScan, col: []const u8, pred: PredicateExpr) void {
+    switch (pred) {
+        .leaf => |l| {
+            if (l.op == .gt and types.columnNameEql(l.col, col)) ms.setSliceSkip(col, l.val, null, false);
+        },
+        .@"and" => |arms| {
+            if (arms.len != 2 or arms[0] != .leaf or arms[1] != .leaf) return;
+            const a = arms[0].leaf;
+            const b = arms[1].leaf;
+            if (a.op == .gt and b.op == .lte and
+                types.columnNameEql(a.col, col) and types.columnNameEql(b.col, col))
+            {
+                ms.setSliceSkip(col, a.val, b.val, false);
+            }
+        },
+        .@"or" => |arms| {
+            if (arms.len != 2 or arms[0] != .leaf or arms[1] != .is_null) return;
+            const a = arms[0].leaf;
+            if (a.op == .lte and types.columnNameEql(a.col, col) and
+                types.columnNameEql(arms[1].is_null, col))
+            {
+                ms.setSliceSkip(col, null, a.val, true);
+            }
+        },
+        else => {},
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SEPARABLE BY — sliced stage fill.
+//
+// The declared block's stage fills by compiling its body N times, each with a
+// disjoint key-range predicate applied at its leaves (wrapSlicePred above) at
+// internal DOP 1, running the N pipelines on their own threads, and adopting
+// their outputs in slice order. Shared upstream stages are computed ONCE,
+// unsliced, and range-filtered per slice — equivalent under the separability
+// contract (a per-key block commutes with a key filter) and strictly less
+// work. The body IR is shared read-only; the predicate travels as a compile
+// parameter, never an IR mutation.
+// ---------------------------------------------------------------------------
+
+const SlicedFillCtx = struct {
+    /// Captured compile input — the allocator/session/arena pointers inside
+    /// live for the whole query, so a value copy stays valid at fill time.
+    input: engine_v2.CompileInput,
+    spec: ir.SeparableSpec,
+    body: *const ir.Op,
+    /// Snapshot of the stage map at collect time (post-order: everything the
+    /// body references is already in it). Backing memory in `arena`. Slice
+    /// compiles only read it.
+    map: StageMap,
+    arena: std.heap.ArenaAllocator,
+};
+
+fn makeSlicedFill(
+    input: engine_v2.CompileInput,
+    spec: ir.SeparableSpec,
+    body: *const ir.Op,
+    map: *const StageMap,
+) !mat_stage.Stage.SlicedFill {
+    const ctx = try input.allocator.create(SlicedFillCtx);
+    errdefer input.allocator.destroy(ctx);
+    ctx.* = .{
+        .input = input,
+        .spec = spec,
+        .body = body,
+        .map = .empty,
+        .arena = std.heap.ArenaAllocator.init(input.allocator),
+    };
+    errdefer ctx.arena.deinit();
+    var it = @constCast(map).iterator();
+    while (it.next()) |e| try ctx.map.put(ctx.arena.allocator(), e.key_ptr.*, e.value_ptr.*);
+    return .{ .ctx = ctx, .run = slicedFillRun, .drop = slicedFillDrop };
+}
+
+fn slicedFillDrop(ctx_op: *anyopaque) void {
+    const ctx: *SlicedFillCtx = @ptrCast(@alignCast(ctx_op));
+    const alloc = ctx.input.allocator;
+    ctx.arena.deinit();
+    alloc.destroy(ctx);
+}
+
+/// Every shared stage the body reads — the slice pipelines' stage leaves.
+/// Recursion mirrors collectStages; a materialize NOT in the map is a
+/// single-ref body that will inline into the slice pipelines, so its own
+/// subtree's inputs count too.
+fn collectBodyInputStages(
+    op: *const ir.Op,
+    map: *const StageMap,
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(*mat_stage.Stage),
+) !void {
+    switch (op.*) {
+        .materialize => |m| {
+            if (map.get(op)) |st| {
+                for (out.items) |s| if (s == st) return;
+                try out.append(alloc, st);
+                return;
+            }
+            try collectBodyInputStages(m.upstream, map, alloc, out);
+        },
+        .select => |p| try collectBodyInputStages(p.upstream, map, alloc, out),
+        .exclude => |p| try collectBodyInputStages(p.upstream, map, alloc, out),
+        .filter => |f| try collectBodyInputStages(f.upstream, map, alloc, out),
+        .order_by => |o| try collectBodyInputStages(o.upstream, map, alloc, out),
+        .group_by => |g| try collectBodyInputStages(g.upstream, map, alloc, out),
+        .compute => |c| try collectBodyInputStages(c.upstream, map, alloc, out),
+        .alias => |a| try collectBodyInputStages(a.upstream, map, alloc, out),
+        .limit => |l| try collectBodyInputStages(l.upstream, map, alloc, out),
+        .window => |w| try collectBodyInputStages(w.upstream, map, alloc, out),
+        .join => |j| {
+            try collectBodyInputStages(j.left, map, alloc, out);
+            try collectBodyInputStages(j.right, map, alloc, out);
+        },
+        .set_union => |u| {
+            try collectBodyInputStages(u.left, map, alloc, out);
+            try collectBodyInputStages(u.right, map, alloc, out);
+        },
+        else => {},
+    }
+}
+
+fn sliceChunkView(chunk: *const mat_stage.MaterializedResult.Chunk, ci: usize) storage_column.ColumnView {
+    if (chunk.views.len > 0) return chunk.views[ci];
+    return chunk.cols[ci].view();
+}
+
+fn sliceValueAt(v: storage_column.ColumnView, row: usize) ?types.Value {
+    return switch (v.data) {
+        .int => |s| .{ .int = s[row] },
+        .bigint => |s| .{ .bigint = s[row] },
+        .tinyint => |s| .{ .tinyint = s[row] },
+        .smallint => |s| .{ .smallint = s[row] },
+        .date => |s| .{ .date = s[row] },
+        .datetime => |s| .{ .datetime = s[row] },
+        .float => |s| .{ .float = s[row] },
+        .double => |s| .{ .double = s[row] },
+        .decimal64 => |s| .{ .decimal64 = s[row] },
+        .largeint => |s| .{ .largeint = s[row] },
+        .varchar, .string, .char => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
+        else => null,
+    };
+}
+
+fn sliceValueLess(_: void, a: types.Value, b: types.Value) bool {
+    return a.compare(b) == .lt;
+}
+
+fn dupeSliceValue(arena: Allocator, v: types.Value) !types.Value {
+    return switch (v) {
+        .text => |t| .{ .text = try arena.dupe(u8, t) },
+        else => v,
+    };
+}
+
+/// Stride-sample the slice column from the first input stage that carries
+/// it. Returns a SORTED sample (values arena-owned) or null when no input
+/// carries the column / the column's type isn't range-partitionable.
+fn sampleSliceColumn(ctx: *SlicedFillCtx, col: []const u8, inputs: []const *mat_stage.Stage) !?[]types.Value {
+    const aa = ctx.arena.allocator();
+    next_input: for (inputs) |s| {
+        var ci: usize = 0;
+        const found: bool = blk: {
+            for (s.schema, 0..) |sc, i| {
+                if (types.columnNameEql(sc.name, col)) {
+                    ci = i;
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        if (!found) continue;
+        const r = s.result orelse continue;
+        if (r.total_rows == 0) continue;
+        const stride: usize = @intCast(@max(1, r.total_rows / 4096));
+        var vals: std.ArrayListUnmanaged(types.Value) = .empty;
+        var tick: usize = 0;
+        for (r.chunks.items) |*ch| {
+            const v = sliceChunkView(ch, ci);
+            var row: usize = 0;
+            while (row < ch.rows) : (row += 1) {
+                tick += 1;
+                if (tick % stride != 0) continue;
+                if (!v.isValid(row)) continue; // NULL keys route to slice 0
+                const val = sliceValueAt(v, row) orelse continue :next_input; // unpartitionable type
+                try vals.append(aa, try dupeSliceValue(aa, val));
+            }
+        }
+        if (vals.items.len < 2) continue;
+        std.mem.sort(types.Value, vals.items, {}, sliceValueLess);
+        return vals.items;
+    }
+    return null;
+}
+
+fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.MaterializedResult) anyerror!bool {
+    const ctx: *SlicedFillCtx = @ptrCast(@alignCast(ctx_op));
+    const trace = getenv("THINDB_TRACE_SEP") != null;
+    const alloc = ctx.input.allocator;
+    if (ctx.spec.cols.len != 1) {
+        if (trace) std.debug.print("[sep] stage#{d} decline: multi-column spec\n", .{stage.id});
+        return false;
+    }
+    // A downstream borrower expects ONE contiguous store per column; a
+    // sliced fill adopts N parts. Keep the borrow optimization instead.
+    if (stage.want_contiguous) {
+        if (trace) std.debug.print("[sep] stage#{d} decline: contiguous borrower registered\n", .{stage.id});
+        return false;
+    }
+    const col = ctx.spec.cols[0];
+
+    // Materialize the body's shared inputs now (driving thread — ensureRun
+    // is not re-entrant) and hold a guard use on each: a slice releasing its
+    // reads must never be the "last consumer" while another slice is still
+    // compiling against the same stage.
+    var inputs: std.ArrayListUnmanaged(*mat_stage.Stage) = .empty;
+    defer inputs.deinit(alloc);
+    try collectBodyInputStages(ctx.body, &ctx.map, alloc, &inputs);
+    for (inputs.items) |s| try s.ensureRun();
+    for (inputs.items) |s| s.registerUse();
+    defer for (inputs.items) |s| s.releaseUse();
+
+    const samples = (try sampleSliceColumn(ctx, col, inputs.items)) orelse {
+        if (trace) std.debug.print("[sep] stage#{d} decline: no input stage carries '{s}'\n", .{ stage.id, col });
+        return false;
+    };
+
+    var n_slices: usize = ctx.input.effectiveDop();
+    if (getenv("THINDB_SEP_SLICES")) |sv| {
+        n_slices = std.fmt.parseInt(usize, std.mem.span(sv), 10) catch n_slices;
+    }
+    if (n_slices < 2) {
+        if (trace) std.debug.print("[sep] stage#{d} decline: n_slices={d}\n", .{ stage.id, n_slices });
+        return false;
+    }
+
+    // Boundaries = N-tiles of the sorted sample, deduped: heavy skew
+    // collapses neighboring tiles, and fewer, fuller slices beat empty ones.
+    const aa = ctx.arena.allocator();
+    var bounds: std.ArrayListUnmanaged(types.Value) = .empty;
+    var j: usize = 1;
+    while (j < n_slices) : (j += 1) {
+        const b = samples[samples.len * j / n_slices];
+        if (bounds.items.len == 0 or bounds.items[bounds.items.len - 1].compare(b) == .lt) {
+            try bounds.append(aa, b);
+        }
+    }
+    if (bounds.items.len == 0) {
+        if (trace) std.debug.print("[sep] stage#{d} decline: degenerate bounds (constant key)\n", .{stage.id});
+        return false;
+    }
+    const nb = bounds.items.len;
+    const total = nb + 1;
+
+    // Per-slice range predicates. A NULL slice key matches no range — slice
+    // 0 also takes IS NULL so those rows aren't silently dropped.
+    const preds = try aa.alloc(PredicateExpr, total);
+    for (preds, 0..) |*p, i| {
+        if (i == 0) {
+            const arms = try aa.alloc(PredicateExpr, 2);
+            arms[0] = .{ .leaf = .{ .col = col, .op = .lte, .val = bounds.items[0] } };
+            arms[1] = .{ .is_null = col };
+            p.* = .{ .@"or" = arms };
+        } else if (i == nb) {
+            p.* = .{ .leaf = .{ .col = col, .op = .gt, .val = bounds.items[nb - 1] } };
+        } else {
+            const arms = try aa.alloc(PredicateExpr, 2);
+            arms[0] = .{ .leaf = .{ .col = col, .op = .gt, .val = bounds.items[i - 1] } };
+            arms[1] = .{ .leaf = .{ .col = col, .op = .lte, .val = bounds.items[i] } };
+            p.* = .{ .@"and" = arms };
+        }
+    }
+    if (trace) std.debug.print("[sep] stage#{d} slicing on '{s}': {d} slices ({d} sampled)\n", .{ stage.id, col, total, samples.len });
+
+    const workers = try alloc.alloc(std.Thread, total);
+    defer alloc.free(workers);
+    const errs = try alloc.alloc(?anyerror, total);
+    defer alloc.free(errs);
+    @memset(errs, null);
+
+    // Sinks are created HERE: init allocates from the stage allocator, which
+    // is only proven for driving-thread use. Slice threads touch only their
+    // own sink's c_allocator-backed arenas.
+    const row_hint: usize = @intCast(@min(stage.stats_upper_rows, 1 << 22) / total + 1);
+    const sinks = try alloc.alloc(mat_stage.ContigSink, total);
+    {
+        var made: usize = 0;
+        while (made < total) : (made += 1) {
+            sinks[made] = mat_stage.ContigSink.init(stage.allocator, stage.schema, row_hint) catch |e| {
+                for (sinks[0..made]) |*sk| sk.deinit();
+                alloc.free(sinks);
+                return e;
+            };
+        }
+    }
+
+    var spawned: usize = 0;
+    for (workers, 0..) |*th, i| {
+        th.* = std.Thread.spawn(.{}, sliceWorker, .{ ctx, stage, preds[i], &sinks[i], &errs[i] }) catch |e| {
+            errs[i] = e;
+            break;
+        };
+        spawned += 1;
+    }
+    for (workers[0..spawned]) |th| th.join();
+
+    var first_err: ?anyerror = null;
+    for (errs) |e| {
+        if (e) |err| {
+            if (first_err == null) first_err = err;
+        }
+    }
+    if (first_err) |e| {
+        for (sinks) |*sk| sk.deinit();
+        alloc.free(sinks);
+        return e;
+    }
+    try res.adoptSlices(sinks, .{ .col = col, .bounds = bounds.items });
+    alloc.free(sinks);
+    if (trace) std.debug.print("[sep] stage#{d} done: rows={d}\n", .{ stage.id, res.total_rows });
+    return true;
+}
+
+fn sliceWorker(
+    ctx: *SlicedFillCtx,
+    stage: *mat_stage.Stage,
+    pred: PredicateExpr,
+    sink: *mat_stage.ContigSink,
+    err_out: *?anyerror,
+) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    var sin = ctx.input;
+    sin.allocator = arena.allocator();
+    sin.node_arena = arena.allocator();
+    sin.accountant = null; // result bytes charged by ensureRun post-join
+    sin.dop_cap = 1;
+    sin.slice_pred = pred;
+    sin.slice_cols = ctx.spec.cols;
+    var q = compileBlock(sin, ctx.body, @constCast(&ctx.map)) catch |e| {
+        err_out.* = e;
+        return;
+    };
+    // The slice's output must line up with the stage schema the sink was
+    // built on — re-apply the canonical body's column pruning when the raw
+    // output is wider (same projection the staged compiler applied).
+    if (!sliceSchemaMatches(q.outputSchema(), stage.schema)) {
+        const names = arena.allocator().alloc([]const u8, stage.schema.len) catch |e| {
+            q.deinit();
+            err_out.* = e;
+            return;
+        };
+        for (stage.schema, names) |sc, *nm| nm.* = sc.name;
+        q = q.project(names) catch |e| {
+            err_out.* = e;
+            return;
+        };
+    }
+    while (true) {
+        const batch = q.next() catch |e| {
+            err_out.* = e;
+            q.deinit();
+            return;
+        };
+        if (batch == null) break;
+        sink.append(batch.?) catch |e| {
+            err_out.* = e;
+            q.deinit();
+            return;
+        };
+    }
+    q.deinit();
+}
+
+fn sliceSchemaMatches(a: []const types.Column, b: []const types.Column) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (!types.columnNameEql(ca.name, cb.name)) return false;
+    }
+    return true;
 }
 
 /// A pure row-streaming chain — compute / filter / select / exclude / alias —

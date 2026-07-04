@@ -792,6 +792,10 @@ pub const Window = struct {
             src.ensureRun() catch break :bind;
             const res = src.result orelse break :bind;
             const ad = res.adopted orelse break :bind;
+            // One contiguous store per column only — a SEPARABLE sliced fill
+            // adopts N stores per column (slice parts), which can't be
+            // shallow-referenced as single columns. Degrade to accumulation.
+            if (ad.stores.len != res.schema.len) break :bind;
             for (self.borrow_map, 0..) |m, ci| {
                 if (m) |src_idx| self.accumulated[ci] = ad.stores[src_idx];
             }

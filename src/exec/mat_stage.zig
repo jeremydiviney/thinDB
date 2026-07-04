@@ -59,6 +59,9 @@ pub const MaterializedResult = struct {
     /// contiguous buffers (window-output-as-stage) instead of pull-copied.
     /// The chunks are then borrowed view windows over these stores.
     adopted: ?Adopted = null,
+    /// The slice-key column name when this result was slice-adopted (chunks
+    /// carry key ranges); readers validate their skip column against it.
+    sliced_key: ?[]const u8 = null,
 
     /// Ownership record for adopted contiguous columns: entries flagged in
     /// `arena_backed` are reclaimed wholesale by sweeping `arenas`; the
@@ -78,6 +81,14 @@ pub const MaterializedResult = struct {
         /// bitmaps slice cleanly.
         views: []ColumnView = &.{},
         rows: usize = 0,
+        /// SEPARABLE sliced results: this chunk's slice-key range —
+        /// values are in (key_lo, key_hi], null bound = unbounded. A
+        /// slice-range reader skips chunks with disjoint ranges (see
+        /// MatScan.setSliceSkip). Defaults are the "no information"
+        /// state: never skipped.
+        key_lo: ?types.Value = null,
+        key_hi: ?types.Value = null,
+        key_nulls: bool = true,
     };
 
     /// Take ownership of a producer's contiguous result columns and expose
@@ -98,6 +109,63 @@ pub const MaterializedResult = struct {
             lo += take;
         }
         self.total_rows = rows;
+    }
+
+    /// SEPARABLE sliced fill: adopt N slice sinks' contiguous stores as this
+    /// result's chunks, in slice order — a deterministic concat (disjoint key
+    /// ranges in ascending slice order also preserve a leading-slice-key
+    /// sort). Takes full ownership: the sinks' store/arena arrays are copied
+    /// into one flat Adopted record and their top-level arrays freed; the
+    /// arena-backed column data frees with the result's normal adopted sweep.
+    pub const SliceKey = struct {
+        col: []const u8,
+        /// Ascending slice boundaries: slice i holds (bounds[i-1], bounds[i]],
+        /// open at the ends; NULL keys live in slice 0. Borrowed — must
+        /// outlive the result (the sliced-fill ctx owns them).
+        bounds: []const types.Value,
+    };
+
+    pub fn adoptSlices(self: *MaterializedResult, sinks: []ContigSink, key: ?SliceKey) !void {
+        const ncols = self.schema.len;
+        const stores = try self.allocator.alloc(engine.ColumnStore, sinks.len * ncols);
+        errdefer self.allocator.free(stores);
+        const arenas = try self.allocator.alloc(std.heap.ArenaAllocator, sinks.len * ncols);
+        errdefer self.allocator.free(arenas);
+        const backed = try self.allocator.alloc(bool, sinks.len * ncols);
+        errdefer self.allocator.free(backed);
+        for (sinks, 0..) |*sk, i| {
+            const ad = sk.take();
+            @memcpy(stores[i * ncols ..][0..ncols], ad.stores);
+            @memcpy(arenas[i * ncols ..][0..ncols], ad.arenas);
+            @memcpy(backed[i * ncols ..][0..ncols], ad.arena_backed);
+            sk.allocator.free(ad.stores);
+            sk.allocator.free(ad.arenas);
+            sk.allocator.free(ad.arena_backed);
+        }
+        self.adopted = .{ .stores = stores, .arenas = arenas, .arena_backed = backed };
+        if (key) |k| self.sliced_key = k.col;
+        for (sinks, 0..) |*sk, i| {
+            const pstores = stores[i * ncols ..][0..ncols];
+            const n: usize = @intCast(sk.rows);
+            var lo: usize = 0;
+            while (lo < n) {
+                const take_n = @min(chunk_rows, n - lo);
+                const views = try self.allocator.alloc(ColumnView, ncols);
+                errdefer self.allocator.free(views);
+                for (pstores, self.schema, views) |*st, sc, *v| {
+                    v.* = presentAsSchemaType(engine.transform.subViewAligned(st.view(), lo, take_n), sc.type);
+                }
+                var chunk: Chunk = .{ .views = views, .rows = take_n };
+                if (key) |k| {
+                    chunk.key_lo = if (i > 0) k.bounds[i - 1] else null;
+                    chunk.key_hi = if (i < k.bounds.len) k.bounds[i] else null;
+                    chunk.key_nulls = i == 0;
+                }
+                try self.chunks.append(self.allocator, chunk);
+                lo += take_n;
+            }
+            self.total_rows += sk.rows;
+        }
     }
 
     /// The pull-copy path launders physical string-family tags into the
@@ -214,7 +282,7 @@ pub const MaterializedResult = struct {
 /// column (adopted-style; per-column arenas so the sweep-free ownership
 /// story matches window adoption), for stages a downstream window wants to
 /// borrow from. Fixed-width buffers pre-reserve the stage's row bound.
-const ContigSink = struct {
+pub const ContigSink = struct {
     allocator: Allocator,
     stores: []engine.ColumnStore,
     arenas: []std.heap.ArenaAllocator,
@@ -222,7 +290,7 @@ const ContigSink = struct {
     rows: u64 = 0,
     taken: bool = false,
 
-    fn init(allocator: Allocator, schema: []const Column, expect_rows: usize) !ContigSink {
+    pub fn init(allocator: Allocator, schema: []const Column, expect_rows: usize) !ContigSink {
         const stores = try allocator.alloc(engine.ColumnStore, schema.len);
         errdefer allocator.free(stores);
         const arenas = try allocator.alloc(std.heap.ArenaAllocator, schema.len);
@@ -238,19 +306,19 @@ const ContigSink = struct {
         return .{ .allocator = allocator, .stores = stores, .arenas = arenas, .arena_backed = arena_backed };
     }
 
-    fn append(self: *ContigSink, batch: exec.Batch) !void {
+    pub fn append(self: *ContigSink, batch: exec.Batch) !void {
         for (self.stores, self.arenas, 0..) |*st, *ar, ci| {
             try engine.transform.appendAllColumn(ar.allocator(), batch.values[ci], st);
         }
         self.rows += batch.row_count;
     }
 
-    fn take(self: *ContigSink) MaterializedResult.Adopted {
+    pub fn take(self: *ContigSink) MaterializedResult.Adopted {
         self.taken = true;
         return .{ .stores = self.stores, .arenas = self.arenas, .arena_backed = self.arena_backed };
     }
 
-    fn deinit(self: *ContigSink) void {
+    pub fn deinit(self: *ContigSink) void {
         if (self.taken) return;
         for (self.arenas) |*a| a.deinit();
         self.allocator.free(self.stores);
@@ -284,9 +352,12 @@ pub const Stage = struct {
     col_stats: []exec.ColStat,
     result: ?*MaterializedResult = null,
     /// Consumers bound at compile time / consumers finished. When the last
-    /// finishes, the result frees in the background.
-    uses_total: usize = 0,
-    uses_done: usize = 0,
+    /// finishes, the result frees in the background. Atomic: SEPARABLE
+    /// slice pipelines register (compile) and release (deinit) from their
+    /// own threads; the FINAL release is still single-threaded — the fill
+    /// holds a guard use per input stage until every slice has joined.
+    uses_total: std.atomic.Value(usize) = .init(0),
+    uses_done: std.atomic.Value(usize) = .init(0),
     free_thread: ?std.Thread = null,
     /// Query-scoped accountant the buffered result is charged against
     /// (null = no tracking). All reserve/release calls happen on the
@@ -329,7 +400,9 @@ pub const Stage = struct {
 
     pub const SlicedFill = struct {
         ctx: *anyopaque,
-        run: *const fn (ctx: *anyopaque, stage: *Stage, res: *MaterializedResult) anyerror!void,
+        /// Returns false to DECLINE (no sliceable input, degenerate bounds):
+        /// ensureRun then falls through to the normal drain of `query`.
+        run: *const fn (ctx: *anyopaque, stage: *Stage, res: *MaterializedResult) anyerror!bool,
         drop: *const fn (ctx: *anyopaque) void,
     };
 
@@ -347,7 +420,18 @@ pub const Stage = struct {
         errdefer res.deinitChunks();
         errdefer self.releaseReserved();
         const row_bytes = exec.memory.estimateRowBytes(self.schema);
-        if (self.adopt_window) |win| {
+        var sliced = false;
+        if (self.sliced_fill) |sf| {
+            sliced = try sf.run(sf.ctx, self, res);
+            if (sliced) {
+                if (self.accountant) |acct| {
+                    const bytes = row_bytes * @as(usize, @intCast(res.total_rows));
+                    try acct.reserve(.materialize, bytes);
+                    self.reserved_bytes += bytes;
+                }
+            }
+        }
+        if (sliced) {} else if (self.adopt_window) |win| {
             try win.ensureDrained();
             if (self.accountant) |acct| {
                 const bytes = row_bytes * @as(usize, @intCast(win.accumulated_rows));
@@ -421,7 +505,7 @@ pub const Stage = struct {
     /// over the one immutable result) counts as ONE use; it registers here and
     /// releases once at its own deinit.
     pub fn registerUse(self: *Stage) void {
-        self.uses_total += 1;
+        _ = self.uses_total.fetchAdd(1, .monotonic);
     }
 
     /// A consumer finished (fully drained or torn down). On the last one,
@@ -430,8 +514,8 @@ pub const Stage = struct {
     /// back HERE (driving thread, before the async free) so accounting
     /// stays deterministic for the caller.
     pub fn releaseUse(self: *Stage) void {
-        self.uses_done += 1;
-        if (self.uses_done < self.uses_total) return;
+        const done = self.uses_done.fetchAdd(1, .acq_rel) + 1;
+        if (done < self.uses_total.load(.acquire)) return;
         const res = self.result orelse return;
         self.result = null;
         self.releaseReserved();
@@ -447,6 +531,7 @@ pub const Stage = struct {
     }
 
     fn deinit(self: *Stage) void {
+        if (self.sliced_fill) |sf| sf.drop(sf.ctx);
         if (self.free_thread) |th| th.join();
         if (self.result) |res| freeResultThread(res);
         self.releaseReserved();
@@ -523,7 +608,7 @@ pub const StageSet = struct {
             // haven't registered) yet — without the pin, the result would
             // free out from under them. Released by releaseCompilePins once
             // the whole plan is built.
-            .uses_total = 1,
+            .uses_total = .init(1),
         };
         try self.stages.append(self.allocator, stage);
         return stage;
@@ -561,14 +646,49 @@ pub const MatScan = struct {
     views: []ColumnView,
     cursor: usize = 0,
     released: bool = false,
+    /// Slice-range chunk skip hint (see setSliceSkip).
+    skip_col: ?[]const u8 = null,
+    skip_lo: ?types.Value = null,
+    skip_hi: ?types.Value = null,
+    skip_want_null: bool = false,
 
     pub fn create(allocator: Allocator, stage: *Stage) !exec.Query {
         const views = try allocator.alloc(ColumnView, stage.schema.len);
         errdefer allocator.free(views);
         const self = try allocator.create(MatScan);
         self.* = .{ .allocator = allocator, .stage = stage, .views = views };
-        stage.uses_total += 1;
+        stage.registerUse();
         return exec.makeQuery(allocator, self);
+    }
+
+    /// SEPARABLE slice reader hint: this scan feeds a range filter
+    /// `col > lo AND col <= hi` (null bound = open; `want_null` when the
+    /// filter also passes NULL keys). Chunks of a slice-adopted result carry
+    /// key ranges — disjoint chunks are skipped wholesale. Pure optimization:
+    /// the filter above still evaluates, so a wrong hint can only cost rows
+    /// it would have discarded anyway... never invent rows.
+    pub fn setSliceSkip(self: *MatScan, col: []const u8, lo: ?types.Value, hi: ?types.Value, want_null: bool) void {
+        self.skip_col = col;
+        self.skip_lo = lo;
+        self.skip_hi = hi;
+        self.skip_want_null = want_null;
+    }
+
+    fn chunkDisjoint(self: *const MatScan, chunk: *const MaterializedResult.Chunk) bool {
+        if (self.skip_want_null and chunk.key_nulls) return false;
+        if (self.skip_lo) |lo| {
+            // Chunk holds values <= key_hi; filter needs values > lo.
+            if (chunk.key_hi) |chi| {
+                if (chi.compare(lo) != .gt) return true;
+            }
+        }
+        if (self.skip_hi) |hi| {
+            // Chunk holds values > key_lo; filter needs values <= hi.
+            if (chunk.key_lo) |clo| {
+                if (clo.compare(hi) != .lt) return true;
+            }
+        }
+        return false;
     }
 
     pub fn next(self: *MatScan) !?exec.Batch {
@@ -577,10 +697,13 @@ pub const MatScan = struct {
             self.releaseOnce();
             return null;
         };
+        const skip_active = self.skip_col != null and res.sliced_key != null and
+            types.columnNameEql(self.skip_col.?, res.sliced_key.?);
         while (self.cursor < res.chunks.items.len) {
             const chunk = res.chunks.items[self.cursor];
             self.cursor += 1;
             if (chunk.rows == 0) continue;
+            if (skip_active and self.chunkDisjoint(&chunk)) continue;
             if (chunk.views.len > 0) {
                 return exec.Batch{
                     .schema = self.stage.schema,
