@@ -943,7 +943,15 @@ pub const Scan = struct {
         for (self.filter_rewritten.items) |slice| self.allocator.free(slice);
         self.filter_rewritten.deinit(self.allocator);
         if (self.owns_accountant) {
-            if (self.owned_accountant) |a| self.allocator.destroy(a);
+            if (self.owned_accountant) |a| {
+                // Backstop: reservations still outstanding at teardown (an
+                // undrained pipeline, an error unwind, a LIMIT cutting a
+                // blocking operator short) would otherwise stay in the
+                // cross-query pool FOREVER — the pool erodes run by run
+                // until unrelated queries spuriously fail MemoryBudget.
+                a.drainToPool();
+                self.allocator.destroy(a);
+            }
         }
         if (self.seg_skip) |s| self.allocator.free(s);
         if (self.filtered) |arr| {

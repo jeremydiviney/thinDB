@@ -968,7 +968,7 @@ fn dupeSliceValue(arena: Allocator, v: types.Value) !types.Value {
 /// Stride-sample the slice column from the first input stage that carries
 /// it. Returns a SORTED sample (values arena-owned) or null when no input
 /// carries the column / the column's type isn't range-partitionable.
-fn sampleSliceColumn(ctx: *SlicedFillCtx, col: []const u8, inputs: []const *mat_stage.Stage) !?[]types.Value {
+fn sampleSliceColumn(ctx: *SlicedFillCtx, col: []const u8, inputs: []const *mat_stage.Stage, target: usize) !?[]types.Value {
     const aa = ctx.arena.allocator();
     next_input: for (inputs) |s| {
         var ci: usize = 0;
@@ -984,7 +984,7 @@ fn sampleSliceColumn(ctx: *SlicedFillCtx, col: []const u8, inputs: []const *mat_
         if (!found) continue;
         const r = s.result orelse continue;
         if (r.total_rows == 0) continue;
-        const stride: usize = @intCast(@max(1, r.total_rows / 4096));
+        const stride: usize = @intCast(@max(1, r.total_rows / target));
         var vals: std.ArrayListUnmanaged(types.Value) = .empty;
         var tick: usize = 0;
         for (r.chunks.items) |*ch| {
@@ -1052,7 +1052,7 @@ fn collectScanLeaves(
 /// the next candidate is tried. Only physical columns sample this way — a
 /// derived slice key (an expression alias) has no table to sample, and the
 /// fill declines with the physical-column hint in the trace.
-fn sampleTableColumn(ctx: *SlicedFillCtx, col: []const u8) !?[]types.Value {
+fn sampleTableColumn(ctx: *SlicedFillCtx, col: []const u8, target: usize) !?[]types.Value {
     const aa = ctx.arena.allocator();
     var tables: std.ArrayListUnmanaged(ir.TableRef) = .empty;
     defer tables.deinit(aa);
@@ -1072,7 +1072,7 @@ fn sampleTableColumn(ctx: *SlicedFillCtx, col: []const u8) !?[]types.Value {
             q.deinit();
             continue;
         }
-        const stride: usize = @intCast(@max(1, upper / 4096));
+        const stride: usize = @intCast(@max(1, upper / target));
         var vals: std.ArrayListUnmanaged(types.Value) = .empty;
         var tick: usize = 0;
         while (true) {
@@ -1292,6 +1292,22 @@ const GroupSortCtx = struct {
             if (ord == .gt) return false;
         }
         return a.idx < b.idx;
+    }
+};
+
+const GroupClaim = struct {
+    sinks: []mat_stage.ContigSink,
+    fresh: []mat_stage.ContigSink,
+    kidx: []const usize,
+    errs: []?anyerror,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn worker(self: *GroupClaim) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.sinks.len) return;
+            groupSliceSink(&self.sinks[i], &self.fresh[i], self.kidx, &self.errs[i]);
+        }
     }
 };
 
@@ -1661,16 +1677,24 @@ fn prePartition(
             const gerrs = try alloc.alloc(?anyerror, total);
             defer alloc.free(gerrs);
             @memset(gerrs, null);
-            const gthreads = try alloc.alloc(?std.Thread, total);
+            var gclaim = GroupClaim{ .sinks = sinks, .fresh = fresh, .kidx = kidx, .errs = gerrs };
+            const g_workers: usize = @min(ctx.input.effectiveDop(), total);
+            const gthreads = try alloc.alloc(?std.Thread, g_workers);
             defer alloc.free(gthreads);
-            for (gthreads, 0..) |*gt, i| {
-                gt.* = std.Thread.spawn(.{}, groupSliceSink, .{ &sinks[i], &fresh[i], kidx, &gerrs[i] }) catch null;
+            for (gthreads) |*gt| {
+                gt.* = std.Thread.spawn(.{}, GroupClaim.worker, .{&gclaim}) catch null;
             }
+            var any_spawned = false;
+            for (gthreads) |gt| {
+                if (gt != null) any_spawned = true;
+            }
+            if (!any_spawned) GroupClaim.worker(&gclaim);
+            for (gthreads) |gt| if (gt) |th| th.join();
             var all_ok = true;
-            for (gthreads, 0..) |gt, i| {
-                if (gt) |th| th.join() else all_ok = false;
-                if (gerrs[i] != null) all_ok = false;
+            for (gerrs) |e| {
+                if (e != null) all_ok = false;
             }
+            if (gclaim.next.load(.acquire) < total) all_ok = false; // a strip died mid-queue
             if (!all_ok) {
                 for (fresh) |*sk| sk.deinit();
                 alloc.free(fresh);
@@ -1763,13 +1787,12 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
         std.debug.print("[sep] phase inputs: {d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - ph)});
         ph = exec.prof.nowTicks();
     }
-    const samples = (try sampleSliceColumn(ctx, col, inputs.items)) orelse
-        (try sampleTableColumn(ctx, col)) orelse
-    {
-        if (trace) std.debug.print("[sep] stage#{d} decline: no input stage or base table carries '{s}' (derived keys need a physical column, e.g. a stored hash)\n", .{ stage.id, col });
-        return false;
-    };
-
+    // THINDB_SEP_SLICES > dop = COHORT mode: many small slices, each
+    // pipeline's whole working set cache-sized, run by the dop-wide
+    // claiming pool. Measured on the rollforward: cache locality is real
+    // but PER-SLICE COMPILATION dominates past ~2x dop (the 39-CTE plan
+    // costs ~0.5s to compile x N slices) — the default stays at dop until
+    // slice plans can be compiled once and re-parameterized per range.
     var n_slices: usize = ctx.input.effectiveDop();
     if (getenv("THINDB_SEP_SLICES")) |sv| {
         n_slices = std.fmt.parseInt(usize, std.mem.span(sv), 10) catch n_slices;
@@ -1778,6 +1801,14 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
         if (trace) std.debug.print("[sep] stage#{d} decline: n_slices={d}\n", .{ stage.id, n_slices });
         return false;
     }
+    const sample_target = @max(@as(usize, 4096), n_slices * 16);
+
+    const samples = (try sampleSliceColumn(ctx, col, inputs.items, sample_target)) orelse
+        (try sampleTableColumn(ctx, col, sample_target)) orelse
+    {
+        if (trace) std.debug.print("[sep] stage#{d} decline: no input stage or base table carries '{s}' (derived keys need a physical column, e.g. a stored hash)\n", .{ stage.id, col });
+        return false;
+    };
 
     // Boundaries = N-tiles of the sorted sample, deduped: heavy skew
     // collapses neighboring tiles, and fewer, fuller slices beat empty ones.
@@ -1861,19 +1892,29 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
         }
     }
 
-    // Diagnostic: THINDB_SEP_SEQUENTIAL runs slices one at a time —
-    // separates per-slice pipeline cost from concurrency effects.
+    // Claiming pool: dop workers eat the slice queue. With cohort-sized
+    // slices this IS the cache-friendly execution: each worker's live
+    // pipeline holds one small slice end-to-end, so dop concurrent
+    // working sets share L3 instead of fighting over DRAM.
+    // THINDB_SEP_SEQUENTIAL runs one worker — separates per-slice
+    // pipeline cost from concurrency effects.
     const sequential = getenv("THINDB_SEP_SEQUENTIAL") != null;
+    const pool_workers: usize = if (sequential) 1 else @min(ctx.input.effectiveDop(), total);
+    var claim = SliceClaim{
+        .ctx = ctx,
+        .stage = stage,
+        .pre_parts = pre_parts,
+        .preds = preds,
+        .sinks = sinks,
+        .errs = errs,
+    };
     var spawned: usize = 0;
-    for (workers, 0..) |*th, i| {
-        th.* = std.Thread.spawn(.{}, sliceWorker, .{ ctx, stage, pre_parts, i, preds[i], &sinks[i], &errs[i] }) catch |e| {
-            errs[i] = e;
-            break;
-        };
+    for (workers[0..pool_workers]) |*th| {
+        th.* = std.Thread.spawn(.{}, SliceClaim.worker, .{&claim}) catch break;
         spawned += 1;
-        if (sequential) th.join();
     }
-    if (!sequential) for (workers[0..spawned]) |th| th.join();
+    if (spawned == 0) SliceClaim.worker(&claim); // spawn failed: run inline
+    for (workers[0..spawned]) |th| th.join();
     if (trace) {
         std.debug.print("[sep] phase slices: {d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - ph)});
         ph = exec.prof.nowTicks();
@@ -1895,6 +1936,26 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     if (trace) std.debug.print("[sep] stage#{d} done: rows={d}\n", .{ stage.id, res.total_rows });
     return true;
 }
+
+/// Shared claim state for the slice pool: workers fetch slice indices from
+/// the atomic cursor and run each to completion.
+const SliceClaim = struct {
+    ctx: *SlicedFillCtx,
+    stage: *mat_stage.Stage,
+    pre_parts: []const PrePart,
+    preds: []const PredicateExpr,
+    sinks: []mat_stage.ContigSink,
+    errs: []?anyerror,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn worker(self: *SliceClaim) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.preds.len) return;
+            sliceWorker(self.ctx, self.stage, self.pre_parts, i, self.preds[i], &self.sinks[i], &self.errs[i]);
+        }
+    }
+};
 
 fn sliceWorker(
     ctx: *SlicedFillCtx,
