@@ -48,9 +48,8 @@ const transform = @import("../engine/transform.zig");
 const join_mod = @import("join.zig");
 const Spec = join_mod.Spec;
 
-const cell_io = @import("cell_io.zig");
 
-const output_batch_rows: usize = 1024;
+const output_batch_rows: usize = 8192;
 
 pub const RangeSweepJoin = struct {
     allocator: Allocator,
@@ -95,9 +94,14 @@ pub const RangeSweepJoin = struct {
     cur_emit_pos: u32 = 0,
 
 
-    // Output staging.
+    // Output staging. Matched (A,B) row pairs accumulate in `a_rows`/
+    // `b_rows` and flush through a bulk per-column gather — never a
+    // per-cell emit.
     output_columns: []ColumnStore,
     views: []ColumnView,
+    a_rows: []u32,
+    b_rows: []u32,
+    pair_len: usize = 0,
     pending_clear: bool = false,
 
     phase: Phase = .materializing,
@@ -184,6 +188,11 @@ pub const RangeSweepJoin = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
+        const a_rows = try allocator.alloc(u32, output_batch_rows);
+        errdefer allocator.free(a_rows);
+        const b_rows = try allocator.alloc(u32, output_batch_rows);
+        errdefer allocator.free(b_rows);
+
         const cached_stats = try exec.concatJoinStats(allocator, left, right, left_schema.len, null, output_schema.len);
         errdefer if (cached_stats.len > 0) allocator.free(cached_stats);
 
@@ -202,6 +211,8 @@ pub const RangeSweepJoin = struct {
             .right_materialized = right_mat,
             .output_columns = output_columns,
             .views = views,
+            .a_rows = a_rows,
+            .b_rows = b_rows,
         };
         const q = makeQuery(allocator, self);
         if (spec.extra_predicate) |pred| {
@@ -224,6 +235,8 @@ pub const RangeSweepJoin = struct {
         for (self.output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_columns);
         self.allocator.free(self.views);
+        self.allocator.free(self.a_rows);
+        self.allocator.free(self.b_rows);
         self.allocator.free(self.output_schema);
         if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
         self.arena.deinit();
@@ -352,31 +365,30 @@ pub const RangeSweepJoin = struct {
         }
 
         while (true) {
-            // Drain any in-progress emit slice first.
+            // Drain any in-progress emit slice first: stage as many (A,b)
+            // pairs as the batch has room for, then bulk-gather.
             if (self.cur_emit_pos < self.cur_emit_hi) {
                 const b_row = self.right_perm[self.b_cursor];
-                while (self.cur_emit_pos < self.cur_emit_hi) : (self.cur_emit_pos += 1) {
-                    const a_row = self.left_perm[self.cur_emit_pos];
-                    try self.emitOutputRow(a_row, b_row);
-                    if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
-                        self.cur_emit_pos += 1;
-                        // If this was the last emit of the slice,
-                        // retire the slice now. Otherwise the next
-                        // call's drain check (pos < hi) is false, the
-                        // outer loop falls through, recomputes the
-                        // slice for the SAME b, and re-emits it.
-                        if (self.cur_emit_pos >= self.cur_emit_hi) {
-                            self.b_cursor += 1;
-                            self.cur_emit_hi = 0;
-                            self.cur_emit_pos = 0;
-                        }
-                        return try self.flushOutput();
-                    }
+                const room = output_batch_rows - self.pair_len;
+                const avail: usize = self.cur_emit_hi - self.cur_emit_pos;
+                const take = @min(room, avail);
+                @memcpy(
+                    self.a_rows[self.pair_len..][0..take],
+                    self.left_perm[self.cur_emit_pos..][0..take],
+                );
+                @memset(self.b_rows[self.pair_len..][0..take], b_row);
+                self.pair_len += take;
+                self.cur_emit_pos += @intCast(take);
+                if (self.cur_emit_pos >= self.cur_emit_hi) {
+                    // Slice exhausted — advance to the next b.
+                    self.b_cursor += 1;
+                    self.cur_emit_hi = 0;
+                    self.cur_emit_pos = 0;
                 }
-                // Slice exhausted normally — advance to next b.
-                self.b_cursor += 1;
-                self.cur_emit_hi = 0;
-                self.cur_emit_pos = 0;
+                if (self.pair_len == output_batch_rows) {
+                    try self.gatherPairs();
+                    return try self.flushOutput();
+                }
                 continue;
             }
 
@@ -393,7 +405,25 @@ pub const RangeSweepJoin = struct {
             self.cur_emit_hi = slice.hi;
             self.cur_emit_pos = slice.lo;
         }
+        // Tail: gather any staged pairs; the caller's final flushOutput
+        // picks up the rows.
+        if (self.pair_len > 0) try self.gatherPairs();
         return null;
+    }
+
+    /// Bulk-gather the staged (A,B) row pairs into the output columns —
+    /// one `appendByIndices` per column instead of a per-cell emit.
+    fn gatherPairs(self: *RangeSweepJoin) !void {
+        const a = self.a_rows[0..self.pair_len];
+        const b = self.b_rows[0..self.pair_len];
+        for (self.left_materialized, 0..) |*store, i| {
+            try transform.appendByIndices(self.allocator, store.view(), a, &self.output_columns[i]);
+        }
+        for (self.right_materialized, 0..) |*store, i| {
+            try transform.appendByIndices(self.allocator, store.view(), b, &self.output_columns[self.left_col_count + i]);
+        }
+        self.prof_emitted += self.pair_len;
+        self.pair_len = 0;
     }
 
     const Slice = struct { lo: u32, hi: u32 };
@@ -443,19 +473,6 @@ pub const RangeSweepJoin = struct {
             },
             else => unreachable,
         }
-    }
-
-    fn emitOutputRow(self: *RangeSweepJoin, left_row: u32, right_row: u32) !void {
-        self.prof_emitted += 1;
-        try cell_io.emitMatchedRow(
-            self.allocator,
-            self.output_columns,
-            self.left_materialized,
-            left_row,
-            self.right_materialized,
-            right_row,
-            null,
-        );
     }
 
     fn flushOutput(self: *RangeSweepJoin) !?Batch {
