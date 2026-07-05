@@ -898,12 +898,28 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRo
     defer late_q.deinit();
     const late: *LateScan = @ptrCast(@alignCast(late_q.ptr));
 
+    // Materialize in LOCATION order, not group order: sorted locs form
+    // maximal per-(segment,row-group) runs, so each touched block decodes
+    // once instead of once per survivor (group order is effectively random —
+    // 3M+ groups meant 3M+ single-row block borrows). The key gather below
+    // already reads through an index buffer, so emitting in group order
+    // costs nothing extra: the buffer becomes the inverse permutation.
+    const loc_order = try allocator.alloc(u32, rows.len);
+    defer allocator.free(loc_order);
+    for (0..rows.len) |i| loc_order[i] = @intCast(i);
+    std.mem.sortUnstable(u32, loc_order, rows, struct {
+        fn less(rs: []const HarnessCore.TopRow, a: u32, b: u32) bool {
+            return rs[a].rowref < rs[b].rowref;
+        }
+    }.less);
     const locs = try allocator.alloc(i64, rows.len);
     defer allocator.free(locs);
-    for (rows, 0..) |row, i| locs[i] = row.rowref;
+    for (loc_order, 0..) |ri, j| locs[j] = rows[ri].rowref;
 
+    const t_mat = exec.prof.nowTicks();
     try late.materializeInto(locs, scan_ptr.memtableSnap());
     const materialized = late.outputColumns();
+    const mat_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_mat);
 
     // Recompute any derived key columns over the materialized source rows with
     // the standard Compute operator; the result batch then carries every key
@@ -922,17 +938,26 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRo
         result = (try compute_q.?.next()) orelse return error.UnsupportedQueryShape;
     }
 
+    // Inverse permutation: output row i (group order) reads materialized
+    // row idx_buf[i] (location order).
     const idx_buf = try allocator.alloc(u32, rows.len);
     defer allocator.free(idx_buf);
-    for (0..rows.len) |i| idx_buf[i] = @intCast(i);
+    for (loc_order, 0..) |ri, j| idx_buf[ri] = @intCast(j);
 
+    const t_keys = exec.prof.nowTicks();
     for (op.plan.layout.parts[0..part_count], 0..) |part, j| {
         const ci = types.findColumn(result.schema, part.name) orelse return error.UnsupportedQueryShape;
         try transform.appendByIndices(allocator, result.values[ci], idx_buf, &op.output_cols[j]);
     }
+    const t_aggs = exec.prof.nowTicks();
     for (rows) |row| {
         for (op.plan.aggregates[0..op.plan.aggregate_count], 0..) |agg_plan, i| {
             try appendAggregateValue(allocator, &op.output_cols[part_count + i], agg_plan, row);
+        }
+    }
+    if (comptime build_options.profiling) {
+        if (getenv("THINDB_V2_PIPELINE_TRACE") != null) {
+            std.debug.print("[v2-emit] rows={d} late_mat={d:.1}ms keys={d:.1}ms aggs={d:.1}ms\n", .{ rows.len, mat_ms, exec.prof.ticksToMs(t_aggs - t_keys), exec.prof.ticksToMs(exec.prof.nowTicks() - t_aggs) });
         }
     }
     op.row_count += rows.len;
