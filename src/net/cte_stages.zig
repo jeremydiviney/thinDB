@@ -958,6 +958,70 @@ fn sliceValueLess(_: void, a: types.Value, b: types.Value) bool {
     return a.compare(b) == .lt;
 }
 
+// --- Composite (multi-column) slice keys: tuples ordered lexicographically.
+
+fn tupleLexCompare(a: []const types.Value, b: []const types.Value) std.math.Order {
+    for (a, b) |va, vb| {
+        const ord = va.compare(vb);
+        if (ord != .eq) return ord;
+    }
+    return .eq;
+}
+
+fn tupleLexLess(_: void, a: []types.Value, b: []types.Value) bool {
+    return tupleLexCompare(a, b) == .lt;
+}
+
+/// Lexicographic tuple comparison as a predicate tree:
+///   (k0 OP' b0) OR (k0 = b0 AND k1 OP' b1) OR ... — strict OP' on every
+/// component except the LAST, which uses `last_op` (.lte gives tuple <=,
+/// .gt gives tuple >). Single-column keys reduce to a bare leaf, keeping
+/// the exact shapes the chunk-skip recognizer already matches.
+fn tupleCmpPred(
+    aa: Allocator,
+    cols: []const []const u8,
+    bound: []const types.Value,
+    last_op: exec.predicate.PredicateOp,
+) !PredicateExpr {
+    const k = cols.len;
+    const strict: exec.predicate.PredicateOp = if (last_op == .lte or last_op == .lt) .lt else .gt;
+    if (k == 1) return .{ .leaf = .{ .col = cols[0], .op = last_op, .val = bound[0] } };
+    const arms = try aa.alloc(PredicateExpr, k);
+    for (0..k) |i| {
+        const op = if (i == k - 1) last_op else strict;
+        if (i == 0) {
+            arms[0] = .{ .leaf = .{ .col = cols[0], .op = op, .val = bound[0] } };
+        } else {
+            const sub = try aa.alloc(PredicateExpr, i + 1);
+            for (0..i) |j| sub[j] = .{ .leaf = .{ .col = cols[j], .op = .eq, .val = bound[j] } };
+            sub[i] = .{ .leaf = .{ .col = cols[i], .op = op, .val = bound[i] } };
+            arms[i] = .{ .@"and" = sub };
+        }
+    }
+    return .{ .@"or" = arms };
+}
+
+/// OR of IS NULL over the key columns — a NULL in ANY component routes the
+/// row to slice 0 (value comparisons are 2VL and would drop it otherwise).
+fn tupleAnyNullPred(aa: Allocator, cols: []const []const u8) !PredicateExpr {
+    if (cols.len == 1) return .{ .is_null = cols[0] };
+    const arms = try aa.alloc(PredicateExpr, cols.len);
+    for (cols, arms) |c, *a| a.* = .{ .is_null = c };
+    return .{ .@"or" = arms };
+}
+
+/// First tuple boundary >= t wins its slice; any-NULL tuples were routed by
+/// the caller.
+fn sliceIndexForTuple(t: []const types.Value, bounds: []const []const types.Value) usize {
+    var lo: usize = 0;
+    var hi: usize = bounds.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (tupleLexCompare(t, bounds[mid]) == .gt) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
 fn dupeSliceValue(arena: Allocator, v: types.Value) !types.Value {
     return switch (v) {
         .text => |t| .{ .text = try arena.dupe(u8, t) },
@@ -965,41 +1029,43 @@ fn dupeSliceValue(arena: Allocator, v: types.Value) !types.Value {
     };
 }
 
-/// Stride-sample the slice column from the first input stage that carries
-/// it. Returns a SORTED sample (values arena-owned) or null when no input
-/// carries the column / the column's type isn't range-partitionable.
-fn sampleSliceColumn(ctx: *SlicedFillCtx, col: []const u8, inputs: []const *mat_stage.Stage, target: usize) !?[]types.Value {
+/// Stride-sample the slice key TUPLE from the first input stage that carries
+/// every key column. Returns a lexicographically SORTED sample (tuples
+/// arena-owned) or null when no input qualifies / a component type isn't
+/// range-partitionable. Tuples containing a NULL are skipped — they route to
+/// slice 0 regardless of bounds.
+fn sampleSliceColumn(ctx: *SlicedFillCtx, cols: []const []const u8, inputs: []const *mat_stage.Stage, target: usize) !?[][]types.Value {
     const aa = ctx.arena.allocator();
+    const cis = try aa.alloc(usize, cols.len);
     next_input: for (inputs) |s| {
-        var ci: usize = 0;
-        const found: bool = blk: {
-            for (s.schema, 0..) |sc, i| {
-                if (types.columnNameEql(sc.name, col)) {
-                    ci = i;
-                    break :blk true;
-                }
-            }
-            break :blk false;
-        };
-        if (!found) continue;
+        for (cols, cis) |col, *ci| {
+            ci.* = for (s.schema, 0..) |sc, i| {
+                if (types.columnNameEql(sc.name, col)) break i;
+            } else continue :next_input;
+        }
         const r = s.result orelse continue;
         if (r.total_rows == 0) continue;
         const stride: usize = @intCast(@max(1, r.total_rows / target));
-        var vals: std.ArrayListUnmanaged(types.Value) = .empty;
+        var vals: std.ArrayListUnmanaged([]types.Value) = .empty;
         var tick: usize = 0;
+        const views = try aa.alloc(storage_column.ColumnView, cols.len);
         for (r.chunks.items) |*ch| {
-            const v = sliceChunkView(ch, ci);
+            for (cis, views) |ci, *v| v.* = sliceChunkView(ch, ci);
             var row: usize = 0;
-            while (row < ch.rows) : (row += 1) {
+            rows: while (row < ch.rows) : (row += 1) {
                 tick += 1;
                 if (tick % stride != 0) continue;
-                if (!v.isValid(row)) continue; // NULL keys route to slice 0
-                const val = sliceValueAt(v, row) orelse continue :next_input; // unpartitionable type
-                try vals.append(aa, try dupeSliceValue(aa, val));
+                const tuple = try aa.alloc(types.Value, cols.len);
+                for (views, tuple) |v, *slot| {
+                    if (!v.isValid(row)) continue :rows; // NULL keys route to slice 0
+                    const val = sliceValueAt(v, row) orelse continue :next_input; // unpartitionable type
+                    slot.* = try dupeSliceValue(aa, val);
+                }
+                try vals.append(aa, tuple);
             }
         }
         if (vals.items.len < 2) continue;
-        std.mem.sort(types.Value, vals.items, {}, sliceValueLess);
+        std.mem.sort([]types.Value, vals.items, {}, tupleLexLess);
         return vals.items;
     }
     return null;
@@ -1052,7 +1118,7 @@ fn collectScanLeaves(
 /// the next candidate is tried. Only physical columns sample this way — a
 /// derived slice key (an expression alias) has no table to sample, and the
 /// fill declines with the physical-column hint in the trace.
-fn sampleTableColumn(ctx: *SlicedFillCtx, col: []const u8, target: usize) !?[]types.Value {
+fn sampleTableColumn(ctx: *SlicedFillCtx, cols: []const []const u8, target: usize) !?[][]types.Value {
     const aa = ctx.arena.allocator();
     var tables: std.ArrayListUnmanaged(ir.TableRef) = .empty;
     defer tables.deinit(aa);
@@ -1060,10 +1126,8 @@ fn sampleTableColumn(ctx: *SlicedFillCtx, col: []const u8, target: usize) !?[]ty
     outer: for (tables.items) |ref| {
         const scan = try aa.create(ir.Op);
         scan.* = .{ .scan = .{ .table = ref, .alias = null } };
-        const cols_arr = try aa.alloc([]const u8, 1);
-        cols_arr[0] = col;
         const sel = try aa.create(ir.Op);
-        sel.* = .{ .select = .{ .columns = cols_arr, .upstream = scan } };
+        sel.* = .{ .select = .{ .columns = cols, .upstream = scan } };
         var sin = ctx.input;
         sin.accountant = null;
         var q = engine_v2.compileSelectBlock(sin, sel) catch continue;
@@ -1073,7 +1137,7 @@ fn sampleTableColumn(ctx: *SlicedFillCtx, col: []const u8, target: usize) !?[]ty
             continue;
         }
         const stride: usize = @intCast(@max(1, upper / target));
-        var vals: std.ArrayListUnmanaged(types.Value) = .empty;
+        var vals: std.ArrayListUnmanaged([]types.Value) = .empty;
         var tick: usize = 0;
         while (true) {
             const b = q.next() catch {
@@ -1082,21 +1146,24 @@ fn sampleTableColumn(ctx: *SlicedFillCtx, col: []const u8, target: usize) !?[]ty
             };
             const batch = b orelse break;
             var row: usize = 0;
-            while (row < batch.row_count) : (row += 1) {
+            rows: while (row < batch.row_count) : (row += 1) {
                 tick += 1;
                 if (tick % stride != 0) continue;
-                const v = batch.values[0];
-                if (!v.isValid(row)) continue;
-                const val = sliceValueAt(v, row) orelse {
-                    q.deinit();
-                    continue :outer;
-                };
-                try vals.append(aa, try dupeSliceValue(aa, val));
+                const tuple = try aa.alloc(types.Value, cols.len);
+                for (batch.values[0..cols.len], tuple) |v, *slot| {
+                    if (!v.isValid(row)) continue :rows; // NULL keys route to slice 0
+                    const val = sliceValueAt(v, row) orelse {
+                        q.deinit();
+                        continue :outer;
+                    };
+                    slot.* = try dupeSliceValue(aa, val);
+                }
+                try vals.append(aa, tuple);
             }
         }
         q.deinit();
         if (vals.items.len < 2) continue;
-        std.mem.sort(types.Value, vals.items, {}, sliceValueLess);
+        std.mem.sort([]types.Value, vals.items, {}, tupleLexLess);
         return vals.items;
     }
     return null;
@@ -1489,8 +1556,8 @@ fn sliceIndexForValue(v: types.Value, bounds: []const types.Value) usize {
 fn prePartition(
     ctx: *SlicedFillCtx,
     stage: *mat_stage.Stage,
-    col: []const u8,
-    bounds: []const types.Value,
+    cols: []const []const u8,
+    bounds: []const []const types.Value,
     trace: bool,
 ) ![]PrePart {
     const alloc = ctx.input.allocator;
@@ -1537,15 +1604,14 @@ fn prePartition(
             sorted_keys = key_names;
         }
         const raw_schema = q.outputSchema();
-        var ci: usize = 0;
+        const cis = try aa.alloc(usize, cols.len);
         const found: bool = blk: {
-            for (raw_schema, 0..) |sc, i| {
-                if (types.columnNameEql(sc.name, col)) {
-                    ci = i;
-                    break :blk true;
-                }
+            for (cols, cis) |col, *ci| {
+                ci.* = for (raw_schema, 0..) |sc, i| {
+                    if (types.columnNameEql(sc.name, col)) break i;
+                } else break :blk false;
             }
-            break :blk false;
+            break :blk true;
         };
         if (!found) {
             q.deinit();
@@ -1603,6 +1669,8 @@ fn prePartition(
         }
 
         var route_err: ?anyerror = null;
+        const key_views = try aa.alloc(storage_column.ColumnView, cols.len);
+        const row_tuple = try aa.alloc(types.Value, cols.len);
         while (true) {
             const b = q.next() catch |e| {
                 route_err = e;
@@ -1610,16 +1678,18 @@ fn prePartition(
             };
             const batch = b orelse break;
             for (idx_lists) |*l| l.clearRetainingCapacity();
-            const v = batch.values[ci];
+            for (cis, key_views) |kci, *kv| kv.* = batch.values[kci];
             var row: usize = 0;
             while (row < batch.row_count) : (row += 1) {
                 const si = blk: {
-                    if (!v.isValid(row)) break :blk 0; // NULL keys ride slice 0
-                    const val = sliceValueAt(v, row) orelse {
-                        route_err = error.UnsupportedQueryShape;
-                        break;
-                    };
-                    break :blk sliceIndexForValue(val, bounds);
+                    for (key_views, row_tuple) |v, *slot| {
+                        if (!v.isValid(row)) break :blk 0; // NULL keys ride slice 0
+                        slot.* = sliceValueAt(v, row) orelse {
+                            route_err = error.UnsupportedQueryShape;
+                            break :blk 0;
+                        };
+                    }
+                    break :blk sliceIndexForTuple(row_tuple, bounds);
                 };
                 idx_lists[si].append(alloc, @intCast(row)) catch |e| {
                     route_err = e;
@@ -1760,17 +1830,13 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     const trace = getenv("THINDB_TRACE_SEP") != null;
     const alloc = ctx.input.allocator;
     var ph = exec.prof.nowTicks();
-    if (ctx.spec.cols.len != 1) {
-        if (trace) std.debug.print("[sep] stage#{d} decline: multi-column spec\n", .{stage.id});
-        return false;
-    }
     // A downstream borrower expects ONE contiguous store per column; a
     // sliced fill adopts N parts. Keep the borrow optimization instead.
     if (stage.want_contiguous) {
         if (trace) std.debug.print("[sep] stage#{d} decline: contiguous borrower registered\n", .{stage.id});
         return false;
     }
-    const col = ctx.spec.cols[0];
+    const cols = ctx.spec.cols;
 
     // Materialize the body's shared inputs now (driving thread — ensureRun
     // is not re-entrant) and hold a guard use on each: a slice releasing its
@@ -1803,21 +1869,22 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     }
     const sample_target = @max(@as(usize, 4096), n_slices * 16);
 
-    const samples = (try sampleSliceColumn(ctx, col, inputs.items, sample_target)) orelse
-        (try sampleTableColumn(ctx, col, sample_target)) orelse
+    const samples = (try sampleSliceColumn(ctx, cols, inputs.items, sample_target)) orelse
+        (try sampleTableColumn(ctx, cols, sample_target)) orelse
     {
-        if (trace) std.debug.print("[sep] stage#{d} decline: no input stage or base table carries '{s}' (derived keys need a physical column, e.g. a stored hash)\n", .{ stage.id, col });
+        if (trace) std.debug.print("[sep] stage#{d} decline: no input stage or base table carries '{s}' (derived keys need a physical column, e.g. a stored hash)\n", .{ stage.id, cols[0] });
         return false;
     };
 
-    // Boundaries = N-tiles of the sorted sample, deduped: heavy skew
-    // collapses neighboring tiles, and fewer, fuller slices beat empty ones.
+    // Boundaries = N-tiles of the lexicographically sorted tuple sample,
+    // deduped: heavy skew collapses neighboring tiles, and fewer, fuller
+    // slices beat empty ones.
     const aa = ctx.arena.allocator();
-    var bounds: std.ArrayListUnmanaged(types.Value) = .empty;
+    var bounds: std.ArrayListUnmanaged([]types.Value) = .empty;
     var j: usize = 1;
     while (j < n_slices) : (j += 1) {
         const b = samples[samples.len * j / n_slices];
-        if (bounds.items.len == 0 or bounds.items[bounds.items.len - 1].compare(b) == .lt) {
+        if (bounds.items.len == 0 or tupleLexCompare(bounds.items[bounds.items.len - 1], b) == .lt) {
             try bounds.append(aa, b);
         }
     }
@@ -1828,25 +1895,40 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     const nb = bounds.items.len;
     const total = nb + 1;
 
-    // Per-slice range predicates. A NULL slice key matches no range — slice
-    // 0 also takes IS NULL so those rows aren't silently dropped.
+    // Per-slice lexicographic range predicates. A NULL in ANY key component
+    // matches no range — slice 0 takes those via the any-null arm, and the
+    // other slices guard against non-leading NULLs sneaking through a
+    // leading-column comparison (a leading NULL already fails every branch).
+    const non_leading_guard: ?PredicateExpr = if (cols.len > 1) blk: {
+        const guards = try aa.alloc(PredicateExpr, cols.len - 1);
+        for (cols[1..], guards) |c, *g| g.* = .{ .is_not_null = c };
+        break :blk if (guards.len == 1) guards[0] else .{ .@"and" = guards };
+    } else null;
     const preds = try aa.alloc(PredicateExpr, total);
     for (preds, 0..) |*p, i| {
         if (i == 0) {
             const arms = try aa.alloc(PredicateExpr, 2);
-            arms[0] = .{ .leaf = .{ .col = col, .op = .lte, .val = bounds.items[0] } };
-            arms[1] = .{ .is_null = col };
+            arms[0] = try tupleCmpPred(aa, cols, bounds.items[0], .lte);
+            arms[1] = try tupleAnyNullPred(aa, cols);
             p.* = .{ .@"or" = arms };
         } else if (i == nb) {
-            p.* = .{ .leaf = .{ .col = col, .op = .gt, .val = bounds.items[nb - 1] } };
+            const gt = try tupleCmpPred(aa, cols, bounds.items[nb - 1], .gt);
+            p.* = if (non_leading_guard) |g| blk: {
+                const arms = try aa.alloc(PredicateExpr, 2);
+                arms[0] = gt;
+                arms[1] = g;
+                break :blk .{ .@"and" = arms };
+            } else gt;
         } else {
-            const arms = try aa.alloc(PredicateExpr, 2);
-            arms[0] = .{ .leaf = .{ .col = col, .op = .gt, .val = bounds.items[i - 1] } };
-            arms[1] = .{ .leaf = .{ .col = col, .op = .lte, .val = bounds.items[i] } };
+            const n_arms: usize = if (non_leading_guard != null) 3 else 2;
+            const arms = try aa.alloc(PredicateExpr, n_arms);
+            arms[0] = try tupleCmpPred(aa, cols, bounds.items[i - 1], .gt);
+            arms[1] = try tupleCmpPred(aa, cols, bounds.items[i], .lte);
+            if (non_leading_guard) |g| arms[2] = g;
             p.* = .{ .@"and" = arms };
         }
     }
-    if (trace) std.debug.print("[sep] stage#{d} slicing on '{s}': {d} slices ({d} sampled)\n", .{ stage.id, col, total, samples.len });
+    if (trace) std.debug.print("[sep] stage#{d} slicing on {d} key col(s) ('{s}'...): {d} slices ({d} sampled)\n", .{ stage.id, cols.len, cols[0], total, samples.len });
 
     // Scan-once: private table-backed multi-ref blocks fill N per-slice
     // buffers from ONE full-DOP scan instead of being rescanned per slice.
@@ -1854,7 +1936,7 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
         std.debug.print("[sep] phase bounds: {d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - ph)});
         ph = exec.prof.nowTicks();
     }
-    const pre_parts = try prePartition(ctx, stage, col, bounds.items, trace);
+    const pre_parts = try prePartition(ctx, stage, cols, bounds.items, trace);
     if (trace) {
         std.debug.print("[sep] phase pre-partition: {d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - ph)});
         ph = exec.prof.nowTicks();
@@ -1931,7 +2013,16 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
         alloc.free(sinks);
         return e;
     }
-    try res.adoptSlices(sinks, .{ .col = col, .bounds = bounds.items });
+    // Chunk-range metadata (and the MatScan skip it feeds) is single-key
+    // only; composite keys concat without ranges — the slice predicates
+    // remain the correctness authority either way.
+    if (cols.len == 1) {
+        const flat = try aa.alloc(types.Value, bounds.items.len);
+        for (bounds.items, flat) |t, *f| f.* = t[0];
+        try res.adoptSlices(sinks, .{ .col = cols[0], .bounds = flat });
+    } else {
+        try res.adoptSlices(sinks, null);
+    }
     alloc.free(sinks);
     if (trace) std.debug.print("[sep] stage#{d} done: rows={d}\n", .{ stage.id, res.total_rows });
     return true;
