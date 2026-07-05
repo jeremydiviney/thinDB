@@ -265,6 +265,16 @@ fn irBlockCarriesCol(op: *const ir.Op, col: []const u8) bool {
             }
             cur = c.upstream;
         },
+        .group_by => |g| {
+            // Output = group keys + aggregate names; the projection decides.
+            for (g.group_cols) |k| {
+                if (types.columnNameEql(k, col)) return true;
+            }
+            for (g.aggs) |a| {
+                if (types.columnNameEql(a.as, col)) return true;
+            }
+            return false;
+        },
         .filter => |f| cur = f.upstream,
         .order_by => |o| cur = o.upstream,
         .alias => |a| cur = a.upstream,
@@ -1291,7 +1301,9 @@ fn collectPrePartCandidates(
             const rep = ctx.canon.get(op) orelse op;
             if (ctx.map.get(rep) != null) return; // shared: already staged once
             const multi = (ctx.refs.get(rep) orelse 1) >= 2 or rep.materialize.forced;
-            if (multi and irBlockIsSimpleTableChain(rep.materialize.upstream)) {
+            const prepart_ok = irBlockIsSimpleTableChain(rep.materialize.upstream) or
+                getenv("THINDB_SEP_PREPART_NONSIMPLE") != null;
+            if (multi and prepart_ok) {
                 for (out.items) |e| if (e == rep) return;
                 try out.append(alloc, rep);
                 return;
@@ -1690,14 +1702,22 @@ fn prePartition(
 
     var parts: std.ArrayListUnmanaged(PrePart) = .empty;
     errdefer parts.deinit(alloc);
+    // Like the slice workers, compile against the FILL's arena: the captured
+    // ctx.input still points at the compile-phase arena, which is dead by
+    // fill time. Simple select chains never allocate from node_arena during
+    // compile so they masked this; group-by-rooted blocks (IR rewrites, plan
+    // structures) segfault on the freed arena.
+    var pin = ctx.input;
+    pin.allocator = aa;
+    pin.node_arena = aa;
     next_cand: for (cands.items) |node| {
         if (trace) std.debug.print("[sep] prePartition: compiling candidate {*}\n", .{node});
-        var q = compileBlock(ctx.input, node.materialize.upstream, @constCast(&ctx.map)) catch {
+        var q = compileBlock(pin, node.materialize.upstream, @constCast(&ctx.map)) catch {
             if (trace) std.debug.print("[sep] prePartition: candidate compile FAILED\n", .{});
             continue;
         };
         if (trace) std.debug.print("[sep] prePartition: candidate compiled\n", .{});
-        q = pruneStageColumns(ctx.input, q);
+        q = pruneStageColumns(pin, q);
         // Buffers get partition-GROUPED after routing (a parallel per-slice
         // pass — grouping only needs digest order, not a semantic sort), so
         // the windows above take the grouped fast path. Record the keys now;
