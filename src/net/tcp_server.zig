@@ -132,7 +132,11 @@ pub const Server = struct {
                 .auth_token = self.auth_token,
                 .limiter = self.limiter,
             };
-            const thread = std.Thread.spawn(.{}, ConnJob.run, .{job}) catch {
+            // Query compilation recurses per IR op; a deep CTE chain compiled
+            // as ONE block (e.g. a SEPARABLE closure privatizing a ~130-CTE
+            // statement) overflows the default 16 MiB stack — silent segfault
+            // on Windows. Reserve big; pages commit lazily, so idle cost ~0.
+            const thread = std.Thread.spawn(.{ .stack_size = 1024 << 20 }, ConnJob.run, .{job}) catch {
                 self.limiter.release();
                 stream.close(self.io);
                 self.allocator.destroy(job);

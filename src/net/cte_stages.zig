@@ -212,6 +212,67 @@ const PrivSet = std.AutoHashMapUnmanaged(*const ir.Op, void);
 /// statement-wide count is PRIVATE to that body: no consumer outside the
 /// separable block reads it, so it needn't exist as a shared stage — each
 /// slice computes its own 1/N-sized copy.
+/// Conservative IR-level check: does this block's OUTPUT provably carry
+/// every named column? Walks projection-transparent ops; a .select decides
+/// (its columns/outputs ARE the projection); a .compute adds derived names
+/// and keeps looking for the rest. Anything else (group_by, window, join,
+/// star-less shapes) = unknown → false. Used to decide whether a multi-ref
+/// private block can be pre-partitioned by the slice key at all.
+fn irBlockCarriesCols(op: *const ir.Op, cols: []const []const u8) bool {
+    for (cols) |c| {
+        if (!irBlockCarriesCol(op, c)) return false;
+    }
+    return true;
+}
+
+/// True when the block is a plain projection chain over a table scan —
+/// select/compute/filter/alias/limit/order_by only. This is the shape the
+/// scan-once pre-partition is proven on; blocks rooted in group_by/window/
+/// join/union stay shared (draining a parallel-aggregate-rooted block
+/// through the router crashes — bug filed, dodge until fixed).
+fn irBlockIsSimpleTableChain(op: *const ir.Op) bool {
+    var cur = op;
+    while (true) switch (cur.*) {
+        .scan => return true,
+        .select => |p| cur = p.upstream,
+        .exclude => |p| cur = p.upstream,
+        .filter => |f| cur = f.upstream,
+        .compute => |c| cur = c.upstream,
+        .alias => |a| cur = a.upstream,
+        .limit => |l| cur = l.upstream,
+        .order_by => |o| cur = o.upstream,
+        else => return false,
+    };
+}
+
+fn irBlockCarriesCol(op: *const ir.Op, col: []const u8) bool {
+    var cur = op;
+    while (true) switch (cur.*) {
+        .select => |p| {
+            if (p.outputs) |outs| {
+                for (p.columns, outs) |src, out_opt| {
+                    const name = out_opt orelse src;
+                    if (types.columnNameEql(name, col)) return true;
+                }
+            } else for (p.columns) |src| {
+                if (types.columnNameEql(src, col)) return true;
+            }
+            return false; // the projection decides — col not among it
+        },
+        .compute => |c| {
+            for (c.derived) |d| {
+                if (types.columnNameEql(d.name, col)) return true;
+            }
+            cur = c.upstream;
+        },
+        .filter => |f| cur = f.upstream,
+        .order_by => |o| cur = o.upstream,
+        .alias => |a| cur = a.upstream,
+        .limit => |l| cur = l.upstream,
+        else => return false, // unknown projection: assume absent
+    };
+}
+
 fn countBodyMatRefs(
     allocator: Allocator,
     op: *const ir.Op,
@@ -298,10 +359,31 @@ fn collectStages(
                 try countBodyMatRefs(input.allocator, rep.materialize.upstream, cse, &body_refs);
                 var bp: PrivSet = .empty;
                 errdefer bp.deinit(input.allocator);
+                const sep_cols = rep.materialize.separable.?.cols;
                 var it = body_refs.iterator();
                 while (it.next()) |e| {
                     const total = cse.refs.get(e.key_ptr.*) orelse 1;
-                    if (e.value_ptr.* >= total) try bp.put(input.allocator, e.key_ptr.*, {});
+                    if (e.value_ptr.* < total) continue;
+                    // A multi-ref block stays PRIVATE only when the scan-once
+                    // pre-partition can actually route it: table-backed AND
+                    // its output provably carries the slice key. Everything
+                    // else stays SHARED — a normal stage (computed once with
+                    // the full machinery) that every slice reads through its
+                    // range-filtered MatScan; never recomputed per slice.
+                    // A multi-ref block whose output CARRIES the slice key
+                    // stays PRIVATE: per-slice it costs ~1/N (the range
+                    // predicate constrains it), and simple table chains
+                    // additionally get the scan-once pre-partition. A
+                    // key-less multi-ref block is DEMOTED to a normal
+                    // shared stage — computed once with the full machinery
+                    // and read by every slice — because recomputing it per
+                    // slice costs N x its full price.
+                    const carries = irBlockCarriesCols(e.key_ptr.*.materialize.upstream, sep_cols);
+                    if (getenv("THINDB_TRACE_SEP") != null and total >= 2) {
+                        std.debug.print("[sep] priv-decide {*}: refs={d} carries={} -> {s}\n", .{ e.key_ptr.*, total, carries, if (carries) "PRIVATE" else "DEMOTE-SHARED" });
+                    }
+                    if (total >= 2 and !carries) continue;
+                    try bp.put(input.allocator, e.key_ptr.*, {});
                 }
                 body_priv = bp;
                 break :blk &body_priv.?;
@@ -432,7 +514,22 @@ fn blockSource(op: *const ir.Op) BlockSource {
     }
 }
 
+threadlocal var compile_block_depth: usize = 0;
+
 fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
+    // Recursion guard: a compile that nests blocks this deep is either a
+    // pathological plan or a walk cycle — fail the query instead of
+    // silently smashing the stack (Windows kills without a trace). The
+    // dump past the threshold shows the repeating node pattern.
+    compile_block_depth += 1;
+    defer compile_block_depth -= 1;
+    if (compile_block_depth > 5000) {
+        if (compile_block_depth < 5030) {
+            std.debug.print("[depth] compileBlock {d}: {s} {*}\n", .{ compile_block_depth, @tagName(op.*), op });
+            return error.UnsupportedQueryShape;
+        }
+        return error.UnsupportedQueryShape;
+    }
     return switch (blockSource(op)) {
         // Table-backed block: the regular V2 handlers, full parallelism.
         // pg_catalog virtual tables are in-memory metadata batches, not
@@ -1177,6 +1274,10 @@ fn sampleTableColumn(ctx: *SlicedFillCtx, cols: []const []const u8, target: usiz
 const PrePart = struct {
     node: *const ir.Op,
     stages: []*mat_stage.Stage,
+    /// True when every slot in `stages` is the SAME stage — a multi-ref
+    /// block whose output lacks the slice key: unsliceable, so computed
+    /// once and read-shared by every slice (release/deinit exactly once).
+    shared: bool = false,
 };
 
 fn collectPrePartCandidates(
@@ -1190,7 +1291,7 @@ fn collectPrePartCandidates(
             const rep = ctx.canon.get(op) orelse op;
             if (ctx.map.get(rep) != null) return; // shared: already staged once
             const multi = (ctx.refs.get(rep) orelse 1) >= 2 or rep.materialize.forced;
-            if (multi and blockSource(rep.materialize.upstream) == .table) {
+            if (multi and irBlockIsSimpleTableChain(rep.materialize.upstream)) {
                 for (out.items) |e| if (e == rep) return;
                 try out.append(alloc, rep);
                 return;
@@ -1566,6 +1667,7 @@ fn prePartition(
     var cands: std.ArrayListUnmanaged(*const ir.Op) = .empty;
     defer cands.deinit(alloc);
     try collectPrePartCandidates(ctx, ctx.body, alloc, &cands);
+    if (trace) std.debug.print("[sep] prePartition: {d} candidates\n", .{cands.items.len});
 
     // The dominant window PARTITION BY set under the body: sorting the
     // partitioner's output by it (once, full DOP, before the stable router)
@@ -1576,6 +1678,7 @@ fn prePartition(
     var pcounts: std.ArrayListUnmanaged(usize) = .empty;
     defer pcounts.deinit(alloc);
     try commonWindowPartitionSet(ctx, ctx.body, alloc, &psets, &pcounts);
+    if (trace) std.debug.print("[sep] prePartition: window sets collected ({d})\n", .{psets.items.len});
     var part_set: []const []const u8 = &.{};
     var part_best: usize = 0;
     for (psets.items, pcounts.items) |s, c| {
@@ -1588,7 +1691,12 @@ fn prePartition(
     var parts: std.ArrayListUnmanaged(PrePart) = .empty;
     errdefer parts.deinit(alloc);
     next_cand: for (cands.items) |node| {
-        var q = compileBlock(ctx.input, node.materialize.upstream, @constCast(&ctx.map)) catch continue;
+        if (trace) std.debug.print("[sep] prePartition: compiling candidate {*}\n", .{node});
+        var q = compileBlock(ctx.input, node.materialize.upstream, @constCast(&ctx.map)) catch {
+            if (trace) std.debug.print("[sep] prePartition: candidate compile FAILED\n", .{});
+            continue;
+        };
+        if (trace) std.debug.print("[sep] prePartition: candidate compiled\n", .{});
         q = pruneStageColumns(ctx.input, q);
         // Buffers get partition-GROUPED after routing (a parallel per-slice
         // pass — grouping only needs digest order, not a semantic sort), so
@@ -1613,16 +1721,17 @@ fn prePartition(
             }
             break :blk true;
         };
-        if (!found) {
-            q.deinit();
-            continue;
-        }
         // Deep-copy the schema (ctx arena) — the compiled pipeline dies after
         // this drain, but the pre-filled stages' consumers keep referring.
         const schema = try aa.alloc(types.Column, raw_schema.len);
         for (raw_schema, schema) |src, *dst| {
             dst.* = src;
             dst.name = try aa.dupe(u8, src.name);
+        }
+
+        if (!found) {
+            q.deinit();
+            continue;
         }
 
         const sinks = try alloc.alloc(mat_stage.ContigSink, total);
@@ -1943,7 +2052,11 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     }
     defer {
         for (pre_parts) |pp| {
-            for (pp.stages) |st| {
+            if (pp.shared) {
+                // Every slot is the same stage — guard + free exactly once.
+                pp.stages[0].releaseUse();
+                pp.stages[0].deinit();
+            } else for (pp.stages) |st| {
                 st.releaseUse(); // drop the guard; frees when slices are done
                 st.deinit();
             }
@@ -1992,7 +2105,9 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     };
     var spawned: usize = 0;
     for (workers[0..pool_workers]) |*th| {
-        th.* = std.Thread.spawn(.{}, SliceClaim.worker, .{&claim}) catch break;
+        // Each slice compiles the WHOLE private closure as one block; deep
+        // CTE chains overflow the 16 MiB default stack (reserve-only cost).
+        th.* = std.Thread.spawn(.{ .stack_size = 1024 << 20 }, SliceClaim.worker, .{&claim}) catch break;
         spawned += 1;
     }
     if (spawned == 0) SliceClaim.worker(&claim); // spawn failed: run inline
@@ -2003,8 +2118,9 @@ fn slicedFillRun(ctx_op: *anyopaque, stage: *mat_stage.Stage, res: *mat_stage.Ma
     }
 
     var first_err: ?anyerror = null;
-    for (errs) |e| {
+    for (errs, 0..) |e, i| {
         if (e) |err| {
+            if (trace) std.debug.print("[sep] slice {d} FAILED: {s}\n", .{ i, @errorName(err) });
             if (first_err == null) first_err = err;
         }
     }
