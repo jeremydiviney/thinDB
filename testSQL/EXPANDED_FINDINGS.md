@@ -22,6 +22,25 @@
   → As one monolithic CTE, thinDB is ~2× faster here AND fits where StarRocks needs tuning. (The temp-table
   decomposition exists precisely because the monolithic form is too big for one fragment on either engine.)
 
+## 2026-07-05 update: emit fix → 14–16 s monolithic (~4.5× faster than StarRocks)
+- Profiling showed 72% of wall (15.4 s) inside the two big GroupTopNPipeline calls — and inside THOSE,
+  99.4% was `late.materializeInto`: the hashed-key emit late-materialized 3.37M group rowrefs in
+  group-hash (random) order, so LateScan's per-rowgroup run batching degenerated to 3.37M single-row
+  block borrows. Fix (8f5581c): sort rowrefs ascending before materializing, feed the key-gather the
+  inverse permutation. late_mat 15 723 ms → 61 ms; **monolithic wall 33 s → 14–16 s**, all fingerprint
+  SUMs bit-identical. This fix applies engine-wide to hashed-key GROUP BY emit (Q29-class shapes).
+- `SEPARABLE BY (customerNumberLC)`: correct (all 8 fingerprint SUMs bit-identical) at ~28–30 s —
+  **slower than monolithic now**. Post-fix the mono plan is already fully parallel at DOP 12; slicing
+  adds routing/recompute overhead without reducing total compute. SEPARABLE's winning regime remains
+  window/DRAM-bound tails (the 39-CTE rollforward: ratio 0.68).
+- Pre-partition UAF crash FIXED (76c89d9): group-by-rooted candidates compiled against the dead
+  compile-phase arena. `THINDB_SEP_PREPART_NONSIMPLE=1` now routes aggregate/window-rooted candidates
+  crash-free (values exact), but candidates serially re-inline shared prefixes → loses wall-clock;
+  default stays gated to simple table chains. Follow-up: let candidates read earlier candidates'
+  routed buffers.
+- New mono profile is balanced: Join 34.5% (2.6 s), Compute 18%, GroupTopN 16% — no single-lever
+  target remains; the ~3 s × 6 sequential 341K-row window stages are the next structural candidate.
+
 ## Bug found + fixed: missing division sentinels (DATA gap, not an engine bug)
 - thinDB initially returned **0 rows**. Bisected to `rollforward_with_plan_and_division_aba7f3c5`:
   `INNER JOIN division ON division.id = r.divisionId` with cross-division rows carrying `divisionId = -2`.
