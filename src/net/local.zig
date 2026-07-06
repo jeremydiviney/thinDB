@@ -2937,6 +2937,57 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
             defer freeOwnedNames(ctx.allocator, names);
             break :blk try NamesOp.create(ctx.allocator, "name", names);
         },
+        .functions => blk: {
+            var names: std.ArrayList([]u8) = .empty;
+            defer {
+                for (names.items) |n| ctx.allocator.free(n);
+                names.deinit(ctx.allocator);
+            }
+            const sql_names = try catalog.sql_fns.listNames(ctx.allocator, ctx.session.current_db);
+            defer ctx.allocator.free(sql_names);
+            for (sql_names) |n| try names.append(ctx.allocator, n);
+            for (catalog.udfs.tables.items) |t| {
+                try names.append(ctx.allocator, try ctx.allocator.dupe(u8, t.name));
+            }
+            std.mem.sortUnstable([]u8, names.items, {}, struct {
+                fn lt(_: void, a: []u8, b: []u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lt);
+            break :blk try NamesOp.create(ctx.allocator, "name", names.items);
+        },
+        .create_function => |fname| blk: {
+            // SQL inline function: the canonical persisted CREATE text.
+            if (catalog.sql_fns.get(ctx.session.current_db, fname)) |def| {
+                var one = [_][]u8{@constCast(def.create_text)};
+                break :blk try NamesOp.create(ctx.allocator, "Create Function", &one);
+            }
+            // LANGUAGE zig function: reconstruct the CREATE around the
+            // persisted source; embedded registrations have no source.
+            if (catalog.udfs.tableByName(fname)) |entry| {
+                for (catalog.zig_fns.items) |h| {
+                    if (std.ascii.eqlIgnoreCase(h.name, fname)) {
+                        const text = try std.fmt.allocPrint(
+                            ctx.allocator,
+                            "CREATE FUNCTION {s} LANGUAGE zig AS $${s}$$",
+                            .{ entry.name, h.source },
+                        );
+                        defer ctx.allocator.free(text);
+                        var one = [_][]u8{text};
+                        break :blk try NamesOp.create(ctx.allocator, "Create Function", &one);
+                    }
+                }
+                const note = try std.fmt.allocPrint(
+                    ctx.allocator,
+                    "-- {s}: embedded-registered table function (no stored source)",
+                    .{entry.name},
+                );
+                defer ctx.allocator.free(note);
+                var one = [_][]u8{note};
+                break :blk try NamesOp.create(ctx.allocator, "Create Function", &one);
+            }
+            return Error.FunctionNotFound;
+        },
     };
 }
 

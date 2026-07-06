@@ -200,7 +200,6 @@ pub fn match(
         std.mem.startsWith(u8, lc, "show full processlist"))
         return Outcome{ .empty_result = .processlist };
     if (std.mem.startsWith(u8, lc, "show procedure status") or
-        std.mem.startsWith(u8, lc, "show function status") or
         std.mem.startsWith(u8, lc, "show triggers") or
         std.mem.startsWith(u8, lc, "show events") or
         std.mem.startsWith(u8, lc, "show master status") or

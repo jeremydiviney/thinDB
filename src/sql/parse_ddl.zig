@@ -745,7 +745,28 @@ pub fn parseShow(p: anytype) !*ir.Op {
             }
             return try p.allocOp(.{ .show = .{ .tables = ref } });
         },
-        else => return PE.SqlExpectedKeyword,
+        .kw_create => {
+            try p.advance();
+            if (!isIdentText(p, "function")) return PE.SqlExpectedKeyword;
+            try p.advance();
+            const name = try p.dupedIdent();
+            return try p.allocOp(.{ .show = .{ .create_function = name } });
+        },
+        else => {
+            // Contextual: SHOW FUNCTIONS / SHOW FUNCTION STATUS (the real
+            // MySQL spelling). FUNCTION/FUNCTIONS are not reserved words.
+            if (isIdentText(p, "functions")) {
+                try p.advance();
+                return try p.allocOp(.{ .show = .functions });
+            }
+            if (isIdentText(p, "function")) {
+                try p.advance();
+                if (!isIdentText(p, "status")) return PE.SqlExpectedKeyword;
+                try p.advance();
+                return try p.allocOp(.{ .show = .functions });
+            }
+            return PE.SqlExpectedKeyword;
+        },
     }
 }
 

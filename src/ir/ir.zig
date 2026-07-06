@@ -239,6 +239,11 @@ pub const ShowOp = union(enum) {
     schemas: ?[]const u8,
     /// All three fields fall back to the Session as needed.
     tables: TableRef,
+    /// `SHOW FUNCTIONS` / `SHOW FUNCTION STATUS`: registered table
+    /// functions — SQL inline (current db) + Zig/embedded (process-wide).
+    functions,
+    /// `SHOW CREATE FUNCTION name`: the persisted definition text.
+    create_function: []const u8,
 };
 
 /// PostgreSQL `COPY ... FROM STDIN` / `COPY ... TO STDOUT` bulk
@@ -1385,6 +1390,8 @@ const ShowTag = enum(u8) {
     databases = 0,
     schemas = 1,
     tables = 2,
+    functions = 3,
+    create_function = 4,
 };
 
 fn encodeShow(allocator: Allocator, out: *std.ArrayList(u8), s: ShowOp) EncodeError!void {
@@ -1397,6 +1404,12 @@ fn encodeShow(allocator: Allocator, out: *std.ArrayList(u8), s: ShowOp) EncodeEr
         .tables => |ref| {
             try out.append(allocator, @intFromEnum(ShowTag.tables));
             try encodeTableRef(allocator, out, ref);
+        },
+        .functions => try out.append(allocator, @intFromEnum(ShowTag.functions)),
+        .create_function => |name| {
+            try out.append(allocator, @intFromEnum(ShowTag.create_function));
+            try appendU32(allocator, out, @intCast(name.len));
+            try out.appendSlice(allocator, name);
         },
     }
 }
@@ -2548,12 +2561,14 @@ fn decodeShow(bytes: []const u8, cursor: *usize) DecodeError!ShowOp {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(ShowTag.tables)) return Error.IrCorrupt;
+    if (t > @intFromEnum(ShowTag.create_function)) return Error.IrCorrupt;
     const tag: ShowTag = @enumFromInt(t);
     return switch (tag) {
         .databases => ShowOp.databases,
         .schemas => ShowOp{ .schemas = try decodeOptString(bytes, cursor) },
         .tables => ShowOp{ .tables = try decodeTableRef(bytes, cursor) },
+        .functions => ShowOp.functions,
+        .create_function => ShowOp{ .create_function = try readString(bytes, cursor) },
     };
 }
 

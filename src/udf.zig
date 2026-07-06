@@ -329,6 +329,25 @@ pub const SqlFnRegistry = struct {
     /// they need into their arena before releasing implied ownership
     /// (queries parse fast; DDL on a function mid-parse of a query using
     /// it is a documented race we accept like table DDL).
+    /// Names of every function registered for `db`, allocated copies.
+    pub fn listNames(self: *SqlFnRegistry, allocator: Allocator, db: []const u8) ![][]u8 {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |n| allocator.free(n);
+            out.deinit(allocator);
+        }
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const map_key = entry.key_ptr.*;
+            if (map_key.len <= db.len + 1) continue;
+            if (!std.mem.eql(u8, map_key[0..db.len], db) or map_key[db.len] != 0) continue;
+            try out.append(allocator, try allocator.dupe(u8, map_key[db.len + 1 ..]));
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     pub fn get(self: *SqlFnRegistry, db: []const u8, name: []const u8) ?*const SqlTableFn {
         var kbuf: [512]u8 = undefined;
         if (db.len + 1 + name.len > kbuf.len) return null;
