@@ -38,10 +38,11 @@ fn seed(db: *thindb.Database) !void {
 /// without window contortions" kernel, written against the RAW layer.
 fn runningTotal(
     ctx: *const thindb.udf.TvfContext,
-    part: *const thindb.udf.TvfPartition,
+    parts: []const thindb.udf.TvfPartition,
     out: *thindb.udf.TvfOutput,
 ) !void {
     _ = ctx;
+    const part = &parts[0];
     const ids = part.columns[0].data.bigint;
     const amts = part.columns[2].data.bigint;
     var running: i64 = 0;
@@ -65,7 +66,7 @@ const output_cols = [_]thindb.Column{
 fn register(db: *thindb.Database, execution: thindb.udf.TvfExecution) !void {
     try db.registerTableUdf(.{
         .name = "running_total",
-        .input_schema = &input_cols,
+        .input_schemas = &.{&input_cols},
         .output_schema = &output_cols,
         .execution = execution,
         .process = runningTotal,

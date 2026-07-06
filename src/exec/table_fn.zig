@@ -56,9 +56,17 @@ pub var force_parallel_in_tests: bool = false;
 
 pub const TableFnExec = struct {
     allocator: Allocator,
-    upstream: Query,
+    /// One upstream per declared input table. `upstream`/`input_map`/
+    /// `key_idx`/`order_idx` below alias input 0 so the single-input
+    /// execution path stays byte-identical; the multi path indexes these
+    /// arrays directly.
+    upstreams: []Query,
+    input_maps: [][]usize,
+    key_idxs: [][]usize,
+    order_idxs: [][]usize,
     entry: *const udf_mod.TableEntry,
     /// For each declared input column, its index in the upstream schema.
+    upstream: Query,
     input_map: []usize,
     /// Partition key / order columns as indices into the DECLARED input
     /// columns (post input_map remap).
@@ -74,7 +82,7 @@ pub const TableFnExec = struct {
 
     pub fn create(
         allocator: Allocator,
-        upstream: Query,
+        ups: []const Query,
         entry: *const udf_mod.TableEntry,
         partition_by: []const []const u8,
         order_by: []const SortSpec,
@@ -86,33 +94,61 @@ pub const TableFnExec = struct {
             .global => if (partition_by.len != 0) return Error.TableFnExecutionMismatch,
             .either => {},
         }
+        if (ups.len != entry.input_schemas.len or ups.len == 0) return Error.TableFnInputMismatch;
+        // Multi-input co-grouping needs the packed digest path; keys and a
+        // single int-family order column are required there (checked at
+        // execute for input 0; enforce PARTITION BY presence here).
+        if (ups.len > 1 and partition_by.len == 0) return Error.TableFnExecutionMismatch;
 
-        // Input shape contract: exact column set, exact types, sound
-        // nullability (nullable upstream cannot feed NOT NULL declared).
-        const up_schema = upstream.outputSchema();
-        if (up_schema.len != entry.input_schema.len) return Error.TableFnInputMismatch;
-        const input_map = try allocator.alloc(usize, entry.input_schema.len);
-        errdefer allocator.free(input_map);
-        for (entry.input_schema, input_map) |decl, *slot| {
-            const ui = types.findColumn(up_schema, decl.name) orelse return Error.TableFnInputMismatch;
-            if (!inputTypeMatches(up_schema[ui].type, decl.type)) return Error.TableFnInputMismatch;
-            if (up_schema[ui].nullable and !decl.nullable) return Error.TableFnInputMismatch;
-            slot.* = ui;
+        const n_in = ups.len;
+        const upstreams = try allocator.dupe(Query, ups);
+        errdefer allocator.free(upstreams);
+
+        // Per input: shape contract (exact column set, exact types, sound
+        // nullability) + key/order columns resolved in ITS declared schema.
+        const input_maps = try allocator.alloc([]usize, n_in);
+        errdefer allocator.free(input_maps);
+        const key_idxs = try allocator.alloc([]usize, n_in);
+        errdefer allocator.free(key_idxs);
+        const order_idxs = try allocator.alloc([]usize, n_in);
+        errdefer allocator.free(order_idxs);
+        var built_in: usize = 0;
+        errdefer for (0..built_in) |i| {
+            allocator.free(input_maps[i]);
+            allocator.free(key_idxs[i]);
+            allocator.free(order_idxs[i]);
+        };
+        for (0..n_in) |i| {
+            const decl_schema = entry.input_schemas[i];
+            const up_schema = upstreams[i].outputSchema();
+            if (up_schema.len != decl_schema.len) return Error.TableFnInputMismatch;
+            const imap = try allocator.alloc(usize, decl_schema.len);
+            errdefer allocator.free(imap);
+            for (decl_schema, imap) |decl, *slot| {
+                const ui = types.findColumn(up_schema, decl.name) orelse return Error.TableFnInputMismatch;
+                if (!inputTypeMatches(up_schema[ui].type, decl.type)) return Error.TableFnInputMismatch;
+                if (up_schema[ui].nullable and !decl.nullable) return Error.TableFnInputMismatch;
+                slot.* = ui;
+            }
+            const kidx = try allocator.alloc(usize, partition_by.len);
+            errdefer allocator.free(kidx);
+            for (partition_by, kidx) |name, *slot| {
+                slot.* = types.findColumn(decl_schema, name) orelse return Error.TableFnInputMismatch;
+            }
+            const oidx = try allocator.alloc(usize, order_by.len);
+            errdefer allocator.free(oidx);
+            for (order_by, oidx) |spec, *slot| {
+                slot.* = types.findColumn(decl_schema, spec.col) orelse return Error.TableFnInputMismatch;
+            }
+            input_maps[i] = imap;
+            key_idxs[i] = kidx;
+            order_idxs[i] = oidx;
+            built_in += 1;
         }
 
-        const key_idx = try allocator.alloc(usize, partition_by.len);
-        errdefer allocator.free(key_idx);
-        for (partition_by, key_idx) |name, *slot| {
-            slot.* = types.findColumn(entry.input_schema, name) orelse return Error.TableFnInputMismatch;
-        }
-        const order_idx = try allocator.alloc(usize, order_by.len);
-        errdefer allocator.free(order_idx);
         const order_desc = try allocator.alloc(bool, order_by.len);
         errdefer allocator.free(order_desc);
-        for (order_by, order_idx, order_desc) |spec, *oi, *od| {
-            oi.* = types.findColumn(entry.input_schema, spec.col) orelse return Error.TableFnInputMismatch;
-            od.* = spec.desc;
-        }
+        for (order_by, order_desc) |spec, *od| od.* = spec.desc;
 
         const output_cols = try allocator.alloc(ColumnStore, entry.output_schema.len);
         errdefer allocator.free(output_cols);
@@ -132,11 +168,15 @@ pub const TableFnExec = struct {
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .upstream = upstream,
+            .upstreams = upstreams,
+            .input_maps = input_maps,
+            .key_idxs = key_idxs,
+            .order_idxs = order_idxs,
             .entry = entry,
-            .input_map = input_map,
-            .key_idx = key_idx,
-            .order_idx = order_idx,
+            .upstream = upstreams[0],
+            .input_map = input_maps[0],
+            .key_idx = key_idxs[0],
+            .order_idx = order_idxs[0],
             .order_desc = order_desc,
             .output_cols = output_cols,
             .views = views,
@@ -147,15 +187,20 @@ pub const TableFnExec = struct {
     }
 
     pub fn deinit(self: *TableFnExec) void {
-        var up = self.upstream;
-        up.deinit();
+        for (self.upstreams) |*up| up.deinit();
+        self.allocator.free(self.upstreams);
         for (self.output_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_cols);
         self.allocator.free(self.views);
         self.allocator.free(self.col_stats);
-        self.allocator.free(self.input_map);
-        self.allocator.free(self.key_idx);
-        self.allocator.free(self.order_idx);
+        for (0..self.input_maps.len) |i| {
+            self.allocator.free(self.input_maps[i]);
+            self.allocator.free(self.key_idxs[i]);
+            self.allocator.free(self.order_idxs[i]);
+        }
+        self.allocator.free(self.input_maps);
+        self.allocator.free(self.key_idxs);
+        self.allocator.free(self.order_idxs);
         self.allocator.free(self.order_desc);
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -248,7 +293,7 @@ pub const TableFnExec = struct {
         const prof = exec.prof;
         const trace = getenv("THINDB_TVF_TRACE") != null;
         var t0 = prof.nowTicks();
-        const n_cols = self.entry.input_schema.len;
+        const n_cols = self.entry.input_schemas[0].len;
 
         // Drain the input into buffers laid out in DECLARED column order.
         var input_cols = try self.allocator.alloc(ColumnStore, n_cols);
@@ -257,7 +302,7 @@ pub const TableFnExec = struct {
             for (input_cols[0..inited]) |*c| c.deinit(self.allocator);
             self.allocator.free(input_cols);
         }
-        for (self.entry.input_schema, input_cols) |col, *store| {
+        for (self.entry.input_schemas[0], input_cols) |col, *store| {
             store.* = try ColumnStore.init(self.allocator, col.type, col.nullable);
             inited += 1;
         }
@@ -491,12 +536,12 @@ pub const TableFnExec = struct {
             perm: []const u32,
             out_stores: []ColumnStore,
         ) !Runner {
-            const n_cols = op.entry.input_schema.len;
+            const n_cols = op.entry.input_schemas[0].len;
             const scratch = try allocator.alloc(ColumnStore, n_cols);
             errdefer allocator.free(scratch);
             var inited: usize = 0;
             errdefer for (scratch[0..inited]) |*c| c.deinit(allocator);
-            for (op.entry.input_schema, scratch) |col, *store| {
+            for (op.entry.input_schemas[0], scratch) |col, *store| {
                 store.* = try ColumnStore.init(allocator, col.type, col.nullable);
                 inited += 1;
             }
@@ -551,18 +596,18 @@ pub const TableFnExec = struct {
                 .arena = self.arena.allocator(),
                 .user_data = op.entry.user_data,
             };
-            const part = udf_mod.TvfPartition{
+            const parts = [_]udf_mod.TvfPartition{.{
                 .columns = self.part_views,
                 .row_count = run.end - run.start,
                 .keys = self.key_vals,
-            };
+            }};
             var out = udf_mod.TvfOutput{
                 .columns = self.out_ptrs,
                 .allocator = self.allocator,
             };
             const before = self.out_ptrs[0].rowCount();
             const k0 = exec.prof.nowTicks();
-            try op.entry.process(&ctx, &part, &out);
+            try op.entry.process(&ctx, &parts, &out);
             self.kernel_ticks += exec.prof.nowTicks() - k0;
 
             const after = self.out_ptrs[0].rowCount();

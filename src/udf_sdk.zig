@@ -406,25 +406,59 @@ pub fn Writer(comptime Output: type) type {
 /// Reflect a function module (`spec` + `Input` + `Output` + `process`) into
 /// the raw engine descriptor. The schemas live in comptime statics; the
 /// registry copies them at registration.
+/// The module's input struct types, in call order: `Input`, then `Input2`,
+/// `Input3`, ... — one per input subquery at the call site.
+pub fn inputTypesOf(comptime Mod: type) []const type {
+    comptime {
+        var list: []const type = &.{Mod.Input};
+        var i: usize = 2;
+        while (true) : (i += 1) {
+            var buf: [16]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, "Input{d}", .{i}) catch unreachable;
+            if (!@hasDecl(Mod, name)) break;
+            list = list ++ &[_]type{@field(Mod, name)};
+        }
+        return list;
+    }
+}
+
 pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
+    const inputs = comptime inputTypesOf(Mod);
     const S = struct {
-        const input = schemaFor(Mod.Input);
+        const input_schemas = blk: {
+            var out: [inputs.len][]const types.Column = undefined;
+            for (inputs, 0..) |T, i| {
+                const cols = schemaFor(T);
+                out[i] = &cols;
+            }
+            break :blk out;
+        };
         const output = schemaFor(Mod.Output);
 
         fn trampoline(
             raw_ctx: *const udf.TvfContext,
-            part: *const udf.TvfPartition,
+            parts: []const udf.TvfPartition,
             out: *udf.TvfOutput,
         ) anyerror!void {
+            std.debug.assert(parts.len == inputs.len);
             var ctx = Ctx{ .arena = raw_ctx.arena, .user_data = raw_ctx.user_data };
-            const p = Partition(Mod.Input){ .raw = part, .len = part.row_count };
             var w = Writer(Mod.Output){ .raw = out };
-            try Mod.process(&ctx, p, &w);
+            // Build (ctx, p1, p2, ..., writer) and call process with it.
+            var args: CallArgs = undefined;
+            args.@"0" = &ctx;
+            inline for (inputs, 0..) |T, i| {
+                @field(args, std.fmt.comptimePrint("{d}", .{i + 1})) =
+                    Partition(T){ .raw = &parts[i], .len = parts[i].row_count };
+            }
+            @field(args, std.fmt.comptimePrint("{d}", .{inputs.len + 1})) = &w;
+            try @call(.auto, Mod.process, args);
         }
+
+        const CallArgs = std.meta.ArgsTuple(@TypeOf(Mod.process));
     };
     return .{
         .name = Mod.spec.name,
-        .input_schema = &S.input,
+        .input_schemas = &S.input_schemas,
         .output_schema = &S.output,
         .execution = Mod.spec.execution,
         .process = S.trampoline,

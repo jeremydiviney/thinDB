@@ -163,9 +163,13 @@ pub const TvfContext = struct {
     user_data: ?*anyopaque = null,
 };
 
+/// One co-grouped partition per input table, in declared input order. A
+/// single-input function receives `parts.len == 1`. An input with no rows
+/// for the group's key still gets an entry (row_count 0, columns empty)
+/// with `keys` populated — empty tables are ALIGNED, never skipped.
 pub const TvfProcess = *const fn (
     ctx: *const TvfContext,
-    part: *const TvfPartition,
+    parts: []const TvfPartition,
     out: *TvfOutput,
 ) anyerror!void;
 
@@ -177,8 +181,9 @@ pub const TvfProcess = *const fn (
 /// exactly the declared columns.
 pub const TableUdf = struct {
     name: []const u8,
-    /// Declared input columns, in the order the callback receives them.
-    input_schema: []const types.Column,
+    /// Declared input tables, each a column list in the order the callback
+    /// receives it. One entry per input subquery at the call site.
+    input_schemas: []const []const types.Column,
     /// Declared output columns — the operator's output schema.
     output_schema: []const types.Column,
     execution: TvfExecution = .either,
@@ -188,7 +193,7 @@ pub const TableUdf = struct {
 
 pub const TableEntry = struct {
     name: []const u8,
-    input_schema: []const types.Column,
+    input_schemas: []const []const types.Column,
     output_schema: []const types.Column,
     execution: TvfExecution,
     process: TvfProcess,
@@ -390,7 +395,8 @@ pub const UdfRegistry = struct {
         self.aggregates.deinit(self.allocator);
         for (self.tables.items) |entry| {
             self.allocator.free(entry.name);
-            freeColumns(self.allocator, entry.input_schema);
+            for (entry.input_schemas) |cols| freeColumns(self.allocator, cols);
+            self.allocator.free(entry.input_schemas);
             freeColumns(self.allocator, entry.output_schema);
         }
         self.tables.deinit(self.allocator);
@@ -419,20 +425,31 @@ pub const UdfRegistry = struct {
 
     pub fn registerTable(self: *UdfRegistry, udf: TableUdf) !void {
         try validateName(udf.name);
-        if (udf.input_schema.len == 0 or udf.output_schema.len == 0) {
+        if (udf.input_schemas.len == 0 or udf.output_schema.len == 0) {
             return Error.FunctionInvalidDefinition;
+        }
+        for (udf.input_schemas) |cols| {
+            if (cols.len == 0) return Error.FunctionInvalidDefinition;
         }
         if (self.tableByName(udf.name) != null) return Error.FunctionAlreadyExists;
 
         const name = try lowerName(self.allocator, udf.name);
         errdefer self.allocator.free(name);
-        const input_schema = try dupeColumns(self.allocator, udf.input_schema);
-        errdefer freeColumns(self.allocator, input_schema);
+        const input_schemas = try self.allocator.alloc([]const types.Column, udf.input_schemas.len);
+        var n_in: usize = 0;
+        errdefer {
+            for (input_schemas[0..n_in]) |cols| freeColumns(self.allocator, cols);
+            self.allocator.free(input_schemas);
+        }
+        for (udf.input_schemas, input_schemas) |src, *dst| {
+            dst.* = try dupeColumns(self.allocator, src);
+            n_in += 1;
+        }
         const output_schema = try dupeColumns(self.allocator, udf.output_schema);
         errdefer freeColumns(self.allocator, output_schema);
         try self.tables.append(self.allocator, .{
             .name = name,
-            .input_schema = input_schema,
+            .input_schemas = input_schemas,
             .output_schema = output_schema,
             .execution = udf.execution,
             .process = udf.process,
@@ -444,7 +461,8 @@ pub const UdfRegistry = struct {
         for (self.tables.items, 0..) |entry, i| {
             if (std.ascii.eqlIgnoreCase(entry.name, name)) {
                 self.allocator.free(entry.name);
-                freeColumns(self.allocator, entry.input_schema);
+                for (entry.input_schemas) |cols| freeColumns(self.allocator, cols);
+                self.allocator.free(entry.input_schemas);
                 freeColumns(self.allocator, entry.output_schema);
                 _ = self.tables.swapRemove(i);
                 return true;

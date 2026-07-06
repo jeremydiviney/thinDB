@@ -448,6 +448,10 @@ fn explainShow(allocator: Allocator, out: *std.ArrayList(u8), s: ShowOp) !void {
             try writeTableRef(allocator, out, ref);
             try out.append(allocator, '\n');
         },
+        .functions => try out.appendSlice(allocator, "ShowFunctions\n"),
+        .create_function => |name| {
+            try writeAll(allocator, out, "ShowCreateFunction ", name, "\n");
+        },
     }
 }
 

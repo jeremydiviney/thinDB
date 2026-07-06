@@ -41,7 +41,7 @@ pub const Error = error{
     ZigCompileFailed,
 };
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 const EmbeddedFile = struct { path: []const u8, data: []const u8 };
 
@@ -70,12 +70,16 @@ const WRAPPER_MAIN =
     \\    type_tag: u8,
     \\    nullable: bool,
     \\};
+    \\pub const TableDesc = extern struct {
+    \\    n_cols: usize,
+    \\    cols: [*]const ColDesc,
+    \\};
     \\pub const Desc = extern struct {
     \\    name_ptr: [*]const u8,
     \\    name_len: usize,
     \\    execution: u8,
-    \\    n_in: usize,
-    \\    in_cols: [*]const ColDesc,
+    \\    n_tables: usize,
+    \\    tables: [*]const TableDesc,
     \\    n_out: usize,
     \\    out_cols: [*]const ColDesc,
     \\};
@@ -93,33 +97,47 @@ const WRAPPER_MAIN =
     \\    return out;
     \\}
     \\
-    \\const in_descs = colDescs(desc_gen.input_schema);
+    \\const n_tables = desc_gen.input_schemas.len;
+    \\const table_descs = blk: {
+    \\    var cols_storage: [n_tables][]const ColDesc = undefined;
+    \\    for (desc_gen.input_schemas, 0..) |cols, i| {
+    \\        const arr = colDescs(cols);
+    \\        const frozen = arr;
+    \\        cols_storage[i] = &frozen;
+    \\    }
+    \\    var out: [n_tables]TableDesc = undefined;
+    \\    for (cols_storage, 0..) |cd, i| {
+    \\        out[i] = .{ .n_cols = cd.len, .cols = cd.ptr };
+    \\    }
+    \\    break :blk out;
+    \\};
     \\const out_descs = colDescs(desc_gen.output_schema);
     \\const the_desc = Desc{
     \\    .name_ptr = desc_gen.name.ptr,
     \\    .name_len = desc_gen.name.len,
     \\    .execution = @intFromEnum(desc_gen.execution),
-    \\    .n_in = in_descs.len,
-    \\    .in_cols = &in_descs,
+    \\    .n_tables = n_tables,
+    \\    .tables = &table_descs,
     \\    .n_out = out_descs.len,
     \\    .out_cols = &out_descs,
     \\};
     \\
     \\export fn thindb_tvf_abi_version() callconv(.c) u32 {
-    \\    return 1;
+    \\    return 2;
     \\}
     \\export fn thindb_tvf_descriptor() callconv(.c) *const Desc {
     \\    return &the_desc;
     \\}
     \\export fn thindb_tvf_process(
     \\    ctx: *const anyopaque,
-    \\    part: *const anyopaque,
+    \\    parts_ptr: [*]const anyopaque,
+    \\    n_parts: usize,
     \\    out: *anyopaque,
     \\) callconv(.c) i32 {
     \\    const c: *const tdb.TvfContext = @ptrCast(@alignCast(ctx));
-    \\    const p: *const tdb.TvfPartition = @ptrCast(@alignCast(part));
+    \\    const p: [*]const tdb.TvfPartition = @ptrCast(@alignCast(parts_ptr));
     \\    const o: *tdb.TvfOutput = @ptrCast(@alignCast(out));
-    \\    desc_gen.process(c, p, o) catch return -1;
+    \\    desc_gen.process(c, p[0..n_parts], o) catch return -1;
     \\    return 0;
     \\}
 ;
@@ -143,7 +161,7 @@ const VALIDATE_MAIN =
     \\    std.process.exit(3);
     \\}
     \\
-    \\fn synthesize(allocator: std.mem.Allocator, cols: []const @TypeOf(desc.input_schema[0]), stores: []tdb.ColumnStore) !void {
+    \\fn synthesize(allocator: std.mem.Allocator, cols: anytype, stores: []tdb.ColumnStore) !void {
     \\    for (cols, stores) |c, *st| {
     \\        st.* = try tdb.ColumnStore.init(allocator, c.type, c.nullable);
     \\        for (0..3) |i| {
@@ -170,10 +188,15 @@ const VALIDATE_MAIN =
     \\    var gpa = std.heap.DebugAllocator(.{}){};
     \\    const allocator = gpa.allocator();
     \\
-    \\    var in_stores: [desc.input_schema.len]tdb.ColumnStore = undefined;
-    \\    try synthesize(allocator, desc.input_schema, &in_stores);
-    \\    var views: [desc.input_schema.len]tdb.ColumnView = undefined;
-    \\    for (&in_stores, &views) |st, *v| v.* = st.view();
+    \\    const n_tables = desc.input_schemas.len;
+    \\    var parts: [n_tables]tdb.TvfPartition = undefined;
+    \\    inline for (desc.input_schemas, 0..) |cols, t| {
+    \\        var stores = try allocator.alloc(tdb.ColumnStore, cols.len);
+    \\        try synthesize(allocator, cols, stores);
+    \\        var views = try allocator.alloc(tdb.ColumnView, cols.len);
+    \\        for (stores, views) |st, *v| v.* = st.view();
+    \\        parts[t] = .{ .columns = views, .row_count = 3, .keys = &.{} };
+    \\    }
     \\
     \\    var out_stores: [desc.output_schema.len]tdb.ColumnStore = undefined;
     \\    for (desc.output_schema, &out_stores) |c, *st| {
@@ -185,10 +208,9 @@ const VALIDATE_MAIN =
     \\    var arena = std.heap.ArenaAllocator.init(allocator);
     \\    defer arena.deinit();
     \\    const ctx = tdb.TvfContext{ .arena = arena.allocator() };
-    \\    const part = tdb.TvfPartition{ .columns = &views, .row_count = 3, .keys = &.{} };
     \\    var out = tdb.TvfOutput{ .columns = &out_ptrs, .allocator = allocator };
     \\
-    \\    desc.process(&ctx, &part, &out) catch |err| {
+    \\    desc.process(&ctx, &parts, &out) catch |err| {
     \\        std.debug.print("validate: process failed: {t}\n", .{err});
     \\        std.process.exit(1);
     \\    };
@@ -210,24 +232,28 @@ pub const ColDesc = extern struct {
     type_tag: u8,
     nullable: bool,
 };
+pub const TableDesc = extern struct {
+    n_cols: usize,
+    cols: [*]const ColDesc,
+};
 pub const Desc = extern struct {
     name_ptr: [*]const u8,
     name_len: usize,
     execution: u8,
-    n_in: usize,
-    in_cols: [*]const ColDesc,
+    n_tables: usize,
+    tables: [*]const TableDesc,
     n_out: usize,
     out_cols: [*]const ColDesc,
 };
 
-const DllProcess = *const fn (*const anyopaque, *const anyopaque, *anyopaque) callconv(.c) i32;
+const DllProcess = *const fn (*const anyopaque, [*]const udf_mod.TvfPartition, usize, *anyopaque) callconv(.c) i32;
 
 /// The shim registered as every Zig function's TvfProcess: `user_data`
 /// carries the library's process pointer (threaded through TvfContext by
 /// the exec operator), so no per-function server code exists.
-fn dllShim(ctx: *const udf_mod.TvfContext, part: *const udf_mod.TvfPartition, out: *udf_mod.TvfOutput) anyerror!void {
+fn dllShim(ctx: *const udf_mod.TvfContext, parts: []const udf_mod.TvfPartition, out: *udf_mod.TvfOutput) anyerror!void {
     const f: DllProcess = @ptrCast(@alignCast(ctx.user_data.?));
-    if (f(ctx, part, out) != 0) return error.TableFnKernelError;
+    if (f(ctx, parts.ptr, parts.len, out) != 0) return error.TableFnKernelError;
 }
 
 /// A loaded Zig function: keeps the library alive for the registry
@@ -490,12 +516,16 @@ pub fn loadAndRegister(
 
     var cols_arena = std.heap.ArenaAllocator.init(allocator);
     defer cols_arena.deinit();
-    const input_schema = try descCols(cols_arena.allocator(), desc.in_cols[0..desc.n_in]);
+    if (desc.n_tables == 0 or desc.n_tables > 16) return Error.FunctionInvalidDefinition;
+    const input_schemas = try cols_arena.allocator().alloc([]const types.Column, desc.n_tables);
+    for (desc.tables[0..desc.n_tables], input_schemas) |t, *slot| {
+        slot.* = try descCols(cols_arena.allocator(), t.cols[0..t.n_cols]);
+    }
     const output_schema = try descCols(cols_arena.allocator(), desc.out_cols[0..desc.n_out]);
 
     try registry.registerTable(.{
         .name = name,
-        .input_schema = input_schema,
+        .input_schemas = input_schemas,
         .output_schema = output_schema,
         .execution = @enumFromInt(desc.execution),
         .process = dllShim,
