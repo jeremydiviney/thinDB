@@ -51,12 +51,39 @@ await q("replace", "CREATE OR REPLACE FUNCTION zt_running LANGUAGE zig AS $$" + 
 const rows2 = await q("call-replaced", "SELECT running FROM TABLE(zt_running((SELECT id, g, amt FROM zt)) PARTITION BY g ORDER BY id) ORDER BY running");
 const got2 = rows2 ? rows2.map(r => Number(r.running)).join(",") : "";
 if (got2 !== "20,60,80,120,180") { console.log(`replaced-values: FAIL (${got2})`); failed++; } else console.log("replaced-values: OK");
+// P3: two-input LANGUAGE zig function over the wire (ABI v2 multi-table).
+const src3 = `
+const tdb = @import("tdb");
+pub const spec = tdb.TableFnSpec{ .name = "zt_pair", .execution = .partitioned };
+pub const Input = struct { g: ?i32, amt: ?i64 };
+pub const Input2 = struct { g: ?i32, amt: ?i64 };
+pub const Output = struct { g: ?i32, a_sum: i64, b_sum: i64 };
+pub fn process(ctx: *tdb.Ctx, a: tdb.Partition(Input), b: tdb.Partition(Input2), out: *tdb.Writer(Output)) !void {
+    _ = ctx;
+    var sa: i64 = 0;
+    var sb: i64 = 0;
+    const aa = a.col(.amt);
+    const ba = b.col(.amt);
+    for (0..a.len) |i| sa += aa.get(i) orelse 0;
+    for (0..b.len) |i| sb += ba.get(i) orelse 0;
+    const g = if (a.len > 0) a.col(.g).get(0) else b.col(.g).get(0);
+    try out.row(.{ .g = g, .a_sum = sa, .b_sum = sb });
+}
+`;
+await q("multi-create", "CREATE OR REPLACE FUNCTION zt_pair LANGUAGE zig AS $$" + src3 + "$$");
+const rows4 = await q("multi-call",
+  "SELECT g, a_sum, b_sum FROM TABLE(zt_pair((SELECT g, amt FROM zt), (SELECT g, amt FROM zt WHERE g = 1)) PARTITION BY g) ORDER BY g");
+const got4 = rows4 ? rows4.map(r => `${r.g}:${r.a_sum}/${r.b_sum}`).join(",") : "";
+if (got4 !== "1:60/60,2:90/0") { console.log(`multi-values: FAIL (${got4})`); failed++; } else console.log("multi-values: OK");
+await q("multi-drop", "DROP FUNCTION zt_pair");
 await q("drop", "DROP FUNCTION zt_running");
 await q("post-drop", "SELECT * FROM TABLE(zt_running((SELECT id, g, amt FROM zt)) PARTITION BY g)", "UnsupportedQueryShape");
 // DLL tier: register the library the compile tier just built, directly.
 const { readdirSync } = await import("fs");
 const scratch = "../../.zigfn-db/_zigfn_build/main_zt_running";
-const dlls = readdirSync(scratch).filter(f => f.endsWith(".dll")).sort();
+const { statSync } = await import("fs");
+const dlls = readdirSync(scratch).filter(f => f.endsWith(".dll"))
+  .sort((a, b) => statSync(scratch + "/" + a).mtimeMs - statSync(scratch + "/" + b).mtimeMs);
 const dll = scratch + "/" + dlls[dlls.length - 1];
 await q("dll-create", `CREATE FUNCTION zt_running LANGUAGE zig USING '${dll}'`);
 const rows3 = await q("dll-call", "SELECT running FROM TABLE(zt_running((SELECT id, g, amt FROM zt)) PARTITION BY g ORDER BY id) ORDER BY running");

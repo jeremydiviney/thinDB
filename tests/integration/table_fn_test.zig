@@ -579,6 +579,98 @@ test "table UDF P3: two co-partitioned inputs with empty-partition alignment" {
     try std.testing.expectEqualSlices(i64, &.{ -20, 150, -40, 70 }, variances.items);
 }
 
+test "table UDF P3: parallel multi-input matches serial" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+
+    // 48 groups; input A has all of them, input B only the lower half
+    // (so half the B partitions arrive empty under parallel workers too).
+    const t = try db.table("t", schema, opts);
+    var id: i64 = 1;
+    for (0..6) |round| {
+        for (0..48) |g| {
+            try t.insert(&.{.{
+                .id = id,
+                .g = @as(i32, @intCast(g)),
+                .amt = @as(i64, @intCast(g * 10 + round)),
+            }});
+            id += 1;
+        }
+    }
+    try t.flush();
+
+    const pair_sums = struct {
+        pub const spec = tdb.TableFnSpec{ .name = "pair_sums", .execution = .partitioned };
+        pub const Input = struct { id: ?i64, g: ?i32, amt: ?i64 };
+        pub const Input2 = struct { id: ?i64, g: ?i32, amt: ?i64 };
+        pub const Output = struct { g: ?i32, a_sum: i64, b_sum: i64 };
+
+        pub fn process(ctx: *tdb.Ctx, a: tdb.Partition(Input), b: tdb.Partition(Input2), out: *tdb.Writer(Output)) !void {
+            _ = ctx;
+            var sa: i64 = 0;
+            var sb: i64 = 0;
+            const aa = a.col(.amt);
+            const ba = b.col(.amt);
+            for (0..a.len) |i| sa += aa.get(i) orelse 0;
+            for (0..b.len) |i| sb += ba.get(i) orelse 0;
+            const g = if (a.len > 0) a.col(.g).get(0) else b.col(.g).get(0);
+            try out.row(.{ .g = g, .a_sum = sa, .b_sum = sb });
+        }
+    };
+    try db.registerTableFn(pair_sums);
+
+    const sql =
+        \\SELECT g, a_sum, b_sum
+        \\FROM TABLE(pair_sums(
+        \\  (SELECT id, g, amt FROM t),
+        \\  (SELECT id, g, amt FROM t WHERE g < 24)
+        \\) PARTITION BY g)
+        \\ORDER BY g
+    ;
+    const Row = struct { g: i32, a: i64, b: i64 };
+    var serial: std.ArrayList(Row) = .empty;
+    defer serial.deinit(allocator);
+    {
+        var res = try run(allocator, db, sql);
+        defer res.deinit();
+        while (try res.next()) |batch| {
+            for (0..batch.row_count) |i| try serial.append(allocator, .{
+                .g = batch.values[0].data.int[i],
+                .a = batch.values[1].data.bigint[i],
+                .b = batch.values[2].data.bigint[i],
+            });
+        }
+    }
+    thindb.exec.table_fn.force_parallel_in_tests = true;
+    defer thindb.exec.table_fn.force_parallel_in_tests = false;
+    var parallel: std.ArrayList(Row) = .empty;
+    defer parallel.deinit(allocator);
+    {
+        var res = try run(allocator, db, sql);
+        defer res.deinit();
+        while (try res.next()) |batch| {
+            for (0..batch.row_count) |i| try parallel.append(allocator, .{
+                .g = batch.values[0].data.int[i],
+                .a = batch.values[1].data.bigint[i],
+                .b = batch.values[2].data.bigint[i],
+            });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 48), serial.items.len);
+    try std.testing.expectEqualSlices(Row, serial.items, parallel.items);
+    // Spot-check the empty-B alignment: groups >= 24 have no B rows.
+    for (serial.items) |r| {
+        if (r.g >= 24) try std.testing.expectEqual(@as(i64, 0), r.b);
+    }
+}
+
 test "table UDF P3: global multi-input hands every input whole" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

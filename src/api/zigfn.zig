@@ -130,7 +130,7 @@ const WRAPPER_MAIN =
     \\}
     \\export fn thindb_tvf_process(
     \\    ctx: *const anyopaque,
-    \\    parts_ptr: [*]const anyopaque,
+    \\    parts_ptr: *const anyopaque,
     \\    n_parts: usize,
     \\    out: *anyopaque,
     \\) callconv(.c) i32 {
@@ -191,9 +191,9 @@ const VALIDATE_MAIN =
     \\    const n_tables = desc.input_schemas.len;
     \\    var parts: [n_tables]tdb.TvfPartition = undefined;
     \\    inline for (desc.input_schemas, 0..) |cols, t| {
-    \\        var stores = try allocator.alloc(tdb.ColumnStore, cols.len);
+    \\        const stores = try allocator.alloc(tdb.ColumnStore, cols.len);
     \\        try synthesize(allocator, cols, stores);
-    \\        var views = try allocator.alloc(tdb.ColumnView, cols.len);
+    \\        const views = try allocator.alloc(tdb.ColumnView, cols.len);
     \\        for (stores, views) |st, *v| v.* = st.view();
     \\        parts[t] = .{ .columns = views, .row_count = 3, .keys = &.{} };
     \\    }
