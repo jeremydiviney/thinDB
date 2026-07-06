@@ -434,6 +434,17 @@ pub const TableFnExec = struct {
         for (workers[0..built]) |*w| {
             if (w.err) |err| return err;
         }
+        if (getenv("THINDB_TVF_TRACE") != null) {
+            var sum: i64 = 0;
+            var mx: i64 = 0;
+            for (workers[0..built]) |*w| {
+                sum += w.runner.kernel_ticks;
+                mx = @max(mx, w.runner.kernel_ticks);
+            }
+            std.debug.print("[tvf]   kernel: {d:.0}ms wall (busiest worker), {d:.0}ms cpu across {d} workers\n", .{
+                exec.prof.ticksToMs(mx), exec.prof.ticksToMs(sum), built,
+            });
+        }
         // A claimed-but-never-run slot can only happen on abort; err above
         // covers it. If threads partially spawned, the survivors drained
         // the whole claim range.
@@ -469,6 +480,9 @@ pub const TableFnExec = struct {
         key_vals: []?Value,
         out_ptrs: []*ColumnStore,
         arena: std.heap.ArenaAllocator,
+        /// Ticks spent INSIDE the user kernel (process() calls), for the
+        /// THINDB_TVF_TRACE phase breakdown.
+        kernel_ticks: i64 = 0,
 
         fn init(
             allocator: Allocator,
@@ -547,7 +561,9 @@ pub const TableFnExec = struct {
                 .allocator = self.allocator,
             };
             const before = self.out_ptrs[0].rowCount();
+            const k0 = exec.prof.nowTicks();
             try op.entry.process(&ctx, &part, &out);
+            self.kernel_ticks += exec.prof.nowTicks() - k0;
 
             const after = self.out_ptrs[0].rowCount();
             for (self.out_ptrs[1..]) |c| {

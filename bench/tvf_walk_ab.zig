@@ -439,6 +439,21 @@ pub fn main() !void {
     defer allocator.free(sqls.b);
 
 
+    if (getenv("THINDB_AB_UPSTREAM") != null) {
+        // Bare input-pipeline baseline: how much of the drain is upstream
+        // compute (paid by BOTH variants) vs the TVF's copy.
+        const up_sql = try std.fmt.allocPrint(allocator,
+            "SELECT COUNT(*) AS n FROM ({s}) _up",
+            .{sqls.b[std.mem.indexOf(u8, sqls.b, "((").? + 2 .. std.mem.lastIndexOf(u8, sqls.b, ")) PARTITION BY").?]});
+        defer allocator.free(up_sql);
+        var up_ms: u64 = 0;
+        for (0..2) |i| {
+            const lines = try runToLines(allocator, db, up_sql, &up_ms);
+            freeLines(allocator, lines);
+            std.debug.print("upstream-only pass {d}: {d}ms\n", .{ i, up_ms });
+        }
+    }
+
     // Correctness gate first, then alternating timed passes (pass 0 warms).
     var ms_a: u64 = 0;
     var ms_b: u64 = 0;
