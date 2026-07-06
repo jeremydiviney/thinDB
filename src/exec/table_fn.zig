@@ -281,10 +281,15 @@ pub const TableFnExec = struct {
         // become contiguous runs and each run is already in ORDER BY order.
         const perm = try self.allocator.alloc(u32, n_rows);
         defer self.allocator.free(perm);
+        var digests: ?[]u128 = null;
+        defer if (digests) |d| self.allocator.free(d);
         for (perm, 0..) |*p, i| p.* = @intCast(i);
         if (self.key_idx.len + self.order_idx.len > 0) {
-            const lctx = LessCtx{ .self = self, .views = input_views };
-            std.mem.sortUnstable(u32, perm, lctx, LessCtx.less);
+            digests = try self.packedSort(input_views, perm);
+            if (digests == null) {
+                const lctx = LessCtx{ .self = self, .views = input_views };
+                std.mem.sortUnstable(u32, perm, lctx, LessCtx.less);
+            }
         }
 
         if (trace) {
@@ -296,7 +301,15 @@ pub const TableFnExec = struct {
         var runs: std.ArrayList(Run) = .empty;
         defer runs.deinit(self.allocator);
         var start: usize = 0;
-        while (start < n_rows) {
+        if (digests) |d| {
+            // Digest-grouped ordering: run boundaries are digest changes.
+            while (start < n_rows) {
+                var end = start + 1;
+                while (end < n_rows and d[perm[start]] == d[perm[end]]) end += 1;
+                try runs.append(self.allocator, .{ .start = start, .end = end });
+                start = end;
+            }
+        } else while (start < n_rows) {
             var end = start + 1;
             while (end < n_rows and self.sameKeys(input_views, perm[start], perm[end])) end += 1;
             try runs.append(self.allocator, .{ .start = start, .end = end });
@@ -559,6 +572,115 @@ pub const TableFnExec = struct {
             .varchar, .string, .char => true,
             else => false,
         };
+    }
+
+    /// One row's flattened sort identity: partition keys collapse to a
+    /// u128 digest (digest equality = key equality, the same contract the
+    /// wide-key GROUP BY relies on engine-wide), the first order column
+    /// packs to an i64. Sorting these flat structs replaces the generic
+    /// per-Value comparator — ~10× on multi-million-row inputs.
+    const PackedKey = struct {
+        digest: u128,
+        ord: i64,
+        ord_null: bool,
+        row: u32,
+    };
+
+    const PackCtx = struct {
+        desc: bool,
+
+        fn less(ctx: PackCtx, a: PackedKey, b: PackedKey) bool {
+            if (a.digest != b.digest) return a.digest < b.digest;
+            // NULLs first, matching the engine's validity-aware ordering.
+            if (a.ord_null != b.ord_null) return a.ord_null;
+            if (a.ord != b.ord) return if (ctx.desc) a.ord > b.ord else a.ord < b.ord;
+            return a.row < b.row;
+        }
+    };
+
+    /// Sort `perm` via packed keys when the shape allows it (any partition
+    /// key types; at most ONE order column, int-family ≤64-bit). Returns
+    /// false to fall back to the generic comparator.
+    fn packedSort(self: *const TableFnExec, views: []const ColumnView, perm: []u32) !?[]u128 {
+        if (self.order_idx.len > 1) return null;
+        if (self.order_idx.len == 1) {
+            switch (views[self.order_idx[0]].data) {
+                .int, .bigint, .tinyint, .smallint, .date, .datetime, .decimal64, .boolean => {},
+                else => return null,
+            }
+        }
+        // Float keys: ±0.0 compare equal but hash differently — a digest
+        // would split one real partition. Generic path handles them.
+        for (self.key_idx) |ki| {
+            switch (views[ki].data) {
+                .float, .double => return null,
+                else => {},
+            }
+        }
+
+        const keys = try self.allocator.alloc(PackedKey, perm.len);
+        defer self.allocator.free(keys);
+
+        for (keys, 0..) |*k, i| {
+            var h1 = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+            var h2 = std.hash.Wyhash.init(0x517cc1b727220a95);
+            for (self.key_idx) |ki| {
+                const v = views[ki];
+                if (!v.isValid(i)) {
+                    h1.update(&.{0});
+                    h2.update(&.{0});
+                    continue;
+                }
+                h1.update(&.{1});
+                h2.update(&.{1});
+                switch (v.data) {
+                    .varchar, .string, .char => |sv| {
+                        const bytes = sv.rowBytes(i);
+                        h1.update(bytes);
+                        h2.update(bytes);
+                        // Length delimiter: ("ab","c") must not collide
+                        // with ("a","bc").
+                        h1.update(std.mem.asBytes(&bytes.len));
+                        h2.update(std.mem.asBytes(&bytes.len));
+                    },
+                    inline .int, .bigint, .tinyint, .smallint, .date, .datetime, .largeint, .decimal64, .decimal128, .uuid, .float, .double, .boolean => |s| {
+                        h1.update(std.mem.asBytes(&s[i]));
+                        h2.update(std.mem.asBytes(&s[i]));
+                    },
+                }
+            }
+            k.digest = (@as(u128, h1.final()) << 64) | h2.final();
+            k.row = @intCast(i);
+            if (self.order_idx.len == 1) {
+                const ov = views[self.order_idx[0]];
+                if (ov.isValid(i)) {
+                    k.ord_null = false;
+                    k.ord = switch (ov.data) {
+                        .int, .date => |s| s[i],
+                        .bigint, .datetime, .decimal64 => |s| s[i],
+                        .tinyint => |s| s[i],
+                        .smallint => |s| s[i],
+                        .boolean => |s| s[i],
+                        else => unreachable,
+                    };
+                } else {
+                    k.ord_null = true;
+                    k.ord = 0;
+                }
+            } else {
+                k.ord_null = false;
+                k.ord = 0;
+            }
+        }
+
+        const desc = self.order_desc.len == 1 and self.order_desc[0];
+        std.mem.sortUnstable(PackedKey, keys, PackCtx{ .desc = desc }, PackCtx.less);
+        for (keys, perm) |k, *p| p.* = k.row;
+        // Row-indexed digests for the boundary scan (digest equality =
+        // key equality, so boundaries need no Value comparisons).
+        const digests = try self.allocator.alloc(u128, perm.len);
+        for (keys) |k| digests[k.row] = k.digest;
+        return digests;
     }
 
     fn sameKeys(self: *const TableFnExec, views: []const ColumnView, a: u32, b: u32) bool {

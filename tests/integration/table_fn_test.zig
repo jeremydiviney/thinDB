@@ -365,10 +365,13 @@ test "table UDF SDK: gap fill — strings, dates, nullables, key()" {
     try t.flush();
     try db.registerTableFn(sdk_gap_fill);
 
+    // Outer ORDER BY: partition emission order is unspecified (the concat
+    // contract) — pin it for the assertions below.
     var res = try run(allocator, db,
         \\SELECT customer, month, amt, change, filled
         \\FROM TABLE(sdk_gap_fill((SELECT customer, month, amt FROM rev))
         \\           PARTITION BY customer ORDER BY month)
+        \\ORDER BY customer, month
     );
     defer res.deinit();
 
