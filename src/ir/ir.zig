@@ -129,6 +129,7 @@ pub const DdlOp = union(enum) {
     truncate_table: TableRef,
     create_sql_function: CreateSqlFunction,
     drop_sql_function: DropSqlFunction,
+    create_zig_function: CreateZigFunction,
 };
 
 /// `CREATE [OR REPLACE] FUNCTION name(p T, ...) RETURNS TABLE AS (body)` —
@@ -149,6 +150,18 @@ pub const CreateSqlFunction = struct {
 pub const DropSqlFunction = struct {
     name: []const u8,
     if_exists: bool,
+};
+
+/// `CREATE [OR REPLACE] FUNCTION name LANGUAGE zig AS $$ <source> $$` —
+/// a compiled table UDF. Input/output shapes and execution mode live in
+/// the source's comptime declarations, not in SQL; the server compiles
+/// the source against its embedded SDK and loads the resulting library.
+/// DROP FUNCTION is shared with SQL inline functions.
+pub const CreateZigFunction = struct {
+    name: []const u8,
+    or_replace: bool,
+    /// The complete function file source (the dollar-quoted body).
+    source: []const u8,
 };
 
 pub const ColumnDef = struct {
@@ -1119,6 +1132,7 @@ const DdlTag = enum(u8) {
     truncate_table = 10,
     create_sql_function = 11,
     drop_sql_function = 12,
+    create_zig_function = 13,
 };
 
 const TypeWireTag = enum(u8) {
@@ -1324,6 +1338,14 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try appendU32(allocator, out, @intCast(df.name.len));
             try out.appendSlice(allocator, df.name);
             try out.append(allocator, @intFromBool(df.if_exists));
+        },
+        .create_zig_function => |zf| {
+            try out.append(allocator, @intFromEnum(DdlTag.create_zig_function));
+            try appendU32(allocator, out, @intCast(zf.name.len));
+            try out.appendSlice(allocator, zf.name);
+            try out.append(allocator, @intFromBool(zf.or_replace));
+            try appendU32(allocator, out, @intCast(zf.source.len));
+            try out.appendSlice(allocator, zf.source);
         },
     }
 }
@@ -2353,7 +2375,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(DdlTag.drop_sql_function)) return Error.IrCorrupt;
+    if (t > @intFromEnum(DdlTag.create_zig_function)) return Error.IrCorrupt;
     const tag: DdlTag = @enumFromInt(t);
     return switch (tag) {
         .create_database => DdlOp{ .create_database = try readString(bytes, cursor) },
@@ -2448,6 +2470,18 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             const if_exists = bytes[cursor.*] != 0;
             cursor.* += 1;
             break :blk DdlOp{ .drop_sql_function = .{ .name = name, .if_exists = if_exists } };
+        },
+        .create_zig_function => blk: {
+            const name = try readString(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const or_replace = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            const source = try readString(bytes, cursor);
+            break :blk DdlOp{ .create_zig_function = .{
+                .name = name,
+                .or_replace = or_replace,
+                .source = source,
+            } };
         },
     };
 }

@@ -6,8 +6,8 @@ const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const Type = types.Type;
 const TypeTag = types.TypeTag;
-const storage = @import("storage/storage.zig");
-const ColumnView = storage.ColumnView;
+const storage_column = @import("storage/column.zig");
+const ColumnView = storage_column.ColumnView;
 const store = @import("engine/store.zig");
 const ColumnStore = store.ColumnStore;
 
@@ -419,6 +419,19 @@ pub const UdfRegistry = struct {
             .process = udf.process,
             .user_data = udf.user_data,
         });
+    }
+
+    pub fn dropTable(self: *UdfRegistry, name: []const u8) bool {
+        for (self.tables.items, 0..) |entry, i| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) {
+                self.allocator.free(entry.name);
+                freeColumns(self.allocator, entry.input_schema);
+                freeColumns(self.allocator, entry.output_schema);
+                _ = self.tables.swapRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn tableByName(self: *const UdfRegistry, name: []const u8) ?*const TableEntry {

@@ -256,6 +256,7 @@ pub fn main(init: std.process.Init) !u8 {
         .memory_budget = memory_budget orelse (thindb.Config{}).memory_budget,
         .cache_size_bytes = cache_size_bytes orelse (thindb.Config{}).cache_size_bytes,
         .max_dop = if (max_dop) |v| v else (thindb.Config{}).max_dop,
+        .data_root_path = data_dir,
         // Server default is auto (half the cores) rather than the embedded
         // library's serial default — background merges are the server's job.
         .compact_threads = if (compact_threads) |v| v else 0,

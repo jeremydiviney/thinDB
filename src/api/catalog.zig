@@ -16,7 +16,10 @@ const Database = DatabaseMod.Database;
 
 const snapshot = @import("../util/snapshot.zig");
 const udf_mod = @import("../udf.zig");
+const zigfn = @import("zigfn.zig");
 const memory = @import("../memory.zig");
+
+var zig_fn_seq: u64 = 1;
 
 pub const Catalog = struct {
     allocator: Allocator,
@@ -28,6 +31,10 @@ pub const Catalog = struct {
     /// keyed per database. Loaded from `<db>/_functions/*.sql` on open;
     /// function DDL keeps the registry and the files in sync.
     sql_fns: udf_mod.SqlFnRegistry,
+    /// Loaded LANGUAGE zig functions: keeps each compiled library alive
+    /// while its registry entry exists. Guarded by databases_mutex (DDL
+    /// is rare; no dedicated lock).
+    zig_fns: std.ArrayList(zigfn.ZigFnHandle) = .empty,
     databases: std.StringHashMap(*Database),
     /// The shared cross-query memory pool, when this Catalog minted it from
     /// `Config.memory_budget` (vs. adopting a caller-provided one, which the
@@ -118,6 +125,19 @@ pub const Catalog = struct {
         var it = dir.iterate();
         while (try it.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.name, ".zig")) {
+                // LANGUAGE zig function: recompile the persisted source.
+                // Best-effort like .sql files — a missing toolchain or a
+                // broken source logs and skips, never blocks the open.
+                var zarena = std.heap.ArenaAllocator.init(self.allocator);
+                defer zarena.deinit();
+                const src = dir.readFileAlloc(self.io, entry.name, zarena.allocator(), .limited(4 << 20)) catch continue;
+                const stem = entry.name[0 .. entry.name.len - 4];
+                self.createZigFunction(db.name, stem, src, true) catch |err| {
+                    std.debug.print("[zigfn] load '{s}' failed: {t}\n", .{ entry.name, err });
+                };
+                continue;
+            }
             if (!std.mem.endsWith(u8, entry.name, ".sql")) continue;
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -182,6 +202,114 @@ pub const Catalog = struct {
             dir.deleteFile(self.io, fname) catch {};
         }
         return true;
+    }
+
+    /// `CREATE FUNCTION name LANGUAGE zig AS $$source$$`: compile the
+    /// source against the embedded SDK, load the library, register the
+    /// function, persist the source. `db_name` scopes persistence; the
+    /// registry itself is process-wide (like every UDF kind today).
+    pub fn createZigFunction(
+        self: *Catalog,
+        db_name: []const u8,
+        name: []const u8,
+        source: []const u8,
+        or_replace: bool,
+    ) !void {
+        const root_path = self.config.data_root_path orelse {
+            std.debug.print("[zigfn] LANGUAGE zig requires the server (data_root_path unset)\n", .{});
+            return Error.FunctionInvalidDefinition;
+        };
+        const db = self.database(db_name) orelse return Error.DatabaseNotFound;
+
+        if (self.udfs.tableByName(name) != null) {
+            if (!or_replace) return Error.FunctionAlreadyExists;
+            _ = try self.dropZigFunction(db_name, name);
+        }
+
+        var name_buf: [256]u8 = undefined;
+        const lower = blk: {
+            if (name.len > 200) return Error.FunctionInvalidDefinition;
+            for (name, name_buf[0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
+            break :blk name_buf[0..name.len];
+        };
+        const scratch_rel = try std.fmt.allocPrint(self.allocator, "_zigfn_build/{s}_{s}", .{ db_name, lower });
+        defer self.allocator.free(scratch_rel);
+        var scratch_dir = try self.root_dir.createDirPathOpen(self.io, scratch_rel, .{});
+        defer scratch_dir.close(self.io);
+        const scratch_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root_path, scratch_rel });
+        defer self.allocator.free(scratch_path);
+
+        var log: std.ArrayList(u8) = .empty;
+        defer log.deinit(self.allocator);
+        self.databases_mutex.lockUncancelable(self.io);
+        defer self.databases_mutex.unlock(self.io);
+        const seq: u64 = blk: {
+            var max: u64 = 0;
+            for (self.zig_fns.items) |_| max += 1;
+            break :blk max + zig_fn_seq;
+        };
+        zig_fn_seq += 1;
+        var handle = zigfn.compileAndLoad(
+            self.allocator,
+            self.io,
+            scratch_dir,
+            scratch_path,
+            lower,
+            source,
+            seq,
+            &self.udfs,
+            &log,
+        ) catch |err| return switch (err) {
+            zigfn.Error.FunctionAlreadyExists => Error.FunctionAlreadyExists,
+            zigfn.Error.FunctionInvalidDefinition,
+            zigfn.Error.ZigCompileFailed,
+            => Error.FunctionInvalidDefinition,
+            zigfn.Error.ZigToolchainNotFound,
+            zigfn.Error.ZigToolchainVersionMismatch,
+            => Error.FunctionInvalidDefinition,
+            else => err,
+        };
+        errdefer handle.deinit(self.allocator);
+        try self.zig_fns.append(self.allocator, handle);
+
+        // Persist the source (skip failures only if the fn came from load).
+        var dir = db.db_dir.openDir(self.io, "_functions", .{}) catch
+            try db.db_dir.createDirPathOpen(self.io, "_functions", .{});
+        defer dir.close(self.io);
+        var fbuf: [256]u8 = undefined;
+        const fname = try zigFnFileName(&fbuf, lower);
+        try dir.writeFile(self.io, .{ .sub_path = fname, .data = source });
+    }
+
+    /// Drop a LANGUAGE zig function: unregister, unload, remove the
+    /// persisted source. Returns false when no such zig function exists.
+    pub fn dropZigFunction(self: *Catalog, db_name: []const u8, name: []const u8) !bool {
+        var found: ?usize = null;
+        for (self.zig_fns.items, 0..) |h, i| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) {
+                found = i;
+                break;
+            }
+        }
+        const idx = found orelse return false;
+        _ = self.udfs.dropTable(name);
+        var h = self.zig_fns.swapRemove(idx);
+        h.deinit(self.allocator);
+        if (self.database(db_name)) |db| {
+            var dir = db.db_dir.openDir(self.io, "_functions", .{}) catch return true;
+            defer dir.close(self.io);
+            var fbuf: [256]u8 = undefined;
+            const fname = zigFnFileName(&fbuf, name) catch return true;
+            dir.deleteFile(self.io, fname) catch {};
+        }
+        return true;
+    }
+
+    fn zigFnFileName(buf: []u8, name: []const u8) ![]const u8 {
+        if (name.len + 4 > buf.len) return Error.FunctionInvalidDefinition;
+        for (name, buf[0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
+        @memcpy(buf[name.len..][0..4], ".zig");
+        return buf[0 .. name.len + 4];
     }
 
     fn fnFileName(buf: []u8, name: []const u8) ![]const u8 {
@@ -269,6 +397,8 @@ pub const Catalog = struct {
         var it = self.databases.iterator();
         while (it.next()) |entry| entry.value_ptr.*.closeInPlace();
         self.udfs.deinit();
+        for (self.zig_fns.items) |*h| h.deinit(self.allocator);
+        self.zig_fns.deinit(self.allocator);
         self.sql_fns.deinit();
         self.databases.deinit();
         const allocator = self.allocator;

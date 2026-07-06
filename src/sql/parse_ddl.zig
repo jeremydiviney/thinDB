@@ -149,6 +149,25 @@ pub fn parseCreateFunctionBody(p: anytype, or_replace: bool) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
     const name = try p.dupedIdent();
 
+    // `CREATE FUNCTION name LANGUAGE zig AS $$source$$` — a compiled table
+    // UDF. Shapes live in the source's comptime declarations, so there is
+    // no SQL parameter list.
+    if (isIdentText(p, "language")) {
+        try p.advance();
+        if (!isIdentText(p, "zig")) return PE.SqlExpectedKeyword;
+        try p.advance();
+        if (p.cur.tag != .kw_as) return PE.SqlExpectedKeyword;
+        try p.advance();
+        if (p.cur.tag != .string) return PE.SqlExpectedToken;
+        const source = p.cur.value.string;
+        try p.advance();
+        return try p.allocOp(.{ .ddl = .{ .create_zig_function = .{
+            .name = name,
+            .or_replace = or_replace,
+            .source = source,
+        } } });
+    }
+
     try p.expect(.lparen);
     var param_names: std.ArrayList([]const u8) = .empty;
     defer param_names.deinit(p.arena);

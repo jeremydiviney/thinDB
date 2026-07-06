@@ -1975,8 +1975,19 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             }
             catalog.registerSqlFunction(ctx.session.current_db, cf, false) catch |e| return thindb_api.remapError(Error, e);
         },
+        .create_zig_function => |zf| {
+            catalog.createZigFunction(ctx.session.current_db, zf.name, zf.source, zf.or_replace) catch |err| return switch (err) {
+                error.FunctionAlreadyExists => Error.FunctionAlreadyExists,
+                error.FunctionInvalidDefinition => Error.FunctionInvalidDefinition,
+                error.DatabaseNotFound => Error.DatabaseNotFound,
+                else => err,
+            };
+        },
         .drop_sql_function => |df| {
-            const existed = catalog.dropSqlFunction(ctx.session.current_db, df.name) catch |e| return thindb_api.remapError(Error, e);
+            var existed = catalog.dropSqlFunction(ctx.session.current_db, df.name) catch |e| return thindb_api.remapError(Error, e);
+            if (!existed) {
+                existed = catalog.dropZigFunction(ctx.session.current_db, df.name) catch false;
+            }
             if (!existed and !df.if_exists) return Error.FunctionNotFound;
         },
         .create_schema => |name| {

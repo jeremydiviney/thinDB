@@ -194,6 +194,13 @@ pub const Config = struct {
     /// share cores instead of oversubscribing. `0` is treated as `1`.
     max_dop: usize = 1,
 
+    /// Filesystem path of the data root directory, when the embedder knows
+    /// it (the server passes its --data-dir). Required for LANGUAGE zig
+    /// functions: the compile pipeline spawns the toolchain in a scratch
+    /// directory under this path and dlopens the artifact by path. Null =
+    /// LANGUAGE zig unavailable (clear error at CREATE).
+    data_root_path: ?[]const u8 = null,
+
     /// Max concurrent client connections across all wire protocols.
     /// Server-wide cap; reject (close immediately) when exceeded.
     /// Default 256 — generous for embedded use; bump for high-

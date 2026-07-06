@@ -24,13 +24,20 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("types.zig");
-const storage = @import("storage/storage.zig");
-const ColumnView = storage.ColumnView;
 const column_mod = @import("storage/column.zig");
+const ColumnView = column_mod.ColumnView;
 const StringView = column_mod.StringView;
 const udf = @import("udf.zig");
 
 pub const TvfExecution = udf.TvfExecution;
+
+// Raw-layer types re-exported so a compiled function library's wrapper can
+// name them through the single `tdb` module — one type identity per build.
+pub const TvfContext = udf.TvfContext;
+pub const TvfPartition = udf.TvfPartition;
+pub const TvfOutput = udf.TvfOutput;
+pub const TableUdf = udf.TableUdf;
+pub const TypeTag = types.TypeTag;
 
 pub const TableFnSpec = struct {
     name: []const u8,

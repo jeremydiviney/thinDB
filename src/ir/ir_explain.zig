@@ -426,6 +426,9 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
         .drop_sql_function => |df| {
             try writeAll(allocator, out, "DropSqlFunction ", df.name, "\n");
         },
+        .create_zig_function => |zf| {
+            try writeAll(allocator, out, "CreateZigFunction ", zf.name, "\n");
+        },
     }
 }
 

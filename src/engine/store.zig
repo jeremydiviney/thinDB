@@ -9,10 +9,13 @@ const types = @import("../types.zig");
 const Type = types.Type;
 const TypeTag = types.TypeTag;
 
-const storage = @import("../storage/storage.zig");
-const ColumnView = storage.ColumnView;
-const ValueView = storage.column.ValueView;
-const StringView = storage.StringView;
+// column.zig directly (not storage.zig): keeps this file std-only in its
+// transitive imports so it can compile into function DLLs without the
+// storage subsystem (and its C compression libs).
+const storage_column = @import("../storage/column.zig");
+const ColumnView = storage_column.ColumnView;
+const ValueView = storage_column.ValueView;
+const StringView = storage_column.StringView;
 
 /// Borrowed view over a string column whose total bytes exceed 4 GiB, so its
 /// offsets need u64. Only big in-memory accumulations (the Sort operator over a
