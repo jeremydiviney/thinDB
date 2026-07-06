@@ -160,8 +160,11 @@ pub const DropSqlFunction = struct {
 pub const CreateZigFunction = struct {
     name: []const u8,
     or_replace: bool,
-    /// The complete function file source (the dollar-quoted body).
+    /// The complete function file source (the dollar-quoted body) - or,
+    /// when `using_path` is set, the filesystem path of a pre-compiled
+    /// library (`... LANGUAGE zig USING 'walk.dll'`, the no-toolchain tier).
     source: []const u8,
+    using_path: bool = false,
 };
 
 pub const ColumnDef = struct {
@@ -1346,6 +1349,7 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try out.append(allocator, @intFromBool(zf.or_replace));
             try appendU32(allocator, out, @intCast(zf.source.len));
             try out.appendSlice(allocator, zf.source);
+            try out.append(allocator, @intFromBool(zf.using_path));
         },
     }
 }
@@ -2477,10 +2481,14 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             const or_replace = bytes[cursor.*] != 0;
             cursor.* += 1;
             const source = try readString(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const using_path = bytes[cursor.*] != 0;
+            cursor.* += 1;
             break :blk DdlOp{ .create_zig_function = .{
                 .name = name,
                 .or_replace = or_replace,
                 .source = source,
+                .using_path = using_path,
             } };
         },
     };

@@ -156,6 +156,18 @@ pub fn parseCreateFunctionBody(p: anytype, or_replace: bool) !*ir.Op {
         try p.advance();
         if (!isIdentText(p, "zig")) return PE.SqlExpectedKeyword;
         try p.advance();
+        if (isIdentText(p, "using")) {
+            try p.advance();
+            if (p.cur.tag != .string) return PE.SqlExpectedToken;
+            const path = p.cur.value.string;
+            try p.advance();
+            return try p.allocOp(.{ .ddl = .{ .create_zig_function = .{
+                .name = name,
+                .or_replace = or_replace,
+                .source = path,
+                .using_path = true,
+            } } });
+        }
         if (p.cur.tag != .kw_as) return PE.SqlExpectedKeyword;
         try p.advance();
         if (p.cur.tag != .string) return PE.SqlExpectedToken;

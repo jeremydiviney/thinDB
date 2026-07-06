@@ -125,6 +125,16 @@ pub const Catalog = struct {
         var it = dir.iterate();
         while (try it.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.name, ".dllpath")) {
+                var parena = std.heap.ArenaAllocator.init(self.allocator);
+                defer parena.deinit();
+                const path = dir.readFileAlloc(self.io, entry.name, parena.allocator(), .limited(1 << 16)) catch continue;
+                const stem = entry.name[0 .. entry.name.len - 8];
+                self.createZigFunction(db.name, stem, std.mem.trim(u8, path, " \r\n\t"), true, true) catch |err| {
+                    std.debug.print("[zigfn] dll load '{s}' failed: {t}\n", .{ entry.name, err });
+                };
+                continue;
+            }
             if (std.mem.endsWith(u8, entry.name, ".zig")) {
                 // LANGUAGE zig function: recompile the persisted source.
                 // Best-effort like .sql files — a missing toolchain or a
@@ -133,7 +143,7 @@ pub const Catalog = struct {
                 defer zarena.deinit();
                 const src = dir.readFileAlloc(self.io, entry.name, zarena.allocator(), .limited(4 << 20)) catch continue;
                 const stem = entry.name[0 .. entry.name.len - 4];
-                self.createZigFunction(db.name, stem, src, true) catch |err| {
+                self.createZigFunction(db.name, stem, src, true, false) catch |err| {
                     std.debug.print("[zigfn] load '{s}' failed: {t}\n", .{ entry.name, err });
                 };
                 continue;
@@ -214,6 +224,7 @@ pub const Catalog = struct {
         name: []const u8,
         source: []const u8,
         or_replace: bool,
+        using_path: bool,
     ) !void {
         const root_path = self.config.data_root_path orelse {
             std.debug.print("[zigfn] LANGUAGE zig requires the server (data_root_path unset)\n", .{});
@@ -232,6 +243,26 @@ pub const Catalog = struct {
             for (name, name_buf[0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
             break :blk name_buf[0..name.len];
         };
+
+        if (using_path) {
+            // Pre-compiled library tier: no toolchain involved. `source`
+            // holds the library path; persistence stores that path.
+            self.databases_mutex.lockUncancelable(self.io);
+            defer self.databases_mutex.unlock(self.io);
+            var handle = zigfn.loadAndRegister(self.allocator, source, lower, source, &self.udfs) catch |err| return switch (err) {
+                zigfn.Error.FunctionInvalidDefinition => Error.FunctionInvalidDefinition,
+                else => err,
+            };
+            errdefer handle.deinit(self.allocator);
+            try self.zig_fns.append(self.allocator, handle);
+            var pdir = db.db_dir.openDir(self.io, "_functions", .{}) catch
+                try db.db_dir.createDirPathOpen(self.io, "_functions", .{});
+            defer pdir.close(self.io);
+            var pbuf: [256]u8 = undefined;
+            const pname = try dllPathFileName(&pbuf, lower);
+            try pdir.writeFile(self.io, .{ .sub_path = pname, .data = source });
+            return;
+        }
         const scratch_rel = try std.fmt.allocPrint(self.allocator, "_zigfn_build/{s}_{s}", .{ db_name, lower });
         defer self.allocator.free(scratch_rel);
         var scratch_dir = try self.root_dir.createDirPathOpen(self.io, scratch_rel, .{});
@@ -301,8 +332,17 @@ pub const Catalog = struct {
             var fbuf: [256]u8 = undefined;
             const fname = zigFnFileName(&fbuf, name) catch return true;
             dir.deleteFile(self.io, fname) catch {};
+            const pname = dllPathFileName(&fbuf, name) catch return true;
+            dir.deleteFile(self.io, pname) catch {};
         }
         return true;
+    }
+
+    fn dllPathFileName(buf: []u8, name: []const u8) ![]const u8 {
+        if (name.len + 8 > buf.len) return Error.FunctionInvalidDefinition;
+        for (name, buf[0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
+        @memcpy(buf[name.len..][0..8], ".dllpath");
+        return buf[0 .. name.len + 8];
     }
 
     fn zigFnFileName(buf: []u8, name: []const u8) ![]const u8 {

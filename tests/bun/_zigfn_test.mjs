@@ -53,6 +53,16 @@ const got2 = rows2 ? rows2.map(r => Number(r.running)).join(",") : "";
 if (got2 !== "20,60,80,120,180") { console.log(`replaced-values: FAIL (${got2})`); failed++; } else console.log("replaced-values: OK");
 await q("drop", "DROP FUNCTION zt_running");
 await q("post-drop", "SELECT * FROM TABLE(zt_running((SELECT id, g, amt FROM zt)) PARTITION BY g)", "UnsupportedQueryShape");
+// DLL tier: register the library the compile tier just built, directly.
+const { readdirSync } = await import("fs");
+const scratch = "../../.zigfn-db/_zigfn_build/main_zt_running";
+const dlls = readdirSync(scratch).filter(f => f.endsWith(".dll")).sort();
+const dll = scratch + "/" + dlls[dlls.length - 1];
+await q("dll-create", `CREATE FUNCTION zt_running LANGUAGE zig USING '${dll}'`);
+const rows3 = await q("dll-call", "SELECT running FROM TABLE(zt_running((SELECT id, g, amt FROM zt)) PARTITION BY g ORDER BY id) ORDER BY running");
+const got3 = rows3 ? rows3.map(r => Number(r.running)).join(",") : "";
+if (got3 !== "20,60,80,120,180") { console.log(`dll-values: FAIL (${got3})`); failed++; } else console.log("dll-values: OK");
+await q("dll-drop", "DROP FUNCTION zt_running");
 await c.end();
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILURES`);
 process.exit(failed === 0 ? 0 : 1);

@@ -25,7 +25,6 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("types.zig");
 const column_mod = @import("storage/column.zig");
-const ColumnView = column_mod.ColumnView;
 const StringView = column_mod.StringView;
 const udf = @import("udf.zig");
 
@@ -38,6 +37,9 @@ pub const TvfPartition = udf.TvfPartition;
 pub const TvfOutput = udf.TvfOutput;
 pub const TableUdf = udf.TableUdf;
 pub const TypeTag = types.TypeTag;
+pub const ColumnType = types.Type;
+pub const ColumnView = column_mod.ColumnView;
+pub const ColumnStore = @import("engine/store.zig").ColumnStore;
 
 pub const TableFnSpec = struct {
     name: []const u8,

@@ -124,6 +124,85 @@ const WRAPPER_MAIN =
     \\}
 ;
 
+const VALIDATE_MAIN =
+    \\const std = @import("std");
+    \\const tdb = @import("tdb");
+    \\const userfn = @import("fn_src.zig");
+    \\
+    \\const desc = tdb.descriptorFor(userfn);
+    \\
+    \\extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+    \\
+    \\fn watchdog() void {
+    \\    if (@import("builtin").os.tag == .windows) {
+    \\        Sleep(10_000);
+    \\    } else {
+    \\        var ts = std.posix.timespec{ .sec = 10, .nsec = 0 };
+    \\        _ = std.posix.system.nanosleep(&ts, &ts);
+    \\    }
+    \\    std.process.exit(3);
+    \\}
+    \\
+    \\fn synthesize(allocator: std.mem.Allocator, cols: []const @TypeOf(desc.input_schema[0]), stores: []tdb.ColumnStore) !void {
+    \\    for (cols, stores) |c, *st| {
+    \\        st.* = try tdb.ColumnStore.init(allocator, c.type, c.nullable);
+    \\        for (0..3) |i| {
+    \\            switch (st.data) {
+    \\                .int, .date => |*l| try l.append(allocator, @intCast(i)),
+    \\                .bigint, .datetime, .decimal64 => |*l| try l.append(allocator, @intCast(i)),
+    \\                .tinyint => |*l| try l.append(allocator, @intCast(i)),
+    \\                .smallint => |*l| try l.append(allocator, @intCast(i)),
+    \\                .largeint, .decimal128 => |*l| try l.append(allocator, @intCast(i)),
+    \\                .float => |*l| try l.append(allocator, @floatFromInt(i)),
+    \\                .double => |*l| try l.append(allocator, @floatFromInt(i)),
+    \\                .boolean => |*l| try l.append(allocator, 0),
+    \\                .uuid => |*l| try l.append(allocator, @intCast(i)),
+    \\                .varchar, .string, .char => |*sv| try sv.appendValue(allocator, "x"),
+    \\            }
+    \\            if (st.nulls != null) try st.appendValidBit(allocator, st.rowCount() - 1, true);
+    \\        }
+    \\    }
+    \\}
+    \\
+    \\pub fn main() !void {
+    \\    const wd = try std.Thread.spawn(.{}, watchdog, .{});
+    \\    wd.detach();
+    \\    var gpa = std.heap.DebugAllocator(.{}){};
+    \\    const allocator = gpa.allocator();
+    \\
+    \\    var in_stores: [desc.input_schema.len]tdb.ColumnStore = undefined;
+    \\    try synthesize(allocator, desc.input_schema, &in_stores);
+    \\    var views: [desc.input_schema.len]tdb.ColumnView = undefined;
+    \\    for (&in_stores, &views) |st, *v| v.* = st.view();
+    \\
+    \\    var out_stores: [desc.output_schema.len]tdb.ColumnStore = undefined;
+    \\    for (desc.output_schema, &out_stores) |c, *st| {
+    \\        st.* = try tdb.ColumnStore.init(allocator, c.type, c.nullable);
+    \\    }
+    \\    var out_ptrs: [desc.output_schema.len]*tdb.ColumnStore = undefined;
+    \\    for (&out_stores, &out_ptrs) |*st, *ptr| ptr.* = st;
+    \\
+    \\    var arena = std.heap.ArenaAllocator.init(allocator);
+    \\    defer arena.deinit();
+    \\    const ctx = tdb.TvfContext{ .arena = arena.allocator() };
+    \\    const part = tdb.TvfPartition{ .columns = &views, .row_count = 3, .keys = &.{} };
+    \\    var out = tdb.TvfOutput{ .columns = &out_ptrs, .allocator = allocator };
+    \\
+    \\    desc.process(&ctx, &part, &out) catch |err| {
+    \\        std.debug.print("validate: process failed: {t}\n", .{err});
+    \\        std.process.exit(1);
+    \\    };
+    \\    const expect = out_stores[0].rowCount();
+    \\    for (out_stores[1..]) |st| {
+    \\        if (st.rowCount() != expect) {
+    \\            std.debug.print("validate: non-rectangular output\n", .{});
+    \\            std.process.exit(2);
+    \\        }
+    \\    }
+    \\    std.process.exit(0);
+    \\}
+;
+
 /// Server-side mirrors of the wrapper's handshake structs.
 pub const ColDesc = extern struct {
     name_ptr: [*]const u8,
@@ -209,8 +288,26 @@ extern "kernel32" fn GetProcAddress(hModule: std.os.windows.HMODULE, lpProcName:
 /// Locate the Zig toolchain: THINDB_ZIG_PATH (a zig executable path) →
 /// `zig/zig(.exe)` beside the server executable → `zig` on PATH.
 /// Returned string is allocated.
-pub fn findZigExe(allocator: Allocator) ![]u8 {
+pub fn findZigExe(allocator: Allocator, io: Io) ![]u8 {
     if (getenv("THINDB_ZIG_PATH")) |v| return allocator.dupe(u8, std.mem.span(v));
+    // The bundle layout: a stock zig toolchain directory beside the server
+    // executable. Preferred over PATH so a deployed bundle is self-contained.
+    blk: {
+        var buf: [4096]u8 = undefined;
+        const n = std.process.executablePath(io, &buf) catch break :blk;
+        const exe_path = buf[0..n];
+        const dir_end = std.mem.lastIndexOfAny(u8, exe_path, "/\\") orelse break :blk;
+        const candidate = std.fmt.allocPrint(allocator, "{s}/zig/zig{s}", .{
+            exe_path[0..dir_end],
+            if (builtin.os.tag == .windows) ".exe" else "",
+        }) catch break :blk;
+        const probe = std.Io.Dir.cwd().openFile(io, candidate, .{}) catch {
+            allocator.free(candidate);
+            break :blk;
+        };
+        probe.close(io);
+        return candidate;
+    }
     return allocator.dupe(u8, "zig");
 }
 
@@ -266,7 +363,7 @@ pub fn compileAndLoad(
     try scratch_dir.writeFile(io, .{ .sub_path = "fn_src.zig", .data = source });
     try scratch_dir.writeFile(io, .{ .sub_path = "dll_main.zig", .data = WRAPPER_MAIN });
 
-    const zig_exe = try findZigExe(allocator);
+    const zig_exe = try findZigExe(allocator, io);
     defer allocator.free(zig_exe);
 
     // Exact-version gate: the library shares pointer-rich structs with the
@@ -324,8 +421,53 @@ pub fn compileAndLoad(
         return err;
     };
 
+    // Validation battery: build a Debug validator around the same source
+    // and run it against a synthetic 3-row partition. Panics, kernel
+    // errors, non-rectangular output, and hangs (self-watchdog, 10s) all
+    // become the CREATE error instead of a surprise at first query.
+    {
+        try scratch_dir.writeFile(io, .{ .sub_path = "validate_main.zig", .data = VALIDATE_MAIN });
+        const vexe = if (builtin.os.tag == .windows) "validate.exe" else "validate";
+        const vemit = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{vexe});
+        defer allocator.free(vemit);
+        runZig(allocator, io, &.{
+            zig_exe,
+            "build-exe",
+            vemit,
+            "--dep",
+            "tdb",
+            "-Mroot=validate_main.zig",
+            "-Mtdb=udf_sdk.zig",
+        }, scratch_path, compile_log) catch |err| {
+            if (err == Error.ZigCompileFailed) {
+                std.debug.print("[zigfn] validator compile failed for '{s}':\n{s}\n", .{ name, compile_log.items });
+                return Error.FunctionInvalidDefinition;
+            }
+            return err;
+        };
+        const vpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ scratch_path, vexe });
+        defer allocator.free(vpath);
+        runZig(allocator, io, &.{vpath}, ".", compile_log) catch {
+            std.debug.print("[zigfn] validation failed for '{s}':\n{s}\n", .{ name, compile_log.items });
+            return Error.FunctionInvalidDefinition;
+        };
+    }
+
     const dll_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ scratch_path, dll_name });
     defer allocator.free(dll_path);
+    return loadAndRegister(allocator, dll_path, name, source, registry);
+}
+
+/// Open a compiled function library, validate the handshake, and register
+/// it. Shared by the compile tier and the direct DLL tier
+/// (`CREATE FUNCTION name LANGUAGE zig USING 'path'`).
+pub fn loadAndRegister(
+    allocator: Allocator,
+    dll_path: []const u8,
+    name: []const u8,
+    source: []const u8,
+    registry: *udf_mod.UdfRegistry,
+) !ZigFnHandle {
     var lib = Dyn.open(dll_path) catch return Error.FunctionInvalidDefinition;
     errdefer lib.close();
 
