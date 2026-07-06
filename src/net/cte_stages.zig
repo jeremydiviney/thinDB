@@ -2446,7 +2446,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             for (t.inputs) |inp| {
                 try ups.append(input.allocator, try compileBlock(input, inp, map));
             }
-            const q = try exec.table_fn.TableFnExec.create(input.allocator, ups.items, entry, t.partition_by, t.order_by, input.effectiveDop());
+            const q = try exec.table_fn.TableFnExec.create(input.allocator, ups.items, entry, t.args, t.partition_by, t.order_by, input.effectiveDop());
             if (t.alias) |a| {
                 errdefer @constCast(&q).deinit();
                 return exec.AliasRename.create(input.allocator, q, a);

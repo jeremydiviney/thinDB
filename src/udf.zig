@@ -161,6 +161,9 @@ pub const TvfContext = struct {
     /// scratch allocations cannot leak.
     arena: Allocator,
     user_data: ?*anyopaque = null,
+    /// Scalar call arguments (literals at the call site), in declared
+    /// order. Identical for every partition of one call.
+    args: []const ?types.Value = &.{},
 };
 
 /// One co-grouped partition per input table, in declared input order. A
@@ -187,6 +190,8 @@ pub const TableUdf = struct {
     /// Declared output columns — the operator's output schema.
     output_schema: []const types.Column,
     execution: TvfExecution = .either,
+    /// Declared scalar argument types, in call order (empty = none).
+    arg_types: []const types.Type = &.{},
     process: TvfProcess,
     user_data: ?*anyopaque = null,
 };
@@ -196,6 +201,7 @@ pub const TableEntry = struct {
     input_schemas: []const []const types.Column,
     output_schema: []const types.Column,
     execution: TvfExecution,
+    arg_types: []const types.Type,
     process: TvfProcess,
     user_data: ?*anyopaque,
 };
@@ -398,6 +404,7 @@ pub const UdfRegistry = struct {
             for (entry.input_schemas) |cols| freeColumns(self.allocator, cols);
             self.allocator.free(entry.input_schemas);
             freeColumns(self.allocator, entry.output_schema);
+            self.allocator.free(entry.arg_types);
         }
         self.tables.deinit(self.allocator);
         self.* = undefined;
@@ -447,11 +454,14 @@ pub const UdfRegistry = struct {
         }
         const output_schema = try dupeColumns(self.allocator, udf.output_schema);
         errdefer freeColumns(self.allocator, output_schema);
+        const arg_types = try self.allocator.dupe(types.Type, udf.arg_types);
+        errdefer self.allocator.free(arg_types);
         try self.tables.append(self.allocator, .{
             .name = name,
             .input_schemas = input_schemas,
             .output_schema = output_schema,
             .execution = udf.execution,
+            .arg_types = arg_types,
             .process = udf.process,
             .user_data = udf.user_data,
         });
@@ -464,6 +474,7 @@ pub const UdfRegistry = struct {
                 for (entry.input_schemas) |cols| freeColumns(self.allocator, cols);
                 self.allocator.free(entry.input_schemas);
                 freeColumns(self.allocator, entry.output_schema);
+                self.allocator.free(entry.arg_types);
                 _ = self.tables.swapRemove(i);
                 return true;
             }

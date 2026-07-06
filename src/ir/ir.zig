@@ -627,6 +627,8 @@ pub const Op = union(OpTag) {
         name: []const u8,
         /// One subtree per input subquery, in call order.
         inputs: []const *Op,
+        /// Scalar literal arguments at the call site, in call order.
+        args: []const ?Value = &.{},
         partition_by: []const []const u8,
         order_by: []const SortSpec,
         alias: ?[]const u8 = null,
@@ -780,6 +782,7 @@ pub const Op = union(OpTag) {
             .table_fn => |t| {
                 allocator.free(t.partition_by);
                 allocator.free(t.order_by);
+                allocator.free(t.args);
                 for (t.inputs) |inp| {
                     inp.deinitDecoded(allocator);
                     allocator.destroy(inp);
@@ -954,6 +957,11 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             try encodeOptString(allocator, out, t.alias);
             try appendU32(allocator, out, @intCast(t.inputs.len));
             for (t.inputs) |inp| try encodeOp(allocator, out, inp.*);
+            try appendU32(allocator, out, @intCast(t.args.len));
+            for (t.args) |arg| {
+                try out.append(allocator, @intFromBool(arg != null));
+                if (arg) |v| try encodeValue(allocator, out, v);
+            }
         },
         .limit => |l| {
             try appendU64(allocator, out, l.n);
@@ -1850,9 +1858,22 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 slot.* = inp;
                 made += 1;
             }
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n_args = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            if (n_args > 64) return Error.IrCorrupt;
+            const args = try allocator.alloc(?Value, n_args);
+            errdefer allocator.free(args);
+            for (args) |*slot| {
+                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+                const has = bytes[cursor.*] != 0;
+                cursor.* += 1;
+                slot.* = if (has) try decodeValue(bytes, cursor) else null;
+            }
             break :blk Op{ .table_fn = .{
                 .name = name,
                 .inputs = inputs,
+                .args = args,
                 .partition_by = partition_by,
                 .order_by = order_by,
                 .alias = fn_alias,

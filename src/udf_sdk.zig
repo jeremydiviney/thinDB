@@ -40,6 +40,7 @@ pub const TypeTag = types.TypeTag;
 pub const ColumnType = types.Type;
 pub const ColumnView = column_mod.ColumnView;
 pub const ColumnStore = @import("engine/store.zig").ColumnStore;
+pub const RawValue = types.Value;
 
 pub const TableFnSpec = struct {
     name: []const u8,
@@ -422,6 +423,83 @@ pub fn inputTypesOf(comptime Mod: type) []const type {
     }
 }
 
+/// Declared scalar argument types from the module's optional `Args`
+/// struct declaration (field order = call order). No decl = no args.
+pub fn argTypesFor(comptime Mod: type) []const types.Type {
+    if (!@hasDecl(Mod, "Args")) return &.{};
+    comptime {
+        const fields = @typeInfo(Mod.Args).@"struct".fields;
+        var out: [fields.len]types.Type = undefined;
+        for (fields, 0..) |f, i| {
+            const T = switch (@typeInfo(f.type)) {
+                .optional => |o| o.child,
+                else => f.type,
+            };
+            out[i] = columnTypeFor(T);
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+/// Decode one raw call argument into the field type an `Args` struct
+/// declares. Argument count and type-family were validated at compile,
+/// so mismatches here are engine bugs, not user errors.
+fn argFromValue(comptime T: type, v: ?types.Value) T {
+    if (@typeInfo(T) == .optional) {
+        const C = @typeInfo(T).optional.child;
+        return if (v == null) null else argFromValue(C, v);
+    }
+    const val = v.?;
+    return switch (T) {
+        i8, i16, i32, i64, i128 => switch (val) {
+            .tinyint => |x| @intCast(x),
+            .smallint => |x| @intCast(x),
+            .int => |x| @intCast(x),
+            .bigint => |x| @intCast(x),
+            .largeint => |x| @intCast(x),
+            else => unreachable,
+        },
+        f32, f64 => switch (val) {
+            .float => |x| @floatCast(x),
+            .double => |x| @floatCast(x),
+            .tinyint => |x| @floatFromInt(x),
+            .smallint => |x| @floatFromInt(x),
+            .int => |x| @floatFromInt(x),
+            .bigint => |x| @floatFromInt(x),
+            else => unreachable,
+        },
+        bool => switch (val) {
+            .boolean => |x| x,
+            .tinyint => |x| x != 0,
+            .int => |x| x != 0,
+            .bigint => |x| x != 0,
+            else => unreachable,
+        },
+        []const u8 => val.text,
+        Date => switch (val) {
+            .date => |x| Date.fromDays(x),
+            .int => |x| Date.fromDays(x),
+            .bigint => |x| Date.fromDays(@intCast(x)),
+            else => unreachable,
+        },
+        DateTime => switch (val) {
+            .datetime => |x| DateTime.fromMicros(x),
+            .bigint => |x| DateTime.fromMicros(x),
+            else => unreachable,
+        },
+        else => @compileError("thinDB table UDF: unsupported Args field type '" ++ @typeName(T) ++ "'"),
+    };
+}
+
+fn argsValueFor(comptime Mod: type, raw: []const ?types.Value) Mod.Args {
+    var out: Mod.Args = undefined;
+    inline for (@typeInfo(Mod.Args).@"struct".fields, 0..) |f, i| {
+        @field(out, f.name) = argFromValue(f.type, raw[i]);
+    }
+    return out;
+}
+
 pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
     const inputs = comptime inputTypesOf(Mod);
     const S = struct {
@@ -435,6 +513,8 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
         };
         const output = schemaFor(Mod.Output);
 
+        const has_args = @hasDecl(Mod, "Args");
+
         fn trampoline(
             raw_ctx: *const udf.TvfContext,
             parts: []const udf.TvfPartition,
@@ -443,15 +523,19 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
             std.debug.assert(parts.len == inputs.len);
             var ctx = Ctx{ .arena = raw_ctx.arena, .user_data = raw_ctx.user_data };
             var w = Writer(Mod.Output){ .raw = out };
-            // Build (ctx, p1, p2, ..., writer) and call process with it.
-            var args: CallArgs = undefined;
-            args.@"0" = &ctx;
+            // Build (ctx, [args,] p1, p2, ..., writer) and call process.
+            const arg_ofs = if (has_args) 1 else 0;
+            var call: CallArgs = undefined;
+            call.@"0" = &ctx;
+            if (has_args) {
+                @field(call, "1") = argsValueFor(Mod, raw_ctx.args);
+            }
             inline for (inputs, 0..) |T, i| {
-                @field(args, std.fmt.comptimePrint("{d}", .{i + 1})) =
+                @field(call, std.fmt.comptimePrint("{d}", .{i + 1 + arg_ofs})) =
                     Partition(T){ .raw = &parts[i], .len = parts[i].row_count };
             }
-            @field(args, std.fmt.comptimePrint("{d}", .{inputs.len + 1})) = &w;
-            try @call(.auto, Mod.process, args);
+            @field(call, std.fmt.comptimePrint("{d}", .{inputs.len + 1 + arg_ofs})) = &w;
+            try @call(.auto, Mod.process, call);
         }
 
         const CallArgs = std.meta.ArgsTuple(@TypeOf(Mod.process));
@@ -461,6 +545,7 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
         .input_schemas = &S.input_schemas,
         .output_schema = &S.output,
         .execution = Mod.spec.execution,
+        .arg_types = argTypesFor(Mod),
         .process = S.trampoline,
     };
 }

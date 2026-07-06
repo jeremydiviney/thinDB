@@ -64,6 +64,8 @@ pub const TableFnExec = struct {
     input_maps: [][]usize,
     key_idxs: [][]usize,
     order_idxs: [][]usize,
+    /// Owned scalar call arguments, handed to every process() call.
+    call_args: []?Value,
     entry: *const udf_mod.TableEntry,
     /// For each declared input column, its index in the upstream schema.
     upstream: Query,
@@ -84,6 +86,7 @@ pub const TableFnExec = struct {
         allocator: Allocator,
         ups: []const Query,
         entry: *const udf_mod.TableEntry,
+        call_args: []const ?Value,
         partition_by: []const []const u8,
         order_by: []const SortSpec,
         dop: usize,
@@ -95,6 +98,29 @@ pub const TableFnExec = struct {
             .either => {},
         }
         if (ups.len != entry.input_schemas.len or ups.len == 0) return Error.TableFnInputMismatch;
+
+        // Scalar argument contract: count and per-position type family.
+        if (call_args.len != entry.arg_types.len) return Error.TableFnInputMismatch;
+        for (call_args, entry.arg_types) |arg, want| {
+            const v = arg orelse continue;
+            if (!argTypeMatches(v, want)) return Error.TableFnInputMismatch;
+        }
+        const args = try allocator.alloc(?Value, call_args.len);
+        errdefer allocator.free(args);
+        var args_duped: usize = 0;
+        errdefer for (args[0..args_duped]) |a| {
+            if (a) |v| switch (v) {
+                .text => |t| allocator.free(t),
+                else => {},
+            };
+        };
+        for (call_args, args) |src, *dst| {
+            dst.* = if (src) |v| switch (v) {
+                .text => |t| Value{ .text = try allocator.dupe(u8, t) },
+                else => v,
+            } else null;
+            args_duped += 1;
+        }
 
         const n_in = ups.len;
         const upstreams = try allocator.dupe(Query, ups);
@@ -168,6 +194,7 @@ pub const TableFnExec = struct {
             .input_maps = input_maps,
             .key_idxs = key_idxs,
             .order_idxs = order_idxs,
+            .call_args = args,
             .entry = entry,
             .upstream = upstreams[0],
             .input_map = input_maps[0],
@@ -183,6 +210,13 @@ pub const TableFnExec = struct {
     }
 
     pub fn deinit(self: *TableFnExec) void {
+        for (self.call_args) |a| {
+            if (a) |v| switch (v) {
+                .text => |t| self.allocator.free(t),
+                else => {},
+            };
+        }
+        self.allocator.free(self.call_args);
         for (self.upstreams) |*up| up.deinit();
         self.allocator.free(self.upstreams);
         for (self.output_cols) |*c| c.deinit(self.allocator);
@@ -751,6 +785,7 @@ pub const TableFnExec = struct {
             const ctx = udf_mod.TvfContext{
                 .arena = self.arena.allocator(),
                 .user_data = op.entry.user_data,
+                .args = op.call_args,
             };
             var out = udf_mod.TvfOutput{
                 .columns = self.out_ptrs,
@@ -981,6 +1016,7 @@ pub const TableFnExec = struct {
             const ctx = udf_mod.TvfContext{
                 .arena = self.arena.allocator(),
                 .user_data = op.entry.user_data,
+                .args = op.call_args,
             };
             const parts = [_]udf_mod.TvfPartition{.{
                 .columns = self.part_views,
@@ -1132,6 +1168,27 @@ pub const TableFnExec = struct {
         const digests = try self.allocator.alloc(u128, perm.len);
         for (keys) |k| digests[k.row] = k.digest;
         return digests;
+    }
+
+    /// A literal Value satisfies a declared argument type: exact tag, any
+    /// int-family literal into any int-family declared type, text into the
+    /// string family, int into double.
+    fn argTypeMatches(v: Value, want: types.Type) bool {
+        const int_lit = switch (v) {
+            .tinyint, .smallint, .int, .bigint, .largeint => true,
+            else => false,
+        };
+        return switch (want) {
+            .tinyint, .smallint, .int, .bigint, .largeint => int_lit,
+            .float, .double => int_lit or v == .float or v == .double,
+            .varchar, .string, .char => v == .text,
+            .date => v == .date or int_lit,
+            .datetime => v == .datetime or int_lit,
+            .boolean => v == .boolean or int_lit,
+            .decimal64 => v == .decimal64 or int_lit,
+            .decimal128 => v == .decimal128 or int_lit,
+            .uuid => v == .uuid,
+        };
     }
 
     fn sameKeys(self: *const TableFnExec, views: []const ColumnView, a: u32, b: u32) bool {

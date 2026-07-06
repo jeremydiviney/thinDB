@@ -76,6 +76,28 @@ const rows4 = await q("multi-call",
 const got4 = rows4 ? rows4.map(r => `${r.g}:${r.a_sum}/${r.b_sum}`).join(",") : "";
 if (got4 !== "1:60/60,2:90/0") { console.log(`multi-values: FAIL (${got4})`); failed++; } else console.log("multi-values: OK");
 await q("multi-drop", "DROP FUNCTION zt_pair");
+// P4: scalar arguments.
+const src4 = `
+const tdb = @import("tdb");
+pub const spec = tdb.TableFnSpec{ .name = "zt_scaled", .execution = .partitioned };
+pub const Args = struct { mult: i64, label: []const u8 };
+pub const Input = struct { g: ?i32, amt: ?i64 };
+pub const Output = struct { g: ?i32, scaled: i64, tag: []const u8 };
+pub fn process(ctx: *tdb.Ctx, args: Args, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+    _ = ctx;
+    var sum: i64 = 0;
+    const amts = p.col(.amt);
+    for (0..p.len) |i| sum += amts.get(i) orelse 0;
+    try out.row(.{ .g = p.col(.g).get(0), .scaled = sum * args.mult, .tag = args.label });
+}
+`;
+await q("args-create", "CREATE OR REPLACE FUNCTION zt_scaled LANGUAGE zig AS $$" + src4 + "$$");
+const rows5 = await q("args-call",
+  "SELECT g, scaled, tag FROM TABLE(zt_scaled((SELECT g, amt FROM zt), 3, 'x2') PARTITION BY g) ORDER BY g");
+const got5 = rows5 ? rows5.map(r => `${r.g}:${r.scaled}:${r.tag}`).join(",") : "";
+if (got5 !== "1:180:x2,2:270:x2") { console.log(`args-values: FAIL (${got5})`); failed++; } else console.log("args-values: OK");
+await q("args-badcount", "SELECT * FROM TABLE(zt_scaled((SELECT g, amt FROM zt), 3) PARTITION BY g)", "TableFnInputMismatch");
+await q("args-drop", "DROP FUNCTION zt_scaled");
 await q("drop", "DROP FUNCTION zt_running");
 await q("post-drop", "SELECT * FROM TABLE(zt_running((SELECT id, g, amt FROM zt)) PARTITION BY g)", "UnsupportedQueryShape");
 // DLL tier: register the library the compile tier just built, directly.

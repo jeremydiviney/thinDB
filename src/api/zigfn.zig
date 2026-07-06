@@ -41,7 +41,7 @@ pub const Error = error{
     ZigCompileFailed,
 };
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 const EmbeddedFile = struct { path: []const u8, data: []const u8 };
 
@@ -82,6 +82,8 @@ const WRAPPER_MAIN =
     \\    tables: [*]const TableDesc,
     \\    n_out: usize,
     \\    out_cols: [*]const ColDesc,
+    \\    n_args: usize,
+    \\    arg_tags: [*]const u8,
     \\};
     \\
     \\fn colDescs(comptime cols: anytype) [cols.len]ColDesc {
@@ -112,6 +114,13 @@ const WRAPPER_MAIN =
     \\    break :blk out;
     \\};
     \\const out_descs = colDescs(desc_gen.output_schema);
+    \\const arg_tags = blk: {
+    \\    var out: [desc_gen.arg_types.len]u8 = undefined;
+    \\    for (desc_gen.arg_types, 0..) |t, i| {
+    \\        out[i] = @intFromEnum(@as(tdb.TypeTag, t));
+    \\    }
+    \\    break :blk out;
+    \\};
     \\const the_desc = Desc{
     \\    .name_ptr = desc_gen.name.ptr,
     \\    .name_len = desc_gen.name.len,
@@ -120,10 +129,12 @@ const WRAPPER_MAIN =
     \\    .tables = &table_descs,
     \\    .n_out = out_descs.len,
     \\    .out_cols = &out_descs,
+    \\    .n_args = arg_tags.len,
+    \\    .arg_tags = &arg_tags,
     \\};
     \\
     \\export fn thindb_tvf_abi_version() callconv(.c) u32 {
-    \\    return 2;
+    \\    return 3;
     \\}
     \\export fn thindb_tvf_descriptor() callconv(.c) *const Desc {
     \\    return &the_desc;
@@ -207,7 +218,25 @@ const VALIDATE_MAIN =
     \\
     \\    var arena = std.heap.ArenaAllocator.init(allocator);
     \\    defer arena.deinit();
-    \\    const ctx = tdb.TvfContext{ .arena = arena.allocator() };
+    \\    var arg_vals: [desc.arg_types.len]?tdb.RawValue = undefined;
+    \\    inline for (desc.arg_types, 0..) |t, i| {
+    \\        arg_vals[i] = switch (t) {
+    \\            .tinyint => .{ .tinyint = 1 },
+    \\            .smallint => .{ .smallint = 1 },
+    \\            .int => .{ .int = 1 },
+    \\            .bigint => .{ .bigint = 1 },
+    \\            .largeint => .{ .largeint = 1 },
+    \\            .float => .{ .float = 1 },
+    \\            .double => .{ .double = 1 },
+    \\            .boolean => .{ .boolean = true },
+    \\            .date => .{ .date = 1 },
+    \\            .datetime => .{ .datetime = 1 },
+    \\            .varchar, .string, .char => .{ .text = "x" },
+    \\            .uuid => .{ .uuid = 1 },
+    \\            else => .{ .bigint = 1 },
+    \\        };
+    \\    }
+    \\    const ctx = tdb.TvfContext{ .arena = arena.allocator(), .args = &arg_vals };
     \\    var out = tdb.TvfOutput{ .columns = &out_ptrs, .allocator = allocator };
     \\
     \\    desc.process(&ctx, &parts, &out) catch |err| {
@@ -244,6 +273,8 @@ pub const Desc = extern struct {
     tables: [*]const TableDesc,
     n_out: usize,
     out_cols: [*]const ColDesc,
+    n_args: usize,
+    arg_tags: [*]const u8,
 };
 
 const DllProcess = *const fn (*const anyopaque, [*]const udf_mod.TvfPartition, usize, *anyopaque) callconv(.c) i32;
@@ -522,11 +553,17 @@ pub fn loadAndRegister(
         slot.* = try descCols(cols_arena.allocator(), t.cols[0..t.n_cols]);
     }
     const output_schema = try descCols(cols_arena.allocator(), desc.out_cols[0..desc.n_out]);
+    if (desc.n_args > 64) return Error.FunctionInvalidDefinition;
+    const arg_types = try cols_arena.allocator().alloc(types.Type, desc.n_args);
+    for (desc.arg_tags[0..desc.n_args], arg_types) |tag, *slot| {
+        slot.* = argTypeFromTag(tag) orelse return Error.FunctionInvalidDefinition;
+    }
 
     try registry.registerTable(.{
         .name = name,
         .input_schemas = input_schemas,
         .output_schema = output_schema,
+        .arg_types = arg_types,
         .execution = @enumFromInt(desc.execution),
         .process = dllShim,
         .user_data = @constCast(@ptrCast(process_fn)),
@@ -536,6 +573,25 @@ pub fn loadAndRegister(
         .name = try std.ascii.allocLowerString(allocator, name),
         .lib = lib,
         .source = try allocator.dupe(u8, source),
+    };
+}
+
+fn argTypeFromTag(tag: u8) ?types.Type {
+    if (tag > @intFromEnum(types.TypeTag.uuid)) return null;
+    return switch (@as(types.TypeTag, @enumFromInt(tag))) {
+        .tinyint => .tinyint,
+        .smallint => .smallint,
+        .int => .int,
+        .bigint => .bigint,
+        .largeint => .largeint,
+        .float => .float,
+        .double => .double,
+        .boolean => .boolean,
+        .date => .date,
+        .datetime => .datetime,
+        .string => .string,
+        .uuid => .uuid,
+        else => null,
     };
 }
 

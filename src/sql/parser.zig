@@ -2744,16 +2744,26 @@ pub const Parser = struct {
         try self.expect(.lparen);
         var inputs: std.ArrayList(*ir.Op) = .empty;
         defer inputs.deinit(self.arena);
+        var fn_args: std.ArrayList(?Value) = .empty;
+        defer fn_args.deinit(self.arena);
         while (true) {
-            try self.expect(.lparen);
-            const inner = try self.parseStatement();
-            if (self.pending_separable != null) return ParseError.SqlSeparableScope;
-            try self.expect(.rparen);
-            try inputs.append(self.arena, inner);
+            if (self.cur.tag == .lparen) {
+                try self.advance();
+                const inner = try self.parseStatement();
+                if (self.pending_separable != null) return ParseError.SqlSeparableScope;
+                try self.expect(.rparen);
+                try inputs.append(self.arena, inner);
+            } else if (self.cur.tag == .kw_null) {
+                try self.advance();
+                try fn_args.append(self.arena, null);
+            } else {
+                try fn_args.append(self.arena, try self.parseValue());
+            }
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
         try self.expect(.rparen);
+        if (inputs.items.len == 0) return ParseError.SqlExpectedToken;
 
         var partition_by: std.ArrayList([]const u8) = .empty;
         defer partition_by.deinit(self.arena);
@@ -2799,6 +2809,7 @@ pub const Parser = struct {
         const op = try self.allocOp(.{ .table_fn = .{
             .name = fname,
             .inputs = try self.arena.dupe(*ir.Op, inputs.items),
+            .args = try self.arena.dupe(?Value, fn_args.items),
             .partition_by = try self.arena.dupe([]const u8, partition_by.items),
             .order_by = try self.arena.dupe(ir.SortSpec, order_by.items),
             .alias = if (resolved_name.ptr != fname.ptr) resolved_name else null,
