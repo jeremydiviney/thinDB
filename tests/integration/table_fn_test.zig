@@ -172,6 +172,74 @@ test "table UDF: declared execution mode is compile-enforced both ways" {
     );
 }
 
+test "table UDF: parallel partition execution matches serial (thread-safe allocator)" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+
+    // 64 groups × 8 rows, shuffled ids so ORDER BY works per partition.
+    const t = try db.table("t", schema, opts);
+    var id: i64 = 1;
+    for (0..8) |round| {
+        for (0..64) |g| {
+            try t.insert(&.{.{
+                .id = id + @as(i64, @intCast((round * 37 + g * 11) % 512)) * 1000,
+                .g = @as(i32, @intCast(g)),
+                .amt = @as(i64, @intCast(g + round)),
+            }});
+            id += 1;
+        }
+    }
+    try t.flush();
+    try register(db, .either);
+
+    const sql =
+        \\SELECT id, running
+        \\FROM TABLE(running_total((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id)
+    ;
+    var serial_ids: std.ArrayList(i64) = .empty;
+    defer serial_ids.deinit(allocator);
+    var serial_run: std.ArrayList(i64) = .empty;
+    defer serial_run.deinit(allocator);
+    {
+        var res = try run(allocator, db, sql);
+        defer res.deinit();
+        while (try res.next()) |batch| {
+            for (0..batch.row_count) |i| {
+                try serial_ids.append(allocator, batch.values[0].data.bigint[i]);
+                try serial_run.append(allocator, batch.values[1].data.bigint[i]);
+            }
+        }
+    }
+
+    thindb.exec.table_fn.force_parallel_in_tests = true;
+    defer thindb.exec.table_fn.force_parallel_in_tests = false;
+    var par_ids: std.ArrayList(i64) = .empty;
+    defer par_ids.deinit(allocator);
+    var par_run: std.ArrayList(i64) = .empty;
+    defer par_run.deinit(allocator);
+    {
+        var res = try run(allocator, db, sql);
+        defer res.deinit();
+        while (try res.next()) |batch| {
+            for (0..batch.row_count) |i| {
+                try par_ids.append(allocator, batch.values[0].data.bigint[i]);
+                try par_run.append(allocator, batch.values[1].data.bigint[i]);
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 512), serial_ids.items.len);
+    try std.testing.expectEqualSlices(i64, serial_ids.items, par_ids.items);
+    try std.testing.expectEqualSlices(i64, serial_run.items, par_run.items);
+}
+
 test "table UDF: input shape violations are compile errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

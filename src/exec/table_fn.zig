@@ -15,10 +15,15 @@
 //!   - PARTITION BY presence must match the function's declared execution
 //!     mode; partition/order columns must be declared input columns.
 //!
-//! v1 executes partitions SERIALLY; the partition loop is the seam where
-//! the claiming-pool parallelism lands next.
+//! Partitions execute in PARALLEL: workers claim run indices off an atomic
+//! counter, each invoking process() into its own private output stores
+//! (kernels need only be pure per-partition — no cross-partition state);
+//! the final output concatenates per-run segments in run order, so results
+//! are deterministic regardless of worker scheduling. Serial fallback for
+//! DOP 1 / single-run (GLOBAL) / test builds.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
@@ -45,6 +50,10 @@ const makeQuery = exec.makeQuery;
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 
+/// Test hook: std.testing.allocator is single-threaded, so tests run the
+/// serial path unless they opt in with a thread-safe allocator of their own.
+pub var force_parallel_in_tests: bool = false;
+
 pub const TableFnExec = struct {
     allocator: Allocator,
     upstream: Query,
@@ -58,6 +67,7 @@ pub const TableFnExec = struct {
     order_desc: []bool,
     output_cols: []ColumnStore,
     views: []ColumnView,
+    dop: usize,
     done: bool = false,
 
     pub fn create(
@@ -66,6 +76,7 @@ pub const TableFnExec = struct {
         entry: *const udf_mod.TableEntry,
         partition_by: []const []const u8,
         order_by: []const SortSpec,
+        dop: usize,
     ) !Query {
         // Execution mode vs call-site shape.
         switch (entry.execution) {
@@ -124,6 +135,7 @@ pub const TableFnExec = struct {
             .order_desc = order_desc,
             .output_cols = output_cols,
             .views = views,
+            .dop = @max(1, dop),
         };
         return makeQuery(allocator, self);
     }
@@ -221,49 +233,222 @@ pub const TableFnExec = struct {
             std.mem.sortUnstable(u32, perm, lctx, LessCtx.less);
         }
 
-        // Walk partition runs and invoke the callback per run. Global mode
-        // (no keys) is one run covering everything.
-        var scratch = try self.allocator.alloc(ColumnStore, n_cols);
-        var sinited: usize = 0;
-        defer {
-            for (scratch[0..sinited]) |*c| c.deinit(self.allocator);
-            self.allocator.free(scratch);
-        }
-        for (self.entry.input_schema, scratch) |col, *store| {
-            store.* = try ColumnStore.init(self.allocator, col.type, col.nullable);
-            sinited += 1;
-        }
-        const part_views = try self.allocator.alloc(ColumnView, n_cols);
-        defer self.allocator.free(part_views);
-        const key_vals = try self.allocator.alloc(?Value, self.key_idx.len);
-        defer self.allocator.free(key_vals);
-        var out = udf_mod.TvfOutput{
-            .columns = try self.allocator.alloc(*ColumnStore, self.output_cols.len),
-            .allocator = self.allocator,
-        };
-        defer self.allocator.free(out.columns);
-        for (self.output_cols, out.columns) |*c, *slot| slot.* = c;
-
+        // Partition boundaries: contiguous runs of equal keys in the sorted
+        // permutation. Global mode (no keys) is one run covering everything.
+        var runs: std.ArrayList(Run) = .empty;
+        defer runs.deinit(self.allocator);
         var start: usize = 0;
         while (start < n_rows) {
             var end = start + 1;
             while (end < n_rows and self.sameKeys(input_views, perm[start], perm[end])) end += 1;
+            try runs.append(self.allocator, .{ .start = start, .end = end });
+            start = end;
+        }
 
-            for (scratch) |*c| {
-                c.deinit(self.allocator);
+        // std.testing.allocator is not thread-safe, so test builds stay
+        // serial by default; a test that supplies its own thread-safe
+        // allocator sets the override to exercise the parallel path.
+        const allow_parallel = !builtin.is_test or force_parallel_in_tests;
+        const n_workers = if (allow_parallel) @min(self.dop, runs.items.len) else 1;
+        if (n_workers <= 1) {
+            var runner = try Runner.init(self.allocator, self, input_views, perm, self.output_cols);
+            defer runner.deinit();
+            for (runs.items) |run| _ = try runner.runOne(run);
+            return;
+        }
+        try self.executeParallel(input_views, perm, runs.items, n_workers);
+    }
+
+    const Run = struct { start: usize, end: usize };
+
+    /// Where each run's output landed: which worker produced it and the
+    /// row range inside that worker's private output stores. Written by
+    /// exactly one worker per slot — no synchronization needed beyond the
+    /// claim counter.
+    const RunSeg = struct { worker: u32 = 0, off: usize = 0, len: usize = 0 };
+
+    fn executeParallel(
+        self: *TableFnExec,
+        input_views: []const ColumnView,
+        perm: []const u32,
+        runs: []const Run,
+        n_workers: usize,
+    ) !void {
+        const segs = try self.allocator.alloc(RunSeg, runs.len);
+        defer self.allocator.free(segs);
+
+        const Worker = struct {
+            runner: Runner,
+            out_stores: []ColumnStore,
+            err: ?anyerror = null,
+
+            fn main(
+                w: *@This(),
+                wid: u32,
+                run_list: []const Run,
+                seg_list: []RunSeg,
+                next_run: *std.atomic.Value(usize),
+                abort: *std.atomic.Value(bool),
+            ) void {
+                while (true) {
+                    if (abort.load(.acquire)) return;
+                    const r = next_run.fetchAdd(1, .monotonic);
+                    if (r >= run_list.len) return;
+                    const before = w.out_stores[0].rowCount();
+                    const emitted = w.runner.runOne(run_list[r]) catch |err| {
+                        w.err = err;
+                        abort.store(true, .release);
+                        return;
+                    };
+                    seg_list[r] = .{ .worker = wid, .off = before, .len = emitted };
+                }
             }
-            sinited = 0;
-            for (self.entry.input_schema, scratch) |col, *store| {
+        };
+
+        const workers = try self.allocator.alloc(Worker, n_workers);
+        var built: usize = 0;
+        defer {
+            for (workers[0..built]) |*w| {
+                w.runner.deinit();
+                for (w.out_stores) |*c| c.deinit(self.allocator);
+                self.allocator.free(w.out_stores);
+            }
+            self.allocator.free(workers);
+        }
+        for (workers) |*w| {
+            const out_stores = try self.allocator.alloc(ColumnStore, self.entry.output_schema.len);
+            var inited: usize = 0;
+            errdefer {
+                for (out_stores[0..inited]) |*c| c.deinit(self.allocator);
+                self.allocator.free(out_stores);
+            }
+            for (self.entry.output_schema, out_stores) |col, *store| {
                 store.* = try ColumnStore.init(self.allocator, col.type, col.nullable);
-                sinited += 1;
+                inited += 1;
             }
-            for (input_views, scratch) |v, *store| {
-                try transform.appendByIndices(self.allocator, v, perm[start..end], store);
+            w.* = .{
+                .runner = try Runner.init(self.allocator, self, input_views, perm, out_stores),
+                .out_stores = out_stores,
+            };
+            built += 1;
+        }
+
+        var next_run = std.atomic.Value(usize).init(0);
+        var abort = std.atomic.Value(bool).init(false);
+        const threads = try self.allocator.alloc(?std.Thread, n_workers);
+        defer self.allocator.free(threads);
+        @memset(threads, null);
+        for (workers, threads, 0..) |*w, *th, wid| {
+            th.* = std.Thread.spawn(.{}, Worker.main, .{
+                w, @as(u32, @intCast(wid)), runs, segs, &next_run, &abort,
+            }) catch null;
+            // Spawn failure: this worker's runs are claimed by the others.
+        }
+        var spawned: usize = 0;
+        for (threads) |th| {
+            if (th) |t| {
+                t.join();
+                spawned += 1;
             }
-            for (scratch, part_views) |c, *v| v.* = c.view();
-            for (self.key_idx, key_vals) |ki, *kv| {
-                kv.* = if (input_views[ki].isValid(perm[start]))
-                    valueAt(input_views[ki], perm[start])
+        }
+        if (spawned == 0) {
+            // Total spawn failure — run everything on this thread.
+            Worker.main(&workers[0], 0, runs, segs, &next_run, &abort);
+        }
+        for (workers[0..built]) |*w| {
+            if (w.err) |err| return err;
+        }
+        // A claimed-but-never-run slot can only happen on abort; err above
+        // covers it. If threads partially spawned, the survivors drained
+        // the whole claim range.
+
+        // Concatenate per-run segments IN RUN ORDER: output is
+        // deterministic regardless of worker scheduling.
+        var idx: std.ArrayList(u32) = .empty;
+        defer idx.deinit(self.allocator);
+        for (segs) |seg| {
+            if (seg.len == 0) continue;
+            idx.clearRetainingCapacity();
+            try idx.ensureTotalCapacity(self.allocator, seg.len);
+            for (0..seg.len) |i| idx.appendAssumeCapacity(@intCast(seg.off + i));
+            const w = &workers[seg.worker];
+            for (w.out_stores, self.output_cols) |src, *dst| {
+                try transform.appendByIndices(self.allocator, src.view(), idx.items, dst);
+            }
+        }
+    }
+
+    /// Per-worker execution state: scratch input stores for the gathered
+    /// partition, borrowed views, key values, and the output sink (pointing
+    /// at either the operator's output columns — serial — or the worker's
+    /// private stores). `runOne` gathers a run, invokes process(), and
+    /// enforces the rectangular-output contract; returns rows emitted.
+    const Runner = struct {
+        allocator: Allocator,
+        op: *const TableFnExec,
+        input_views: []const ColumnView,
+        perm: []const u32,
+        scratch: []ColumnStore,
+        part_views: []ColumnView,
+        key_vals: []?Value,
+        out_ptrs: []*ColumnStore,
+
+        fn init(
+            allocator: Allocator,
+            op: *const TableFnExec,
+            input_views: []const ColumnView,
+            perm: []const u32,
+            out_stores: []ColumnStore,
+        ) !Runner {
+            const n_cols = op.entry.input_schema.len;
+            const scratch = try allocator.alloc(ColumnStore, n_cols);
+            errdefer allocator.free(scratch);
+            var inited: usize = 0;
+            errdefer for (scratch[0..inited]) |*c| c.deinit(allocator);
+            for (op.entry.input_schema, scratch) |col, *store| {
+                store.* = try ColumnStore.init(allocator, col.type, col.nullable);
+                inited += 1;
+            }
+            const part_views = try allocator.alloc(ColumnView, n_cols);
+            errdefer allocator.free(part_views);
+            const key_vals = try allocator.alloc(?Value, op.key_idx.len);
+            errdefer allocator.free(key_vals);
+            const out_ptrs = try allocator.alloc(*ColumnStore, out_stores.len);
+            errdefer allocator.free(out_ptrs);
+            for (out_stores, out_ptrs) |*c, *slot| slot.* = c;
+            return .{
+                .allocator = allocator,
+                .op = op,
+                .input_views = input_views,
+                .perm = perm,
+                .scratch = scratch,
+                .part_views = part_views,
+                .key_vals = key_vals,
+                .out_ptrs = out_ptrs,
+            };
+        }
+
+        fn deinit(self: *Runner) void {
+            for (self.scratch) |*c| c.deinit(self.allocator);
+            self.allocator.free(self.scratch);
+            self.allocator.free(self.part_views);
+            self.allocator.free(self.key_vals);
+            self.allocator.free(self.out_ptrs);
+        }
+
+        fn runOne(self: *Runner, run: Run) !usize {
+            const op = self.op;
+            for (op.entry.input_schema, self.scratch) |col, *store| {
+                store.deinit(self.allocator);
+                store.* = try ColumnStore.init(self.allocator, col.type, col.nullable);
+            }
+            for (self.input_views, self.scratch) |v, *store| {
+                try transform.appendByIndices(self.allocator, v, self.perm[run.start..run.end], store);
+            }
+            for (self.scratch, self.part_views) |c, *v| v.* = c.view();
+            for (op.key_idx, self.key_vals) |ki, *kv| {
+                kv.* = if (self.input_views[ki].isValid(self.perm[run.start]))
+                    valueAt(self.input_views[ki], self.perm[run.start])
                 else
                     null;
             }
@@ -272,25 +457,27 @@ pub const TableFnExec = struct {
             defer arena.deinit();
             const ctx = udf_mod.TvfContext{
                 .arena = arena.allocator(),
-                .user_data = self.entry.user_data,
+                .user_data = op.entry.user_data,
             };
             const part = udf_mod.TvfPartition{
-                .columns = part_views,
-                .row_count = end - start,
-                .keys = key_vals,
+                .columns = self.part_views,
+                .row_count = run.end - run.start,
+                .keys = self.key_vals,
             };
-            try self.entry.process(&ctx, &part, &out);
+            var out = udf_mod.TvfOutput{
+                .columns = self.out_ptrs,
+                .allocator = self.allocator,
+            };
+            const before = self.out_ptrs[0].rowCount();
+            try op.entry.process(&ctx, &part, &out);
 
-            // Rectangular-output contract: every output column at the same
-            // row count after each partition.
-            const expect = self.output_cols[0].rowCount();
-            for (self.output_cols[1..]) |c| {
-                if (c.rowCount() != expect) return Error.TableFnOutputMismatch;
+            const after = self.out_ptrs[0].rowCount();
+            for (self.out_ptrs[1..]) |c| {
+                if (c.rowCount() != after) return Error.TableFnOutputMismatch;
             }
-
-            start = end;
+            return after - before;
         }
-    }
+    };
 
     fn sameKeys(self: *const TableFnExec, views: []const ColumnView, a: u32, b: u32) bool {
         for (self.key_idx) |ki| {

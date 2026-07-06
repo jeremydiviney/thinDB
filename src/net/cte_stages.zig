@@ -2442,7 +2442,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             const entry = registry.tableByName(t.name) orelse return error.UnsupportedQueryShape;
             var up = try compileBlock(input, t.input, map);
             errdefer up.deinit();
-            const q = try exec.table_fn.TableFnExec.create(input.allocator, up, entry, t.partition_by, t.order_by);
+            const q = try exec.table_fn.TableFnExec.create(input.allocator, up, entry, t.partition_by, t.order_by, input.effectiveDop());
             if (t.alias) |a| {
                 errdefer @constCast(&q).deinit();
                 return exec.AliasRename.create(input.allocator, q, a);
