@@ -48,6 +48,23 @@ const transform = @import("../engine/transform.zig");
 const cell_io = @import("cell_io.zig");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+fn keyValueAt(v: ColumnView, row: usize) ?types.Value {
+    return switch (v.data) {
+        .int => |s| .{ .int = s[row] },
+        .bigint => |s| .{ .bigint = s[row] },
+        .tinyint => |s| .{ .tinyint = s[row] },
+        .smallint => |s| .{ .smallint = s[row] },
+        .date => |s| .{ .date = s[row] },
+        .datetime => |s| .{ .datetime = s[row] },
+        .float => |s| .{ .float = s[row] },
+        .double => |s| .{ .double = s[row] },
+        .decimal64 => |s| .{ .decimal64 = s[row] },
+        .largeint => |s| .{ .largeint = s[row] },
+        .varchar, .string, .char => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
+        else => null,
+    };
+}
 const appendNullTo = cell_io.appendNullTo;
 const appendOneFromBuild = cell_io.appendOneFromBuild;
 const appendOneFromView = cell_io.appendOneFromView;
@@ -474,6 +491,13 @@ pub const Join = struct {
     /// the `on` spec. Used by the compound-key builder.
     left_key_indices: []usize,
     right_key_indices: []usize,
+    /// Per-side join key column NAMES (arena copies). The index slices
+    /// above are resolved against the create-time schemas and go stale
+    /// when later projection pushdown narrows a side — anything running
+    /// at execution time (the build-key prune offer) must re-resolve by
+    /// name against the side's CURRENT outputSchema().
+    left_key_names: []const []const u8,
+    right_key_names: []const []const u8,
 
     /// Optional skew detector. Set when Spec.skew_ratio_threshold > 0;
     /// observed during buildPhase, checked at end. Allocated in
@@ -707,9 +731,13 @@ pub const Join = struct {
         // Resolve key column indices on each side.
         const left_keys = try aa.alloc(usize, spec.on.len);
         const right_keys = try aa.alloc(usize, spec.on.len);
+        const left_key_names = try aa.alloc([]const u8, spec.on.len);
+        const right_key_names = try aa.alloc([]const u8, spec.on.len);
         for (spec.on, 0..) |pair, i| {
             left_keys[i] = columnIndex(left_schema, pair.left) orelse return Error.ColumnNotFound;
             right_keys[i] = columnIndex(right_schema, pair.right) orelse return Error.ColumnNotFound;
+            left_key_names[i] = try aa.dupe(u8, left_schema[left_keys[i]].name);
+            right_key_names[i] = try aa.dupe(u8, right_schema[right_keys[i]].name);
             // Types must match by tag (varchar/string/char are
             // compatible string-family; otherwise must match exactly).
             const lt: TypeTag = left_schema[left_keys[i]].type;
@@ -850,6 +878,8 @@ pub const Join = struct {
             .left = left_in,
             .right = right_in,
             .join_type = spec.join_type,
+            .left_key_names = left_key_names,
+            .right_key_names = right_key_names,
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
             .ranges = resolved_ranges,
@@ -1182,6 +1212,15 @@ pub const Join = struct {
                         self.phase = .done;
                         return null;
                     }
+                    // Sideways info passing: an INNER join only emits probe
+                    // rows whose keys fall inside the build keys' [min, max],
+                    // so offer that range to the probe subtree as prune hints
+                    // (zonemap row-group/segment skips). Only when the probe
+                    // hasn't started — Scan.addPrune isn't safe on a running
+                    // scan, and a peeked batch means workers are live.
+                    if (self.join_type == .inner and self.peeked_probe == null and self.build_rows > 0) {
+                        self.offerBuildKeyPrunes();
+                    }
                     // FULL OUTER needs a matched-row bitmap so we can
                     // emit the unmatched build rows at the end.
                     if (self.join_type == .full) {
@@ -1232,6 +1271,51 @@ pub const Join = struct {
     // Build phase: drain the build side, materialize into
     // build_columns, populate the hash table.
     // -----------------------------------------------------------------
+
+    /// Derive per-key-column [min, max] over the finished build side and
+    /// offer them to the probe subtree as prune hints. Each column's range
+    /// is independently superset-safe (a probe row outside ANY key column's
+    /// build range cannot match), NULL build keys never match an INNER join
+    /// so validity-skipping them tightens the range for free, and Value
+    /// comparison is byte order for strings — the same order the zonemap
+    /// stats use. Best-effort: any unsupported type or rejection just means
+    /// no pruning for that column.
+    fn offerBuildKeyPrunes(self: *Join) void {
+        const build_names = if (self.build_is_left) self.left_key_names else self.right_key_names;
+        const probe_names = if (self.build_is_left) self.right_key_names else self.left_key_names;
+        // Resolve by NAME against the CURRENT schemas: the create-time index
+        // slices go stale when projection pushdown narrows a side, and
+        // build_columns follow the runtime batch layout.
+        const build_schema = if (self.build_is_left) self.left.outputSchema() else self.right.outputSchema();
+        const probe_schema = if (self.build_is_left) self.right.outputSchema() else self.left.outputSchema();
+        var probe = if (self.build_is_left) &self.right else &self.left;
+        const jtrace = getenv("THINDB_TRACE_JOINFUSE") != null;
+        keys: for (build_names, probe_names) |bname, pname| {
+            const bci = columnIndex(build_schema, bname) orelse continue;
+            const pci = columnIndex(probe_schema, pname) orelse continue;
+            if (bci >= self.build_columns.len) continue;
+            // Mismatched physical types would make the Value comparison in
+            // predicate eval subtly wrong — only prune same-typed keys.
+            if (!std.meta.eql(build_schema[bci].type, probe_schema[pci].type)) continue;
+            const view = self.build_columns[bci].view();
+            var mn: ?types.Value = null;
+            var mx: ?types.Value = null;
+            var row: usize = 0;
+            while (row < self.build_rows) : (row += 1) {
+                if (!view.isValid(row)) continue;
+                const v = keyValueAt(view, row) orelse continue :keys;
+                if (mn == null or v.compare(mn.?) == .lt) mn = v;
+                if (mx == null or v.compare(mx.?) == .gt) mx = v;
+            }
+            const lo = mn orelse continue;
+            const hi = mx orelse continue;
+            probe.addPrune(.{ .col = pname, .op = .gte, .val = lo }) catch continue;
+            probe.addPrune(.{ .col = pname, .op = .lte, .val = hi }) catch {};
+            if (jtrace) {
+                std.debug.print("[jf] build-key prune offered on '{s}' ({d} build rows)\n", .{ pname, self.build_rows });
+            }
+        }
+    }
 
     fn buildPhase(self: *Join) !void {
         var up = if (self.build_is_left) &self.left else &self.right;
