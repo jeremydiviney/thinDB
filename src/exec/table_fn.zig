@@ -68,7 +68,9 @@ pub const TableFnExec = struct {
     output_cols: []ColumnStore,
     views: []ColumnView,
     dop: usize,
+    col_stats: []exec.ColStat,
     done: bool = false,
+    stats_ready: bool = false,
 
     pub fn create(
         allocator: Allocator,
@@ -122,6 +124,9 @@ pub const TableFnExec = struct {
         }
         const views = try allocator.alloc(ColumnView, entry.output_schema.len);
         errdefer allocator.free(views);
+        const col_stats = try allocator.alloc(exec.ColStat, entry.output_schema.len);
+        errdefer allocator.free(col_stats);
+        @memset(col_stats, .{});
 
         const self = try allocator.create(TableFnExec);
         errdefer allocator.destroy(self);
@@ -135,6 +140,7 @@ pub const TableFnExec = struct {
             .order_desc = order_desc,
             .output_cols = output_cols,
             .views = views,
+            .col_stats = col_stats,
             .dop = @max(1, dop),
         };
         return makeQuery(allocator, self);
@@ -146,6 +152,7 @@ pub const TableFnExec = struct {
         for (self.output_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_cols);
         self.allocator.free(self.views);
+        self.allocator.free(self.col_stats);
         self.allocator.free(self.input_map);
         self.allocator.free(self.key_idx);
         self.allocator.free(self.order_idx);
@@ -164,9 +171,49 @@ pub const TableFnExec = struct {
         return Error.ColumnNotFound;
     }
 
+    /// Before execution nothing can be bounded — a kernel may emit any
+    /// number of rows per partition. After execution the whole output is
+    /// materialized, so report EXACT figures: the row count, per-column
+    /// NDV capped at the row count, and actual min/max scanned off the
+    /// int-family output columns. Downstream consumers that consult stats
+    /// lazily (GROUP BY routing at first pull) see the exact numbers.
     pub fn stats(self: *TableFnExec) exec.PipelineStats {
-        _ = self;
-        return .{ .upper_rows = std.math.maxInt(u64) };
+        if (!self.done) return .{ .upper_rows = std.math.maxInt(u64) };
+        const n = self.output_cols[0].rowCount();
+        if (!self.stats_ready) {
+            self.computeOutputStats(n);
+            self.stats_ready = true;
+        }
+        return .{ .upper_rows = n, .column_stats = self.col_stats };
+    }
+
+    fn computeOutputStats(self: *TableFnExec, n_rows: u64) void {
+        const ndv_cap: u32 = if (n_rows > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(n_rows);
+        for (self.output_cols, self.col_stats) |c, *stat| {
+            stat.* = .{ .ndv = .{ .exact = ndv_cap } };
+            const view = c.view();
+            var mn: i128 = std.math.maxInt(i128);
+            var mx: i128 = std.math.minInt(i128);
+            var any = false;
+            const nrows = c.rowCount();
+            switch (view.data) {
+                inline .int, .bigint, .tinyint, .smallint, .date, .datetime, .largeint, .decimal64 => |s| {
+                    for (s, 0..) |v, i| {
+                        if (!view.isValid(i)) continue;
+                        const w: i128 = v;
+                        mn = @min(mn, w);
+                        mx = @max(mx, w);
+                        any = true;
+                    }
+                },
+                else => {},
+            }
+            _ = nrows;
+            if (any) {
+                stat.min = mn;
+                stat.max = mx;
+            }
+        }
     }
 
     pub fn accountant(self: *TableFnExec) ?*exec.memory.MemoryAccountant {
