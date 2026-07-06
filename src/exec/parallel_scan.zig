@@ -820,10 +820,13 @@ pub const ParallelScan = struct {
             qq.deinit();
         }
         if (self.compute_q.len > 0) self.allocator.free(self.compute_q);
-        // agg-fusion and compute-fusion are mutually exclusive, so exactly one of
-        // these counts is non-zero; their wrappers own workers[0..owned], the rest
-        // are freed directly.
-        const owned = self.agg_built + self.compute_built;
+        // agg-fusion and compute-fusion are mutually exclusive, so exactly one
+        // of these counts is non-zero; their wrappers own workers[0..owned],
+        // the rest are freed directly. Clamped: the deferred-leaf agg path
+        // sizes agg_q by plannedChunks() — an upper bound that can exceed the
+        // realized worker count (its wrappers wrap ProbeChunkScan, and like
+        // the probe-fused normal path, no worker is directly deinited here).
+        const owned = @min(self.agg_built + self.compute_built, self.workers.len);
         for (self.workers[owned..]) |w| w.deinit();
         self.allocator.free(self.workers);
         self.allocator.free(self.round);
