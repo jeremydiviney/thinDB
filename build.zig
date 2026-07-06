@@ -238,6 +238,24 @@ pub fn build(b: *std.Build) void {
     const probe_step = b.step("probe", "Open .clickbench-db and dump discovered databases/schemas");
     probe_step.dependOn(&run_probe.step);
 
+    // ---- TVF flagship A/B: bench/tvf_walk_ab.zig (always ReleaseFast) ----
+    const tvf_ab_mod = b.createModule(.{
+        .root_source_file = b.path("bench/tvf_walk_ab.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tvf_ab_mod.addImport("thindb", thindb_mod);
+    const tvf_ab_exe = b.addExecutable(.{
+        .name = "tvf_walk_ab",
+        .root_module = tvf_ab_mod,
+    });
+    b.installArtifact(tvf_ab_exe);
+    const run_tvf_ab = b.addRunArtifact(tvf_ab_exe);
+    run_tvf_ab.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_tvf_ab.addArgs(args);
+    const tvf_ab_step = b.step("tvf-walk-ab", "Rollforward gap-fill walk: table UDF vs 6-CTE chain, values + wall-clock (pass -Doptimize=ReleaseFast)");
+    tvf_ab_step.dependOn(&run_tvf_ab.step);
+
     // ---- thindb-server executable: standalone multi-wire server -------------
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/cmd/server.zig"),
