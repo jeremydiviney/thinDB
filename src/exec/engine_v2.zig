@@ -138,6 +138,7 @@ pub fn isSelectQuery(op: *const ir.Op) bool {
         .single_row,
         .file_scan,
         .alias,
+        .table_fn,
         => true,
         .ddl,
         .show,

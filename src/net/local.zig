@@ -1848,6 +1848,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .window,
         .set_union,
         .single_row,
+        .table_fn,
         => Error.UnsupportedOp,
         .ddl => |d| try compileDdl(ctx, d),
         .show => |s| try compileShow(ctx, s),

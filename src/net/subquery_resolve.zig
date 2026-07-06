@@ -64,6 +64,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
     switch (op.*) {
         .scan, .file_scan, .ddl, .show, .insert, .copy, .single_row => {},
         .alias => |a| try resolveSubqueriesInOp(ctx, @constCast(a.upstream)),
+        .table_fn => |t| try resolveSubqueriesInOp(ctx, t.input),
         .explain => |e| try resolveSubqueriesInOp(ctx, e.inner),
         .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value),
         .delete_op => |*d| {

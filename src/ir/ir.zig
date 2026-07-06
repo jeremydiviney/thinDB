@@ -472,6 +472,10 @@ pub const OpTag = enum(u8) {
     file_scan = 24,
     /// FROM-clause alias over a non-scan source such as a CTE or subquery.
     alias = 25,
+    /// Table-valued UDF call: `FROM TABLE(f(<subquery>) PARTITION BY k
+    /// ORDER BY o)`. One input subtree; the registered function's declared
+    /// output schema is the node's output.
+    table_fn = 26,
 };
 
 pub const BatchOp = struct {
@@ -590,6 +594,21 @@ pub const Op = union(OpTag) {
     single_row: void,
     file_scan: FileScan,
     alias: Alias,
+    table_fn: TableFn,
+
+    /// `FROM TABLE(name(<subquery>) [PARTITION BY cols] [ORDER BY specs])`.
+    /// The registered function's declared input schema is matched against
+    /// the subquery's output at compile (name + type, immediate error);
+    /// its declared output schema becomes this node's schema. Empty
+    /// `partition_by` = GLOBAL execution: exactly one partition holding
+    /// every input row.
+    pub const TableFn = struct {
+        name: []const u8,
+        input: *Op,
+        partition_by: []const []const u8,
+        order_by: []const SortSpec,
+        alias: ?[]const u8 = null,
+    };
 
     pub const Scan = struct {
         /// Qualified table reference. Each segment is null when the user
@@ -735,6 +754,12 @@ pub const Op = union(OpTag) {
             .alias => |a| {
                 a.upstream.deinitDecoded(allocator);
                 allocator.destroy(a.upstream);
+            },
+            .table_fn => |t| {
+                allocator.free(t.partition_by);
+                allocator.free(t.order_by);
+                t.input.deinitDecoded(allocator);
+                allocator.destroy(t.input);
             },
             .explain => |e| {
                 e.inner.deinitDecoded(allocator);
@@ -886,6 +911,23 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .alias => |a| {
             try encodeOptString(allocator, out, a.alias);
             try encodeOp(allocator, out, a.upstream.*);
+        },
+        .table_fn => |t| {
+            try appendU32(allocator, out, @intCast(t.name.len));
+            try out.appendSlice(allocator, t.name);
+            try appendU32(allocator, out, @intCast(t.partition_by.len));
+            for (t.partition_by) |c| {
+                try appendU32(allocator, out, @intCast(c.len));
+                try out.appendSlice(allocator, c);
+            }
+            try appendU32(allocator, out, @intCast(t.order_by.len));
+            for (t.order_by) |s| {
+                try appendU32(allocator, out, @intCast(s.col.len));
+                try out.appendSlice(allocator, s.col);
+                try out.append(allocator, @intFromBool(s.desc));
+            }
+            try encodeOptString(allocator, out, t.alias);
+            try encodeOp(allocator, out, t.input.*);
         },
         .limit => |l| {
             try appendU64(allocator, out, l.n);
@@ -1709,7 +1751,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.alias)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.table_fn)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -1725,6 +1767,37 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             errdefer allocator.destroy(upstream);
             upstream.* = try decodeOp(allocator, bytes, cursor);
             break :blk Op{ .alias = .{ .alias = alias, .upstream = upstream } };
+        },
+        .table_fn => blk: {
+            const name = try readString(bytes, cursor);
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n_parts = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const partition_by = try allocator.alloc([]const u8, n_parts);
+            errdefer allocator.free(partition_by);
+            for (partition_by) |*c| c.* = try readString(bytes, cursor);
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n_specs = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const order_by = try allocator.alloc(SortSpec, n_specs);
+            errdefer allocator.free(order_by);
+            for (order_by) |*s| {
+                s.col = try readString(bytes, cursor);
+                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+                s.desc = bytes[cursor.*] != 0;
+                cursor.* += 1;
+            }
+            const fn_alias = try decodeOptString(bytes, cursor);
+            const input = try allocator.create(Op);
+            errdefer allocator.destroy(input);
+            input.* = try decodeOp(allocator, bytes, cursor);
+            break :blk Op{ .table_fn = .{
+                .name = name,
+                .input = input,
+                .partition_by = partition_by,
+                .order_by = order_by,
+                .alias = fn_alias,
+            } };
         },
         .limit => blk: {
             if (cursor.* + 16 > bytes.len) return Error.IrCorrupt;

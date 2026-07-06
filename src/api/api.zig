@@ -304,6 +304,7 @@ pub const udf = @import("../udf.zig");
 pub const UdfRegistry = udf.UdfRegistry;
 pub const ScalarUdf = udf.ScalarUdf;
 pub const AggregateUdf = udf.AggregateUdf;
+pub const TableUdf = udf.TableUdf;
 pub const UdfVolatility = udf.Volatility;
 pub const UdfNullStrategy = udf.NullStrategy;
 

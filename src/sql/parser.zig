@@ -2633,6 +2633,9 @@ pub const Parser = struct {
     /// the resolved *ir.Op plus the name to use for ON-clause
     /// qualifier resolution.
     fn parseFromTarget(self: *Parser) ParseError!FromTarget {
+        if (self.cur.tag == .kw_table) {
+            return self.parseTableFnTarget();
+        }
         if (self.cur.tag == .lparen) {
             // Anonymous subquery: ( select_stmt ) [AS] alias. Like every CTE
             // boundary, it materializes: the subquery runs as its own stage
@@ -2725,6 +2728,74 @@ pub const Parser = struct {
             op = try self.applyAliasToFromOp(op, resolved_name, alias_in_place);
             try self.advance();
         }
+        return .{ .name = resolved_name, .op = op };
+    }
+
+    /// `TABLE( fname( (subquery) ) [PARTITION BY col, ...]
+    ///        [ORDER BY col [ASC|DESC], ...] ) [AS] [alias]`
+    /// — a table-valued UDF call. The input subquery must be parenthesized.
+    /// No PARTITION BY = GLOBAL execution (one partition holding all rows);
+    /// the registered function's declared execution mode is enforced at
+    /// compile.
+    fn parseTableFnTarget(self: *Parser) ParseError!FromTarget {
+        try self.advance(); // TABLE
+        try self.expect(.lparen);
+        const fname = try self.dupedIdent();
+        try self.expect(.lparen);
+        try self.expect(.lparen);
+        const inner = try self.parseStatement();
+        if (self.pending_separable != null) return ParseError.SqlSeparableScope;
+        try self.expect(.rparen);
+        try self.expect(.rparen);
+
+        var partition_by: std.ArrayList([]const u8) = .empty;
+        defer partition_by.deinit(self.arena);
+        if (self.cur.tag == .kw_partition) {
+            try self.advance();
+            if (self.cur.tag != .kw_by) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            while (true) {
+                try partition_by.append(self.arena, try self.dupedIdent());
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+        }
+        var order_by: std.ArrayList(ir.SortSpec) = .empty;
+        defer order_by.deinit(self.arena);
+        if (self.cur.tag == .kw_order) {
+            try self.advance();
+            if (self.cur.tag != .kw_by) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            while (true) {
+                const col = try self.dupedIdent();
+                var desc = false;
+                if (self.cur.tag == .kw_asc) {
+                    try self.advance();
+                } else if (self.cur.tag == .kw_desc) {
+                    desc = true;
+                    try self.advance();
+                }
+                try order_by.append(self.arena, .{ .col = col, .desc = desc });
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+        }
+        try self.expect(.rparen); // close TABLE(
+
+        var resolved_name: []const u8 = fname;
+        if (self.cur.tag == .kw_as) {
+            try self.advance();
+            resolved_name = try self.dupedIdent();
+        } else if (self.cur.tag == .identifier and !self.identStartsSeparable()) {
+            resolved_name = try self.dupedIdent();
+        }
+        const op = try self.allocOp(.{ .table_fn = .{
+            .name = fname,
+            .input = inner,
+            .partition_by = try self.arena.dupe([]const u8, partition_by.items),
+            .order_by = try self.arena.dupe(ir.SortSpec, order_by.items),
+            .alias = if (resolved_name.ptr != fname.ptr) resolved_name else null,
+        } });
         return .{ .name = resolved_name, .op = op };
     }
 

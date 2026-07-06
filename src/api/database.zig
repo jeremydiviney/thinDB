@@ -256,6 +256,11 @@ pub const Database = struct {
         return catalog.registerAggregateUdf(desc);
     }
 
+    pub fn registerTableUdf(self: *Database, desc: api.TableUdf) !void {
+        const catalog = self.catalog orelse self.owned_catalog orelse return Error.DatabaseNotFound;
+        return catalog.registerTableUdf(desc);
+    }
+
     /// Look up a table across schemas using the public schema first.
     /// Used by transports (`net/local.zig`, `net/tcp_server.zig`) that
     /// pre-v2 reached straight into `db.tables.get(name)`.

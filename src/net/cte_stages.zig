@@ -48,7 +48,7 @@ const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
 /// operators over the leaf, no table-backed V2 handler applies.
 pub fn needsStaging(op: *const ir.Op) bool {
     return switch (op.*) {
-        .materialize, .join, .window, .set_union, .single_row, .file_scan => true,
+        .materialize, .join, .window, .set_union, .single_row, .file_scan, .table_fn => true,
         .select => |p| needsStaging(p.upstream),
         .exclude => |p| needsStaging(p.upstream),
         .filter => |f| needsStaging(f.upstream),
@@ -105,6 +105,7 @@ fn wrapWindowsInMaterialize(node_arena: Allocator, op: *ir.Op, cse: *const MatCs
         .alias => |*a| try wrapWindowChild(node_arena, &a.upstream, cse),
         .limit => |*l| try wrapWindowChild(node_arena, &l.upstream, cse),
         .window => |*w| try wrapWindowChild(node_arena, &w.upstream, cse),
+        .table_fn => |*t| try wrapWindowChild(node_arena, &t.input, cse),
         .materialize => |*m| {
             // A CTE that will stage anyway (multi-ref or AS MATERIALIZED)
             // and whose body IS the window adopts it directly through its
@@ -191,6 +192,7 @@ fn countMatRefs(allocator: Allocator, op: *const ir.Op, cse: *MatCse) anyerror!v
         .alias => |a| try countMatRefs(allocator, a.upstream, cse),
         .limit => |l| try countMatRefs(allocator, l.upstream, cse),
         .window => |w| try countMatRefs(allocator, w.upstream, cse),
+        .table_fn => |t| try countMatRefs(allocator, t.input, cse),
         .join => |j| {
             try countMatRefs(allocator, j.left, cse);
             try countMatRefs(allocator, j.right, cse);
@@ -309,6 +311,7 @@ fn countBodyMatRefs(
         .alias => |a| try countBodyMatRefs(allocator, a.upstream, cse, out),
         .limit => |l| try countBodyMatRefs(allocator, l.upstream, cse, out),
         .window => |w| try countBodyMatRefs(allocator, w.upstream, cse, out),
+        .table_fn => |t| try countBodyMatRefs(allocator, t.input, cse, out),
         .join => |j| {
             try countBodyMatRefs(allocator, j.left, cse, out);
             try countBodyMatRefs(allocator, j.right, cse, out);
@@ -481,6 +484,7 @@ fn collectStages(
         .alias => |a| try collectStages(input, a.upstream, set, map, cse, inherited, priv),
         .limit => |l| try collectStages(input, l.upstream, set, map, cse, inherited, priv),
         .window => |w| try collectStages(input, w.upstream, set, map, cse, inherited, priv),
+        .table_fn => |t| try collectStages(input, t.input, set, map, cse, inherited, priv),
         .join => |j| {
             try collectStages(input, j.left, set, map, cse, inherited, priv);
             try collectStages(input, j.right, set, map, cse, inherited, priv);
@@ -493,7 +497,7 @@ fn collectStages(
     }
 }
 
-const BlockSource = enum { table, leaf, mat, join, window, set_union, unsupported };
+const BlockSource = enum { table, leaf, mat, join, window, set_union, table_fn, unsupported };
 
 /// A query block is a linear pipeline; its source is whatever the upstream
 /// chain bottoms out at. A window node is a block boundary like a join:
@@ -510,6 +514,7 @@ fn blockSource(op: *const ir.Op) BlockSource {
             .materialize => return .mat,
             .join => return .join,
             .window => return .window,
+            .table_fn => return .table_fn,
             .set_union => return .set_union,
             .select => |p| cur = p.upstream,
             .exclude => |p| cur = p.upstream,
@@ -553,7 +558,7 @@ fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap)
         // SingleRow / FileScan leaves. The heavy inputs were already produced
         // by upstream stage handlers or stream in from table-backed child
         // blocks; single-row and file leaves are not perf shapes.
-        .leaf, .mat, .join, .window, .set_union => buildGenericBlock(input, op, map, op),
+        .leaf, .mat, .join, .window, .set_union, .table_fn => buildGenericBlock(input, op, map, op),
         .unsupported => error.UnsupportedQueryShape,
     };
 }
@@ -2431,6 +2436,18 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // and a table-backed body keeps its full V2 handlers.
             if (map.get(op)) |stage| return wrapSlicePred(input, try mat_stage.MatScan.create(input.allocator, stage));
             return compileBlock(input, m.upstream, map);
+        },
+        .table_fn => |t| {
+            const registry = input.udf_registry orelse return error.UnsupportedQueryShape;
+            const entry = registry.tableByName(t.name) orelse return error.UnsupportedQueryShape;
+            var up = try compileBlock(input, t.input, map);
+            errdefer up.deinit();
+            const q = try exec.table_fn.TableFnExec.create(input.allocator, up, entry, t.partition_by, t.order_by);
+            if (t.alias) |a| {
+                errdefer @constCast(&q).deinit();
+                return exec.AliasRename.create(input.allocator, q, a);
+            }
+            return q;
         },
         .alias => |a| {
             var up = try buildGenericBlock(input, a.upstream, map, block_root);

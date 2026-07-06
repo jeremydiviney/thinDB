@@ -69,6 +69,7 @@ test {
     _ = @import("rle_encoding_test.zig");
     _ = @import("dict_encoding_test.zig");
     _ = @import("udf_test.zig");
+    _ = @import("table_fn_test.zig");
 }
 
 test "integration entry exists" {

@@ -122,6 +122,79 @@ pub const AggregateEntry = struct {
     user_data: ?*anyopaque,
 };
 
+/// Execution modes for table-valued UDFs. Part of the declared signature
+/// and compile-time enforced against the call site: a `.partitioned`
+/// function requires PARTITION BY (per-key state would silently bleed
+/// across keys without it); a `.global` function forbids it (global
+/// visibility silently lost); `.either` accepts both.
+pub const TvfExecution = enum {
+    partitioned,
+    global,
+    either,
+};
+
+/// One input partition handed to a table UDF's process callback: the
+/// declared input columns (in declared order), the row count, and — for
+/// partitioned calls — the partition key values (one per PARTITION BY
+/// column, in clause order; empty for global calls). Column views are
+/// borrowed for the duration of the call; rows within the partition are
+/// ordered per the call site's ORDER BY.
+pub const TvfPartition = struct {
+    columns: []const ColumnView,
+    row_count: usize,
+    keys: []const ?types.Value,
+};
+
+/// Output sink for a table UDF's process callback: append values
+/// column-by-column for each emitted row via the engine ColumnStores
+/// (one per declared output column, in declared order). The RAW layer —
+/// the ergonomic comptime SDK wraps this later. The callback must leave
+/// every output column at the same row count (rectangular output); the
+/// operator validates after each partition.
+pub const TvfOutput = struct {
+    columns: []*ColumnStore,
+    allocator: Allocator,
+};
+
+pub const TvfContext = struct {
+    /// Per-partition arena: freed after each process() call returns, so
+    /// scratch allocations cannot leak.
+    arena: Allocator,
+    user_data: ?*anyopaque = null,
+};
+
+pub const TvfProcess = *const fn (
+    ctx: *const TvfContext,
+    part: *const TvfPartition,
+    out: *TvfOutput,
+) anyerror!void;
+
+/// A table-valued UDF: the raw engine-facing descriptor (the comptime
+/// user SDK generates one of these). Declared input/output shapes are
+/// the type contract — the compiler matches the call's input subquery
+/// against `input_schema` name-for-name/type-for-type and reports
+/// `output_schema` downstream, and the operator hands the callback
+/// exactly the declared columns.
+pub const TableUdf = struct {
+    name: []const u8,
+    /// Declared input columns, in the order the callback receives them.
+    input_schema: []const types.Column,
+    /// Declared output columns — the operator's output schema.
+    output_schema: []const types.Column,
+    execution: TvfExecution = .either,
+    process: TvfProcess,
+    user_data: ?*anyopaque = null,
+};
+
+pub const TableEntry = struct {
+    name: []const u8,
+    input_schema: []const types.Column,
+    output_schema: []const types.Column,
+    execution: TvfExecution,
+    process: TvfProcess,
+    user_data: ?*anyopaque,
+};
+
 /// A SQL inline table function: `CREATE FUNCTION f(a INT, ...) RETURNS
 /// TABLE AS (SELECT ...)`. A parameterized view — the parser expands a
 /// `FROM f(1, 'x')` reference by re-parsing `body` with each parameter
@@ -279,6 +352,7 @@ pub const UdfRegistry = struct {
     allocator: Allocator,
     scalars: std.ArrayList(ScalarEntry) = .empty,
     aggregates: std.ArrayList(AggregateEntry) = .empty,
+    tables: std.ArrayList(TableEntry) = .empty,
 
     pub fn init(allocator: Allocator) UdfRegistry {
         return .{ .allocator = allocator };
@@ -295,7 +369,63 @@ pub const UdfRegistry = struct {
             self.allocator.free(entry.arg_types);
         }
         self.aggregates.deinit(self.allocator);
+        for (self.tables.items) |entry| {
+            self.allocator.free(entry.name);
+            freeColumns(self.allocator, entry.input_schema);
+            freeColumns(self.allocator, entry.output_schema);
+        }
+        self.tables.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    fn freeColumns(allocator: Allocator, cols: []const types.Column) void {
+        for (cols) |c| allocator.free(c.name);
+        allocator.free(cols);
+    }
+
+    fn dupeColumns(allocator: Allocator, cols: []const types.Column) ![]const types.Column {
+        const out = try allocator.alloc(types.Column, cols.len);
+        var n: usize = 0;
+        errdefer {
+            for (out[0..n]) |c| allocator.free(c.name);
+            allocator.free(out);
+        }
+        for (cols, out) |src, *dst| {
+            dst.* = src;
+            dst.name = try allocator.dupe(u8, src.name);
+            n += 1;
+        }
+        return out;
+    }
+
+    pub fn registerTable(self: *UdfRegistry, udf: TableUdf) !void {
+        try validateName(udf.name);
+        if (udf.input_schema.len == 0 or udf.output_schema.len == 0) {
+            return Error.FunctionInvalidDefinition;
+        }
+        if (self.tableByName(udf.name) != null) return Error.FunctionAlreadyExists;
+
+        const name = try lowerName(self.allocator, udf.name);
+        errdefer self.allocator.free(name);
+        const input_schema = try dupeColumns(self.allocator, udf.input_schema);
+        errdefer freeColumns(self.allocator, input_schema);
+        const output_schema = try dupeColumns(self.allocator, udf.output_schema);
+        errdefer freeColumns(self.allocator, output_schema);
+        try self.tables.append(self.allocator, .{
+            .name = name,
+            .input_schema = input_schema,
+            .output_schema = output_schema,
+            .execution = udf.execution,
+            .process = udf.process,
+            .user_data = udf.user_data,
+        });
+    }
+
+    pub fn tableByName(self: *const UdfRegistry, name: []const u8) ?*const TableEntry {
+        for (self.tables.items) |*entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry;
+        }
+        return null;
     }
 
     pub fn registerScalar(self: *UdfRegistry, udf: ScalarUdf) !void {

@@ -227,6 +227,14 @@ pub const Catalog = struct {
         };
     }
 
+    pub fn registerTableUdf(self: *Catalog, desc: udf_mod.TableUdf) !void {
+        return self.udfs.registerTable(desc) catch |err| switch (err) {
+            udf_mod.Error.FunctionAlreadyExists => Error.FunctionAlreadyExists,
+            udf_mod.Error.FunctionInvalidDefinition => Error.FunctionInvalidDefinition,
+            else => err,
+        };
+    }
+
     /// Scan `root_dir` for subdirectories and adopt each one as a Database
     /// in `out_map`. Skips reserved names (currently just `_temp/`). Used
     /// at Catalog open to surface previously-persisted databases.

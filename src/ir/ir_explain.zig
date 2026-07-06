@@ -67,6 +67,13 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try out.append(allocator, '\n');
             try explainOp(allocator, out, a.upstream.*, depth + 1);
         },
+        .table_fn => |t| {
+            try out.appendSlice(allocator, "TableFn ");
+            try out.appendSlice(allocator, t.name);
+            try out.appendSlice(allocator, if (t.partition_by.len == 0) " [global]" else " [partitioned]");
+            try out.append(allocator, '\n');
+            try explainOp(allocator, out, t.input.*, depth + 1);
+        },
         .limit => |l| {
             var buf: [48]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "Limit n={d}\n", .{l.n});
