@@ -240,6 +240,191 @@ test "table UDF: parallel partition execution matches serial (thread-safe alloca
     try std.testing.expectEqualSlices(i64, serial_run.items, par_run.items);
 }
 
+// ---------------------------------------------------------------------------
+// SDK layer: the same functions written as a user would write them — plain
+// struct row types, tdb.Partition/Writer, registerTableFn.
+// ---------------------------------------------------------------------------
+
+const tdb = thindb.tdb;
+
+const sdk_running_total = struct {
+    pub const spec = tdb.TableFnSpec{ .name = "sdk_running_total", .execution = .either };
+    pub const Input = struct { id: i64, g: i32, amt: i64 };
+    pub const Output = struct { id: i64, running: i64 };
+
+    pub fn process(ctx: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+        _ = ctx;
+        const ids = p.col(.id);
+        const amts = p.col(.amt);
+        var running: i64 = 0;
+        for (0..p.len) |i| {
+            running += amts[i];
+            try out.row(.{ .id = ids[i], .running = running });
+        }
+    }
+};
+
+/// Exercises every accessor flavor: string partition key, nullable input
+/// via Opt.get, Date arithmetic, the row iterator, at(), and nullable +
+/// string output columns.
+const sdk_gap_fill = struct {
+    pub const spec = tdb.TableFnSpec{ .name = "sdk_gap_fill", .execution = .partitioned };
+    pub const Input = struct { customer: []const u8, month: tdb.Date, amt: ?i64 };
+    pub const Output = struct {
+        customer: []const u8,
+        month: tdb.Date,
+        amt: i64,
+        change: ?i64,
+        filled: bool,
+    };
+
+    pub fn process(ctx: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+        _ = ctx;
+        const customer = p.key(.customer);
+        const months = p.col(.month);
+        const amts = p.col(.amt);
+
+        var prev: ?i64 = null;
+        var m = months[0];
+        const last = months[p.len - 1];
+        var i: usize = 0;
+        while (m.lte(last)) : (m = m.addMonths(1)) {
+            const present = i < p.len and months[i].eq(m);
+            const cur: i64 = if (present) (amts.get(i) orelse 0) else (prev orelse 0);
+            if (present) i += 1;
+            try out.row(.{
+                .customer = customer,
+                .month = m,
+                .amt = cur,
+                .change = if (prev) |pv| cur - pv else null,
+                .filled = !present,
+            });
+            prev = cur;
+        }
+    }
+};
+
+const gap_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "customer", .type = .{ .varchar = 64 } },
+        .{ .name = "month", .type = .date },
+        .{ .name = "amt", .type = .bigint, .nullable = true },
+    },
+    .order_key = &.{ "customer", "month" },
+    .unique = true,
+};
+const gap_ok = [_][]const u8{ "customer", "month" };
+const gap_opts = thindb.TableOptions{ .order_key = &gap_ok, .unique = true, .row_group_size = 8 };
+
+test "table UDF SDK: running total via struct row types" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try db.registerTableFn(sdk_running_total);
+
+    var res = try run(allocator, db,
+        \\SELECT id, running
+        \\FROM TABLE(sdk_running_total((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id)
+    );
+    defer res.deinit();
+
+    var got: std.ArrayList(i64) = .empty;
+    defer got.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| try got.append(allocator, batch.values[1].data.bigint[i]);
+    }
+    try std.testing.expectEqualSlices(i64, &.{ 10, 30, 60, 40, 90 }, got.items);
+}
+
+test "table UDF SDK: gap fill — strings, dates, nullables, key()" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const jan = tdb.Date.fromYmd(.{ .y = 2026, .m = 1, .d = 1 });
+    const feb = jan.addMonths(1);
+    const apr = jan.addMonths(3);
+    const t = try db.table("rev", gap_schema, gap_opts);
+    // acme: Jan=100, Feb=NULL(→0), Apr=250 — March missing (gap → carried).
+    // bolt: Jan=50 only.
+    try t.insert(&.{
+        .{ .customer = "acme", .month = jan.days(), .amt = @as(?i64, 100) },
+        .{ .customer = "acme", .month = feb.days(), .amt = @as(?i64, null) },
+        .{ .customer = "acme", .month = apr.days(), .amt = @as(?i64, 250) },
+        .{ .customer = "bolt", .month = jan.days(), .amt = @as(?i64, 50) },
+    });
+    try t.flush();
+    try db.registerTableFn(sdk_gap_fill);
+
+    var res = try run(allocator, db,
+        \\SELECT customer, month, amt, change, filled
+        \\FROM TABLE(sdk_gap_fill((SELECT customer, month, amt FROM rev))
+        \\           PARTITION BY customer ORDER BY month)
+    );
+    defer res.deinit();
+
+    var rows: usize = 0;
+    var amts: std.ArrayList(i64) = .empty;
+    defer amts.deinit(allocator);
+    var filled: std.ArrayList(bool) = .empty;
+    defer filled.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try amts.append(allocator, batch.values[2].data.bigint[i]);
+            try filled.append(allocator, batch.values[4].data.boolean[i] != 0);
+            rows += 1;
+        }
+    }
+    // acme: Jan 100, Feb 0 (NULL→0), Mar 0 (gap, carried), Apr 250; bolt: Jan 50.
+    try std.testing.expectEqual(@as(usize, 5), rows);
+    try std.testing.expectEqualSlices(i64, &.{ 100, 0, 0, 250, 50 }, amts.items);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, false, false }, filled.items);
+}
+
+test "table UDF SDK: row iterator and at() match columnar access" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const iter_fn = struct {
+        pub const spec = tdb.TableFnSpec{ .name = "iter_sum", .execution = .global };
+        pub const Input = struct { id: i64, g: i32, amt: i64 };
+        pub const Output = struct { total: i64 };
+
+        pub fn process(ctx: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+            _ = ctx;
+            var via_iter: i64 = 0;
+            var it = p.iter();
+            while (it.next()) |row| via_iter += row.amt;
+            var via_at: i64 = 0;
+            for (0..p.len) |i| via_at += p.at(i).amt;
+            std.debug.assert(via_iter == via_at);
+            try out.row(.{ .total = via_iter });
+        }
+    };
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try db.registerTableFn(iter_fn);
+
+    var res = try run(allocator, db,
+        "SELECT total FROM TABLE(iter_sum((SELECT id, g, amt FROM t)))");
+    defer res.deinit();
+    const batch = (try res.next()).?;
+    try std.testing.expectEqual(@as(i64, 150), batch.values[0].data.bigint[0]);
+}
+
 test "table UDF: input shape violations are compile errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

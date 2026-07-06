@@ -22,6 +22,7 @@ pub const api = @import("api/api.zig");
 pub const exec = @import("exec/exec.zig");
 pub const regex = @import("util/regex.zig");
 pub const udf = @import("udf.zig");
+pub const tdb = @import("udf_sdk.zig");
 
 pub const Database = api.Database;
 pub const Catalog = api.Catalog;

@@ -93,7 +93,7 @@ pub const TableFnExec = struct {
         errdefer allocator.free(input_map);
         for (entry.input_schema, input_map) |decl, *slot| {
             const ui = types.findColumn(up_schema, decl.name) orelse return Error.TableFnInputMismatch;
-            if (!std.meta.eql(up_schema[ui].type, decl.type)) return Error.TableFnInputMismatch;
+            if (!inputTypeMatches(up_schema[ui].type, decl.type)) return Error.TableFnInputMismatch;
             if (up_schema[ui].nullable and !decl.nullable) return Error.TableFnInputMismatch;
             slot.* = ui;
         }
@@ -478,6 +478,23 @@ pub const TableFnExec = struct {
             return after - before;
         }
     };
+
+    /// Type contract match: exact equality, except the string family
+    /// (varchar/string/char) is mutually compatible — all three share the
+    /// same StringView representation, and a declared `[]const u8` input
+    /// must accept a VARCHAR(n) table column.
+    fn inputTypeMatches(actual: types.Type, declared: types.Type) bool {
+        if (std.meta.eql(actual, declared)) return true;
+        const string_family = switch (actual) {
+            .varchar, .string, .char => true,
+            else => false,
+        };
+        if (!string_family) return false;
+        return switch (declared) {
+            .varchar, .string, .char => true,
+            else => false,
+        };
+    }
 
     fn sameKeys(self: *const TableFnExec, views: []const ColumnView, a: u32, b: u32) bool {
         for (self.key_idx) |ki| {

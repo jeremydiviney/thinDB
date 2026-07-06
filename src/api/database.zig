@@ -261,6 +261,13 @@ pub const Database = struct {
         return catalog.registerTableUdf(desc);
     }
 
+    /// Register a table UDF written against the comptime SDK: `Mod` is a
+    /// module/struct with `spec`, `Input`, `Output`, and `process` public
+    /// declarations (see src/udf_sdk.zig).
+    pub fn registerTableFn(self: *Database, comptime Mod: type) !void {
+        return self.registerTableUdf(@import("../udf_sdk.zig").descriptorFor(Mod));
+    }
+
     /// Look up a table across schemas using the public schema first.
     /// Used by transports (`net/local.zig`, `net/tcp_server.zig`) that
     /// pre-v2 reached straight into `db.tables.get(name)`.
