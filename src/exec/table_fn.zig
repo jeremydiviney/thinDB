@@ -198,6 +198,9 @@ pub const TableFnExec = struct {
     }
 
     fn execute(self: *TableFnExec) !void {
+        const prof = exec.prof;
+        const trace = getenv("THINDB_TVF_TRACE") != null;
+        var t0 = prof.nowTicks();
         const n_cols = self.entry.input_schema.len;
 
         // Drain the input into buffers laid out in DECLARED column order.
@@ -217,6 +220,10 @@ pub const TableFnExec = struct {
             }
         }
         const n_rows = input_cols[0].rowCount();
+        if (trace) {
+            std.debug.print("[tvf] drain {d} rows: {d:.0}ms\n", .{ n_rows, prof.ticksToMs(prof.nowTicks() - t0) });
+            t0 = prof.nowTicks();
+        }
         if (n_rows == 0) return;
 
         const input_views = try self.allocator.alloc(ColumnView, n_cols);
@@ -233,6 +240,10 @@ pub const TableFnExec = struct {
             std.mem.sortUnstable(u32, perm, lctx, LessCtx.less);
         }
 
+        if (trace) {
+            std.debug.print("[tvf] sort: {d:.0}ms\n", .{prof.ticksToMs(prof.nowTicks() - t0)});
+            t0 = prof.nowTicks();
+        }
         // Partition boundaries: contiguous runs of equal keys in the sorted
         // permutation. Global mode (no keys) is one run covering everything.
         var runs: std.ArrayList(Run) = .empty;
@@ -249,6 +260,11 @@ pub const TableFnExec = struct {
         // serial by default; a test that supplies its own thread-safe
         // allocator sets the override to exercise the parallel path.
         const allow_parallel = !builtin.is_test or force_parallel_in_tests;
+        if (trace) {
+            std.debug.print("[tvf] boundaries ({d} runs): {d:.0}ms\n", .{ runs.items.len, prof.ticksToMs(prof.nowTicks() - t0) });
+            t0 = prof.nowTicks();
+        }
+        defer if (trace) std.debug.print("[tvf] partitions: {d:.0}ms\n", .{prof.ticksToMs(prof.nowTicks() - t0)});
         const n_workers = if (allow_parallel) @min(self.dop, runs.items.len) else 1;
         if (n_workers <= 1) {
             var runner = try Runner.init(self.allocator, self, input_views, perm, self.output_cols);
@@ -392,6 +408,7 @@ pub const TableFnExec = struct {
         part_views: []ColumnView,
         key_vals: []?Value,
         out_ptrs: []*ColumnStore,
+        arena: std.heap.ArenaAllocator,
 
         fn init(
             allocator: Allocator,
@@ -425,10 +442,12 @@ pub const TableFnExec = struct {
                 .part_views = part_views,
                 .key_vals = key_vals,
                 .out_ptrs = out_ptrs,
+                .arena = std.heap.ArenaAllocator.init(allocator),
             };
         }
 
         fn deinit(self: *Runner) void {
+            self.arena.deinit();
             for (self.scratch) |*c| c.deinit(self.allocator);
             self.allocator.free(self.scratch);
             self.allocator.free(self.part_views);
@@ -438,10 +457,10 @@ pub const TableFnExec = struct {
 
         fn runOne(self: *Runner, run: Run) !usize {
             const op = self.op;
-            for (op.entry.input_schema, self.scratch) |col, *store| {
-                store.deinit(self.allocator);
-                store.* = try ColumnStore.init(self.allocator, col.type, col.nullable);
-            }
+            // clear() retains capacity: with ~229k partitions per query,
+            // per-run store realloc + arena create were ~26µs/run of pure
+            // overhead (6.1s of the flagship's 13.3s).
+            for (self.scratch) |*store| store.clear();
             for (self.input_views, self.scratch) |v, *store| {
                 try transform.appendByIndices(self.allocator, v, self.perm[run.start..run.end], store);
             }
@@ -453,10 +472,9 @@ pub const TableFnExec = struct {
                     null;
             }
 
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
+            _ = self.arena.reset(.retain_capacity);
             const ctx = udf_mod.TvfContext{
-                .arena = arena.allocator(),
+                .arena = self.arena.allocator(),
                 .user_data = op.entry.user_data,
             };
             const part = udf_mod.TvfPartition{
@@ -562,3 +580,5 @@ pub const TableFnExec = struct {
         };
     }
 };
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
