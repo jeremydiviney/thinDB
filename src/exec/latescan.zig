@@ -210,6 +210,7 @@ pub const LateScan = struct {
     /// makes repeats across runs cheap). Memtable survivors read directly from
     /// the pinned snapshot's columns by row index.
     fn materialize(self: *LateScan, locs: []const i64) !void {
+        if (!std.sort.isSorted(i64, locs, {}, std.sort.asc(i64))) return self.materializeUnordered(locs);
         var i: usize = 0;
         var cur_entry: ?*storage.cache.SegmentHandles.Entry = null;
         var cur_seg_idx: usize = std.math.maxInt(usize);
@@ -244,6 +245,49 @@ pub const LateScan = struct {
                     i = run_end;
                 },
             }
+        }
+    }
+
+    /// Out-of-order locations (TopN emit order, group-hash order) degenerate
+    /// the per-(segment,row-group) run batching in `materialize` to per-row
+    /// block borrows. Sort the locations, materialize location-ordered into
+    /// scratch columns (maximal runs), then scatter rows back into `locs`
+    /// order — a bounded extra copy, orders of magnitude cheaper than
+    /// per-survivor block decodes.
+    fn materializeUnordered(self: *LateScan, locs: []const i64) anyerror!void {
+        const n = locs.len;
+        const order = try self.allocator.alloc(u32, n);
+        defer self.allocator.free(order);
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        std.mem.sortUnstable(u32, order, locs, struct {
+            fn less(ls: []const i64, a: u32, b: u32) bool {
+                return ls[a] < ls[b];
+            }
+        }.less);
+        const sorted = try self.allocator.alloc(i64, n);
+        defer self.allocator.free(sorted);
+        for (order, 0..) |oi, j| sorted[j] = locs[oi];
+
+        const scratch = try self.allocator.alloc(ColumnStore, self.output_columns.len);
+        var inited: usize = 0;
+        defer {
+            for (scratch[0..inited]) |*c| c.deinit(self.allocator);
+            self.allocator.free(scratch);
+        }
+        for (self.out_schema, 0..) |col, i| {
+            scratch[i] = try ColumnStore.init(self.allocator, col.type, col.nullable);
+            inited += 1;
+        }
+        const real = self.output_columns;
+        self.output_columns = scratch;
+        defer self.output_columns = real;
+        try self.materialize(sorted);
+
+        const idx = try self.allocator.alloc(u32, n);
+        defer self.allocator.free(idx);
+        for (order, 0..) |oi, j| idx[oi] = @intCast(j);
+        for (real, scratch) |*out, *sc| {
+            try engine.transform.appendByIndices(self.allocator, sc.view(), idx, out);
         }
     }
 
