@@ -29,7 +29,7 @@ const api = @import("../api/api.zig");
 const Catalog = api.Catalog;
 const Session = api.Session;
 
-pub const Table = enum { pg_namespace, pg_class, pg_attribute, pg_type, pg_database };
+pub const Table = enum { pg_namespace, pg_class, pg_attribute, pg_type, pg_database, pg_proc };
 
 /// Recognize a FROM target as a `pg_catalog` relation. Matches a bare name
 /// (`pg_class`) or one explicitly qualified by the `pg_catalog` schema;
@@ -45,6 +45,7 @@ pub fn match(ref: ir.TableRef) ?Table {
     if (std.ascii.eqlIgnoreCase(n, "pg_attribute")) return .pg_attribute;
     if (std.ascii.eqlIgnoreCase(n, "pg_type")) return .pg_type;
     if (std.ascii.eqlIgnoreCase(n, "pg_database")) return .pg_database;
+    if (std.ascii.eqlIgnoreCase(n, "pg_proc")) return .pg_proc;
     return null;
 }
 
@@ -184,6 +185,7 @@ pub fn build(gpa: Allocator, catalog: *Catalog, session: Session, table: Table) 
         .pg_attribute => try buildAttribute(a, catalog, session, self),
         .pg_type => try buildType(a, self),
         .pg_database => try buildDatabase(a, catalog, self),
+        .pg_proc => try buildProc(a, catalog, session, self),
     }
     return exec.makeQuery(gpa, self);
 }
@@ -394,6 +396,59 @@ fn buildType(a: Allocator, self: *PgCatalogSource) !void {
     views[2] = try colInt(a, nsp);
     views[3] = try colString(a, typtype);
     views[4] = try colSmallint(a, lens);
+    self.schema = schema;
+    self.views = views;
+    self.row_count = n;
+}
+
+/// Registered table functions: SQL inline (session database) + Zig/DLL/
+/// embedded table UDFs (process-wide). Enough shape for programmatic
+/// discovery (`SELECT * FROM pg_proc`); psql's full `\df` additionally
+/// calls pg_get_function_* helpers we don't serve yet.
+fn buildProc(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource) !void {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var langs: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    const sql_names = try catalog.sql_fns.listNames(a, session.current_db);
+    for (sql_names) |n| {
+        try names.append(a, n);
+        try langs.append(a, "sql");
+    }
+    for (catalog.udfs.tables.items) |t| {
+        try names.append(a, try a.dupe(u8, t.name));
+        try langs.append(a, "zig");
+    }
+
+    const n = names.items.len;
+    const oids = try a.alloc(i32, n);
+    const nsp = try a.alloc(i32, n);
+    const owner = try a.alloc(i32, n);
+    const kind = try a.alloc([]const u8, n);
+    const rettype = try a.alloc(i32, n);
+    for (0..n) |i| {
+        oids[i] = oidIn(TABLE_OID_BASE, &.{ "fn", names.items[i] });
+        nsp[i] = schemaOid("public");
+        owner[i] = 10;
+        kind[i] = "f";
+        rettype[i] = 2249; // record
+    }
+
+    const schema = try a.alloc(Column, 7);
+    schema[0] = .{ .name = "oid", .type = .int };
+    schema[1] = .{ .name = "proname", .type = .string };
+    schema[2] = .{ .name = "pronamespace", .type = .int };
+    schema[3] = .{ .name = "proowner", .type = .int };
+    schema[4] = .{ .name = "prokind", .type = .string };
+    schema[5] = .{ .name = "prorettype", .type = .int };
+    schema[6] = .{ .name = "prolang_name", .type = .string };
+    const views = try a.alloc(ColumnView, 7);
+    views[0] = try colInt(a, oids);
+    views[1] = try colString(a, names.items);
+    views[2] = try colInt(a, nsp);
+    views[3] = try colInt(a, owner);
+    views[4] = try colString(a, kind);
+    views[5] = try colInt(a, rettype);
+    views[6] = try colString(a, langs.items);
     self.schema = schema;
     self.views = views;
     self.row_count = n;
