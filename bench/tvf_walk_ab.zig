@@ -63,6 +63,10 @@ const rf_walk = struct {
         lastExchangeRate: ?f64,
         diffAmount: ?i32,
         fxChange: ?i32,
+        customerStartDate: ?tdb.Date,
+        upDown: []const u8,
+        activeChange: i32,
+        isActive: i64,
     };
 
     /// One synthesizable row: either a real input row (index) or a filler.
@@ -152,7 +156,21 @@ const rf_walk = struct {
 
         std.mem.sortUnstable(Pending, rows.items, {}, monthLess);
 
+        // rollforward_with_customer_start_date: whole-partition
+        // MIN(minDate) over rows with originalAmount > 0 (fillers carry
+        // originalAmount = 0, so they never contribute — same as SQL,
+        // which computes this after gap filling).
+        var customer_start: ?tdb.Date = null;
+        for (rows.items) |r| {
+            if ((r.original orelse 0) > 0) {
+                if (r.min_date) |md| {
+                    if (customer_start == null or md.lt(customer_start.?)) customer_start = md;
+                }
+            }
+        }
+
         // Pass 2: LAG carries + diff arithmetic over the merged stream.
+        var is_active: i64 = 0;
         var last_amount: ?i64 = 0;
         var last_original: ?i64 = 0;
         var last_plan: ?i32 = null;
@@ -171,6 +189,36 @@ const rf_walk = struct {
             if (r.amount != null and last_amount != null and diff != null) {
                 fx = @intCast(r.amount.? - last_amount.? - diff.?);
             }
+
+            // rollforward_with_updown: SQL CASE with 3VL — a NULL operand
+            // fails its WHEN and falls through.
+            const orig = r.original;
+            const last_orig_c: i64 = last_original orelse 0;
+            const up_down: []const u8 = blk: {
+                if (orig != null and last_orig_c <= 0 and orig.? > 0) {
+                    if (customer_start) |csd| {
+                        if (r.month != null and csd.lt(r.month.?)) break :blk "reactivation";
+                    }
+                    break :blk "new";
+                }
+                if (orig != null and last_orig_c > 0 and orig.? <= 0) break :blk "churn";
+                if (orig != null and last_original != null) {
+                    const d = orig.? - last_original.?;
+                    if (@abs(d) > 1 and d > 0) break :blk "up";
+                    if (@abs(d) > 1 and d < 0) break :blk "down";
+                }
+                break :blk "same";
+            };
+            // rollforward_with_active_change + active_status: running sum
+            // of the +1/-1 transitions, in month order.
+            const active_change: i32 = if (std.mem.eql(u8, up_down, "churn"))
+                -1
+            else if (std.mem.eql(u8, up_down, "new") or std.mem.eql(u8, up_down, "reactivation"))
+                1
+            else
+                0;
+            is_active += active_change;
+
             try out.row(.{
                 .projectId = project,
                 .divisionId = division,
@@ -190,6 +238,10 @@ const rf_walk = struct {
                 .lastExchangeRate = last_er,
                 .diffAmount = diff,
                 .fxChange = fx,
+                .customerStartDate = customer_start,
+                .upDown = up_down,
+                .activeChange = active_change,
+                .isActive = is_active,
             });
             last_amount = r.amount;
             last_original = r.original;
@@ -250,11 +302,13 @@ const rf_walk = struct {
 // ---------------------------------------------------------------------------
 
 const CUT_B = ", rollforward_customer_records_for_union AS (";
-const CUT_A = ", rollforward_with_customer_start_date_f7c96fc2 AS (";
+const CUT_A = ", rollforward_with_plan_and_division_f7c96fc2 AS (";
 
 const SUMMARY_COLS =
     "month, COUNT(*) AS n, SUM(amount) AS s_amount, SUM(lastAmount) AS s_last," ++
-    " SUM(diffAmount) AS s_diff, SUM(fxChange) AS s_fx";
+    " SUM(diffAmount) AS s_diff, SUM(fxChange) AS s_fx," ++
+    " SUM(activeChange) AS s_ac, SUM(isActive) AS s_ia," ++
+    " SUM(LENGTH(upDown)) AS s_ud, MIN(customerStartDate) AS s_csd";
 
 fn buildSqls(allocator: std.mem.Allocator, io: std.Io, project: []const u8, division: []const u8) !struct { a: []u8, b: []u8 } {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, "testSQL/rollforward_template.sql", allocator, .limited(4 << 20));
@@ -268,7 +322,7 @@ fn buildSqls(allocator: std.mem.Allocator, io: std.Io, project: []const u8, divi
     const cut_a = std.mem.indexOf(u8, trimmed, CUT_A) orelse return error.TemplateMarkerMissing;
     const sql_a = try std.fmt.allocPrint(allocator,
         \\{s}
-        \\SELECT * FROM rollforward_with_last_amounts_and_diffs_f7c96fc2
+        \\SELECT * FROM rollforward_with_active_status_f7c96fc2
         \\)
         \\SELECT {s} FROM primary_pipeline_mat1 GROUP BY month ORDER BY month
     , .{ trimmed[0..cut_a], SUMMARY_COLS });
