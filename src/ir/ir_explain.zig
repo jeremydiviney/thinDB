@@ -72,7 +72,7 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try out.appendSlice(allocator, t.name);
             try out.appendSlice(allocator, if (t.partition_by.len == 0) " [global]" else " [partitioned]");
             try out.append(allocator, '\n');
-            try explainOp(allocator, out, t.input.*, depth + 1);
+            for (t.inputs) |inp| try explainOp(allocator, out, inp.*, depth + 1);
         },
         .limit => |l| {
             var buf: [48]u8 = undefined;

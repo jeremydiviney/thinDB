@@ -429,6 +429,205 @@ test "table UDF SDK: row iterator and at() match columnar access" {
     try std.testing.expectEqual(@as(i64, 150), batch.values[0].data.bigint[0]);
 }
 
+// ---------------------------------------------------------------------------
+// P3: co-partitioned multiple inputs.
+// ---------------------------------------------------------------------------
+
+const sdk_reconcile = struct {
+    pub const spec = tdb.TableFnSpec{ .name = "sdk_reconcile", .execution = .partitioned };
+    pub const Input = struct { customer: []const u8, month: tdb.Date, amount: ?i64 };
+    pub const Input2 = struct { customer: []const u8, month: tdb.Date, estimate: ?i64 };
+    pub const Output = struct {
+        customer: []const u8,
+        month: tdb.Date,
+        actual: i64,
+        estimated: i64,
+        variance: i64,
+    };
+
+    pub fn process(ctx: *tdb.Ctx, inv: tdb.Partition(Input), est: tdb.Partition(Input2), out: *tdb.Writer(Output)) !void {
+        _ = ctx;
+        // Key from whichever side has rows — the empty side is aligned,
+        // not skipped.
+        const customer = if (inv.len > 0) inv.key(.customer) else est.key(.customer);
+        const im = inv.col(.month);
+        const ia = inv.col(.amount);
+        const em = est.col(.month);
+        const ea = est.col(.estimate);
+
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < inv.len or j < est.len) {
+            const have_inv = i < inv.len;
+            const have_est = j < est.len;
+            const m = if (have_inv and (!have_est or im[i].lte(em[j]))) im[i] else em[j];
+            var actual: i64 = 0;
+            var estimated: i64 = 0;
+            if (have_inv and im[i].eq(m)) {
+                actual = ia.get(i) orelse 0;
+                i += 1;
+            }
+            if (have_est and em[j].eq(m)) {
+                estimated = ea.get(j) orelse 0;
+                j += 1;
+            }
+            try out.row(.{
+                .customer = customer,
+                .month = m,
+                .actual = actual,
+                .estimated = estimated,
+                .variance = actual - estimated,
+            });
+        }
+    }
+};
+
+test "table UDF P3: two co-partitioned inputs with empty-partition alignment" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const inv_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "customer", .type = .{ .varchar = 32 } },
+            .{ .name = "month", .type = .date },
+            .{ .name = "amount", .type = .bigint, .nullable = true },
+        },
+        .order_key = &.{ "customer", "month" },
+        .unique = true,
+    };
+    const est_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "customer", .type = .{ .varchar = 32 } },
+            .{ .name = "month", .type = .date },
+            .{ .name = "estimate", .type = .bigint, .nullable = true },
+        },
+        .order_key = &.{ "customer", "month" },
+        .unique = true,
+    };
+    const key2 = [_][]const u8{ "customer", "month" };
+    const t_opts = thindb.TableOptions{ .order_key = &key2, .unique = true, .row_group_size = 8 };
+
+    const jan = tdb.Date.fromYmd(.{ .y = 2026, .m = 1, .d = 1 });
+    const feb = jan.addMonths(1);
+
+    // acme: invoices Jan+Feb, forecast Jan only.
+    // bolt: forecast ONLY (its invoice partition arrives EMPTY).
+    // cara: invoices ONLY (its estimate partition arrives EMPTY).
+    const ti = try db.table("inv", inv_schema, t_opts);
+    try ti.insert(&.{
+        .{ .customer = "acme", .month = jan.days(), .amount = @as(?i64, 100) },
+        .{ .customer = "acme", .month = feb.days(), .amount = @as(?i64, 150) },
+        .{ .customer = "cara", .month = jan.days(), .amount = @as(?i64, 70) },
+    });
+    try ti.flush();
+    const te = try db.table("fc", est_schema, t_opts);
+    try te.insert(&.{
+        .{ .customer = "acme", .month = jan.days(), .estimate = @as(?i64, 120) },
+        .{ .customer = "bolt", .month = feb.days(), .estimate = @as(?i64, 40) },
+    });
+    try te.flush();
+
+    try db.registerTableFn(sdk_reconcile);
+
+    var res = try run(allocator, db,
+        \\SELECT customer, month, actual, estimated, variance
+        \\FROM TABLE(sdk_reconcile(
+        \\  (SELECT customer, month, amount FROM inv),
+        \\  (SELECT customer, month, estimate FROM fc)
+        \\) PARTITION BY customer ORDER BY month)
+        \\ORDER BY customer, month
+    );
+    defer res.deinit();
+
+    var customers: std.ArrayList([]u8) = .empty;
+    defer {
+        for (customers.items) |c| allocator.free(c);
+        customers.deinit(allocator);
+    }
+    var actuals: std.ArrayList(i64) = .empty;
+    defer actuals.deinit(allocator);
+    var estimates: std.ArrayList(i64) = .empty;
+    defer estimates.deinit(allocator);
+    var variances: std.ArrayList(i64) = .empty;
+    defer variances.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            const sv = switch (batch.values[0].data) {
+                .varchar, .string, .char => |v| v.rowBytes(i),
+                else => unreachable,
+            };
+            try customers.append(allocator, try allocator.dupe(u8, sv));
+            try actuals.append(allocator, batch.values[2].data.bigint[i]);
+            try estimates.append(allocator, batch.values[3].data.bigint[i]);
+            try variances.append(allocator, batch.values[4].data.bigint[i]);
+        }
+    }
+    // acme Jan (100 vs 120), acme Feb (150 vs 0), bolt Feb (0 vs 40),
+    // cara Jan (70 vs 0).
+    try std.testing.expectEqual(@as(usize, 4), customers.items.len);
+    try std.testing.expectEqualStrings("acme", customers.items[0]);
+    try std.testing.expectEqualStrings("acme", customers.items[1]);
+    try std.testing.expectEqualStrings("bolt", customers.items[2]);
+    try std.testing.expectEqualStrings("cara", customers.items[3]);
+    try std.testing.expectEqualSlices(i64, &.{ 100, 150, 0, 70 }, actuals.items);
+    try std.testing.expectEqualSlices(i64, &.{ 120, 0, 40, 0 }, estimates.items);
+    try std.testing.expectEqualSlices(i64, &.{ -20, 150, -40, 70 }, variances.items);
+}
+
+test "table UDF P3: global multi-input hands every input whole" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const totals = struct {
+        pub const spec = tdb.TableFnSpec{ .name = "totals2", .execution = .global };
+        pub const Input = struct { id: ?i64, g: ?i32, amt: ?i64 };
+        pub const Input2 = struct { id: ?i64, g: ?i32, amt: ?i64 };
+        pub const Output = struct { a_total: i64, b_total: i64, a_rows: i64, b_rows: i64 };
+
+        pub fn process(ctx: *tdb.Ctx, a: tdb.Partition(Input), b: tdb.Partition(Input2), out: *tdb.Writer(Output)) !void {
+            _ = ctx;
+            var ta: i64 = 0;
+            var tb: i64 = 0;
+            const aa = a.col(.amt);
+            const ba = b.col(.amt);
+            for (0..a.len) |i| ta += aa.get(i) orelse 0;
+            for (0..b.len) |i| tb += ba.get(i) orelse 0;
+            try out.row(.{
+                .a_total = ta,
+                .b_total = tb,
+                .a_rows = @intCast(a.len),
+                .b_rows = @intCast(b.len),
+            });
+        }
+    };
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try db.registerTableFn(totals);
+
+    var res = try run(allocator, db,
+        \\SELECT a_total, b_total, a_rows, b_rows
+        \\FROM TABLE(totals2(
+        \\  (SELECT id, g, amt FROM t),
+        \\  (SELECT id, g, amt FROM t WHERE g = 1)
+        \\))
+    );
+    defer res.deinit();
+    const batch = (try res.next()).?;
+    try std.testing.expectEqual(@as(i64, 150), batch.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 60), batch.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 5), batch.values[2].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 3), batch.values[3].data.bigint[0]);
+}
+
 test "table UDF: input shape violations are compile errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

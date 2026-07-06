@@ -95,10 +95,6 @@ pub const TableFnExec = struct {
             .either => {},
         }
         if (ups.len != entry.input_schemas.len or ups.len == 0) return Error.TableFnInputMismatch;
-        // Multi-input co-grouping needs the packed digest path; keys and a
-        // single int-family order column are required there (checked at
-        // execute for input 0; enforce PARTITION BY presence here).
-        if (ups.len > 1 and partition_by.len == 0) return Error.TableFnExecutionMismatch;
 
         const n_in = ups.len;
         const upstreams = try allocator.dupe(Query, ups);
@@ -290,6 +286,7 @@ pub const TableFnExec = struct {
     }
 
     fn execute(self: *TableFnExec) !void {
+        if (self.upstreams.len > 1) return self.executeMulti();
         const prof = exec.prof;
         const trace = getenv("THINDB_TVF_TRACE") != null;
         var t0 = prof.nowTicks();
@@ -379,6 +376,395 @@ pub const TableFnExec = struct {
         }
         try self.executeParallel(input_views, perm, runs.items, n_workers);
     }
+
+    /// One co-grouped partition's spans, one per input (start==end =
+    /// this input has no rows for the group's key).
+    const Span = struct { start: usize, end: usize };
+
+    /// Multi-input execution: drain every input, digest-sort each on the
+    /// SHARED partition keys (same hash - digests align across inputs),
+    /// N-way merge the sorted digest streams into groups, and invoke the
+    /// kernel once per group with one ALIGNED partition per input.
+    /// GLOBAL (no keys): one group holding every input whole.
+    fn executeMulti(self: *TableFnExec) !void {
+        const a = self.allocator;
+        const n_in = self.upstreams.len;
+
+        const Drained = struct {
+            cols: []ColumnStore,
+            views: []ColumnView,
+            perm: []u32,
+            digests: []u128,
+        };
+        const ins = try a.alloc(Drained, n_in);
+        var drained: usize = 0;
+        defer {
+            for (ins[0..drained]) |*d| {
+                for (d.cols) |*c| c.deinit(a);
+                a.free(d.cols);
+                a.free(d.views);
+                a.free(d.perm);
+                a.free(d.digests);
+            }
+            a.free(ins);
+        }
+        for (0..n_in) |i| {
+            const decl = self.entry.input_schemas[i];
+            const cols = try a.alloc(ColumnStore, decl.len);
+            var inited: usize = 0;
+            errdefer {
+                for (cols[0..inited]) |*c| c.deinit(a);
+                a.free(cols);
+            }
+            for (decl, cols) |col, *store| {
+                store.* = try ColumnStore.init(a, col.type, col.nullable);
+                inited += 1;
+            }
+            var up = self.upstreams[i];
+            while (try up.next()) |batch| {
+                for (self.input_maps[i], cols) |ui, *store| {
+                    try transform.appendAllColumn(a, batch.values[ui], store);
+                }
+            }
+            const n_rows = cols[0].rowCount();
+            const views = try a.alloc(ColumnView, decl.len);
+            errdefer a.free(views);
+            for (cols, views) |c, *v| v.* = c.view();
+            const perm = try a.alloc(u32, n_rows);
+            errdefer a.free(perm);
+            for (perm, 0..) |*p, r| p.* = @intCast(r);
+            var digests: []u128 = undefined;
+            if (self.key_idxs[i].len + self.order_idxs[i].len > 0) {
+                digests = (try self.packedSortFor(views, self.key_idxs[i], self.order_idxs[i], perm)) orelse
+                    return Error.TableFnInputMismatch;
+            } else {
+                digests = try a.alloc(u128, n_rows);
+                @memset(digests, 0);
+            }
+            ins[i] = .{ .cols = cols, .views = views, .perm = perm, .digests = digests };
+            drained += 1;
+        }
+
+        // Per input: digest runs (contiguous in the sorted perm).
+        const DRun = struct { digest: u128, start: usize, end: usize };
+        const run_lists = try a.alloc([]DRun, n_in);
+        var built_lists: usize = 0;
+        defer {
+            for (run_lists[0..built_lists]) |rl| a.free(rl);
+            a.free(run_lists);
+        }
+        for (0..n_in) |i| {
+            var list: std.ArrayList(DRun) = .empty;
+            errdefer list.deinit(a);
+            const d = ins[i].digests;
+            const perm = ins[i].perm;
+            var start: usize = 0;
+            while (start < perm.len) {
+                var end = start + 1;
+                const dg = d[perm[start]];
+                while (end < perm.len and d[perm[end]] == dg) end += 1;
+                try list.append(a, .{ .digest = dg, .start = start, .end = end });
+                start = end;
+            }
+            run_lists[i] = try list.toOwnedSlice(a);
+            built_lists += 1;
+        }
+
+        // N-way merge into groups: a group exists for every digest present
+        // in ANY input; absent inputs contribute an empty span.
+        var groups: std.ArrayList([]Span) = .empty;
+        defer {
+            for (groups.items) |g| a.free(g);
+            groups.deinit(a);
+        }
+        const cursors = try a.alloc(usize, n_in);
+        defer a.free(cursors);
+        @memset(cursors, 0);
+        while (true) {
+            var min_digest: u128 = std.math.maxInt(u128);
+            var any = false;
+            for (0..n_in) |i| {
+                if (cursors[i] < run_lists[i].len) {
+                    any = true;
+                    min_digest = @min(min_digest, run_lists[i][cursors[i]].digest);
+                }
+            }
+            if (!any) break;
+            const spans = try a.alloc(Span, n_in);
+            errdefer a.free(spans);
+            for (0..n_in) |i| {
+                if (cursors[i] < run_lists[i].len and run_lists[i][cursors[i]].digest == min_digest) {
+                    const r = run_lists[i][cursors[i]];
+                    spans[i] = .{ .start = r.start, .end = r.end };
+                    cursors[i] += 1;
+                } else {
+                    spans[i] = .{ .start = 0, .end = 0 };
+                }
+            }
+            try groups.append(a, spans);
+        }
+
+        // Execute groups: same claim-loop shape as the single-input path.
+        const allow_parallel = !builtin.is_test or force_parallel_in_tests;
+        const n_workers = if (allow_parallel) @min(self.dop, groups.items.len) else 1;
+        const views_by_input = try a.alloc([]const ColumnView, n_in);
+        defer a.free(views_by_input);
+        const perms_by_input = try a.alloc([]const u32, n_in);
+        defer a.free(perms_by_input);
+        for (0..n_in) |i| {
+            views_by_input[i] = ins[i].views;
+            perms_by_input[i] = ins[i].perm;
+        }
+        if (n_workers <= 1) {
+            var runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, self.output_cols);
+            defer runner.deinit();
+            for (groups.items) |g| _ = try runner.runOne(g);
+            return;
+        }
+        try self.executeMultiParallel(views_by_input, perms_by_input, groups.items, n_workers);
+    }
+
+    fn executeMultiParallel(
+        self: *TableFnExec,
+        views_by_input: []const []const ColumnView,
+        perms_by_input: []const []const u32,
+        groups: []const []Span,
+        n_workers: usize,
+    ) !void {
+        const a = self.allocator;
+        const segs = try a.alloc(RunSeg, groups.len);
+        defer a.free(segs);
+        @memset(segs, .{});
+
+        const Worker = struct {
+            runner: MultiRunner,
+            out_stores: []ColumnStore,
+            err: ?anyerror = null,
+
+            fn main(
+                w: *@This(),
+                wid: u32,
+                group_list: []const []Span,
+                seg_list: []RunSeg,
+                next_group: *std.atomic.Value(usize),
+                abort: *std.atomic.Value(bool),
+            ) void {
+                while (true) {
+                    if (abort.load(.acquire)) return;
+                    const g = next_group.fetchAdd(1, .monotonic);
+                    if (g >= group_list.len) return;
+                    const before = w.out_stores[0].rowCount();
+                    const emitted = w.runner.runOne(group_list[g]) catch |err| {
+                        w.err = err;
+                        abort.store(true, .release);
+                        return;
+                    };
+                    seg_list[g] = .{ .worker = wid, .off = before, .len = emitted };
+                }
+            }
+        };
+
+        const workers = try a.alloc(Worker, n_workers);
+        var built: usize = 0;
+        defer {
+            for (workers[0..built]) |*w| {
+                w.runner.deinit();
+                for (w.out_stores) |*c| c.deinit(a);
+                a.free(w.out_stores);
+            }
+            a.free(workers);
+        }
+        for (workers) |*w| {
+            const out_stores = try a.alloc(ColumnStore, self.entry.output_schema.len);
+            var inited: usize = 0;
+            errdefer {
+                for (out_stores[0..inited]) |*c| c.deinit(a);
+                a.free(out_stores);
+            }
+            for (self.entry.output_schema, out_stores) |col, *store| {
+                store.* = try ColumnStore.init(a, col.type, col.nullable);
+                inited += 1;
+            }
+            w.* = .{
+                .runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, out_stores),
+                .out_stores = out_stores,
+            };
+            built += 1;
+        }
+
+        var next_group = std.atomic.Value(usize).init(0);
+        var abort = std.atomic.Value(bool).init(false);
+        const threads = try a.alloc(?std.Thread, n_workers);
+        defer a.free(threads);
+        @memset(threads, null);
+        for (workers, threads, 0..) |*w, *th, wid| {
+            th.* = std.Thread.spawn(.{}, Worker.main, .{
+                w, @as(u32, @intCast(wid)), groups, segs, &next_group, &abort,
+            }) catch null;
+        }
+        var spawned: usize = 0;
+        for (threads) |th| {
+            if (th) |t| {
+                t.join();
+                spawned += 1;
+            }
+        }
+        if (spawned == 0) Worker.main(&workers[0], 0, groups, segs, &next_group, &abort);
+        for (workers[0..built]) |*w| {
+            if (w.err) |err| return err;
+        }
+
+        var idx: std.ArrayList(u32) = .empty;
+        defer idx.deinit(a);
+        for (segs) |seg| {
+            if (seg.len == 0) continue;
+            idx.clearRetainingCapacity();
+            try idx.ensureTotalCapacity(a, seg.len);
+            for (0..seg.len) |i| idx.appendAssumeCapacity(@intCast(seg.off + i));
+            const w = &workers[seg.worker];
+            for (w.out_stores, self.output_cols) |src, *dst| {
+                try transform.appendByIndices(a, src.view(), idx.items, dst);
+            }
+        }
+    }
+
+    /// Per-worker multi-input execution state: one scratch set per input.
+    const MultiRunner = struct {
+        allocator: Allocator,
+        op: *const TableFnExec,
+        views_by_input: []const []const ColumnView,
+        perms_by_input: []const []const u32,
+        scratch: [][]ColumnStore,
+        part_views: [][]ColumnView,
+        parts: []udf_mod.TvfPartition,
+        key_vals: []?Value,
+        out_ptrs: []*ColumnStore,
+        arena: std.heap.ArenaAllocator,
+
+        fn init(
+            allocator: Allocator,
+            op: *const TableFnExec,
+            views_by_input: []const []const ColumnView,
+            perms_by_input: []const []const u32,
+            out_stores: []ColumnStore,
+        ) !MultiRunner {
+            const n_in = op.upstreams.len;
+            const scratch = try allocator.alloc([]ColumnStore, n_in);
+            errdefer allocator.free(scratch);
+            const part_views = try allocator.alloc([]ColumnView, n_in);
+            errdefer allocator.free(part_views);
+            var built: usize = 0;
+            errdefer for (0..built) |i| {
+                for (scratch[i]) |*c| c.deinit(allocator);
+                allocator.free(scratch[i]);
+                allocator.free(part_views[i]);
+            };
+            for (0..n_in) |i| {
+                const decl = op.entry.input_schemas[i];
+                const sc = try allocator.alloc(ColumnStore, decl.len);
+                var inited: usize = 0;
+                errdefer {
+                    for (sc[0..inited]) |*c| c.deinit(allocator);
+                    allocator.free(sc);
+                }
+                for (decl, sc) |col, *store| {
+                    store.* = try ColumnStore.init(allocator, col.type, col.nullable);
+                    inited += 1;
+                }
+                scratch[i] = sc;
+                part_views[i] = try allocator.alloc(ColumnView, decl.len);
+                built += 1;
+            }
+            const parts = try allocator.alloc(udf_mod.TvfPartition, n_in);
+            errdefer allocator.free(parts);
+            const key_vals = try allocator.alloc(?Value, op.key_idxs[0].len);
+            errdefer allocator.free(key_vals);
+            const out_ptrs = try allocator.alloc(*ColumnStore, out_stores.len);
+            errdefer allocator.free(out_ptrs);
+            for (out_stores, out_ptrs) |*c, *slot| slot.* = c;
+            return .{
+                .allocator = allocator,
+                .op = op,
+                .views_by_input = views_by_input,
+                .perms_by_input = perms_by_input,
+                .scratch = scratch,
+                .part_views = part_views,
+                .parts = parts,
+                .key_vals = key_vals,
+                .out_ptrs = out_ptrs,
+                .arena = std.heap.ArenaAllocator.init(allocator),
+            };
+        }
+
+        fn deinit(self: *MultiRunner) void {
+            self.arena.deinit();
+            for (0..self.scratch.len) |i| {
+                for (self.scratch[i]) |*c| c.deinit(self.allocator);
+                self.allocator.free(self.scratch[i]);
+                self.allocator.free(self.part_views[i]);
+            }
+            self.allocator.free(self.scratch);
+            self.allocator.free(self.part_views);
+            self.allocator.free(self.parts);
+            self.allocator.free(self.key_vals);
+            self.allocator.free(self.out_ptrs);
+        }
+
+        fn runOne(self: *MultiRunner, spans: []const Span) !usize {
+            const op = self.op;
+            // Gather each input's span; empty spans leave arity-correct
+            // zero-row columns (cleared scratch views).
+            for (0..op.upstreams.len) |i| {
+                for (self.scratch[i]) |*store| store.clear();
+                const span = spans[i];
+                if (span.end > span.start) {
+                    const perm = self.perms_by_input[i];
+                    for (self.views_by_input[i], self.scratch[i]) |v, *store| {
+                        try transform.appendByIndices(self.allocator, v, perm[span.start..span.end], store);
+                    }
+                }
+                for (self.scratch[i], self.part_views[i]) |c, *v| v.* = c.view();
+            }
+            // Key values from the first non-empty input.
+            @memset(self.key_vals, null);
+            for (0..op.upstreams.len) |i| {
+                if (spans[i].end > spans[i].start) {
+                    const row = self.perms_by_input[i][spans[i].start];
+                    for (op.key_idxs[i], self.key_vals) |ki, *kv| {
+                        kv.* = if (self.views_by_input[i][ki].isValid(row))
+                            valueAt(self.views_by_input[i][ki], row)
+                        else
+                            null;
+                    }
+                    break;
+                }
+            }
+            for (0..op.upstreams.len) |i| {
+                self.parts[i] = .{
+                    .columns = self.part_views[i],
+                    .row_count = spans[i].end - spans[i].start,
+                    .keys = self.key_vals,
+                };
+            }
+
+            _ = self.arena.reset(.retain_capacity);
+            const ctx = udf_mod.TvfContext{
+                .arena = self.arena.allocator(),
+                .user_data = op.entry.user_data,
+            };
+            var out = udf_mod.TvfOutput{
+                .columns = self.out_ptrs,
+                .allocator = self.allocator,
+            };
+            const before = self.out_ptrs[0].rowCount();
+            try op.entry.process(&ctx, self.parts, &out);
+            const after = self.out_ptrs[0].rowCount();
+            for (self.out_ptrs[1..]) |c| {
+                if (c.rowCount() != after) return Error.TableFnOutputMismatch;
+            }
+            return after - before;
+        }
+    };
 
     const Run = struct { start: usize, end: usize };
 
@@ -663,16 +1049,20 @@ pub const TableFnExec = struct {
     /// key types; at most ONE order column, int-family ≤64-bit). Returns
     /// false to fall back to the generic comparator.
     fn packedSort(self: *const TableFnExec, views: []const ColumnView, perm: []u32) !?[]u128 {
-        if (self.order_idx.len > 1) return null;
-        if (self.order_idx.len == 1) {
-            switch (views[self.order_idx[0]].data) {
+        return self.packedSortFor(views, self.key_idx, self.order_idx, perm);
+    }
+
+    fn packedSortFor(self: *const TableFnExec, views: []const ColumnView, key_idx: []const usize, order_idx: []const usize, perm: []u32) !?[]u128 {
+        if (order_idx.len > 1) return null;
+        if (order_idx.len == 1) {
+            switch (views[order_idx[0]].data) {
                 .int, .bigint, .tinyint, .smallint, .date, .datetime, .decimal64, .boolean => {},
                 else => return null,
             }
         }
         // Float keys: ±0.0 compare equal but hash differently — a digest
         // would split one real partition. Generic path handles them.
-        for (self.key_idx) |ki| {
+        for (key_idx) |ki| {
             switch (views[ki].data) {
                 .float, .double => return null,
                 else => {},
@@ -685,7 +1075,7 @@ pub const TableFnExec = struct {
         for (keys, 0..) |*k, i| {
             var h1 = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
             var h2 = std.hash.Wyhash.init(0x517cc1b727220a95);
-            for (self.key_idx) |ki| {
+            for (key_idx) |ki| {
                 const v = views[ki];
                 if (!v.isValid(i)) {
                     h1.update(&.{0});
@@ -712,8 +1102,8 @@ pub const TableFnExec = struct {
             }
             k.digest = (@as(u128, h1.final()) << 64) | h2.final();
             k.row = @intCast(i);
-            if (self.order_idx.len == 1) {
-                const ov = views[self.order_idx[0]];
+            if (order_idx.len == 1) {
+                const ov = views[order_idx[0]];
                 if (ov.isValid(i)) {
                     k.ord_null = false;
                     k.ord = switch (ov.data) {

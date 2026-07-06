@@ -625,7 +625,8 @@ pub const Op = union(OpTag) {
     /// every input row.
     pub const TableFn = struct {
         name: []const u8,
-        input: *Op,
+        /// One subtree per input subquery, in call order.
+        inputs: []const *Op,
         partition_by: []const []const u8,
         order_by: []const SortSpec,
         alias: ?[]const u8 = null,
@@ -779,8 +780,11 @@ pub const Op = union(OpTag) {
             .table_fn => |t| {
                 allocator.free(t.partition_by);
                 allocator.free(t.order_by);
-                t.input.deinitDecoded(allocator);
-                allocator.destroy(t.input);
+                for (t.inputs) |inp| {
+                    inp.deinitDecoded(allocator);
+                    allocator.destroy(inp);
+                }
+                allocator.free(t.inputs);
             },
             .explain => |e| {
                 e.inner.deinitDecoded(allocator);
@@ -948,7 +952,8 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
                 try out.append(allocator, @intFromBool(s.desc));
             }
             try encodeOptString(allocator, out, t.alias);
-            try encodeOp(allocator, out, t.input.*);
+            try appendU32(allocator, out, @intCast(t.inputs.len));
+            for (t.inputs) |inp| try encodeOp(allocator, out, inp.*);
         },
         .limit => |l| {
             try appendU64(allocator, out, l.n);
@@ -1827,12 +1832,27 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 cursor.* += 1;
             }
             const fn_alias = try decodeOptString(bytes, cursor);
-            const input = try allocator.create(Op);
-            errdefer allocator.destroy(input);
-            input.* = try decodeOp(allocator, bytes, cursor);
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n_inputs = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            if (n_inputs == 0 or n_inputs > 16) return Error.IrCorrupt;
+            const inputs = try allocator.alloc(*Op, n_inputs);
+            errdefer allocator.free(inputs);
+            var made: usize = 0;
+            errdefer for (inputs[0..made]) |inp| {
+                inp.deinitDecoded(allocator);
+                allocator.destroy(inp);
+            };
+            for (inputs) |*slot| {
+                const inp = try allocator.create(Op);
+                errdefer allocator.destroy(inp);
+                inp.* = try decodeOp(allocator, bytes, cursor);
+                slot.* = inp;
+                made += 1;
+            }
             break :blk Op{ .table_fn = .{
                 .name = name,
-                .input = input,
+                .inputs = inputs,
                 .partition_by = partition_by,
                 .order_by = order_by,
                 .alias = fn_alias,

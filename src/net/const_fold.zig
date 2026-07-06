@@ -98,7 +98,7 @@ pub fn foldDeadBranches(op: *ir.Op) void {
         .group_by => |g| foldDeadBranches(g.upstream),
         .compute => |c| foldDeadBranches(c.upstream),
         .materialize => |m| foldDeadBranches(m.upstream),
-        .table_fn => |t| foldDeadBranches(t.input),
+        .table_fn => |t| for (t.inputs) |inp| foldDeadBranches(inp),
         .window => |w| foldDeadBranches(w.upstream),
         .alias => |a| foldDeadBranches(a.upstream),
         .explain => |e| foldDeadBranches(@constCast(e.inner)),
