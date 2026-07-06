@@ -73,6 +73,7 @@ pub const Error = error{
     SchemaAlreadyExists,
     FunctionAlreadyExists,
     FunctionInvalidDefinition,
+    FunctionNotFound,
     /// In-flight query was cancelled by a peer (MySQL KILL or PG
     /// CancelRequest / pg_cancel_backend). Caller should map this to
     /// the protocol-specific abort code and continue serving the
@@ -1960,6 +1961,23 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
     switch (d) {
         .create_database => |name| _ = catalog.createDatabase(name) catch |e| return thindb_api.remapError(Error, e),
         .drop_database => |name| catalog.dropDatabase(name) catch |e| return thindb_api.remapError(Error, e),
+        .create_sql_function => |cf| {
+            // Trial-parse the body (every parameter bound to NULL) so
+            // syntax errors surface at CREATE, not at first call. Column
+            // resolution still happens per call at compile.
+            {
+                var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+                defer arena.deinit();
+                @import("../sql/sql.zig").validateFnBody(arena.allocator(), cf.body, cf.param_names) catch {
+                    return Error.FunctionInvalidDefinition;
+                };
+            }
+            catalog.registerSqlFunction(ctx.session.current_db, cf, false) catch |e| return thindb_api.remapError(Error, e);
+        },
+        .drop_sql_function => |df| {
+            const existed = catalog.dropSqlFunction(ctx.session.current_db, df.name) catch |e| return thindb_api.remapError(Error, e);
+            if (!existed and !df.if_exists) return Error.FunctionNotFound;
+        },
         .create_schema => |name| {
             const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
             _ = db.createSchema(name) catch |e| return thindb_api.remapError(Error, e);

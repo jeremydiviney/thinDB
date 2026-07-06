@@ -83,6 +83,9 @@ pub const ParseError = error{
     SqlCopyUnsupportedFormat,
     SqlUnsupportedFileFunction,
     SqlUnsupportedFileOption,
+    /// SQL table-function call-site errors: argument count mismatch or
+    /// nested expansion beyond the recursion bound.
+    SqlFunctionArgMismatch,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -228,6 +231,16 @@ pub fn parseDialectWithUdfs(
     dialect: types.Dialect,
     udf_registry: ?*const udf_mod.UdfRegistry,
 ) ParseError!*ir.Op {
+    return parseWithContext(arena, sql, dialect, udf_registry, null);
+}
+
+pub fn parseWithContext(
+    arena: Allocator,
+    sql: []const u8,
+    dialect: types.Dialect,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+    sql_fns: ?udf_mod.SqlFnCtx,
+) ParseError!*ir.Op {
     var lex = Lexer.init(arena, sql);
     lex.dialect = dialect;
     var parser = Parser{
@@ -235,6 +248,7 @@ pub fn parseDialectWithUdfs(
         .lex = &lex,
         .cur = try lex.next(),
         .udf_registry = udf_registry,
+        .sql_fns = sql_fns,
     };
 
     // Skip leading empty statements (e.g. ";;SELECT ...").
@@ -272,6 +286,31 @@ pub fn parseDialectWithUdfs(
     const owned = try arena.alloc(*ir.Op, statements.items.len);
     for (statements.items, 0..) |s, i| owned[i] = s;
     return try parser.allocOp(.{ .batch = .{ .statements = owned } });
+}
+
+/// Validate a SQL table-function body at CREATE time: parse it with every
+/// parameter bound to NULL. Catches syntax errors up front; column/type
+/// resolution still happens per call at compile.
+pub fn validateFnBody(
+    arena: Allocator,
+    body: []const u8,
+    param_names: []const []const u8,
+) ParseError!void {
+    var bindings: std.StringHashMapUnmanaged(Token) = .empty;
+    for (param_names) |pn| {
+        try bindings.put(arena, pn, .{ .tag = .kw_null, .text = "null" });
+    }
+    var lex = Lexer.init(arena, body);
+    var sub = Parser{
+        .arena = arena,
+        .lex = &lex,
+        .cur = .{ .tag = .semicolon, .text = "" },
+        .param_bindings = &bindings,
+    };
+    try sub.advance();
+    _ = try sub.parseStatement();
+    try sub.applyAutoMaterialize();
+    if (sub.cur.tag != .eof and sub.cur.tag != .semicolon) return ParseError.SqlTrailingTokens;
 }
 
 const ParsedAgg = struct {
@@ -393,6 +432,16 @@ pub const Parser = struct {
     /// Optional catalog-owned registry used only to classify aggregate UDF
     /// names during parse. Scalar UDFs stay normal Expr.call nodes.
     udf_registry: ?*const udf_mod.UdfRegistry = null,
+    /// Optional SQL inline-table-function context (registry + the
+    /// session's current database). Consulted by `parseFromTarget` when a
+    /// FROM target looks like `name(...)`; absent = no expansion.
+    sql_fns: ?udf_mod.SqlFnCtx = null,
+    /// Non-null while parsing a function BODY: parameter name → the
+    /// call's literal argument token, substituted in `advance`.
+    param_bindings: ?*const std.StringHashMapUnmanaged(Token) = null,
+    /// Nested expansion depth (a function body referencing another
+    /// function). Bounded to reject accidental recursion.
+    fn_expand_depth: u8 = 0,
     predicate_derived: std.ArrayList(ir.Derived) = .empty,
     predicate_derived_counter: usize = 0,
     predicate_derived_enabled: bool = false,
@@ -406,6 +455,35 @@ pub const Parser = struct {
 
     pub fn advance(self: *Parser) ParseError!void {
         self.cur = try self.lex.next();
+        // SQL table-function expansion: inside a function body, parameter
+        // identifiers resolve to the call's literal argument tokens. One
+        // interception point makes parameters work anywhere an expression
+        // can appear. Case-insensitive, like column names.
+        if (self.param_bindings) |bindings| {
+            if (self.cur.tag == .identifier) {
+                var it = bindings.iterator();
+                while (it.next()) |e| {
+                    if (std.ascii.eqlIgnoreCase(e.key_ptr.*, self.cur.text)) {
+                        self.cur = e.value_ptr.*;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The full SQL source being parsed.
+    pub fn sourceText(self: *const Parser) []const u8 {
+        return self.lex.src;
+    }
+
+    /// Current lexer byte offset: while `cur` holds token X this is X's
+    /// source END (the parser runs one token ahead). The CREATE FUNCTION
+    /// body capture recovers raw-text spans from it — token `.text` can't
+    /// serve as an offset source (identifier text is an arena-lowercased
+    /// copy, not a source slice).
+    pub fn lexPos(self: *const Parser) usize {
+        return self.lex.pos;
     }
 
     pub fn aggregateFuncForName(self: *const Parser, name: []const u8) ?ir.AggFunc {
@@ -2591,8 +2669,13 @@ pub const Parser = struct {
         var resolved_name: []const u8 = first_dup;
         var alias_in_place = true;
         if (self.cur.tag == .lparen) {
-            const format = fileFormatForFunction(first) orelse return ParseError.SqlUnsupportedFileFunction;
-            op = try self.parseFileTableFunction(format);
+            if (self.lookupSqlFn(first)) |def| {
+                op = try self.expandSqlFunction(def);
+                alias_in_place = false;
+            } else {
+                const format = fileFormatForFunction(first) orelse return ParseError.SqlUnsupportedFileFunction;
+                op = try self.parseFileTableFunction(format);
+            }
         } else if (self.cur.tag != .dot and self.ctes.get(first) != null) {
             const entry = self.ctes.get(first).?;
             // NOT MATERIALIZED = regenerate per use: each reference gets its
@@ -2643,6 +2726,88 @@ pub const Parser = struct {
             try self.advance();
         }
         return .{ .name = resolved_name, .op = op };
+    }
+
+    fn lookupSqlFn(self: *Parser, name: []const u8) ?*const udf_mod.SqlTableFn {
+        const ctx = self.sql_fns orelse return null;
+        return ctx.registry.get(ctx.db, name);
+    }
+
+    /// Expand a SQL inline table function call site: parse the literal
+    /// argument list, then re-parse the function body with each parameter
+    /// identifier bound to its argument token. The result is wrapped in
+    /// its own single-reference Materialize node — the shape the compiler
+    /// expects at every block boundary, and single-ref materialize bodies
+    /// COMPILE INLINE (no stage, full pushdown/fusion), so each call site
+    /// behaves as if its body had been written in place.
+    fn expandSqlFunction(self: *Parser, def: *const udf_mod.SqlTableFn) ParseError!*ir.Op {
+        if (self.fn_expand_depth >= 16) return ParseError.SqlFunctionArgMismatch;
+        try self.expect(.lparen);
+        // Defensive copies into the arena: the registry entry can be
+        // replaced by concurrent DDL after this lookup (same documented
+        // race as table DDL mid-query).
+        const body = try self.arena.dupe(u8, def.body);
+        const n_params = def.param_names.len;
+        const param_names = try self.arena.alloc([]const u8, n_params);
+        for (def.param_names, param_names) |src_name, *dst| dst.* = try self.arena.dupe(u8, src_name);
+
+        var bindings: std.StringHashMapUnmanaged(Token) = .empty;
+        var argi: usize = 0;
+        if (self.cur.tag != .rparen) {
+            while (true) {
+                if (argi >= n_params) return ParseError.SqlFunctionArgMismatch;
+                try bindings.put(self.arena, param_names[argi], try self.captureLiteralToken());
+                argi += 1;
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+        }
+        try self.expect(.rparen);
+        if (argi != n_params) return ParseError.SqlFunctionArgMismatch;
+
+        var sub_lex = Lexer.init(self.arena, body);
+        sub_lex.dialect = self.lex.dialect;
+        var sub = Parser{
+            .arena = self.arena,
+            .lex = &sub_lex,
+            .cur = .{ .tag = .semicolon, .text = "" },
+            .udf_registry = self.udf_registry,
+            .sql_fns = self.sql_fns,
+            .param_bindings = &bindings,
+            .fn_expand_depth = self.fn_expand_depth + 1,
+        };
+        try sub.advance(); // load the first body token (with param interception)
+        const op = try sub.parseStatement();
+        if (sub.pending_separable != null) return ParseError.SqlSeparableScope;
+        try sub.applyAutoMaterialize();
+        if (sub.cur.tag != .eof and sub.cur.tag != .semicolon) return ParseError.SqlExpectedToken;
+        return try self.allocOp(.{ .materialize = .{ .upstream = op } });
+    }
+
+    /// The current token as a literal argument for a function expansion:
+    /// number / string / TRUE / FALSE / NULL, with a leading minus folded
+    /// into the numeric token. Anything else (column refs, expressions,
+    /// subqueries) is rejected — v1 arguments are literals.
+    fn captureLiteralToken(self: *Parser) ParseError!Token {
+        switch (self.cur.tag) {
+            .integer, .floating, .string, .kw_null, .kw_true, .kw_false => {
+                const t = self.cur;
+                try self.advance();
+                return t;
+            },
+            .minus => {
+                try self.advance();
+                var t = self.cur;
+                switch (t.tag) {
+                    .integer => t.value = .{ .integer = -t.value.integer },
+                    .floating => t.value = .{ .floating = -t.value.floating },
+                    else => return ParseError.SqlExpectedValue,
+                }
+                try self.advance();
+                return t;
+            },
+            else => return ParseError.SqlExpectedValue,
+        }
     }
 
     fn parseFileTableFunction(self: *Parser, format: ir.FileFormat) ParseError!*ir.Op {
@@ -4363,4 +4528,19 @@ fn reverseRangeOp(op: PredicateOp) PredicateOp {
         .gte => .lte,
         else => op,
     };
+}
+
+test "sql table function: CREATE parse, body capture, validation, expansion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const stmt = "CREATE FUNCTION t_f(pid INT, div INT) RETURNS TABLE AS (SELECT c FROM t WHERE a = pid AND b = div)";
+    const op = try parse(aa, stmt);
+    try std.testing.expect(op.* == .ddl);
+    const cf = op.ddl.create_sql_function;
+    try std.testing.expectEqualStrings("t_f", cf.name);
+    try std.testing.expectEqual(@as(usize, 2), cf.param_names.len);
+    try std.testing.expectEqualStrings("SELECT c FROM t WHERE a = pid AND b = div", cf.body);
+    try validateFnBody(aa, cf.body, cf.param_names);
 }

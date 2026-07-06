@@ -411,6 +411,14 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
             try writeTableRef(allocator, out, ref);
             try out.append(allocator, '\n');
         },
+        .create_sql_function => |cf| {
+            try out.appendSlice(allocator, "CreateSqlFunction ");
+            try out.appendSlice(allocator, cf.name);
+            try out.print(allocator, " params={d}\n", .{cf.param_names.len});
+        },
+        .drop_sql_function => |df| {
+            try writeAll(allocator, out, "DropSqlFunction ", df.name, "\n");
+        },
     }
 }
 

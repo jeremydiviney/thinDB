@@ -122,6 +122,159 @@ pub const AggregateEntry = struct {
     user_data: ?*anyopaque,
 };
 
+/// A SQL inline table function: `CREATE FUNCTION f(a INT, ...) RETURNS
+/// TABLE AS (SELECT ...)`. A parameterized view — the parser expands a
+/// `FROM f(1, 'x')` reference by re-parsing `body` with each parameter
+/// identifier bound to the call's literal argument, splicing the result
+/// inline (no materialize boundary, full pushdown/fusion apply).
+pub const SqlTableFn = struct {
+    /// Lowercased function name (single identifier, database-scoped).
+    name: []const u8,
+    /// Parameter names in declaration order (original case; matched
+    /// case-insensitively at expansion).
+    param_names: []const []const u8,
+    /// Declared parameter types (arity/documentation; argument literals
+    /// are substituted as-is in v1).
+    param_types: []const Type,
+    /// Raw SQL text of the body SELECT (inside the `AS ( ... )` parens).
+    body: []const u8,
+    /// The verbatim CREATE FUNCTION statement — the persistence format:
+    /// stored as `<db>/_functions/<name>.sql` and re-parsed on open.
+    create_text: []const u8,
+};
+
+/// Catalog-owned registry of SQL inline table functions, keyed by
+/// `<database>\x00<name>` (functions are database-scoped like tables).
+/// All strings are owned copies. Thread-safe: parse-time lookups and
+/// DDL mutations take the mutex.
+pub const SqlFnRegistry = struct {
+    allocator: Allocator,
+    map: std.StringHashMapUnmanaged(SqlTableFn) = .empty,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    pub fn init(allocator: Allocator) SqlFnRegistry {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *SqlFnRegistry) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.freeFn(e.value_ptr.*);
+        }
+        self.map.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn freeFn(self: *SqlFnRegistry, f: SqlTableFn) void {
+        self.allocator.free(f.name);
+        for (f.param_names) |p| self.allocator.free(p);
+        self.allocator.free(f.param_names);
+        self.allocator.free(f.param_types);
+        self.allocator.free(f.body);
+        self.allocator.free(f.create_text);
+    }
+
+    fn key(allocator: Allocator, db: []const u8, name: []const u8) ![]u8 {
+        const k = try allocator.alloc(u8, db.len + 1 + name.len);
+        @memcpy(k[0..db.len], db);
+        k[db.len] = 0;
+        for (name, k[db.len + 1 ..]) |c, *o| o.* = std.ascii.toLower(c);
+        return k;
+    }
+
+    /// Register (copies everything). `replace=false` errors on collision.
+    pub fn register(
+        self: *SqlFnRegistry,
+        db: []const u8,
+        f: SqlTableFn,
+        replace: bool,
+    ) !void {
+        try validateName(f.name);
+        if (f.param_names.len != f.param_types.len or f.param_names.len > 32) {
+            return Error.FunctionInvalidDefinition;
+        }
+        const k = try key(self.allocator, db, f.name);
+        errdefer self.allocator.free(k);
+        const name = try lowerName(self.allocator, f.name);
+        errdefer self.allocator.free(name);
+        const param_names = try self.allocator.alloc([]const u8, f.param_names.len);
+        var pn: usize = 0;
+        errdefer {
+            for (param_names[0..pn]) |p| self.allocator.free(p);
+            self.allocator.free(param_names);
+        }
+        for (f.param_names) |p| {
+            param_names[pn] = try self.allocator.dupe(u8, p);
+            pn += 1;
+        }
+        const param_types = try self.allocator.dupe(Type, f.param_types);
+        errdefer self.allocator.free(param_types);
+        const body = try self.allocator.dupe(u8, f.body);
+        errdefer self.allocator.free(body);
+        const create_text = try self.allocator.dupe(u8, f.create_text);
+        errdefer self.allocator.free(create_text);
+        const owned: SqlTableFn = .{
+            .name = name,
+            .param_names = param_names,
+            .param_types = param_types,
+            .body = body,
+            .create_text = create_text,
+        };
+
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        const gop = try self.map.getOrPut(self.allocator, k);
+        if (gop.found_existing) {
+            // The error return frees k + every `owned` component via the
+            // errdefers above — no manual frees here or they double-free.
+            if (!replace) return Error.FunctionAlreadyExists;
+            self.allocator.free(k);
+            self.freeFn(gop.value_ptr.*);
+            gop.value_ptr.* = owned;
+        } else {
+            gop.value_ptr.* = owned;
+        }
+    }
+
+    /// Remove. Returns false when absent.
+    pub fn drop(self: *SqlFnRegistry, db: []const u8, name: []const u8) !bool {
+        const k = try key(self.allocator, db, name);
+        defer self.allocator.free(k);
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.map.fetchRemove(k)) |kv| {
+            self.allocator.free(kv.key);
+            self.freeFn(kv.value);
+            return true;
+        }
+        return false;
+    }
+
+    /// Parse-time lookup. The returned pointer stays valid only while no
+    /// concurrent register/drop mutates this entry — callers copy what
+    /// they need into their arena before releasing implied ownership
+    /// (queries parse fast; DDL on a function mid-parse of a query using
+    /// it is a documented race we accept like table DDL).
+    pub fn get(self: *SqlFnRegistry, db: []const u8, name: []const u8) ?*const SqlTableFn {
+        var kbuf: [512]u8 = undefined;
+        if (db.len + 1 + name.len > kbuf.len) return null;
+        @memcpy(kbuf[0..db.len], db);
+        kbuf[db.len] = 0;
+        for (name, kbuf[db.len + 1 ..][0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        return self.map.getPtr(kbuf[0 .. db.len + 1 + name.len]);
+    }
+};
+
+/// Parse-time context for SQL table-function expansion: which registry
+/// to consult and which database scopes unqualified names.
+pub const SqlFnCtx = struct {
+    registry: *SqlFnRegistry,
+    db: []const u8,
+};
+
 pub const UdfRegistry = struct {
     allocator: Allocator,
     scalars: std.ArrayList(ScalarEntry) = .empty,

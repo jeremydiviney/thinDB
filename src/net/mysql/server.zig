@@ -2688,7 +2688,7 @@ fn runEngineQuery(
     defer arena.deinit();
 
     const parse_start = profiler.start();
-    const op = sql.parseDialectWithUdfs(arena.allocator(), payload, .mysql, &catalog.udfs) catch |err| {
+    const op = sql.parseWithContext(arena.allocator(), payload, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db }) catch |err| {
         profiler.recordSince(.query_parse, parse_start);
         const mapped = errors.mapInternal(err, "Parse error");
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, @errorName(err));
@@ -2929,7 +2929,7 @@ fn handleStmtPrepare(
         const infer_start = profiler.start();
         blk: {
             const dummy_sql = prepared.renderDummySubstitution(arena.allocator(), payload, num_params) catch break :blk;
-            const dummy_op = sql.parseDialectWithUdfs(arena.allocator(), dummy_sql, .mysql, &catalog.udfs) catch break :blk;
+            const dummy_op = sql.parseWithContext(arena.allocator(), dummy_sql, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db }) catch break :blk;
             if (dummy_op.* == .batch) break :blk;
             if (isSideEffectOp(dummy_op.*)) break :blk;
             const main_db = catalog.database(session.current_db) orelse break :blk;
@@ -3070,7 +3070,7 @@ fn handleStmtExecute(
     }
 
     const parse_start = profiler.start();
-    const op = sql.parseDialectWithUdfs(arena_alloc, substituted, .mysql, &catalog.udfs) catch |err| {
+    const op = sql.parseWithContext(arena_alloc, substituted, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db }) catch |err| {
         profiler.recordSince(.stmt_execute_parse, parse_start);
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);

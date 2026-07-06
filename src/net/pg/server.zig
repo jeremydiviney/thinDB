@@ -598,7 +598,7 @@ fn extended_handleExecute(
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const op = try sql.parseDialectWithUdfs(aa, portal.bound_sql, .postgres, &catalog.udfs);
+    const op = try sql.parseWithContext(aa, portal.bound_sql, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db });
 
     if (op.* == .batch) {
         for (op.batch.statements) |stmt| {
@@ -975,7 +975,7 @@ fn runEngineQuery(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const op = try sql.parseDialectWithUdfs(arena.allocator(), sql_text, .postgres, &catalog.udfs);
+    const op = try sql.parseWithContext(arena.allocator(), sql_text, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db });
 
     if (op.* == .batch) {
         // PG simple-Query protocol natively supports `;`-separated
@@ -1088,6 +1088,8 @@ fn commandTagFor(op: ir.Op) []const u8 {
             .alter_table_add_column => "ALTER TABLE",
             .truncate_table => "TRUNCATE TABLE",
             .use_schema, .use_database_schema => "SET",
+            .create_sql_function => "CREATE FUNCTION",
+            .drop_sql_function => "DROP FUNCTION",
         },
         else => "OK",
     };

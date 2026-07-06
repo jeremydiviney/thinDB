@@ -29,6 +29,21 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                 const name = try p.dupedIdent();
                 return try p.allocOp(.{ .ddl = .{ .create_schema = name } });
             }
+            // CREATE [OR REPLACE] FUNCTION — `function`/`returns` are
+            // contextual keywords (matched by identifier text) so columns
+            // named "function" keep working everywhere else.
+            var or_replace = false;
+            if (p.cur.tag == .kw_or) {
+                try p.advance();
+                if (p.cur.tag != .kw_replace) return PE.SqlExpectedKeyword;
+                try p.advance();
+                or_replace = true;
+            }
+            if (isIdentText(p, "function")) {
+                try p.advance();
+                return try parseCreateFunctionBody(p, or_replace);
+            }
+            if (or_replace) return PE.SqlExpectedKeyword;
             var is_temp = false;
             if (p.cur.tag == .kw_temp or p.cur.tag == .kw_temporary) {
                 is_temp = true;
@@ -50,6 +65,21 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                 try p.advance();
                 const name = try p.dupedIdent();
                 return try p.allocOp(.{ .ddl = .{ .drop_schema = name } });
+            }
+            if (isIdentText(p, "function")) {
+                try p.advance();
+                var if_exists = false;
+                if (p.cur.tag == .kw_if) {
+                    try p.advance();
+                    if (p.cur.tag != .kw_exists) return PE.SqlExpectedKeyword;
+                    try p.advance();
+                    if_exists = true;
+                }
+                const name = try p.dupedIdent();
+                return try p.allocOp(.{ .ddl = .{ .drop_sql_function = .{
+                    .name = name,
+                    .if_exists = if_exists,
+                } } });
             }
             if (p.cur.tag == .kw_temp or p.cur.tag == .kw_temporary) {
                 try p.advance();
@@ -102,6 +132,82 @@ pub fn parseDdl(p: anytype) !*ir.Op {
         },
         else => unreachable,
     }
+}
+
+fn isIdentText(p: anytype, comptime text: []const u8) bool {
+    return p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, text);
+}
+
+/// CREATE [OR REPLACE] FUNCTION name([pname ptype, ...]) RETURNS TABLE AS ( body )
+///
+/// A SQL inline table function. The body SELECT is captured as RAW TEXT
+/// (token-boundary balanced-paren scan) — it is validated by a trial
+/// parse at registration and re-parsed with bound parameters at every
+/// call site. `FUNCTION`/`RETURNS`/`TABLE` here; the leading CREATE [OR
+/// REPLACE] was consumed by the caller.
+pub fn parseCreateFunctionBody(p: anytype, or_replace: bool) !*ir.Op {
+    const PE = @TypeOf(p.*).Err;
+    const name = try p.dupedIdent();
+
+    try p.expect(.lparen);
+    var param_names: std.ArrayList([]const u8) = .empty;
+    defer param_names.deinit(p.arena);
+    var param_types: std.ArrayList(types.Type) = .empty;
+    defer param_types.deinit(p.arena);
+    if (p.cur.tag != .rparen) {
+        while (true) {
+            try param_names.append(p.arena, try p.dupedIdent());
+            try param_types.append(p.arena, try parseColumnType(p));
+            if (p.cur.tag != .comma) break;
+            try p.advance();
+        }
+    }
+    try p.expect(.rparen);
+
+    if (!isIdentText(p, "returns")) return PE.SqlExpectedKeyword;
+    try p.advance();
+    if (p.cur.tag != .kw_table) return PE.SqlExpectedKeyword;
+    try p.advance();
+    if (p.cur.tag != .kw_as) return PE.SqlExpectedKeyword;
+    try p.advance();
+
+    // Raw body capture via LEXER POSITION: while the parser holds token X,
+    // `lex.pos` sits at X's source end (the parser is exactly one token
+    // ahead). Token `.text` can't be used for offsets — identifier text is
+    // an arena-lowercased copy, not a source slice. So: the position at
+    // the opening paren is the body start; the position recorded before
+    // each advance is the end of the last body token when the matching
+    // close paren breaks the loop.
+    if (p.cur.tag != .lparen) return PE.SqlExpectedToken;
+    const src = p.sourceText();
+    const body_start = p.lexPos();
+    try p.advance();
+    var depth: usize = 0;
+    var body_end = body_start;
+    while (true) {
+        switch (p.cur.tag) {
+            .eof => return PE.SqlExpectedToken,
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) break;
+                depth -= 1;
+            },
+            else => {},
+        }
+        body_end = p.lexPos();
+        try p.advance();
+    }
+    const body = std.mem.trim(u8, src[body_start..body_end], " \t\r\n");
+    if (body.len == 0) return PE.SqlExpectedSelect;
+    try p.advance(); // consume the closing rparen
+
+    return try p.allocOp(.{ .ddl = .{ .create_sql_function = .{
+        .name = name,
+        .or_replace = or_replace,
+        .param_names = try p.arena.dupe([]const u8, param_names.items),
+        .param_types = try p.arena.dupe(types.Type, param_types.items),
+        .body = try p.arena.dupe(u8, body),
+    } } });
 }
 
 /// CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] [db.][schema.]name

@@ -127,6 +127,28 @@ pub const DdlOp = union(enum) {
     rename_table: RenameTable,
     alter_table_add_column: AlterTableAddColumn,
     truncate_table: TableRef,
+    create_sql_function: CreateSqlFunction,
+    drop_sql_function: DropSqlFunction,
+};
+
+/// `CREATE [OR REPLACE] FUNCTION name(p T, ...) RETURNS TABLE AS (body)` —
+/// a SQL inline table function (parameterized view). The body is stored
+/// as raw text; the parser expands every `FROM name(args)` call site by
+/// re-parsing it with parameters bound to the argument literals.
+pub const CreateSqlFunction = struct {
+    name: []const u8,
+    or_replace: bool,
+    param_names: []const []const u8,
+    param_types: []const @import("../types.zig").Type,
+    /// Raw body text between the `AS (` ... `)` parens. The canonical
+    /// CREATE statement (the `<db>/_functions/<name>.sql` persistence
+    /// format) is regenerated from these fields at registration.
+    body: []const u8,
+};
+
+pub const DropSqlFunction = struct {
+    name: []const u8,
+    if_exists: bool,
 };
 
 pub const ColumnDef = struct {
@@ -820,6 +842,10 @@ fn freeDecodedDdl(d: DdlOp, allocator: Allocator) void {
             allocator.free(ct.columns);
             allocator.free(ct.order_key);
         },
+        .create_sql_function => |cf| {
+            allocator.free(cf.param_names);
+            allocator.free(cf.param_types);
+        },
         else => {},
     }
 }
@@ -1049,6 +1075,8 @@ const DdlTag = enum(u8) {
     rename_table = 8,
     alter_table_add_column = 9,
     truncate_table = 10,
+    create_sql_function = 11,
+    drop_sql_function = 12,
 };
 
 const TypeWireTag = enum(u8) {
@@ -1234,6 +1262,26 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
         .truncate_table => |ref| {
             try out.append(allocator, @intFromEnum(DdlTag.truncate_table));
             try encodeTableRef(allocator, out, ref);
+        },
+        .create_sql_function => |cf| {
+            try out.append(allocator, @intFromEnum(DdlTag.create_sql_function));
+            try appendU32(allocator, out, @intCast(cf.name.len));
+            try out.appendSlice(allocator, cf.name);
+            try out.append(allocator, @intFromBool(cf.or_replace));
+            try appendU32(allocator, out, @intCast(cf.param_names.len));
+            for (cf.param_names, cf.param_types) |pn, pt| {
+                try appendU32(allocator, out, @intCast(pn.len));
+                try out.appendSlice(allocator, pn);
+                try encodeType(allocator, out, pt);
+            }
+            try appendU32(allocator, out, @intCast(cf.body.len));
+            try out.appendSlice(allocator, cf.body);
+        },
+        .drop_sql_function => |df| {
+            try out.append(allocator, @intFromEnum(DdlTag.drop_sql_function));
+            try appendU32(allocator, out, @intCast(df.name.len));
+            try out.appendSlice(allocator, df.name);
+            try out.append(allocator, @intFromBool(df.if_exists));
         },
     }
 }
@@ -2232,7 +2280,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(DdlTag.truncate_table)) return Error.IrCorrupt;
+    if (t > @intFromEnum(DdlTag.drop_sql_function)) return Error.IrCorrupt;
     const tag: DdlTag = @enumFromInt(t);
     return switch (tag) {
         .create_database => DdlOp{ .create_database = try readString(bytes, cursor) },
@@ -2296,6 +2344,38 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             break :blk DdlOp{ .alter_table_add_column = .{ .table = ref, .column = column } };
         },
         .truncate_table => DdlOp{ .truncate_table = try decodeTableRef(bytes, cursor) },
+        .create_sql_function => blk: {
+            const name = try readString(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const or_replace = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n_params = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const param_names = try allocator.alloc([]const u8, n_params);
+            errdefer allocator.free(param_names);
+            const param_types = try allocator.alloc(types.Type, n_params);
+            errdefer allocator.free(param_types);
+            for (param_names, param_types) |*pn, *pt| {
+                pn.* = try readString(bytes, cursor);
+                pt.* = try decodeType(bytes, cursor);
+            }
+            const body = try readString(bytes, cursor);
+            break :blk DdlOp{ .create_sql_function = .{
+                .name = name,
+                .or_replace = or_replace,
+                .param_names = param_names,
+                .param_types = param_types,
+                .body = body,
+            } };
+        },
+        .drop_sql_function => blk: {
+            const name = try readString(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const if_exists = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            break :blk DdlOp{ .drop_sql_function = .{ .name = name, .if_exists = if_exists } };
+        },
     };
 }
 

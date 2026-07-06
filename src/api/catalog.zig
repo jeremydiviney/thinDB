@@ -24,6 +24,10 @@ pub const Catalog = struct {
     root_dir: Io.Dir,
     config: Config,
     udfs: udf_mod.UdfRegistry,
+    /// SQL inline table functions (`CREATE FUNCTION ... RETURNS TABLE`),
+    /// keyed per database. Loaded from `<db>/_functions/*.sql` on open;
+    /// function DDL keeps the registry and the files in sync.
+    sql_fns: udf_mod.SqlFnRegistry,
     databases: std.StringHashMap(*Database),
     /// The shared cross-query memory pool, when this Catalog minted it from
     /// `Config.memory_budget` (vs. adopting a caller-provided one, which the
@@ -84,18 +88,127 @@ pub const Catalog = struct {
             .config = cfg,
             .owned_pool = owned_pool,
             .udfs = udf_mod.UdfRegistry.init(allocator),
+            .sql_fns = udf_mod.SqlFnRegistry.init(allocator),
             .databases = .init(allocator),
         };
         errdefer {
             var it = self.databases.iterator();
             while (it.next()) |entry| entry.value_ptr.*.closeInPlace();
             self.udfs.deinit();
+            self.sql_fns.deinit();
             self.databases.deinit();
         }
         try discoverDatabasesOnDisk(allocator, io, root_dir, cfg, &self.databases);
         var it = self.databases.iterator();
-        while (it.next()) |entry| entry.value_ptr.*.catalog = self;
+        while (it.next()) |entry| {
+            entry.value_ptr.*.catalog = self;
+            self.loadSqlFunctions(entry.value_ptr.*) catch {};
+        }
         return self;
+    }
+
+    /// Load persisted SQL inline table functions from `<db>/_functions/`.
+    /// Each file holds one verbatim CREATE FUNCTION statement; re-parsing
+    /// it is the single source of truth. Unreadable or unparsable files
+    /// are skipped (best-effort — a bad file must not block the open).
+    pub fn loadSqlFunctions(self: *Catalog, db: *Database) !void {
+        const sqlp = @import("../sql/sql.zig");
+        var dir = db.db_dir.openDir(self.io, "_functions", .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".sql")) continue;
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const text = dir.readFileAlloc(self.io, entry.name, arena.allocator(), .limited(1 << 20)) catch continue;
+            const op = sqlp.parse(arena.allocator(), text) catch continue;
+            if (op.* != .ddl or op.ddl != .create_sql_function) continue;
+            const cf = op.ddl.create_sql_function;
+            self.registerSqlFunction(db.name, cf, true) catch continue;
+        }
+    }
+
+    /// Register a SQL function from its parsed CREATE statement and
+    /// persist the canonical statement text to `<db>/_functions/<name>.sql`.
+    /// `persist=false` on the load-from-disk path.
+    pub fn registerSqlFunction(
+        self: *Catalog,
+        db_name: []const u8,
+        cf: @import("../ir/ir.zig").CreateSqlFunction,
+        skip_persist: bool,
+    ) !void {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(self.allocator);
+        try text.appendSlice(self.allocator, "CREATE FUNCTION ");
+        try text.appendSlice(self.allocator, cf.name);
+        try text.append(self.allocator, '(');
+        for (cf.param_names, cf.param_types, 0..) |pn, pt, i| {
+            if (i > 0) try text.appendSlice(self.allocator, ", ");
+            try text.appendSlice(self.allocator, pn);
+            try text.append(self.allocator, ' ');
+            try appendSqlTypeName(&text, self.allocator, pt);
+        }
+        try text.appendSlice(self.allocator, ") RETURNS TABLE AS (\n");
+        try text.appendSlice(self.allocator, cf.body);
+        try text.appendSlice(self.allocator, "\n)");
+
+        try self.sql_fns.register(db_name, .{
+            .name = cf.name,
+            .param_names = cf.param_names,
+            .param_types = cf.param_types,
+            .body = cf.body,
+            .create_text = text.items,
+        }, cf.or_replace or skip_persist);
+
+        if (skip_persist) return;
+        const db = self.database(db_name) orelse return Error.DatabaseNotFound;
+        var dir = db.db_dir.openDir(self.io, "_functions", .{}) catch
+            try db.db_dir.createDirPathOpen(self.io, "_functions", .{});
+        defer dir.close(self.io);
+        var namebuf: [300]u8 = undefined;
+        const fname = try fnFileName(&namebuf, cf.name);
+        try dir.writeFile(self.io, .{ .sub_path = fname, .data = text.items });
+    }
+
+    pub fn dropSqlFunction(self: *Catalog, db_name: []const u8, name: []const u8) !bool {
+        const existed = try self.sql_fns.drop(db_name, name);
+        if (!existed) return false;
+        if (self.database(db_name)) |db| {
+            var dir = db.db_dir.openDir(self.io, "_functions", .{}) catch return true;
+            defer dir.close(self.io);
+            var namebuf: [300]u8 = undefined;
+            const fname = fnFileName(&namebuf, name) catch return true;
+            dir.deleteFile(self.io, fname) catch {};
+        }
+        return true;
+    }
+
+    fn fnFileName(buf: []u8, name: []const u8) ![]const u8 {
+        if (name.len + 4 > buf.len) return Error.FunctionInvalidDefinition;
+        for (name, buf[0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
+        @memcpy(buf[name.len..][0..4], ".sql");
+        return buf[0 .. name.len + 4];
+    }
+
+    fn appendSqlTypeName(list: *std.ArrayList(u8), allocator: Allocator, t: @import("../types.zig").Type) !void {
+        switch (t) {
+            .int => try list.appendSlice(allocator, "INT"),
+            .bigint => try list.appendSlice(allocator, "BIGINT"),
+            .boolean => try list.appendSlice(allocator, "BOOLEAN"),
+            .varchar => |n| try list.print(allocator, "VARCHAR({d})", .{n}),
+            .string => try list.appendSlice(allocator, "STRING"),
+            .float => try list.appendSlice(allocator, "FLOAT"),
+            .double => try list.appendSlice(allocator, "DOUBLE"),
+            .date => try list.appendSlice(allocator, "DATE"),
+            .datetime => try list.appendSlice(allocator, "DATETIME"),
+            .tinyint => try list.appendSlice(allocator, "TINYINT"),
+            .smallint => try list.appendSlice(allocator, "SMALLINT"),
+            .largeint => try list.appendSlice(allocator, "LARGEINT"),
+            .char => |n| try list.print(allocator, "CHAR({d})", .{n}),
+            .decimal64, .decimal128 => |d| try list.print(allocator, "DECIMAL({d},{d})", .{ d.p, d.s }),
+            .uuid => try list.appendSlice(allocator, "UUID"),
+        }
     }
 
     pub fn registerScalarUdf(self: *Catalog, desc: udf_mod.ScalarUdf) !void {
@@ -148,6 +261,7 @@ pub const Catalog = struct {
         var it = self.databases.iterator();
         while (it.next()) |entry| entry.value_ptr.*.closeInPlace();
         self.udfs.deinit();
+        self.sql_fns.deinit();
         self.databases.deinit();
         const allocator = self.allocator;
         if (self.owned_pool) |p| allocator.destroy(p);

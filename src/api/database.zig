@@ -125,6 +125,7 @@ pub const Database = struct {
         while (try dir_it.next(io)) |entry| {
             if (entry.kind != .directory) continue;
             if (std.mem.eql(u8, entry.name, default_schema_name)) continue;
+            if (entry.name.len > 0 and entry.name[0] == 0x5F) continue; // _functions, _temp: database-internal, never schemas
             if (self.schemas.get(entry.name) != null) continue;
             const s = Schema.open(allocator, io, db_dir, entry.name, config) catch continue;
             s.database = self;

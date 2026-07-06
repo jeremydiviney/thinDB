@@ -22,6 +22,7 @@ pub const Error = error{
     SchemaAlreadyExists,
     FunctionAlreadyExists,
     FunctionInvalidDefinition,
+    FunctionNotFound,
 };
 
 pub const SyncMode = enum { none, per_flush };
@@ -384,6 +385,7 @@ pub fn remapError(comptime DstError: type, e: anyerror) anyerror {
         Error.TableAlreadyExists => DstError.TableAlreadyExists,
         Error.FunctionAlreadyExists => DstError.FunctionAlreadyExists,
         Error.FunctionInvalidDefinition => DstError.FunctionInvalidDefinition,
+        Error.FunctionNotFound => DstError.FunctionNotFound,
         else => e,
     };
 }
