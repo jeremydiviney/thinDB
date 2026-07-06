@@ -88,6 +88,47 @@ Three candidates:
 Streaming across partitions, materialized within a partition. No fully
 streaming row protocol in v1.
 
+### 3.1b Partitioned vs GLOBAL execution (owner decision 2026-07-05)
+
+Both modes are required, and the global case IS the degenerate partition
+case — one partition containing every input row, `process()` called
+exactly once. Same Zig function shape, same SDK, no second API. The
+differences live at the call site and in the engine:
+
+```sql
+-- partitioned: N independent parallel calls, memory = largest partition
+SELECT * FROM TABLE(f(<subquery>) PARTITION BY k ORDER BY o) t;
+-- global: exactly ONE call with all rows (globally sorted when ORDER BY)
+SELECT * FROM TABLE(f(<subquery>) ORDER BY o) t;
+SELECT * FROM TABLE(f(<subquery>)) t;   -- global, arrival order
+```
+
+Omitting PARTITION BY means EXACTLY one partition — deterministic, not
+Snowflake's "implementation-defined partitioning" (a semantics trap).
+The input subquery runs at full DOP in both modes; only the process()
+call is serial in global mode. Global mode holds the whole input
+resident, so it reserves through the query accountant (admission control
++ clean failure at budget, per the larger-than-RAM rule).
+
+The execution mode is part of the declared signature (extends the §3.2b
+type contract):
+
+```zig
+pub const execution = .partitioned; // or .global, or .either (default)
+```
+
+Compile-time enforced both ways: calling a `.partitioned` function
+without PARTITION BY (per-key state would silently bleed across keys) or
+a `.global` function with it (global visibility silently lost) errors
+immediately. The SDK comptime-gates the Partition API to match — key
+accessors don't exist on a `.global` function's Partition type.
+
+Explicitly NOT in v1: a hybrid "process partitions then combine
+globally" mode — that's the UDAF/two-phase-aggregate contract, and it
+would break the concat-only guarantee that makes partitioned execution
+parallel and reasoned-about. The composition instead: partitioned TVF →
+global TVF (or a normal GROUP BY) as two clean stages.
+
 ### 3.2 The user-facing API shape
 
 Columnar in / row-writer out, with comptime-declared schemas so the SDK does
