@@ -308,7 +308,7 @@ fn valueFromRow(aa: Allocator, view: ColumnView, row: u32) !types.Value {
         .decimal64 => |v| .{ .decimal64 = v[row] },
         .decimal128 => |v| .{ .decimal128 = v[row] },
         .uuid => |v| .{ .uuid = v[row] },
-        .varchar, .string, .char => .{ .text = try aa.dupe(u8, stringRowBytes(view, @intCast(row))) },
+        .varchar, .string, .char, .json => .{ .text = try aa.dupe(u8, stringRowBytes(view, @intCast(row))) },
     };
 }
 
@@ -342,7 +342,7 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
         .decimal64 => |v| std.math.order(v[row], val.decimal64),
         .decimal128 => |v| std.math.order(v[row], val.decimal128),
         .uuid => |v| std.math.order(v[row], val.uuid),
-        .varchar, .string, .char => std.mem.order(u8, stringRowBytes(view, @intCast(row)), val.text),
+        .varchar, .string, .char, .json => std.mem.order(u8, stringRowBytes(view, @intCast(row)), val.text),
     };
 }
 
@@ -375,6 +375,7 @@ fn appendValueToColumn(allocator: Allocator, col: *ColumnStore, out_type: Type, 
         .varchar => try col.data.varchar.appendValue(allocator, value.text),
         .string => try col.data.string.appendValue(allocator, value.text),
         .char => try col.data.char.appendValue(allocator, value.text),
+        .json => try col.data.json.appendValue(allocator, value.text),
     }
 }
 
@@ -911,7 +912,7 @@ pub const Aggregate = struct {
             .single_str_key = group_col_indices.len == 1 and
                 !up_schema[group_col_indices[0]].nullable and
                 switch (up_schema[group_col_indices[0]].type) {
-                    .string, .varchar, .char => true,
+                    .string, .varchar, .char, .json => true,
                     else => false,
                 },
             .top_k = resolved_top_k,
@@ -1557,7 +1558,7 @@ pub const Aggregate = struct {
                     }
                 }
             },
-            .varchar, .string, .char => |sv| {
+            .varchar, .string, .char, .json => |sv| {
                 const col = self.agg_cols[ai].other;
                 for (gids, 0..) |g, r| {
                     if (has_nulls and !view.isValid(r)) continue;
@@ -2026,7 +2027,7 @@ pub const Aggregate = struct {
 
         const str_view: ?storage.StringView = if (coded_cc == null and self.single_str_key)
             switch (batch.values[self.group_col_indices[0]].data) {
-                .string, .varchar, .char => |sv| sv,
+                .string, .varchar, .char, .json => |sv| sv,
                 else => unreachable,
             }
         else
@@ -2159,7 +2160,7 @@ pub const Aggregate = struct {
             // code back to its string via the query dictionary.
             const code = std.mem.readInt(u32, self.gkeys.items[gid][0..4], native_endian);
             switch (self.output_columns[0].data) {
-                .string, .varchar, .char => |*ss| try ss.appendValue(self.allocator, ck.dict.decode(code)),
+                .string, .varchar, .char, .json => |*ss| try ss.appendValue(self.allocator, ck.dict.decode(code)),
                 else => unreachable,
             }
         } else if (self.int_layout) |layout| {
@@ -2167,7 +2168,7 @@ pub const Aggregate = struct {
         } else if (self.single_str_key) {
             // Raw string bytes — no compound framing to decode.
             switch (self.output_columns[0].data) {
-                .string, .varchar, .char => |*ss| try ss.appendValue(self.allocator, self.gkeys.items[gid]),
+                .string, .varchar, .char, .json => |*ss| try ss.appendValue(self.allocator, self.gkeys.items[gid]),
                 else => unreachable,
             }
         } else {
@@ -3120,7 +3121,7 @@ pub fn updateState(
                 .largeint, .decimal128 => |sl| return foldMinLarge(s, simd.minOf(i128, sl[lo..hi])),
                 .float => |sl| return foldMinFloat(s, simd.minOf(f32, sl[lo..hi])),
                 .double => |sl| return foldMinFloat(s, simd.minOf(f64, sl[lo..hi])),
-                .varchar, .string, .char => {},
+                .varchar, .string, .char, .json => {},
                 else => unreachable,
             };
             switch (view.data) {
@@ -3169,7 +3170,7 @@ pub fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.min_float == null or v < s.min_float.?) s.min_float = v;
                 },
-                .varchar, .string, .char => {
+                .varchar, .string, .char, .json => {
                     var r: u32 = row_start;
                     while (r < row_end) : (r += 1) {
                         if (!view.isValid(r)) continue;
@@ -3197,7 +3198,7 @@ pub fn updateState(
                 .largeint, .decimal128 => |sl| return foldMaxLarge(s, simd.maxOf(i128, sl[lo..hi])),
                 .float => |sl| return foldMaxFloat(s, simd.maxOf(f32, sl[lo..hi])),
                 .double => |sl| return foldMaxFloat(s, simd.maxOf(f64, sl[lo..hi])),
-                .varchar, .string, .char => {},
+                .varchar, .string, .char, .json => {},
                 else => unreachable,
             };
             switch (view.data) {
@@ -3246,7 +3247,7 @@ pub fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.max_float == null or v > s.max_float.?) s.max_float = v;
                 },
-                .varchar, .string, .char => {
+                .varchar, .string, .char, .json => {
                     var r: u32 = row_start;
                     while (r < row_end) : (r += 1) {
                         if (!view.isValid(r)) continue;
@@ -3429,7 +3430,7 @@ fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32,
             // string-family columns have an empty form — the other types
             // reaching this path are float/double, where `sv` stays null.
             const sv: ?storage.StringView = switch (view.data) {
-                .string, .varchar, .char => |strv| strv,
+                .string, .varchar, .char, .json => |strv| strv,
                 else => null,
             };
             var scratch: std.ArrayList(u8) = .empty;
@@ -3533,6 +3534,7 @@ fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u
             .string => |sv| sv.rowBytes(r),
             .varchar => |sv| sv.rowBytes(r),
             .char => |sv| sv.rowBytes(r),
+            .json => |sv| sv.rowBytes(r),
             else => unreachable,
         };
         const c = s.concat orelse blk: {
@@ -3554,6 +3556,7 @@ fn stringRowBytes(view: ColumnView, row: u32) []const u8 {
         .varchar => |sv| sv.rowBytes(row),
         .string => |sv| sv.rowBytes(row),
         .char => |sv| sv.rowBytes(row),
+        .json => |sv| sv.rowBytes(row),
         else => unreachable,
     };
 }
@@ -3597,7 +3600,7 @@ fn encodeOneValue(aa: Allocator, out: *std.ArrayList(u8), view: ColumnView, row:
             storage.format.writeF64(&b, s[row]);
             try out.appendSlice(aa, &b);
         },
-        .string, .varchar, .char => |sv| {
+        .string, .varchar, .char, .json => |sv| {
             const bytes = sv.rowBytes(row);
             try storage.format.appendU32(aa, out, @intCast(bytes.len));
             try out.appendSlice(aa, bytes);
@@ -3709,6 +3712,7 @@ pub fn appendAccToColumn(
                     .varchar => try col.data.varchar.appendValue(allocator, v),
                     .string => try col.data.string.appendValue(allocator, v),
                     .char => try col.data.char.appendValue(allocator, v),
+                    .json => try col.data.json.appendValue(allocator, v),
                     else => unreachable,
                 } else {
                     try col.data.appendNullPlaceholder(allocator);
@@ -4234,7 +4238,7 @@ pub fn appendIntGroupKey(
             const code = unpackField(u32, key, f);
             const bytes = layout.coded_dicts[i].?.decode(code);
             switch (out_cols[i].data) {
-                .varchar, .string, .char => |*ss| try ss.appendValue(allocator, bytes),
+                .varchar, .string, .char, .json => |*ss| try ss.appendValue(allocator, bytes),
                 else => unreachable,
             }
             continue;
@@ -4318,6 +4322,11 @@ fn buildCompoundGroupKey(
                 try storage.format.appendU32(allocator, out, @intCast(bytes.len));
                 try out.appendSlice(allocator, bytes);
             },
+            .json => |sv| {
+                const bytes = sv.rowBytes(row);
+                try storage.format.appendU32(allocator, out, @intCast(bytes.len));
+                try out.appendSlice(allocator, bytes);
+            },
             .decimal64 => |s| try storage.format.appendI64(allocator, out, s[row]),
             .decimal128 => |s| {
                 var b: [16]u8 = undefined;
@@ -4373,7 +4382,7 @@ fn appendGroupKey(
                 try out_cols[i].data.boolean.append(allocator, key_bytes[cursor]);
                 cursor += 1;
             },
-            .varchar, .string, .char => {
+            .varchar, .string, .char, .json => {
                 const len = storage.format.readU32(key_bytes[cursor .. cursor + 4]);
                 cursor += 4;
                 const bytes = key_bytes[cursor .. cursor + len];
@@ -4382,6 +4391,7 @@ fn appendGroupKey(
                     .varchar => |*x| x,
                     .string => |*x| x,
                     .char => |*x| x,
+                    .json => |*x| x,
                     else => unreachable,
                 };
                 try ss.appendValue(allocator, bytes);

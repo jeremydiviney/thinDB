@@ -15,6 +15,8 @@ const types = @import("../../types.zig");
 const Column = types.Column;
 const TypeTag = types.TypeTag;
 
+const json_binary = @import("../../exec/json_binary.zig");
+
 const packet = @import("packet.zig");
 const handshake = @import("handshake.zig");
 const errors = @import("errors.zig");
@@ -31,6 +33,7 @@ pub const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 pub const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 pub const MYSQL_TYPE_DATE: u8 = 0x0a;
 pub const MYSQL_TYPE_DATETIME: u8 = 0x0c;
+pub const MYSQL_TYPE_JSON: u8 = 0xf5;
 pub const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 pub const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 pub const MYSQL_TYPE_STRING: u8 = 0xfe;
@@ -72,6 +75,7 @@ fn mysqlTypeOf(t: types.Type) struct { type_byte: u8, decimals: u8, len: u32, ch
         .varchar => |n| .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = @as(u32, n) * 4, .charset = CHARSET_UTF8MB4 },
         .char => |n| .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = @as(u32, n) * 4, .charset = CHARSET_UTF8MB4 },
         .string => .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = 65535, .charset = CHARSET_UTF8MB4 },
+        .json => .{ .type_byte = MYSQL_TYPE_JSON, .decimals = 0, .len = 4294967295, .charset = CHARSET_UTF8MB4 },
     };
 }
 
@@ -146,8 +150,19 @@ fn formatCell(scratch: *std.ArrayList(u8), allocator: Allocator, schema_col: Col
             try scratch.appendSlice(allocator, try wire_format.formatUuid(&buf, s[row]));
         },
         .string, .varchar, .char => |sv| try scratch.appendSlice(allocator, sv.rowBytes(row)),
+        .json => |sv| try appendJsonText(allocator, scratch, sv.rowBytes(row)),
     }
     return scratch.items;
+}
+
+/// A JSON column stores JSONB (self-identifying by tag byte); serialize it to
+/// canonical text for the wire. Legacy text values pass through.
+fn appendJsonText(allocator: Allocator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+    if (json_binary.looksBinary(bytes)) {
+        try json_binary.toText(allocator, out, bytes);
+    } else {
+        try out.appendSlice(allocator, bytes);
+    }
 }
 
 /// Emit the appropriate result-set terminator for `client_caps`.

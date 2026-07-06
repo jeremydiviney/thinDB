@@ -1061,7 +1061,7 @@ fn sliceValueAt(v: storage_column.ColumnView, row: usize) ?types.Value {
         .double => |s| .{ .double = s[row] },
         .decimal64 => |s| .{ .decimal64 = s[row] },
         .largeint => |s| .{ .largeint = s[row] },
-        .varchar, .string, .char => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
+        .varchar, .string, .char, .json => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
         else => null,
     };
 }

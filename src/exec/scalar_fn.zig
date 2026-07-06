@@ -48,6 +48,7 @@ const math = @import("scalar_fn_math.zig");
 const date = @import("scalar_fn_date.zig");
 const cond = @import("scalar_fn_cond.zig");
 const dec = @import("scalar_fn_decimal.zig");
+const json = @import("scalar_fn_json.zig");
 const common = @import("scalar_fn_common.zig");
 
 pub const NullStrategy = udf_mod.NullStrategy;
@@ -374,7 +375,7 @@ fn scalarDeclaredTypeAt(f: ScalarFn, i: usize) Type {
 /// Folding them lets a `VARCHAR(n)` column resolve string builtins with no cast.
 fn canonScalarTag(t: TypeTag) TypeTag {
     return switch (t) {
-        .varchar, .char => .string,
+        .varchar, .char, .json => .string,
         else => t,
     };
 }
@@ -461,6 +462,16 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "regexp_replace", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.regexpReplaceKernel },
     .{ .name = "regexp_like", .arg_types = &.{ .string, .string }, .return_type = .boolean, .kernel = string.regexpLikeKernel },
     .{ .name = "regexp_substr", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpSubstrKernel },
+    // --- json ---
+    .{ .name = "json_extract", .arg_types = &.{ .string, .string }, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonExtractKernel },
+    .{ .name = "json_value", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonValueKernel },
+    .{ .name = "json_unquote", .arg_types = &.{.string}, .return_type = .string, .kernel = json.jsonUnquoteKernel },
+    .{ .name = "json_valid", .arg_types = &.{.string}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonValidKernel },
+    .{ .name = "json_type", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonTypeKernel },
+    .{ .name = "json_length", .arg_types = &.{.string}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = json.jsonLengthKernel },
+    .{ .name = "json_contains", .arg_types = &.{ .string, .string }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonContainsKernel },
+    .{ .name = "json_keys", .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonKeysKernel },
+    .{ .name = "to_json", .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.toJsonKernel },
     // --- coalesce overloads ---
     .{ .name = "coalesce", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .absorbs, .kernel = cond.coalesceStringKernel },
     .{ .name = "coalesce", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 2, .null_strategy = .absorbs, .kernel = cond.coalesceStringKernel },

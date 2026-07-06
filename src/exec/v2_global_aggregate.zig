@@ -430,7 +430,7 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
             // extreme bytes. The batch's StringView is transient (recycled per
             // batch), so the kept value must be dup'd, not borrowed.
             const sv = switch (view.data) {
-                .varchar, .string, .char => |s| s,
+                .varchar, .string, .char, .json => |s| s,
                 else => continue,
             };
             var r: usize = 0;
@@ -600,7 +600,7 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
                 return;
             }
             const sv = switch (view.data) {
-                .varchar, .string, .char => |s| s,
+                .varchar, .string, .char, .json => |s| s,
                 else => return,
             };
             var prev_key: u128 = 0;
@@ -843,13 +843,13 @@ fn distinctKindFor(typ: Type) DistinctKind {
         .boolean, .tinyint, .smallint, .int, .bigint, .date, .datetime, .decimal64 => .int,
         .largeint, .decimal128, .uuid => .wide,
         .float, .double => .float,
-        .varchar, .string, .char => .string,
+        .varchar, .string, .char, .json => .string,
     };
 }
 
 fn isStringType(typ: Type) bool {
     return switch (typ) {
-        .varchar, .string, .char => true,
+        .varchar, .string, .char, .json => true,
         else => false,
     };
 }

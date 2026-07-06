@@ -425,7 +425,7 @@ pub const MetaAggStats = struct {
 fn exactStatsType(t: Type) bool {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64, .largeint, .decimal128 => true,
-        .uuid, .varchar, .string, .char, .float, .double => false,
+        .uuid, .varchar, .string, .char, .json, .float, .double => false,
     };
 }
 

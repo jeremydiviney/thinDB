@@ -37,6 +37,13 @@ pub const TypeTag = enum(u8) {
     /// `Uuid` (logical wrapper); inserts of textual UUIDs are surfaced
     /// later via the uuid_from_string scalar function.
     uuid = 16,
+    /// JSON document. Physically stored as UTF-8 text (raw JSON) — behaves
+    /// like a string for storage, encoding, and the wire — but carries a
+    /// distinct logical identity so the `->` / `->>` operators and the
+    /// JSON_* scalar functions can type-check against it, and so wire
+    /// metadata reports it as JSON. Phase 1 keeps the text representation;
+    /// a binary JSONB form and columnar shredding are later phases.
+    json = 17,
 };
 
 /// Precision/scale carried by both decimal type variants.
@@ -79,6 +86,7 @@ pub const Type = union(TypeTag) {
     decimal64: DecimalSpec,
     decimal128: DecimalSpec,
     uuid,
+    json,
 
     pub fn fixedSize(self: Type) ?usize {
         return switch (self) {
@@ -95,15 +103,23 @@ pub const Type = union(TypeTag) {
             .decimal64 => @sizeOf(i64),
             .decimal128 => @sizeOf(i128),
             .uuid => @sizeOf(u128),
-            .varchar, .string, .char => null,
+            .varchar, .string, .char, .json => null,
         };
     }
 
+    /// JSON and the VARCHAR family share one physical representation:
+    /// variable-length UTF-8 bytes. Storage, encoding, and the wire all key
+    /// off `isString`, so JSON flows through them unchanged. Use `isJson`
+    /// where the *logical* distinction matters (operators, wire type code).
     pub fn isString(self: Type) bool {
         return switch (self) {
-            .varchar, .string, .char => true,
+            .varchar, .string, .char, .json => true,
             else => false,
         };
+    }
+
+    pub fn isJson(self: Type) bool {
+        return self == .json;
     }
 
     pub fn isFloat(self: Type) bool {
@@ -158,7 +174,7 @@ pub const Type = union(TypeTag) {
             .decimal64 => T == i64 or T == comptime_int,
             .decimal128 => T == i128 or T == comptime_int,
             .uuid => T == Uuid or T == u128 or T == comptime_int,
-            .varchar, .string, .char => isStringLikeType(T),
+            .varchar, .string, .char, .json => isStringLikeType(T),
         };
     }
 };
@@ -261,7 +277,7 @@ pub const ValueTag = enum(u8) {
             .int => .int,
             .bigint => .bigint,
             .boolean => .boolean,
-            .varchar, .string, .char => .text,
+            .varchar, .string, .char, .json => .text,
             .float => .float,
             .double => .double,
             .date => .date,

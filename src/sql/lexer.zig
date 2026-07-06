@@ -134,6 +134,8 @@ pub const TokenTag = enum {
     minus, // -
     slash, // /
     percent, // %
+    arrow, // -> (MySQL JSON extract: JSON_EXTRACT)
+    arrow2, // ->> (MySQL JSON extract + unquote: JSON_UNQUOTE(JSON_EXTRACT))
     pipe_pipe, // || (PG/ANSI string concat; MySQL logical OR)
     coloncolon, // :: (PG cast operator)
     comma, // ,
@@ -250,6 +252,15 @@ pub const Lexer = struct {
             // arithmetic operator.
             '-' => {
                 self.pos += 1;
+                // `->` / `->>` MySQL JSON extraction operators.
+                if (self.pos < self.src.len and self.src[self.pos] == '>') {
+                    self.pos += 1;
+                    if (self.pos < self.src.len and self.src[self.pos] == '>') {
+                        self.pos += 1;
+                        return Token{ .tag = .arrow2, .text = self.src[start..self.pos] };
+                    }
+                    return Token{ .tag = .arrow, .text = self.src[start..self.pos] };
+                }
                 return Token{ .tag = .minus, .text = self.src[start..self.pos] };
             },
             '/' => {

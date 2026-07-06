@@ -1839,6 +1839,7 @@ fn allocMysqlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
         .varchar => |n| std.fmt.allocPrint(allocator, "varchar({d})", .{n}),
         .char => |n| std.fmt.allocPrint(allocator, "char({d})", .{n}),
         .string => allocator.dupe(u8, "text"),
+        .json => allocator.dupe(u8, "json"),
     };
 }
 
@@ -1880,6 +1881,7 @@ fn allocInfoDataType(allocator: Allocator, t: types.Type) ![]u8 {
         .uuid => allocator.dupe(u8, "char"),
         .varchar => allocator.dupe(u8, "varchar"),
         .char => allocator.dupe(u8, "char"),
+        .json => allocator.dupe(u8, "json"),
         .string => allocator.dupe(u8, "text"),
     };
 }

@@ -1075,6 +1075,8 @@ test {
     _ = UdfAggregate;
     _ = @import("exec_test.zig");
     _ = @import("scalar_fn_test.zig");
+    _ = @import("scalar_fn_json.zig");
+    _ = @import("json_binary.zig");
     _ = @import("cast.zig");
     _ = LateScan;
     _ = ZonemapTopN;

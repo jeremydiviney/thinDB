@@ -108,7 +108,7 @@ pub fn routeRadixGroupBy(
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc) orelse return null;
         switch (schema[idx].type) {
-            .varchar, .string, .char => return null,
+            .varchar, .string, .char, .json => return null,
             else => {},
         }
     }

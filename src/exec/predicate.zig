@@ -1069,6 +1069,7 @@ fn compareCellToValue(view: ColumnView, idx: usize, op: PredicateOp, ref: Value)
         .varchar => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
         .string => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
         .char => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
+        .json => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
     };
 }
 
@@ -1282,7 +1283,7 @@ fn extractValueFromView(view: anytype, idx: usize) !Value {
         .decimal128 => |s| .{ .decimal128 = s[idx] },
         .uuid => |s| .{ .uuid = s[idx] },
         // Strings aren't supported in range comparisons.
-        .varchar, .string, .char => Error.UnsupportedOperatorForType,
+        .varchar, .string, .char, .json => Error.UnsupportedOperatorForType,
     };
 }
 
@@ -1366,6 +1367,7 @@ fn cellMatchesValue(view: ColumnView, idx: usize, ref: Value) bool {
         .varchar => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
         .string => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
         .char => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
+        .json => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
     };
 }
 
@@ -1411,6 +1413,7 @@ pub fn evaluateInSetMask(view: ColumnView, values: []const Value, negate: bool, 
         .varchar => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
         .string => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
         .char => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
+        .json => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
         else => return Error.UnsupportedOperatorForType,
     }
 }
@@ -1494,18 +1497,28 @@ pub fn evaluateColColMask(left: ColumnView, right: ColumnView, op: PredicateOp, 
             .varchar => |r| stringCmpCol(l, r, op, n, mask),
             .string => |r| stringCmpCol(l, r, op, n, mask),
             .char => |r| stringCmpCol(l, r, op, n, mask),
+            .json => |r| stringCmpCol(l, r, op, n, mask),
             else => unreachable,
         },
         .string => |l| switch (right.data) {
             .varchar => |r| stringCmpCol(l, r, op, n, mask),
             .string => |r| stringCmpCol(l, r, op, n, mask),
             .char => |r| stringCmpCol(l, r, op, n, mask),
+            .json => |r| stringCmpCol(l, r, op, n, mask),
             else => unreachable,
         },
         .char => |l| switch (right.data) {
             .varchar => |r| stringCmpCol(l, r, op, n, mask),
             .string => |r| stringCmpCol(l, r, op, n, mask),
             .char => |r| stringCmpCol(l, r, op, n, mask),
+            .json => |r| stringCmpCol(l, r, op, n, mask),
+            else => unreachable,
+        },
+        .json => |l| switch (right.data) {
+            .varchar => |r| stringCmpCol(l, r, op, n, mask),
+            .string => |r| stringCmpCol(l, r, op, n, mask),
+            .char => |r| stringCmpCol(l, r, op, n, mask),
+            .json => |r| stringCmpCol(l, r, op, n, mask),
             else => unreachable,
         },
     }
@@ -1539,7 +1552,7 @@ pub fn evaluateLikeMask(view: ColumnView, pattern: []const u8, n: usize, mask: [
     // Compile the pattern once per batch, then match each row against the plan.
     const plan = compileLike(pattern);
     switch (view.data) {
-        .varchar, .string, .char => |sv| {
+        .varchar, .string, .char, .json => |sv| {
             if (active) |act| {
                 for (0..n) |i| mask[i] = act[i] and view.isValid(i) and plan.match(sv.rowBytes(i));
             } else {
@@ -1558,7 +1571,7 @@ pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bo
         .int => |s| cmpInto(i32, s[0..n], p.val.int, mask[0..n], op),
         .bigint => |s| cmpInto(i64, s[0..n], p.val.bigint, mask[0..n], op),
         .boolean => |s| cmpInto(u8, s[0..n], @intFromBool(p.val.boolean), mask[0..n], op),
-        .varchar, .char => |sv| {
+        .varchar, .char, .json => |sv| {
             if (p.val.text.len == 0 and (op == .eq or op == .neq)) {
                 emptyStringMask(sv, op == .eq, n, mask[0..n]);
             } else {
@@ -1674,7 +1687,7 @@ pub fn typeHasRange(t: types.Type) bool {
         .int, .bigint, .smallint, .tinyint, .largeint => true,
         .boolean, .date, .datetime => true,
         .decimal64, .decimal128 => true,
-        .varchar, .string, .char, .uuid, .float, .double => false,
+        .varchar, .string, .char, .json, .uuid, .float, .double => false,
     };
 }
 

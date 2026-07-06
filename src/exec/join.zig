@@ -61,7 +61,7 @@ fn keyValueAt(v: ColumnView, row: usize) ?types.Value {
         .double => |s| .{ .double = s[row] },
         .decimal64 => |s| .{ .decimal64 = s[row] },
         .largeint => |s| .{ .largeint = s[row] },
-        .varchar, .string, .char => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
+        .varchar, .string, .char, .json => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
         else => null,
     };
 }
@@ -327,7 +327,7 @@ fn commonJoinKeyTag(left: TypeTag, right: TypeTag) ?TypeTag {
 fn canStringifyJoinKey(tag: TypeTag) bool {
     return switch (tag) {
         .int, .bigint, .double, .boolean => true,
-        .string, .varchar, .char => true,
+        .string, .varchar, .char, .json => true,
         else => false,
     };
 }
@@ -366,7 +366,7 @@ const FastKeyKind = enum { int, string, compound };
 fn fastKindOfType(t: TypeTag) ?FastKeyKind {
     return switch (t) {
         .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
-        .varchar, .string, .char => .string,
+        .varchar, .string, .char, .json => .string,
         else => null,
     };
 }
@@ -381,7 +381,7 @@ const MAX_FAST_KEYS: usize = 8;
 fn fastCellDigest(view: ColumnView, row: u32) u64 {
     return switch (view.data) {
         .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => fastIntKey(view, row),
-        .varchar, .string, .char => std.hash.Wyhash.hash(0, stringRowBytes(view, row)),
+        .varchar, .string, .char, .json => std.hash.Wyhash.hash(0, stringRowBytes(view, row)),
         else => unreachable,
     };
 }
@@ -463,7 +463,7 @@ fn fastIntKey(view: ColumnView, row: u32) u64 {
 
 fn stringRowBytes(view: ColumnView, row: u32) []const u8 {
     return switch (view.data) {
-        .varchar, .string, .char => |sv| sv.rowBytes(row),
+        .varchar, .string, .char, .json => |sv| sv.rowBytes(row),
         else => unreachable,
     };
 }
@@ -1434,7 +1434,7 @@ pub const Join = struct {
         const key_view = self.build_columns[build_key_indices[0]].view();
         const kind: FastKeyKind = if (build_key_indices.len > 1) .compound else switch (key_view.data) {
             .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
-            .varchar, .string, .char => .string,
+            .varchar, .string, .char, .json => .string,
             else => return,
         };
         var key_views: []ColumnView = &.{};
@@ -2467,7 +2467,7 @@ fn columnIndex(schema: []const Column, name: []const u8) ?usize {
 
 fn isStringTag(t: TypeTag) bool {
     return switch (t) {
-        .varchar, .string, .char => true,
+        .varchar, .string, .char, .json => true,
         else => false,
     };
 }
@@ -2505,7 +2505,7 @@ fn buildCompoundKey(
             .decimal64 => |s| try appendInt(allocator, out, i64, s[row]),
             .decimal128 => |s| try appendInt(allocator, out, i128, s[row]),
             .uuid => |s| try appendInt(allocator, out, u128, s[row]),
-            .varchar, .string, .char => |sv| {
+            .varchar, .string, .char, .json => |sv| {
                 const bytes = sv.rowBytes(row);
                 try appendBits(allocator, out, u32, @intCast(bytes.len));
                 try out.appendSlice(allocator, bytes);
@@ -2551,6 +2551,7 @@ pub fn compareCellsOp(left: ColumnView, lrow: u32, right: ColumnView, rrow: u32,
         .varchar => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.varchar.rowBytes(rrow), op),
         .string => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.string.rowBytes(rrow), op),
         .char => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.char.rowBytes(rrow), op),
+        .json => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.json.rowBytes(rrow), op),
     }
 }
 

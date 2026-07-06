@@ -137,7 +137,7 @@ fn isFloatType(t: Type) bool {
 
 fn isStringType(t: Type) bool {
     return switch (t) {
-        .varchar, .string, .char => true,
+        .varchar, .string, .char, .json => true,
         else => false,
     };
 }
@@ -563,7 +563,7 @@ fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
         } else {
             const dict = w.dicts[part_i].?;
             const sv = switch (batch.values[ci].data) {
-                .varchar, .string, .char => |s| s,
+                .varchar, .string, .char, .json => |s| s,
                 else => return error.UnsupportedQueryShape,
             };
             for (keys, 0..) |*k, r| {
@@ -1498,7 +1498,7 @@ fn appendInt(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i12
 
 fn appendString(allocator: Allocator, col: *ColumnStore, s: []const u8) !void {
     switch (col.data) {
-        .varchar, .string, .char => |*ss| try ss.appendValue(allocator, s),
+        .varchar, .string, .char, .json => |*ss| try ss.appendValue(allocator, s),
         else => return error.TypeMismatch,
     }
 }

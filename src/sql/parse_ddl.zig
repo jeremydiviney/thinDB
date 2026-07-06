@@ -701,6 +701,7 @@ pub fn parseColumnType(p: anytype) !types.Type {
     // timestamptz is accepted as a synonym; thinDB datetimes are UTC-naive.
     if (asciiEqlAny(name, &.{ "datetime", "timestamp", "timestamptz" })) return .datetime;
     if (asciiEqlAny(name, &.{"uuid"})) return .uuid;
+    if (asciiEqlAny(name, &.{ "json", "jsonb" })) return .json;
     return PE.SqlExpectedKeyword;
 }
 

@@ -192,7 +192,7 @@ pub const PartitionedAggregate = struct {
             .uuid => |s| for (hashes, s[0..hashes.len], 0..) |*h, v, row| {
                 h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) (@as(u64, @truncate(v)) ^ @as(u64, @truncate(v >> 64))) else NULL_SENTINEL));
             },
-            .varchar, .string, .char => |sv| for (hashes, 0..) |*h, row| {
+            .varchar, .string, .char, .json => |sv| for (hashes, 0..) |*h, row| {
                 h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) std.hash.Wyhash.hash(0, sv.rowBytes(row)) else NULL_SENTINEL));
             },
         }

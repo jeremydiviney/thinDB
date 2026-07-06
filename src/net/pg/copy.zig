@@ -265,7 +265,7 @@ fn cellToValue(col: Column, text: ?[]const u8) !?Value {
         .boolean => Value{ .boolean = try parseBoolText(s) },
         .float => Value{ .float = std.fmt.parseFloat(f32, s) catch return Error.CopyMalformedRow },
         .double => Value{ .double = std.fmt.parseFloat(f64, s) catch return Error.CopyMalformedRow },
-        .date, .datetime, .uuid, .decimal64, .decimal128, .varchar, .string, .char => Value{ .text = s },
+        .date, .datetime, .uuid, .decimal64, .decimal128, .varchar, .string, .char, .json => Value{ .text = s },
     };
 }
 
@@ -400,7 +400,7 @@ fn formatCellText(
             var buf: [40]u8 = undefined;
             try out.appendSlice(allocator, try wire_format.formatUuid(&buf, s[row]));
         },
-        .string, .varchar, .char => |sv| try out.appendSlice(allocator, sv.rowBytes(row)),
+        .string, .varchar, .char, .json => |sv| try out.appendSlice(allocator, sv.rowBytes(row)),
     }
 }
 

@@ -315,6 +315,7 @@ fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {
         .varchar => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
         .string => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
         .char => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
+        .json => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
     };
 }
 
@@ -336,6 +337,7 @@ fn extractScalarValueAt(allocator: Allocator, view: storage.ColumnView, idx: usi
         .varchar => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
         .string => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
         .char => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
+        .json => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
     };
 }
 

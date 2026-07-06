@@ -70,6 +70,7 @@ fn cellOf(arena: std.mem.Allocator, v: ColumnView, row: usize) !Cell {
         .varchar => |s| .{ .str = try arena.dupe(u8, s.rowBytes(row)) },
         .string => |s| .{ .str = try arena.dupe(u8, s.rowBytes(row)) },
         .char => |s| .{ .str = try arena.dupe(u8, s.rowBytes(row)) },
+        .json => |s| .{ .str = try arena.dupe(u8, s.rowBytes(row)) },
     };
 }
 

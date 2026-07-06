@@ -186,7 +186,7 @@ const VALIDATE_MAIN =
     \\                .double => |*l| try l.append(allocator, @floatFromInt(i)),
     \\                .boolean => |*l| try l.append(allocator, 0),
     \\                .uuid => |*l| try l.append(allocator, @intCast(i)),
-    \\                .varchar, .string, .char => |*sv| try sv.appendValue(allocator, "x"),
+    \\                .varchar, .string, .char, .json => |*sv| try sv.appendValue(allocator, "x"),
     \\            }
     \\            if (st.nulls != null) try st.appendValidBit(allocator, st.rowCount() - 1, true);
     \\        }
@@ -231,7 +231,7 @@ const VALIDATE_MAIN =
     \\            .boolean => .{ .boolean = true },
     \\            .date => .{ .date = 1 },
     \\            .datetime => .{ .datetime = 1 },
-    \\            .varchar, .string, .char => .{ .text = "x" },
+    \\            .varchar, .string, .char, .json => .{ .text = "x" },
     \\            .uuid => .{ .uuid = 1 },
     \\            else => .{ .bigint = 1 },
     \\        };

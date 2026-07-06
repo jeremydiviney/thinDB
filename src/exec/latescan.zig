@@ -369,7 +369,7 @@ fn appendDictRows(
     const db = storage.segment_reader.dictBlockOf(values, row_count);
     const dst_start = out.data.rowCount();
     switch (out.data) {
-        .varchar, .string, .char => |*ss| {
+        .varchar, .string, .char, .json => |*ss| {
             for (offsets) |off| try ss.appendValue(allocator, db.dictValue(db.rowCode(off)));
         },
         else => unreachable, // the writer only dict-encodes string-family columns
@@ -405,7 +405,7 @@ fn appendFsstRows(
     defer scratch.deinit(allocator);
     const dst_start = out.data.rowCount();
     switch (out.data) {
-        .varchar, .string, .char => |*ss| {
+        .varchar, .string, .char, .json => |*ss| {
             for (offsets) |off| {
                 const comp = fb.rowComp(off);
                 try scratch.resize(allocator, storage.fsst.decodedSizeBound(comp.len));

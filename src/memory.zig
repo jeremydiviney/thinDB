@@ -201,7 +201,7 @@ pub fn estimateColumnBytes(t: types.Type) usize {
         .int, .date, .float => 4,
         .bigint, .datetime, .decimal64, .double => 8,
         .largeint, .decimal128, .uuid => 16,
-        .varchar, .string, .char => 32,
+        .varchar, .string, .char, .json => 32,
     };
 }
 

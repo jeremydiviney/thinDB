@@ -206,6 +206,19 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
     var col_dup = try parseQualifiedColRef(p);
 
+    // JSON extraction on the LHS: `doc->'$.x' op rhs` / `doc->>'$.x' op rhs`.
+    // Desugars to a json_extract/json_value call and routes through the
+    // generic expression-comparison path.
+    if (p.cur.tag == .arrow or p.cur.tag == .arrow2) {
+        const lhs = try p.consumeJsonArrows(.{ .col_ref = col_dup });
+        if (!isComparisonToken(p.cur.tag)) {
+            return try makeExprComparisonPredicate(p, lhs, .eq, .{ .lit = .{ .boolean = true } });
+        }
+        const op = try parseComparisonToken(p);
+        const rhs = try p.parseAddSub();
+        return try makeExprComparisonPredicate(p, lhs, op, rhs);
+    }
+
     // Aggregate reference inside a predicate — only meaningful in HAVING
     // (e.g. `HAVING COUNT(*) > 100000`). Canonicalize to the aggregate's
     // output-column name; a post-parse pass rewrites it to the matching

@@ -1291,7 +1291,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
 
 fn isStringKeyType(t: Type) bool {
     return switch (t) {
-        .varchar, .string, .char => true,
+        .varchar, .string, .char, .json => true,
         else => false,
     };
 }

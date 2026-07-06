@@ -2857,7 +2857,7 @@ fn genericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storag
 
 inline fn updateKeyHash(h: *std.hash.Wyhash, view: thindb.storage.ColumnView, typ: thindb.types.Type, row: usize) void {
     switch (view.data) {
-        .string, .varchar, .char => |sv| h.update(sv.rowBytes(row)),
+        .string, .varchar, .char, .json => |sv| h.update(sv.rowBytes(row)),
         else => {
             const bits = readGenericKeyBits(view, typ, row) catch 0;
             h.update(std.mem.asBytes(&bits));
@@ -2889,7 +2889,7 @@ fn hashGenericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.st
             if (tag[0] == 0) continue;
         }
         switch (key_views[i].data) {
-            .string, .varchar, .char => |sv| {
+            .string, .varchar, .char, .json => |sv| {
                 const d: u128 = if (key_digests[i]) |ds| ds[row] else thindb.exec.stringKeyDigest(sv.rowBytes(row));
                 lo.update(std.mem.asBytes(&d));
                 hi.update(std.mem.asBytes(&d));
@@ -2987,7 +2987,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         for (layout.str_columns, 0..) |sc, i| {
             const view = batch.columnView(sc.source_name) orelse return error.ColumnNotFound;
             str_views_buf[i] = switch (view.data) {
-                .varchar, .string, .char => |sv| sv,
+                .varchar, .string, .char, .json => |sv| sv,
                 else => return error.TypeMismatch,
             };
             str_nulls_buf[i] = view.nulls;

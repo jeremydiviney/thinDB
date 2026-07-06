@@ -2028,6 +2028,7 @@ fn appendCellFromView(
                 .varchar => |sv| sv.rowBytes(src_idx),
                 .string => |sv| sv.rowBytes(src_idx),
                 .char => |sv| sv.rowBytes(src_idx),
+                .json => |sv| sv.rowBytes(src_idx),
                 else => unreachable,
             };
             try s.appendValue(allocator, bytes);
@@ -2037,6 +2038,7 @@ fn appendCellFromView(
                 .varchar => |sv| sv.rowBytes(src_idx),
                 .string => |sv| sv.rowBytes(src_idx),
                 .char => |sv| sv.rowBytes(src_idx),
+                .json => |sv| sv.rowBytes(src_idx),
                 else => unreachable,
             };
             try s.appendValue(allocator, bytes);
@@ -2046,6 +2048,17 @@ fn appendCellFromView(
                 .varchar => |sv| sv.rowBytes(src_idx),
                 .string => |sv| sv.rowBytes(src_idx),
                 .char => |sv| sv.rowBytes(src_idx),
+                .json => |sv| sv.rowBytes(src_idx),
+                else => unreachable,
+            };
+            try s.appendValue(allocator, bytes);
+        },
+        .json => |*s| {
+            const bytes = switch (src.data) {
+                .varchar => |sv| sv.rowBytes(src_idx),
+                .string => |sv| sv.rowBytes(src_idx),
+                .char => |sv| sv.rowBytes(src_idx),
+                .json => |sv| sv.rowBytes(src_idx),
                 else => unreachable,
             };
             try s.appendValue(allocator, bytes);

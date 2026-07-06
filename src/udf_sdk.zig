@@ -262,7 +262,7 @@ fn scalarSlice(comptime T: type, view: ColumnView) []const T {
 
 fn stringViewOf(view: ColumnView) StringView {
     return switch (view.data) {
-        .varchar, .string, .char => |s| s,
+        .varchar, .string, .char, .json => |s| s,
         else => unreachable,
     };
 }
@@ -395,7 +395,7 @@ pub fn Writer(comptime Output: type) type {
                 Date => try store.data.date.append(alloc, v.days()),
                 DateTime => try store.data.datetime.append(alloc, v.micros()),
                 []const u8 => switch (store.data) {
-                    .varchar, .string, .char => |*s| try s.appendValue(alloc, v),
+                    .varchar, .string, .char, .json => |*s| try s.appendValue(alloc, v),
                     else => unreachable,
                 },
                 else => comptime unreachable,

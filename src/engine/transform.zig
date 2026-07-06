@@ -55,6 +55,7 @@ pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
         .varchar => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
         .string => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
         .char => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
+        .json => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
         .tinyint => |l| std.math.order(l.items[a], l.items[b]),
         .smallint => |l| std.math.order(l.items[a], l.items[b]),
         .largeint => |l| std.math.order(l.items[a], l.items[b]),
@@ -81,6 +82,7 @@ pub fn compareViewRows(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.m
         .varchar => |s| std.mem.order(u8, s.rowBytes(a), vb.data.varchar.rowBytes(b)),
         .string => |s| std.mem.order(u8, s.rowBytes(a), vb.data.string.rowBytes(b)),
         .char => |s| std.mem.order(u8, s.rowBytes(a), vb.data.char.rowBytes(b)),
+        .json => |s| std.mem.order(u8, s.rowBytes(a), vb.data.json.rowBytes(b)),
         .tinyint => |l| std.math.order(l[a], vb.data.tinyint[b]),
         .smallint => |l| std.math.order(l[a], vb.data.smallint[b]),
         .largeint => |l| std.math.order(l[a], vb.data.largeint[b]),
@@ -119,6 +121,7 @@ pub fn subViewAligned(v: ColumnView, off: usize, n: usize) ColumnView {
         .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .json => |sv| .{ .data = .{ .json = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
     };
 }
 
@@ -147,7 +150,7 @@ pub fn appendAllColumn(
         // union / stage boundary may reconcile varchar/char data under a
         // `string` schema tag while streaming the arm's views uncast (see
         // set_union.zig sameRepr), so exact-tag matching would be wrong.
-        .varchar, .string, .char => |sv| {
+        .varchar, .string, .char, .json => |sv| {
             for (0..sv.rowCount()) |i| try appendStrValue(allocator, out, sv.rowBytes(i));
         },
         .float => |s| switch (out.data) {
@@ -267,6 +270,7 @@ pub fn appendColumnRange(
         .varchar => |sv| try appendStrRange(allocator, out, sv, start, end),
         .string => |sv| try appendStrRange(allocator, out, sv, start, end),
         .char => |sv| try appendStrRange(allocator, out, sv, start, end),
+        .json => |sv| try appendStrRange(allocator, out, sv, start, end),
     }
     if (out.nulls != null) {
         try out.appendValidityRangeFrom(allocator, dst_start, view.nulls, start, n);
@@ -296,9 +300,9 @@ pub fn prepareAppend(allocator: Allocator, view: ColumnView, n: usize, out: *Col
     const base_row = out.data.rowCount();
     var prep = PreparedAppend{ .base_row = base_row };
     switch (view.data) {
-        .varchar, .string, .char => |sv| {
+        .varchar, .string, .char, .json => |sv| {
             const ss = switch (out.data) {
-                .varchar, .string, .char => |*s| s,
+                .varchar, .string, .char, .json => |*s| s,
                 else => unreachable,
             };
             const total: usize = sv.offsets[n] - sv.offsets[0];
@@ -312,7 +316,7 @@ pub fn prepareAppend(allocator: Allocator, view: ColumnView, n: usize, out: *Col
         },
         else => {
             switch (out.data) {
-                .varchar, .string, .char => unreachable,
+                .varchar, .string, .char, .json => unreachable,
                 inline else => |*list| try list.resize(allocator, base_row + n),
             }
         },
@@ -330,9 +334,9 @@ pub fn prepareAppend(allocator: Allocator, view: ColumnView, n: usize, out: *Col
 pub fn writeAppendSlice(view: ColumnView, lo: usize, hi: usize, out: *ColumnStore, prep: PreparedAppend) void {
     if (hi <= lo) return;
     switch (view.data) {
-        .varchar, .string, .char => |sv| {
+        .varchar, .string, .char, .json => |sv| {
             const ss = switch (out.data) {
-                .varchar, .string, .char => |*s| s,
+                .varchar, .string, .char, .json => |*s| s,
                 else => unreachable,
             };
             const src0 = sv.offsets[0];
@@ -372,7 +376,7 @@ pub fn writeAppendSlice(view: ColumnView, lo: usize, hi: usize, out: *ColumnStor
 
 fn writeFixedSlice(comptime T: type, s: []const T, lo: usize, hi: usize, out: *ColumnStore, prep: PreparedAppend) void {
     switch (out.data) {
-        .varchar, .string, .char => unreachable,
+        .varchar, .string, .char, .json => unreachable,
         inline else => |*list| {
             if (comptime std.meta.Child(@TypeOf(list.items)) == T) {
                 @memcpy(list.items[prep.base_row + lo ..][0 .. hi - lo], s[lo..hi]);
@@ -386,6 +390,7 @@ inline fn appendStrRange(allocator: Allocator, out: *ColumnStore, sv: storage.St
         .varchar => |*ss| try ss.appendRange(allocator, sv, start, end),
         .string => |*ss| try ss.appendRange(allocator, sv, start, end),
         .char => |*ss| try ss.appendRange(allocator, sv, start, end),
+        .json => |*ss| try ss.appendRange(allocator, sv, start, end),
         else => unreachable,
     }
 }
@@ -401,6 +406,7 @@ inline fn appendStrValue(allocator: Allocator, out: *ColumnStore, bytes: []const
         .varchar => |*ss| try ss.appendValue(allocator, bytes),
         .string => |*ss| try ss.appendValue(allocator, bytes),
         .char => |*ss| try ss.appendValue(allocator, bytes),
+        .json => |*ss| try ss.appendValue(allocator, bytes),
         else => unreachable,
     }
 }
@@ -411,7 +417,7 @@ inline fn appendStrValue(allocator: Allocator, out: *ColumnStore, bytes: []const
 /// only when the column is (or would go) wide.
 fn gatherStrByIndices(allocator: Allocator, sv: storage.StringView, indices: []const u32, out: *ColumnStore) !void {
     const ss = switch (out.data) {
-        .varchar, .string, .char => |*s| s,
+        .varchar, .string, .char, .json => |*s| s,
         else => unreachable,
     };
     var total: usize = 0;
@@ -478,6 +484,7 @@ pub fn appendOneRow(
             else => unreachable,
         },
         .char => |sv| try appendStrValue(allocator, out, sv.rowBytes(row)),
+        .json => |sv| try appendStrValue(allocator, out, sv.rowBytes(row)),
         .decimal64 => |s| switch (out.data) {
             .decimal64 => |*list| try list.append(allocator, s[row]),
             else => unreachable,
@@ -581,6 +588,7 @@ pub fn appendByIndices(
             else => unreachable,
         },
         .char => |sv| try gatherStrByIndices(allocator, sv, indices, out),
+        .json => |sv| try gatherStrByIndices(allocator, sv, indices, out),
         .decimal64 => |s| switch (out.data) {
             .decimal64 => |*list| {
                 try list.ensureUnusedCapacity(allocator, indices.len);
@@ -683,6 +691,7 @@ pub fn appendMaskedColumn(
         .varchar => |sv| try appendMaskedStringy(allocator, sv, mask, out),
         .string => |sv| try appendMaskedStringy(allocator, sv, mask, out),
         .char => |sv| try appendMaskedStringy(allocator, sv, mask, out),
+        .json => |sv| try appendMaskedStringy(allocator, sv, mask, out),
         .float => |s| switch (out.data) {
             .float => |*list| try compactInto(f32, allocator, s, mask, list),
             else => unreachable,
@@ -750,7 +759,7 @@ fn appendMaskedStringy(allocator: Allocator, sv: anytype, mask: []const bool, ou
     const n = mask.len;
     const src_span: usize = if (n == 0) 0 else sv.offsets[n] - sv.offsets[0];
     switch (out.data) {
-        .varchar, .string, .char => |*ss| {
+        .varchar, .string, .char, .json => |*ss| {
             try ss.ensureUnusedValueCapacity(allocator, n, src_span);
             for (mask, 0..) |m, row| {
                 if (m) ss.appendValueAssumeCapacity(sv.rowBytes(row));
@@ -845,6 +854,12 @@ pub fn applyPermutation(
             errdefer dst.deinit(allocator);
             for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
             break :blk DataStore{ .char = dst };
+        },
+        .json => |s| blk: {
+            var dst = try StringStore.init(allocator);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
+            break :blk DataStore{ .json = dst };
         },
         .decimal64 => |l| blk: {
             var dst: std.ArrayList(i64) = try .initCapacity(allocator, perm.len);

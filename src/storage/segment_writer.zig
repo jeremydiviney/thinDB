@@ -26,7 +26,7 @@ const null_hash: u64 = 0x9E3779B97F4A7C15;
 
 fn hashCell(view: ColumnView, row: usize) u64 {
     switch (view.data) {
-        .varchar, .string, .char => |sv| return std.hash.Wyhash.hash(0, sv.rowBytes(row)),
+        .varchar, .string, .char, .json => |sv| return std.hash.Wyhash.hash(0, sv.rowBytes(row)),
         // Full-value 64-bit hash (not a truncated prefix) so two distinct
         // values never collapse — under-counting would wrongly make a
         // high-cardinality field look hashable.
@@ -895,7 +895,7 @@ fn tryEncodeDict(
     row_end: usize,
 ) !bool {
     const sv: StringView = switch (view.data) {
-        .varchar, .string, .char => |s| s,
+        .varchar, .string, .char, .json => |s| s,
         else => return false,
     };
 
@@ -1002,7 +1002,7 @@ const lz4_string_min_block_bytes: usize = 64 * 1024;
 /// strings-only: that's where the resident bytes live).
 fn isStringView(view: ColumnView) bool {
     return switch (view.data) {
-        .varchar, .string, .char => true,
+        .varchar, .string, .char, .json => true,
         else => false,
     };
 }
@@ -1040,7 +1040,7 @@ fn tryEncodeFsst(
     threads: usize,
 ) !bool {
     const sv: StringView = switch (view.data) {
-        .varchar, .string, .char => |s| s,
+        .varchar, .string, .char, .json => |s| s,
         else => return false,
     };
     const n = row_end - row_start;
@@ -1329,6 +1329,7 @@ fn writeRawColumnBlock(
             }
         },
         .char => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
+        .json => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
         .decimal64 => |data| {
             const slice = data[row_start..row_end];
             try buf.ensureUnusedCapacity(allocator, slice.len * 8);
@@ -1386,7 +1387,7 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
         },
         // Strings store the prefix-encoded i128 of the first 16 bytes of each
         // row's value. See `format.encodeStringPrefix`.
-        .varchar, .string, .char => |sv| computeStringStats(view, sv, row_start, row_end),
+        .varchar, .string, .char, .json => |sv| computeStringStats(view, sv, row_start, row_end),
         // Floats: order-preserving bit transform, NaN skipped. See
         // `format.encodeFloatOrder`.
         .float => |d| extentFloat(f32, view, d, row_start, row_end),

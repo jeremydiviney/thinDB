@@ -418,6 +418,7 @@ pub const DataStore = union(TypeTag) {
     decimal64: std.ArrayList(i64),
     decimal128: std.ArrayList(i128),
     uuid: std.ArrayList(u128),
+    json: StringStore,
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return initCapacity(allocator, t, 0, 0);
@@ -446,6 +447,7 @@ pub const DataStore = union(TypeTag) {
             .decimal64 => .{ .decimal64 = try ensuredCapList(i64, allocator, rows_cap) },
             .decimal128 => .{ .decimal128 = try ensuredCapList(i128, allocator, rows_cap) },
             .uuid => .{ .uuid = try ensuredCapList(u128, allocator, rows_cap) },
+            .json => .{ .json = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
         };
     }
 
@@ -473,6 +475,7 @@ pub const DataStore = union(TypeTag) {
             .decimal64 => |*list| list.deinit(allocator),
             .decimal128 => |*list| list.deinit(allocator),
             .uuid => |*list| list.deinit(allocator),
+            .json => |*ss| ss.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -495,6 +498,7 @@ pub const DataStore = union(TypeTag) {
             .decimal64 => |l| l.items.len,
             .decimal128 => |l| l.items.len,
             .uuid => |l| l.items.len,
+            .json => |s| s.rowCount(),
         };
     }
 
@@ -516,6 +520,7 @@ pub const DataStore = union(TypeTag) {
             .decimal64 => |l| .{ .decimal64 = l.items },
             .decimal128 => |l| .{ .decimal128 = l.items },
             .uuid => |l| .{ .uuid = l.items },
+            .json => |s| .{ .json = s.view() },
         };
     }
 
@@ -537,6 +542,7 @@ pub const DataStore = union(TypeTag) {
             .decimal64 => |*l| l.clearRetainingCapacity(),
             .decimal128 => |*l| l.clearRetainingCapacity(),
             .uuid => |*l| l.clearRetainingCapacity(),
+            .json => |*s| s.clear(),
         }
     }
 
@@ -561,6 +567,7 @@ pub const DataStore = union(TypeTag) {
             .decimal64 => |*l| try l.append(allocator, 0),
             .decimal128 => |*l| try l.append(allocator, 0),
             .uuid => |*l| try l.append(allocator, 0),
+            .json => |*s| try s.appendValue(allocator, ""),
         }
     }
 
@@ -584,6 +591,7 @@ pub const DataStore = union(TypeTag) {
             .decimal64 => |*l| try l.appendNTimes(allocator, 0, n),
             .decimal128 => |*l| try l.appendNTimes(allocator, 0, n),
             .uuid => |*l| try l.appendNTimes(allocator, 0, n),
+            .json => |*s| try s.appendEmptyValues(allocator, n),
         }
     }
 };

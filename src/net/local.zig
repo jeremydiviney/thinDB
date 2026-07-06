@@ -1591,7 +1591,7 @@ fn analyzeProjection(allocator: Allocator, root: *const ir.Op) ?[][]const u8 {
 /// coded 32-bit field) so the gate's fit pre-check matches `planIntKey` exactly.
 fn codedKeyBits(t: types.Type) ?u16 {
     return switch (t) {
-        .varchar, .string, .char => 32,
+        .varchar, .string, .char, .json => 32,
         .boolean, .tinyint => 8,
         .smallint => 16,
         .int, .date => 32,
@@ -2462,7 +2462,7 @@ pub const InsertColumnBuilder = struct {
                 .smallint => 2,
                 .tinyint, .boolean => 1,
                 .largeint, .decimal128, .uuid => 16,
-                .varchar, .string, .char => 0,
+                .varchar, .string, .char, .json => 0,
             };
             fixed_slabs[i] = if (per_row == 0)
                 &[_]u8{}
@@ -2546,7 +2546,7 @@ pub const InsertColumnBuilder = struct {
             .smallint => self.fixed_cursor[col_idx] / 2,
             .tinyint, .boolean => self.fixed_cursor[col_idx],
             .largeint, .decimal128, .uuid => self.fixed_cursor[col_idx] / 16,
-            .varchar, .string, .char => self.string_offsets[col_idx].items.len - 1,
+            .varchar, .string, .char, .json => self.string_offsets[col_idx].items.len - 1,
         };
     }
 
@@ -2557,7 +2557,7 @@ pub const InsertColumnBuilder = struct {
             .smallint => self.writeFixedZero(col_idx, 2),
             .tinyint, .boolean => self.writeFixedZero(col_idx, 1),
             .largeint, .decimal128, .uuid => self.writeFixedZero(col_idx, 16),
-            .varchar, .string, .char => {
+            .varchar, .string, .char, .json => {
                 const cur = self.string_offsets[col_idx].items[self.string_offsets[col_idx].items.len - 1];
                 try self.string_offsets[col_idx].append(self.allocator, cur);
             },
@@ -2591,7 +2591,7 @@ pub const InsertColumnBuilder = struct {
             .decimal64 => |spec| self.writeFixedInt(col_idx, i64, try coerceToDecimal64(v, spec)),
             .decimal128 => |spec| self.writeFixedInt(col_idx, i128, try coerceToDecimal128(v, spec)),
             .uuid => self.writeFixedInt(col_idx, u128, try coerceToUuid(v)),
-            .varchar, .string, .char => {
+            .varchar, .string, .char, .json => {
                 const s = try coerceToText(v);
                 const sb = &self.string_bytes[col_idx];
                 try sb.appendSlice(self.allocator, s);
@@ -2638,6 +2638,10 @@ pub const InsertColumnBuilder = struct {
                     .bytes = self.string_bytes[i].items,
                 } },
                 .char => .{ .char = .{
+                    .offsets = self.string_offsets[i].items,
+                    .bytes = self.string_bytes[i].items,
+                } },
+                .json => .{ .json = .{
                     .offsets = self.string_offsets[i].items,
                     .bytes = self.string_bytes[i].items,
                 } },

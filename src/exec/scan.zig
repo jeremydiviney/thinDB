@@ -50,6 +50,7 @@ fn subView(v: ColumnView, off: usize, n: usize) ColumnView {
         .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .json => |sv| .{ .data = .{ .json = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
     };
 }
 
@@ -746,7 +747,7 @@ pub const Scan = struct {
             if (!@import("../types.zig").columnNameEql(col.name, name)) continue;
             if (col.nullable) return null;
             switch (col.type) {
-                .varchar, .string, .char => {},
+                .varchar, .string, .char, .json => {},
                 else => return null,
             }
             const low_card = j < self.cached_stats.len and switch (self.cached_stats[j].ndv) {
@@ -801,7 +802,7 @@ pub const Scan = struct {
             if (!@import("../types.zig").columnNameEql(col.name, name)) continue;
             if (col.nullable) return null;
             return switch (col.type) {
-                .varchar, .string, .char => j,
+                .varchar, .string, .char, .json => j,
                 else => null,
             };
         }
@@ -1387,6 +1388,7 @@ pub const Scan = struct {
             .varchar => .{ .data = .{ .varchar = sc } },
             .string => .{ .data = .{ .string = sc } },
             .char => .{ .data = .{ .char = sc } },
+            .json => .{ .data = .{ .json = sc } },
             else => unreachable,
         };
     }
@@ -1443,7 +1445,7 @@ pub const Scan = struct {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
-                .varchar, .string, .char => |s| s.view(),
+                .varchar, .string, .char, .json => |s| s.view(),
                 else => unreachable,
             };
             for (0..rg_count) |i| codes[i] = try gdict.intern(self.allocator, sv.rowBytes(i));
@@ -1506,7 +1508,7 @@ pub const Scan = struct {
             }
         } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
             const sv = switch (view.data) {
-                .varchar, .string, .char => |s| s,
+                .varchar, .string, .char, .json => |s| s,
                 else => return error.TypeMismatch,
             };
             for (0..rg_count) |i| digests[i] = exec.stringKeyDigest(sv.rowBytes(i));
@@ -1514,7 +1516,7 @@ pub const Scan = struct {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
-                .varchar, .string, .char => |s| s.view(),
+                .varchar, .string, .char, .json => |s| s.view(),
                 else => return error.TypeMismatch,
             };
             for (0..rg_count) |i| digests[i] = exec.stringKeyDigest(sv.rowBytes(i));
@@ -2028,7 +2030,7 @@ pub const Scan = struct {
         }
 
         switch (col_type) {
-            .varchar, .string, .char => {
+            .varchar, .string, .char, .json => {
                 const lit: []const u8 = switch (leaf.val) {
                     .text => |t| t,
                     else => return false,
@@ -2303,7 +2305,7 @@ pub const Scan = struct {
         };
         const col_type = self.table.schema.columns[pred_phys].type;
         switch (col_type) {
-            .varchar, .string, .char => {},
+            .varchar, .string, .char, .json => {},
             else => return false,
         }
 
@@ -2322,7 +2324,7 @@ pub const Scan = struct {
         if (block.encoding == .raw) {
             const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
             const sv = switch (view.data) {
-                .varchar, .string, .char => |s| s,
+                .varchar, .string, .char, .json => |s| s,
                 else => return false,
             };
             const plan = predicate.compileLike(lp.pattern);
@@ -2824,7 +2826,7 @@ pub const Scan = struct {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
-                .varchar, .string, .char => |s| s.view(),
+                .varchar, .string, .char, .json => |s| s.view(),
                 else => unreachable,
             };
             var k: usize = 0;
@@ -2895,7 +2897,7 @@ pub const Scan = struct {
             };
         } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
             const sv = switch (view.data) {
-                .varchar, .string, .char => |s| s,
+                .varchar, .string, .char, .json => |s| s,
                 else => return error.TypeMismatch,
             };
             var k: usize = 0;
@@ -2907,7 +2909,7 @@ pub const Scan = struct {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
-                .varchar, .string, .char => |s| s.view(),
+                .varchar, .string, .char, .json => |s| s.view(),
                 else => return error.TypeMismatch,
             };
             var k: usize = 0;
@@ -2922,7 +2924,7 @@ pub const Scan = struct {
     /// coded group key (downstream reads the sidecar codes, not this column).
     fn fillEmptyStrings(self: *Scan, out: *ColumnStore, n: usize) !void {
         switch (out.data) {
-            .varchar, .string, .char => |*ss| {
+            .varchar, .string, .char, .json => |*ss| {
                 var i: usize = 0;
                 while (i < n) : (i += 1) try ss.appendValue(self.allocator, "");
             },
@@ -3016,7 +3018,7 @@ pub const Scan = struct {
         var scratch: std.ArrayListUnmanaged(u8) = .empty;
         defer scratch.deinit(self.allocator);
         switch (out.data) {
-            .varchar, .string, .char => |*ss| {
+            .varchar, .string, .char, .json => |*ss| {
                 for (mask, 0..) |m, row| {
                     if (!m) continue;
                     const comp = fv.block.rowComp(row);
@@ -3223,7 +3225,7 @@ pub const Scan = struct {
                 try self.code_bufs[j].resize(self.allocator, matched);
                 const codes = self.code_bufs[j].items[0..matched];
                 const sv = switch (src.data) {
-                    .varchar, .string, .char => |s| s,
+                    .varchar, .string, .char, .json => |s| s,
                     else => unreachable,
                 };
                 var k: usize = 0;
@@ -3242,7 +3244,7 @@ pub const Scan = struct {
                 try self.hash_bufs[j].resize(self.allocator, matched);
                 const digests = self.hash_bufs[j].items[0..matched];
                 const sv = switch (src.data) {
-                    .varchar, .string, .char => |s| s,
+                    .varchar, .string, .char, .json => |s| s,
                     else => return error.TypeMismatch,
                 };
                 var k: usize = 0;

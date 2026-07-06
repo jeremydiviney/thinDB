@@ -298,7 +298,7 @@ pub fn typeHasStats(t: @import("../types.zig").Type) bool {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => true,
         .largeint, .decimal128, .uuid => true,
-        .varchar, .string, .char => true,
+        .varchar, .string, .char, .json => true,
         .float, .double => true,
     };
 }
@@ -312,7 +312,7 @@ pub fn sumKindOf(t: @import("../types.zig").Type) SumKind {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => .int,
         .float, .double => .float,
-        .varchar, .string, .char => .string_min,
+        .varchar, .string, .char, .json => .string_min,
         .largeint, .decimal128, .uuid => .none,
     };
 }

@@ -18,6 +18,7 @@ pub const ColumnStore = store.ColumnStore;
 pub const DataStore = store.DataStore;
 
 const transform = @import("transform.zig");
+const json_binary = @import("../exec/json_binary.zig");
 pub const appendAllColumn = transform.appendAllColumn;
 pub const appendByIndices = transform.appendByIndices;
 pub const appendOneRow = transform.appendOneRow;
@@ -29,6 +30,7 @@ pub const Error = error{
     ColumnNotFound,
     TypeMismatch,
     MissingColumn,
+    InvalidJson,
 };
 
 /// Owns the buffers produced by `Memtable.buildSortedSnapshot`. `views`
@@ -167,6 +169,7 @@ pub const Memtable = struct {
                 .smallint => |l| l.items.len * @sizeOf(i16),
                 .largeint => |l| l.items.len * @sizeOf(i128),
                 .char => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
+                .json => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
                 .decimal64 => |l| l.items.len * @sizeOf(i64),
                 .decimal128 => |l| l.items.len * @sizeOf(i128),
                 .uuid => |l| l.items.len * @sizeOf(u128),
@@ -535,7 +538,7 @@ pub const Memtable = struct {
                 .uuid => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
                 else => return Error.TypeMismatch,
             },
-            .varchar, .string, .char => |sv| {
+            .varchar, .string, .char, .json => |sv| {
                 // Honor the wire's null bitmap if present. appendString
                 // always writes valid=true, so for null rows we have to
                 // route through appendNullToColumn instead.
@@ -572,7 +575,7 @@ pub const Memtable = struct {
 
     fn isStringTag(t: types.TypeTag) bool {
         return switch (t) {
-            .varchar, .string, .char => true,
+            .varchar, .string, .char, .json => true,
             else => false,
         };
     }
@@ -804,6 +807,18 @@ pub const Memtable = struct {
             .varchar => |*ss| try ss.appendValue(self.allocator, value),
             .string => |*ss| try ss.appendValue(self.allocator, value),
             .char => |*ss| try ss.appendValue(self.allocator, value),
+            // JSON columns store JSONB. Text inserts are parsed + normalized;
+            // values already in binary form (e.g. from INSERT ... SELECT of a
+            // JSON expression) pass through unchanged.
+            .json => |*ss| {
+                if (json_binary.looksBinary(value)) {
+                    try ss.appendValue(self.allocator, value);
+                } else {
+                    const enc = json_binary.encodeFromText(self.allocator, value) catch return Error.InvalidJson;
+                    defer self.allocator.free(enc);
+                    try ss.appendValue(self.allocator, enc);
+                }
+            },
             else => return Error.TypeMismatch,
         }
         if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);

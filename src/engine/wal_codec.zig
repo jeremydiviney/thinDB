@@ -89,6 +89,7 @@ fn predicateMatches(view: ColumnView, row: u32, op_byte: u8, val: Value) bool {
         .varchar => |sv| cmpStr(sv.rowBytes(row), val.text, op_byte),
         .string => |sv| cmpStr(sv.rowBytes(row), val.text, op_byte),
         .char => |sv| cmpStr(sv.rowBytes(row), val.text, op_byte),
+        .json => |sv| cmpStr(sv.rowBytes(row), val.text, op_byte),
     };
 }
 
@@ -169,7 +170,7 @@ pub fn encodeColumnRange(
         .decimal64 => |s| try writePackedI64(allocator, out, s[from..to]),
         .decimal128 => |s| try writePackedI128(allocator, out, s[from..to]),
         .uuid => |s| try writePackedBytes(allocator, out, std.mem.sliceAsBytes(s[from..to])),
-        .varchar, .string, .char => |sv| try writePackedStrings(allocator, out, sv, from, to),
+        .varchar, .string, .char, .json => |sv| try writePackedStrings(allocator, out, sv, from, to),
     }
 }
 
@@ -270,7 +271,7 @@ fn decodeColumnRange(
             }
             cursor += want;
         },
-        .varchar, .string, .char => {
+        .varchar, .string, .char, .json => {
             for (0..n) |i| {
                 if (cursor + 4 > payload.len) return Error.WalCorrupt;
                 const len = format.readU32(payload[cursor .. cursor + 4]);
@@ -329,6 +330,7 @@ fn appendOne(
         .varchar => |*ss| try ss.appendValue(allocator, v.bytes),
         .string => |*ss| try ss.appendValue(allocator, v.bytes),
         .char => |*ss| try ss.appendValue(allocator, v.bytes),
+        .json => |*ss| try ss.appendValue(allocator, v.bytes),
     }
     if (col.nulls != null) {
         try col.appendValidBit(allocator, col.data.rowCount() - 1, true);
@@ -957,7 +959,7 @@ fn colColMatches(lv: ColumnView, rv: ColumnView, row: u32, op: u8) bool {
             .boolean => cmpI(u8, lv.data.boolean[row], rv.data.boolean[row], op),
             else => false,
         },
-        .varchar, .string, .char => switch (rv.data) {
+        .varchar, .string, .char, .json => switch (rv.data) {
             .varchar => |sv| cmpStr(rowStringBytes(lv, row), sv.rowBytes(row), op),
             .string => |sv| cmpStr(rowStringBytes(lv, row), sv.rowBytes(row), op),
             .char => |sv| cmpStr(rowStringBytes(lv, row), sv.rowBytes(row), op),

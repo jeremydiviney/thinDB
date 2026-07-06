@@ -1047,12 +1047,12 @@ pub const TableFnExec = struct {
     fn inputTypeMatches(actual: types.Type, declared: types.Type) bool {
         if (std.meta.eql(actual, declared)) return true;
         const string_family = switch (actual) {
-            .varchar, .string, .char => true,
+            .varchar, .string, .char, .json => true,
             else => false,
         };
         if (!string_family) return false;
         return switch (declared) {
-            .varchar, .string, .char => true,
+            .varchar, .string, .char, .json => true,
             else => false,
         };
     }
@@ -1121,7 +1121,7 @@ pub const TableFnExec = struct {
                 h1.update(&.{1});
                 h2.update(&.{1});
                 switch (v.data) {
-                    .varchar, .string, .char => |sv| {
+                    .varchar, .string, .char, .json => |sv| {
                         const bytes = sv.rowBytes(i);
                         h1.update(bytes);
                         h2.update(bytes);
@@ -1181,7 +1181,7 @@ pub const TableFnExec = struct {
         return switch (want) {
             .tinyint, .smallint, .int, .bigint, .largeint => int_lit,
             .float, .double => int_lit or v == .float or v == .double,
-            .varchar, .string, .char => v == .text,
+            .varchar, .string, .char, .json => v == .text,
             .date => v == .date or int_lit,
             .datetime => v == .datetime or int_lit,
             .boolean => v == .boolean or int_lit,
@@ -1252,7 +1252,7 @@ pub const TableFnExec = struct {
             .decimal64 => |s| .{ .decimal64 = s[row] },
             .largeint => |s| .{ .largeint = s[row] },
             .boolean => |s| .{ .boolean = s[row] != 0 },
-            .varchar, .string, .char => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
+            .varchar, .string, .char, .json => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
             else => null,
         };
     }

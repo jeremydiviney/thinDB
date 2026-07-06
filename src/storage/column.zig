@@ -60,6 +60,7 @@ pub const ValueView = union(TypeTag) {
     decimal64: []const i64,
     decimal128: []const i128,
     uuid: []const u128,
+    json: StringView,
 
     pub fn rowCount(self: ValueView) usize {
         return switch (self) {
@@ -79,6 +80,7 @@ pub const ValueView = union(TypeTag) {
             .decimal64 => |s| s.len,
             .decimal128 => |s| s.len,
             .uuid => |s| s.len,
+            .json => |s| s.rowCount(),
         };
     }
 };
@@ -159,6 +161,7 @@ pub const OwnedData = union(TypeTag) {
     decimal64: []i64,
     decimal128: []i128,
     uuid: []u128,
+    json: OwnedStringColumn,
 
     pub fn rowCount(self: OwnedData) usize {
         return switch (self) {
@@ -178,6 +181,7 @@ pub const OwnedData = union(TypeTag) {
             .decimal64 => |s| s.len,
             .decimal128 => |s| s.len,
             .uuid => |s| s.len,
+            .json => |s| s.offsets.len - 1,
         };
     }
 
@@ -199,6 +203,7 @@ pub const OwnedData = union(TypeTag) {
             .decimal64 => |s| .{ .decimal64 = s },
             .decimal128 => |s| .{ .decimal128 = s },
             .uuid => |s| .{ .uuid = s },
+            .json => |s| .{ .json = s.view() },
         };
     }
 
@@ -220,6 +225,7 @@ pub const OwnedData = union(TypeTag) {
             .decimal64 => |s| allocator.free(s),
             .decimal128 => |s| allocator.free(s),
             .uuid => |s| allocator.free(s),
+            .json => |*s| s.deinit(allocator),
         }
         self.* = undefined;
     }

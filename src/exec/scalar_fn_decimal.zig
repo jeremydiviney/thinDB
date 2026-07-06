@@ -376,7 +376,7 @@ pub fn toDecimalKernel(allocator: Allocator, arg_types: []const Type, out_type: 
                 const scaled = f64At(args[0], src, row) * pow10f(target.s);
                 break :blk @as(i128, @intFromFloat(@round(scaled)));
             },
-            .varchar, .string, .char => parseDecimal(common.stringViewOf(args[0]).rowBytes(row), target.s) catch if (valid) return error.ArithmeticOverflow else 0,
+            .varchar, .string, .char, .json => parseDecimal(common.stringViewOf(args[0]).rowBytes(row), target.s) catch if (valid) return error.ArithmeticOverflow else 0,
             else => return error.ComputeNoSuchOverload,
         };
         try appendDec(allocator, out, out_type, m, valid);

@@ -504,7 +504,7 @@ pub const Window = struct {
                     for (g.perm, 0..) |r, out_row| {
                         const bytes = scratch[r] orelse "";
                         switch (st.data) {
-                            .varchar, .string, .char => |*ss| try ss.appendValue(aa, bytes),
+                            .varchar, .string, .char, .json => |*ss| try ss.appendValue(aa, bytes),
                             else => return Error.WindowUnsupported,
                         }
                         try st.appendValidBit(aa, @intCast(out_row), scratch[r] != null);
@@ -2265,7 +2265,7 @@ fn preSizeColumn(allocator: Allocator, out: *ColumnStore, t: Type, n: usize) !vo
         .decimal64 => |*l| try l.appendNTimes(allocator, 0, n),
         .decimal128 => |*l| try l.appendNTimes(allocator, 0, n),
         .uuid => |*l| try l.appendNTimes(allocator, 0, n),
-        .varchar, .string, .char => return Error.WindowUnsupported,
+        .varchar, .string, .char, .json => return Error.WindowUnsupported,
     }
     _ = t;
     if (out.nulls) |*nb| {
@@ -2321,7 +2321,7 @@ fn appendStringScratchIndices(
 
 fn isStringType(t: Type) bool {
     return switch (t) {
-        .string, .varchar, .char => true,
+        .string, .varchar, .char, .json => true,
         else => false,
     };
 }
@@ -2334,7 +2334,7 @@ fn isStringType(t: Type) bool {
 /// columns grow internally and are left alone.
 fn reserveAggressive(allocator: Allocator, out: *ColumnStore, add_rows: usize) !void {
     switch (out.data) {
-        .varchar, .string, .char => {},
+        .varchar, .string, .char, .json => {},
         inline else => |*l| {
             const need = l.items.len + add_rows;
             if (need > l.capacity) try l.ensureTotalCapacity(allocator, @max(need, l.capacity * 4));
@@ -2760,7 +2760,7 @@ pub fn orderPrefix(col: ColumnStore, row: u32, desc: bool) u64 {
         .uuid => |l| @truncate(l.items[row] >> 64),
         .float => |l| floatNorm(@as(f64, l.items[row])),
         .double => |l| floatNorm(l.items[row]),
-        .varchar, .string, .char => |s| stringPrefix(s.rowBytesWide(row)),
+        .varchar, .string, .char, .json => |s| stringPrefix(s.rowBytesWide(row)),
     };
     return if (desc) ~norm else norm;
 }
@@ -2812,7 +2812,7 @@ fn digestCell(h: *std.hash.Wyhash, col: ColumnStore, row: u32) void {
         .uuid => |l| h.update(std.mem.asBytes(&l.items[row])),
         .float => |l| hashInt(h, @as(i64, @bitCast(floatNorm(@as(f64, l.items[row]))))),
         .double => |l| hashInt(h, @as(i64, @bitCast(floatNorm(l.items[row])))),
-        .varchar, .string, .char => |s| {
+        .varchar, .string, .char, .json => |s| {
             const bytes = s.rowBytesWide(row);
             var len: u64 = bytes.len;
             h.update(std.mem.asBytes(&len));
@@ -2970,7 +2970,7 @@ fn copyCell(src: ColumnStore, src_row: u32, out: *ColumnStore, out_row: u32) !vo
             .uuid => |*o| o.items[out_row] = l.items[src_row],
             else => return Error.WindowUnsupported,
         },
-        .varchar, .string, .char => return Error.WindowUnsupported,
+        .varchar, .string, .char, .json => return Error.WindowUnsupported,
     }
     setValid(out, out_row);
 }

@@ -30,6 +30,7 @@ pub inline fn stringViewOf(v: ColumnView) storage.StringView {
         .varchar => |sv| sv,
         .string => |sv| sv,
         .char => |sv| sv,
+        .json => |sv| sv,
         else => unreachable, // resolve() already gated on type
     };
 }
@@ -39,6 +40,7 @@ pub inline fn stringStoreOf(out: *ColumnStore) *store.StringStore {
         .varchar => |*ss| ss,
         .string => |*ss| ss,
         .char => |*ss| ss,
+        .json => |*ss| ss,
         else => unreachable,
     };
 }

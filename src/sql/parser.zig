@@ -1616,7 +1616,7 @@ pub const Parser = struct {
     /// recognize in expression position (+ - * / %).
     fn isBinaryOpToken(tag: TokenTag) bool {
         return switch (tag) {
-            .plus, .minus, .star, .slash, .percent, .pipe_pipe => true,
+            .plus, .minus, .star, .slash, .percent, .pipe_pipe, .arrow, .arrow2 => true,
             else => false,
         };
     }
@@ -1633,9 +1633,9 @@ pub const Parser = struct {
     /// identifier/call/dotted-col but not yet checked for an
     /// operator). Returns `atom` unchanged if no operator follows.
     fn continueBinaryFrom(self: *Parser, atom: ir.Expr) ParseError!ir.Expr {
-        // First, extend the atom into a MulDiv-level expression
-        // (same precedence the inner parseMulDiv would have produced).
-        var lhs = atom;
+        // JSON `->`/`->>` bind tighter than arithmetic — consume any that
+        // trail the already-parsed atom before climbing precedence levels.
+        var lhs = try self.consumeJsonArrows(atom);
         while (self.cur.tag == .star or self.cur.tag == .slash or self.cur.tag == .percent) {
             const fn_name: []const u8 = switch (self.cur.tag) {
                 .star => "mul",
@@ -2221,6 +2221,25 @@ pub const Parser = struct {
             try self.advance();
             atom = try self.parseCastTarget(atom);
         }
+        return try self.consumeJsonArrows(atom);
+    }
+
+    /// MySQL JSON extraction: `doc -> '$.path'` desugars to
+    /// JSON_EXTRACT(doc, path); `doc ->> '$.path'` additionally unquotes via
+    /// JSON_VALUE. Binds like a postfix so `a->'$.x' = 'y'` groups as
+    /// `(a->'$.x') = 'y'`, and left-associatively so `a->'$.x'->'$.y'`
+    /// chains.
+    pub fn consumeJsonArrows(self: *Parser, atom_in: ir.Expr) ParseError!ir.Expr {
+        var atom = atom_in;
+        while (self.cur.tag == .arrow or self.cur.tag == .arrow2) {
+            const fn_name: []const u8 = if (self.cur.tag == .arrow2) "json_value" else "json_extract";
+            try self.advance();
+            const path = try self.parseCallAtomBase();
+            const args = try self.arena.alloc(ir.Expr, 2);
+            args[0] = atom;
+            args[1] = path;
+            atom = ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
+        }
         return atom;
     }
 
@@ -2240,6 +2259,7 @@ pub const Parser = struct {
             .date => "to_date",
             .datetime => "to_datetime",
             .varchar, .char, .string => "to_string",
+            .json => "to_json",
             // No conversion kernel yet: decimal, uuid.
             .decimal64, .decimal128, .uuid => null,
         };

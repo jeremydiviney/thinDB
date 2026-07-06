@@ -12,6 +12,8 @@ const types = @import("../../types.zig");
 const Column = types.Column;
 const Type = types.Type;
 
+const json_binary = @import("../../exec/json_binary.zig");
+
 const packet = @import("packet.zig");
 const wire_format = @import("../wire_format.zig");
 
@@ -27,6 +29,7 @@ const OID_TEXT: u32 = 25;
 const OID_DATE: u32 = 1082;
 const OID_TIMESTAMP: u32 = 1114;
 const OID_UUID: u32 = 2950;
+const OID_JSON: u32 = 114;
 
 const TypeInfo = struct {
     oid: u32,
@@ -48,6 +51,7 @@ fn pgTypeOf(t: Type) TypeInfo {
         .decimal64, .decimal128 => .{ .oid = OID_NUMERIC, .type_size = -1 },
         .uuid => .{ .oid = OID_UUID, .type_size = 16 },
         .varchar, .string, .char => .{ .oid = OID_TEXT, .type_size = -1 },
+        .json => .{ .oid = OID_JSON, .type_size = -1 },
     };
 }
 
@@ -144,6 +148,14 @@ fn formatCell(
             try scratch.appendSlice(allocator, try wire_format.formatUuid(&buf, s[row]));
         },
         .string, .varchar, .char => |sv| try scratch.appendSlice(allocator, sv.rowBytes(row)),
+        .json => |sv| {
+            const bytes = sv.rowBytes(row);
+            if (json_binary.looksBinary(bytes)) {
+                try json_binary.toText(allocator, scratch, bytes);
+            } else {
+                try scratch.appendSlice(allocator, bytes);
+            }
+        },
     }
     return scratch.items;
 }

@@ -86,7 +86,7 @@ fn typeOid(t: types.Type) i32 {
         .datetime => 1114,
         .decimal64, .decimal128 => 1700,
         .uuid => 2950,
-        .varchar, .string, .char => 25,
+        .varchar, .string, .char, .json => 25,
     };
 }
 fn typeLen(t: types.Type) i16 {

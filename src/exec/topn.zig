@@ -263,6 +263,7 @@ pub const TopN = struct {
             .varchar => |s| std.mem.order(u8, s.rowBytes(a), vb.data.varchar.rowBytes(b)),
             .string => |s| std.mem.order(u8, s.rowBytes(a), vb.data.string.rowBytes(b)),
             .char => |s| std.mem.order(u8, s.rowBytes(a), vb.data.char.rowBytes(b)),
+            .json => |s| std.mem.order(u8, s.rowBytes(a), vb.data.json.rowBytes(b)),
             .tinyint => |s| std.math.order(s[a], vb.data.tinyint[b]),
             .smallint => |s| std.math.order(s[a], vb.data.smallint[b]),
             .largeint => |s| std.math.order(s[a], vb.data.largeint[b]),

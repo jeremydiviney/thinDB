@@ -1173,6 +1173,7 @@ const TypeWireTag = enum(u8) {
     decimal64 = 13,
     decimal128 = 14,
     uuid = 15,
+    json = 16,
 };
 
 fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) EncodeError!void {
@@ -1207,6 +1208,7 @@ fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) Enco
             try out.append(allocator, spec.s);
         },
         .uuid => try out.append(allocator, @intFromEnum(TypeWireTag.uuid)),
+        .json => try out.append(allocator, @intFromEnum(TypeWireTag.json)),
     }
 }
 
@@ -1214,7 +1216,7 @@ fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(TypeWireTag.uuid)) return Error.IrCorrupt;
+    if (t > @intFromEnum(TypeWireTag.json)) return Error.IrCorrupt;
     const tag: TypeWireTag = @enumFromInt(t);
     return switch (tag) {
         .int => .int,
@@ -1240,6 +1242,7 @@ fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
             cursor.* += 4;
             break :blk types.Type{ .char = n };
         },
+        .json => .json,
         .decimal64 => blk: {
             if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
             const p = bytes[cursor.*];

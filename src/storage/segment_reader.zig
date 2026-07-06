@@ -530,6 +530,7 @@ fn decodeRawColumn(
         .smallint => return .{ .data = .{ .smallint = try decodeFixed(i16, allocator, values, row_count) }, .nulls = nulls },
         .largeint => return .{ .data = .{ .largeint = try decodeFixed(i128, allocator, values, row_count) }, .nulls = nulls },
         .char => return .{ .data = .{ .char = try decodeStringRaw(allocator, values, row_count) }, .nulls = nulls },
+        .json => return .{ .data = .{ .json = try decodeStringRaw(allocator, values, row_count) }, .nulls = nulls },
         .decimal64 => return .{ .data = .{ .decimal64 = try decodeFixed(i64, allocator, values, row_count) }, .nulls = nulls },
         .decimal128 => return .{ .data = .{ .decimal128 = try decodeFixed(i128, allocator, values, row_count) }, .nulls = nulls },
         .uuid => return .{ .data = .{ .uuid = try decodeFixed(u128, allocator, values, row_count) }, .nulls = nulls },
@@ -917,6 +918,7 @@ pub fn viewRawColumn(
         .varchar => return stringView(values, row_count, nulls, .varchar),
         .string => return stringView(values, row_count, nulls, .string),
         .char => return stringView(values, row_count, nulls, .char),
+        .json => return stringView(values, row_count, nulls, .json),
     }
 }
 
@@ -1068,6 +1070,7 @@ pub fn decodeDictColumn(
         .varchar => .{ .data = .{ .varchar = sc }, .nulls = nulls },
         .string => .{ .data = .{ .string = sc }, .nulls = nulls },
         .char => .{ .data = .{ .char = sc }, .nulls = nulls },
+        .json => .{ .data = .{ .json = sc }, .nulls = nulls },
         else => unreachable,
     };
 }
@@ -1198,6 +1201,7 @@ pub fn expandFsstPooled(
         .varchar => .{ .data = .{ .varchar = sc }, .nulls = fv.nulls },
         .string => .{ .data = .{ .string = sc }, .nulls = fv.nulls },
         .char => .{ .data = .{ .char = sc }, .nulls = fv.nulls },
+        .json => .{ .data = .{ .json = sc }, .nulls = fv.nulls },
         else => format.Error.CorruptColumnBlockHeader,
     };
 }
@@ -1248,6 +1252,7 @@ pub fn decodeFsstColumn(
         .varchar => .{ .data = .{ .varchar = sc }, .nulls = nulls },
         .string => .{ .data = .{ .string = sc }, .nulls = nulls },
         .char => .{ .data = .{ .char = sc }, .nulls = nulls },
+        .json => .{ .data = .{ .json = sc }, .nulls = nulls },
         else => unreachable,
     };
 }

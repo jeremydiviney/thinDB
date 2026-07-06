@@ -533,7 +533,7 @@ fn appendBinaryCell(
             const text = try wire_format.formatUuid(&buf, s[row]);
             try packet.appendLenEncString(allocator, out, text);
         },
-        .varchar, .char, .string => |sv| try packet.appendLenEncString(allocator, out, sv.rowBytes(row)),
+        .varchar, .char, .string, .json => |sv| try packet.appendLenEncString(allocator, out, sv.rowBytes(row)),
     }
 }
 

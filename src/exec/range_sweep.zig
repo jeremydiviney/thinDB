@@ -494,7 +494,7 @@ fn columnIndex(schema: []const Column, name: []const u8) ?usize {
 
 fn isStringTag(t: TypeTag) bool {
     return switch (t) {
-        .varchar, .string, .char => true,
+        .varchar, .string, .char, .json => true,
         else => false,
     };
 }
@@ -518,6 +518,7 @@ fn cmpCells(left: ColumnView, lrow: u32, right: ColumnView, rrow: u32) std.math.
         .varchar => return std.mem.order(u8, left.data.varchar.rowBytes(lrow), right.data.varchar.rowBytes(rrow)),
         .string => return std.mem.order(u8, left.data.string.rowBytes(lrow), right.data.string.rowBytes(rrow)),
         .char => return std.mem.order(u8, left.data.char.rowBytes(lrow), right.data.char.rowBytes(rrow)),
+        .json => return std.mem.order(u8, left.data.json.rowBytes(lrow), right.data.json.rowBytes(rrow)),
     }
 }
 
@@ -555,6 +556,7 @@ fn cmpInColumn(col: ColumnView, a: u32, b: u32) std.math.Order {
         .varchar => std.mem.order(u8, col.data.varchar.rowBytes(a), col.data.varchar.rowBytes(b)),
         .string => std.mem.order(u8, col.data.string.rowBytes(a), col.data.string.rowBytes(b)),
         .char => std.mem.order(u8, col.data.char.rowBytes(a), col.data.char.rowBytes(b)),
+        .json => std.mem.order(u8, col.data.json.rowBytes(a), col.data.json.rowBytes(b)),
     };
 }
 
