@@ -38,7 +38,7 @@ So:
 |---|---|---|---|
 | PK/unique | CDC upsert+delete | JDBC | **effectively-once, FREE** |
 | Keyless (`ORDER BY`) | append-only | JDBC | at-least-once (dupes possible) |
-| Keyless | append-only, no dupes | Stream Load + 2PC | exactly-once |
+| Keyless | append-only, no dupes | JDBC + XA (`exactlyOnceSink`) | exactly-once |
 
 Upsert is idempotent → replay overwrites the same row. Append is NOT → replay
 double-counts. Only keyless append streams need true exactly-once.
@@ -56,10 +56,9 @@ double-counts. Only keyless append streams need true exactly-once.
 - Connector/J session-init probes: `@@version_comment`, `@@session.auto_increment_increment`,
   `SET NAMES`, `SET character_set_results`, `@@sql_mode`, `SHOW VARIABLES LIKE`.
 
-**Remaining to ship:** a live Flink run (real Connector/J), a recipe, docs.
-Guarantee: **effectively-once for PK tables, at-least-once for keyless.** Flink's
-own exactly-once JDBC sink is XA-based; thinDB has no XA, so true exactly-once is
-NOT available over plain JDBC (see Stage 2).
+Guarantee: **effectively-once for PK tables, at-least-once for keyless.** For
+true exactly-once (keyless/append streams), thinDB now speaks XA — see Stage 2,
+which is shipped.
 
 ### Flink recipe (JDBC)
 ```sql
