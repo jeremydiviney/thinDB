@@ -1,7 +1,23 @@
 # Flink → thinDB ingest (#132)
 
-Two-stage plan. Stage 1 (JDBC) is **server-complete and wire-validated**; Stage 2
-(HTTP Stream Load, then exactly-once) is designed with the code seams mapped.
+Two-stage plan, **both SHIPPED and validated with real Flink** (2026-07-07).
+
+## Status — COMPLETE
+
+- **Stage 1 (JDBC): done.** Snapshot + CDC (insert/update/delete) via
+  flink-connector-jdbc / mysql-cdc, effectively-once for PK tables. Proven with a
+  real MySQL-CDC → Flink → thinDB pipeline (`tests/flink/cdc_job.sql`).
+- **Stage 2 (exactly-once via XA): done.** `XA START/END/PREPARE/COMMIT/ROLLBACK/
+  RECOVER` on the MySQL wire; durable prepared branches survive a crash; proven
+  end to end with the **real Connector/J `XAResource`** including kill-and-recover
+  (`tests/flink/xa-java`) and a 1M-row `JdbcSink.exactlyOnceSink` run
+  (`tests/flink/ingest-bench`). Orphan branches are GC'd (`--xa-timeout-secs`);
+  failures map to real MySQL XA error codes.
+- **Throughput (1M rows, parallelism 2):** ~140K rows/s both modes after the
+  incremental-upsert-index fix (d390e2c); exactly-once ≈ at-least-once (2PC
+  overhead negligible). Bottleneck is now off thinDB's insert path.
+
+Recipe for the exactly-once DataStream sink is at the bottom of this doc.
 
 ---
 
@@ -107,16 +123,24 @@ reproduces under the next checkpoint. xid = opaque dedup key.
 - **Staging hook** (local.zig compileInsert @1855): if the connection has an
   active xid → `XaManager.stage(xid, table, rows)` instead of `insertBatch`.
 
-### Build slices
-- **S1 (mysql2-testable, no Docker):** XA parse + XaConnState + in-memory XaManager
-  (begin/stage/end/prepare/commit/rollback/recover) + insert-staging hook. Full
-  command flow works; NOT crash-safe yet. Idempotent commit for retries.
-- **S2 (durability):** prepared branches + staged rows survive restart — stage to
-  durable staging-segments (reuse segment writer, fsync) on PREPARE; COMMIT =
-  atomic manifest swap adding them + recording the xid; label/xid store in a
-  manifest sidecar; recovery on open feeds `XA RECOVER`.
-- **S3 (proof):** real Flink `sink.semantic=exactly-once` in Docker; kill JM/TM
-  mid-stream, restart, assert no dupes / no loss on a KEYLESS (`ORDER BY`) table.
+### Build slices — ALL SHIPPED
+As built, `src/net/xa.zig` holds the XaManager; the wire hooks live in
+`src/net/mysql/server.zig` (`handleXaCommand` + the DML-staging checks on both
+the COM_QUERY and COM_STMT_EXECUTE compile sites), not `compileInsert`.
+- **S1 (a12ff13):** XA parse + `SessionState.xa_active` + XaManager
+  (begin/stage/end/prepare/commit/rollback/recover). Staged DML buffered as
+  encoded IR; idempotent commit.
+- **S2 (0749ccd):** prepared branches persisted to `<root>/_xa/<hex-xid>.xa`
+  (xid + db + staged IR), reloaded on open; COMMIT/ROLLBACK unlink. Crash between
+  PREPARE and COMMIT survives.
+- **RECOVER (b818dfa):** MySQL 4-column result (formatID, gtrid_length,
+  bqual_length, data); `parseXid` decomposes Connector/J's `0x`-hex xid form.
+- **GC (f28541a):** background sweep rolls back orphaned prepared branches older
+  than `--xa-timeout-secs` (default 24h).
+- **Error codes (f78e6a9):** XAER_DUPID / XAER_NOTA / XAER_RMFAIL.
+- **Proof:** `tests/flink/xa-java` (real Connector/J XAResource, incl. prepare →
+  kill → restart → recover → commit) + `tests/flink/ingest-bench` (1M-row
+  `JdbcSink.exactlyOnceSink`, 1M exact).
 
 ### Deferred (not building): HTTP Stream Load
 Kept here only as the future throughput/bulk option. Same 2PC core, HTTP skin
@@ -189,3 +213,40 @@ Stream Load skin when throughput demands it.
 - Real Flink end-to-end (checkpoint/recovery, exactly-once kill test): **Flink in
   Docker Desktop** → thinDB on host via `host.docker.internal`. thinDB stays on
   Windows; only Flink needs the container.
+
+---
+
+## Recipe — Flink exactly-once JDBC sink → thinDB
+
+thinDB speaks MySQL XA, so Flink's `JdbcSink.exactlyOnceSink` works unchanged
+(DataStream API; the Table/SQL `jdbc` connector is at-least-once only). Full
+runnable example: `tests/flink/ingest-bench/`.
+
+```java
+env.enableCheckpointing(5000); // exactly-once commits fire on checkpoint
+
+stream.addSink(JdbcSink.exactlyOnceSink(
+    "INSERT INTO events (id,a,b) VALUES (?,?,?)", // thinDB upserts on PK
+    (ps, r) -> { ps.setInt(1, r.id); ps.setInt(2, r.a); ps.setLong(3, r.b); },
+    JdbcExecutionOptions.builder().withBatchSize(1000).withMaxRetries(0).build(),
+    JdbcExactlyOnceOptions.builder()
+        .withTransactionPerConnection(true) // REQUIRED for MySQL XA
+        .build(),
+    () -> {                                  // XADataSource supplier
+        MysqlXADataSource ds = new MysqlXADataSource();
+        ds.setUrl("jdbc:mysql://<host>:3306/main?rewriteBatchedStatements=true");
+        ds.setUser("root"); ds.setPassword("");
+        return ds;
+    }));
+```
+
+Gotchas, all load-bearing:
+- **`withTransactionPerConnection(true)`** — MySQL XA disallows multiple branches
+  per connection; without it the sink errors.
+- **`withMaxRetries(0)`** — XA requires it (retries + 2PC don't mix).
+- **`rewriteBatchedStatements=true`** — collapses each batch into one multi-row
+  INSERT; without it every row is a separate round-trip (~30× slower).
+- **`--xa-timeout-secs`** on the server must exceed your checkpoint interval + max
+  tolerable downtime, or a slowly-recovering job's prepared branch gets GC'd.
+- For at-least-once (effectively-once on PK tables) use plain `JdbcSink.sink(...)`
+  with `JdbcConnectionOptions` — no XA, simpler, same `rewriteBatchedStatements`.
