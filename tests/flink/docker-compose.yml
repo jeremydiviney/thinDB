@@ -1,0 +1,44 @@
+# Phase-1 JDBC ingest validation: Flink (JobManager + TaskManager) with the
+# JDBC + MySQL connector jars, sinking into thinDB running on the Windows HOST.
+#
+# Prereqs: Docker Desktop running; thinDB server up on the host, e.g.
+#   ./zig-out/bin/thindb-server.exe --data-dir .flink-db --mysql-port 3306 --max-dop 4
+# and the target table created (see job.sql header).
+#
+# Run:
+#   docker compose -f tests/flink/docker-compose.yml build
+#   docker compose -f tests/flink/docker-compose.yml up -d
+#   docker compose -f tests/flink/docker-compose.yml exec jobmanager \
+#     ./bin/sql-client.sh -f /opt/sql/job.sql
+# Then query thinDB (mysql -P 3306) to see rows land + upsert.
+services:
+  jobmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile.flink
+    ports:
+      - "8081:8081" # Flink web UI
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # reach thinDB on the host
+    volumes:
+      - ./job.sql:/opt/sql/job.sql:ro
+
+  taskmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile.flink
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
