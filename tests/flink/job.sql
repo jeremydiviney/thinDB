@@ -30,7 +30,7 @@ CREATE TEMPORARY TABLE thindb_dim (
   PRIMARY KEY (id) NOT ENFORCED         -- upsert mode → INSERT ... ON DUPLICATE KEY UPDATE
 ) WITH (
   'connector' = 'jdbc',
-  'url' = 'jdbc:mysql://host.docker.internal:3306/main',
+  'url' = 'jdbc:mysql://host.docker.internal:13306/main',
   'table-name' = 'dim',
   'username' = 'root',
   'password' = '',

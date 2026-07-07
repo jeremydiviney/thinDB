@@ -1218,6 +1218,14 @@ fn syntheticVariableValue(var_in: []const u8, current_schema: []const u8) []cons
     if (std.mem.eql(u8, v, "autocommit")) return "1";
     if (std.mem.eql(u8, v, "lower_case_table_names")) return "1";
     if (std.mem.eql(u8, v, "auto_increment_increment")) return "1";
+    if (std.mem.eql(u8, v, "auto_increment_offset")) return "1";
+    // Writable server. MySQL Connector/J parses these as integers on every
+    // batch (isReadOnly()); returning "" throws NumberFormatException and
+    // breaks the JDBC sink. thinDB is never read-only.
+    if (std.mem.eql(u8, v, "read_only") or
+        std.mem.eql(u8, v, "super_read_only") or
+        std.mem.eql(u8, v, "transaction_read_only") or
+        std.mem.eql(u8, v, "tx_read_only")) return "0";
     if (std.mem.eql(u8, v, "default_storage_engine") or std.mem.eql(u8, v, "storage_engine")) return "thinDB";
 
     if (std.mem.eql(u8, v, "character_set_client") or
