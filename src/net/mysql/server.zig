@@ -290,6 +290,9 @@ const SessionState = struct {
     /// COM_RESET_CONNECTION / COM_CHANGE_USER). `captureVars` copies the
     /// pointer back after each statement compiles.
     vars: ?*SessionVars = null,
+    /// The XA branch xid started on this connection (between XA START and XA
+    /// END). While set, DML is staged into that branch instead of executing.
+    xa_active: ?[]const u8 = null,
 
     fn init(allocator: Allocator, catalog: *Catalog, backend_id: u32) !SessionState {
         return .{
@@ -304,6 +307,8 @@ const SessionState = struct {
     fn deinit(self: *SessionState) void {
         self.dropTempNamespace();
         self.resetVars();
+        if (self.xa_active) |x| self.allocator.free(x);
+        self.xa_active = null;
         self.allocator.free(self.current_db);
         self.allocator.free(self.current_schema);
         var it = self.prepared_statements.iterator();
@@ -2697,6 +2702,16 @@ fn runEngineQuery(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
+    // XA transaction control (Flink exactly-once): `XA START|END|PREPARE|COMMIT|
+    // ROLLBACK|RECOVER ...`. Not thinDB SQL — intercept before the parser.
+    {
+        const t = std.mem.trim(u8, payload, " \t\r\n;");
+        if (t.len > 2 and std.ascii.eqlIgnoreCase(t[0..2], "XA") and (t[2] == ' ' or t[2] == '\t')) {
+            try handleXaCommand(allocator, w, catalog, session, t, seq_id.*);
+            return;
+        }
+    }
+
     const parse_start = profiler.start();
     const op = sql.parseWithContext(arena.allocator(), payload, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views }) catch |err| {
         profiler.recordSince(.query_parse, parse_start);
@@ -2729,6 +2744,96 @@ fn runEngineQuery(
     }
 
     try runSingleStatement(allocator, w, catalog, session, op, seq_id, session.transactionStatus(), profiler);
+}
+
+fn isXaStageable(op: ir.Op) bool {
+    return switch (op) {
+        .insert, .insert_select, .delete_op, .update_op => true,
+        else => false,
+    };
+}
+
+fn xaErr(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, e: anyerror) !void {
+    try handshake.sendErrPacket(allocator, w, seq_id, 1397, "XAE05".*, @errorName(e));
+}
+
+/// XA transaction control for the Flink exactly-once JDBC sink. `text` is the
+/// trimmed statement (leading `XA `, no trailing `;`). Writes staged by the DML
+/// hook in `runSingleStatement` are replayed here at COMMIT. Idempotent: a
+/// COMMIT/ROLLBACK for an unknown xid is a no-op success (Flink retries).
+fn handleXaCommand(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    text: []const u8,
+    seq_id: u8,
+) !void {
+    const rest = std.mem.trim(u8, text[2..], " \t\r\n");
+    const vend = blk: {
+        for (rest, 0..) |c, i| if (c == ' ' or c == '\t') break :blk i;
+        break :blk rest.len;
+    };
+    const verb = rest[0..vend];
+    var xid = std.mem.trim(u8, rest[vend..], " \t\r\n");
+    const eq = std.ascii.eqlIgnoreCase;
+
+    if (eq(verb, "recover")) {
+        // Stage 1 is in-memory: no cross-restart recovery, report none prepared.
+        var sid = seq_id;
+        try result.sendSingleColumnRows(allocator, w, "data", &[_][]const u8{}, &sid, session.client_caps);
+        return;
+    }
+    if (eq(verb, "start") or eq(verb, "begin")) {
+        catalog.xa.begin(xid) catch |e| return xaErr(allocator, w, seq_id, e);
+        if (session.xa_active) |old| allocator.free(old);
+        session.xa_active = try allocator.dupe(u8, xid);
+        return handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
+    }
+    if (eq(verb, "end")) {
+        catalog.xa.end(xid) catch |e| return xaErr(allocator, w, seq_id, e);
+        if (session.xa_active) |a| {
+            allocator.free(a);
+            session.xa_active = null;
+        }
+        return handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
+    }
+    if (eq(verb, "prepare")) {
+        catalog.xa.prepare(xid) catch |e| return xaErr(allocator, w, seq_id, e);
+        return handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
+    }
+    if (eq(verb, "rollback")) {
+        catalog.xa.rollback(xid);
+        if (session.xa_active) |a| if (std.mem.eql(u8, a, xid)) {
+            allocator.free(a);
+            session.xa_active = null;
+        };
+        return handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
+    }
+    if (eq(verb, "commit")) {
+        if (xid.len >= 9 and eq(xid[xid.len - 9 ..], "one phase"))
+            xid = std.mem.trim(u8, xid[0 .. xid.len - 9], " \t\r\n,");
+        if (catalog.xa.takeForCommit(xid)) |branch| {
+            defer catalog.xa.finishCommit(branch);
+            if (catalog.database(session.current_db)) |main_db| {
+                var carena = std.heap.ArenaAllocator.init(allocator);
+                defer carena.deinit();
+                const ca = carena.allocator();
+                for (branch.stmts.items) |enc| {
+                    const dop = ir.decode(ca, enc) catch continue;
+                    var compiled = local.compileWithSession(ca, main_db, session.asSession(), &dop) catch continue;
+                    defer compiled.deinit();
+                    while (compiled.next() catch null) |_| {}
+                }
+            }
+        }
+        if (session.xa_active) |a| if (std.mem.eql(u8, a, xid)) {
+            allocator.free(a);
+            session.xa_active = null;
+        };
+        return handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
+    }
+    try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, "Unknown XA command");
 }
 
 /// Compile + emit ONE statement's packets. `extra_status` is OR'd into
@@ -2777,6 +2882,25 @@ fn runSingleStatement(
     var counter = counting_allocator.CountingAllocator.init(allocator, &mem_stats);
     const qalloc = if (oprof.enabled) counter.allocator() else allocator;
     if (oprof.enabled) oprof.resetPhases();
+
+    // Inside an XA branch, stage writes instead of executing them; XA COMMIT
+    // replays the staged statements. Only DML is staged — Flink sends only
+    // writes between XA START and XA END.
+    if (session.xa_active) |xid| {
+        if (isXaStageable(op.*)) {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            if (ir.encode(allocator, &buf, op.*)) |_| {
+                catalog.xa.stage(xid, buf.items) catch |err| {
+                    const mapped = errors.mapInternal(err, "XA stage failed");
+                    try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
+                    return;
+                };
+                try handshake.sendOkPacket(allocator, w, seq_id.*, 0, 0);
+                return;
+            } else |_| {}
+        }
+    }
 
     const compile_start = profiler.start();
     var compiled = local.compileWithSession(qalloc, main_db, session.asSession(), op) catch |err| {
@@ -3105,6 +3229,24 @@ fn handleStmtExecute(
             try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
             return;
         };
+    }
+
+    // Prepared DML inside an XA branch (Flink's exactly-once sink executes its
+    // batch as prepared statements): stage instead of executing.
+    if (session.xa_active) |xid| {
+        if (isXaStageable(op.*)) {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            if (ir.encode(allocator, &buf, op.*)) |_| {
+                catalog.xa.stage(xid, buf.items) catch |err| {
+                    const mapped = errors.mapInternal(err, "XA stage failed");
+                    try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+                    return;
+                };
+                try handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
+                return;
+            } else |_| {}
+        }
     }
 
     const compile_start = profiler.start();

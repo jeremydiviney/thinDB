@@ -36,6 +36,9 @@ pub const Catalog = struct {
     /// persists as an ordinary table; this registry only holds its defining
     /// query (for REFRESH) and marks the name as a view.
     views: udf_mod.ViewRegistry,
+    /// XA transaction branches (Flink exactly-once JDBC sink). In-memory in
+    /// stage 1; keyed by xid, prepared branches shared across connections.
+    xa: @import("../net/xa.zig").XaManager,
     /// Loaded LANGUAGE zig functions: keeps each compiled library alive
     /// while its registry entry exists. Guarded by databases_mutex (DDL
     /// is rare; no dedicated lock).
@@ -102,6 +105,7 @@ pub const Catalog = struct {
             .udfs = udf_mod.UdfRegistry.init(allocator),
             .sql_fns = udf_mod.SqlFnRegistry.init(allocator),
             .views = udf_mod.ViewRegistry.init(allocator),
+            .xa = @import("../net/xa.zig").XaManager.init(allocator),
             .databases = .init(allocator),
         };
         errdefer {
@@ -110,6 +114,7 @@ pub const Catalog = struct {
             self.udfs.deinit();
             self.sql_fns.deinit();
             self.views.deinit();
+            self.xa.deinit();
             self.databases.deinit();
         }
         try discoverDatabasesOnDisk(allocator, io, root_dir, cfg, &self.databases);
@@ -516,6 +521,7 @@ pub const Catalog = struct {
         self.zig_fns.deinit(self.allocator);
         self.sql_fns.deinit();
         self.views.deinit();
+        self.xa.deinit();
         self.databases.deinit();
         const allocator = self.allocator;
         if (self.owned_pool) |p| allocator.destroy(p);
