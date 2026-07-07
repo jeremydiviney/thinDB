@@ -31,6 +31,9 @@ const usage_text =
     \\  --native-port PORT      Native thinDB wire listener port (default 7878; 0 disables).
     \\  --bind ADDR             Interface to bind (default 0.0.0.0).
     \\  --max-connections N     Cap on concurrent client connections across all wires (default 256).
+    \\  --xa-timeout-secs N     Roll back orphaned PREPARED XA branches (Flink exactly-once) older
+    \\                          than N seconds (default 86400 = 24h; 0 disables). Must exceed the
+    \\                          Flink checkpoint interval + max tolerable downtime.
     \\  --idle-timeout-secs N   Close a connection after N seconds of read silence (default 0 = disabled).
     \\  --max-dop N             Max worker threads per query for the parallel scan leaf (default 1 =
     \\                          serial). >1 hands row-group ranges to up to N workers; the per-query
@@ -90,6 +93,10 @@ pub fn main(init: std.process.Init) !u8 {
     var native_port: u16 = thindb.default_port;
     var bind: []const u8 = default_bind;
     var max_connections: u32 = 256;
+    // Orphaned prepared XA branches (Flink job died without committing) older
+    // than this are rolled back by the background sweep. 0 disables. Default 24h
+    // — must exceed Flink's checkpoint interval + max tolerable downtime.
+    var xa_timeout_secs: u32 = 24 * 3600;
     var idle_timeout_secs: u32 = 0;
     var query_memory_budget: ?usize = null;
     var memory_budget: ?usize = null;
@@ -169,6 +176,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (try takePort(arg, "--native-port", &args_iter, err_w)) |p| {
             native_port = p;
+            continue;
+        }
+        if (try takeU32(arg, "--xa-timeout-secs", &args_iter, err_w)) |v| {
+            xa_timeout_secs = v;
             continue;
         }
         if (try takeU32(arg, "--max-connections", &args_iter, err_w)) |v| {
@@ -273,6 +284,7 @@ pub fn main(init: std.process.Init) !u8 {
         try err_w.flush();
         return 1;
     };
+    catalog.xa.gc_max_age_us = @as(i64, xa_timeout_secs) * 1_000_000;
 
     var shared_limiter = thindb.ConnectionLimiter.init(max_connections);
 

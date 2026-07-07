@@ -626,6 +626,7 @@ pub const Catalog = struct {
             Io.sleep(sleeper_io, duration, .awake) catch return;
             if (should_stop.load(.acquire)) return;
             self.backgroundFlushSweep() catch {};
+            _ = self.xa.gcSweep(); // roll back orphaned prepared XA branches
         }
     }
 

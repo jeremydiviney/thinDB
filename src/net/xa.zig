@@ -39,6 +39,9 @@ pub const Branch = struct {
     db: []const u8,
     state: State = .active,
     stmts: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Wall-clock microseconds when the branch was PREPARED (0 while ACTIVE).
+    /// Absolute real time so age survives a restart; drives GC of orphans.
+    prepared_at_us: i64 = 0,
 
     fn deinit(self: *Branch) void {
         self.arena.deinit();
@@ -55,6 +58,12 @@ pub const XaManager = struct {
     /// Durable store for PREPARED branches. Null = in-memory only (tests).
     io: ?Io = null,
     dir: ?Io.Dir = null,
+    /// A PREPARED branch older than this is orphaned (its Flink job died /
+    /// was cancelled without committing) and gets rolled back by `gcSweep`.
+    /// Must exceed Flink's checkpoint interval + max tolerable downtime, or a
+    /// slowly-recovering job's branch could be aborted from under it. Default
+    /// 24h; 0 disables GC.
+    gc_max_age_us: i64 = 24 * 3600 * 1_000_000,
 
     pub fn init(allocator: Allocator) XaManager {
         return .{ .allocator = allocator };
@@ -125,7 +134,43 @@ pub const XaManager = struct {
         const branch = self.map.get(xid) orelse return Error.XaBranchUnknown;
         if (branch.state != .ended) return Error.XaProtocol;
         branch.state = .prepared;
+        branch.prepared_at_us = if (self.io) |io| std.Io.Timestamp.now(io, .real).toMicroseconds() else 0;
         self.persist(xid, branch) catch {}; // best-effort; commit still works in-memory
+    }
+
+    /// Roll back every PREPARED branch older than `gc_max_age_us` — orphans from
+    /// a Flink job that died / was cancelled without committing. Returns the
+    /// count aborted. A no-op when GC is disabled or no clock is configured.
+    pub fn gcSweep(self: *XaManager) usize {
+        const io = self.io orelse return 0;
+        return self.gcSweepAt(std.Io.Timestamp.now(io, .real).toMicroseconds());
+    }
+
+    /// `gcSweep` with an injected clock (for tests).
+    pub fn gcSweepAt(self: *XaManager, now: i64) usize {
+        if (self.gc_max_age_us <= 0) return 0;
+
+        // Collect stale xids first — dup'd, because rollback() frees the map's
+        // key and re-locks (can't hold the lock across it).
+        var stale: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (stale.items) |x| self.allocator.free(x);
+            stale.deinit(self.allocator);
+        }
+        self.lock();
+        {
+            var it = self.map.iterator();
+            while (it.next()) |e| {
+                const b = e.value_ptr.*;
+                if (b.state == .prepared and b.prepared_at_us != 0 and now - b.prepared_at_us > self.gc_max_age_us) {
+                    const dup = self.allocator.dupe(u8, e.key_ptr.*) catch continue;
+                    stale.append(self.allocator, dup) catch self.allocator.free(dup);
+                }
+            }
+        }
+        self.mutex.unlock();
+        for (stale.items) |xid| self.rollback(xid);
+        return stale.items.len;
     }
 
     /// Detach a branch for COMMIT and remove its durable record. Returns null
@@ -202,6 +247,9 @@ pub const XaManager = struct {
         try body.appendSlice(self.allocator, xid);
         try appendU32(self.allocator, &body, @intCast(branch.db.len));
         try body.appendSlice(self.allocator, branch.db);
+        var ts: [8]u8 = undefined;
+        std.mem.writeInt(i64, &ts, branch.prepared_at_us, .little);
+        try body.appendSlice(self.allocator, &ts);
         try appendU32(self.allocator, &body, @intCast(branch.stmts.items.len));
         for (branch.stmts.items) |s| {
             try appendU32(self.allocator, &body, @intCast(s.len));
@@ -235,6 +283,9 @@ pub const XaManager = struct {
         var c: usize = 0;
         const xid = try readSlice(bytes, &c);
         const db = try readSlice(bytes, &c);
+        if (c + 8 > bytes.len) return error.Corrupt;
+        const prepared_at = std.mem.readInt(i64, bytes[c..][0..8], .little);
+        c += 8;
         if (c + 4 > bytes.len) return error.Corrupt;
         const n = readU32(bytes[c .. c + 4]);
         c += 4;
@@ -243,7 +294,7 @@ pub const XaManager = struct {
         errdefer self.allocator.free(key);
         const branch = try self.allocator.create(Branch);
         errdefer self.allocator.destroy(branch);
-        branch.* = .{ .arena = std.heap.ArenaAllocator.init(self.allocator), .db = "", .state = .prepared };
+        branch.* = .{ .arena = std.heap.ArenaAllocator.init(self.allocator), .db = "", .state = .prepared, .prepared_at_us = prepared_at };
         const a = branch.arena.allocator();
         branch.db = try a.dupe(u8, db);
         var i: u32 = 0;
@@ -392,6 +443,37 @@ test "parseXid: opaque fallback + default format" {
     try std.testing.expectEqualStrings("dx1", p.gtrid);
     try std.testing.expectEqual(@as(usize, 0), p.bqual.len);
     try std.testing.expectEqual(@as(i64, 1), p.format_id);
+}
+
+test "xa gc: aborts prepared branches older than max age, keeps young ones" {
+    const testing = std.testing;
+    var mgr = XaManager.init(testing.allocator);
+    defer mgr.deinit();
+    mgr.gc_max_age_us = 1000;
+
+    // Two prepared branches with controlled prepare times.
+    for ([_][]const u8{ "old", "young" }) |x| {
+        try mgr.begin(x, "main");
+        try mgr.stage(x, &.{1});
+        try mgr.end(x);
+        try mgr.prepare(x);
+    }
+    mgr.map.get("old").?.prepared_at_us = 100;
+    mgr.map.get("young").?.prepared_at_us = 9_500;
+
+    // now = 10_000: old is 9_900µs stale (> 1000 → aborted), young is 500µs.
+    try testing.expectEqual(@as(usize, 1), mgr.gcSweepAt(10_000));
+    try testing.expect(mgr.takeForCommit("old") == null); // gone
+    const young = mgr.takeForCommit("young") orelse return error.YoungAborted;
+    mgr.finishCommit(young); // survived
+
+    // Disabled GC is a no-op.
+    mgr.gc_max_age_us = 0;
+    try mgr.begin("z", "main");
+    try mgr.end("z");
+    try mgr.prepare("z");
+    mgr.map.get("z").?.prepared_at_us = 1;
+    try testing.expectEqual(@as(usize, 0), mgr.gcSweepAt(1_000_000_000));
 }
 
 test "xa rollback discards" {
