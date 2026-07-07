@@ -16,51 +16,87 @@ const comparison = @import("comparison.zig");
 /// exists somewhere in the table (older memtable row, or a flushed segment)
 /// causes the older copy to be tombstoned. Always keeps the LAST occurrence
 /// in the memtable.
+/// Drop the persistent index (memtable swapped/emptied). Keeps map + arena
+/// capacity for reuse; the next resolution rebuilds from row 0.
+fn upsertIndexReset(t: *Table) void {
+    t.upsert_idx.clearRetainingCapacity();
+    if (t.upsert_idx_arena) |*a| _ = a.reset(.retain_capacity);
+    t.upsert_idx_mt = null;
+    t.upsert_idx_rows = 0;
+}
+
 pub fn applyUpsertResolution(t: *Table) !void {
     std.debug.assert(t.order_key_indices.len > 0);
 
+    const n: usize = @intCast(t.memtable.row_count);
+    if (n == 0) {
+        upsertIndexReset(t);
+        return;
+    }
+
+    // Bind the persistent key index to the current memtable generation. A
+    // memtable swap (flush / dedup-clone) or shrink invalidates it → rebuild
+    // from row 0; otherwise process only the rows added since last time.
+    const same_gen = if (t.upsert_idx_mt) |m| m == t.memtable else false;
+    if (!same_gen or t.upsert_idx_rows > n) {
+        upsertIndexReset(t);
+        t.upsert_idx_mt = t.memtable;
+    }
+    if (t.upsert_idx_arena == null) t.upsert_idx_arena = std.heap.ArenaAllocator.init(t.allocator);
+    const idx_aa = t.upsert_idx_arena.?.allocator();
+    const start: usize = t.upsert_idx_rows;
+
+    // Scratch for this batch's temporaries (probe key set).
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const n: usize = @intCast(t.memtable.row_count);
-    if (n == 0) return;
+    // ---- 1. Incremental intra-memtable dedup: only the NEW rows. Look each
+    // new row's key up in the persistent index; a hit tombstones the older
+    // memtable row (last writer wins) and a miss is a key we must also probe
+    // against segments (below).
+    var dropped: std.ArrayList(u32) = .empty;
+    defer dropped.deinit(t.allocator);
+    var new_keys: std.ArrayList([]const u8) = .empty; // arena-owned; survive an index reset
 
-    // ---- 1. Intra-memtable dedup: keep only the last occurrence per key. --
-    const keep = try t.allocator.alloc(bool, n);
-    defer t.allocator.free(keep);
-    @memset(keep, true);
-
-    var last_seen: std.StringHashMapUnmanaged(u32) = .empty;
-    // Owned by arena; no explicit deinit needed.
-
-    for (0..n) |i| {
-        const key_bytes = try compoundKeyFromColumnStores(aa, t.memtable.columns, t.order_key_indices, @intCast(i));
-        const gop = try last_seen.getOrPut(aa, key_bytes);
-        if (gop.found_existing) keep[gop.value_ptr.*] = false;
+    for (start..n) |i| {
+        const key_bytes = try compoundKeyFromColumnStores(idx_aa, t.memtable.columns, t.order_key_indices, @intCast(i));
+        const gop = try t.upsert_idx.getOrPut(t.allocator, key_bytes);
+        if (gop.found_existing) {
+            try dropped.append(t.allocator, gop.value_ptr.*);
+        } else {
+            try new_keys.append(aa, try aa.dupe(u8, key_bytes));
+        }
         gop.value_ptr.* = @intCast(i);
     }
+    t.upsert_idx_rows = @intCast(n);
 
-    // Snapshot-isolated retire-replace if any rows were dropped. Scans that
-    // pinned the pre-resolution memtable keep seeing those rows; new scans
-    // see the deduped state.
-    if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
-        const old_mt = t.memtable;
-        t.memtable = new_mt;
-        old_mt.retire();
-        old_mt.release();
+    // Snapshot-isolated retire-replace for the tombstoned older rows. Scans
+    // that pinned the pre-resolution memtable keep seeing them; new scans see
+    // the deduped state. The swap changes row indices, so drop the index (the
+    // next batch rebuilds against the cloned memtable).
+    if (dropped.items.len > 0) {
+        const keep = try t.allocator.alloc(bool, n);
+        defer t.allocator.free(keep);
+        @memset(keep, true);
+        for (dropped.items) |d| keep[d] = false;
+        if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
+            const old_mt = t.memtable;
+            t.memtable = new_mt;
+            old_mt.retire();
+            old_mt.release();
+            upsertIndexReset(t);
+        }
     }
 
-    // ---- 2. Build a set of surviving keys to probe segments with. --------
-    const surviving_n: usize = @intCast(t.memtable.row_count);
-    if (surviving_n == 0 or t.manifest.segments.items.len == 0) return;
+    // ---- 2. Probe segments only for keys NEW to the memtable this batch. A
+    // key needs a segment tombstone check exactly once — when it first enters
+    // the memtable; a re-insert already tombstoned its segment match.
+    if (new_keys.items.len == 0 or t.manifest.segments.items.len == 0) return;
 
     var surviving_set: std.StringHashMapUnmanaged(void) = .empty;
-    try surviving_set.ensureTotalCapacity(aa, @intCast(surviving_n));
-    for (0..surviving_n) |i| {
-        const key_bytes = try compoundKeyFromColumnStores(aa, t.memtable.columns, t.order_key_indices, @intCast(i));
-        surviving_set.putAssumeCapacity(key_bytes, {});
-    }
+    try surviving_set.ensureTotalCapacity(aa, @intCast(new_keys.items.len));
+    for (new_keys.items) |k| surviving_set.putAssumeCapacity(k, {});
 
     // ---- 3. For each segment, scan row groups, find matching keys. --------
     for (t.manifest.segments.items) |entry| {

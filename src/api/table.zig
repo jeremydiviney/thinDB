@@ -75,6 +75,17 @@ pub const Table = struct {
     /// hold a reference (see `Memtable.acquire` / `release`).
     memtable: *engine.Memtable,
 
+    /// Incremental upsert key index (unique tables): compound-order-key bytes
+    /// → current live memtable row index. Persists across insert batches so
+    /// upsert resolution processes only the NEW rows (O(batch)) instead of
+    /// rescanning the whole memtable (O(n) per batch → O(n²) total). Bound to
+    /// one memtable generation by pointer identity; a memtable swap (flush /
+    /// dedup-clone) forces a rebuild. Key bytes live in `upsert_idx_arena`.
+    upsert_idx: std.StringHashMapUnmanaged(u32) = .empty,
+    upsert_idx_arena: ?std.heap.ArenaAllocator = null,
+    upsert_idx_mt: ?*engine.Memtable = null,
+    upsert_idx_rows: u32 = 0,
+
     /// WAL writer when `Config.wal_enabled = true`. `null` otherwise.
     wal: ?engine.wal.WalWriter,
 
@@ -220,6 +231,8 @@ pub const Table = struct {
         const allocator = self.allocator;
         const io = self.io;
         if (self.wal) |*w| w.deinit();
+        self.upsert_idx.deinit(allocator);
+        if (self.upsert_idx_arena) |*a| a.deinit();
         self.seg_handles.deinit(allocator);
         self.cache.deinit();
         // Drop the Table's reference. If scans pinned a snapshot, the
