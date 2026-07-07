@@ -124,6 +124,9 @@ pub const Catalog = struct {
             self.loadSqlFunctions(entry.value_ptr.*) catch {};
             self.loadViews(entry.value_ptr.*) catch {};
         }
+        // Load any prepared XA branches left by a prior run (crash between
+        // PREPARE and COMMIT) so `XA RECOVER` / `XA COMMIT` can complete them.
+        self.xa.setStorage(io, root_dir);
         return self;
     }
 

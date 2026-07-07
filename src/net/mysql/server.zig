@@ -2785,7 +2785,7 @@ fn handleXaCommand(
         return;
     }
     if (eq(verb, "start") or eq(verb, "begin")) {
-        catalog.xa.begin(xid) catch |e| return xaErr(allocator, w, seq_id, e);
+        catalog.xa.begin(xid, session.current_db) catch |e| return xaErr(allocator, w, seq_id, e);
         if (session.xa_active) |old| allocator.free(old);
         session.xa_active = try allocator.dupe(u8, xid);
         return handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
@@ -2815,7 +2815,8 @@ fn handleXaCommand(
             xid = std.mem.trim(u8, xid[0 .. xid.len - 9], " \t\r\n,");
         if (catalog.xa.takeForCommit(xid)) |branch| {
             defer catalog.xa.finishCommit(branch);
-            if (catalog.database(session.current_db)) |main_db| {
+            const dbname = if (branch.db.len > 0) branch.db else session.current_db;
+            if (catalog.database(dbname)) |main_db| {
                 var carena = std.heap.ArenaAllocator.init(allocator);
                 defer carena.deinit();
                 const ca = carena.allocator();
