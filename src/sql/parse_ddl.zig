@@ -433,6 +433,20 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     }
     try p.expect(.rparen);
 
+    // Non-unique order key: `ORDER BY (col, ...)`. The table gets a sort /
+    // clustering key without a uniqueness constraint — inserts append and
+    // duplicate key values are kept (vs PRIMARY KEY, which upserts). Exactly
+    // one of PRIMARY KEY / ORDER BY may appear.
+    var sort_key: ?[]const []const u8 = null;
+    if (p.cur.tag == .kw_order) {
+        try p.advance();
+        if (p.cur.tag != .kw_by) return PE.SqlExpectedKeyword;
+        try p.advance();
+        try p.expect(.lparen);
+        sort_key = try p.parseIdentList();
+        try p.expect(.rparen);
+    }
+
     // StarRocks-style trailing options: PROPERTIES ("key" = "value", ...).
     // Recognized keys error on bad values; unknown keys are rejected so a
     // typo'd option never silently no-ops.
@@ -473,13 +487,20 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     if (inline_pk != null and table_pk != null) {
         return PE.SqlInvalidProjection;
     }
+    const has_pk = inline_pk != null or table_pk != null;
+    // Exactly one key clause: PRIMARY KEY (unique) or ORDER BY (non-unique).
+    if (has_pk and sort_key != null) return PE.SqlInvalidProjection;
+    const unique = has_pk;
     const order_key: []const []const u8 = if (table_pk) |tpk|
         tpk
     else if (inline_pk) |ipk| blk: {
         const one = try p.arena.alloc([]const u8, 1);
         one[0] = ipk;
         break :blk one;
-    } else return PE.SqlInvalidProjection;
+    } else if (sort_key) |sk|
+        sk
+    else
+        return PE.SqlInvalidProjection;
 
     const owned_cols = try p.arena.alloc(ir.ColumnDef, cols.items.len);
     for (cols.items, 0..) |c, i| owned_cols[i] = c;
@@ -490,6 +511,7 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
         .is_temp = is_temp,
         .columns = owned_cols,
         .order_key = order_key,
+        .unique = unique,
         .compression = compression,
     } } });
 }

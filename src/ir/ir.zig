@@ -214,7 +214,12 @@ pub const CreateTable = struct {
     /// / RESET CONNECTION / DISCARD ALL.
     is_temp: bool = false,
     columns: []const ColumnDef,
+    /// The order (clustering / sort) key — always present. From `PRIMARY KEY`
+    /// (then `unique = true`, inserts upsert last-writer-wins) or from a
+    /// non-unique `ORDER BY (...)` clause (then `unique = false`, inserts
+    /// append and duplicates on the key are kept).
     order_key: []const []const u8,
+    unique: bool = true,
     /// From `PROPERTIES ("compression" = "...")`; null = table default (lz4).
     compression: ?types.TableCompression = null,
 };
@@ -1341,6 +1346,7 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try encodeTableRef(allocator, out, ct.table);
             try out.append(allocator, @intFromBool(ct.if_not_exists));
             try out.append(allocator, @intFromBool(ct.is_temp));
+            try out.append(allocator, @intFromBool(ct.unique));
             try appendU32(allocator, out, @intCast(ct.columns.len));
             for (ct.columns) |c| try encodeColumnDef(allocator, out, c);
             try appendU32(allocator, out, @intCast(ct.order_key.len));
@@ -2505,6 +2511,9 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const is_temp = bytes[cursor.*] != 0;
             cursor.* += 1;
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const unique = bytes[cursor.*] != 0;
+            cursor.* += 1;
             if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
             const ncols = readU32(bytes[cursor.* .. cursor.* + 4]);
             cursor.* += 4;
@@ -2527,6 +2536,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
                 .is_temp = is_temp,
                 .columns = cols,
                 .order_key = keys,
+                .unique = unique,
                 .compression = if (comp_byte == 255) null else @enumFromInt(comp_byte),
             } };
         },

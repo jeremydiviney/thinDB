@@ -2065,12 +2065,12 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             const schema_def: TableSchema = .{
                 .columns = cols,
                 .order_key = ct.order_key,
-                .unique = true,
+                .unique = ct.unique,
                 .compression = ct.compression orelse types.default_table_compression,
             };
             const opts: TableOptions = .{
                 .order_key = ct.order_key,
-                .unique = true,
+                .unique = ct.unique,
                 .row_group_size = null,
             };
 
