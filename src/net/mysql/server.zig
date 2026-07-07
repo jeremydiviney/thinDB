@@ -25,6 +25,7 @@ const Table = thindb_api.Table;
 
 const local = @import("../local.zig");
 const ir = @import("../../ir/ir.zig");
+const xa_mod = @import("../xa.zig");
 const sql = @import("../../sql/sql.zig");
 const types = @import("../../types.zig");
 const core_scheduler = @import("../../util/core_scheduler.zig");
@@ -2779,9 +2780,33 @@ fn handleXaCommand(
     const eq = std.ascii.eqlIgnoreCase;
 
     if (eq(verb, "recover")) {
-        // Stage 1 is in-memory: no cross-restart recovery, report none prepared.
+        // MySQL XA RECOVER result: formatID, gtrid_length, bqual_length, data
+        // (= gtrid ++ bqual). Connector/J's recover() reconstructs each Xid from
+        // these, so a crashed job can re-commit its prepared branches.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const xids = catalog.xa.preparedXids(aa) catch &[_][]const u8{};
         var sid = seq_id;
-        try result.sendSingleColumnRows(allocator, w, "data", &[_][]const u8{}, &sid, session.client_caps);
+        const cols = [_]types.Column{
+            .{ .name = "formatID", .type = .int },
+            .{ .name = "gtrid_length", .type = .int },
+            .{ .name = "bqual_length", .type = .int },
+            .{ .name = "data", .type = .string },
+        };
+        try result.sendResultHeader(allocator, w, &cols, "", "", &sid);
+        try result.sendColumnDefBoundary(allocator, w, &sid, session.client_caps);
+        for (xids) |x| {
+            const p = xa_mod.parseXid(aa, x) catch continue;
+            const cells = [_]?[]const u8{
+                try std.fmt.allocPrint(aa, "{d}", .{p.format_id}),
+                try std.fmt.allocPrint(aa, "{d}", .{p.gtrid.len}),
+                try std.fmt.allocPrint(aa, "{d}", .{p.bqual.len}),
+                try std.mem.concat(aa, u8, &.{ p.gtrid, p.bqual }),
+            };
+            try result.sendTextRow(allocator, w, &cells, &sid);
+        }
+        try result.sendResultTerminator(allocator, w, &sid, session.client_caps);
         return;
     }
     if (eq(verb, "start") or eq(verb, "begin")) {

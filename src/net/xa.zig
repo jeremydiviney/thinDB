@@ -257,6 +257,72 @@ pub const XaManager = struct {
     }
 };
 
+pub const ParsedXid = struct { format_id: i64, gtrid: []const u8, bqual: []const u8 };
+
+/// Decompose a MySQL XA xid literal into (formatID, gtrid, bqual) for XA
+/// RECOVER. Accepts `gtrid`, `gtrid,bqual`, or `gtrid,bqual,formatID` where each
+/// of gtrid/bqual is `'text'`, `X'hex'`/`x'hex'`, `0xhex`, or bare text (which is
+/// what MySQL Connector/J's XAResource emits — it hex-encodes). Bytes are
+/// allocated from `allocator`. Falls back to the whole string as an opaque gtrid.
+pub fn parseXid(allocator: Allocator, text: []const u8) !ParsedXid {
+    var parts: [3][]const u8 = undefined;
+    var np: usize = 0;
+    var start: usize = 0;
+    var in_q = false;
+    var i: usize = 0;
+    while (i < text.len and np < 2) : (i += 1) {
+        if (text[i] == '\'') in_q = !in_q;
+        if (text[i] == ',' and !in_q) {
+            parts[np] = std.mem.trim(u8, text[start..i], " \t");
+            np += 1;
+            start = i + 1;
+        }
+    }
+    parts[np] = std.mem.trim(u8, text[start..], " \t");
+    np += 1;
+
+    const gtrid = try decodeXidPart(allocator, parts[0]);
+    const bqual = if (np >= 2) try decodeXidPart(allocator, parts[1]) else try allocator.dupe(u8, "");
+    var fmt: i64 = 1;
+    if (np >= 3) {
+        // Connector/J emits the formatID as 0x-hex too (e.g. `0x1`).
+        const fp = parts[2];
+        fmt = if (fp.len >= 2 and fp[0] == '0' and (fp[1] == 'x' or fp[1] == 'X'))
+            std.fmt.parseInt(i64, fp[2..], 16) catch 1
+        else
+            std.fmt.parseInt(i64, fp, 10) catch 1;
+    }
+    return .{ .format_id = fmt, .gtrid = gtrid, .bqual = bqual };
+}
+
+fn decodeXidPart(allocator: Allocator, s: []const u8) ![]const u8 {
+    if (s.len >= 3 and (s[0] == 'X' or s[0] == 'x') and s[1] == '\'' and s[s.len - 1] == '\'')
+        return hexDecode(allocator, s[2 .. s.len - 1]);
+    if (s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X'))
+        return hexDecode(allocator, s[2..]);
+    if (s.len >= 2 and s[0] == '\'' and s[s.len - 1] == '\'')
+        return allocator.dupe(u8, s[1 .. s.len - 1]);
+    return allocator.dupe(u8, s);
+}
+
+fn hexDecode(allocator: Allocator, hex: []const u8) ![]const u8 {
+    const out = try allocator.alloc(u8, hex.len / 2);
+    errdefer allocator.free(out);
+    for (out, 0..) |*o, i| {
+        o.* = (@as(u8, try hexNibble(hex[i * 2])) << 4) | @as(u8, try hexNibble(hex[i * 2 + 1]));
+    }
+    return out;
+}
+
+fn hexNibble(c: u8) !u4 {
+    return switch (c) {
+        '0'...'9' => @intCast(c - '0'),
+        'a'...'f' => @intCast(c - 'a' + 10),
+        'A'...'F' => @intCast(c - 'A' + 10),
+        else => error.BadHex,
+    };
+}
+
 fn appendU32(allocator: Allocator, out: *std.ArrayList(u8), v: u32) !void {
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, v, .little);
@@ -302,6 +368,30 @@ test "xa branch lifecycle: begin/stage/end/prepare/commit + idempotent" {
     mgr.finishCommit(branch);
 
     try testing.expect(mgr.takeForCommit("x1") == null); // idempotent
+}
+
+test "parseXid: hex gtrid/bqual + formatID" {
+    const a = std.testing.allocator;
+    const p = try parseXid(a, "X'6774726964',X'6271',7"); // hex('gtrid'), hex('bq'), 7
+    defer {
+        a.free(p.gtrid);
+        a.free(p.bqual);
+    }
+    try std.testing.expectEqualStrings("gtrid", p.gtrid);
+    try std.testing.expectEqualStrings("bq", p.bqual);
+    try std.testing.expectEqual(@as(i64, 7), p.format_id);
+}
+
+test "parseXid: opaque fallback + default format" {
+    const a = std.testing.allocator;
+    const p = try parseXid(a, "'dx1'");
+    defer {
+        a.free(p.gtrid);
+        a.free(p.bqual);
+    }
+    try std.testing.expectEqualStrings("dx1", p.gtrid);
+    try std.testing.expectEqual(@as(usize, 0), p.bqual.len);
+    try std.testing.expectEqual(@as(i64, 1), p.format_id);
 }
 
 test "xa rollback discards" {
