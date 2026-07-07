@@ -1,32 +1,49 @@
-# Phase-1 JDBC ingest validation: Flink (JobManager + TaskManager) with the
-# JDBC + MySQL connector jars, sinking into thinDB running on the Windows HOST.
+# End-to-end CDC validation:
+#   MySQL (binlog source) --Flink CDC snapshot+stream--> thinDB (JDBC upsert sink)
 #
-# Prereqs: Docker Desktop running; thinDB server up on the host, e.g.
-#   ./zig-out/bin/thindb-server.exe --data-dir .flink-db --mysql-port 3306 --max-dop 4
-# and the target table created (see job.sql header).
-#
-# Run:
-#   docker compose -f tests/flink/docker-compose.yml build
-#   docker compose -f tests/flink/docker-compose.yml up -d
-#   docker compose -f tests/flink/docker-compose.yml exec jobmanager \
-#     ./bin/sql-client.sh -f /opt/sql/job.sql
-# Then query thinDB (mysql -P 3306) to see rows land + upsert.
+# thinDB runs on the HOST (Windows/Linux) on port 13306; Flink reaches it via
+# host.docker.internal. The MySQL source runs here in Docker. See README.md.
 services:
+  mysql:
+    image: mysql:8.0
+    command: >-
+      --server-id=223344
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: src
+    ports:
+      - "13307:3306" # host access to seed/insert into the source
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   jobmanager:
     build:
       context: .
       dockerfile: Dockerfile.flink
     ports:
-      - "8081:8081" # Flink web UI
+      - "8081:8081"
     command: jobmanager
     environment:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
+        execution.checkpointing.interval: 3s
     extra_hosts:
-      - "host.docker.internal:host-gateway" # reach thinDB on the host
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./job.sql:/opt/sql/job.sql:ro
+      - ./cdc_job.sql:/opt/sql/cdc_job.sql:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
 
   taskmanager:
     build:

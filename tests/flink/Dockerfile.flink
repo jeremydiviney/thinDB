@@ -1,10 +1,12 @@
-# Flink image with the JDBC + MySQL connector jars needed to sink into thinDB.
-# Pin versions together (Flink 1.19 + flink-connector-jdbc 3.2.0-1.19 + mysql-j 8.3.0).
+# Flink image with the connector jars needed to sink into thinDB and to read
+# CDC from a MySQL source. Pin versions together (Flink 1.19).
 FROM flink:1.19.1-scala_2.12-java11
 
 ENV JDBC_CONN=3.2.0-1.19
 ENV MYSQL_J=8.3.0
+ENV CDC=3.2.0
 
 RUN cd /opt/flink/lib \
  && curl -fsSLO https://repo1.maven.org/maven2/org/apache/flink/flink-connector-jdbc/${JDBC_CONN}/flink-connector-jdbc-${JDBC_CONN}.jar \
- && curl -fsSLO https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/${MYSQL_J}/mysql-connector-j-${MYSQL_J}.jar
+ && curl -fsSLO https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/${MYSQL_J}/mysql-connector-j-${MYSQL_J}.jar \
+ && curl -fsSLO https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-mysql-cdc/${CDC}/flink-sql-connector-mysql-cdc-${CDC}.jar

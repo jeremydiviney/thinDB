@@ -1,8 +1,45 @@
-# Flink → thinDB JDBC ingest validation (Phase 1)
+# Flink → thinDB ingest validation
 
 Validates the JDBC ingest path with a **real Flink job + real Connector/J**
-(what mysql2 smoke tests can't fully cover). thinDB runs natively on the host
-(Windows/Linux); only Flink runs in Docker. See `../../INGEST_DESIGN.md`.
+(what mysql2 smoke tests can't cover). thinDB runs natively on the host
+(Windows/Linux) on **port 13306**; Flink (and a MySQL CDC source) run in Docker
+and reach thinDB via `host.docker.internal`. See `../../INGEST_DESIGN.md`.
+
+Two harnesses share this compose stack:
+- **`job.sql`** — datagen → thinDB upsert (basic JDBC-sink sanity).
+- **`cdc_job.sql`** — the real one: **MySQL binlog → Flink CDC → thinDB**.
+
+## End-to-end CDC test (snapshot + streaming insert/update/delete)
+
+Proves the production scenario: a MySQL source with existing data is snapshotted
+into thinDB, then live inserts/updates/deletes tail the binlog into thinDB.
+
+```
+# 0. thinDB on the host + target table (mysql client on :13306):
+./zig-out/bin/thindb-server.exe --data-dir .flink-db --mysql-port 13306 --max-dop 4
+#    CREATE TABLE orders (id INT, customer_id INT, amount INT, status STRING, PRIMARY KEY(id));
+
+# 1. Bring up MySQL (binlog source) + Flink:
+docker compose -f tests/flink/docker-compose.yml up -d --build
+
+# 2. Seed the MySQL source + point thinDB at it (from tests/bun, has mysql2):
+node _cdc_driver.mjs seed 1000            # 1000 rows into src.orders (MySQL :13307)
+
+# 3. Submit the CDC job (MSYS_NO_PATHCONV=1 needed in Git Bash for the -f path):
+MSYS_NO_PATHCONV=1 docker compose -f tests/flink/docker-compose.yml \
+  exec -T jobmanager ./bin/sql-client.sh -f /opt/sql/cdc_job.sql
+
+# 4. Snapshot lands:            node _cdc_driver.mjs check   -> COUNT = 1000
+# 5. Live insert:               node _cdc_driver.mjs live 1001 50   -> COUNT = 1050
+# 6. Update + delete:           node _cdc_driver.mjs mutate
+#      -> id=1 amount=999999, id=2 DELETED, COUNT = 1049
+```
+
+Result (verified 2026-07-07): snapshot 1000 → live +50 → update+delete all
+propagate correctly through the JDBC upsert sink. `mutate` exercises the full
+CDC changelog: `+U` → `ON DUPLICATE KEY UPDATE`, `-D` → `DELETE WHERE pk=?`.
+
+## Basic JDBC-sink sanity (datagen)
 
 ## Steps
 
