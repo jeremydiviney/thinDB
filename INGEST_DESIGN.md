@@ -65,7 +65,67 @@ INSERT INTO thindb_dim SELECT ... ;         -- upsert stream → ON DUPLICATE KE
 
 ---
 
-## Stage 2 — HTTP Stream Load (bulk) + exactly-once
+## Stage 2 — Exactly-once over JDBC via XA (DECISION 2026-07-07)
+
+**We go JDBC-only. HTTP Stream Load is dropped** (it was only ever buying bulk
+throughput + StarRocks-connector drop-in — neither is a functional need). Flink's
+JDBC connector does exactly-once via **XA transactions**; Connector/J's XA path
+issues `XA START/END/PREPARE/COMMIT/ROLLBACK/RECOVER` as **SQL statements on the
+MySQL wire**. So thinDB implements those and Flink's `sink.semantic=exactly-once`
+JDBC sink works — no HTTP, testable with mysql2 on Windows (final proof needs
+real Flink kill-and-replay in Docker).
+
+The hard part is the same either way: the **durable 2PC core**. XA is just a thin
+SQL skin on it.
+
+### XA flow (what Connector/J does per Flink checkpoint)
+```
+XA START 'xid'   → begin branch, bind to this connection
+INSERT ...       → rows STAGED in the branch (not applied)
+XA END 'xid'     → detach branch from connection
+XA PREPARE 'xid' → make staged data durable + invisible (crash-safe)
+XA COMMIT 'xid'  → atomically make visible + record xid (idempotent: re-commit = no-op)
+XA ROLLBACK 'xid'→ discard
+XA RECOVER       → list prepared-but-uncommitted xids (recovery after restart)
+```
+Crash between PREPARE and COMMIT: on restart Flink does `XA RECOVER`, finds the
+xid, re-`COMMIT`s (idempotent). Crash before PREPARE: staging lost, Flink
+reproduces under the next checkpoint. xid = opaque dedup key.
+
+### Code seams (mapped)
+- **Session** (api.zig:332) is copied by value; connection-persistent state lives
+  behind a Connection-owned pointer (see `vars: ?*SessionVars`). Add
+  `xa: ?*XaConnState` the same way → tracks this connection's active xid.
+- **XaManager** (new module, Catalog- or Database-level): branches keyed by xid →
+  { state ACTIVE|IDLE|PREPARED, staged rows per target table }. Prepared branches
+  are global (survive connection close + restart). Single writer thread serializes
+  commits → no lock manager needed.
+- **Parser**: `XA <cmd> ['xid']` → new IR op (contextual like REFRESH; `XA` lexes
+  as identifier). 
+- **Dispatch** (local.zig compileOp @1830): handle the XA op → XaManager calls
+  using the session's connection state.
+- **Staging hook** (local.zig compileInsert @1855): if the connection has an
+  active xid → `XaManager.stage(xid, table, rows)` instead of `insertBatch`.
+
+### Build slices
+- **S1 (mysql2-testable, no Docker):** XA parse + XaConnState + in-memory XaManager
+  (begin/stage/end/prepare/commit/rollback/recover) + insert-staging hook. Full
+  command flow works; NOT crash-safe yet. Idempotent commit for retries.
+- **S2 (durability):** prepared branches + staged rows survive restart — stage to
+  durable staging-segments (reuse segment writer, fsync) on PREPARE; COMMIT =
+  atomic manifest swap adding them + recording the xid; label/xid store in a
+  manifest sidecar; recovery on open feeds `XA RECOVER`.
+- **S3 (proof):** real Flink `sink.semantic=exactly-once` in Docker; kill JM/TM
+  mid-stream, restart, assert no dupes / no loss on a KEYLESS (`ORDER BY`) table.
+
+### Deferred (not building): HTTP Stream Load
+Kept here only as the future throughput/bulk option. Same 2PC core, HTTP skin
+(`/api/transaction/{begin,prepare,commit,rollback}` + `_stream_load`). Revisit
+only if JDBC row-batch ingest throughput becomes a bottleneck.
+
+---
+
+## (Deferred) HTTP Stream Load reference
 
 ### 2a. Stream Load endpoint (bulk, effectively-once)
 New HTTP listener alongside the mysql/pg/native ones.
