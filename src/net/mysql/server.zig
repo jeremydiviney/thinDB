@@ -2754,8 +2754,20 @@ fn isXaStageable(op: ir.Op) bool {
     };
 }
 
+// Map internal XA errors to MySQL's XA error codes so Connector/J surfaces the
+// right XAException.errorCode and Flink's committer reacts correctly (e.g. it
+// treats XAER_NOTA on recovery as already-resolved).
 fn xaErr(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, e: anyerror) !void {
-    try handshake.sendErrPacket(allocator, w, seq_id, 1397, "XAE05".*, @errorName(e));
+    switch (e) {
+        error.XaBranchExists => // XAER_DUPID
+        try handshake.sendErrPacket(allocator, w, seq_id, 1440, "XAE08".*, "XAER_DUPID: XID already exists"),
+        error.XaBranchUnknown => // XAER_NOTA
+        try handshake.sendErrPacket(allocator, w, seq_id, 1397, "XAE04".*, "XAER_NOTA: unknown XID"),
+        error.XaProtocol => // XAER_RMFAIL: wrong state for this command
+        try handshake.sendErrPacket(allocator, w, seq_id, 1399, "XAE07".*, "XAER_RMFAIL: command invalid in the current XA state"),
+        else => // XAER_INVAL
+        try handshake.sendErrPacket(allocator, w, seq_id, 1398, "XAE05".*, @errorName(e)),
+    }
 }
 
 /// XA transaction control for the Flink exactly-once JDBC sink. `text` is the
