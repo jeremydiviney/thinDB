@@ -11,6 +11,7 @@ test {
     _ = @import("ddl_test.zig");
     _ = @import("uuid_test.zig");
     _ = @import("json_test.zig");
+    _ = @import("views_test.zig");
     _ = @import("compute_test.zig");
     _ = @import("compute_scalar_test.zig");
     _ = @import("decimal_test.zig");

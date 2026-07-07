@@ -31,6 +31,11 @@ pub const Catalog = struct {
     /// keyed per database. Loaded from `<db>/_functions/*.sql` on open;
     /// function DDL keeps the registry and the files in sync.
     sql_fns: udf_mod.SqlFnRegistry,
+    /// Views (`CREATE [MATERIALIZED] VIEW`), keyed per database. Loaded from
+    /// `<db>/_views/*.sql` on open. A materialized view's backing table
+    /// persists as an ordinary table; this registry only holds its defining
+    /// query (for REFRESH) and marks the name as a view.
+    views: udf_mod.ViewRegistry,
     /// Loaded LANGUAGE zig functions: keeps each compiled library alive
     /// while its registry entry exists. Guarded by databases_mutex (DDL
     /// is rare; no dedicated lock).
@@ -96,6 +101,7 @@ pub const Catalog = struct {
             .owned_pool = owned_pool,
             .udfs = udf_mod.UdfRegistry.init(allocator),
             .sql_fns = udf_mod.SqlFnRegistry.init(allocator),
+            .views = udf_mod.ViewRegistry.init(allocator),
             .databases = .init(allocator),
         };
         errdefer {
@@ -103,6 +109,7 @@ pub const Catalog = struct {
             while (it.next()) |entry| entry.value_ptr.*.closeInPlace();
             self.udfs.deinit();
             self.sql_fns.deinit();
+            self.views.deinit();
             self.databases.deinit();
         }
         try discoverDatabasesOnDisk(allocator, io, root_dir, cfg, &self.databases);
@@ -110,6 +117,7 @@ pub const Catalog = struct {
         while (it.next()) |entry| {
             entry.value_ptr.*.catalog = self;
             self.loadSqlFunctions(entry.value_ptr.*) catch {};
+            self.loadViews(entry.value_ptr.*) catch {};
         }
         return self;
     }
@@ -206,6 +214,72 @@ pub const Catalog = struct {
         if (!existed) return false;
         if (self.database(db_name)) |db| {
             var dir = db.db_dir.openDir(self.io, "_functions", .{}) catch return true;
+            defer dir.close(self.io);
+            var namebuf: [300]u8 = undefined;
+            const fname = fnFileName(&namebuf, name) catch return true;
+            dir.deleteFile(self.io, fname) catch {};
+        }
+        return true;
+    }
+
+    /// Load persisted views from `<db>/_views/`. Each file holds one verbatim
+    /// CREATE [MATERIALIZED] VIEW statement; a materialized view's backing
+    /// table is loaded through the normal table-discovery path. Best-effort.
+    pub fn loadViews(self: *Catalog, db: *Database) !void {
+        const sqlp = @import("../sql/sql.zig");
+        var dir = db.db_dir.openDir(self.io, "_views", .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".sql")) continue;
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const text = dir.readFileAlloc(self.io, entry.name, arena.allocator(), .limited(1 << 20)) catch continue;
+            const op = sqlp.parse(arena.allocator(), text) catch continue;
+            if (op.* != .ddl or op.ddl != .create_view) continue;
+            self.registerView(db.name, op.ddl.create_view, true) catch continue;
+        }
+    }
+
+    /// Register a view from its parsed CREATE statement and persist the
+    /// canonical statement to `<db>/_views/<name>.sql`. `skip_persist=true`
+    /// on the load-from-disk path.
+    pub fn registerView(
+        self: *Catalog,
+        db_name: []const u8,
+        cv: @import("../ir/ir.zig").CreateView,
+        skip_persist: bool,
+    ) !void {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(self.allocator);
+        try text.appendSlice(self.allocator, if (cv.materialized) "CREATE MATERIALIZED VIEW " else "CREATE VIEW ");
+        try text.appendSlice(self.allocator, cv.name);
+        try text.appendSlice(self.allocator, " AS ");
+        try text.appendSlice(self.allocator, cv.body);
+
+        try self.views.register(db_name, .{
+            .name = cv.name,
+            .materialized = cv.materialized,
+            .body = cv.body,
+            .create_text = text.items,
+        }, cv.or_replace or skip_persist);
+
+        if (skip_persist) return;
+        const db = self.database(db_name) orelse return Error.DatabaseNotFound;
+        var dir = db.db_dir.openDir(self.io, "_views", .{}) catch
+            try db.db_dir.createDirPathOpen(self.io, "_views", .{});
+        defer dir.close(self.io);
+        var namebuf: [300]u8 = undefined;
+        const fname = try fnFileName(&namebuf, cv.name);
+        try dir.writeFile(self.io, .{ .sub_path = fname, .data = text.items });
+    }
+
+    pub fn dropView(self: *Catalog, db_name: []const u8, name: []const u8) !bool {
+        const existed = try self.views.drop(db_name, name);
+        if (!existed) return false;
+        if (self.database(db_name)) |db| {
+            var dir = db.db_dir.openDir(self.io, "_views", .{}) catch return true;
             defer dir.close(self.io);
             var namebuf: [300]u8 = undefined;
             const fname = fnFileName(&namebuf, name) catch return true;
@@ -441,6 +515,7 @@ pub const Catalog = struct {
         for (self.zig_fns.items) |*h| h.deinit(self.allocator);
         self.zig_fns.deinit(self.allocator);
         self.sql_fns.deinit();
+        self.views.deinit();
         self.databases.deinit();
         const allocator = self.allocator;
         if (self.owned_pool) |p| allocator.destroy(p);

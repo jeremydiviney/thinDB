@@ -130,6 +130,30 @@ pub const DdlOp = union(enum) {
     create_sql_function: CreateSqlFunction,
     drop_sql_function: DropSqlFunction,
     create_zig_function: CreateZigFunction,
+    create_view: CreateView,
+    drop_view: DropView,
+    /// `REFRESH MATERIALIZED VIEW name` — re-run the stored defining query
+    /// and replace the backing table's contents.
+    refresh_view: []const u8,
+};
+
+/// `CREATE [OR REPLACE] [MATERIALIZED] VIEW name AS <select>`. Like an
+/// inline function, the defining query is stored as raw text. A plain view
+/// is expanded inline at each `FROM name` reference; a materialized view
+/// additionally builds a backing table now (and on REFRESH) that plain
+/// scans read.
+pub const CreateView = struct {
+    name: []const u8,
+    or_replace: bool,
+    materialized: bool,
+    /// Raw defining-query text (everything after `AS`).
+    body: []const u8,
+};
+
+pub const DropView = struct {
+    name: []const u8,
+    if_exists: bool,
+    materialized: bool,
 };
 
 /// `CREATE [OR REPLACE] FUNCTION name(p T, ...) RETURNS TABLE AS (body)` —
@@ -1154,6 +1178,9 @@ const DdlTag = enum(u8) {
     create_sql_function = 11,
     drop_sql_function = 12,
     create_zig_function = 13,
+    create_view = 14,
+    drop_view = 15,
+    refresh_view = 16,
 };
 
 const TypeWireTag = enum(u8) {
@@ -1371,6 +1398,27 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try appendU32(allocator, out, @intCast(zf.source.len));
             try out.appendSlice(allocator, zf.source);
             try out.append(allocator, @intFromBool(zf.using_path));
+        },
+        .create_view => |cv| {
+            try out.append(allocator, @intFromEnum(DdlTag.create_view));
+            try appendU32(allocator, out, @intCast(cv.name.len));
+            try out.appendSlice(allocator, cv.name);
+            try out.append(allocator, @intFromBool(cv.or_replace));
+            try out.append(allocator, @intFromBool(cv.materialized));
+            try appendU32(allocator, out, @intCast(cv.body.len));
+            try out.appendSlice(allocator, cv.body);
+        },
+        .drop_view => |dv| {
+            try out.append(allocator, @intFromEnum(DdlTag.drop_view));
+            try appendU32(allocator, out, @intCast(dv.name.len));
+            try out.appendSlice(allocator, dv.name);
+            try out.append(allocator, @intFromBool(dv.if_exists));
+            try out.append(allocator, @intFromBool(dv.materialized));
+        },
+        .refresh_view => |n| {
+            try out.append(allocator, @intFromEnum(DdlTag.refresh_view));
+            try appendU32(allocator, out, @intCast(n.len));
+            try out.appendSlice(allocator, n);
         },
     }
 }
@@ -2548,6 +2596,29 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
                 .using_path = using_path,
             } };
         },
+        .create_view => blk: {
+            const name = try readString(bytes, cursor);
+            if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
+            const or_replace = bytes[cursor.*] != 0;
+            const materialized = bytes[cursor.* + 1] != 0;
+            cursor.* += 2;
+            const body = try readString(bytes, cursor);
+            break :blk DdlOp{ .create_view = .{
+                .name = name,
+                .or_replace = or_replace,
+                .materialized = materialized,
+                .body = body,
+            } };
+        },
+        .drop_view => blk: {
+            const name = try readString(bytes, cursor);
+            if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
+            const if_exists = bytes[cursor.*] != 0;
+            const materialized = bytes[cursor.* + 1] != 0;
+            cursor.* += 2;
+            break :blk DdlOp{ .drop_view = .{ .name = name, .if_exists = if_exists, .materialized = materialized } };
+        },
+        .refresh_view => DdlOp{ .refresh_view = try readString(bytes, cursor) },
     };
 }
 

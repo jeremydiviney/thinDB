@@ -2157,8 +2157,113 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             try t.truncate();
             ctx.affected_rows = 0;
         },
+        .create_view => |cv| {
+            const db_name = ctx.session.current_db;
+            if (!cv.or_replace and catalog.views.get(db_name, cv.name) != null) return Error.TableAlreadyExists;
+            // Validate the defining query parses now, not at first use.
+            {
+                var va = std.heap.ArenaAllocator.init(ctx.allocator);
+                defer va.deinit();
+                _ = @import("../sql/sql.zig").parseWithContext(
+                    va.allocator(),
+                    cv.body,
+                    ctx.session.dialect,
+                    &catalog.udfs,
+                    .{ .registry = &catalog.sql_fns, .db = db_name, .views = &catalog.views },
+                ) catch return Error.FunctionInvalidDefinition;
+            }
+            if (cv.materialized) {
+                const n = try buildMaterializedView(ctx, catalog, cv.name, cv.body, cv.or_replace, true);
+                ctx.affected_rows = @intCast(n);
+            }
+            catalog.registerView(db_name, cv, false) catch |e| return thindb_api.remapError(Error, e);
+        },
+        .drop_view => |dv| {
+            const existed = catalog.dropView(ctx.session.current_db, dv.name) catch |e| return thindb_api.remapError(Error, e);
+            if (existed and dv.materialized) {
+                if (catalog.database(ctx.session.current_db)) |db| {
+                    if (db.schema(ctx.session.current_schema)) |sc| {
+                        sc.dropTable(dv.name) catch {};
+                    }
+                }
+            }
+            if (!existed and !dv.if_exists) return Error.TableNotFound;
+        },
+        .refresh_view => |name| {
+            const def = catalog.views.get(ctx.session.current_db, name) orelse return Error.TableNotFound;
+            if (!def.materialized) return Error.UnsupportedOp;
+            // Copy the body: the registry entry can change under concurrent DDL.
+            const body = try ctx.allocator.dupe(u8, def.body);
+            defer ctx.allocator.free(body);
+            const n = try buildMaterializedView(ctx, catalog, name, body, true, false);
+            ctx.affected_rows = @intCast(n);
+        },
     }
     return try EmptyOp.create(ctx.allocator);
+}
+
+/// Build (or REFRESH) a materialized view's backing table: re-parse the
+/// defining query, compile it, and stream its rows into a table named
+/// `name`. On create the table is made fresh (dropped first if `replace`);
+/// on refresh the existing table is truncated and refilled. Returns the row
+/// count. The parsed IR lives in a local arena that outlives the drain.
+fn buildMaterializedView(
+    ctx: *CompileCtx,
+    catalog: *Catalog,
+    name: []const u8,
+    body: []const u8,
+    replace: bool,
+    is_create: bool,
+) anyerror!usize {
+    var pa = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer pa.deinit();
+    const parsed = @import("../sql/sql.zig").parseWithContext(
+        pa.allocator(),
+        body,
+        ctx.session.dialect,
+        &catalog.udfs,
+        .{ .registry = &catalog.sql_fns, .db = ctx.session.current_db, .views = &catalog.views },
+    ) catch return Error.FunctionInvalidDefinition;
+
+    var source = try compileSubplan(ctx, parsed);
+    defer source.deinit();
+    const src_schema = source.outputSchema();
+    if (src_schema.len == 0) return Error.BadRequest;
+
+    const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
+    const sc = db.schema(ctx.session.current_schema) orelse return Error.SchemaNotFound;
+
+    const cols = try ctx.allocator.alloc(types.Column, src_schema.len);
+    defer ctx.allocator.free(cols);
+    for (src_schema, cols) |s, *c| c.* = .{ .name = s.name, .type = s.type, .nullable = s.nullable };
+    const order_key = try ctx.allocator.alloc([]const u8, 1);
+    defer ctx.allocator.free(order_key);
+    order_key[0] = cols[0].name;
+    const target_schema: TableSchema = .{ .columns = cols, .order_key = order_key, .unique = false };
+    const opts: TableOptions = .{ .order_key = order_key, .unique = false, .row_group_size = null };
+
+    sc.tables_mutex.lockUncancelable(sc.io);
+    var exists = sc.tables.get(name) != null;
+    sc.tables_mutex.unlock(sc.io);
+    if (is_create and exists) {
+        if (!replace) return Error.TableAlreadyExists;
+        sc.dropTable(name) catch |e| return thindb_api.remapError(Error, e);
+        exists = false;
+    }
+
+    const t = if (exists)
+        try resolveTable(catalog, ctx.session.*, .{ .name = name })
+    else
+        sc.table(name, target_schema, opts) catch |e| return thindb_api.remapError(Error, e);
+    if (exists) try t.truncate();
+
+    var total: usize = 0;
+    while (try source.next()) |b| {
+        try t.insertBatch(b.schema, b.values, b.row_count);
+        total += b.row_count;
+    }
+    try t.flush();
+    return total;
 }
 
 /// CREATE TABLE name AS SELECT ... — infer target schema from the

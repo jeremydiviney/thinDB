@@ -598,7 +598,7 @@ fn extended_handleExecute(
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const op = try sql.parseWithContext(aa, portal.bound_sql, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db });
+    const op = try sql.parseWithContext(aa, portal.bound_sql, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views });
 
     if (op.* == .batch) {
         for (op.batch.statements) |stmt| {
@@ -975,7 +975,7 @@ fn runEngineQuery(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const op = try sql.parseWithContext(arena.allocator(), sql_text, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db });
+    const op = try sql.parseWithContext(arena.allocator(), sql_text, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views });
 
     if (op.* == .batch) {
         // PG simple-Query protocol natively supports `;`-separated
@@ -1091,6 +1091,9 @@ fn commandTagFor(op: ir.Op) []const u8 {
             .create_sql_function => "CREATE FUNCTION",
         .create_zig_function => "CREATE FUNCTION",
             .drop_sql_function => "DROP FUNCTION",
+            .create_view => |cv| if (cv.materialized) "CREATE MATERIALIZED VIEW" else "CREATE VIEW",
+            .drop_view => |dv| if (dv.materialized) "DROP MATERIALIZED VIEW" else "DROP VIEW",
+            .refresh_view => "REFRESH MATERIALIZED VIEW",
         },
         else => "OK",
     };

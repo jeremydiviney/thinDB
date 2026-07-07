@@ -597,6 +597,13 @@ pub const Parser = struct {
             .kw_set => return try self.parseSetVar(),
             .kw_delete => return try self.parseDelete(),
             .kw_update => return try self.parseUpdate(),
+            // REFRESH MATERIALIZED VIEW — `refresh` is contextual (not a
+            // reserved keyword), so match it by identifier text here.
+            .identifier => {
+                if (std.ascii.eqlIgnoreCase(self.cur.text, "refresh")) {
+                    return try parse_ddl.parseRefresh(self);
+                }
+            },
             else => {},
         }
         // Optional WITH clause: zero-or-more named CTEs precede the
@@ -2711,6 +2718,12 @@ pub const Parser = struct {
             else
                 entry.op;
             alias_in_place = false;
+        } else if (self.cur.tag != .dot and self.plainViewDef(first) != null) {
+            // A plain (non-materialized) view expands inline, like a
+            // zero-arg inline function. Materialized views are real tables
+            // and fall through to the scan path below.
+            op = try self.expandView(self.plainViewDef(first).?);
+            alias_in_place = false;
         } else {
             var parts_buf: [3][]const u8 = undefined;
             parts_buf[0] = first_dup;
@@ -2840,6 +2853,39 @@ pub const Parser = struct {
     fn lookupSqlFn(self: *Parser, name: []const u8) ?*const udf_mod.SqlTableFn {
         const ctx = self.sql_fns orelse return null;
         return ctx.registry.get(ctx.db, name);
+    }
+
+    /// A non-materialized view named `name`, or null. Materialized views own
+    /// a backing table and resolve through the normal scan path instead.
+    fn plainViewDef(self: *Parser, name: []const u8) ?*const udf_mod.ViewDef {
+        const ctx = self.sql_fns orelse return null;
+        const vr = ctx.views orelse return null;
+        const def = vr.get(ctx.db, name) orelse return null;
+        return if (def.materialized) null else def;
+    }
+
+    /// Expand a plain-view reference: re-parse the stored defining query and
+    /// wrap it in a single-reference Materialize (which compiles inline, so
+    /// the view body behaves as if written in place). No parameters.
+    fn expandView(self: *Parser, def: *const udf_mod.ViewDef) ParseError!*ir.Op {
+        if (self.fn_expand_depth >= 16) return ParseError.SqlFunctionArgMismatch;
+        const body = try self.arena.dupe(u8, def.body);
+        var sub_lex = Lexer.init(self.arena, body);
+        sub_lex.dialect = self.lex.dialect;
+        var sub = Parser{
+            .arena = self.arena,
+            .lex = &sub_lex,
+            .cur = .{ .tag = .semicolon, .text = "" },
+            .udf_registry = self.udf_registry,
+            .sql_fns = self.sql_fns,
+            .fn_expand_depth = self.fn_expand_depth + 1,
+        };
+        try sub.advance();
+        const op = try sub.parseStatement();
+        if (sub.pending_separable != null) return ParseError.SqlSeparableScope;
+        try sub.applyAutoMaterialize();
+        if (sub.cur.tag != .eof and sub.cur.tag != .semicolon) return ParseError.SqlExpectedToken;
+        return try self.allocOp(.{ .materialize = .{ .upstream = op } });
     }
 
     /// Expand a SQL inline table function call site: parse the literal

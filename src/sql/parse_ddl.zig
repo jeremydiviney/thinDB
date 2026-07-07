@@ -43,6 +43,18 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                 try p.advance();
                 return try parseCreateFunctionBody(p, or_replace);
             }
+            // CREATE [OR REPLACE] [MATERIALIZED] VIEW name AS <select>.
+            // `materialized` is a reserved keyword; `view` is contextual.
+            if (p.cur.tag == .kw_materialized) {
+                try p.advance();
+                if (!isIdentText(p, "view")) return PE.SqlExpectedKeyword;
+                try p.advance();
+                return try parseCreateViewBody(p, or_replace, true);
+            }
+            if (isIdentText(p, "view")) {
+                try p.advance();
+                return try parseCreateViewBody(p, or_replace, false);
+            }
             if (or_replace) return PE.SqlExpectedKeyword;
             var is_temp = false;
             if (p.cur.tag == .kw_temp or p.cur.tag == .kw_temporary) {
@@ -80,6 +92,31 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                     .name = name,
                     .if_exists = if_exists,
                 } } });
+            }
+            // DROP [MATERIALIZED] VIEW [IF EXISTS] name.
+            {
+                var materialized = false;
+                if (p.cur.tag == .kw_materialized) {
+                    materialized = true;
+                    try p.advance();
+                }
+                if (materialized or isIdentText(p, "view")) {
+                    if (!isIdentText(p, "view")) return PE.SqlExpectedKeyword;
+                    try p.advance();
+                    var if_exists = false;
+                    if (p.cur.tag == .kw_if) {
+                        try p.advance();
+                        if (p.cur.tag != .kw_exists) return PE.SqlExpectedKeyword;
+                        try p.advance();
+                        if_exists = true;
+                    }
+                    const name = try p.dupedIdent();
+                    return try p.allocOp(.{ .ddl = .{ .drop_view = .{
+                        .name = name,
+                        .if_exists = if_exists,
+                        .materialized = materialized,
+                    } } });
+                }
             }
             if (p.cur.tag == .kw_temp or p.cur.tag == .kw_temporary) {
                 try p.advance();
@@ -239,6 +276,102 @@ pub fn parseCreateFunctionBody(p: anytype, or_replace: bool) !*ir.Op {
         .param_types = try p.arena.dupe(types.Type, param_types.items),
         .body = try p.arena.dupe(u8, body),
     } } });
+}
+
+/// CREATE [OR REPLACE] [MATERIALIZED] VIEW name AS <select>. The defining
+/// query is captured as raw text (to end of statement), mirroring the
+/// inline-function body capture. `MATERIALIZED VIEW` builds a backing table
+/// at compile time; a plain view is expanded inline at reference.
+pub fn parseCreateViewBody(p: anytype, or_replace: bool, materialized: bool) !*ir.Op {
+    const PE = @TypeOf(p.*).Err;
+    const name = try p.dupedIdent();
+    // Explicit view column lists (`VIEW v (a, b) AS ...`) are not supported
+    // in v1 — the column names come from the SELECT's own output.
+    if (p.cur.tag == .lparen) return PE.SqlExpectedKeyword;
+    if (p.cur.tag != .kw_as) return PE.SqlExpectedKeyword;
+
+    // Raw body capture by lexer position (see parseCreateFunctionBody): the
+    // position while the parser holds `AS` is the body start; each token's
+    // end position updates `body_end` until a top-level `;` / EOF closes it.
+    const src = p.sourceText();
+    const body_start = p.lexPos();
+    try p.advance();
+    var depth: usize = 0;
+    var body_end = body_start;
+    while (true) {
+        switch (p.cur.tag) {
+            .eof => break,
+            .semicolon => if (depth == 0) break,
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        body_end = p.lexPos();
+        try p.advance();
+    }
+    const raw = std.mem.trim(u8, src[body_start..body_end], " \t\r\n");
+    const body = stripOuterParens(raw);
+    if (body.len == 0) return PE.SqlExpectedSelect;
+
+    return try p.allocOp(.{ .ddl = .{ .create_view = .{
+        .name = name,
+        .or_replace = or_replace,
+        .materialized = materialized,
+        .body = try p.arena.dupe(u8, body),
+    } } });
+}
+
+/// REFRESH MATERIALIZED VIEW name. `refresh` was matched contextually by the
+/// caller (parseStatement); this consumes it and the rest.
+pub fn parseRefresh(p: anytype) !*ir.Op {
+    const PE = @TypeOf(p.*).Err;
+    try p.advance(); // consume "refresh"
+    if (p.cur.tag != .kw_materialized) return PE.SqlExpectedKeyword;
+    try p.advance();
+    if (!isIdentText(p, "view")) return PE.SqlExpectedKeyword;
+    try p.advance();
+    const name = try p.dupedIdent();
+    return try p.allocOp(.{ .ddl = .{ .refresh_view = name } });
+}
+
+/// Strip a fully-wrapping outer paren pair (`(SELECT ...)` → `SELECT ...`),
+/// repeatedly. String literals are skipped so parens inside them don't throw
+/// off the balance. Leaves a non-wrapped body untouched.
+fn stripOuterParens(body: []const u8) []const u8 {
+    var s = body;
+    while (s.len >= 2 and s[0] == '(') {
+        var depth: usize = 0;
+        var close: ?usize = null;
+        var in_str = false;
+        var quote: u8 = 0;
+        for (s, 0..) |c, i| {
+            if (in_str) {
+                if (c == quote) in_str = false;
+                continue;
+            }
+            switch (c) {
+                '\'', '"' => {
+                    in_str = true;
+                    quote = c;
+                },
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        close = i;
+                        break;
+                    }
+                },
+                else => {},
+            }
+        }
+        const m = close orelse break;
+        if (m != s.len - 1) break;
+        s = std.mem.trim(u8, s[1..m], " \t\r\n");
+    }
+    return s;
 }
 
 /// CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] [db.][schema.]name

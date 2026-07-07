@@ -14,6 +14,8 @@ const ColumnStore = store.ColumnStore;
 pub const Error = error{
     FunctionAlreadyExists,
     FunctionInvalidDefinition,
+    ViewAlreadyExists,
+    ViewNotFound,
 };
 
 pub const NullStrategy = enum {
@@ -371,11 +373,139 @@ pub const SqlFnRegistry = struct {
     }
 };
 
+/// A view: `CREATE [MATERIALIZED] VIEW name AS <select>`. A plain view is a
+/// named query expanded inline at each `FROM name` reference (like a
+/// zero-parameter inline function). A materialized view additionally owns a
+/// backing table of the same name; `body` is the defining query re-run by
+/// REFRESH.
+pub const ViewDef = struct {
+    name: []const u8,
+    materialized: bool,
+    /// Raw defining-query text (everything after `AS`).
+    body: []const u8,
+    /// Verbatim CREATE statement — the `<db>/_views/<name>.sql` persistence
+    /// format, re-parsed on catalog open.
+    create_text: []const u8,
+};
+
+/// Catalog-owned registry of views, keyed `<database>\x00<name>` like the
+/// function registry. All strings are owned copies; thread-safe.
+pub const ViewRegistry = struct {
+    allocator: Allocator,
+    map: std.StringHashMapUnmanaged(ViewDef) = .empty,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    pub fn init(allocator: Allocator) ViewRegistry {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ViewRegistry) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.freeView(e.value_ptr.*);
+        }
+        self.map.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn freeView(self: *ViewRegistry, v: ViewDef) void {
+        self.allocator.free(v.name);
+        self.allocator.free(v.body);
+        self.allocator.free(v.create_text);
+    }
+
+    fn viewKey(allocator: Allocator, db: []const u8, name: []const u8) ![]u8 {
+        const k = try allocator.alloc(u8, db.len + 1 + name.len);
+        @memcpy(k[0..db.len], db);
+        k[db.len] = 0;
+        for (name, k[db.len + 1 ..]) |c, *o| o.* = std.ascii.toLower(c);
+        return k;
+    }
+
+    /// Register (copies everything). `replace=false` errors on collision.
+    pub fn register(self: *ViewRegistry, db: []const u8, v: ViewDef, replace: bool) !void {
+        try validateName(v.name);
+        const k = try viewKey(self.allocator, db, v.name);
+        errdefer self.allocator.free(k);
+        const name = try lowerName(self.allocator, v.name);
+        errdefer self.allocator.free(name);
+        const body = try self.allocator.dupe(u8, v.body);
+        errdefer self.allocator.free(body);
+        const create_text = try self.allocator.dupe(u8, v.create_text);
+        errdefer self.allocator.free(create_text);
+        const owned: ViewDef = .{
+            .name = name,
+            .materialized = v.materialized,
+            .body = body,
+            .create_text = create_text,
+        };
+
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        const gop = try self.map.getOrPut(self.allocator, k);
+        if (gop.found_existing) {
+            if (!replace) return Error.ViewAlreadyExists;
+            self.allocator.free(k);
+            self.freeView(gop.value_ptr.*);
+            gop.value_ptr.* = owned;
+        } else {
+            gop.value_ptr.* = owned;
+        }
+    }
+
+    /// Remove. Returns false when absent.
+    pub fn drop(self: *ViewRegistry, db: []const u8, name: []const u8) !bool {
+        const k = try viewKey(self.allocator, db, name);
+        defer self.allocator.free(k);
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.map.fetchRemove(k)) |kv| {
+            self.allocator.free(kv.key);
+            self.freeView(kv.value);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn get(self: *ViewRegistry, db: []const u8, name: []const u8) ?*const ViewDef {
+        var kbuf: [512]u8 = undefined;
+        if (db.len + 1 + name.len > kbuf.len) return null;
+        @memcpy(kbuf[0..db.len], db);
+        kbuf[db.len] = 0;
+        for (name, kbuf[db.len + 1 ..][0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        return self.map.getPtr(kbuf[0 .. db.len + 1 + name.len]);
+    }
+
+    /// Names of every view registered for `db`, allocated copies.
+    pub fn listNames(self: *ViewRegistry, allocator: Allocator, db: []const u8) ![][]u8 {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |n| allocator.free(n);
+            out.deinit(allocator);
+        }
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const map_key = entry.key_ptr.*;
+            if (map_key.len <= db.len + 1) continue;
+            if (!std.mem.eql(u8, map_key[0..db.len], db) or map_key[db.len] != 0) continue;
+            try out.append(allocator, try allocator.dupe(u8, map_key[db.len + 1 ..]));
+        }
+        return out.toOwnedSlice(allocator);
+    }
+};
+
 /// Parse-time context for SQL table-function expansion: which registry
-/// to consult and which database scopes unqualified names.
+/// to consult and which database scopes unqualified names. Also carries the
+/// view registry so a bare `FROM viewname` can be expanded inline.
 pub const SqlFnCtx = struct {
     registry: *SqlFnRegistry,
     db: []const u8,
+    views: ?*ViewRegistry = null,
 };
 
 pub const UdfRegistry = struct {

@@ -74,6 +74,36 @@ pub fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunRe
     };
 }
 
+/// Like `runSql` but parses with the database's SQL-function and view
+/// registries in scope, so a bare `FROM viewname` expands. Single-statement
+/// only. Used by view/function tests; plain `runSql` (no context) suffices
+/// for everything else.
+pub fn runSqlCtx(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const cat = db.catalog.?;
+    const root = try thindb.sql.parseWithContext(
+        arena.allocator(),
+        sql,
+        .neutral,
+        &cat.udfs,
+        .{ .registry = &cat.sql_fns, .db = db.name, .views = &cat.views },
+    );
+    const cq = try thindb.net.compile(allocator, db, root);
+    return .{
+        .arena = arena,
+        .cq = cq,
+        .owned_vars = cq.sessionValue().vars,
+        .backing_allocator = allocator,
+    };
+}
+
+pub fn execCtx(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !void {
+    var q = try runSqlCtx(allocator, db, sql);
+    defer q.deinit();
+    while (try q.next()) |_| {}
+}
+
 /// Convenience wrapper for fire-and-forget statements (DDL, INSERT
 /// VALUES, etc.) — drains the batches and discards.
 pub fn exec(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !void {

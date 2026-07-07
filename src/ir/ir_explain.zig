@@ -429,6 +429,17 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
         .create_zig_function => |zf| {
             try writeAll(allocator, out, "CreateZigFunction ", zf.name, "\n");
         },
+        .create_view => |cv| {
+            try out.appendSlice(allocator, if (cv.materialized) "CreateMaterializedView " else "CreateView ");
+            try out.appendSlice(allocator, cv.name);
+            try out.append(allocator, '\n');
+        },
+        .drop_view => |dv| {
+            try out.appendSlice(allocator, if (dv.materialized) "DropMaterializedView " else "DropView ");
+            try out.appendSlice(allocator, dv.name);
+            try out.append(allocator, '\n');
+        },
+        .refresh_view => |n| try writeAll(allocator, out, "RefreshMaterializedView ", n, "\n"),
     }
 }
 
