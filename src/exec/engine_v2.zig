@@ -993,6 +993,11 @@ fn buildGlobalAggregateReduced(
 const ScanSelectPlan = struct {
     scan: ir.Op.Scan,
     where_filter: ?ir.Op.Filter = null,
+    /// A second WHERE filter sitting BELOW the compute layers (directly over
+    /// the scan) — produced when the parser splits an AND so base-column
+    /// conjuncts stay pushable while computed ones (`__pred_expr`) ride above
+    /// the Compute. Applied before the compute layers.
+    scan_filter: ?ir.Op.Filter = null,
     compute_layers: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined,
     compute_layer_count: usize = 0,
     order_by: ?ir.Op.OrderBy = null,
@@ -1061,6 +1066,7 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     // any `.exclude` decorators (plan-builder API), in any order, down to
     // the table scan.
     var where_filter: ?ir.Op.Filter = null;
+    var scan_filter: ?ir.Op.Filter = null;
     var compute_layers: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined;
     var compute_layer_count: usize = 0;
     var excludes: [MAX_SCAN_EXCLUDES][]const []const u8 = undefined;
@@ -1074,8 +1080,17 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
                 op = c.upstream;
             },
             .filter => |f| {
-                if (where_filter != null) return null;
-                where_filter = f;
+                // A filter above the computes is the WHERE (post-compute if it
+                // reads a derived col); a filter reached AFTER peeling a
+                // compute sits below them, directly over the scan, and is
+                // pushable. Allow one of each.
+                if (compute_layer_count == 0) {
+                    if (where_filter != null) return null;
+                    where_filter = f;
+                } else {
+                    if (scan_filter != null) return null;
+                    scan_filter = f;
+                }
                 op = f.upstream;
             },
             .exclude => |p| {
@@ -1091,6 +1106,7 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     return .{
         .scan = op.scan,
         .where_filter = where_filter,
+        .scan_filter = scan_filter,
         .compute_layers = compute_layers,
         .compute_layer_count = compute_layer_count,
         .order_by = order_by,
@@ -1266,12 +1282,36 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
         try exec.scanWithProjection(allocator, table, input.accountant, needed);
     errdefer q.deinit();
 
-    if (plan.where_filter) |f| q = try q.filter(f.predicate);
+    // A WHERE predicate over base-table columns pushes into the scan (early
+    // filtering / zonemap pruning). A predicate that references a column
+    // PRODUCED by a compute layer — e.g. `WHERE UPPER(s)='x'`, whose parser-
+    // derived `__pred_expr` lives in a Compute below the Filter — must run
+    // AFTER those computes instead. `matchScanSelect` flattens the
+    // compute/filter order, so decide here from the predicate's own columns.
+    const filter_after_compute = if (plan.where_filter) |f| blk: {
+        var pcols: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer pcols.deinit(allocator);
+        collectPredicateColumns(allocator, &pcols, f.predicate) catch break :blk false;
+        for (pcols.items) |pc| {
+            if (types.findColumn(table.schema.columns, pc) == null) break :blk true;
+        }
+        break :blk false;
+    } else false;
+
+    // Pushable base-column filter (below the computes) goes straight onto the
+    // scan first.
+    if (plan.scan_filter) |sf| q = try q.filter(sf.predicate);
+    if (plan.where_filter) |f| {
+        if (!filter_after_compute) q = try q.filter(f.predicate);
+    }
     var compute_i = plan.compute_layer_count;
     while (compute_i > 0) {
         compute_i -= 1;
         const derived = plan.compute_layers[compute_i];
         if (derived.len > 0) q = try computeDerivedFused(allocator, q, derived, input.udf_registry);
+    }
+    if (plan.where_filter) |f| {
+        if (filter_after_compute) q = try q.filter(f.predicate);
     }
     // Innermost exclude first (they were collected outermost-first walking
     // down). Each is a complement-projection over the current schema, so a

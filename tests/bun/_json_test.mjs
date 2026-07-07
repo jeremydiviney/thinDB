@@ -68,15 +68,10 @@ await scalar("length-obj", "SELECT JSON_LENGTH(doc) FROM jt WHERE id = 2", "5");
 await scalar("valid-true", "SELECT JSON_VALID(doc) FROM jt WHERE id = 1", "1");
 await scalar("valid-false", "SELECT JSON_VALID('{bad json') FROM jt WHERE id = 1", "0");
 
-// Filtering on an extracted value. A JSON extraction directly in a WHERE
-// predicate (`WHERE doc->>'$.x' = ...`) hits the engine's pre-existing
-// "scalar-function-of-column in a bare WHERE" gap — the same limitation as
-// `WHERE UPPER(col) = ...`. The portable form projects the extraction in a
-// subquery / CTE, then filters the derived column.
-const filtered = await q(
-  "where",
-  "SELECT id FROM (SELECT id, doc->>'$.city' AS city FROM jt) t WHERE city = 'NYC' ORDER BY id",
-);
+// Filtering on an extracted value directly in a WHERE predicate. `->>` lowers
+// to JSON_VALUE(doc, path), a scalar function of a column; the scan-select
+// builder runs that derived Compute before the Filter (see where_expr_test).
+const filtered = await q("where", "SELECT id FROM jt WHERE doc->>'$.city' = 'NYC' ORDER BY id");
 const ids = filtered ? filtered.map((r) => r.id).join(",") : "";
 if (ids === "1,3") console.log("where-filter: OK");
 else { console.log(`where-filter: FAIL (want '1,3', got '${ids}')`); failed++; }
