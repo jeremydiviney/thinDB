@@ -14,6 +14,7 @@ test {
     _ = @import("views_test.zig");
     _ = @import("where_expr_test.zig");
     _ = @import("nonunique_table_test.zig");
+    _ = @import("on_duplicate_key_test.zig");
     _ = @import("compute_test.zig");
     _ = @import("compute_scalar_test.zig");
     _ = @import("decimal_test.zig");

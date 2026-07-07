@@ -610,6 +610,35 @@ fn parseInsertLike(p: anytype, mode: ir.InsertMode) !*ir.Op {
     const rows_owned = try p.arena.alloc([]const ?Value, rows.items.len);
     for (rows.items, 0..) |r, i| rows_owned[i] = r;
 
+    // MySQL upsert clause: `ON DUPLICATE KEY UPDATE col = VALUES(col), ...`.
+    // thinDB's INSERT already upserts on a unique table (last-writer-wins) and
+    // appends on a non-unique one — exactly this clause's full-row-replace
+    // semantics, and the form Flink's JDBC upsert sink emits. So validate that
+    // shape and drop it. Partial / expression updates (`c = c + VALUES(c)`)
+    // can't be a full replace, so reject them rather than silently mis-apply.
+    if (p.cur.tag == .kw_on) {
+        try p.advance();
+        if (!isIdentText(p, "duplicate")) return PE.SqlExpectedKeyword;
+        try p.advance();
+        if (p.cur.tag != .kw_key) return PE.SqlExpectedKeyword;
+        try p.advance();
+        if (p.cur.tag != .kw_update) return PE.SqlExpectedKeyword;
+        try p.advance();
+        while (true) {
+            const target = try p.dupedIdent();
+            if (p.cur.tag != .eq) return PE.SqlExpectedKeyword;
+            try p.advance();
+            if (p.cur.tag != .kw_values) return PE.SqlInvalidProjection;
+            try p.advance();
+            try p.expect(.lparen);
+            const src = try p.dupedIdent();
+            try p.expect(.rparen);
+            if (!std.ascii.eqlIgnoreCase(target, src)) return PE.SqlInvalidProjection;
+            if (p.cur.tag != .comma) break;
+            try p.advance();
+        }
+    }
+
     return try p.allocOp(.{ .insert = .{
         .mode = mode,
         .table = ref,
