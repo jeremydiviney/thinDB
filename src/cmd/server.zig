@@ -97,6 +97,11 @@ pub fn main(init: std.process.Init) !u8 {
     // than this are rolled back by the background sweep. 0 disables. Default 24h
     // — must exceed Flink's checkpoint interval + max tolerable downtime.
     var xa_timeout_secs: u32 = 24 * 3600;
+    // Background segment compaction. On by default; --no-compaction disables the
+    // compactor thread. INTERIM ESCAPE HATCH while #136 (a compactor-vs-write
+    // race → double-free/leak under sustained writes) is unfixed — lets a
+    // write-heavy sink run stably at the cost of unmerged segments.
+    var enable_compaction: bool = true;
     var idle_timeout_secs: u32 = 0;
     var query_memory_budget: ?usize = null;
     var memory_budget: ?usize = null;
@@ -180,6 +185,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (try takeU32(arg, "--xa-timeout-secs", &args_iter, err_w)) |v| {
             xa_timeout_secs = v;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--no-compaction")) {
+            enable_compaction = false;
             continue;
         }
         if (try takeU32(arg, "--max-connections", &args_iter, err_w)) |v| {
@@ -357,7 +366,10 @@ pub fn main(init: std.process.Init) !u8 {
     // leaving the table fragmented. The heavy merge runs lock-free; only
     // the manifest swap briefly excludes readers.
     var compactor_ctx: CompactorCtx = .{ .catalog = catalog, .io = io };
-    const compactor_thread = try std.Thread.spawn(.{}, CompactorCtx.run, .{&compactor_ctx});
+    const compactor_thread: ?std.Thread = if (enable_compaction)
+        try std.Thread.spawn(.{}, CompactorCtx.run, .{&compactor_ctx})
+    else
+        null;
 
     waitForStop(io);
 
@@ -365,7 +377,7 @@ pub fn main(init: std.process.Init) !u8 {
     closed = true;
     for (threads[0..n_listeners]) |t| t.join();
     flusher_thread.join();
-    compactor_thread.join();
+    if (compactor_thread) |t| t.join();
 
     try out_w.writeAll("thindb-server shutting down\n");
     try out_w.flush();
