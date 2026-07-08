@@ -16,9 +16,7 @@ test {
     _ = @import("nonunique_table_test.zig");
     _ = @import("on_duplicate_key_test.zig");
     _ = @import("upsert_incremental_test.zig");
-    // compact_tombstone_test.zig — #136 repro; currently reproduces the
-    // compactor-vs-write race (leaks + double-free). Re-enable once #136 is
-    // fixed so it passes clean.
+    _ = @import("compact_tombstone_test.zig");
     _ = @import("compute_test.zig");
     _ = @import("compute_scalar_test.zig");
     _ = @import("decimal_test.zig");

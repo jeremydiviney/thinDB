@@ -776,7 +776,7 @@ pub const Table = struct {
     /// none). Cached file read; caller frees, same contract as
     /// `storage.tombstone.read`.
     pub fn segmentTombstones(self: *Table, allocator: Allocator, entry: *storage.cache.SegmentHandles.Entry) !?[]u32 {
-        return self.seg_handles.tombstones(allocator, self.io, self.segments_dir, entry);
+        return self.seg_handles.tombstones(self.allocator, allocator, self.io, self.segments_dir, entry);
     }
 
     pub fn deleteSegmentFiles(self: *Table, seg_id: u64) !void {

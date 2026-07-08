@@ -9,6 +9,7 @@ const std = @import("std");
 const thindb = @import("thindb");
 const helpers = @import("sql_helpers.zig");
 const exec = helpers.exec;
+const runSql = helpers.runSql;
 
 const Stop = std.atomic.Value(bool);
 
@@ -46,9 +47,19 @@ test "background compactor races upsert tombstoning without double-free (#136)" 
 
     // Continuous upserts of the same keys → each flush creates a segment and
     // tombstones the prior copies; the background loop merges them concurrently.
+    // The SELECT runs on a query-lifetime arena (like every server query) — it
+    // must not poison the table-lifetime tombstone cache with arena memory.
     var round: usize = 0;
     while (round < 300) : (round += 1) {
         try exec(allocator, db, "INSERT INTO t (id, v) VALUES (1,0),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),(8,0)");
         try tbl.flush();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        // WHERE forces a real segment scan (COUNT(*)/SUM alone are served by
+        // metadata lanes and would never touch the tombstone cache).
+        var q = try runSql(arena.allocator(), db, "SELECT COUNT(*) FROM t WHERE v = 0");
+        defer q.deinit();
+        while (try q.next()) |_| {}
     }
 }

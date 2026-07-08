@@ -542,9 +542,15 @@ pub const SegmentHandles = struct {
 
     /// The segment's tombstone row list as a caller-owned dupe (null = none).
     /// The underlying file is read once and cached until `invalidateTombstones`.
+    /// `gpa` must be the table-lifetime allocator: the cached `entry.tombs`
+    /// outlives any query, and `invalidateTombstones`/`destroyEntry` free it
+    /// with that allocator. A query-scoped allocator here leaves a dangling
+    /// cache entry the compactor later frees (#136). `out_allocator` (typically
+    /// per-query) owns only the returned dupe.
     pub fn tombstones(
         self: *SegmentHandles,
-        allocator: Allocator,
+        gpa: Allocator,
+        out_allocator: Allocator,
         io: std.Io,
         dir: std.Io.Dir,
         entry: *Entry,
@@ -552,11 +558,11 @@ pub const SegmentHandles = struct {
         self.lockSpin();
         defer self.lock.unlock();
         if (!entry.tombs_loaded) {
-            entry.tombs = try tombstone.read(allocator, io, dir, entry.segment_id);
+            entry.tombs = try tombstone.read(gpa, io, dir, entry.segment_id);
             entry.tombs_loaded = true;
         }
         const t = entry.tombs orelse return null;
-        return try allocator.dupe(u32, t);
+        return try out_allocator.dupe(u32, t);
     }
 
     /// A tombstone merge wrote new offsets for `segment_id` — drop the cached

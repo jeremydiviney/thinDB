@@ -509,7 +509,9 @@ fn streamMerge(
     if (!any) {
         for (cursors[0..opened]) |*c| c.deinit();
         opened = 0;
-        return null; // sketches_owned_here errdefer frees out_sketches
+        // Normal return — the errdefer above doesn't fire here.
+        t.allocator.free(out_sketches);
+        return null;
     }
 
     var writer = try storage.MergedSegmentWriter.begin(
