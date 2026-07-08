@@ -556,6 +556,11 @@ fn streamMerge(
         batch_gens.deinit(t.allocator);
     }
 
+    // Compound-key hashes of the surviving (merged) rows → the output segment's
+    // Bloom (unique tables only).
+    var key_hashes: std.ArrayList(u64) = .empty;
+    defer key_hashes.deinit(t.allocator);
+
     while (true) {
         // Pick the smallest current row across live cursors by the order key,
         // tie-broken by input index for a deterministic total order. k is small,
@@ -583,18 +588,25 @@ fn streamMerge(
         try src.next();
 
         if (picks.items.len == t.row_group_size) {
-            try flushMergeBatch(t, &picks, &batch_gens, out_cols, out_views, &writer);
+            try flushMergeBatch(t, &picks, &batch_gens, out_cols, out_views, &writer, &key_hashes);
         }
     }
 
     if (picks.items.len > 0) {
-        try flushMergeBatch(t, &picks, &batch_gens, out_cols, out_views, &writer);
+        try flushMergeBatch(t, &picks, &batch_gens, out_cols, out_views, &writer, &key_hashes);
     }
 
     for (cursors[0..opened]) |*c| c.deinit();
     opened = 0;
 
-    return try writer.finish(t.io, t.segments_dir, file_name, sync);
+    var out_info = try writer.finish(t.io, t.segments_dir, file_name, sync);
+    errdefer out_info.deinit(t.allocator);
+    // Attach the compound-key Bloom over the merged rows (unique tables), so the
+    // merged segment stays prunable by the upsert probe after compaction.
+    if (t.schema.unique and t.order_key_indices.len > 0 and key_hashes.items.len > 0) {
+        out_info.key_bloom = try @import("upsert.zig").serializeKeyBloom(t.allocator, key_hashes.items);
+    }
+    return out_info;
 }
 
 /// Gather one indexed output batch (parallel per column), hand it to the
@@ -606,6 +618,7 @@ fn flushMergeBatch(
     out_cols: []engine.ColumnStore,
     out_views: []storage.ColumnView,
     writer: *storage.MergedSegmentWriter,
+    key_hashes: *std.ArrayList(u64),
 ) !void {
     var job = MergeGatherJob{
         .allocator = t.allocator,
@@ -618,6 +631,12 @@ fn flushMergeBatch(
 
     for (out_cols, 0..) |c, ci| out_views[ci] = c.view();
     try writer.writeRowGroup(out_views);
+    // Accumulate this batch's compound-key hashes for the merged segment's
+    // Bloom (unique tables) before the columns are cleared.
+    if (t.schema.unique and t.order_key_indices.len > 0) {
+        const rows: usize = if (out_views.len == 0) 0 else out_views[0].rowCount();
+        try @import("upsert.zig").appendKeyHashes(t.allocator, key_hashes, out_views, t.order_key_indices, rows);
+    }
     for (out_cols) |*c| c.clear();
 
     for (batch_gens.items) |g| {
@@ -715,6 +734,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
     errdefer if (new_entry) |e| {
         if (e.column_stats.len > 0) t.allocator.free(e.column_stats);
         if (e.column_sketches.len > 0) t.allocator.free(e.column_sketches);
+        if (e.key_bloom.len > 0) t.allocator.free(e.key_bloom);
     };
 
     {
@@ -756,6 +776,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
         } else {
             if (entry.column_stats.len > 0) t.allocator.free(entry.column_stats);
             if (entry.column_sketches.len > 0) t.allocator.free(entry.column_sketches);
+            if (entry.key_bloom.len > 0) t.allocator.free(entry.key_bloom);
         }
     }
 

@@ -11,6 +11,37 @@ const engine = @import("../engine/engine.zig");
 const api = @import("api.zig");
 const Table = api.Table;
 const comparison = @import("comparison.zig");
+const bloom = @import("../util/bloom.zig");
+
+/// Hash each row's compound primary key and append to `out`. Segment writers
+/// (flush + compaction) call this to build the per-segment key Bloom; it uses
+/// the SAME key-byte encoding as the probe below, so hashes line up. `columns`
+/// is the full column set; `key_indices` selects the order-key columns.
+pub fn appendKeyHashes(
+    allocator: Allocator,
+    out: *std.ArrayList(u64),
+    columns: []const storage.ColumnView,
+    key_indices: []const usize,
+    row_count: usize,
+) !void {
+    var keybuf: std.ArrayList(u8) = .empty;
+    defer keybuf.deinit(allocator);
+    var r: u32 = 0;
+    while (r < row_count) : (r += 1) {
+        keybuf.clearRetainingCapacity();
+        for (key_indices) |ci| try comparison.appendColumnValueBytes(allocator, &keybuf, columns[ci], r);
+        try out.append(allocator, bloom.keyHash(keybuf.items));
+    }
+}
+
+/// Build + serialize a key Bloom from accumulated hashes. Caller owns the slice.
+pub fn serializeKeyBloom(allocator: Allocator, hashes: []const u64) ![]u8 {
+    var bf = try bloom.Bloom.build(allocator, hashes, bloom.default_bits_per_key);
+    defer bf.deinit(allocator);
+    const out = try allocator.alloc(u8, bf.serializedLen());
+    _ = bf.writeTo(out);
+    return out;
+}
 
 /// After `insertRows`, every newly-inserted row whose order key already
 /// exists somewhere in the table (older memtable row, or a flushed segment)
@@ -98,8 +129,26 @@ pub fn applyUpsertResolution(t: *Table) !void {
     try surviving_set.ensureTotalCapacity(aa, @intCast(new_keys.items.len));
     for (new_keys.items) |k| surviving_set.putAssumeCapacity(k, {});
 
+    // Precompute this batch's Bloom hashes once; reused across every segment.
+    const key_hashes = try aa.alloc(u64, new_keys.items.len);
+    for (new_keys.items, 0..) |k, i| key_hashes[i] = bloom.keyHash(k);
+
     // ---- 3. For each segment, scan row groups, find matching keys. --------
     for (t.manifest.segments.items) |entry| {
+        // Bloom prune: if the segment carries a key filter and none of this
+        // batch's keys may be present, skip it entirely — no file open, no
+        // decode. Turns the probe from O(all segment rows) into O(survivors),
+        // which is the fix for the O(n²) bulk-upsert load (#138).
+        if (entry.key_bloom.len > 0) {
+            var maybe = false;
+            for (key_hashes) |h| {
+                if (bloom.Bloom.mayContainSerialized(entry.key_bloom, h)) {
+                    maybe = true;
+                    break;
+                }
+            }
+            if (!maybe) continue;
+        }
         var name_buf: [32]u8 = undefined;
         const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
         var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);

@@ -48,7 +48,7 @@ const hll = @import("../util/hll.zig");
 const types = @import("../types.zig");
 
 pub const manifest_magic: [4]u8 = .{ 't', 'D', 'B', 'M' };
-pub const manifest_version: u16 = 8;
+pub const manifest_version: u16 = 9;
 pub const manifest_filename = "manifest";
 pub const manifest_tmp_filename = "manifest.tmp";
 pub const header_size: usize = 32;
@@ -93,6 +93,12 @@ pub const ManifestEntry = struct {
     /// a distinct-value estimate. Lifetime tied to the owning `Manifest`.
     /// Empty when not populated.
     column_sketches: []u8 = &.{},
+    /// Serialized Bloom filter over the compound primary key (util/bloom.zig
+    /// format). Kept in-memory so the upsert existence probe can skip a whole
+    /// segment with zero I/O when its keys definitely aren't present. Variable
+    /// length (sized to the segment's row count). Empty on non-unique tables.
+    /// Lifetime tied to the owning `Manifest`.
+    key_bloom: []u8 = &.{},
 };
 
 pub const Manifest = struct {
@@ -122,6 +128,7 @@ pub const Manifest = struct {
         for (self.segments.items) |e| {
             if (e.column_stats.len > 0) self.allocator.free(e.column_stats);
             if (e.column_sketches.len > 0) self.allocator.free(e.column_sketches);
+            if (e.key_bloom.len > 0) self.allocator.free(e.key_bloom);
         }
         self.segments.deinit(self.allocator);
         self.* = undefined;
@@ -196,6 +203,10 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
             try buf.appendSlice(m.allocator, e.column_sketches);
             try buf.appendNTimes(m.allocator, 0, want - e.column_sketches.len);
         }
+
+        // Compound-key Bloom filter: length-prefixed (variable size). 0 = none.
+        try appendU32(m.allocator, &buf, @intCast(e.key_bloom.len));
+        try buf.appendSlice(m.allocator, e.key_bloom);
     }
 
     try buf.appendSlice(m.allocator, &manifest_magic);
@@ -232,9 +243,12 @@ pub fn readManifest(
     const column_count = format.readU32(bytes[20..24]);
     const auto_inc_next = format.readU64(bytes[24..32]);
 
-    const entry_size: usize = entry_prefix_size + @as(usize, column_count) * (stats_slot_size + sketch_slot_size);
-    const expected_size: usize = header_size + @as(usize, count) * entry_size + trailer_size;
-    if (bytes.len != expected_size) return Error.ManifestCorrupt;
+    // Per-entry minimum: prefix + fixed stats/sketch slots + the 4-byte
+    // key-Bloom length prefix. The Bloom itself is variable-length, so the total
+    // is a lower bound, not an exact size — the trailing magic validates the end.
+    const entry_min: usize = entry_prefix_size + @as(usize, column_count) * (stats_slot_size + sketch_slot_size) + 4;
+    const min_size: usize = header_size + @as(usize, count) * entry_min + trailer_size;
+    if (bytes.len < min_size) return Error.ManifestCorrupt;
 
     if (!std.mem.eql(u8, bytes[bytes.len - 4 .. bytes.len], &manifest_magic)) {
         return Error.ManifestBadTrailerMagic;
@@ -245,6 +259,7 @@ pub fn readManifest(
         for (segments.items) |e| {
             if (e.column_stats.len > 0) allocator.free(e.column_stats);
             if (e.column_sketches.len > 0) allocator.free(e.column_sketches);
+            if (e.key_bloom.len > 0) allocator.free(e.key_bloom);
         }
         segments.deinit(allocator);
     }
@@ -299,6 +314,17 @@ pub fn readManifest(
             @memcpy(sketches, bytes[off .. off + sketch_bytes]);
             off += sketch_bytes;
             entry.column_sketches = sketches;
+        }
+
+        // Compound-key Bloom filter (length-prefixed; written unconditionally).
+        const bloom_len = format.readU32(bytes[off .. off + 4]);
+        off += 4;
+        if (bloom_len > 0) {
+            const bloom = try allocator.alloc(u8, bloom_len);
+            errdefer allocator.free(bloom);
+            @memcpy(bloom, bytes[off .. off + bloom_len]);
+            off += bloom_len;
+            entry.key_bloom = bloom;
         }
 
         segments.appendAssumeCapacity(entry);
@@ -369,6 +395,14 @@ pub fn entryFromSegmentInfo(
         const sk = try allocator.alloc(u8, info.column_sketches.len);
         @memcpy(sk, info.column_sketches);
         entry.column_sketches = sk;
+    }
+
+    // Carry the compound-key Bloom (built by the API layer) into the entry, so
+    // the in-memory manifest can prune the upsert probe with zero I/O.
+    if (info.key_bloom.len > 0) {
+        const bf = try allocator.alloc(u8, info.key_bloom.len);
+        @memcpy(bf, info.key_bloom);
+        entry.key_bloom = bf;
     }
 
     if (leading_key_idx) |idx| {

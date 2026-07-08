@@ -278,6 +278,11 @@ pub const SegmentInfo = struct {
     /// bytes `[ci*hll.m .. (ci+1)*hll.m]`. Mergeable across segments. Empty
     /// when the writer didn't compute it.
     column_sketches: []const u8 = &.{},
+    /// Serialized Bloom filter over the compound primary key (util/bloom.zig
+    /// format). Built at write time for `unique` tables; lets the upsert
+    /// existence probe skip a whole segment when a key definitely isn't in it.
+    /// Empty on non-unique tables.
+    key_bloom: []const u8 = &.{},
 
     pub fn deinit(self: SegmentInfo, allocator: std.mem.Allocator) void {
         for (self.row_groups) |rg| {
@@ -286,6 +291,7 @@ pub const SegmentInfo = struct {
         }
         allocator.free(self.row_groups);
         if (self.column_sketches.len > 0) allocator.free(self.column_sketches);
+        if (self.key_bloom.len > 0) allocator.free(self.key_bloom);
     }
 };
 

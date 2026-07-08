@@ -278,7 +278,25 @@ pub fn readSegment(
     file_name: []const u8,
     schema: TableSchema,
 ) !ReadSegment {
-    var file = try dir.openFile(io, file_name, .{});
+    // A segment open can transiently race the compactor deleting an old
+    // segment (Windows returns a sharing/delete-pending error, surfaced as
+    // error.FileBusy). It clears in milliseconds, so retry with backoff a
+    // bounded number of times before surfacing it — bounded ⇒ never deadlocks,
+    // and with the Bloom prune these opens are already rare (#137).
+    var file = blk: {
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            if (dir.openFile(io, file_name, .{})) |f| {
+                break :blk f;
+            } else |err| {
+                if (err == error.FileBusy and attempt < 50) {
+                    Io.sleep(io, Io.Duration.fromMilliseconds(2), .awake) catch {};
+                    continue;
+                }
+                return err;
+            }
+        }
+    };
     errdefer file.close(io);
 
     const file_size = (try file.stat(io)).size;

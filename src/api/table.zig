@@ -451,6 +451,17 @@ pub const Table = struct {
         );
         defer info.deinit(self.allocator);
 
+        // Compound-key Bloom over the flushed rows — carried into the manifest
+        // entry so the upsert probe can skip this segment with zero I/O when a
+        // key definitely isn't present (#138). Unique tables only.
+        if (self.schema.unique and self.order_key_indices.len > 0 and info.row_count > 0) {
+            const upsert_mod = @import("upsert.zig");
+            var hashes: std.ArrayList(u64) = .empty;
+            defer hashes.deinit(self.allocator);
+            try upsert_mod.appendKeyHashes(self.allocator, &hashes, snapshot.views, self.order_key_indices, @intCast(info.row_count));
+            info.key_bloom = try upsert_mod.serializeKeyBloom(self.allocator, hashes.items);
+        }
+
         try self.manifest.appendSegment(try self.entryFor(info));
         try storage.writeManifest(self.io, self.table_dir, self.manifest, sync);
 
@@ -784,11 +795,29 @@ pub const Table = struct {
         self.seg_handles.retire(self.allocator, seg_id);
         var dat_buf: [32]u8 = undefined;
         const dat_name = try Table.segmentFileName(&dat_buf, seg_id);
-        self.segments_dir.deleteFile(self.io, dat_name) catch {};
+        self.deleteFileTolerant(dat_name);
 
         var tomb_buf: [32]u8 = undefined;
         const tomb_name = try storage.tombstone.fileNameFor(&tomb_buf, seg_id);
-        self.segments_dir.deleteFile(self.io, tomb_name) catch {};
+        self.deleteFileTolerant(tomb_name);
+    }
+
+    /// Delete a segment file, retrying briefly if a reader still has it open
+    /// (Windows error.FileBusy). Bounded, and never surfaces an error — a
+    /// still-contended file is left for a later compaction to reclaim rather
+    /// than crash the writer (#137).
+    fn deleteFileTolerant(self: *Table, name: []const u8) void {
+        var attempt: u8 = 0;
+        while (attempt < 50) : (attempt += 1) {
+            self.segments_dir.deleteFile(self.io, name) catch |err| {
+                if (err == error.FileBusy) {
+                    Io.sleep(self.io, Io.Duration.fromMilliseconds(2), .awake) catch {};
+                    continue;
+                }
+                return; // FileNotFound or anything else: nothing to do
+            };
+            return; // deleted
+        }
     }
 };
 
