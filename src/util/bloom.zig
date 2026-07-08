@@ -11,9 +11,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Default bits-per-key. 10 bits/key with k=7 gives ~1% false-positive rate —
-/// a good balance of footer size (~1.25 bytes/key) and skip effectiveness.
-pub const default_bits_per_key: u32 = 10;
+/// Default bits-per-key. The upsert probe tests a WHOLE BATCH (~2000 keys) and
+/// can skip a segment only if EVERY key misses, so the union false-positive rate
+/// over the batch must stay low: P(skip) ≈ (1-fp)^batch. At 10 bits/key (~0.8%
+/// fp) that's ~e^-16 ≈ 0 — the segment never skips. 28 bits/key (~1e-6 fp) gives
+/// ~e^-0.003 ≈ 99.7% skip for a 2000-key batch, at ~3.5 bytes/key. This is the
+/// lever that makes the Bloom actually prune a bulk upsert load (#138).
+pub const default_bits_per_key: u32 = 28;
 
 pub const Bloom = struct {
     /// Bit array. `bits.len * 8` addressable bits.
