@@ -20,7 +20,16 @@ let lastBad = false;
 
 async function jobStates() {
   const r = await fetch(`${FLINK}/jobs/overview`).then((x) => x.json());
-  return r.jobs.filter((j) => j.name.includes("sink_")).map((j) => ({ name: j.name.split("sink_")[1], state: j.state }));
+  // The JM remembers every job it ever ran (cancelled/failed history included).
+  // Health = the NEWEST job per table only.
+  const latest = new Map();
+  for (const j of r.jobs) {
+    if (!j.name.includes("sink_")) continue;
+    const name = j.name.split("sink_")[1];
+    const prev = latest.get(name);
+    if (!prev || j["start-time"] > prev.start) latest.set(name, { name, state: j.state, start: j["start-time"] });
+  }
+  return [...latest.values()];
 }
 
 async function check() {
