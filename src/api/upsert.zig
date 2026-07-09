@@ -149,10 +149,13 @@ pub fn applyUpsertResolution(t: *Table) !void {
             }
             if (!maybe) continue;
         }
-        var name_buf: [32]u8 = undefined;
-        const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
-        var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);
-        defer seg.deinit();
+        // Pinned cache handle, not a direct open: reuses the parsed footer
+        // across batches and can't race a concurrent compaction's delete of
+        // a just-retired segment file (#137) — a pinned entry keeps the
+        // handle alive until release even if the segment is retired mid-probe.
+        const handle = try t.acquireSegment(entry.segment_id);
+        defer t.releaseSegment(handle);
+        const seg = &handle.seg;
 
         var deleted: std.ArrayList(u32) = .empty;
         defer deleted.deinit(t.allocator);

@@ -17,6 +17,7 @@ test {
     _ = @import("on_duplicate_key_test.zig");
     _ = @import("upsert_incremental_test.zig");
     _ = @import("compact_tombstone_test.zig");
+    _ = @import("lifecycle_flush_test.zig");
     _ = @import("compute_test.zig");
     _ = @import("compute_scalar_test.zig");
     _ = @import("decimal_test.zig");

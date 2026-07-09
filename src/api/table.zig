@@ -65,6 +65,16 @@ pub const Table = struct {
     /// first row. Reset to `null` after every flush. Drives the time trigger.
     first_write_ts: ?Io.Timestamp = null,
 
+    /// Consecutive background-flush failures, for throttled logging only.
+    flush_fail_streak: u32 = 0,
+
+    /// Segment ids whose files couldn't be deleted because a reader still
+    /// held them open past the bounded retry (#137). Retried by the
+    /// background flush sweep until reclaimed, so nothing is orphaned.
+    /// Compactor appends, flusher drains — hence the dedicated lock.
+    pending_deletes: std.ArrayListUnmanaged(u64) = .empty,
+    pending_deletes_lock: std.atomic.Mutex = .unlocked,
+
     table_dir: Io.Dir,
     segments_dir: Io.Dir,
 
@@ -210,6 +220,12 @@ pub const Table = struct {
             .next_segment_id = .init(manifest.nextSegmentId()),
         };
 
+        // Reclaim orphaned segment files: a crash mid-compaction, or a #137
+        // pending delete that never drained before shutdown, leaves .dat/
+        // .tomb files no manifest entry references. Nothing is writing yet,
+        // so any unreferenced file here is garbage. Best-effort.
+        self.sweepOrphanedSegmentFiles() catch {};
+
         // If we replayed WAL records into a unique-key table's memtable,
         // re-run upsert resolution so any same-key dupes get tombstoned
         // (intra-memtable + against existing segments). Without this,
@@ -230,6 +246,7 @@ pub const Table = struct {
     pub fn close(self: *Table) void {
         const allocator = self.allocator;
         const io = self.io;
+        self.pending_deletes.deinit(allocator);
         if (self.wal) |*w| w.deinit();
         self.upsert_idx.deinit(allocator);
         if (self.upsert_idx_arena) |*a| a.deinit();
@@ -518,10 +535,26 @@ pub const Table = struct {
     /// Used by the Database-level background flusher thread. Tries to
     /// acquire the table's mutex non-blockingly; on success, runs the
     /// time-based auto-flush check. No-op on lock contention.
+    ///
+    /// The sweep caller swallows errors (one bad table must not stop the
+    /// sweep), so a deterministically-failing flush would otherwise retry
+    /// silently forever while the memtable stays volatile — log it here,
+    /// throttled, so the failure is visible in the server log.
     pub fn tryBackgroundFlush(self: *Table) !void {
         if (!self.mutex.tryLock()) return;
         defer self.mutex.unlock(self.io);
-        try self.maybeAutoFlushLocked();
+        self.drainPendingDeletesLocked();
+        self.maybeAutoFlushLocked() catch |err| {
+            self.flush_fail_streak +|= 1;
+            if (self.flush_fail_streak == 1 or self.flush_fail_streak % 60 == 0) {
+                std.debug.print(
+                    "thindb: background flush failed on table '{s}' ({d} consecutive): {s}\n",
+                    .{ self.name, self.flush_fail_streak, @errorName(err) },
+                );
+            }
+            return err;
+        };
+        self.flush_fail_streak = 0;
     }
 
     /// Background-compactor entry point. Caller (the background compact
@@ -793,20 +826,76 @@ pub const Table = struct {
     pub fn deleteSegmentFiles(self: *Table, seg_id: u64) !void {
         // Close any cached handle first — Windows refuses to delete open files.
         self.seg_handles.retire(self.allocator, seg_id);
+        if (!self.tryDeleteSegmentFiles(seg_id)) {
+            // A pinned reader outlasted the bounded retry (long scan). Queue
+            // the id so the background flush sweep reclaims the files once
+            // the reader drains, instead of orphaning them on disk (#137).
+            while (!self.pending_deletes_lock.tryLock()) std.atomic.spinLoopHint();
+            defer self.pending_deletes_lock.unlock();
+            self.pending_deletes.append(self.allocator, seg_id) catch {};
+        }
+    }
+
+    fn tryDeleteSegmentFiles(self: *Table, seg_id: u64) bool {
         var dat_buf: [32]u8 = undefined;
-        const dat_name = try Table.segmentFileName(&dat_buf, seg_id);
-        self.deleteFileTolerant(dat_name);
+        const dat_name = Table.segmentFileName(&dat_buf, seg_id) catch return true;
+        const dat_ok = self.deleteFileTolerant(dat_name);
 
         var tomb_buf: [32]u8 = undefined;
-        const tomb_name = try storage.tombstone.fileNameFor(&tomb_buf, seg_id);
-        self.deleteFileTolerant(tomb_name);
+        const tomb_name = storage.tombstone.fileNameFor(&tomb_buf, seg_id) catch return true;
+        const tomb_ok = self.deleteFileTolerant(tomb_name);
+        return dat_ok and tomb_ok;
+    }
+
+    /// Delete any segment/tombstone file whose id has no manifest entry.
+    /// Runs once at open (before any writes), so unreferenced files can only
+    /// be leftovers of a crash or an undrained pending delete (#137).
+    fn sweepOrphanedSegmentFiles(self: *Table) !void {
+        var live: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer live.deinit(self.allocator);
+        for (self.manifest.segments.items) |entry| {
+            try live.put(self.allocator, entry.segment_id, {});
+        }
+
+        var to_delete: std.ArrayListUnmanaged(u64) = .empty;
+        defer to_delete.deinit(self.allocator);
+        // segments_dir wasn't opened with .iterate; take a scoped handle.
+        var iter_dir = try self.table_dir.openDir(self.io, "segments", .{ .iterate = true });
+        defer iter_dir.close(self.io);
+        var it = iter_dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+            const dot = std.mem.lastIndexOfScalar(u8, entry.name, '.') orelse continue;
+            const ext = entry.name[dot..];
+            if (!std.mem.eql(u8, ext, ".dat") and !std.mem.eql(u8, ext, ".tomb")) continue;
+            const id = std.fmt.parseInt(u64, entry.name[0..dot], 10) catch continue;
+            if (!live.contains(id)) try to_delete.append(self.allocator, id);
+        }
+        // Deleting while iterating the directory is undefined on some
+        // platforms — collect first, delete after.
+        for (to_delete.items) |id| _ = self.tryDeleteSegmentFiles(id);
+    }
+
+    /// Retry the deletes a prior compaction couldn't finish. Called from the
+    /// background flush sweep (under the table mutex).
+    fn drainPendingDeletesLocked(self: *Table) void {
+        while (!self.pending_deletes_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.pending_deletes_lock.unlock();
+        var i: usize = 0;
+        while (i < self.pending_deletes.items.len) {
+            if (self.tryDeleteSegmentFiles(self.pending_deletes.items[i])) {
+                _ = self.pending_deletes.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Delete a segment file, retrying briefly if a reader still has it open
     /// (Windows error.FileBusy). Bounded, and never surfaces an error — a
-    /// still-contended file is left for a later compaction to reclaim rather
-    /// than crash the writer (#137).
-    fn deleteFileTolerant(self: *Table, name: []const u8) void {
+    /// still-contended file goes on the pending-delete queue rather than
+    /// crash the writer (#137). Returns false when the file is still busy.
+    fn deleteFileTolerant(self: *Table, name: []const u8) bool {
         var attempt: u8 = 0;
         while (attempt < 50) : (attempt += 1) {
             self.segments_dir.deleteFile(self.io, name) catch |err| {
@@ -814,10 +903,11 @@ pub const Table = struct {
                     Io.sleep(self.io, Io.Duration.fromMilliseconds(2), .awake) catch {};
                     continue;
                 }
-                return; // FileNotFound or anything else: nothing to do
+                return true; // FileNotFound or anything else: nothing to do
             };
-            return; // deleted
+            return true; // deleted
         }
+        return false;
     }
 };
 

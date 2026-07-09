@@ -68,7 +68,23 @@ pub const Schema = struct {
 
     pub fn close(self: *Schema) void {
         var it = self.tables.iterator();
-        while (it.next()) |entry| entry.value_ptr.*.close();
+        while (it.next()) |entry| {
+            const t = entry.value_ptr.*;
+            // Persist any memtable residue before teardown: without a WAL
+            // (the default), rows still in memory are otherwise lost on a
+            // clean shutdown. WAL-backed tables skip this — replay already
+            // covers close-without-flush, and flushing here would defeat
+            // that recovery path. Best-effort — close must proceed
+            // regardless. The drop paths delete the table dir right after
+            // close, so a wasted flush there is harmless.
+            if (t.wal == null) {
+                t.flush() catch |err| std.debug.print(
+                    "thindb: shutdown flush failed on table '{s}': {s}\n",
+                    .{ t.name, @errorName(err) },
+                );
+            }
+            t.close();
+        }
         self.tables.deinit();
         self.schema_dir.close(self.io);
         const allocator = self.allocator;
