@@ -216,11 +216,13 @@ pub fn keyHashesFromPredicateExpr(
     if (!t.schema.unique or oki.len == 0) return null;
     const max_keys = 256;
 
-    const conjuncts: []const exec.predicate.PredicateExpr = switch (expr) {
-        .@"and" => |children| children,
-        .leaf, .in_set => (&[_]exec.predicate.PredicateExpr{expr})[0..1],
-        else => return null,
-    };
+    // The parser builds left-deep binary AND trees (`a AND b AND c` =
+    // and(and(a,b),c)), so conjuncts must be collected recursively — a
+    // one-level view leaves all but the last key column "unbound" and
+    // silently disables the gate for any 3+-conjunct keyed statement.
+    var conj_list: std.ArrayList(exec.predicate.PredicateExpr) = .empty;
+    if (!try appendConjuncts(aa, &conj_list, expr)) return null;
+    const conjuncts: []const exec.predicate.PredicateExpr = conj_list.items;
 
     const eq_vals = try aa.alloc(?types.Value, oki.len);
     @memset(eq_vals, null);
@@ -260,6 +262,29 @@ pub fn keyHashesFromPredicateExpr(
         try hashes.append(aa, bloom.keyHash(key_buf.items));
     }
     return try hashes.toOwnedSlice(aa);
+}
+
+/// Flatten a (possibly nested) AND tree into its leaf/in_set conjuncts.
+/// Returns false when the expression contains any non-conjunctive node
+/// (OR, NOT, ...) — the caller must then skip bloom gating entirely.
+fn appendConjuncts(
+    aa: Allocator,
+    list: *std.ArrayList(exec.predicate.PredicateExpr),
+    expr: exec.predicate.PredicateExpr,
+) !bool {
+    switch (expr) {
+        .@"and" => |children| {
+            for (children) |c| {
+                if (!try appendConjuncts(aa, list, c)) return false;
+            }
+            return true;
+        },
+        .leaf, .in_set => {
+            try list.append(aa, expr);
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// True when `key_bloom` (may be empty = no filter) admits at least one of

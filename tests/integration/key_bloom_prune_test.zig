@@ -124,3 +124,43 @@ test "full-key bloom pruning: compound key equality" {
     defer allocator.free(none);
     try std.testing.expectEqual(@as(usize, 0), none.len);
 }
+
+test "full-key bloom pruning: coerced literals (text date, int-width) still hash to the stored key" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    // The CDC sink shape: DATE in the compound key, predicates arriving as
+    // text literals. The bloom gate must coerce them exactly like predicate
+    // evaluation — a mis-hashed coercion makes the bloom reject a PRESENT
+    // key and the DELETE silently no-ops.
+    // Three key columns: `pid = ? AND mt = ? AND d = ?` parses as a NESTED
+    // left-deep AND tree — the shape that used to bypass the conjunct walk.
+    try exec(allocator, db, "CREATE TABLE k (pid INT NOT NULL, mt STRING NOT NULL, d DATE NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (pid, mt, d))");
+    const tbl = try db.openTable("k", .{});
+
+    try exec(allocator, db, "INSERT INTO k (pid,mt,d,v) VALUES (1,'a','2026-07-01',10),(2,'a','2026-07-02',20)");
+    try tbl.flush();
+    try exec(allocator, db, "INSERT INTO k (pid,mt,d,v) VALUES (1,'b','2026-07-03',30),(3,'a','2026-07-04',40)");
+    try tbl.flush();
+
+    // Point SELECT through a text date literal must find the row.
+    const hit = try helpers.collectBigints(allocator, db, "SELECT v FROM k WHERE pid = 1 AND mt = 'b' AND d = '2026-07-03'");
+    defer allocator.free(hit);
+    try std.testing.expectEqualSlices(i64, &.{30}, hit);
+
+    // Keyed DELETE through a nested-AND + text date literal must actually delete.
+    try exec(allocator, db, "DELETE FROM k WHERE pid = 2 AND mt = 'a' AND d = '2026-07-02'");
+    const after = try helpers.collectBigints(allocator, db, "SELECT v FROM k ORDER BY v");
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(i64, &.{ 10, 30, 40 }, after);
+
+    // Keyed UPDATE through the same shape must hit as well.
+    try exec(allocator, db, "UPDATE k SET v = 99 WHERE pid = 3 AND mt = 'a' AND d = '2026-07-04'");
+    const upd = try helpers.collectBigints(allocator, db, "SELECT v FROM k WHERE pid = 3 AND mt = 'a' AND d = '2026-07-04'");
+    defer allocator.free(upd);
+    try std.testing.expectEqualSlices(i64, &.{99}, upd);
+}

@@ -526,7 +526,10 @@ fn findCol(schema: []const Column, name: []const u8) ?usize {
 ///   - float → double
 ///   - 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' text → date / datetime
 /// Returns NoWidening when no safe coercion exists.
-fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
+/// Pub: the keyed-access bloom gate (api/comparison.appendPredicateValueBytes)
+/// must coerce literals identically to predicate evaluation, or a single
+/// text-vs-DATE key column silently disables bloom pruning for the statement.
+pub fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
     // Text literal compared against a temporal column: parse it.
     if (val.* == .text) {
         switch (target) {

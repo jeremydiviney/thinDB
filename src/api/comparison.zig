@@ -75,8 +75,16 @@ pub fn appendPredicateValueBytes(
     val: types.Value,
 ) !bool {
     if (col_type == .char) return false;
-    if (types.ValueTag.fromType(col_type) != std.meta.activeTag(val)) return false;
-    switch (val) {
+    var coerced = val;
+    const want = types.ValueTag.fromType(col_type);
+    if (want != std.meta.activeTag(coerced)) {
+        // Coerce exactly like predicate evaluation does (text→date/datetime,
+        // integer widen/narrow, float→double) — the hash must be computed on
+        // the same representation the column stores, and a bail here turns a
+        // keyed DELETE into a full-table probe.
+        exec.predicate.tryWidenLiteral(&coerced, want) catch return false;
+    }
+    switch (coerced) {
         .int => |v| try storage.format.appendI32(aa, buf, v),
         .bigint => |v| try storage.format.appendI64(aa, buf, v),
         .boolean => |v| try buf.append(aa, @intFromBool(v)),
