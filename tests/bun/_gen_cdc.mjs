@@ -94,7 +94,9 @@ ${flinkCols},
   'scan.incremental.snapshot.chunk.size' = '${chunkSize}',
   'scan.snapshot.fetch.size' = '4096',
   'scan.incremental.snapshot.backfill.skip' = 'true',
-  'jdbc.properties.tcpKeepAlive' = 'true'${chunkKey ? `,
+  'jdbc.properties.tcpKeepAlive' = 'true',
+  'heartbeat.interval' = '15s',
+  'debezium.connect.keep.alive.interval.ms' = '30000'${chunkKey ? `,
   'scan.incremental.snapshot.chunk.key-column' = '${chunkKey}'` : ""}
 );
 CREATE TEMPORARY TABLE sink_${table} (
