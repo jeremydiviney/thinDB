@@ -60,11 +60,15 @@ async function check() {
   }
 
   const ts = new Date().toISOString().slice(11, 19);
-  if (problems.length) {
+  // Emit only on state CHANGE (problem set differs from last check), so a
+  // known-degraded state during a long recovery doesn't spam every interval.
+  // Staleness minutes are rounded to 30-min buckets for signature stability.
+  const sig = problems.map((p) => p.replace(/\d+ min old/, (m) => `${Math.floor(parseInt(m) / 30) * 30}+ min old`)).join(" | ");
+  if (problems.length && sig !== lastBad) {
     console.log(`${ts} SYNC-ALERT: ${problems.join(" | ")}`);
-    lastBad = true;
-  } else if (lastBad) {
-    console.log(`${ts} SYNC-RECOVERED: all ${EXPECTED_JOBS} jobs RUNNING, freshness within ${LAG_MAX / 60000} min`);
+    lastBad = sig;
+  } else if (!problems.length && lastBad) {
+    console.log(`${ts} SYNC-RECOVERED: all ${EXPECTED_JOBS} tables healthy, freshness within ${LAG_MAX / 60000} min`);
     lastBad = false;
   }
 }
