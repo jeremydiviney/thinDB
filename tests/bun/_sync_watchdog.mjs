@@ -20,25 +20,30 @@ let lastBad = false;
 
 async function jobStates() {
   const r = await fetch(`${FLINK}/jobs/overview`).then((x) => x.json());
-  // The JM remembers every job it ever ran (cancelled/failed history included).
-  // Health = the NEWEST job per table only.
-  const latest = new Map();
+  // The JM remembers every job it ever ran (cancelled/failed history
+  // included), and after a recovery cycle a table's newest-by-start job can
+  // be a cancelled duplicate. Health per table = exactly one RUNNING job:
+  // zero means the pipeline is down, two+ means duplicate readers (server-id
+  // collisions on the RDS side).
+  const counts = new Map();
   for (const j of r.jobs) {
     if (!j.name.includes("sink_")) continue;
     const name = j.name.split("sink_")[1];
-    const prev = latest.get(name);
-    if (!prev || j["start-time"] > prev.start) latest.set(name, { name, state: j.state, start: j["start-time"] });
+    counts.set(name, (counts.get(name) ?? 0) + (j.state === "RUNNING" ? 1 : 0));
   }
-  return [...latest.values()];
+  return [...counts.entries()].map(([name, running]) => ({ name, running }));
 }
 
 async function check() {
   const problems = [];
   try {
     const jobs = await jobStates();
-    const running = jobs.filter((j) => j.state === "RUNNING");
-    for (const j of jobs) if (j.state !== "RUNNING") problems.push(`job ${j.name} is ${j.state}`);
-    if (running.length < EXPECTED_JOBS) problems.push(`only ${running.length}/${EXPECTED_JOBS} sink jobs RUNNING`);
+    for (const j of jobs) {
+      if (j.running === 0) problems.push(`no RUNNING job for ${j.name}`);
+      if (j.running > 1) problems.push(`${j.running} duplicate RUNNING jobs for ${j.name}`);
+    }
+    const healthy = jobs.filter((j) => j.running === 1).length;
+    if (healthy < EXPECTED_JOBS) problems.push(`only ${healthy}/${EXPECTED_JOBS} tables healthy`);
   } catch (e) {
     problems.push(`flink REST unreachable: ${e.message}`);
   }
