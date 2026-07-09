@@ -57,6 +57,11 @@ services:
     depends_on:
       - jobmanager
     command: taskmanager
+    # The TM deliberately self-kills when a task cancellation wedges past the
+    # 180s cancellation watchdog (seen twice on 2026-07-09: cancelling a job
+    # whose binlog reader was stuck on a dead WAN socket). Jobs redeploy from
+    # checkpoints on the replacement TM; the sync watchdog records the event.
+    restart: unless-stopped
     environment:
       - |
         FLINK_PROPERTIES=
