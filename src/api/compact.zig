@@ -745,6 +745,14 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
         var maybe_info = try streamMerge(t, seg_ids, prior_sketches.items, new_seg_id, file_name, sync);
         if (maybe_info) |*info| {
             defer info.deinit(t.allocator);
+            // Persist the merged Bloom as the segment's sidecar (#140) —
+            // written once here, never rewritten. A crash before commit
+            // leaves .dat+.bloom orphans the open-time sweep reclaims.
+            if (info.key_bloom.len > 0) {
+                var bbuf: [32]u8 = undefined;
+                const bloom_name = try Table.segmentBloomFileName(&bbuf, new_seg_id);
+                try storage.writeFileSynced(t.io, t.segments_dir, bloom_name, info.key_bloom, sync);
+            }
             new_entry = try t.entryFor(info.*);
         }
     }

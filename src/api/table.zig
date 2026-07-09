@@ -15,6 +15,7 @@ const TypeTag = types.TypeTag;
 const storage = @import("../storage/storage.zig");
 const engine = @import("../engine/engine.zig");
 const exec = @import("../exec/exec.zig");
+const bloom_util = @import("../util/bloom.zig");
 
 const api = @import("api.zig");
 const Config = api.Config;
@@ -225,6 +226,7 @@ pub const Table = struct {
         // .tomb files no manifest entry references. Nothing is writing yet,
         // so any unreferenced file here is garbage. Best-effort.
         self.sweepOrphanedSegmentFiles() catch {};
+        self.loadKeyBloomSidecars();
 
         // If we replayed WAL records into a unique-key table's memtable,
         // re-run upsert resolution so any same-key dupes get tombstoned
@@ -468,15 +470,23 @@ pub const Table = struct {
         );
         defer info.deinit(self.allocator);
 
-        // Compound-key Bloom over the flushed rows — carried into the manifest
-        // entry so the upsert probe can skip this segment with zero I/O when a
-        // key definitely isn't present (#138). Unique tables only.
+        // Compound-key Bloom over the flushed rows — carried into the in-memory
+        // manifest entry so the upsert probe can skip this segment with zero
+        // I/O when a key definitely isn't present (#138), and persisted as a
+        // `<id>.bloom` sidecar written ONCE here — not into manifest.bin,
+        // which is rewritten wholly on every flush under the table mutex and
+        // would grow O(total rows) (#140). Unique tables only. A crash after
+        // the segment but before the sidecar just costs pruning (probe treats
+        // a missing sidecar as "no filter").
         if (self.schema.unique and self.order_key_indices.len > 0 and info.row_count > 0) {
             const upsert_mod = @import("upsert.zig");
             var hashes: std.ArrayList(u64) = .empty;
             defer hashes.deinit(self.allocator);
             try upsert_mod.appendKeyHashes(self.allocator, &hashes, snapshot.views, self.order_key_indices, @intCast(info.row_count));
             info.key_bloom = try upsert_mod.serializeKeyBloom(self.allocator, hashes.items);
+            var bbuf: [32]u8 = undefined;
+            const bloom_name = try Table.segmentBloomFileName(&bbuf, seg_id);
+            try storage.writeFileSynced(self.io, self.segments_dir, bloom_name, info.key_bloom, sync);
         }
 
         try self.manifest.appendSegment(try self.entryFor(info));
@@ -619,6 +629,12 @@ pub const Table = struct {
 
     pub fn segmentFileName(buf: []u8, seg_id: u64) ![]u8 {
         return std.fmt.bufPrint(buf, "{d:0>20}.dat", .{seg_id});
+    }
+
+    /// Compound-key Bloom sidecar (#140). Written once when the segment is
+    /// (flush or compaction), deleted with it.
+    pub fn segmentBloomFileName(buf: []u8, seg_id: u64) ![]u8 {
+        return std.fmt.bufPrint(buf, "{d:0>20}.bloom", .{seg_id});
     }
 
     /// Allocate a fresh, never-reused (within this run) segment ID.
@@ -844,7 +860,30 @@ pub const Table = struct {
         var tomb_buf: [32]u8 = undefined;
         const tomb_name = storage.tombstone.fileNameFor(&tomb_buf, seg_id) catch return true;
         const tomb_ok = self.deleteFileTolerant(tomb_name);
-        return dat_ok and tomb_ok;
+
+        var bloom_buf: [32]u8 = undefined;
+        const bloom_name = Table.segmentBloomFileName(&bloom_buf, seg_id) catch return true;
+        const bloom_ok = self.deleteFileTolerant(bloom_name);
+        return dat_ok and tomb_ok and bloom_ok;
+    }
+
+    /// Attach persisted key-Bloom sidecars (#140) to the in-memory manifest
+    /// entries. Called once at open; flush/compaction attach the blooms of
+    /// segments they create directly. Best-effort: a missing or torn sidecar
+    /// (crash between segment write and sidecar write) just means no probe
+    /// pruning for that segment.
+    fn loadKeyBloomSidecars(self: *Table) void {
+        if (!self.schema.unique) return;
+        for (self.manifest.segments.items) |*entry| {
+            var buf: [32]u8 = undefined;
+            const name = Table.segmentBloomFileName(&buf, entry.segment_id) catch continue;
+            const bytes = self.segments_dir.readFileAlloc(self.io, name, self.allocator, .limited(1 << 30)) catch continue;
+            if (!bloom_util.validSerialized(bytes)) {
+                self.allocator.free(bytes);
+                continue;
+            }
+            entry.key_bloom = bytes;
+        }
     }
 
     /// Delete any segment/tombstone file whose id has no manifest entry.
@@ -867,7 +906,7 @@ pub const Table = struct {
             if (entry.kind != .file) continue;
             const dot = std.mem.lastIndexOfScalar(u8, entry.name, '.') orelse continue;
             const ext = entry.name[dot..];
-            if (!std.mem.eql(u8, ext, ".dat") and !std.mem.eql(u8, ext, ".tomb")) continue;
+            if (!std.mem.eql(u8, ext, ".dat") and !std.mem.eql(u8, ext, ".tomb") and !std.mem.eql(u8, ext, ".bloom")) continue;
             const id = std.fmt.parseInt(u64, entry.name[0..dot], 10) catch continue;
             if (!live.contains(id)) try to_delete.append(self.allocator, id);
         }

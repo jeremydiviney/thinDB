@@ -48,7 +48,9 @@ const hll = @import("../util/hll.zig");
 const types = @import("../types.zig");
 
 pub const manifest_magic: [4]u8 = .{ 't', 'D', 'B', 'M' };
-pub const manifest_version: u16 = 9;
+// v10: key Blooms moved out of the manifest into per-segment `<id>.bloom`
+// sidecars (#140) — entries are fixed-size again.
+pub const manifest_version: u16 = 10;
 pub const manifest_filename = "manifest";
 pub const manifest_tmp_filename = "manifest.tmp";
 pub const header_size: usize = 32;
@@ -204,9 +206,11 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
             try buf.appendNTimes(m.allocator, 0, want - e.column_sketches.len);
         }
 
-        // Compound-key Bloom filter: length-prefixed (variable size). 0 = none.
-        try appendU32(m.allocator, &buf, @intCast(e.key_bloom.len));
-        try buf.appendSlice(m.allocator, e.key_bloom);
+        // The compound-key Bloom is NOT serialized here (v10): the manifest
+        // is rewritten wholly on every flush under the table mutex, and
+        // blooms scale with total rows (#140). They live in per-segment
+        // `<id>.bloom` sidecars written once, loaded into the in-memory
+        // entries at table open.
     }
 
     try buf.appendSlice(m.allocator, &manifest_magic);
@@ -243,12 +247,11 @@ pub fn readManifest(
     const column_count = format.readU32(bytes[20..24]);
     const auto_inc_next = format.readU64(bytes[24..32]);
 
-    // Per-entry minimum: prefix + fixed stats/sketch slots + the 4-byte
-    // key-Bloom length prefix. The Bloom itself is variable-length, so the total
-    // is a lower bound, not an exact size — the trailing magic validates the end.
-    const entry_min: usize = entry_prefix_size + @as(usize, column_count) * (stats_slot_size + sketch_slot_size) + 4;
-    const min_size: usize = header_size + @as(usize, count) * entry_min + trailer_size;
-    if (bytes.len < min_size) return Error.ManifestCorrupt;
+    // Entries are fixed-size again in v10 (blooms moved to sidecar files),
+    // so the total is exact.
+    const entry_size: usize = entry_prefix_size + @as(usize, column_count) * (stats_slot_size + sketch_slot_size);
+    const want_size: usize = header_size + @as(usize, count) * entry_size + trailer_size;
+    if (bytes.len != want_size) return Error.ManifestCorrupt;
 
     if (!std.mem.eql(u8, bytes[bytes.len - 4 .. bytes.len], &manifest_magic)) {
         return Error.ManifestBadTrailerMagic;
@@ -314,17 +317,6 @@ pub fn readManifest(
             @memcpy(sketches, bytes[off .. off + sketch_bytes]);
             off += sketch_bytes;
             entry.column_sketches = sketches;
-        }
-
-        // Compound-key Bloom filter (length-prefixed; written unconditionally).
-        const bloom_len = format.readU32(bytes[off .. off + 4]);
-        off += 4;
-        if (bloom_len > 0) {
-            const bloom = try allocator.alloc(u8, bloom_len);
-            errdefer allocator.free(bloom);
-            @memcpy(bloom, bytes[off .. off + bloom_len]);
-            off += bloom_len;
-            entry.key_bloom = bloom;
         }
 
         segments.appendAssumeCapacity(entry);

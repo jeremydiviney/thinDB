@@ -127,6 +127,17 @@ pub const Bloom = struct {
     }
 };
 
+/// Sanity-check a serialized filter before trusting it on the probe path —
+/// e.g. a sidecar file that a crash could have torn. Header present, nonzero
+/// byte-aligned m, bit array fully present (m == 0 would divide-by-zero in
+/// the probe; short bits would index out of bounds).
+pub fn validSerialized(buf: []const u8) bool {
+    if (buf.len < 5) return false;
+    const m = std.mem.readInt(u32, buf[0..4], .little);
+    if (m < 8 or m % 8 != 0) return false;
+    return buf.len >= 5 + m / 8;
+}
+
 /// Hash compound-key bytes to a 64-bit value for the filter. Callers must use
 /// this exact function on both build and query so probes line up.
 pub inline fn keyHash(key_bytes: []const u8) u64 {
