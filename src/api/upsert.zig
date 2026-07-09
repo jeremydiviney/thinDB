@@ -9,6 +9,8 @@ const storage = @import("../storage/storage.zig");
 const engine = @import("../engine/engine.zig");
 
 const api = @import("api.zig");
+const exec = @import("../exec/exec.zig");
+const types = @import("../types.zig");
 const Table = api.Table;
 const comparison = @import("comparison.zig");
 const bloom = @import("../util/bloom.zig");
@@ -197,6 +199,77 @@ pub fn applyUpsertResolution(t: *Table) !void {
             t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
         }
     }
+}
+
+/// Full-key Bloom candidates for a keyed DELETE/UPDATE (#143). When the
+/// predicate's top-level AND conjuncts (or a bare leaf) pin every order-key
+/// column with equality — allowing at most one column an IN set of ≤256
+/// values — return the compound-key hashes, encoded exactly as the Bloom was
+/// built. Returns null when the key set can't be derived (caller scans
+/// normally). Allocated in `aa`.
+pub fn keyHashesFromPredicateExpr(
+    t: *Table,
+    aa: Allocator,
+    expr: exec.predicate.PredicateExpr,
+) !?[]u64 {
+    const oki = t.order_key_indices;
+    if (!t.schema.unique or oki.len == 0) return null;
+    const max_keys = 256;
+
+    const conjuncts: []const exec.predicate.PredicateExpr = switch (expr) {
+        .@"and" => |children| children,
+        .leaf, .in_set => (&[_]exec.predicate.PredicateExpr{expr})[0..1],
+        else => return null,
+    };
+
+    const eq_vals = try aa.alloc(?types.Value, oki.len);
+    @memset(eq_vals, null);
+    var in_vals: ?[]const types.Value = null;
+    var in_pos: usize = 0;
+    for (oki, 0..) |col_idx, k| {
+        const col_name = t.schema.columns[col_idx].name;
+        for (conjuncts) |c| switch (c) {
+            .leaf => |p| {
+                if (p.op == .eq and types.columnNameEql(p.col, col_name)) {
+                    eq_vals[k] = p.val;
+                }
+            },
+            .in_set => |s| {
+                if (!s.negate and types.columnNameEql(s.col, col_name) and eq_vals[k] == null) {
+                    if (in_vals != null and in_pos != k) return null; // two IN-bound key columns
+                    if (s.values.len == 0 or s.values.len > max_keys) return null;
+                    in_vals = s.values;
+                    in_pos = k;
+                }
+            },
+            else => {},
+        };
+        if (eq_vals[k] == null and (in_vals == null or in_pos != k)) return null; // unbound
+    }
+
+    var hashes: std.ArrayList(u64) = .empty;
+    var key_buf: std.ArrayList(u8) = .empty;
+    const n_combos: usize = if (in_vals) |vs| vs.len else 1;
+    var ci: usize = 0;
+    while (ci < n_combos) : (ci += 1) {
+        key_buf.clearRetainingCapacity();
+        for (oki, 0..) |col_idx, k| {
+            const v = eq_vals[k] orelse in_vals.?[ci];
+            if (!try comparison.appendPredicateValueBytes(aa, &key_buf, t.schema.columns[col_idx].type, v)) return null;
+        }
+        try hashes.append(aa, bloom.keyHash(key_buf.items));
+    }
+    return try hashes.toOwnedSlice(aa);
+}
+
+/// True when `key_bloom` (may be empty = no filter) admits at least one of
+/// `hashes` — i.e. the segment cannot be skipped.
+pub fn bloomAdmitsAny(key_bloom: []const u8, hashes: []const u64) bool {
+    if (key_bloom.len == 0) return true;
+    for (hashes) |h| {
+        if (bloom.Bloom.mayContainSerialized(key_bloom, h)) return true;
+    }
+    return false;
 }
 
 /// Pack the order-key columns of `row` from a memtable's `ColumnStore` array

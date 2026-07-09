@@ -18,6 +18,7 @@ test {
     _ = @import("upsert_incremental_test.zig");
     _ = @import("compact_tombstone_test.zig");
     _ = @import("lifecycle_flush_test.zig");
+    _ = @import("key_bloom_prune_test.zig");
     _ = @import("compute_test.zig");
     _ = @import("compute_scalar_test.zig");
     _ = @import("decimal_test.zig");

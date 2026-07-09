@@ -119,8 +119,22 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
     }
     const pred_or_null = pred_local;
 
+    // Full-key Bloom gate (#143): a keyed DELETE — every order-key column
+    // pinned by AND-equality, the exact shape a CDC binlog delete takes —
+    // can skip every segment whose Bloom rejects the key(s): no open, no
+    // whole-row-group decode. Arena-scoped; null = not a keyed delete.
+    var gate_arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer gate_arena.deinit();
+    const key_hashes: ?[]u64 = if (pred_or_null) |p|
+        @import("upsert.zig").keyHashesFromPredicateExpr(t, gate_arena.allocator(), p) catch null
+    else
+        null;
+
     // ---- Segments ----
     for (t.manifest.segments.items) |entry| {
+        if (key_hashes) |hs| {
+            if (!@import("upsert.zig").bloomAdmitsAny(entry.key_bloom, hs)) continue;
+        }
         var name_buf: [32]u8 = undefined;
         const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
         var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);

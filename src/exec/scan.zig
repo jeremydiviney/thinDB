@@ -14,6 +14,8 @@ const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
 const sformat = @import("../storage/format.zig");
 const hll = @import("../util/hll.zig");
+const bloom_util = @import("../util/bloom.zig");
+const comparison = @import("../api/comparison.zig");
 
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
@@ -321,6 +323,12 @@ pub const Scan = struct {
     prunes: std.ArrayList(PruneHint),
     /// Pushed-down `IN (...)` set hints for the same min/max row-group skip.
     in_prunes: std.ArrayListUnmanaged(InPruneHint) = .empty,
+    /// Typed `IN (...)` sets on ORDER-KEY columns, kept verbatim for the
+    /// full-key Bloom pass (`keyBloomPrunePass`) — `in_prunes` coerces to
+    /// i128 and drops non-numeric values, which loses hash-encoding
+    /// fidelity. Value slices reference the fused predicate expression,
+    /// which outlives the Scan's pruning phase.
+    key_in_sets: std.ArrayListUnmanaged(KeyInSet) = .empty,
     /// Owns the reordered AND/OR child arrays produced when cost-ordering the
     /// fused predicate (see `orderFusedConjuncts`); freed in `deinit`.
     filter_rewritten: std.ArrayListUnmanaged([]PredicateExpr) = .empty,
@@ -478,6 +486,13 @@ pub const Scan = struct {
     pub const InPruneHint = struct {
         col_idx: usize,
         values: []i128,
+    };
+
+    /// An `IN (...)` set on an order-key column, values kept typed (see
+    /// `key_in_sets`). Slice borrowed from the predicate expression.
+    pub const KeyInSet = struct {
+        col_idx: usize,
+        values: []const Value,
     };
 
     /// Standalone scan: mints + owns its own accountant from the table's
@@ -941,6 +956,7 @@ pub const Scan = struct {
         self.prunes.deinit(self.allocator);
         for (self.in_prunes.items) |hint| self.allocator.free(hint.values);
         self.in_prunes.deinit(self.allocator);
+        self.key_in_sets.deinit(self.allocator);
         for (self.filter_rewritten.items) |slice| self.allocator.free(slice);
         self.filter_rewritten.deinit(self.allocator);
         if (self.owns_accountant) {
@@ -1063,12 +1079,14 @@ pub const Scan = struct {
             try self.filter_rewritten.append(self.allocator, arms);
             self.fused_filter = .{ .@"and" = arms };
             try self.extractPruneHints(coerced);
+            self.keyBloomPrunePass() catch {};
             try self.orderFusedConjuncts();
             return true;
         }
         self.fused_filter = coerced;
         try self.setupFilterEval(coerced);
         try self.extractPruneHints(coerced);
+        self.keyBloomPrunePass() catch {};
         try self.orderFusedConjuncts();
         return true;
     }
@@ -1115,6 +1133,15 @@ pub const Scan = struct {
 
     fn addInPrune(self: *Scan, s: predicate.InSet) !void {
         const col_idx = types.findColumn(self.table.schema.columns, s.col) orelse return;
+        // Keep the typed values verbatim when this is an order-key column —
+        // the full-key Bloom pass needs exact hash-encoding fidelity, which
+        // the i128 reduction below can't provide (and drops strings).
+        for (self.table.order_key_indices) |ki| {
+            if (ki == col_idx) {
+                try self.key_in_sets.append(self.allocator, .{ .col_idx = col_idx, .values = s.values });
+                break;
+            }
+        }
         if (!storage.format.typeHasStats(self.table.schema.columns[col_idx].type)) return;
         var values = try self.allocator.alloc(i128, s.values.len);
         errdefer self.allocator.free(values);
@@ -1247,6 +1274,88 @@ pub const Scan = struct {
             };
             const lk = lk_opt orelse continue;
             if (!predicate.statsOverlapPredicateBlankAware(lk, op, val, blanks_excluded)) {
+                if (skipped_buf == null) {
+                    const buf = try self.allocator.alloc(bool, self.segment_count);
+                    @memset(buf, false);
+                    skipped_buf = buf;
+                }
+                skipped_buf.?[i] = true;
+                any_skipped = true;
+            }
+        }
+        if (any_skipped) self.seg_skip = skipped_buf;
+    }
+
+    /// Full-compound-key Bloom pruning (#143): when the top-level AND
+    /// conjuncts pin EVERY order-key column to a constant — allowing at most
+    /// one column to range over a small IN set — the candidate key set is
+    /// known exactly. Probe each surviving segment's key Bloom and skip
+    /// segments that definitely contain none of the keys. Zonemaps cannot do
+    /// this on upsert-churned tables: segments are cut by arrival time, so
+    /// they all overlap in key range, and a compound key behind a skewed
+    /// leading column defeats leading-key stats. Soundness: a segment whose
+    /// Bloom rejects every candidate key holds no row matching the full
+    /// conjunction (tombstoned copies included — irrelevant rows only).
+    fn keyBloomPrunePass(self: *Scan) !void {
+        const oki = self.table.order_key_indices;
+        if (!self.table.schema.unique or oki.len == 0) return;
+        const segs = self.table.manifest.segments.items[0..self.segment_count];
+        if (segs.len == 0) return;
+        const max_keys = 256;
+
+        var eq_vals = try self.allocator.alloc(?Value, oki.len);
+        defer self.allocator.free(eq_vals);
+        @memset(eq_vals, null);
+        var in_vals: ?[]const Value = null;
+        var in_pos: usize = 0;
+        for (oki, 0..) |col_idx, k| {
+            for (self.prunes.items) |h| {
+                if (h.col_idx == col_idx and h.op == .eq) {
+                    eq_vals[k] = h.val;
+                    break;
+                }
+            }
+            if (eq_vals[k] != null) continue;
+            for (self.key_in_sets.items) |s| {
+                if (s.col_idx == col_idx) {
+                    if (in_vals != null) return; // two IN-bound key columns — skip
+                    if (s.values.len == 0 or s.values.len > max_keys) return;
+                    in_vals = s.values;
+                    in_pos = k;
+                    break;
+                }
+            }
+            if (eq_vals[k] == null and (in_vals == null or in_pos != k)) return; // unbound key column
+        }
+
+        var hashes: std.ArrayListUnmanaged(u64) = .empty;
+        defer hashes.deinit(self.allocator);
+        var key_buf: std.ArrayList(u8) = .empty;
+        defer key_buf.deinit(self.allocator);
+        const n_combos: usize = if (in_vals) |vs| vs.len else 1;
+        var ci: usize = 0;
+        while (ci < n_combos) : (ci += 1) {
+            key_buf.clearRetainingCapacity();
+            for (oki, 0..) |col_idx, k| {
+                const v: Value = eq_vals[k] orelse in_vals.?[ci];
+                if (!try comparison.appendPredicateValueBytes(self.allocator, &key_buf, self.table.schema.columns[col_idx].type, v)) return;
+            }
+            try hashes.append(self.allocator, bloom_util.keyHash(key_buf.items));
+        }
+
+        var skipped_buf: ?[]bool = self.seg_skip;
+        var any_skipped = false;
+        for (segs, 0..) |entry, i| {
+            if (skipped_buf) |s| if (s[i]) continue;
+            if (entry.key_bloom.len == 0) continue; // no filter → can't rule out
+            var maybe = false;
+            for (hashes.items) |h| {
+                if (bloom_util.Bloom.mayContainSerialized(entry.key_bloom, h)) {
+                    maybe = true;
+                    break;
+                }
+            }
+            if (!maybe) {
                 if (skipped_buf == null) {
                     const buf = try self.allocator.alloc(bool, self.segment_count);
                     @memset(buf, false);

@@ -171,10 +171,25 @@ fn processSegments(
     assignments: []const Assignment,
     segs_at_start: usize,
 ) !usize {
+    // Full-key Bloom gate (#143): a keyed UPDATE (every order-key column
+    // pinned by AND-equality) skips segments whose Bloom rejects the key(s)
+    // — this path otherwise decodes EVERY column of EVERY row group.
+    var gate_arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer gate_arena.deinit();
+    const upsert_mod = @import("upsert.zig");
+    const key_hashes: ?[]u64 = if (pred_opt) |p|
+        upsert_mod.keyHashesFromPredicateExpr(t, gate_arena.allocator(), p) catch null
+    else
+        null;
+
     var total: usize = 0;
     var i: usize = 0;
     while (i < segs_at_start) : (i += 1) {
-        total += try processOneSegment(t, pred_opt, assignments, t.manifest.segments.items[i]);
+        const entry = t.manifest.segments.items[i];
+        if (key_hashes) |hs| {
+            if (!upsert_mod.bloomAdmitsAny(entry.key_bloom, hs)) continue;
+        }
+        total += try processOneSegment(t, pred_opt, assignments, entry);
     }
     return total;
 }

@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 
 const storage = @import("../storage/storage.zig");
 const exec = @import("../exec/exec.zig");
+const types = @import("../types.zig");
 
 pub fn cmpU32(target: u32, item: u32) std.math.Order {
     return std.math.order(target, item);
@@ -62,6 +63,60 @@ pub fn evalRow(view: storage.ColumnView, row: u32, pred: exec.Predicate) bool {
 ///   - FLOAT (f32):  4 bytes LE         - DOUBLE (f64): 8 bytes LE
 ///   - DATE (i32):   4 bytes LE         - DATETIME (i64): 8 bytes LE
 ///   - VARCHAR/STRING/CHAR: 4-byte LE length + bytes
+/// Encode a predicate constant EXACTLY as `appendColumnValueBytes` encodes
+/// the column value at key-Bloom build time — probe hashes must line up
+/// byte-for-byte (#143). Returns false (caller must not prune) on any
+/// fidelity risk: value tag not matching the column's post-coercion tag, or
+/// a CHAR column (padding semantics can differ from the literal).
+pub fn appendPredicateValueBytes(
+    aa: Allocator,
+    buf: *std.ArrayList(u8),
+    col_type: types.Type,
+    val: types.Value,
+) !bool {
+    if (col_type == .char) return false;
+    if (types.ValueTag.fromType(col_type) != std.meta.activeTag(val)) return false;
+    switch (val) {
+        .int => |v| try storage.format.appendI32(aa, buf, v),
+        .bigint => |v| try storage.format.appendI64(aa, buf, v),
+        .boolean => |v| try buf.append(aa, @intFromBool(v)),
+        .text => |v| {
+            try storage.format.appendU32(aa, buf, @intCast(v.len));
+            try buf.appendSlice(aa, v);
+        },
+        .float => |v| {
+            var b: [4]u8 = undefined;
+            storage.format.writeF32(&b, v);
+            try buf.appendSlice(aa, &b);
+        },
+        .double => |v| {
+            var b: [8]u8 = undefined;
+            storage.format.writeF64(&b, v);
+            try buf.appendSlice(aa, &b);
+        },
+        .date => |v| try storage.format.appendI32(aa, buf, v),
+        .datetime => |v| try storage.format.appendI64(aa, buf, v),
+        .tinyint => |v| try buf.append(aa, @bitCast(v)),
+        .smallint => |v| {
+            var b: [2]u8 = undefined;
+            std.mem.writeInt(i16, &b, v, .little);
+            try buf.appendSlice(aa, &b);
+        },
+        .largeint, .decimal128 => |v| {
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(i128, &b, v, .little);
+            try buf.appendSlice(aa, &b);
+        },
+        .decimal64 => |v| try storage.format.appendI64(aa, buf, v),
+        .uuid => |v| {
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(u128, &b, v, .little);
+            try buf.appendSlice(aa, &b);
+        },
+    }
+    return true;
+}
+
 pub fn appendColumnValueBytes(
     aa: Allocator,
     buf: *std.ArrayList(u8),
