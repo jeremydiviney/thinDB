@@ -62,8 +62,11 @@ async function check() {
   const ts = new Date().toISOString().slice(11, 19);
   // Emit only on state CHANGE (problem set differs from last check), so a
   // known-degraded state during a long recovery doesn't spam every interval.
-  // Staleness minutes are rounded to 30-min buckets for signature stability.
-  const sig = problems.map((p) => p.replace(/\d+ min old/, (m) => `${Math.floor(parseInt(m) / 30) * 30}+ min old`)).join(" | ");
+  // The signature ignores the staleness magnitude entirely — during a
+  // from-scratch snapshot the updatedAt frontier drifts continuously and
+  // would re-alert on every bucket. Which tables/kinds are unhealthy is the
+  // signal; the current minutes are still in the printed message.
+  const sig = problems.map((p) => p.replace(/\d+ min old/, "N min old")).join(" | ");
   if (problems.length && sig !== lastBad) {
     console.log(`${ts} SYNC-ALERT: ${problems.join(" | ")}`);
     lastBad = sig;
