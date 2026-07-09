@@ -62,3 +62,5 @@ bench/clickbench/coverage*.json
 # Stray build/server logs
 *.log
 /build_err.txt
+tests/flink/_checkpoints/
+.wayroll-prod-db/

@@ -36,11 +36,16 @@ services:
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
         execution.checkpointing.interval: 3s
+        state.checkpoints.dir: file:///checkpoints
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        heartbeat.timeout: 300000
+        heartbeat.interval: 30000
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./job.sql:/opt/sql/job.sql:ro
       - ./cdc_job.sql:/opt/sql/cdc_job.sql:ro
+      - ./_checkpoints:/checkpoints
     depends_on:
       mysql:
         condition: service_healthy
@@ -56,6 +61,13 @@ services:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
-        taskmanager.numberOfTaskSlots: 2
+        taskmanager.numberOfTaskSlots: 16
+        taskmanager.memory.process.size: 24g
+        taskmanager.memory.managed.fraction: 0.1
+        heartbeat.timeout: 300000
+        heartbeat.interval: 30000
+        state.checkpoints.dir: file:///checkpoints
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - ./_checkpoints:/checkpoints
