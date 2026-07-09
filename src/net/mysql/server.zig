@@ -783,6 +783,23 @@ fn handleConnection(
             // verifier path with the initial handshake (same salt is
             // retained on SessionState).
             0x11 => try handleChangeUser(allocator, w, catalog, &session, body, auth_password),
+            // COM_SET_OPTION — toggle CLIENT_MULTI_STATEMENTS mid-connection.
+            // Connector/J sends this (rather than negotiating the capability
+            // at handshake) right before a semicolon-joined batch, e.g. the
+            // Flink JDBC sink's DELETE batches, which can't be rewritten as a
+            // single multi-VALUES INSERT. Body: u16 LE, 0 = ON, 1 = OFF.
+            0x1B => {
+                if (body.len >= 2 and std.mem.readInt(u16, body[0..2], .little) == 0) {
+                    session.client_caps |= handshake.CLIENT_MULTI_STATEMENTS;
+                } else {
+                    session.client_caps &= ~handshake.CLIENT_MULTI_STATEMENTS;
+                }
+                if ((session.client_caps & handshake.CLIENT_DEPRECATE_EOF) != 0) {
+                    try handshake.sendEofOkPacketStatus(allocator, w, 1, session.transactionStatus());
+                } else {
+                    try handshake.sendLegacyEofPacketStatus(allocator, w, 1, session.transactionStatus());
+                }
+            },
             else => try handshake.sendErrPacket(allocator, w, 1, 1047, "HY000".*, "Unknown command"),
         }
         const flush_start = profiler.start();
