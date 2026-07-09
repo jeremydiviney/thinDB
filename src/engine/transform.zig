@@ -664,6 +664,39 @@ fn compactInto(
     list.items.len = pos;
 }
 
+/// Copy mask-selected rows from a numeric source slice into a numeric
+/// destination list of a DIFFERENT element type: checked int↔int casts
+/// (error.NumericOverflow when out of range), int→float, float↔float.
+/// Cold path — only taken when a Compute-produced column's tag doesn't
+/// match the table column's declared type (e.g. `SET v = 99` types the
+/// literal .int while the column is BIGINT).
+fn compactIntoConvert(
+    comptime S: type,
+    comptime D: type,
+    allocator: Allocator,
+    src: []const S,
+    mask: []const bool,
+    list: *std.ArrayList(D),
+) !void {
+    var survivors: usize = 0;
+    for (mask) |m| survivors += @intFromBool(m);
+    if (survivors == 0) return;
+    try list.ensureUnusedCapacity(allocator, survivors);
+    for (src, mask) |v, m| {
+        if (!m) continue;
+        const converted: D = switch (@typeInfo(D)) {
+            .float => switch (@typeInfo(S)) {
+                .float => @floatCast(v),
+                .int => @floatFromInt(v),
+                else => @compileError("unsupported conversion source"),
+            },
+            .int => std.math.cast(D, v) orelse return error.NumericOverflow,
+            else => @compileError("unsupported conversion destination"),
+        };
+        list.appendAssumeCapacity(converted);
+    }
+}
+
 pub fn appendMaskedColumn(
     allocator: Allocator,
     view: ColumnView,
@@ -674,15 +707,27 @@ pub fn appendMaskedColumn(
     switch (view.data) {
         .int => |s| switch (out.data) {
             .int => |*list| try compactInto(i32, allocator, s, mask, list),
-            else => unreachable,
+            .bigint => |*list| try compactIntoConvert(i32, i64, allocator, s, mask, list),
+            .largeint => |*list| try compactIntoConvert(i32, i128, allocator, s, mask, list),
+            .smallint => |*list| try compactIntoConvert(i32, i16, allocator, s, mask, list),
+            .tinyint => |*list| try compactIntoConvert(i32, i8, allocator, s, mask, list),
+            .double => |*list| try compactIntoConvert(i32, f64, allocator, s, mask, list),
+            .float => |*list| try compactIntoConvert(i32, f32, allocator, s, mask, list),
+            else => return error.ColumnTypeMismatch,
         },
         .bigint => |s| switch (out.data) {
             .bigint => |*list| try compactInto(i64, allocator, s, mask, list),
-            else => unreachable,
+            .int => |*list| try compactIntoConvert(i64, i32, allocator, s, mask, list),
+            .largeint => |*list| try compactIntoConvert(i64, i128, allocator, s, mask, list),
+            .smallint => |*list| try compactIntoConvert(i64, i16, allocator, s, mask, list),
+            .tinyint => |*list| try compactIntoConvert(i64, i8, allocator, s, mask, list),
+            .double => |*list| try compactIntoConvert(i64, f64, allocator, s, mask, list),
+            .float => |*list| try compactIntoConvert(i64, f32, allocator, s, mask, list),
+            else => return error.ColumnTypeMismatch,
         },
         .boolean => |s| switch (out.data) {
             .boolean => |*list| try compactInto(u8, allocator, s, mask, list),
-            else => unreachable,
+            else => return error.ColumnTypeMismatch,
         },
         // String family: any source (varchar/string/char) can land
         // in any string-family destination — the wire / Compute paths
@@ -694,43 +739,61 @@ pub fn appendMaskedColumn(
         .json => |sv| try appendMaskedStringy(allocator, sv, mask, out),
         .float => |s| switch (out.data) {
             .float => |*list| try compactInto(f32, allocator, s, mask, list),
-            else => unreachable,
+            .double => |*list| try compactIntoConvert(f32, f64, allocator, s, mask, list),
+            else => return error.ColumnTypeMismatch,
         },
         .double => |s| switch (out.data) {
             .double => |*list| try compactInto(f64, allocator, s, mask, list),
-            else => unreachable,
+            .float => |*list| try compactIntoConvert(f64, f32, allocator, s, mask, list),
+            else => return error.ColumnTypeMismatch,
         },
         .date => |s| switch (out.data) {
             .date => |*list| try compactInto(i32, allocator, s, mask, list),
-            else => unreachable,
+            else => return error.ColumnTypeMismatch,
         },
         .datetime => |s| switch (out.data) {
             .datetime => |*list| try compactInto(i64, allocator, s, mask, list),
-            else => unreachable,
+            else => return error.ColumnTypeMismatch,
         },
         .tinyint => |s| switch (out.data) {
             .tinyint => |*list| try compactInto(i8, allocator, s, mask, list),
-            else => unreachable,
+            .smallint => |*list| try compactIntoConvert(i8, i16, allocator, s, mask, list),
+            .int => |*list| try compactIntoConvert(i8, i32, allocator, s, mask, list),
+            .bigint => |*list| try compactIntoConvert(i8, i64, allocator, s, mask, list),
+            .largeint => |*list| try compactIntoConvert(i8, i128, allocator, s, mask, list),
+            .double => |*list| try compactIntoConvert(i8, f64, allocator, s, mask, list),
+            .float => |*list| try compactIntoConvert(i8, f32, allocator, s, mask, list),
+            else => return error.ColumnTypeMismatch,
         },
         .smallint => |s| switch (out.data) {
             .smallint => |*list| try compactInto(i16, allocator, s, mask, list),
-            else => unreachable,
+            .tinyint => |*list| try compactIntoConvert(i16, i8, allocator, s, mask, list),
+            .int => |*list| try compactIntoConvert(i16, i32, allocator, s, mask, list),
+            .bigint => |*list| try compactIntoConvert(i16, i64, allocator, s, mask, list),
+            .largeint => |*list| try compactIntoConvert(i16, i128, allocator, s, mask, list),
+            .double => |*list| try compactIntoConvert(i16, f64, allocator, s, mask, list),
+            .float => |*list| try compactIntoConvert(i16, f32, allocator, s, mask, list),
+            else => return error.ColumnTypeMismatch,
         },
         .largeint => |s| switch (out.data) {
             .largeint => |*list| try compactInto(i128, allocator, s, mask, list),
-            else => unreachable,
+            .tinyint => |*list| try compactIntoConvert(i128, i8, allocator, s, mask, list),
+            .smallint => |*list| try compactIntoConvert(i128, i16, allocator, s, mask, list),
+            .int => |*list| try compactIntoConvert(i128, i32, allocator, s, mask, list),
+            .bigint => |*list| try compactIntoConvert(i128, i64, allocator, s, mask, list),
+            else => return error.ColumnTypeMismatch,
         },
         .decimal64 => |s| switch (out.data) {
             .decimal64 => |*list| try compactInto(i64, allocator, s, mask, list),
-            else => unreachable,
+            else => return error.ColumnTypeMismatch,
         },
         .decimal128 => |s| switch (out.data) {
             .decimal128 => |*list| try compactInto(i128, allocator, s, mask, list),
-            else => unreachable,
+            else => return error.ColumnTypeMismatch,
         },
         .uuid => |s| switch (out.data) {
             .uuid => |*list| try compactInto(u128, allocator, s, mask, list),
-            else => unreachable,
+            else => return error.ColumnTypeMismatch,
         },
     }
     if (out.nulls != null) {
@@ -961,5 +1024,71 @@ test "appendMaskedColumn fixed-width: trailing filtered-out row never overruns" 
         const view = ColumnView{ .data = .{ .bigint = &src } };
         try appendMaskedColumn(testing.allocator, view, &mask, &out);
         try testing.expectEqualSlices(i64, &want, out.data.bigint.items);
+    }
+}
+
+test "appendMaskedColumn converts across numeric widths (UPDATE literal-width bug)" {
+    const testing = std.testing;
+    // `UPDATE t SET v = 99` on a BIGINT column routes a Compute-produced
+    // .int column into a .bigint store. This used to hit `unreachable` —
+    // undefined behavior in ReleaseFast that wrote 99 + garbage*2^32.
+    const yes = [_]bool{ true, true, true };
+
+    // int -> bigint (the observed corruption shape)
+    {
+        var src = [_]i32{ 99, -7, 2_000_000_000 };
+        var out = try ColumnStore.init(testing.allocator, .bigint, false);
+        defer out.deinit(testing.allocator);
+        try appendMaskedColumn(testing.allocator, .{ .data = .{ .int = &src } }, &yes, &out);
+        try testing.expectEqualSlices(i64, &[_]i64{ 99, -7, 2_000_000_000 }, out.data.bigint.items);
+    }
+    // bigint -> int narrows when in range, errors on overflow
+    {
+        var src = [_]i64{ 1, -2, 3 };
+        var out = try ColumnStore.init(testing.allocator, .int, false);
+        defer out.deinit(testing.allocator);
+        try appendMaskedColumn(testing.allocator, .{ .data = .{ .bigint = &src } }, &yes, &out);
+        try testing.expectEqualSlices(i32, &[_]i32{ 1, -2, 3 }, out.data.int.items);
+
+        var big = [_]i64{ 1, 1 << 40, 3 };
+        var out2 = try ColumnStore.init(testing.allocator, .int, false);
+        defer out2.deinit(testing.allocator);
+        try testing.expectError(
+            error.NumericOverflow,
+            appendMaskedColumn(testing.allocator, .{ .data = .{ .bigint = &big } }, &yes, &out2),
+        );
+    }
+    // int -> double
+    {
+        var src = [_]i32{ 5, -10, 0 };
+        var out = try ColumnStore.init(testing.allocator, .double, false);
+        defer out.deinit(testing.allocator);
+        try appendMaskedColumn(testing.allocator, .{ .data = .{ .int = &src } }, &yes, &out);
+        try testing.expectEqualSlices(f64, &[_]f64{ 5, -10, 0 }, out.data.double.items);
+    }
+    // float -> double and double -> float
+    {
+        var src = [_]f32{ 1.5, -2.25, 8 };
+        var out = try ColumnStore.init(testing.allocator, .double, false);
+        defer out.deinit(testing.allocator);
+        try appendMaskedColumn(testing.allocator, .{ .data = .{ .float = &src } }, &yes, &out);
+        try testing.expectEqualSlices(f64, &[_]f64{ 1.5, -2.25, 8 }, out.data.double.items);
+
+        var dsrc = [_]f64{ 0.5, 4, -1.25 };
+        var out2 = try ColumnStore.init(testing.allocator, .float, false);
+        defer out2.deinit(testing.allocator);
+        try appendMaskedColumn(testing.allocator, .{ .data = .{ .double = &dsrc } }, &yes, &out2);
+        try testing.expectEqualSlices(f32, &[_]f32{ 0.5, 4, -1.25 }, out2.data.float.items);
+    }
+    // semantically incompatible tags error instead of undefined behavior
+    {
+        var src = [_]i32{1};
+        var one = [_]bool{true};
+        var out = try ColumnStore.init(testing.allocator, .datetime, false);
+        defer out.deinit(testing.allocator);
+        try testing.expectError(
+            error.ColumnTypeMismatch,
+            appendMaskedColumn(testing.allocator, .{ .data = .{ .int = &src } }, &one, &out),
+        );
     }
 }
