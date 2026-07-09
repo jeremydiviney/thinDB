@@ -16,6 +16,12 @@ pub const CLIENT_CONNECT_WITH_DB: u32 = 0x00000008;
 /// chain of result sets, setting SERVER_MORE_RESULTS_EXISTS on all
 /// but the last terminator.
 pub const CLIENT_MULTI_STATEMENTS: u32 = 0x00010000;
+/// Must accompany CLIENT_MULTI_STATEMENTS: Connector/J's
+/// useMultiResults() gates reading chained results on this bit alone —
+/// without it the driver abandons the chain after the first OK and
+/// NPEs on the leftovers, no matter how correct the packets are.
+pub const CLIENT_MULTI_RESULTS: u32 = 0x00020000;
+pub const CLIENT_PS_MULTI_RESULTS: u32 = 0x00040000;
 pub const CLIENT_PROTOCOL_41: u32 = 0x00000200;
 /// Advertised so drivers know transaction-related status bits in
 /// OK/EOF packets are meaningful. thinDB doesn't actually run
@@ -35,6 +41,8 @@ pub const server_capabilities: u32 =
     CLIENT_LONG_FLAG |
     CLIENT_CONNECT_WITH_DB |
     CLIENT_MULTI_STATEMENTS |
+    CLIENT_MULTI_RESULTS |
+    CLIENT_PS_MULTI_RESULTS |
     CLIENT_PROTOCOL_41 |
     CLIENT_TRANSACTIONS |
     CLIENT_SECURE_CONNECTION |

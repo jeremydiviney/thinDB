@@ -2756,12 +2756,17 @@ fn runEngineQuery(
             const is_last = i + 1 == stmts.len;
             const base: u16 = session.transactionStatus();
             const extra: u16 = if (is_last) base else base | handshake.SERVER_MORE_RESULTS_EXISTS;
-            try runSingleStatement(allocator, w, catalog, session, stmt, seq_id, extra, profiler);
+            const ok = try runSingleStatement(allocator, w, catalog, session, stmt, seq_id, extra, profiler);
+            // An ERR terminates a multi-statement response; the client stops
+            // reading there, so any further packets would desync the
+            // connection permanently (Connector/J then NPEs on every
+            // subsequent command).
+            if (!ok) return;
         }
         return;
     }
 
-    try runSingleStatement(allocator, w, catalog, session, op, seq_id, session.transactionStatus(), profiler);
+    _ = try runSingleStatement(allocator, w, catalog, session, op, seq_id, session.transactionStatus(), profiler);
 }
 
 fn isXaStageable(op: ir.Op) bool {
@@ -2894,7 +2899,8 @@ fn handleXaCommand(
 /// Compile + emit ONE statement's packets. `extra_status` is OR'd into
 /// the terminator's status_flags — multi-statement responses pass
 /// SERVER_MORE_RESULTS_EXISTS for every non-final statement so the
-/// client keeps reading the chain.
+/// client keeps reading the chain. Returns false when an ERR packet was
+/// sent — the caller must then abort any remaining chained statements.
 fn runSingleStatement(
     allocator: Allocator,
     w: *std.Io.Writer,
@@ -2904,7 +2910,7 @@ fn runSingleStatement(
     seq_id: *u8,
     extra_status: u16,
     profiler: *MysqlProfiler,
-) !void {
+) !bool {
     // Serial-stage core lease: pin this connection thread to one core for the
     // whole statement (compile + execute + drain). Parallel-scan workers lease
     // ADDITIONAL cores per stage and release between them; this thread reuses
@@ -2918,14 +2924,14 @@ fn runSingleStatement(
     profiler.recordSqlKind(classifySqlKind(op.*));
     const main_db = catalog.database(session.current_db) orelse {
         try handshake.sendErrPacket(allocator, w, seq_id.*, 1049, "42000".*, "Unknown database");
-        return;
+        return false;
     };
 
     if (needsTempNamespace(op.*)) {
         _ = session.ensureTempNamespace() catch |err| {
             const mapped = errors.mapInternal(err, null);
             try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
-            return;
+            return false;
         };
     }
 
@@ -2949,10 +2955,15 @@ fn runSingleStatement(
                 catalog.xa.stage(xid, buf.items) catch |err| {
                     const mapped = errors.mapInternal(err, "XA stage failed");
                     try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
-                    return;
+                    return false;
                 };
-                try handshake.sendOkPacket(allocator, w, seq_id.*, 0, 0);
-                return;
+                // Must carry extra_status + advance seq: staged DML inside a
+                // multi-statement chain (Connector/J DELETE batches) otherwise
+                // ends the client's read after the first OK and the remaining
+                // responses desync the connection.
+                try handshake.sendOkPacketStatus(allocator, w, seq_id.*, 0, 0, extra_status);
+                seq_id.* +%= 1;
+                return true;
             } else |_| {}
         }
     }
@@ -2962,7 +2973,7 @@ fn runSingleStatement(
         profiler.recordSince(.query_compile, compile_start);
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
-        return;
+        return false;
     };
     profiler.recordSince(.query_compile, compile_start);
     // Registered BEFORE the deinit defer so it runs AFTER teardown (LIFO) — the
@@ -2989,7 +3000,7 @@ fn runSingleStatement(
             profiler.recordSince(.query_execute, exec_start);
             const mapped = errors.mapInternal(err, null);
             try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
-            return;
+            return false;
         };
         profiler.recordSince(.query_execute, exec_start);
         const new_session = compiled.sessionValue();
@@ -3008,7 +3019,7 @@ fn runSingleStatement(
         );
         profiler.recordSince(.query_write, write_start);
         seq_id.* +%= 1;
-        return;
+        return true;
     }
 
     oprof.reset();
@@ -3054,11 +3065,15 @@ fn runSingleStatement(
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
     session.captureVars(new_session);
+    return true;
 }
 
+// DML must answer with a protocol OK carrying affected_rows (MySQL never
+// returns a resultset for DELETE/UPDATE) — Connector/J's batch reader NPEs
+// on a resultset-shaped response in multi-statement mode.
 fn isSideEffectOp(op: ir.Op) bool {
     return switch (op) {
-        .ddl, .insert, .insert_select, .set_var => true,
+        .ddl, .insert, .insert_select, .set_var, .delete_op, .update_op => true,
         else => false,
     };
 }
