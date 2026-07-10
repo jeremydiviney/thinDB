@@ -325,11 +325,11 @@ fn decodeBinaryValue(
 }
 
 /// Decode a MySQL binary DATE / DATETIME / TIMESTAMP payload (length-
-/// prefixed) and render as a thinDB-parseable integer literal:
-///   DATE → days since 1970-01-01 (i32)
-///   DATETIME/TIMESTAMP → microseconds since 1970-01-01 (i64)
-/// thinDB's parser doesn't accept ISO date strings as literals yet, so
-/// emitting the underlying integer keeps the substituted SQL valid.
+/// prefixed) and render as a quoted temporal literal ('YYYY-MM-DD' /
+/// 'YYYY-MM-DD HH:MM:SS[.ffffff]') — exactly what a text-protocol client
+/// would send, so the value coerces into date/datetime AND string columns
+/// alike. The old raw-integer form (µs / days) fails type-checking against
+/// native datetime columns.
 fn decodeBinaryTemporal(arena: Allocator, body: []const u8, cursor: *usize) ![]const u8 {
     if (cursor.* + 1 > body.len) return error.MalformedExecute;
     const len = body[cursor.*];
@@ -356,11 +356,15 @@ fn decodeBinaryTemporal(arena: Allocator, body: []const u8, cursor: *usize) ![]c
 
     const days_since_epoch: i64 = wire_format.daysFromCivil(@intCast(year), month, day);
     if (len == 4) {
-        return try std.fmt.allocPrint(arena, "{d}", .{days_since_epoch});
+        var buf: [16]u8 = undefined;
+        const txt = try wire_format.formatDate(&buf, @intCast(days_since_epoch));
+        return try std.fmt.allocPrint(arena, "'{s}'", .{txt});
     }
     const seconds_of_day: i64 = (@as(i64, hour) * 3600) + (@as(i64, minute) * 60) + @as(i64, second);
     const total_micros: i64 = days_since_epoch * 86_400_000_000 + seconds_of_day * 1_000_000 + @as(i64, micros);
-    return try std.fmt.allocPrint(arena, "{d}", .{total_micros});
+    var buf: [40]u8 = undefined;
+    const txt = try wire_format.formatDateTime(&buf, total_micros);
+    return try std.fmt.allocPrint(arena, "'{s}'", .{txt});
 }
 
 // ---------------------------------------------------------------------------

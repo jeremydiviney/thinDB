@@ -119,23 +119,62 @@ pub fn parseDateString(s: []const u8) !i32 {
     return ymdToDays(year, month, day);
 }
 
-/// Parse a `YYYY-MM-DD[ T]HH:MM:SS` datetime string to micros-since-epoch.
+/// Parse a datetime string to micros-since-epoch. Accepted forms:
+///   `YYYY-MM-DD`                      (midnight)
+///   `YYYY-MM-DD[ T]HH:MM:SS`
+///   `YYYY-MM-DD[ T]HH:MM:SS.f{1,6}`   (fraction right-padded to micros)
+/// with an optional trailing `Z` (values are UTC-naive; an explicit UTC
+/// marker is a no-op). Anything else after the recognized prefix errors —
+/// a truncating parse would make `=` comparisons silently miss µs-precision
+/// rows (the original #148 bug).
 pub fn parseDateTimeString(s: []const u8) !i64 {
-    if (s.len < 19) return error.Invalid;
+    if (s.len < 10) return error.Invalid;
     if (s[4] != '-' or s[7] != '-') return error.Invalid;
-    const sep = s[10];
-    if (sep != ' ' and sep != 'T') return error.Invalid;
-    if (s[13] != ':' or s[16] != ':') return error.Invalid;
     const year = try std.fmt.parseInt(i32, s[0..4], 10);
     const month = try std.fmt.parseInt(u32, s[5..7], 10);
     const day = try std.fmt.parseInt(u32, s[8..10], 10);
-    const hour = try std.fmt.parseInt(u32, s[11..13], 10);
-    const minute = try std.fmt.parseInt(u32, s[14..16], 10);
-    const second = try std.fmt.parseInt(u32, s[17..19], 10);
-    if (hour > 23 or minute > 59 or second > 59) return error.Invalid;
+    if (month < 1 or month > 12 or day < 1 or day > 31) return error.Invalid;
     const days = ymdToDays(year, month, day);
-    const day_secs: i64 = @as(i64, days) * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
-    return day_secs * 1_000_000;
+
+    var idx: usize = 10;
+    var day_micros: i64 = 0;
+    if (idx < s.len and (s[idx] == ' ' or s[idx] == 'T')) {
+        if (s.len < idx + 9) return error.Invalid;
+        if (s[idx + 3] != ':' or s[idx + 6] != ':') return error.Invalid;
+        const hour = try std.fmt.parseInt(u32, s[idx + 1 .. idx + 3], 10);
+        const minute = try std.fmt.parseInt(u32, s[idx + 4 .. idx + 6], 10);
+        const second = try std.fmt.parseInt(u32, s[idx + 7 .. idx + 9], 10);
+        if (hour > 23 or minute > 59 or second > 59) return error.Invalid;
+        idx += 9;
+        var micros: i64 = 0;
+        if (idx < s.len and s[idx] == '.') {
+            idx += 1;
+            var digits: usize = 0;
+            while (idx < s.len and digits < 6 and s[idx] >= '0' and s[idx] <= '9') : (idx += 1) {
+                micros = micros * 10 + (s[idx] - '0');
+                digits += 1;
+            }
+            if (digits == 0) return error.Invalid;
+            while (digits < 6) : (digits += 1) micros *= 10;
+        }
+        day_micros = (@as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second)) * 1_000_000 + micros;
+    }
+    if (idx < s.len and s[idx] == 'Z') idx += 1;
+    if (idx != s.len) return error.Invalid;
+    return @as(i64, days) * 86_400_000_000 + day_micros;
+}
+
+test "parseDateTimeString: fractions, date-only, Z, rejects" {
+    try std.testing.expectEqual(@as(i64, 1783663005455833), try parseDateTimeString("2026-07-10 05:56:45.455833"));
+    try std.testing.expectEqual(@as(i64, 1783663005455000), try parseDateTimeString("2026-07-10 05:56:45.455"));
+    try std.testing.expectEqual(@as(i64, 1783663005000000), try parseDateTimeString("2026-07-10 05:56:45"));
+    try std.testing.expectEqual(@as(i64, 1783641600000000), try parseDateTimeString("2026-07-10"));
+    try std.testing.expectEqual(@as(i64, 1783663005455833), try parseDateTimeString("2026-07-10T05:56:45.455833Z"));
+    try std.testing.expectError(error.Invalid, parseDateTimeString("2026-07-10 05:56"));
+    try std.testing.expectError(error.Invalid, parseDateTimeString("2026-07-10 05:56:45."));
+    try std.testing.expectError(error.Invalid, parseDateTimeString("2026-07-10 05:56:45.455833x"));
+    try std.testing.expectError(error.Invalid, parseDateTimeString("2026-07-10x"));
+    try std.testing.expectError(error.Invalid, parseDateTimeString("1783663005455833"));
 }
 
 /// Days in month for a given (year, 1-indexed month). Handles Feb leap-year.

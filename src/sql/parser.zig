@@ -4081,21 +4081,7 @@ pub const Parser = struct {
     }
 
     fn parseDateTimeString(s: []const u8) !i64 {
-        if (s.len < 19) return error.Invalid;
-        if (s[4] != '-' or s[7] != '-') return error.Invalid;
-        const sep = s[10];
-        if (sep != ' ' and sep != 'T') return error.Invalid;
-        if (s[13] != ':' or s[16] != ':') return error.Invalid;
-        const year = try std.fmt.parseInt(i32, s[0..4], 10);
-        const month = try std.fmt.parseInt(u32, s[5..7], 10);
-        const day = try std.fmt.parseInt(u32, s[8..10], 10);
-        const hour = try std.fmt.parseInt(u32, s[11..13], 10);
-        const minute = try std.fmt.parseInt(u32, s[14..16], 10);
-        const second = try std.fmt.parseInt(u32, s[17..19], 10);
-        if (hour > 23 or minute > 59 or second > 59) return error.Invalid;
-        const days = ymdToDays(year, month, day);
-        const day_secs: i64 = @as(i64, days) * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
-        return day_secs * 1_000_000;
+        return @import("../exec/scalar_fn_common.zig").parseDateTimeString(s);
     }
 
     fn ymdToDays(year: i32, month: u32, day: u32) i32 {

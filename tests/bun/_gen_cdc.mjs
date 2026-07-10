@@ -16,7 +16,32 @@ const chunkOverride = process.argv[5] || null;
 // exposure while splitting), smaller = lighter per-split heap/GC and snappier
 // RDS chunk reads. 64000 measured ~9-10K rows/s end-to-end, 16000 ~33-39K/s.
 const chunkSize = parseInt(process.argv[6] || "64000", 10);
-if (!table || !sidBase) { console.error("usage: _gen_cdc.mjs <table> <serverIdBase> [parallelism] [chunkKeyColumn] [chunkSize]"); process.exit(1); }
+// Recovery mode: skip the snapshot entirely and replay the binlog from a
+// point in the past onto the existing table (idempotent for upsert sinks).
+// GTID form is required on RDS (GTID mode) — file/pos start points are
+// silently ignored and the reader jumps to head. Timestamp form works too.
+//   --from-gtid  '<uuid>:1-<n>'   e.g. from a checkpoint's logged offset
+//   --from-ts    <epoch-millis>   e.g. shortly before the outage began
+//   --earliest                    replay the whole retained binlog
+let startupOpts = "";
+for (let i = 7; i < process.argv.length; i += 2) {
+  if (process.argv[i] === "--from-gtid") {
+    startupOpts = `,
+  'scan.startup.mode' = 'specific-offset',
+  'scan.startup.specific-offset.gtid-set' = '${process.argv[i + 1]}'`;
+  } else if (process.argv[i] === "--from-ts") {
+    startupOpts = `,
+  'scan.startup.mode' = 'timestamp',
+  'scan.startup.timestamp-millis' = '${process.argv[i + 1]}'`;
+  } else if (process.argv[i] === "--earliest") {
+    startupOpts = `,
+  'scan.startup.mode' = 'earliest-offset'`;
+    i -= 1; // flag takes no value
+  }
+}
+// Recovery modes replay onto the EXISTING converged table — never drop it.
+const keepTable = startupOpts !== "";
+if (!table || !sidBase) { console.error("usage: _gen_cdc.mjs <table> <serverIdBase> [parallelism] [chunkKeyColumn] [chunkSize] [--from-gtid <set> | --from-ts <millis>]"); process.exit(1); }
 
 const PROD = {
   host: process.env.APP_H, port: 3306, user: process.env.AU, password: process.env.AP,
@@ -25,18 +50,29 @@ const PROD = {
 const SINK = { host: "127.0.0.1", port: 13310, user: "root", password: "", database: "wayroll_prod__public" };
 const OUT = `C:/Users/jerem/AppData/Local/Temp/claude/C--development-thinDB/c2cce1cf-9c7d-4061-98b7-3a1c71c0bfd8/scratchpad/cdc_${table}.sql`;
 
-// MySQL type -> { thin, flink }. Native where thinDB is strong; STRING for the
-// CDC-friction-prone (datetime/json/enum/text) on this first pass.
+// MySQL type -> { thin, flink }. Faithful native mapping: numbers as numbers,
+// decimals as decimals, temporals as temporals, json as json. STRING only for
+// genuinely-textual types (varchar/text/enum/set — enum values ARE strings)
+// and for types thinDB has no equivalent of (time/binary).
 function mapType(dt, prec, scale, dtprec) {
   switch (dt) {
-    case "int": case "integer": case "mediumint": case "smallint": case "tinyint":
+    case "tinyint": return { thin: "TINYINT", flink: "TINYINT" };
+    case "smallint": return { thin: "SMALLINT", flink: "SMALLINT" };
+    case "int": case "integer": case "mediumint": case "year":
       return { thin: "INT", flink: "INT" };
     case "bigint": return { thin: "BIGINT", flink: "BIGINT" };
     case "decimal": case "numeric":
       return { thin: `DECIMAL(${prec},${scale})`, flink: `DECIMAL(${prec},${scale})` };
-    case "float": case "double": case "real": return { thin: "DOUBLE", flink: "DOUBLE" };
+    case "float": return { thin: "FLOAT", flink: "FLOAT" };
+    case "double": case "real": return { thin: "DOUBLE", flink: "DOUBLE" };
     case "date": return { thin: "DATE", flink: "DATE" };
-    default: return { thin: "STRING", flink: "STRING" }; // varchar/text/enum/set/json/datetime/timestamp/time/...
+    // thinDB datetime = µs-since-epoch UTC-naive; covers MySQL datetime AND
+    // timestamp (source declares TIMESTAMP + 'server-time-zone'=UTC so both
+    // arrive as UTC wall-clock text the sink coerces losslessly).
+    case "datetime": case "timestamp":
+      return { thin: "DATETIME", flink: `TIMESTAMP(${dtprec ?? 0})` };
+    case "json": return { thin: "JSON", flink: "STRING" };
+    default: return { thin: "STRING", flink: "STRING" }; // varchar/text/enum/set/time/binary/...
   }
 }
 
@@ -90,6 +126,7 @@ ${flinkCols},
   'username' = '${PROD.user}', 'password' = '${PROD.password}',
   'database-name' = 'wayroll', 'table-name' = '${table}',
   'server-id' = '${sidBase}-${sidBase + 15}',
+  'server-time-zone' = 'UTC',
   'scan.incremental.snapshot.enabled' = 'true',
   'scan.incremental.snapshot.chunk.size' = '${chunkSize}',
   'scan.snapshot.fetch.size' = '4096',
@@ -97,7 +134,7 @@ ${flinkCols},
   'jdbc.properties.tcpKeepAlive' = 'true',
   'heartbeat.interval' = '15s',
   'debezium.connect.keep.alive.interval.ms' = '30000'${chunkKey ? `,
-  'scan.incremental.snapshot.chunk.key-column' = '${chunkKey}'` : ""}
+  'scan.incremental.snapshot.chunk.key-column' = '${chunkKey}'` : ""}${startupOpts}
 );
 CREATE TEMPORARY TABLE sink_${table} (
 ${flinkCols},
@@ -107,17 +144,19 @@ ${flinkCols},
   'url' = 'jdbc:mysql://host.docker.internal:13310/wayroll_prod__public?rewriteBatchedStatements=true',
   'table-name' = '${table}', 'username' = 'root', 'password' = '',
   'sink.buffer-flush.max-rows' = '2000', 'sink.buffer-flush.interval' = '1s',
-  'sink.max-retries' = '15'
+  'sink.max-retries' = '1'
 );
 INSERT INTO sink_${table} SELECT ${colList} FROM src_${table};
 `;
 
 fs.writeFileSync(OUT, flinkSQL);
 
-const s = await mysql.createConnection(SINK);
-try { await s.query(`DROP TABLE \`${table}\``); } catch (e) {} // thinDB has no IF EXISTS
-try { await s.query(thinDDL); } catch (e) { if (e.code !== "ER_TABLE_EXISTS_ERROR") throw e; } // re-run keeps existing table
-await s.end();
+if (!keepTable) {
+  const s = await mysql.createConnection(SINK);
+  try { await s.query(`DROP TABLE \`${table}\``); } catch (e) {} // thinDB has no IF EXISTS
+  try { await s.query(thinDDL); } catch (e) { if (e.code !== "ER_TABLE_EXISTS_ERROR") throw e; } // re-run keeps existing table
+  await s.end();
+}
 
 console.log(`OK ${table}: ${cols.length} cols, PK(${pkCols.join(",")}), chunk-key=${chunkKey ?? pkCols[0]}, prod rows=${cnt.n}, server-id ${sidBase}-${sidBase + 3}`);
 console.log(`  thinDB table created; Flink job -> ${OUT.split("/").pop()}`);

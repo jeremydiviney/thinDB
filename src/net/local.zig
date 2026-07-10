@@ -2963,34 +2963,7 @@ pub fn parseDateLiteral(s: []const u8) !i32 {
 }
 
 pub fn parseDateTimeLiteral(s: []const u8) !i64 {
-    if (s.len < 19) return Error.TypeMismatch;
-    if (s[4] != '-' or s[7] != '-') return Error.TypeMismatch;
-    const sep = s[10];
-    if (sep != ' ' and sep != 'T') return Error.TypeMismatch;
-    if (s[13] != ':' or s[16] != ':') return Error.TypeMismatch;
-    const year = try parseIntField(i32, s[0..4]);
-    const month = try parseIntField(u32, s[5..7]);
-    const day = try parseIntField(u32, s[8..10]);
-    const hour = try parseIntField(u32, s[11..13]);
-    const minute = try parseIntField(u32, s[14..16]);
-    const second = try parseIntField(u32, s[17..19]);
-    if (hour > 23 or minute > 59 or second > 59) return Error.TypeMismatch;
-    var micros: u64 = 0;
-    if (s.len > 19) {
-        if (s[19] != '.') return Error.TypeMismatch;
-        var idx: usize = 20;
-        var digits: usize = 0;
-        while (idx < s.len and digits < 6 and s[idx] >= '0' and s[idx] <= '9') : (idx += 1) {
-            micros = micros * 10 + (s[idx] - '0');
-            digits += 1;
-        }
-        // Right-pad to microseconds.
-        while (digits < 6) : (digits += 1) micros *= 10;
-        if (idx != s.len) return Error.TypeMismatch;
-    }
-    const days = try civilToDays(year, month, day);
-    const day_secs: i64 = @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
-    return @as(i64, days) * 86_400 * 1_000_000 + day_secs * 1_000_000 + @as(i64, @intCast(micros));
+    return @import("../exec/scalar_fn_common.zig").parseDateTimeString(s) catch Error.TypeMismatch;
 }
 
 pub fn parseUuidLiteral(s: []const u8) !u128 {
