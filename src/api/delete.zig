@@ -98,6 +98,41 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
     return total;
 }
 
+const RgHint = struct {
+    col_idx: usize,
+    op: exec.PredicateOp,
+    val: types.Value,
+};
+
+/// Walk a predicate collecting (a) row-group zonemap prune hints from
+/// AND-tree leaf comparisons and (b) the set of columns the predicate
+/// references. Errors on any node shape it doesn't understand — the caller
+/// then falls back to decode-everything / prune-nothing, which is always
+/// correct.
+fn collectDeletePruneInfo(
+    columns: []const Column,
+    expr: predicate.PredicateExpr,
+    aa: std.mem.Allocator,
+    hints: *std.ArrayList(RgHint),
+    ref_cols: []bool,
+) !void {
+    switch (expr) {
+        .@"and" => |kids| for (kids) |k| try collectDeletePruneInfo(columns, k, aa, hints, ref_cols),
+        .leaf => |p| {
+            const ci = types.findColumn(columns, p.col) orelse return error.UnknownShape;
+            ref_cols[ci] = true;
+            try hints.append(aa, .{ .col_idx = ci, .op = p.op, .val = p.val });
+        },
+        .in_set => |s| {
+            const ci = types.findColumn(columns, s.col) orelse return error.UnknownShape;
+            ref_cols[ci] = true;
+            // IN sets don't produce a single-op hint; referenced-column
+            // tracking alone is the win here.
+        },
+        else => return error.UnknownShape,
+    }
+}
+
 /// `DELETE FROM t [WHERE expr]` — generalized delete accepting the
 /// rich `PredicateExpr` (AND/OR/IN/etc). Same per-segment streaming
 /// shape as `execDelete` — tombstone offsets accumulate per segment
@@ -130,6 +165,22 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
     else
         null;
 
+    // Row-group prune hints + referenced-column set. Top-level AND-leaf
+    // conjuncts prune row groups via the footer zonemaps (a keyed CDC
+    // delete on an order-key-sorted segment prunes to ~one row group);
+    // whatever the predicate's shape, only the columns it references get
+    // decoded. Falls back to no-prune/all-columns on unhandled shapes.
+    const ga = gate_arena.allocator();
+    var rg_hints: std.ArrayList(RgHint) = .empty;
+    const ref_cols: []bool = try ga.alloc(bool, t.schema.columns.len);
+    @memset(ref_cols, false);
+    if (pred_or_null) |p| {
+        collectDeletePruneInfo(t.schema.columns, p, ga, &rg_hints, ref_cols) catch {
+            @memset(ref_cols, true);
+            rg_hints.clearRetainingCapacity();
+        };
+    }
+
     // ---- Segments ----
     for (t.manifest.segments.items) |entry| {
         if (key_hashes) |hs| {
@@ -155,22 +206,37 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
                 continue;
             }
 
-            // Decode all columns the predicate might touch — for v1
-            // simplicity, decode the whole row group. (A future
-            // optimization could pre-scan the predicate to learn
-            // which columns are referenced.)
-            const owned_cols = try t.allocator.alloc(storage.OwnedColumn, t.schema.columns.len);
+            var rg_can_match = true;
+            for (rg_hints.items) |h| {
+                if (!predicate.statsOverlapPredicate(rg.stats[h.col_idx], h.op, h.val)) {
+                    rg_can_match = false;
+                    break;
+                }
+            }
+            if (!rg_can_match) {
+                row_offset += n;
+                continue;
+            }
+
+            // Decode only the predicate's referenced columns; the rest get
+            // empty placeholder views that predicate evaluation never reads.
+            const owned_cols = try t.allocator.alloc(?storage.OwnedColumn, t.schema.columns.len);
             defer {
-                for (owned_cols) |*oc| oc.deinit(t.allocator);
+                for (owned_cols) |*oc| if (oc.*) |*c| c.deinit(t.allocator);
                 t.allocator.free(owned_cols);
             }
+            @memset(owned_cols, null);
             for (t.schema.columns, 0..) |_, ci| {
-                owned_cols[ci] = try seg.decodeColumn(t.allocator, t.schema, rg_idx, ci);
+                if (ref_cols[ci]) {
+                    owned_cols[ci] = try seg.decodeColumn(t.allocator, t.schema, rg_idx, ci);
+                }
             }
 
             const views = try t.allocator.alloc(storage.ColumnView, t.schema.columns.len);
             defer t.allocator.free(views);
-            for (owned_cols, views) |oc, *v| v.* = oc.view();
+            for (owned_cols, views) |oc, *v| {
+                v.* = if (oc) |c| c.view() else .{ .data = .{ .int = &.{} } };
+            }
 
             const fake_batch: exec.Batch = .{
                 .schema = t.schema.columns,
