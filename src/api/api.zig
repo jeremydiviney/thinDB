@@ -403,4 +403,5 @@ test {
     _ = @import("api_test.zig");
     _ = @import("compact.zig");
     _ = @import("delete.zig");
+    _ = @import("upsert.zig");
 }

@@ -91,7 +91,13 @@ pub fn applyUpsertResolution(t: *Table) !void {
     var dropped: std.ArrayList(u32) = .empty;
     defer dropped.deinit(t.allocator);
     var new_keys: std.ArrayList([]const u8) = .empty; // arena-owned; survive an index reset
+    // First order-key column value per NEW key, for row-group zonemap
+    // pruning during the segment probe (#138). String bytes are duped into
+    // the arena — the memtable may be swapped before the probe runs.
+    var new_first_vals: std.ArrayList(types.Value) = .empty;
+    var prune_ok = true;
 
+    const first_key_view = t.memtable.columns[t.order_key_indices[0]].view();
     for (start..n) |i| {
         const key_bytes = try compoundKeyFromColumnStores(idx_aa, t.memtable.columns, t.order_key_indices, @intCast(i));
         const gop = try t.upsert_idx.getOrPut(t.allocator, key_bytes);
@@ -99,6 +105,11 @@ pub fn applyUpsertResolution(t: *Table) !void {
             try dropped.append(t.allocator, gop.value_ptr.*);
         } else {
             try new_keys.append(aa, try aa.dupe(u8, key_bytes));
+            if (try viewValueAt(aa, first_key_view, @intCast(i))) |v| {
+                try new_first_vals.append(aa, v);
+            } else {
+                prune_ok = false;
+            }
         }
         gop.value_ptr.* = @intCast(i);
     }
@@ -164,9 +175,23 @@ pub fn applyUpsertResolution(t: *Table) !void {
 
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
-            // Decode all order-key columns for this row group. Compound keys
-            // with a string component would need string stats to prune at
-            // the row-group level; for now, always scan.
+            // Zonemap prune on the first key column (#138): segments are
+            // sorted by the order key, so a batch's keys land in a handful
+            // of row groups — skip decoding the rest entirely.
+            if (prune_ok) {
+                var admit = false;
+                for (new_first_vals.items) |v| {
+                    if (exec.predicate.statsOverlapPredicate(rg.stats[t.order_key_indices[0]], .eq, v)) {
+                        admit = true;
+                        break;
+                    }
+                }
+                if (!admit) {
+                    row_offset += rg.row_count;
+                    continue;
+                }
+            }
+
             const decoded_keys = try aa.alloc(storage.OwnedColumn, t.order_key_indices.len);
             for (t.order_key_indices, 0..) |col_idx, i| {
                 decoded_keys[i] = try seg.decodeColumn(t.allocator, t.schema, rg_idx, col_idx);
@@ -297,6 +322,29 @@ pub fn bloomAdmitsAny(key_bloom: []const u8, hashes: []const u64) bool {
     return false;
 }
 
+/// Read row `row` of a column view as a `types.Value` for zonemap checks.
+/// String bytes are duped into `aa` so the value outlives a memtable swap.
+/// Returns null for a NULL cell — the caller must then skip pruning.
+fn viewValueAt(aa: Allocator, view: storage.ColumnView, row: u32) !?types.Value {
+    if (!view.isValid(row)) return null;
+    return switch (view.data) {
+        .int => |s| .{ .int = s[row] },
+        .bigint => |s| .{ .bigint = s[row] },
+        .boolean => |s| .{ .boolean = s[row] != 0 },
+        .varchar, .string, .char, .json => |sv| .{ .text = try aa.dupe(u8, sv.rowBytes(row)) },
+        .float => |s| .{ .float = s[row] },
+        .double => |s| .{ .double = s[row] },
+        .date => |s| .{ .date = s[row] },
+        .datetime => |s| .{ .datetime = s[row] },
+        .tinyint => |s| .{ .tinyint = s[row] },
+        .smallint => |s| .{ .smallint = s[row] },
+        .largeint => |s| .{ .largeint = s[row] },
+        .decimal64 => |s| .{ .decimal64 = s[row] },
+        .decimal128 => |s| .{ .decimal128 = s[row] },
+        .uuid => |s| .{ .uuid = s[row] },
+    };
+}
+
 /// Pack the order-key columns of `row` from a memtable's `ColumnStore` array
 /// into a contiguous byte slice suitable for hashing/comparison. Allocated
 /// in `aa`; lifetime = arena.
@@ -325,4 +373,82 @@ fn compoundKeyFromOwnedColumns(
         try comparison.appendColumnValueBytes(aa, &buf, c.view(), row);
     }
     return buf.toOwnedSlice(aa);
+}
+
+test "upsert probe with zonemap pruning still tombstones the old segment copy" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    // 12 rows -> one flushed segment with 3 row groups.
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .v = @as(i32, 1) },   .{ .id = @as(i64, 2), .v = @as(i32, 2) },
+        .{ .id = @as(i64, 3), .v = @as(i32, 3) },   .{ .id = @as(i64, 4), .v = @as(i32, 4) },
+        .{ .id = @as(i64, 5), .v = @as(i32, 5) },   .{ .id = @as(i64, 6), .v = @as(i32, 6) },
+        .{ .id = @as(i64, 7), .v = @as(i32, 7) },   .{ .id = @as(i64, 8), .v = @as(i32, 8) },
+        .{ .id = @as(i64, 9), .v = @as(i32, 9) },   .{ .id = @as(i64, 10), .v = @as(i32, 10) },
+        .{ .id = @as(i64, 11), .v = @as(i32, 11) }, .{ .id = @as(i64, 12), .v = @as(i32, 12) },
+    });
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.manifest.segments.items.len);
+    const seg_id = t.manifest.segments.items[0].segment_id;
+
+    // Re-insert key 6 (middle row group) — resolution must tombstone the
+    // old copy even though the other row groups get zonemap-pruned.
+    try t.insert(&.{.{ .id = @as(i64, 6), .v = @as(i32, 60) }});
+
+    const tombs = (try storage.tombstone.read(allocator, io, t.segments_dir, seg_id)) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(tombs);
+    try std.testing.expectEqualSlices(u32, &.{5}, tombs); // id=6 sits at offset 5
+}
+
+test "upsert probe pruning: string first key column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "k", .type = .string },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"k"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 2 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k"}, .unique = true });
+
+    try t.insert(&.{
+        .{ .k = "alpha", .v = @as(i32, 1) },
+        .{ .k = "bravo", .v = @as(i32, 2) },
+        .{ .k = "charlie", .v = @as(i32, 3) },
+        .{ .k = "delta", .v = @as(i32, 4) },
+    });
+    try t.flush();
+    const seg_id = t.manifest.segments.items[0].segment_id;
+
+    try t.insert(&.{.{ .k = "delta", .v = @as(i32, 40) }});
+
+    const tombs = (try storage.tombstone.read(allocator, io, t.segments_dir, seg_id)) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(tombs);
+    try std.testing.expectEqualSlices(u32, &.{3}, tombs);
 }
