@@ -29,7 +29,7 @@ const api = @import("../api/api.zig");
 const Catalog = api.Catalog;
 const Session = api.Session;
 
-pub const Table = enum { pg_namespace, pg_class, pg_attribute, pg_type, pg_database, pg_proc, pg_tables };
+pub const Table = enum { pg_namespace, pg_class, pg_attribute, pg_type, pg_database, pg_proc, pg_tables, pg_views, pg_indexes };
 
 /// Recognize a FROM target as a `pg_catalog` relation. Matches a bare name
 /// (`pg_class`) or one explicitly qualified by the `pg_catalog` schema;
@@ -47,6 +47,8 @@ pub fn match(ref: ir.TableRef) ?Table {
     if (std.ascii.eqlIgnoreCase(n, "pg_database")) return .pg_database;
     if (std.ascii.eqlIgnoreCase(n, "pg_proc")) return .pg_proc;
     if (std.ascii.eqlIgnoreCase(n, "pg_tables")) return .pg_tables;
+    if (std.ascii.eqlIgnoreCase(n, "pg_views")) return .pg_views;
+    if (std.ascii.eqlIgnoreCase(n, "pg_indexes")) return .pg_indexes;
     return null;
 }
 
@@ -188,6 +190,8 @@ pub fn build(gpa: Allocator, catalog: *Catalog, session: Session, table: Table) 
         .pg_database => try buildDatabase(a, catalog, self),
         .pg_proc => try buildProc(a, catalog, session, self),
         .pg_tables => try buildPgTables(a, catalog, session, self),
+        .pg_views => try buildPgViews(a, catalog, session, self),
+        .pg_indexes => try buildPgIndexes(a, catalog, session, self),
     }
     return exec.makeQuery(gpa, self);
 }
@@ -274,6 +278,95 @@ fn buildPgTables(a: Allocator, catalog: *Catalog, session: Session, self: *PgCat
     views[4] = try colBool(a, flags);
     views[5] = try colBool(a, flags);
     views[6] = try colBool(a, flags);
+    self.schema = schema;
+    self.views = views;
+    self.row_count = n;
+}
+
+/// The `pg_views` system view over the catalog's registered views. thinDB
+/// views are database-scoped, so they present under the session's current
+/// schema name.
+fn buildPgViews(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource) !void {
+    var schemanames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var viewnames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var defs: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    {
+        while (!catalog.views.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer catalog.views.mutex.unlock();
+        var it = catalog.views.map.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
+            if (!std.mem.eql(u8, key[0..sep], session.current_db)) continue;
+            try schemanames.append(a, try a.dupe(u8, session.current_schema));
+            try viewnames.append(a, try a.dupe(u8, e.value_ptr.name));
+            try defs.append(a, try a.dupe(u8, e.value_ptr.body));
+        }
+    }
+
+    const n = viewnames.items.len;
+    const owners = try a.alloc([]const u8, n);
+    for (0..n) |i| owners[i] = "thindb";
+
+    const schema = try a.alloc(Column, 4);
+    schema[0] = .{ .name = "schemaname", .type = .string };
+    schema[1] = .{ .name = "viewname", .type = .string };
+    schema[2] = .{ .name = "viewowner", .type = .string };
+    schema[3] = .{ .name = "definition", .type = .string };
+    const views = try a.alloc(ColumnView, 4);
+    views[0] = try colString(a, schemanames.items);
+    views[1] = try colString(a, viewnames.items);
+    views[2] = try colString(a, owners);
+    views[3] = try colString(a, defs.items);
+    self.schema = schema;
+    self.views = views;
+    self.row_count = n;
+}
+
+/// The `pg_indexes` system view: one synthetic row per table describing its
+/// clustering key (PRIMARY for unique tables, order_key otherwise) — the
+/// only index-like structure thinDB has.
+fn buildPgIndexes(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource) !void {
+    var schemanames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var tablenames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var indexnames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var defs: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    if (currentDb(catalog, session)) |db| {
+        const schema_names = try db.listSchemas(a);
+        for (schema_names) |sname| {
+            const sc = db.schema(sname) orelse continue;
+            const tnames = try sc.listTables(a);
+            for (tnames) |tname| {
+                const t = sc.openTable(tname, .{}) catch continue;
+                var def: std.ArrayListUnmanaged(u8) = .empty;
+                try def.print(a, "CREATE {s}INDEX ON {s}.{s} (", .{
+                    if (t.schema.unique) "UNIQUE " else "", sname, tname,
+                });
+                for (t.schema.order_key, 0..) |k, i| {
+                    try def.print(a, "{s}{s}", .{ if (i == 0) "" else ", ", k });
+                }
+                try def.append(a, ')');
+                try schemanames.append(a, sname);
+                try tablenames.append(a, tname);
+                try indexnames.append(a, if (t.schema.unique) "PRIMARY" else "order_key");
+                try defs.append(a, def.items);
+            }
+        }
+    }
+
+    const n = tablenames.items.len;
+    const schema = try a.alloc(Column, 4);
+    schema[0] = .{ .name = "schemaname", .type = .string };
+    schema[1] = .{ .name = "tablename", .type = .string };
+    schema[2] = .{ .name = "indexname", .type = .string };
+    schema[3] = .{ .name = "indexdef", .type = .string };
+    const views = try a.alloc(ColumnView, 4);
+    views[0] = try colString(a, schemanames.items);
+    views[1] = try colString(a, tablenames.items);
+    views[2] = try colString(a, indexnames.items);
+    views[3] = try colString(a, defs.items);
     self.schema = schema;
     self.views = views;
     self.row_count = n;

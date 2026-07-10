@@ -129,6 +129,10 @@ pub fn match(
         return Probe{ .single_value = .{ .col = "standard_conforming_strings", .val = "on" } };
     if (std.mem.eql(u8, lc, "show transaction_isolation"))
         return Probe{ .single_value = .{ .col = "transaction_isolation", .val = "read committed" } };
+    if (std.mem.eql(u8, lc, "show search_path"))
+        return Probe{ .single_value = .{ .col = "search_path", .val = current_schema } };
+    if (std.mem.eql(u8, lc, "select pg_backend_pid()"))
+        return Probe{ .single_value = .{ .col = "pg_backend_pid", .val = "1" } };
 
     if (std.mem.eql(u8, lc, "select current_database()"))
         return Probe{ .single_value = .{ .col = "current_database", .val = current_db } };
