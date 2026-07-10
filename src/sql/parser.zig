@@ -1204,7 +1204,9 @@ pub const Parser = struct {
         while (self.cur.tag == .dot) {
             if (n == parts_buf.len) return ParseError.SqlExpectedIdent;
             try self.advance();
-            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+            // After a dot only a name can follow, so reserved words are
+            // identifiers here — `information_schema.tables`, `x.columns`.
+            if (self.cur.tag != .identifier and !wordLikeToken(self.cur.text)) return ParseError.SqlExpectedIdent;
             parts_buf[n] = try self.arena.dupe(u8, self.cur.text);
             n += 1;
             try self.advance();
@@ -1215,6 +1217,15 @@ pub const Parser = struct {
             3 => ir.TableRef{ .database = parts_buf[0], .schema = parts_buf[1], .name = parts_buf[2] },
             else => unreachable,
         };
+    }
+
+    fn wordLikeToken(text: []const u8) bool {
+        if (text.len == 0) return false;
+        if (!std.ascii.isAlphabetic(text[0]) and text[0] != '_') return false;
+        for (text[1..]) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+        }
+        return true;
     }
 
     pub fn dupedIdent(self: *Parser) ParseError![]const u8 {
@@ -2731,7 +2742,9 @@ pub const Parser = struct {
             while (self.cur.tag == .dot) {
                 if (parts_len == parts_buf.len) return ParseError.SqlExpectedIdent;
                 try self.advance();
-                if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+                // After a dot only a name can follow, so reserved words are
+                // identifiers here — `information_schema.tables`.
+                if (self.cur.tag != .identifier and !wordLikeToken(self.cur.text)) return ParseError.SqlExpectedIdent;
                 parts_buf[parts_len] = try self.arena.dupe(u8, self.cur.text);
                 parts_len += 1;
                 try self.advance();

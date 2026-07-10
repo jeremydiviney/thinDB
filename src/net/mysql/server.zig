@@ -2092,7 +2092,56 @@ fn isOrderKeyColumn(t: *Table, col_name: []const u8) bool {
     return false;
 }
 
-const InfoSchemaKind = enum { schemata, tables, columns, statistics };
+const InfoSchemaKind = enum { schemata, tables, columns, statistics, key_column_usage, table_constraints };
+
+/// LIMIT/OFFSET for the streamed information_schema emitters. `admit`
+/// consumes one row slot; once it reports done the emitters stop scanning.
+const InfoLimit = struct {
+    skip: usize = 0,
+    remaining: usize = std.math.maxInt(usize),
+
+    fn admit(self: *InfoLimit) bool {
+        if (self.skip > 0) {
+            self.skip -= 1;
+            return false;
+        }
+        if (self.remaining == 0) return false;
+        self.remaining -= 1;
+        return true;
+    }
+    fn done(self: *const InfoLimit) bool {
+        return self.remaining == 0;
+    }
+};
+
+/// Parse `LIMIT n`, `LIMIT m, n`, and `LIMIT n OFFSET m` from the statement
+/// tail. Anything unparseable leaves the unbounded default.
+fn parseInfoLimit(tail: []const u8) InfoLimit {
+    const idx = topLevelKeywordIgnoreCase(tail, "limit") orelse return .{};
+    var i = skipMetadataWhitespace(tail, idx + "limit".len);
+    const first = parseInfoUint(tail, &i) orelse return .{};
+    i = skipMetadataWhitespace(tail, i);
+    if (i < tail.len and tail[i] == ',') {
+        i = skipMetadataWhitespace(tail, i + 1);
+        const second = parseInfoUint(tail, &i) orelse return .{};
+        return .{ .skip = first, .remaining = second };
+    }
+    if (tokenAtIgnoreCase(tail, i, "offset")) {
+        i = skipMetadataWhitespace(tail, i + "offset".len);
+        const off = parseInfoUint(tail, &i) orelse return .{ .remaining = first };
+        return .{ .skip = off, .remaining = first };
+    }
+    return .{ .remaining = first };
+}
+
+fn parseInfoUint(text: []const u8, i: *usize) ?usize {
+    const start = i.*;
+    var end = start;
+    while (end < text.len and text[end] >= '0' and text[end] <= '9') end += 1;
+    if (end == start) return null;
+    i.* = end;
+    return std.fmt.parseInt(usize, text[start..end], 10) catch null;
+}
 
 const InfoProjection = struct {
     column: types.Column,
@@ -2125,6 +2174,7 @@ fn sendInformationSchemaSelect(
 ) !bool {
     const kind = informationSchemaKind(tail) orelse return false;
     const filters = parseInfoFilters(tail);
+    var lim = parseInfoLimit(tail);
 
     var projections = std.ArrayList(InfoProjection).empty;
     defer projections.deinit(allocator);
@@ -2138,10 +2188,12 @@ fn sendInformationSchemaSelect(
     try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
 
     switch (kind) {
-        .schemata => try emitInfoSchemataRows(allocator, w, catalog, projections.items, filters, seq_id),
-        .tables => try emitInfoTablesRows(allocator, w, catalog, projections.items, filters, seq_id),
-        .columns => try emitInfoColumnsRows(allocator, w, catalog, projections.items, filters, seq_id),
-        .statistics => try emitInfoStatisticsRows(allocator, w, catalog, projections.items, filters, seq_id),
+        .schemata => try emitInfoSchemataRows(allocator, w, catalog, projections.items, filters, &lim, seq_id),
+        .tables => try emitInfoTablesRows(allocator, w, catalog, projections.items, filters, &lim, seq_id),
+        .columns => try emitInfoColumnsRows(allocator, w, catalog, projections.items, filters, &lim, seq_id),
+        .statistics => try emitInfoStatisticsRows(allocator, w, catalog, projections.items, filters, &lim, seq_id),
+        .key_column_usage => try emitInfoKeyColumnUsageRows(allocator, w, catalog, projections.items, filters, &lim, seq_id),
+        .table_constraints => try emitInfoTableConstraintsRows(allocator, w, catalog, projections.items, filters, &lim, seq_id),
     }
 
     try result.sendResultTerminator(allocator, w, seq_id, client_caps);
@@ -2149,6 +2201,10 @@ fn sendInformationSchemaSelect(
 }
 
 fn informationSchemaKind(tail: []const u8) ?InfoSchemaKind {
+    // Most-specific names first: substring matching would misroute
+    // `key_column_usage`/`table_constraints` to columns/tables.
+    if (std.mem.indexOf(u8, tail, "key_column_usage") != null) return .key_column_usage;
+    if (std.mem.indexOf(u8, tail, "table_constraints") != null) return .table_constraints;
     if (std.mem.indexOf(u8, tail, "schemata") != null) return .schemata;
     if (std.mem.indexOf(u8, tail, "statistics") != null) return .statistics;
     if (std.mem.indexOf(u8, tail, "columns") != null) return .columns;
@@ -2310,6 +2366,29 @@ fn appendDefaultInfoProjections(
             try appendInfoProjectionLiteral(allocator, projections, "INDEX_TYPE", "index_type");
             try appendInfoProjectionLiteral(allocator, projections, "IS_VISIBLE", "is_visible");
         },
+        .key_column_usage => {
+            try appendInfoProjectionLiteral(allocator, projections, "CONSTRAINT_CATALOG", "constraint_catalog");
+            try appendInfoProjectionLiteral(allocator, projections, "CONSTRAINT_SCHEMA", "constraint_schema");
+            try appendInfoProjectionLiteral(allocator, projections, "CONSTRAINT_NAME", "constraint_name");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_CATALOG", "table_catalog");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_SCHEMA", "table_schema");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_NAME", "table_name");
+            try appendInfoProjectionLiteral(allocator, projections, "COLUMN_NAME", "column_name");
+            try appendInfoProjectionLiteral(allocator, projections, "ORDINAL_POSITION", "ordinal_position");
+            try appendInfoProjectionLiteral(allocator, projections, "POSITION_IN_UNIQUE_CONSTRAINT", "position_in_unique_constraint");
+            try appendInfoProjectionLiteral(allocator, projections, "REFERENCED_TABLE_SCHEMA", "referenced_table_schema");
+            try appendInfoProjectionLiteral(allocator, projections, "REFERENCED_TABLE_NAME", "referenced_table_name");
+            try appendInfoProjectionLiteral(allocator, projections, "REFERENCED_COLUMN_NAME", "referenced_column_name");
+        },
+        .table_constraints => {
+            try appendInfoProjectionLiteral(allocator, projections, "CONSTRAINT_CATALOG", "constraint_catalog");
+            try appendInfoProjectionLiteral(allocator, projections, "CONSTRAINT_SCHEMA", "constraint_schema");
+            try appendInfoProjectionLiteral(allocator, projections, "CONSTRAINT_NAME", "constraint_name");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_SCHEMA", "table_schema");
+            try appendInfoProjectionLiteral(allocator, projections, "TABLE_NAME", "table_name");
+            try appendInfoProjectionLiteral(allocator, projections, "CONSTRAINT_TYPE", "constraint_type");
+            try appendInfoProjectionLiteral(allocator, projections, "ENFORCED", "enforced");
+        },
     }
 }
 
@@ -2327,17 +2406,23 @@ fn emitInfoSchemataRows(
     catalog: *Catalog,
     projections: []const InfoProjection,
     filters: InfoFilters,
+    lim: *InfoLimit,
     seq_id: *u8,
 ) !void {
     const db_names = try catalog.listDatabases(allocator);
     defer freeNameList(allocator, db_names);
     for (db_names) |db_name| {
+        if (lim.done()) return;
         const db = catalog.database(db_name) orelse continue;
         const schema_names = try db.listSchemas(allocator);
         defer freeNameList(allocator, schema_names);
         for (schema_names) |schema_name| {
             const row: InfoRow = .{ .db_name = db_name, .schema_name = schema_name };
             if (!rowMatchesInfoFilters(row, filters)) continue;
+            if (!lim.admit()) {
+                if (lim.done()) return;
+                continue;
+            }
             try sendInfoRow(allocator, w, projections, row, seq_id);
         }
     }
@@ -2349,15 +2434,18 @@ fn emitInfoTablesRows(
     catalog: *Catalog,
     projections: []const InfoProjection,
     filters: InfoFilters,
+    lim: *InfoLimit,
     seq_id: *u8,
 ) !void {
     const db_names = try catalog.listDatabases(allocator);
     defer freeNameList(allocator, db_names);
     for (db_names) |db_name| {
+        if (lim.done()) return;
         const db = catalog.database(db_name) orelse continue;
         const schema_names = try db.listSchemas(allocator);
         defer freeNameList(allocator, schema_names);
         for (schema_names) |schema_name| {
+            if (lim.done()) return;
             const sc = db.schema(schema_name) orelse continue;
             const table_names = try sc.listTables(allocator);
             defer freeNameList(allocator, table_names);
@@ -2370,6 +2458,10 @@ fn emitInfoTablesRows(
                     .table = table,
                 };
                 if (!rowMatchesInfoFilters(row, filters)) continue;
+                if (!lim.admit()) {
+                    if (lim.done()) return;
+                    continue;
+                }
                 try sendInfoRow(allocator, w, projections, row, seq_id);
             }
         }
@@ -2382,15 +2474,18 @@ fn emitInfoColumnsRows(
     catalog: *Catalog,
     projections: []const InfoProjection,
     filters: InfoFilters,
+    lim: *InfoLimit,
     seq_id: *u8,
 ) !void {
     const db_names = try catalog.listDatabases(allocator);
     defer freeNameList(allocator, db_names);
     for (db_names) |db_name| {
+        if (lim.done()) return;
         const db = catalog.database(db_name) orelse continue;
         const schema_names = try db.listSchemas(allocator);
         defer freeNameList(allocator, schema_names);
         for (schema_names) |schema_name| {
+            if (lim.done()) return;
             const sc = db.schema(schema_name) orelse continue;
             const table_names = try sc.listTables(allocator);
             defer freeNameList(allocator, table_names);
@@ -2406,6 +2501,10 @@ fn emitInfoColumnsRows(
                         .ordinal = i + 1,
                     };
                     if (!rowMatchesInfoFilters(row, filters)) continue;
+                    if (!lim.admit()) {
+                        if (lim.done()) return;
+                        continue;
+                    }
                     try sendInfoRow(allocator, w, projections, row, seq_id);
                 }
             }
@@ -2419,20 +2518,53 @@ fn emitInfoStatisticsRows(
     catalog: *Catalog,
     projections: []const InfoProjection,
     filters: InfoFilters,
+    lim: *InfoLimit,
     seq_id: *u8,
+) !void {
+    return emitInfoOrderKeyRows(allocator, w, catalog, projections, filters, lim, seq_id, false);
+}
+
+/// key_column_usage emits the same one-row-per-order-key-column shape as
+/// statistics, but only for unique tables — MySQL lists PRIMARY KEY
+/// constraint columns there, and a non-unique clustering key is not a
+/// constraint.
+fn emitInfoKeyColumnUsageRows(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    projections: []const InfoProjection,
+    filters: InfoFilters,
+    lim: *InfoLimit,
+    seq_id: *u8,
+) !void {
+    return emitInfoOrderKeyRows(allocator, w, catalog, projections, filters, lim, seq_id, true);
+}
+
+fn emitInfoOrderKeyRows(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    projections: []const InfoProjection,
+    filters: InfoFilters,
+    lim: *InfoLimit,
+    seq_id: *u8,
+    unique_only: bool,
 ) !void {
     const db_names = try catalog.listDatabases(allocator);
     defer freeNameList(allocator, db_names);
     for (db_names) |db_name| {
+        if (lim.done()) return;
         const db = catalog.database(db_name) orelse continue;
         const schema_names = try db.listSchemas(allocator);
         defer freeNameList(allocator, schema_names);
         for (schema_names) |schema_name| {
+            if (lim.done()) return;
             const sc = db.schema(schema_name) orelse continue;
             const table_names = try sc.listTables(allocator);
             defer freeNameList(allocator, table_names);
             for (table_names) |table_name| {
                 const table = schemaTable(sc, table_name) orelse continue;
+                if (unique_only and !table.schema.unique) continue;
                 for (table.schema.order_key, 0..) |col_name, i| {
                     const col = table.schema.column(col_name) orelse continue;
                     const row: InfoRow = .{
@@ -2445,8 +2577,54 @@ fn emitInfoStatisticsRows(
                         .key_seq = i + 1,
                     };
                     if (!rowMatchesInfoFilters(row, filters)) continue;
+                    if (!lim.admit()) {
+                        if (lim.done()) return;
+                        continue;
+                    }
                     try sendInfoRow(allocator, w, projections, row, seq_id);
                 }
+            }
+        }
+    }
+}
+
+/// One PRIMARY KEY constraint row per unique table.
+fn emitInfoTableConstraintsRows(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    projections: []const InfoProjection,
+    filters: InfoFilters,
+    lim: *InfoLimit,
+    seq_id: *u8,
+) !void {
+    const db_names = try catalog.listDatabases(allocator);
+    defer freeNameList(allocator, db_names);
+    for (db_names) |db_name| {
+        if (lim.done()) return;
+        const db = catalog.database(db_name) orelse continue;
+        const schema_names = try db.listSchemas(allocator);
+        defer freeNameList(allocator, schema_names);
+        for (schema_names) |schema_name| {
+            if (lim.done()) return;
+            const sc = db.schema(schema_name) orelse continue;
+            const table_names = try sc.listTables(allocator);
+            defer freeNameList(allocator, table_names);
+            for (table_names) |table_name| {
+                const table = schemaTable(sc, table_name) orelse continue;
+                if (!table.schema.unique) continue;
+                const row: InfoRow = .{
+                    .db_name = db_name,
+                    .schema_name = schema_name,
+                    .table_name = table_name,
+                    .table = table,
+                };
+                if (!rowMatchesInfoFilters(row, filters)) continue;
+                if (!lim.admit()) {
+                    if (lim.done()) return;
+                    continue;
+                }
+                try sendInfoRow(allocator, w, projections, row, seq_id);
             }
         }
     }
@@ -2480,7 +2658,15 @@ fn infoCell(
     row: InfoRow,
 ) !?[]const u8 {
     if (keyContains(key, "catalog")) return try cellDup(allocator, owned, "def");
-    if (keyContains(key, "table_schema") or keyContains(key, "schema_name") or keyContains(key, "index_schema"))
+    // FK-only columns come before the generic table/column matches —
+    // `referenced_table_name` would otherwise hit the `table_name` arm.
+    // thinDB has no foreign keys, so these are always NULL.
+    if (keyContains(key, "referenced_") or keyContains(key, "position_in_unique_constraint")) return null;
+    if (keyContains(key, "constraint_type")) return try cellDup(allocator, owned, "PRIMARY KEY");
+    if (keyContains(key, "constraint_name")) return try cellDup(allocator, owned, "PRIMARY");
+    if (keyContains(key, "enforced")) return try cellDup(allocator, owned, "YES");
+    if (keyContains(key, "table_schema") or keyContains(key, "schema_name") or
+        keyContains(key, "index_schema") or keyContains(key, "constraint_schema"))
         return try cellSchemaName(allocator, owned, row.db_name, row.schema_name);
     if (keyContains(key, "default_character_set_name") or keyContains(key, "character_set_name"))
         return try cellDup(allocator, owned, "utf8mb4");

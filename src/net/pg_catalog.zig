@@ -29,14 +29,35 @@ const api = @import("../api/api.zig");
 const Catalog = api.Catalog;
 const Session = api.Session;
 
-pub const Table = enum { pg_namespace, pg_class, pg_attribute, pg_type, pg_database, pg_proc, pg_tables, pg_views, pg_indexes };
+pub const Table = enum {
+    pg_namespace,
+    pg_class,
+    pg_attribute,
+    pg_type,
+    pg_database,
+    pg_proc,
+    pg_tables,
+    pg_views,
+    pg_indexes,
+    info_schemata,
+    info_tables,
+    info_columns,
+};
 
-/// Recognize a FROM target as a `pg_catalog` relation. Matches a bare name
-/// (`pg_class`) or one explicitly qualified by the `pg_catalog` schema;
-/// the `pg_` prefix is reserved, so a bare match never shadows a user table.
+/// Recognize a FROM target as a `pg_catalog` or `information_schema`
+/// relation. pg_catalog matches a bare name (`pg_class`) or one explicitly
+/// qualified — the `pg_` prefix is reserved, so a bare match never shadows a
+/// user table. information_schema relations match ONLY when qualified: a
+/// bare `tables` must stay a user table.
 pub fn match(ref: ir.TableRef) ?Table {
     if (ref.database != null) return null;
     if (ref.schema) |s| {
+        if (std.ascii.eqlIgnoreCase(s, "information_schema")) {
+            if (std.ascii.eqlIgnoreCase(ref.name, "schemata")) return .info_schemata;
+            if (std.ascii.eqlIgnoreCase(ref.name, "tables")) return .info_tables;
+            if (std.ascii.eqlIgnoreCase(ref.name, "columns")) return .info_columns;
+            return null;
+        }
         if (!std.ascii.eqlIgnoreCase(s, "pg_catalog")) return null;
     }
     const n = ref.name;
@@ -192,6 +213,9 @@ pub fn build(gpa: Allocator, catalog: *Catalog, session: Session, table: Table) 
         .pg_tables => try buildPgTables(a, catalog, session, self),
         .pg_views => try buildPgViews(a, catalog, session, self),
         .pg_indexes => try buildPgIndexes(a, catalog, session, self),
+        .info_schemata => try buildInfoSchemata(a, catalog, session, self),
+        .info_tables => try buildInfoTables(a, catalog, session, self),
+        .info_columns => try buildInfoColumns(a, catalog, session, self),
     }
     return exec.makeQuery(gpa, self);
 }
@@ -278,6 +302,131 @@ fn buildPgTables(a: Allocator, catalog: *Catalog, session: Session, self: *PgCat
     views[4] = try colBool(a, flags);
     views[5] = try colBool(a, flags);
     views[6] = try colBool(a, flags);
+    self.schema = schema;
+    self.views = views;
+    self.row_count = n;
+}
+
+/// PostgreSQL-style data_type names for information_schema.columns.
+fn pgDataTypeName(t: types.Type) []const u8 {
+    return switch (t) {
+        .tinyint, .smallint => "smallint",
+        .int => "integer",
+        .bigint => "bigint",
+        .largeint, .decimal64, .decimal128 => "numeric",
+        .boolean => "boolean",
+        .float => "real",
+        .double => "double precision",
+        .date => "date",
+        .datetime => "timestamp without time zone",
+        .uuid => "uuid",
+        .varchar, .char => "character varying",
+        .string => "text",
+        .json => "json",
+    };
+}
+
+fn buildInfoSchemata(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource) !void {
+    var catalogs: std.ArrayListUnmanaged([]const u8) = .empty;
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (currentDb(catalog, session)) |db| {
+        const schema_names = try db.listSchemas(a);
+        for (schema_names) |n| {
+            try catalogs.append(a, session.current_db);
+            try names.append(a, n);
+        }
+    }
+    const schema = try a.alloc(Column, 2);
+    schema[0] = .{ .name = "catalog_name", .type = .string };
+    schema[1] = .{ .name = "schema_name", .type = .string };
+    const views = try a.alloc(ColumnView, 2);
+    views[0] = try colString(a, catalogs.items);
+    views[1] = try colString(a, names.items);
+    self.schema = schema;
+    self.views = views;
+    self.row_count = names.items.len;
+}
+
+fn buildInfoTables(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource) !void {
+    var schemanames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var tablenames: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (currentDb(catalog, session)) |db| {
+        const schema_names = try db.listSchemas(a);
+        for (schema_names) |sname| {
+            const sc = db.schema(sname) orelse continue;
+            const tnames = try sc.listTables(a);
+            for (tnames) |tname| {
+                try schemanames.append(a, sname);
+                try tablenames.append(a, tname);
+            }
+        }
+    }
+    const n = tablenames.items.len;
+    const cats = try a.alloc([]const u8, n);
+    const ttypes = try a.alloc([]const u8, n);
+    for (0..n) |i| {
+        cats[i] = session.current_db;
+        ttypes[i] = "BASE TABLE";
+    }
+    const schema = try a.alloc(Column, 4);
+    schema[0] = .{ .name = "table_catalog", .type = .string };
+    schema[1] = .{ .name = "table_schema", .type = .string };
+    schema[2] = .{ .name = "table_name", .type = .string };
+    schema[3] = .{ .name = "table_type", .type = .string };
+    const views = try a.alloc(ColumnView, 4);
+    views[0] = try colString(a, cats);
+    views[1] = try colString(a, schemanames.items);
+    views[2] = try colString(a, tablenames.items);
+    views[3] = try colString(a, ttypes);
+    self.schema = schema;
+    self.views = views;
+    self.row_count = n;
+}
+
+fn buildInfoColumns(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource) !void {
+    var schemanames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var tablenames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var colnames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var ordinals: std.ArrayListUnmanaged(i32) = .empty;
+    var nullables: std.ArrayListUnmanaged([]const u8) = .empty;
+    var dtypes: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (currentDb(catalog, session)) |db| {
+        const schema_names = try db.listSchemas(a);
+        for (schema_names) |sname| {
+            const sc = db.schema(sname) orelse continue;
+            const tnames = try sc.listTables(a);
+            for (tnames) |tname| {
+                const t = sc.openTable(tname, .{}) catch continue;
+                for (t.schema.columns, 0..) |col, i| {
+                    try schemanames.append(a, sname);
+                    try tablenames.append(a, tname);
+                    try colnames.append(a, try a.dupe(u8, col.name));
+                    try ordinals.append(a, @intCast(i + 1));
+                    try nullables.append(a, if (col.nullable) "YES" else "NO");
+                    try dtypes.append(a, pgDataTypeName(col.type));
+                }
+            }
+        }
+    }
+    const n = colnames.items.len;
+    const cats = try a.alloc([]const u8, n);
+    for (0..n) |i| cats[i] = session.current_db;
+    const schema = try a.alloc(Column, 7);
+    schema[0] = .{ .name = "table_catalog", .type = .string };
+    schema[1] = .{ .name = "table_schema", .type = .string };
+    schema[2] = .{ .name = "table_name", .type = .string };
+    schema[3] = .{ .name = "column_name", .type = .string };
+    schema[4] = .{ .name = "ordinal_position", .type = .int };
+    schema[5] = .{ .name = "is_nullable", .type = .string };
+    schema[6] = .{ .name = "data_type", .type = .string };
+    const views = try a.alloc(ColumnView, 7);
+    views[0] = try colString(a, cats);
+    views[1] = try colString(a, schemanames.items);
+    views[2] = try colString(a, tablenames.items);
+    views[3] = try colString(a, colnames.items);
+    views[4] = try colInt(a, ordinals.items);
+    views[5] = try colString(a, nullables.items);
+    views[6] = try colString(a, dtypes.items);
     self.schema = schema;
     self.views = views;
     self.row_count = n;
