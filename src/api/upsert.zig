@@ -267,7 +267,7 @@ pub fn keyHashesFromPredicateExpr(
 /// Flatten a (possibly nested) AND tree into its leaf/in_set conjuncts.
 /// Returns false when the expression contains any non-conjunctive node
 /// (OR, NOT, ...) — the caller must then skip bloom gating entirely.
-fn appendConjuncts(
+pub fn appendConjuncts(
     aa: Allocator,
     list: *std.ArrayList(exec.predicate.PredicateExpr),
     expr: exec.predicate.PredicateExpr,

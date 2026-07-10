@@ -694,6 +694,46 @@ pub const Table = struct {
         return deleted;
     }
 
+    /// Batched keyed DELETE (#146): N `DELETE ... WHERE <full key>`
+    /// statements executed as one segment sweep under a single mutex
+    /// acquisition — one Bloom/zonemap-pruned probe pass, one tombstone
+    /// write per touched segment. `counts[j]` gets statement j's
+    /// affected-row count. Returns null (before any mutation) when a
+    /// statement isn't a strict full-key equality conjunction on a
+    /// unique table; the caller must then execute them individually.
+    pub fn deleteKeyedBatch(
+        self: *Table,
+        preds: []const ?exec.PredicateExpr,
+        counts: []usize,
+    ) !?usize {
+        const del = @import("delete.zig");
+
+        // Widen literals up front (same as deleteByExpr) so key encoding,
+        // zonemap checks, and the WAL all see the widened shape.
+        const local_preds = try self.allocator.alloc(?exec.PredicateExpr, preds.len);
+        defer self.allocator.free(local_preds);
+        for (preds, local_preds) |p, *lp| {
+            lp.* = p;
+            if (lp.*) |*x| try exec.predicate.validateExpr(x, self.schema.columns);
+        }
+
+        self.mutex.lockUncancelable(self.io);
+        var wal_target: ?u64 = null;
+        var deleted: ?usize = null;
+        {
+            defer self.mutex.unlock(self.io);
+            if (!try del.keyedBatchEligible(self, local_preds)) return null;
+            // Log first, execute second — same ordering as deleteByExpr;
+            // replaying a delete that already ran is a no-op.
+            for (local_preds) |p| {
+                if (try self.logDeleteExprLocked(p)) |target| wal_target = target;
+            }
+            deleted = try del.execDeleteKeyedBatch(self, local_preds, counts);
+        }
+        try self.awaitWalDurable(wal_target);
+        return deleted;
+    }
+
     /// WAL-log a rich `DELETE FROM t WHERE ...` predicate. Mutex must
     /// be held. Returns the WAL write_offset to await for durability,
     /// or null when there's no WAL writer or the predicate shape

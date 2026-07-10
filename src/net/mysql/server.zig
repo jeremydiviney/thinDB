@@ -25,6 +25,7 @@ const Table = thindb_api.Table;
 
 const local = @import("../local.zig");
 const ir = @import("../../ir/ir.zig");
+const PredicateExpr = @import("../../exec/predicate.zig").PredicateExpr;
 const xa_mod = @import("../xa.zig");
 const sql = @import("../../sql/sql.zig");
 const types = @import("../../types.zig");
@@ -2752,21 +2753,108 @@ fn runEngineQuery(
             return;
         }
         const stmts = op.batch.statements;
-        for (stmts, 0..) |stmt, i| {
+        var i: usize = 0;
+        while (i < stmts.len) {
+            // Coalesce a run of same-table DELETEs into one batched keyed
+            // delete (#146) — the JDBC sink's rewriteBatchedStatements
+            // DELETE chain is exactly this shape. One segment sweep + one
+            // tombstone write per segment instead of one per statement;
+            // each statement still gets its own OK with real affected_rows.
+            const run = deleteRunLen(stmts[i..]);
+            if (run >= 2) {
+                if (try runKeyedDeleteBatch(allocator, w, catalog, session, stmts[i .. i + run], seq_id, i + run == stmts.len, profiler)) |ok| {
+                    if (!ok) return;
+                    i += run;
+                    continue;
+                }
+            }
             const is_last = i + 1 == stmts.len;
             const base: u16 = session.transactionStatus();
             const extra: u16 = if (is_last) base else base | handshake.SERVER_MORE_RESULTS_EXISTS;
-            const ok = try runSingleStatement(allocator, w, catalog, session, stmt, seq_id, extra, profiler);
+            const ok = try runSingleStatement(allocator, w, catalog, session, stmts[i], seq_id, extra, profiler);
             // An ERR terminates a multi-statement response; the client stops
             // reading there, so any further packets would desync the
             // connection permanently (Connector/J then NPEs on every
             // subsequent command).
             if (!ok) return;
+            i += 1;
         }
         return;
     }
 
     _ = try runSingleStatement(allocator, w, catalog, session, op, seq_id, session.transactionStatus(), profiler);
+}
+
+fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn tableRefEql(a: ir.TableRef, b: ir.TableRef) bool {
+    return optStrEql(a.database, b.database) and
+        optStrEql(a.schema, b.schema) and
+        std.mem.eql(u8, a.name, b.name);
+}
+
+/// Length of the leading run of DELETE statements against one table.
+fn deleteRunLen(stmts: []const *ir.Op) usize {
+    if (stmts.len == 0 or stmts[0].* != .delete_op) return 0;
+    const first = stmts[0].delete_op.table;
+    var n: usize = 1;
+    while (n < stmts.len and stmts[n].* == .delete_op and tableRefEql(stmts[n].delete_op.table, first)) n += 1;
+    return n;
+}
+
+/// Execute a run of same-table DELETE statements as one batched keyed
+/// delete, then emit one OK per statement carrying its affected_rows.
+/// Returns null when the batch isn't eligible OR anything errors — the
+/// caller then falls back to per-statement execution, which is always
+/// safe because keyed deletes are idempotent (re-tombstoning a row and
+/// re-filtering the memtable are no-ops) and reports precise per-statement
+/// errors. Returns false only if an ERR packet was already sent.
+fn runKeyedDeleteBatch(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    stmts: []const *ir.Op,
+    seq_id: *u8,
+    last_is_final: bool,
+    profiler: *MysqlProfiler,
+) !?bool {
+    const main_db = catalog.database(session.current_db) orelse return null;
+    const cat = local.catalogFor(main_db) orelse return null;
+    const t = local.resolveTable(cat, session.asSession(), stmts[0].delete_op.table) catch return null;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const preds = try aa.alloc(?PredicateExpr, stmts.len);
+    for (stmts, preds) |s, *p| p.* = s.delete_op.predicate;
+    const counts = try aa.alloc(usize, stmts.len);
+
+    var qlease = core_scheduler.global().acquire();
+    defer qlease.release();
+
+    const exec_start = profiler.start();
+    const maybe_total = t.deleteKeyedBatch(preds, counts) catch null;
+    const total = maybe_total orelse {
+        profiler.recordSince(.query_execute, exec_start);
+        return null;
+    };
+    profiler.recordSince(.query_execute, exec_start);
+    profiler.addRowsAffected(total);
+    for (stmts) |s| profiler.recordSqlKind(classifySqlKind(s.*));
+
+    for (counts, 0..) |c, j| {
+        const is_last = last_is_final and j + 1 == stmts.len;
+        const base: u16 = session.transactionStatus();
+        const extra: u16 = if (is_last) base else base | handshake.SERVER_MORE_RESULTS_EXISTS;
+        try handshake.sendOkPacketStatus(allocator, w, seq_id.*, c, 0, extra);
+        seq_id.* +%= 1;
+    }
+    return true;
 }
 
 fn isXaStageable(op: ir.Op) bool {
