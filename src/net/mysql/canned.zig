@@ -46,8 +46,10 @@ pub const EmptyResultKind = enum {
     plugins,
     collations,
     character_sets,
+    tables,
     full_tables,
     table_status,
+    create_table,
     columns,
     indexes,
     grants,
@@ -182,8 +184,15 @@ pub fn match(
         return Outcome{ .empty_result = .character_sets };
     if (std.mem.startsWith(u8, lc, "show full tables"))
         return Outcome{ .empty_result = .full_tables };
+    // Handled on the wire (not the engine parser) so the MySQL-dialect
+    // forms — FROM/IN a flattened `db__schema` name, LIKE patterns, the
+    // `Tables_in_<db>` column header — all behave like real MySQL.
+    if (std.mem.startsWith(u8, lc, "show tables"))
+        return Outcome{ .empty_result = .tables };
     if (std.mem.startsWith(u8, lc, "show table status"))
         return Outcome{ .empty_result = .table_status };
+    if (std.mem.startsWith(u8, lc, "show create table "))
+        return Outcome{ .empty_result = .create_table };
     if (std.mem.startsWith(u8, lc, "show full columns") or
         std.mem.startsWith(u8, lc, "show columns") or
         std.mem.startsWith(u8, lc, "show fields") or

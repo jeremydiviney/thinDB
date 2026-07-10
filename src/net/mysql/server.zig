@@ -26,6 +26,7 @@ const Table = thindb_api.Table;
 const local = @import("../local.zig");
 const ir = @import("../../ir/ir.zig");
 const PredicateExpr = @import("../../exec/predicate.zig").PredicateExpr;
+const exec_predicate = @import("../../exec/predicate.zig");
 const xa_mod = @import("../xa.zig");
 const sql = @import("../../sql/sql.zig");
 const types = @import("../../types.zig");
@@ -1358,8 +1359,10 @@ fn sendMetadataResult(
     client_caps: u32,
 ) !void {
     return switch (kind) {
+        .tables => sendTablesResult(allocator, w, catalog, session, payload, seq_id, client_caps),
         .full_tables => sendFullTablesResult(allocator, w, catalog, session, payload, seq_id, client_caps),
         .table_status => sendTableStatusResult(allocator, w, catalog, session, payload, seq_id, client_caps),
+        .create_table => sendCreateTableResult(allocator, w, catalog, session, payload, seq_id, client_caps),
         .columns => sendColumnsResult(allocator, w, catalog, session, payload, seq_id, client_caps),
         .indexes => sendIndexesResult(allocator, w, catalog, session, payload, seq_id, client_caps),
         else => sendEmptyMetadataResult(allocator, w, kind, seq_id, client_caps),
@@ -1389,6 +1392,149 @@ const IdentPath = struct {
     next: usize,
 };
 
+/// Extract the string literal of a top-level `LIKE '...'` clause, or null.
+/// Doubled '' escapes stay raw — table/column names can't contain quotes,
+/// so a pattern with them simply matches nothing.
+fn parseShowLikePattern(sql_text: []const u8) ?[]const u8 {
+    const s = trimSqlForMetadata(sql_text);
+    const idx = topLevelKeywordIgnoreCase(s, "like") orelse return null;
+    var i = idx + "like".len;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+    if (i >= s.len or s[i] != '\'') return null;
+    const end = skipQuoted(s, i, '\'');
+    if (end >= s.len) return null;
+    return s[i + 1 .. end];
+}
+
+/// Case-insensitive SQL LIKE over an identifier — SHOW ... LIKE filters
+/// compare case-insensitively in MySQL regardless of platform.
+fn likeMatchesIdent(allocator: Allocator, name: []const u8, pattern: []const u8) bool {
+    const lname = std.ascii.allocLowerString(allocator, name) catch return true;
+    defer allocator.free(lname);
+    const lpat = std.ascii.allocLowerString(allocator, pattern) catch return true;
+    defer allocator.free(lpat);
+    return exec_predicate.likeMatch(lname, lpat);
+}
+
+fn sendTablesResult(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    const schema_name = parseShowSchemaName(payload);
+    const like = parseShowLikePattern(payload);
+    const resolved = resolveMetadataSchema(catalog, session, schema_name) orelse {
+        return sendEmptyMetadataResult(allocator, w, .tables, seq_id, client_caps);
+    };
+
+    const client_schema = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ resolved.db_name, resolved.schema_name });
+    defer allocator.free(client_schema);
+    const tables_col = try std.fmt.allocPrint(allocator, "Tables_in_{s}", .{client_schema});
+    defer allocator.free(tables_col);
+
+    const cols = [_]types.Column{.{ .name = tables_col, .type = .string }};
+    try result.sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+
+    const table_names = try resolved.schema.listTables(allocator);
+    defer freeNameList(allocator, table_names);
+    for (table_names) |name| {
+        if (like) |pat| if (!likeMatchesIdent(allocator, name, pat)) continue;
+        const cells = [_]?[]const u8{name};
+        try result.sendTextRow(allocator, w, cells[0..], seq_id);
+    }
+    // Session temp tables appear only in the unqualified form — the temp
+    // namespace is session-local, not schema-local (mirrors compileShow).
+    if (schema_name == null) if (session.temp_namespace) |ns| {
+        const temps = try ns.listTables(allocator);
+        defer freeNameList(allocator, temps);
+        outer: for (temps) |name| {
+            for (table_names) |p| if (std.mem.eql(u8, p, name)) continue :outer;
+            if (like) |pat| if (!likeMatchesIdent(allocator, name, pat)) continue;
+            const cells = [_]?[]const u8{name};
+            try result.sendTextRow(allocator, w, cells[0..], seq_id);
+        }
+    };
+
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
+}
+
+fn sendCreateTableResult(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    catalog: *Catalog,
+    session: *SessionState,
+    payload: []const u8,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    const cols = [_]types.Column{
+        .{ .name = "Table", .type = .string },
+        .{ .name = "Create Table", .type = .string },
+    };
+    try result.sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+
+    blk: {
+        const s = trimSqlForMetadata(payload);
+        const idx = topLevelKeywordIgnoreCase(s, "table") orelse break :blk;
+        const path = readIdentifierPath(s, idx + "table".len + 1) orelse break :blk;
+        const target = ShowTableTarget{
+            .schema_name = if (path.count >= 2) path.first else null,
+            .table_name = path.last,
+        };
+        const resolved = resolveMetadataTable(catalog, session, target) orelse break :blk;
+        const ddl = try allocCreateTableText(allocator, resolved.table);
+        defer allocator.free(ddl);
+        const cells = [_]?[]const u8{ resolved.table.name, ddl };
+        try result.sendTextRow(allocator, w, cells[0..], seq_id);
+    }
+
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
+}
+
+/// Reconstruct re-runnable DDL from the live schema. thinDB dialect: unique
+/// tables carry PRIMARY KEY inside the parens; non-unique tables carry the
+/// ORDER BY clustering clause after them (that's what CREATE TABLE accepts).
+fn allocCreateTableText(allocator: Allocator, t: *Table) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "CREATE TABLE `{s}` (", .{t.name});
+    for (t.schema.columns, 0..) |col, i| {
+        const type_text = try allocMysqlColumnType(allocator, col.type);
+        defer allocator.free(type_text);
+        try out.print(allocator, "{s}\n  `{s}` {s}", .{ if (i == 0) "" else ",", col.name, type_text });
+        if (!col.nullable) try out.appendSlice(allocator, " NOT NULL");
+        if (col.default_value) |dv| {
+            const dtext = (try allocColumnDefaultText(allocator, col)).?;
+            defer allocator.free(dtext);
+            switch (dv) {
+                .text => try out.print(allocator, " DEFAULT '{s}'", .{dtext}),
+                else => try out.print(allocator, " DEFAULT {s}", .{dtext}),
+            }
+        }
+        if (col.auto_increment) try out.appendSlice(allocator, " AUTO_INCREMENT");
+    }
+    if (t.schema.unique) {
+        try out.appendSlice(allocator, ",\n  PRIMARY KEY (");
+        for (t.schema.order_key, 0..) |k, i| {
+            try out.print(allocator, "{s}`{s}`", .{ if (i == 0) "" else ", ", k });
+        }
+        try out.appendSlice(allocator, ")\n)");
+    } else {
+        try out.appendSlice(allocator, "\n) ORDER BY (");
+        for (t.schema.order_key, 0..) |k, i| {
+            try out.print(allocator, "{s}`{s}`", .{ if (i == 0) "" else ", ", k });
+        }
+        try out.appendSlice(allocator, ")");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn sendFullTablesResult(
     allocator: Allocator,
     w: *std.Io.Writer,
@@ -1415,9 +1561,11 @@ fn sendFullTablesResult(
     try result.sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
     try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
 
+    const like = parseShowLikePattern(payload);
     const table_names = try resolved.schema.listTables(allocator);
     defer freeNameList(allocator, table_names);
     for (table_names) |name| {
+        if (like) |pat| if (!likeMatchesIdent(allocator, name, pat)) continue;
         const cells = [_]?[]const u8{ name, "BASE TABLE" };
         try result.sendTextRow(allocator, w, cells[0..], seq_id);
     }
@@ -1530,10 +1678,12 @@ fn sendColumnsResult(
     try result.sendResultHeader(allocator, w, cols, "", "", seq_id);
     try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
 
+    const like = parseShowLikePattern(payload);
     if (parseShowTableTarget(payload)) |target| {
         if (resolveMetadataTable(catalog, session, target)) |resolved| {
             const table = resolved.table;
             for (table.schema.columns) |col| {
+                if (like) |pat| if (!likeMatchesIdent(allocator, col.name, pat)) continue;
                 const type_text = try allocMysqlColumnType(allocator, col.type);
                 defer allocator.free(type_text);
                 const default_text = try allocColumnDefaultText(allocator, col);
@@ -1707,9 +1857,17 @@ fn tableRowCount(t: *Table) u64 {
 
 fn parseShowSchemaName(sql_text: []const u8) ?[]const u8 {
     const s = trimSqlForMetadata(sql_text);
-    const idx = topLevelKeywordIgnoreCase(s, "from") orelse topLevelKeywordIgnoreCase(s, "in") orelse return null;
-    const path = readIdentifierPath(s, idx + 4) orelse return null;
-    return path.last;
+    // Keyword-specific offsets: `idx + 4` on an `IN` match would start the
+    // identifier scan two bytes late and truncate the name.
+    if (topLevelKeywordIgnoreCase(s, "from")) |idx| {
+        const path = readIdentifierPath(s, idx + "from".len) orelse return null;
+        return path.last;
+    }
+    if (topLevelKeywordIgnoreCase(s, "in")) |idx| {
+        const path = readIdentifierPath(s, idx + "in".len) orelse return null;
+        return path.last;
+    }
+    return null;
 }
 
 fn parseShowTableTarget(sql_text: []const u8) ?ShowTableTarget {
@@ -2548,6 +2706,19 @@ fn sendEmptyMetadataResult(
                 .{ .name = "Description", .type = .string },
                 .{ .name = "Default collation", .type = .string },
                 .{ .name = "Maxlen", .type = .int },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .tables => {
+            const cols = [_]types.Column{
+                .{ .name = "Tables_in_public", .type = .string },
+            };
+            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
+        },
+        .create_table => {
+            const cols = [_]types.Column{
+                .{ .name = "Table", .type = .string },
+                .{ .name = "Create Table", .type = .string },
             };
             return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
         },

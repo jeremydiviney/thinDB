@@ -29,7 +29,7 @@ const api = @import("../api/api.zig");
 const Catalog = api.Catalog;
 const Session = api.Session;
 
-pub const Table = enum { pg_namespace, pg_class, pg_attribute, pg_type, pg_database, pg_proc };
+pub const Table = enum { pg_namespace, pg_class, pg_attribute, pg_type, pg_database, pg_proc, pg_tables };
 
 /// Recognize a FROM target as a `pg_catalog` relation. Matches a bare name
 /// (`pg_class`) or one explicitly qualified by the `pg_catalog` schema;
@@ -46,6 +46,7 @@ pub fn match(ref: ir.TableRef) ?Table {
     if (std.ascii.eqlIgnoreCase(n, "pg_type")) return .pg_type;
     if (std.ascii.eqlIgnoreCase(n, "pg_database")) return .pg_database;
     if (std.ascii.eqlIgnoreCase(n, "pg_proc")) return .pg_proc;
+    if (std.ascii.eqlIgnoreCase(n, "pg_tables")) return .pg_tables;
     return null;
 }
 
@@ -186,6 +187,7 @@ pub fn build(gpa: Allocator, catalog: *Catalog, session: Session, table: Table) 
         .pg_type => try buildType(a, self),
         .pg_database => try buildDatabase(a, catalog, self),
         .pg_proc => try buildProc(a, catalog, session, self),
+        .pg_tables => try buildPgTables(a, catalog, session, self),
     }
     return exec.makeQuery(gpa, self);
 }
@@ -225,6 +227,53 @@ fn buildNamespace(a: Allocator, catalog: *Catalog, session: Session, self: *PgCa
     views[0] = try colInt(a, oids);
     views[1] = try colString(a, names.items);
     views[2] = try colInt(a, owners);
+    self.schema = schema;
+    self.views = views;
+    self.row_count = n;
+}
+
+/// The `pg_tables` system view — the shape psql documents and countless
+/// tools query directly instead of joining pg_class/pg_namespace themselves.
+fn buildPgTables(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource) !void {
+    var schemanames: std.ArrayListUnmanaged([]const u8) = .empty;
+    var tablenames: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    if (currentDb(catalog, session)) |db| {
+        const schema_names = try db.listSchemas(a);
+        for (schema_names) |sname| {
+            const sc = db.schema(sname) orelse continue;
+            const tnames = try sc.listTables(a);
+            for (tnames) |tname| {
+                try schemanames.append(a, sname);
+                try tablenames.append(a, tname);
+            }
+        }
+    }
+
+    const n = tablenames.items.len;
+    const owners = try a.alloc([]const u8, n);
+    const flags = try a.alloc(u8, n);
+    for (0..n) |i| {
+        owners[i] = "thindb";
+        flags[i] = 0;
+    }
+
+    const schema = try a.alloc(Column, 7);
+    schema[0] = .{ .name = "schemaname", .type = .string };
+    schema[1] = .{ .name = "tablename", .type = .string };
+    schema[2] = .{ .name = "tableowner", .type = .string };
+    schema[3] = .{ .name = "hasindexes", .type = .boolean };
+    schema[4] = .{ .name = "hasrules", .type = .boolean };
+    schema[5] = .{ .name = "hastriggers", .type = .boolean };
+    schema[6] = .{ .name = "rowsecurity", .type = .boolean };
+    const views = try a.alloc(ColumnView, 7);
+    views[0] = try colString(a, schemanames.items);
+    views[1] = try colString(a, tablenames.items);
+    views[2] = try colString(a, owners);
+    views[3] = try colBool(a, flags);
+    views[4] = try colBool(a, flags);
+    views[5] = try colBool(a, flags);
+    views[6] = try colBool(a, flags);
     self.schema = schema;
     self.views = views;
     self.row_count = n;
