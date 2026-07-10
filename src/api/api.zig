@@ -401,4 +401,5 @@ pub fn remapError(comptime DstError: type, e: anyerror) anyerror {
 test {
     _ = @import("table.zig");
     _ = @import("api_test.zig");
+    _ = @import("compact.zig");
 }

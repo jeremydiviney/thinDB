@@ -691,19 +691,67 @@ fn unionInputSketches(t: *Table, seg_ids: []const u64, ncols: usize) ![]u8 {
 /// which excludes other compactions and DDL (drop/alter/rename) for the
 /// whole call — so the inputs' schema, directory, and files are stable.
 ///
-/// Two phases:
-///   ASIDE  — read the inputs and write the merged output to a fresh
-///            segment file. Holds no `ddl_lock`/`mutex` (only a brief
-///            mutex to snapshot, done by the caller), so scans and
-///            inserts run unimpeded.
-///   COMMIT — under `ddl_lock` exclusive (waits out in-flight scans) +
-///            `mutex`: rebuild the keep-list from the *current* manifest
-///            (a flush may have appended during the merge), swap it in,
-///            and delete the old files. Brief.
+/// Two phases (separately callable for tests and future parallel workers):
+///   ASIDE  (`mergeAside`) — read the inputs and write the merged output
+///            to a fresh segment file. Holds no `ddl_lock`/`mutex` (only
+///            brief mutex snapshots), so scans and writers run unimpeded.
+///   COMMIT (`commitMerge`) — under `ddl_lock` exclusive + `mutex`:
+///            reconcile tombstones that landed on the inputs during the
+///            aside merge, rebuild the keep-list from the *current*
+///            manifest (a flush may have appended during the merge), swap
+///            it in, re-apply late deletes to the merged output, and
+///            delete the old files.
 pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
     if (seg_ids.len == 0) return;
+    var pending = try mergeAside(t, seg_ids);
+    defer pending.deinit(t.allocator);
+    try commitMerge(t, &pending);
+}
 
-    // --- ASIDE -----------------------------------------------------------
+/// Everything `commitMerge` needs from the aside phase. `deinit` is safe to
+/// call whether or not the commit ran (entry ownership moves to the manifest
+/// on splice and is nulled here).
+pub const PendingMerge = struct {
+    seg_ids: []u64,
+    /// Per-input tombstone set as of just before the merge cursors read the
+    /// same files. Parallel to `seg_ids`; null = no tombstones at snapshot.
+    tomb_snapshots: []?[]u32,
+    new_entry: ?storage.manifest.ManifestEntry,
+    new_seg_id: u64,
+
+    pub fn deinit(self: *PendingMerge, allocator: std.mem.Allocator) void {
+        for (self.tomb_snapshots) |s| if (s) |x| allocator.free(x);
+        allocator.free(self.tomb_snapshots);
+        allocator.free(self.seg_ids);
+        if (self.new_entry) |e| {
+            if (e.column_stats.len > 0) allocator.free(e.column_stats);
+            if (e.column_sketches.len > 0) allocator.free(e.column_sketches);
+            if (e.key_bloom.len > 0) allocator.free(e.key_bloom);
+            self.new_entry = null;
+        }
+    }
+};
+
+pub fn mergeAside(t: *Table, seg_ids_in: []const u64) !PendingMerge {
+    const seg_ids = try t.allocator.dupe(u64, seg_ids_in);
+    errdefer t.allocator.free(seg_ids);
+
+    // Snapshot each input's tombstones BEFORE streamMerge's cursors read the
+    // same files: a delete landing after this point shows up in the
+    // commit-time diff. One landing between this read and the cursor's own
+    // read is both dropped by the merge AND re-applied at commit — the
+    // re-apply probes a key with no matching row and no-ops, so the
+    // over-inclusion is harmless.
+    const snapshots = try t.allocator.alloc(?[]u32, seg_ids.len);
+    @memset(snapshots, null);
+    errdefer {
+        for (snapshots) |s| if (s) |x| t.allocator.free(x);
+        t.allocator.free(snapshots);
+    }
+    for (seg_ids, 0..) |id, i| {
+        snapshots[i] = try storage.tombstone.read(t.allocator, t.io, t.segments_dir, id);
+    }
+
     // Snapshot every current segment's per-column sketch for the global
     // dict-eligibility gate. Brief lock so a concurrent flush can't realloc the
     // manifest mid-read; the duped bytes outlive the lock. Passing the inputs'
@@ -728,8 +776,8 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
 
     // Write the merged output to a brand-new segment file (unless every
     // input row was tombstoned). The entry owns its stats independent of
-    // the manifest until spliced in at commit; errdefer frees it if commit
-    // setup fails before then.
+    // the manifest until spliced in at commit; PendingMerge.deinit frees it
+    // if the commit never takes ownership.
     var new_entry: ?storage.manifest.ManifestEntry = null;
     errdefer if (new_entry) |e| {
         if (e.column_stats.len > 0) t.allocator.free(e.column_stats);
@@ -737,8 +785,8 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
         if (e.key_bloom.len > 0) t.allocator.free(e.key_bloom);
     };
 
+    const new_seg_id = t.allocSegmentId();
     {
-        const new_seg_id = t.allocSegmentId();
         var name_buf: [32]u8 = undefined;
         const file_name = try Table.segmentFileName(&name_buf, new_seg_id);
 
@@ -757,11 +805,61 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
         }
     }
 
-    // --- COMMIT ----------------------------------------------------------
+    return .{
+        .seg_ids = seg_ids,
+        .tomb_snapshots = snapshots,
+        .new_entry = new_entry,
+        .new_seg_id = new_seg_id,
+    };
+}
+
+pub fn commitMerge(t: *Table, pending: *PendingMerge) !void {
     t.ddl_lock.lockUncancelable(t.io);
     defer t.ddl_lock.unlock(t.io);
     t.mutex.lockUncancelable(t.io);
     defer t.mutex.unlock(t.io);
+
+    const sync = t.syncEnabled();
+
+    // Late-tombstone reconciliation: deletes that landed on input segments
+    // DURING the aside merge exist only in the old segments' tombstone
+    // files, which are removed below — without this, the merged output
+    // silently resurrects those rows. Diff each input's current tombstones
+    // against the aside snapshot and collect the late-deleted rows' order
+    // keys (from the old files, still on disk here) for re-deletion from
+    // the merged output after the swap.
+    var late_arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer late_arena.deinit();
+    const la = late_arena.allocator();
+    var late_keys: std.StringHashMapUnmanaged(void) = .empty;
+
+    for (pending.seg_ids, pending.tomb_snapshots) |id, snap| {
+        const cur = (try storage.tombstone.read(la, t.io, t.segments_dir, id)) orelse continue;
+        const old: []const u32 = snap orelse &[_]u32{};
+        var late: std.ArrayList(u32) = .empty;
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < cur.len) {
+            if (j < old.len and old[j] == cur[i]) {
+                i += 1;
+                j += 1;
+            } else if (j < old.len and old[j] < cur[i]) {
+                j += 1;
+            } else {
+                try late.append(la, cur[i]);
+                i += 1;
+            }
+        }
+        if (late.items.len == 0) continue;
+        if (!t.schema.unique or t.order_key_indices.len == 0) {
+            // No unique key to identify the rows by — abandon the merged
+            // output instead; the compactor re-picks with fresh tombstones.
+            std.log.warn("compaction abandoned: {d} delete(s) landed mid-merge on keyless table", .{late.items.len});
+            try t.deleteSegmentFiles(pending.new_seg_id);
+            return;
+        }
+        try collectKeysForOffsets(t, la, &late_keys, id, late.items);
+    }
 
     // Rebuild the keep-list from the CURRENT manifest. A flush may have
     // appended segments during the aside merge — those aren't in `seg_ids`,
@@ -774,7 +872,7 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
     var first_dropped_idx: ?usize = null;
     for (t.manifest.segments.items, 0..) |entry, idx| {
         var is_input = false;
-        for (seg_ids) |id| if (id == entry.segment_id) {
+        for (pending.seg_ids) |id| if (id == entry.segment_id) {
             is_input = true;
             if (first_dropped_idx == null) first_dropped_idx = idx;
             break;
@@ -788,22 +886,195 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
         }
     }
 
-    if (new_entry) |entry| {
+    const has_output = pending.new_entry != null;
+    if (pending.new_entry) |entry| {
         // Splice the new segment in where the first dropped input was, so
         // older segments stay older.
         const insert_at = first_dropped_idx orelse keep.items.len;
         try keep.insert(t.allocator, @min(insert_at, keep.items.len), entry);
-        new_entry = null; // ownership now lives in the manifest
+        pending.new_entry = null; // ownership now lives in the manifest
     }
 
     t.manifest.segments.clearRetainingCapacity();
     try t.manifest.segments.appendSlice(t.allocator, keep.items);
     try storage.writeManifest(t.io, t.table_dir, t.manifest, sync);
 
-    for (seg_ids) |id| try t.deleteSegmentFiles(id);
+    // Re-apply the late deletes to the merged output. (If the merge wrote
+    // no output, every input row was already tombstoned in the snapshot, so
+    // any late tombstone re-deleted an already-dropped row: nothing to do.)
+    if (has_output and late_keys.count() > 0) {
+        try tombstoneKeysInSegment(t, la, &late_keys, pending.new_seg_id, sync);
+    }
+
+    for (pending.seg_ids) |id| try t.deleteSegmentFiles(id);
+}
+
+/// Decode the order keys of `offsets` (sorted, segment-absolute) in segment
+/// `seg_id` and add their encoded key bytes to `map`. Key bytes and map
+/// storage live in `la`; per-row-group decode scratch is freed as we go.
+fn collectKeysForOffsets(
+    t: *Table,
+    la: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged(void),
+    seg_id: u64,
+    offsets: []const u32,
+) !void {
+    var name_buf: [32]u8 = undefined;
+    const file_name = try Table.segmentFileName(&name_buf, seg_id);
+    var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);
+    defer seg.deinit();
+
+    var rg_arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer rg_arena.deinit();
+
+    var oi: usize = 0;
+    var rg_base: u32 = 0;
+    for (seg.info.row_groups, 0..) |rg, rg_idx| {
+        const rg_end = rg_base + rg.row_count;
+        if (oi < offsets.len and offsets[oi] < rg_end) {
+            _ = rg_arena.reset(.retain_capacity);
+            const ra = rg_arena.allocator();
+            const key_cols = try ra.alloc(storage.OwnedColumn, t.order_key_indices.len);
+            for (t.order_key_indices, 0..) |ci, k| {
+                key_cols[k] = try seg.decodeColumn(ra, t.schema, rg_idx, ci);
+            }
+            while (oi < offsets.len and offsets[oi] < rg_end) : (oi += 1) {
+                var buf: std.ArrayList(u8) = .empty;
+                for (key_cols) |kc| {
+                    try comparison.appendColumnValueBytes(la, &buf, kc.view(), offsets[oi] - rg_base);
+                }
+                try map.put(la, buf.items, {});
+            }
+        }
+        rg_base = rg_end;
+        if (oi >= offsets.len) break;
+    }
+}
+
+/// Tombstone every row of segment `seg_id` whose encoded order key is in
+/// `map`. Decodes only the key columns, one row group at a time.
+fn tombstoneKeysInSegment(
+    t: *Table,
+    la: std.mem.Allocator,
+    map: *const std.StringHashMapUnmanaged(void),
+    seg_id: u64,
+    sync: bool,
+) !void {
+    var name_buf: [32]u8 = undefined;
+    const file_name = try Table.segmentFileName(&name_buf, seg_id);
+    var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);
+    defer seg.deinit();
+
+    var rg_arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer rg_arena.deinit();
+
+    var hits: std.ArrayList(u32) = .empty;
+    var rg_base: u32 = 0;
+    for (seg.info.row_groups, 0..) |rg, rg_idx| {
+        _ = rg_arena.reset(.retain_capacity);
+        const ra = rg_arena.allocator();
+        const key_cols = try ra.alloc(storage.OwnedColumn, t.order_key_indices.len);
+        for (t.order_key_indices, 0..) |ci, k| {
+            key_cols[k] = try seg.decodeColumn(ra, t.schema, rg_idx, ci);
+        }
+        var buf: std.ArrayList(u8) = .empty;
+        var r: u32 = 0;
+        while (r < rg.row_count) : (r += 1) {
+            buf.clearRetainingCapacity();
+            for (key_cols) |kc| {
+                try comparison.appendColumnValueBytes(ra, &buf, kc.view(), r);
+            }
+            if (map.contains(buf.items)) try hits.append(la, rg_base + r);
+        }
+        rg_base += rg.row_count;
+    }
+
+    if (hits.items.len > 0) {
+        try storage.tombstone.merge(t.allocator, t.io, t.segments_dir, seg_id, hits.items, sync);
+        t.seg_handles.invalidateTombstones(t.allocator, seg_id);
+    }
 }
 
 // ---------- tests --------------------------------------------------------
+
+test "commitMerge re-applies deletes that land during the aside merge" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const exec = @import("../exec/exec.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .v = @as(i32, 10) },
+        .{ .id = @as(i64, 2), .v = @as(i32, 20) },
+        .{ .id = @as(i64, 3), .v = @as(i32, 30) },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .id = @as(i64, 4), .v = @as(i32, 40) },
+        .{ .id = @as(i64, 5), .v = @as(i32, 50) },
+        .{ .id = @as(i64, 6), .v = @as(i32, 60) },
+    });
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 2), t.manifest.segments.items.len);
+
+    const input_ids = [_]u64{
+        t.manifest.segments.items[0].segment_id,
+        t.manifest.segments.items[1].segment_id,
+    };
+
+    // The race, deterministically sequenced: the aside merge snapshots the
+    // (empty) tombstones and writes the merged output; THEN a keyed delete
+    // lands on an input segment; THEN the commit swaps. Without the
+    // late-tombstone reconciliation the deleted row is resurrected.
+    var pending = try mergeAside(t, &input_ids);
+    defer pending.deinit(allocator);
+
+    const pred = exec.predicate.PredicateExpr{
+        .leaf = .{ .col = "id", .op = .eq, .val = .{ .bigint = 2 } },
+    };
+    const deleted = try t.deleteByExpr(pred);
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+
+    try commitMerge(t, &pending);
+
+    // One merged segment; the mid-merge delete must survive as a tombstone
+    // on it, pointing at the id=2 row.
+    try std.testing.expectEqual(@as(usize, 1), t.manifest.segments.items.len);
+    const new_id = t.manifest.segments.items[0].segment_id;
+
+    const tombs = (try storage.tombstone.read(allocator, io, t.segments_dir, new_id)) orelse {
+        return error.TestUnexpectedResult; // resurrection: no tombstone written
+    };
+    defer allocator.free(tombs);
+    try std.testing.expectEqual(@as(usize, 1), tombs.len);
+
+    var name_buf: [32]u8 = undefined;
+    const file_name = try Table.segmentFileName(&name_buf, new_id);
+    var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
+    defer seg.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    for (seg.info.row_groups, 0..) |_, rg_idx| {
+        var c = try seg.decodeColumn(allocator, schema, rg_idx, 0);
+        defer c.deinit(allocator);
+        try ids.appendSlice(allocator, c.data.bigint);
+    }
+    try std.testing.expectEqual(@as(i64, 2), ids.items[tombs[0]]);
+}
 
 test "segmentTier buckets row counts logarithmically" {
     // tier-1 floor is 2^19 (524,288); each tier is 4x the previous.
