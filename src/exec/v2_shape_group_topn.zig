@@ -1114,6 +1114,11 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 // physical slot — decline rather than truncate. decimal64 folds
                 // like a 64-bit int (mantissa) and recovers scale at emit.
                 if (input_type == .decimal128) return traceDecline(request, "decimal128 aggregate");
+                // Temporal MIN/MAX folds as the day/µs int; SUM/AVG over a
+                // temporal is a dialect error (validateAggFn) — decline here
+                // too so the silo never emits a nonsense µs sum.
+                if ((input_type == .date or input_type == .datetime) and agg.func != .min and agg.func != .max)
+                    return traceDecline(request, "temporal sum/avg");
                 // SUM/AVG over a 64-bit integer accumulates into i128 (the
                 // result widens to LARGEINT): the aggregate takes TWO state
                 // slots (lo, hi) and runs in the generic per-row program.
@@ -1504,8 +1509,10 @@ fn aggInputSupported(typ: Type) bool {
         // decimal64 folds through the i64 physical slot like a 64-bit int
         // (the mantissa); SUM widens to i128 and AVG recovers the scale at
         // emit. decimal128 (i128 mantissa) is declined earlier — it can't be
-        // read through the i64 slot.
-        .boolean, .tinyint, .smallint, .int, .bigint, .float, .double, .decimal64 => true,
+        // read through the i64 slot. date/datetime fold as their day/µs ints
+        // (MIN/MAX only — the temporal SUM/AVG decline lives at the plan arm,
+        // matching validateAggFn's dialect).
+        .boolean, .tinyint, .smallint, .int, .bigint, .float, .double, .decimal64, .date, .datetime => true,
         else => false,
     };
 }
@@ -1590,6 +1597,8 @@ fn appendIntegerAggregate(allocator: Allocator, col: *ColumnStore, out_type: Typ
         .int => try col.data.int.append(allocator, @intCast(value)),
         .bigint => try col.data.bigint.append(allocator, @intCast(value)),
         .largeint => try col.data.largeint.append(allocator, value),
+        .date => try col.data.date.append(allocator, @intCast(value)),
+        .datetime => try col.data.datetime.append(allocator, @intCast(value)),
         .decimal64 => try col.data.decimal64.append(allocator, @intCast(value)),
         .decimal128 => try col.data.decimal128.append(allocator, value),
         .double => try col.data.double.append(allocator, @floatFromInt(value)),
