@@ -417,6 +417,60 @@ test "upsert probe with zonemap pruning still tombstones the old segment copy" {
     try std.testing.expectEqualSlices(u32, &.{5}, tombs); // id=6 sits at offset 5
 }
 
+test "upsert probe pruning: old copy lives in a COMPACTION-MERGED segment" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const compact_mod = @import("compact.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .v = @as(i32, 1) },
+        .{ .id = @as(i64, 2), .v = @as(i32, 2) },
+        .{ .id = @as(i64, 3), .v = @as(i32, 3) },
+        .{ .id = @as(i64, 4), .v = @as(i32, 4) },
+    });
+    try t.flush();
+    try t.insert(&.{
+        .{ .id = @as(i64, 5), .v = @as(i32, 5) },
+        .{ .id = @as(i64, 6), .v = @as(i32, 6) },
+    });
+    try t.flush();
+
+    // Fold both flush segments into ONE merged segment — the probe's target
+    // is now a MergedSegmentWriter product, not a flush product.
+    const input_ids = [_]u64{
+        t.manifest.segments.items[0].segment_id,
+        t.manifest.segments.items[1].segment_id,
+    };
+    try compact_mod.mergeSegments(t, &input_ids);
+    try std.testing.expectEqual(@as(usize, 1), t.manifest.segments.items.len);
+    const merged_id = t.manifest.segments.items[0].segment_id;
+
+    // Re-upsert key 3: resolution must tombstone the old copy inside the
+    // merged segment (zonemap pruning must admit its row group).
+    try t.insert(&.{.{ .id = @as(i64, 3), .v = @as(i32, 30) }});
+
+    const tombs = (try storage.tombstone.read(allocator, io, t.segments_dir, merged_id)) orelse
+        return error.TestUnexpectedResult; // BUG: old copy in merged segment survived
+    defer allocator.free(tombs);
+    try std.testing.expectEqual(@as(usize, 1), tombs.len);
+    try std.testing.expectEqualSlices(u32, &.{2}, tombs); // id=3 at merged offset 2
+}
+
 test "upsert probe pruning: string first key column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
