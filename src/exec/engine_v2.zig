@@ -746,12 +746,33 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     if (hasUdfAgg(plan.group_by.aggs)) return try buildUdafGroupBy(input, table, plan);
     if (hasMaxByAgg(plan.group_by.aggs)) return try buildOperatorGroupBy(input, table, plan);
 
+    // A grouped shape most often reaches this decline because a referenced
+    // column doesn't exist — surface that as the real error (ER_BAD_FIELD /
+    // 1054 on the wire) instead of an opaque unsupported-shape.
+    for (plan.group_by.group_cols) |c| {
+        if (types.findColumn(table.schema.columns, c) == null and !nameInDerivedList(plan.derived, c))
+            return error.ColumnNotFound;
+    }
+    for (plan.group_by.aggs) |a| {
+        if (a.col) |c| {
+            if (!std.mem.eql(u8, c, "*") and
+                types.findColumn(table.schema.columns, c) == null and
+                !nameInDerivedList(plan.derived, c))
+                return error.ColumnNotFound;
+        }
+    }
+
     // The silo-grid core carries fixed numeric state slots and string MIN/MAX,
     // but declines variable-state aggregates it can't hold in the group table —
     // COUNT(DISTINCT) (a growing per-group set), percentile, group_concat. There
     // is no single-threaded fallback: a grouped shape the parallel core can't run
     // is unsupported, not silently serialized.
     return error.UnsupportedQueryShape;
+}
+
+fn nameInDerivedList(derived: []const ir.Derived, name: []const u8) bool {
+    for (derived) |d| if (types.columnNameEql(d.name, name)) return true;
+    return false;
 }
 
 // Push the fusable subset of derived columns DOWN into the ParallelScan workers

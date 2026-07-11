@@ -128,7 +128,7 @@ pub fn resolveWithRegistry(
 
     // Fast path: exact TypeTag match. No allocation, no cost calc.
     for (builtins) |f| {
-        if (!std.mem.eql(u8, f.name, name)) continue;
+        if (!std.ascii.eqlIgnoreCase(f.name, name)) continue;
         if (!scalarArityMatches(f, arg_types.len)) continue;
         var all_match = true;
         for (arg_types, 0..) |given, i| {
@@ -152,7 +152,7 @@ pub fn resolveWithRegistry(
     var best: ?ScalarFn = null;
     var best_cost: u64 = std.math.maxInt(u64);
     for (builtins) |f| {
-        if (!std.mem.eql(u8, f.name, name)) continue;
+        if (!std.ascii.eqlIgnoreCase(f.name, name)) continue;
         const total_cost = scalarCastCost(f, arg_types) orelse continue;
         if (total_cost < best_cost) {
             best_cost = total_cost;
@@ -228,11 +228,11 @@ fn allDecimalOrInt(arg_types: []const Type) bool {
 }
 
 fn arithOp(name: []const u8) ?dec.Op {
-    if (std.mem.eql(u8, name, "add")) return .add;
-    if (std.mem.eql(u8, name, "sub")) return .sub;
-    if (std.mem.eql(u8, name, "mul")) return .mul;
-    if (std.mem.eql(u8, name, "div")) return .div;
-    if (std.mem.eql(u8, name, "mod")) return .mod;
+    if (std.ascii.eqlIgnoreCase(name, "add")) return .add;
+    if (std.ascii.eqlIgnoreCase(name, "sub")) return .sub;
+    if (std.ascii.eqlIgnoreCase(name, "mul")) return .mul;
+    if (std.ascii.eqlIgnoreCase(name, "div")) return .div;
+    if (std.ascii.eqlIgnoreCase(name, "mod")) return .mod;
     return null;
 }
 
@@ -286,52 +286,52 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
     // Unary decimal functions (source must be decimal).
     if (arg_types.len == 1 and arg_types[0].isDecimal()) {
         const sp = arg_types[0].decimalSpec().?;
-        if (std.mem.eql(u8, name, "to_double") or std.mem.eql(u8, name, "to_float"))
+        if (std.ascii.eqlIgnoreCase(name, "to_double") or std.ascii.eqlIgnoreCase(name, "to_float"))
             return try buildDecFn(aa, name, arg_types, .double, dec.toDoubleKernel, .propagates);
         if (intCastTarget(name)) |it|
             return try buildDecFn(aa, name, arg_types, it, dec.toIntKernel, .propagates);
-        if (std.mem.eql(u8, name, "to_string"))
+        if (std.ascii.eqlIgnoreCase(name, "to_string"))
             return try buildDecFn(aa, name, arg_types, .string, dec.toStringKernel, .propagates);
-        if (std.mem.eql(u8, name, "abs"))
+        if (std.ascii.eqlIgnoreCase(name, "abs"))
             return try buildDecFn(aa, name, arg_types, arg_types[0], dec.absKernel, .propagates);
-        if (std.mem.eql(u8, name, "round"))
+        if (std.ascii.eqlIgnoreCase(name, "round"))
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.roundKernel, .propagates);
-        if (std.mem.eql(u8, name, "floor"))
+        if (std.ascii.eqlIgnoreCase(name, "floor"))
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.floorKernel, .propagates);
-        if (std.mem.eql(u8, name, "ceil") or std.mem.eql(u8, name, "ceiling"))
+        if (std.ascii.eqlIgnoreCase(name, "ceil") or std.ascii.eqlIgnoreCase(name, "ceiling"))
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.ceilKernel, .propagates);
-        if (std.mem.eql(u8, name, "truncate"))
+        if (std.ascii.eqlIgnoreCase(name, "truncate"))
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.truncateKernel, .propagates);
         return null;
     }
 
     // ROUND/TRUNCATE(decimal, n) — keeps the source scale, rounds the value.
     if (arg_types.len == 2 and arg_types[0].isDecimal() and arg_types[1].isInteger()) {
-        if (std.mem.eql(u8, name, "round"))
+        if (std.ascii.eqlIgnoreCase(name, "round"))
             return try buildDecFn(aa, name, arg_types, arg_types[0], dec.roundNKernel, .propagates);
-        if (std.mem.eql(u8, name, "truncate"))
+        if (std.ascii.eqlIgnoreCase(name, "truncate"))
             return try buildDecFn(aa, name, arg_types, arg_types[0], dec.truncateNKernel, .propagates);
     }
 
     // COALESCE / IFNULL — first non-null, all operands decimal/int.
-    if ((std.mem.eql(u8, name, "coalesce") or std.mem.eql(u8, name, "ifnull")) and allDecimalOrInt(arg_types)) {
+    if ((std.ascii.eqlIgnoreCase(name, "coalesce") or std.ascii.eqlIgnoreCase(name, "ifnull")) and allDecimalOrInt(arg_types)) {
         const spec = dec.commonSpec(arg_types) orelse return null;
         return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), dec.coalesceKernel, .absorbs);
     }
 
-    if (std.mem.eql(u8, name, "nullif") and arg_types.len == 2 and allDecimalOrInt(arg_types)) {
+    if (std.ascii.eqlIgnoreCase(name, "nullif") and arg_types.len == 2 and allDecimalOrInt(arg_types)) {
         const spec = dec.commonSpec(arg_types) orelse return null;
         return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), dec.nullifKernel, .kernel_managed);
     }
 
-    if (std.mem.eql(u8, name, "if") and arg_types.len == 3 and arg_types[0] == .boolean and allDecimalOrInt(arg_types[1..])) {
+    if (std.ascii.eqlIgnoreCase(name, "if") and arg_types.len == 3 and arg_types[0] == .boolean and allDecimalOrInt(arg_types[1..])) {
         const spec = dec.commonSpec(arg_types[1..]) orelse return null;
         return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), dec.ifKernel, .kernel_managed);
     }
 
-    if ((std.mem.eql(u8, name, "greatest") or std.mem.eql(u8, name, "least")) and allDecimalOrInt(arg_types)) {
+    if ((std.ascii.eqlIgnoreCase(name, "greatest") or std.ascii.eqlIgnoreCase(name, "least")) and allDecimalOrInt(arg_types)) {
         const spec = dec.commonSpec(arg_types) orelse return null;
-        const k = if (std.mem.eql(u8, name, "greatest")) dec.greatestKernel else dec.leastKernel;
+        const k = if (std.ascii.eqlIgnoreCase(name, "greatest")) dec.greatestKernel else dec.leastKernel;
         return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), k, .propagates);
     }
 
@@ -339,11 +339,11 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
 }
 
 fn intCastTarget(name: []const u8) ?Type {
-    if (std.mem.eql(u8, name, "to_int")) return .int;
-    if (std.mem.eql(u8, name, "to_bigint")) return .bigint;
-    if (std.mem.eql(u8, name, "to_smallint")) return .smallint;
-    if (std.mem.eql(u8, name, "to_tinyint")) return .tinyint;
-    if (std.mem.eql(u8, name, "to_largeint")) return .largeint;
+    if (std.ascii.eqlIgnoreCase(name, "to_int")) return .int;
+    if (std.ascii.eqlIgnoreCase(name, "to_bigint")) return .bigint;
+    if (std.ascii.eqlIgnoreCase(name, "to_smallint")) return .smallint;
+    if (std.ascii.eqlIgnoreCase(name, "to_tinyint")) return .tinyint;
+    if (std.ascii.eqlIgnoreCase(name, "to_largeint")) return .largeint;
     return null;
 }
 
@@ -422,7 +422,7 @@ pub fn overloadsOf(name: []const u8) []const ScalarFn {
     var start: ?usize = null;
     var end: usize = 0;
     for (builtins, 0..) |f, i| {
-        if (std.mem.eql(u8, f.name, name)) {
+        if (std.ascii.eqlIgnoreCase(f.name, name)) {
             if (start == null) start = i;
             end = i + 1;
         }

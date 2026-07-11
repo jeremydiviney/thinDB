@@ -499,9 +499,12 @@ pub const Lexer = struct {
         }
         const text = self.src[start..self.pos];
         if (keywordFor(text)) |kw| return Token{ .tag = kw, .text = text };
-        const lowered = try self.arena.alloc(u8, text.len);
-        for (text, 0..) |c, i| lowered[i] = std.ascii.toLower(c);
-        return Token{ .tag = .identifier, .text = lowered };
+        // Identifiers keep the case the client typed: MySQL/PG echo names
+        // as-typed in result columns while COMPARING case-insensitively.
+        // Every downstream match must therefore be case-insensitive
+        // (columnNameEql / eqlIgnoreCase / lowercase-at-map-boundary) —
+        // lowering here made grouped output labels silently lowercase.
+        return Token{ .tag = .identifier, .text = text };
     }
 
     /// PG dollar-quoted string: `$tag$ ... $tag$` (tag may be empty:
@@ -727,18 +730,20 @@ test "lexer: simple SELECT" {
     try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
 }
 
-test "lexer: case-insensitive keywords + unquoted idents lowercased" {
+test "lexer: case-insensitive keywords + unquoted idents keep typed case" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lx = Lexer.init(arena.allocator(), "select Foo from Bar");
     try std.testing.expectEqual(@as(TokenTag, .kw_select), (try lx.next()).tag);
     const id1 = try lx.next();
     try std.testing.expectEqual(@as(TokenTag, .identifier), id1.tag);
-    try std.testing.expectEqualStrings("foo", id1.text);
+    // Identifiers lex as-typed: result labels must echo the client's case
+    // (MySQL/PG behavior); matching stays case-insensitive downstream.
+    try std.testing.expectEqualStrings("Foo", id1.text);
     try std.testing.expectEqual(@as(TokenTag, .kw_from), (try lx.next()).tag);
     const id2 = try lx.next();
     try std.testing.expectEqual(@as(TokenTag, .identifier), id2.tag);
-    try std.testing.expectEqualStrings("bar", id2.text);
+    try std.testing.expectEqualStrings("Bar", id2.text);
 }
 
 test "lexer: backtick-quoted identifier preserves case + allows spaces" {

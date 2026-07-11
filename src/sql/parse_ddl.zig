@@ -21,12 +21,12 @@ pub fn parseDdl(p: anytype) !*ir.Op {
         .kw_create => {
             if (p.cur.tag == .kw_database) {
                 try p.advance();
-                const name = try p.dupedIdent();
+                const name = try p.dupedIdentLower();
                 return try p.allocOp(.{ .ddl = .{ .create_database = name } });
             }
             if (p.cur.tag == .kw_schema) {
                 try p.advance();
-                const name = try p.dupedIdent();
+                const name = try p.dupedIdentLower();
                 return try p.allocOp(.{ .ddl = .{ .create_schema = name } });
             }
             // CREATE [OR REPLACE] FUNCTION — `function`/`returns` are
@@ -70,12 +70,12 @@ pub fn parseDdl(p: anytype) !*ir.Op {
         .kw_drop => {
             if (p.cur.tag == .kw_database) {
                 try p.advance();
-                const name = try p.dupedIdent();
+                const name = try p.dupedIdentLower();
                 return try p.allocOp(.{ .ddl = .{ .drop_database = name } });
             }
             if (p.cur.tag == .kw_schema) {
                 try p.advance();
-                const name = try p.dupedIdent();
+                const name = try p.dupedIdentLower();
                 return try p.allocOp(.{ .ddl = .{ .drop_schema = name } });
             }
             if (isIdentText(p, "function")) {
@@ -87,7 +87,7 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                     try p.advance();
                     if_exists = true;
                 }
-                const name = try p.dupedIdent();
+                const name = try p.dupedIdentLower();
                 return try p.allocOp(.{ .ddl = .{ .drop_sql_function = .{
                     .name = name,
                     .if_exists = if_exists,
@@ -110,7 +110,7 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                         try p.advance();
                         if_exists = true;
                     }
-                    const name = try p.dupedIdent();
+                    const name = try p.dupedIdentLower();
                     return try p.allocOp(.{ .ddl = .{ .drop_view = .{
                         .name = name,
                         .if_exists = if_exists,
@@ -128,10 +128,10 @@ pub fn parseDdl(p: anytype) !*ir.Op {
             return PE.SqlExpectedKeyword;
         },
         .kw_use => {
-            const first = try p.dupedIdent();
+            const first = try p.dupedIdentLower();
             if (p.cur.tag == .dot) {
                 try p.advance();
-                const second = try p.dupedIdent();
+                const second = try p.dupedIdentLower();
                 return try p.allocOp(.{ .ddl = .{ .use_database_schema = .{
                     .database = first,
                     .schema = second,
@@ -184,7 +184,7 @@ fn isIdentText(p: anytype, comptime text: []const u8) bool {
 /// REPLACE] was consumed by the caller.
 pub fn parseCreateFunctionBody(p: anytype, or_replace: bool) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
-    const name = try p.dupedIdent();
+    const name = try p.dupedIdentLower();
 
     // `CREATE FUNCTION name LANGUAGE zig AS $$source$$` — a compiled table
     // UDF. Shapes live in the source's comptime declarations, so there is
@@ -284,7 +284,7 @@ pub fn parseCreateFunctionBody(p: anytype, or_replace: bool) !*ir.Op {
 /// at compile time; a plain view is expanded inline at reference.
 pub fn parseCreateViewBody(p: anytype, or_replace: bool, materialized: bool) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
-    const name = try p.dupedIdent();
+    const name = try p.dupedIdentLower();
     // Explicit view column lists (`VIEW v (a, b) AS ...`) are not supported
     // in v1 — the column names come from the SELECT's own output.
     if (p.cur.tag == .lparen) return PE.SqlExpectedKeyword;
@@ -332,7 +332,7 @@ pub fn parseRefresh(p: anytype) !*ir.Op {
     try p.advance();
     if (!isIdentText(p, "view")) return PE.SqlExpectedKeyword;
     try p.advance();
-    const name = try p.dupedIdent();
+    const name = try p.dupedIdentLower();
     return try p.allocOp(.{ .ddl = .{ .refresh_view = name } });
 }
 
@@ -910,7 +910,7 @@ pub fn parseShow(p: anytype) !*ir.Op {
             var db: ?[]const u8 = null;
             if (p.cur.tag == .kw_from) {
                 try p.advance();
-                db = try p.dupedIdent();
+                db = try p.dupedIdentLower();
             }
             return try p.allocOp(.{ .show = .{ .schemas = db } });
         },
@@ -919,10 +919,10 @@ pub fn parseShow(p: anytype) !*ir.Op {
             var ref: ir.TableRef = .{ .name = "" };
             if (p.cur.tag == .kw_from) {
                 try p.advance();
-                const first = try p.dupedIdent();
+                const first = try p.dupedIdentLower();
                 if (p.cur.tag == .dot) {
                     try p.advance();
-                    const second = try p.dupedIdent();
+                    const second = try p.dupedIdentLower();
                     ref = .{ .database = first, .schema = second, .name = "" };
                 } else {
                     ref = .{ .schema = first, .name = "" };
@@ -934,7 +934,7 @@ pub fn parseShow(p: anytype) !*ir.Op {
             try p.advance();
             if (!isIdentText(p, "function")) return PE.SqlExpectedKeyword;
             try p.advance();
-            const name = try p.dupedIdent();
+            const name = try p.dupedIdentLower();
             return try p.allocOp(.{ .show = .{ .create_function = name } });
         },
         else => {

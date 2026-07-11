@@ -1198,7 +1198,7 @@ pub const Parser = struct {
         var parts_buf: [3][]const u8 = undefined;
         var n: usize = 0;
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-        parts_buf[0] = try self.arena.dupe(u8, self.cur.text);
+        parts_buf[0] = try std.ascii.allocLowerString(self.arena, self.cur.text);
         n = 1;
         try self.advance();
         while (self.cur.tag == .dot) {
@@ -1207,7 +1207,7 @@ pub const Parser = struct {
             // After a dot only a name can follow, so reserved words are
             // identifiers here — `information_schema.tables`, `x.columns`.
             if (self.cur.tag != .identifier and !wordLikeToken(self.cur.text)) return ParseError.SqlExpectedIdent;
-            parts_buf[n] = try self.arena.dupe(u8, self.cur.text);
+            parts_buf[n] = try std.ascii.allocLowerString(self.arena, self.cur.text);
             n += 1;
             try self.advance();
         }
@@ -1231,6 +1231,18 @@ pub const Parser = struct {
     pub fn dupedIdent(self: *Parser) ParseError![]const u8 {
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const out = try self.arena.dupe(u8, self.cur.text);
+        try self.advance();
+        return out;
+    }
+
+    /// Duplicate the current identifier lowercased. For OBJECT names —
+    /// tables, schemas, databases, CTEs — which thinDB stores and resolves
+    /// case-insensitively (the wire advertises lower_case_table_names=1).
+    /// Column/alias/function identifiers keep their typed case instead:
+    /// they surface as result labels and must echo as-typed.
+    pub fn dupedIdentLower(self: *Parser) ParseError![]const u8 {
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const out = try std.ascii.allocLowerString(self.arena, self.cur.text);
         try self.advance();
         return out;
     }
@@ -2706,19 +2718,22 @@ pub const Parser = struct {
         }
         const first = try self.expectIdent();
         const first_dup = try self.arena.dupe(u8, first);
+        // Object-name lookups (CTEs, functions, views, tables) are
+        // case-insensitive; the maps key on lowercase.
+        const first_lc = try std.ascii.allocLowerString(self.arena, first_dup);
         var op: *ir.Op = undefined;
         var resolved_name: []const u8 = first_dup;
         var alias_in_place = true;
         if (self.cur.tag == .lparen) {
-            if (self.lookupSqlFn(first)) |def| {
+            if (self.lookupSqlFn(first_lc)) |def| {
                 op = try self.expandSqlFunction(def);
                 alias_in_place = false;
             } else {
-                const format = fileFormatForFunction(first) orelse return ParseError.SqlUnsupportedFileFunction;
+                const format = fileFormatForFunction(first_lc) orelse return ParseError.SqlUnsupportedFileFunction;
                 op = try self.parseFileTableFunction(format);
             }
-        } else if (self.cur.tag != .dot and self.ctes.get(first) != null) {
-            const entry = self.ctes.get(first).?;
+        } else if (self.cur.tag != .dot and self.ctes.get(first_lc) != null) {
+            const entry = self.ctes.get(first_lc).?;
             // NOT MATERIALIZED = regenerate per use: each reference gets its
             // OWN materialize node over the shared body subtree, so the
             // engine builds (and frees) an independent stage per branch.
@@ -2729,15 +2744,15 @@ pub const Parser = struct {
             else
                 entry.op;
             alias_in_place = false;
-        } else if (self.cur.tag != .dot and self.plainViewDef(first) != null) {
+        } else if (self.cur.tag != .dot and self.plainViewDef(first_lc) != null) {
             // A plain (non-materialized) view expands inline, like a
             // zero-arg inline function. Materialized views are real tables
             // and fall through to the scan path below.
-            op = try self.expandView(self.plainViewDef(first).?);
+            op = try self.expandView(self.plainViewDef(first_lc).?);
             alias_in_place = false;
         } else {
             var parts_buf: [3][]const u8 = undefined;
-            parts_buf[0] = first_dup;
+            parts_buf[0] = first_lc;
             var parts_len: usize = 1;
             while (self.cur.tag == .dot) {
                 if (parts_len == parts_buf.len) return ParseError.SqlExpectedIdent;
@@ -2745,7 +2760,7 @@ pub const Parser = struct {
                 // After a dot only a name can follow, so reserved words are
                 // identifiers here — `information_schema.tables`.
                 if (self.cur.tag != .identifier and !wordLikeToken(self.cur.text)) return ParseError.SqlExpectedIdent;
-                parts_buf[parts_len] = try self.arena.dupe(u8, self.cur.text);
+                parts_buf[parts_len] = try std.ascii.allocLowerString(self.arena, self.cur.text);
                 parts_len += 1;
                 try self.advance();
             }
@@ -3142,7 +3157,9 @@ pub const Parser = struct {
         try self.advance(); // consume WITH
         while (true) {
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-            const name = try self.arena.dupe(u8, self.cur.text);
+            // CTE names are object names: stored/looked up lowercased so
+            // `WITH Foo ... FROM foo` resolves (idents now lex as-typed).
+            const name = try std.ascii.allocLowerString(self.arena, self.cur.text);
             try self.advance();
             if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
             try self.advance();
