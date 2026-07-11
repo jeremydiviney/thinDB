@@ -384,6 +384,15 @@ fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
                 }
             }
             if (ctx.mode == .mutate and kept < c.derived.len) {
+                if (kept == 0) {
+                    // Every derived is dead: splice the node out entirely
+                    // (same as the all-calls-dead window case) — an empty
+                    // Compute is not a legal operator (ComputeNoColumns).
+                    if (trace()) std.debug.print("[prune] compute spliced out (all derived dead)\n", .{});
+                    op.* = c.upstream.*;
+                    walk(ctx, op, needed);
+                    return;
+                }
                 if (ctx.arena.alloc(ir.Derived, kept)) |ds| {
                     var w: usize = 0;
                     for (c.derived, 0..) |d, j| {
@@ -894,4 +903,25 @@ test "compute keeps a derived that a kept sibling references" {
     try testing.expectEqual(@as(usize, 2), cmp.compute.derived.len);
     try testing.expectEqualStrings("d1", cmp.compute.derived[0].name);
     try testing.expectEqualStrings("d2", cmp.compute.derived[1].name);
+}
+
+test "compute with every derived dead is spliced out (never an empty Compute)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var base = scanOp();
+    var inner = ir.Op{ .select = .{ .columns = &.{"x"}, .upstream = &base } };
+    const derived = [_]ir.Derived{
+        .{ .name = "dead1", .expr = .{ .col_ref = "x" } },
+        .{ .name = "dead2", .expr = .{ .col_ref = "x" } },
+    };
+    var cmp = ir.Op{ .compute = .{ .derived = &derived, .upstream = &inner } };
+    var outer = ir.Op{ .select = .{ .columns = &.{"x"}, .upstream = &cmp } };
+    pruneDeadColumns(arena, &outer);
+    // The node itself must have become the select below it — an empty
+    // Compute is not a legal operator (ComputeNoColumns at compile).
+    try testing.expect(cmp == .select);
+    try testing.expectEqual(@as(usize, 1), cmp.select.columns.len);
+    try testing.expectEqualStrings("x", cmp.select.columns[0]);
 }
