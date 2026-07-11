@@ -1105,14 +1105,15 @@ const LowCardGroup = struct {
         table.ddl_lock.lockSharedUncancelable(table.io);
         defer table.ddl_lock.unlockShared(table.io);
 
-        const snap = Scan.captureSnapshot(table);
+        const snap = try Scan.captureSnapshotAlloc(table, allocator);
         var pin_held = true;
         defer if (pin_held) snap.memtable_snap.release();
+        defer allocator.free(snap.segments);
 
         const seg_start = try allocator.alloc(usize, snap.segment_count + 1);
         defer allocator.free(seg_start);
         var total_rgs: usize = 0;
-        for (table.manifest.segments.items[0..snap.segment_count], 0..) |entry, i| {
+        for (snap.segments, 0..) |entry, i| {
             seg_start[i] = total_rgs;
             total_rgs += entry.row_group_count;
         }

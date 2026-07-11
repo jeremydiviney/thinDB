@@ -555,17 +555,21 @@ pub const ParallelScan = struct {
         exec.prof.addPhase("pscan.create.ddl_lock", @intCast(exec.prof.nowTicks() - t_lock));
 
         const t_snap = exec.prof.nowTicks();
-        const snap = Scan.captureSnapshot(table);
+        // Dupe the entry array too (allocator-backed): every worker reads
+        // this stable copy, never the live manifest ArrayList a concurrent
+        // flush can realloc out from under them (#139 UAF).
+        const snap = try Scan.captureSnapshotAlloc(table, allocator);
         exec.prof.addPhase("pscan.create.snapshot", @intCast(exec.prof.nowTicks() - t_snap));
         var pin_held = true;
         errdefer if (pin_held) snap.memtable_snap.release();
+        defer allocator.free(snap.segments);
 
-        // Flat row-group total + per-segment prefix sums, straight from the
-        // manifest (each entry carries its row_group_count) — no footer reads.
+        // Flat row-group total + per-segment prefix sums, from the STABLE
+        // snapshot (each entry carries its row_group_count) — no footer reads.
         const seg_start = try allocator.alloc(usize, snap.segment_count + 1);
         defer allocator.free(seg_start);
         var total_rgs: usize = 0;
-        for (table.manifest.segments.items[0..snap.segment_count], 0..) |e, i| {
+        for (snap.segments, 0..) |e, i| {
             seg_start[i] = total_rgs;
             total_rgs += e.row_group_count;
         }
@@ -602,7 +606,7 @@ pub const ParallelScan = struct {
         // hiccup can never break the query.
         const t_part = exec.prof.nowTicks();
         const bounds: ?[]const usize = if (n_chunks > 1 and total_rgs > n_chunks)
-            byteAwareBounds(allocator, table, snap.segment_count, total_rgs, n_chunks, needed)
+            byteAwareBounds(allocator, table, snap.segments, total_rgs, n_chunks, needed)
         else
             null;
         defer if (bounds) |b| allocator.free(b);
@@ -1914,7 +1918,7 @@ fn rgWeight(rg: storage.RowGroupMeta, proj: ?[]const usize, ncols: usize) u64 {
 fn byteAwareBounds(
     allocator: Allocator,
     table: *Table,
-    segment_count: usize,
+    segs: []const storage.ManifestEntry,
     total_rgs: usize,
     eff: usize,
     needed: ?[]const []const u8,
@@ -1941,7 +1945,7 @@ fn byteAwareBounds(
 
     var total_bytes: u64 = 0;
     var flat: usize = 0;
-    for (table.manifest.segments.items[0..segment_count]) |entry| {
+    for (segs) |entry| {
         const handle = table.acquireSegment(entry.segment_id) catch return null;
         defer table.releaseSegment(handle);
         for (handle.seg.info.row_groups) |rg| {

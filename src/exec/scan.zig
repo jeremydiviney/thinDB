@@ -229,6 +229,20 @@ pub const Scan = struct {
 
     segment_count: usize,
 
+    /// Owned shallow snapshot of the first `segment_count` manifest entries,
+    /// captured under the table mutex at create. Reads go here, NEVER to the
+    /// live `table.manifest.segments.items` — a concurrent flush's
+    /// `appendSegment` reallocates that ArrayList's backing store with no
+    /// lock a scan holds (flush takes only `mutex`; the scan holds only
+    /// `ddl_lock` shared during execution), so iterating the live slice is a
+    /// use-after-free: a freed entry's `key_bloom` header reads as garbage
+    /// and `hash % m` with m==0 is the 0xc0000094 silent crash (#139). The
+    /// entries are shallow copies — their `key_bloom` / `column_stats`
+    /// pointers still alias manifest-owned buffers, but those are only freed
+    /// by compaction under `ddl_lock` EXCLUSIVE, which the scan's shared hold
+    /// excludes. Freed in `deinit`.
+    segs: []const storage.ManifestEntry,
+
     /// Pinned snapshot of the memtable at scan-create time. The scan holds
     /// an `acquire`d reference so flush/delete/upsert can swap the table's
     /// active memtable without invalidating this scan's view. Released in
@@ -554,21 +568,41 @@ pub const Scan = struct {
         segment_count: usize,
         memtable_snap: *engine.Memtable,
         memtable_row_count: u64,
+        /// Owned shallow dupe of the segment entries at capture time (see
+        /// `Scan.segs`). The orchestrator owns this and frees it once every
+        /// worker has duped its own copy; null when the capturer didn't ask
+        /// for it (callers that only need counts).
+        segments: []storage.ManifestEntry = &.{},
     };
 
-    /// Capture a consistent snapshot, pinning the memtable. The caller owns the
-    /// returned pin and must `memtable_snap.release()` it once every worker Scan
-    /// (each of which acquires its own pin) has been constructed.
-    pub fn captureSnapshot(table: *Table) Snapshot {
+    /// Capture a consistent snapshot, pinning the memtable and (when
+    /// `allocator` is non-null) duping the segment entry array so downstream
+    /// readers never touch the live, flush-mutated manifest ArrayList. The
+    /// caller owns the returned pin (`memtable_snap.release()`) and the
+    /// `segments` dupe (`allocator.free`), releasing both once every worker
+    /// Scan has been constructed.
+    pub fn captureSnapshotAlloc(table: *Table, allocator: ?Allocator) !Snapshot {
         table.mutex.lockUncancelable(table.io);
         defer table.mutex.unlock(table.io);
         const ms = table.memtable;
         ms.acquire();
+        const count = table.manifest.segments.items.len;
+        const segs: []storage.ManifestEntry = if (allocator) |a|
+            try a.dupe(storage.ManifestEntry, table.manifest.segments.items[0..count])
+        else
+            &.{};
         return .{
-            .segment_count = table.manifest.segments.items.len,
+            .segment_count = count,
             .memtable_snap = ms,
             .memtable_row_count = ms.row_count,
+            .segments = segs,
         };
+    }
+
+    pub fn captureSnapshot(table: *Table) Snapshot {
+        // Count-only capture (no entry dupe) — for callers that read segment
+        // entries under their own lock or not at all.
+        return captureSnapshotAlloc(table, null) catch unreachable;
     }
 
     pub fn allocWithProjectionLoc(
@@ -634,6 +668,11 @@ pub const Scan = struct {
         var segment_count: usize = undefined;
         var memtable_snap: *engine.Memtable = undefined;
         var memtable_row_count: u64 = undefined;
+        // Owned segment-entry snapshot (see `Scan.segs`). Duped from the
+        // orchestrator's stable capture for a worker, or from the live
+        // manifest under the mutex for a standalone scan.
+        var segs: []storage.ManifestEntry = &.{};
+        errdefer allocator.free(segs);
         if (injected_snap) |snap| {
             // Parallel worker: reuse the orchestrator's single captured view so
             // every worker agrees. Acquire our own pin (balanced by deinit).
@@ -641,12 +680,21 @@ pub const Scan = struct {
             memtable_snap = snap.memtable_snap;
             memtable_snap.acquire();
             memtable_row_count = snap.memtable_row_count;
+            // snap.segments length == snap.segment_count by construction; a
+            // count-only capture (empty segments) can't feed a worker that
+            // reads entries, so this dupe is the authoritative source.
+            segs = try allocator.dupe(storage.ManifestEntry, snap.segments);
         } else {
             table.mutex.lockUncancelable(table.io);
             segment_count = table.manifest.segments.items.len;
             memtable_snap = table.memtable;
             memtable_snap.acquire();
             memtable_row_count = memtable_snap.row_count;
+            segs = allocator.dupe(storage.ManifestEntry, table.manifest.segments.items[0..segment_count]) catch |e| {
+                memtable_snap.release();
+                table.mutex.unlock(table.io);
+                return e;
+            };
             table.mutex.unlock(table.io);
         }
 
@@ -669,7 +717,7 @@ pub const Scan = struct {
         const cached_stats = try computeColumnStats(
             allocator,
             table.schema.columns,
-            table.manifest.segments.items[0..segment_count],
+            segs,
             out_phys,
             memtable_row_count,
         );
@@ -680,6 +728,7 @@ pub const Scan = struct {
             .io = table.io,
             .table = table,
             .segment_count = segment_count,
+            .segs = segs,
             .memtable_snap = memtable_snap,
             .memtable_row_count = memtable_row_count,
             .decoded = decoded,
@@ -977,6 +1026,7 @@ pub const Scan = struct {
         }
         self.allocator.free(self.decoded);
         self.allocator.free(self.views);
+        if (self.segs.len > 0) self.allocator.free(@constCast(self.segs));
         if (self.filter_phys.len > 0) self.allocator.free(self.filter_phys);
         if (self.filter_eval_schema.len > 0) self.allocator.free(self.filter_eval_schema);
         if (self.filter_eval_views.len > 0) self.allocator.free(self.filter_eval_views);
@@ -1109,7 +1159,7 @@ pub const Scan = struct {
         const col_stats = try computeColumnStats(
             self.allocator,
             schema,
-            self.table.manifest.segments.items[0..self.segment_count],
+            self.segs,
             all_phys,
             self.memtable_row_count,
         );
@@ -1263,7 +1313,7 @@ pub const Scan = struct {
     fn segmentPrunePass(self: *Scan, col_idx: usize, op: PredicateOp, val: Value, blanks_excluded: bool) !void {
         const order_key_cols = self.table.order_key_indices;
         const is_leading = order_key_cols.len > 0 and order_key_cols[0] == col_idx;
-        const segs = self.table.manifest.segments.items[0..self.segment_count];
+        const segs = self.segs;
         var any_skipped = false;
         var skipped_buf: ?[]bool = self.seg_skip;
         for (segs, 0..) |entry, i| {
@@ -1299,7 +1349,7 @@ pub const Scan = struct {
     fn keyBloomPrunePass(self: *Scan) !void {
         const oki = self.table.order_key_indices;
         if (!self.table.schema.unique or oki.len == 0) return;
-        const segs = self.table.manifest.segments.items[0..self.segment_count];
+        const segs = self.segs;
         if (segs.len == 0) return;
         const max_keys = 256;
 
@@ -1397,7 +1447,7 @@ pub const Scan = struct {
     pub fn survivingWorkUnits(self: *const Scan) ?usize {
         if (self.prunes.items.len == 0 and self.in_prunes.items.len == 0) return null;
         var surviving: usize = (@as(usize, @intCast(self.memtable_row_count)) + 65535) / 65536;
-        for (self.table.manifest.segments.items[0..self.segment_count]) |entry| {
+        for (self.segs) |entry| {
             const handle = self.table.acquireSegment(entry.segment_id) catch return null;
             defer self.table.releaseSegment(handle);
             for (handle.seg.info.row_groups) |rg| {
@@ -1426,7 +1476,7 @@ pub const Scan = struct {
     ///     strict (`max[i] < min[i+1]`) since equal boundary values
     ///     break secondary-key ordering across segments.
     pub fn stats(self: *Scan) exec.PipelineStats {
-        const segs = self.table.manifest.segments.items[0..self.segment_count];
+        const segs = self.segs;
         var seg_rows: u64 = 0;
         for (segs) |s| seg_rows += s.row_count;
 
@@ -1672,7 +1722,7 @@ pub const Scan = struct {
                     self.phase = .memtable;
                     break;
                 }
-                const entry = self.table.manifest.segments.items[self.cur_seg_idx];
+                const entry = self.segs[self.cur_seg_idx];
                 self.cur_seg_idx += 1;
                 const tombs = try storage.tombstone.read(self.allocator, self.io, self.table.segments_dir, entry.segment_id);
                 defer if (tombs) |t| self.allocator.free(t);
@@ -1857,7 +1907,7 @@ pub const Scan = struct {
             self.phase = .memtable;
             return false;
         }
-        const entry = self.table.manifest.segments.items[self.cur_seg_idx];
+        const entry = self.segs[self.cur_seg_idx];
         const handle = try self.table.acquireSegment(entry.segment_id);
         self.cur_seg_entry = handle;
         self.cur_segment = &handle.seg;
