@@ -912,10 +912,18 @@ pub const Window = struct {
             if (pd.preps.len > 0) self.allocator.free(pd.preps);
             if (pd.bounds.len > 0) self.allocator.free(pd.bounds);
         }
+        var drain_up_ticks: i64 = 0;
+        var drain_ap_ticks: i64 = 0;
+        var drain_batches: usize = 0;
         while (true) {
             const _ut = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const got = try self.upstream.next();
-            if (exec.prof.enabled) exec.prof.addPhase("window.drain.upstream", @intCast(@max(0, exec.prof.nowTicks() - _ut)));
+            if (exec.prof.enabled) {
+                const d = @max(0, exec.prof.nowTicks() - _ut);
+                exec.prof.addPhase("window.drain.upstream", @intCast(d));
+                drain_up_ticks += d;
+                drain_batches += 1;
+            }
             const batch = got orelse break;
             const _at = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const b = batch.row_count * row_bytes;
@@ -957,7 +965,27 @@ pub const Window = struct {
                 }
             }
             self.accumulated_rows += batch.row_count;
-            if (exec.prof.enabled) exec.prof.addPhase("window.drain.append", @intCast(@max(0, exec.prof.nowTicks() - _at)));
+            if (exec.prof.enabled) {
+                const d = @max(0, exec.prof.nowTicks() - _at);
+                exec.prof.addPhase("window.drain.append", @intCast(d));
+                drain_ap_ticks += d;
+            }
+        }
+        if (exec.prof.enabled) {
+            std.debug.print("[hprof] window.drain rows={d} batches={d} upstream={d:.2} ms append={d:.2} ms borrow={} calls={d}\n", .{
+                self.accumulated_rows,
+                drain_batches,
+                exec.prof.ticksToMs(drain_up_ticks),
+                exec.prof.ticksToMs(drain_ap_ticks),
+                self.borrowing,
+                self.calls.len,
+            });
+            if (exec.prof.ticksToMs(drain_up_ticks) > 100.0) explain: {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(self.allocator);
+                self.upstream.explain(&buf, self.allocator, 2) catch break :explain;
+                std.debug.print("[hprof] window.drain slow upstream plan:\n{s}", .{buf.items});
+            }
         }
         // Borrowed stores are row-aligned by the compile-time contract
         // (no filters in the chain); a mismatch means that contract broke.

@@ -764,6 +764,15 @@ const AdaptiveGroupBy = struct {
         if (self.routed) return;
         self.routed = true;
         for (self.stages) |s| try s.ensureRun();
+        const trace_gb = getenv("THINDB_TRACE_GBROUTE") != null;
+        if (trace_gb) {
+            std.debug.print("[gbroute-adaptive] keys={d} aggs=", .{self.group_cols.len});
+            for (self.aggs) |a| std.debug.print("{s},", .{@tagName(a.func)});
+            std.debug.print(
+                " upper_rows={d} max_dop={d} top_k={} emit_limit={} stages={d}\n",
+                .{ self.up.stats().upper_rows, self.max_dop, self.top_k != null, self.emit_limit != null, self.stages.len },
+            );
+        }
         // A plain (no top-k / no limit) GROUP BY over a buffer with a realized
         // row count worth threading: try the specialized serial-beating paths
         // (sorted-stream, radix) first, and if both decline — the string-key /
@@ -774,13 +783,16 @@ const AdaptiveGroupBy = struct {
             getenv("THINDB_NO_PARALLEL_GROUP") == null)
         {
             if (try group_route.routeStreamGroupBy(self.allocator, &self.up, self.group_cols, self.aggs, self.budget)) |q| {
+                if (trace_gb) std.debug.print("[gbroute-adaptive]   -> stream\n", .{});
                 self.chosen = q;
                 return;
             }
             if (try group_route.routeRadixGroupBy(self.up, self.group_cols, self.aggs, self.top_k, self.emit_limit)) |q| {
+                if (trace_gb) std.debug.print("[gbroute-adaptive]   -> radix\n", .{});
                 self.chosen = q;
                 return;
             }
+            if (trace_gb) std.debug.print("[gbroute-adaptive]   -> partitioned\n", .{});
             self.chosen = try partitioned_aggregate.PartitionedAggregate.create(
                 self.allocator,
                 self.up,
@@ -790,6 +802,7 @@ const AdaptiveGroupBy = struct {
             );
             return;
         }
+        if (trace_gb) std.debug.print("[gbroute-adaptive]   -> serial routeGroupBy (gate failed)\n", .{});
         self.chosen = try group_route.routeGroupBy(
             self.allocator,
             &self.up,
@@ -2632,6 +2645,11 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     input.db.config.query_memory_budget,
                     input.effectiveDop(),
                 );
+            }
+            if (getenv("THINDB_TRACE_GBROUTE") != null) {
+                std.debug.print("[gbroute-compile] no stages beneath group_by: keys={d} aggs=", .{g.group_cols.len});
+                for (g.aggs) |a| std.debug.print("{s},", .{@tagName(a.func)});
+                std.debug.print(" upper_rows={d}\n", .{up.stats().upper_rows});
             }
             return group_route.routeGroupBy(
                 input.allocator,

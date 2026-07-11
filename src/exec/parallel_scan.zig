@@ -477,6 +477,8 @@ pub const ParallelScan = struct {
     round_gen: std.atomic.Value(u32) = .{ .raw = 0 },
     round_done: std.atomic.Value(u32) = .{ .raw = 0 },
     pool_shutdown: std.atomic.Value(bool) = .{ .raw = false },
+    prof_round_ticks: i64 = 0,
+    prof_rounds: usize = 0,
 
     // Materialize-mode state (fused-filter path). Chosen lazily on the first
     // next() once we know whether a filter was fused in. `wbufs`/`emit_views`
@@ -1497,6 +1499,11 @@ pub const ParallelScan = struct {
     /// long unfiltered scan no longer pays N thread spawns per round.
     fn runRound(self: *ParallelScan) !void {
         const n = self.workers.len;
+        const _rt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        defer if (exec.prof.enabled) {
+            self.prof_round_ticks += @max(0, exec.prof.nowTicks() - _rt);
+            self.prof_rounds += 1;
+        };
         if (!self.pool_started) self.startRoundPool();
 
         for (self.round) |*r| r.* = null;
@@ -1528,7 +1535,19 @@ pub const ParallelScan = struct {
         // Stream exhausted: tear the pool down so its threads stop spinning. The
         // already-staged batches in `round[]` stay valid (they alias the worker
         // Scans, freed only in deinit) and are emitted by `nextRound`.
-        if (all) self.shutdownRoundPool();
+        if (all) {
+            self.shutdownRoundPool();
+            if (exec.prof.enabled) {
+                std.debug.print("[hprof] pscan.rounds ordered={} chunks={d} threads={d} rounds={d} round_wall={d:.2} ms compute_fused={}\n", .{
+                    self.ordered,
+                    n,
+                    self.eff_threads,
+                    self.prof_rounds,
+                    exec.prof.ticksToMs(self.prof_round_ticks),
+                    self.compute_fused,
+                });
+            }
+        }
     }
 
     /// Claim chunk-scans from `next_chunk` and run one `next()` on each into its
@@ -1849,6 +1868,11 @@ fn exprFusable(e: Expr, scan_cols: []const Column) bool {
             }
             return true;
         },
+        // CASE stays serial by MEASUREMENT, not capability: the per-stripe
+        // Compute instances evaluate it correctly (own CasePlan per op), but
+        // the wayroll A/B (2026-07-11) showed fusing CASE-heavy chains is a
+        // net loss — the work is memory-bandwidth-bound, so N workers buy
+        // nothing while the per-chunk operator instances add allocation cost.
         .case, .scalar_subquery, .exists_subquery, .var_ref => false,
     };
 }
