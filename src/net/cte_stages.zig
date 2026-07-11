@@ -2862,10 +2862,112 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             errdefer left.deinit();
             var right = try compileUnionArm(input, u.right, map);
             errdefer right.deinit();
+            // Pre-push lossless widening casts into the arms so the exec
+            // union is cast-free: rebatched()'s serial per-batch kernels
+            // disappear, and a join's probe sink can forward into BOTH arms
+            // (a cast arm otherwise pins the union's serial lane — on the
+            // wayroll rollforward that lane carried the heavy 3.2M-row arm).
+            // The cast Compute fuses into the arm's stripe workers, or rides
+            // the ChainForward terminal push when a probe later chains
+            // through it; worst case it evaluates where rebatched would
+            // have, so this can't regress.
+            try unifyUnionArmTypes(input, &left, &right);
             return exec.SetUnion.create(input.allocator, left, right, u.all);
         },
         else => return error.UnsupportedQueryShape,
     }
+}
+
+/// Integer-family widening rank; null for anything outside the family.
+fn intRank(t: types.Type) ?u8 {
+    return switch (t) {
+        .tinyint => 0,
+        .smallint => 1,
+        .int => 2,
+        .bigint => 3,
+        .largeint => 4,
+        else => null,
+    };
+}
+
+/// The scalar conversion fn implementing a lossless widening to `t`.
+fn wideningFnName(t: types.Type) ?[]const u8 {
+    return switch (t) {
+        .smallint => "to_smallint",
+        .int => "to_int",
+        .bigint => "to_bigint",
+        .largeint => "to_largeint",
+        .double => "to_double",
+        .datetime => "to_datetime",
+        else => null,
+    };
+}
+
+/// The common type both union arms should widen to — ONLY when the pair is
+/// a lossless, unambiguous widening (int-family → the wider member;
+/// float/double → double; date/datetime → datetime, a date being its own
+/// midnight). Everything else returns null and stays on the exec union's
+/// own cast kernels, exactly as before.
+fn unionWideningType(l: types.Type, r: types.Type) ?types.Type {
+    if (std.meta.activeTag(l) == std.meta.activeTag(r)) return null; // no cast needed
+    if (intRank(l)) |lr| {
+        if (intRank(r)) |rr| return if (lr > rr) l else r;
+        return null;
+    }
+    const lf = l == .float or l == .double;
+    const rf = r == .float or r == .double;
+    if (lf and rf) return .double;
+    const ld = l == .date or l == .datetime;
+    const rd = r == .date or r == .datetime;
+    if (ld and rd) return .datetime;
+    return null;
+}
+
+/// Rewrite each arm so cast-needing columns are widened INSIDE the arm
+/// (fused into its scan workers where the chain allows) instead of by the
+/// union's serial per-batch kernels. Only the safe widening subset — see
+/// `unionWideningType`. Arm ownership transfers into the wrapping Compute
+/// on success; on ANY failure the arms are left exactly as passed in.
+fn unifyUnionArmTypes(input: engine_v2.CompileInput, left: *exec.Query, right: *exec.Query) !void {
+    const ls = left.outputSchema();
+    const rs = right.outputSchema();
+    if (ls.len != rs.len) return; // SetUnion.create reports the real error
+    var l_derived: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    var r_derived: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    const trace_jf = getenv("THINDB_TRACE_JOINFUSE") != null;
+    for (ls, rs) |lc, rc| {
+        const common = unionWideningType(lc.type, rc.type) orelse {
+            if (trace_jf and std.meta.activeTag(lc.type) != std.meta.activeTag(rc.type)) {
+                std.debug.print("[jf]   union widen skip: {s} {s} vs {s}\n", .{ lc.name, @tagName(lc.type), @tagName(rc.type) });
+            }
+            continue;
+        };
+        const fn_name = wideningFnName(common) orelse continue;
+        if (std.meta.activeTag(lc.type) != std.meta.activeTag(common)) {
+            try l_derived.append(input.node_arena, try castDerived(input.node_arena, lc.name, fn_name));
+        }
+        if (std.meta.activeTag(rc.type) != std.meta.activeTag(common)) {
+            try r_derived.append(input.node_arena, try castDerived(input.node_arena, rc.name, fn_name));
+        }
+    }
+    if (l_derived.items.len > 0) {
+        left.* = try engine_v2.computeDerivedFused(input.allocator, left.*, l_derived.items, input.udf_registry);
+    }
+    if (r_derived.items.len > 0) {
+        right.* = try engine_v2.computeDerivedFused(input.allocator, right.*, r_derived.items, input.udf_registry);
+    }
+}
+
+/// `name = to_T(name)` — replaces the arm's own output slot in place (a
+/// derived whose name matches an upstream column replaces that slot, order
+/// preserved). Everything lives in the statement's node arena: the Compute
+/// keeps a shallow dupe of the derived list, so the expr internals must
+/// outlive compile.
+fn castDerived(arena: std.mem.Allocator, col_name: []const u8, fn_name: []const u8) !ir.Derived {
+    const name = try arena.dupe(u8, col_name);
+    const args = try arena.alloc(ir.Expr, 1);
+    args[0] = .{ .col_ref = name };
+    return .{ .name = name, .expr = .{ .call = .{ .fn_name = fn_name, .args = args } } };
 }
 
 /// Ride-the-order eligibility: every spec of the (potential rider) window
