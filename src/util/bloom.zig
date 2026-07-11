@@ -104,6 +104,13 @@ pub const Bloom = struct {
         const m = std.mem.readInt(u32, buf[0..4], .little);
         const k = buf[4];
         const bits = buf[5..];
+        // STOPGAP for the manifest-entry lifetime race (#139): a concurrent
+        // compaction commit can free this buffer under a lock the scan path
+        // deliberately doesn't hold, and a freed header read as m == 0 turns
+        // `cur % m` into the 0xc0000094 silent server death. Answering
+        // "maybe" is always safe (callers treat true as can't-rule-out).
+        // The real fix is refcounting the entry's heap fields.
+        if (m == 0 or bits.len * 8 < m) return true;
         const p = positions(h);
         var i: u8 = 0;
         var cur: u32 = p.h1;
