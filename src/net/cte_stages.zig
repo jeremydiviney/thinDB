@@ -603,7 +603,7 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
     if (input.effectiveDop() > 1 and is_probe and
         streamingChainOverStage(op, map, false, true))
     {
-        return buildFusedStreamOverStage(input, op, map, true);
+        return buildFusedStreamOverStage(input, op, map, .deferred);
     }
     return compileBlock(input, op, map);
 }
@@ -843,28 +843,41 @@ const AdaptiveGroupBy = struct {
 /// (parity with MatScan.create's bump), so it cleanly REPLACES the serial leaf
 /// — never built alongside it. Returns null for any other shape (the caller
 /// falls back to the serial `buildGenericBlock`).
-fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, deferred: bool) anyerror!?exec.Query {
+/// How a stage-backed parallel scan seam materializes: `.eager` runs the
+/// stage at compile (round/materialize modes), `.deferred` lazily on first
+/// pull, `.ordered` eagerly with original-row-order emission (the only mode
+/// legal under `force_ordered` — ride/borrow chains).
+const StageScanMode = enum { eager, deferred, ordered };
+
+fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, mode: StageScanMode) anyerror!?exec.Query {
     if (input.effectiveDop() <= 1) return null;
     const stage = switch (op.*) {
         .materialize => map.get(op) orelse return null,
         else => return null,
     };
-    if (deferred) {
-        return try wrapSlicePred(input, try exec.ParallelScan.createOverStageDeferred(
+    return try wrapSlicePred(input, try switch (mode) {
+        .deferred => exec.ParallelScan.createOverStageDeferred(
             input.allocator,
             input.db.allocator,
             stage,
             input.accountant,
             input.effectiveDop(),
-        ));
-    }
-    return try wrapSlicePred(input, try exec.ParallelScan.createOverStage(
-        input.allocator,
-        input.db.allocator,
-        stage,
-        input.accountant,
-        input.effectiveDop(),
-    ));
+        ),
+        .eager => exec.ParallelScan.createOverStage(
+            input.allocator,
+            input.db.allocator,
+            stage,
+            input.accountant,
+            input.effectiveDop(),
+        ),
+        .ordered => exec.ParallelScan.createOverStageOrdered(
+            input.allocator,
+            input.db.allocator,
+            stage,
+            input.accountant,
+            input.effectiveDop(),
+        ),
+    });
 }
 
 /// SEPARABLE slice predicate: wrap a freshly compiled LEAF (a base-table
@@ -2358,36 +2371,36 @@ fn streamingChainOverStage(op: *const ir.Op, map: *StageMap, require_work: bool,
 /// stripe workers (round mode emits batch-at-a-time, no full-result copy).
 /// Mirrors `buildGenericBlock`'s streaming arms but pushes the fusable compute
 /// down via `computeDerivedFused`. Precondition: `streamingChainOverStage`.
-fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, deferred: bool) anyerror!exec.Query {
+fn buildFusedStreamOverStage(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, mode: StageScanMode) anyerror!exec.Query {
     switch (op.*) {
         .materialize => |m| {
-            if (map.get(op) != null) return (try tryStageParallelScan(input, op, map, deferred)) orelse error.UnsupportedQueryShape;
-            return buildFusedStreamOverStage(input, m.upstream, map, deferred);
+            if (map.get(op) != null) return (try tryStageParallelScan(input, op, map, mode)) orelse error.UnsupportedQueryShape;
+            return buildFusedStreamOverStage(input, m.upstream, map, mode);
         },
         .compute => |c| {
-            var up = try buildFusedStreamOverStage(input, c.upstream, map, deferred);
+            var up = try buildFusedStreamOverStage(input, c.upstream, map, mode);
             errdefer up.deinit();
             return engine_v2.computeDerivedFused(input.allocator, up, c.derived, input.udf_registry);
         },
         .filter => |f| {
-            var up = try buildFusedStreamOverStage(input, f.upstream, map, deferred);
+            var up = try buildFusedStreamOverStage(input, f.upstream, map, mode);
             errdefer up.deinit();
             return up.filter(f.predicate);
         },
         .select => |s| {
-            var up = try buildFusedStreamOverStage(input, s.upstream, map, deferred);
+            var up = try buildFusedStreamOverStage(input, s.upstream, map, mode);
             errdefer up.deinit();
             return local.compileSelectProject(input.allocator, up, s);
         },
         .exclude => |e| {
-            var up = try buildFusedStreamOverStage(input, e.upstream, map, deferred);
+            var up = try buildFusedStreamOverStage(input, e.upstream, map, mode);
             errdefer up.deinit();
             const remaining = try local.complementColumns(input.allocator, up.outputSchema(), e.columns);
             defer input.allocator.free(remaining);
             return up.project(remaining);
         },
         .alias => |a| {
-            var up = try buildFusedStreamOverStage(input, a.upstream, map, deferred);
+            var up = try buildFusedStreamOverStage(input, a.upstream, map, mode);
             errdefer up.deinit();
             return exec.AliasRename.create(input.allocator, up, a.alias);
         },
@@ -2407,13 +2420,32 @@ fn compileUnionArm(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageM
         !streamingChainOverStage(op, map, true, false) and
         streamingChainOverStage(op, map, true, true))
     {
-        return buildFusedStreamOverStage(input, op, map, true);
+        return buildFusedStreamOverStage(input, op, map, .deferred);
     }
     return compileBlock(input, op, map);
 }
 
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
-    if (input.effectiveDop() > 1 and !input.force_ordered and streamingChainOverStage(op, map, true, false)) return buildFusedStreamOverStage(input, op, map, false);
+    if (input.effectiveDop() > 1 and streamingChainOverStage(op, map, true, false)) {
+        if (!input.force_ordered) return buildFusedStreamOverStage(input, op, map, .eager);
+        // ride/borrow chains demand source row order — the ORDERED stage
+        // scan provides it while the chain work still evaluates in the
+        // stripe workers. Too-large stages (or the escape hatch) decline
+        // back to the serial chain.
+        if (getenv("THINDB_NO_ORDERED_PSCAN") == null) {
+            if (buildFusedStreamOverStage(input, op, map, .ordered)) |q| {
+                if (getenv("THINDB_TRACE_OPSCAN") != null) std.debug.print("[opscan] ordered seam ENGAGED\n", .{});
+                return q;
+            } else |err| switch (err) {
+                error.UnsupportedQueryShape => {
+                    if (getenv("THINDB_TRACE_OPSCAN") != null) std.debug.print("[opscan] ordered seam DECLINED (shape)\n", .{});
+                },
+                else => return err,
+            }
+        }
+    } else if (input.force_ordered and input.effectiveDop() > 1 and getenv("THINDB_TRACE_OPSCAN") != null) {
+        std.debug.print("[opscan] force_ordered chain NOT streaming-over-stage (op={s})\n", .{@tagName(op.*)});
+    }
     switch (op.*) {
         .scan => |s| {
             // Only pg_catalog virtual scans route here; real-table blocks
@@ -2544,7 +2576,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         .group_by => |g| {
             for (g.aggs) |a| if (a.func == .udf) return error.UnsupportedQueryShape;
-            var up = (try tryStageParallelScan(input, g.upstream, map, false)) orelse
+            var up = (try tryStageParallelScan(input, g.upstream, map, .eager)) orelse
                 try buildGenericBlock(input, g.upstream, map, block_root);
             errdefer up.deinit();
             // Probe-fused join below: aggregate the joined batches inside

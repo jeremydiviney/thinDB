@@ -186,6 +186,70 @@ test "createOverStage: parallel buffer scan preserves the row multiset" {
     for (seen) |s| try std.testing.expect(s); // every row exactly once
 }
 
+test "createOverStageOrdered: emission is the stage's exact row order" {
+    const allocator = std.testing.allocator;
+    const mat_stage = @import("mat_stage.zig");
+
+    const EmitStub = struct {
+        allocator: Allocator,
+        schema: [1]Column = .{.{ .name = "v", .type = .{ .bigint = {} }, .nullable = false }},
+        data: []i64,
+        views: [1]ColumnView = undefined,
+        emitted: bool = false,
+
+        pub fn next(self: *@This()) !?Batch {
+            if (self.emitted) return null;
+            self.emitted = true;
+            self.views[0] = .{ .data = .{ .bigint = self.data }, .nulls = null };
+            return Batch{ .schema = &self.schema, .values = &self.views, .row_count = self.data.len };
+        }
+        pub fn deinit(self: *@This()) void {
+            self.allocator.destroy(self);
+        }
+        pub fn outputSchema(self: *@This()) []const Column {
+            return &self.schema;
+        }
+        pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
+        pub fn stats(_: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        }
+        pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
+            return null;
+        }
+        pub fn explain(_: *@This(), out: *std.ArrayList(u8), a: Allocator, depth: usize) !void {
+            try exec.explainLine(out, a, depth, "EmitStub");
+        }
+    };
+
+    // Several chunks + DOP > 1 so parallel compute happens, then assert the
+    // stream is EXACTLY 0..n-1 in order — the ordered contract ride/borrow
+    // chains rely on (round mode only guarantees the multiset).
+    const n: usize = mat_stage.chunk_rows * 3 + 777;
+    const data = try allocator.alloc(i64, n);
+    defer allocator.free(data);
+    for (data, 0..) |*d, i| d.* = @intCast(i);
+
+    const stub = try allocator.create(EmitStub);
+    stub.* = .{ .allocator = allocator, .data = data };
+    const sq = exec.makeQuery(allocator, stub);
+
+    const set = try mat_stage.StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(sq, null);
+
+    var q = try ParallelScan.createOverStageOrdered(allocator, allocator, stage, null, 3);
+    defer q.deinit();
+
+    var expect_next: i64 = 0;
+    while (try q.next()) |batch| {
+        for (batch.values[0].data.bigint) |v| {
+            try std.testing.expectEqual(expect_next, v);
+            expect_next += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(i64, @intCast(n)), expect_next);
+}
+
 test "createOverStage + fused partial aggregate drains without corruption" {
     const allocator = std.testing.allocator;
     const mat_stage = @import("mat_stage.zig");
@@ -392,6 +456,12 @@ pub const ParallelScan = struct {
     exhausted: []bool, // worker has returned null (done)
     round_cursor: usize, // next round slot to emit; == workers.len ⇒ run a round
     all_done: bool,
+    /// Ordered stage scan: one chunk-scan PER stage chunk, so each worker
+    /// yields exactly one batch and round emission (chunk-index order) IS the
+    /// stage's original row order. `stats` then keeps the source's sort
+    /// property instead of clearing it — the seam a window's ride/borrow
+    /// chain can cross without giving up parallel compute.
+    ordered: bool = false,
 
     // Round-mode persistent worker pool. The fork-join in `runRound` reuses
     // `n_threads-1` long-lived threads (the calling thread is the nth) that
@@ -611,6 +681,33 @@ pub const ParallelScan = struct {
         injected_acct: ?*exec.memory.MemoryAccountant,
         max_dop: usize,
     ) !Query {
+        return createOverStageMode(allocator, worker_alloc_in, stage, injected_acct, max_dop, false);
+    }
+
+    /// Order-preserving variant: emission is the stage's original row order
+    /// (see `ordered` field). One round computes every chunk in parallel and
+    /// holds all its batches until emitted, so the cap below bounds the
+    /// transient footprint; a bigger stage declines (caller compiles serial).
+    pub fn createOverStageOrdered(
+        allocator: Allocator,
+        worker_alloc_in: Allocator,
+        stage: *Stage,
+        injected_acct: ?*exec.memory.MemoryAccountant,
+        max_dop: usize,
+    ) !Query {
+        return createOverStageMode(allocator, worker_alloc_in, stage, injected_acct, max_dop, true);
+    }
+
+    const ORDERED_MAX_CHUNKS: usize = 1024;
+
+    fn createOverStageMode(
+        allocator: Allocator,
+        worker_alloc_in: Allocator,
+        stage: *Stage,
+        injected_acct: ?*exec.memory.MemoryAccountant,
+        max_dop: usize,
+        ordered: bool,
+    ) !Query {
         const worker_alloc = workerAlloc(worker_alloc_in);
         const dop = @max(@as(usize, 1), max_dop);
 
@@ -619,11 +716,15 @@ pub const ParallelScan = struct {
         try stage.ensureRun();
         const result = stage.result orelse return error.UnsupportedQueryShape;
         const total_chunks = result.chunks.items.len;
+        if (ordered and total_chunks > ORDERED_MAX_CHUNKS) return error.UnsupportedQueryShape;
 
         // Each 65536-row chunk is a uniform work unit, so equal-count stripes are
         // already byte-balanced (no footer-weighted partition needed).
         const n_threads = @max(@as(usize, 1), @min(dop, @max(total_chunks, 1)));
-        const n_chunks = @max(n_threads, @min(dop * CHUNK_FACTOR, @max(total_chunks, 1)));
+        const n_chunks = if (ordered)
+            @max(total_chunks, 1)
+        else
+            @max(n_threads, @min(dop * CHUNK_FACTOR, @max(total_chunks, 1)));
 
         const workers = try allocator.alloc(Leaf, n_chunks);
         var built: usize = 0;
@@ -675,6 +776,7 @@ pub const ParallelScan = struct {
             .exhausted = exhausted,
             .round_cursor = n_chunks,
             .all_done = false,
+            .ordered = ordered,
         };
         return makeQuery(allocator, self);
     }
@@ -1119,8 +1221,10 @@ pub const ParallelScan = struct {
         // emission (round steal / drain merge) interleaves stripes — the
         // emitted stream is only the same multiset. Claiming the source's
         // order here would let a downstream sorted-stream GROUP BY consume
-        // scrambled rows as if grouped-adjacent.
-        if (self.n_threads > 1) st.sort_state = .{};
+        // scrambled rows as if grouped-adjacent. The ORDERED stage scan is
+        // the exception: one chunk-scan per stage chunk, emitted in chunk
+        // index order = the source's row order, so its claim stands.
+        if (self.n_threads > 1 and !self.ordered) st.sort_state = .{};
         if (self.out_col_stats.len > 0) {
             return .{ .upper_rows = st.upper_rows, .sort_state = st.sort_state, .column_stats = self.out_col_stats };
         }
@@ -1129,7 +1233,7 @@ pub const ParallelScan = struct {
 
     pub fn explain(self: *ParallelScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
         var buf: [192]u8 = undefined;
-        const tag = if (self.agg_fused) "materialize+partial-agg" else if (self.compute_fused) "materialize+compute" else if (self.workers.len == 0) "deferred" else if (self.workers[0].fusedActive()) "materialize" else "stream";
+        const tag = if (self.ordered) "ordered" else if (self.agg_fused) "materialize+partial-agg" else if (self.compute_fused) "materialize+compute" else if (self.workers.len == 0) "deferred" else if (self.workers[0].fusedActive()) "materialize" else "stream";
         const src_name = if (self.table) |t| t.name else "<buffer>";
         const line = std.fmt.bufPrint(&buf, "ParallelScan {s} (DOP={d}, {s})", .{ src_name, self.n_threads, tag }) catch "ParallelScan";
         try exec.explainLine(out, allocator, depth, line);
