@@ -2426,7 +2426,14 @@ fn compileUnionArm(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageM
 }
 
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
-    if (input.effectiveDop() > 1 and streamingChainOverStage(op, map, true, false)) {
+    if (input.effectiveDop() > 1 and (streamingChainOverStage(op, map, true, false) or
+        // Ordered only: window-input chains usually reach the previous
+        // window's forced stage through a single-ref CTE wrapper — walk
+        // through it (buildFusedStreamOverStage recurses the same way).
+        // The eager compile-time pin this costs is one the borrow chain
+        // holds on that stage anyway.
+        (input.force_ordered and streamingChainOverStage(op, map, true, true))))
+    {
         if (!input.force_ordered) return buildFusedStreamOverStage(input, op, map, .eager);
         // ride/borrow chains demand source row order — the ORDERED stage
         // scan provides it while the chain work still evaluates in the
@@ -2444,7 +2451,25 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             }
         }
     } else if (input.force_ordered and input.effectiveDop() > 1 and getenv("THINDB_TRACE_OPSCAN") != null) {
-        std.debug.print("[opscan] force_ordered chain NOT streaming-over-stage (op={s})\n", .{@tagName(op.*)});
+        var cur = op;
+        var depth: usize = 0;
+        const stop: []const u8 = blk: while (depth < 32) : (depth += 1) {
+            switch (cur.*) {
+                .materialize => {
+                    if (map.get(cur)) |stage| {
+                        break :blk if (stage.stats_upper_rows <= mat_stage.chunk_rows) "mat-small-stats" else "mat-ok?";
+                    }
+                    break :blk "mat-single-ref";
+                },
+                .compute => |c| cur = c.upstream,
+                .filter => |f| cur = f.upstream,
+                .select => |p| cur = p.upstream,
+                .exclude => |e| cur = e.upstream,
+                .alias => |a| cur = a.upstream,
+                else => break :blk @tagName(cur.*),
+            }
+        } else "deep";
+        std.debug.print("[opscan] force_ordered chain declined: root={s} stop={s}\n", .{ @tagName(op.*), stop });
     }
     switch (op.*) {
         .scan => |s| {
