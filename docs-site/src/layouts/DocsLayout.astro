@@ -1,0 +1,108 @@
+---
+import Sidebar from '../components/Sidebar.astro'
+import SearchDialog from '../components/SearchDialog.astro'
+import '../styles/global.css'
+
+interface Props {
+  title: string
+  description: string
+  headings?: { depth: number; slug: string; text: string }[]
+}
+
+const { title, description, headings = [] } = Astro.props
+---
+
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#f7f8f5" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>{title} | thinDB Docs</title>
+    <script is:inline>
+      const storedTheme = localStorage.getItem('thindb-theme')
+      const theme = storedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+      document.documentElement.dataset.theme = theme
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <Sidebar />
+    <div class="nav-scrim" data-close-nav></div>
+
+    <header class="mobile-header">
+      <button class="icon-button" type="button" data-open-nav aria-label="Open navigation">&#x2630;</button>
+      <a href="/" class="mobile-brand">thinDB <span>docs</span></a>
+      <button class="icon-button" type="button" data-toggle-theme aria-label="Toggle color theme">&#x25D0;</button>
+    </header>
+
+    <main class="main-shell" id="main-content">
+      <article class="docs-content">
+        <slot />
+      </article>
+
+      {headings.length > 0 && (
+        <aside class="toc" aria-label="On this page">
+          <strong>On this page</strong>
+          {headings.filter((heading) => heading.depth <= 3).map((heading) => (
+            <a href={`#${heading.slug}`} class:list={{ nested: heading.depth === 3 }}>{heading.text}</a>
+          ))}
+          <button type="button" data-toggle-theme><span aria-hidden="true">&#x25D0;</span> Theme</button>
+        </aside>
+      )}
+    </main>
+
+    <SearchDialog />
+    <script is:inline>
+      const root = document.documentElement
+      const sidebar = document.querySelector('#docs-sidebar')
+      const dialog = document.querySelector('[data-search-dialog]')
+      const input = document.querySelector('[data-search-input]')
+      const searchItems = [...document.querySelectorAll('[data-search-item]')]
+      const empty = document.querySelector('[data-search-empty]')
+
+      document.querySelectorAll('[data-open-nav]').forEach((button) => button.addEventListener('click', () => {
+        sidebar?.classList.add('open')
+        document.body.classList.add('nav-open')
+      }))
+      document.querySelectorAll('[data-close-nav]').forEach((button) => button.addEventListener('click', () => {
+        sidebar?.classList.remove('open')
+        document.body.classList.remove('nav-open')
+      }))
+      document.querySelectorAll('[data-toggle-theme]').forEach((button) => button.addEventListener('click', () => {
+        const next = root.dataset.theme === 'dark' ? 'light' : 'dark'
+        root.dataset.theme = next
+        localStorage.setItem('thindb-theme', next)
+      }))
+      const openSearch = () => {
+        if (dialog && !dialog.open) dialog.showModal()
+        setTimeout(() => input?.focus(), 0)
+      }
+      document.querySelectorAll('[data-open-search]').forEach((button) => button.addEventListener('click', openSearch))
+      document.addEventListener('keydown', (event) => {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+          event.preventDefault()
+          openSearch()
+        }
+      })
+      input?.addEventListener('input', () => {
+        const query = input.value.trim().toLowerCase()
+        let visible = 0
+        searchItems.forEach((item) => {
+          const show = !query || item.dataset.searchText.includes(query)
+          item.hidden = !show
+          if (show) visible += 1
+        })
+        empty.hidden = visible !== 0
+      })
+      document.querySelectorAll('[data-copy-code]').forEach((button) => button.addEventListener('click', async () => {
+        const code = button.closest('.code-block')?.querySelector('code')?.textContent || ''
+        await navigator.clipboard.writeText(code)
+        button.textContent = 'Copied'
+        setTimeout(() => { button.textContent = 'Copy' }, 1200)
+      }))
+    </script>
+  </body>
+</html>

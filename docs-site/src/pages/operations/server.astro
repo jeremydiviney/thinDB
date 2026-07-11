@@ -1,0 +1,70 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import CodeBlock from '../../components/CodeBlock.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'baseline', text: 'Production baseline' },
+  { depth: 2, slug: 'listeners-and-access', text: 'Listeners and access' },
+  { depth: 2, slug: 'memory', text: 'Memory budgets' },
+  { depth: 2, slug: 'parallelism-and-compaction', text: 'Parallelism and compaction' },
+  { depth: 2, slug: 'diagnostics', text: 'Diagnostics' },
+]
+---
+<DocsLayout title="Server configuration" description="Configure thinDB listeners, memory, parallelism, files, authentication, and diagnostics." headings={headings}>
+  <PageHeader eyebrow="Operate" title="Server configuration" description="The standalone server opens one shared catalog and exposes any combination of MySQL, PostgreSQL, and native listeners. Tune memory and worker limits to the machine, not to a cluster." />
+  <h2 id="baseline">Production baseline</h2>
+  <CodeBlock language="bash" code={`thindb-server \
+  --data-dir /var/lib/thindb \
+  --bind 10.0.10.15 \
+  --mysql-port 3306 \
+  --pg-port 5432 \
+  --native-port 0 \
+  --mysql-password "$THINDB_MYSQL_PASSWORD" \
+  --pg-password "$THINDB_PG_PASSWORD" \
+  --max-connections 256 \
+  --idle-timeout-secs 1800 \
+  --max-dop 8 \
+  --memory-budget 16G \
+  --query-memory-budget 4G \
+  --cache-size 8G`} />
+  <p>Pass bytes directly or use <code>K</code>, <code>M</code>, and <code>G</code> suffixes where supported. The data directory is created if absent.</p>
+
+  <h2 id="listeners-and-access">Listeners and access</h2>
+  <div class="table-scroll"><table><thead><tr><th>Flag</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+    <tr><td><code>--data-dir PATH</code></td><td>required</td><td>Catalog root and Zig-function persistence/build root.</td></tr>
+    <tr><td><code>--bind ADDR</code></td><td><code>0.0.0.0</code></td><td>Bind interface shared by enabled listeners.</td></tr>
+    <tr><td><code>--mysql-port PORT</code></td><td><code>3306</code></td><td>MySQL listener; <code>0</code> disables.</td></tr>
+    <tr><td><code>--pg-port PORT</code></td><td><code>5432</code></td><td>PostgreSQL listener; <code>0</code> disables.</td></tr>
+    <tr><td><code>--native-port PORT</code></td><td><code>7878</code></td><td>thinDB native listener; <code>0</code> disables.</td></tr>
+    <tr><td><code>--mysql-password PW</code></td><td>trust</td><td>Require MySQL native-password authentication.</td></tr>
+    <tr><td><code>--pg-password PW</code></td><td>trust</td><td>Require PostgreSQL SCRAM-SHA-256 authentication.</td></tr>
+    <tr><td><code>--max-connections N</code></td><td><code>256</code></td><td>Process-wide cap across all wires.</td></tr>
+    <tr><td><code>--idle-timeout-secs N</code></td><td><code>0</code></td><td>Close connections after read silence; zero disables.</td></tr>
+    <tr><td><code>--file-root PATH</code></td><td>disabled</td><td>Allow SQL file scans only beneath this root.</td></tr>
+    <tr><td><code>--xa-timeout-secs N</code></td><td><code>86400</code></td><td>Rollback stale prepared XA branches; zero disables.</td></tr>
+  </tbody></table></div>
+  <Callout type="warning" title="Secret handling"><p>Password flags place secrets in process arguments, which may be visible to local process-inspection tools. Restrict host access and process visibility; a dedicated secret-source option is not currently exposed.</p></Callout>
+
+  <h2 id="memory">Memory budgets</h2>
+  <div class="table-scroll"><table><thead><tr><th>Flag</th><th>Automatic behavior</th><th>Controls</th></tr></thead><tbody>
+    <tr><td><code>--query-memory-budget B</code></td><td>Approximately 25% of physical RAM, floor 256 MiB.</td><td>One query's blocking operators.</td></tr>
+    <tr><td><code>--memory-budget B</code></td><td>Approximately 50% of physical RAM, floor 256 MiB.</td><td>Shared reservations across concurrent queries.</td></tr>
+    <tr><td><code>--cache-size B</code></td><td>Current engine auto-sizing uses approximately 35% of RAM, floor 256 MiB.</td><td>Per-table decompressed block buffer pools.</td></tr>
+  </tbody></table></div>
+  <p>Sorts, hash group-by, hash-join build sides, sort-merge buffers, and materialization reserve query memory. The decompressed block cache is a separate bucket. A tracked budget of <code>0</code> disables that tracker.</p>
+  <Callout type="warning" title="No spill"><p>Blocking operators do not spill to disk. A query that cannot fit its estimated or actual budget fails with <code>MemoryBudgetExceeded</code> instead of silently degrading.</p></Callout>
+
+  <h2 id="parallelism-and-compaction">Parallelism and compaction</h2>
+  <div class="table-scroll"><table><thead><tr><th>Flag</th><th>Meaning</th></tr></thead><tbody>
+    <tr><td><code>--max-dop N</code></td><td>Maximum scan/filter workers per query, further limited by a shared worker-slot budget.</td></tr>
+    <tr><td><code>--compact-threads N</code></td><td>Threads used for block encode/compress during compaction; zero selects about 25% of physical cores.</td></tr>
+    <tr><td><code>--no-compaction</code></td><td>Disables the background compactor. Use only as an operational escape hatch; segment count will grow.</td></tr>
+  </tbody></table></div>
+
+  <h2 id="diagnostics">Diagnostics</h2>
+  <ul><li><code>--profile-ops</code> prints inclusive per-operator timings after each query.</li><li><code>--trace-group-by</code> prints hash/sort/radix routing inputs and decisions.</li><li><code>--force-group-by auto|hash|sort|radix</code> overrides routing for diagnosis and benchmarks.</li><li><code>THINDB_MYSQL_PROFILE=1</code> logs per-connection MySQL protocol phase timings.</li><li><code>--scan-batch N</code> overrides the scan sub-batch size for diagnostics.</li><li><code>--version</code> and <code>--help</code> report the binary build and current flags.</li></ul>
+  <Callout type="note" title="Diagnostic overrides"><p>Forced group-by and scan-batch settings are process-wide diagnostic controls. Do not use benchmark overrides as unexplained production defaults.</p></Callout>
+  <PageLinks previous={{ label: 'Embedded UDFs', href: '/functions/embedded/' }} next={{ label: 'Storage and durability', href: '/operations/storage/' }} />
+</DocsLayout>

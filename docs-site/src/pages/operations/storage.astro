@@ -1,0 +1,40 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'write-path', text: 'Write path' },
+  { depth: 2, slug: 'flush', text: 'Flush' },
+  { depth: 2, slug: 'wal', text: 'Write-ahead log' },
+  { depth: 2, slug: 'segments', text: 'Segments and pruning' },
+  { depth: 2, slug: 'compaction', text: 'Compaction' },
+  { depth: 2, slug: 'read-consistency', text: 'Read consistency' },
+]
+---
+<DocsLayout title="Storage and durability" description="Understand thinDB memtables, WAL, segments, flush, compaction, and snapshot reads." headings={headings}>
+  <PageHeader eyebrow="Operate" title="Storage and durability" description="Writes enter a mutable in-memory table and become immutable, sorted columnar segments. WAL, atomic manifests, tombstones, and compaction provide the local durability lifecycle." />
+  <h2 id="write-path">Write path</h2>
+  <ol class="steps"><li><strong>Validate and append.</strong> Values are checked against the strict table schema and accumulated in a memtable.</li><li><strong>Log when enabled.</strong> Insert/delete records enter the per-table WAL before the operation acknowledges.</li><li><strong>Flush.</strong> The memtable is sorted by the order key and encoded into an immutable segment.</li><li><strong>Publish.</strong> A replacement manifest is written and atomically renamed into place.</li><li><strong>Compact.</strong> Background merges combine segments and apply tombstones.</li></ol>
+
+  <h2 id="flush">Flush</h2>
+  <p>A flush fires when any configured row, byte, or age threshold is met. Defaults are 1,000,000 rows, 64 MiB, or roughly 30 seconds from the first write. The server runs the background sweep; embedded applications must run <code>Database.runBackgroundFlusher</code>, invoke <code>backgroundFlushSweep</code>, or call <code>Table.flush</code> explicitly.</p>
+  <Callout type="warning" title="Embedded shutdown"><p>Without WAL or an explicit flush, rows remaining only in a memtable are lost when the process exits. Tests and batch jobs that require persisted data should end with <code>t.flush()</code>.</p></Callout>
+
+  <h2 id="wal">Write-ahead log</h2>
+  <p>When enabled, insert and delete batches append to a per-table WAL and fsync before returning. Reopen replays entries that were not captured by a completed segment flush. Group commit is used by the server write path to amortize concurrent durability work.</p>
+  <p>Batch rows in one insert when possible: the WAL durability cost is per insert/delete call, not per row. Segment durability and manifest syncing are controlled separately by the embedded <code>sync_mode</code>.</p>
+
+  <h2 id="segments">Segments and pruning</h2>
+  <p>Each segment contains rows sorted by the table order key and divided into row groups (65,536 rows by default). Column blocks carry encoding/compression metadata, validity bits where nullable, and statistics such as min, max, sum, and null count.</p>
+  <p>Manifest and row-group statistics support range pruning. Encodings include fixed-width, dictionary, frame-of-reference, run-length, and string compression paths selected by column shape. Decoded blocks enter an LRU buffer pool and remain pinned while in use.</p>
+
+  <h2 id="compaction">Compaction</h2>
+  <p>Compaction performs a sorted merge, resolves last-writer-wins rows for unique keys, removes tombstoned rows, writes replacement segments, and atomically publishes a new manifest. Background selection considers segment count and tombstone pressure.</p>
+  <p>Old segments remain safe for readers already holding a snapshot. Physical deletion waits until the relevant ownership and snapshot rules permit it.</p>
+
+  <h2 id="read-consistency">Read consistency</h2>
+  <p>A query captures a manifest and memtable snapshot at start. It sees a stable combination of published segments and eligible in-memory rows even while writers flush or compact. Reads run concurrently; write orchestration serializes catalog/table mutations.</p>
+  <Callout type="note" title="Isolation boundary"><p>This snapshot behavior protects a single query. It is not a general multi-statement transaction or cross-table atomic snapshot contract.</p></Callout>
+  <PageLinks previous={{ label: 'Server configuration', href: '/operations/server/' }} next={{ label: 'Data types', href: '/reference/data-types/' }} />
+</DocsLayout>

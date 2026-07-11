@@ -1,0 +1,42 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'support-matrix', text: 'Support matrix' },
+  { depth: 2, slug: 'wire-compatibility', text: 'Wire compatibility' },
+  { depth: 2, slug: 'sql-limitations', text: 'SQL limitations' },
+  { depth: 2, slug: 'operational-limitations', text: 'Operational limitations' },
+  { depth: 2, slug: 'not-a-drop-in-replacement', text: 'Not a drop-in replacement' },
+]
+---
+<DocsLayout title="Compatibility" description="thinDB SQL and wire-protocol support matrix and current limitations." headings={headings}>
+  <PageHeader eyebrow="Reference" title="Compatibility and limitations" description="thinDB speaks familiar protocols and accepts a focused analytical SQL dialect. Protocol compatibility does not imply complete MySQL or PostgreSQL server behavior." />
+  <h2 id="support-matrix">Support matrix</h2>
+  <div class="table-scroll"><table><thead><tr><th>Area</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+    <tr><td>MySQL wire</td><td><span class="tag">Supported</span></td><td>Handshake, auth, text queries, binary prepared statements, result metadata, errors, common driver probes.</td></tr>
+    <tr><td>PostgreSQL wire</td><td><span class="tag">Supported</span></td><td>Startup/auth, Simple and Extended Query, cancellation, COPY streaming, result metadata, common catalog probes.</td></tr>
+    <tr><td>DDL/DML</td><td><span class="tag">Supported</span></td><td>Catalog/schema/table lifecycle, CTAS, insert/select, update, delete, upsert, temporary tables, views.</td></tr>
+    <tr><td>Analytical SELECT</td><td><span class="tag">Supported</span></td><td>Grouping, exact aggregates, joins, windows, CTEs, subqueries, sorting, limits.</td></tr>
+    <tr><td>General transactions</td><td><span class="tag tag-warning">Not supported</span></td><td>No multi-statement atomicity or rollback for ordinary SQL writes.</td></tr>
+    <tr><td>Distributed operation</td><td><span class="tag tag-warning">Not planned</span></td><td>Single process, single node, local storage.</td></tr>
+    <tr><td>Spill to disk</td><td><span class="tag tag-warning">Not supported</span></td><td>Blocking operators must fit configured memory budgets.</td></tr>
+    <tr><td>Language Zig UDFs</td><td><span class="tag">Preview</span></td><td>Trusted native table functions, ABI v3.</td></tr>
+  </tbody></table></div>
+
+  <h2 id="wire-compatibility">Wire compatibility</h2>
+  <p>thinDB includes canned responses and catalog surfaces needed by common drivers and pools. MySQL namespace encoding and PostgreSQL catalog emulation intentionally cover client interoperability, not every server variable, system table, extension, or administrative command.</p>
+  <ul><li>MySQL uses <code>?</code> prepared placeholders and PostgreSQL uses <code>$N</code>.</li><li>Both wires support trust mode or one configured server password, not a full user/role catalog.</li><li>Client cancellation and connection limits are supported.</li><li>Type metadata is mapped to the closest wire type, but dialect-specific edge behavior can differ.</li></ul>
+
+  <h2 id="sql-limitations">SQL limitations</h2>
+  <ul><li><code>UNION ALL</code> is implemented; duplicate-eliminating <code>UNION</code> is not.</li><li>Searched <code>CASE WHEN</code> is implemented; simple <code>CASE expression WHEN value</code> is not.</li><li>SQL join types are inner, left, right, and full; semi, anti, cross, and natural join syntax is absent.</li><li>Join <code>ON</code> clauses accept supported equality/range shapes, not arbitrary boolean expressions; range joins are inner-only.</li><li><code>NTILE</code>, <code>CUME_DIST</code>, and <code>PERCENT_RANK</code> are reserved but not executed.</li><li><code>EXPLAIN ANALYZE</code> currently produces a plan without running the query.</li><li>SQL functions return tables. Procedural stored functions and scalar SQL UDF syntax are absent.</li><li>View column lists such as <code>CREATE VIEW v(a,b) AS ...</code> are not supported.</li><li><code>COPY</code> accepts text format over STDIN/STDOUT; CSV and server-side paths are rejected.</li><li>Foreign keys, secondary indexes, triggers, stored procedures, and a general privilege model are not present.</li></ul>
+
+  <h2 id="operational-limitations">Operational limitations</h2>
+  <ul><li>No replication, high-availability protocol, sharding, or distributed query execution.</li><li>No general transaction isolation across statements or tables. <code>BEGIN</code>/<code>COMMIT</code>/<code>ROLLBACK</code> compatibility responses maintain driver state but do not provide rollback semantics.</li><li>XA support targets connector/checkpoint workflows and should not be interpreted as a general OLTP transaction manager.</li><li><code>TIMESTAMPTZ</code> is timezone-naive after parsing.</li><li>Zig functions are trusted native code and are not sandboxed.</li><li>Data-directory backup/restore orchestration and online replication are application/operator responsibilities.</li></ul>
+  <Callout type="warning" title="Durability is configurable"><p>Do not equate a successful write with power-loss durability unless WAL and the relevant sync behavior are enabled for your deployment. Validate recovery with the exact configuration and filesystem you plan to operate.</p></Callout>
+
+  <h2 id="not-a-drop-in-replacement">Not a drop-in replacement</h2>
+  <p>Use MySQL/PostgreSQL drivers as transport adapters to thinDB, not as evidence that every ORM migration, administrative tool, or vendor-specific query will work unchanged. Qualify critical application SQL against this reference and an integration test suite.</p>
+  <PageLinks previous={{ label: 'Data types', href: '/reference/data-types/' }} />
+</DocsLayout>

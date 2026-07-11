@@ -1,0 +1,22 @@
+---
+import { flatNavigation } from '../data/navigation'
+---
+
+<dialog class="search-dialog" data-search-dialog>
+  <form method="dialog" class="search-shell">
+    <label class="search-field">
+      <span aria-hidden="true">&#x2315;</span>
+      <input type="search" placeholder="Search pages..." autocomplete="off" data-search-input />
+      <button type="submit" aria-label="Close search">Esc</button>
+    </label>
+    <div class="search-results" data-search-results>
+      {flatNavigation.map((item) => (
+        <a href={item.href} data-search-item data-search-text={`${item.label} ${item.description}`.toLowerCase()}>
+          <strong>{item.label}</strong>
+          <span>{item.description}</span>
+        </a>
+      ))}
+      <p class="search-empty" data-search-empty hidden>No matching pages.</p>
+    </div>
+  </form>
+</dialog>

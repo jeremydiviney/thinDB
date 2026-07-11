@@ -1,0 +1,56 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import CodeBlock from '../../components/CodeBlock.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'join-types', text: 'Join types' },
+  { depth: 2, slug: 'equality-joins', text: 'Equality joins' },
+  { depth: 2, slug: 'range-joins', text: 'Range joins' },
+  { depth: 2, slug: 'execution', text: 'Execution behavior' },
+  { depth: 2, slug: 'limitations', text: 'Current limitations' },
+]
+---
+<DocsLayout title="Joins" description="Join tables in thinDB using equality and supported range predicates." headings={headings}>
+  <PageHeader eyebrow="SQL guide" title="Joins" description="Combine columnar relations with inner, left, right, and full joins over equality and supported range predicates. thinDB selects from several local algorithms without a distributed planner." />
+  <h2 id="join-types">Join types</h2>
+  <div class="table-scroll"><table><thead><tr><th>SQL form</th><th>Result</th></tr></thead><tbody>
+    <tr><td><code>INNER JOIN</code> / <code>JOIN</code></td><td>Rows with matching keys or supported range predicates.</td></tr>
+    <tr><td><code>LEFT [OUTER] JOIN</code></td><td>All left rows, null-extending unmatched right columns.</td></tr>
+    <tr><td><code>RIGHT [OUTER] JOIN</code></td><td>All right rows, null-extending unmatched left columns.</td></tr>
+    <tr><td><code>FULL [OUTER] JOIN</code></td><td>All matched and unmatched rows from both sides.</td></tr>
+  </tbody></table></div>
+
+  <h2 id="equality-joins">Equality joins</h2>
+  <CodeBlock language="sql" code={`SELECT i.invoice_id, c.name, i.amount
+FROM invoices AS i
+JOIN customers AS c
+  ON i.customer_id = c.customer_id
+ AND i.division_id = c.division_id;
+
+SELECT c.customer_id
+FROM customers c
+LEFT JOIN invoices i ON c.customer_id = i.customer_id
+WHERE i.invoice_id IS NULL;`} />
+  <p>Composite equality joins are supported. Qualify columns in multi-table queries so the parser can assign each key to the correct side.</p>
+  <Callout type="note" title="Outer join keys"><p>The executor drops the right-side copy of equality join keys. For unmatched right rows in <code>RIGHT</code> and <code>FULL</code> joins, the retained left key is null rather than a SQL-standard coalesced key. Project and coalesce explicit non-key columns when that distinction matters.</p></Callout>
+
+  <h2 id="range-joins">Range joins</h2>
+  <CodeBlock language="sql" code={`SELECT e.event_id, p.price
+FROM events e
+JOIN prices p
+  ON e.product_id = p.product_id
+ AND e.occurred_at >= p.valid_from
+ AND e.occurred_at < p.valid_to;`} />
+  <p>Inner joins may combine equality keys with supported inequality ranges. The engine includes a range-sweep path for compatible shapes. General boolean predicates are not a fallback nested-loop expression language; the parser validates the supported join predicate structure.</p>
+
+  <h2 id="execution">Execution behavior</h2>
+  <p>The execution layer includes hash join, sort-merge join, nested-loop join, and range-sweep join. The <code>auto</code> route uses manifest statistics and can respond to skew. Algorithm choice is internal physical execution, not a semantic SQL rewrite.</p>
+  <ul><li>Order keys and segment statistics can reduce scan work before the join.</li><li>Hash execution is effective for ordinary equality joins that fit the query budget.</li><li>Sort-merge provides a bounded path for ordered inputs and skewed keys.</li><li>Nested-loop is reserved for shapes where the other algorithms do not apply.</li></ul>
+
+  <h2 id="limitations">Current limitations</h2>
+  <Callout type="warning" title="ON predicates"><p>Arbitrary <code>OR</code> expressions and unrestricted computed boolean predicates in <code>ON</code> are rejected. Non-equality ranges are limited to inner joins. Use equality keys plus supported range clauses, or move single-table filters into <code>WHERE</code> before joining.</p></Callout>
+  <p><code>SEMI JOIN</code>, <code>ANTI JOIN</code>, <code>CROSS JOIN</code>, <code>NATURAL JOIN</code>, and broad MySQL/PostgreSQL join-hint compatibility are not implemented in the SQL parser. Express semi/anti behavior with <code>EXISTS</code>/<code>NOT EXISTS</code> or supported outer-join shapes, and prefer explicit <code>ON left.key = right.key</code> predicates.</p>
+  <PageLinks previous={{ label: 'Query data', href: '/sql/queries/' }} next={{ label: 'Window functions', href: '/sql/windows/' }} />
+</DocsLayout>

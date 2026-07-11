@@ -1,0 +1,65 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro'
+import PageHeader from '../components/PageHeader.astro'
+import CodeBlock from '../components/CodeBlock.astro'
+import Callout from '../components/Callout.astro'
+import PageLinks from '../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'prerequisites', text: 'Prerequisites' },
+  { depth: 2, slug: 'build', text: 'Build' },
+  { depth: 2, slug: 'start-the-server', text: 'Start the server' },
+  { depth: 2, slug: 'create-a-table', text: 'Create a table' },
+  { depth: 2, slug: 'development-commands', text: 'Development commands' },
+]
+---
+<DocsLayout title="Install and run" description="Build thinDB with Zig and start the standalone server." headings={headings}>
+  <PageHeader eyebrow="Start" title="Install and run thinDB" description="Build from source with Zig 0.16, start all three wire listeners, and verify the database with an ordinary SQL client." />
+  <h2 id="prerequisites">Prerequisites</h2>
+  <ul><li><strong>Zig 0.16</strong> on your <code>PATH</code>.</li><li>A writable data directory.</li><li>Optionally, <code>mysql</code>, <code>psql</code>, or an application driver for a wire-protocol smoke test.</li></ul>
+  <Callout type="warning" title="Version requirement"><p>thinDB targets Zig 0.16. Zig language and standard-library APIs are not stable across older releases, so builds with 0.14 or 0.15 are not supported.</p></Callout>
+
+  <h2 id="build">Build</h2>
+  <CodeBlock language="powershell" code={`git clone <repository-url> thindb
+cd thindb
+zig version
+zig build -Doptimize=ReleaseFast`} />
+  <p>The default install step produces the library and <code>zig-out/bin/thindb-server</code> (or <code>.exe</code> on Windows). Use a debug build while changing the engine and <code>ReleaseFast</code> for realistic query performance.</p>
+
+  <h2 id="start-the-server">Start the server</h2>
+  <CodeBlock language="powershell" title="Direct executable" code={`.\\zig-out\\bin\\thindb-server.exe ` + "`" + `
+  --data-dir .\\thindb-data ` + "`" + `
+  --bind 127.0.0.1 ` + "`" + `
+  --mysql-port 3306 ` + "`" + `
+  --pg-port 5432 ` + "`" + `
+  --native-port 7878`} />
+  <CodeBlock language="powershell" title="Through the Zig build runner" code={`zig build server -Doptimize=ReleaseFast -- --data-dir .\\thindb-data`} />
+  <p>Set any listener port to <code>0</code> to disable it. All enabled wires share the same catalog, so a table created through PostgreSQL is immediately visible through MySQL.</p>
+
+  <h2 id="create-a-table">Create a table</h2>
+  <CodeBlock language="sql" code={`CREATE TABLE page_views (
+  view_id BIGINT PRIMARY KEY,
+  site_id INT NOT NULL,
+  viewed_at DATETIME NOT NULL,
+  path VARCHAR(512) NOT NULL,
+  duration_ms INT
+);
+
+INSERT INTO page_views VALUES
+  (1, 7, '2026-07-10 10:30:00', '/pricing', 1840),
+  (2, 7, '2026-07-10 10:31:10', '/docs', 3200);
+
+SELECT site_id, COUNT(*) AS views, AVG(duration_ms) AS avg_duration
+FROM page_views
+GROUP BY site_id;`} />
+
+  <h2 id="development-commands">Development commands</h2>
+  <div class="table-scroll"><table><thead><tr><th>Command</th><th>Purpose</th></tr></thead><tbody>
+    <tr><td><code>zig build</code></td><td>Debug build.</td></tr>
+    <tr><td><code>zig build test</code></td><td>Run Zig unit and integration tests.</td></tr>
+    <tr><td><code>zig build test -Dtest-filter="scan"</code></td><td>Run tests matching a name filter.</td></tr>
+    <tr><td><code>zig build -Doptimize=ReleaseFast</code></td><td>Build optimized production artifacts.</td></tr>
+    <tr><td><code>zig build bench</code></td><td>Run the benchmark suite in ReleaseFast mode.</td></tr>
+    <tr><td><code>zig build server -- --help</code></td><td>Print current server flags.</td></tr>
+  </tbody></table></div>
+  <PageLinks previous={{ label: 'Overview', href: '/' }} next={{ label: 'Connect a client', href: '/connect/' }} />
+</DocsLayout>

@@ -7,10 +7,47 @@
 // it can drive a Monitor/alert pipe. Exit code stays 0; this observes.
 // Usage: node _sync_watchdog.mjs [intervalSecs] [lagThresholdSecs]
 import mysql from "mysql2/promise";
+import fs from "fs";
+import { execFile } from "child_process";
 
 const INTERVAL = (parseInt(process.argv[2], 10) || 120) * 1000;
 const LAG_MAX = (parseInt(process.argv[3], 10) || 900) * 1000; // 15 min default
 const FLINK = "http://localhost:8081";
+// Prod creds (scratchpad only, never committed) — used ONLY to confirm a
+// suspected-stale table against prod's own frontier before alerting. A quiet
+// prod (no writes for >LAG_MAX) is indistinguishable from a wedged reader by
+// wall clock alone and caused recurring off-hours false alarms.
+const SP = "C:/Users/jerem/AppData/Local/Temp/claude/C--development-thinDB/c2cce1cf-9c7d-4061-98b7-3a1c71c0bfd8/scratchpad";
+let PROD = null;
+try {
+  const cfg = fs.readFileSync(SP + "/cdc_invoice_import_amortized.sql", "utf8");
+  PROD = {
+    host: cfg.match(/'hostname' *= *'([^']+)'/)[1],
+    user: cfg.match(/'username' *= *'([^']+)'/)[1],
+    password: cfg.match(/'password' *= *'([^']+)'/)[1],
+  };
+} catch { /* no creds — fall back to wall-clock-only alerts */ }
+
+// True when the apparent staleness is benign: prod's frontier matches
+// thinDB's exactly (prod is quiet, sync at head), OR prod is ahead only
+// because it wrote a burst moments before the check — a 15s grace re-read of
+// thinDB catching up to prod's frontier clears it (uniform datetime text
+// compares lexicographically). Fail-open: any error → false, real wedges
+// still alert.
+async function staleIsBenign(table, thindbMx, tdbConn) {
+  if (!PROD) return false;
+  try {
+    const p = await mysql.createConnection({ ...PROD, database: "wayroll", dateStrings: true, connectTimeout: 15000 });
+    const [[r]] = await p.query(`SELECT MAX(updatedAt) mx FROM \`${table}\``);
+    await p.end();
+    if (String(r.mx) === String(thindbMx)) return true;
+    await new Promise((res) => setTimeout(res, 15000));
+    const [[again]] = await tdbConn.query(`SELECT MAX(updatedAt) mx FROM \`${table}\``);
+    return String(again.mx) >= String(r.mx);
+  } catch {
+    return false;
+  }
+}
 // Tables whose updatedAt advances continuously in prod — freshness is a valid
 // health signal. Small/rarely-written tables are state-checked only.
 const FRESH_TABLES = ["invoice_import_amortized", "report_customer_revenue_rollforward"];
@@ -48,16 +85,36 @@ async function check() {
     problems.push(`flink REST unreachable: ${e.message}`);
   }
   try {
-    const c = await mysql.createConnection({ host: "127.0.0.1", port: 13310, user: "root", password: "", database: "wayroll_prod__public", connectTimeout: 8000 });
+    const c = await mysql.createConnection({ host: "127.0.0.1", port: 13310, user: "root", password: "", database: "wayroll_prod__public", connectTimeout: 8000, dateStrings: true });
     for (const t of FRESH_TABLES) {
       const [[r]] = await c.query(`SELECT MAX(updatedAt) mx FROM \`${t}\``);
-      const lagMs = Date.now() - Math.floor(Number(r.mx) / 1000);
-      if (lagMs > LAG_MAX) problems.push(`${t} stale: newest row ${Math.round(lagMs / 60000)} min old (wedged reader?)`);
+      // native DATETIME returns 'YYYY-MM-DD HH:MM:SS[.ffffff]' UTC text
+      // (was µs-epoch numeric text pre-resync); parse explicitly as UTC.
+      const mxMs = /^\d{4}-/.test(String(r.mx)) ? Date.parse(String(r.mx).replace(" ", "T") + "Z") : Math.floor(Number(r.mx) / 1000);
+      const lagMs = Date.now() - mxMs;
+      if (lagMs > LAG_MAX && !(await staleIsBenign(t, r.mx, c))) {
+        problems.push(`${t} stale: newest row ${Math.round(lagMs / 60000)} min old, prod frontier ahead (wedged reader?)`);
+      }
     }
     await c.end();
   } catch (e) {
     problems.push(`thinDB unreachable: ${e.message}`);
   }
+  // Sink-error storm: the 2026-07-09 wire bug had every batch failing for 2h
+  // while jobs stayed RUNNING and checkpoints completed — the only external
+  // signal was JdbcOutputFormat retry errors in the TM log. Any at all inside
+  // one interval means a sink is failing NOW.
+  try {
+    const errCount = await new Promise((resolve) => {
+      execFile("docker", ["logs", "flink-taskmanager-1", "--since", `${Math.ceil(INTERVAL / 1000)}s`],
+        { maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+          if (err && !stdout && !stderr) return resolve(-1);
+          const all = stdout + stderr;
+          resolve((all.match(/JDBC executeBatch error/g) ?? []).length);
+        });
+    });
+    if (errCount > 0) problems.push(`sink errors: ${errCount} executeBatch failures in last interval`);
+  } catch { /* docker unavailable — job-state checks still cover us */ }
 
   const ts = new Date().toISOString().slice(11, 19);
   // Emit only on state CHANGE (problem set differs from last check), so a
@@ -66,7 +123,7 @@ async function check() {
   // from-scratch snapshot the updatedAt frontier drifts continuously and
   // would re-alert on every bucket. Which tables/kinds are unhealthy is the
   // signal; the current minutes are still in the printed message.
-  const sig = problems.map((p) => p.replace(/\d+ min old/, "N min old")).join(" | ");
+  const sig = problems.map((p) => p.replace(/\d+ min old/, "N min old").replace(/sink errors: \d+/, "sink errors: N")).join(" | ");
   if (problems.length && sig !== lastBad) {
     console.log(`${ts} SYNC-ALERT: ${problems.join(" | ")}`);
     lastBad = sig;

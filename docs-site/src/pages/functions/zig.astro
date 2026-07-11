@@ -1,0 +1,108 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import CodeBlock from '../../components/CodeBlock.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'source-function', text: 'Submit Zig source' },
+  { depth: 2, slug: 'call-contract', text: 'Call contract' },
+  { depth: 2, slug: 'arguments-and-multiple-inputs', text: 'Arguments and multiple inputs' },
+  { depth: 2, slug: 'prebuilt-library', text: 'Load a prebuilt library' },
+  { depth: 2, slug: 'security-and-operations', text: 'Security and operations' },
+]
+---
+<DocsLayout title="Zig functions" description="Create thinDB table functions from Zig source or a prebuilt dynamic library." headings={headings}>
+  <PageHeader eyebrow="Extensibility" title="Zig table functions" description="Run typed, stateful table transformations next to the execution engine. Submit source for server-side compilation or register an ABI-compatible dynamic library built in your own environment." />
+  <h2 id="source-function">Submit Zig source</h2>
+  <CodeBlock language="zig" title="running_total.zig" code={`const tdb = @import("tdb");
+
+pub const spec = tdb.TableFnSpec{
+    .name = "running_total",
+    .execution = .partitioned,
+};
+
+pub const Input = struct { id: ?i64, account_id: ?i64, amount: ?i64 };
+pub const Output = struct { id: ?i64, running: i64 };
+
+pub fn process(
+    ctx: *tdb.Ctx,
+    input: tdb.Partition(Input),
+    out: *tdb.Writer(Output),
+) !void {
+    _ = ctx;
+    const ids = input.col(.id);
+    const amounts = input.col(.amount);
+    var total: i64 = 0;
+    for (0..input.len) |i| {
+        total += amounts.get(i) orelse 0;
+        try out.row(.{ .id = ids.get(i), .running = total });
+    }
+}`} />
+  <CodeBlock language="sql" title="Create from source" code={`CREATE FUNCTION running_total LANGUAGE zig AS $$
+-- complete Zig source from above
+$$;
+
+CREATE OR REPLACE FUNCTION running_total LANGUAGE zig AS $$
+-- replacement source
+$$;`} />
+  <p>The server locates Zig through <code>THINDB_ZIG_PATH</code>, a bundled <code>zig/zig</code> beside the executable, or <code>zig</code> on <code>PATH</code>. Its version must exactly match the compiler used to build the server. The server compiles a ReleaseFast dynamic library and runs a validation executable before registering it.</p>
+
+  <h2 id="call-contract">Call contract</h2>
+  <CodeBlock language="sql" code={`SELECT id, running
+FROM TABLE(
+  running_total((SELECT id, account_id, amount FROM events))
+  PARTITION BY account_id
+  ORDER BY id
+)
+ORDER BY id;`} />
+  <p>The subquery's column names, order, types, and nullability must exactly match <code>Input</code>. <code>PARTITION BY</code> defines independent callback invocations; <code>ORDER BY</code> orders rows within each partition. Output fields define the downstream SQL schema at compile time.</p>
+  <div class="table-scroll"><table><thead><tr><th>Execution mode</th><th>Call-site rule</th></tr></thead><tbody>
+    <tr><td><code>.partitioned</code></td><td>Requires <code>PARTITION BY</code>.</td></tr>
+    <tr><td><code>.global</code></td><td>Forbids <code>PARTITION BY</code>; receives one logical partition.</td></tr>
+    <tr><td><code>.either</code></td><td>Accepts either form.</td></tr>
+  </tbody></table></div>
+
+  <h2 id="arguments-and-multiple-inputs">Arguments and multiple inputs</h2>
+  <p>Declare <code>Args</code> for typed scalar literals and <code>Input2</code>, <code>Input3</code>, and so on for co-grouped input relations.</p>
+  <CodeBlock language="zig" code={`pub const Args = struct { multiplier: i64, label: []const u8 };
+pub const Input = struct { account_id: ?i64, amount: ?i64 };
+pub const Input2 = struct { account_id: ?i64, budget: ?i64 };
+pub const Output = struct { account_id: ?i64, variance: i64, label: []const u8 };
+
+pub fn process(
+    ctx: *tdb.Ctx,
+    args: Args,
+    actual: tdb.Partition(Input),
+    budget: tdb.Partition(Input2),
+    out: *tdb.Writer(Output),
+) !void {
+    _ = ctx;
+    // Inputs are aligned by the SQL PARTITION BY key.
+    _ = args;
+    _ = actual;
+    _ = budget;
+    _ = out;
+}`} />
+  <CodeBlock language="sql" code={`SELECT * FROM TABLE(reconcile(
+  (SELECT account_id, amount FROM actuals),
+  (SELECT account_id, budget FROM budgets),
+  100,
+  'forecast'
+) PARTITION BY account_id);`} />
+
+  <h2 id="prebuilt-library">Load a prebuilt library</h2>
+  <CodeBlock language="sql" code={`CREATE FUNCTION running_total LANGUAGE zig
+USING 'C:/functions/running_total.dll';
+
+-- Linux
+CREATE FUNCTION running_total LANGUAGE zig
+USING '/opt/thindb/functions/running_total.so';`} />
+  <p>The direct tier loads the library without invoking the compiler. It must export <code>thindb_tvf_abi_version</code>, <code>thindb_tvf_descriptor</code>, and <code>thindb_tvf_process</code>; the current ABI version is <code>3</code>. The descriptor name must equal the DDL name.</p>
+  <Callout type="warning" title="Exact build contract"><p>A prebuilt library is not an arbitrary C ABI plugin. Build it with the same Zig version and byte-identical thinDB UDF SDK/wrapper used by the target server. ABI version checks catch known incompatibility, but matching the server build environment remains your responsibility.</p></Callout>
+  <p>The server-generated build uses the submitted function as <code>fn_src.zig</code>, the embedded <code>udf_sdk.zig</code> as module <code>tdb</code>, and a wrapper that reflects the function descriptor. For reproducible external builds, vendor these files from the exact thinDB revision deployed to the server and compile a dynamic ReleaseFast library for the server's operating system and architecture.</p>
+
+  <h2 id="security-and-operations">Security and operations</h2>
+  <ul><li>Zig functions execute native code in the server process with the server's operating-system permissions.</li><li>There is no CPU, memory, syscall, or filesystem sandbox.</li><li>Only trusted administrators should receive <code>CREATE FUNCTION ... LANGUAGE zig</code> access.</li><li>Submitted source persists under the database and is recompiled when the catalog opens; compiled output is a cache.</li><li><code>SHOW CREATE FUNCTION</code>, <code>SHOW FUNCTIONS</code>, and <code>DROP FUNCTION</code> manage the lifecycle.</li></ul>
+  <PageLinks previous={{ label: 'SQL functions', href: '/functions/sql/' }} next={{ label: 'Embedded UDFs', href: '/functions/embedded/' }} />
+</DocsLayout>

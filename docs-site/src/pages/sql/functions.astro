@@ -1,0 +1,141 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import CodeBlock from '../../components/CodeBlock.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'scalar-functions', text: 'Scalar functions' },
+  { depth: 3, slug: 'string', text: 'String and binary' },
+  { depth: 3, slug: 'math', text: 'Math and numeric' },
+  { depth: 3, slug: 'date-time', text: 'Date and time' },
+  { depth: 3, slug: 'json', text: 'JSON' },
+  { depth: 3, slug: 'conditional-conversion', text: 'Conditional and conversion' },
+  { depth: 2, slug: 'aggregate-functions', text: 'Aggregate functions' },
+  { depth: 2, slug: 'special-forms', text: 'Special SQL forms' },
+  { depth: 2, slug: 'wire-probes', text: 'Wire compatibility probes' },
+  { depth: 2, slug: 'resolution', text: 'Types and overload resolution' },
+]
+---
+<DocsLayout title="Built-in functions" description="Reference for thinDB scalar and aggregate SQL functions." headings={headings}>
+  <PageHeader eyebrow="SQL reference" title="Built-in functions" description="The shipped registry covers string processing, regular expressions, math, dates, JSON, conversion, conditional logic, exact aggregates, and statistical aggregates." />
+  <h2 id="scalar-functions">Scalar functions</h2>
+  <p>Function names are case-insensitive in SQL. The tables below list the public names present in the scalar registry; aliases are shown separately because they may be useful when porting MySQL or PostgreSQL queries.</p>
+
+  <h3 id="string">String and binary</h3>
+  <div class="table-scroll"><table><thead><tr><th>Purpose</th><th>Functions</th></tr></thead><tbody>
+    <tr><td>Case and trim</td><td><code>upper</code>, <code>ucase</code>, <code>lower</code>, <code>lcase</code>, <code>initcap</code>, <code>trim</code>, <code>ltrim</code>, <code>rtrim</code></td></tr>
+    <tr><td>Length and bytes</td><td><code>length</code>, <code>char_length</code>, <code>octet_length</code>, <code>bit_length</code></td></tr>
+    <tr><td>Compose</td><td><code>concat</code>, <code>concat_ws</code>, <code>repeat</code>, <code>space</code>, <code>lpad</code>, <code>rpad</code></td></tr>
+    <tr><td>Slice</td><td><code>substring</code>, <code>left</code>, <code>right</code>, <code>split_part</code>, <code>substring_index</code></td></tr>
+    <tr><td>Search</td><td><code>instr</code>, <code>locate</code>, <code>position</code>, <code>strpos</code>, <code>field</code>, <code>find_in_set</code>, <code>starts_with</code>, <code>ends_with</code></td></tr>
+    <tr><td>Transform</td><td><code>replace</code>, <code>translate</code>, <code>reverse</code>, <code>strcmp</code></td></tr>
+    <tr><td>Regular expressions</td><td><code>regexp_like</code>, <code>regexp_replace</code>, <code>regexp_substr</code></td></tr>
+    <tr><td>Characters and encodings</td><td><code>ascii</code>, <code>ord</code>, <code>char</code>, <code>chr</code>, <code>hex</code>, <code>unhex</code>, <code>bin</code>, <code>to_base64</code>, <code>from_base64</code>, <code>conv</code></td></tr>
+    <tr><td>Hashes</td><td><code>crc32</code>, <code>md5</code>, <code>md5sum</code>, <code>sha1</code>, <code>sha2</code>, <code>sha256</code>, <code>murmur_hash3_32</code>, <code>xx_hash3_64</code>, <code>xx_hash3_128</code></td></tr>
+  </tbody></table></div>
+  <CodeBlock language="sql" code={`SELECT
+  upper(trim(name)) AS normalized,
+  regexp_replace(path, '/+', '/') AS clean_path,
+  substring(description, 1, 80) AS preview,
+  sha256(external_id) AS id_hash
+FROM imports;`} />
+
+  <h3 id="math">Math and numeric</h3>
+  <div class="table-scroll"><table><thead><tr><th>Purpose</th><th>Functions</th></tr></thead><tbody>
+    <tr><td>Basic</td><td><code>abs</code>, <code>sign</code>, <code>ceil</code>, <code>ceiling</code>, <code>floor</code>, <code>round</code>, <code>truncate</code>, <code>mod</code>, <code>pmod</code>, <code>fmod</code></td></tr>
+    <tr><td>Powers and logs</td><td><code>pow</code>, <code>power</code>, <code>square</code>, <code>sqrt</code>, <code>cbrt</code>, <code>exp</code>, <code>ln</code>, <code>log</code>, <code>log10</code>, <code>log2</code></td></tr>
+    <tr><td>Trigonometry</td><td><code>sin</code>, <code>cos</code>, <code>tan</code>, <code>asin</code>, <code>acos</code>, <code>atan</code>, <code>atan2</code>, <code>cot</code>, <code>degrees</code>, <code>radians</code>, <code>pi</code></td></tr>
+    <tr><td>Comparison</td><td><code>greatest</code>, <code>least</code></td></tr>
+    <tr><td>Bits and random</td><td><code>bit_count</code>, <code>rand</code>, <code>random</code></td></tr>
+    <tr><td>Operator kernels</td><td><code>add</code>, <code>sub</code>, <code>mul</code>, <code>div</code> back SQL arithmetic and are callable by name.</td></tr>
+  </tbody></table></div>
+
+  <h3 id="date-time">Date and time</h3>
+  <div class="table-scroll"><table><thead><tr><th>Purpose</th><th>Functions</th></tr></thead><tbody>
+    <tr><td>Parts</td><td><code>year</code>, <code>quarter</code>, <code>month</code>, <code>monthname</code>, <code>day</code>, <code>dayofmonth</code>, <code>dayofweek</code>, <code>dayofyear</code>, <code>dayname</code>, <code>hour</code>, <code>minute</code>, <code>second</code></td></tr>
+    <tr><td>Construct and boundaries</td><td><code>makedate</code>, <code>last_day</code>, <code>date_trunc</code></td></tr>
+    <tr><td>Differences</td><td><code>datediff</code>, <code>date_diff</code>, <code>timestampdiff</code></td></tr>
+    <tr><td>Add and subtract</td><td><code>date_add</code>, <code>date_sub</code>, <code>date_add_months</code>, <code>date_add_years</code>, <code>timestampadd</code></td></tr>
+    <tr><td>Format and epoch</td><td><code>date_format</code>, <code>unix_timestamp</code>, <code>from_unixtime</code></td></tr>
+  </tbody></table></div>
+  <Callout type="note" title="Current time"><p><code>now()</code>, <code>current_timestamp</code>, <code>localtimestamp</code>, <code>utc_timestamp</code>, <code>current_time</code>, <code>curtime</code>, and <code>localtime</code> return the statement-stable current <code>DATETIME</code>. <code>current_date</code>, <code>curdate</code>, and <code>utc_date</code> return the current <code>DATE</code>. Parenthesized and bare forms are accepted where applicable. These are parser-special substitutions, so they do not appear in the ordinary scalar registry.</p></Callout>
+
+  <h3 id="json">JSON</h3>
+  <p>Use the MySQL-style arrow operators for concise JSON navigation. <code>-&gt;</code> preserves the selected value as JSON; <code>-&gt;&gt;</code> returns its unquoted text representation. They are shorthand for <code>json_extract</code> and <code>json_value</code>, respectively.</p>
+  <CodeBlock language="sql" title="JSON arrow operators" code={`SELECT
+  payload -> '$.customer' AS customer_json,
+  payload ->> '$.customer.name' AS customer_name,
+  payload ->> '$.items[0].sku' AS first_sku
+FROM events;
+
+-- Arrow extraction is valid in predicates.
+SELECT event_id
+FROM events
+WHERE payload ->> '$.status' = 'paid';
+
+-- Operators chain from left to right.
+SELECT payload -> '$.customer' ->> '$.name' AS customer_name
+FROM events;`} />
+  <div class="table-scroll"><table><thead><tr><th>Operator</th><th>Equivalent call</th><th>Result</th></tr></thead><tbody>
+    <tr><td><code>document -&gt; path</code></td><td><code>json_extract(document, path)</code></td><td>A JSON-typed value. JSON strings remain JSON strings and JSON <code>null</code> remains a JSON value.</td></tr>
+    <tr><td><code>document -&gt;&gt; path</code></td><td><code>json_value(document, path)</code></td><td>Text. Strings are unquoted; numbers and booleans use their text form. JSON <code>null</code> becomes SQL <code>NULL</code>.</td></tr>
+  </tbody></table></div>
+
+  <p>Paths are rooted at <code>$</code>. Supported steps are <code>.member</code>, <code>.&quot;quoted member&quot;</code>, zero-based <code>[index]</code>, and <code>[&quot;quoted member&quot;]</code>.</p>
+  <CodeBlock language="sql" title="Supported path forms" code={`SELECT
+  payload ->> '$.address.city',
+  payload ->> '$."display name"',
+  payload ->> '$.items[2]',
+  payload ->> '$["key.with.dots"]'
+FROM events;`} />
+  <Callout type="warning" title="Path limitations"><p>Use a constant path for a query batch. Wildcards such as <code>$.*</code> and <code>$[*]</code>, recursive descent, slices, filters, and negative array indices are not implemented. Malformed or unsupported path syntax is an error.</p></Callout>
+  <Callout type="note" title="Missing and invalid values"><p>A missing member/index, SQL <code>NULL</code> document, or invalid JSON document produces SQL <code>NULL</code>. For a selected JSON <code>null</code>, <code>-&gt;</code> returns JSON <code>null</code>, while <code>-&gt;&gt;</code> returns SQL <code>NULL</code>.</p></Callout>
+  <div class="table-scroll"><table><thead><tr><th>Function</th><th>Result</th></tr></thead><tbody>
+    <tr><td><code>json_extract</code></td><td><code>json_extract(json, path)</code> returns JSON at a supported path.</td></tr>
+    <tr><td><code>json_value</code></td><td><code>json_value(json, path)</code> returns a scalar as text.</td></tr>
+    <tr><td><code>json_unquote</code></td><td>Unquoted JSON string content.</td></tr>
+    <tr><td><code>json_valid</code></td><td>Whether text is valid JSON.</td></tr>
+    <tr><td><code>json_type</code></td><td>JSON type name.</td></tr>
+    <tr><td><code>json_length</code></td><td>Array/object length.</td></tr>
+    <tr><td><code>json_contains</code></td><td>Document/candidate containment predicate.</td></tr>
+    <tr><td><code>json_keys</code></td><td>Object keys as JSON.</td></tr>
+    <tr><td><code>to_json</code></td><td>Validated JSON value from text.</td></tr>
+  </tbody></table></div>
+
+  <h3 id="conditional-conversion">Conditional and conversion</h3>
+  <p><code>coalesce</code>, <code>if</code>, <code>ifnull</code>, and <code>nullif</code> implement null-aware conditional expressions. Conversions include <code>to_tinyint</code>, <code>to_smallint</code>, <code>to_int</code>, <code>to_bigint</code>, <code>to_largeint</code>, <code>to_double</code>, <code>to_boolean</code>, <code>to_string</code>, <code>to_date</code>, and <code>to_datetime</code>. Use <code>CAST(value AS DECIMAL(p,s))</code> for a precision/scale-specific decimal conversion.</p>
+
+  <h2 id="aggregate-functions">Aggregate functions</h2>
+  <div class="table-scroll"><table><thead><tr><th>Family</th><th>Functions</th></tr></thead><tbody>
+    <tr><td>Core</td><td><code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>avg</code>, <code>count_if</code> (alias <code>countif</code>)</td></tr>
+    <tr><td>Distinct</td><td><code>count(distinct x)</code>, <code>sum(distinct x)</code>, <code>avg(distinct x)</code></td></tr>
+    <tr><td>Boolean and bitwise</td><td><code>bool_and</code>, <code>bool_or</code>, <code>bit_and</code>, <code>bit_or</code>, <code>bit_xor</code></td></tr>
+    <tr><td>Value selection</td><td><code>any_value</code>, <code>first</code>, <code>last</code>, <code>max_by</code> (<code>max_by(value, key)</code>)</td></tr>
+    <tr><td>Statistics</td><td><code>stddev_pop</code>, <code>stddev_samp</code> (aliases <code>std</code>, <code>stddev</code>), <code>var_pop</code>, <code>var_samp</code> (aliases <code>variance</code>, <code>variance_pop</code>, <code>variance_samp</code>)</td></tr>
+    <tr><td>Exact cardinality</td><td><code>count_distinct</code>, <code>approx_count_distinct</code>. Both currently use the exact distinct implementation.</td></tr>
+    <tr><td>Percentiles</td><td>Exact <code>percentile</code>, <code>percentile_cont</code>, and <code>median</code>.</td></tr>
+    <tr><td>Strings</td><td><code>group_concat</code> and alias <code>string_agg</code> with a separator payload.</td></tr>
+  </tbody></table></div>
+  <Callout type="warning" title="Memory-sensitive aggregates"><p>Exact distinct aggregates, exact percentile, and <code>group_concat</code> keep unbounded per-group state. Size the query and process memory budgets for their cardinality, or use a bounded query shape.</p></Callout>
+
+  <h2 id="special-forms">Special SQL forms</h2>
+  <div class="table-scroll"><table><thead><tr><th>Form</th><th>Behavior</th></tr></thead><tbody>
+    <tr><td><code>EXTRACT(field FROM value)</code></td><td>Lowers to <code>year</code>, <code>month</code>, <code>day</code>, <code>hour</code>, <code>minute</code>, or <code>second</code>. Other fields are rejected.</td></tr>
+    <tr><td><code>CAST(value AS type)</code></td><td>Lowers to the appropriate typed conversion, including precision/scale-aware decimal casts.</td></tr>
+    <tr><td><code>json -&gt; path</code></td><td>MySQL-style JSON extraction; lowers to <code>json_extract</code>.</td></tr>
+    <tr><td><code>json -&gt;&gt; path</code></td><td>JSON scalar extraction; lowers to <code>json_value</code>.</td></tr>
+    <tr><td><code>read_csv</code>, <code>read_json</code>, <code>read_parquet</code></td><td>Table-source functions gated by the server's <code>--file-root</code>. They are not scalar calls.</td></tr>
+  </tbody></table></div>
+
+  <h2 id="wire-probes">Wire compatibility probes</h2>
+  <p>These names are handled by the wire layer for client and pool discovery. They are intentionally narrower than ordinary scalar functions; rely on the standalone probe shapes shown below rather than embedding them in arbitrary expressions.</p>
+  <div class="table-scroll"><table><thead><tr><th>Wire</th><th>Accepted probes</th></tr></thead><tbody>
+    <tr><td>MySQL</td><td><code>version()</code>, <code>database()</code>, <code>schema()</code>, <code>user()</code>, <code>current_user()</code>, <code>session_user()</code>, <code>connection_id()</code>, plus documented <code>@@</code> server/session variables.</td></tr>
+    <tr><td>PostgreSQL</td><td><code>version()</code>, <code>pg_catalog.version()</code>, <code>pg_backend_pid()</code>, <code>pg_cancel_backend(pid)</code>, <code>pg_terminate_backend(pid)</code>, <code>current_database()</code>, <code>current_schema()</code>, bare <code>current_user</code>, <code>user</code>, and <code>session_user</code>.</td></tr>
+  </tbody></table></div>
+
+  <h2 id="resolution">Types and overload resolution</h2>
+  <p>The registry resolves exact signatures first, then applies cost-ranked implicit numeric coercions. Decimal arithmetic receives precision/scale-specialized kernels. String-to-number conversion remains explicit: use a <code>to_*</code> function or <code>CAST</code>.</p>
+  <PageLinks previous={{ label: 'Window functions', href: '/sql/windows/' }} next={{ label: 'SQL functions', href: '/functions/sql/' }} />
+</DocsLayout>

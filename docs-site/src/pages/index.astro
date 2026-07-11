@@ -1,0 +1,62 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro'
+import PageHeader from '../components/PageHeader.astro'
+import CodeBlock from '../components/CodeBlock.astro'
+import Callout from '../components/Callout.astro'
+import PageLinks from '../components/PageLinks.astro'
+
+const headings = [
+  { depth: 2, slug: 'what-thindb-is', text: 'What thinDB is' },
+  { depth: 2, slug: 'first-query', text: 'First query' },
+  { depth: 2, slug: 'design-boundaries', text: 'Design boundaries' },
+]
+---
+
+<DocsLayout title="Overview" description="Technical documentation for thinDB, a single-node columnar analytics database." headings={headings}>
+  <PageHeader eyebrow="thinDB documentation" title="Columnar analytics without the distributed machinery" description="thinDB is a single-node analytics database written in Zig. Use it as an embedded library or run the standalone server with MySQL, PostgreSQL, and native wire endpoints." />
+
+  <div class="feature-grid">
+    <a class="feature-card" href="/getting-started/"><strong>Build and run</strong><p>Compile with Zig 0.16, start the multi-wire server, and create the first table.</p><span>Start here &rarr;</span></a>
+    <a class="feature-card" href="/connect/"><strong>Use existing clients</strong><p>Connect through mysql2, node-postgres, the MySQL CLI, psql, or thinDB's native protocol.</p><span>Connection guide &rarr;</span></a>
+    <a class="feature-card" href="/sql/queries/"><strong>Write analytical SQL</strong><p>Use joins, CTEs, correlated subqueries, grouping, windows, and columnar file scans.</p><span>SQL guide &rarr;</span></a>
+    <a class="feature-card" href="/functions/zig/"><strong>Extend with Zig</strong><p>Compile table functions from submitted source or load a prebuilt dynamic library.</p><span>Function guide &rarr;</span></a>
+  </div>
+
+  <h2 id="what-thindb-is">What thinDB is</h2>
+  <p>thinDB stores immutable, order-key-sorted columnar segments and evaluates analytical queries through vectorized operators. An optional write-ahead log can protect accepted writes, memtables absorb recent rows, and background flush and compaction turn those rows into prunable segments.</p>
+  <p>The engine is deliberately local. There is no coordinator, distributed shuffle, replica protocol, or cost-based optimizer. Query structure stays visible and predictable while the engine selects bounded physical paths such as hash versus sort grouping and join algorithms.</p>
+
+  <Callout type="note" title="Release status">
+    <p>The SQL server and wire protocols are present and tested, but the project still reports itself as a technical preview. Review <a href="/reference/compatibility/">compatibility and limitations</a> before adopting thinDB as a drop-in replacement for MySQL or PostgreSQL.</p>
+  </Callout>
+
+  <h2 id="first-query">First query</h2>
+  <CodeBlock language="powershell" title="Build and start" code={`zig build -Doptimize=ReleaseFast
+.\\zig-out\\bin\\thindb-server.exe --data-dir .\\data`} />
+  <CodeBlock language="sql" title="MySQL or PostgreSQL client" code={`CREATE TABLE events (
+  event_id BIGINT PRIMARY KEY,
+  account_id BIGINT NOT NULL,
+  occurred_at DATETIME NOT NULL,
+  amount DECIMAL(18, 2),
+  kind VARCHAR(32) NOT NULL
+);
+
+INSERT INTO events VALUES
+  (1, 100, '2026-07-10 09:00:00', 29.00, 'checkout'),
+  (2, 100, '2026-07-10 09:02:00', 49.00, 'checkout');
+
+SELECT account_id, COUNT(*) AS events, SUM(amount) AS revenue
+FROM events
+GROUP BY account_id;`} />
+
+  <h2 id="design-boundaries">Design boundaries</h2>
+  <div class="table-scroll"><table><thead><tr><th>thinDB favors</th><th>thinDB does not try to be</th></tr></thead><tbody>
+    <tr><td>Single-machine analytical throughput</td><td>A distributed data warehouse</td></tr>
+    <tr><td>Columnar scans, grouping, joins, and windows</td><td>An OLTP database with general transactions</td></tr>
+    <tr><td>Explicit SQL and stable execution behavior</td><td>A cost-based optimizer that rewrites query intent</td></tr>
+    <tr><td>Strict types and explicit schemas</td><td>A permissive MySQL-compatible type-coercion layer</td></tr>
+    <tr><td>Zig-native embedded and extension APIs</td><td>A sandbox for untrusted user code</td></tr>
+  </tbody></table></div>
+
+  <PageLinks next={{ label: 'Install and run', href: '/getting-started/' }} />
+</DocsLayout>

@@ -1,0 +1,45 @@
+---
+import { navigation } from '../data/navigation'
+
+const pathname = Astro.url.pathname
+const normalizedPath = pathname.length > 1 ? pathname.replace(/\/$/, '') : pathname
+const isActive = (href: string) => {
+  const normalizedHref = href.length > 1 ? href.replace(/\/$/, '') : href
+  return normalizedPath === normalizedHref
+}
+---
+
+<aside class="sidebar" id="docs-sidebar" aria-label="Documentation navigation">
+  <div class="sidebar-brand">
+    <a class="brand" href="/" aria-label="thinDB documentation home">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span><strong>thinDB</strong><small>documentation</small></span>
+    </a>
+    <button class="sidebar-close icon-button" type="button" data-close-nav aria-label="Close navigation">&#x2715;</button>
+  </div>
+
+  <button class="search-trigger" type="button" data-open-search>
+    <span aria-hidden="true">&#x2315;</span>
+    <span>Search documentation</span>
+    <kbd>Ctrl K</kbd>
+  </button>
+
+  <nav class="sidebar-nav">
+    {navigation.map((group) => (
+      <section class="nav-group">
+        <h2>{group.label}</h2>
+        {group.items.map((item) => (
+          <a href={item.href} class:list={{ active: isActive(item.href) }} aria-current={isActive(item.href) ? 'page' : undefined}>
+            {item.label}
+          </a>
+        ))}
+      </section>
+    ))}
+  </nav>
+
+  <div class="sidebar-meta">
+    <span class="status-dot"></span>
+    <span>Technical preview</span>
+    <a href="/reference/compatibility/">Status</a>
+  </div>
+</aside>

@@ -1,0 +1,57 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import CodeBlock from '../../components/CodeBlock.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'type-table', text: 'Type table' },
+  { depth: 2, slug: 'decimal', text: 'Decimal behavior' },
+  { depth: 2, slug: 'temporal', text: 'Temporal behavior' },
+  { depth: 2, slug: 'strings-json-uuid', text: 'Strings, JSON, and UUID' },
+  { depth: 2, slug: 'nullability', text: 'Nullability and defaults' },
+]
+---
+<DocsLayout title="Data types" description="Reference for thinDB SQL data types, storage, aliases, and behavior." headings={headings}>
+  <PageHeader eyebrow="Reference" title="Data types" description="thinDB uses a compact, strict type system designed for columnar analytics. SQL aliases improve client compatibility without changing the underlying representation." />
+  <h2 id="type-table">Type table</h2>
+  <div class="table-scroll"><table><thead><tr><th>SQL type</th><th>Aliases</th><th>Physical representation</th></tr></thead><tbody>
+    <tr><td><code>TINYINT</code></td><td>&mdash;</td><td>Embedded type is signed 8-bit; current SQL DDL maps <code>TINYINT</code> to <code>SMALLINT</code>.</td></tr>
+    <tr><td><code>SMALLINT</code></td><td><code>INT2</code></td><td>Signed 16-bit integer.</td></tr>
+    <tr><td><code>INT</code></td><td><code>INTEGER</code>, <code>INT4</code></td><td>Signed 32-bit integer.</td></tr>
+    <tr><td><code>BIGINT</code></td><td><code>INT8</code></td><td>Signed 64-bit integer.</td></tr>
+    <tr><td><code>LARGEINT</code> (embedded)</td><td>Not accepted in SQL DDL</td><td>Signed 128-bit integer; used by promoted aggregates.</td></tr>
+    <tr><td><code>FLOAT</code></td><td><code>REAL</code>, <code>FLOAT4</code></td><td>IEEE 754 32-bit.</td></tr>
+    <tr><td><code>DOUBLE</code></td><td><code>DOUBLE PRECISION</code>, <code>FLOAT8</code></td><td>IEEE 754 64-bit.</td></tr>
+    <tr><td><code>DECIMAL(p,s)</code></td><td><code>NUMERIC(p,s)</code></td><td>Scaled i64 for precision up to 18; scaled i128 through 38.</td></tr>
+    <tr><td><code>VARCHAR(n)</code></td><td>&mdash;</td><td>Variable UTF-8 bytes; declared bound is currently metadata.</td></tr>
+    <tr><td><code>CHAR(n)</code> (embedded)</td><td>Not accepted in SQL DDL</td><td>Variable UTF-8 bytes without blank-padding; declared bound is metadata.</td></tr>
+    <tr><td><code>STRING</code></td><td><code>TEXT</code></td><td>Unbounded variable UTF-8 bytes.</td></tr>
+    <tr><td><code>BOOLEAN</code></td><td><code>BOOL</code></td><td>One-byte value in fixed-width storage.</td></tr>
+    <tr><td><code>DATE</code></td><td>&mdash;</td><td>i32 days since 1970-01-01 UTC.</td></tr>
+    <tr><td><code>DATETIME</code></td><td><code>TIMESTAMP</code>, <code>TIMESTAMPTZ</code></td><td>i64 microseconds since Unix epoch, timezone-naive.</td></tr>
+    <tr><td><code>UUID</code></td><td>&mdash;</td><td>Unsigned 128-bit value.</td></tr>
+    <tr><td><code>JSON</code></td><td><code>JSONB</code></td><td>Validated/logically typed UTF-8 JSON text.</td></tr>
+  </tbody></table></div>
+
+  <h2 id="decimal">Decimal behavior</h2>
+  <p>Precision is 1 through 38 and scale is 0 through precision. Overflow is an error rather than silent truncation. Integer sums promote to <code>LARGEINT</code>; decimal sums promote to <code>DECIMAL(38, s)</code>; <code>AVG</code> returns <code>DOUBLE</code>.</p>
+  <CodeBlock language="sql" code={`CREATE TABLE ledger (
+  entry_id BIGINT PRIMARY KEY,
+  amount DECIMAL(18, 2) NOT NULL,
+  rate DECIMAL(10, 6) NOT NULL
+);
+
+SELECT SUM(amount), ROUND(amount * rate, 2) FROM ledger GROUP BY entry_id;`} />
+
+  <h2 id="temporal">Temporal behavior</h2>
+  <p><code>DATE</code> and <code>DATETIME</code> support typed literals, extraction, interval arithmetic, formatting, grouping, ordering, predicates, and wire conversion. Month/year addition clamps to the last valid day of a shorter target month.</p>
+  <Callout type="warning" title="No timezone identity"><p><code>TIMESTAMPTZ</code> is accepted as a compatibility alias for <code>DATETIME</code>. It does not retain an offset or timezone. Normalize timestamps at application boundaries.</p></Callout>
+
+  <h2 id="strings-json-uuid">Strings, JSON, and UUID</h2>
+  <p><code>VARCHAR(n)</code> and <code>CHAR(n)</code> bounds are metadata in the underlying type model, and <code>CHAR</code> is not blank-padded. JSON carries a distinct logical type for functions and operators but uses the same variable-byte storage family. UUID uses numeric 128-bit ordering and canonical wire text.</p>
+
+  <h2 id="nullability">Nullability and defaults</h2>
+  <p>SQL DDL follows the standard nullable-by-default rule. <code>PRIMARY KEY</code>, <code>NOT NULL</code>, <code>SERIAL</code>, and <code>AUTO_INCREMENT</code> produce non-nullable columns. The embedded Zig schema API defaults to non-nullable and requires <code>.nullable = true</code> explicitly. The engine stores one validity bit per row only for nullable columns. Defaults are currently literal values, and <code>AUTO_INCREMENT</code> applies to one integer-family column per table.</p>
+  <PageLinks previous={{ label: 'Storage and durability', href: '/operations/storage/' }} next={{ label: 'Compatibility', href: '/reference/compatibility/' }} />
+</DocsLayout>

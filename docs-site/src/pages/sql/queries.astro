@@ -1,0 +1,84 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import CodeBlock from '../../components/CodeBlock.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'select', text: 'SELECT pipeline' },
+  { depth: 2, slug: 'predicates', text: 'Predicates' },
+  { depth: 2, slug: 'grouping', text: 'Grouping and aggregates' },
+  { depth: 2, slug: 'ctes-and-subqueries', text: 'CTEs and subqueries' },
+  { depth: 2, slug: 'sets-and-ordering', text: 'Sets and ordering' },
+  { depth: 2, slug: 'files', text: 'Query files' },
+  { depth: 2, slug: 'explain', text: 'EXPLAIN' },
+]
+---
+<DocsLayout title="Query data" description="Query thinDB with filters, grouping, CTEs, subqueries, and file scans." headings={headings}>
+  <PageHeader eyebrow="SQL guide" title="Query data" description="thinDB supports the analytical SQL shapes needed to scan, transform, group, combine, and rank columnar data while keeping execution behavior explicit." />
+  <h2 id="select">SELECT pipeline</h2>
+  <CodeBlock language="sql" code={`SELECT
+  customer_id,
+  amount * exchange_rate AS converted_amount,
+  CASE WHEN amount >= 1000 THEN 'large' ELSE 'standard' END AS band
+FROM invoices
+WHERE issued_on >= DATE '2026-01-01'
+ORDER BY converted_amount DESC
+LIMIT 100 OFFSET 20;`} />
+  <p>Projection expressions support column references, typed literals, arithmetic, casts, scalar functions, searched <code>CASE WHEN</code>, and scalar subqueries. Aliases can be referenced by downstream ordering where unambiguous.</p>
+
+  <h2 id="predicates">Predicates</h2>
+  <p>Use <code>=</code>, <code>&lt;&gt;</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>, <code>BETWEEN</code>, <code>IN</code>, <code>LIKE</code>, <code>IS NULL</code>, <code>IS NOT NULL</code>, and boolean <code>AND</code>/<code>OR</code>/<code>NOT</code>. SQL three-valued null semantics apply.</p>
+  <CodeBlock language="sql" code={`SELECT * FROM events
+WHERE occurred_at BETWEEN '2026-07-01 00:00:00' AND '2026-07-31 23:59:59'
+  AND kind IN ('checkout', 'refund')
+  AND source LIKE 'web%'
+  AND deleted_at IS NULL;`} />
+
+  <h2 id="grouping">Grouping and aggregates</h2>
+  <CodeBlock language="sql" code={`SELECT
+  customer_id,
+  COUNT(*) AS invoice_count,
+  COUNT(DISTINCT currency) AS currencies,
+  SUM(amount) AS total,
+  AVG(amount) AS average,
+  MAX_BY(invoice_id, amount) AS largest_invoice
+FROM invoices
+GROUP BY customer_id
+HAVING SUM(amount) > 10000
+ORDER BY total DESC
+LIMIT 50;`} />
+  <p>Grouping can route through hash, sort, radix, low-cardinality, or partitioned execution based on input shape and memory budget. This physical choice does not reorder the logical query.</p>
+
+  <h2 id="ctes-and-subqueries">CTEs and subqueries</h2>
+  <CodeBlock language="sql" code={`WITH customer_totals AS (
+  SELECT customer_id, SUM(amount) AS total
+  FROM invoices
+  GROUP BY customer_id
+), active AS (
+  SELECT customer_id FROM customers WHERE status = 'active'
+)
+SELECT c.customer_id, c.total
+FROM customer_totals c
+WHERE c.customer_id IN (SELECT customer_id FROM active)
+  AND c.total > (SELECT AVG(total) FROM customer_totals);`} />
+  <p>Supported forms include named CTEs, scalar subqueries, <code>IN</code>/<code>NOT IN</code> subqueries, <code>EXISTS</code>/<code>NOT EXISTS</code>, derived tables, and correlated equality/range subqueries covered by the parser and integration suite.</p>
+
+  <h2 id="sets-and-ordering">Sets and ordering</h2>
+  <p><code>UNION ALL</code> combines compatible query outputs. <code>DISTINCT</code>, multi-column <code>ORDER BY</code>, ascending/descending direction, null ordering, <code>LIMIT</code>, <code>OFFSET</code>, and ANSI <code>FETCH</code> forms are available where parsed by the current grammar.</p>
+  <Callout type="warning" title="UNION limitation"><p><code>UNION</code> with implicit duplicate elimination is not implemented. Use <code>UNION ALL</code>, or explicitly deduplicate the combined result when an equivalent query shape is available.</p></Callout>
+
+  <h2 id="files">Query files</h2>
+  <p>With <code>--file-root PATH</code>, SQL may scan approved CSV, JSON, and Parquet files under that root through <code>read_csv</code>, <code>read_json</code>, <code>read_parquet</code>, or recognized file sources. Paths outside the configured root are rejected.</p>
+  <CodeBlock language="sql" code={`SELECT region, SUM(amount) AS total
+FROM read_parquet('imports/invoices.parquet')
+GROUP BY region;`} />
+
+  <h2 id="explain">EXPLAIN</h2>
+  <CodeBlock language="sql" code={`EXPLAIN SELECT customer_id, SUM(amount)
+FROM invoices GROUP BY customer_id;
+
+EXPLAIN (FORMAT JSON) SELECT * FROM invoices WHERE invoice_id = 1001;`} />
+  <Callout type="note" title="ANALYZE status"><p><code>EXPLAIN ANALYZE</code> is accepted, but currently aliases plain <code>EXPLAIN</code>; it does not execute the query or report measured row counts and timings.</p></Callout>
+  <PageLinks previous={{ label: 'Tables and data', href: '/sql/tables/' }} next={{ label: 'Joins', href: '/sql/joins/' }} />
+</DocsLayout>

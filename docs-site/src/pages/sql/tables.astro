@@ -1,0 +1,75 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import CodeBlock from '../../components/CodeBlock.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'create-tables', text: 'Create tables' },
+  { depth: 2, slug: 'write-data', text: 'Write data' },
+  { depth: 2, slug: 'update-and-delete', text: 'Update and delete' },
+  { depth: 2, slug: 'copy', text: 'COPY streaming' },
+  { depth: 2, slug: 'views-and-temporary-tables', text: 'Views and temporary tables' },
+]
+---
+<DocsLayout title="Tables and data" description="Create thinDB tables and write, update, delete, or stream rows." headings={headings}>
+  <PageHeader eyebrow="SQL guide" title="Tables and data" description="Define strict columnar tables, load rows directly or from queries, and use update, delete, upsert, views, and streaming COPY where the workload needs them." />
+  <h2 id="create-tables">Create tables</h2>
+  <CodeBlock language="sql" code={`CREATE TABLE invoices (
+  invoice_id BIGINT PRIMARY KEY,
+  customer_id BIGINT NOT NULL,
+  issued_on DATE NOT NULL,
+  amount DECIMAL(18, 2) NOT NULL,
+  memo VARCHAR(256),
+  imported_at DATETIME DEFAULT '2026-07-10 00:00:00'
+);
+
+CREATE TABLE invoice_summary AS
+SELECT customer_id, SUM(amount) AS total
+FROM invoices
+GROUP BY customer_id;`} />
+  <p>A primary key supplies a unique order key. Tables can also use a non-unique order key through the embedded schema API. SQL columns are nullable by default; <code>PRIMARY KEY</code>, <code>NOT NULL</code>, <code>SERIAL</code>, and <code>AUTO_INCREMENT</code> make the relevant column non-nullable. Defaults must be compatible with the declared type.</p>
+  <p>Supported lifecycle statements include <code>CREATE TABLE</code>, <code>CREATE TABLE AS SELECT</code>, <code>ALTER TABLE</code>, <code>TRUNCATE TABLE</code>, and <code>DROP TABLE [IF EXISTS]</code>.</p>
+
+  <h2 id="write-data">Write data</h2>
+  <CodeBlock language="sql" code={`INSERT INTO invoices (invoice_id, customer_id, issued_on, amount)
+VALUES
+  (1001, 42, DATE '2026-07-01', 125.00),
+  (1002, 42, DATE '2026-07-08', 75.50);
+
+INSERT INTO invoice_archive
+SELECT * FROM invoices WHERE issued_on < DATE '2026-01-01';
+
+INSERT INTO invoices VALUES (1002, 42, DATE '2026-07-08', 80.00)
+ON DUPLICATE KEY UPDATE amount = 80.00;`} />
+  <p>Unique tables use last-writer-wins key resolution. <code>INSERT ... ON DUPLICATE KEY UPDATE</code> is supported for MySQL-oriented ingestion, along with insert-from-select paths.</p>
+
+  <h2 id="update-and-delete">Update and delete</h2>
+  <CodeBlock language="sql" code={`UPDATE invoices
+SET amount = amount * 1.02,
+    memo = 'adjusted'
+WHERE issued_on < DATE '2026-07-01';
+
+DELETE FROM invoices
+WHERE customer_id = 42 AND amount = 0;`} />
+  <p>Update expressions may reference existing columns, scalar functions, session variables, and scalar subqueries. Deletes create tombstones for persisted segments and remove matching memtable rows; compaction later folds tombstones away.</p>
+
+  <h2 id="copy">COPY streaming</h2>
+  <p>The PostgreSQL wire supports <code>COPY table [(columns)] FROM STDIN</code> and <code>COPY ... TO STDOUT</code> in text format.</p>
+  <CodeBlock language="sql" code={`COPY invoices (invoice_id, customer_id, issued_on, amount)
+FROM STDIN WITH (FORMAT TEXT);
+
+COPY invoices TO STDOUT WITH (FORMAT TEXT);`} />
+  <Callout type="note" title="COPY scope"><p><code>FORMAT CSV</code>, <code>COPY FROM 'path'</code>, and <code>COPY TO 'path'</code> are rejected. File reads use guarded table sources such as <code>read_csv</code> and require <code>--file-root</code>.</p></Callout>
+
+  <h2 id="views-and-temporary-tables">Views and temporary tables</h2>
+  <CodeBlock language="sql" code={`CREATE VIEW open_invoices AS
+SELECT * FROM invoices WHERE amount > 0;
+
+CREATE TEMP TABLE current_batch AS
+SELECT * FROM invoices WHERE issued_on >= DATE '2026-07-01';
+
+DROP VIEW open_invoices;`} />
+  <p>Plain views store a reusable query definition. Temporary tables belong to the session namespace and disappear with the session. Materialized-view metadata exists, but treat refresh behavior as preview functionality and verify it against the current release before operational use.</p>
+  <PageLinks previous={{ label: 'Connect a client', href: '/connect/' }} next={{ label: 'Query data', href: '/sql/queries/' }} />
+</DocsLayout>

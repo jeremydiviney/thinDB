@@ -1,0 +1,17 @@
+---
+interface Props {
+  code: string
+  language?: string
+  title?: string
+}
+
+const { code, language = 'text', title } = Astro.props
+---
+
+<div class="code-block">
+  <div class="code-toolbar">
+    <span>{title ?? language}</span>
+    <button type="button" data-copy-code aria-label="Copy code">Copy</button>
+  </div>
+  <pre><code class={`language-${language}`}>{code}</code></pre>
+</div>

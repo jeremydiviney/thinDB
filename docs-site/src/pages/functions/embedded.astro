@@ -1,0 +1,151 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import CodeBlock from '../../components/CodeBlock.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'table-sdk', text: 'Typed table-function SDK' },
+  { depth: 3, slug: 'table-patterns', text: 'Core table API patterns' },
+  { depth: 2, slug: 'scalar-udfs', text: 'Scalar UDFs' },
+  { depth: 3, slug: 'scalar-kernel', text: 'Kernel contract' },
+  { depth: 3, slug: 'scalar-nulls', text: 'Null handling' },
+  { depth: 2, slug: 'aggregate-udfs', text: 'Aggregate UDFs' },
+  { depth: 2, slug: 'contracts', text: 'Registration contracts' },
+]
+---
+<DocsLayout title="Embedded UDFs" description="Register scalar, aggregate, and table UDFs through the embedded Zig API." headings={headings}>
+  <PageHeader eyebrow="Extensibility" title="Embedded UDFs" description="Applications embedding thinDB can register functions directly, avoiding dynamic loading while retaining typed vector and table interfaces." />
+  <h2 id="table-sdk">Typed table-function SDK</h2>
+  <CodeBlock language="zig" code={`const thindb = @import("thindb");
+const tdb = thindb.tdb;
+
+const running_total = struct {
+    pub const spec = tdb.TableFnSpec{
+        .name = "running_total",
+        .execution = .either,
+    };
+    pub const Input = struct { id: i64, customer_id: i64, amount: i64 };
+    pub const Output = struct { id: i64, customer_id: i64, running: i64, normalized_amount: f64 };
+
+    pub fn process(ctx: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+        _ = ctx;
+        const ids = p.col(.id);
+        const amounts = p.col(.amount);
+        var total: i64 = 0;
+        for (0..p.len) |i| {
+            total += amounts[i];
+            try out.row(.{
+                .id = ids[i],
+                .customer_id = p.key(.customer_id),
+                .running = total,
+                .normalized_amount = @floatFromInt(amounts[i]),
+            });
+        }
+    }
+};
+
+try db.registerTableFn(running_total);`} />
+  <p>Plain Zig struct fields define SQL column names and order. Mappings include <code>i32</code> to <code>INT</code>, <code>i64</code> to <code>BIGINT</code>, <code>f64</code> to <code>DOUBLE</code>, <code>[]const u8</code> to string, <code>tdb.Date</code>, <code>tdb.DateTime</code>, and <code>?T</code> for nullable columns.</p>
+  <p><code>Partition</code> supports zero-copy column access with <code>col</code>, row access with <code>at</code>/<code>iter</code>, and partition keys with <code>key</code>. <code>Writer.row</code> makes missing, extra, or mistyped output fields compile errors.</p>
+
+  <h3 id="table-patterns">Core table API patterns</h3>
+  <CodeBlock language="zig" code={`pub fn process(
+    ctx: *tdb.Ctx,
+    p: tdb.Partition(Input),
+    out: *tdb.Writer(Output),
+) !void {
+    // col() is the zero-copy columnar hot path.
+    const amounts = p.col(.amount);
+    const customer_id = p.key(.customer_id);
+
+    // arena is query-lifetime scratch memory.
+    const normalized = try ctx.arena.alloc(f64, p.len);
+    for (0..p.len) |i| normalized[i] = @floatFromInt(amounts[i]);
+
+    // iter() and at() are typed row-convenience paths.
+    var rows = p.iter();
+    var i: usize = 0;
+    var total: i64 = 0;
+    while (rows.next()) |row| : (i += 1) {
+        total += p.at(i).amount;
+        try out.row(.{
+            .id = row.id,
+            .customer_id = customer_id,
+            .running = total,
+            .normalized_amount = normalized[i],
+        });
+    }
+}`} />
+  <p>Use <code>Args</code> on the function struct for scalar configuration values supplied after the input subquery, and <code>Input2</code> for a second co-grouped input relation. Execution mode declares whether the function requires one global partition, accepts independent partitions, or supports either. The <a href="/functions/zig/">Zig functions guide</a> covers source submission, scalar <code>Args</code>, multiple inputs, SQL call syntax, and prebuilt libraries.</p>
+
+  <h2 id="scalar-udfs">Scalar UDFs</h2>
+  <Callout type="note" title="Embedded registration only"><p>Native scalar Zig UDFs are registered by the embedding application. <code>CREATE FUNCTION ... LANGUAGE zig</code> currently compiles table functions, not scalar kernels, and thinDB does not yet provide SQL DDL for scalar UDFs.</p></Callout>
+  <CodeBlock language="zig" title="Kernel and registration" code={`fn scoreBucketKernel(
+    ctx: *const thindb.udf.ScalarContext,
+    args: []const thindb.storage.ColumnView,
+    out: *thindb.engine.ColumnStore,
+    row_count: usize,
+) !void {
+    const scores = args[0].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const bucket: i32 = if (scores[i] < 3.0) 0 else 1;
+        try out.data.int.append(ctx.allocator, bucket);
+    }
+}
+
+try db.registerScalarUdf(.{
+    .name = "score_bucket",
+    .arg_types = &.{ .double },
+    .return_type = .int,
+    .null_strategy = .propagates,
+    .volatility = .immutable,
+    .kernel = scoreBucketKernel,
+});`} />
+  <CodeBlock language="sql" title="Call from SQL" code={`SELECT event_id, score_bucket(score) AS bucket
+FROM events
+WHERE score_bucket(score) = 1;`} />
+  <p>After registration, the name resolves like a built-in scalar function. Overloads may share a name when their argument type signatures differ.</p>
+
+  <h3 id="scalar-kernel">Kernel contract</h3>
+  <ul><li><code>args</code> contains one <code>ColumnView</code> per declared argument, in declaration order, with <code>row_count</code> aligned rows.</li><li>Read the union field matching each declared argument type, such as <code>data.double</code>, <code>data.int</code>, or <code>data.string</code>.</li><li>Append exactly <code>row_count</code> physical values to the output data field matching <code>return_type</code>.</li><li>Use <code>ctx.allocator</code> for required output or scratch allocation, but keep allocation out of the per-row loop.</li><li><code>ctx.user_data</code> exposes the optional application pointer from the registration descriptor. Its lifetime and synchronization are owned by the application.</li></ul>
+  <CodeBlock language="zig" title="String output pattern" code={`const values = args[0].data.string;
+var i: usize = 0;
+while (i < row_count) : (i += 1) {
+    const value = values.rowBytes(i);
+    try out.data.string.appendValue(ctx.allocator, value);
+}`} />
+
+  <h3 id="scalar-nulls">Null handling</h3>
+  <table><thead><tr><th>Strategy</th><th>Engine behavior</th><th>Kernel responsibility</th></tr></thead><tbody><tr><td><code>.propagates</code></td><td>The result is null when any argument is null.</td><td>Append one physical placeholder/result per row; the engine writes output validity.</td></tr><tr><td><code>.absorbs</code></td><td>The default result validity is valid when at least one argument is valid.</td><td>Inspect argument validity and implement value semantics such as fallback/coalescing.</td></tr><tr><td><code>.kernel_managed</code></td><td>The engine does not define result nullability.</td><td>Append every physical value and write every output validity bit.</td></tr></tbody></table>
+  <CodeBlock language="zig" title="Kernel-managed validity" code={`const base = out.rowCount();
+const values = args[0].data.double;
+var i: usize = 0;
+while (i < row_count) : (i += 1) {
+    const valid = args[0].isValid(i);
+    try out.data.int.append(ctx.allocator, if (valid and values[i] >= 0) 1 else 0);
+    try out.appendValidBit(ctx.allocator, base + i, valid);
+}`} />
+  <p>Volatility describes repeatability: <code>.immutable</code> depends only on its arguments, <code>.stable</code> is constant within a statement, and <code>.@&quot;volatile&quot;</code> may change for every evaluation. Declare the strictest truthful level; it is part of the function's optimization contract.</p>
+
+  <h2 id="aggregate-udfs">Aggregate UDFs</h2>
+  <CodeBlock language="zig" code={`try db.registerAggregateUdf(.{
+    .name = "weighted_avg",
+    .arg_types = &.{ .double, .double },
+    .return_type = .double,
+    .state_size = @sizeOf(WeightedState),
+    .state_align = @alignOf(WeightedState),
+    .init = weightedInit,
+    .update_one = weightedUpdate,
+    .update_batch = weightedUpdateBatch,
+    .combine = weightedCombine,
+    .finalize = weightedFinalize,
+});`} />
+  <p>Aggregate UDFs define a fixed-size state plus initialization, update, optional batch update, optional parallel combine, finalize, and optional destroy callbacks. A combine callback allows safe partial aggregation across workers.</p>
+
+  <h2 id="contracts">Registration contracts</h2>
+  <ul><li>Function names contain only alphanumeric characters and underscores.</li><li>Built-in scalar and aggregate names are reserved.</li><li>Scalar and aggregate functions may overload a user-defined name by argument signature, but duplicate signatures are rejected.</li><li>Arguments are capped at 16 for scalar and aggregate UDFs.</li><li>Descriptors and callback pointers must remain valid for the database/catalog lifetime.</li><li>Callbacks run inside the query process and must be thread-safe when parallel execution can reach them.</li></ul>
+  <Callout type="note" title="Raw table API"><p><code>registerTableUdf</code> accepts a raw descriptor for advanced integrations. Prefer <code>registerTableFn</code>; its comptime reflection removes most schema and rectangular-output mistakes.</p></Callout>
+  <PageLinks previous={{ label: 'Zig functions', href: '/functions/zig/' }} next={{ label: 'Server configuration', href: '/operations/server/' }} />
+</DocsLayout>

@@ -238,6 +238,22 @@ pub fn build(b: *std.Build) void {
     const probe_step = b.step("probe", "Open .clickbench-db and dump discovered databases/schemas");
     probe_step.dependOn(&run_probe.step);
 
+    // ---- segstats: per-row-group stats invariant checker (diagnostic) ----
+    const segstats_mod = b.createModule(.{
+        .root_source_file = b.path("bench/segstats.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    segstats_mod.addImport("thindb", thindb_mod);
+    const segstats_exe = b.addExecutable(.{
+        .name = "segstats",
+        .root_module = segstats_mod,
+    });
+    const run_segstats = b.addRunArtifact(segstats_exe);
+    if (b.args) |args| run_segstats.addArgs(args);
+    const segstats_step = b.step("segstats", "Verify per-RG footer stats vs decoded values: -- <table_dir> <column>");
+    segstats_step.dependOn(&run_segstats.step);
+
     // ---- TVF flagship A/B: bench/tvf_walk_ab.zig (always ReleaseFast) ----
     const tvf_ab_mod = b.createModule(.{
         .root_source_file = b.path("bench/tvf_walk_ab.zig"),

@@ -1,0 +1,67 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro'
+import PageHeader from '../components/PageHeader.astro'
+import CodeBlock from '../components/CodeBlock.astro'
+import Callout from '../components/Callout.astro'
+import PageLinks from '../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'mysql', text: 'MySQL' },
+  { depth: 2, slug: 'postgresql', text: 'PostgreSQL' },
+  { depth: 2, slug: 'namespaces', text: 'Databases and schemas' },
+  { depth: 2, slug: 'prepared-statements', text: 'Prepared statements' },
+  { depth: 2, slug: 'authentication', text: 'Authentication' },
+]
+---
+<DocsLayout title="Connect a client" description="Connect MySQL and PostgreSQL clients to thinDB." headings={headings}>
+  <PageHeader eyebrow="Start" title="Connect an existing SQL client" description="thinDB speaks the MySQL and PostgreSQL wire protocols on separate ports. Use standard drivers and connection pools while targeting thinDB's SQL surface." />
+  <h2 id="mysql">MySQL</h2>
+  <CodeBlock language="bash" title="MySQL CLI" code={`mysql --host=127.0.0.1 --port=3306 --user=thindb --database=main__public`} />
+  <CodeBlock language="typescript" title="mysql2" code={`import mysql from "mysql2/promise";
+
+const db = await mysql.createPool({
+  host: "127.0.0.1",
+  port: 3306,
+  user: "thindb",
+  password: "",
+  database: "main__public",
+});
+
+const [rows] = await db.execute(
+  "SELECT account_id, SUM(amount) AS total FROM events WHERE occurred_at >= ? GROUP BY account_id",
+  ["2026-07-01 00:00:00"],
+);`} />
+
+  <h2 id="postgresql">PostgreSQL</h2>
+  <CodeBlock language="bash" title="psql" code={`psql "host=127.0.0.1 port=5432 user=thindb dbname=main"`} />
+  <CodeBlock language="typescript" title="node-postgres" code={`import { Pool } from "pg";
+
+const db = new Pool({
+  host: "127.0.0.1",
+  port: 5432,
+  user: "thindb",
+  password: "",
+  database: "main",
+});
+
+const result = await db.query(
+  "SELECT account_id, SUM(amount) AS total FROM events WHERE occurred_at >= $1 GROUP BY account_id",
+  ["2026-07-01 00:00:00"],
+);`} />
+
+  <h2 id="namespaces">Databases and schemas</h2>
+  <p>The catalog supports <code>database.schema.table</code> names. New sessions default to database <code>main</code> and schema <code>public</code>.</p>
+  <div class="table-scroll"><table><thead><tr><th>Client</th><th>Initial namespace</th><th>Qualified table</th></tr></thead><tbody>
+    <tr><td>MySQL</td><td><code>main__public</code> encodes database and schema in the selected database name.</td><td><code>main__public.events</code> or session-relative <code>events</code>.</td></tr>
+    <tr><td>PostgreSQL</td><td>Connect to <code>main</code>; schema defaults to <code>public</code>.</td><td><code>public.events</code> or <code>main.public.events</code>.</td></tr>
+  </tbody></table></div>
+  <p>Use <code>SHOW DATABASES</code>, <code>SHOW SCHEMAS</code>, and <code>SHOW TABLES</code> to inspect the catalog.</p>
+
+  <h2 id="prepared-statements">Prepared statements</h2>
+  <p>The MySQL listener implements binary <code>COM_STMT_PREPARE</code>/<code>COM_STMT_EXECUTE</code> with <code>?</code> placeholders. PostgreSQL implements the Extended Query sequence (Parse, Bind, Describe, Execute, Sync) with <code>$1</code>, <code>$2</code>, and so on. Integer, bigint, floating-point, string, boolean, date/time, and null bindings are supported.</p>
+  <Callout type="tip" title="Use parameters"><p>Prefer driver parameters to manually interpolated literals. Each wire path renders and re-parses a typed SQL literal while respecting its own identifier and string syntax.</p></Callout>
+
+  <h2 id="authentication">Authentication</h2>
+  <p>Without password flags, both listeners run in trust mode. Set <code>--mysql-password</code> to enable <code>mysql_native_password</code> verification and <code>--pg-password</code> to enable SCRAM-SHA-256 verification.</p>
+  <Callout type="warning" title="Network exposure"><p>The default bind address is <code>0.0.0.0</code>. Bind to loopback during local development, and do not expose a trust-mode listener to an untrusted network.</p></Callout>
+  <PageLinks previous={{ label: 'Install and run', href: '/getting-started/' }} next={{ label: 'Tables and data', href: '/sql/tables/' }} />
+</DocsLayout>

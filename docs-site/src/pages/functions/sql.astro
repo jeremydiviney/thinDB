@@ -1,0 +1,114 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import PageHeader from '../../components/PageHeader.astro'
+import CodeBlock from '../../components/CodeBlock.astro'
+import Callout from '../../components/Callout.astro'
+import PageLinks from '../../components/PageLinks.astro'
+const headings = [
+  { depth: 2, slug: 'model', text: 'Reusable SQL chunks' },
+  { depth: 2, slug: 'define', text: 'Define a SQL function' },
+  { depth: 3, slug: 'parameters', text: 'Scalar parameters' },
+  { depth: 2, slug: 'call', text: 'Call it from a query' },
+  { depth: 3, slug: 'composition', text: 'Composition patterns' },
+  { depth: 2, slug: 'lifecycle', text: 'Lifecycle and persistence' },
+  { depth: 2, slug: 'semantics', text: 'Semantics and limitations' },
+]
+---
+<DocsLayout title="SQL functions" description="Build reusable parameterized SQL table functions in thinDB." headings={headings}>
+  <PageHeader eyebrow="Extensibility" title="SQL table functions" description="Name a reusable chunk of SQL, pass scalar values into it, and use its result anywhere a table source is accepted." />
+
+  <h2 id="model">Reusable SQL chunks</h2>
+  <p>A SQL table function is thinDB's parameterized-view feature. Its body is an ordinary <code>SELECT</code>, its parameters are scalar values, and its result is a relation. At each call site thinDB binds the supplied literals, reparses the stored body, and inserts that operator tree into the caller. There is no stored-procedure runtime or forced materialization step.</p>
+  <CodeBlock language="sql" title="The mental model" code={`-- Define the reusable query once.
+CREATE FUNCTION orders_for_customer(customer BIGINT)
+RETURNS TABLE AS (
+  SELECT order_id, ordered_at, total
+  FROM orders
+  WHERE customer_id = customer
+);
+
+-- Use its rows as a normal FROM source.
+SELECT order_id, total
+FROM orders_for_customer(42)
+WHERE total >= 100
+ORDER BY total DESC;`} />
+  <Callout type="note" title="Table-valued, scalar-parameterized"><p>The arguments are scalar values, but the function itself returns rows. This is different from a scalar UDF such as <code>score_bucket(score)</code>, which returns one value per input row.</p></Callout>
+
+  <h2 id="define">Define a SQL function</h2>
+  <CodeBlock language="sql" code={`CREATE FUNCTION customer_invoices(
+  customer BIGINT,
+  minimum_amount DOUBLE,
+  include_unpaid BOOLEAN
+) RETURNS TABLE AS (
+  SELECT invoice_id, issued_on, amount, paid
+  FROM invoices
+  WHERE customer_id = customer
+    AND amount >= minimum_amount
+    AND (include_unpaid OR paid = TRUE)
+);
+
+CREATE OR REPLACE FUNCTION high_value(cutoff DECIMAL(18, 2))
+RETURNS TABLE AS (
+  SELECT * FROM invoices WHERE amount >= cutoff
+);`} />
+  <p>The body must be a non-empty <code>SELECT</code> enclosed in parentheses. Parameter names bind case-insensitively anywhere an expression is accepted in that body, including projections, filters, grouping expressions, ordering, limits, scalar-function arguments, and nested subqueries.</p>
+
+  <h3 id="parameters">Scalar parameters</h3>
+  <p>Each parameter is declared as <code>name type</code>. The declaration is retained in catalog metadata and by <code>SHOW CREATE FUNCTION</code>. Calls are positional: the first argument binds the first parameter, and every declared parameter must receive exactly one argument.</p>
+  <CodeBlock language="sql" code={`CREATE FUNCTION recent_orders(days_back INT, region_name STRING)
+RETURNS TABLE AS (
+  SELECT order_id, region, total
+  FROM orders
+  WHERE ordered_at >= DATE_SUB(CURRENT_DATE, days_back)
+    AND region = region_name
+);
+
+SELECT * FROM recent_orders(30, 'west');`} />
+  <p>Current call-site arguments are literal tokens: integers, floating-point numbers, strings, <code>TRUE</code>, <code>FALSE</code>, <code>NULL</code>, and negative numeric literals. Column references, arithmetic expressions, scalar-function calls, subqueries, and typed-literal prefixes such as <code>DATE '2026-01-01'</code> are not accepted directly as arguments.</p>
+  <Callout type="warning" title="Types do not coerce call arguments"><p>The declared parameter type is currently catalog metadata, not an argument-casting step. The bound literal keeps its literal token type and the surrounding SQL expression performs its normal type checking. Pass a compatible literal and use <code>CAST</code> inside the function body when an explicit conversion is required.</p></Callout>
+
+  <h2 id="call">Call it from a query</h2>
+  <CodeBlock language="sql" code={`SELECT *
+FROM customer_invoices(42, 100.0, TRUE)
+ORDER BY issued_on;
+
+SELECT customer_id, SUM(amount)
+FROM high_value(1000.00)
+GROUP BY customer_id;`} />
+  <p>Call the function in <code>FROM</code> using the same number and order of arguments as its declaration. Its projected columns become the columns exposed by that table source. The call is not valid where a scalar expression is required.</p>
+
+  <h3 id="composition">Composition patterns</h3>
+  <CodeBlock language="sql" code={`-- Filter, aggregate, and sort the returned rows.
+SELECT paid, COUNT(*) AS invoices, SUM(amount) AS total
+FROM customer_invoices(42, 0.0, TRUE)
+GROUP BY paid
+ORDER BY total DESC;
+
+-- A function may call another SQL table function in its body.
+CREATE FUNCTION large_customer_invoices(customer BIGINT)
+RETURNS TABLE AS (
+  SELECT invoice_id, issued_on, amount
+  FROM customer_invoices(customer, 1000.0, TRUE)
+);
+
+-- A zero-parameter function is a named reusable query.
+CREATE FUNCTION open_invoices()
+RETURNS TABLE AS (
+  SELECT * FROM invoices WHERE paid = FALSE
+);
+
+SELECT * FROM open_invoices();`} />
+  <p>Because expansion is inline, the surrounding query can continue with normal filters, joins, aggregation, window functions, ordering, and limits. Nested SQL function and view expansion is bounded to 16 levels.</p>
+
+  <h2 id="lifecycle">Lifecycle and persistence</h2>
+  <CodeBlock language="sql" code={`SHOW FUNCTIONS;
+SHOW CREATE FUNCTION customer_invoices;
+DROP FUNCTION customer_invoices;
+DROP FUNCTION IF EXISTS customer_invoices;`} />
+  <p>SQL functions are database-scoped. The verbatim creation statement is persisted under the database's <code>_functions</code> directory and reloaded when the catalog opens.</p>
+
+  <h2 id="semantics">Semantics and limitations</h2>
+  <ul><li>Arguments are positional literals; named arguments and default parameter values are not implemented.</li><li>Argument count must match exactly or the call fails with a function-argument mismatch.</li><li>Overloading SQL table functions by parameter signature is not implemented; a database has one definition per function name.</li><li>The function returns a relation. Scalar SQL UDF syntax such as <code>RETURNS INT RETURN x + 1</code> is not implemented.</li><li>The body is expanded per call; there is no hidden materialization boundary or cached result.</li><li>Expansion beyond 16 nested function/view levels is rejected.</li><li>Functions do not contain procedural statements, mutation, transaction control, or dynamic SQL.</li></ul>
+  <Callout type="tip" title="Best use"><p>Use a SQL function for a stable, parameterized slice of analytical SQL: tenant filters, reusable cohorts, report bases, and shared transformations. Use a view when there are no parameters.</p></Callout>
+  <PageLinks previous={{ label: 'Built-in functions', href: '/sql/functions/' }} next={{ label: 'Zig functions', href: '/functions/zig/' }} />
+</DocsLayout>
