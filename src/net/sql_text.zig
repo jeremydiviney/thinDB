@@ -39,11 +39,21 @@ const pg_quotes: QuoteRules = .{
 /// Both wires' canned-probe matchers normalize input identically; this
 /// is the shared helper. Caller owns the returned slice.
 pub fn normalizeForCannedMatch(allocator: Allocator, sql: []const u8) ![]u8 {
-    var s = stripLeadingComments(std.mem.trim(u8, sql, " \t\r\n"));
-    while (s.len > 0 and s[s.len - 1] == ';') s = std.mem.trim(u8, s[0 .. s.len - 1], " \t\r\n");
+    const s = normalizeForCannedMatchKeepCase(sql);
     const out = try allocator.alloc(u8, s.len);
     for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
     return out;
+}
+
+/// The same trim/comment/semicolon normalization WITHOUT lowercasing —
+/// byte-for-byte parallel to `normalizeForCannedMatch`'s output, so an
+/// offset into one indexes the same character in the other. Matchers work
+/// on the lowered buffer; display text (column labels echo the client's
+/// case) slices from this one. Borrows from `sql`.
+pub fn normalizeForCannedMatchKeepCase(sql: []const u8) []const u8 {
+    var s = stripLeadingComments(std.mem.trim(u8, sql, " \t\r\n"));
+    while (s.len > 0 and s[s.len - 1] == ';') s = std.mem.trim(u8, s[0 .. s.len - 1], " \t\r\n");
+    return s;
 }
 
 fn stripLeadingComments(sql: []const u8) []const u8 {

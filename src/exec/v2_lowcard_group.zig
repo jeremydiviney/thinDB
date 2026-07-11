@@ -225,6 +225,11 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                 const typ = columnType(table, col_name) orelse return declineFree(allocator, aggs);
                 if (columnNullable(table, col_name)) return declineFree(allocator, aggs);
                 if (keyTypeBits(typ) == null and !isFloatType(typ)) return declineFree(allocator, aggs);
+                // Temporal SUM/AVG is a dialect error (validateAggFn) — decline
+                // so the shape errors consistently instead of this lane quietly
+                // summing day/µs ints when the key cardinality happens to be low.
+                if ((typ == .date or typ == .datetime) and agg.func != .min and agg.func != .max)
+                    return declineFree(allocator, aggs);
                 // decimal128 (i128 mantissa) can't fit this path's i64 slots;
                 // decline so the shape surfaces an error rather than truncating.
                 // decimal64 is fine: SUM/MIN/MAX fold in i64 and widen at emit,

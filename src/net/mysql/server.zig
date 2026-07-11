@@ -1098,12 +1098,20 @@ fn sendSyntheticWorkbenchSelect(
         return true;
     }
 
+    // Parallel case-preserved view of the same normalized statement:
+    // matching runs on `lc`, column labels slice from `orig` at the same
+    // offsets so they echo the client's typed case.
+    const orig_full = sql_text_mod.normalizeForCannedMatchKeepCase(payload);
+
     var select_list: []const u8 = lc["select ".len..];
+    var orig_list: []const u8 = orig_full["select ".len..];
     if (topLevelKeyword(select_list, "limit")) |limit_idx| {
         select_list = std.mem.trim(u8, select_list[0..limit_idx], " \t\r\n");
+        orig_list = std.mem.trim(u8, orig_list[0..limit_idx], " \t\r\n");
     }
     if (std.mem.startsWith(u8, select_list, "sql_no_cache ")) {
         select_list = std.mem.trim(u8, select_list["sql_no_cache ".len..], " \t\r\n");
+        orig_list = std.mem.trim(u8, orig_list["sql_no_cache ".len..], " \t\r\n");
     }
 
     var cols = std.ArrayList(types.Column).empty;
@@ -1115,20 +1123,21 @@ fn sendSyntheticWorkbenchSelect(
     while (start < select_list.len) {
         const end = nextTopLevelComma(select_list, start) orelse select_list.len;
         const raw_expr = std.mem.trim(u8, select_list[start..end], " \t\r\n");
+        const orig_raw = std.mem.trim(u8, orig_list[start..end], " \t\r\n");
         if (raw_expr.len > 0) {
             const expr = stripAlias(raw_expr).expr;
-            // Temporal nullary functions resolve to real wall-clock through
-            // the engine's FROM-less SELECT path — bail the whole query to
-            // the engine instead of returning a canned epoch value here.
-            if (std.mem.eql(u8, expr, "now()") or
-                std.mem.eql(u8, expr, "current_timestamp()") or
-                std.mem.eql(u8, expr, "current_date()") or
-                std.mem.eql(u8, expr, "current_timestamp") or
-                std.mem.eql(u8, expr, "current_date")) return false;
-            const col_name = stripIdentifierQuotes(stripAlias(raw_expr).alias orelse raw_expr);
-            const value = syntheticSelectValue(expr, session.current_schema);
-            try cols.append(allocator, .{ .name = col_name, .type = .string, .nullable = value == null });
-            try cells.append(allocator, value);
+            // Anything this layer doesn't positively recognize — literals,
+            // arithmetic, real scalar functions, temporal nullaries — bails
+            // the WHOLE statement to the engine, which answers FROM-less
+            // SELECTs with proper values and types. Answering "" here (the
+            // old fallback) silently lost values.
+            const value = syntheticSelectValue(expr, session.current_schema) orelse return false;
+            const col_name = stripIdentifierQuotes(stripAlias(orig_raw).alias orelse orig_raw);
+            try cols.append(allocator, .{ .name = col_name, .type = .string, .nullable = value == .null_value });
+            try cells.append(allocator, switch (value) {
+                .text => |t| t,
+                .null_value => null,
+            });
         }
         start = end + 1;
     }
@@ -1185,31 +1194,151 @@ fn stripIdentifierQuotes(s_in: []const u8) []const u8 {
     return s;
 }
 
-fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8) ?[]const u8 {
+/// Best-effort identification of the missing column behind a
+/// ColumnNotFound compile error, so ER_BAD_FIELD can NAME it the way MySQL
+/// does. Walks a linear SELECT chain down to its scan, collecting referenced
+/// column names and Compute-provided names; the first reference missing from
+/// the table's schema (and not Compute-provided) is the culprit. Conservative
+/// by construction: joins, unions, subqueries, qualified/star/synthetic names
+/// and overflowing shapes return null and the generic message stands.
+fn findUnknownColumn(catalog: *Catalog, session: *SessionState, root: *const ir.Op) ?[]const u8 {
+    var needed_buf: [64][]const u8 = undefined;
+    var needed_n: usize = 0;
+    var provided_buf: [32][]const u8 = undefined;
+    var provided_n: usize = 0;
+
+    var op = root;
+    const scan_table = walk: while (true) {
+        switch (op.*) {
+            .scan => |s| break :walk s,
+            .select, .exclude => |pr| {
+                for (pr.columns) |c| {
+                    if (!plausibleColumnName(c)) continue;
+                    if (needed_n == needed_buf.len) return null;
+                    needed_buf[needed_n] = c;
+                    needed_n += 1;
+                }
+                op = pr.upstream;
+            },
+            .filter => |f| {
+                if (!collectPredicateColumns(f.predicate, &needed_buf, &needed_n)) return null;
+                op = f.upstream;
+            },
+            .group_by => |g| {
+                for (g.group_cols) |c| {
+                    if (!plausibleColumnName(c)) continue;
+                    if (needed_n == needed_buf.len) return null;
+                    needed_buf[needed_n] = c;
+                    needed_n += 1;
+                }
+                for (g.aggs) |a| {
+                    for ([_]?[]const u8{ a.col, a.arg2_col }) |maybe| {
+                        const c = maybe orelse continue;
+                        if (std.mem.eql(u8, c, "*") or !plausibleColumnName(c)) continue;
+                        if (needed_n == needed_buf.len) return null;
+                        needed_buf[needed_n] = c;
+                        needed_n += 1;
+                    }
+                }
+                op = g.upstream;
+            },
+            .order_by => |o| {
+                for (o.specs) |sp| {
+                    if (!plausibleColumnName(sp.col)) continue;
+                    if (needed_n == needed_buf.len) return null;
+                    needed_buf[needed_n] = sp.col;
+                    needed_n += 1;
+                }
+                op = o.upstream;
+            },
+            .compute => |cm| {
+                for (cm.derived) |d| {
+                    if (provided_n == provided_buf.len) return null;
+                    provided_buf[provided_n] = d.name;
+                    provided_n += 1;
+                }
+                op = cm.upstream;
+            },
+            .limit => |l| op = l.upstream,
+            .alias => |a| op = a.upstream,
+            else => return null,
+        }
+    };
+
+    const db = catalog.database(scan_table.table.database orelse session.current_db) orelse return null;
+    const sc = db.schema(scan_table.table.schema orelse session.current_schema) orelse return null;
+    const t = schemaTable(sc, scan_table.table.name) orelse return null;
+
+    outer: for (needed_buf[0..needed_n]) |name| {
+        if (types.findColumn(t.schema.columns, name) != null) continue;
+        for (provided_buf[0..provided_n]) |pn| {
+            if (types.columnNameEql(pn, name)) continue :outer;
+        }
+        return name;
+    }
+    return null;
+}
+
+fn plausibleColumnName(name: []const u8) bool {
+    if (name.len == 0 or std.mem.eql(u8, name, "*")) return false;
+    // Qualified (alias.col), star-expanded (t.*), and synthetic (__agg_arg_n)
+    // names carry resolution rules this walker doesn't model.
+    if (std.mem.indexOfScalar(u8, name, '.') != null) return false;
+    if (std.mem.startsWith(u8, name, "__")) return false;
+    return true;
+}
+
+fn collectPredicateColumns(expr: PredicateExpr, buf: *[64][]const u8, n: *usize) bool {
+    switch (expr) {
+        .leaf => |p| {
+            if (plausibleColumnName(p.col)) {
+                if (n.* == buf.len) return false;
+                buf[n.*] = p.col;
+                n.* += 1;
+            }
+        },
+        .in_set => |s| {
+            if (plausibleColumnName(s.col)) {
+                if (n.* == buf.len) return false;
+                buf[n.*] = s.col;
+                n.* += 1;
+            }
+        },
+        .@"and", .@"or" => |kids| for (kids) |k| {
+            if (!collectPredicateColumns(k, buf, n)) return false;
+        },
+        .not => |child| return collectPredicateColumns(child.*, buf, n),
+        else => {},
+    }
+    return true;
+}
+
+const SyntheticValue = union(enum) { text: []const u8, null_value };
+
+/// A recognized connection-setup probe expression, or null when this layer
+/// has no answer — the caller then bails the statement to the engine (which
+/// evaluates FROM-less SELECTs with real values and types). This layer only
+/// exists for the multi-column `@@var` init probes drivers send, which the
+/// engine has no system-variable support for.
+fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8) ?SyntheticValue {
     const expr = std.mem.trim(u8, expr_in, " \t\r\n");
-    if (expr.len == 0) return "";
-    if (std.mem.eql(u8, expr, "null")) return null;
-    if (std.mem.eql(u8, expr, "1") or std.mem.eql(u8, expr, "0")) return expr;
-    if (expr.len >= 2 and expr[0] == '\'' and expr[expr.len - 1] == '\'') return expr[1 .. expr.len - 1];
+    if (std.mem.eql(u8, expr, "null")) return .null_value;
 
     if (std.mem.startsWith(u8, expr, "@@")) {
-        return syntheticVariableValue(expr[2..], current_schema);
+        return .{ .text = syntheticVariableValue(expr[2..], current_schema) };
     }
 
-    if (std.mem.eql(u8, expr, "version()")) return handshake.server_version;
-    if (std.mem.eql(u8, expr, "database()") or std.mem.eql(u8, expr, "schema()")) return current_schema;
+    if (std.mem.eql(u8, expr, "version()")) return .{ .text = handshake.server_version };
+    if (std.mem.eql(u8, expr, "database()") or std.mem.eql(u8, expr, "schema()")) return .{ .text = current_schema };
     if (std.mem.eql(u8, expr, "user()") or
         std.mem.eql(u8, expr, "current_user()") or
         std.mem.eql(u8, expr, "session_user()") or
         std.mem.eql(u8, expr, "system_user()"))
-        return "thindb@localhost";
-    if (std.mem.eql(u8, expr, "connection_id()")) return "1";
-    if (std.mem.eql(u8, expr, "connection_id")) return "1";
+        return .{ .text = "thindb@localhost" };
+    if (std.mem.eql(u8, expr, "connection_id()")) return .{ .text = "1" };
+    if (std.mem.eql(u8, expr, "connection_id")) return .{ .text = "1" };
 
-    // Workbench and drivers occasionally probe scalar expressions
-    // during connection setup. Returning a benign string result keeps
-    // those probes out of thinDB's FROM-requiring SQL parser.
-    return "";
+    return null;
 }
 
 fn syntheticVariableValue(var_in: []const u8, current_schema: []const u8) []const u8 {
@@ -3417,7 +3546,16 @@ fn runSingleStatement(
     var compiled = local.compileWithSession(qalloc, main_db, session.asSession(), op) catch |err| {
         profiler.recordSince(.query_compile, compile_start);
         const mapped = errors.mapInternal(err, null);
-        try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
+        var msg: []const u8 = mapped.message;
+        var msg_owned: ?[]u8 = null;
+        defer if (msg_owned) |m| allocator.free(m);
+        if (err == error.ColumnNotFound) {
+            if (findUnknownColumn(catalog, session, op)) |col| {
+                msg_owned = std.fmt.allocPrint(allocator, "Unknown column '{s}' in 'field list'", .{col}) catch null;
+                if (msg_owned) |m| msg = m;
+            }
+        }
+        try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, msg);
         return false;
     };
     profiler.recordSince(.query_compile, compile_start);

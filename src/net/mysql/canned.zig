@@ -120,8 +120,10 @@ pub fn match(
         return Outcome{ .kill = id };
     }
 
-    if (std.mem.eql(u8, lc, "select 1"))
-        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "1"), .val = "1" } };
+    // `SELECT 1` deliberately NOT canned: the engine's FROM-less SELECT
+    // answers it with a properly-typed integer column (a canned reply can
+    // only send text, and drivers doing strict comparisons on ping results
+    // care about the type).
 
     if (std.mem.eql(u8, lc, "select @@version_comment") or
         std.mem.eql(u8, lc, "select @@version_comment limit 1"))

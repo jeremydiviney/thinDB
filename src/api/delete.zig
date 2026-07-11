@@ -39,6 +39,10 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
         var deleted: std.ArrayList(u32) = .empty;
         defer deleted.deinit(t.allocator);
 
+        const existing = try storage.tombstone.read(t.allocator, t.io, t.segments_dir, entry.segment_id);
+        defer if (existing) |e| t.allocator.free(e);
+        var dead = TombCursor{ .tombs = existing orelse &.{} };
+
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
             // Quick prune via stats. String columns prune too (eq + range via
@@ -55,7 +59,7 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
             const n = rg.row_count;
             var i: u32 = 0;
             while (i < n) : (i += 1) {
-                if (comparison.evalRow(col.view(), i, pred)) {
+                if (comparison.evalRow(col.view(), i, pred) and !dead.isDead(row_offset + i)) {
                     try deleted.append(t.allocator, row_offset + i);
                 }
             }
@@ -215,6 +219,10 @@ pub fn execDeleteKeyedBatch(
         var deleted: std.ArrayList(u32) = .empty;
         defer deleted.deinit(t.allocator);
 
+        const existing = try t.segmentTombstones(t.allocator, handle);
+        defer if (existing) |e| t.allocator.free(e);
+        var dead = TombCursor{ .tombs = existing orelse &.{} };
+
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
             const n = rg.row_count;
@@ -245,6 +253,7 @@ pub fn execDeleteKeyedBatch(
                 keybuf.clearRetainingCapacity();
                 for (decoded) |c| try comparison.appendColumnValueBytes(aa, &keybuf, c.view(), row);
                 if (key_map.get(keybuf.items)) |stmt_idx| {
+                    if (dead.isDead(row_offset + row)) continue;
                     try deleted.append(t.allocator, row_offset + row);
                     counts[stmt_idx] += 1;
                 }
@@ -301,6 +310,22 @@ pub fn execDeleteKeyedBatch(
 
     return total;
 }
+
+/// Forward cursor over a segment's existing (sorted, deduped) tombstone
+/// list. Delete paths visit row offsets in increasing order, so one linear
+/// walk answers every membership probe. Rows already dead must not be
+/// re-counted in affected_rows — an upsert-superseded old copy matching the
+/// predicate would otherwise inflate the count (observed 2.02M reported vs
+/// 1.2M live rows on a keyed table).
+const TombCursor = struct {
+    tombs: []const u32 = &.{},
+    i: usize = 0,
+
+    fn isDead(self: *TombCursor, off: u32) bool {
+        while (self.i < self.tombs.len and self.tombs[self.i] < off) self.i += 1;
+        return self.i < self.tombs.len and self.tombs[self.i] == off;
+    }
+};
 
 const RgHint = struct {
     col_idx: usize,
@@ -398,6 +423,10 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
         var deleted: std.ArrayList(u32) = .empty;
         defer deleted.deinit(t.allocator);
 
+        const existing = try storage.tombstone.read(t.allocator, t.io, t.segments_dir, entry.segment_id);
+        defer if (existing) |e| t.allocator.free(e);
+        var dead = TombCursor{ .tombs = existing orelse &.{} };
+
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
             const n = rg.row_count;
@@ -405,7 +434,10 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
             if (pred_or_null == null) {
                 // No predicate → every row tombstoned. Skip decoding.
                 var i: u32 = 0;
-                while (i < n) : (i += 1) try deleted.append(t.allocator, row_offset + i);
+                while (i < n) : (i += 1) {
+                    if (dead.isDead(row_offset + i)) continue;
+                    try deleted.append(t.allocator, row_offset + i);
+                }
                 row_offset += n;
                 continue;
             }
@@ -453,7 +485,7 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
 
             var i: u32 = 0;
             while (i < n) : (i += 1) {
-                if (mask[i]) try deleted.append(t.allocator, row_offset + i);
+                if (mask[i] and !dead.isDead(row_offset + i)) try deleted.append(t.allocator, row_offset + i);
             }
             row_offset += n;
         }
@@ -506,6 +538,44 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
     }
 
     return total;
+}
+
+test "delete: affected count excludes already-tombstoned rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .v = @as(i32, 1) },
+        .{ .id = @as(i64, 2), .v = @as(i32, 2) },
+        .{ .id = @as(i64, 3), .v = @as(i32, 3) },
+    });
+    try t.flush();
+
+    const pred = exec.Predicate{ .col = "v", .op = .lte, .val = .{ .int = 2 } };
+    try std.testing.expectEqual(@as(usize, 2), try execDelete(t, pred));
+    // The matching rows are dead now; re-running the same predicate must
+    // report 0, not re-count the tombstoned copies.
+    try std.testing.expectEqual(@as(usize, 0), try execDelete(t, pred));
+
+    var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "v", .op = .gte, .val = .{ .int = 1 } } };
+    try predicate.validateExpr(&expr, t.schema.columns);
+    try std.testing.expectEqual(@as(usize, 1), try execDeleteByExpr(t, expr));
+    try std.testing.expectEqual(@as(usize, 0), try execDeleteByExpr(t, expr));
 }
 
 test "keyed batch delete: one sweep, per-statement counts, literal widening" {
