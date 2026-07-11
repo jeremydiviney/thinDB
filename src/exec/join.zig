@@ -942,7 +942,7 @@ pub const Join = struct {
                 var it = std.mem.splitScalar(u8, buf.items, '\n');
                 var depth: usize = 0;
                 while (it.next()) |line| : (depth += 1) {
-                    if (depth >= 4 or line.len == 0) break;
+                    if (depth >= 14 or line.len == 0) break;
                     std.debug.print("[jf]     probe: {s}\n", .{std.mem.trim(u8, line, " ")});
                 }
             }
