@@ -35,6 +35,9 @@ pub const Project = struct {
     /// passed-through column keeps its ndv + min/max). Empty when the
     /// upstream has none. Cached at create.
     cached_stats: []const exec.ColStat = &.{},
+    /// Composed probe remap owned by this projection (an incoming
+    /// sink.probe_map composed with column_map in tryFuseProbe).
+    owned_probe_map: ?[]usize = null,
 
     pub fn create(allocator: Allocator, upstream: Query, names: []const []const u8) !Query {
         return createNamed(allocator, upstream, names, null);
@@ -101,6 +104,7 @@ pub const Project = struct {
         self.allocator.free(self.column_map);
         self.allocator.free(self.views);
         if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
+        if (self.owned_probe_map) |m| self.allocator.free(m);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -158,8 +162,11 @@ pub const Project = struct {
     /// key/gather indices against OUR output order, so a narrowing or
     /// reordering projection hands the accepting scan its column_map via
     /// `sink.probe_map` — the scan remaps each batch's values before the
-    /// sink sees them, replacing the remap next() would have done. Declines
-    /// when a map is already set (chained projections; rare, not composed).
+    /// sink sees them, replacing the remap next() would have done. A sink
+    /// that already carries a map (a projection higher in the chain, e.g.
+    /// across a UNION arm boundary) COMPOSES: its indices address our
+    /// output, ours address the upstream, so `column_map[m[i]]` addresses
+    /// the upstream directly.
     pub fn tryFuseProbe(self: *Project, sink: exec.ProbeSink) !bool {
         var fwd = sink;
         const identity = blk: {
@@ -168,7 +175,22 @@ pub const Project = struct {
             break :blk true;
         };
         if (!identity) {
-            if (sink.probe_map != null) return false;
+            if (sink.probe_map) |m| {
+                const composed = try self.allocator.alloc(usize, m.len);
+                errdefer self.allocator.free(composed);
+                for (m, composed) |mi, *c| c.* = self.column_map[mi];
+                const ok = try self.upstream.tryFuseProbe(blk2: {
+                    fwd.probe_map = composed;
+                    break :blk2 fwd;
+                });
+                if (!ok) {
+                    self.allocator.free(composed);
+                    return false;
+                }
+                self.owned_probe_map = composed;
+                self.probe_fused = true;
+                return true;
+            }
             fwd.probe_map = self.column_map;
         }
         const ok = try self.upstream.tryFuseProbe(fwd);

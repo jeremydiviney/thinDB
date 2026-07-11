@@ -291,6 +291,26 @@ const ChainForward = struct {
 
     fn bindHook(ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void {
         const cf: *ChainForward = @ptrCast(@alignCast(ctx));
+        // Grow-only (see Join.sinkBind): a SetUnion forwards one sink to both
+        // arms, so this can bind twice at compile time. Keep the larger clone
+        // set; still forward to the inner sink (itself grow-only).
+        if (cf.per_chunk.len >= n_chunks) {
+            if (cf.inner) |inner| try inner.bind(inner.ctx, n_chunks, alloc);
+            return;
+        }
+        if (cf.per_chunk.len > 0) {
+            for (cf.per_chunk, cf.stubs) |*q, st| {
+                q.deinit();
+                cf.bind_alloc.destroy(st);
+            }
+            cf.bind_alloc.free(cf.per_chunk);
+            cf.bind_alloc.free(cf.stubs);
+            cf.per_chunk = &.{};
+            cf.stubs = &.{};
+            for (cf.map_views) |v| cf.bind_alloc.free(v);
+            if (cf.map_views.len > 0) cf.bind_alloc.free(cf.map_views);
+            cf.map_views = &.{};
+        }
         cf.bind_alloc = alloc;
         const qs = try alloc.alloc(Query, n_chunks);
         errdefer alloc.free(qs);

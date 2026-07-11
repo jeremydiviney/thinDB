@@ -2741,3 +2741,135 @@ test "parallel scan compute split: safe derived fused, unsafe (CASE) stays seria
         try std.testing.expectEqualSlices(i64, a, b);
     }
 }
+
+test "SetUnion probe forwarding: join probes union arms inside scan workers" {
+    // A LEFT join whose probe side is a UNION ALL of two arms must forward
+    // its probe sink through the union: a ParallelScan arm probes in its
+    // stripe workers (fused), a plain-Scan arm declines and the union probes
+    // its raw batches serially through the same sink. All three shapes —
+    // both arms fused, one fused, none (reference) — must emit the same
+    // (id, lv, rv) multiset, including NULL rv for unmatched probe rows.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pschema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "lv", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const bschema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "rv", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 64,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+
+    const a1 = try db.table("a1", pschema, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    const a2 = try db.table("a2", pschema, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    const b = try db.table("b", bschema, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+
+    var rows1: [600]struct { id: i64, lv: i32 } = undefined;
+    for (&rows1, 0..) |*r, i| {
+        r.id = @intCast(i);
+        r.lv = @intCast(i * 2);
+    }
+    try a1.insert(&rows1);
+    try a1.flush();
+    var rows2: [400]struct { id: i64, lv: i32 } = undefined;
+    for (&rows2, 0..) |*r, i| {
+        r.id = @intCast(1000 + i);
+        r.lv = @intCast(i * 3);
+    }
+    try a2.insert(&rows2);
+    try a2.flush();
+    // Every 3rd id across both arm ranges matches; the rest miss (NULL rv).
+    var brows: [467]struct { id: i64, rv: i32 } = undefined;
+    for (&brows, 0..) |*r, i| {
+        r.id = @intCast(i * 3);
+        r.rv = @intCast(i * 3 * 10);
+    }
+    try b.insert(&brows);
+    try b.flush();
+
+    const collect = struct {
+        fn run(a: std.mem.Allocator, q: *Query, out: *std.ArrayList(i64)) !void {
+            defer q.deinit();
+            while (try q.next()) |batch| {
+                const ids = batch.values[0].data.bigint;
+                const lvs = batch.values[1].data.int;
+                const rvs = batch.values[2].data.int;
+                for (0..batch.row_count) |i| {
+                    const rv: i64 = if (batch.values[2].isValid(@intCast(i))) rvs[i] else -1;
+                    try out.append(a, ids[i] * 1_000_000 + @as(i64, lvs[i]) * 100_000 + rv);
+                }
+            }
+        }
+    }.run;
+
+    const spec = @import("join.zig").Spec{
+        .on = &.{.{ .left = "id", .right = "id" }},
+        .join_type = .left,
+        .algorithm = .auto,
+    };
+
+    // Serial reference: plain scans decline the probe offer end-to-end.
+    var ref: std.ArrayList(i64) = .empty;
+    defer ref.deinit(allocator);
+    {
+        const l1 = try scan(allocator, a1);
+        const l2 = try scan(allocator, a2);
+        var u = try exec.SetUnion.create(allocator, l1, l2, true);
+        errdefer u.deinit();
+        var q = try u.join(try scan(allocator, b), spec);
+        const j = exec.queryAs(@import("join.zig").Join, q).?;
+        try std.testing.expect(!j.probe_fused);
+        try collect(allocator, &q, &ref);
+    }
+    try std.testing.expectEqual(@as(usize, 1000), ref.items.len);
+    std.sort.pdq(i64, ref.items, {}, std.sort.asc(i64));
+
+    // Both arms parallel: probe fuses through the union into both scans.
+    {
+        const l1 = try exec.ParallelScan.create(allocator, a1, null, null, 4);
+        const l2 = try exec.ParallelScan.create(allocator, a2, null, null, 4);
+        var u = try exec.SetUnion.create(allocator, l1, l2, true);
+        errdefer u.deinit();
+        var q = try u.join(try scan(allocator, b), spec);
+        const j = exec.queryAs(@import("join.zig").Join, q).?;
+        try std.testing.expect(j.probe_fused);
+        const su = exec.queryAs(exec.SetUnion, j.left).?;
+        try std.testing.expect(su.left_fused and su.right_fused);
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        try collect(allocator, &q, &got);
+        std.sort.pdq(i64, got.items, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, ref.items, got.items);
+    }
+
+    // Mixed arms: the plain-Scan arm declines — the union probes it
+    // serially through the sink's chunk-0 scratch after the fused arm
+    // drains. Same multiset.
+    {
+        const l1 = try exec.ParallelScan.create(allocator, a1, null, null, 4);
+        const l2 = try scan(allocator, a2);
+        var u = try exec.SetUnion.create(allocator, l1, l2, true);
+        errdefer u.deinit();
+        var q = try u.join(try scan(allocator, b), spec);
+        const j = exec.queryAs(@import("join.zig").Join, q).?;
+        try std.testing.expect(j.probe_fused);
+        const su = exec.queryAs(exec.SetUnion, j.left).?;
+        try std.testing.expect(su.left_fused and !su.right_fused);
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        try collect(allocator, &q, &got);
+        std.sort.pdq(i64, got.items, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, ref.items, got.items);
+    }
+}

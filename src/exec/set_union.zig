@@ -51,6 +51,18 @@ pub const SetUnion = struct {
     /// Per-output-column stats merged from both arms at create. Empty when
     /// neither arm carried information. See `exec.unionColStats`.
     cached_stats: []const exec.ColStat = &.{},
+    /// A join's probe sink forwarded through this union (tryFuseProbe): a
+    /// fused arm's batches arrive already joined and pass through; a
+    /// declined arm's raw batches are probed HERE through the sink on the
+    /// calling thread. The arms drain strictly sequentially, so reusing the
+    /// sink's chunk-0 scratch for the serial arm never races a worker.
+    probe_sink: ?exec.ProbeSink = null,
+    left_fused: bool = false,
+    right_fused: bool = false,
+    /// Remap scratch for the serial-arm probe when the sink carries a
+    /// probe_map (a narrowing Project above the join's probe side). A fused
+    /// arm's scan applies the map itself; the serial path applies it here.
+    probe_map_views: []ColumnView = &.{},
 
     pub fn create(allocator: Allocator, left: Query, right: Query, all: bool) !Query {
         const left_schema = left.outputSchema();
@@ -130,12 +142,46 @@ pub const SetUnion = struct {
         self.allocator.free(self.right_cast_cols);
         self.allocator.free(self.views);
         if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
+        if (self.probe_map_views.len > 0) self.allocator.free(self.probe_map_views);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
 
     pub fn outputSchema(self: *SetUnion) []const Column {
+        // Probe-fused: every emitted batch (worker-joined or serially probed
+        // below) carries the JOIN's schema — same live-forward rule as a
+        // fused Project/Filter.
+        if (self.probe_sink) |sink| return sink.out_schema;
         return self.output_schema;
+    }
+
+    /// Forward a join's probe-sink offer into the arms so the probe runs in
+    /// their parallel-scan workers instead of serially above this union.
+    /// Requires cast-free arms (raw arm batches must be positionally and
+    /// representationally valid probe input — the sink's compiled indices
+    /// were resolved against our output schema) and no probe_map (each arm
+    /// would need its own remap space). Accepts when EITHER arm accepts: a
+    /// declined arm still joins correctly — next() probes its raw batches
+    /// through the sink on the calling thread, which is exactly the serial
+    /// work the caller would otherwise do itself. The sink's bind hooks are
+    /// grow-only, so the two accepting scans binding different chunk counts
+    /// compose (larger space wins; arms drain sequentially, never racing).
+    pub fn tryFuseProbe(self: *SetUnion, sink: exec.ProbeSink) !bool {
+        if (self.probe_sink != null) return false;
+        for (self.left_casts) |k| if (k != null) return false;
+        for (self.right_casts) |k| if (k != null) return false;
+        const l = try self.left.tryFuseProbe(sink);
+        const r = try self.right.tryFuseProbe(sink);
+        if (!l and !r) return false;
+        // A fused arm's scan applies sink.probe_map itself; the serial path
+        // in nextFused needs its own remap scratch.
+        if (sink.probe_map) |m| {
+            if (!(l and r)) self.probe_map_views = try self.allocator.alloc(ColumnView, m.len);
+        }
+        self.probe_sink = sink;
+        self.left_fused = l;
+        self.right_fused = r;
+        return true;
     }
 
     pub fn addPrune(_: *SetUnion, _: Predicate) !void {
@@ -149,7 +195,9 @@ pub const SetUnion = struct {
         return .{
             .upper_rows = l.upper_rows +| r.upper_rows,
             .sort_state = .{ .keys = &.{}, .global = false },
-            .column_stats = self.cached_stats,
+            // Fused: cached_stats index the pre-fusion union schema, not the
+            // join output the batches now carry.
+            .column_stats = if (self.probe_sink != null) &.{} else self.cached_stats,
         };
     }
 
@@ -164,6 +212,7 @@ pub const SetUnion = struct {
     }
 
     pub fn next(self: *SetUnion) !?Batch {
+        if (self.probe_sink) |sink| return self.nextFused(sink);
         if (!self.left_exhausted) {
             if (try self.left.next()) |b| {
                 return try rebatched(self, b, self.left_casts, self.left_cast_cols);
@@ -174,6 +223,37 @@ pub const SetUnion = struct {
             return try rebatched(self, b, self.right_casts, self.right_cast_cols);
         }
         return null;
+    }
+
+    /// Fused drain: a fused arm's batches are already joined — forward. A
+    /// declined arm's raw batches probe through the sink here, looping past
+    /// batches the join fully missed on (process → null / zero rows), same
+    /// contract the scan workers follow.
+    fn nextFused(self: *SetUnion, sink: exec.ProbeSink) !?Batch {
+        if (!self.left_exhausted) {
+            while (try self.left.next()) |b| {
+                if (self.left_fused) return b;
+                if (b.row_count == 0) continue;
+                if (try sink.process(sink.ctx, 0, self.remapped(sink, b))) |jb| {
+                    if (jb.row_count > 0) return jb;
+                }
+            }
+            self.left_exhausted = true;
+        }
+        while (try self.right.next()) |b| {
+            if (self.right_fused) return b;
+            if (b.row_count == 0) continue;
+            if (try sink.process(sink.ctx, 0, self.remapped(sink, b))) |jb| {
+                if (jb.row_count > 0) return jb;
+            }
+        }
+        return null;
+    }
+
+    fn remapped(self: *SetUnion, sink: exec.ProbeSink, batch: Batch) Batch {
+        const m = sink.probe_map orelse return batch;
+        for (m, self.probe_map_views) |src, *v| v.* = batch.values[src];
+        return .{ .schema = batch.schema, .values = self.probe_map_views, .row_count = batch.row_count };
     }
 
     fn rebatched(self: *SetUnion, src: Batch, kernels: []const ?CastKernel, cast_cols: []ColumnStore) !Batch {

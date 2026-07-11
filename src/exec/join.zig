@@ -1981,6 +1981,15 @@ pub const Join = struct {
 
     fn sinkBind(ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void {
         const self: *Join = @ptrCast(@alignCast(ctx));
+        // Grow-only: a SetUnion forwarding this sink binds once per accepting
+        // arm scan (compile time, nothing in flight yet) — keep the larger
+        // chunk space so either arm's chunk indices stay valid.
+        if (self.probe_chunks.len >= n_chunks) return;
+        if (self.probe_chunks.len > 0) {
+            for (self.probe_chunks) |*ch| freeProbeChunk(self.probe_chunk_alloc, ch);
+            self.probe_chunk_alloc.free(self.probe_chunks);
+            self.probe_chunks = &.{};
+        }
         self.probe_chunk_alloc = alloc;
         const chunks = try alloc.alloc(ProbeChunk, n_chunks);
         var done: usize = 0;
