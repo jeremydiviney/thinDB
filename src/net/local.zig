@@ -57,6 +57,7 @@ const wire_format = @import("wire_format.zig");
 const subquery_resolve = @import("subquery_resolve.zig");
 const predicate_pushdown = @import("predicate_pushdown.zig");
 const const_fold = @import("const_fold.zig");
+const prune_columns = @import("prune_columns.zig");
 const pgcat = @import("pg_catalog.zig");
 
 pub const Error = error{
@@ -1256,6 +1257,11 @@ pub fn compileWithSession(
     // to `.always`) and unlink WHERE-TRUE plumbing. Runs before projection
     // analysis and staging so ref counts see the pruned tree.
     const_fold.foldDeadBranches(@constCast(root));
+    // Dead-column elimination: delete select items / window calls /
+    // aggregates whose outputs nothing above consumes, so wide CTE stacks
+    // stop carrying long-dead columns through every stage buffer. Runs
+    // before projection analysis so the flat set shrinks with the tree.
+    prune_columns.pruneDeadColumns(ctx.nodeArena(), @constCast(root));
     // Projection pushdown: after subqueries are resolved to constants,
     // figure out which base columns the (single) scan must produce.
     ctx.prune_names = analyzeProjection(allocator, root);
