@@ -204,6 +204,24 @@ pub const Window = struct {
         return self.borrowing and ci < self.borrow_map.len and self.borrow_map[ci] != null;
     }
 
+    /// Per-row bytes the ADOPTED result will physically own. Borrowed input
+    /// columns are shallow references into the pinned upstream stage's stores
+    /// (already charged there), so charging them again in the adopting stage
+    /// multiplies the bill once per borrower down a window chain — a long
+    /// chain then trips MemoryBudgetExceeded at a small fraction of its real
+    /// footprint. The sorted-perm path gathers every column into fresh
+    /// stores, so borrowing doesn't discount it.
+    pub fn adoptedRowBytesEstimate(self: *const Window) usize {
+        if (!self.borrowing or self.sorted_perm != null)
+            return exec.memory.estimateRowBytes(self.schema);
+        var total: usize = 0;
+        for (0..self.schema.len) |ci| {
+            if (ci < self.input_schema.len and self.isBorrowed(ci)) continue;
+            total += exec.memory.estimateRowBytes(self.schema[ci .. ci + 1]);
+        }
+        return total;
+    }
+
     /// True when every spec shares one resolved sort-key set — the only
     /// shape ride-the-order handles (one permutation describes the op).
     pub fn singleSortGroup(self: *const Window) bool {

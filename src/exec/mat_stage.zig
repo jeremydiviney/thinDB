@@ -446,7 +446,10 @@ pub const Stage = struct {
         if (sliced) {} else if (self.adopt_window) |win| {
             try win.ensureDrained();
             if (self.accountant) |acct| {
-                const bytes = row_bytes * @as(usize, @intCast(win.accumulated_rows));
+                // Borrowed pass-through columns are shallow references into
+                // the pinned upstream stage (charged there); bill only what
+                // the adopted result owns or a window chain pays N times.
+                const bytes = win.adoptedRowBytesEstimate() * @as(usize, @intCast(win.accumulated_rows));
                 try acct.reserve(.materialize, bytes);
                 self.reserved_bytes += bytes;
             }
