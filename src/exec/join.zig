@@ -1040,9 +1040,16 @@ pub const Join = struct {
     /// own (small) build side serially before its probe first pulls, so the
     /// natural next() cascade completes every build before workers spawn.
     pub fn tryFuseProbe(self: *Join, sink: exec.ProbeSink) !bool {
-        if (!self.probe_fused or self.chained_sink != null) return false;
+        const trace = getenv("THINDB_TRACE_JOINFUSE") != null;
+        if (!self.probe_fused or self.chained_sink != null) {
+            if (trace) std.debug.print("[jf]   inner-join decline: probe_fused={} chained={}\n", .{ self.probe_fused, self.chained_sink != null });
+            return false;
+        }
         const probe = if (self.build_is_left) self.right else self.left;
-        if (!(try probe.rechainProbeSink(sink))) return false;
+        if (!(try probe.rechainProbeSink(sink))) {
+            if (trace) std.debug.print("[jf]   inner-join decline: rechain refused below\n", .{});
+            return false;
+        }
         if (sink.probe_map) |m| {
             for (self.probe_chunks) |*ch| {
                 ch.chain_views = try self.probe_chunk_alloc.alloc(ColumnView, m.len);

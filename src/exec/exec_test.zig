@@ -2872,4 +2872,51 @@ test "SetUnion probe forwarding: join probes union arms inside scan workers" {
         std.sort.pdq(i64, got.items, {}, std.sort.asc(i64));
         try std.testing.expectEqualSlices(i64, ref.items, got.items);
     }
+
+    // Cast-needing arm: a3.lv is SMALLINT, so the union widens it to INT.
+    // That arm can't host worker probes (the sink's indices address the
+    // POST-cast schema) — it must take the serial lane, cast first, while
+    // the cast-free ParallelScan arm still fuses.
+    const cschema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "lv", .type = .smallint } },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const a3 = try db.table("a3", cschema, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    var rows3: [300]struct { id: i64, lv: i16 } = undefined;
+    for (&rows3, 0..) |*r, i| {
+        r.id = @intCast(2000 + i);
+        r.lv = @intCast(i);
+    }
+    try a3.insert(&rows3);
+    try a3.flush();
+
+    var ref3: std.ArrayList(i64) = .empty;
+    defer ref3.deinit(allocator);
+    {
+        const l1 = try scan(allocator, a1);
+        const l3 = try scan(allocator, a3);
+        var u = try exec.SetUnion.create(allocator, l1, l3, true);
+        errdefer u.deinit();
+        var q = try u.join(try scan(allocator, b), spec);
+        try collect(allocator, &q, &ref3);
+    }
+    try std.testing.expectEqual(@as(usize, 900), ref3.items.len);
+    std.sort.pdq(i64, ref3.items, {}, std.sort.asc(i64));
+    {
+        const l1 = try exec.ParallelScan.create(allocator, a1, null, null, 4);
+        const l3 = try exec.ParallelScan.create(allocator, a3, null, null, 4);
+        var u = try exec.SetUnion.create(allocator, l1, l3, true);
+        errdefer u.deinit();
+        var q = try u.join(try scan(allocator, b), spec);
+        const j = exec.queryAs(@import("join.zig").Join, q).?;
+        try std.testing.expect(j.probe_fused);
+        const su = exec.queryAs(exec.SetUnion, j.left).?;
+        try std.testing.expect(su.left_fused and !su.right_fused);
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        try collect(allocator, &q, &got);
+        std.sort.pdq(i64, got.items, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, ref3.items, got.items);
+    }
 }

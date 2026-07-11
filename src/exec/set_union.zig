@@ -32,6 +32,8 @@ const CastKernel = cast.CastKernel;
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 
+const getenv_su = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const u8, .{ .name = "getenv", .library_name = "c" });
+
 pub const SetUnion = struct {
     allocator: Allocator,
     left: Query,
@@ -167,11 +169,23 @@ pub const SetUnion = struct {
     /// grow-only, so the two accepting scans binding different chunk counts
     /// compose (larger space wins; arms drain sequentially, never racing).
     pub fn tryFuseProbe(self: *SetUnion, sink: exec.ProbeSink) !bool {
+        const trace = getenv_su("THINDB_TRACE_JOINFUSE") != null;
         if (self.probe_sink != null) return false;
-        for (self.left_casts) |k| if (k != null) return false;
-        for (self.right_casts) |k| if (k != null) return false;
-        const l = try self.left.tryFuseProbe(sink);
-        const r = try self.right.tryFuseProbe(sink);
+        // An arm that needs a unifying cast can't probe from its workers (the
+        // sink's indices address the POST-cast union schema) — but it can
+        // still take the serial lane below, where rebatched() casts first.
+        // Only cast-free arms receive the forward.
+        const l_castfree = blk: {
+            for (self.left_casts) |k| if (k != null) break :blk false;
+            break :blk true;
+        };
+        const r_castfree = blk: {
+            for (self.right_casts) |k| if (k != null) break :blk false;
+            break :blk true;
+        };
+        const l = if (l_castfree) try self.left.tryFuseProbe(sink) else false;
+        const r = if (r_castfree) try self.right.tryFuseProbe(sink) else false;
+        if (trace) std.debug.print("[jf]   union arms: left={} (castfree={}) right={} (castfree={})\n", .{ l, l_castfree, r, r_castfree });
         if (!l and !r) return false;
         // A fused arm's scan applies sink.probe_map itself; the serial path
         // in nextFused needs its own remap scratch.
@@ -226,15 +240,17 @@ pub const SetUnion = struct {
     }
 
     /// Fused drain: a fused arm's batches are already joined — forward. A
-    /// declined arm's raw batches probe through the sink here, looping past
-    /// batches the join fully missed on (process → null / zero rows), same
-    /// contract the scan workers follow.
+    /// declined arm's raw batches probe through the sink here — cast to the
+    /// union schema first (the sink's indices were compiled against it),
+    /// looping past batches the join fully missed on (process → null / zero
+    /// rows), same contract the scan workers follow.
     fn nextFused(self: *SetUnion, sink: exec.ProbeSink) !?Batch {
         if (!self.left_exhausted) {
             while (try self.left.next()) |b| {
                 if (self.left_fused) return b;
                 if (b.row_count == 0) continue;
-                if (try sink.process(sink.ctx, 0, self.remapped(sink, b))) |jb| {
+                const cast_b = try rebatched(self, b, self.left_casts, self.left_cast_cols);
+                if (try sink.process(sink.ctx, 0, self.remapped(sink, cast_b))) |jb| {
                     if (jb.row_count > 0) return jb;
                 }
             }
@@ -243,7 +259,8 @@ pub const SetUnion = struct {
         while (try self.right.next()) |b| {
             if (self.right_fused) return b;
             if (b.row_count == 0) continue;
-            if (try sink.process(sink.ctx, 0, self.remapped(sink, b))) |jb| {
+            const cast_b = try rebatched(self, b, self.right_casts, self.right_cast_cols);
+            if (try sink.process(sink.ctx, 0, self.remapped(sink, cast_b))) |jb| {
                 if (jb.row_count > 0) return jb;
             }
         }
