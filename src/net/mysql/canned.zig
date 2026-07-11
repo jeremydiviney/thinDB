@@ -69,6 +69,23 @@ fn isUserVarSet(lc: []const u8) bool {
     return rest.len >= 1 and rest[0] == '@' and !(rest.len >= 2 and rest[1] == '@');
 }
 
+/// Column label for a canned `SELECT <expr>` reply. Real MySQL echoes the
+/// expression text EXACTLY as the client typed it — `select version()` names
+/// the column `version()`, `SELECT VeRsIoN()` names it `VeRsIoN()` — and
+/// clients (TypeORM, mysql2, JDBC) read result fields by that literal text,
+/// so a hardcoded label breaks them. Slice the expression from the original
+/// statement: everything after the leading SELECT, trailing `;`/whitespace
+/// and an optional LIMIT clause trimmed. The slice borrows from `sql`, which
+/// outlives the Outcome (the caller holds the query payload while replying).
+fn selectExprLabel(sql: []const u8, fallback: []const u8) []const u8 {
+    var s = std.mem.trim(u8, sql, " \t\r\n;");
+    if (s.len < 8 or !std.ascii.eqlIgnoreCase(s[0..6], "select")) return fallback;
+    if (s[6] != ' ' and s[6] != '\t') return fallback;
+    s = std.mem.trim(u8, s[7..], " \t\r\n");
+    if (std.ascii.indexOfIgnoreCase(s, " limit ")) |i| s = std.mem.trimEnd(u8, s[0..i], " \t");
+    return if (s.len == 0) fallback else s;
+}
+
 pub fn match(
     allocator: Allocator,
     sql: []const u8,
@@ -104,50 +121,50 @@ pub fn match(
     }
 
     if (std.mem.eql(u8, lc, "select 1"))
-        return Outcome{ .single_value = .{ .col = "1", .val = "1" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "1"), .val = "1" } };
 
     if (std.mem.eql(u8, lc, "select @@version_comment") or
         std.mem.eql(u8, lc, "select @@version_comment limit 1"))
-        return Outcome{ .single_value = .{ .col = "@@version_comment", .val = "thinDB" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@version_comment"), .val = "thinDB" } };
 
     if (std.mem.eql(u8, lc, "select @@version"))
-        return Outcome{ .single_value = .{ .col = "@@version", .val = handshake.server_version } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@version"), .val = handshake.server_version } };
 
     if (std.mem.eql(u8, lc, "select version()"))
-        return Outcome{ .single_value = .{ .col = "VERSION()", .val = handshake.server_version } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "version()"), .val = handshake.server_version } };
 
     if (std.mem.eql(u8, lc, "select @@version_compile_os"))
-        return Outcome{ .single_value = .{ .col = "@@version_compile_os", .val = osLabel() } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@version_compile_os"), .val = osLabel() } };
 
     if (std.mem.eql(u8, lc, "select @@max_allowed_packet"))
-        return Outcome{ .single_value = .{ .col = "@@max_allowed_packet", .val = "16777216" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@max_allowed_packet"), .val = "16777216" } };
 
     if (std.mem.eql(u8, lc, "select @@tx_isolation") or
         std.mem.eql(u8, lc, "select @@transaction_isolation"))
-        return Outcome{ .single_value = .{ .col = "@@tx_isolation", .val = "REPEATABLE-READ" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@tx_isolation"), .val = "REPEATABLE-READ" } };
 
     if (std.mem.eql(u8, lc, "select @@session.auto_increment_increment"))
-        return Outcome{ .single_value = .{ .col = "@@session.auto_increment_increment", .val = "1" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@session.auto_increment_increment"), .val = "1" } };
 
     if (std.mem.eql(u8, lc, "select @@character_set_client"))
-        return Outcome{ .single_value = .{ .col = "@@character_set_client", .val = "utf8mb4" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@character_set_client"), .val = "utf8mb4" } };
     if (std.mem.eql(u8, lc, "select @@character_set_connection"))
-        return Outcome{ .single_value = .{ .col = "@@character_set_connection", .val = "utf8mb4" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@character_set_connection"), .val = "utf8mb4" } };
     if (std.mem.eql(u8, lc, "select @@character_set_results"))
-        return Outcome{ .single_value = .{ .col = "@@character_set_results", .val = "utf8mb4" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@character_set_results"), .val = "utf8mb4" } };
     if (std.mem.eql(u8, lc, "select @@collation_connection"))
-        return Outcome{ .single_value = .{ .col = "@@collation_connection", .val = "utf8mb4_general_ci" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@collation_connection"), .val = "utf8mb4_general_ci" } };
     if (std.mem.eql(u8, lc, "select @@collation_server"))
-        return Outcome{ .single_value = .{ .col = "@@collation_server", .val = "utf8mb4_general_ci" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@collation_server"), .val = "utf8mb4_general_ci" } };
     if (std.mem.eql(u8, lc, "select @@time_zone"))
-        return Outcome{ .single_value = .{ .col = "@@time_zone", .val = "SYSTEM" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "@@time_zone"), .val = "SYSTEM" } };
 
     if (std.mem.eql(u8, lc, "select database()")) {
-        if (current_schema.len == 0) return Outcome{ .single_null = "DATABASE()" };
-        return Outcome{ .single_value = .{ .col = "DATABASE()", .val = current_schema } };
+        if (current_schema.len == 0) return Outcome{ .single_null = selectExprLabel(sql, "database()") };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "database()"), .val = current_schema } };
     }
     if (std.mem.eql(u8, lc, "select user()") or std.mem.eql(u8, lc, "select current_user()"))
-        return Outcome{ .single_value = .{ .col = "USER()", .val = "thindb@localhost" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "user()"), .val = "thindb@localhost" } };
 
     if (isShowVariables(lc)) {
         if (std.mem.indexOf(u8, lc, "sql_mode") != null)
