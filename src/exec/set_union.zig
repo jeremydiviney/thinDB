@@ -151,9 +151,16 @@ pub const SetUnion = struct {
 
     pub fn outputSchema(self: *SetUnion) []const Column {
         // Probe-fused: every emitted batch (worker-joined or serially probed
-        // below) carries the JOIN's schema — same live-forward rule as a
-        // fused Project/Filter.
-        if (self.probe_sink) |sink| return sink.out_schema;
+        // below) carries the fused pipeline's CURRENT schema — live-forward
+        // through a fused arm, same rule as a fused Project/Filter. Live
+        // matters: an upper join's rechain re-types the scans below, and the
+        // originally stored sink.out_schema goes stale. With only one fused
+        // arm the serial lane's chainEmit output matches it.
+        if (self.probe_sink) |sink| {
+            if (self.left_fused) return self.left.outputSchema();
+            if (self.right_fused) return self.right.outputSchema();
+            return sink.out_schema;
+        }
         return self.output_schema;
     }
 
@@ -237,6 +244,22 @@ pub const SetUnion = struct {
             return try rebatched(self, b, self.right_casts, self.right_cast_cols);
         }
         return null;
+    }
+
+    /// A rechain passing through this union (an upper join extending the
+    /// fused pipeline): forward it into the FUSED arms so their scans
+    /// re-bind and re-type. The serial lane needs nothing — its batches
+    /// still flow through the ORIGINAL sink, whose owner (the join directly
+    /// above us) now chains its output into the upper sink itself.
+    /// Arms that accepted tryFuseProbe moments earlier in the same compile
+    /// accept the rechain too (same pipeline, mode still unset); a decline
+    /// half-way would leave the first arm re-typed, so this contract is
+    /// load-bearing.
+    pub fn rechainProbeSink(self: *SetUnion, sink: exec.ProbeSink) !bool {
+        if (self.probe_sink == null) return false;
+        if (self.left_fused and !(try self.left.rechainProbeSink(sink))) return false;
+        if (self.right_fused and !(try self.right.rechainProbeSink(sink))) return false;
+        return true;
     }
 
     /// Fused drain: a fused arm's batches are already joined — forward. A

@@ -45,6 +45,7 @@ const cast = @import("cast.zig");
 const CastKernel = cast.CastKernel;
 
 const exec = @import("exec.zig");
+const getenv_cp = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const u8, .{ .name = "getenv", .library_name = "c" });
 const Batch = exec.Batch;
 const Query = exec.Query;
 const Predicate = exec.Predicate;
@@ -608,12 +609,19 @@ pub const Compute = struct {
     /// chain then runs inside the scan's stripe workers, and this operator
     /// becomes a pass-through for the final joined batches.
     pub fn tryFuseProbe(self: *Compute, sink: exec.ProbeSink) !bool {
+        const trace_jf = getenv_cp("THINDB_TRACE_JOINFUSE") != null;
         if (self.chain) |cf| {
             // Upgrade a TERMINAL push: the wrapper is already bound below;
             // rechain the upper sink to the bottom scan (bind + re-type),
             // then adopt it so the per-chunk evaluation feeds it.
-            if (cf.inner != null) return false;
-            if (!(try self.upstream.rechainProbeSink(sink))) return false;
+            if (cf.inner != null) {
+                if (trace_jf) std.debug.print("[jf]   compute decline: chain already has inner sink\n", .{});
+                return false;
+            }
+            if (!(try self.upstream.rechainProbeSink(sink))) {
+                if (trace_jf) std.debug.print("[jf]   compute decline: rechain refused below terminal push\n", .{});
+                return false;
+            }
             if (sink.probe_map) |m| {
                 const mv = try cf.bind_alloc.alloc([]ColumnView, cf.per_chunk.len);
                 errdefer cf.bind_alloc.free(mv);
@@ -642,6 +650,7 @@ pub const Compute = struct {
             .process = ChainForward.processHook,
         }) catch false;
         if (!ok) {
+            if (trace_jf) std.debug.print("[jf]   compute decline: upstream refused wrapped sink\n", .{});
             self.allocator.destroy(chain);
             return false;
         }

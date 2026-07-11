@@ -2920,3 +2920,138 @@ test "SetUnion probe forwarding: join probes union arms inside scan workers" {
         try std.testing.expectEqualSlices(i64, ref3.items, got.items);
     }
 }
+
+test "SetUnion rechain: a second join above the union extends the fused pipeline" {
+    // Join stack over a union: j2(j1(union)). j1 fuses its probe through the
+    // union into the arm scans; j2 then RECHAINS through j1 and the union so
+    // the whole two-join tail runs inside the workers. Must match the
+    // all-serial reference multiset.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pschema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "lv", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const b1schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "rv", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const b2schema = types.TableSchema{
+        .columns = &.{ .{ .name = "rv", .type = .int }, .{ .name = "sv", .type = .int } },
+        .order_key = &.{"rv"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 64,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+
+    const a1 = try db.table("ra1", pschema, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    const a2 = try db.table("ra2", pschema, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    const b1 = try db.table("rb1", b1schema, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    const b2 = try db.table("rb2", b2schema, .{ .order_key = &.{"rv"}, .unique = true, .row_group_size = 64 });
+
+    var rows1: [400]struct { id: i64, lv: i32 } = undefined;
+    for (&rows1, 0..) |*r, i| {
+        r.id = @intCast(i);
+        r.lv = @intCast(i);
+    }
+    try a1.insert(&rows1);
+    try a1.flush();
+    var rows2: [300]struct { id: i64, lv: i32 } = undefined;
+    for (&rows2, 0..) |*r, i| {
+        r.id = @intCast(1000 + i);
+        r.lv = @intCast(i);
+    }
+    try a2.insert(&rows2);
+    try a2.flush();
+    // b1 covers every 2nd id; rv = id * 7 mod 97 gives spread for b2.
+    var brows1: [650]struct { id: i64, rv: i32 } = undefined;
+    for (&brows1, 0..) |*r, i| {
+        r.id = @intCast(i * 2);
+        r.rv = @intCast((i * 7) % 97);
+    }
+    try b1.insert(&brows1);
+    try b1.flush();
+    // b2 covers rv 0..96 step 3.
+    var brows2: [33]struct { rv: i32, sv: i32 } = undefined;
+    for (&brows2, 0..) |*r, i| {
+        r.rv = @intCast(i * 3);
+        r.sv = @intCast(i * 100);
+    }
+    try b2.insert(&brows2);
+    try b2.flush();
+
+    const spec1 = @import("join.zig").Spec{
+        .on = &.{.{ .left = "id", .right = "id" }},
+        .join_type = .left,
+        .algorithm = .auto,
+    };
+    const spec2 = @import("join.zig").Spec{
+        .on = &.{.{ .left = "rv", .right = "rv" }},
+        .join_type = .left,
+        .algorithm = .auto,
+    };
+
+    const collect2 = struct {
+        fn run(a: std.mem.Allocator, q: *Query, out: *std.ArrayList(i64)) !void {
+            defer q.deinit();
+            while (try q.next()) |batch| {
+                const n = batch.values.len;
+                for (0..batch.row_count) |i| {
+                    var acc: i64 = 0;
+                    for (0..n) |c| {
+                        const v: i64 = if (!batch.values[c].isValid(@intCast(i))) -1 else switch (batch.values[c].data) {
+                            .bigint => |s| s[i],
+                            .int => |s| s[i],
+                            else => 0,
+                        };
+                        acc = acc *% 1099511628211 +% v;
+                    }
+                    try out.append(a, acc);
+                }
+            }
+        }
+    }.run;
+
+    var ref: std.ArrayList(i64) = .empty;
+    defer ref.deinit(allocator);
+    {
+        const l1 = try scan(allocator, a1);
+        const l2 = try scan(allocator, a2);
+        var u = try exec.SetUnion.create(allocator, l1, l2, true);
+        errdefer u.deinit();
+        var j1 = try u.join(try scan(allocator, b1), spec1);
+        var q = try j1.join(try scan(allocator, b2), spec2);
+        try collect2(allocator, &q, &ref);
+    }
+    try std.testing.expectEqual(@as(usize, 700), ref.items.len);
+    std.sort.pdq(i64, ref.items, {}, std.sort.asc(i64));
+
+    {
+        const l1 = try exec.ParallelScan.create(allocator, a1, null, null, 4);
+        const l2 = try exec.ParallelScan.create(allocator, a2, null, null, 4);
+        var u = try exec.SetUnion.create(allocator, l1, l2, true);
+        errdefer u.deinit();
+        var j1 = try u.join(try scan(allocator, b1), spec1);
+        var q = try j1.join(try scan(allocator, b2), spec2);
+        const j2op = exec.queryAs(@import("join.zig").Join, q).?;
+        // Both joins must be probe-fused: j1 through the union into the arm
+        // scans, j2 by RECHAINING through j1 and the union (the new path).
+        try std.testing.expect(j2op.probe_fused);
+        const j1op = exec.queryAs(@import("join.zig").Join, j2op.left).?;
+        try std.testing.expect(j1op.probe_fused);
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        try collect2(allocator, &q, &got);
+        std.sort.pdq(i64, got.items, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, ref.items, got.items);
+    }
+}
