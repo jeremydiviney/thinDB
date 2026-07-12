@@ -75,6 +75,13 @@ pub fn read(
 }
 
 /// Atomically replace the tombstone file with the given sorted/deduped offsets.
+///
+/// Write-aside + rename (#147): `createFile` on the live name truncates in
+/// place, so a crash between the truncate and the write completing left an
+/// observable zero-byte window — losing EVERY delete recorded for the
+/// segment (deleted rows resurrect on the next open). Same pattern as the
+/// manifest swap; readers see either the old file or the new one, never a
+/// torn intermediate.
 pub fn write(
     io: Io,
     segments_dir: Io.Dir,
@@ -85,6 +92,8 @@ pub fn write(
 ) !void {
     var name_buf: [32]u8 = undefined;
     const file_name = try fileNameFor(&name_buf, seg_id);
+    var tmp_buf: [40]u8 = undefined;
+    const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{file_name});
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(scratch);
@@ -96,7 +105,8 @@ pub fn write(
     for (offsets) |off| try appendU32(scratch, &buf, off);
     try buf.appendSlice(scratch, &tombstone_magic);
 
-    try @import("storage.zig").writeFileSynced(io, segments_dir, file_name, buf.items, sync);
+    try @import("storage.zig").writeFileSynced(io, segments_dir, tmp_name, buf.items, sync);
+    try Io.Dir.rename(segments_dir, tmp_name, segments_dir, file_name, io);
 }
 
 /// Read existing tombstones (if any), merge in `new_offsets`, dedupe, sort,
@@ -161,6 +171,27 @@ test "read of missing tomb returns null" {
     defer tmp.cleanup();
 
     try std.testing.expect((try read(allocator, io, tmp.dir, 99)) == null);
+}
+
+test "write replaces via rename: no .tmp residue, old content survives until swap" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try write(io, tmp.dir, 3, &[_]u32{ 1, 2 }, allocator, false);
+    try write(io, tmp.dir, 3, &[_]u32{ 9, 10, 11 }, allocator, false);
+
+    const got = (try read(allocator, io, tmp.dir, 3)).?;
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 9, 10, 11 }, got);
+
+    var name_buf: [32]u8 = undefined;
+    const file_name = try fileNameFor(&name_buf, 3);
+    var tmp_buf: [40]u8 = undefined;
+    const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{file_name});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, tmp_name, .{}));
 }
 
 test "merge sorts and dedupes" {
