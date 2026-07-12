@@ -1394,6 +1394,8 @@ pub const Aggregate = struct {
                         try updateStateRow(aa_state, s, a, batch, self.agg_col_indices[ai], r);
                     }
                 },
+                .max_by => try self.scatterMaxBy(ai, a, gids, batch, aa_state),
+                .any_value, .first => try self.scatterAnyValue(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state),
                 else => {
                     const col = self.agg_cols[ai].other;
                     var r: u32 = 0;
@@ -1504,6 +1506,43 @@ pub const Aggregate = struct {
                 }
             },
             else => unreachable,
+        }
+    }
+
+    /// MAX_BY scatter. Mirrors `maxByUpdate` exactly, but resolves the order
+    /// column ONCE per batch — the per-row `updateStateRow` fallback paid a
+    /// linear `findColumn` (string compares over the whole schema) for every
+    /// single row.
+    fn scatterMaxBy(self: *Aggregate, ai: usize, a: AggSpec, gids: []const u32, batch: Batch, aa: Allocator) !void {
+        const key_name = a.arg2_col orelse return Error.AggregateColumnRequired;
+        const key_idx = types.findColumn(batch.schema, key_name) orelse return Error.ColumnNotFound;
+        const key_view = batch.values[key_idx];
+        const value_view = batch.values[self.agg_col_indices[ai].?];
+        const col = self.agg_cols[ai].other;
+        var r: u32 = 0;
+        while (r < gids.len) : (r += 1) {
+            if (!value_view.isValid(r) or !key_view.isValid(r)) continue;
+            const s = &col[gids[r]];
+            if (s.max_by.seen and rowVsValue(key_view, r, s.max_by.key) != .gt) continue;
+            s.max_by.key = try valueFromRow(aa, key_view, r);
+            s.max_by.value = try valueFromRow(aa, value_view, r);
+            s.max_by.seen = true;
+        }
+    }
+
+    /// ANY_VALUE / FIRST scatter. Once a group has seen a value nothing can
+    /// change it, so the hot path is one load+branch per row instead of the
+    /// two-call `updateStateRow`→`valueUpdate` chain. Mirrors `valueUpdate`
+    /// for these funcs (`.last` overwrites and stays on the generic path).
+    fn scatterAnyValue(self: *Aggregate, ai: usize, gids: []const u32, view: ColumnView, aa: Allocator) !void {
+        const col = self.agg_cols[ai].other;
+        var r: u32 = 0;
+        while (r < gids.len) : (r += 1) {
+            const s = &col[gids[r]];
+            if (s.value_acc.seen) continue;
+            if (!view.isValid(r)) continue;
+            s.value_acc.value = try valueFromRow(aa, view, r);
+            s.value_acc.seen = true;
         }
     }
 
