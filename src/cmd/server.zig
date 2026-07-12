@@ -371,6 +371,18 @@ pub fn main(init: std.process.Init) !u8 {
     else
         null;
 
+    // net_read_timeout enforcement — see ReaperCtx.
+    const net_read_timeout_secs = envU64(init.environ_map, "THINDB_NET_READ_TIMEOUT_SECS", 30);
+    var reaper_ctx: ReaperCtx = .{
+        .registry = &shared_registry,
+        .io = io,
+        .timeout_ms = net_read_timeout_secs * 1000,
+    };
+    const reaper_thread: ?std.Thread = if (net_read_timeout_secs > 0)
+        try std.Thread.spawn(.{}, ReaperCtx.run, .{&reaper_ctx})
+    else
+        null;
+
     waitForStop(io);
 
     for (listeners[0..n_listeners]) |*l| l.close();
@@ -378,6 +390,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (threads[0..n_listeners]) |t| t.join();
     flusher_thread.join();
     if (compactor_thread) |t| t.join();
+    if (reaper_thread) |t| t.join();
 
     try out_w.writeAll("thindb-server shutting down\n");
     try out_w.flush();
@@ -424,6 +437,11 @@ fn envFlag(map: *std.process.Environ.Map, key: []const u8) bool {
     return true;
 }
 
+fn envU64(map: *std.process.Environ.Map, key: []const u8, default: u64) u64 {
+    const value = map.get(key) orelse return default;
+    return std.fmt.parseInt(u64, value, 10) catch default;
+}
+
 const FlusherCtx = struct {
     catalog: *thindb.Catalog,
     io: Io,
@@ -439,6 +457,28 @@ const CompactorCtx = struct {
 
     fn run(self: *CompactorCtx) void {
         self.catalog.runBackgroundCompactor(self.io, 2000, &stop_flag);
+    }
+};
+
+/// net_read_timeout reaper (#164): sweep the connection registry and shut
+/// down any socket stuck mid-packet longer than `timeout_ms`. Mirrors
+/// MySQL's net_read_timeout (default 30 s); override with
+/// `THINDB_NET_READ_TIMEOUT_SECS` (0 disables). A wedged mid-packet read
+/// otherwise hangs until the client gives up — the 2026-07-11 incident
+/// held a Flink sink connection at zero packets for 559 s.
+const ReaperCtx = struct {
+    registry: *thindb.ConnectionRegistry,
+    io: Io,
+    timeout_ms: u64,
+
+    fn run(self: *ReaperCtx) void {
+        const poll: Io.Duration = .fromMilliseconds(5000);
+        while (!stop_flag.load(.acquire)) {
+            Io.sleep(self.io, poll, .awake) catch return;
+            const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
+            const now_ms: u64 = @intCast(@divTrunc(@max(now_ns, 0), std.time.ns_per_ms));
+            _ = self.registry.reapStalledReads(self.io, now_ms, self.timeout_ms);
+        }
     }
 };
 

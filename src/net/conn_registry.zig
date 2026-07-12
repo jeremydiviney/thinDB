@@ -32,6 +32,30 @@ pub const ConnectionState = struct {
     /// it to true causes the in-flight query to abort with
     /// error.QueryCancelled. Reset to false when a new query starts.
     cancel_flag: std.atomic.Value(bool) = .{ .raw = false },
+    /// Socket handle for the net_read_timeout reaper (#164). Set once,
+    /// before `Registry.register` publishes this state (the register
+    /// lock is the publication barrier). Null for transports that
+    /// don't arm the reaper.
+    reap_socket: ?std.Io.net.Socket.Handle = null,
+    /// Transfer-wait mark: `(began_ms << 2) | class`, 0 = no transfer
+    /// in flight. `began_ms` is the awake clock in milliseconds when
+    /// the currently-posted socket operation began. Classes:
+    ///
+    ///   0 (nonzero ms) — packet-HEADER read: idle-between-commands,
+    ///     unbounded, but probed for the wedged-read signature (bytes
+    ///     queued while the read pends).
+    ///   1 — packet-BODY read: the client committed to a length, so
+    ///     the wait is bounded hard by net_read_timeout (MySQL
+    ///     semantics).
+    ///   2 — response WRITE: bounded by net_write_timeout (2× the
+    ///     read timeout, mirroring MySQL's 30/60 defaults).
+    ///
+    /// Why (#164): the 2026-07-11 incident held one sink connection at
+    /// zero packets for 559 s while the server kept serving others — a
+    /// server must never depend on the CLIENT's timeout for its own
+    /// liveness. These marks make every socket transfer observable and
+    /// every stall bounded, whatever the underlying cause.
+    transfer_wait: std.atomic.Value(u64) = .{ .raw = 0 },
 
     pub fn init(backend_id: u32, secret_key: u32) ConnectionState {
         return .{ .backend_id = backend_id, .secret_key = secret_key };
@@ -58,6 +82,18 @@ pub const ConnectionState = struct {
 
     pub fn isCancelled(self: *const ConnectionState) bool {
         return self.cancel_flag.load(.acquire);
+    }
+
+    pub fn beginRead(self: *ConnectionState, now_ms: u64, mid_packet: bool) void {
+        self.transfer_wait.store((@max(now_ms, 1) << 2) | @intFromBool(mid_packet), .release);
+    }
+
+    pub fn beginWrite(self: *ConnectionState, now_ms: u64) void {
+        self.transfer_wait.store((@max(now_ms, 1) << 2) | 2, .release);
+    }
+
+    pub fn endTransfer(self: *ConnectionState) void {
+        self.transfer_wait.store(0, .release);
     }
 };
 
@@ -133,6 +169,82 @@ pub const Registry = struct {
         defer self.mutex.unlock();
         return self.entries.count();
     }
+
+    /// Grace before probing a header-wait for the wedged-read signature.
+    /// Long enough that a legitimately in-flight command (client mid-send)
+    /// never probes positive; short enough that a wedged sink connection
+    /// recovers in seconds, not minutes.
+    const wedge_probe_grace_ms: u64 = 10_000;
+
+    /// Stalled-read enforcement (#164). Two independent conditions:
+    ///
+    ///   1. net_read_timeout: a mid-packet read (client committed to a
+    ///      length, payload incomplete) older than `timeout_ms`. MySQL
+    ///      semantics (its default is 30 s).
+    ///   2. Wedged read: a header read pending past the grace period
+    ///      while the socket has bytes QUEUED — an idle connection has
+    ///      an empty receive buffer, so queued-but-undelivered bytes
+    ///      mean the pended read lost its completion (Windows AFD race,
+    ///      the 559 s incident signature). Idle connections are never
+    ///      touched: no bytes, no reap, no matter how long they idle.
+    ///
+    /// Shutdown — not close — so the handle stays valid for the owning
+    /// thread (no reuse race); the pending read completes with EOF or
+    /// reset and the connection thread exits through its normal error
+    /// path. Runs under the registry lock, which excludes a concurrent
+    /// unregister: an entry seen here cannot have had its socket closed
+    /// yet (close happens after unregister on the connection thread).
+    ///
+    /// `io` supplies netShutdown — on Windows the Io.net sockets are
+    /// AFD handles that ws2_32 calls reject, so the shutdown must go
+    /// through the same Io vtable that opened them.
+    pub fn reapStalledReads(self: *Registry, io: std.Io, now_ms: u64, timeout_ms: u64) usize {
+        const afd_probe = @import("afd_probe.zig");
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var reaped: usize = 0;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry| {
+            const state = entry.*;
+            const raw = state.transfer_wait.load(.acquire);
+            if (raw == 0) continue;
+            const began = raw >> 2;
+            const class = raw & 3;
+            if (now_ms < began) continue;
+            const waited = now_ms - began;
+            const handle = state.reap_socket orelse continue;
+
+            switch (class) {
+                1 => { // packet-body read: net_read_timeout
+                    if (timeout_ms == 0 or waited < timeout_ms) continue;
+                    std.debug.print(
+                        "thindb: net_read_timeout: connection {d} stuck mid-packet for {d}ms — shutting down its socket\n",
+                        .{ state.backend_id, waited },
+                    );
+                },
+                2 => { // response write: net_write_timeout = 2× read timeout
+                    if (timeout_ms == 0 or waited < timeout_ms * 2) continue;
+                    std.debug.print(
+                        "thindb: net_write_timeout: connection {d} response write stuck for {d}ms — shutting down its socket\n",
+                        .{ state.backend_id, waited },
+                    );
+                },
+                else => { // header read: idle unless bytes are queued
+                    if (waited < wedge_probe_grace_ms) continue;
+                    const avail = afd_probe.bytesAvailable(handle) orelse continue;
+                    if (avail == 0) continue; // genuinely idle
+                    std.debug.print(
+                        "thindb: wedged read: connection {d} has {d} bytes queued but its read has pended {d}ms — shutting down its socket\n",
+                        .{ state.backend_id, avail, waited },
+                    );
+                },
+            }
+            state.endTransfer(); // one-shot per stall
+            io.vtable.netShutdown(io.userdata, handle, .both) catch {};
+            reaped += 1;
+        }
+        return reaped;
+    }
 };
 
 test "register / requestCancel / unregister" {
@@ -163,6 +275,32 @@ test "register / requestCancel / unregister" {
     reg.unregister(1);
     try std.testing.expectEqual(@as(usize, 1), reg.count());
     try std.testing.expect(!reg.requestCancel(1, 0));
+}
+
+test "transfer-wait marks encode class; reap skips unarmed sockets" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    var s = ConnectionState.init(7, 0);
+    try reg.register(&s);
+
+    s.beginRead(500, false);
+    try std.testing.expectEqual(@as(u64, 500 << 2), s.transfer_wait.load(.monotonic));
+    s.beginRead(500, true);
+    try std.testing.expectEqual(@as(u64, (500 << 2) | 1), s.transfer_wait.load(.monotonic));
+    s.beginWrite(500);
+    try std.testing.expectEqual(@as(u64, (500 << 2) | 2), s.transfer_wait.load(.monotonic));
+
+    // No socket armed: even a grossly stale mid-packet mark is skipped.
+    s.beginRead(1_000, true);
+    try std.testing.expectEqual(@as(usize, 0), reg.reapStalledReads(io, 10_000_000, 15_000));
+
+    s.endTransfer();
+    try std.testing.expectEqual(@as(u64, 0), s.transfer_wait.load(.monotonic));
+    reg.unregister(7);
 }
 
 test "nextBackendId is monotonically increasing" {

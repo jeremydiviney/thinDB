@@ -129,17 +129,37 @@ pub fn writePacket(w: *std.Io.Writer, seq_id: u8, payload: []const u8) !void {
     try w.writeAll(payload);
 }
 
-/// Read one MySQL packet header + payload. Returns the sequence id and
-/// an allocator-owned payload slice (caller frees).
-pub fn readPacket(allocator: Allocator, r: *std.Io.Reader) !struct { seq_id: u8, payload: []u8 } {
+pub const Header = struct { len: u32, seq_id: u8 };
+
+/// Read one packet's 4-byte header. Blocking here is "idle between
+/// commands" — unbounded by design. Split from `readBody` so the server
+/// can bound the payload wait (net_read_timeout, #164) without putting
+/// a timeout on idle connections.
+pub fn readHeader(r: *std.Io.Reader) !Header {
     var hdr: [header_size]u8 = undefined;
     try r.readSliceAll(&hdr);
-    const len: u32 = @as(u32, hdr[0]) | (@as(u32, hdr[1]) << 8) | (@as(u32, hdr[2]) << 16);
-    const seq_id = hdr[3];
+    return .{
+        .len = @as(u32, hdr[0]) | (@as(u32, hdr[1]) << 8) | (@as(u32, hdr[2]) << 16),
+        .seq_id = hdr[3],
+    };
+}
+
+/// Read a packet payload of `len` bytes into an allocator-owned slice
+/// (caller frees). Blocking here is "mid-packet" — the client has
+/// committed to a length and the rest must arrive promptly.
+pub fn readBody(allocator: Allocator, r: *std.Io.Reader, len: u32) ![]u8 {
     const payload = try allocator.alloc(u8, len);
     errdefer allocator.free(payload);
     try r.readSliceAll(payload);
-    return .{ .seq_id = seq_id, .payload = payload };
+    return payload;
+}
+
+/// Read one MySQL packet header + payload. Returns the sequence id and
+/// an allocator-owned payload slice (caller frees).
+pub fn readPacket(allocator: Allocator, r: *std.Io.Reader) !struct { seq_id: u8, payload: []u8 } {
+    const hdr = try readHeader(r);
+    const payload = try readBody(allocator, r, hdr.len);
+    return .{ .seq_id = hdr.seq_id, .payload = payload };
 }
 
 test "lenenc int round-trips across size brackets" {

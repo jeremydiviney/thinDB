@@ -600,6 +600,64 @@ fn profilePhaseName(phase: ProfilePhase) []const u8 {
     };
 }
 
+/// Millisecond reading of the awake clock — the same timebase the
+/// net_read_timeout reaper compares against (cmd/server.zig).
+fn nowMs(io: Io) u64 {
+    const ns = Io.Clock.awake.now(io).nanoseconds;
+    return @intCast(@divTrunc(@max(ns, 0), std.time.ns_per_ms));
+}
+
+// ---------------------------------------------------------------------------
+// Guarded socket writes (#164): every send on a connection's stream writer is
+// bracketed with a transfer-wait mark so the reaper can bound a wedged
+// response write (net_write_timeout — a stuck send otherwise hangs until the
+// client gives up, exactly the failure class a server must bound itself).
+// Interposing at the drain vtable catches every send, including implicit
+// drains when a large result set overflows the write buffer. Threadlocal is
+// safe here because each connection owns a dedicated thread for its whole
+// lifetime.
+// ---------------------------------------------------------------------------
+
+const WriteGuard = struct { state: *ConnectionState, io: Io };
+threadlocal var tl_write_guard: ?WriteGuard = null;
+
+/// The stream writer's original vtable — one static value for every
+/// `Io.net.Stream.Writer`, captured at first interpose. Atomic only to
+/// keep the cross-thread publication defined; all stores write the same
+/// pointer.
+var orig_stream_writer_vtable = std.atomic.Value(?*const Io.Writer.VTable).init(null);
+
+const guarded_writer_vtable: Io.Writer.VTable = .{
+    .drain = guardedDrain,
+    .sendFile = guardedSendFile,
+};
+
+fn interposeWriteGuard(w: *Io.Writer, state: *ConnectionState, io: Io) void {
+    orig_stream_writer_vtable.store(w.vtable, .release);
+    w.vtable = &guarded_writer_vtable;
+    tl_write_guard = .{ .state = state, .io = io };
+}
+
+fn guardedDrain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+    const orig = orig_stream_writer_vtable.load(.acquire).?;
+    if (tl_write_guard) |g| {
+        g.state.beginWrite(nowMs(g.io));
+        defer g.state.endTransfer();
+        return orig.drain(w, data, splat);
+    }
+    return orig.drain(w, data, splat);
+}
+
+fn guardedSendFile(w: *Io.Writer, file_reader: *std.Io.File.Reader, limit: std.Io.Limit) Io.Writer.FileError!usize {
+    const orig = orig_stream_writer_vtable.load(.acquire).?;
+    if (tl_write_guard) |g| {
+        g.state.beginWrite(nowMs(g.io));
+        defer g.state.endTransfer();
+        return orig.sendFile(w, file_reader, limit);
+    }
+    return orig.sendFile(w, file_reader, limit);
+}
+
 fn classifySqlKind(op: ir.Op) SqlKind {
     return switch (std.meta.activeTag(op)) {
         .scan,
@@ -651,6 +709,13 @@ fn handleConnection(
     // because handleConnection only returns after the connection
     // closes.
     var conn_state = ConnectionState.init(connection_id, ConnectionState.deriveSecret(connection_id));
+    // Arm the reaper BEFORE register publishes the state (#164): a
+    // guarded read or write that stalls past its timeout gets the
+    // socket shut down, which completes the wedged operation and lets
+    // this thread exit through the normal error path.
+    conn_state.reap_socket = stream.socket.handle;
+    interposeWriteGuard(w, &conn_state, io);
+    defer tl_write_guard = null;
     if (registry) |reg| {
         try reg.register(&conn_state);
     }
@@ -665,7 +730,13 @@ fn handleConnection(
     try handshake.sendInitialHandshake(allocator, w, connection_id, salt);
     try w.flush();
 
-    const hs_packet = try packet.readPacket(allocator, r);
+    const hs_packet = blk: {
+        conn_state.beginRead(nowMs(io), false);
+        const hdr = try packet.readHeader(r);
+        conn_state.beginRead(nowMs(io), true);
+        defer conn_state.endTransfer();
+        break :blk .{ .seq_id = hdr.seq_id, .payload = try packet.readBody(allocator, r, hdr.len) };
+    };
     defer allocator.free(hs_packet.payload);
     const client = handshake.parseHandshakeResponse(hs_packet.payload) catch {
         try handshake.sendErrPacket(allocator, w, 2, 1064, "42000".*, "Malformed handshake");
@@ -722,9 +793,26 @@ fn handleConnection(
 
     while (true) {
         const read_start = profiler.start();
-        const pkt = packet.readPacket(allocator, r) catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => return err,
+        // Both read waits are marked for the reaper (#164). Header wait
+        // = idle between commands: unbounded UNLESS bytes are queued on
+        // the socket while the read pends (the wedged-read signature).
+        // Payload wait = mid-packet: bounded hard by net_read_timeout.
+        // Without the reaper a wedged transfer hangs until the CLIENT
+        // gives up; the sink treats a dead connection fine, but a
+        // silently wedged one delays failover by minutes.
+        const pkt = blk: {
+            conn_state.beginRead(nowMs(io), false);
+            const hdr = packet.readHeader(r) catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => return err,
+            };
+            conn_state.beginRead(nowMs(io), true);
+            defer conn_state.endTransfer();
+            const payload = packet.readBody(allocator, r, hdr.len) catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => return err,
+            };
+            break :blk .{ .seq_id = hdr.seq_id, .payload = payload };
         };
         profiler.recordSince(.packet_read, read_start);
         defer allocator.free(pkt.payload);

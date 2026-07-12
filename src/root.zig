@@ -128,6 +128,8 @@ test {
     _ = @import("util/core_scheduler.zig");
     _ = @import("util/huge_page.zig");
     _ = @import("util/buffer_pool.zig");
+    _ = @import("util/fair_mutex.zig");
+    _ = @import("net/conn_registry.zig");
     _ = @import("net/const_fold.zig");
     _ = @import("exec/affine_agg.zig");
     _ = @import("exec/mat_stage.zig");

@@ -16,6 +16,7 @@ const storage = @import("../storage/storage.zig");
 const engine = @import("../engine/engine.zig");
 const exec = @import("../exec/exec.zig");
 const bloom_util = @import("../util/bloom.zig");
+const FairMutex = @import("../util/fair_mutex.zig").FairMutex;
 
 const api = @import("api.zig");
 const Config = api.Config;
@@ -114,7 +115,13 @@ pub const Table = struct {
     /// entry points (`insert`, `delete`, `flush`, `compact`) lock this
     /// before touching the memtable / manifest. Internal `*Locked` helpers
     /// assume it's already held.
-    mutex: Io.Mutex = .init,
+    ///
+    /// FIFO-fair (not `Io.Mutex`): critical sections here are long — a
+    /// unique-key batch holds it across the segment probe and any inline
+    /// auto-flush — and under sustained sink traffic a barging lock starved
+    /// one parked writer for 559 s while fresh acquirers kept stealing the
+    /// word (#164, 2026-07-11 incident).
+    mutex: FairMutex = .init,
 
     /// Reader/DDL coordination. Scans hold this SHARED for their entire
     /// lifetime (acquire on create, release on deinit). DDL operations
