@@ -151,10 +151,7 @@ fn processMemtable(
     for (mask, keep) |m, *k| k.* = !m;
 
     if (try t.memtable.cloneWithRetainedRows(allocator, keep)) |new_mt| {
-        const old_mt = t.memtable;
-        t.memtable = new_mt;
-        old_mt.retire();
-        old_mt.release();
+        t.installMemtableLocked(new_mt);
     }
 
     try insertMaterializedRows(t, &new_rows);

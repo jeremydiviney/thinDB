@@ -424,8 +424,5 @@ fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64) !void {
     // pre-alter schema; consumers that captured a scan before ALTER must
     // finish or be discarded before the schema mismatch matters).
     const new_mt = try engine.Memtable.create(allocator, t.schema);
-    const old_mt = t.memtable;
-    t.memtable = new_mt;
-    old_mt.retire();
-    old_mt.release();
+    t.installMemtableLocked(new_mt);
 }

@@ -54,7 +54,7 @@ pub fn serializeKeyBloom(allocator: Allocator, hashes: []const u64) ![]u8 {
 fn upsertIndexReset(t: *Table) void {
     t.upsert_idx.clearRetainingCapacity();
     if (t.upsert_idx_arena) |*a| _ = a.reset(.retain_capacity);
-    t.upsert_idx_mt = null;
+    t.upsert_idx_gen = null;
     t.upsert_idx_rows = 0;
 }
 
@@ -67,13 +67,17 @@ pub fn applyUpsertResolution(t: *Table) !void {
         return;
     }
 
-    // Bind the persistent key index to the current memtable generation. A
-    // memtable swap (flush / dedup-clone) or shrink invalidates it → rebuild
-    // from row 0; otherwise process only the rows added since last time.
-    const same_gen = if (t.upsert_idx_mt) |m| m == t.memtable else false;
+    // Bind the persistent key index to the current memtable generation
+    // counter. ANY swap (flush / delete / update / dedup-clone) bumps the
+    // counter via installMemtableLocked → rebuild from row 0; otherwise
+    // process only the rows added since last time. NOT a pointer compare —
+    // a freed memtable's address can be reused by a later clone (ABA),
+    // silently revalidating a stale index whose row mappings then
+    // tombstone unrelated rows.
+    const same_gen = if (t.upsert_idx_gen) |g| g == t.memtable_gen else false;
     if (!same_gen or t.upsert_idx_rows > n) {
         upsertIndexReset(t);
-        t.upsert_idx_mt = t.memtable;
+        t.upsert_idx_gen = t.memtable_gen;
     }
     if (t.upsert_idx_arena == null) t.upsert_idx_arena = std.heap.ArenaAllocator.init(t.allocator);
     const idx_aa = t.upsert_idx_arena.?.allocator();
@@ -125,10 +129,7 @@ pub fn applyUpsertResolution(t: *Table) !void {
         @memset(keep, true);
         for (dropped.items) |d| keep[d] = false;
         if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
-            const old_mt = t.memtable;
-            t.memtable = new_mt;
-            old_mt.retire();
-            old_mt.release();
+            t.installMemtableLocked(new_mt);
             upsertIndexReset(t);
         }
     }
@@ -373,6 +374,48 @@ fn compoundKeyFromOwnedColumns(
         try comparison.appendColumnValueBytes(aa, &buf, c.view(), row);
     }
     return buf.toOwnedSlice(aa);
+}
+
+test "memtable swaps invalidate the incremental upsert index (gen counter, not pointer)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    // Interleave upserts (which build/extend the index) with DELETEs (which
+    // clone-and-swap the memtable) many times. With the old pointer-identity
+    // binding, an allocator reusing a freed memtable's address revalidated a
+    // stale index whose row mappings then tombstoned UNRELATED live rows.
+    var round: i32 = 1;
+    while (round <= 40) : (round += 1) {
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .v = round }, .{ .id = @as(i64, 2), .v = round },
+            .{ .id = @as(i64, 3), .v = round }, .{ .id = @as(i64, 4), .v = round },
+            .{ .id = @as(i64, 5), .v = round }, .{ .id = @as(i64, 6), .v = round },
+        });
+        const gen_before = t.memtable_gen;
+        const pred: exec.PredicateExpr = .{ .leaf = .{ .col = "id", .op = .eq, .val = .{ .bigint = 3 } } };
+        _ = try t.deleteByExpr(pred);
+        try std.testing.expect(t.memtable_gen > gen_before); // swap bumped the generation
+        // Re-add the deleted key; the rebuilt index must dedup it correctly.
+        try t.insert(&.{.{ .id = @as(i64, 3), .v = round }});
+    }
+    // No flush happened: every live row is in the memtable, and dedup
+    // physically removes older versions — exactly 6 keys must remain.
+    try std.testing.expectEqual(@as(u32, 6), t.memtable.row_count);
 }
 
 test "upsert probe with zonemap pruning still tombstones the old segment copy" {

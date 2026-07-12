@@ -93,10 +93,7 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
         for (0..n) |i| keep[i] = !comparison.evalRow(view, @intCast(i), pred);
 
         if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
-            const old_mt = t.memtable;
-            t.memtable = new_mt;
-            old_mt.retire();
-            old_mt.release();
+            t.installMemtableLocked(new_mt);
             total += n - new_mt.row_count;
         }
     }
@@ -300,10 +297,7 @@ pub fn execDeleteKeyedBatch(
 
         if (matched_any) {
             if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
-                const old_mt = t.memtable;
-                t.memtable = new_mt;
-                old_mt.retire();
-                old_mt.release();
+                t.installMemtableLocked(new_mt);
             }
         }
     }
@@ -529,10 +523,7 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
         }
 
         if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
-            const old_mt = t.memtable;
-            t.memtable = new_mt;
-            old_mt.retire();
-            old_mt.release();
+            t.installMemtableLocked(new_mt);
             total += n - new_mt.row_count;
         }
     }
