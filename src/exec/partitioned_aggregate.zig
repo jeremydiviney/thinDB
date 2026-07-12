@@ -48,6 +48,9 @@ const Partition = struct {
     out_cols: []engine.ColumnStore = &.{},
     out_rows: usize = 0,
     err: ?anyerror = null,
+    /// Set once aggregated — partition 0 runs early as the core-selection
+    /// probe, and the pooled `.aggregate` phase must not run it twice.
+    agg_done: bool = false,
 };
 
 /// Single-batch source over a partition's gathered input columns — the serial
@@ -94,6 +97,12 @@ pub const PartitionedAggregate = struct {
     emit_part: usize = 0,
     emit_chunk: usize = 0,
     views: []ColumnView,
+    /// Chosen by the partition-0 probe: near-unique groups with heavy
+    /// per-group states (MAX_BY/ANY_VALUE/...) make the hash core pay a
+    /// heap state + string dupes for EVERY group; sort+stream holds one
+    /// live group. Low-NDV shapes keep the hash core — the sort would be
+    /// pure loss there.
+    sorted_stream_rest: bool = false,
 
     pub fn create(
         allocator: Allocator,
@@ -297,9 +306,23 @@ fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indic
         part.in_rows += indices.len;
     }
 
+    /// Aggregates whose per-group state lives on the heap (a `Value` copy or
+    /// worse). Near-unique group counts multiply that cost by the row count —
+    /// the trigger for the sort+stream core.
+    fn heavyStateAggCount(aggs: []const AggSpec) usize {
+        var n: usize = 0;
+        for (aggs) |a| switch (a.func) {
+            .max_by, .any_value, .first, .last, .group_concat, .count_distinct, .sum_distinct, .avg_distinct => n += 1,
+            else => {},
+        };
+        return n;
+    }
+
     /// Phase B (one worker per partition): run the serial Aggregate over the
     /// partition's gathered input and retain its output rows in the same arena.
     fn aggregateOne(self: *PartitionedAggregate, part: *Partition) void {
+        if (part.agg_done) return;
+        part.agg_done = true;
         runPartition(self, part) catch |e| {
             part.err = e;
         };
@@ -314,7 +337,15 @@ fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indic
         var scan = InputScan{ .schema = up_schema, .views = in_views, .rows = part.in_rows };
         const src = exec.makeQuery(aa, &scan);
 
-        var agg = try aggregate.Aggregate.create(aa, src, self.group_cols, self.aggs, null, null);
+        var agg = if (self.sorted_stream_rest) blk: {
+            // Near-unique groups (probe verdict): sort this partition by the
+            // group keys and stream — one live group's state instead of a
+            // hash table holding a heap state per group.
+            const specs = try aa.alloc(exec.SortSpec, self.group_cols.len);
+            for (self.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+            const sorted = try src.orderBy(specs);
+            break :blk try sorted.streamGroupBy(self.group_cols, self.aggs);
+        } else try aggregate.Aggregate.create(aa, src, self.group_cols, self.aggs, null, null);
         defer agg.deinit();
 
         const out_cols = try aa.alloc(engine.ColumnStore, self.output_schema.len);
@@ -392,6 +423,26 @@ fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indic
             if (prof_on) copy_ticks += exec.prof.nowTicks() - c0;
         }
         const t1 = if (prof_on) exec.prof.nowTicks() else 0;
+
+        // Core-selection probe: aggregate partition 0 on this thread with the
+        // hash core, then read its groups/rows ratio. Near-unique groups with
+        // heavy per-group states send the REMAINING partitions down the
+        // sort+stream core (partition 0 keeps its hash result — same output
+        // either way, only the core differs).
+        self.aggregateOne(&self.parts[0]);
+        // ≥90% unique: at moderate ratios (measured: 73% unique, 3.6M rows)
+        // the hash core still wins — the sort's row-bound cost only pays off
+        // when nearly every row opens a fresh group's heap states.
+        if (self.parts[0].in_rows >= 4096 and
+            self.parts[0].out_rows * 10 >= self.parts[0].in_rows * 9 and
+            heavyStateAggCount(self.aggs) >= 2)
+        {
+            self.sorted_stream_rest = true;
+            if (prof_on) std.debug.print(
+                "[hprof] pagg.probe: groups/rows={d}/{d} heavy_aggs={d} -> sort+stream rest\n",
+                .{ self.parts[0].out_rows, self.parts[0].in_rows, heavyStateAggCount(self.aggs) },
+            );
+        }
 
         if (spawn_ok) {
             pool.runBarrier(.aggregate);
