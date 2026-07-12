@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-labelledby="title desc">
+  <title id="title">thinDB concept mark</title>
+  <desc id="desc">Three compact columnar data segments with a highlighted analytical scan path.</desc>
+  <rect x="8" y="8" width="144" height="144" rx="24" fill="#10261f"/>
+  <rect x="8.75" y="8.75" width="142.5" height="142.5" rx="23.25" fill="none" stroke="#31594d" stroke-width="1.5"/>
+
+  <path d="M35 39h90" fill="none" stroke="#d7e96e" stroke-width="5" stroke-linecap="round"/>
+  <path d="M116 30l10 9-10 9" fill="none" stroke="#d7e96e" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g fill="#51b89c">
+    <rect x="31" y="61" width="25" height="17" rx="4"/>
+    <rect x="31" y="83" width="25" height="17" rx="4"/>
+    <rect x="31" y="105" width="25" height="17" rx="4"/>
+  </g>
+  <g fill="#e9f2ef">
+    <rect x="67" y="61" width="25" height="17" rx="4"/>
+    <rect x="67" y="83" width="25" height="17" rx="4"/>
+    <rect x="67" y="105" width="25" height="17" rx="4"/>
+  </g>
+  <g fill="#e67b5f">
+    <rect x="103" y="61" width="25" height="17" rx="4"/>
+    <rect x="103" y="83" width="25" height="17" rx="4" opacity="0.42"/>
+    <rect x="103" y="105" width="25" height="17" rx="4" opacity="0.42"/>
+  </g>
+
+  <circle cx="115.5" cy="69.5" r="4.5" fill="#10261f"/>
+</svg>
