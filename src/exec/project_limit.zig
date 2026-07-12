@@ -69,6 +69,29 @@ pub const Project = struct {
                 if (types.columnNameEql(prior.name, out_schema[i].name)) return Error.ComputeNameCollision;
             }
         }
+        // Identity elision: keeps every upstream column in place with its
+        // exact label — the operator would be a pure pull-through frame, so
+        // don't build it. Labels compare by bytes, not columnNameEql: a
+        // case-only "rename" is a real relabel on the wire.
+        const identity = blk: {
+            if (names.len != up_schema.len) break :blk false;
+            for (column_map, 0..) |src, i| {
+                if (src != i) break :blk false;
+            }
+            if (output_names) |outs| {
+                for (outs, 0..) |o, i| {
+                    if (!std.mem.eql(u8, o, up_schema[i].name)) break :blk false;
+                }
+            }
+            break :blk true;
+        };
+        if (identity) {
+            allocator.free(views);
+            allocator.free(column_map);
+            allocator.free(out_schema);
+            return upstream;
+        }
+
         const owned_names: ?[][]u8 = if (output_names != null) try cloneOutputNames(allocator, out_schema) else null;
         errdefer if (owned_names) |owned| freeOutputNames(allocator, owned);
 
