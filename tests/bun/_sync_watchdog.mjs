@@ -51,9 +51,66 @@ async function staleIsBenign(table, thindbMx, tdbConn) {
 // Tables whose updatedAt advances continuously in prod — freshness is a valid
 // health signal. Small/rarely-written tables are state-checked only.
 const FRESH_TABLES = ["invoice_import_amortized", "report_customer_revenue_rollforward"];
+// All synced tables — the hourly count-parity probe covers every one.
+const ALL_TABLES = [
+  "invoice_import_amortized", "report_customer_revenue_rollforward",
+  "estimate_date_map", "number_sequence", "currency_exchange_rate",
+  "division", "external_plan",
+];
 const EXPECTED_JOBS = 7;
 
 let lastBad = false;
+let checkCount = 0;
+const PARITY_EVERY = Math.max(1, Math.round(3600000 / INTERVAL)); // ~hourly
+
+// Count-parity probe (#164d): the sink's delivery contract is at-least-once
+// JDBC + idempotent keyed upserts/deletes — XA was evaluated and rejected
+// (see INGEST_DESIGN.md). The safety net for any acked-but-lost class is
+// VERIFICATION: compare a recent-window row count per table between prod and
+// thinDB over IDENTICAL literal bounds (client-computed; window ends 15 min
+// ago so in-flight CDC lag can't false-positive; 24 h deep so it catches
+// yesterday's losses too). Confirmed drifts survive a 60 s recheck, which
+// absorbs the read race between the two queries. Fail-open: probe errors
+// never alert on their own.
+async function parityDrift() {
+  if (!PROD) return [];
+  const fmt = (ms) => new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+  const where = `updatedAt >= '${fmt(Date.now() - 24 * 3600000)}' AND updatedAt < '${fmt(Date.now() - 15 * 60000)}'`;
+  const p = await mysql.createConnection({ ...PROD, database: "wayroll", connectTimeout: 15000 });
+  const t = await mysql.createConnection({ host: "127.0.0.1", port: 13310, user: "root", password: "", database: "wayroll_prod__public", connectTimeout: 8000 });
+  // Small tables (estimate_date_map etc.) have no updatedAt on prod — full
+  // COUNT(*) is cheap there; only the churn giants need the window bound.
+  const countBoth = async (table) => {
+    let pr, tr;
+    try {
+      [[pr]] = await p.query({ sql: `SELECT COUNT(*) c FROM \`${table}\` WHERE ${where}`, timeout: 120000 });
+      [[tr]] = await t.query({ sql: `SELECT COUNT(*) c FROM \`${table}\` WHERE ${where}`, timeout: 120000 });
+    } catch (e) {
+      if (e.code !== "ER_BAD_FIELD_ERROR") throw e;
+      [[pr]] = await p.query({ sql: `SELECT COUNT(*) c FROM \`${table}\``, timeout: 120000 });
+      [[tr]] = await t.query({ sql: `SELECT COUNT(*) c FROM \`${table}\``, timeout: 120000 });
+    }
+    return [Number(pr.c), Number(tr.c)];
+  };
+  try {
+    const suspects = [];
+    for (const table of ALL_TABLES) {
+      const [pc, tc] = await countBoth(table);
+      if (pc !== tc) suspects.push(table);
+    }
+    if (!suspects.length) return [];
+    await new Promise((r) => setTimeout(r, 60000));
+    const confirmed = [];
+    for (const table of suspects) {
+      const [pc, tc] = await countBoth(table);
+      if (pc !== tc) confirmed.push(`${table} parity drift (24h window): prod=${pc} thindb=${tc}`);
+    }
+    return confirmed;
+  } finally {
+    p.end().catch(() => {});
+    t.end().catch(() => {});
+  }
+}
 
 async function jobStates() {
   const r = await fetch(`${FLINK}/jobs/overview`).then((x) => x.json());
@@ -115,6 +172,13 @@ async function check() {
     });
     if (errCount > 0) problems.push(`sink errors: ${errCount} executeBatch failures in last interval`);
   } catch { /* docker unavailable — job-state checks still cover us */ }
+
+  checkCount++;
+  if ((checkCount - 1) % PARITY_EVERY === 0) {
+    try {
+      problems.push(...(await parityDrift()));
+    } catch { /* fail-open — parity is a supplementary signal */ }
+  }
 
   const ts = new Date().toISOString().slice(11, 19);
   // Emit only on state CHANGE (problem set differs from last check), so a

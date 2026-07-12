@@ -43,6 +43,33 @@ So:
 Upsert is idempotent → replay overwrites the same row. Append is NOT → replay
 double-counts. Only keyless append streams need true exactly-once.
 
+### Streaming sinks stay at-least-once (DECISION 2026-07-12, #164d)
+
+Evaluated flipping the wayroll streaming sinks to `sink.semantic=exactly-once`
+(XA) after the 2026-07-11 lost-rows incident. **Rejected** — XA stays reserved
+for resync jobs and keyless/append streams:
+
+1. **XA would not have prevented the incident.** The loss was an engine apply
+   bug (upsert-index ABA, fixed a023ae9): the server *believed* it applied the
+   rows, and would have acked `XA COMMIT` just as confidently as it acked the
+   plain batch. 2PC protects the crash window between ack and durability; it
+   cannot protect against a wrong apply.
+2. **Every streaming table is PK/upsert → already effectively-once.** Replays
+   converge to the same end state; exactly-once changes nothing observable.
+3. **The sinks' traffic hits a real XA gap.** Re-amortization batches are
+   per-PK DELETE + re-upsert; keyed DELETEs execute immediately rather than
+   staging in the branch (c5014c7-era design), so a delete-carrying XA
+   checkpoint would not actually be atomic.
+4. **Cost.** 2PC + prepare-file fsync per checkpoint per table, in-doubt xid
+   handling across Flink restarts, Connector/J XA-pooling fragility.
+
+The defense for the acked-but-lost class is **verification, not transactions**:
+the sync watchdog (`tests/bun/_sync_watchdog.mjs`) runs an hourly count-parity
+probe — per table, prod vs thinDB row counts over identical literal bounds
+(24 h `updatedAt` window ending 15 min ago for the churn giants; full count for
+small tables without `updatedAt`), with a 60 s recheck before alerting. Any
+future silent loss surfaces within the hour instead of via manual audit.
+
 ---
 
 ## Stage 1 — JDBC (server-complete)
