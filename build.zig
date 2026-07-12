@@ -254,6 +254,22 @@ pub fn build(b: *std.Build) void {
     const segstats_step = b.step("segstats", "Verify per-RG footer stats vs decoded values: -- <table_dir> <column>");
     segstats_step.dependOn(&run_segstats.step);
 
+    // ---- compact-table: force compaction sweeps to a fixed point (diagnostic) ----
+    const compact_tool_mod = b.createModule(.{
+        .root_source_file = b.path("bench/compact_table.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compact_tool_mod.addImport("thindb", thindb_mod);
+    const compact_tool_exe = b.addExecutable(.{
+        .name = "compact-table",
+        .root_module = compact_tool_mod,
+    });
+    const run_compact_tool = b.addRunArtifact(compact_tool_exe);
+    if (b.args) |args| run_compact_tool.addArgs(args);
+    const compact_tool_step = b.step("compact-table", "Force compaction sweeps on a database dir: -- <database_dir> [table]");
+    compact_tool_step.dependOn(&run_compact_tool.step);
+
     // ---- TVF flagship A/B: bench/tvf_walk_ab.zig (always ReleaseFast) ----
     const tvf_ab_mod = b.createModule(.{
         .root_source_file = b.path("bench/tvf_walk_ab.zig"),
