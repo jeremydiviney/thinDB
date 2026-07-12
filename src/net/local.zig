@@ -58,6 +58,7 @@ const subquery_resolve = @import("subquery_resolve.zig");
 const predicate_pushdown = @import("predicate_pushdown.zig");
 const const_fold = @import("const_fold.zig");
 const prune_columns = @import("prune_columns.zig");
+const partition_keys = @import("partition_keys.zig");
 const pgcat = @import("pg_catalog.zig");
 
 pub const Error = error{
@@ -1262,6 +1263,10 @@ pub fn compileWithSession(
     // stop carrying long-dead columns through every stage buffer. Runs
     // before projection analysis so the flat set shrinks with the tree.
     prune_columns.pruneDeadColumns(ctx.nodeArena(), @constCast(root));
+    // Partition-key subtree report (THINDB_TRACE_PARTKEYS, no plan changes):
+    // Phase 1 of partition-parallel execution — prints each maximal subtree
+    // a single hash-partition exchange could parallelize end-to-end.
+    partition_keys.report(ctx.nodeArena(), root);
     // Projection pushdown: after subqueries are resolved to constants,
     // figure out which base columns the (single) scan must produce.
     ctx.prune_names = analyzeProjection(allocator, root);
