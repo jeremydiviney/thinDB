@@ -1089,7 +1089,7 @@ pub const ParallelScan = struct {
             self.agg_q = q;
             for (q, 0..) |*slot, i| {
                 const pcs = try self.worker_alloc.create(ProbeChunkScan);
-                pcs.* = .{ .ps = self, .chunk = i };
+                pcs.* = .{ .ps = self, .chunk = i, .schema = self.out_schema };
                 slot.* = try makeQuery(self.worker_alloc, pcs).groupBy(group_cols, aggs);
                 self.agg_built = i + 1;
             }
@@ -1105,7 +1105,7 @@ pub const ParallelScan = struct {
             // JOINED batches: scan → probe (ProbeChunkScan) → partial agg.
             const sq = if (self.probe_sink != null) blk: {
                 const pcs = try self.worker_alloc.create(ProbeChunkScan);
-                pcs.* = .{ .ps = self, .chunk = i };
+                pcs.* = .{ .ps = self, .chunk = i, .schema = self.out_schema };
                 break :blk makeQuery(self.worker_alloc, pcs);
             } else switch (w) {
                 inline else => |p| makeQuery(self.worker_alloc, p),
@@ -1652,6 +1652,14 @@ pub const ParallelScan = struct {
 const ProbeChunkScan = struct {
     ps: *ParallelScan,
     chunk: usize,
+    /// Joined-batch schema, captured at creation. `ps.out_schema` is NOT
+    /// stable — tryFuseAggregate replaces it with the partial-agg OUTPUT
+    /// schema right after building the per-chunk pipelines, and the
+    /// per-chunk Aggregate lazily re-reads upstream.outputSchema() at
+    /// first accumulate (agg-input type resolution). Reading the live
+    /// pointer there mis-typed — or indexed out of bounds of — the
+    /// narrower agg schema (#118).
+    schema: []const Column,
 
     pub fn next(self: *ProbeChunkScan) !?Batch {
         const ps = self.ps;
@@ -1674,7 +1682,7 @@ const ProbeChunkScan = struct {
     }
 
     pub fn outputSchema(self: *ProbeChunkScan) []const Column {
-        return self.ps.out_schema;
+        return self.schema;
     }
 
     pub fn addPrune(self: *ProbeChunkScan, pred: predicate.Predicate) !void {

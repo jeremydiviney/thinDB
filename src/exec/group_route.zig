@@ -190,7 +190,11 @@ pub fn routeJoinPartialGroupBy(
     if (trace_pa) std.debug.print("[pagg-route] enter keys={d} aggs={d}\n", .{ group_cols.len, aggs.len });
     for (aggs) |a| switch (a.func) {
         .count, .sum => {},
-        .min, .max => if (group_cols.len == 0) return null,
+        // any_value combines like min/max: a representative of per-chunk
+        // representatives is still a representative. Grouped only — like
+        // MIN/MAX, a global partial over an empty chunk would emit a NULL
+        // row that could win the combine over real values.
+        .min, .max, .any_value => if (group_cols.len == 0) return null,
         else => {
             if (trace_pa) std.debug.print("[pagg-route]   decline agg func={s}\n", .{@tagName(a.func)});
             return null;
@@ -246,6 +250,7 @@ pub fn routeJoinPartialGroupBy(
                 .count, .sum => .sum,
                 .min => .min,
                 .max => .max,
+                .any_value => .any_value,
                 else => unreachable,
             },
             .col = a.as,
