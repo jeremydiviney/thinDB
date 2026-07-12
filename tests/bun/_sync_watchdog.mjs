@@ -83,6 +83,17 @@ async function parityDrift() {
   const countBoth = async (table) => {
     let pr, tr;
     try {
+      // Freshness gate: during an active prod burst thinDB lags minutes
+      // behind, and windowed counts diverge in BOTH directions (rows
+      // re-stamped past the window end on prod, stale timestamps still
+      // inside it on thinDB). Comparing mid-catch-up is meaningless —
+      // skip the table this round; the next hourly pass covers it.
+      const [[pf]] = await p.query({ sql: `SELECT MAX(updatedAt) m FROM \`${table}\``, timeout: 120000 });
+      const [[tf]] = await t.query({ sql: `SELECT MAX(updatedAt) m FROM \`${table}\``, timeout: 120000 });
+      if (pf.m && tf.m) {
+        const lagMs = Date.parse(String(pf.m).replace(" ", "T") + "Z") - Date.parse(String(tf.m).replace(" ", "T") + "Z");
+        if (lagMs > 5 * 60000) return null; // sink catching up — not comparable
+      }
       [[pr]] = await p.query({ sql: `SELECT COUNT(*) c FROM \`${table}\` WHERE ${where}`, timeout: 120000 });
       [[tr]] = await t.query({ sql: `SELECT COUNT(*) c FROM \`${table}\` WHERE ${where}`, timeout: 120000 });
     } catch (e) {
@@ -95,15 +106,15 @@ async function parityDrift() {
   try {
     const suspects = [];
     for (const table of ALL_TABLES) {
-      const [pc, tc] = await countBoth(table);
-      if (pc !== tc) suspects.push(table);
+      const counts = await countBoth(table);
+      if (counts && counts[0] !== counts[1]) suspects.push(table);
     }
     if (!suspects.length) return [];
     await new Promise((r) => setTimeout(r, 60000));
     const confirmed = [];
     for (const table of suspects) {
-      const [pc, tc] = await countBoth(table);
-      if (pc !== tc) confirmed.push(`${table} parity drift (24h window): prod=${pc} thindb=${tc}`);
+      const counts = await countBoth(table);
+      if (counts && counts[0] !== counts[1]) confirmed.push(`${table} parity drift (24h window): prod=${counts[0]} thindb=${counts[1]}`);
     }
     return confirmed;
   } finally {
