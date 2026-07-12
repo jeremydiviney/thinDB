@@ -341,6 +341,17 @@ pub const Schema = struct {
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
 
+        // The WAL file lives inside table_dir and Windows refuses to
+        // rename a directory containing open handles. Flush residue so
+        // the log carries nothing live, close it across the rename, and
+        // recreate it fresh in the renamed directory.
+        const had_wal = t.wal != null;
+        if (had_wal) {
+            try t.flushLocked();
+            t.wal.?.deinit();
+            t.wal = null;
+        }
+
         t.segments_dir.close(t.io);
         t.table_dir.close(t.io);
 
@@ -348,6 +359,14 @@ pub const Schema = struct {
 
         t.table_dir = try self.schema_dir.openDir(self.io, new_name, .{});
         t.segments_dir = try t.table_dir.openDir(t.io, "segments", .{});
+        if (had_wal) {
+            t.wal = try @import("../engine/engine.zig").wal.WalWriter.create(
+                t.allocator,
+                t.io,
+                t.table_dir,
+                t.schema_fingerprint,
+            );
+        }
 
         const new_owned = try self.allocator.dupe(u8, new_name);
         const old_owned = t.name;

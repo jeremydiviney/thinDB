@@ -86,6 +86,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     const catalog = try thindb.Catalog.open(allocator, io, data_root, .{
         .compact_threads = n_threads,
+        // Bulk import of reimportable bench data: WAL would double the
+        // write volume for nothing (a failed load reruns with --wipe).
+        .wal_enabled = false,
     });
     defer catalog.close();
     const db = try catalog.createOrOpenDatabase(database_name);

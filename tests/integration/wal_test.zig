@@ -42,8 +42,11 @@ test "wal: inserts survive close-without-flush + reopen" {
     defer db.close();
     const t = try db.table("orders", schema_v1, opts_v1);
 
-    // Still no segment, but the memtable should have been reconstructed.
-    try std.testing.expectEqual(@as(usize, 0), t.segmentCount());
+    // Replayed rows are flushed to a segment at open BEFORE the WAL is
+    // truncated — otherwise a second crash before the next flush would
+    // drop them (the fresh log no longer carries their records).
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+    try std.testing.expectEqual(@as(u64, 0), t.memtable.row_count);
 
     var q = try thindb.scan(allocator, t);
     defer q.deinit();
@@ -354,13 +357,19 @@ test "wal: concurrent writers survive close + reopen" {
     }
 
     // Reopen: WAL replay should reconstruct every row from every thread.
+    // Replayed rows are flushed to a segment at open (before the log is
+    // truncated), so count them through a scan rather than the memtable.
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{
         .wal_enabled = true,
         .sync_mode = .per_flush,
     });
     defer db.close();
     const t = try db.table("orders", schema, opts);
-    try std.testing.expectEqual(@as(u64, num_threads * per_thread), t.memtable.row_count);
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var total: u64 = 0;
+    while (try q.next()) |batch| total += batch.row_count;
+    try std.testing.expectEqual(@as(u64, num_threads * per_thread), total);
 }
 
 // =============================================================================

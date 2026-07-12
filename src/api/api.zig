@@ -134,18 +134,25 @@ pub const Config = struct {
     sync_mode: SyncMode = .none,
 
     /// Enable the write-ahead log. When true, every insert and delete is
-    /// appended to a single per-table WAL file and fsynced BEFORE the
-    /// operation returns success. On reopen, the WAL is replayed to
-    /// reconstruct any memtable contents that were lost on shutdown.
+    /// appended to a single per-table WAL file; on reopen the WAL is
+    /// replayed to reconstruct memtable contents lost on shutdown.
     ///
-    /// This gives "INSERT returned OK = durable" semantics without
-    /// per-insert segment flushes. Pairs naturally with `sync_mode =
-    /// .per_flush` (segments + manifest also durable).
+    /// Durability tier depends on `sync_mode`:
+    ///   - `.none` (default): appends land in the OS page cache, no
+    ///     fsync. A PROCESS crash or kill loses nothing (the OS still
+    ///     writes the pages); only an OS crash / power loss can drop
+    ///     the tail. Near-zero write-path cost.
+    ///   - `.per_flush`: the WAL append is group-commit fsynced BEFORE
+    ///     the operation returns — "INSERT returned OK = durable" even
+    ///     across power loss. One amortized fsync per commit group;
+    ///     batch inserts where possible.
     ///
-    /// Cost: one fsync per insert() / delete() call. Many small calls →
-    /// many fsyncs. Application code should batch inserts where possible
-    /// — a single insert(big_batch) is one fsync regardless of row count.
-    wal_enabled: bool = false,
+    /// Default ON since 2026-07-12: a crash between ack and flush
+    /// otherwise silently sheds acknowledged rows — acceptable for a
+    /// disposable bench replica, not for a server another system
+    /// trusts (the CDC sink lost acked rows to exactly this, twice).
+    /// Bulk import tools loading reimportable data opt out explicitly.
+    wal_enabled: bool = true,
 
     /// Per-query memory ceiling for blocking operators (Sort, hash
     /// GroupBy, hash Join build, SMJ sort buffers, materialize-with-

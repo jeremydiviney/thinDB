@@ -255,8 +255,13 @@ pub const Table = struct {
         }
 
         if (cfg.wal_enabled) {
-            // Replay already happened above (from the on-disk file). Now
-            // truncate-and-recreate so subsequent writes go through a fresh log.
+            // Replay already happened above (from the on-disk file).
+            // Persist any replayed rows BEFORE truncating the log: a
+            // second crash before the next flush would otherwise drop
+            // them (the fresh WAL no longer carries their records).
+            if (self.memtable.row_count > 0) try self.flushLocked();
+            // Now truncate-and-recreate so subsequent writes go through
+            // a fresh log.
             self.wal = try engine.wal.WalWriter.create(allocator, io, table_dir, fp);
         }
         return self;

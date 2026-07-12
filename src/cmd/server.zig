@@ -35,6 +35,9 @@ const usage_text =
     \\                          than N seconds (default 86400 = 24h; 0 disables). Must exceed the
     \\                          Flink checkpoint interval + max tolerable downtime.
     \\  --idle-timeout-secs N   Close a connection after N seconds of read silence (default 0 = disabled).
+    \\  --no-wal                Disable the write-ahead log (default: on). Without it, rows acked
+    \\                          but not yet flushed are lost on a crash or kill — only for
+    \\                          disposable bench data dirs where data is reimportable.
     \\  --max-dop N             Max worker threads per query for the parallel scan leaf (default 1 =
     \\                          serial). >1 hands row-group ranges to up to N workers; the per-query
     \\                          count is also bounded by a global ~(cores-1) worker-slot budget.
@@ -102,6 +105,9 @@ pub fn main(init: std.process.Init) !u8 {
     // race → double-free/leak under sustained writes) is unfixed — lets a
     // write-heavy sink run stably at the cost of unmerged segments.
     var enable_compaction: bool = true;
+    // WAL on by default (matches the library): crash between ack and flush
+    // must not shed acknowledged rows. --no-wal for disposable bench dirs.
+    var enable_wal: bool = true;
     var idle_timeout_secs: u32 = 0;
     var query_memory_budget: ?usize = null;
     var memory_budget: ?usize = null;
@@ -189,6 +195,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (std.mem.eql(u8, arg, "--no-compaction")) {
             enable_compaction = false;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--no-wal")) {
+            enable_wal = false;
             continue;
         }
         if (try takeU32(arg, "--max-connections", &args_iter, err_w)) |v| {
@@ -281,6 +291,7 @@ pub fn main(init: std.process.Init) !u8 {
         // library's serial default — background merges are the server's job.
         .compact_threads = if (compact_threads) |v| v else 0,
         .file_scan_access = if (file_root) |root| .{ .root = root } else .disabled,
+        .wal_enabled = enable_wal,
     };
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
