@@ -37,6 +37,21 @@ pub fn routeGroupBy(
     return upstream.groupByTopK(group_cols, aggs, top_k, emit_limit);
 }
 
+// NEGATIVE RESULT (2026-07-13, plan-selection campaign): a dop-aware variant
+// of routeGroupBy for the no-stages compile fallback was built and reverted
+// twice. The target was customer_monthly_totals (keys=4/SUM over 3.4M
+// filtered rows, serial hash Aggregate 1.2s inside a 14s query).
+// (a) PartitionedAggregate arm: agg dropped 1.31s -> 0.70s but the consumer
+//     stage refunded it exactly (+0.8s exec, +0.45s teardown) — pagg's
+//     partition-concat emission shuffles the input-clustered order the
+//     downstream window implicitly exploited. Wall-neutral.
+// (b) Parallel sort + streamGroupBy arm: key-sorted output, but the 3.4M-row
+//     sort cost MORE than the serial agg saved (wall +1s) — the window keys
+//     don't ride the group-key order here.
+// The serial hash aggregate's insertion-order emission is load-bearing for
+// this shape. Any parallel replacement must preserve (or make the consumer
+// exploit) that order — see task #173.
+
 pub fn routeStreamGroupBy(
     allocator: Allocator,
     upstream: *Query,

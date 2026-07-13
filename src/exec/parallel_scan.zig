@@ -1037,14 +1037,27 @@ pub const ParallelScan = struct {
     /// buffers, emission views, and budget charge re-type to the JOIN's
     /// schema (`out_schema` swap below).
     pub fn tryFuseProbe(self: *ParallelScan, sink: exec.ProbeSink) !bool {
-        if (self.mode != .unset) return false;
-        if (self.agg_fused) return false;
+        const trace_jf = getenv("THINDB_TRACE_JOINFUSE") != null;
+        if (self.mode != .unset) {
+            if (trace_jf) std.debug.print("[jf]   ps decline: mode={s} table={}\n", .{ @tagName(self.mode), self.table != null });
+            return false;
+        }
+        if (self.agg_fused) {
+            if (trace_jf) std.debug.print("[jf]   ps decline: agg_fused\n", .{});
+            return false;
+        }
         // A stage-backed scan with fused per-stripe computes still accepts:
         // round mode probes each stripe's compute chain, so the sink sees
         // derived batches. Table-backed compute fusion keeps declining — its
         // materialize-mode drain composes compute and sink differently.
-        if (self.compute_fused and self.table != null) return false;
-        if (self.emit_keep != null or self.owns_out_schema) return false;
+        if (self.compute_fused and self.table != null) {
+            if (trace_jf) std.debug.print("[jf]   ps decline: table compute_fused\n", .{});
+            return false;
+        }
+        if (self.emit_keep != null or self.owns_out_schema) {
+            if (trace_jf) std.debug.print("[jf]   ps decline: emit_keep={} owns_schema={}\n", .{ self.emit_keep != null, self.owns_out_schema });
+            return false;
+        }
         if (sink.probe_map) |m| {
             const slices = try self.allocator.alloc([]ColumnView, self.plannedChunks());
             var built: usize = 0;

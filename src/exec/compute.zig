@@ -650,7 +650,18 @@ pub const Compute = struct {
             .process = ChainForward.processHook,
         }) catch false;
         if (!ok) {
-            if (trace_jf) std.debug.print("[jf]   compute decline: upstream refused wrapped sink\n", .{});
+            if (trace_jf) {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(self.allocator);
+                self.upstream.explain(&buf, self.allocator, 0) catch {};
+                var it = std.mem.splitScalar(u8, buf.items, '\n');
+                std.debug.print("[jf]   compute decline: upstream refused wrapped sink; subtree:\n", .{});
+                var n: usize = 0;
+                while (it.next()) |line| : (n += 1) {
+                    if (n >= 12) break;
+                    if (line.len > 0) std.debug.print("[jf]     {s}\n", .{line});
+                }
+            }
             self.allocator.destroy(chain);
             return false;
         }
