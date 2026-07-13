@@ -396,7 +396,7 @@ fn appendField(allocator: Allocator, batch: *Batch, col_idx: usize, field: []con
         .double => try store.data.double.append(allocator, try parseFloatOrZero(f64, field)),
         .date => try store.data.date.append(allocator, try parseDateOrZero(field)),
         .datetime => try store.data.datetime.append(allocator, try parseDateTimeOrZero(field)),
-        .varchar, .string, .char => try store.data.string.appendValue(allocator, field),
+        .varchar, .string, .char, .json => try store.data.string.appendValue(allocator, field),
         .decimal64, .decimal128, .uuid => return error.UnsupportedType,
     }
 }
