@@ -144,10 +144,10 @@ fn wrapWindowChild(node_arena: Allocator, child: **ir.Op, cse: *const MatCse) an
 const MatRefCounts = std.AutoHashMapUnmanaged(*const ir.Op, u32);
 
 /// Reference counting + structural CSE state for materialize nodes.
-/// `canon` maps a duplicate node (a FROM-subquery whose IR encodes
-/// byte-identically to an earlier one) to its representative; `refs`
-/// counts references per CANONICAL node. Encoding scratch and the
-/// bytes→node table live in `enc_arena` (freed after stage collection).
+/// `canon` maps an opted-in duplicate node (a FROM-subquery whose IR encodes
+/// byte-identically to an earlier one) to its representative; `refs` counts
+/// references per CANONICAL node. Encoding scratch and the bytes→node table
+/// live in `enc_arena` (freed after stage collection).
 const MatCse = struct {
     refs: MatRefCounts = .empty,
     canon: std.AutoHashMapUnmanaged(*const ir.Op, *const ir.Op) = .empty,
@@ -156,8 +156,8 @@ const MatCse = struct {
 };
 
 /// Count how many places in the tree reference each materialize node,
-/// merging structurally identical bodies (byte-equal IR encodings) into
-/// one canonical node first — so two copies of the same FROM-subquery
+/// merging opted-in structurally identical bodies (byte-equal IR encodings)
+/// into one canonical node first — so two copies of the same FROM-subquery
 /// (a self-join over identical subqueries) count as TWO references to
 /// ONE node and share a stage instead of scanning twice. A canonical
 /// node referenced once gets no stage — its body compiles inline at the
@@ -166,7 +166,7 @@ const MatCse = struct {
 fn countMatRefs(allocator: Allocator, op: *const ir.Op, cse: *MatCse) anyerror!void {
     switch (op.*) {
         .materialize => |m| {
-            const rep: *const ir.Op = blk: {
+            const rep: *const ir.Op = if (!m.structural_cse) op else blk: {
                 var buf: std.ArrayList(u8) = .empty;
                 ir.encode(cse.enc_arena, &buf, op.*) catch break :blk op; // unencodable: no CSE
                 const gop = try cse.bodies.getOrPut(cse.enc_arena, buf.items);

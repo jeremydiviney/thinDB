@@ -2694,7 +2694,10 @@ pub const Parser = struct {
             const op = try self.parseStatement();
             if (self.pending_separable != null) return ParseError.SqlSeparableScope;
             try self.expect(.rparen);
-            const wrapped = try self.allocOp(.{ .materialize = .{ .upstream = op } });
+            const wrapped = try self.allocOp(.{ .materialize = .{
+                .upstream = op,
+                .structural_cse = true,
+            } });
             // Optional AS, mandatory alias.
             if (self.cur.tag == .kw_as) try self.advance();
             if (self.cur.tag != .identifier) return ParseError.SqlSubqueryNeedsAlias;
@@ -2735,12 +2738,15 @@ pub const Parser = struct {
         } else if (self.cur.tag != .dot and self.ctes.get(first_lc) != null) {
             const entry = self.ctes.get(first_lc).?;
             // NOT MATERIALIZED = regenerate per use: each reference gets its
-            // OWN materialize node over the shared body subtree, so the
-            // engine builds (and frees) an independent stage per branch.
+            // OWN materialize node over the shared body subtree. Structural
+            // CSE may still merge byte-identical expansions before staging.
             // MATERIALIZED / default share one node — the post-parse pass
             // wraps the body in place so every reference reads one stage.
             op = if (entry.hint == .never)
-                try self.allocOp(.{ .materialize = .{ .upstream = entry.op } })
+                try self.allocOp(.{ .materialize = .{
+                    .upstream = entry.op,
+                    .structural_cse = true,
+                } })
             else
                 entry.op;
             alias_in_place = false;
@@ -2913,7 +2919,10 @@ pub const Parser = struct {
         if (sub.pending_separable != null) return ParseError.SqlSeparableScope;
         try sub.applyAutoMaterialize();
         if (sub.cur.tag != .eof and sub.cur.tag != .semicolon) return ParseError.SqlExpectedToken;
-        return try self.allocOp(.{ .materialize = .{ .upstream = op } });
+        return try self.allocOp(.{ .materialize = .{
+            .upstream = op,
+            .structural_cse = true,
+        } });
     }
 
     /// Expand a SQL inline table function call site: parse the literal
@@ -2964,7 +2973,10 @@ pub const Parser = struct {
         if (sub.pending_separable != null) return ParseError.SqlSeparableScope;
         try sub.applyAutoMaterialize();
         if (sub.cur.tag != .eof and sub.cur.tag != .semicolon) return ParseError.SqlExpectedToken;
-        return try self.allocOp(.{ .materialize = .{ .upstream = op } });
+        return try self.allocOp(.{ .materialize = .{
+            .upstream = op,
+            .structural_cse = true,
+        } });
     }
 
     /// The current token as a literal argument for a function expansion:
@@ -4714,4 +4726,43 @@ test "sql table function: CREATE parse, body capture, validation, expansion" {
     try std.testing.expectEqual(@as(usize, 2), cf.param_names.len);
     try std.testing.expectEqualStrings("SELECT c FROM t WHERE a = pid AND b = div", cf.body);
     try validateFnBody(aa, cf.body, cf.param_names);
+}
+
+fn firstMaterializeForTest(op: *const ir.Op) ?*const ir.Op {
+    return switch (op.*) {
+        .materialize => op,
+        .select => |p| firstMaterializeForTest(p.upstream),
+        .exclude => |p| firstMaterializeForTest(p.upstream),
+        .filter => |f| firstMaterializeForTest(f.upstream),
+        .order_by => |o| firstMaterializeForTest(o.upstream),
+        .group_by => |g| firstMaterializeForTest(g.upstream),
+        .compute => |c| firstMaterializeForTest(c.upstream),
+        .alias => |a| firstMaterializeForTest(a.upstream),
+        .limit => |l| firstMaterializeForTest(l.upstream),
+        .window => |w| firstMaterializeForTest(w.upstream),
+        .join => |j| firstMaterializeForTest(j.left) orelse firstMaterializeForTest(j.right),
+        .set_union => |u| firstMaterializeForTest(u.left) orelse firstMaterializeForTest(u.right),
+        else => null,
+    };
+}
+
+test "structural materialize CSE is limited to independent expansions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const shared = try parse(aa, "WITH c AS (SELECT x FROM t) SELECT x FROM c");
+    const shared_mat = firstMaterializeForTest(shared);
+    try std.testing.expect(shared_mat != null);
+    try std.testing.expect(!shared_mat.?.materialize.structural_cse);
+
+    const anonymous = try parse(aa, "SELECT s.x FROM (SELECT x FROM t) AS s");
+    const anonymous_mat = firstMaterializeForTest(anonymous);
+    try std.testing.expect(anonymous_mat != null);
+    try std.testing.expect(anonymous_mat.?.materialize.structural_cse);
+
+    const regenerated = try parse(aa, "WITH c AS NOT MATERIALIZED (SELECT x FROM t) SELECT c.x FROM c JOIN c AS d ON c.x = d.x");
+    const regenerated_mat = firstMaterializeForTest(regenerated);
+    try std.testing.expect(regenerated_mat != null);
+    try std.testing.expect(regenerated_mat.?.materialize.structural_cse);
 }

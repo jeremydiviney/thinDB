@@ -765,6 +765,12 @@ pub const Op = union(OpTag) {
         /// real buffer, so the staged compiler materializes even a single-
         /// reference node it would otherwise inline-stream.
         forced: bool = false,
+        /// Independently expanded boundaries may be structurally identical
+        /// even though they have different pointers. Shared named CTEs never
+        /// need this: pointer identity already deduplicates them, and encoding
+        /// every nested body would make deep CTE stacks quadratic. This is a
+        /// parse-time compilation hint, not part of the serialized IR.
+        structural_cse: bool = false,
         /// `SEPARABLE BY (cols)` on the wrapped block: the author asserts no
         /// output row depends on rows with a different key, so the stage may
         /// fill as N disjoint key-range slices run concurrently and
