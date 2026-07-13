@@ -2651,7 +2651,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 for (g.aggs) |a| std.debug.print("{s},", .{@tagName(a.func)});
                 std.debug.print(" upper_rows={d}\n", .{up.stats().upper_rows});
             }
-            return group_route.routeGroupBy(
+            return group_route.routeGroupByDop(
                 input.allocator,
                 &up,
                 g.group_cols,
@@ -2659,6 +2659,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 g.top_k,
                 g.emit_limit,
                 input.db.config.query_memory_budget,
+                input.effectiveDop(),
             );
         },
         .window => |w| {

@@ -16,6 +16,7 @@ const exec = @import("exec.zig");
 const Query = exec.Query;
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
+const partitioned_aggregate = @import("partitioned_aggregate.zig");
 
 /// The standard GROUP BY routing trio — sorted-stream / radix / hash — shared
 /// by the embedded dispatcher and the staged CTE mat-block compiler. Follows
@@ -37,20 +38,47 @@ pub fn routeGroupBy(
     return upstream.groupByTopK(group_cols, aggs, top_k, emit_limit);
 }
 
-// NEGATIVE RESULT (2026-07-13, plan-selection campaign): a dop-aware variant
-// of routeGroupBy for the no-stages compile fallback was built and reverted
-// twice. The target was customer_monthly_totals (keys=4/SUM over 3.4M
-// filtered rows, serial hash Aggregate 1.2s inside a 14s query).
-// (a) PartitionedAggregate arm: agg dropped 1.31s -> 0.70s but the consumer
-//     stage refunded it exactly (+0.8s exec, +0.45s teardown) — pagg's
-//     partition-concat emission shuffles the input-clustered order the
-//     downstream window implicitly exploited. Wall-neutral.
-// (b) Parallel sort + streamGroupBy arm: key-sorted output, but the 3.4M-row
-//     sort cost MORE than the serial agg saved (wall +1s) — the window keys
-//     don't ride the group-key order here.
-// The serial hash aggregate's insertion-order emission is load-bearing for
-// this shape. Any parallel replacement must preserve (or make the consumer
-// exploit) that order — see task #173.
+/// `routeGroupBy` with a partition-parallel arm before the serial hash
+/// fallback — for compile paths with NO materialized stages beneath (a
+/// table-backed GROUP BY inside a CTE block never reaches the V2 table
+/// handlers or the stage-priming AdaptiveGroupBy). Stream and radix keep
+/// priority; what changes is the last resort: a big input (upper_rows is a
+/// PRE-filter bound, so this over-admits selective filters — pagg's fixed
+/// cost there is one scatter pass + arena setup) aggregates its hash
+/// partitions on `dop` threads instead of one.
+///
+/// A/B notes (plan-selection campaign, customer_monthly_totals: keys=4/SUM
+/// over 3.4M filtered rows): pagg = agg 1.31s→0.69s, query −0.6s across 4/4
+/// samples. A parallel sort+streamGroupBy arm was tried and is NEGATIVE
+/// (the 3.4M-row sort costs more than the serial agg saves; the downstream
+/// window does not ride the group-key order). A single-sample pair earlier
+/// suggested pagg's shuffled emission was refunded downstream — noise;
+/// trust multi-run same-server medians only. THINDB_NO_PAGG_FALLBACK=1
+/// restores the serial hash fallback.
+pub fn routeGroupByDop(
+    allocator: Allocator,
+    upstream: *Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    top_k: ?ir.Op.TopK,
+    emit_limit: ?u32,
+    budget: usize,
+    dop: usize,
+) !Query {
+    if (try routeStreamGroupBy(allocator, upstream, group_cols, aggs, budget)) |q| return q;
+    if (try routeRadixGroupBy(upstream.*, group_cols, aggs, top_k, emit_limit)) |q| return q;
+    if (dop > 1 and group_cols.len > 0 and top_k == null and emit_limit == null and
+        exec.force_group_by == .auto and
+        getenv_gr("THINDB_NO_PAGG_FALLBACK") == null and
+        upstream.stats().upper_rows >= partitioned_aggregate.MIN_ROWS_FOR_PARALLEL)
+    {
+        if (getenv_gr("THINDB_TRACE_GBROUTE") != null) {
+            std.debug.print("[gbroute-compile]   -> partitioned (no-stage fallback, dop={d})\n", .{dop});
+        }
+        return partitioned_aggregate.PartitionedAggregate.create(allocator, upstream.*, group_cols, aggs, dop);
+    }
+    return upstream.groupByTopK(group_cols, aggs, top_k, emit_limit);
+}
 
 pub fn routeStreamGroupBy(
     allocator: Allocator,
