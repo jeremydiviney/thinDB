@@ -205,6 +205,10 @@ pub const SetUnion = struct {
         return true;
     }
 
+    pub fn probeFusionReachable(self: *const SetUnion) bool {
+        return self.left.probeFusionReachable() or self.right.probeFusionReachable();
+    }
+
     pub fn addPrune(_: *SetUnion, _: Predicate) !void {
         // Pushdown across UNION would need to clone the predicate down
         // each side; not worth the complication for v1.

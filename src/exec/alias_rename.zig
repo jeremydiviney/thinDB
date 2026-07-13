@@ -111,6 +111,10 @@ pub const AliasRename = struct {
         return ok;
     }
 
+    pub fn probeFusionReachable(self: *const AliasRename) bool {
+        return self.upstream.probeFusionReachable();
+    }
+
     pub fn rechainProbeSink(self: *AliasRename, sink: exec.ProbeSink) !bool {
         if (!self.probe_fused) return false;
         return self.upstream.rechainProbeSink(sink);

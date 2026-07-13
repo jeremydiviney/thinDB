@@ -221,6 +221,10 @@ pub const Project = struct {
         return ok;
     }
 
+    pub fn probeFusionReachable(self: *const Project) bool {
+        return self.upstream.probeFusionReachable();
+    }
+
     pub fn rechainProbeSink(self: *Project, sink: exec.ProbeSink) !bool {
         if (!self.probe_fused) return false;
         return self.upstream.rechainProbeSink(sink);

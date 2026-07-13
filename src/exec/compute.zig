@@ -669,6 +669,10 @@ pub const Compute = struct {
         return true;
     }
 
+    pub fn probeFusionReachable(self: *const Compute) bool {
+        return self.upstream.probeFusionReachable();
+    }
+
     pub fn rechainProbeSink(self: *Compute, sink: exec.ProbeSink) !bool {
         // Only a FULLY chained compute (inner sink adopted, or terminal at
         // the very tail being extended by the caller above) passes through.
@@ -2139,4 +2143,3 @@ fn fillNullColumn(allocator: Allocator, buf: *ColumnStore, n: usize) !void {
         try buf.appendValidBit(allocator, buf.data.rowCount() - 1, false);
     }
 }
-

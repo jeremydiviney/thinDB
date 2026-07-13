@@ -1059,6 +1059,10 @@ pub const Join = struct {
         return true;
     }
 
+    pub fn probeFusionReachable(self: *const Join) bool {
+        return self.probe_fused and self.chained_sink == null;
+    }
+
     /// A rechain passing through this join: intermediate joins already emit
     /// through their own chained sinks, so the new sink (kept by the CALLER,
     /// the pipeline's current tail) just continues down the probe side to
@@ -2593,4 +2597,3 @@ fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
         .gte => ord != .lt,
     };
 }
-

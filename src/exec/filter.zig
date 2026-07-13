@@ -369,6 +369,10 @@ pub const Filter = struct {
         return true;
     }
 
+    pub fn probeFusionReachable(self: *const Filter) bool {
+        return self.upstream.probeFusionReachable();
+    }
+
     pub fn rechainProbeSink(self: *Filter, sink: exec.ProbeSink) !bool {
         if (!self.fused and self.chain == null) return false;
         return self.upstream.rechainProbeSink(sink);

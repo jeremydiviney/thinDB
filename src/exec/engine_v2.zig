@@ -802,15 +802,18 @@ pub fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived:
 /// its stripe workers as a chained sink and the operator passes the final
 /// batches through. Serial pull semantics are unchanged on decline.
 pub fn computeSelfPushed(up: exec.Query, derived: []const ir.Derived, udf_registry: ?*const @import("../udf.zig").UdfRegistry) !exec.Query {
+    const probe_fusion_reachable = up.probeFusionReachable();
     const q = try up.computeWithRegistry(derived, udf_registry);
-    if (exec.queryAs(@import("compute.zig").Compute, q)) |c| {
-        const pushed = c.tryFuseSelf();
-        if (getenv_c("THINDB_TRACE_SELFPUSH") != null and !pushed) {
-            var buf: std.ArrayList(u8) = .empty;
-            defer buf.deinit(std.heap.page_allocator);
-            c.upstream.explain(&buf, std.heap.page_allocator, 0) catch {};
-            const line = if (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| buf.items[0..nl] else buf.items;
-            std.debug.print("[selfpush] DECLINED n_derived={d} upstream={s}\n", .{ derived.len, line });
+    if (probe_fusion_reachable) {
+        if (exec.queryAs(@import("compute.zig").Compute, q)) |c| {
+            const pushed = c.tryFuseSelf();
+            if (getenv_c("THINDB_TRACE_SELFPUSH") != null and !pushed) {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(std.heap.page_allocator);
+                c.upstream.explain(&buf, std.heap.page_allocator, 0) catch {};
+                const line = if (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| buf.items[0..nl] else buf.items;
+                std.debug.print("[selfpush] DECLINED n_derived={d} upstream={s}\n", .{ derived.len, line });
+            }
         }
     }
     return q;

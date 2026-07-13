@@ -1077,6 +1077,10 @@ pub const ParallelScan = struct {
         return true;
     }
 
+    pub fn probeFusionReachable(_: *const ParallelScan) bool {
+        return true;
+    }
+
     /// Apply the sink's probe-side column remap (if any) so the sink's
     /// compiled indices address the batch the way the declining Project
     /// would have presented it.

@@ -392,6 +392,10 @@ pub const Query = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     allocator: Allocator,
+    /// Cached at operator construction. False means no probe-fusion source is
+    /// reachable through this pipeline, so speculative sink offers can skip a
+    /// recursive walk that is otherwise quadratic in deep operator stacks.
+    probe_fusion_reachable: bool,
 
     pub fn next(self: *Query) !?Batch {
         return self.vtable.next(self.ptr);
@@ -413,6 +417,10 @@ pub const Query = struct {
     /// Offer a join-probe sink for in-worker probing (see `ProbeSink`).
     pub fn tryFuseProbe(self: Query, sink: ProbeSink) !bool {
         return self.vtable.tryFuseProbe(self.ptr, sink);
+    }
+
+    pub fn probeFusionReachable(self: Query) bool {
+        return self.probe_fusion_reachable;
     }
 
     /// Rebind a new sink at the bottom of an already probe-fused pipeline.
@@ -647,7 +655,13 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
         if (info != .pointer) @compileError("makeQuery: expected pointer to operator");
         break :blk info.pointer.child;
     };
-    return .{ .ptr = op, .vtable = &OpWrapper(Op).vt, .allocator = allocator };
+    const probe_fusion_reachable = if (@hasDecl(Op, "probeFusionReachable")) op.probeFusionReachable() else false;
+    return .{
+        .ptr = op,
+        .vtable = &OpWrapper(Op).vt,
+        .allocator = allocator,
+        .probe_fusion_reachable = probe_fusion_reachable,
+    };
 }
 
 /// Comptime-typed downcast of a type-erased `Query`. The vtable is a
