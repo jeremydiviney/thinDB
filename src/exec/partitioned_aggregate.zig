@@ -312,7 +312,7 @@ fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indic
     fn heavyStateAggCount(aggs: []const AggSpec) usize {
         var n: usize = 0;
         for (aggs) |a| switch (a.func) {
-            .max_by, .any_value, .first, .last, .group_concat, .count_distinct, .sum_distinct, .avg_distinct => n += 1,
+            .max_by, .max_by_key, .any_value, .first, .last, .group_concat, .count_distinct, .sum_distinct, .avg_distinct => n += 1,
             else => {},
         };
         return n;
@@ -613,4 +613,155 @@ test "PartitionedAggregate matches serial aggregate on string key + MAX_BY" {
     try testing.expectEqual(@as(usize, 7), ser_lines.len);
     try testing.expectEqual(ser_lines.len, par_lines.len);
     for (par_lines, ser_lines) |p, s| try testing.expectEqualStrings(s, p);
+}
+
+test "two-phase max_by via max_by_key partials matches single-phase (NULL-value trap)" {
+    const a = testing.allocator;
+    const Aggregate = @import("aggregate.zig").Aggregate;
+
+    const schema = [_]Column{
+        .{ .name = "key", .type = .string, .nullable = false },
+        .{ .name = "val", .type = .string, .nullable = true },
+        .{ .name = "ord", .type = .bigint, .nullable = true },
+    };
+
+    // Chunk A carries g0's HIGHEST ord on a NULL-value row — a naive hidden
+    // MAX(ord) would carry ord 99 alongside chunk A's value "early" and beat
+    // chunk B's honest ("winner", 50) in the combine. max_by_key shares
+    // max_by's skip-if-either-NULL pair semantics, so A's pair is (early, 10).
+    const Row = struct { k: []const u8, v: ?[]const u8, o: ?i64 };
+    const chunk_a = [_]Row{
+        .{ .k = "g0", .v = "early", .o = 10 },
+        .{ .k = "g0", .v = null, .o = 99 },
+        .{ .k = "g1", .v = "a", .o = 5 },
+        .{ .k = "g1", .v = "z", .o = null },
+    };
+    const chunk_b = [_]Row{
+        .{ .k = "g0", .v = "winner", .o = 50 },
+        .{ .k = "g0", .v = "low", .o = 1 },
+        .{ .k = "g1", .v = "b", .o = 7 },
+        .{ .k = "g2", .v = "solo", .o = 3 },
+    };
+
+    const fillStores = struct {
+        fn fill(alloc: Allocator, stores: []engine_store, rows: []const Row) !void {
+            for (rows) |r| {
+                try stores[0].data.string.appendValue(alloc, r.k);
+                if (r.v) |v| {
+                    const row = stores[1].rowCount();
+                    try stores[1].data.string.appendValue(alloc, v);
+                    try stores[1].appendValidBit(alloc, row, true);
+                } else try stores[1].appendNulls(alloc, 1);
+                if (r.o) |o| {
+                    const row = stores[2].rowCount();
+                    try stores[2].data.bigint.append(alloc, o);
+                    try stores[2].appendValidBit(alloc, row, true);
+                } else try stores[2].appendNulls(alloc, 1);
+            }
+        }
+    }.fill;
+
+    const part_aggs = [_]AggSpec{
+        .{ .func = .max_by, .col = "val", .arg2_col = "ord", .as = "v" },
+        .{ .func = .max_by_key, .col = "val", .arg2_col = "ord", .as = "__o", .out_type_override = .bigint },
+    };
+    const group_cols = [_][]const u8{"key"};
+
+    // Phase 1: partial per chunk, appended into the combine input stores.
+    const part_schema = [_]Column{
+        .{ .name = "key", .type = .string, .nullable = false },
+        .{ .name = "v", .type = .string, .nullable = true },
+        .{ .name = "__o", .type = .bigint, .nullable = true },
+    };
+    var part_stores: [3]engine_store = undefined;
+    for (&part_stores, part_schema) |*s, col| s.* = try engine_store.init(a, col.type, col.nullable);
+    defer for (&part_stores) |*s| s.deinit(a);
+
+    inline for (.{ chunk_a[0..], chunk_b[0..] }) |rows| {
+        var stores: [3]engine_store = undefined;
+        for (&stores, schema) |*s, col| s.* = try engine_store.init(a, col.type, col.nullable);
+        defer for (&stores) |*s| s.deinit(a);
+        try fillStores(a, &stores, rows);
+        var views: [3]ColumnView = undefined;
+        for (&views, &stores) |*v, *s| v.* = s.view();
+        var scan = InputScan{ .schema = &schema, .views = &views, .rows = rows.len };
+        var agg = try Aggregate.create(a, exec.makeQuery(a, &scan), &group_cols, &part_aggs, null, null);
+        defer agg.deinit();
+        while (try agg.next()) |b| {
+            var row: usize = 0;
+            while (row < b.row_count) : (row += 1) {
+                try part_stores[0].data.string.appendValue(a, b.values[0].data.string.rowBytes(@intCast(row)));
+                if (b.values[1].isValid(@intCast(row))) {
+                    const pr = part_stores[1].rowCount();
+                    try part_stores[1].data.string.appendValue(a, b.values[1].data.string.rowBytes(@intCast(row)));
+                    try part_stores[1].appendValidBit(a, pr, true);
+                } else try part_stores[1].appendNulls(a, 1);
+                if (b.values[2].isValid(@intCast(row))) {
+                    const pr = part_stores[2].rowCount();
+                    try part_stores[2].data.bigint.append(a, b.values[2].data.bigint[row]);
+                    try part_stores[2].appendValidBit(a, pr, true);
+                } else try part_stores[2].appendNulls(a, 1);
+            }
+        }
+    }
+
+    const collect = struct {
+        fn run(alloc: Allocator, q: *Query) ![][]u8 {
+            var lines: std.ArrayList([]u8) = .empty;
+            defer lines.deinit(alloc);
+            while (try q.next()) |b| {
+                var row: usize = 0;
+                while (row < b.row_count) : (row += 1) {
+                    const key = b.values[0].data.string.rowBytes(@intCast(row));
+                    const v = if (b.values[1].isValid(@intCast(row))) b.values[1].data.string.rowBytes(@intCast(row)) else "<NULL>";
+                    try lines.append(alloc, try std.fmt.allocPrint(alloc, "{s}|{s}", .{ key, v }));
+                }
+            }
+            std.mem.sort([]u8, lines.items, {}, struct {
+                fn lt(_: void, x: []u8, y: []u8) bool {
+                    return std.mem.lessThan(u8, x, y);
+                }
+            }.lt);
+            return lines.toOwnedSlice(alloc);
+        }
+    }.run;
+
+    // Phase 2: combine over the concatenated partials.
+    const combine_aggs = [_]AggSpec{
+        .{ .func = .max_by, .col = "v", .arg2_col = "__o", .as = "v" },
+    };
+    var part_views: [3]ColumnView = undefined;
+    for (&part_views, &part_stores) |*v, *s| v.* = s.view();
+    var part_scan = InputScan{ .schema = &part_schema, .views = &part_views, .rows = part_stores[0].rowCount() };
+    var comb = try Aggregate.create(a, exec.makeQuery(a, &part_scan), &group_cols, &combine_aggs, null, null);
+    const two_phase = try collect(a, &comb);
+    defer {
+        for (two_phase) |l| a.free(l);
+        a.free(two_phase);
+    }
+    comb.deinit();
+
+    // Single-phase truth over all rows.
+    var all_stores: [3]engine_store = undefined;
+    for (&all_stores, schema) |*s, col| s.* = try engine_store.init(a, col.type, col.nullable);
+    defer for (&all_stores) |*s| s.deinit(a);
+    try fillStores(a, &all_stores, chunk_a[0..]);
+    try fillStores(a, &all_stores, chunk_b[0..]);
+    var all_views: [3]ColumnView = undefined;
+    for (&all_views, &all_stores) |*v, *s| v.* = s.view();
+    var all_scan = InputScan{ .schema = &schema, .views = &all_views, .rows = chunk_a.len + chunk_b.len };
+    var single = try Aggregate.create(a, exec.makeQuery(a, &all_scan), &group_cols, &[_]AggSpec{
+        .{ .func = .max_by, .col = "val", .arg2_col = "ord", .as = "v" },
+    }, null, null);
+    const one_phase = try collect(a, &single);
+    defer {
+        for (one_phase) |l| a.free(l);
+        a.free(one_phase);
+    }
+    single.deinit();
+
+    try testing.expectEqual(@as(usize, 3), one_phase.len);
+    try testing.expectEqual(one_phase.len, two_phase.len);
+    for (two_phase, one_phase) |t, s| try testing.expectEqualStrings(s, t);
+    try testing.expectEqualStrings("g0|winner", two_phase[0]);
 }

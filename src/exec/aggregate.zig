@@ -75,6 +75,11 @@ pub const AggFunc = enum {
     last,
     /// Return the value from the row whose second argument is maximal.
     max_by,
+    /// Internal twin of max_by for two-phase partials: identical accumulation
+    /// (same skip-if-either-NULL pair semantics) but emits the winning KEY
+    /// (order value) instead of the value. Never produced by the parser;
+    /// producers must set `out_type_override` to the key column's type.
+    max_by_key,
     /// Bitwise aggregates over integer-family inputs.
     bit_and,
     bit_or,
@@ -110,7 +115,7 @@ pub const AggFunc = enum {
 fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
-        .any_value, .first, .last, .max_by, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .group_concat, .udf => return false,
+        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .group_concat, .udf => return false,
     };
     return true;
 }
@@ -1394,7 +1399,7 @@ pub const Aggregate = struct {
                         try updateStateRow(aa_state, s, a, batch, self.agg_col_indices[ai], r);
                     }
                 },
-                .max_by => try self.scatterMaxBy(ai, a, gids, batch, aa_state),
+                .max_by, .max_by_key => try self.scatterMaxBy(ai, a, gids, batch, aa_state),
                 .any_value, .first => try self.scatterAnyValue(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state),
                 else => {
                     const col = self.agg_cols[ai].other;
@@ -2787,7 +2792,7 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .bool_and => .{ .bool_acc = .{ .value = true } },
         .bool_or => .{ .bool_acc = .{ .value = false } },
         .any_value, .first, .last => .{ .value_acc = .{} },
-        .max_by => .{ .max_by = .{} },
+        .max_by, .max_by_key => .{ .max_by = .{} },
         .bit_and, .bit_or, .bit_xor => .{ .bitwise = .{} },
         .sum_distinct, .avg_distinct => .{ .distinct_numeric = .empty },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
@@ -2920,6 +2925,9 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile => .double,
         .bool_and, .bool_or => .boolean,
         .any_value, .first, .last, .max_by => in orelse return Error.AggregateColumnRequired,
+        // The output is the KEY column's type, unknowable from `in` —
+        // internal producers must set `out_type_override`.
+        .max_by_key => Error.AggregateUnsupportedType,
         .bit_and, .bit_or, .bit_xor => .bigint,
         .group_concat => .string,
         .udf => Error.AggregateUnsupportedType,
@@ -2942,7 +2950,7 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
         .any_value, .first, .last => {
             _ = in orelse return Error.AggregateColumnRequired;
         },
-        .max_by => {
+        .max_by, .max_by_key => {
             _ = in orelse return Error.AggregateColumnRequired;
             _ = arg2_in orelse return Error.AggregateColumnRequired;
         },
@@ -3367,7 +3375,7 @@ pub fn updateState(
         .any_value, .first, .last => {
             try valueUpdate(aa, s, func, batch.values[col_idx.?], row_start, row_end);
         },
-        .max_by => {
+        .max_by, .max_by_key => {
             const key_name = spec.arg2_col orelse return Error.AggregateColumnRequired;
             const key_idx = types.findColumn(batch.schema, key_name) orelse return Error.ColumnNotFound;
             try maxByUpdate(aa, s, batch.values[col_idx.?], batch.values[key_idx], row_start, row_end);
@@ -3794,6 +3802,13 @@ pub fn appendAccToColumn(
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             } else try appendValueToColumn(allocator, col, out_type, v.value);
+        },
+        .max_by_key => {
+            const v = state.max_by;
+            if (!v.seen) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else try appendValueToColumn(allocator, col, out_type, v.key);
         },
         .bit_and, .bit_or, .bit_xor => {
             const b = state.bitwise;

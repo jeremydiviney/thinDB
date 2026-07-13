@@ -156,7 +156,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
         .var_samp => "var_samp",
-        .percentile, .group_concat, .udf => null,
+        .percentile, .group_concat, .udf, .max_by_key => null,
     };
 }
 

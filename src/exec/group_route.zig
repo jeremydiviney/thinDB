@@ -167,7 +167,8 @@ pub fn routeRadixGroupBy(
 /// this). Each scan chunk runs scan → probe → partial aggregate on its own
 /// core; the serial combine above re-aggregates the per-chunk partials.
 ///
-/// Gated to combinable fixed aggregates (COUNT/SUM/MIN/MAX). A GLOBAL
+/// Gated to combinable aggregates (COUNT/SUM/MIN/MAX/ANY_VALUE, plus
+/// MAX_BY via a hidden max_by_key partial). A GLOBAL
 /// (no-key) aggregate additionally excludes MIN/MAX: an empty chunk's
 /// global partial emits a zero row (the SUM-over-empty dialect), which
 /// combines safely for COUNT/SUM but would poison MIN/MAX. Grouped partials
@@ -194,11 +195,45 @@ pub fn routeJoinPartialGroupBy(
         // representatives is still a representative. Grouped only — like
         // MIN/MAX, a global partial over an empty chunk would emit a NULL
         // row that could win the combine over real values.
-        .min, .max, .any_value => if (group_cols.len == 0) return null,
+        //
+        // max_by combines via a hidden max_by_key twin appended to the
+        // partial list: each partial row carries (value-at-chunk-max-ord,
+        // that pair's ord), and the combine is max_by(value, hidden ord).
+        // The twin shares max_by's skip-if-EITHER-NULL pair semantics — a
+        // plain MAX(ord) would count NULL-value rows and could carry an ord
+        // higher than its partial's value, poisoning the combine.
+        .min, .max, .any_value, .max_by => if (group_cols.len == 0) return null,
         else => {
             if (trace_pa) std.debug.print("[pagg-route]   decline agg func={s}\n", .{@tagName(a.func)});
             return null;
         },
+    };
+
+    // Partial spec list: the originals, plus one hidden max_by_key twin per
+    // max_by so its winning ord rides along for the combine.
+    var n_hidden: usize = 0;
+    for (aggs) |a| {
+        if (a.func == .max_by) n_hidden += 1;
+    }
+    const part_aggs: []const ir.AggSpec = if (n_hidden == 0) aggs else blk: {
+        const up_schema = upstream.outputSchema();
+        const buf = try combine_arena.alloc(ir.AggSpec, aggs.len + n_hidden);
+        @memcpy(buf[0..aggs.len], aggs);
+        var j: usize = aggs.len;
+        for (aggs) |a| {
+            if (a.func != .max_by) continue;
+            const ord_name = a.arg2_col orelse return null;
+            const ord_idx = types.findColumn(up_schema, ord_name) orelse return null;
+            buf[j] = .{
+                .func = .max_by_key,
+                .col = a.col,
+                .arg2_col = ord_name,
+                .as = try std.fmt.allocPrint(combine_arena, "__mb_ord__{s}", .{a.as}),
+                .out_type_override = up_schema[ord_idx].type,
+            };
+            j += 1;
+        }
+        break :blk buf;
     };
 
     if (group_cols.len > 0) {
@@ -231,19 +266,22 @@ pub fn routeJoinPartialGroupBy(
         }
         if (known) {
             est = @min(est, @max(st.upper_rows, 1));
-            const per_group = perGroupTableBytes(schema, group_cols, aggs);
+            const per_group = perGroupTableBytes(schema, group_cols, part_aggs);
             if (per_group != 0 and est *| per_group > RADIX_CACHE_BYTES) return null;
         }
     }
 
-    const fused = try upstream.tryFuseAggregate(group_cols, aggs);
+    const fused = try upstream.tryFuseAggregate(group_cols, part_aggs);
     if (trace_pa) std.debug.print("[pagg-route]   tryFuseAggregate -> {}\n", .{fused});
     if (!fused) return null;
 
     // Combine specs over the partials, read by `.as`, type-forced to the
     // partial output type (COUNT's bigint must not be widened by SUM).
+    // Hidden max_by_key columns sit past aggs.len in the partial schema —
+    // combine inputs only, never re-emitted.
     const part_schema = upstream.outputSchema();
     const combine = try combine_arena.alloc(ir.AggSpec, aggs.len);
+    var hj: usize = aggs.len;
     for (aggs, 0..) |a, i| {
         combine[i] = .{
             .func = switch (a.func) {
@@ -251,12 +289,17 @@ pub fn routeJoinPartialGroupBy(
                 .min => .min,
                 .max => .max,
                 .any_value => .any_value,
+                .max_by => .max_by,
                 else => unreachable,
             },
             .col = a.as,
             .as = a.as,
             .out_type_override = part_schema[group_cols.len + i].type,
         };
+        if (a.func == .max_by) {
+            combine[i].arg2_col = part_aggs[hj].as;
+            hj += 1;
+        }
     }
     return try upstream.groupByTopK(group_cols, combine, top_k, emit_limit);
 }
