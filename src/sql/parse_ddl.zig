@@ -437,14 +437,42 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     // clustering key without a uniqueness constraint — inserts append and
     // duplicate key values are kept (vs PRIMARY KEY, which upserts). Exactly
     // one of PRIMARY KEY / ORDER BY may appear.
+    //
+    // StarRocks dialect: `DISTRIBUTED BY HASH (col, ...) [BUCKETS n]` also
+    // parses (either order relative to ORDER BY, each at most once). The
+    // hash columns serve as a NON-unique order key only when no real key
+    // clause was given — SR's duplicate-key default keeps duplicates, so
+    // implying PRIMARY KEY here would silently dedupe. BUCKETS is a
+    // distribution detail with no single-node meaning; parsed and ignored.
     var sort_key: ?[]const []const u8 = null;
-    if (p.cur.tag == .kw_order) {
-        try p.advance();
-        if (p.cur.tag != .kw_by) return PE.SqlExpectedKeyword;
-        try p.advance();
-        try p.expect(.lparen);
-        sort_key = try p.parseIdentList();
-        try p.expect(.rparen);
+    var dist_key: ?[]const []const u8 = null;
+    while (true) {
+        if (p.cur.tag == .kw_order and sort_key == null) {
+            try p.advance();
+            if (p.cur.tag != .kw_by) return PE.SqlExpectedKeyword;
+            try p.advance();
+            try p.expect(.lparen);
+            sort_key = try p.parseIdentList();
+            try p.expect(.rparen);
+        } else if (p.cur.tag == .identifier and dist_key == null and
+            std.ascii.eqlIgnoreCase(p.cur.text, "distributed"))
+        {
+            try p.advance();
+            if (p.cur.tag != .kw_by) return PE.SqlExpectedKeyword;
+            try p.advance();
+            if (!(p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "hash"))) {
+                return PE.SqlExpectedKeyword;
+            }
+            try p.advance();
+            try p.expect(.lparen);
+            dist_key = try p.parseIdentList();
+            try p.expect(.rparen);
+            if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "buckets")) {
+                try p.advance();
+                if (p.cur.tag != .integer) return PE.SqlExpectedKeyword;
+                try p.advance();
+            }
+        } else break;
     }
 
     // StarRocks-style trailing options: PROPERTIES ("key" = "value", ...).
@@ -469,6 +497,9 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
                     .lz4_fsst
                 else
                     return PE.SqlInvalidProjection;
+            } else if (std.ascii.eqlIgnoreCase(key, "replication_num")) {
+                // StarRocks replication factor — no single-node meaning.
+                // Accepted so SR-dialect DDL runs verbatim; value ignored.
             } else {
                 return PE.SqlInvalidProjection;
             }
@@ -499,6 +530,8 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
         break :blk one;
     } else if (sort_key) |sk|
         sk
+    else if (dist_key) |dk|
+        dk
     else
         return PE.SqlInvalidProjection;
 

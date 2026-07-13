@@ -772,3 +772,38 @@ test "sql ddl: CREATE TABLE PROPERTIES sets table compression" {
         return error.TestExpectedError;
     } else |_| {}
 }
+
+test "sql ddl: StarRocks CREATE TABLE — DISTRIBUTED BY HASH key + BUCKETS + replication_num" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // The exact shape StarRocks clients emit (wayroll plan-selection temp
+    // table). Keyless column list: the hash columns become a NON-unique
+    // order key — duplicates must be kept (SR duplicate-key semantics).
+    try exec(allocator, db,
+        \\CREATE TABLE ep (externalPlanId VARCHAR(255))
+        \\DISTRIBUTED BY HASH(externalPlanId) BUCKETS 1
+        \\PROPERTIES ("replication_num" = "1")
+    );
+    try exec(allocator, db, "INSERT INTO ep VALUES ('a'), ('b'), ('a')");
+
+    var q = try runSql(allocator, db, "SELECT COUNT(*) AS c FROM ep");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 3), b.values[0].data.bigint[0]);
+
+    // A real key clause wins over DISTRIBUTED BY: still a unique PK table.
+    try exec(allocator, db,
+        \\CREATE TABLE ep2 (id BIGINT, PRIMARY KEY(id))
+        \\DISTRIBUTED BY HASH(id) BUCKETS 4
+    );
+    try exec(allocator, db, "INSERT INTO ep2 VALUES (1), (1)");
+    var q2 = try runSql(allocator, db, "SELECT COUNT(*) AS c FROM ep2");
+    defer q2.deinit();
+    const b2 = (try q2.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), b2.values[0].data.bigint[0]);
+}
