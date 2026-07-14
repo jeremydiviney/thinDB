@@ -259,6 +259,52 @@ test "lag: column-ref default returns current row's value" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 10, 20 }, got);
 }
 
+test "window output schema tracks guaranteed nullability" {
+    const allocator = std.testing.allocator;
+    var f = try Fixture.open(allocator);
+    defer f.close();
+    try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL, n BIGINT NULL)");
+    try f.exec(allocator, "INSERT INTO t VALUES (1, 10, NULL), (2, 20, 200), (3, 30, 300)");
+
+    var q = try runSql(allocator, f.db,
+        \\SELECT
+        \\  row_number() OVER (ORDER BY id) AS rn,
+        \\  rank() OVER (ORDER BY id) AS rk,
+        \\  dense_rank() OVER (ORDER BY id) AS drk,
+        \\  count(*) OVER (ORDER BY id) AS cnt,
+        \\  ntile(2) OVER (ORDER BY id) AS tile,
+        \\  percent_rank() OVER (ORDER BY id) AS pct,
+        \\  cume_dist() OVER (ORDER BY id) AS cume,
+        \\  lag(v) OVER (ORDER BY id) AS missing_default,
+        \\  lag(v, 1, 0) OVER (ORDER BY id) AS literal_default,
+        \\  lag(v, 1, v) OVER (ORDER BY id) AS column_default,
+        \\  lag(v, 1, NULL) OVER (ORDER BY id) AS null_default,
+        \\  lag(n, 1, 0) OVER (ORDER BY id) AS nullable_value,
+        \\  lag(v, 1, n) OVER (ORDER BY id) AS nullable_default,
+        \\  sum(v) OVER (ORDER BY id) AS running_sum,
+        \\  first_value(v) OVER (ORDER BY id) AS first_v
+        \\FROM t
+        \\ORDER BY id
+    );
+    defer q.deinit();
+
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(@as(usize, 15), schema.len);
+    const expected_nullable = [_]bool{
+        false, false, false, false, false, false, false,
+        true, false, false, true, true, true, true, true,
+    };
+    for (schema, expected_nullable) |column, nullable| {
+        try std.testing.expectEqual(nullable, column.nullable);
+    }
+
+    while (try q.next()) |batch| {
+        for (0..7) |col_idx| try std.testing.expect(batch.values[col_idx].nulls == null);
+        try std.testing.expect(batch.values[8].nulls == null);
+        try std.testing.expect(batch.values[9].nulls == null);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FIRST_VALUE / LAST_VALUE / NTH_VALUE
 // ---------------------------------------------------------------------------

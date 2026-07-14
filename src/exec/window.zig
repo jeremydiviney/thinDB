@@ -301,7 +301,7 @@ pub const Window = struct {
             schema[input_schema.len + ci] = .{
                 .name = c.output_name,
                 .type = out_type,
-                .nullable = true, // window outputs may be NULL (out-of-bounds LAG, etc.)
+                .nullable = outputNullable(c, call_plans[ci], input_schema),
             };
         }
 
@@ -326,7 +326,7 @@ pub const Window = struct {
         errdefer for (output_columns[0..oinit]) |*c| c.deinit(allocator);
         for (calls, 0..) |_, ci| {
             const col = schema[input_schema.len + ci];
-            output_columns[ci] = try ColumnStore.init(allocator, col.type, true);
+            output_columns[ci] = try ColumnStore.init(allocator, col.type, col.nullable);
             oinit = ci + 1;
         }
 
@@ -344,7 +344,7 @@ pub const Window = struct {
         errdefer for (out_output_columns[0..ooinit]) |*c| c.deinit(allocator);
         for (calls, 0..) |_, ci| {
             const col = schema[input_schema.len + ci];
-            out_output_columns[ci] = try ColumnStore.init(allocator, col.type, true);
+            out_output_columns[ci] = try ColumnStore.init(allocator, col.type, col.nullable);
             ooinit = ci + 1;
         }
 
@@ -2259,6 +2259,18 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
     };
 }
 
+fn outputNullable(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) bool {
+    return switch (c.func) {
+        .row_number, .rank, .dense_rank, .count, .ntile, .percent_rank, .cume_dist => false,
+        .lag, .lead => schema[plan.value_col].nullable or switch (plan.default_kind) {
+            .none => true,
+            .literal => false,
+            .col_ref => schema[plan.default_col].nullable,
+        },
+        .sum, .avg, .min, .max, .first_value, .last_value, .nth_value => true,
+    };
+}
+
 fn exprColIdx(e: ir.Expr, schema: []const Column) !usize {
     return switch (e) {
         .col_ref => |name| lookupCol(schema, name) orelse return Error.ColumnNotFound,
@@ -3020,4 +3032,3 @@ fn copyCell(src: ColumnStore, src_row: u32, out: *ColumnStore, out_row: u32) !vo
     }
     setValid(out, out_row);
 }
-
