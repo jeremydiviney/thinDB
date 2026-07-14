@@ -426,6 +426,8 @@ const FastTable = struct {
     slot_keys: []u64,
     heads: []u32,
     mask: u64,
+    /// Duplicate-key chains. Empty for unique non-FULL joins, where every
+    /// slot has exactly one row and the array would never be read.
     next: []u32,
     /// View over the build key column, captured after buildPhase
     /// (build_columns are immutable from then on). Single-key kinds only.
@@ -1459,7 +1461,11 @@ pub const Join = struct {
         const slot_keys = try aa.alloc(u64, cap);
         const heads = try aa.alloc(u32, cap);
         @memset(heads, FAST_EMPTY);
-        const chain_next = try aa.alloc(u32, n);
+        var chain_next: []u32 = &.{};
+        if (self.join_type == .full) {
+            chain_next = try aa.alloc(u32, n);
+            @memset(chain_next, FAST_EMPTY);
+        }
         const mask: u64 = cap - 1;
 
         var row: u32 = @intCast(n);
@@ -1483,7 +1489,6 @@ pub const Join = struct {
             while (true) {
                 if (heads[slot] == FAST_EMPTY) {
                     slot_keys[slot] = key;
-                    chain_next[row] = FAST_EMPTY;
                     heads[slot] = row;
                     break;
                 }
@@ -1493,6 +1498,10 @@ pub const Join = struct {
                     // resident: chains of length > 1 exist, so pass-through
                     // can't assume one match per probe row.
                     self.build_keys_unique = false;
+                    if (chain_next.len == 0) {
+                        chain_next = try aa.alloc(u32, n);
+                        @memset(chain_next, FAST_EMPTY);
+                    }
                     chain_next[row] = heads[slot];
                     heads[slot] = row;
                     break;
@@ -1849,6 +1858,9 @@ pub const Join = struct {
                     const head = ft.heads[slot];
                     if (head == FAST_EMPTY) return FAST_EMPTY;
                     if (ft.slot_keys[slot] == key) {
+                        if (ft.next.len == 0) {
+                            return if (std.mem.eql(u8, stringRowBytes(ft.build_key_view, head), bytes)) head else FAST_EMPTY;
+                        }
                         var r = head;
                         while (r != FAST_EMPTY) : (r = ft.next[r]) {
                             if (std.mem.eql(u8, stringRowBytes(ft.build_key_view, r), bytes)) return r;
@@ -1865,6 +1877,9 @@ pub const Join = struct {
                     const head = ft.heads[slot];
                     if (head == FAST_EMPTY) return FAST_EMPTY;
                     if (ft.slot_keys[slot] == key) {
+                        if (ft.next.len == 0) {
+                            return if (compoundRowsEqual(probe_views, i, ft.build_key_views, head)) head else FAST_EMPTY;
+                        }
                         var r = head;
                         while (r != FAST_EMPTY) : (r = ft.next[r]) {
                             if (compoundRowsEqual(probe_views, i, ft.build_key_views, r)) return r;
