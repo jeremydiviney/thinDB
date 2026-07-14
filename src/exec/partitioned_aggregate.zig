@@ -20,6 +20,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const getenv_pa = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const u8, .{ .name = "getenv", .library_name = "c" });
+
 const exec = @import("exec.zig");
 const types = @import("../types.zig");
 const engine = @import("../engine/engine.zig");
@@ -81,6 +83,76 @@ const InputScan = struct {
     pub fn explain(self: *InputScan, out: *std.ArrayList(u8), alloc: Allocator, depth: usize) !void {
         _ = self;
         try exec.explainLine(out, alloc, depth, "PartitionInput");
+    }
+};
+
+/// Sorted view over an already-buffered partition. The generic Sort operator
+/// would first copy every input column into another full-size accumulation
+/// buffer; here the partition stores are stable, so only the permutation and
+/// one bounded output batch are needed.
+const PermutedInputScan = struct {
+    allocator: Allocator,
+    schema: []const Column,
+    source: []const ColumnView,
+    perm: []const u32,
+    output: []engine.ColumnStore,
+    views: []ColumnView,
+    offset: usize = 0,
+
+    const batch_size: usize = 8192;
+
+    fn init(
+        allocator: Allocator,
+        schema: []const Column,
+        source: []const ColumnView,
+        perm: []const u32,
+    ) !PermutedInputScan {
+        const output = try allocator.alloc(engine.ColumnStore, schema.len);
+        errdefer allocator.free(output);
+        var inited: usize = 0;
+        errdefer for (output[0..inited]) |*store| store.deinit(allocator);
+        for (schema, output) |sc, *store| {
+            store.* = try engine.ColumnStore.init(allocator, sc.type, sc.nullable);
+            inited += 1;
+        }
+        const views = try allocator.alloc(ColumnView, schema.len);
+        errdefer allocator.free(views);
+        return .{
+            .allocator = allocator,
+            .schema = schema,
+            .source = source,
+            .perm = perm,
+            .output = output,
+            .views = views,
+        };
+    }
+
+    pub fn next(self: *PermutedInputScan) !?Batch {
+        if (self.offset >= self.perm.len) return null;
+        const end = @min(self.offset + batch_size, self.perm.len);
+        const indices = self.perm[self.offset..end];
+        for (self.output, self.source, self.views) |*store, source, *view| {
+            store.clear();
+            try engine.transform.appendByIndices(self.allocator, source, indices, store);
+            view.* = store.view();
+        }
+        self.offset = end;
+        return Batch{ .schema = self.schema, .values = self.views, .row_count = indices.len };
+    }
+
+    pub fn deinit(_: *PermutedInputScan) void {}
+    pub fn outputSchema(self: *PermutedInputScan) []const Column {
+        return self.schema;
+    }
+    pub fn addPrune(_: *PermutedInputScan, _: exec.Predicate) !void {}
+    pub fn stats(self: *PermutedInputScan) exec.PipelineStats {
+        return .{ .upper_rows = self.perm.len };
+    }
+    pub fn accountant(_: *PermutedInputScan) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *PermutedInputScan, out: *std.ArrayList(u8), alloc: Allocator, depth: usize) !void {
+        try exec.explainLine(out, alloc, depth, "PermutedPartitionInput");
     }
 };
 
@@ -276,28 +348,28 @@ pub const PartitionedAggregate = struct {
     };
 
     /// Each partition's arena holds its gathered input plus retained output —
-/// hundreds of MB total on multi-million-row groups, and OS page release
-/// dominates teardown. The arenas are independent and exclusively owned
-/// here, so free them concurrently.
-fn freeArenasParallel(parts: []Partition) void {
-    if (parts.len < 2) {
-        for (parts) |*p| p.arena.deinit();
-        return;
+    /// hundreds of MB total on multi-million-row groups, and OS page release
+    /// dominates teardown. The arenas are independent and exclusively owned
+    /// here, so free them concurrently.
+    fn freeArenasParallel(parts: []Partition) void {
+        if (parts.len < 2) {
+            for (parts) |*p| p.arena.deinit();
+            return;
+        }
+        var threads: [MAX_PARTS]?std.Thread = .{null} ** MAX_PARTS;
+        for (parts[1..], 1..) |*p, i| {
+            threads[i] = std.Thread.spawn(.{}, freeOneArena, .{p}) catch null;
+            if (threads[i] == null) p.arena.deinit();
+        }
+        parts[0].arena.deinit();
+        for (threads[1..parts.len]) |maybe| if (maybe) |th| th.join();
     }
-    var threads: [MAX_PARTS]?std.Thread = .{null} ** MAX_PARTS;
-    for (parts[1..], 1..) |*p, i| {
-        threads[i] = std.Thread.spawn(.{}, freeOneArena, .{p}) catch null;
-        if (threads[i] == null) p.arena.deinit();
+
+    fn freeOneArena(part: *Partition) void {
+        part.arena.deinit();
     }
-    parts[0].arena.deinit();
-    for (threads[1..parts.len]) |maybe| if (maybe) |th| th.join();
-}
 
-fn freeOneArena(part: *Partition) void {
-    part.arena.deinit();
-}
-
-fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indices: []const u32) !void {
+    fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indices: []const u32) !void {
         if (indices.len == 0) return;
         const aa = part.arena.allocator();
         for (part.in_cols, 0..) |*store, ci| {
@@ -335,17 +407,47 @@ fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indic
         const in_views = try aa.alloc(ColumnView, up_schema.len);
         for (part.in_cols, in_views) |*store, *v| v.* = store.view();
         var scan = InputScan{ .schema = up_schema, .views = in_views, .rows = part.in_rows };
-        const src = exec.makeQuery(aa, &scan);
+        var permuted_scan: PermutedInputScan = undefined;
 
-        var agg = if (self.sorted_stream_rest) blk: {
+        // These columns are already stable in the partition arena, so sort a
+        // row permutation directly. The environment switch retains the prior
+        // generic Sort path as an operational fallback.
+        var agg = if (self.sorted_stream_rest and getenv_pa("THINDB_PAGG_BUFFERED_SORT") == null) blk: {
+            const perm = try aa.alloc(u32, part.in_rows);
+            for (perm, 0..) |*row, i| row.* = @intCast(i);
+            const SortCtx = struct {
+                columns: []const engine.ColumnStore,
+                indices: []const usize,
+
+                fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                    for (ctx.indices) |ci| {
+                        const order = engine.transform.compareInColumnNullsFirst(ctx.columns[ci], a, b);
+                        if (order == .lt) return true;
+                        if (order == .gt) return false;
+                    }
+                    return false;
+                }
+            };
+            std.sort.pdq(u32, perm, SortCtx{
+                .columns = part.in_cols,
+                .indices = self.group_indices,
+            }, SortCtx.lessThan);
+            permuted_scan = try PermutedInputScan.init(aa, up_schema, in_views, perm);
+            const src = exec.makeQuery(aa, &permuted_scan);
+            break :blk try src.streamGroupBy(self.group_cols, self.aggs);
+        } else if (self.sorted_stream_rest) blk: {
             // Near-unique groups (probe verdict): sort this partition by the
             // group keys and stream — one live group's state instead of a
             // hash table holding a heap state per group.
             const specs = try aa.alloc(exec.SortSpec, self.group_cols.len);
             for (self.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
+            const src = exec.makeQuery(aa, &scan);
             const sorted = try src.orderBy(specs);
             break :blk try sorted.streamGroupBy(self.group_cols, self.aggs);
-        } else try aggregate.Aggregate.create(aa, src, self.group_cols, self.aggs, null, null);
+        } else blk: {
+            const src = exec.makeQuery(aa, &scan);
+            break :blk try aggregate.Aggregate.create(aa, src, self.group_cols, self.aggs, null, null);
+        };
         defer agg.deinit();
 
         const out_cols = try aa.alloc(engine.ColumnStore, self.output_schema.len);
@@ -611,6 +713,65 @@ test "PartitionedAggregate matches serial aggregate on string key + MAX_BY" {
     ser.deinit();
 
     try testing.expectEqual(@as(usize, 7), ser_lines.len);
+    try testing.expectEqual(ser_lines.len, par_lines.len);
+    for (par_lines, ser_lines) |p, s| try testing.expectEqualStrings(s, p);
+}
+
+test "PartitionedAggregate near-unique direct sort matches serial aggregate" {
+    const a = testing.allocator;
+    const row_count = 20_000;
+    const group_count = 19_000;
+
+    const schema = [_]Column{
+        .{ .name = "key", .type = .string, .nullable = false },
+        .{ .name = "val", .type = .bigint, .nullable = false },
+        .{ .name = "ord", .type = .bigint, .nullable = false },
+        .{ .name = "label", .type = .string, .nullable = false },
+    };
+    var stores: [4]engine_store = undefined;
+    for (&stores, schema) |*s, col| s.* = try engine_store.init(a, col.type, col.nullable);
+    defer for (&stores) |*s| s.deinit(a);
+
+    for (0..row_count) |i| {
+        const group_id = i % group_count;
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "g{d}", .{group_id});
+        try stores[0].data.string.appendValue(a, key);
+        try stores[1].data.bigint.append(a, @intCast(group_id));
+        try stores[2].data.bigint.append(a, @intCast(i));
+        var label_buf: [16]u8 = undefined;
+        const label = try std.fmt.bufPrint(&label_buf, "L{d}", .{i});
+        try stores[3].data.string.appendValue(a, label);
+    }
+
+    var views: [4]ColumnView = undefined;
+    for (&views, &stores) |*v, *s| v.* = s.view();
+    const group_cols = [_][]const u8{"key"};
+    const aggs = [_]AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .any_value, .col = "val", .as = "v" },
+        .{ .func = .max_by, .col = "label", .arg2_col = "ord", .as = "mb" },
+    };
+
+    var scan_p = InputScan{ .schema = &schema, .views = &views, .rows = row_count };
+    var pa = try PartitionedAggregate.create(a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4);
+    const par_lines = try testCollectSorted(a, &pa);
+    defer {
+        for (par_lines) |line| a.free(line);
+        a.free(par_lines);
+    }
+    pa.deinit();
+
+    var scan_s = InputScan{ .schema = &schema, .views = &views, .rows = row_count };
+    var ser = try aggregate.Aggregate.create(a, exec.makeQuery(a, &scan_s), &group_cols, &aggs, null, null);
+    const ser_lines = try testCollectSorted(a, &ser);
+    defer {
+        for (ser_lines) |line| a.free(line);
+        a.free(ser_lines);
+    }
+    ser.deinit();
+
+    try testing.expectEqual(@as(usize, group_count), par_lines.len);
     try testing.expectEqual(ser_lines.len, par_lines.len);
     for (par_lines, ser_lines) |p, s| try testing.expectEqualStrings(s, p);
 }
