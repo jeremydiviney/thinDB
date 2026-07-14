@@ -1644,6 +1644,12 @@ pub const Join = struct {
                         const head = ft.heads[slot];
                         if (head == FAST_EMPTY) break;
                         if (ft.slot_keys[slot] == key) {
+                            if (ft.next.len == 0) {
+                                found = true;
+                                try pushPair(alloc, probe_rows, build_rows, i, head);
+                                if (self.matched_build) |*mb| mb.set(head);
+                                break;
+                            }
                             var r = head;
                             while (r != FAST_EMPTY) : (r = ft.next[r]) {
                                 found = true;
@@ -1663,6 +1669,14 @@ pub const Join = struct {
                         const head = ft.heads[slot];
                         if (head == FAST_EMPTY) break;
                         if (ft.slot_keys[slot] == key) {
+                            if (ft.next.len == 0) {
+                                if (std.mem.eql(u8, stringRowBytes(ft.build_key_view, head), bytes)) {
+                                    found = true;
+                                    try pushPair(alloc, probe_rows, build_rows, i, head);
+                                    if (self.matched_build) |*mb| mb.set(head);
+                                }
+                                break;
+                            }
                             var r = head;
                             while (r != FAST_EMPTY) : (r = ft.next[r]) {
                                 if (!std.mem.eql(u8, stringRowBytes(ft.build_key_view, r), bytes)) continue;
@@ -1682,6 +1696,14 @@ pub const Join = struct {
                         const head = ft.heads[slot];
                         if (head == FAST_EMPTY) break;
                         if (ft.slot_keys[slot] == key) {
+                            if (ft.next.len == 0) {
+                                if (compoundRowsEqual(probe_views, i, ft.build_key_views, head)) {
+                                    found = true;
+                                    try pushPair(alloc, probe_rows, build_rows, i, head);
+                                    if (self.matched_build) |*mb| mb.set(head);
+                                }
+                                break;
+                            }
                             var r = head;
                             while (r != FAST_EMPTY) : (r = ft.next[r]) {
                                 if (!compoundRowsEqual(probe_views, i, ft.build_key_views, r)) continue;

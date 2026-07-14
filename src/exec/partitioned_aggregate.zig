@@ -127,6 +127,9 @@ const PermutedInputScan = struct {
         };
     }
 
+    /// Output stores are recycled every call — the previous batch's views die
+    /// on the next `next()` (consume-before-next contract), unlike the old
+    /// Sort path whose accumulated batches stayed live for the whole drain.
     pub fn next(self: *PermutedInputScan) !?Batch {
         if (self.offset >= self.perm.len) return null;
         const end = @min(self.offset + batch_size, self.perm.len);
