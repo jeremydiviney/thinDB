@@ -998,6 +998,52 @@ pub const TableFnExec = struct {
         });
         const allow_parallel = !builtin.is_test or force_parallel_in_tests;
         const n_workers = if (allow_parallel) @min(self.dop, groups.items.len) else 1;
+
+        // Input 0's kernel-visible columns in GROUP-CONTIGUOUS order — the
+        // single-input path's bulk gather: one permuted copy per column
+        // (columns in parallel) replaces the per-group scratch gathers, and
+        // every group's input-0 view becomes a zero-copy slice.
+        const n_kernel0: usize = self.entry.kernel_input_cols;
+        var max_run0: usize = 0;
+        for (groups.items) |g| max_run0 = @max(max_run0, g[0].end - g[0].start);
+        const kernel0_views = try a.alloc(ColumnView, n_kernel0);
+        defer a.free(kernel0_views);
+        var k0_arenas: []std.heap.ArenaAllocator = &.{};
+        var k0_stores: []ColumnStore = &.{};
+        var k0_inited: usize = 0;
+        defer {
+            for (k0_arenas[0..k0_inited]) |*ar| ar.deinit();
+            if (k0_arenas.len > 0) a.free(k0_arenas);
+            if (k0_stores.len > 0) a.free(k0_stores);
+        }
+        if (self.key_idxs[0].len + self.order_idxs[0].len == 0) {
+            @memcpy(kernel0_views, ins[0].views[0..n_kernel0]);
+        } else {
+            const t_kg = if (trace) prof.nowTicks() else 0;
+            k0_arenas = try a.alloc(std.heap.ArenaAllocator, n_kernel0);
+            const k0_backing = if (builtin.is_test) a else std.heap.c_allocator;
+            for (k0_arenas) |*ar| {
+                ar.* = std.heap.ArenaAllocator.init(k0_backing);
+                k0_inited += 1;
+            }
+            k0_stores = try a.alloc(ColumnStore, n_kernel0);
+            const jobs = try a.alloc(GatherJob, n_kernel0);
+            defer a.free(jobs);
+            for (0..n_kernel0) |ci| {
+                const col = self.entry.input_schemas[0][ci];
+                k0_stores[ci] = try ColumnStore.init(k0_arenas[ci].allocator(), col.type, col.nullable);
+                jobs[ci] = .{
+                    .src = ins[0].views[ci],
+                    .alloc = k0_arenas[ci].allocator(),
+                    .dst = &k0_stores[ci],
+                };
+            }
+            try runGatherJobs(jobs, ins[0].perm, false, if (allow_parallel) self.dop else 1);
+            for (k0_stores, kernel0_views) |c, *v| v.* = c.view();
+            if (trace) std.debug.print("[tvf]   kernel gather: {d:.0}ms ({d} cols)\n", .{
+                prof.ticksToMs(prof.nowTicks() - t_kg), n_kernel0,
+            });
+        }
         const views_by_input = try a.alloc([]const ColumnView, n_in);
         defer a.free(views_by_input);
         const perms_by_input = try a.alloc([]const u32, n_in);
@@ -1008,14 +1054,14 @@ pub const TableFnExec = struct {
         }
         const t_kernel = if (trace) prof.nowTicks() else 0;
         if (n_workers <= 1) {
-            var runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, self.output_cols);
+            var runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, kernel0_views, max_run0, self.output_cols);
             defer runner.deinit();
             for (groups.items) |g| _ = try runner.runOne(g);
             if (trace) std.debug.print("[tvf]   kernel (serial, {d} groups): {d:.0}ms\n", .{
                 groups.items.len, prof.ticksToMs(prof.nowTicks() - t_kernel),
             });
         } else {
-            try self.executeMultiParallel(views_by_input, perms_by_input, groups.items, n_workers);
+            try self.executeMultiParallel(views_by_input, perms_by_input, kernel0_views, max_run0, groups.items, n_workers);
             if (trace) std.debug.print("[tvf]   kernel ({d} workers, {d} groups): {d:.0}ms\n", .{
                 n_workers, groups.items.len, prof.ticksToMs(prof.nowTicks() - t_kernel),
             });
@@ -1034,6 +1080,8 @@ pub const TableFnExec = struct {
         self: *TableFnExec,
         views_by_input: []const []const ColumnView,
         perms_by_input: []const []const u32,
+        kernel0_views: []const ColumnView,
+        max_run0: usize,
         groups: []const []Span,
         n_workers: usize,
     ) !void {
@@ -1098,7 +1146,7 @@ pub const TableFnExec = struct {
                 inited += 1;
             }
             w.* = .{
-                .runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, out_stores),
+                .runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, kernel0_views, max_run0, out_stores),
                 .out_stores = out_stores,
             };
             built += 1;
@@ -1147,6 +1195,12 @@ pub const TableFnExec = struct {
         perms_by_input: []const []const u32,
         scratch: [][]ColumnStore,
         part_views: [][]ColumnView,
+        /// Input 0's kernel columns in group-contiguous order (the bulk
+        /// gather) — group views are zero-copy slices, like the
+        /// single-input Runner. `valid0_scratch` re-bases validity bitmaps
+        /// for slices whose start is not byte-aligned.
+        kernel0_views: []const ColumnView,
+        valid0_scratch: [][]u8,
         parts: []udf_mod.TvfPartition,
         key_vals: []?Value,
         out_ptrs: []*ColumnStore,
@@ -1162,6 +1216,8 @@ pub const TableFnExec = struct {
             op: *const TableFnExec,
             views_by_input: []const []const ColumnView,
             perms_by_input: []const []const u32,
+            kernel0_views: []const ColumnView,
+            max_run0: usize,
             out_stores: []ColumnStore,
         ) !MultiRunner {
             const n_in = op.upstreams.len;
@@ -1178,18 +1234,19 @@ pub const TableFnExec = struct {
             for (0..n_in) |i| {
                 // Input 0's kernel-visible prefix only — carry columns are
                 // pass-through sources and never reach the kernel. Other
-                // inputs are handed whole.
+                // inputs are handed whole. Input 0 needs no scratch stores:
+                // its group views slice the bulk-gathered kernel columns.
                 const decl = if (i == 0)
                     op.entry.input_schemas[0][0..op.entry.kernel_input_cols]
                 else
                     op.entry.input_schemas[i];
-                const sc = try allocator.alloc(ColumnStore, decl.len);
+                const sc = try allocator.alloc(ColumnStore, if (i == 0) 0 else decl.len);
                 var inited: usize = 0;
                 errdefer {
                     for (sc[0..inited]) |*c| c.deinit(allocator);
                     allocator.free(sc);
                 }
-                for (decl, sc) |col, *store| {
+                for (decl[0..sc.len], sc) |col, *store| {
                     store.* = try ColumnStore.init(allocator, col.type, col.nullable);
                     inited += 1;
                 }
@@ -1201,6 +1258,16 @@ pub const TableFnExec = struct {
             // full input views once — no per-group gather, no scratch.
             for (op.entry.broadcast_inputs) |b| {
                 for (views_by_input[b][0..part_views[b].len], part_views[b]) |v, *pv| pv.* = v;
+            }
+            const valid0_scratch = try allocator.alloc([]u8, kernel0_views.len);
+            errdefer allocator.free(valid0_scratch);
+            var vs_built: usize = 0;
+            errdefer for (valid0_scratch[0..vs_built]) |vs| {
+                if (vs.len > 0) allocator.free(vs);
+            };
+            for (kernel0_views, valid0_scratch) |kv, *vs| {
+                vs.* = if (kv.nulls != null) try allocator.alloc(u8, (max_run0 + 7) / 8) else &.{};
+                vs_built += 1;
             }
             const parts = try allocator.alloc(udf_mod.TvfPartition, n_in);
             errdefer allocator.free(parts);
@@ -1226,6 +1293,8 @@ pub const TableFnExec = struct {
                 .perms_by_input = perms_by_input,
                 .scratch = scratch,
                 .part_views = part_views,
+                .kernel0_views = kernel0_views,
+                .valid0_scratch = valid0_scratch,
                 .parts = parts,
                 .key_vals = key_vals,
                 .out_ptrs = out_ptrs,
@@ -1244,6 +1313,10 @@ pub const TableFnExec = struct {
             }
             self.allocator.free(self.scratch);
             self.allocator.free(self.part_views);
+            for (self.valid0_scratch) |vs| {
+                if (vs.len > 0) self.allocator.free(vs);
+            }
+            self.allocator.free(self.valid0_scratch);
             self.allocator.free(self.parts);
             self.allocator.free(self.key_vals);
             self.allocator.free(self.out_ptrs);
@@ -1251,12 +1324,20 @@ pub const TableFnExec = struct {
 
         fn runOne(self: *MultiRunner, spans: []const Span) !usize {
             const op = self.op;
-            // Gather each input's span (input 0: kernel-visible prefix
-            // only); empty spans leave arity-correct zero-row columns
-            // (cleared scratch views). Broadcast inputs skip the gather —
-            // their full views were bound once at init.
+            // Bind each input's span. Input 0: zero-copy slices of the
+            // bulk-gathered group-contiguous kernel columns. Broadcast
+            // inputs: full views bound once at init. Anything else (rare —
+            // a co-partitioned non-broadcast lookup): per-group scratch
+            // gather; empty spans leave arity-correct zero-row columns.
             for (0..op.upstreams.len) |i| {
                 if (op.isBroadcastInput(i)) continue;
+                if (i == 0) {
+                    const span = spans[0];
+                    for (self.kernel0_views, self.part_views[0], self.valid0_scratch) |kv, *pv, vs| {
+                        pv.* = sliceRunView(kv, span.start, span.end, vs);
+                    }
+                    continue;
+                }
                 for (self.scratch[i]) |*store| store.clear();
                 const span = spans[i];
                 if (span.end > span.start) {
