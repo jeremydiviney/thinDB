@@ -290,11 +290,15 @@ pub fn parseWithContext(
 
 /// Validate a SQL table-function body at CREATE time: parse it with every
 /// parameter bound to NULL. Catches syntax errors up front; column/type
-/// resolution still happens per call at compile.
+/// resolution still happens per call at compile. `sql_fns` lets the body
+/// reference other registered table functions (layered definitions) — a
+/// referenced function must already exist when the referencing one is
+/// created, so deploy leaf functions first.
 pub fn validateFnBody(
     arena: Allocator,
     body: []const u8,
     param_names: []const []const u8,
+    sql_fns: ?udf_mod.SqlFnCtx,
 ) ParseError!void {
     var bindings: std.StringHashMapUnmanaged(Token) = .empty;
     for (param_names) |pn| {
@@ -306,6 +310,7 @@ pub fn validateFnBody(
         .lex = &lex,
         .cur = .{ .tag = .semicolon, .text = "" },
         .param_bindings = &bindings,
+        .sql_fns = sql_fns,
     };
     try sub.advance();
     _ = try sub.parseStatement();
@@ -4725,7 +4730,7 @@ test "sql table function: CREATE parse, body capture, validation, expansion" {
     try std.testing.expectEqualStrings("t_f", cf.name);
     try std.testing.expectEqual(@as(usize, 2), cf.param_names.len);
     try std.testing.expectEqualStrings("SELECT c FROM t WHERE a = pid AND b = div", cf.body);
-    try validateFnBody(aa, cf.body, cf.param_names);
+    try validateFnBody(aa, cf.body, cf.param_names, null);
 }
 
 fn firstMaterializeForTest(op: *const ir.Op) ?*const ir.Op {

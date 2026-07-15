@@ -1980,11 +1980,17 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
         .create_sql_function => |cf| {
             // Trial-parse the body (every parameter bound to NULL) so
             // syntax errors surface at CREATE, not at first call. Column
-            // resolution still happens per call at compile.
+            // resolution still happens per call at compile. The registry
+            // context lets the body reference other registered functions
+            // (layered definitions).
             {
                 var arena = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena.deinit();
-                @import("../sql/sql.zig").validateFnBody(arena.allocator(), cf.body, cf.param_names) catch {
+                @import("../sql/sql.zig").validateFnBody(arena.allocator(), cf.body, cf.param_names, .{
+                    .registry = &catalog.sql_fns,
+                    .db = ctx.session.current_db,
+                    .views = &catalog.views,
+                }) catch {
                     return Error.FunctionInvalidDefinition;
                 };
             }
