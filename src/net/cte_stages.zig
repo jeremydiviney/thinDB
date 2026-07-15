@@ -36,6 +36,7 @@ const storage_column = @import("../storage/column.zig");
 const engine_mod = @import("../engine/engine.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
 const join_mod = @import("../exec/join.zig");
+const udf = @import("../udf.zig");
 
 const PredicateExpr = exec.predicate.PredicateExpr;
 
@@ -2540,7 +2541,9 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     null;
                 if (rideSource(map, t.inputs[0], keys)) |src| {
                     if (src.covered) {
-                        src.win.?.emit_sorted = true;
+                        // A TVF source (win == null) already emits in its
+                        // advertised order — nothing to mark.
+                        if (src.win) |sw| sw.emit_sorted = true;
                         tvf_ordered = true;
                     }
                     if (!src.has_filter) {
@@ -2586,6 +2589,10 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 // Hold one use for the operator's lifetime; released in
                 // TableFnExec.deinit.
                 if (tvf_borrow_src) |src| src.registerUse();
+                tf.advertised_keys = try tvfEmitKeys(input.node_arena, entry, t);
+                if (tf.advertised_keys != null and getenv("THINDB_TVF_TRACE") != null) {
+                    std.debug.print("[tvf] compile {s}: advertises output order\n", .{t.name});
+                }
             }
             if (t.alias) |a| {
                 errdefer @constCast(&q).deinit();
@@ -2754,7 +2761,9 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 const rider_keys: ?ir.WindowSpec = if (sameKeysAllSpecs(w.specs)) w.specs[0] else null;
                 if (rideSource(map, w.upstream, rider_keys)) |src| {
                     if (src.covered) {
-                        src.win.?.emit_sorted = true;
+                        // A TVF source (win == null) already emits in its
+                        // advertised order — nothing to mark.
+                        if (src.win) |sw| sw.emit_sorted = true;
                         ride = true;
                         ride_keys = src.keys.?;
                     }
@@ -2899,6 +2908,12 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                         if (any) {
                             win.borrow_src = src_stage;
                             win.borrow_map = bm;
+                            // Operator-lifetime pin (released in Window.deinit):
+                            // without it, a ROOT (non-staged) borrowing window
+                            // can outlive the source result — the chain's own
+                            // use releases at drain exhaustion, before the
+                            // window evaluates over the borrowed stores.
+                            src_stage.registerUse();
                         }
                     }
                 }
@@ -3098,6 +3113,138 @@ fn riderCoveredBy(src: ir.WindowSpec, rider: ir.WindowSpec) bool {
     return true;
 }
 
+/// The output-order advertisement a TVF call can make, in OUTPUT-schema
+/// column names: partition keys adjacent (partition ORDER unspecified —
+/// digest-major, exactly like window emissions), ordered within each
+/// partition by the order keys. Two ways to earn it:
+///   - `ordered_output` (kernel-asserted, any row shape): the call keys
+///     must exist in the output schema by name — the kernel promises those
+///     columns carry the partition's key values / the emit order.
+///   - row_aligned with EVERY call key pass-through: provable — output row
+///     i of a run is input row i, and the pass-through columns are permuted
+///     copies of the key inputs. Advertised under the pass-through OUTPUT
+///     names.
+/// Anything else (row-generating without the flag, keys not in the output,
+/// multi-input) advertises nothing.
+fn tvfEmitKeys(node_arena: Allocator, entry: *const udf.TableEntry, t: ir.Op.TableFn) !?ir.WindowSpec {
+    if (t.inputs.len != 1) return null;
+    if (t.partition_by.len + t.order_by.len == 0) return null;
+    if (entry.ordered_output) {
+        for (t.partition_by) |k| {
+            if (types.findColumn(entry.output_schema, k) == null) return null;
+        }
+        for (t.order_by) |s| {
+            if (types.findColumn(entry.output_schema, s.col) == null) return null;
+        }
+        return .{ .partition_by = t.partition_by, .order_by = t.order_by, .frame = ir.Frame.default_no_order };
+    }
+    if (!entry.row_aligned) return null;
+    const decl = entry.input_schemas[0];
+    const parts = try node_arena.alloc([]const u8, t.partition_by.len);
+    for (t.partition_by, parts) |k, *slot| {
+        slot.* = passOutNameFor(entry, decl, k) orelse return null;
+    }
+    const ords = try node_arena.alloc(ir.SortSpec, t.order_by.len);
+    for (t.order_by, ords) |s, *slot| {
+        slot.* = .{
+            .col = passOutNameFor(entry, decl, s.col) orelse return null,
+            .desc = s.desc,
+        };
+    }
+    return .{ .partition_by = parts, .order_by = ords, .frame = ir.Frame.default_no_order };
+}
+
+/// The OUTPUT column name a pass-through pair gives input column `name`,
+/// or null when the column isn't pass-through.
+fn passOutNameFor(entry: *const udf.TableEntry, decl: []const types.Column, name: []const u8) ?[]const u8 {
+    const in_idx = types.findColumn(decl, name) orelse return null;
+    for (entry.passthrough) |pp| {
+        if (pp.in_idx == in_idx) return entry.output_schema[pp.out_idx].name;
+    }
+    return null;
+}
+
+test "tvfEmitKeys: advertisement conditions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const stub = struct {
+        fn process(_: *const udf.TvfContext, _: []const udf.TvfPartition, _: *udf.TvfOutput) anyerror!void {}
+    };
+    const in0 = [_]types.Column{
+        .{ .name = "k", .type = .{ .int = {} }, .nullable = false },
+        .{ .name = "o", .type = .{ .bigint = {} }, .nullable = false },
+        .{ .name = "v", .type = .{ .bigint = {} }, .nullable = false },
+    };
+    const out_renamed = [_]types.Column{
+        .{ .name = "k_out", .type = .{ .int = {} }, .nullable = false },
+        .{ .name = "o_out", .type = .{ .bigint = {} }, .nullable = false },
+        .{ .name = "r", .type = .{ .bigint = {} }, .nullable = false },
+    };
+    var entry = udf.TableEntry{
+        .name = "f",
+        .input_schemas = &.{&in0},
+        .output_schema = &out_renamed,
+        .execution = .either,
+        .arg_types = &.{},
+        .row_aligned = true,
+        .ordered_output = false,
+        .passthrough = &.{ .{ .out_idx = 0, .in_idx = 0 }, .{ .out_idx = 1, .in_idx = 1 } },
+        .kernel_input_cols = 3,
+        .process = stub.process,
+        .user_data = null,
+    };
+    var dummy_op: ir.Op = undefined;
+    var call = ir.Op.TableFn{
+        .name = "f",
+        .inputs = &.{&dummy_op},
+        .partition_by = &.{"k"},
+        .order_by = &.{.{ .col = "o", .desc = true }},
+    };
+
+    // Provable path: row-aligned + all keys pass-through → OUTPUT names.
+    {
+        const spec = (try tvfEmitKeys(aa, &entry, call)).?;
+        try std.testing.expectEqualStrings("k_out", spec.partition_by[0]);
+        try std.testing.expectEqualStrings("o_out", spec.order_by[0].col);
+        try std.testing.expect(spec.order_by[0].desc);
+    }
+    // A key without a pass-through pair kills the advertisement.
+    entry.passthrough = &.{.{ .out_idx = 0, .in_idx = 0 }};
+    try std.testing.expectEqual(@as(?ir.WindowSpec, null), try tvfEmitKeys(aa, &entry, call));
+    // Not row-aligned (row-generating) without the flag: nothing.
+    entry.row_aligned = false;
+    entry.passthrough = &.{};
+    try std.testing.expectEqual(@as(?ir.WindowSpec, null), try tvfEmitKeys(aa, &entry, call));
+    // Kernel-asserted flag: advertised under the CALL names, which must
+    // exist in the output schema.
+    entry.ordered_output = true;
+    const out_named = [_]types.Column{
+        .{ .name = "k", .type = .{ .int = {} }, .nullable = false },
+        .{ .name = "o", .type = .{ .bigint = {} }, .nullable = false },
+    };
+    entry.output_schema = &out_named;
+    {
+        const spec = (try tvfEmitKeys(aa, &entry, call)).?;
+        try std.testing.expectEqualStrings("k", spec.partition_by[0]);
+        try std.testing.expectEqualStrings("o", spec.order_by[0].col);
+    }
+    const out_missing = [_]types.Column{
+        .{ .name = "k", .type = .{ .int = {} }, .nullable = false },
+    };
+    entry.output_schema = &out_missing;
+    try std.testing.expectEqual(@as(?ir.WindowSpec, null), try tvfEmitKeys(aa, &entry, call));
+    // Multi-input and keyless calls never advertise.
+    entry.output_schema = &out_named;
+    call.inputs = &.{ &dummy_op, &dummy_op };
+    try std.testing.expectEqual(@as(?ir.WindowSpec, null), try tvfEmitKeys(aa, &entry, call));
+    call.inputs = &.{&dummy_op};
+    call.partition_by = &.{};
+    call.order_by = &.{};
+    try std.testing.expectEqual(@as(?ir.WindowSpec, null), try tvfEmitKeys(aa, &entry, call));
+}
+
 test "riderCoveredBy: partition equality + order-prefix with matching desc" {
     const mk = struct {
         fn spec(part: []const []const u8, ord: []const ir.SortSpec) ir.WindowSpec {
@@ -3145,18 +3292,27 @@ fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {
             },
             .materialize => |m| {
                 if (map.get(cur)) |stage| {
-                    const win = stage.adopt_window orelse {
-                        // Not a window stage — no order to ride, but a
-                        // filterless chain can still BORROW its columns:
-                        // ask it to materialize contiguous.
-                        return .{ .win = null, .stage = stage, .keys = null, .covered = false, .has_filter = has_filter };
-                    };
-                    const src_keys = win.effectiveEmitKeys();
-                    const covered = if (keys) |k|
-                        (if (src_keys) |sk| riderCoveredBy(sk, k) else false)
-                    else
-                        false;
-                    return .{ .win = win, .stage = stage, .keys = src_keys, .covered = covered, .has_filter = has_filter };
+                    if (stage.adopt_window) |win| {
+                        const src_keys = win.effectiveEmitKeys();
+                        const covered = if (keys) |k|
+                            (if (src_keys) |sk| riderCoveredBy(sk, k) else false)
+                        else
+                            false;
+                        return .{ .win = win, .stage = stage, .keys = src_keys, .covered = covered, .has_filter = has_filter };
+                    }
+                    // A TVF stage advertising its output order (partition
+                    // keys adjacent, ordered within) is ridable exactly
+                    // like a window stage; its adopted stores are already
+                    // in that order, so there is no emit_sorted to mark.
+                    if (stage.adopt_table_fn) |tf| {
+                        if (tf.advertised_keys) |sk| {
+                            const covered = if (keys) |k| riderCoveredBy(sk, k) else false;
+                            return .{ .win = null, .stage = stage, .keys = sk, .covered = covered, .has_filter = has_filter };
+                        }
+                    }
+                    // No order to ride, but a filterless chain can still
+                    // BORROW its columns: ask it to materialize contiguous.
+                    return .{ .win = null, .stage = stage, .keys = null, .covered = false, .has_filter = has_filter };
                 }
                 // single-ref: the body compiles inline at this use site —
                 // no rematerialization between us and it.

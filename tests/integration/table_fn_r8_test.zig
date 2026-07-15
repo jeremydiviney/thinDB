@@ -1,0 +1,387 @@
+//! Round-8 TVF features: multi-input pass-through (row-aligned to input 0)
+//! and TVF output-order advertisement (TVF→TVF and window→TVF rides).
+
+const std = @import("std");
+const thindb = @import("thindb");
+const tdb = thindb.tdb;
+const helpers = @import("sql_helpers.zig");
+
+const schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "g", .type = .int },
+        .{ .name = "amt", .type = .bigint },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const ok = [_][]const u8{"id"};
+const opts = thindb.TableOptions{ .order_key = &ok, .unique = true, .row_group_size = 8 };
+
+fn seed(db: *thindb.Database) !void {
+    const t = try db.table("t", schema, opts);
+    try t.insert(&.{
+        .{ .id = @as(i64, 4), .g = @as(i32, 2), .amt = @as(i64, 40) },
+        .{ .id = @as(i64, 1), .g = @as(i32, 1), .amt = @as(i64, 10) },
+        .{ .id = @as(i64, 3), .g = @as(i32, 1), .amt = @as(i64, 30) },
+        .{ .id = @as(i64, 2), .g = @as(i32, 1), .amt = @as(i64, 20) },
+        .{ .id = @as(i64, 5), .g = @as(i32, 2), .amt = @as(i64, 50) },
+    });
+    try t.flush();
+}
+
+fn registryFor(db: *thindb.Database) *const thindb.UdfRegistry {
+    if (db.catalog) |catalog| return &catalog.udfs;
+    return &db.owned_catalog.?.udfs;
+}
+
+fn run(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8) !helpers.RunResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const root = try thindb.sql.parseDialectWithUdfs(arena.allocator(), sql, .neutral, registryFor(db));
+    const cq = try thindb.net.compile(allocator, db, root);
+    return .{
+        .arena = arena,
+        .cq = cq,
+        .owned_vars = cq.sessionValue().vars,
+        .backing_allocator = allocator,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Multi-input pass-through: row-aligned 1:1 with input 0, small lookup input.
+// ---------------------------------------------------------------------------
+
+/// val = amt * rate; rate comes from the co-partitioned lookup input (one
+/// row per key; an EMPTY lookup partition yields NULL vals). The kernel
+/// sees only input 0's kernel prefix (amt) — id is pass-through, g is a
+/// carry-style key column past the prefix.
+fn fxConvert(
+    ctx: *const thindb.udf.TvfContext,
+    parts: []const thindb.udf.TvfPartition,
+    out: *thindb.udf.TvfOutput,
+) !void {
+    _ = ctx;
+    const main = &parts[0];
+    const rates = &parts[1];
+    const amts = main.columns[0].data.bigint;
+    const rate: ?i64 = if (rates.row_count > 0) rates.columns[1].data.bigint[0] else null;
+    const val = out.columns[0];
+    for (0..main.row_count) |i| {
+        try val.data.bigint.append(out.allocator, if (rate) |r| amts[i] * r else 0);
+        try val.appendValidBit(out.allocator, val.rowCount() - 1, rate != null);
+    }
+}
+
+const fx_in0 = [_]thindb.Column{
+    .{ .name = "amt", .type = .bigint },
+    .{ .name = "id", .type = .bigint },
+    .{ .name = "g", .type = .int },
+};
+const fx_in1 = [_]thindb.Column{
+    .{ .name = "g", .type = .int },
+    .{ .name = "rate", .type = .bigint },
+};
+const fx_out = [_]thindb.Column{
+    .{ .name = "id", .type = .bigint },
+    .{ .name = "val", .type = .bigint, .nullable = true },
+};
+
+fn seedRates(db: *thindb.Database) !void {
+    const rates_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "g", .type = .int },
+            .{ .name = "rate", .type = .bigint },
+        },
+        .order_key = &.{"g"},
+        .unique = true,
+    };
+    const rk = [_][]const u8{"g"};
+    const t = try db.table("rates", rates_schema, .{ .order_key = &rk, .unique = true, .row_group_size = 8 });
+    // Only g=1 has a rate — g=2's lookup partition arrives EMPTY.
+    try t.insert(&.{.{ .g = @as(i32, 1), .rate = @as(i64, 2) }});
+    try t.flush();
+}
+
+fn registerFx(db: *thindb.Database) !void {
+    try db.registerTableUdf(.{
+        .name = "fx_convert",
+        .input_schemas = &.{ &fx_in0, &fx_in1 },
+        .output_schema = &fx_out,
+        .execution = .partitioned,
+        .row_aligned = true,
+        .passthrough = &.{.{ .out_idx = 0, .in_idx = 1 }},
+        .kernel_input_cols = 1,
+        .process = fxConvert,
+    });
+}
+
+fn expectFxValues(allocator: std.mem.Allocator, db: *thindb.Database) !void {
+    // No ORDER BY: keys must resolve in EVERY co-partitioned input's
+    // schema and the lookup input has no `id`; row alignment to input 0
+    // is order-independent anyway.
+    var res = try run(allocator, db,
+        \\SELECT id, val FROM TABLE(fx_convert(
+        \\  (SELECT amt, id, g FROM t),
+        \\  (SELECT g, rate FROM rates)
+        \\) PARTITION BY g)
+    );
+    defer res.deinit();
+    var vals: std.AutoHashMapUnmanaged(i64, ?i64) = .empty;
+    defer vals.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try vals.put(
+                allocator,
+                batch.values[0].data.bigint[i],
+                if (batch.values[1].isValid(i)) batch.values[1].data.bigint[i] else null,
+            );
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), vals.count());
+    try std.testing.expectEqual(@as(??i64, @as(?i64, 20)), vals.get(1));
+    try std.testing.expectEqual(@as(??i64, @as(?i64, 40)), vals.get(2));
+    try std.testing.expectEqual(@as(??i64, @as(?i64, 60)), vals.get(3));
+    try std.testing.expectEqual(@as(??i64, @as(?i64, null)), vals.get(4));
+    try std.testing.expectEqual(@as(??i64, @as(?i64, null)), vals.get(5));
+}
+
+test "table UDF multi-input passthrough: row-aligned to input 0 (serial)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try seedRates(db);
+    try registerFx(db);
+    try expectFxValues(allocator, db);
+}
+
+test "table UDF multi-input passthrough: parallel matches serial" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seed(db);
+    try seedRates(db);
+    try registerFx(db);
+
+    thindb.exec.table_fn.force_parallel_in_tests = true;
+    defer thindb.exec.table_fn.force_parallel_in_tests = false;
+    try expectFxValues(allocator, db);
+}
+
+test "table UDF multi-input passthrough: validation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // Multi-input passthrough without row_aligned: rejected.
+    try std.testing.expectError(thindb.udf.Error.FunctionInvalidDefinition, db.registerTableUdf(.{
+        .name = "bad_multi",
+        .input_schemas = &.{ &fx_in0, &fx_in1 },
+        .output_schema = &fx_out,
+        .row_aligned = false,
+        .passthrough = &.{.{ .out_idx = 0, .in_idx = 1 }},
+        .process = fxConvert,
+    }));
+    // Pair in_idx must index INPUT 0's columns — an index valid only for
+    // input 1 is rejected.
+    try std.testing.expectError(thindb.udf.Error.FunctionInvalidDefinition, db.registerTableUdf(.{
+        .name = "bad_multi2",
+        .input_schemas = &.{ &fx_in1, &fx_in0 },
+        .output_schema = &fx_out,
+        .row_aligned = true,
+        .passthrough = &.{.{ .out_idx = 0, .in_idx = 2 }},
+        .process = fxConvert,
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// TVF output-order advertisement: TVF→TVF and window→TVF rides.
+// ---------------------------------------------------------------------------
+
+/// Row-GENERATING kernel with `ordered_output`: re-emits the partition's
+/// rows in order, then one synthetic trailer row (id = last + 100, amt 0)
+/// — the gap-fill shape. Keys (g, id) are computed outputs, so only the
+/// flag can advertise the order.
+fn gapPad(
+    ctx: *const thindb.udf.TvfContext,
+    parts: []const thindb.udf.TvfPartition,
+    out: *thindb.udf.TvfOutput,
+) !void {
+    _ = ctx;
+    const p = &parts[0];
+    const ids = p.columns[0].data.bigint;
+    const gs = p.columns[1].data.int;
+    const amts = p.columns[2].data.bigint;
+    for (0..p.row_count) |i| {
+        try out.columns[0].data.bigint.append(out.allocator, ids[i]);
+        try out.columns[1].data.int.append(out.allocator, gs[i]);
+        try out.columns[2].data.bigint.append(out.allocator, amts[i]);
+    }
+    if (p.row_count > 0) {
+        try out.columns[0].data.bigint.append(out.allocator, ids[p.row_count - 1] + 100);
+        try out.columns[1].data.int.append(out.allocator, gs[p.row_count - 1]);
+        try out.columns[2].data.bigint.append(out.allocator, 0);
+    }
+}
+
+fn runningTotal(
+    ctx: *const thindb.udf.TvfContext,
+    parts: []const thindb.udf.TvfPartition,
+    out: *thindb.udf.TvfOutput,
+) !void {
+    _ = ctx;
+    const part = &parts[0];
+    const ids = part.columns[0].data.bigint;
+    const amts = part.columns[2].data.bigint;
+    var running: i64 = 0;
+    for (0..part.row_count) |i| {
+        running += amts[i];
+        try out.columns[0].data.bigint.append(out.allocator, ids[i]);
+        try out.columns[1].data.bigint.append(out.allocator, running);
+    }
+}
+
+const iga_cols = [_]thindb.Column{
+    .{ .name = "id", .type = .bigint },
+    .{ .name = "g", .type = .int },
+    .{ .name = "amt", .type = .bigint },
+};
+const running_out = [_]thindb.Column{
+    .{ .name = "id", .type = .bigint },
+    .{ .name = "running", .type = .bigint },
+};
+
+fn registerChain(db: *thindb.Database) !void {
+    try db.registerTableUdf(.{
+        .name = "gap_pad",
+        .input_schemas = &.{&iga_cols},
+        .output_schema = &iga_cols,
+        .execution = .partitioned,
+        .ordered_output = true,
+        .process = gapPad,
+    });
+    try db.registerTableUdf(.{
+        .name = "running2",
+        .input_schemas = &.{&iga_cols},
+        .output_schema = &running_out,
+        .execution = .partitioned,
+        .process = runningTotal,
+    });
+}
+
+fn expectChainValues(allocator: std.mem.Allocator, db: *thindb.Database) !void {
+    var res = try run(allocator, db,
+        \\WITH a AS (SELECT id, g, amt FROM TABLE(gap_pad((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id))
+        \\SELECT id, running FROM TABLE(running2((SELECT id, g, amt FROM a)) PARTITION BY g ORDER BY id)
+    );
+    defer res.deinit();
+    var got: std.AutoHashMapUnmanaged(i64, i64) = .empty;
+    defer got.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try got.put(allocator, batch.values[0].data.bigint[i], batch.values[1].data.bigint[i]);
+        }
+    }
+    // g=1: (1,10)(2,20)(3,30)(103,0) -> 10,30,60,60; g=2: (4,40)(5,50)(105,0)
+    // -> 40,90,90.
+    try std.testing.expectEqual(@as(usize, 7), got.count());
+    try std.testing.expectEqual(@as(?i64, 10), got.get(1));
+    try std.testing.expectEqual(@as(?i64, 30), got.get(2));
+    try std.testing.expectEqual(@as(?i64, 60), got.get(3));
+    try std.testing.expectEqual(@as(?i64, 60), got.get(103));
+    try std.testing.expectEqual(@as(?i64, 40), got.get(4));
+    try std.testing.expectEqual(@as(?i64, 90), got.get(5));
+    try std.testing.expectEqual(@as(?i64, 90), got.get(105));
+}
+
+test "table UDF ordered_output: TVF-to-TVF chain rides the advertised order (serial)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try registerChain(db);
+    try expectChainValues(allocator, db);
+}
+
+test "table UDF ordered_output: TVF-to-TVF chain rides — parallel matches" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seed(db);
+    try registerChain(db);
+
+    thindb.exec.table_fn.force_parallel_in_tests = true;
+    defer thindb.exec.table_fn.force_parallel_in_tests = false;
+    try expectChainValues(allocator, db);
+}
+
+test "table UDF ordered_output: a same-key window rides the TVF stage" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // max_dop > 1 so the window rider machinery engages.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seed(db);
+    try registerChain(db);
+
+    var res = try run(allocator, db,
+        \\WITH a AS (SELECT id, g, amt FROM TABLE(gap_pad((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id))
+        \\SELECT id, amt, LAG(amt) OVER (PARTITION BY g ORDER BY id) AS prev FROM a
+    );
+    defer res.deinit();
+    var got: std.AutoHashMapUnmanaged(i64, [2]?i64) = .empty;
+    defer got.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try got.put(allocator, batch.values[0].data.bigint[i], .{
+                if (batch.values[1].isValid(i)) batch.values[1].data.bigint[i] else null,
+                if (batch.values[2].isValid(i)) batch.values[2].data.bigint[i] else null,
+            });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 7), got.count());
+    const expected = [_]struct { id: i64, amt: ?i64, prev: ?i64 }{
+        .{ .id = 1, .amt = 10, .prev = null },
+        .{ .id = 2, .amt = 20, .prev = 10 },
+        .{ .id = 3, .amt = 30, .prev = 20 },
+        .{ .id = 103, .amt = 0, .prev = 30 },
+        .{ .id = 4, .amt = 40, .prev = null },
+        .{ .id = 5, .amt = 50, .prev = 40 },
+        .{ .id = 105, .amt = 0, .prev = 50 },
+    };
+    for (expected) |e| {
+        const row = got.get(e.id) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(e.amt, row[0]);
+        try std.testing.expectEqual(e.prev, row[1]);
+    }
+}

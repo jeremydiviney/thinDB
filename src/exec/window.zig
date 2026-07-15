@@ -376,6 +376,13 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
+        // Pairs with the staged compiler's registerUse at borrow install:
+        // the upstream chain's own stage use releases at drain EXHAUSTION,
+        // but borrowed columns are read through evaluation and emission —
+        // the operator must hold the source result open for its lifetime.
+        // (Staged borrowers are additionally pinned via Stage.pinned_upstream,
+        // which carries the refs past this operator's teardown.)
+        if (self.borrow_src) |src| src.releaseUse();
         var up = self.upstream;
         up.deinit();
         if (!self.evicted) {

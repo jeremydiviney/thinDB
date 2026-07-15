@@ -80,6 +80,7 @@ test {
     _ = @import("dict_encoding_test.zig");
     _ = @import("udf_test.zig");
     _ = @import("table_fn_test.zig");
+    _ = @import("table_fn_r8_test.zig");
 }
 
 test "integration entry exists" {

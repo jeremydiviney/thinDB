@@ -186,8 +186,8 @@ pub const TvfProcess = *const fn (
 /// exactly the declared columns.
 /// One operator-filled output column: `out_idx` (into output_schema) is
 /// materialized by the operator as a permuted copy of input column
-/// `in_idx` (into input_schemas[0]) — the kernel never sees or emits it.
-/// Requires `row_aligned` (single-input only).
+/// `in_idx` (into input_schemas[0] — always the FIRST input) — the kernel
+/// never sees or emits it. Requires `row_aligned`.
 pub const PassPair = struct { out_idx: u32, in_idx: u32 };
 
 pub const TableUdf = struct {
@@ -200,15 +200,28 @@ pub const TableUdf = struct {
     execution: TvfExecution = .either,
     /// Declared scalar argument types, in call order (empty = none).
     arg_types: []const types.Type = &.{},
-    /// The callback emits exactly one output row per input row, in
-    /// partition order (validated per partition). Unlocks pass-through.
+    /// The callback emits exactly one output row per row of input 0, in
+    /// partition order (validated per partition/group). Unlocks
+    /// pass-through. Multi-input functions align to input 0: a group where
+    /// input 0 arrives empty must emit zero rows.
     row_aligned: bool = false,
-    /// Operator-filled pass-through columns (requires row_aligned). The
-    /// callback receives views for only the first
-    /// `kernel_input_cols` input columns and output stores for only the
-    /// non-pass-through output columns (dense, in declared order).
+    /// The callback asserts its emitted rows are, within each partition,
+    /// in nondecreasing (call-site ORDER BY) order, and that output
+    /// columns named like the call's PARTITION BY / ORDER BY keys carry
+    /// the partition's key values / that order. Lets the staged compiler
+    /// advertise the operator's output order so downstream same-key
+    /// windows / TVFs skip their sorts. `row_aligned` functions whose key
+    /// columns are all pass-through get this for free — the flag exists
+    /// for row-GENERATING kernels (e.g. gap fill) where the engine cannot
+    /// prove it.
+    ordered_output: bool = false,
+    /// Operator-filled pass-through columns (requires row_aligned; sources
+    /// always come from input 0). The callback receives views for only the
+    /// first `kernel_input_cols` input-0 columns and output stores for
+    /// only the non-pass-through output columns (dense, in declared
+    /// order).
     passthrough: []const PassPair = &.{},
-    /// How many leading input columns the callback reads. Columns past
+    /// How many leading input-0 columns the callback reads. Columns past
     /// this exist purely as pass-through sources ("carry" columns).
     /// 0 = all of input_schemas[0] (no carry split).
     kernel_input_cols: u32 = 0,
@@ -223,6 +236,7 @@ pub const TableEntry = struct {
     execution: TvfExecution,
     arg_types: []const types.Type,
     row_aligned: bool,
+    ordered_output: bool,
     passthrough: []const PassPair,
     kernel_input_cols: u32,
     process: TvfProcess,
@@ -591,10 +605,10 @@ pub const UdfRegistry = struct {
             if (cols.len == 0) return Error.FunctionInvalidDefinition;
         }
         if (udf.passthrough.len > 0) {
-            // Pass-through requires row alignment, a single input, at least
+            // Pass-through requires row alignment (to input 0), at least
             // one kernel-computed output column, and every pair must
-            // reference real columns with matching types.
-            if (!udf.row_aligned or udf.input_schemas.len != 1) {
+            // reference real input-0 / output columns with matching types.
+            if (!udf.row_aligned) {
                 return Error.FunctionInvalidDefinition;
             }
             if (udf.passthrough.len >= udf.output_schema.len) {
@@ -642,6 +656,7 @@ pub const UdfRegistry = struct {
             .execution = udf.execution,
             .arg_types = arg_types,
             .row_aligned = udf.row_aligned,
+            .ordered_output = udf.ordered_output,
             .passthrough = passthrough,
             .kernel_input_cols = if (udf.kernel_input_cols == 0)
                 @intCast(udf.input_schemas[0].len)

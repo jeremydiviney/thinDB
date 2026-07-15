@@ -45,10 +45,18 @@ pub const RawValue = types.Value;
 pub const TableFnSpec = struct {
     name: []const u8,
     execution: TvfExecution = .either,
-    /// The kernel emits exactly one output row per input row, in partition
-    /// order (the operator validates per partition). Required for
-    /// `passthrough` columns.
+    /// The kernel emits exactly one output row per row of input 0, in
+    /// partition order (the operator validates per partition/group).
+    /// Required for `passthrough` columns.
     row_aligned: bool = false,
+    /// The kernel asserts its emitted rows are, within each partition, in
+    /// nondecreasing (call-site ORDER BY) order, and that output columns
+    /// named like the call's keys carry the partition key values / that
+    /// order — lets downstream same-key windows/TVFs ride the output order
+    /// instead of re-sorting. Only needed for row-GENERATING kernels;
+    /// row-aligned functions whose keys are pass-through advertise
+    /// automatically.
+    ordered_output: bool = false,
 };
 
 /// Per-partition context. `arena` is freed after each process() call —
@@ -570,8 +578,9 @@ fn passPairsFor(comptime Mod: type) []const udf.PassPair {
         if (!@hasDecl(Mod, "passthrough")) break :blk &[_]udf.PassPair{};
         if (!Mod.spec.row_aligned) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
             "': `passthrough` requires `spec.row_aligned = true`");
-        if (inputTypesOf(Mod).len != 1) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
-            "': `passthrough` requires a single input table");
+        // Multi-input functions pass through from the FIRST input table
+        // (Input + Carry); rows align to input 0 per the row_aligned
+        // contract.
         const out_fields = @typeInfo(Mod.Output).@"struct".fields;
         const in_fields = fullInputFields(Mod);
         var pairs: [Mod.passthrough.len]udf.PassPair = undefined;
@@ -595,10 +604,10 @@ fn passPairsFor(comptime Mod: type) []const udf.PassPair {
 }
 
 fn kernelInputCols(comptime Mod: type) u32 {
+    // `Carry` extends the FIRST input table only — the kernel sees the
+    // `Input` fields of input 0 plus every other input whole.
     const n = comptime blk: {
         if (!@hasDecl(Mod, "Carry")) break :blk 0;
-        if (inputTypesOf(Mod).len != 1) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
-            "': `Carry` requires a single input table");
         break :blk @typeInfo(Mod.Input).@"struct".fields.len;
     };
     return n;
@@ -682,6 +691,7 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
         .execution = Mod.spec.execution,
         .arg_types = argTypesFor(Mod),
         .row_aligned = Mod.spec.row_aligned,
+        .ordered_output = Mod.spec.ordered_output,
         .passthrough = passPairsFor(Mod),
         .kernel_input_cols = kernelInputCols(Mod),
         .process = S.trampoline,

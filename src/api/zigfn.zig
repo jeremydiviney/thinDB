@@ -41,7 +41,7 @@ pub const Error = error{
     ZigCompileFailed,
 };
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 const EmbeddedFile = struct { path: []const u8, data: []const u8 };
 
@@ -86,6 +86,7 @@ const WRAPPER_MAIN =
     \\    n_args: usize,
     \\    arg_tags: [*]const u8,
     \\    row_aligned: u8,
+    \\    ordered_output: u8,
     \\    kernel_input_cols: usize,
     \\    n_pass: usize,
     \\    pass_pairs: [*]const PassPairDesc,
@@ -144,13 +145,14 @@ const WRAPPER_MAIN =
     \\    .n_args = arg_tags.len,
     \\    .arg_tags = &arg_tags,
     \\    .row_aligned = @intFromBool(desc_gen.row_aligned),
+    \\    .ordered_output = @intFromBool(desc_gen.ordered_output),
     \\    .kernel_input_cols = desc_gen.kernel_input_cols,
     \\    .n_pass = pass_descs.len,
     \\    .pass_pairs = &pass_descs,
     \\};
     \\
     \\export fn thindb_tvf_abi_version() callconv(.c) u32 {
-    \\    return 4;
+    \\    return 5;
     \\}
     \\export fn thindb_tvf_descriptor() callconv(.c) *const Desc {
     \\    return &the_desc;
@@ -317,6 +319,7 @@ pub const Desc = extern struct {
     n_args: usize,
     arg_tags: [*]const u8,
     row_aligned: u8,
+    ordered_output: u8,
     kernel_input_cols: usize,
     n_pass: usize,
     pass_pairs: [*]const PassPairDesc,
@@ -618,6 +621,7 @@ pub fn loadAndRegister(
         .arg_types = arg_types,
         .execution = @enumFromInt(desc.execution),
         .row_aligned = desc.row_aligned != 0,
+        .ordered_output = desc.ordered_output != 0,
         .passthrough = passthrough,
         .kernel_input_cols = @intCast(desc.kernel_input_cols),
         .process = dllShim,

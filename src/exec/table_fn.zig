@@ -46,6 +46,7 @@ const ColumnStore = engine.ColumnStore;
 const transform = engine.transform;
 
 const udf_mod = @import("../udf.zig");
+const ir = @import("../ir/ir.zig");
 const sort_mod = @import("sort.zig");
 const SortSpec = sort_mod.SortSpec;
 
@@ -112,6 +113,14 @@ pub const TableFnExec = struct {
     /// Observability (tests + trace attribution): columns the last execute
     /// actually bound as borrowed views (0 = bind declined or no plan).
     borrowed_bound: usize = 0,
+    /// Output-order advertisement (installed by the staged compiler): the
+    /// operator's output is grouped by these partition keys (equal keys
+    /// adjacent — partition ORDER is unspecified) and ordered within each
+    /// partition by the order keys, named in OUTPUT-schema terms. Set when
+    /// provable (row_aligned with every key pass-through) or kernel-
+    /// asserted (`ordered_output`). Downstream same-key windows / TVFs
+    /// ride it instead of re-sorting. Slices are node-arena owned.
+    advertised_keys: ?ir.WindowSpec = null,
 
     pub fn create(
         allocator: Allocator,
@@ -771,8 +780,6 @@ pub const TableFnExec = struct {
     /// kernel once per group with one ALIGNED partition per input.
     /// GLOBAL (no keys): one group holding every input whole.
     fn executeMulti(self: *TableFnExec) !void {
-        // registerTable rejects passthrough on multi-input functions.
-        std.debug.assert(self.entry.passthrough.len == 0);
         const a = self.allocator;
         const n_in = self.upstreams.len;
 
@@ -905,9 +912,17 @@ pub const TableFnExec = struct {
             var runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, self.output_cols);
             defer runner.deinit();
             for (groups.items) |g| _ = try runner.runOne(g);
-            return;
+        } else {
+            try self.executeMultiParallel(views_by_input, perms_by_input, groups.items, n_workers);
         }
-        try self.executeMultiParallel(views_by_input, perms_by_input, groups.items, n_workers);
+        // Pass-through fill (sources = input 0): groups iterate in ascending
+        // merged-digest order and input 0's runs are digest-ascending along
+        // its sorted perm, so the group-order concat of input 0's spans IS
+        // its full permutation — one bulk gather per column, exactly like
+        // the single-input path. Row-aligned kernels emit spans[0].len rows
+        // per group (validated in runOne), so output rows align 1:1.
+        const contiguous0 = self.key_idxs[0].len + self.order_idxs[0].len == 0;
+        try self.gatherPassthrough(ins[0].views, ins[0].perm, contiguous0, if (allow_parallel) self.dop else 1);
     }
 
     fn executeMultiParallel(
@@ -939,7 +954,9 @@ pub const TableFnExec = struct {
                     if (abort.load(.acquire)) return;
                     const g = next_group.fetchAdd(1, .monotonic);
                     if (g >= group_list.len) return;
-                    const before = w.out_stores[0].rowCount();
+                    // Offsets track the first COMPUTED store — pass-through
+                    // private stores stay empty (bulk-gathered afterwards).
+                    const before = w.runner.out_ptrs[0].rowCount();
                     const emitted = w.runner.runOne(group_list[g]) catch |err| {
                         w.err = err;
                         abort.store(true, .release);
@@ -1000,10 +1017,17 @@ pub const TableFnExec = struct {
             if (w.err) |err| return err;
         }
 
+        // Pass-through columns are skipped — their private stores are
+        // empty and the operator bulk-gathers them after the concat.
+        const is_pass = try a.alloc(bool, self.output_cols.len);
+        defer a.free(is_pass);
+        @memset(is_pass, false);
+        for (self.entry.passthrough) |pp| is_pass[pp.out_idx] = true;
         for (segs) |seg| {
             if (seg.len == 0) continue;
             const w = &workers[seg.worker];
-            for (w.out_stores, self.output_cols) |src, *dst| {
+            for (w.out_stores, self.output_cols, is_pass) |src, *dst, skip| {
+                if (skip) continue;
                 try transform.appendColumnRange(a, src.view(), seg.off, seg.off + seg.len, dst);
             }
         }
@@ -1041,7 +1065,13 @@ pub const TableFnExec = struct {
                 allocator.free(part_views[i]);
             };
             for (0..n_in) |i| {
-                const decl = op.entry.input_schemas[i];
+                // Input 0's kernel-visible prefix only — carry columns are
+                // pass-through sources and never reach the kernel. Other
+                // inputs are handed whole.
+                const decl = if (i == 0)
+                    op.entry.input_schemas[0][0..op.entry.kernel_input_cols]
+                else
+                    op.entry.input_schemas[i];
                 const sc = try allocator.alloc(ColumnStore, decl.len);
                 var inited: usize = 0;
                 errdefer {
@@ -1060,9 +1090,19 @@ pub const TableFnExec = struct {
             errdefer allocator.free(parts);
             const key_vals = try allocator.alloc(?Value, op.key_idxs[0].len);
             errdefer allocator.free(key_vals);
-            const out_ptrs = try allocator.alloc(*ColumnStore, out_stores.len);
+            // Kernel output sink: computed stores only — pass-through
+            // columns are operator-filled after all groups complete.
+            const out_ptrs = try allocator.alloc(*ColumnStore, out_stores.len - op.entry.passthrough.len);
             errdefer allocator.free(out_ptrs);
-            for (out_stores, out_ptrs) |*c, *slot| slot.* = c;
+            var n_computed: usize = 0;
+            outer: for (out_stores, 0..) |*c, i| {
+                for (op.entry.passthrough) |pp| {
+                    if (pp.out_idx == i) continue :outer;
+                }
+                out_ptrs[n_computed] = c;
+                n_computed += 1;
+            }
+            std.debug.assert(n_computed == out_ptrs.len);
             return .{
                 .allocator = allocator,
                 .op = op,
@@ -1093,14 +1133,15 @@ pub const TableFnExec = struct {
 
         fn runOne(self: *MultiRunner, spans: []const Span) !usize {
             const op = self.op;
-            // Gather each input's span; empty spans leave arity-correct
-            // zero-row columns (cleared scratch views).
+            // Gather each input's span (input 0: kernel-visible prefix
+            // only); empty spans leave arity-correct zero-row columns
+            // (cleared scratch views).
             for (0..op.upstreams.len) |i| {
                 for (self.scratch[i]) |*store| store.clear();
                 const span = spans[i];
                 if (span.end > span.start) {
                     const perm = self.perms_by_input[i];
-                    for (self.views_by_input[i], self.scratch[i]) |v, *store| {
+                    for (self.views_by_input[i][0..self.scratch[i].len], self.scratch[i]) |v, *store| {
                         try transform.appendByIndices(self.allocator, v, perm[span.start..span.end], store);
                     }
                 }
@@ -1143,6 +1184,12 @@ pub const TableFnExec = struct {
             const after = self.out_ptrs[0].rowCount();
             for (self.out_ptrs[1..]) |c| {
                 if (c.rowCount() != after) return Error.TableFnOutputMismatch;
+            }
+            // Row alignment is to INPUT 0: a group where input 0 arrived
+            // empty must emit nothing (the pass-through fill is one bulk
+            // gather over input 0's permutation).
+            if (op.entry.row_aligned and after - before != spans[0].end - spans[0].start) {
+                return Error.TableFnOutputMismatch;
             }
             return after - before;
         }

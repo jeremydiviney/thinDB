@@ -1094,6 +1094,7 @@ test "table UDF borrow: operator binds contiguous stage stores zero-copy" {
         .execution = .either,
         .arg_types = &.{},
         .row_aligned = false,
+        .ordered_output = false,
         .passthrough = &.{},
         .kernel_input_cols = 3,
         .process = runningTotal,
