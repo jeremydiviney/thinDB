@@ -166,6 +166,16 @@ pub const TvfContext = struct {
     /// Scalar call arguments (literals at the call site), in declared
     /// order. Identical for every partition of one call.
     args: []const ?types.Value = &.{},
+    /// Worker-lifetime arena + state slot: one worker executes many
+    /// partitions, and a kernel may lazily build shared lookup state on
+    /// its first call (allocate in worker_arena, stash the pointer in
+    /// worker_state.*) and reuse it for every later partition the same
+    /// worker claims. Valid contents derive only from broadcast inputs
+    /// and args — per-partition data changes call to call. Null when the
+    /// execution path has no worker lifetime (validation); kernels fall
+    /// back to the per-partition arena via the SDK.
+    worker_arena: ?Allocator = null,
+    worker_state: ?*?*anyopaque = null,
 };
 
 /// One co-grouped partition per input table, in declared input order. A
@@ -215,6 +225,11 @@ pub const TableUdf = struct {
     /// for row-GENERATING kernels (e.g. gap fill) where the engine cannot
     /// prove it.
     ordered_output: bool = false,
+    /// Inputs (indices into input_schemas; never 0) delivered WHOLE to
+    /// every partition instead of co-grouped: lookup tables the kernel
+    /// probes rather than streams. Broadcast inputs need no PARTITION
+    /// BY / ORDER BY columns in their schema and are never sorted.
+    broadcast_inputs: []const u32 = &.{},
     /// Operator-filled pass-through columns (requires row_aligned; sources
     /// always come from input 0). The callback receives views for only the
     /// first `kernel_input_cols` input-0 columns and output stores for
@@ -237,6 +252,7 @@ pub const TableEntry = struct {
     arg_types: []const types.Type,
     row_aligned: bool,
     ordered_output: bool,
+    broadcast_inputs: []const u32,
     passthrough: []const PassPair,
     kernel_input_cols: u32,
     process: TvfProcess,
@@ -571,6 +587,7 @@ pub const UdfRegistry = struct {
             freeColumns(self.allocator, entry.output_schema);
             self.allocator.free(entry.arg_types);
             self.allocator.free(entry.passthrough);
+            self.allocator.free(entry.broadcast_inputs);
         }
         self.tables.deinit(self.allocator);
         self.* = undefined;
@@ -629,6 +646,13 @@ pub const UdfRegistry = struct {
         if (udf.kernel_input_cols > udf.input_schemas[0].len) {
             return Error.FunctionInvalidDefinition;
         }
+        // Broadcast inputs: valid indices only, never input 0 (it defines
+        // partitioning and row alignment).
+        for (udf.broadcast_inputs) |b| {
+            if (b == 0 or b >= udf.input_schemas.len) {
+                return Error.FunctionInvalidDefinition;
+            }
+        }
         if (self.tableByName(udf.name) != null) return Error.FunctionAlreadyExists;
 
         const name = try lowerName(self.allocator, udf.name);
@@ -649,6 +673,8 @@ pub const UdfRegistry = struct {
         errdefer self.allocator.free(arg_types);
         const passthrough = try self.allocator.dupe(PassPair, udf.passthrough);
         errdefer self.allocator.free(passthrough);
+        const broadcast_inputs = try self.allocator.dupe(u32, udf.broadcast_inputs);
+        errdefer self.allocator.free(broadcast_inputs);
         try self.tables.append(self.allocator, .{
             .name = name,
             .input_schemas = input_schemas,
@@ -657,6 +683,7 @@ pub const UdfRegistry = struct {
             .arg_types = arg_types,
             .row_aligned = udf.row_aligned,
             .ordered_output = udf.ordered_output,
+            .broadcast_inputs = broadcast_inputs,
             .passthrough = passthrough,
             .kernel_input_cols = if (udf.kernel_input_cols == 0)
                 @intCast(udf.input_schemas[0].len)
@@ -676,6 +703,7 @@ pub const UdfRegistry = struct {
                 freeColumns(self.allocator, entry.output_schema);
                 self.allocator.free(entry.arg_types);
                 self.allocator.free(entry.passthrough);
+                self.allocator.free(entry.broadcast_inputs);
                 _ = self.tables.swapRemove(i);
                 return true;
             }

@@ -552,3 +552,151 @@ test "table UDF multi-input: generic-sort ORDER BY shapes (parallel)" {
     defer thindb.exec.table_fn.force_parallel_in_tests = false;
     try expectAllOrderShapes(allocator, db);
 }
+
+// ---------------------------------------------------------------------------
+// Broadcast inputs: the lookup input arrives WHOLE in every partition, its
+// schema carries no call keys, and the kernel builds its probe map once per
+// worker (worker_state / worker_arena).
+// ---------------------------------------------------------------------------
+
+const BcastState = struct { map: std.AutoHashMapUnmanaged(i32, i64) };
+
+/// fxConvert semantics via a broadcast lookup: build g→rate once per
+/// worker from the full rates input, probe with this partition's key.
+fn fxConvertBcast(
+    ctx: *const thindb.udf.TvfContext,
+    parts: []const thindb.udf.TvfPartition,
+    out: *thindb.udf.TvfOutput,
+) !void {
+    const main = &parts[0];
+    const rates = &parts[1];
+    const st: *BcastState = blk: {
+        if (ctx.worker_state) |slot| {
+            if (slot.*) |p| break :blk @ptrCast(@alignCast(p));
+        }
+        const wa = ctx.worker_arena orelse ctx.arena;
+        const s = try wa.create(BcastState);
+        s.* = .{ .map = .empty };
+        for (0..rates.row_count) |i| {
+            try s.map.put(wa, rates.columns[0].data.int[i], rates.columns[1].data.bigint[i]);
+        }
+        if (ctx.worker_state) |slot| slot.* = s;
+        break :blk s;
+    };
+    const rate: ?i64 = if (main.keys[0]) |kv| st.map.get(kv.int) else null;
+    const amts = main.columns[0].data.bigint;
+    const val = out.columns[0];
+    for (0..main.row_count) |i| {
+        try val.data.bigint.append(out.allocator, if (rate) |r| amts[i] * r else 0);
+        try val.appendValidBit(out.allocator, val.rowCount() - 1, rate != null);
+    }
+}
+
+// No `g` column: a broadcast input needs no call keys in its schema.
+const bcast_in1 = [_]thindb.Column{
+    .{ .name = "gg", .type = .int },
+    .{ .name = "rate", .type = .bigint },
+};
+
+fn registerFxBcast(db: *thindb.Database) !void {
+    try db.registerTableUdf(.{
+        .name = "fx_bcast",
+        .input_schemas = &.{ &fx_in0, &bcast_in1 },
+        .output_schema = &fx_out,
+        .execution = .partitioned,
+        .row_aligned = true,
+        .broadcast_inputs = &.{1},
+        .passthrough = &.{.{ .out_idx = 0, .in_idx = 1 }},
+        .kernel_input_cols = 1,
+        .process = fxConvertBcast,
+    });
+}
+
+fn expectBcastValues(allocator: std.mem.Allocator, db: *thindb.Database) !void {
+    var res = try run(allocator, db,
+        \\SELECT id, val FROM TABLE(fx_bcast(
+        \\  (SELECT amt, id, g FROM t),
+        \\  (SELECT g AS gg, rate FROM rates)
+        \\) PARTITION BY g)
+    );
+    defer res.deinit();
+    var vals: std.AutoHashMapUnmanaged(i64, ?i64) = .empty;
+    defer vals.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try vals.put(
+                allocator,
+                batch.values[0].data.bigint[i],
+                if (batch.values[1].isValid(i)) batch.values[1].data.bigint[i] else null,
+            );
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), vals.count());
+    try std.testing.expectEqual(@as(??i64, @as(?i64, 20)), vals.get(1));
+    try std.testing.expectEqual(@as(??i64, @as(?i64, 40)), vals.get(2));
+    try std.testing.expectEqual(@as(??i64, @as(?i64, 60)), vals.get(3));
+    try std.testing.expectEqual(@as(??i64, @as(?i64, null)), vals.get(4));
+    try std.testing.expectEqual(@as(??i64, @as(?i64, null)), vals.get(5));
+}
+
+test "table UDF broadcast input: whole lookup per partition, no call keys in its schema (serial)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try seedRates(db);
+    try registerFxBcast(db);
+    try expectBcastValues(allocator, db);
+}
+
+test "table UDF broadcast input: parallel matches serial (worker_state per worker)" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seed(db);
+    try seedRates(db);
+    try registerFxBcast(db);
+
+    thindb.exec.table_fn.force_parallel_in_tests = true;
+    defer thindb.exec.table_fn.force_parallel_in_tests = false;
+    try expectBcastValues(allocator, db);
+}
+
+test "table UDF broadcast input: validation rejects input 0 and out-of-range indices" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try std.testing.expectError(thindb.udf.Error.FunctionInvalidDefinition, db.registerTableUdf(.{
+        .name = "bad_bcast0",
+        .input_schemas = &.{ &fx_in0, &bcast_in1 },
+        .output_schema = &fx_out,
+        .row_aligned = true,
+        .broadcast_inputs = &.{0},
+        .kernel_input_cols = 1,
+        .process = fxConvertBcast,
+    }));
+    try std.testing.expectError(thindb.udf.Error.FunctionInvalidDefinition, db.registerTableUdf(.{
+        .name = "bad_bcast2",
+        .input_schemas = &.{ &fx_in0, &bcast_in1 },
+        .output_schema = &fx_out,
+        .row_aligned = true,
+        .broadcast_inputs = &.{2},
+        .kernel_input_cols = 1,
+        .process = fxConvertBcast,
+    }));
+}

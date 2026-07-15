@@ -57,12 +57,30 @@ pub const TableFnSpec = struct {
     /// row-aligned functions whose keys are pass-through advertise
     /// automatically.
     ordered_output: bool = false,
+    /// Inputs (indices into the process() partition parameters; never 0)
+    /// delivered WHOLE to every partition instead of co-grouped — lookup
+    /// tables the kernel probes rather than streams. Broadcast inputs
+    /// need no PARTITION BY / ORDER BY columns in their schema and are
+    /// never sorted. Pair with `worker_state` to build a lookup structure
+    /// once per worker instead of once per partition.
+    broadcast_inputs: []const u32 = &.{},
 };
 
 /// Per-partition context. `arena` is freed after each process() call —
 /// scratch allocations cannot leak.
 pub const Ctx = struct {
     arena: Allocator,
+    /// Worker-lifetime arena + state slot: one worker executes many
+    /// partitions, so a kernel with broadcast inputs can build its lookup
+    /// maps once — on the first call, allocate in `worker_arena`, stash
+    /// the pointer in `worker_state.*`, and reuse it on every later call
+    /// that finds the slot non-null. State must derive only from
+    /// broadcast inputs and args; partition data changes call to call.
+    /// On paths without a worker lifetime these degrade to the
+    /// per-partition arena and a call-local slot (state rebuilt per
+    /// call — slower, never wrong).
+    worker_arena: Allocator,
+    worker_state: *?*anyopaque,
     user_data: ?*anyopaque = null,
 };
 
@@ -668,7 +686,13 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
         ) anyerror!void {
             std.debug.assert(parts.len == inputs.len);
             comptime assertWriterShape(Mod, WriterT.Row);
-            var ctx = Ctx{ .arena = raw_ctx.arena, .user_data = raw_ctx.user_data };
+            var call_local_state: ?*anyopaque = null;
+            var ctx = Ctx{
+                .arena = raw_ctx.arena,
+                .worker_arena = raw_ctx.worker_arena orelse raw_ctx.arena,
+                .worker_state = raw_ctx.worker_state orelse &call_local_state,
+                .user_data = raw_ctx.user_data,
+            };
             var w = WriterT{ .raw = out };
             // Build (ctx, [args,] p1, p2, ..., writer) and call process.
             var call: CallArgs = undefined;
@@ -692,6 +716,7 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
         .arg_types = argTypesFor(Mod),
         .row_aligned = Mod.spec.row_aligned,
         .ordered_output = Mod.spec.ordered_output,
+        .broadcast_inputs = Mod.spec.broadcast_inputs,
         .passthrough = passPairsFor(Mod),
         .kernel_input_cols = kernelInputCols(Mod),
         .process = S.trampoline,

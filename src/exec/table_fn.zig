@@ -197,16 +197,22 @@ pub const TableFnExec = struct {
                 if (up_schema[ui].nullable and !decl.nullable) return Error.TableFnInputMismatch;
                 slot.* = ui;
             }
-            const kidx = try allocator.alloc(usize, partition_by.len);
+            // Broadcast inputs are never co-grouped: the call keys need
+            // not resolve in their schema and they are never sorted.
+            var is_bcast = false;
+            for (entry.broadcast_inputs) |b| {
+                if (b == i) is_bcast = true;
+            }
+            const kidx = try allocator.alloc(usize, if (is_bcast) 0 else partition_by.len);
             errdefer allocator.free(kidx);
-            for (partition_by, kidx) |name, *slot| {
-                slot.* = types.findColumn(decl_schema, name) orelse return Error.TableFnInputMismatch;
-            }
-            const oidx = try allocator.alloc(usize, order_by.len);
+            if (!is_bcast) for (partition_by, kidx) |kname, *slot| {
+                slot.* = types.findColumn(decl_schema, kname) orelse return Error.TableFnInputMismatch;
+            };
+            const oidx = try allocator.alloc(usize, if (is_bcast) 0 else order_by.len);
             errdefer allocator.free(oidx);
-            for (order_by, oidx) |spec, *slot| {
+            if (!is_bcast) for (order_by, oidx) |spec, *slot| {
                 slot.* = types.findColumn(decl_schema, spec.col) orelse return Error.TableFnInputMismatch;
-            }
+            };
             input_maps[i] = imap;
             key_idxs[i] = kidx;
             order_idxs[i] = oidx;
@@ -787,6 +793,13 @@ pub const TableFnExec = struct {
     /// N-way merge the sorted digest streams into groups, and invoke the
     /// kernel once per group with one ALIGNED partition per input.
     /// GLOBAL (no keys): one group holding every input whole.
+    fn isBroadcastInput(self: *const TableFnExec, i: usize) bool {
+        for (self.entry.broadcast_inputs) |b| {
+            if (b == i) return true;
+        }
+        return false;
+    }
+
     fn executeMulti(self: *TableFnExec) !void {
         const a = self.allocator;
         const n_in = self.upstreams.len;
@@ -925,15 +938,19 @@ pub const TableFnExec = struct {
         for (0..n_in) |i| {
             var list: std.ArrayList(DRun) = .empty;
             errdefer list.deinit(a);
-            const d = ins[i].digests;
-            const perm = ins[i].perm;
-            var start: usize = 0;
-            while (start < perm.len) {
-                var end = start + 1;
-                const dg = d[perm[start]];
-                while (end < perm.len and d[perm[end]] == dg) end += 1;
-                try list.append(a, .{ .digest = dg, .start = start, .end = end });
-                start = end;
+            // Broadcast inputs never form runs (empty list) — they join
+            // every group whole, patched in below.
+            if (!self.isBroadcastInput(i)) {
+                const d = ins[i].digests;
+                const perm = ins[i].perm;
+                var start: usize = 0;
+                while (start < perm.len) {
+                    var end = start + 1;
+                    const dg = d[perm[start]];
+                    while (end < perm.len and d[perm[end]] == dg) end += 1;
+                    try list.append(a, .{ .digest = dg, .start = start, .end = end });
+                    start = end;
+                }
             }
             run_lists[i] = try list.toOwnedSlice(a);
             built_lists += 1;
@@ -962,7 +979,9 @@ pub const TableFnExec = struct {
             const spans = try a.alloc(Span, n_in);
             errdefer a.free(spans);
             for (0..n_in) |i| {
-                if (cursors[i] < run_lists[i].len and run_lists[i][cursors[i]].digest == min_digest) {
+                if (self.isBroadcastInput(i)) {
+                    spans[i] = .{ .start = 0, .end = ins[i].perm.len };
+                } else if (cursors[i] < run_lists[i].len and run_lists[i][cursors[i]].digest == min_digest) {
                     const r = run_lists[i][cursors[i]];
                     spans[i] = .{ .start = r.start, .end = r.end };
                     cursors[i] += 1;
@@ -1132,6 +1151,11 @@ pub const TableFnExec = struct {
         key_vals: []?Value,
         out_ptrs: []*ColumnStore,
         arena: std.heap.ArenaAllocator,
+        /// Worker-lifetime arena + kernel state slot (never reset between
+        /// groups): kernels with broadcast inputs build lookup structures
+        /// once per worker and reuse them across every group it claims.
+        worker_arena: std.heap.ArenaAllocator,
+        worker_state: ?*anyopaque = null,
 
         fn init(
             allocator: Allocator,
@@ -1173,6 +1197,11 @@ pub const TableFnExec = struct {
                 part_views[i] = try allocator.alloc(ColumnView, decl.len);
                 built += 1;
             }
+            // Broadcast inputs are handed WHOLE to every group: bind their
+            // full input views once — no per-group gather, no scratch.
+            for (op.entry.broadcast_inputs) |b| {
+                for (views_by_input[b][0..part_views[b].len], part_views[b]) |v, *pv| pv.* = v;
+            }
             const parts = try allocator.alloc(udf_mod.TvfPartition, n_in);
             errdefer allocator.free(parts);
             const key_vals = try allocator.alloc(?Value, op.key_idxs[0].len);
@@ -1201,11 +1230,13 @@ pub const TableFnExec = struct {
                 .key_vals = key_vals,
                 .out_ptrs = out_ptrs,
                 .arena = std.heap.ArenaAllocator.init(allocator),
+                .worker_arena = std.heap.ArenaAllocator.init(allocator),
             };
         }
 
         fn deinit(self: *MultiRunner) void {
             self.arena.deinit();
+            self.worker_arena.deinit();
             for (0..self.scratch.len) |i| {
                 for (self.scratch[i]) |*c| c.deinit(self.allocator);
                 self.allocator.free(self.scratch[i]);
@@ -1222,8 +1253,10 @@ pub const TableFnExec = struct {
             const op = self.op;
             // Gather each input's span (input 0: kernel-visible prefix
             // only); empty spans leave arity-correct zero-row columns
-            // (cleared scratch views).
+            // (cleared scratch views). Broadcast inputs skip the gather —
+            // their full views were bound once at init.
             for (0..op.upstreams.len) |i| {
+                if (op.isBroadcastInput(i)) continue;
                 for (self.scratch[i]) |*store| store.clear();
                 const span = spans[i];
                 if (span.end > span.start) {
@@ -1261,6 +1294,8 @@ pub const TableFnExec = struct {
                 .arena = self.arena.allocator(),
                 .user_data = op.entry.user_data,
                 .args = op.call_args,
+                .worker_arena = self.worker_arena.allocator(),
+                .worker_state = &self.worker_state,
             };
             var out = udf_mod.TvfOutput{
                 .columns = self.out_ptrs,
@@ -1621,6 +1656,10 @@ pub const TableFnExec = struct {
         /// filled by the operator's bulk gather after all runs complete.
         out_ptrs: []*ColumnStore,
         arena: std.heap.ArenaAllocator,
+        /// Worker-lifetime arena + kernel state slot (never reset between
+        /// runs) — see MultiRunner.
+        worker_arena: std.heap.ArenaAllocator,
+        worker_state: ?*anyopaque = null,
         /// Ticks spent INSIDE the user kernel (process() calls), for the
         /// THINDB_TVF_TRACE phase breakdown.
         kernel_ticks: i64 = 0,
@@ -1671,11 +1710,13 @@ pub const TableFnExec = struct {
                 .key_vals = key_vals,
                 .out_ptrs = out_ptrs,
                 .arena = std.heap.ArenaAllocator.init(allocator),
+                .worker_arena = std.heap.ArenaAllocator.init(allocator),
             };
         }
 
         fn deinit(self: *Runner) void {
             self.arena.deinit();
+            self.worker_arena.deinit();
             for (self.valid_scratch) |vs| {
                 if (vs.len > 0) self.allocator.free(vs);
             }
@@ -1702,6 +1743,8 @@ pub const TableFnExec = struct {
                 .arena = self.arena.allocator(),
                 .user_data = op.entry.user_data,
                 .args = op.call_args,
+                .worker_arena = self.worker_arena.allocator(),
+                .worker_state = &self.worker_state,
             };
             const parts = [_]udf_mod.TvfPartition{.{
                 .columns = self.part_views,
@@ -1840,17 +1883,17 @@ pub const TableFnExec = struct {
         }
     };
 
-    /// Parallel samplesort over a row permutation for the generic-comparator
-    /// fallbacks. Both LessCtx and MultiLessCtx end in an arrival-index
-    /// tie-break, so the order is strict and total — the result is
-    /// byte-identical to the serial sort no matter how rows scatter into
-    /// buckets. Serial below the threshold, where bucket bookkeeping costs
-    /// more than it saves.
-    fn parallelSortPerm(comptime Ctx: type, allocator: Allocator, perm: []u32, ctx: Ctx, dop: usize) !void {
-        const n = perm.len;
+    /// Parallel samplesort for the operator's sorts (the generic-comparator
+    /// permutation fallbacks and the packed-key sort). Every comparator
+    /// here ends in a row/arrival tie-break, so the order is strict and
+    /// total — the result is byte-identical to the serial sort no matter
+    /// how items scatter into buckets. Serial below the threshold, where
+    /// bucket bookkeeping costs more than it saves.
+    fn parallelSortItems(comptime T: type, comptime Ctx: type, allocator: Allocator, items: []T, ctx: Ctx, dop: usize) !void {
+        const n = items.len;
         const allow_parallel = !builtin.is_test or force_parallel_in_tests;
         if (!allow_parallel or dop <= 1 or n < (1 << 17)) {
-            std.mem.sortUnstable(u32, perm, ctx, Ctx.less);
+            std.mem.sortUnstable(T, items, ctx, Ctx.less);
             return;
         }
         const workers: usize = @min(dop, 32);
@@ -1860,25 +1903,25 @@ pub const TableFnExec = struct {
         // makes every sampled key distinct, so heavy-duplicate key columns
         // still split into level ranges.
         const sample_len = @min(n, bucket_count * 16);
-        const sample = try allocator.alloc(u32, sample_len);
+        const sample = try allocator.alloc(T, sample_len);
         defer allocator.free(sample);
         const stride = n / sample_len;
-        for (sample, 0..) |*s, i| s.* = perm[i * stride];
-        std.mem.sortUnstable(u32, sample, ctx, Ctx.less);
-        const splitters = try allocator.alloc(u32, bucket_count - 1);
+        for (sample, 0..) |*s, i| s.* = items[i * stride];
+        std.mem.sortUnstable(T, sample, ctx, Ctx.less);
+        const splitters = try allocator.alloc(T, bucket_count - 1);
         defer allocator.free(splitters);
         for (splitters, 1..) |*sp, b| sp.* = sample[b * sample_len / bucket_count];
 
-        const placed = try allocator.alloc(u32, n);
+        const placed = try allocator.alloc(T, n);
         defer allocator.free(placed);
         const counts = try allocator.alloc(usize, workers * bucket_count);
         defer allocator.free(counts);
         @memset(counts, 0);
 
         const Job = struct {
-            perm: []u32,
-            placed: []u32,
-            splitters: []const u32,
+            items: []T,
+            placed: []T,
+            splitters: []const T,
             counts: []usize,
             sort_ctx: Ctx,
             workers: usize,
@@ -1886,31 +1929,31 @@ pub const TableFnExec = struct {
             bucket_offsets: []usize,
             next_bucket: std.atomic.Value(usize) = .init(0),
 
-            fn bucketOf(job: *const @This(), row: u32) usize {
+            fn bucketOf(job: *const @This(), item: T) usize {
                 var lo: usize = 0;
                 var hi: usize = job.splitters.len;
                 while (lo < hi) {
                     const mid = (lo + hi) / 2;
-                    if (Ctx.less(job.sort_ctx, row, job.splitters[mid])) hi = mid else lo = mid + 1;
+                    if (Ctx.less(job.sort_ctx, item, job.splitters[mid])) hi = mid else lo = mid + 1;
                 }
                 return lo;
             }
             fn rowRange(job: *const @This(), w: usize) [2]usize {
-                const per = (job.perm.len + job.workers - 1) / job.workers;
-                const s = @min(job.perm.len, w * per);
-                return .{ s, @min(job.perm.len, s + per) };
+                const per = (job.items.len + job.workers - 1) / job.workers;
+                const s = @min(job.items.len, w * per);
+                return .{ s, @min(job.items.len, s + per) };
             }
             fn countPhase(job: *@This(), w: usize) void {
                 const r = job.rowRange(w);
                 const my = job.counts[w * job.bucket_count ..][0..job.bucket_count];
-                for (job.perm[r[0]..r[1]]) |row| my[job.bucketOf(row)] += 1;
+                for (job.items[r[0]..r[1]]) |item| my[job.bucketOf(item)] += 1;
             }
             fn placePhase(job: *@This(), w: usize) void {
                 const r = job.rowRange(w);
                 const my = job.counts[w * job.bucket_count ..][0..job.bucket_count];
-                for (job.perm[r[0]..r[1]]) |row| {
-                    const b = job.bucketOf(row);
-                    job.placed[my[b]] = row;
+                for (job.items[r[0]..r[1]]) |item| {
+                    const b = job.bucketOf(item);
+                    job.placed[my[b]] = item;
                     my[b] += 1;
                 }
             }
@@ -1920,7 +1963,7 @@ pub const TableFnExec = struct {
                     if (b >= job.bucket_count) return;
                     const s = job.bucket_offsets[b];
                     const e = job.bucket_offsets[b + 1];
-                    std.mem.sortUnstable(u32, job.placed[s..e], job.sort_ctx, Ctx.less);
+                    std.mem.sortUnstable(T, job.placed[s..e], job.sort_ctx, Ctx.less);
                 }
             }
             // A failed spawn runs the phase inline on this thread — slower,
@@ -1942,7 +1985,7 @@ pub const TableFnExec = struct {
         const bucket_offsets = try allocator.alloc(usize, bucket_count + 1);
         defer allocator.free(bucket_offsets);
         var job = Job{
-            .perm = perm,
+            .items = items,
             .placed = placed,
             .splitters = splitters,
             .counts = counts,
@@ -1954,7 +1997,7 @@ pub const TableFnExec = struct {
         job.runPhase(Job.countPhase);
         // Bucket-major prefix over worker-local counts: each worker's
         // in-bucket writes land after every earlier worker's — placement is
-        // deterministic, so the buckets (and the final perm) are too.
+        // deterministic, so the buckets (and the final order) are too.
         var off: usize = 0;
         for (0..bucket_count) |b| {
             bucket_offsets[b] = off;
@@ -1967,7 +2010,11 @@ pub const TableFnExec = struct {
         bucket_offsets[bucket_count] = off;
         job.runPhase(Job.placePhase);
         job.runPhase(Job.bucketPhase);
-        @memcpy(perm, placed);
+        @memcpy(items, placed);
+    }
+
+    fn parallelSortPerm(comptime Ctx: type, allocator: Allocator, perm: []u32, ctx: Ctx, dop: usize) !void {
+        return parallelSortItems(u32, Ctx, allocator, perm, ctx, dop);
     }
 
     /// Sort `perm` via packed keys when the shape allows it (any partition
@@ -2023,7 +2070,7 @@ pub const TableFnExec = struct {
         }
 
         const desc = self.order_desc.len == 1 and self.order_desc[0];
-        std.mem.sortUnstable(PackedKey, keys, PackCtx{ .desc = desc }, PackCtx.less);
+        try parallelSortItems(PackedKey, PackCtx, self.allocator, keys, PackCtx{ .desc = desc }, self.dop);
         for (keys, perm) |k, *p| p.* = k.row;
         // Row-indexed digests for the boundary scan (digest equality =
         // key equality, so boundaries need no Value comparisons).

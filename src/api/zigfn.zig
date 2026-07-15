@@ -41,7 +41,7 @@ pub const Error = error{
     ZigCompileFailed,
 };
 
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 const EmbeddedFile = struct { path: []const u8, data: []const u8 };
 
@@ -90,6 +90,8 @@ const WRAPPER_MAIN =
     \\    kernel_input_cols: usize,
     \\    n_pass: usize,
     \\    pass_pairs: [*]const PassPairDesc,
+    \\    n_broadcast: usize,
+    \\    broadcast: [*]const u32,
     \\};
     \\
     \\fn colDescs(comptime cols: anytype) [cols.len]ColDesc {
@@ -134,6 +136,11 @@ const WRAPPER_MAIN =
     \\    }
     \\    break :blk out;
     \\};
+    \\const broadcast_descs = blk: {
+    \\    var out: [desc_gen.broadcast_inputs.len]u32 = undefined;
+    \\    for (desc_gen.broadcast_inputs, 0..) |b, i| out[i] = b;
+    \\    break :blk out;
+    \\};
     \\const the_desc = Desc{
     \\    .name_ptr = desc_gen.name.ptr,
     \\    .name_len = desc_gen.name.len,
@@ -149,10 +156,12 @@ const WRAPPER_MAIN =
     \\    .kernel_input_cols = desc_gen.kernel_input_cols,
     \\    .n_pass = pass_descs.len,
     \\    .pass_pairs = &pass_descs,
+    \\    .n_broadcast = broadcast_descs.len,
+    \\    .broadcast = &broadcast_descs,
     \\};
     \\
     \\export fn thindb_tvf_abi_version() callconv(.c) u32 {
-    \\    return 5;
+    \\    return 6;
     \\}
     \\export fn thindb_tvf_descriptor() callconv(.c) *const Desc {
     \\    return &the_desc;
@@ -323,6 +332,8 @@ pub const Desc = extern struct {
     kernel_input_cols: usize,
     n_pass: usize,
     pass_pairs: [*]const PassPairDesc,
+    n_broadcast: usize,
+    broadcast: [*]const u32,
 };
 
 const DllProcess = *const fn (*const anyopaque, [*]const udf_mod.TvfPartition, usize, *anyopaque) callconv(.c) i32;
@@ -613,6 +624,13 @@ pub fn loadAndRegister(
     for (desc.pass_pairs[0..desc.n_pass], passthrough) |pd, *slot| {
         slot.* = .{ .out_idx = pd.out_idx, .in_idx = pd.in_idx };
     }
+    // Broadcast inputs: valid indices only, never input 0 (it defines
+    // partitioning and row alignment).
+    if (desc.n_broadcast >= desc.n_tables) return Error.FunctionInvalidDefinition;
+    const broadcast_inputs = try cols_arena.allocator().dupe(u32, desc.broadcast[0..desc.n_broadcast]);
+    for (broadcast_inputs) |b| {
+        if (b == 0 or b >= desc.n_tables) return Error.FunctionInvalidDefinition;
+    }
 
     try registry.registerTable(.{
         .name = name,
@@ -622,6 +640,7 @@ pub fn loadAndRegister(
         .execution = @enumFromInt(desc.execution),
         .row_aligned = desc.row_aligned != 0,
         .ordered_output = desc.ordered_output != 0,
+        .broadcast_inputs = broadcast_inputs,
         .passthrough = passthrough,
         .kernel_input_cols = @intCast(desc.kernel_input_cols),
         .process = dllShim,
