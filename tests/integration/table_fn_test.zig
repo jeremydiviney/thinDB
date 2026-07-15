@@ -927,3 +927,205 @@ test "table UDF passthrough: registerTable rejects malformed descriptors" {
     bad.passthrough = &.{ .{ .out_idx = 0, .in_idx = 0 }, .{ .out_idx = 1, .in_idx = 1 } };
     try std.testing.expectError(thindb.udf.Error.FunctionInvalidDefinition, db.registerTableUdf(bad));
 }
+
+/// Canonicalize a (id, running) result into an id-indexed map so tests
+/// stay agnostic to partition emission order (digest order vs input order).
+fn collectRunningById(allocator: std.mem.Allocator, res: *helpers.RunResult) !std.AutoHashMapUnmanaged(i64, i64) {
+    var out: std.AutoHashMapUnmanaged(i64, i64) = .empty;
+    errdefer out.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try out.put(allocator, batch.values[0].data.bigint[i], batch.values[1].data.bigint[i]);
+        }
+    }
+    return out;
+}
+
+fn expectRunningMap(map: *const std.AutoHashMapUnmanaged(i64, i64)) !void {
+    // g=1 in id order: 10, 30, 60. g=2: 40, 90.
+    try std.testing.expectEqual(@as(usize, 5), map.count());
+    try std.testing.expectEqual(@as(?i64, 10), map.get(1));
+    try std.testing.expectEqual(@as(?i64, 30), map.get(2));
+    try std.testing.expectEqual(@as(?i64, 60), map.get(3));
+    try std.testing.expectEqual(@as(?i64, 40), map.get(4));
+    try std.testing.expectEqual(@as(?i64, 90), map.get(5));
+}
+
+test "table UDF ride: window-staged input covers the TVF keys — values match" {
+    // The input CTE is a forced window stage whose spec (PARTITION BY g
+    // ORDER BY id) covers the TVF call keys: the compile marks the source
+    // emit_sorted and the operator skips its input sort (and borrows the
+    // pass-through columns from the stage's contiguous buffers). Values
+    // must be identical to the plain sorted path.
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seed(db);
+    try register(db, .either);
+
+    const sql =
+        \\WITH w AS (SELECT id, g, amt, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM t),
+        \\r AS (SELECT id, running FROM TABLE(running_total((SELECT id, g, amt FROM w)) PARTITION BY g ORDER BY id))
+        \\SELECT id, running FROM r
+    ;
+    {
+        var res = try run(allocator, db, sql);
+        defer res.deinit();
+        var map = try collectRunningById(allocator, &res);
+        defer map.deinit(allocator);
+        try expectRunningMap(&map);
+    }
+    // Same shape with parallel partition execution.
+    thindb.exec.table_fn.force_parallel_in_tests = true;
+    defer thindb.exec.table_fn.force_parallel_in_tests = false;
+    {
+        var res = try run(allocator, db, sql);
+        defer res.deinit();
+        var map = try collectRunningById(allocator, &res);
+        defer map.deinit(allocator);
+        try expectRunningMap(&map);
+    }
+}
+
+test "table UDF borrow: shared CTE stage input — values match" {
+    // `src` is multi-referenced (TVF input + join probe), so it stages;
+    // the TVF input chain is a bare projection over the stage and the
+    // compile installs a borrow plan for all three declared columns.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try register(db, .either);
+
+    var res = try run(allocator, db,
+        \\WITH src AS (SELECT id, g, amt FROM t),
+        \\r AS (SELECT id, running FROM TABLE(running_total((SELECT id, g, amt FROM src)) PARTITION BY g ORDER BY id))
+        \\SELECT r.id, r.running, s.amt FROM r JOIN src s ON s.id = r.id
+    );
+    defer res.deinit();
+    var got: std.AutoHashMapUnmanaged(i64, [2]i64) = .empty;
+    defer got.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try got.put(allocator, batch.values[0].data.bigint[i], .{
+                batch.values[1].data.bigint[i],
+                batch.values[2].data.bigint[i],
+            });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), got.count());
+    const expected = [_][3]i64{ .{ 1, 10, 10 }, .{ 2, 30, 20 }, .{ 3, 60, 30 }, .{ 4, 40, 40 }, .{ 5, 90, 50 } };
+    for (expected) |e| {
+        const row = got.get(e[0]) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(e[1], row[0]);
+        try std.testing.expectEqual(e[2], row[1]);
+    }
+}
+
+/// Emits every (id, g, amt) row of the seed data in one batch, unsorted.
+const BorrowStub = struct {
+    allocator: std.mem.Allocator,
+    schema: [3]thindb.Column = .{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "g", .type = .int },
+        .{ .name = "amt", .type = .bigint },
+    },
+    ids: [5]i64 = .{ 4, 1, 3, 2, 5 },
+    gs: [5]i32 = .{ 2, 1, 1, 1, 2 },
+    amts: [5]i64 = .{ 40, 10, 30, 20, 50 },
+    views: [3]thindb.storage.ColumnView = undefined,
+    emitted: bool = false,
+
+    pub fn next(self: *@This()) !?thindb.exec.Batch {
+        if (self.emitted) return null;
+        self.emitted = true;
+        self.views = .{
+            .{ .data = .{ .bigint = &self.ids } },
+            .{ .data = .{ .int = &self.gs } },
+            .{ .data = .{ .bigint = &self.amts } },
+        };
+        return thindb.exec.Batch{ .schema = &self.schema, .values = &self.views, .row_count = 5 };
+    }
+    pub fn deinit(self: *@This()) void {
+        self.allocator.destroy(self);
+    }
+    pub fn outputSchema(self: *@This()) []const thindb.Column {
+        return &self.schema;
+    }
+    pub fn addPrune(_: *@This(), _: thindb.exec.Predicate) !void {}
+    pub fn stats(_: *@This()) thindb.exec.PipelineStats {
+        return .{ .upper_rows = 5 };
+    }
+    pub fn accountant(_: *@This()) ?*thindb.exec.memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *@This(), out: *std.ArrayList(u8), a: std.mem.Allocator, depth: usize) !void {
+        try thindb.exec.explainLine(out, a, depth, "BorrowStub");
+    }
+};
+
+test "table UDF borrow: operator binds contiguous stage stores zero-copy" {
+    const allocator = std.testing.allocator;
+
+    const stub = try allocator.create(BorrowStub);
+    stub.* = .{ .allocator = allocator };
+    const sq = thindb.exec.makeQuery(allocator, stub);
+
+    const set = try thindb.exec.mat_stage.StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(sq, null);
+    stage.want_contiguous = true;
+
+    const ms = try thindb.exec.mat_stage.MatScan.create(allocator, stage);
+    const entry = thindb.udf.TableEntry{
+        .name = "running_total",
+        .input_schemas = &.{&input_cols},
+        .output_schema = &output_cols,
+        .execution = .either,
+        .arg_types = &.{},
+        .row_aligned = false,
+        .passthrough = &.{},
+        .kernel_input_cols = 3,
+        .process = runningTotal,
+        .user_data = null,
+    };
+    var q = try thindb.exec.table_fn.TableFnExec.create(
+        allocator,
+        &.{ms},
+        &entry,
+        &.{},
+        &.{"g"},
+        &.{.{ .col = "id" }},
+        1,
+    );
+    defer q.deinit();
+    const tf = thindb.exec.queryAs(thindb.exec.table_fn.TableFnExec, q).?;
+    tf.borrow_src = stage;
+    tf.borrow_map = &[_]?usize{ 0, 1, 2 };
+    // Production pairing: the compiler registers a use for the operator's
+    // lifetime (released in deinit) so the borrowed stores can't free at
+    // drain exhaustion.
+    stage.registerUse();
+
+    var got: std.AutoHashMapUnmanaged(i64, i64) = .empty;
+    defer got.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try got.put(allocator, batch.values[0].data.bigint[i], batch.values[1].data.bigint[i]);
+        }
+    }
+    // All three declared columns bound as borrowed views — the drain
+    // copied nothing.
+    try std.testing.expectEqual(@as(usize, 3), tf.borrowed_bound);
+    try expectRunningMap(&got);
+}

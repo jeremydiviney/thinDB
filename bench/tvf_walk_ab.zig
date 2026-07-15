@@ -342,6 +342,10 @@ fn buildSqls(allocator: std.mem.Allocator, io: std.Io, project: []const u8, divi
     return .{ .a = sql_a, .b = sql_b };
 }
 
+/// Session database name for compiles (env-overridable so the harness can
+/// run against snapshot dirs whose db is named e.g. `wayroll_prod`).
+var ab_db_name: []const u8 = "wayroll";
+
 fn registryFor(db: *thindb.Database) *const thindb.UdfRegistry {
     if (db.catalog) |catalog| return &catalog.udfs;
     return &db.owned_catalog.?.udfs;
@@ -354,7 +358,7 @@ fn runToLines(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u
     defer arena.deinit();
     const t0 = thindb.exec.prof.nowTicks();
     const root = try thindb.sql.parseDialectWithUdfs(arena.allocator(), sql, .neutral, registryFor(db));
-    var cq = try thindb.net.compileWithSession(allocator, db, .{ .current_db = "wayroll" }, root);
+    var cq = try thindb.net.compileWithSession(allocator, db, .{ .current_db = ab_db_name }, root);
     defer cq.deinit();
     defer thindb.net.CompiledQuery.freeSessionVars(allocator, cq.sessionValue().vars);
 
@@ -412,6 +416,7 @@ pub fn main() !void {
     const io = threaded.io();
 
     const db_path: []const u8 = if (getenv("THINDB_AB_DB")) |v| std.mem.span(v) else ".wayroll-db";
+    const db_name: []const u8 = if (getenv("THINDB_AB_DBNAME")) |v| std.mem.span(v) else "wayroll";
     const passes: usize = if (getenv("THINDB_AB_PASSES")) |p|
         try std.fmt.parseInt(usize, std.mem.span(p), 10)
     else
@@ -421,7 +426,8 @@ pub fn main() !void {
     defer data_root.close(io);
     const catalog = try thindb.Catalog.open(allocator, io, data_root, .{ .max_dop = 12 });
     defer catalog.close();
-    const db = catalog.database("wayroll") orelse return error.DatabaseNotFound;
+    const db = catalog.database(db_name) orelse return error.DatabaseNotFound;
+    ab_db_name = db_name;
     try db.registerTableFn(rf_walk);
 
     {

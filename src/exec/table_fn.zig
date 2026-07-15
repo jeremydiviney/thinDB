@@ -21,6 +21,14 @@
 //! the final output concatenates per-run segments in run order, so results
 //! are deterministic regardless of worker scheduling. Serial fallback for
 //! DOP 1 / single-run (GLOBAL) / test builds.
+//!
+//! Staged-compiler fast paths (installed by net/cte_stages): input columns
+//! a filterless chain passes through from a stage's contiguous result are
+//! BORROWED zero-copy instead of drain-copied (`borrow_src`/`borrow_map`);
+//! an input provably pre-sorted by (partition ++ order) keys skips the sort
+//! entirely (`input_ordered`). Kernel-visible columns are materialized once
+//! in run-contiguous order (a no-op under an identity permutation), so
+//! per-partition views are zero-copy slices rather than per-run gathers.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -84,6 +92,26 @@ pub const TableFnExec = struct {
     /// Output stores handed to an adopting stage (mat_stage) — the stage
     /// owns their buffers now; deinit must not free them.
     adopted_out: bool = false,
+    /// Zero-copy input borrowing (installed by the staged compiler): the
+    /// single input chain is row-aligned (no filters) with `borrow_src`'s
+    /// adopted contiguous result, so declared input columns the chain passes
+    /// through untransformed take shallow views into its stores instead of
+    /// being drain-copied. borrow_map[ci] = source store index for declared
+    /// input column ci; null = derived/renamed → drained normally. The map
+    /// is node-arena owned (never freed here); the source stage stays alive
+    /// through execute() via the compiled upstream chain's MatScan use, and
+    /// everything emitted or gathered from it is a copy, so no reference
+    /// outlives the operator.
+    borrow_src: ?*exec.mat_stage.Stage = null,
+    borrow_map: []const ?usize = &.{},
+    /// Installed by the staged compiler when the input provably arrives
+    /// sorted by (partition_by ++ order_by) with engine comparison semantics
+    /// (a covered window-stage ride): skip the sort — identity permutation,
+    /// adjacent-equal run boundaries.
+    input_ordered: bool = false,
+    /// Observability (tests + trace attribution): columns the last execute
+    /// actually bound as borrowed views (0 = bind declined or no plan).
+    borrowed_bound: usize = 0,
 
     pub fn create(
         allocator: Allocator,
@@ -213,6 +241,10 @@ pub const TableFnExec = struct {
     }
 
     pub fn deinit(self: *TableFnExec) void {
+        // Pairs with the staged compiler's registerUse when it installed
+        // the borrow plan — borrowed views must outlive execute(), and the
+        // upstream chain's own use releases at drain exhaustion.
+        if (self.borrow_src) |src| src.releaseUse();
         for (self.call_args) |a| {
             if (a) |v| switch (v) {
                 .text => |t| self.allocator.free(t),
@@ -372,7 +404,51 @@ pub const TableFnExec = struct {
         var t0 = prof.nowTicks();
         const n_cols = self.entry.input_schemas[0].len;
 
-        // Drain the input into buffers laid out in DECLARED column order.
+        // Zero-copy borrow bind: run the source stage (it runs lazily on
+        // first pull anyway) and take shallow views into its adopted
+        // contiguous stores for every column the compile-time walk proved
+        // passes through the input chain untransformed. Any miss (no
+        // contiguous result — chunked copy, sliced fill) degrades those
+        // columns back to the drain copy.
+        const borrowed_views = try self.allocator.alloc(?ColumnView, n_cols);
+        defer self.allocator.free(borrowed_views);
+        @memset(borrowed_views, null);
+        var borrow_rows: u64 = 0;
+        var n_borrowed: usize = 0;
+        if (self.borrow_src) |src| bind: {
+            src.ensureRun() catch break :bind;
+            const res = src.result orelse break :bind;
+            const ad = res.adopted orelse break :bind;
+            // One contiguous store per column only — a SEPARABLE sliced
+            // fill adopts N stores per column (slice parts), which can't be
+            // shallow-referenced as single columns.
+            if (ad.stores.len != res.schema.len) break :bind;
+            for (self.borrow_map, 0..) |m, ci| {
+                if (ci >= n_cols) break;
+                const si = m orelse continue;
+                borrowed_views[ci] = exec.mat_stage.MaterializedResult.presentAsSchemaType(
+                    ad.stores[si].view(),
+                    self.entry.input_schemas[0][ci].type,
+                );
+                n_borrowed += 1;
+            }
+            borrow_rows = res.total_rows;
+        }
+        self.borrowed_bound = n_borrowed;
+        const owned_buf = try self.allocator.alloc(usize, n_cols);
+        defer self.allocator.free(owned_buf);
+        var n_owned: usize = 0;
+        for (0..n_cols) |ci| {
+            if (borrowed_views[ci] == null) {
+                owned_buf[n_owned] = ci;
+                n_owned += 1;
+            }
+        }
+        const owned = owned_buf[0..n_owned];
+
+        // Drain the input into buffers laid out in DECLARED column order —
+        // borrowed columns skip the copy; the pull itself always runs (it
+        // verifies the row-alignment contract and feeds the owned columns).
         // Per-column arenas make the parallel per-batch column copies
         // race-free (the #108 window fused-drain protocol); the upstream
         // pull itself stays on this thread — batches are only valid until
@@ -394,12 +470,12 @@ pub const TableFnExec = struct {
             store.* = try ColumnStore.init(arena.allocator(), col.type, col.nullable);
         }
 
-        var dp = DrainPar{ .op = self, .arenas = drain_arenas, .stores = input_cols };
+        var dp = DrainPar{ .op = self, .arenas = drain_arenas, .stores = input_cols, .owned = owned };
         var dworkers: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
         var n_dworkers: usize = 0;
         var max_tiles: usize = 1;
-        if (self.dop > 1 and n_cols >= 2 and (!builtin.is_test or force_parallel_in_tests)) {
-            const want = @min(@min(self.dop - 1, n_cols - 1), max_drain_workers);
+        if (self.dop > 1 and owned.len >= 2 and (!builtin.is_test or force_parallel_in_tests)) {
+            const want = @min(@min(self.dop - 1, owned.len - 1), max_drain_workers);
             while (n_dworkers < want) {
                 dworkers[n_dworkers] = std.Thread.spawn(.{}, DrainPar.worker, .{&dp}) catch break;
                 n_dworkers += 1;
@@ -419,7 +495,7 @@ pub const TableFnExec = struct {
         while (try self.upstream.next()) |batch| {
             if (n_dworkers > 0) {
                 dp.batch = batch;
-                dp.runPhase(.prepare, n_cols, n_dworkers);
+                dp.runPhase(.prepare, owned.len, n_dworkers);
                 if (dp.failed.load(.acquire)) return error.OutOfMemory;
                 // Row tiles on absolute 8-row boundaries: the first bound
                 // absorbs the base misalignment so no two tiles share a
@@ -436,39 +512,60 @@ pub const TableFnExec = struct {
                     if (dp.bounds[nt] > n) dp.bounds[nt] = n;
                 }
                 dp.n_tiles = nt;
-                dp.runPhase(.write, n_cols * nt, n_dworkers);
+                dp.runPhase(.write, owned.len * nt, n_dworkers);
                 // Rare non-positional columns take the classic serial
                 // append — single caller, own arena.
-                for (input_cols, drain_arenas, self.input_map, 0..) |*store, *arena, ui, ci| {
+                for (owned) |ci| {
                     if (dp.preps[ci].positional) continue;
-                    try transform.appendColumnRange(arena.allocator(), batch.values[ui], 0, n, store);
+                    try transform.appendColumnRange(
+                        drain_arenas[ci].allocator(),
+                        batch.values[self.input_map[ci]],
+                        0,
+                        n,
+                        &input_cols[ci],
+                    );
                 }
             } else {
-                for (self.input_map, input_cols, drain_arenas) |ui, *store, *arena| {
-                    try transform.appendAllColumn(arena.allocator(), batch.values[ui], store);
+                for (owned) |ci| {
+                    try transform.appendAllColumn(
+                        drain_arenas[ci].allocator(),
+                        batch.values[self.input_map[ci]],
+                        &input_cols[ci],
+                    );
                 }
             }
             accumulated += batch.row_count;
         }
-        const n_rows = input_cols[0].rowCount();
+        // Borrowed stores are row-aligned with the drained chain by the
+        // compile-time contract (no filters); a mismatch means it broke.
+        if (n_borrowed > 0 and accumulated != borrow_rows) return Error.TableFnInputMismatch;
+        const n_rows = accumulated;
         if (trace) {
-            std.debug.print("[tvf] drain {d} rows: {d:.0}ms\n", .{ n_rows, prof.ticksToMs(prof.nowTicks() - t0) });
+            std.debug.print("[tvf] drain {d} rows: {d:.0}ms (borrowed {d}/{d} cols)\n", .{
+                n_rows, prof.ticksToMs(prof.nowTicks() - t0), n_borrowed, n_cols,
+            });
             t0 = prof.nowTicks();
         }
         if (n_rows == 0) return;
 
         const input_views = try self.allocator.alloc(ColumnView, n_cols);
         defer self.allocator.free(input_views);
-        for (input_cols, input_views) |c, *v| v.* = c.view();
+        for (0..n_cols) |ci| {
+            input_views[ci] = borrowed_views[ci] orelse input_cols[ci].view();
+        }
 
         // Sort a row permutation by (partition keys, order keys): partitions
         // become contiguous runs and each run is already in ORDER BY order.
+        // A provably pre-ordered input (input_ordered) keeps the identity
+        // permutation — the drain order IS the sorted order.
         const perm = try self.allocator.alloc(u32, n_rows);
         defer self.allocator.free(perm);
         var digests: ?[]u128 = null;
         defer if (digests) |d| self.allocator.free(d);
         for (perm, 0..) |*p, i| p.* = @intCast(i);
-        if (self.key_idx.len + self.order_idx.len > 0) {
+        const have_keys = self.key_idx.len + self.order_idx.len > 0;
+        const identity_perm = self.input_ordered or !have_keys;
+        if (have_keys and !self.input_ordered) {
             digests = try self.packedSort(input_views, perm);
             if (digests == null) {
                 const lctx = LessCtx{ .self = self, .views = input_views };
@@ -477,13 +574,18 @@ pub const TableFnExec = struct {
         }
 
         if (trace) {
-            std.debug.print("[tvf] sort: {d:.0}ms\n", .{prof.ticksToMs(prof.nowTicks() - t0)});
+            if (self.input_ordered and have_keys) {
+                std.debug.print("[tvf] sort: skipped (pre-ordered input)\n", .{});
+            } else {
+                std.debug.print("[tvf] sort: {d:.0}ms\n", .{prof.ticksToMs(prof.nowTicks() - t0)});
+            }
             t0 = prof.nowTicks();
         }
         // Partition boundaries: contiguous runs of equal keys in the sorted
         // permutation. Global mode (no keys) is one run covering everything.
         var runs: std.ArrayList(Run) = .empty;
         defer runs.deinit(self.allocator);
+        var max_run: usize = 0;
         var start: usize = 0;
         if (digests) |d| {
             // Digest-grouped ordering: run boundaries are digest changes.
@@ -491,12 +593,14 @@ pub const TableFnExec = struct {
                 var end = start + 1;
                 while (end < n_rows and d[perm[start]] == d[perm[end]]) end += 1;
                 try runs.append(self.allocator, .{ .start = start, .end = end });
+                max_run = @max(max_run, end - start);
                 start = end;
             }
         } else while (start < n_rows) {
             var end = start + 1;
             while (end < n_rows and self.sameKeys(input_views, perm[start], perm[end])) end += 1;
             try runs.append(self.allocator, .{ .start = start, .end = end });
+            max_run = @max(max_run, end - start);
             start = end;
         }
 
@@ -508,16 +612,64 @@ pub const TableFnExec = struct {
             std.debug.print("[tvf] boundaries ({d} runs): {d:.0}ms\n", .{ runs.items.len, prof.ticksToMs(prof.nowTicks() - t0) });
             t0 = prof.nowTicks();
         }
+
+        // Kernel-visible input columns in RUN-CONTIGUOUS order: with an
+        // identity permutation the drained/borrowed columns already are;
+        // otherwise ONE bulk permuted gather per kernel column (columns in
+        // parallel) replaces the old per-run scratch copies — same bytes
+        // moved, none of the per-run store/append overhead — and every
+        // partition view becomes a zero-copy slice.
+        const n_kernel: usize = self.entry.kernel_input_cols;
+        const kernel_views = try self.allocator.alloc(ColumnView, n_kernel);
+        defer self.allocator.free(kernel_views);
+        var kernel_arenas: []std.heap.ArenaAllocator = &.{};
+        var kernel_stores: []ColumnStore = &.{};
+        var kernel_arenas_inited: usize = 0;
+        defer {
+            for (kernel_arenas[0..kernel_arenas_inited]) |*a| a.deinit();
+            if (kernel_arenas.len > 0) self.allocator.free(kernel_arenas);
+            if (kernel_stores.len > 0) self.allocator.free(kernel_stores);
+        }
+        if (identity_perm) {
+            @memcpy(kernel_views, input_views[0..n_kernel]);
+        } else {
+            kernel_arenas = try self.allocator.alloc(std.heap.ArenaAllocator, n_kernel);
+            for (kernel_arenas) |*a| {
+                a.* = std.heap.ArenaAllocator.init(drain_backing);
+                kernel_arenas_inited += 1;
+            }
+            kernel_stores = try self.allocator.alloc(ColumnStore, n_kernel);
+            const jobs = try self.allocator.alloc(GatherJob, n_kernel);
+            defer self.allocator.free(jobs);
+            for (0..n_kernel) |ci| {
+                const col = self.entry.input_schemas[0][ci];
+                kernel_stores[ci] = try ColumnStore.init(kernel_arenas[ci].allocator(), col.type, col.nullable);
+                jobs[ci] = .{
+                    .src = input_views[ci],
+                    .alloc = kernel_arenas[ci].allocator(),
+                    .dst = &kernel_stores[ci],
+                };
+            }
+            try runGatherJobs(jobs, perm, false, if (allow_parallel) self.dop else 1);
+            for (kernel_stores, kernel_views) |c, *v| v.* = c.view();
+            if (trace) {
+                std.debug.print("[tvf]   kernel gather: {d:.0}ms ({d} cols)\n", .{
+                    prof.ticksToMs(prof.nowTicks() - t0), n_kernel,
+                });
+                t0 = prof.nowTicks();
+            }
+        }
+
         defer if (trace) std.debug.print("[tvf] partitions: {d:.0}ms\n", .{prof.ticksToMs(prof.nowTicks() - t0)});
         const n_workers = if (allow_parallel) @min(self.dop, runs.items.len) else 1;
         if (n_workers <= 1) {
-            var runner = try Runner.init(self.allocator, self, input_views, perm, self.output_cols);
+            var runner = try Runner.init(self.allocator, self, input_views, kernel_views, perm, max_run, self.output_cols);
             defer runner.deinit();
             for (runs.items) |run| _ = try runner.runOne(run);
         } else {
-            try self.executeParallel(input_views, perm, runs.items, n_workers);
+            try self.executeParallel(input_views, kernel_views, perm, max_run, runs.items, n_workers);
         }
-        try self.gatherPassthrough(input_views, perm, if (allow_parallel) self.dop else 1);
+        try self.gatherPassthrough(input_views, perm, identity_perm, if (allow_parallel) self.dop else 1);
     }
 
     /// Materialize pass-through output columns as ONE permuted bulk copy of
@@ -525,62 +677,88 @@ pub const TableFnExec = struct {
     /// run order, so the concat of per-run gathers is exactly the full-perm
     /// gather — and doing it once per column kills the per-run append
     /// overhead (~3.5s cpu on 240k-run inputs). Columns are gathered in
-    /// parallel: each is an independent destination store.
-    fn gatherPassthrough(self: *TableFnExec, input_views: []const ColumnView, perm: []const u32, dop: usize) !void {
+    /// parallel: each is an independent destination store. An identity
+    /// permutation (pre-ordered input) takes the straight range-copy path
+    /// instead of the per-index gather.
+    fn gatherPassthrough(self: *TableFnExec, input_views: []const ColumnView, perm: []const u32, contiguous: bool, dop: usize) !void {
         const pairs = self.entry.passthrough;
         if (pairs.len == 0) return;
         const t0 = exec.prof.nowTicks();
-        const n_workers = @min(dop, pairs.len);
-        if (n_workers <= 1) {
-            for (pairs) |pp| {
-                try transform.appendByIndices(self.allocator, input_views[pp.in_idx], perm, &self.output_cols[pp.out_idx]);
-            }
-        } else {
-            const Ctx2 = struct {
-                op: *TableFnExec,
-                views: []const ColumnView,
-                perm: []const u32,
-                next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-                err: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-                fn main(ctx: *@This()) void {
-                    const ps = ctx.op.entry.passthrough;
-                    while (true) {
-                        const i = ctx.next.fetchAdd(1, .monotonic);
-                        if (i >= ps.len) return;
-                        transform.appendByIndices(
-                            ctx.op.allocator,
-                            ctx.views[ps[i].in_idx],
-                            ctx.perm,
-                            &ctx.op.output_cols[ps[i].out_idx],
-                        ) catch {
-                            ctx.err.store(true, .release);
-                            return;
-                        };
-                    }
-                }
+        const jobs = try self.allocator.alloc(GatherJob, pairs.len);
+        defer self.allocator.free(jobs);
+        for (pairs, jobs) |pp, *j| {
+            j.* = .{
+                .src = input_views[pp.in_idx],
+                .alloc = self.allocator,
+                .dst = &self.output_cols[pp.out_idx],
             };
-            var ctx = Ctx2{ .op = self, .views = input_views, .perm = perm };
-            const threads = try self.allocator.alloc(?std.Thread, n_workers);
-            defer self.allocator.free(threads);
-            @memset(threads, null);
-            for (threads) |*th| th.* = std.Thread.spawn(.{}, Ctx2.main, .{&ctx}) catch null;
+        }
+        try runGatherJobs(jobs, perm, contiguous, dop);
+        if (getenv("THINDB_TVF_TRACE") != null) {
+            std.debug.print("[tvf]   passthrough gather: {d:.0}ms wall ({d} cols{s})\n", .{
+                exec.prof.ticksToMs(exec.prof.nowTicks() - t0),
+                pairs.len,
+                if (contiguous) ", contiguous" else "",
+            });
+        }
+    }
+
+    /// One independent column copy: `src` rows land in `dst` (via `alloc`)
+    /// either in `perm` order or as one contiguous range copy.
+    const GatherJob = struct {
+        src: ColumnView,
+        alloc: Allocator,
+        dst: *ColumnStore,
+    };
+
+    /// Claim-loop parallel execution of independent column gathers. Each
+    /// job's destination (and its allocator) is private to the job, so
+    /// workers never contend beyond the claim counter. `contiguous` = the
+    /// permutation is identity: bulk range copy instead of per-index gather.
+    fn runGatherJobs(jobs: []const GatherJob, perm: []const u32, contiguous: bool, dop: usize) !void {
+        if (jobs.len == 0) return;
+        const Ctx = struct {
+            jobs: []const GatherJob,
+            perm: []const u32,
+            contiguous: bool,
+            next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+            err: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+            fn main(ctx: *@This()) void {
+                while (true) {
+                    const i = ctx.next.fetchAdd(1, .monotonic);
+                    if (i >= ctx.jobs.len) return;
+                    const j = ctx.jobs[i];
+                    const res = if (ctx.contiguous)
+                        transform.appendColumnRange(j.alloc, j.src, 0, ctx.perm.len, j.dst)
+                    else
+                        transform.appendByIndices(j.alloc, j.src, ctx.perm, j.dst);
+                    res catch {
+                        ctx.err.store(true, .release);
+                        return;
+                    };
+                }
+            }
+        };
+        var ctx = Ctx{ .jobs = jobs, .perm = perm, .contiguous = contiguous };
+        const n_workers = @min(dop, jobs.len);
+        if (n_workers <= 1) {
+            Ctx.main(&ctx);
+        } else {
+            var threads: [16]?std.Thread = .{null} ** 16;
+            const want = @min(n_workers, threads.len);
+            for (threads[0..want]) |*th| th.* = std.Thread.spawn(.{}, Ctx.main, .{&ctx}) catch null;
             var spawned: usize = 0;
-            for (threads) |th| {
+            for (threads[0..want]) |th| {
                 if (th) |t| {
                     t.join();
                     spawned += 1;
                 }
             }
-            if (spawned == 0) Ctx2.main(&ctx);
-            // appendByIndices only fails on allocation.
-            if (ctx.err.load(.acquire)) return error.OutOfMemory;
+            if (spawned == 0) Ctx.main(&ctx);
         }
-        if (getenv("THINDB_TVF_TRACE") != null) {
-            std.debug.print("[tvf]   passthrough gather: {d:.0}ms wall ({d} cols)\n", .{
-                exec.prof.ticksToMs(exec.prof.nowTicks() - t0), pairs.len,
-            });
-        }
+        // The transform appends only fail on allocation.
+        if (ctx.err.load(.acquire)) return error.OutOfMemory;
     }
 
     /// One co-grouped partition's spans, one per input (start==end =
@@ -822,16 +1000,11 @@ pub const TableFnExec = struct {
             if (w.err) |err| return err;
         }
 
-        var idx: std.ArrayList(u32) = .empty;
-        defer idx.deinit(a);
         for (segs) |seg| {
             if (seg.len == 0) continue;
-            idx.clearRetainingCapacity();
-            try idx.ensureTotalCapacity(a, seg.len);
-            for (0..seg.len) |i| idx.appendAssumeCapacity(@intCast(seg.off + i));
             const w = &workers[seg.worker];
             for (w.out_stores, self.output_cols) |src, *dst| {
-                try transform.appendByIndices(a, src.view(), idx.items, dst);
+                try transform.appendColumnRange(a, src.view(), seg.off, seg.off + seg.len, dst);
             }
         }
     }
@@ -1009,6 +1182,9 @@ pub const TableFnExec = struct {
         op: *TableFnExec,
         arenas: []std.heap.ArenaAllocator,
         stores: []ColumnStore,
+        /// Declared column indices that actually drain-copy (borrowed
+        /// columns are excluded — their views come from the source stage).
+        owned: []const usize,
         batch: Batch = undefined,
         preps: []transform.PreparedAppend = &.{},
         bounds: []usize = &.{},
@@ -1047,13 +1223,13 @@ pub const TableFnExec = struct {
         }
 
         fn runUnits(dp: *DrainPar) void {
-            const ncols = dp.stores.len;
+            const ncols = dp.owned.len;
             while (true) {
                 const u = dp.unit_cursor.fetchAdd(1, .acq_rel);
                 if (u >= dp.n_units) return;
                 switch (dp.mode) {
                     .prepare => {
-                        const ci = u;
+                        const ci = dp.owned[u];
                         dp.preps[ci] = transform.prepareAppend(
                             dp.arenas[ci].allocator(),
                             dp.batch.values[dp.op.input_map[ci]],
@@ -1067,7 +1243,7 @@ pub const TableFnExec = struct {
                     .write => {
                         // Interleave column-major so concurrent claims walk
                         // different columns (independent memory streams).
-                        const ci = u % ncols;
+                        const ci = dp.owned[u % ncols];
                         const t = u / ncols;
                         if (dp.preps[ci].positional) {
                             transform.writeAppendSlice(
@@ -1113,7 +1289,9 @@ pub const TableFnExec = struct {
     fn executeParallel(
         self: *TableFnExec,
         input_views: []const ColumnView,
+        kernel_views: []const ColumnView,
         perm: []const u32,
+        max_run: usize,
         runs: []const Run,
         n_workers: usize,
     ) !void {
@@ -1172,7 +1350,7 @@ pub const TableFnExec = struct {
                 inited += 1;
             }
             w.* = .{
-                .runner = try Runner.init(self.allocator, self, input_views, perm, out_stores),
+                .runner = try Runner.init(self.allocator, self, input_views, kernel_views, perm, max_run, out_stores),
                 .out_stores = out_stores,
             };
             built += 1;
@@ -1219,43 +1397,47 @@ pub const TableFnExec = struct {
         // the whole claim range.
 
         // Concatenate per-run segments IN RUN ORDER: output is
-        // deterministic regardless of worker scheduling. Pass-through
-        // columns are skipped — their private stores are empty and the
-        // operator bulk-gathers them afterwards (gatherPassthrough).
+        // deterministic regardless of worker scheduling. Each segment is a
+        // contiguous row range of its worker's private stores, so the
+        // concat is a bulk range copy per column — no per-row index list.
+        // Pass-through columns are skipped — their private stores are
+        // empty and the operator bulk-gathers them afterwards
+        // (gatherPassthrough).
         const is_pass = try self.allocator.alloc(bool, self.output_cols.len);
         defer self.allocator.free(is_pass);
         @memset(is_pass, false);
         for (self.entry.passthrough) |pp| is_pass[pp.out_idx] = true;
-        var idx: std.ArrayList(u32) = .empty;
-        defer idx.deinit(self.allocator);
         for (segs) |seg| {
             if (seg.len == 0) continue;
-            idx.clearRetainingCapacity();
-            try idx.ensureTotalCapacity(self.allocator, seg.len);
-            for (0..seg.len) |i| idx.appendAssumeCapacity(@intCast(seg.off + i));
             const w = &workers[seg.worker];
             for (w.out_stores, self.output_cols, is_pass) |src, *dst, skip| {
                 if (skip) continue;
-                try transform.appendByIndices(self.allocator, src.view(), idx.items, dst);
+                try transform.appendColumnRange(self.allocator, src.view(), seg.off, seg.off + seg.len, dst);
             }
         }
     }
 
-    /// Per-worker execution state: scratch input stores for the gathered
-    /// partition, borrowed views, key values, and the output sink (pointing
-    /// at either the operator's output columns — serial — or the worker's
-    /// private stores). `runOne` gathers a run, invokes process(), and
-    /// enforces the rectangular-output contract; returns rows emitted.
+    /// Per-worker execution state: zero-copy partition views over the
+    /// run-contiguous kernel columns, key values, and the output sink
+    /// (pointing at either the operator's output columns — serial — or the
+    /// worker's private stores). `runOne` slices a run, invokes process(),
+    /// and enforces the rectangular-output contract; returns rows emitted.
     const Runner = struct {
         allocator: Allocator,
         op: *const TableFnExec,
         input_views: []const ColumnView,
+        /// KERNEL-VISIBLE input columns (the first `entry.kernel_input_cols`)
+        /// already in run-contiguous order — a run's partition views are
+        /// slices [run.start, run.end), no per-run copies. Carry columns
+        /// past that are pass-through sources only and never reach the
+        /// kernel.
+        kernel_views: []const ColumnView,
         perm: []const u32,
-        /// Gathered per-run buffers for the KERNEL-VISIBLE input columns
-        /// (the first `entry.kernel_input_cols`); carry columns past that
-        /// are pass-through sources only and never reach the kernel.
-        scratch: []ColumnStore,
         part_views: []ColumnView,
+        /// Per kernel column: bit-shift scratch for validity windows whose
+        /// run start is not byte-aligned (a ColumnView bitmap has no bit
+        /// offset). Empty for columns without a bitmap.
+        valid_scratch: [][]u8,
         key_vals: []?Value,
         /// Kernel output sink: the COMPUTED output stores only (declared
         /// order, pass-through columns skipped). Pass-through stores are
@@ -1270,20 +1452,24 @@ pub const TableFnExec = struct {
             allocator: Allocator,
             op: *const TableFnExec,
             input_views: []const ColumnView,
+            kernel_views: []const ColumnView,
             perm: []const u32,
+            max_run: usize,
             out_stores: []ColumnStore,
         ) !Runner {
-            const n_kernel: usize = op.entry.kernel_input_cols;
-            const scratch = try allocator.alloc(ColumnStore, n_kernel);
-            errdefer allocator.free(scratch);
-            var inited: usize = 0;
-            errdefer for (scratch[0..inited]) |*c| c.deinit(allocator);
-            for (op.entry.input_schemas[0][0..n_kernel], scratch) |col, *store| {
-                store.* = try ColumnStore.init(allocator, col.type, col.nullable);
-                inited += 1;
-            }
+            const n_kernel = kernel_views.len;
             const part_views = try allocator.alloc(ColumnView, n_kernel);
             errdefer allocator.free(part_views);
+            const valid_scratch = try allocator.alloc([]u8, n_kernel);
+            errdefer allocator.free(valid_scratch);
+            var vs_built: usize = 0;
+            errdefer for (valid_scratch[0..vs_built]) |vs| {
+                if (vs.len > 0) allocator.free(vs);
+            };
+            for (kernel_views, valid_scratch) |kv, *vs| {
+                vs.* = if (kv.nulls != null) try allocator.alloc(u8, (max_run + 7) / 8) else &.{};
+                vs_built += 1;
+            }
             const key_vals = try allocator.alloc(?Value, op.key_idx.len);
             errdefer allocator.free(key_vals);
             const out_ptrs = try allocator.alloc(*ColumnStore, out_stores.len - op.entry.passthrough.len);
@@ -1301,9 +1487,10 @@ pub const TableFnExec = struct {
                 .allocator = allocator,
                 .op = op,
                 .input_views = input_views,
+                .kernel_views = kernel_views,
                 .perm = perm,
-                .scratch = scratch,
                 .part_views = part_views,
+                .valid_scratch = valid_scratch,
                 .key_vals = key_vals,
                 .out_ptrs = out_ptrs,
                 .arena = std.heap.ArenaAllocator.init(allocator),
@@ -1312,8 +1499,10 @@ pub const TableFnExec = struct {
 
         fn deinit(self: *Runner) void {
             self.arena.deinit();
-            for (self.scratch) |*c| c.deinit(self.allocator);
-            self.allocator.free(self.scratch);
+            for (self.valid_scratch) |vs| {
+                if (vs.len > 0) self.allocator.free(vs);
+            }
+            self.allocator.free(self.valid_scratch);
             self.allocator.free(self.part_views);
             self.allocator.free(self.key_vals);
             self.allocator.free(self.out_ptrs);
@@ -1321,14 +1510,9 @@ pub const TableFnExec = struct {
 
         fn runOne(self: *Runner, run: Run) !usize {
             const op = self.op;
-            // clear() retains capacity: with ~229k partitions per query,
-            // per-run store realloc + arena create were ~26µs/run of pure
-            // overhead (6.1s of the flagship's 13.3s).
-            for (self.scratch) |*store| store.clear();
-            for (self.input_views[0..self.scratch.len], self.scratch) |v, *store| {
-                try transform.appendByIndices(self.allocator, v, self.perm[run.start..run.end], store);
+            for (self.kernel_views, self.part_views, self.valid_scratch) |kv, *pv, vs| {
+                pv.* = sliceRunView(kv, run.start, run.end, vs);
             }
-            for (self.scratch, self.part_views) |c, *v| v.* = c.view();
             for (op.key_idx, self.key_vals) |ki, *kv| {
                 kv.* = if (self.input_views[ki].isValid(self.perm[run.start]))
                     valueAt(self.input_views[ki], self.perm[run.start])
@@ -1408,8 +1592,10 @@ pub const TableFnExec = struct {
 
         fn less(ctx: PackCtx, a: PackedKey, b: PackedKey) bool {
             if (a.digest != b.digest) return a.digest < b.digest;
-            // NULLs first, matching the engine's validity-aware ordering.
-            if (a.ord_null != b.ord_null) return a.ord_null;
+            // NULLs first ascending / last descending — the engine's
+            // validity-aware ordering (matches the generic comparator and
+            // the window sort, which pre-ordered inputs ride).
+            if (a.ord_null != b.ord_null) return if (ctx.desc) b.ord_null else a.ord_null;
             if (a.ord != b.ord) return if (ctx.desc) a.ord > b.ord else a.ord < b.ord;
             return a.row < b.row;
         }
@@ -1573,6 +1759,62 @@ pub const TableFnExec = struct {
         return x.compare(y);
     }
 
+    /// Zero-copy view of rows [start, end) of a run-contiguous column.
+    /// Data and string offsets slice at any offset (string offsets stay
+    /// absolute into the full bytes buffer); the validity bitmap, which has
+    /// no bit-offset field, is re-based into `scratch` when the window
+    /// start is not byte-aligned. `scratch` must hold (end-start+7)/8 bytes
+    /// whenever the source carries a bitmap.
+    fn sliceRunView(v: ColumnView, start: usize, end: usize, scratch: []u8) ColumnView {
+        const n = end - start;
+        var out: ColumnView = switch (v.data) {
+            .int => |s| .{ .data = .{ .int = s[start..][0..n] } },
+            .bigint => |s| .{ .data = .{ .bigint = s[start..][0..n] } },
+            .boolean => |s| .{ .data = .{ .boolean = s[start..][0..n] } },
+            .tinyint => |s| .{ .data = .{ .tinyint = s[start..][0..n] } },
+            .smallint => |s| .{ .data = .{ .smallint = s[start..][0..n] } },
+            .float => |s| .{ .data = .{ .float = s[start..][0..n] } },
+            .double => |s| .{ .data = .{ .double = s[start..][0..n] } },
+            .date => |s| .{ .data = .{ .date = s[start..][0..n] } },
+            .datetime => |s| .{ .data = .{ .datetime = s[start..][0..n] } },
+            .largeint => |s| .{ .data = .{ .largeint = s[start..][0..n] } },
+            .decimal64 => |s| .{ .data = .{ .decimal64 = s[start..][0..n] } },
+            .decimal128 => |s| .{ .data = .{ .decimal128 = s[start..][0..n] } },
+            .uuid => |s| .{ .data = .{ .uuid = s[start..][0..n] } },
+            .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },
+            .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },
+            .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },
+            .json => |sv| .{ .data = .{ .json = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },
+        };
+        if (v.nulls) |bm| {
+            if (start % 8 == 0) {
+                out.nulls = bm[start / 8 ..];
+            } else {
+                copyValidityWindow(bm, start, n, scratch);
+                out.nulls = scratch[0 .. (n + 7) / 8];
+            }
+        }
+        return out;
+    }
+
+    /// Re-base validity bits [start, start+n) of `src` to bit 0 of `dst`.
+    fn copyValidityWindow(src: []const u8, start: usize, n: usize, dst: []u8) void {
+        const n_bytes = (n + 7) / 8;
+        const base = start / 8;
+        const rem = start % 8;
+        if (rem == 0) {
+            @memcpy(dst[0..n_bytes], src[base..][0..n_bytes]);
+            return;
+        }
+        const r: u3 = @intCast(rem);
+        const inv: u3 = @intCast(8 - rem);
+        for (dst[0..n_bytes], 0..) |*d, j| {
+            const lo = src[base + j] >> r;
+            const hi: u8 = if (base + j + 1 < src.len) src[base + j + 1] else 0;
+            d.* = lo | (hi << inv);
+        }
+    }
+
     fn valueAt(v: ColumnView, row: usize) ?Value {
         return switch (v.data) {
             .int => |s| .{ .int = s[row] },
@@ -1593,3 +1835,74 @@ pub const TableFnExec = struct {
 };
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+test "copyValidityWindow re-bases arbitrary bit windows exactly" {
+    var prng = std.Random.DefaultPrng.init(0xfeedface);
+    var src: [8]u8 = undefined;
+    prng.random().bytes(&src);
+    const total = src.len * 8;
+    var dst: [8]u8 = undefined;
+    var start: usize = 0;
+    while (start < 40) : (start += 1) {
+        const lens = [_]usize{ 1, 3, 7, 8, 9, 16, 17, total - start };
+        for (lens) |n| {
+            if (start + n > total) continue;
+            @memset(&dst, 0xAA);
+            TableFnExec.copyValidityWindow(&src, start, n, &dst);
+            for (0..n) |i| {
+                const want = (src[(start + i) / 8] >> @intCast((start + i) % 8)) & 1 != 0;
+                const got = (dst[i / 8] >> @intCast(i % 8)) & 1 != 0;
+                try std.testing.expectEqual(want, got);
+            }
+        }
+    }
+}
+
+test "sliceRunView: values, validity, and absolute string offsets" {
+    var vals: [16]i64 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @intCast(i * 10);
+    // Valid iff i % 3 != 0.
+    var bm: [2]u8 = .{ 0, 0 };
+    for (0..16) |i| {
+        if (i % 3 != 0) bm[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+    }
+    const v = ColumnView{ .data = .{ .bigint = &vals }, .nulls = &bm };
+
+    // Misaligned start: validity re-based through scratch.
+    var scratch: [2]u8 = undefined;
+    const mid = TableFnExec.sliceRunView(v, 3, 11, &scratch);
+    try std.testing.expectEqual(@as(usize, 8), mid.rowCount());
+    for (0..8) |i| {
+        try std.testing.expectEqual(@as(i64, @intCast((3 + i) * 10)), mid.data.bigint[i]);
+        try std.testing.expectEqual((3 + i) % 3 != 0, mid.isValid(i));
+    }
+
+    // Byte-aligned start: the source bitmap is shared, no copy.
+    const aligned = TableFnExec.sliceRunView(v, 8, 16, &scratch);
+    try std.testing.expectEqual(@intFromPtr(&bm[1]), @intFromPtr(aligned.nulls.?.ptr));
+    for (0..8) |i| {
+        try std.testing.expectEqual((8 + i) % 3 != 0, aligned.isValid(i));
+    }
+
+    // Strings: offsets slice at any position, bytes stay absolute.
+    const offsets = [_]u32{ 0, 2, 3, 3, 6 };
+    const sv = ColumnView{ .data = .{ .string = .{ .offsets = &offsets, .bytes = "aabccc" } } };
+    const strs = TableFnExec.sliceRunView(sv, 1, 3, &scratch);
+    try std.testing.expectEqual(@as(usize, 2), strs.rowCount());
+    try std.testing.expectEqualStrings("b", strs.data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("", strs.data.string.rowBytes(1));
+}
+
+test "packed sort keys: NULL order values first ascending, last descending" {
+    const null_key = TableFnExec.PackedKey{ .digest = 7, .ord = 0, .ord_null = true, .row = 0 };
+    const val_key = TableFnExec.PackedKey{ .digest = 7, .ord = -5, .ord_null = false, .row = 1 };
+    const asc = TableFnExec.PackCtx{ .desc = false };
+    const desc = TableFnExec.PackCtx{ .desc = true };
+    try std.testing.expect(TableFnExec.PackCtx.less(asc, null_key, val_key));
+    try std.testing.expect(!TableFnExec.PackCtx.less(asc, val_key, null_key));
+    try std.testing.expect(!TableFnExec.PackCtx.less(desc, null_key, val_key));
+    try std.testing.expect(TableFnExec.PackCtx.less(desc, val_key, null_key));
+    // Different partitions always order by digest, regardless of desc.
+    const other = TableFnExec.PackedKey{ .digest = 9, .ord = 0, .ord_null = false, .row = 2 };
+    try std.testing.expect(TableFnExec.PackCtx.less(desc, null_key, other));
+}

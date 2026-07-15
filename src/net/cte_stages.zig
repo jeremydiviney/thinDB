@@ -2521,13 +2521,72 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         .table_fn => |t| {
             const registry = input.udf_registry orelse return error.UnsupportedQueryShape;
             const entry = registry.tableByName(t.name) orelse return error.UnsupportedQueryShape;
+            // Input ride/borrow detection (single input over a stage-backed
+            // chain) — the window rider's machinery aimed at the TVF's
+            // (PARTITION BY ++ ORDER BY) keys. Covered source order ⇒ the
+            // operator skips its input sort; a filterless chain ⇒ columns
+            // it passes through untransformed are borrowed zero-copy from
+            // the stage's contiguous result instead of drain-copied. Both
+            // require the compiled chain to deliver rows in source order
+            // (force_ordered), exactly like the window ride/borrow.
+            var tvf_ordered = false;
+            var tvf_borrow_src: ?*mat_stage.Stage = null;
+            var tvf_borrow_map: []const ?usize = &.{};
+            var eff_input = input;
+            if (t.inputs.len == 1) {
+                const keys: ?ir.WindowSpec = if (t.partition_by.len + t.order_by.len > 0)
+                    .{ .partition_by = t.partition_by, .order_by = t.order_by, .frame = ir.Frame.default_no_order }
+                else
+                    null;
+                if (rideSource(map, t.inputs[0], keys)) |src| {
+                    if (src.covered) {
+                        src.win.?.emit_sorted = true;
+                        tvf_ordered = true;
+                    }
+                    if (!src.has_filter) {
+                        const decl = entry.input_schemas[0];
+                        const bm = try input.node_arena.alloc(?usize, decl.len);
+                        var any = false;
+                        for (decl, bm) |col, *slot| {
+                            slot.* = borrowIdxFor(map, t.inputs[0], col.name, src.stage);
+                            if (slot.* != null) any = true;
+                        }
+                        if (any) {
+                            tvf_borrow_src = src.stage;
+                            tvf_borrow_map = bm;
+                            if (src.win == null and src.stage.adopt_table_fn == null) src.stage.want_contiguous = true;
+                        }
+                    }
+                    if (tvf_ordered or tvf_borrow_src != null) eff_input.force_ordered = true;
+                    if (getenv("THINDB_TVF_TRACE") != null) {
+                        var k: usize = 0;
+                        for (tvf_borrow_map) |m| {
+                            if (m != null) k += 1;
+                        }
+                        std.debug.print("[tvf] compile {s}: ride={} borrow={d}/{d}\n", .{
+                            t.name, tvf_ordered, k, entry.input_schemas[0].len,
+                        });
+                    }
+                }
+            }
             var ups: std.ArrayList(exec.Query) = .empty;
             defer ups.deinit(input.allocator);
             errdefer for (ups.items) |*u| u.deinit();
             for (t.inputs) |inp| {
-                try ups.append(input.allocator, try compileBlock(input, inp, map));
+                try ups.append(input.allocator, try compileBlock(eff_input, inp, map));
             }
             const q = try exec.table_fn.TableFnExec.create(input.allocator, ups.items, entry, t.args, t.partition_by, t.order_by, input.effectiveDop());
+            if (exec.queryAs(exec.table_fn.TableFnExec, q)) |tf| {
+                tf.input_ordered = tvf_ordered;
+                tf.borrow_src = tvf_borrow_src;
+                tf.borrow_map = tvf_borrow_map;
+                // The compiled input chain releases its stage use on
+                // EXHAUSTION (end of the drain pull), which can free the
+                // borrowed stores while the operator still reads them.
+                // Hold one use for the operator's lifetime; released in
+                // TableFnExec.deinit.
+                if (tvf_borrow_src) |src| src.registerUse();
+            }
             if (t.alias) |a| {
                 errdefer @constCast(&q).deinit();
                 return exec.AliasRename.create(input.allocator, q, a);
@@ -3037,6 +3096,26 @@ fn riderCoveredBy(src: ir.WindowSpec, rider: ir.WindowSpec) bool {
         if (!columnRefMatchesName(x.col, y.col) or x.desc != y.desc) return false;
     }
     return true;
+}
+
+test "riderCoveredBy: partition equality + order-prefix with matching desc" {
+    const mk = struct {
+        fn spec(part: []const []const u8, ord: []const ir.SortSpec) ir.WindowSpec {
+            return .{ .partition_by = part, .order_by = ord, .frame = ir.Frame.default_no_order };
+        }
+    };
+    const src = mk.spec(&.{ "p", "d" }, &.{ .{ .col = "m" }, .{ .col = "x" } });
+    // Covered: exact keys, any order-prefix (including empty — adjacency only).
+    try std.testing.expect(riderCoveredBy(src, mk.spec(&.{ "p", "d" }, &.{ .{ .col = "m" }, .{ .col = "x" } })));
+    try std.testing.expect(riderCoveredBy(src, mk.spec(&.{ "p", "d" }, &.{.{ .col = "m" }})));
+    try std.testing.expect(riderCoveredBy(src, mk.spec(&.{ "p", "d" }, &.{})));
+    // Not covered: partition count/name/position mismatch, order keys past
+    // the source's, a desc flip, or a non-prefix order key.
+    try std.testing.expect(!riderCoveredBy(src, mk.spec(&.{"p"}, &.{.{ .col = "m" }})));
+    try std.testing.expect(!riderCoveredBy(src, mk.spec(&.{ "d", "p" }, &.{.{ .col = "m" }})));
+    try std.testing.expect(!riderCoveredBy(src, mk.spec(&.{ "p", "d" }, &.{ .{ .col = "m" }, .{ .col = "x" }, .{ .col = "y" } })));
+    try std.testing.expect(!riderCoveredBy(src, mk.spec(&.{ "p", "d" }, &.{.{ .col = "m", .desc = true }})));
+    try std.testing.expect(!riderCoveredBy(src, mk.spec(&.{ "p", "d" }, &.{.{ .col = "x" }})));
 }
 
 fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {

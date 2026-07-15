@@ -173,8 +173,9 @@ pub const MaterializedResult = struct {
     /// stage schema's tag (chunk stores are schema-typed); zero-copy
     /// adoption must present the same tags or consumers compiled against
     /// the schema hit the wrong union arm. varchar/string/char share one
-    /// physical layout (offsets + bytes), so the retag is free.
-    fn presentAsSchemaType(v: ColumnView, t: types.Type) ColumnView {
+    /// physical layout (offsets + bytes), so the retag is free. Pub: the
+    /// TVF input borrow re-tags borrowed store views the same way.
+    pub fn presentAsSchemaType(v: ColumnView, t: types.Type) ColumnView {
         const sv = switch (v.data) {
             .varchar, .string, .char, .json => |x| x,
             else => return v,
