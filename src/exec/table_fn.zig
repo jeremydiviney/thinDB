@@ -782,6 +782,9 @@ pub const TableFnExec = struct {
     fn executeMulti(self: *TableFnExec) !void {
         const a = self.allocator;
         const n_in = self.upstreams.len;
+        const trace = getenv("THINDB_TVF_TRACE") != null;
+        const prof = exec.prof;
+        if (trace) std.debug.print("[tvf] multi {s}: {d} inputs\n", .{ self.entry.name, n_in });
 
         const Drained = struct {
             cols: []ColumnStore,
@@ -813,6 +816,7 @@ pub const TableFnExec = struct {
                 store.* = try ColumnStore.init(a, col.type, col.nullable);
                 inited += 1;
             }
+            const t_drain = if (trace) prof.nowTicks() else 0;
             var up = self.upstreams[i];
             while (try up.next()) |batch| {
                 for (self.input_maps[i], cols) |ui, *store| {
@@ -820,6 +824,9 @@ pub const TableFnExec = struct {
                 }
             }
             const n_rows = cols[0].rowCount();
+            if (trace) std.debug.print("[tvf]   input{d} drain {d} rows: {d:.0}ms\n", .{
+                i, n_rows, prof.ticksToMs(prof.nowTicks() - t_drain),
+            });
             const views = try a.alloc(ColumnView, decl.len);
             errdefer a.free(views);
             for (cols, views) |c, *v| v.* = c.view();
@@ -827,8 +834,12 @@ pub const TableFnExec = struct {
             errdefer a.free(perm);
             for (perm, 0..) |*p, r| p.* = @intCast(r);
             var digests: []u128 = undefined;
+            const t_sort = if (trace) prof.nowTicks() else 0;
+            var sort_path: []const u8 = "none";
             if (self.key_idxs[i].len + self.order_idxs[i].len > 0) {
+                sort_path = "packed";
                 digests = (try self.packedSortFor(views, self.key_idxs[i], self.order_idxs[i], perm)) orelse blk: {
+                    sort_path = "generic-cmp";
                     // Non-packable ORDER BY (multi-column, or a string /
                     // non-int-family column): the generic fallback the
                     // single-input path takes. Digests are computed
@@ -852,11 +863,15 @@ pub const TableFnExec = struct {
                 digests = try a.alloc(u128, n_rows);
                 @memset(digests, 0);
             }
+            if (trace) std.debug.print("[tvf]   input{d} sort ({s}): {d:.0}ms\n", .{
+                i, sort_path, prof.ticksToMs(prof.nowTicks() - t_sort),
+            });
             ins[i] = .{ .cols = cols, .views = views, .perm = perm, .digests = digests };
             drained += 1;
         }
 
         // Per input: digest runs (contiguous in the sorted perm).
+        const t_merge = if (trace) prof.nowTicks() else 0;
         const DRun = struct { digest: u128, start: usize, end: usize };
         const run_lists = try a.alloc([]DRun, n_in);
         var built_lists: usize = 0;
@@ -916,6 +931,9 @@ pub const TableFnExec = struct {
         }
 
         // Execute groups: same claim-loop shape as the single-input path.
+        if (trace) std.debug.print("[tvf]   merge ({d} groups): {d:.0}ms\n", .{
+            groups.items.len, prof.ticksToMs(prof.nowTicks() - t_merge),
+        });
         const allow_parallel = !builtin.is_test or force_parallel_in_tests;
         const n_workers = if (allow_parallel) @min(self.dop, groups.items.len) else 1;
         const views_by_input = try a.alloc([]const ColumnView, n_in);
@@ -926,12 +944,19 @@ pub const TableFnExec = struct {
             views_by_input[i] = ins[i].views;
             perms_by_input[i] = ins[i].perm;
         }
+        const t_kernel = if (trace) prof.nowTicks() else 0;
         if (n_workers <= 1) {
             var runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, self.output_cols);
             defer runner.deinit();
             for (groups.items) |g| _ = try runner.runOne(g);
+            if (trace) std.debug.print("[tvf]   kernel (serial, {d} groups): {d:.0}ms\n", .{
+                groups.items.len, prof.ticksToMs(prof.nowTicks() - t_kernel),
+            });
         } else {
             try self.executeMultiParallel(views_by_input, perms_by_input, groups.items, n_workers);
+            if (trace) std.debug.print("[tvf]   kernel ({d} workers, {d} groups): {d:.0}ms\n", .{
+                n_workers, groups.items.len, prof.ticksToMs(prof.nowTicks() - t_kernel),
+            });
         }
         // Pass-through fill (sources = input 0): groups iterate in ascending
         // merged-digest order and input 0's runs are digest-ascending along
