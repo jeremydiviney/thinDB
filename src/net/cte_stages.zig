@@ -445,7 +445,11 @@ fn collectStages(
             // the window and break the root identity — and with adoption the
             // copy it would save no longer exists.
             const win_root = exec.queryAs(window_op.Window, q);
-            if (win_root == null) q = pruneStageColumns(input, q);
+            // A TVF-rooted body hands its output stores to the stage the
+            // same way (adopt_table_fn) — and like the window case, pruning
+            // would wrap a Project over the root and break its identity.
+            const tvf_root = if (win_root == null) exec.queryAs(exec.table_fn.TableFnExec, q) else null;
+            if (win_root == null and tvf_root == null) q = pruneStageColumns(input, q);
             const stage = try set.addStage(q, input.accountant);
             stage.slice_local = input.dop_cap != null;
             if (stage.slice_local and getenv("THINDB_TRACE_SEP") != null and stage.id < 20) {
@@ -457,6 +461,7 @@ fn collectStages(
                 std.debug.print("[sep] slice-stage#{d} = {s}\n", .{ stage.id, first });
             }
             stage.adopt_window = win_root;
+            stage.adopt_table_fn = tvf_root;
             if (win_root) |wr| {
                 if (wr.borrow_src) |src| {
                     src.registerUse();

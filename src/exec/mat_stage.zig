@@ -29,6 +29,7 @@ const Allocator = std.mem.Allocator;
 
 const exec = @import("exec.zig");
 const window_mod = @import("window.zig");
+const table_fn_mod = @import("table_fn.zig");
 const types = @import("../types.zig");
 const engine = @import("../engine/engine.zig");
 const storage = @import("../storage/storage.zig");
@@ -384,6 +385,11 @@ pub const Stage = struct {
     /// adopts its materialized buffers zero-copy instead of pull-copying
     /// the emit stream.
     adopt_window: ?*window_mod.Window = null,
+    /// TVF-output-as-stage: when the compiled pipeline IS a TableFnExec
+    /// (set via exec.queryAs by the staged compiler), ensureRun adopts its
+    /// output ColumnStores zero-copy instead of pull-copying the emit —
+    /// same contract as adopt_window.
+    adopt_table_fn: ?*table_fn_mod.TableFnExec = null,
     /// Column borrowing: this stage's adopted result contains shallow
     /// references into an upstream stage's contiguous buffers (the window
     /// borrowed its pass-through input columns), so that stage must stay
@@ -454,6 +460,18 @@ pub const Stage = struct {
                 self.reserved_bytes += bytes;
             }
             const ad = try win.adoptBuffers();
+            try res.adoptContiguous(
+                .{ .stores = ad.stores, .arenas = ad.arenas, .arena_backed = ad.arena_backed },
+                ad.rows,
+            );
+        } else if (self.adopt_table_fn) |tf| {
+            try tf.ensureExecuted();
+            if (self.accountant) |acct| {
+                const bytes = row_bytes * @as(usize, @intCast(tf.output_cols[0].rowCount()));
+                try acct.reserve(.materialize, bytes);
+                self.reserved_bytes += bytes;
+            }
+            const ad = try tf.adoptBuffers();
             try res.adoptContiguous(
                 .{ .stores = ad.stores, .arenas = ad.arenas, .arena_backed = ad.arena_backed },
                 ad.rows,

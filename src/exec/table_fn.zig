@@ -81,6 +81,9 @@ pub const TableFnExec = struct {
     col_stats: []exec.ColStat,
     done: bool = false,
     stats_ready: bool = false,
+    /// Output stores handed to an adopting stage (mat_stage) — the stage
+    /// owns their buffers now; deinit must not free them.
+    adopted_out: bool = false,
 
     pub fn create(
         allocator: Allocator,
@@ -219,7 +222,9 @@ pub const TableFnExec = struct {
         self.allocator.free(self.call_args);
         for (self.upstreams) |*up| up.deinit();
         self.allocator.free(self.upstreams);
-        for (self.output_cols) |*c| c.deinit(self.allocator);
+        if (!self.adopted_out) {
+            for (self.output_cols) |*c| c.deinit(self.allocator);
+        }
         self.allocator.free(self.output_cols);
         self.allocator.free(self.views);
         self.allocator.free(self.col_stats);
@@ -307,6 +312,7 @@ pub const TableFnExec = struct {
     }
 
     pub fn next(self: *TableFnExec) !?Batch {
+        std.debug.assert(!self.adopted_out);
         if (self.done) return null;
         self.done = true;
         try self.execute();
@@ -319,6 +325,46 @@ pub const TableFnExec = struct {
         };
     }
 
+    /// Buffers handed to an adopting stage (mat_stage.Stage.adopt_table_fn):
+    /// one contiguous column per output-schema slot. Not arena-backed — the
+    /// new owner deinits each store with its (same-lineage) allocator.
+    pub const AdoptedBuffers = struct {
+        stores: []ColumnStore,
+        arenas: []std.heap.ArenaAllocator,
+        arena_backed: []bool,
+        rows: u64,
+    };
+
+    /// Run the whole pipeline without emitting (the adopting stage's
+    /// barrier calls this instead of pulling `next()`).
+    pub fn ensureExecuted(self: *TableFnExec) !void {
+        if (self.done) return;
+        self.done = true;
+        try self.execute();
+    }
+
+    /// Ownership handover for TVF-output-as-stage: the operator's output
+    /// IS the stage content, so move the stores out instead of letting the
+    /// stage pull-copy 3M-row batches. Leaves the operator emitting nothing
+    /// (deinit stays uniform via `adopted_out`).
+    pub fn adoptBuffers(self: *TableFnExec) !AdoptedBuffers {
+        std.debug.assert(self.done and !self.adopted_out);
+        const stores = try self.allocator.alloc(ColumnStore, self.output_cols.len);
+        errdefer self.allocator.free(stores);
+        const arena_backed = try self.allocator.alloc(bool, self.output_cols.len);
+        errdefer self.allocator.free(arena_backed);
+        @memset(arena_backed, false);
+        const arenas = try self.allocator.alloc(std.heap.ArenaAllocator, 0);
+        @memcpy(stores, self.output_cols);
+        self.adopted_out = true;
+        return .{
+            .stores = stores,
+            .arenas = arenas,
+            .arena_backed = arena_backed,
+            .rows = self.output_cols[0].rowCount(),
+        };
+    }
+
     fn execute(self: *TableFnExec) !void {
         if (self.upstreams.len > 1) return self.executeMulti();
         const prof = exec.prof;
@@ -327,20 +373,82 @@ pub const TableFnExec = struct {
         const n_cols = self.entry.input_schemas[0].len;
 
         // Drain the input into buffers laid out in DECLARED column order.
-        var input_cols = try self.allocator.alloc(ColumnStore, n_cols);
-        var inited: usize = 0;
+        // Per-column arenas make the parallel per-batch column copies
+        // race-free (the #108 window fused-drain protocol); the upstream
+        // pull itself stays on this thread — batches are only valid until
+        // the next pull, so produce and copy can't overlap.
+        const drain_backing = if (builtin.is_test) self.allocator else std.heap.c_allocator;
+        const drain_arenas = try self.allocator.alloc(std.heap.ArenaAllocator, n_cols);
+        var arenas_inited: usize = 0;
         defer {
-            for (input_cols[0..inited]) |*c| c.deinit(self.allocator);
-            self.allocator.free(input_cols);
+            for (drain_arenas[0..arenas_inited]) |*a| a.deinit();
+            self.allocator.free(drain_arenas);
         }
-        for (self.entry.input_schemas[0], input_cols) |col, *store| {
-            store.* = try ColumnStore.init(self.allocator, col.type, col.nullable);
-            inited += 1;
+        for (drain_arenas) |*a| {
+            a.* = std.heap.ArenaAllocator.init(drain_backing);
+            arenas_inited += 1;
         }
-        while (try self.upstream.next()) |batch| {
-            for (self.input_map, input_cols) |ui, *store| {
-                try transform.appendAllColumn(self.allocator, batch.values[ui], store);
+        const input_cols = try self.allocator.alloc(ColumnStore, n_cols);
+        defer self.allocator.free(input_cols);
+        for (self.entry.input_schemas[0], input_cols, drain_arenas) |col, *store, *arena| {
+            store.* = try ColumnStore.init(arena.allocator(), col.type, col.nullable);
+        }
+
+        var dp = DrainPar{ .op = self, .arenas = drain_arenas, .stores = input_cols };
+        var dworkers: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
+        var n_dworkers: usize = 0;
+        var max_tiles: usize = 1;
+        if (self.dop > 1 and n_cols >= 2 and (!builtin.is_test or force_parallel_in_tests)) {
+            const want = @min(@min(self.dop - 1, n_cols - 1), max_drain_workers);
+            while (n_dworkers < want) {
+                dworkers[n_dworkers] = std.Thread.spawn(.{}, DrainPar.worker, .{&dp}) catch break;
+                n_dworkers += 1;
             }
+            dp.parked.store(n_dworkers, .release);
+            max_tiles = (n_dworkers + 1) * 2;
+            dp.preps = try self.allocator.alloc(transform.PreparedAppend, n_cols);
+            dp.bounds = try self.allocator.alloc(usize, max_tiles + 1);
+        }
+        defer {
+            dp.stop.store(true, .release);
+            for (dworkers[0..n_dworkers]) |maybe| if (maybe) |t| t.join();
+            if (dp.preps.len > 0) self.allocator.free(dp.preps);
+            if (dp.bounds.len > 0) self.allocator.free(dp.bounds);
+        }
+        var accumulated: usize = 0;
+        while (try self.upstream.next()) |batch| {
+            if (n_dworkers > 0) {
+                dp.batch = batch;
+                dp.runPhase(.prepare, n_cols, n_dworkers);
+                if (dp.failed.load(.acquire)) return error.OutOfMemory;
+                // Row tiles on absolute 8-row boundaries: the first bound
+                // absorbs the base misalignment so no two tiles share a
+                // destination validity byte.
+                const n = batch.row_count;
+                const pad = (8 - (accumulated % 8)) % 8;
+                const step = ((n / max_tiles) + 8) & ~@as(usize, 7);
+                var nt: usize = 0;
+                dp.bounds[0] = 0;
+                while (dp.bounds[nt] < n) {
+                    const next_b = @min(n, if (nt == 0) pad + step else dp.bounds[nt] + step);
+                    nt += 1;
+                    dp.bounds[nt] = @max(next_b, dp.bounds[nt - 1] + 1);
+                    if (dp.bounds[nt] > n) dp.bounds[nt] = n;
+                }
+                dp.n_tiles = nt;
+                dp.runPhase(.write, n_cols * nt, n_dworkers);
+                // Rare non-positional columns take the classic serial
+                // append — single caller, own arena.
+                for (input_cols, drain_arenas, self.input_map, 0..) |*store, *arena, ui, ci| {
+                    if (dp.preps[ci].positional) continue;
+                    try transform.appendColumnRange(arena.allocator(), batch.values[ui], 0, n, store);
+                }
+            } else {
+                for (self.input_map, input_cols, drain_arenas) |ui, *store, *arena| {
+                    try transform.appendAllColumn(arena.allocator(), batch.values[ui], store);
+                }
+            }
+            accumulated += batch.row_count;
         }
         const n_rows = input_cols[0].rowCount();
         if (trace) {
@@ -868,6 +976,133 @@ pub const TableFnExec = struct {
     };
 
     const Run = struct { start: usize, end: usize };
+
+    /// Most drain-copy threads worth spawning: memcpy saturates memory
+    /// bandwidth well below core count, and each thread only helps while
+    /// there are unclaimed columns.
+    const max_drain_workers: usize = 7;
+
+    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+
+    fn sleepBriefly() void {
+        switch (builtin.os.tag) {
+            .windows => Sleep(1),
+            .linux => {
+                const ts = [2]isize{ 0, std.time.ns_per_ms };
+                _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
+            },
+            else => std.Thread.yield() catch std.atomic.spinLoopHint(),
+        }
+    }
+
+    /// Two-phase parallel per-batch input copy — the window fused-drain
+    /// protocol (#108) adapted to the TVF input drain. Each batch runs two
+    /// claim phases over a unique fetchAdd cursor:
+    ///
+    ///   .prepare — units are COLUMNS: extend each store to its final size
+    ///              (transform.prepareAppend; per-column arenas make the
+    ///              concurrent resizes race-free).
+    ///   .write   — units are (column × row-tile): positional, alloc-free
+    ///              fills. Tile bounds land on absolute 8-row boundaries so
+    ///              no two writers share a validity byte.
+    const DrainPar = struct {
+        op: *TableFnExec,
+        arenas: []std.heap.ArenaAllocator,
+        stores: []ColumnStore,
+        batch: Batch = undefined,
+        preps: []transform.PreparedAppend = &.{},
+        bounds: []usize = &.{},
+        n_tiles: usize = 0,
+        n_units: usize = 0,
+        mode: Mode = .prepare,
+        gen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        unit_cursor: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        units_done: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        parked: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        const Mode = enum { prepare, write };
+
+        fn worker(dp: *DrainPar) void {
+            var seen: usize = 0;
+            while (true) {
+                var spins: usize = 0;
+                while (dp.gen.load(.acquire) == seen) {
+                    if (dp.stop.load(.acquire)) return;
+                    spins += 1;
+                    if (spins < 2048) {
+                        std.atomic.spinLoopHint();
+                    } else if (spins < 4096) {
+                        std.Thread.yield() catch std.atomic.spinLoopHint();
+                    } else {
+                        sleepBriefly();
+                    }
+                }
+                seen = dp.gen.load(.acquire);
+                _ = dp.parked.fetchSub(1, .acq_rel);
+                dp.runUnits();
+                _ = dp.parked.fetchAdd(1, .acq_rel);
+            }
+        }
+
+        fn runUnits(dp: *DrainPar) void {
+            const ncols = dp.stores.len;
+            while (true) {
+                const u = dp.unit_cursor.fetchAdd(1, .acq_rel);
+                if (u >= dp.n_units) return;
+                switch (dp.mode) {
+                    .prepare => {
+                        const ci = u;
+                        dp.preps[ci] = transform.prepareAppend(
+                            dp.arenas[ci].allocator(),
+                            dp.batch.values[dp.op.input_map[ci]],
+                            dp.batch.row_count,
+                            &dp.stores[ci],
+                        ) catch blk: {
+                            dp.failed.store(true, .release);
+                            break :blk .{ .base_row = 0, .positional = false };
+                        };
+                    },
+                    .write => {
+                        // Interleave column-major so concurrent claims walk
+                        // different columns (independent memory streams).
+                        const ci = u % ncols;
+                        const t = u / ncols;
+                        if (dp.preps[ci].positional) {
+                            transform.writeAppendSlice(
+                                dp.batch.values[dp.op.input_map[ci]],
+                                dp.bounds[t],
+                                dp.bounds[t + 1],
+                                &dp.stores[ci],
+                                dp.preps[ci],
+                            );
+                        }
+                    },
+                }
+                _ = dp.units_done.fetchAdd(1, .acq_rel);
+            }
+        }
+
+        /// Publish one phase, participate, and wait for completion + full
+        /// re-park before returning (after which shared state is single-
+        /// owner again).
+        fn runPhase(dp: *DrainPar, mode: Mode, n_units: usize, n_workers: usize) void {
+            dp.mode = mode;
+            dp.n_units = n_units;
+            dp.unit_cursor.store(0, .release);
+            dp.units_done.store(0, .release);
+            _ = dp.gen.fetchAdd(1, .release);
+            dp.runUnits();
+            var spins: usize = 0;
+            while (dp.units_done.load(.acquire) < n_units or
+                dp.parked.load(.acquire) < n_workers)
+            {
+                spins += 1;
+                if (spins < 4096) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+            }
+        }
+    };
 
     /// Where each run's output landed: which worker produced it and the
     /// row range inside that worker's private output stores. Written by
