@@ -828,8 +828,26 @@ pub const TableFnExec = struct {
             for (perm, 0..) |*p, r| p.* = @intCast(r);
             var digests: []u128 = undefined;
             if (self.key_idxs[i].len + self.order_idxs[i].len > 0) {
-                digests = (try self.packedSortFor(views, self.key_idxs[i], self.order_idxs[i], perm)) orelse
-                    return Error.TableFnInputMismatch;
+                digests = (try self.packedSortFor(views, self.key_idxs[i], self.order_idxs[i], perm)) orelse blk: {
+                    // Non-packable ORDER BY (multi-column, or a string /
+                    // non-int-family column): the generic fallback the
+                    // single-input path takes. Digests are computed
+                    // separately (over the PARTITION keys only) so run
+                    // formation and cross-input matching stay byte-
+                    // identical to the packed path; the sort is digest-
+                    // major so each input's run list stays ascending for
+                    // the merge.
+                    const d = try a.alloc(u128, n_rows);
+                    for (d, 0..) |*dg, r| dg.* = keyDigestAt(views, self.key_idxs[i], r);
+                    const mctx = MultiLessCtx{
+                        .digests = d,
+                        .views = views,
+                        .order_idx = self.order_idxs[i],
+                        .order_desc = self.order_desc,
+                    };
+                    std.mem.sortUnstable(u32, perm, mctx, MultiLessCtx.less);
+                    break :blk d;
+                };
             } else {
                 digests = try a.alloc(u128, n_rows);
                 @memset(digests, 0);
@@ -1648,6 +1666,68 @@ pub const TableFnExec = struct {
         }
     };
 
+    /// One row's partition-key digest — the run-matching identity (digest
+    /// equality = key equality, the same contract the wide-key GROUP BY
+    /// relies on engine-wide). Must stay byte-identical between the packed
+    /// sort and the generic multi-input fallback, and across co-partitioned
+    /// inputs (their digests align in the N-way group merge).
+    fn keyDigestAt(views: []const ColumnView, key_idx: []const usize, row: usize) u128 {
+        var h1 = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+        var h2 = std.hash.Wyhash.init(0x517cc1b727220a95);
+        for (key_idx) |ki| {
+            const v = views[ki];
+            if (!v.isValid(row)) {
+                h1.update(&.{0});
+                h2.update(&.{0});
+                continue;
+            }
+            h1.update(&.{1});
+            h2.update(&.{1});
+            switch (v.data) {
+                .varchar, .string, .char, .json => |sv| {
+                    const bytes = sv.rowBytes(row);
+                    h1.update(bytes);
+                    h2.update(bytes);
+                    // Length delimiter: ("ab","c") must not collide
+                    // with ("a","bc").
+                    h1.update(std.mem.asBytes(&bytes.len));
+                    h2.update(std.mem.asBytes(&bytes.len));
+                },
+                inline .int, .bigint, .tinyint, .smallint, .date, .datetime, .largeint, .decimal64, .decimal128, .uuid, .float, .double, .boolean => |s| {
+                    h1.update(std.mem.asBytes(&s[row]));
+                    h2.update(std.mem.asBytes(&s[row]));
+                },
+            }
+        }
+        return (@as(u128, h1.final()) << 64) | h2.final();
+    }
+
+    /// Generic multi-input comparator: partition DIGEST first (run
+    /// formation and the ascending-digest run lists the N-way merge
+    /// depends on must match the packed path exactly), then the order
+    /// columns with the engine's validity-aware ordering (NULLs first
+    /// ascending / last descending), then arrival for a stable tie.
+    const MultiLessCtx = struct {
+        digests: []const u128,
+        views: []const ColumnView,
+        order_idx: []const usize,
+        order_desc: []const bool,
+
+        fn less(ctx: MultiLessCtx, a: u32, b: u32) bool {
+            const da = ctx.digests[a];
+            const db = ctx.digests[b];
+            if (da != db) return da < db;
+            for (ctx.order_idx, ctx.order_desc) |oi, desc| {
+                switch (cmpAt(ctx.views[oi], a, b)) {
+                    .lt => return !desc,
+                    .gt => return desc,
+                    .eq => {},
+                }
+            }
+            return a < b;
+        }
+    };
+
     /// Sort `perm` via packed keys when the shape allows it (any partition
     /// key types; at most ONE order column, int-family ≤64-bit). Returns
     /// false to fall back to the generic comparator.
@@ -1676,34 +1756,7 @@ pub const TableFnExec = struct {
         defer self.allocator.free(keys);
 
         for (keys, 0..) |*k, i| {
-            var h1 = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
-            var h2 = std.hash.Wyhash.init(0x517cc1b727220a95);
-            for (key_idx) |ki| {
-                const v = views[ki];
-                if (!v.isValid(i)) {
-                    h1.update(&.{0});
-                    h2.update(&.{0});
-                    continue;
-                }
-                h1.update(&.{1});
-                h2.update(&.{1});
-                switch (v.data) {
-                    .varchar, .string, .char, .json => |sv| {
-                        const bytes = sv.rowBytes(i);
-                        h1.update(bytes);
-                        h2.update(bytes);
-                        // Length delimiter: ("ab","c") must not collide
-                        // with ("a","bc").
-                        h1.update(std.mem.asBytes(&bytes.len));
-                        h2.update(std.mem.asBytes(&bytes.len));
-                    },
-                    inline .int, .bigint, .tinyint, .smallint, .date, .datetime, .largeint, .decimal64, .decimal128, .uuid, .float, .double, .boolean => |s| {
-                        h1.update(std.mem.asBytes(&s[i]));
-                        h2.update(std.mem.asBytes(&s[i]));
-                    },
-                }
-            }
-            k.digest = (@as(u128, h1.final()) << 64) | h2.final();
+            k.digest = keyDigestAt(views, key_idx, i);
             k.row = @intCast(i);
             if (order_idx.len == 1) {
                 const ov = views[order_idx[0]];

@@ -385,3 +385,170 @@ test "table UDF ordered_output: a same-key window rides the TVF stage" {
         try std.testing.expectEqual(e.prev, row[1]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multi-input generic-sort fallback: ORDER BY shapes packedSortFor declines
+// (multi-column, string, string+date) must run — round 8.5.
+// ---------------------------------------------------------------------------
+
+/// Emits, per group, one row PER INPUT: (g, src, sig) where sig is the
+/// comma-joined `v` values in the exact order the kernel received the
+/// partition — a direct probe of within-partition ORDER BY handling.
+fn orderProbe(
+    ctx: *const thindb.udf.TvfContext,
+    parts: []const thindb.udf.TvfPartition,
+    out: *thindb.udf.TvfOutput,
+) !void {
+    const g: i32 = if (parts[0].keys[0]) |kv| kv.int else -1;
+    for (parts, 0..) |p, src| {
+        var sig: std.ArrayList(u8) = .empty;
+        const vs = p.columns[3].data.bigint;
+        for (0..p.row_count) |r| {
+            if (r > 0) try sig.append(ctx.arena, ',');
+            try sig.print(ctx.arena, "{d}", .{vs[r]});
+        }
+        try out.columns[0].data.int.append(out.allocator, g);
+        try out.columns[1].data.int.append(out.allocator, @intCast(src));
+        switch (out.columns[2].data) {
+            .varchar, .string, .char, .json => |*s| try s.appendValue(out.allocator, sig.items),
+            else => unreachable,
+        }
+    }
+}
+
+const probe_in = [_]thindb.Column{
+    .{ .name = "g", .type = .int },
+    .{ .name = "cur", .type = .string },
+    .{ .name = "d", .type = .date },
+    .{ .name = "v", .type = .bigint },
+};
+const probe_out = [_]thindb.Column{
+    .{ .name = "g", .type = .int },
+    .{ .name = "src", .type = .int },
+    .{ .name = "sig", .type = .string },
+};
+
+fn seedOrderProbe(db: *thindb.Database) !void {
+    const shape = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "g", .type = .int },
+            .{ .name = "cur", .type = .{ .varchar = 8 } },
+            .{ .name = "d", .type = .date },
+            .{ .name = "v", .type = .bigint },
+        },
+        .order_key = &.{"v"},
+        .unique = true,
+    };
+    const vk = [_][]const u8{"v"};
+    const t_opts = thindb.TableOptions{ .order_key = &vk, .unique = true, .row_group_size = 8 };
+    // Scan emits by order_key v — deliberately NOT any tested ORDER BY.
+    const ta = try db.table("ta", shape, t_opts);
+    try ta.insert(&.{
+        .{ .g = @as(i32, 1), .cur = "a", .d = @as(i32, 10), .v = @as(i64, 13) },
+        .{ .g = @as(i32, 1), .cur = "b", .d = @as(i32, 20), .v = @as(i64, 11) },
+        .{ .g = @as(i32, 2), .cur = "c", .d = @as(i32, 10), .v = @as(i64, 14) },
+        .{ .g = @as(i32, 1), .cur = "a", .d = @as(i32, 30), .v = @as(i64, 12) },
+    });
+    try ta.flush();
+    // tb has NO g=2 rows — that group's input-1 partition arrives empty.
+    const tb = try db.table("tb", shape, t_opts);
+    try tb.insert(&.{
+        .{ .g = @as(i32, 1), .cur = "c", .d = @as(i32, 10), .v = @as(i64, 22) },
+        .{ .g = @as(i32, 1), .cur = "a", .d = @as(i32, 20), .v = @as(i64, 21) },
+    });
+    try tb.flush();
+    try db.registerTableUdf(.{
+        .name = "order_probe",
+        .input_schemas = &.{ &probe_in, &probe_in },
+        .output_schema = &probe_out,
+        .execution = .partitioned,
+        .process = orderProbe,
+    });
+}
+
+const ProbeRow = struct { g: i32, src: i32, sig: []const u8 };
+
+fn expectOrderProbe(allocator: std.mem.Allocator, db: *thindb.Database, order_by: []const u8, expected: []const ProbeRow) !void {
+    const sql = try std.fmt.allocPrint(allocator,
+        \\SELECT g, src, sig FROM TABLE(order_probe(
+        \\  (SELECT g, cur, d, v FROM ta),
+        \\  (SELECT g, cur, d, v FROM tb)
+        \\) PARTITION BY g ORDER BY {s})
+    , .{order_by});
+    defer allocator.free(sql);
+    var res = try run(allocator, db, sql);
+    defer res.deinit();
+    var rows: usize = 0;
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            rows += 1;
+            const g = batch.values[0].data.int[i];
+            const src = batch.values[1].data.int[i];
+            const sig = switch (batch.values[2].data) {
+                .varchar, .string, .char, .json => |sv| sv.rowBytes(i),
+                else => unreachable,
+            };
+            for (expected) |e| {
+                if (e.g == g and e.src == src) {
+                    try std.testing.expectEqualStrings(e.sig, sig);
+                    break;
+                }
+            } else return error.TestExpectedEqual;
+        }
+    }
+    try std.testing.expectEqual(expected.len, rows);
+}
+
+fn expectAllOrderShapes(allocator: std.mem.Allocator, db: *thindb.Database) !void {
+    // (a) Two-column int-family ORDER BY (packed sort declines on arity).
+    try expectOrderProbe(allocator, db, "d, v", &.{
+        .{ .g = 1, .src = 0, .sig = "13,11,12" },
+        .{ .g = 1, .src = 1, .sig = "22,21" },
+        .{ .g = 2, .src = 0, .sig = "14" },
+        .{ .g = 2, .src = 1, .sig = "" },
+    });
+    // (b) String ORDER BY (declines on type); the cur="a" tie resolves by
+    // arrival (scan emits by order_key v: 12 before 13).
+    try expectOrderProbe(allocator, db, "cur", &.{
+        .{ .g = 1, .src = 0, .sig = "12,13,11" },
+        .{ .g = 1, .src = 1, .sig = "21,22" },
+        .{ .g = 2, .src = 0, .sig = "14" },
+        .{ .g = 2, .src = 1, .sig = "" },
+    });
+    // (c) String + date ORDER BY: the cur="a" tie now resolves by d.
+    try expectOrderProbe(allocator, db, "cur, d", &.{
+        .{ .g = 1, .src = 0, .sig = "13,12,11" },
+        .{ .g = 1, .src = 1, .sig = "21,22" },
+        .{ .g = 2, .src = 0, .sig = "14" },
+        .{ .g = 2, .src = 1, .sig = "" },
+    });
+}
+
+test "table UDF multi-input: generic-sort ORDER BY shapes (serial)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedOrderProbe(db);
+    try expectAllOrderShapes(allocator, db);
+}
+
+test "table UDF multi-input: generic-sort ORDER BY shapes (parallel)" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seedOrderProbe(db);
+
+    thindb.exec.table_fn.force_parallel_in_tests = true;
+    defer thindb.exec.table_fn.force_parallel_in_tests = false;
+    try expectAllOrderShapes(allocator, db);
+}
