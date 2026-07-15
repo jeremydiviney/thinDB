@@ -113,7 +113,7 @@ fn wrapWindowsInMaterialize(node_arena: Allocator, op: *ir.Op, cse: *const MatCs
             // single-ref (inlining) CTE body still wants the wrap.
             const rep = cse.canon.get(op) orelse op;
             const stages_anyway = (cse.refs.get(rep) orelse 1) > 1 or op.materialize.forced;
-            if (stages_anyway and m.upstream.* == .window) {
+            if (stages_anyway and (m.upstream.* == .window or m.upstream.* == .table_fn)) {
                 try wrapWindowsInMaterialize(node_arena, m.upstream, cse);
             } else {
                 try wrapWindowChild(node_arena, &m.upstream, cse);
@@ -133,7 +133,12 @@ fn wrapWindowsInMaterialize(node_arena: Allocator, op: *ir.Op, cse: *const MatCs
 
 fn wrapWindowChild(node_arena: Allocator, child: **ir.Op, cse: *const MatCse) anyerror!void {
     const c = child.*;
-    if (c.* == .window) {
+    // table_fn gets the same treatment as window: its output is already a
+    // fully materialized buffer, and without a stage everything above it
+    // (joins, computes, downstream window accumulation) degrades to one
+    // serial chain on the connection thread — the stage restores the
+    // parallel buffer-scan seams.
+    if (c.* == .window or c.* == .table_fn) {
         const wrap = try node_arena.create(ir.Op);
         wrap.* = .{ .materialize = .{ .upstream = c, .forced = true } };
         child.* = wrap;
@@ -423,13 +428,14 @@ fn collectStages(
             const prof_stage = forceStageAll() or
                 (stageBarriersOnly() and bodyFormsBarrier(rep.materialize.upstream));
             // Inside a SEPARABLE slice (dop_cap set), the synthetic window
-            // wraps lose their purpose: they exist so DOP>1 chains can
-            // parallel-scan a window's buffered output, but a slice has ONE
-            // serial consumer — staging just adds a full write + re-read of
-            // memory the 12 concurrent slices then fight over. Inline them:
-            // the Window op streams straight into its consumer.
+            // and table_fn wraps lose their purpose: they exist so DOP>1
+            // chains can parallel-scan the op's buffered output, but a slice
+            // has ONE serial consumer — staging just adds a full write +
+            // re-read of memory the 12 concurrent slices then fight over.
+            // Inline them: the op streams straight into its consumer.
             const inline_slice_window = input.dop_cap != null and
-                rep.materialize.upstream.* == .window and single_ref;
+                (rep.materialize.upstream.* == .window or rep.materialize.upstream.* == .table_fn) and
+                single_ref;
             if (inline_slice_window) return;
             if ((single_ref or noStage()) and !rep.materialize.forced and !prof_stage) return;
             const c0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;

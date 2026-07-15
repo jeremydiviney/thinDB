@@ -406,12 +406,73 @@ pub const TableFnExec = struct {
             var runner = try Runner.init(self.allocator, self, input_views, perm, self.output_cols);
             defer runner.deinit();
             for (runs.items) |run| _ = try runner.runOne(run);
-            if (trace and self.entry.passthrough.len > 0) {
-                std.debug.print("[tvf]   passthrough gather: {d:.0}ms\n", .{prof.ticksToMs(runner.pass_ticks)});
-            }
-            return;
+        } else {
+            try self.executeParallel(input_views, perm, runs.items, n_workers);
         }
-        try self.executeParallel(input_views, perm, runs.items, n_workers);
+        try self.gatherPassthrough(input_views, perm, if (allow_parallel) self.dop else 1);
+    }
+
+    /// Materialize pass-through output columns as ONE permuted bulk copy of
+    /// their input sources. Runs are contiguous spans of `perm` processed in
+    /// run order, so the concat of per-run gathers is exactly the full-perm
+    /// gather — and doing it once per column kills the per-run append
+    /// overhead (~3.5s cpu on 240k-run inputs). Columns are gathered in
+    /// parallel: each is an independent destination store.
+    fn gatherPassthrough(self: *TableFnExec, input_views: []const ColumnView, perm: []const u32, dop: usize) !void {
+        const pairs = self.entry.passthrough;
+        if (pairs.len == 0) return;
+        const t0 = exec.prof.nowTicks();
+        const n_workers = @min(dop, pairs.len);
+        if (n_workers <= 1) {
+            for (pairs) |pp| {
+                try transform.appendByIndices(self.allocator, input_views[pp.in_idx], perm, &self.output_cols[pp.out_idx]);
+            }
+        } else {
+            const Ctx2 = struct {
+                op: *TableFnExec,
+                views: []const ColumnView,
+                perm: []const u32,
+                next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+                err: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+                fn main(ctx: *@This()) void {
+                    const ps = ctx.op.entry.passthrough;
+                    while (true) {
+                        const i = ctx.next.fetchAdd(1, .monotonic);
+                        if (i >= ps.len) return;
+                        transform.appendByIndices(
+                            ctx.op.allocator,
+                            ctx.views[ps[i].in_idx],
+                            ctx.perm,
+                            &ctx.op.output_cols[ps[i].out_idx],
+                        ) catch {
+                            ctx.err.store(true, .release);
+                            return;
+                        };
+                    }
+                }
+            };
+            var ctx = Ctx2{ .op = self, .views = input_views, .perm = perm };
+            const threads = try self.allocator.alloc(?std.Thread, n_workers);
+            defer self.allocator.free(threads);
+            @memset(threads, null);
+            for (threads) |*th| th.* = std.Thread.spawn(.{}, Ctx2.main, .{&ctx}) catch null;
+            var spawned: usize = 0;
+            for (threads) |th| {
+                if (th) |t| {
+                    t.join();
+                    spawned += 1;
+                }
+            }
+            if (spawned == 0) Ctx2.main(&ctx);
+            // appendByIndices only fails on allocation.
+            if (ctx.err.load(.acquire)) return error.OutOfMemory;
+        }
+        if (getenv("THINDB_TVF_TRACE") != null) {
+            std.debug.print("[tvf]   passthrough gather: {d:.0}ms wall ({d} cols)\n", .{
+                exec.prof.ticksToMs(exec.prof.nowTicks() - t0), pairs.len,
+            });
+        }
     }
 
     /// One co-grouped partition's spans, one per input (start==end =
@@ -841,7 +902,9 @@ pub const TableFnExec = struct {
                     if (abort.load(.acquire)) return;
                     const r = next_run.fetchAdd(1, .monotonic);
                     if (r >= run_list.len) return;
-                    const before = w.out_stores[0].rowCount();
+                    // Offsets track the first COMPUTED store — pass-through
+                    // private stores stay empty (bulk-gathered afterwards).
+                    const before = w.runner.out_ptrs[0].rowCount();
                     const emitted = w.runner.runOne(run_list[r]) catch |err| {
                         w.err = err;
                         abort.store(true, .release);
@@ -908,25 +971,26 @@ pub const TableFnExec = struct {
         if (getenv("THINDB_TVF_TRACE") != null) {
             var sum: i64 = 0;
             var mx: i64 = 0;
-            var pass_sum: i64 = 0;
             for (workers[0..built]) |*w| {
                 sum += w.runner.kernel_ticks;
                 mx = @max(mx, w.runner.kernel_ticks);
-                pass_sum += w.runner.pass_ticks;
             }
             std.debug.print("[tvf]   kernel: {d:.0}ms wall (busiest worker), {d:.0}ms cpu across {d} workers\n", .{
                 exec.prof.ticksToMs(mx), exec.prof.ticksToMs(sum), built,
             });
-            if (self.entry.passthrough.len > 0) {
-                std.debug.print("[tvf]   passthrough gather: {d:.0}ms cpu\n", .{exec.prof.ticksToMs(pass_sum)});
-            }
         }
         // A claimed-but-never-run slot can only happen on abort; err above
         // covers it. If threads partially spawned, the survivors drained
         // the whole claim range.
 
         // Concatenate per-run segments IN RUN ORDER: output is
-        // deterministic regardless of worker scheduling.
+        // deterministic regardless of worker scheduling. Pass-through
+        // columns are skipped — their private stores are empty and the
+        // operator bulk-gathers them afterwards (gatherPassthrough).
+        const is_pass = try self.allocator.alloc(bool, self.output_cols.len);
+        defer self.allocator.free(is_pass);
+        @memset(is_pass, false);
+        for (self.entry.passthrough) |pp| is_pass[pp.out_idx] = true;
         var idx: std.ArrayList(u32) = .empty;
         defer idx.deinit(self.allocator);
         for (segs) |seg| {
@@ -935,7 +999,8 @@ pub const TableFnExec = struct {
             try idx.ensureTotalCapacity(self.allocator, seg.len);
             for (0..seg.len) |i| idx.appendAssumeCapacity(@intCast(seg.off + i));
             const w = &workers[seg.worker];
-            for (w.out_stores, self.output_cols) |src, *dst| {
+            for (w.out_stores, self.output_cols, is_pass) |src, *dst, skip| {
+                if (skip) continue;
                 try transform.appendByIndices(self.allocator, src.view(), idx.items, dst);
             }
         }
@@ -958,16 +1023,13 @@ pub const TableFnExec = struct {
         part_views: []ColumnView,
         key_vals: []?Value,
         /// Kernel output sink: the COMPUTED output stores only (declared
-        /// order, pass-through columns skipped). The operator fills
-        /// pass-through stores itself in runOne.
+        /// order, pass-through columns skipped). Pass-through stores are
+        /// filled by the operator's bulk gather after all runs complete.
         out_ptrs: []*ColumnStore,
-        out_all: []ColumnStore,
         arena: std.heap.ArenaAllocator,
         /// Ticks spent INSIDE the user kernel (process() calls), for the
         /// THINDB_TVF_TRACE phase breakdown.
         kernel_ticks: i64 = 0,
-        /// Ticks spent gathering pass-through columns into the output.
-        pass_ticks: i64 = 0,
 
         fn init(
             allocator: Allocator,
@@ -1009,7 +1071,6 @@ pub const TableFnExec = struct {
                 .part_views = part_views,
                 .key_vals = key_vals,
                 .out_ptrs = out_ptrs,
-                .out_all = out_stores,
                 .arena = std.heap.ArenaAllocator.init(allocator),
             };
         }
@@ -1068,19 +1129,12 @@ pub const TableFnExec = struct {
             if (op.entry.row_aligned and after - before != n_rows) {
                 return Error.TableFnOutputMismatch;
             }
-            // Pass-through columns: the operator materializes them as
-            // permuted copies of their input sources — the kernel never
-            // touches these stores, so they stay in lockstep with the
-            // computed columns by the row-aligned contract just enforced.
-            if (op.entry.passthrough.len > 0) {
-                const g0 = exec.prof.nowTicks();
-                for (op.entry.passthrough) |pp| {
-                    const dst = &self.out_all[pp.out_idx];
-                    try transform.appendByIndices(self.allocator, self.input_views[pp.in_idx], self.perm[run.start..run.end], dst);
-                    std.debug.assert(dst.rowCount() == after);
-                }
-                self.pass_ticks += exec.prof.nowTicks() - g0;
-            }
+            // Pass-through columns are NOT filled here: runs are contiguous
+            // spans of the sorted permutation processed in run order, so the
+            // concat of per-run gathers IS one full-permutation gather. The
+            // operator does that once per column after all runs complete
+            // (gatherPassthrough) — per-run appends measured ~3.5s cpu of
+            // pure overhead on 240k-run inputs.
             return after - before;
         }
     };
