@@ -45,6 +45,10 @@ pub const RawValue = types.Value;
 pub const TableFnSpec = struct {
     name: []const u8,
     execution: TvfExecution = .either,
+    /// The kernel emits exactly one output row per input row, in partition
+    /// order (the operator validates per partition). Required for
+    /// `passthrough` columns.
+    row_aligned: bool = false,
 };
 
 /// Per-partition context. `arena` is freed after each process() call —
@@ -357,6 +361,8 @@ pub fn Writer(comptime Output: type) type {
     return struct {
         raw: *udf.TvfOutput,
 
+        pub const Row = Output;
+
         const Self = @This();
 
         pub fn row(self: *Self, r: Output) !void {
@@ -500,13 +506,138 @@ fn argsValueFor(comptime Mod: type, raw: []const ?types.Value) Mod.Args {
     return out;
 }
 
+/// Full input-0 field list: `Input` fields, then optional `Carry` fields.
+/// Carry columns are part of the call site's input contract but are never
+/// handed to the kernel — they exist purely as pass-through sources.
+fn fullInputFields(comptime Mod: type) []const std.builtin.Type.StructField {
+    comptime {
+        const base = @typeInfo(Mod.Input).@"struct".fields;
+        if (!@hasDecl(Mod, "Carry")) return base;
+        return base ++ @typeInfo(Mod.Carry).@"struct".fields;
+    }
+}
+
+fn fieldIndexOf(comptime fields: []const std.builtin.Type.StructField, comptime name: []const u8) ?usize {
+    comptime {
+        for (fields, 0..) |f, i| {
+            if (std.mem.eql(u8, f.name, name)) return i;
+        }
+        return null;
+    }
+}
+
+fn isPassthroughField(comptime Mod: type, comptime name: []const u8) bool {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        if (!@hasDecl(Mod, "passthrough")) return false;
+        for (0..Mod.passthrough.len) |k| {
+            if (std.mem.eql(u8, Mod.passthrough[k], name)) return true;
+        }
+        return false;
+    }
+}
+
+/// `Output` minus the pass-through fields, in declaration order — the row
+/// shape the kernel's `Writer` emits. Without a `passthrough` declaration
+/// this is `Output` itself.
+pub fn ComputedOutput(comptime Mod: type) type {
+    if (!@hasDecl(Mod, "passthrough")) return Mod.Output;
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        const all = @typeInfo(Mod.Output).@"struct".fields;
+        var names: [all.len][]const u8 = undefined;
+        var field_types: [all.len]type = undefined;
+        var n: usize = 0;
+        for (all) |f| {
+            if (!isPassthroughField(Mod, f.name)) {
+                names[n] = f.name;
+                field_types[n] = f.type;
+                n += 1;
+            }
+        }
+        if (n == 0) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+            "': every output column is pass-through — the kernel must compute something");
+        const kept_names = names[0..n].*;
+        const kept_types = field_types[0..n].*;
+        const attrs: [n]std.builtin.Type.StructField.Attributes = @splat(.{});
+        return @Struct(.auto, null, &kept_names, &kept_types, &attrs);
+    }
+}
+
+fn passPairsFor(comptime Mod: type) []const udf.PassPair {
+    const result = comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        if (!@hasDecl(Mod, "passthrough")) break :blk &[_]udf.PassPair{};
+        if (!Mod.spec.row_aligned) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+            "': `passthrough` requires `spec.row_aligned = true`");
+        if (inputTypesOf(Mod).len != 1) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+            "': `passthrough` requires a single input table");
+        const out_fields = @typeInfo(Mod.Output).@"struct".fields;
+        const in_fields = fullInputFields(Mod);
+        var pairs: [Mod.passthrough.len]udf.PassPair = undefined;
+        for (0..Mod.passthrough.len) |k| {
+            const name: []const u8 = Mod.passthrough[k];
+            const oi = fieldIndexOf(out_fields, name) orelse
+                @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+                    "': passthrough field '" ++ name ++ "' is not an Output field");
+            const ii = fieldIndexOf(in_fields, name) orelse
+                @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+                    "': passthrough field '" ++ name ++ "' is not an Input/Carry field");
+            if (out_fields[oi].type != in_fields[ii].type)
+                @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+                    "': passthrough field '" ++ name ++ "' has different Input and Output types");
+            pairs[k] = .{ .out_idx = oi, .in_idx = ii };
+        }
+        const frozen = pairs;
+        break :blk &frozen;
+    };
+    return result;
+}
+
+fn kernelInputCols(comptime Mod: type) u32 {
+    const n = comptime blk: {
+        if (!@hasDecl(Mod, "Carry")) break :blk 0;
+        if (inputTypesOf(Mod).len != 1) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+            "': `Carry` requires a single input table");
+        break :blk @typeInfo(Mod.Input).@"struct".fields.len;
+    };
+    return n;
+}
+
+/// The writer row type the module's process() declares must match the
+/// computed output shape (Output minus pass-through) field-for-field —
+/// the operator hands the kernel dense stores in exactly that order.
+fn assertWriterShape(comptime Mod: type, comptime DeclaredRow: type) void {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        const want = @typeInfo(ComputedOutput(Mod)).@"struct".fields;
+        const got = @typeInfo(DeclaredRow).@"struct".fields;
+        if (want.len != got.len) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+            "': process()'s Writer row must have exactly the non-pass-through Output fields");
+        for (want, got) |w, g| {
+            if (!std.mem.eql(u8, w.name, g.name) or w.type != g.type)
+                @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+                    "': Writer field '" ++ g.name ++ "' does not match Output field '" ++
+                    w.name ++ "' (non-pass-through Output fields, in declaration order)");
+        }
+    }
+}
+
 pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
     const inputs = comptime inputTypesOf(Mod);
     const S = struct {
+        const in0_full: []const types.Column = if (@hasDecl(Mod, "Carry")) blk: {
+            const full = schemaFor(inputs[0]) ++ schemaFor(Mod.Carry);
+            break :blk &full;
+        } else blk: {
+            const base = schemaFor(inputs[0]);
+            break :blk &base;
+        };
         const input_schemas = blk: {
             var out: [inputs.len][]const types.Column = undefined;
-            for (inputs, 0..) |T, i| {
-                const cols = schemaFor(T);
+            out[0] = in0_full;
+            for (1..inputs.len) |i| {
+                const cols = schemaFor(inputs[i]);
                 out[i] = &cols;
             }
             break :blk out;
@@ -515,16 +646,22 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
 
         const has_args = @hasDecl(Mod, "Args");
 
+        const CallArgs = std.meta.ArgsTuple(@TypeOf(Mod.process));
+        const arg_ofs = if (has_args) 1 else 0;
+        const WriterT = @typeInfo(
+            @typeInfo(CallArgs).@"struct".fields[inputs.len + 1 + arg_ofs].type,
+        ).pointer.child;
+
         fn trampoline(
             raw_ctx: *const udf.TvfContext,
             parts: []const udf.TvfPartition,
             out: *udf.TvfOutput,
         ) anyerror!void {
             std.debug.assert(parts.len == inputs.len);
+            comptime assertWriterShape(Mod, WriterT.Row);
             var ctx = Ctx{ .arena = raw_ctx.arena, .user_data = raw_ctx.user_data };
-            var w = Writer(Mod.Output){ .raw = out };
+            var w = WriterT{ .raw = out };
             // Build (ctx, [args,] p1, p2, ..., writer) and call process.
-            const arg_ofs = if (has_args) 1 else 0;
             var call: CallArgs = undefined;
             call.@"0" = &ctx;
             if (has_args) {
@@ -537,8 +674,6 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
             @field(call, std.fmt.comptimePrint("{d}", .{inputs.len + 1 + arg_ofs})) = &w;
             try @call(.auto, Mod.process, call);
         }
-
-        const CallArgs = std.meta.ArgsTuple(@TypeOf(Mod.process));
     };
     return .{
         .name = Mod.spec.name,
@@ -546,6 +681,9 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
         .output_schema = &S.output,
         .execution = Mod.spec.execution,
         .arg_types = argTypesFor(Mod),
+        .row_aligned = Mod.spec.row_aligned,
+        .passthrough = passPairsFor(Mod),
+        .kernel_input_cols = kernelInputCols(Mod),
         .process = S.trampoline,
     };
 }

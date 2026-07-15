@@ -406,6 +406,9 @@ pub const TableFnExec = struct {
             var runner = try Runner.init(self.allocator, self, input_views, perm, self.output_cols);
             defer runner.deinit();
             for (runs.items) |run| _ = try runner.runOne(run);
+            if (trace and self.entry.passthrough.len > 0) {
+                std.debug.print("[tvf]   passthrough gather: {d:.0}ms\n", .{prof.ticksToMs(runner.pass_ticks)});
+            }
             return;
         }
         try self.executeParallel(input_views, perm, runs.items, n_workers);
@@ -421,6 +424,8 @@ pub const TableFnExec = struct {
     /// kernel once per group with one ALIGNED partition per input.
     /// GLOBAL (no keys): one group holding every input whole.
     fn executeMulti(self: *TableFnExec) !void {
+        // registerTable rejects passthrough on multi-input functions.
+        std.debug.assert(self.entry.passthrough.len == 0);
         const a = self.allocator;
         const n_in = self.upstreams.len;
 
@@ -903,13 +908,18 @@ pub const TableFnExec = struct {
         if (getenv("THINDB_TVF_TRACE") != null) {
             var sum: i64 = 0;
             var mx: i64 = 0;
+            var pass_sum: i64 = 0;
             for (workers[0..built]) |*w| {
                 sum += w.runner.kernel_ticks;
                 mx = @max(mx, w.runner.kernel_ticks);
+                pass_sum += w.runner.pass_ticks;
             }
             std.debug.print("[tvf]   kernel: {d:.0}ms wall (busiest worker), {d:.0}ms cpu across {d} workers\n", .{
                 exec.prof.ticksToMs(mx), exec.prof.ticksToMs(sum), built,
             });
+            if (self.entry.passthrough.len > 0) {
+                std.debug.print("[tvf]   passthrough gather: {d:.0}ms cpu\n", .{exec.prof.ticksToMs(pass_sum)});
+            }
         }
         // A claimed-but-never-run slot can only happen on abort; err above
         // covers it. If threads partially spawned, the survivors drained
@@ -941,14 +951,23 @@ pub const TableFnExec = struct {
         op: *const TableFnExec,
         input_views: []const ColumnView,
         perm: []const u32,
+        /// Gathered per-run buffers for the KERNEL-VISIBLE input columns
+        /// (the first `entry.kernel_input_cols`); carry columns past that
+        /// are pass-through sources only and never reach the kernel.
         scratch: []ColumnStore,
         part_views: []ColumnView,
         key_vals: []?Value,
+        /// Kernel output sink: the COMPUTED output stores only (declared
+        /// order, pass-through columns skipped). The operator fills
+        /// pass-through stores itself in runOne.
         out_ptrs: []*ColumnStore,
+        out_all: []ColumnStore,
         arena: std.heap.ArenaAllocator,
         /// Ticks spent INSIDE the user kernel (process() calls), for the
         /// THINDB_TVF_TRACE phase breakdown.
         kernel_ticks: i64 = 0,
+        /// Ticks spent gathering pass-through columns into the output.
+        pass_ticks: i64 = 0,
 
         fn init(
             allocator: Allocator,
@@ -957,22 +976,30 @@ pub const TableFnExec = struct {
             perm: []const u32,
             out_stores: []ColumnStore,
         ) !Runner {
-            const n_cols = op.entry.input_schemas[0].len;
-            const scratch = try allocator.alloc(ColumnStore, n_cols);
+            const n_kernel: usize = op.entry.kernel_input_cols;
+            const scratch = try allocator.alloc(ColumnStore, n_kernel);
             errdefer allocator.free(scratch);
             var inited: usize = 0;
             errdefer for (scratch[0..inited]) |*c| c.deinit(allocator);
-            for (op.entry.input_schemas[0], scratch) |col, *store| {
+            for (op.entry.input_schemas[0][0..n_kernel], scratch) |col, *store| {
                 store.* = try ColumnStore.init(allocator, col.type, col.nullable);
                 inited += 1;
             }
-            const part_views = try allocator.alloc(ColumnView, n_cols);
+            const part_views = try allocator.alloc(ColumnView, n_kernel);
             errdefer allocator.free(part_views);
             const key_vals = try allocator.alloc(?Value, op.key_idx.len);
             errdefer allocator.free(key_vals);
-            const out_ptrs = try allocator.alloc(*ColumnStore, out_stores.len);
+            const out_ptrs = try allocator.alloc(*ColumnStore, out_stores.len - op.entry.passthrough.len);
             errdefer allocator.free(out_ptrs);
-            for (out_stores, out_ptrs) |*c, *slot| slot.* = c;
+            var n_computed: usize = 0;
+            outer: for (out_stores, 0..) |*c, i| {
+                for (op.entry.passthrough) |pp| {
+                    if (pp.out_idx == i) continue :outer;
+                }
+                out_ptrs[n_computed] = c;
+                n_computed += 1;
+            }
+            std.debug.assert(n_computed == out_ptrs.len);
             return .{
                 .allocator = allocator,
                 .op = op,
@@ -982,6 +1009,7 @@ pub const TableFnExec = struct {
                 .part_views = part_views,
                 .key_vals = key_vals,
                 .out_ptrs = out_ptrs,
+                .out_all = out_stores,
                 .arena = std.heap.ArenaAllocator.init(allocator),
             };
         }
@@ -1001,7 +1029,7 @@ pub const TableFnExec = struct {
             // per-run store realloc + arena create were ~26µs/run of pure
             // overhead (6.1s of the flagship's 13.3s).
             for (self.scratch) |*store| store.clear();
-            for (self.input_views, self.scratch) |v, *store| {
+            for (self.input_views[0..self.scratch.len], self.scratch) |v, *store| {
                 try transform.appendByIndices(self.allocator, v, self.perm[run.start..run.end], store);
             }
             for (self.scratch, self.part_views) |c, *v| v.* = c.view();
@@ -1035,6 +1063,23 @@ pub const TableFnExec = struct {
             const after = self.out_ptrs[0].rowCount();
             for (self.out_ptrs[1..]) |c| {
                 if (c.rowCount() != after) return Error.TableFnOutputMismatch;
+            }
+            const n_rows = run.end - run.start;
+            if (op.entry.row_aligned and after - before != n_rows) {
+                return Error.TableFnOutputMismatch;
+            }
+            // Pass-through columns: the operator materializes them as
+            // permuted copies of their input sources — the kernel never
+            // touches these stores, so they stay in lockstep with the
+            // computed columns by the row-aligned contract just enforced.
+            if (op.entry.passthrough.len > 0) {
+                const g0 = exec.prof.nowTicks();
+                for (op.entry.passthrough) |pp| {
+                    const dst = &self.out_all[pp.out_idx];
+                    try transform.appendByIndices(self.allocator, self.input_views[pp.in_idx], self.perm[run.start..run.end], dst);
+                    std.debug.assert(dst.rowCount() == after);
+                }
+                self.pass_ticks += exec.prof.nowTicks() - g0;
             }
             return after - before;
         }

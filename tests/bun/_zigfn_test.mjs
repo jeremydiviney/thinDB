@@ -112,6 +112,39 @@ const rows3 = await q("dll-call", "SELECT running FROM TABLE(zt_running((SELECT 
 const got3 = rows3 ? rows3.map(r => Number(r.running)).join(",") : "";
 if (got3 !== "20,60,80,120,180") { console.log(`dll-values: FAIL (${got3})`); failed++; } else console.log("dll-values: OK");
 await q("dll-drop", "DROP FUNCTION zt_running");
+// Pass-through tier: narrow kernel (Input) + carried columns (Carry) with
+// operator-filled pass-through outputs; row_aligned enforced by the
+// create-time validation subprocess.
+const src_pass = `
+const tdb = @import("tdb");
+pub const spec = tdb.TableFnSpec{ .name = "zt_pass", .execution = .partitioned, .row_aligned = true };
+pub const Input = struct { id: ?i64, g: ?i32, amt: ?i64 };
+pub const Carry = struct { note: ?[]const u8 };
+pub const passthrough = .{ "id", "g", "note" };
+pub const Output = struct { id: ?i64, g: ?i32, note: ?[]const u8, running: i64 };
+pub const Computed = struct { running: i64 };
+pub fn process(ctx: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Computed)) !void {
+    _ = ctx;
+    const amts = p.col(.amt);
+    var running: i64 = 0;
+    for (0..p.len) |i| {
+        running += amts.get(i) orelse 0;
+        try out.row(.{ .running = running });
+    }
+}
+`;
+await q("pass-create", "CREATE OR REPLACE FUNCTION zt_pass LANGUAGE zig AS $$" + src_pass + "$$");
+const rows6 = await q("pass-call",
+  "SELECT id, g, note, running FROM TABLE(zt_pass((SELECT id, g, amt, CASE WHEN g = 1 THEN 'one' END AS note FROM zt)) PARTITION BY g ORDER BY id) ORDER BY id");
+const got6 = rows6 ? rows6.map(r => `${r.id}:${r.g}:${r.note}:${r.running}`).join(",") : "";
+if (got6 !== "1:1:one:10,2:1:one:30,3:1:one:60,4:2:null:40,5:2:null:90") { console.log(`pass-values: FAIL (${got6})`); failed++; } else console.log("pass-values: OK");
+await q("pass-drop", "DROP FUNCTION zt_pass");
+const src_misaligned = src_pass
+  .replace('.name = "zt_pass"', '.name = "zt_bad_pass"')
+  .replace("for (0..p.len) |i| {", "for (0..p.len - 1) |i| {");
+await q("pass-misaligned",
+  "CREATE OR REPLACE FUNCTION zt_bad_pass LANGUAGE zig AS $$" + src_misaligned + "$$",
+  "FunctionInvalidDefinition");
 await c.end();
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILURES`);
 process.exit(failed === 0 ? 0 : 1);

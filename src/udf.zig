@@ -184,6 +184,12 @@ pub const TvfProcess = *const fn (
 /// against `input_schema` name-for-name/type-for-type and reports
 /// `output_schema` downstream, and the operator hands the callback
 /// exactly the declared columns.
+/// One operator-filled output column: `out_idx` (into output_schema) is
+/// materialized by the operator as a permuted copy of input column
+/// `in_idx` (into input_schemas[0]) — the kernel never sees or emits it.
+/// Requires `row_aligned` (single-input only).
+pub const PassPair = struct { out_idx: u32, in_idx: u32 };
+
 pub const TableUdf = struct {
     name: []const u8,
     /// Declared input tables, each a column list in the order the callback
@@ -194,6 +200,18 @@ pub const TableUdf = struct {
     execution: TvfExecution = .either,
     /// Declared scalar argument types, in call order (empty = none).
     arg_types: []const types.Type = &.{},
+    /// The callback emits exactly one output row per input row, in
+    /// partition order (validated per partition). Unlocks pass-through.
+    row_aligned: bool = false,
+    /// Operator-filled pass-through columns (requires row_aligned). The
+    /// callback receives views for only the first
+    /// `kernel_input_cols` input columns and output stores for only the
+    /// non-pass-through output columns (dense, in declared order).
+    passthrough: []const PassPair = &.{},
+    /// How many leading input columns the callback reads. Columns past
+    /// this exist purely as pass-through sources ("carry" columns).
+    /// 0 = all of input_schemas[0] (no carry split).
+    kernel_input_cols: u32 = 0,
     process: TvfProcess,
     user_data: ?*anyopaque = null,
 };
@@ -204,6 +222,9 @@ pub const TableEntry = struct {
     output_schema: []const types.Column,
     execution: TvfExecution,
     arg_types: []const types.Type,
+    row_aligned: bool,
+    passthrough: []const PassPair,
+    kernel_input_cols: u32,
     process: TvfProcess,
     user_data: ?*anyopaque,
 };
@@ -535,6 +556,7 @@ pub const UdfRegistry = struct {
             self.allocator.free(entry.input_schemas);
             freeColumns(self.allocator, entry.output_schema);
             self.allocator.free(entry.arg_types);
+            self.allocator.free(entry.passthrough);
         }
         self.tables.deinit(self.allocator);
         self.* = undefined;
@@ -568,6 +590,31 @@ pub const UdfRegistry = struct {
         for (udf.input_schemas) |cols| {
             if (cols.len == 0) return Error.FunctionInvalidDefinition;
         }
+        if (udf.passthrough.len > 0) {
+            // Pass-through requires row alignment, a single input, at least
+            // one kernel-computed output column, and every pair must
+            // reference real columns with matching types.
+            if (!udf.row_aligned or udf.input_schemas.len != 1) {
+                return Error.FunctionInvalidDefinition;
+            }
+            if (udf.passthrough.len >= udf.output_schema.len) {
+                return Error.FunctionInvalidDefinition;
+            }
+            const in_cols = udf.input_schemas[0];
+            for (udf.passthrough) |pp| {
+                if (pp.out_idx >= udf.output_schema.len or pp.in_idx >= in_cols.len) {
+                    return Error.FunctionInvalidDefinition;
+                }
+                const oc = udf.output_schema[pp.out_idx];
+                const ic = in_cols[pp.in_idx];
+                if (!std.meta.eql(oc.type, ic.type) or oc.nullable != ic.nullable) {
+                    return Error.FunctionInvalidDefinition;
+                }
+            }
+        }
+        if (udf.kernel_input_cols > udf.input_schemas[0].len) {
+            return Error.FunctionInvalidDefinition;
+        }
         if (self.tableByName(udf.name) != null) return Error.FunctionAlreadyExists;
 
         const name = try lowerName(self.allocator, udf.name);
@@ -586,12 +633,20 @@ pub const UdfRegistry = struct {
         errdefer freeColumns(self.allocator, output_schema);
         const arg_types = try self.allocator.dupe(types.Type, udf.arg_types);
         errdefer self.allocator.free(arg_types);
+        const passthrough = try self.allocator.dupe(PassPair, udf.passthrough);
+        errdefer self.allocator.free(passthrough);
         try self.tables.append(self.allocator, .{
             .name = name,
             .input_schemas = input_schemas,
             .output_schema = output_schema,
             .execution = udf.execution,
             .arg_types = arg_types,
+            .row_aligned = udf.row_aligned,
+            .passthrough = passthrough,
+            .kernel_input_cols = if (udf.kernel_input_cols == 0)
+                @intCast(udf.input_schemas[0].len)
+            else
+                udf.kernel_input_cols,
             .process = udf.process,
             .user_data = udf.user_data,
         });
@@ -605,6 +660,7 @@ pub const UdfRegistry = struct {
                 self.allocator.free(entry.input_schemas);
                 freeColumns(self.allocator, entry.output_schema);
                 self.allocator.free(entry.arg_types);
+                self.allocator.free(entry.passthrough);
                 _ = self.tables.swapRemove(i);
                 return true;
             }

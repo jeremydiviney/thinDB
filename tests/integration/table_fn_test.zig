@@ -746,3 +746,184 @@ test "table UDF: input shape violations are compile errors" {
         thindb.exec.Error.TableFnInputMismatch,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pass-through: narrow kernel + operator-filled carry columns. The kernel
+// declares only the columns it reads (Input), carries the rest (Carry), and
+// the operator materializes pass-through output columns itself.
+// ---------------------------------------------------------------------------
+
+const sdk_pass_running = struct {
+    pub const spec = tdb.TableFnSpec{ .name = "sdk_pass_running", .execution = .partitioned, .row_aligned = true };
+    pub const Input = struct { id: i64, g: i32, amt: i64 };
+    pub const Carry = struct { label: ?[]const u8, factor: ?i64 };
+    pub const passthrough = .{ "id", "g", "label", "factor" };
+    pub const Output = struct {
+        id: i64,
+        g: i32,
+        label: ?[]const u8,
+        factor: ?i64,
+        running: i64,
+    };
+    pub const Computed = struct { running: i64 };
+
+    pub fn process(ctx: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Computed)) !void {
+        _ = ctx;
+        const amts = p.col(.amt);
+        var running: i64 = 0;
+        for (0..p.len) |i| {
+            running += amts[i];
+            try out.row(.{ .running = running });
+        }
+    }
+};
+
+fn expectPassRunning(allocator: std.mem.Allocator, db: *thindb.Database) !void {
+    // Carry columns synthesized in the input subquery: a nullable string
+    // (NULL for g=2) and a derived bigint.
+    var res = try run(allocator, db,
+        \\SELECT id, g, label, factor, running
+        \\FROM TABLE(sdk_pass_running((
+        \\  SELECT id, g, amt, CASE WHEN g = 1 THEN 'one' END AS label, id * 10 AS factor FROM t
+        \\)) PARTITION BY g ORDER BY id)
+    );
+    defer res.deinit();
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    var runnings: std.ArrayList(i64) = .empty;
+    defer runnings.deinit(allocator);
+    var factors: std.ArrayList(i64) = .empty;
+    defer factors.deinit(allocator);
+    var labels_null: std.ArrayList(bool) = .empty;
+    defer labels_null.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try ids.append(allocator, batch.values[0].data.bigint[i]);
+            try labels_null.append(allocator, !batch.values[2].isValid(i));
+            try factors.append(allocator, batch.values[3].data.bigint[i]);
+            try runnings.append(allocator, batch.values[4].data.bigint[i]);
+        }
+    }
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4, 5 }, ids.items);
+    try std.testing.expectEqualSlices(i64, &.{ 10, 30, 60, 40, 90 }, runnings.items);
+    try std.testing.expectEqualSlices(i64, &.{ 10, 20, 30, 40, 50 }, factors.items);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, true, true }, labels_null.items);
+}
+
+test "table UDF passthrough: carry columns are operator-filled (serial)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try db.registerTableFn(sdk_pass_running);
+    try expectPassRunning(allocator, db);
+}
+
+test "table UDF passthrough: parallel matches serial" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seed(db);
+    try db.registerTableFn(sdk_pass_running);
+
+    thindb.exec.table_fn.force_parallel_in_tests = true;
+    defer thindb.exec.table_fn.force_parallel_in_tests = false;
+    try expectPassRunning(allocator, db);
+}
+
+const sdk_misaligned = struct {
+    pub const spec = tdb.TableFnSpec{ .name = "sdk_misaligned", .execution = .partitioned, .row_aligned = true };
+    pub const Input = struct { id: i64, g: i32, amt: i64 };
+    pub const Output = struct { id: i64, running: i64 };
+
+    pub fn process(ctx: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+        _ = ctx;
+        const ids = p.col(.id);
+        // Deliberately drops the last row of every partition.
+        for (0..p.len - 1) |i| {
+            try out.row(.{ .id = ids[i], .running = 0 });
+        }
+    }
+};
+
+test "table UDF row_aligned: emitting fewer rows than the partition fails" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try db.registerTableFn(sdk_misaligned);
+
+    var res = try run(allocator, db,
+        \\SELECT id, running
+        \\FROM TABLE(sdk_misaligned((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id)
+    );
+    defer res.deinit();
+    try std.testing.expectError(thindb.exec.Error.TableFnOutputMismatch, res.next());
+}
+
+test "table UDF passthrough: registerTable rejects malformed descriptors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const in_pass = [_]thindb.Column{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "v", .type = .bigint },
+    };
+    const out_pass = [_]thindb.Column{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "r", .type = .bigint },
+    };
+    const base = thindb.udf.TableUdf{
+        .name = "bad_pass",
+        .input_schemas = &.{&in_pass},
+        .output_schema = &out_pass,
+        .row_aligned = true,
+        .process = runningTotal,
+    };
+
+    // out_idx beyond the output schema.
+    var bad = base;
+    bad.passthrough = &.{.{ .out_idx = 7, .in_idx = 0 }};
+    try std.testing.expectError(thindb.udf.Error.FunctionInvalidDefinition, db.registerTableUdf(bad));
+
+    // Type mismatch: output col 1 (bigint) fed from an int column.
+    const in_mixed = [_]thindb.Column{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "v", .type = .int },
+    };
+    bad = base;
+    bad.input_schemas = &.{&in_mixed};
+    bad.passthrough = &.{.{ .out_idx = 1, .in_idx = 1 }};
+    try std.testing.expectError(thindb.udf.Error.FunctionInvalidDefinition, db.registerTableUdf(bad));
+
+    // passthrough without row_aligned.
+    bad = base;
+    bad.row_aligned = false;
+    bad.passthrough = &.{.{ .out_idx = 0, .in_idx = 0 }};
+    try std.testing.expectError(thindb.udf.Error.FunctionInvalidDefinition, db.registerTableUdf(bad));
+
+    // Every output column pass-through — nothing computed.
+    bad = base;
+    bad.passthrough = &.{ .{ .out_idx = 0, .in_idx = 0 }, .{ .out_idx = 1, .in_idx = 1 } };
+    try std.testing.expectError(thindb.udf.Error.FunctionInvalidDefinition, db.registerTableUdf(bad));
+}

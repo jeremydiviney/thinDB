@@ -41,7 +41,7 @@ pub const Error = error{
     ZigCompileFailed,
 };
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 const EmbeddedFile = struct { path: []const u8, data: []const u8 };
 
@@ -74,6 +74,7 @@ const WRAPPER_MAIN =
     \\    n_cols: usize,
     \\    cols: [*]const ColDesc,
     \\};
+    \\pub const PassPairDesc = extern struct { out_idx: u32, in_idx: u32 };
     \\pub const Desc = extern struct {
     \\    name_ptr: [*]const u8,
     \\    name_len: usize,
@@ -84,6 +85,10 @@ const WRAPPER_MAIN =
     \\    out_cols: [*]const ColDesc,
     \\    n_args: usize,
     \\    arg_tags: [*]const u8,
+    \\    row_aligned: u8,
+    \\    kernel_input_cols: usize,
+    \\    n_pass: usize,
+    \\    pass_pairs: [*]const PassPairDesc,
     \\};
     \\
     \\fn colDescs(comptime cols: anytype) [cols.len]ColDesc {
@@ -121,6 +126,13 @@ const WRAPPER_MAIN =
     \\    }
     \\    break :blk out;
     \\};
+    \\const pass_descs = blk: {
+    \\    var out: [desc_gen.passthrough.len]PassPairDesc = undefined;
+    \\    for (desc_gen.passthrough, 0..) |pp, i| {
+    \\        out[i] = .{ .out_idx = pp.out_idx, .in_idx = pp.in_idx };
+    \\    }
+    \\    break :blk out;
+    \\};
     \\const the_desc = Desc{
     \\    .name_ptr = desc_gen.name.ptr,
     \\    .name_len = desc_gen.name.len,
@@ -131,10 +143,14 @@ const WRAPPER_MAIN =
     \\    .out_cols = &out_descs,
     \\    .n_args = arg_tags.len,
     \\    .arg_tags = &arg_tags,
+    \\    .row_aligned = @intFromBool(desc_gen.row_aligned),
+    \\    .kernel_input_cols = desc_gen.kernel_input_cols,
+    \\    .n_pass = pass_descs.len,
+    \\    .pass_pairs = &pass_descs,
     \\};
     \\
     \\export fn thindb_tvf_abi_version() callconv(.c) u32 {
-    \\    return 3;
+    \\    return 4;
     \\}
     \\export fn thindb_tvf_descriptor() callconv(.c) *const Desc {
     \\    return &the_desc;
@@ -209,11 +225,31 @@ const VALIDATE_MAIN =
     \\        parts[t] = .{ .columns = views, .row_count = 3, .keys = &.{} };
     \\    }
     \\
-    \\    var out_stores: [desc.output_schema.len]tdb.ColumnStore = undefined;
-    \\    for (desc.output_schema, &out_stores) |c, *st| {
-    \\        st.* = try tdb.ColumnStore.init(allocator, c.type, c.nullable);
+    \\    // The kernel writes only the non-pass-through (computed) columns;
+    \\    // pass-through columns are operator-filled in the real engine.
+    \\    const computed_idx = comptime blk: {
+    \\        @setEvalBranchQuota(1_000_000);
+    \\        var tmp: [desc.output_schema.len]usize = undefined;
+    \\        var n: usize = 0;
+    \\        for (0..desc.output_schema.len) |i| {
+    \\            var pass = false;
+    \\            for (desc.passthrough) |pp| {
+    \\                if (pp.out_idx == i) pass = true;
+    \\            }
+    \\            if (!pass) {
+    \\                tmp[n] = i;
+    \\                n += 1;
+    \\            }
+    \\        }
+    \\        const frozen = tmp[0..n].*;
+    \\        break :blk frozen;
+    \\    };
+    \\    var out_stores: [computed_idx.len]tdb.ColumnStore = undefined;
+    \\    inline for (computed_idx, 0..) |ci, k| {
+    \\        const c = desc.output_schema[ci];
+    \\        out_stores[k] = try tdb.ColumnStore.init(allocator, c.type, c.nullable);
     \\    }
-    \\    var out_ptrs: [desc.output_schema.len]*tdb.ColumnStore = undefined;
+    \\    var out_ptrs: [computed_idx.len]*tdb.ColumnStore = undefined;
     \\    for (&out_stores, &out_ptrs) |*st, *ptr| ptr.* = st;
     \\
     \\    var arena = std.heap.ArenaAllocator.init(allocator);
@@ -250,6 +286,10 @@ const VALIDATE_MAIN =
     \\            std.process.exit(2);
     \\        }
     \\    }
+    \\    if (desc.row_aligned and expect != 3) {
+    \\        std.debug.print("validate: row-aligned function emitted {d} rows for a 3-row partition\n", .{expect});
+    \\        std.process.exit(2);
+    \\    }
     \\    std.process.exit(0);
     \\}
 ;
@@ -265,6 +305,7 @@ pub const TableDesc = extern struct {
     n_cols: usize,
     cols: [*]const ColDesc,
 };
+pub const PassPairDesc = extern struct { out_idx: u32, in_idx: u32 };
 pub const Desc = extern struct {
     name_ptr: [*]const u8,
     name_len: usize,
@@ -275,6 +316,10 @@ pub const Desc = extern struct {
     out_cols: [*]const ColDesc,
     n_args: usize,
     arg_tags: [*]const u8,
+    row_aligned: u8,
+    kernel_input_cols: usize,
+    n_pass: usize,
+    pass_pairs: [*]const PassPairDesc,
 };
 
 const DllProcess = *const fn (*const anyopaque, [*]const udf_mod.TvfPartition, usize, *anyopaque) callconv(.c) i32;
@@ -558,6 +603,13 @@ pub fn loadAndRegister(
     for (desc.arg_tags[0..desc.n_args], arg_types) |tag, *slot| {
         slot.* = argTypeFromTag(tag) orelse return Error.FunctionInvalidDefinition;
     }
+    if (desc.n_pass > desc.n_out or desc.kernel_input_cols > std.math.maxInt(u32)) {
+        return Error.FunctionInvalidDefinition;
+    }
+    const passthrough = try cols_arena.allocator().alloc(udf_mod.PassPair, desc.n_pass);
+    for (desc.pass_pairs[0..desc.n_pass], passthrough) |pd, *slot| {
+        slot.* = .{ .out_idx = pd.out_idx, .in_idx = pd.in_idx };
+    }
 
     try registry.registerTable(.{
         .name = name,
@@ -565,6 +617,9 @@ pub fn loadAndRegister(
         .output_schema = output_schema,
         .arg_types = arg_types,
         .execution = @enumFromInt(desc.execution),
+        .row_aligned = desc.row_aligned != 0,
+        .passthrough = passthrough,
+        .kernel_input_cols = @intCast(desc.kernel_input_cols),
         .process = dllShim,
         .user_data = @constCast(@ptrCast(process_fn)),
     });
