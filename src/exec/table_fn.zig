@@ -105,6 +105,11 @@ pub const TableFnExec = struct {
     /// outlives the operator.
     borrow_src: ?*exec.mat_stage.Stage = null,
     borrow_map: []const ?usize = &.{},
+    /// Multi-input generalization of borrow_src/borrow_map: one optional
+    /// source stage + declared-column map per input. Node-arena owned;
+    /// empty on single-input plans (those use the fields above).
+    multi_borrow_srcs: []const ?*exec.mat_stage.Stage = &.{},
+    multi_borrow_maps: []const []const ?usize = &.{},
     /// Installed by the staged compiler when the input provably arrives
     /// sorted by (partition_by ++ order_by) with engine comparison semantics
     /// (a covered window-stage ride): skip the sort — identity permutation,
@@ -254,6 +259,9 @@ pub const TableFnExec = struct {
         // the borrow plan — borrowed views must outlive execute(), and the
         // upstream chain's own use releases at drain exhaustion.
         if (self.borrow_src) |src| src.releaseUse();
+        for (self.multi_borrow_srcs) |maybe| {
+            if (maybe) |src| src.releaseUse();
+        }
         for (self.call_args) |a| {
             if (a) |v| switch (v) {
                 .text => |t| self.allocator.free(t),
@@ -578,7 +586,7 @@ pub const TableFnExec = struct {
             digests = try self.packedSort(input_views, perm);
             if (digests == null) {
                 const lctx = LessCtx{ .self = self, .views = input_views };
-                std.mem.sortUnstable(u32, perm, lctx, LessCtx.less);
+                try parallelSortPerm(LessCtx, self.allocator, perm, lctx, self.dop);
             }
         }
 
@@ -816,20 +824,55 @@ pub const TableFnExec = struct {
                 store.* = try ColumnStore.init(a, col.type, col.nullable);
                 inited += 1;
             }
-            const t_drain = if (trace) prof.nowTicks() else 0;
-            var up = self.upstreams[i];
-            while (try up.next()) |batch| {
-                for (self.input_maps[i], cols) |ui, *store| {
-                    try transform.appendAllColumn(a, batch.values[ui], store);
+
+            // Zero-copy borrow bind — the single-input contract per input:
+            // a filterless chain over a stage's adopted contiguous result
+            // takes shallow views for every column it passes through
+            // untransformed; the pull below still runs (row-alignment
+            // check + the remaining owned columns), but over a staged
+            // input it is a buffer read, not chain execution.
+            const borrowed = try a.alloc(?ColumnView, decl.len);
+            defer a.free(borrowed);
+            @memset(borrowed, null);
+            var borrow_rows: u64 = 0;
+            var n_borrowed: usize = 0;
+            if (i < self.multi_borrow_srcs.len) {
+                if (self.multi_borrow_srcs[i]) |src| bind: {
+                    src.ensureRun() catch break :bind;
+                    const res = src.result orelse break :bind;
+                    const ad = res.adopted orelse break :bind;
+                    if (ad.stores.len != res.schema.len) break :bind;
+                    for (self.multi_borrow_maps[i], 0..) |m, ci| {
+                        if (ci >= decl.len) break;
+                        const si = m orelse continue;
+                        borrowed[ci] = exec.mat_stage.MaterializedResult.presentAsSchemaType(
+                            ad.stores[si].view(),
+                            decl[ci].type,
+                        );
+                        n_borrowed += 1;
+                    }
+                    borrow_rows = res.total_rows;
                 }
             }
-            const n_rows = cols[0].rowCount();
-            if (trace) std.debug.print("[tvf]   input{d} drain {d} rows: {d:.0}ms\n", .{
-                i, n_rows, prof.ticksToMs(prof.nowTicks() - t_drain),
+
+            const t_drain = if (trace) prof.nowTicks() else 0;
+            var accumulated: usize = 0;
+            var up = self.upstreams[i];
+            while (try up.next()) |batch| {
+                for (self.input_maps[i], cols, 0..) |ui, *store, ci| {
+                    if (borrowed[ci] != null) continue;
+                    try transform.appendAllColumn(a, batch.values[ui], store);
+                }
+                accumulated += batch.row_count;
+            }
+            if (n_borrowed > 0 and accumulated != borrow_rows) return Error.TableFnInputMismatch;
+            const n_rows = accumulated;
+            if (trace) std.debug.print("[tvf]   input{d} drain {d} rows: {d:.0}ms (borrowed {d}/{d} cols)\n", .{
+                i, n_rows, prof.ticksToMs(prof.nowTicks() - t_drain), n_borrowed, decl.len,
             });
             const views = try a.alloc(ColumnView, decl.len);
             errdefer a.free(views);
-            for (cols, views) |c, *v| v.* = c.view();
+            for (cols, views, 0..) |c, *v, ci| v.* = borrowed[ci] orelse c.view();
             const perm = try a.alloc(u32, n_rows);
             errdefer a.free(perm);
             for (perm, 0..) |*p, r| p.* = @intCast(r);
@@ -856,7 +899,7 @@ pub const TableFnExec = struct {
                         .order_idx = self.order_idxs[i],
                         .order_desc = self.order_desc,
                     };
-                    std.mem.sortUnstable(u32, perm, mctx, MultiLessCtx.less);
+                    try parallelSortPerm(MultiLessCtx, a, perm, mctx, self.dop);
                     break :blk d;
                 };
             } else {
@@ -992,20 +1035,24 @@ pub const TableFnExec = struct {
                 seg_list: []RunSeg,
                 next_group: *std.atomic.Value(usize),
                 abort: *std.atomic.Value(bool),
+                batch: usize,
             ) void {
                 while (true) {
                     if (abort.load(.acquire)) return;
-                    const g = next_group.fetchAdd(1, .monotonic);
-                    if (g >= group_list.len) return;
-                    // Offsets track the first COMPUTED store — pass-through
-                    // private stores stay empty (bulk-gathered afterwards).
-                    const before = w.runner.out_ptrs[0].rowCount();
-                    const emitted = w.runner.runOne(group_list[g]) catch |err| {
-                        w.err = err;
-                        abort.store(true, .release);
-                        return;
-                    };
-                    seg_list[g] = .{ .worker = wid, .off = before, .len = emitted };
+                    const base = next_group.fetchAdd(batch, .monotonic);
+                    if (base >= group_list.len) return;
+                    const end = @min(group_list.len, base + batch);
+                    for (group_list[base..end], seg_list[base..end]) |group, *seg| {
+                        // Offsets track the first COMPUTED store — pass-through
+                        // private stores stay empty (bulk-gathered afterwards).
+                        const before = w.runner.out_ptrs[0].rowCount();
+                        const emitted = w.runner.runOne(group) catch |err| {
+                            w.err = err;
+                            abort.store(true, .release);
+                            return;
+                        };
+                        seg.* = .{ .worker = wid, .off = before, .len = emitted };
+                    }
                 }
             }
         };
@@ -1040,12 +1087,13 @@ pub const TableFnExec = struct {
 
         var next_group = std.atomic.Value(usize).init(0);
         var abort = std.atomic.Value(bool).init(false);
+        const batch = claimBatch(groups.len, n_workers);
         const threads = try a.alloc(?std.Thread, n_workers);
         defer a.free(threads);
         @memset(threads, null);
         for (workers, threads, 0..) |*w, *th, wid| {
             th.* = std.Thread.spawn(.{}, Worker.main, .{
-                w, @as(u32, @intCast(wid)), groups, segs, &next_group, &abort,
+                w, @as(u32, @intCast(wid)), groups, segs, &next_group, &abort, batch,
             }) catch null;
         }
         var spawned: usize = 0;
@@ -1055,7 +1103,7 @@ pub const TableFnExec = struct {
                 spawned += 1;
             }
         }
-        if (spawned == 0) Worker.main(&workers[0], 0, groups, segs, &next_group, &abort);
+        if (spawned == 0) Worker.main(&workers[0], 0, groups, segs, &next_group, &abort, batch);
         for (workers[0..built]) |*w| {
             if (w.err) |err| return err;
         }
@@ -1066,14 +1114,10 @@ pub const TableFnExec = struct {
         defer a.free(is_pass);
         @memset(is_pass, false);
         for (self.entry.passthrough) |pp| is_pass[pp.out_idx] = true;
-        for (segs) |seg| {
-            if (seg.len == 0) continue;
-            const w = &workers[seg.worker];
-            for (w.out_stores, self.output_cols, is_pass) |src, *dst, skip| {
-                if (skip) continue;
-                try transform.appendColumnRange(a, src.view(), seg.off, seg.off + seg.len, dst);
-            }
-        }
+        const stores_of = try a.alloc([]ColumnStore, built);
+        defer a.free(stores_of);
+        for (workers[0..built], stores_of) |*w, *s| s.* = w.out_stores;
+        try self.concatRunSegs(segs, stores_of, is_pass);
     }
 
     /// Per-worker multi-input execution state: one scratch set per input.
@@ -1376,6 +1420,48 @@ pub const TableFnExec = struct {
     /// claim counter.
     const RunSeg = struct { worker: u32 = 0, off: usize = 0, len: usize = 0 };
 
+    /// Runs per claim-counter grab. Consecutive runs a worker claims land
+    /// contiguously in its private stores, so batching turns the run-order
+    /// output concat from one range copy per run×column into one per
+    /// batch×column (230K-run row-generating kernels spent more time in
+    /// appendColumnRange call overhead than in the kernel).
+    fn claimBatch(n_runs: usize, n_workers: usize) usize {
+        return @max(1, @min(64, n_runs / (n_workers * 8)));
+    }
+
+    /// Concatenate per-run worker segments into the output columns in run
+    /// order, coalescing adjacent segments that sit contiguously in the
+    /// same worker's private stores (whole claim batches, in the common
+    /// case). Zero-length runs extend the current chain — their offset
+    /// equals the running end.
+    fn concatRunSegs(self: *TableFnExec, segs: []const RunSeg, stores_of: []const []ColumnStore, is_pass: []const bool) !void {
+        const trace = getenv("THINDB_TVF_TRACE") != null;
+        const t0 = if (trace) exec.prof.nowTicks() else 0;
+        var n_chains: usize = 0;
+        var s: usize = 0;
+        while (s < segs.len) {
+            const wid = segs[s].worker;
+            const off = segs[s].off;
+            var len: usize = 0;
+            var e = s;
+            while (e < segs.len and segs[e].worker == wid and segs[e].off == off + len) {
+                len += segs[e].len;
+                e += 1;
+            }
+            if (len > 0) {
+                n_chains += 1;
+                for (stores_of[wid], self.output_cols, is_pass) |src, *dst, skip| {
+                    if (skip) continue;
+                    try transform.appendColumnRange(self.allocator, src.view(), off, off + len, dst);
+                }
+            }
+            s = e;
+        }
+        if (trace) std.debug.print("[tvf]   writer concat: {d:.0}ms ({d} segs -> {d} chains)\n", .{
+            exec.prof.ticksToMs(exec.prof.nowTicks() - t0), segs.len, n_chains,
+        });
+    }
+
     fn executeParallel(
         self: *TableFnExec,
         input_views: []const ColumnView,
@@ -1400,20 +1486,24 @@ pub const TableFnExec = struct {
                 seg_list: []RunSeg,
                 next_run: *std.atomic.Value(usize),
                 abort: *std.atomic.Value(bool),
+                batch: usize,
             ) void {
                 while (true) {
                     if (abort.load(.acquire)) return;
-                    const r = next_run.fetchAdd(1, .monotonic);
-                    if (r >= run_list.len) return;
-                    // Offsets track the first COMPUTED store — pass-through
-                    // private stores stay empty (bulk-gathered afterwards).
-                    const before = w.runner.out_ptrs[0].rowCount();
-                    const emitted = w.runner.runOne(run_list[r]) catch |err| {
-                        w.err = err;
-                        abort.store(true, .release);
-                        return;
-                    };
-                    seg_list[r] = .{ .worker = wid, .off = before, .len = emitted };
+                    const base = next_run.fetchAdd(batch, .monotonic);
+                    if (base >= run_list.len) return;
+                    const end = @min(run_list.len, base + batch);
+                    for (run_list[base..end], seg_list[base..end]) |run, *seg| {
+                        // Offsets track the first COMPUTED store — pass-through
+                        // private stores stay empty (bulk-gathered afterwards).
+                        const before = w.runner.out_ptrs[0].rowCount();
+                        const emitted = w.runner.runOne(run) catch |err| {
+                            w.err = err;
+                            abort.store(true, .release);
+                            return;
+                        };
+                        seg.* = .{ .worker = wid, .off = before, .len = emitted };
+                    }
                 }
             }
         };
@@ -1448,12 +1538,13 @@ pub const TableFnExec = struct {
 
         var next_run = std.atomic.Value(usize).init(0);
         var abort = std.atomic.Value(bool).init(false);
+        const batch = claimBatch(runs.len, n_workers);
         const threads = try self.allocator.alloc(?std.Thread, n_workers);
         defer self.allocator.free(threads);
         @memset(threads, null);
         for (workers, threads, 0..) |*w, *th, wid| {
             th.* = std.Thread.spawn(.{}, Worker.main, .{
-                w, @as(u32, @intCast(wid)), runs, segs, &next_run, &abort,
+                w, @as(u32, @intCast(wid)), runs, segs, &next_run, &abort, batch,
             }) catch null;
             // Spawn failure: this worker's runs are claimed by the others.
         }
@@ -1466,7 +1557,7 @@ pub const TableFnExec = struct {
         }
         if (spawned == 0) {
             // Total spawn failure — run everything on this thread.
-            Worker.main(&workers[0], 0, runs, segs, &next_run, &abort);
+            Worker.main(&workers[0], 0, runs, segs, &next_run, &abort, batch);
         }
         for (workers[0..built]) |*w| {
             if (w.err) |err| return err;
@@ -1497,14 +1588,10 @@ pub const TableFnExec = struct {
         defer self.allocator.free(is_pass);
         @memset(is_pass, false);
         for (self.entry.passthrough) |pp| is_pass[pp.out_idx] = true;
-        for (segs) |seg| {
-            if (seg.len == 0) continue;
-            const w = &workers[seg.worker];
-            for (w.out_stores, self.output_cols, is_pass) |src, *dst, skip| {
-                if (skip) continue;
-                try transform.appendColumnRange(self.allocator, src.view(), seg.off, seg.off + seg.len, dst);
-            }
-        }
+        const stores_of = try self.allocator.alloc([]ColumnStore, built);
+        defer self.allocator.free(stores_of);
+        for (workers[0..built], stores_of) |*w, *s| s.* = w.out_stores;
+        try self.concatRunSegs(segs, stores_of, is_pass);
     }
 
     /// Per-worker execution state: zero-copy partition views over the
@@ -1752,6 +1839,136 @@ pub const TableFnExec = struct {
             return a < b;
         }
     };
+
+    /// Parallel samplesort over a row permutation for the generic-comparator
+    /// fallbacks. Both LessCtx and MultiLessCtx end in an arrival-index
+    /// tie-break, so the order is strict and total — the result is
+    /// byte-identical to the serial sort no matter how rows scatter into
+    /// buckets. Serial below the threshold, where bucket bookkeeping costs
+    /// more than it saves.
+    fn parallelSortPerm(comptime Ctx: type, allocator: Allocator, perm: []u32, ctx: Ctx, dop: usize) !void {
+        const n = perm.len;
+        const allow_parallel = !builtin.is_test or force_parallel_in_tests;
+        if (!allow_parallel or dop <= 1 or n < (1 << 17)) {
+            std.mem.sortUnstable(u32, perm, ctx, Ctx.less);
+            return;
+        }
+        const workers: usize = @min(dop, 32);
+        const bucket_count: usize = @min(@as(usize, 128), std.math.ceilPowerOfTwoAssert(usize, workers * 4));
+
+        // Deterministic evenly-strided sample → splitters. The strict order
+        // makes every sampled key distinct, so heavy-duplicate key columns
+        // still split into level ranges.
+        const sample_len = @min(n, bucket_count * 16);
+        const sample = try allocator.alloc(u32, sample_len);
+        defer allocator.free(sample);
+        const stride = n / sample_len;
+        for (sample, 0..) |*s, i| s.* = perm[i * stride];
+        std.mem.sortUnstable(u32, sample, ctx, Ctx.less);
+        const splitters = try allocator.alloc(u32, bucket_count - 1);
+        defer allocator.free(splitters);
+        for (splitters, 1..) |*sp, b| sp.* = sample[b * sample_len / bucket_count];
+
+        const placed = try allocator.alloc(u32, n);
+        defer allocator.free(placed);
+        const counts = try allocator.alloc(usize, workers * bucket_count);
+        defer allocator.free(counts);
+        @memset(counts, 0);
+
+        const Job = struct {
+            perm: []u32,
+            placed: []u32,
+            splitters: []const u32,
+            counts: []usize,
+            sort_ctx: Ctx,
+            workers: usize,
+            bucket_count: usize,
+            bucket_offsets: []usize,
+            next_bucket: std.atomic.Value(usize) = .init(0),
+
+            fn bucketOf(job: *const @This(), row: u32) usize {
+                var lo: usize = 0;
+                var hi: usize = job.splitters.len;
+                while (lo < hi) {
+                    const mid = (lo + hi) / 2;
+                    if (Ctx.less(job.sort_ctx, row, job.splitters[mid])) hi = mid else lo = mid + 1;
+                }
+                return lo;
+            }
+            fn rowRange(job: *const @This(), w: usize) [2]usize {
+                const per = (job.perm.len + job.workers - 1) / job.workers;
+                const s = @min(job.perm.len, w * per);
+                return .{ s, @min(job.perm.len, s + per) };
+            }
+            fn countPhase(job: *@This(), w: usize) void {
+                const r = job.rowRange(w);
+                const my = job.counts[w * job.bucket_count ..][0..job.bucket_count];
+                for (job.perm[r[0]..r[1]]) |row| my[job.bucketOf(row)] += 1;
+            }
+            fn placePhase(job: *@This(), w: usize) void {
+                const r = job.rowRange(w);
+                const my = job.counts[w * job.bucket_count ..][0..job.bucket_count];
+                for (job.perm[r[0]..r[1]]) |row| {
+                    const b = job.bucketOf(row);
+                    job.placed[my[b]] = row;
+                    my[b] += 1;
+                }
+            }
+            fn bucketPhase(job: *@This(), _: usize) void {
+                while (true) {
+                    const b = job.next_bucket.fetchAdd(1, .monotonic);
+                    if (b >= job.bucket_count) return;
+                    const s = job.bucket_offsets[b];
+                    const e = job.bucket_offsets[b + 1];
+                    std.mem.sortUnstable(u32, job.placed[s..e], job.sort_ctx, Ctx.less);
+                }
+            }
+            // A failed spawn runs the phase inline on this thread — slower,
+            // never wrong (each worker index owns a fixed row range).
+            fn runPhase(job: *@This(), comptime phase: fn (*@This(), usize) void) void {
+                var threads: [32]?std.Thread = @splat(null);
+                for (1..job.workers) |w| {
+                    threads[w] = std.Thread.spawn(.{}, phase, .{ job, w }) catch blk: {
+                        phase(job, w);
+                        break :blk null;
+                    };
+                }
+                phase(job, 0);
+                for (threads[1..job.workers]) |maybe| {
+                    if (maybe) |t| t.join();
+                }
+            }
+        };
+        const bucket_offsets = try allocator.alloc(usize, bucket_count + 1);
+        defer allocator.free(bucket_offsets);
+        var job = Job{
+            .perm = perm,
+            .placed = placed,
+            .splitters = splitters,
+            .counts = counts,
+            .sort_ctx = ctx,
+            .workers = workers,
+            .bucket_count = bucket_count,
+            .bucket_offsets = bucket_offsets,
+        };
+        job.runPhase(Job.countPhase);
+        // Bucket-major prefix over worker-local counts: each worker's
+        // in-bucket writes land after every earlier worker's — placement is
+        // deterministic, so the buckets (and the final perm) are too.
+        var off: usize = 0;
+        for (0..bucket_count) |b| {
+            bucket_offsets[b] = off;
+            for (0..workers) |w| {
+                const c = counts[w * bucket_count + b];
+                counts[w * bucket_count + b] = off;
+                off += c;
+            }
+        }
+        bucket_offsets[bucket_count] = off;
+        job.runPhase(Job.placePhase);
+        job.runPhase(Job.bucketPhase);
+        @memcpy(perm, placed);
+    }
 
     /// Sort `perm` via packed keys when the shape allows it (any partition
     /// key types; at most ONE order column, int-family ≤64-bit). Returns

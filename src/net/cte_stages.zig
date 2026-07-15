@@ -106,7 +106,27 @@ fn wrapWindowsInMaterialize(node_arena: Allocator, op: *ir.Op, cse: *const MatCs
         .alias => |*a| try wrapWindowChild(node_arena, &a.upstream, cse),
         .limit => |*l| try wrapWindowChild(node_arena, &l.upstream, cse),
         .window => |*w| try wrapWindowChild(node_arena, &w.upstream, cse),
-        .table_fn => |*t| for (t.inputs) |inp| try wrapWindowsInMaterialize(node_arena, inp, cse),
+        .table_fn => |*t| {
+            // A multi-input TVF drains every input serially on its own
+            // thread (executeMulti). An input whose body does real
+            // streaming work (union / join / aggregate) would execute that
+            // work single-threaded inside the drain — stage it so it fills
+            // through the parallel buffer-scan seams and the drain becomes
+            // a buffer read (and, filterless, a zero-copy borrow).
+            if (t.inputs.len > 1) {
+                const wrapped = try node_arena.alloc(*ir.Op, t.inputs.len);
+                for (t.inputs, wrapped) |inp, *slot| {
+                    slot.* = inp;
+                    if (tvfInputDoesWork(inp, cse)) {
+                        const wrap = try node_arena.create(ir.Op);
+                        wrap.* = .{ .materialize = .{ .upstream = inp, .forced = true } };
+                        slot.* = wrap;
+                    }
+                }
+                t.inputs = wrapped;
+            }
+            for (t.inputs) |inp| try wrapWindowsInMaterialize(node_arena, inp, cse);
+        },
         .materialize => |*m| {
             // A CTE that will stage anyway (multi-ref or AS MATERIALIZED)
             // and whose body IS the window adopts it directly through its
@@ -130,6 +150,29 @@ fn wrapWindowsInMaterialize(node_arena: Allocator, op: *ir.Op, cse: *const MatCs
         },
         else => {},
     }
+}
+
+/// Does a TVF input's body, peeled of thin projection wrappers, bottom out
+/// in an operation that streams real work (union / join / aggregate)?
+/// Windows and TVFs are excluded — wrapWindowChild stages those itself —
+/// and a chain ending at a shared (multi-ref / forced) materialize already
+/// has a stage the borrow walk will find.
+fn tvfInputDoesWork(op: *const ir.Op, cse: *const MatCse) bool {
+    var cur = op;
+    while (true) switch (cur.*) {
+        .select => |s| cur = s.upstream,
+        .compute => |c| cur = c.upstream,
+        .exclude => |e| cur = e.upstream,
+        .filter => |f| cur = f.upstream,
+        .alias => |al| cur = al.upstream,
+        .materialize => |m| {
+            const rep = cse.canon.get(cur) orelse cur;
+            if ((cse.refs.get(rep) orelse 1) > 1 or cur.materialize.forced) return false;
+            cur = m.upstream;
+        },
+        .set_union, .join, .group_by => return true,
+        else => return false,
+    };
 }
 
 fn wrapWindowChild(node_arena: Allocator, child: **ir.Op, cse: *const MatCse) anyerror!void {
@@ -2531,47 +2574,53 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // require the compiled chain to deliver rows in source order
             // (force_ordered), exactly like the window ride/borrow.
             var tvf_ordered = false;
-            var tvf_borrow_src: ?*mat_stage.Stage = null;
-            var tvf_borrow_map: []const ?usize = &.{};
+            const n_tin = t.inputs.len;
+            const tvf_borrow_srcs = try input.node_arena.alloc(?*mat_stage.Stage, n_tin);
+            @memset(tvf_borrow_srcs, null);
+            const tvf_borrow_maps = try input.node_arena.alloc([]const ?usize, n_tin);
+            @memset(tvf_borrow_maps, &.{});
+            var any_borrow = false;
             var eff_input = input;
-            if (t.inputs.len == 1) {
-                const keys: ?ir.WindowSpec = if (t.partition_by.len + t.order_by.len > 0)
+            for (t.inputs, 0..) |t_in, i| {
+                // Ride keys are a single-input notion (the multi path forms
+                // runs per input from its own sort); borrow applies to all.
+                const keys: ?ir.WindowSpec = if (n_tin == 1 and t.partition_by.len + t.order_by.len > 0)
                     .{ .partition_by = t.partition_by, .order_by = t.order_by, .frame = ir.Frame.default_no_order }
                 else
                     null;
-                if (rideSource(map, t.inputs[0], keys)) |src| {
-                    if (src.covered) {
-                        // A TVF source (win == null) already emits in its
-                        // advertised order — nothing to mark.
-                        if (src.win) |sw| sw.emit_sorted = true;
-                        tvf_ordered = true;
+                const src = rideSource(map, t_in, keys) orelse continue;
+                if (n_tin == 1 and src.covered) {
+                    // A TVF source (win == null) already emits in its
+                    // advertised order — nothing to mark.
+                    if (src.win) |sw| sw.emit_sorted = true;
+                    tvf_ordered = true;
+                }
+                if (!src.has_filter) {
+                    const decl = entry.input_schemas[i];
+                    const bm = try input.node_arena.alloc(?usize, decl.len);
+                    var any = false;
+                    for (decl, bm) |col, *slot| {
+                        slot.* = borrowIdxFor(map, t_in, col.name, src.stage);
+                        if (slot.* != null) any = true;
                     }
-                    if (!src.has_filter) {
-                        const decl = entry.input_schemas[0];
-                        const bm = try input.node_arena.alloc(?usize, decl.len);
-                        var any = false;
-                        for (decl, bm) |col, *slot| {
-                            slot.* = borrowIdxFor(map, t.inputs[0], col.name, src.stage);
-                            if (slot.* != null) any = true;
-                        }
-                        if (any) {
-                            tvf_borrow_src = src.stage;
-                            tvf_borrow_map = bm;
-                            if (src.win == null and src.stage.adopt_table_fn == null) src.stage.want_contiguous = true;
-                        }
-                    }
-                    if (tvf_ordered or tvf_borrow_src != null) eff_input.force_ordered = true;
-                    if (getenv("THINDB_TVF_TRACE") != null) {
-                        var k: usize = 0;
-                        for (tvf_borrow_map) |m| {
-                            if (m != null) k += 1;
-                        }
-                        std.debug.print("[tvf] compile {s}: ride={} borrow={d}/{d}\n", .{
-                            t.name, tvf_ordered, k, entry.input_schemas[0].len,
-                        });
+                    if (any) {
+                        tvf_borrow_srcs[i] = src.stage;
+                        tvf_borrow_maps[i] = bm;
+                        any_borrow = true;
+                        if (src.win == null and src.stage.adopt_table_fn == null) src.stage.want_contiguous = true;
                     }
                 }
+                if (getenv("THINDB_TVF_TRACE") != null) {
+                    var k: usize = 0;
+                    for (tvf_borrow_maps[i]) |m| {
+                        if (m != null) k += 1;
+                    }
+                    std.debug.print("[tvf] compile {s}: input{d} ride={} borrow={d}/{d}\n", .{
+                        t.name, i, tvf_ordered, k, entry.input_schemas[i].len,
+                    });
+                }
             }
+            if (tvf_ordered or any_borrow) eff_input.force_ordered = true;
             var ups: std.ArrayList(exec.Query) = .empty;
             defer ups.deinit(input.allocator);
             errdefer for (ups.items) |*u| u.deinit();
@@ -2581,14 +2630,21 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             const q = try exec.table_fn.TableFnExec.create(input.allocator, ups.items, entry, t.args, t.partition_by, t.order_by, input.effectiveDop());
             if (exec.queryAs(exec.table_fn.TableFnExec, q)) |tf| {
                 tf.input_ordered = tvf_ordered;
-                tf.borrow_src = tvf_borrow_src;
-                tf.borrow_map = tvf_borrow_map;
+                if (n_tin == 1) {
+                    tf.borrow_src = tvf_borrow_srcs[0];
+                    tf.borrow_map = tvf_borrow_maps[0];
+                } else {
+                    tf.multi_borrow_srcs = tvf_borrow_srcs;
+                    tf.multi_borrow_maps = tvf_borrow_maps;
+                }
                 // The compiled input chain releases its stage use on
                 // EXHAUSTION (end of the drain pull), which can free the
                 // borrowed stores while the operator still reads them.
                 // Hold one use for the operator's lifetime; released in
                 // TableFnExec.deinit.
-                if (tvf_borrow_src) |src| src.registerUse();
+                for (tvf_borrow_srcs) |maybe| {
+                    if (maybe) |src| src.registerUse();
+                }
                 tf.advertised_keys = try tvfEmitKeys(input.node_arena, entry, t);
                 if (tf.advertised_keys != null and getenv("THINDB_TVF_TRACE") != null) {
                     std.debug.print("[tvf] compile {s}: advertises output order\n", .{t.name});
