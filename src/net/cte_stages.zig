@@ -946,6 +946,69 @@ const AdaptiveGroupBy = struct {
 /// legal under `force_ordered` — ride/borrow chains).
 const StageScanMode = enum { eager, deferred, ordered };
 
+/// Stage-parallel GROUP BY input for WRAPPED stage refs: peel row-wise
+/// layers (compute / select / exclude / alias / filter) off the upstream
+/// down to a bare materialize ref, build the parallel buffer scan over that
+/// stage, and re-apply the layers — computes through the worker-fusion
+/// offer, filters through the scan offer — so their per-row work runs in
+/// the scan stripes instead of a serial chain on the aggregate's pull path
+/// (a GROUP BY whose SELECT derives columns paid its whole scalar bill,
+/// ~270ms on a 3.6M-row block, on the connection thread). Returns null on
+/// a bare ref (the plain tryStageParallelScan path handles it) or any
+/// non-row-wise layer.
+fn tryStageParallelChain(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!?exec.Query {
+    var layers: std.ArrayListUnmanaged(*const ir.Op) = .empty;
+    defer layers.deinit(input.allocator);
+    var cur: *const ir.Op = op;
+    while (true) {
+        switch (cur.*) {
+            .materialize => break,
+            .compute => |c| {
+                try layers.append(input.allocator, cur);
+                cur = c.upstream;
+            },
+            .select => |s| {
+                try layers.append(input.allocator, cur);
+                cur = s.upstream;
+            },
+            .exclude => |e| {
+                try layers.append(input.allocator, cur);
+                cur = e.upstream;
+            },
+            .alias => |a| {
+                try layers.append(input.allocator, cur);
+                cur = a.upstream;
+            },
+            .filter => |f| {
+                if (f.upstream.* == .join) return null;
+                try layers.append(input.allocator, cur);
+                cur = f.upstream;
+            },
+            else => return null,
+        }
+    }
+    if (layers.items.len == 0) return null;
+    var q = (try tryStageParallelScan(input, cur, map, .eager)) orelse return null;
+    errdefer q.deinit();
+    var i = layers.items.len;
+    while (i > 0) {
+        i -= 1;
+        q = switch (layers.items[i].*) {
+            .compute => |c| try engine_v2.computeDerivedFused(input.allocator, q, c.derived, input.udf_registry),
+            .select => |s| try local.compileSelectProject(input.allocator, q, s),
+            .exclude => |e| blk: {
+                const remaining = try local.complementColumns(input.allocator, q.outputSchema(), e.columns);
+                defer input.allocator.free(remaining);
+                break :blk try q.project(remaining);
+            },
+            .alias => |a| try exec.AliasRename.create(input.allocator, q, a.alias),
+            .filter => |f| try q.filter(f.predicate),
+            else => unreachable,
+        };
+    }
+    return q;
+}
+
 fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, mode: StageScanMode) anyerror!?exec.Query {
     if (input.effectiveDop() <= 1) return null;
     const stage = switch (op.*) {
@@ -2798,7 +2861,8 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         .group_by => |g| {
             for (g.aggs) |a| if (a.func == .udf) return error.UnsupportedQueryShape;
-            var up = (try tryStageParallelScan(input, g.upstream, map, .eager)) orelse
+            var up = (try tryStageParallelChain(input, g.upstream, map)) orelse
+                (try tryStageParallelScan(input, g.upstream, map, .eager)) orelse
                 try buildGenericBlock(input, g.upstream, map, block_root);
             errdefer up.deinit();
             // Probe-fused join below: aggregate the joined batches inside
