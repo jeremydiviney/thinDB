@@ -235,3 +235,24 @@ test "decimal addition propagates precision correctly" {
 - [DESIGN.md](./DESIGN.md) — architecture spec
 - [Zig stdlib docs](https://ziglang.org/documentation/master/std/)
 - [Zig language reference](https://ziglang.org/documentation/master/)
+
+---
+
+## ⛔ PORT 13310 IS PRODUCTION — HANDS OFF (added 2026-07-13 by Claude, ops incident)
+
+**Port 13310 belongs to the production CDC sink** (`.wayroll-prod-db`, live Flink
+pipeline from prod RDS). It is run by a separately-managed process
+(`_prod_bin\thindb-prod.exe`). Rules for ALL agents and scripts:
+
+1. **NEVER kill the process listening on :13310** (not by name, not by PID, not
+   by port). Killing it broke the CDC sink 3× today, and a concurrent second
+   server split-brained two tables (manifest corruption, ~5M rows re-copied).
+2. **NEVER start a server with `--mysql-port 13310`.** thinDB sockets use
+   reuse_address — a second bind SUCCEEDS silently and connections route
+   randomly between the two servers.
+3. Bench servers on the wayroll data: use `--data-dir .wayroll-bench-db
+   --mysql-port 13311` (or any free port ≠ 13310) and point your bench clients
+   at that port.
+4. **NEVER open `--data-dir C:\development\thinDB\.wayroll-prod-db` from a
+   second process.** Two engines on one data dir = dual compactors = corrupted
+   manifests. If you need prod-shaped data, copy the dir first.
