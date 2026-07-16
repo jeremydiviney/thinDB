@@ -2726,7 +2726,11 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         .compute => |c| {
             var up = try buildGenericBlock(input, c.upstream, map, block_root);
             errdefer up.deinit();
-            return engine_v2.computeSelfPushed(up, c.derived, input.udf_registry);
+            // Offer the row-local subset into the parallel-scan workers first
+            // (same split the V2 table handlers and join arms use); the
+            // non-fusable remainder — and the whole list when the upstream
+            // declines — still takes the serial layer + terminal self-push.
+            return engine_v2.computeDerivedFused(input.allocator, up, c.derived, input.udf_registry);
         },
         .order_by => |o| {
             var up = try buildGenericBlock(input, o.upstream, map, block_root);

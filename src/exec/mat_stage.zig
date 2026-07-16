@@ -66,11 +66,14 @@ pub const MaterializedResult = struct {
 
     /// Ownership record for adopted contiguous columns: entries flagged in
     /// `arena_backed` are reclaimed wholesale by sweeping `arenas`; the
-    /// rest deinit with the result's allocator.
+    /// rest deinit with `store_alloc` when set (a producer that allocated
+    /// them elsewhere — parallel-scan worker buffers), else the result's
+    /// allocator.
     pub const Adopted = struct {
         stores: []engine.ColumnStore,
         arenas: []std.heap.ArenaAllocator,
         arena_backed: []bool,
+        store_alloc: ?Allocator = null,
     };
 
     pub const Chunk = struct {
@@ -167,6 +170,57 @@ pub const MaterializedResult = struct {
             }
             self.total_rows += sk.rows;
         }
+    }
+
+    /// Adopt a producer's per-chunk owned stores (parallel-scan worker
+    /// buffers via `takeOwnedChunks`) as this result's chunks — the pull-copy
+    /// path's second deep copy of the whole result disappears. The chunks'
+    /// stores flatten into the single `Adopted` record (owned by `oc.alloc`);
+    /// view chunks are cut per owned chunk in ≤`chunk_rows` windows (64K
+    /// offsets keep validity bitmaps byte-aligned). Takes full ownership,
+    /// including of the handle's arrays.
+    pub fn adoptOwnedChunks(self: *MaterializedResult, oc: exec.OwnedChunks) !void {
+        // The handle owns the store buffers until the infallible tail below —
+        // every fallible step frees ONLY its own arrays on error (view chunks
+        // already appended sweep with the result's normal deinitChunks; their
+        // `cols` are empty, so nothing double-frees the shared buffers).
+        errdefer exec.deinitOwnedChunks(oc);
+        const ncols = self.schema.len;
+        for (oc.chunks) |c| {
+            if (c.stores.len != ncols) return exec.Error.TypeMismatch;
+        }
+        const stores = try self.allocator.alloc(engine.ColumnStore, oc.chunks.len * ncols);
+        errdefer self.allocator.free(stores);
+        const backed = try self.allocator.alloc(bool, oc.chunks.len * ncols);
+        errdefer self.allocator.free(backed);
+        @memset(backed, false);
+        const arenas = try self.allocator.alloc(std.heap.ArenaAllocator, 0);
+        errdefer self.allocator.free(arenas);
+
+        var added: u64 = 0;
+        for (oc.chunks, 0..) |c, i| {
+            @memcpy(stores[i * ncols ..][0..ncols], c.stores);
+            const pstores = stores[i * ncols ..][0..ncols];
+            var lo: usize = 0;
+            while (lo < c.rows) {
+                const take = @min(chunk_rows, c.rows - lo);
+                const views = try self.allocator.alloc(ColumnView, ncols);
+                errdefer self.allocator.free(views);
+                for (pstores, self.schema, views) |*st, sc, *v| {
+                    v.* = presentAsSchemaType(engine.transform.subViewAligned(st.view(), lo, take), sc.type);
+                }
+                try self.chunks.append(self.allocator, .{ .views = views, .rows = take });
+                lo += take;
+            }
+            added += c.rows;
+        }
+
+        // Infallible tail: buffer ownership moves to `adopted`, the handle's
+        // arrays free, and the row count commits.
+        self.adopted = .{ .stores = stores, .arenas = arenas, .arena_backed = backed, .store_alloc = oc.alloc };
+        for (oc.chunks) |c| oc.alloc.free(c.stores);
+        oc.alloc.free(oc.chunks);
+        self.total_rows += added;
     }
 
     /// The pull-copy path launders physical string-family tags into the
@@ -269,7 +323,7 @@ pub const MaterializedResult = struct {
         self.chunks.deinit(self.allocator);
         if (self.adopted) |*ad| {
             for (ad.stores, ad.arena_backed) |*st, ab| {
-                if (!ab) st.deinit(self.allocator);
+                if (!ab) st.deinit(ad.store_alloc orelse self.allocator);
             }
             for (ad.arenas) |*a| a.deinit();
             self.allocator.free(ad.stores);
@@ -491,6 +545,28 @@ pub const Stage = struct {
                 if (prof_on) append_ticks += exec.prof.nowTicks() - a0;
             }
             try res.adoptContiguous(contig.take(), contig.rows);
+        } else if (try self.query.takeOwnedChunks()) |oc| {
+            // The pipeline materialized in its scan workers and handed the
+            // buffers over — adopt them; the pull-copy below never runs.
+            if (self.accountant) |acct| {
+                var rows: u64 = 0;
+                for (oc.chunks) |c| rows += c.rows;
+                const bytes = row_bytes * @as(usize, @intCast(rows));
+                acct.reserve(.materialize, bytes) catch |e| {
+                    exec.deinitOwnedChunks(oc);
+                    return e;
+                };
+                self.reserved_bytes += bytes;
+            }
+            const a0 = if (prof_on) exec.prof.nowTicks() else 0;
+            const n_adopted = oc.chunks.len;
+            try res.adoptOwnedChunks(oc);
+            if (prof_on) {
+                append_ticks = -1; // suppress the copy line; adoption is not a copy
+                std.debug.print("[stage-adopt] stage#{d} chunks={d} rows={d} ({d:.1}ms)\n", .{
+                    self.id, n_adopted, res.total_rows, exec.prof.ticksToMs(exec.prof.nowTicks() - a0),
+                });
+            }
         } else while (try self.query.next()) |batch| {
             if (self.accountant) |acct| {
                 const bytes = row_bytes * batch.row_count;

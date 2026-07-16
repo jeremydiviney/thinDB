@@ -133,6 +133,11 @@ pub const AliasRename = struct {
         return self.upstream.stableData();
     }
 
+    /// Stores carry no names — a relabel forwards stage adoption untouched.
+    pub fn takeOwnedChunks(self: *AliasRename) !?exec.OwnedChunks {
+        return self.upstream.takeOwnedChunks();
+    }
+
     pub fn stats(self: *AliasRename) exec.PipelineStats {
         return self.upstream.stats();
     }

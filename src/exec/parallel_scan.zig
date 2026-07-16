@@ -1330,6 +1330,45 @@ pub const ParallelScan = struct {
         );
     }
 
+    /// Stage-adoption handshake (`VTable.takeOwnedChunks`): run the mode
+    /// decision (and the materialize drain) if not yet started, then hand the
+    /// worker buffers over as owned chunks. Declines in round mode (nothing
+    /// owned to give — batches stream from reused round scratch), once
+    /// emission has started, or on the partial-aggregate path (its output
+    /// feeds a combine, not a stage). The transferred stores were allocated
+    /// from `worker_alloc`, which the returned handle carries as owner;
+    /// deinit here skips them (columns cleared per WorkerBuf).
+    pub fn takeOwnedChunks(self: *ParallelScan) !?exec.OwnedChunks {
+        if (self.mode == .unset) {
+            if (self.stage_deferred and self.workers.len == 0) try self.buildDeferredWorkers();
+            self.rebalanceChunksForPruning();
+            const compute_streams = self.compute_fused and self.table == null;
+            const force_mat = self.agg_fused or self.workers[0].fusedActive() or
+                (self.compute_fused and !compute_streams);
+            if (!force_mat) return null;
+            self.mode = .materialize;
+            try self.runMaterialize();
+        }
+        if (self.mode != .materialize or self.emit_cursor != 0 or self.agg_fused) return null;
+        var n_used: usize = 0;
+        for (self.wbufs) |wb| {
+            if (wb.row_count > 0) n_used += 1;
+        }
+        const chunks = try self.worker_alloc.alloc(exec.OwnedChunk, n_used);
+        var ci: usize = 0;
+        for (self.wbufs) |*wb| {
+            if (wb.row_count == 0) continue;
+            chunks[ci] = .{ .stores = wb.columns, .rows = wb.row_count };
+            wb.columns = &.{};
+            ci += 1;
+        }
+        // Empty buffers keep their (unfilled) column arrays for deinit; mark
+        // the emit exhausted so a stray next() after adoption yields null.
+        self.emit_cursor = self.wbufs.len;
+        self.releaseStageUse();
+        return .{ .chunks = chunks, .alloc = self.worker_alloc };
+    }
+
     pub fn next(self: *ParallelScan) !?Batch {
         if (self.stage_deferred and self.workers.len == 0) try self.buildDeferredWorkers();
         if (self.mode == .unset) {

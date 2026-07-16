@@ -17,6 +17,7 @@ const Column = types.Column;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
+const engine = @import("../engine/engine.zig");
 
 const api = @import("../api/api.zig");
 const Table = api.Table;
@@ -209,6 +210,34 @@ pub const ProbeSink = struct {
     process: *const fn (ctx: *anyopaque, chunk: usize, batch: Batch) anyerror!?Batch,
 };
 
+/// One fully-materialized chunk handed over by `takeOwnedChunks`: owned
+/// column stores in the producer's output-schema order, plus its row count.
+pub const OwnedChunk = struct {
+    stores: []engine.ColumnStore,
+    rows: usize,
+};
+
+/// A pipeline's whole materialized output as owned per-chunk stores. `alloc`
+/// owns every store's buffers AND the `chunks` / per-chunk `stores` arrays —
+/// the adopter frees through it (producers allocate these from a thread-safe
+/// worker allocator, not the consumer's).
+pub const OwnedChunks = struct {
+    chunks: []OwnedChunk,
+    alloc: Allocator,
+};
+
+/// Free an `OwnedChunks` handle in full — every store's buffers plus the
+/// arrays — through its owning allocator. For consumers that fail before
+/// adopting (ownership transferred at take; it must not leak on the error
+/// path).
+pub fn deinitOwnedChunks(oc: OwnedChunks) void {
+    for (oc.chunks) |c| {
+        for (c.stores) |*st| st.deinit(oc.alloc);
+        oc.alloc.free(c.stores);
+    }
+    oc.alloc.free(oc.chunks);
+}
+
 pub const VTable = struct {
     next: *const fn (ptr: *anyopaque) anyerror!?Batch,
     deinit: *const fn (ptr: *anyopaque) void,
@@ -294,6 +323,16 @@ pub const VTable = struct {
     /// by default — any operator that materializes into reused scratch must
     /// never claim it.
     stableData: *const fn (ptr: *anyopaque) bool,
+    /// Stage-adoption handshake: hand the pipeline's FULLY-materialized output
+    /// over as owned per-chunk column stores instead of streaming it batch by
+    /// batch — the consumer (a materializing Stage) adopts the buffers and the
+    /// pull-copy's second deep copy disappears. Only a materialize-mode
+    /// ParallelScan produces one (running its drain if not yet started);
+    /// pass-through layers forward — a fused Filter as-is, a Project with its
+    /// column remap applied. Null (the default) = stream normally. Must be
+    /// called before any `next()`; on success the producer keeps nothing to
+    /// emit and its deinit skips the transferred buffers.
+    takeOwnedChunks: *const fn (ptr: *anyopaque) anyerror!?OwnedChunks,
 };
 
 /// Write `depth` levels of indentation then a complete label line.
@@ -516,6 +555,13 @@ pub const Query = struct {
     /// may be per-`next()` scratch). See `VTable.stableData`.
     pub fn stableData(self: Query) bool {
         return self.vtable.stableData(self.ptr);
+    }
+
+    /// Take ownership of the pipeline's materialized per-chunk buffers (stage
+    /// adoption). Null = not offerable; stream via `next()` instead. See
+    /// `VTable.takeOwnedChunks`.
+    pub fn takeOwnedChunks(self: Query) !?OwnedChunks {
+        return self.vtable.takeOwnedChunks(self.ptr);
     }
 
     // ----- Combinators -----
@@ -781,6 +827,11 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.stableData();
         }
+        fn takeOwnedChunksWrap(ptr: *anyopaque) anyerror!?OwnedChunks {
+            if (!@hasDecl(Op, "takeOwnedChunks")) return null;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.takeOwnedChunks();
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
@@ -801,6 +852,7 @@ fn OpWrapper(comptime Op: type) type {
             .clearDictCodeColumns = clearDictCodeColumnsWrap,
             .setEmitProjection = setEmitProjectionWrap,
             .stableData = stableDataWrap,
+            .takeOwnedChunks = takeOwnedChunksWrap,
         };
     };
 }

@@ -11,6 +11,7 @@ const Column = types.Column;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
+const engine = @import("../engine/engine.zig");
 
 const exec = @import("exec.zig");
 const Query = exec.Query;
@@ -147,6 +148,47 @@ pub const Project = struct {
     /// Pure view remap — data buffers are the upstream's.
     pub fn stableData(self: *Project) bool {
         return self.upstream.stableData();
+    }
+
+    /// Stage adoption crosses a projection by permuting each chunk's store
+    /// array per `column_map` (dropped columns free, in output order after).
+    /// A duplicate source can't share store ownership — decline BEFORE taking
+    /// (transfer is irreversible). Probe-fused batches already carry the join
+    /// schema; forward untouched.
+    pub fn takeOwnedChunks(self: *Project) !?exec.OwnedChunks {
+        if (self.probe_fused) return self.upstream.takeOwnedChunks();
+        for (self.column_map, 0..) |src, i| {
+            for (self.column_map[i + 1 ..]) |other| {
+                if (src == other) return null;
+            }
+        }
+        const oc = (try self.upstream.takeOwnedChunks()) orelse return null;
+        errdefer exec.deinitOwnedChunks(oc);
+        // Pre-allocate every remapped array so the transfer below can't fail
+        // half-applied (errdefer above owns the untouched handle until then).
+        const mapped = try oc.alloc.alloc([]engine.ColumnStore, oc.chunks.len);
+        var built: usize = 0;
+        errdefer {
+            for (mapped[0..built]) |m| oc.alloc.free(m);
+            oc.alloc.free(mapped);
+        }
+        for (mapped) |*m| {
+            m.* = try oc.alloc.alloc(engine.ColumnStore, self.column_map.len);
+            built += 1;
+        }
+        for (oc.chunks, mapped) |*c, m| {
+            for (self.column_map, m) |src, *dst| dst.* = c.stores[src];
+            outer: for (c.stores, 0..) |*st, si| {
+                for (self.column_map) |src| {
+                    if (src == si) continue :outer;
+                }
+                st.deinit(oc.alloc);
+            }
+            oc.alloc.free(c.stores);
+            c.stores = m;
+        }
+        oc.alloc.free(mapped);
+        return oc;
     }
 
     /// Project keeps row count unchanged. Sort state survives as long

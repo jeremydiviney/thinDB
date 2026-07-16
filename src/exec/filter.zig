@@ -327,6 +327,14 @@ pub const Filter = struct {
         return self.upstream.tryFuseAggregate(group_cols, aggs);
     }
 
+    /// A scan-fused Filter is a pass-through — the buffers below already hold
+    /// the filtered survivors, so stage adoption forwards. An unfused Filter
+    /// must evaluate rows itself and cannot hand anything over.
+    pub fn takeOwnedChunks(self: *Filter) !?exec.OwnedChunks {
+        if (!self.fused) return null;
+        return self.upstream.takeOwnedChunks();
+    }
+
     pub fn tryLeaseGroupBy(self: *Filter, group_cols: []const []const u8, aggs: []const exec.AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK, emit_limit: ?u32, dop: usize) !?exec.Query {
         if (!self.fused) return null;
         return self.upstream.tryLeaseGroupBy(group_cols, aggs, top_k, emit_limit, dop);
