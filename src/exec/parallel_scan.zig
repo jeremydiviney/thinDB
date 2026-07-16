@@ -524,6 +524,13 @@ pub const ParallelScan = struct {
     /// planned upper-bound chunk count.
     stage_deferred: bool = false,
     deferred_dop: usize = 0,
+    /// Compute-fusion offers accepted BEFORE the deferred barrier ran (no
+    /// workers yet): one derived slice per accepted layer, applied to the
+    /// freshly built workers in `buildDeferredWorkers`. `pending_schema_qs`
+    /// holds one never-pulled probe Compute per layer — it owns the resolved
+    /// post-fusion schema `outputSchema()` must answer in the meantime.
+    pending_computes: std.ArrayListUnmanaged([]const Derived) = .empty,
+    pending_schema_qs: std.ArrayListUnmanaged(Query) = .empty,
     /// Stage use released early (round drain exhausted) — the buffer frees
     /// as soon as the last consumer finishes, like a MatScan drain, instead
     /// of pinning until query teardown. deinit skips the second release.
@@ -885,6 +892,29 @@ pub const ParallelScan = struct {
         self.thread_active = thread_active;
         self.exhausted = exhausted;
         self.round_cursor = n_chunks;
+
+        // Fusion offers accepted before the barrier: wrap the fresh workers
+        // now, one accepted layer at a time (first layer mirrors the eager
+        // fuse, later layers stack onto the per-worker pipelines). The probe
+        // Computes in pending_schema_qs stay alive — earlier compile steps
+        // may hold their resolved schemas.
+        for (self.pending_computes.items, 0..) |derived, li| {
+            if (li == 0) {
+                const q = try self.allocator.alloc(Query, self.workers.len);
+                self.compute_q = q;
+                for (self.workers, 0..) |w, i| {
+                    const sq = switch (w) {
+                        inline else => |p| makeQuery(self.worker_alloc, p),
+                    };
+                    q[i] = try sq.compute(derived);
+                    self.compute_built = i + 1;
+                }
+                self.compute_fused = true;
+            } else {
+                for (self.compute_q) |*wq| wq.* = try wq.compute(derived);
+            }
+        }
+        if (self.compute_fused) self.out_schema = self.compute_q[0].outputSchema();
     }
 
     pub fn deinit(self: *ParallelScan) void {
@@ -913,6 +943,10 @@ pub const ParallelScan = struct {
             for (self.probe_map_views) |s| self.allocator.free(s);
             self.allocator.free(self.probe_map_views);
         }
+        for (self.pending_schema_qs.items) |*q| q.deinit();
+        self.pending_schema_qs.deinit(self.allocator);
+        for (self.pending_computes.items) |d| self.allocator.free(d);
+        self.pending_computes.deinit(self.allocator);
 
         // Ownership split (compute-fused path): scans [0..compute_built) are
         // owned by their per-worker Compute (compute_q) and freed by its deinit;
@@ -987,6 +1021,37 @@ pub const ParallelScan = struct {
     /// `compute_built` tracks construction so deinit's ownership split is correct
     /// even if a mid-build allocation fails.
     pub fn tryFuseCompute(self: *ParallelScan, derived: []const Derived) !bool {
+        if (self.stage_deferred and self.workers.len == 0) {
+            // Deferred barrier not run yet: accept the offer by STASHING the
+            // layer — buildDeferredWorkers wraps the workers at first pull,
+            // so the stage still materializes lazily in execution order (no
+            // compile-time pin). The post-fusion schema is resolved through
+            // a probe Compute over a schema-only stub; the probe never runs
+            // but owns the schema until the scan deinits.
+            if (self.mode != .unset or self.agg_fused or self.probe_sink != null) return false;
+            const cur_cols = self.out_schema;
+            for (derived) |d| {
+                if (!derivedFusable(d, cur_cols)) return false;
+            }
+            // The offered slice is typically the caller's TEMPORARY split
+            // buffer (computeDerivedFused frees it on return) — own a copy;
+            // the exprs inside live in the IR arena for the query's life.
+            const owned = try self.allocator.dupe(Derived, derived);
+            errdefer self.allocator.free(owned);
+            const stub = try self.allocator.create(DeferredSchemaStub);
+            stub.* = .{ .alloc = self.allocator, .schema = cur_cols };
+            const sq = makeQuery(self.allocator, stub);
+            var probe = sq.compute(owned) catch |e| {
+                var s = sq;
+                s.deinit();
+                return e;
+            };
+            errdefer probe.deinit();
+            try self.pending_computes.append(self.allocator, owned);
+            try self.pending_schema_qs.append(self.allocator, probe);
+            self.out_schema = probe.outputSchema();
+            return true;
+        }
         if (self.stage_deferred) return false;
         if (self.mode != .unset) return false;
         // CASE over a TABLE scan stays serial by MEASUREMENT, not capability:
@@ -2043,6 +2108,33 @@ fn exprFusable(e: Expr, scan_cols: []const Column) bool {
         .scalar_subquery, .exists_subquery, .var_ref => false,
     };
 }
+
+/// Schema-only upstream for a deferred scan's fusion probe Compute: never
+/// pulled, exists so the probe can resolve the post-fusion output schema
+/// before the real workers are built.
+const DeferredSchemaStub = struct {
+    alloc: Allocator,
+    schema: []const Column,
+    pub fn next(_: *DeferredSchemaStub) !?Batch {
+        return null;
+    }
+    pub fn deinit(s: *DeferredSchemaStub) void {
+        s.alloc.destroy(s);
+    }
+    pub fn outputSchema(s: *DeferredSchemaStub) []const Column {
+        return s.schema;
+    }
+    pub fn addPrune(_: *DeferredSchemaStub, _: predicate.Predicate) !void {}
+    pub fn stats(_: *DeferredSchemaStub) exec.PipelineStats {
+        return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+    }
+    pub fn accountant(_: *DeferredSchemaStub) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *DeferredSchemaStub, out: *std.ArrayList(u8), a: Allocator, depth: usize) !void {
+        try exec.explainLine(out, a, depth, "DeferredSchemaStub");
+    }
+};
 
 fn exprHasCase(e: Expr) bool {
     return switch (e) {

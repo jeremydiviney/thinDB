@@ -501,6 +501,13 @@ fn collectStages(
             // same way (adopt_table_fn) — and like the window case, pruning
             // would wrap a Project over the root and break its identity.
             const tvf_root = if (win_root == null) exec.queryAs(exec.table_fn.TableFnExec, q) else null;
+            if (getenv("THINDB_TRACE_FUSE") != null and win_root == null and tvf_root == null) {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(input.allocator);
+                q.explain(&buf, input.allocator, 0) catch {};
+                const first = if (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| buf.items[0..nl] else buf.items;
+                std.debug.print("[stage-noadopt] root={s}\n", .{first});
+            }
             if (win_root == null and tvf_root == null) q = pruneStageColumns(input, q);
             const stage = try set.addStage(q, input.accountant);
             stage.slice_local = input.dop_cap != null;
@@ -960,9 +967,24 @@ fn tryStageParallelChain(input: engine_v2.CompileInput, op: *const ir.Op, map: *
     var layers: std.ArrayListUnmanaged(*const ir.Op) = .empty;
     defer layers.deinit(input.allocator);
     var cur: *const ir.Op = op;
+    var crossed_wrapper = false;
     while (true) {
         switch (cur.*) {
-            .materialize => break,
+            // A mapped materialize is the stage leaf we scan; an unmapped one
+            // is a single-ref inline CTE wrapper. Walking through it (and
+            // scanning DEFERRED below, via ParallelScan's pending-compute
+            // machinery) is measured at −150ms on the rollforward p6 prefix
+            // — but on the cross-division shape the full query still exceeds
+            // the memory budget by ~one whale stage (+2190 MiB 'materialize'
+            // over 15770, 2026-07-16; eager was equally red, serial baseline
+            // green), so the crossing stays opt-in until the extra stage-
+            // lifetime pin is found. THINDB_CHAIN_WRAPPERS=1 enables it.
+            .materialize => |m| {
+                if (map.get(cur) != null) break;
+                if (getenv("THINDB_CHAIN_WRAPPERS") == null) return null;
+                crossed_wrapper = true;
+                cur = m.upstream;
+            },
             .compute => |c| {
                 try layers.append(input.allocator, cur);
                 cur = c.upstream;
@@ -989,7 +1011,8 @@ fn tryStageParallelChain(input: engine_v2.CompileInput, op: *const ir.Op, map: *
     }
     if (layers.items.len == 0) return null;
     const trace_chain = getenv("THINDB_TRACE_FUSE") != null;
-    var q = (try tryStageParallelScan(input, cur, map, .eager)) orelse {
+    const mode: StageScanMode = if (crossed_wrapper) .deferred else .eager;
+    var q = (try tryStageParallelScan(input, cur, map, mode)) orelse {
         if (trace_chain) std.debug.print("[chain] pscan-over-stage DECLINED (layers={d})\n", .{layers.items.len});
         return null;
     };

@@ -528,6 +528,7 @@ pub const Stage = struct {
                 ad.rows,
             );
         } else if (self.adopt_table_fn) |tf| {
+            if (exec.prof.enabled) std.debug.print("[stage-tvfadopt] stage#{d}\n", .{self.id});
             try tf.ensureExecuted();
             if (self.accountant) |acct| {
                 const bytes = row_bytes * @as(usize, @intCast(tf.output_cols[0].rowCount()));
