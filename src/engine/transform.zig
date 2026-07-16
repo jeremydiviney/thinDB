@@ -150,8 +150,12 @@ pub fn appendAllColumn(
         // union / stage boundary may reconcile varchar/char data under a
         // `string` schema tag while streaming the arm's views uncast (see
         // set_union.zig sameRepr), so exact-tag matching would be wrong.
+        // Bulk range append: one bytes memcpy + rebased offsets. The
+        // per-value loop this replaces cost ~28ns/string and dominated the
+        // parallel-scan worker deep copy (41M string appends on a 3.16M-row
+        // 13-string-column scan).
         .varchar, .string, .char, .json => |sv| {
-            for (0..sv.rowCount()) |i| try appendStrValue(allocator, out, sv.rowBytes(i));
+            try appendStrRange(allocator, out, sv, 0, sv.rowCount());
         },
         .float => |s| switch (out.data) {
             .float => |*list| try list.appendSlice(allocator, s),
