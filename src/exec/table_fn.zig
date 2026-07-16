@@ -1545,15 +1545,22 @@ pub const TableFnExec = struct {
         return @max(1, @min(64, n_runs / (n_workers * 8)));
     }
 
+    /// One coalesced run of adjacent segments in a worker's private stores.
+    const SegChain = struct { worker: u32, off: usize, len: usize };
+
     /// Concatenate per-run worker segments into the output columns in run
     /// order, coalescing adjacent segments that sit contiguously in the
     /// same worker's private stores (whole claim batches, in the common
-    /// case). Zero-length runs extend the current chain — their offset
-    /// equals the running end.
+    /// case) into chains ONCE, then copying COLUMN-PARALLEL: each output
+    /// column walks the chain list into its own store — independent
+    /// destinations, same claim-loop shape (and thread-safe allocator
+    /// contract) as runGatherJobs. Zero-length runs extend the current
+    /// chain — their offset equals the running end.
     fn concatRunSegs(self: *TableFnExec, segs: []const RunSeg, stores_of: []const []ColumnStore, is_pass: []const bool) !void {
         const trace = getenv("THINDB_TVF_TRACE") != null;
         const t0 = if (trace) exec.prof.nowTicks() else 0;
-        var n_chains: usize = 0;
+        var chains: std.ArrayListUnmanaged(SegChain) = .empty;
+        defer chains.deinit(self.allocator);
         var s: usize = 0;
         while (s < segs.len) {
             const wid = segs[s].worker;
@@ -1564,17 +1571,64 @@ pub const TableFnExec = struct {
                 len += segs[e].len;
                 e += 1;
             }
-            if (len > 0) {
-                n_chains += 1;
-                for (stores_of[wid], self.output_cols, is_pass) |src, *dst, skip| {
-                    if (skip) continue;
-                    try transform.appendColumnRange(self.allocator, src.view(), off, off + len, dst);
-                }
-            }
+            if (len > 0) try chains.append(self.allocator, .{ .worker = wid, .off = off, .len = len });
             s = e;
         }
+        var cols: std.ArrayListUnmanaged(usize) = .empty;
+        defer cols.deinit(self.allocator);
+        for (is_pass, 0..) |skip, j| {
+            if (!skip) try cols.append(self.allocator, j);
+        }
+        const Ctx = struct {
+            chains: []const SegChain,
+            cols: []const usize,
+            stores_of: []const []ColumnStore,
+            out: []ColumnStore,
+            alloc: Allocator,
+            next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+            err: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+            fn main(ctx: *@This()) void {
+                while (true) {
+                    const i = ctx.next.fetchAdd(1, .monotonic);
+                    if (i >= ctx.cols.len) return;
+                    const j = ctx.cols[i];
+                    for (ctx.chains) |c| {
+                        transform.appendColumnRange(ctx.alloc, ctx.stores_of[c.worker][j].view(), c.off, c.off + c.len, &ctx.out[j]) catch {
+                            ctx.err.store(true, .release);
+                            return;
+                        };
+                    }
+                }
+            }
+        };
+        var ctx = Ctx{
+            .chains = chains.items,
+            .cols = cols.items,
+            .stores_of = stores_of,
+            .out = self.output_cols,
+            .alloc = self.allocator,
+        };
+        const n_workers = @min(self.dop, cols.items.len);
+        if (n_workers <= 1) {
+            Ctx.main(&ctx);
+        } else {
+            var threads: [16]?std.Thread = .{null} ** 16;
+            const want = @min(n_workers, threads.len);
+            for (threads[0..want]) |*th| th.* = std.Thread.spawn(.{}, Ctx.main, .{&ctx}) catch null;
+            var spawned: usize = 0;
+            for (threads[0..want]) |th| {
+                if (th) |t| {
+                    t.join();
+                    spawned += 1;
+                }
+            }
+            if (spawned == 0) Ctx.main(&ctx);
+        }
+        // The transform appends only fail on allocation.
+        if (ctx.err.load(.acquire)) return error.OutOfMemory;
         if (trace) std.debug.print("[tvf]   writer concat: {d:.0}ms ({d} segs -> {d} chains)\n", .{
-            exec.prof.ticksToMs(exec.prof.nowTicks() - t0), segs.len, n_chains,
+            exec.prof.ticksToMs(exec.prof.nowTicks() - t0), segs.len, chains.items.len,
         });
     }
 
