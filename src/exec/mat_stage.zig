@@ -774,6 +774,12 @@ pub const MatScan = struct {
 
     pub fn addPrune(_: *MatScan, _: exec.Predicate) !void {}
 
+    /// Batches are views over the stage's immutable `MaterializedResult` —
+    /// data lives until the stage is released at deinit.
+    pub fn stableData(_: *MatScan) bool {
+        return true;
+    }
+
     pub fn stats(self: *MatScan) exec.PipelineStats {
         return .{
             .upper_rows = self.stage.stats_upper_rows,

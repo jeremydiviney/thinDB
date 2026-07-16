@@ -128,6 +128,11 @@ pub const AliasRename = struct {
         return self.upstream.tryFuseAggregate(group_cols, aggs);
     }
 
+    /// Schema relabel only — data buffers are the upstream's.
+    pub fn stableData(self: *AliasRename) bool {
+        return self.upstream.stableData();
+    }
+
     pub fn stats(self: *AliasRename) exec.PipelineStats {
         return self.upstream.stats();
     }

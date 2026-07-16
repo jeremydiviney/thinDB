@@ -17,6 +17,7 @@ const Query = exec.Query;
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
 const partitioned_aggregate = @import("partitioned_aggregate.zig");
+const parallel_reduce = @import("parallel_reduce.zig");
 
 /// The standard GROUP BY routing trio — sorted-stream / radix / hash — shared
 /// by the embedded dispatcher and the staged CTE mat-block compiler. Follows
@@ -57,6 +58,7 @@ pub fn routeGroupBy(
 /// restores the serial hash fallback.
 pub fn routeGroupByDop(
     allocator: Allocator,
+    worker_alloc: Allocator,
     upstream: *Query,
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
@@ -65,6 +67,9 @@ pub fn routeGroupByDop(
     budget: usize,
     dop: usize,
 ) !Query {
+    if (group_cols.len == 0 and top_k == null and emit_limit == null and exec.force_group_by == .auto) {
+        if (try routeGlobalReduce(allocator, worker_alloc, upstream, aggs, dop)) |q| return q;
+    }
     if (try routeStreamGroupBy(allocator, upstream, group_cols, aggs, budget)) |q| return q;
     if (try routeRadixGroupBy(upstream.*, group_cols, aggs, top_k, emit_limit)) |q| return q;
     if (dop > 1 and group_cols.len > 0 and top_k == null and emit_limit == null and
@@ -78,6 +83,29 @@ pub fn routeGroupByDop(
         return partitioned_aggregate.PartitionedAggregate.create(allocator, upstream.*, group_cols, aggs, dop);
     }
     return upstream.groupByTopK(group_cols, aggs, top_k, emit_limit);
+}
+
+/// Parallel reduce for a GLOBAL (no-key) aggregate over a stable-data
+/// upstream — the missing parallel lane between the V2 table handlers (which
+/// have their own reduce) and the grouped pagg/radix/stream trio (all gated
+/// on `group_cols.len > 0`). Without it a `SELECT SUM(..), MAX(..) FROM cte`
+/// folds millions of rows serially on the connection thread. Engages only
+/// when the upstream's batch data is stable (stage-backed reads and pure view
+/// remaps above them — see `VTable.stableData`) and every aggregate is
+/// two-phase combinable. THINDB_NO_GLOBAL_REDUCE=1 restores the serial path.
+/// Consumes `upstream` only on success.
+pub fn routeGlobalReduce(
+    allocator: Allocator,
+    worker_alloc: Allocator,
+    upstream: *Query,
+    aggs: []const ir.AggSpec,
+    dop: usize,
+) !?Query {
+    if (dop <= 1) return null;
+    if (getenv_gr("THINDB_NO_GLOBAL_REDUCE") != null) return null;
+    if (upstream.stats().upper_rows < partitioned_aggregate.MIN_ROWS_FOR_PARALLEL) return null;
+    if (!upstream.stableData()) return null;
+    return parallel_reduce.ParallelReduceAggregate.create(allocator, worker_alloc, upstream.*, aggs, dop);
 }
 
 pub fn routeStreamGroupBy(
@@ -211,11 +239,10 @@ pub fn routeRadixGroupBy(
 /// core; the serial combine above re-aggregates the per-chunk partials.
 ///
 /// Gated to combinable aggregates (COUNT/SUM/MIN/MAX/ANY_VALUE, plus
-/// MAX_BY via a hidden max_by_key partial). A GLOBAL
-/// (no-key) aggregate additionally excludes MIN/MAX: an empty chunk's
-/// global partial emits a zero row (the SUM-over-empty dialect), which
-/// combines safely for COUNT/SUM but would poison MIN/MAX. Grouped partials
-/// emit nothing for empty chunks, so all four are safe there. Cardinality
+/// MAX_BY via a hidden max_by_key partial) — global and grouped alike:
+/// post-#79 an empty chunk's GLOBAL partial emits COUNT=0 and NULL for
+/// everything else, and every combine function skips NULLs (max_by via its
+/// pair semantics), so empty partials can't poison the result. Cardinality
 /// gate mirrors routeParallelGroupBy: only proven-small key spaces — above
 /// the radix cache line the serial combine over ~unreduced partials loses.
 ///
@@ -232,52 +259,12 @@ pub fn routeJoinPartialGroupBy(
 ) !?Query {
     const trace_pa = getenv_gr("THINDB_TRACE_PARTIALAGG") != null;
     if (trace_pa) std.debug.print("[pagg-route] enter keys={d} aggs={d}\n", .{ group_cols.len, aggs.len });
-    for (aggs) |a| switch (a.func) {
-        .count, .sum => {},
-        // any_value combines like min/max: a representative of per-chunk
-        // representatives is still a representative. Grouped only — like
-        // MIN/MAX, a global partial over an empty chunk would emit a NULL
-        // row that could win the combine over real values.
-        //
-        // max_by combines via a hidden max_by_key twin appended to the
-        // partial list: each partial row carries (value-at-chunk-max-ord,
-        // that pair's ord), and the combine is max_by(value, hidden ord).
-        // The twin shares max_by's skip-if-EITHER-NULL pair semantics — a
-        // plain MAX(ord) would count NULL-value rows and could carry an ord
-        // higher than its partial's value, poisoning the combine.
-        .min, .max, .any_value, .max_by => if (group_cols.len == 0) return null,
-        else => {
-            if (trace_pa) std.debug.print("[pagg-route]   decline agg func={s}\n", .{@tagName(a.func)});
-            return null;
-        },
-    };
-
-    // Partial spec list: the originals, plus one hidden max_by_key twin per
-    // max_by so its winning ord rides along for the combine.
-    var n_hidden: usize = 0;
-    for (aggs) |a| {
-        if (a.func == .max_by) n_hidden += 1;
+    if (!parallel_reduce.combinable(aggs)) {
+        if (trace_pa) std.debug.print("[pagg-route]   decline: non-combinable agg\n", .{});
+        return null;
     }
-    const part_aggs: []const ir.AggSpec = if (n_hidden == 0) aggs else blk: {
-        const up_schema = upstream.outputSchema();
-        const buf = try combine_arena.alloc(ir.AggSpec, aggs.len + n_hidden);
-        @memcpy(buf[0..aggs.len], aggs);
-        var j: usize = aggs.len;
-        for (aggs) |a| {
-            if (a.func != .max_by) continue;
-            const ord_name = a.arg2_col orelse return null;
-            const ord_idx = types.findColumn(up_schema, ord_name) orelse return null;
-            buf[j] = .{
-                .func = .max_by_key,
-                .col = a.col,
-                .arg2_col = ord_name,
-                .as = try std.fmt.allocPrint(combine_arena, "__mb_ord__{s}", .{a.as}),
-                .out_type_override = up_schema[ord_idx].type,
-            };
-            j += 1;
-        }
-        break :blk buf;
-    };
+
+    const part_aggs = (try parallel_reduce.partialSpecs(combine_arena, upstream.outputSchema(), aggs)) orelse return null;
 
     if (group_cols.len > 0) {
         // Decline only a PROVEN-large key space. Unknown cardinality takes
@@ -318,32 +305,9 @@ pub fn routeJoinPartialGroupBy(
     if (trace_pa) std.debug.print("[pagg-route]   tryFuseAggregate -> {}\n", .{fused});
     if (!fused) return null;
 
-    // Combine specs over the partials, read by `.as`, type-forced to the
-    // partial output type (COUNT's bigint must not be widened by SUM).
-    // Hidden max_by_key columns sit past aggs.len in the partial schema —
-    // combine inputs only, never re-emitted.
-    const part_schema = upstream.outputSchema();
-    const combine = try combine_arena.alloc(ir.AggSpec, aggs.len);
-    var hj: usize = aggs.len;
-    for (aggs, 0..) |a, i| {
-        combine[i] = .{
-            .func = switch (a.func) {
-                .count, .sum => .sum,
-                .min => .min,
-                .max => .max,
-                .any_value => .any_value,
-                .max_by => .max_by,
-                else => unreachable,
-            },
-            .col = a.as,
-            .as = a.as,
-            .out_type_override = part_schema[group_cols.len + i].type,
-        };
-        if (a.func == .max_by) {
-            combine[i].arg2_col = part_aggs[hj].as;
-            hj += 1;
-        }
-    }
+    // Combine specs over the partials (see `parallel_reduce.combineSpecs`);
+    // the partial schema is the fused upstream's output.
+    const combine = try parallel_reduce.combineSpecs(combine_arena, aggs, part_aggs, upstream.outputSchema(), group_cols.len);
     return try upstream.groupByTopK(group_cols, combine, top_k, emit_limit);
 }
 

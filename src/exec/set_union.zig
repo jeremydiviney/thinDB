@@ -214,6 +214,16 @@ pub const SetUnion = struct {
         // each side; not worth the complication for v1.
     }
 
+    /// Stable only when both arms are and no cast kernel rewrites arm
+    /// batches into this operator's reused `cast_cols` scratch. A probe
+    /// sink's serial lane also reuses chunk-0 scratch — unstable.
+    pub fn stableData(self: *SetUnion) bool {
+        if (self.probe_sink != null) return false;
+        for (self.left_casts) |c| if (c != null) return false;
+        for (self.right_casts) |c| if (c != null) return false;
+        return self.left.stableData() and self.right.stableData();
+    }
+
     pub fn stats(self: *SetUnion) exec.PipelineStats {
         const l = self.left.stats();
         const r = self.right.stats();

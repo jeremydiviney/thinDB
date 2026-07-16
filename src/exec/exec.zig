@@ -284,6 +284,16 @@ pub const VTable = struct {
     /// Filter swallows it (its predicate still needs those columns at runtime).
     /// Every other operator no-ops via `makeQuery`'s `@hasDecl` guard.
     setEmitProjection: *const fn (ptr: *anyopaque, keep: []const []const u8) anyerror!void,
+    /// True when the column DATA (and any sidecar payloads) behind every batch
+    /// this operator emits stays valid until the operator's deinit — only the
+    /// view-struct arrays may be per-`next()` scratch. Loosens the Batch
+    /// lifetime contract for a parallel consumer that holds batches across
+    /// further `next()` calls (it must copy the view structs, never the data).
+    /// True for readers over immutable materialized stages (MatScan) and pure
+    /// view remaps above them (Project/AliasRename/cast-free SetUnion); false
+    /// by default — any operator that materializes into reused scratch must
+    /// never claim it.
+    stableData: *const fn (ptr: *anyopaque) bool,
 };
 
 /// Write `depth` levels of indentation then a complete label line.
@@ -500,6 +510,12 @@ pub const Query = struct {
     /// Phase 4.2 multi-key: roll back the underlying Scan's coded-column setup.
     pub fn clearDictCodeColumns(self: Query) void {
         return self.vtable.clearDictCodeColumns(self.ptr);
+    }
+
+    /// True when emitted batches' DATA stays valid until deinit (view structs
+    /// may be per-`next()` scratch). See `VTable.stableData`.
+    pub fn stableData(self: Query) bool {
+        return self.vtable.stableData(self.ptr);
     }
 
     // ----- Combinators -----
@@ -760,6 +776,11 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.setEmitProjection(keep);
         }
+        fn stableDataWrap(ptr: *anyopaque) bool {
+            if (!@hasDecl(Op, "stableData")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.stableData();
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
@@ -779,6 +800,7 @@ fn OpWrapper(comptime Op: type) type {
             .canCodeColumn = canCodeColumnWrap,
             .clearDictCodeColumns = clearDictCodeColumnsWrap,
             .setEmitProjection = setEmitProjectionWrap,
+            .stableData = stableDataWrap,
         };
     };
 }

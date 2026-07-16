@@ -785,6 +785,8 @@ fn collectBlockStages(
 /// stays cheap to print and the stages aren't run.
 const AdaptiveGroupBy = struct {
     allocator: Allocator,
+    /// Thread-safe allocator for parallel routes (global reduce workers).
+    worker_alloc: Allocator,
     up: exec.Query,
     stages: []*mat_stage.Stage,
     group_cols: []const []const u8,
@@ -799,6 +801,7 @@ const AdaptiveGroupBy = struct {
 
     fn create(
         allocator: Allocator,
+        worker_alloc: Allocator,
         up: exec.Query,
         stages: []*mat_stage.Stage,
         group_cols: []const []const u8,
@@ -813,6 +816,7 @@ const AdaptiveGroupBy = struct {
         const self = try allocator.create(AdaptiveGroupBy);
         self.* = .{
             .allocator = allocator,
+            .worker_alloc = worker_alloc,
             .up = up,
             .stages = stages,
             .group_cols = group_cols,
@@ -838,6 +842,20 @@ const AdaptiveGroupBy = struct {
                 " upper_rows={d} max_dop={d} top_k={} emit_limit={} stages={d}\n",
                 .{ self.up.stats().upper_rows, self.max_dop, self.top_k != null, self.emit_limit != null, self.stages.len },
             );
+        }
+        // A GLOBAL aggregate (no keys) over a big primed buffer: fold partials
+        // on `max_dop` workers sharing the buffer reads instead of draining
+        // the whole input serially on this thread. Declines itself (falling
+        // through to the serial path) when the input's batch data isn't
+        // stable or an aggregate isn't two-phase combinable.
+        if (self.group_cols.len == 0 and self.top_k == null and self.emit_limit == null and
+            exec.force_group_by == .auto and getenv("THINDB_NO_PARALLEL_GROUP") == null)
+        {
+            if (try group_route.routeGlobalReduce(self.allocator, self.worker_alloc, &self.up, self.aggs, self.max_dop)) |q| {
+                if (trace_gb) std.debug.print("[gbroute-adaptive]   -> global reduce\n", .{});
+                self.chosen = q;
+                return;
+            }
         }
         // A plain (no top-k / no limit) GROUP BY over a buffer with a realized
         // row count worth threading: try the specialized serial-beating paths
@@ -2795,6 +2813,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 errdefer input.allocator.free(owned);
                 return AdaptiveGroupBy.create(
                     input.allocator,
+                    input.db.allocator,
                     up,
                     owned,
                     g.group_cols,
@@ -2812,6 +2831,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             }
             return group_route.routeGroupByDop(
                 input.allocator,
+                input.db.allocator,
                 &up,
                 g.group_cols,
                 g.aggs,
@@ -3292,6 +3312,7 @@ test "tvfEmitKeys: advertisement conditions" {
         .ordered_output = false,
         .passthrough = &.{ .{ .out_idx = 0, .in_idx = 0 }, .{ .out_idx = 1, .in_idx = 1 } },
         .kernel_input_cols = 3,
+        .broadcast_inputs = &.{},
         .process = stub.process,
         .user_data = null,
     };

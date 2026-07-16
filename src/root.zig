@@ -137,4 +137,5 @@ test {
     _ = @import("net/cte_stages.zig");
     _ = @import("exec/parallel_scan.zig");
     _ = @import("exec/partitioned_aggregate.zig");
+    _ = @import("exec/parallel_reduce.zig");
 }

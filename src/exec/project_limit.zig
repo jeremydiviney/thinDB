@@ -144,6 +144,11 @@ pub const Project = struct {
         return self.upstream.addPrune(pred);
     }
 
+    /// Pure view remap — data buffers are the upstream's.
+    pub fn stableData(self: *Project) bool {
+        return self.upstream.stableData();
+    }
+
     /// Project keeps row count unchanged. Sort state survives as long
     /// as every key in the upstream's sort_state.keys is still in the
     /// output schema; otherwise the sort claim is truncated to the
