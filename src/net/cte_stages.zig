@@ -988,7 +988,20 @@ fn tryStageParallelChain(input: engine_v2.CompileInput, op: *const ir.Op, map: *
         }
     }
     if (layers.items.len == 0) return null;
-    var q = (try tryStageParallelScan(input, cur, map, .eager)) orelse return null;
+    const trace_chain = getenv("THINDB_TRACE_FUSE") != null;
+    var q = (try tryStageParallelScan(input, cur, map, .eager)) orelse {
+        if (trace_chain) std.debug.print("[chain] pscan-over-stage DECLINED (layers={d})\n", .{layers.items.len});
+        return null;
+    };
+    if (trace_chain) {
+        std.debug.print("[chain] engaged: layers={d} [", .{layers.items.len});
+        var li = layers.items.len;
+        while (li > 0) {
+            li -= 1;
+            std.debug.print(" {s}", .{@tagName(layers.items[li].*)});
+        }
+        std.debug.print(" ]\n", .{});
+    }
     errdefer q.deinit();
     var i = layers.items.len;
     while (i > 0) {

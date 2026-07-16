@@ -988,7 +988,35 @@ pub const ParallelScan = struct {
     /// even if a mid-build allocation fails.
     pub fn tryFuseCompute(self: *ParallelScan, derived: []const Derived) !bool {
         if (self.stage_deferred) return false;
-        if (self.mode != .unset or self.compute_fused) return false;
+        if (self.mode != .unset) return false;
+        // CASE over a TABLE scan stays serial by MEASUREMENT, not capability:
+        // the wayroll A/B (2026-07-11, table-source) showed fusing CASE-heavy
+        // chains there is a net loss — the scan is memory-bandwidth-bound, so
+        // N workers buy nothing while per-chunk operator instances add cost.
+        // Over a BUFFER (stage) scan the same fusion is a clear win (block-6
+        // A/B 2026-07-16: serial pull 280ms → 55ms): the alternative is the
+        // whole scalar bill on the consumer thread. THINDB_FUSE_CASE=1
+        // force-enables table-source fusion for future re-measurement.
+        if (self.table != null and getenv("THINDB_FUSE_CASE") == null) {
+            for (derived) |d| {
+                if (exprHasCase(d.expr)) return false;
+            }
+        }
+        if (self.compute_fused) {
+            // Stack a second fused Compute: the offer's exprs reference the
+            // post-fusion schema (prior derived included), so chain one more
+            // Compute onto each worker's pipeline. A mid-loop failure leaves
+            // every q[i] a valid (wrapped or unwrapped) query, so deinit's
+            // chain teardown stays correct while the error propagates.
+            const cur_cols = self.out_schema;
+            for (derived) |d| {
+                if (!derivedFusable(d, cur_cols)) return false;
+            }
+            const q = self.compute_q;
+            for (q) |*wq| wq.* = try wq.compute(derived);
+            self.out_schema = q[0].outputSchema();
+            return true;
+        }
         const scan_cols = self.workers[0].outputSchema();
         for (derived) |d| {
             if (!derivedFusable(d, scan_cols)) return false;
@@ -1374,16 +1402,18 @@ pub const ParallelScan = struct {
         if (self.mode == .unset) {
             self.rebalanceChunksForPruning();
             // Fusion happens after create() (the wrapping Filter/Compute fuse on
-            // their way up), so the strategy is settled by the first pull. A
-            // fused filter (bounded survivors) ⇒ materialize + concat. A fused
-            // compute over a BUFFER source streams (round mode): the workers run
-            // the derived columns per stripe and emit batch-at-a-time, so a
-            // streaming CTE chain crosses the stage boundary parallel with NO
-            // full-result copy. (Table-source compute still materializes — the
-            // table hot path is unchanged.)
-            const compute_streams = self.compute_fused and self.table == null;
-            const force_mat = self.agg_fused or self.workers[0].fusedActive() or
-                (self.compute_fused and !compute_streams);
+            // their way up), so the strategy is settled by the first pull. Over
+            // a TABLE, a fused filter (bounded survivors) or compute ⇒
+            // materialize + concat. Over a BUFFER source, fused filters AND
+            // computes stream (round mode): the workers evaluate per stripe and
+            // emit batch-at-a-time, so a streaming CTE chain crosses the stage
+            // boundary parallel with NO full-result copy — duplicating an
+            // already-materialized buffer wholesale is what blows the memory
+            // budget on wide stages. (A STAGE consumer still gets materialized
+            // buffers via takeOwnedChunks, which decides its own mode above.)
+            const buffer_src = self.table == null;
+            const force_mat = self.agg_fused or
+                ((self.workers[0].fusedActive() or self.compute_fused) and !buffer_src);
             self.mode = if (force_mat) .materialize else .round;
             if (self.mode == .materialize) try self.runMaterialize();
         }
@@ -2005,12 +2035,61 @@ fn exprFusable(e: Expr, scan_cols: []const Column) bool {
             }
             return true;
         },
-        // CASE stays serial by MEASUREMENT, not capability: the per-stripe
-        // Compute instances evaluate it correctly (own CasePlan per op), but
-        // the wayroll A/B (2026-07-11) showed fusing CASE-heavy chains is a
-        // net loss — the work is memory-bandwidth-bound, so N workers buy
-        // nothing while the per-chunk operator instances add allocation cost.
-        .case, .scalar_subquery, .exists_subquery, .var_ref => false,
+        // CASE is fusable when row-local (branch conds, THENs, and ELSE all
+        // reference upstream columns only). Whether fusing it actually WINS
+        // depends on the source — see the table-source gate in
+        // `ParallelScan.tryFuseCompute`.
+        .case => |c| caseFusable(c, scan_cols),
+        .scalar_subquery, .exists_subquery, .var_ref => false,
+    };
+}
+
+fn exprHasCase(e: Expr) bool {
+    return switch (e) {
+        .case => true,
+        .call => |c| blk: {
+            for (c.args) |a| {
+                if (exprHasCase(a)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+/// Row-locality check for a CASE expression: every branch condition,
+/// every THEN, and the ELSE must reference only upstream scan columns.
+fn caseFusable(c: Expr.Case, scan_cols: []const Column) bool {
+    for (c.branches) |b| {
+        if (!predFusable(b.cond, scan_cols)) return false;
+        if (!exprFusable(b.then, scan_cols)) return false;
+    }
+    if (c.else_branch) |e| {
+        if (!exprFusable(e.*, scan_cols)) return false;
+    }
+    return true;
+}
+
+/// Row-locality check for a predicate used inside a CASE branch condition.
+/// Opaque/unresolved variants (subqueries, correlated forms, var refs) touch
+/// query-wide state and are never fusable.
+fn predFusable(p: predicate.PredicateExpr, scan_cols: []const Column) bool {
+    return switch (p) {
+        .leaf, .day_leaf => |l| types.findColumn(scan_cols, l.col) != null,
+        .leaf_col_col => |c| types.findColumn(scan_cols, c.left) != null and
+            types.findColumn(scan_cols, c.right) != null,
+        .is_null, .is_not_null => |name| types.findColumn(scan_cols, name) != null,
+        .like => |l| types.findColumn(scan_cols, l.col) != null,
+        .in_set => |s| types.findColumn(scan_cols, s.col) != null,
+        .@"and", .@"or" => |arms| blk: {
+            for (arms) |a| {
+                if (!predFusable(a, scan_cols)) break :blk false;
+            }
+            break :blk true;
+        },
+        .not => |n| predFusable(n.*, scan_cols),
+        .always, .unknown => true,
+        else => false,
     };
 }
 

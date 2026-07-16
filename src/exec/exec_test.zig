@@ -2692,9 +2692,17 @@ test "parallel scan compute split: safe derived fused, unsafe (CASE) stays seria
         .else_branch = &else_zero,
     } } };
 
-    // Classification: length(s) is fusable; CASE is not.
+    // Classification: length(s) is fusable; a row-local CASE now classifies
+    // fusable too (the measured table-source exclusion lives in
+    // ParallelScan.tryFuseCompute, not here). A CASE whose branch condition
+    // references a column outside the scan schema stays non-fusable.
     try std.testing.expect(exec.derivedFusable(safe, schema.columns));
-    try std.testing.expect(!exec.derivedFusable(unsafe, schema.columns));
+    try std.testing.expect(exec.derivedFusable(unsafe, schema.columns));
+    const sibling_case = Derived{ .name = "c2", .expr = .{ .case = .{
+        .branches = &.{.{ .cond = leafExpr("not_a_column", .gte, .{ .bigint = 50 }), .then = .{ .lit = .{ .int = 1 } } }},
+        .else_branch = &else_zero,
+    } } };
+    try std.testing.expect(!exec.derivedFusable(sibling_case, schema.columns));
 
     // Encode each surviving row's (l, c) as one i64 so we can compare multisets.
     const collectLC = struct {
@@ -2728,6 +2736,9 @@ test "parallel scan compute split: safe derived fused, unsafe (CASE) stays seria
         // unsafe CASE serially above — what fuseSplitCompute does at compile.
         const fused = try filtered.tryFuseCompute(&.{safe});
         try std.testing.expect(fused);
+        // Table-backed scan declines the CASE offer (measured net loss);
+        // it stays a serial layer above.
+        try std.testing.expect(!(try filtered.tryFuseCompute(&.{unsafe})));
         var q = try filtered.compute(&.{unsafe});
         try collectLC(allocator, &q, &got);
 

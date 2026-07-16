@@ -263,41 +263,59 @@ pub fn isNotNullExpr(col: []const u8) PredicateExpr {
     return .{ .is_not_null = col };
 }
 
+/// One column relabel for pushing an expression through a renaming
+/// projection: a reference to `from` (the projection's output label)
+/// becomes `to` (the source column's label on the far side).
+pub const ColRename = struct { from: []const u8, to: []const u8 };
+
+/// Resolve a column reference through a rename list; identity when absent.
+pub fn renameOf(renames: []const ColRename, name: []const u8) []const u8 {
+    for (renames) |r| {
+        if (types.columnNameEql(r.from, name)) return r.to;
+    }
+    return name;
+}
+
 /// Deep-clone a PredicateExpr into `out_arena`. Mirrors
 /// `expr.deepClone` for the boolean side of a CASE/WHERE expression;
 /// used when an Expr.case needs to outlive its source arena.
 pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.mem.Allocator.Error!PredicateExpr {
+    return deepClonePredicateRenamed(out_arena, p, &.{});
+}
+
+/// deepClonePredicate with column-reference substitution (see `ColRename`).
+pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr, renames: []const ColRename) std.mem.Allocator.Error!PredicateExpr {
     return switch (p) {
         .leaf => |lf| .{ .leaf = .{
-            .col = try out_arena.dupe(u8, lf.col),
+            .col = try out_arena.dupe(u8, renameOf(renames, lf.col)),
             .op = lf.op,
             .val = try cloneValue(out_arena, lf.val),
         } },
         .day_leaf => |lf| .{ .day_leaf = .{
-            .col = try out_arena.dupe(u8, lf.col),
+            .col = try out_arena.dupe(u8, renameOf(renames, lf.col)),
             .op = lf.op,
             .val = try cloneValue(out_arena, lf.val),
         } },
         .leaf_col_col => |lc| .{ .leaf_col_col = .{
-            .left = try out_arena.dupe(u8, lc.left),
+            .left = try out_arena.dupe(u8, renameOf(renames, lc.left)),
             .op = lc.op,
-            .right = try out_arena.dupe(u8, lc.right),
+            .right = try out_arena.dupe(u8, renameOf(renames, lc.right)),
         } },
-        .is_null => |c| .{ .is_null = try out_arena.dupe(u8, c) },
-        .is_not_null => |c| .{ .is_not_null = try out_arena.dupe(u8, c) },
+        .is_null => |c| .{ .is_null = try out_arena.dupe(u8, renameOf(renames, c)) },
+        .is_not_null => |c| .{ .is_not_null = try out_arena.dupe(u8, renameOf(renames, c)) },
         .like => |lp| .{ .like = .{
-            .col = try out_arena.dupe(u8, lp.col),
+            .col = try out_arena.dupe(u8, renameOf(renames, lp.col)),
             .pattern = try out_arena.dupe(u8, lp.pattern),
         } },
         .scalar_subquery => |sq| .{ .scalar_subquery = .{
-            .col = try out_arena.dupe(u8, sq.col),
+            .col = try out_arena.dupe(u8, renameOf(renames, sq.col)),
             .op = sq.op,
             .source = sq.source,
         } },
         .exists_subquery => |src| .{ .exists_subquery = src },
         .always => |b| .{ .always = b },
         .in_subquery => |s| .{ .in_subquery = .{
-            .col = try out_arena.dupe(u8, s.col),
+            .col = try out_arena.dupe(u8, renameOf(renames, s.col)),
             .source = s.source,
             .negate = s.negate,
         } },
@@ -305,14 +323,14 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
             const vals = try out_arena.alloc(Value, s.values.len);
             for (s.values, vals) |v, *out| out.* = try cloneValue(out_arena, v);
             break :blk .{ .in_set = .{
-                .col = try out_arena.dupe(u8, s.col),
+                .col = try out_arena.dupe(u8, renameOf(renames, s.col)),
                 .values = vals,
                 .negate = s.negate,
             } };
         },
         .correlated_set => |s| blk: {
             const outer_cols = try out_arena.alloc([]const u8, s.outer_cols.len);
-            for (s.outer_cols, outer_cols) |src, *dst| dst.* = try out_arena.dupe(u8, src);
+            for (s.outer_cols, outer_cols) |src, *dst| dst.* = try out_arena.dupe(u8, renameOf(renames, src));
             const rows = try out_arena.alloc([]const Value, s.rows.len);
             for (s.rows, rows) |src, *dst| {
                 const tuple = try out_arena.alloc(Value, src.len);
@@ -327,7 +345,7 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
         },
         .correlated_scalar => |s| blk: {
             const outer_keys = try out_arena.alloc([]const u8, s.outer_keys.len);
-            for (s.outer_keys, outer_keys) |src, *dst| dst.* = try out_arena.dupe(u8, src);
+            for (s.outer_keys, outer_keys) |src, *dst| dst.* = try out_arena.dupe(u8, renameOf(renames, src));
             const rows = try out_arena.alloc(CorrelatedScalarRow, s.rows.len);
             for (s.rows, rows) |src, *dst| {
                 const key = try out_arena.alloc(Value, src.key.len);
@@ -335,7 +353,7 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
                 dst.* = .{ .key = key, .value = try cloneValue(out_arena, src.value) };
             }
             break :blk .{ .correlated_scalar = .{
-                .outer_compared = try out_arena.dupe(u8, s.outer_compared),
+                .outer_compared = try out_arena.dupe(u8, renameOf(renames, s.outer_compared)),
                 .op = s.op,
                 .outer_keys = outer_keys,
                 .rows = rows,
@@ -343,7 +361,7 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
         },
         .correlated_range => |s| blk: {
             const outer_keys = try out_arena.alloc([]const u8, s.outer_keys.len);
-            for (s.outer_keys, outer_keys) |src, *dst| dst.* = try out_arena.dupe(u8, src);
+            for (s.outer_keys, outer_keys) |src, *dst| dst.* = try out_arena.dupe(u8, renameOf(renames, src));
             const groups = try out_arena.alloc(CorrelatedRangeGroup, s.groups.len);
             for (s.groups, groups) |src, *dst| {
                 const key = try out_arena.alloc(Value, src.key.len);
@@ -352,10 +370,10 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
                 for (src.values, values) |v, *o| o.* = try cloneValue(out_arena, v);
                 dst.* = .{ .key = key, .values = values };
             }
-            const upper_col_dup: ?[]const u8 = if (s.outer_range_col_upper) |c| try out_arena.dupe(u8, c) else null;
+            const upper_col_dup: ?[]const u8 = if (s.outer_range_col_upper) |c| try out_arena.dupe(u8, renameOf(renames, c)) else null;
             break :blk .{ .correlated_range = .{
                 .outer_keys = outer_keys,
-                .outer_range_col = try out_arena.dupe(u8, s.outer_range_col),
+                .outer_range_col = try out_arena.dupe(u8, renameOf(renames, s.outer_range_col)),
                 .op = s.op,
                 .outer_range_col_upper = upper_col_dup,
                 .op_upper = s.op_upper,
@@ -365,21 +383,21 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
         },
         .@"and" => |kids| blk: {
             const dup = try out_arena.alloc(PredicateExpr, kids.len);
-            for (kids, 0..) |k, i| dup[i] = try deepClonePredicate(out_arena, k);
+            for (kids, 0..) |k, i| dup[i] = try deepClonePredicateRenamed(out_arena, k, renames);
             break :blk .{ .@"and" = dup };
         },
         .@"or" => |kids| blk: {
             const dup = try out_arena.alloc(PredicateExpr, kids.len);
-            for (kids, 0..) |k, i| dup[i] = try deepClonePredicate(out_arena, k);
+            for (kids, 0..) |k, i| dup[i] = try deepClonePredicateRenamed(out_arena, k, renames);
             break :blk .{ .@"or" = dup };
         },
         .not => |child| blk: {
             const dup = try out_arena.create(PredicateExpr);
-            dup.* = try deepClonePredicate(out_arena, child.*);
+            dup.* = try deepClonePredicateRenamed(out_arena, child.*, renames);
             break :blk .{ .not = dup };
         },
         .leaf_var => |v| .{ .leaf_var = .{
-            .col = try out_arena.dupe(u8, v.col),
+            .col = try out_arena.dupe(u8, renameOf(renames, v.col)),
             .op = v.op,
             .var_name = try out_arena.dupe(u8, v.var_name),
         } },

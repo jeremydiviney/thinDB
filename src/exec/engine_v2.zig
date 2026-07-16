@@ -791,8 +791,20 @@ pub fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived:
     for (derived) |d| {
         if (exec.derivedFusable(d, scan_cols)) try fusable.append(allocator, d) else try serial.append(allocator, d);
     }
+    const trace_fuse = getenv_c("THINDB_TRACE_FUSE") != null;
+    if (trace_fuse) std.debug.print("[fuse] split fusable={d} serial={d}\n", .{ fusable.items.len, serial.items.len });
     if (fusable.items.len == 0) return computeSelfPushed(result, derived, udf_registry);
-    if (!try result.tryFuseCompute(fusable.items)) return computeSelfPushed(result, derived, udf_registry);
+    if (!try result.tryFuseCompute(fusable.items)) {
+        if (trace_fuse) {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            result.explain(&buf, allocator, 0) catch {};
+            const line = if (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| buf.items[0..nl] else buf.items;
+            std.debug.print("[fuse] tryFuseCompute DECLINED ({d} cols) upstream={s}\n", .{ fusable.items.len, line });
+        }
+        return computeSelfPushed(result, derived, udf_registry);
+    }
+    if (trace_fuse) std.debug.print("[fuse] tryFuseCompute OK ({d} cols)\n", .{fusable.items.len});
     if (serial.items.len == 0) return result;
     return computeSelfPushed(result, serial.items, udf_registry);
 }

@@ -107,26 +107,33 @@ pub fn call(arena: Allocator, fn_name: []const u8, args: []const Expr) !Expr {
 /// source. Resolution copies the user-built tree into the operator's
 /// own arena via this.
 pub fn deepClone(out_arena: Allocator, e: Expr) Allocator.Error!Expr {
+    return deepCloneRenamed(out_arena, e, &.{});
+}
+
+/// deepClone with column-reference substitution (CASE branch conditions
+/// included): used to push an expression through a renaming projection,
+/// where every ref must re-bind to the source column's label.
+pub fn deepCloneRenamed(out_arena: Allocator, e: Expr, renames: []const predicate_mod.ColRename) Allocator.Error!Expr {
     return switch (e) {
-        .col_ref => |name| .{ .col_ref = try out_arena.dupe(u8, name) },
+        .col_ref => |name| .{ .col_ref = try out_arena.dupe(u8, predicate_mod.renameOf(renames, name)) },
         .lit => |v| .{ .lit = try cloneValue(out_arena, v) },
         .null_lit => |t| .{ .null_lit = t },
         .call => |c| blk: {
             const name_dup = try out_arena.dupe(u8, c.fn_name);
             const args_dup = try out_arena.alloc(Expr, c.args.len);
-            for (c.args, 0..) |child, i| args_dup[i] = try deepClone(out_arena, child);
+            for (c.args, 0..) |child, i| args_dup[i] = try deepCloneRenamed(out_arena, child, renames);
             break :blk .{ .call = .{ .fn_name = name_dup, .args = args_dup } };
         },
         .case => |cs| blk: {
             const branches_dup = try out_arena.alloc(Expr.Branch, cs.branches.len);
             for (cs.branches, 0..) |br, i| branches_dup[i] = .{
-                .cond = try predicate_mod.deepClonePredicate(out_arena, br.cond),
-                .then = try deepClone(out_arena, br.then),
+                .cond = try predicate_mod.deepClonePredicateRenamed(out_arena, br.cond, renames),
+                .then = try deepCloneRenamed(out_arena, br.then, renames),
             };
             var else_dup: ?*const Expr = null;
             if (cs.else_branch) |eb| {
                 const eb_owned = try out_arena.create(Expr);
-                eb_owned.* = try deepClone(out_arena, eb.*);
+                eb_owned.* = try deepCloneRenamed(out_arena, eb.*, renames);
                 else_dup = eb_owned;
             }
             break :blk .{ .case = .{ .branches = branches_dup, .else_branch = else_dup } };

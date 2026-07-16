@@ -21,6 +21,7 @@ const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
+const expr_mod = @import("expr.zig");
 
 pub const Project = struct {
     allocator: Allocator,
@@ -39,6 +40,9 @@ pub const Project = struct {
     /// Composed probe remap owned by this projection (an incoming
     /// sink.probe_map composed with column_map in tryFuseProbe).
     owned_probe_map: ?[]usize = null,
+    /// Owns rename-rewritten derived exprs forwarded below in
+    /// tryFuseCompute (the fused Compute borrows the trees).
+    rewrite_arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn create(allocator: Allocator, upstream: Query, names: []const []const u8) !Query {
         return createNamed(allocator, upstream, names, null);
@@ -129,6 +133,10 @@ pub const Project = struct {
         self.allocator.free(self.views);
         if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
         if (self.owned_probe_map) |m| self.allocator.free(m);
+        if (self.rewrite_arena) |ar| {
+            ar.deinit();
+            self.allocator.destroy(ar);
+        }
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -228,6 +236,94 @@ pub const Project = struct {
         try self.upstream.explain(out, allocator, depth + 1);
     }
 
+    /// Forward a row-local compute offer downward so the derived columns
+    /// evaluate in the scan workers pre-projection; the projection then
+    /// extends its map to pass them through (output = projected set +
+    /// derived, same as a Compute stacked above). Where the projection
+    /// relabels, the derived exprs' refs are rewritten to the source
+    /// column's label first (they bind by NAME below). Declines when a
+    /// derived name collides with an output column (Compute's "replace
+    /// that slot" semantics can't cross a projection) or an upstream one
+    /// (a dropped column would shadow it in the worker pipeline).
+    pub fn tryFuseCompute(self: *Project, derived: []const @import("compute.zig").Derived) !bool {
+        const trace = getenv("THINDB_TRACE_FUSE") != null;
+        if (self.probe_fused) {
+            if (trace) std.debug.print("[fuse]   project decline: probe_fused\n", .{});
+            return false;
+        }
+        const up_schema = self.upstream.outputSchema();
+        for (derived) |d| {
+            if (types.findColumn(up_schema, d.name) != null or types.findColumn(self.output_schema, d.name) != null) {
+                if (trace) std.debug.print("[fuse]   project decline: derived name collides ({s})\n", .{d.name});
+                return false;
+            }
+        }
+        var renames: std.ArrayListUnmanaged(predicate.ColRename) = .empty;
+        defer renames.deinit(self.allocator);
+        for (self.column_map, self.output_schema) |src, out| {
+            if (!std.mem.eql(u8, out.name, up_schema[src].name)) {
+                try renames.append(self.allocator, .{ .from = out.name, .to = up_schema[src].name });
+            }
+        }
+        var fwd_derived = derived;
+        if (renames.items.len > 0) {
+            // The fused Compute below shallow-copies the trees, so the
+            // rewritten exprs must live as long as this operator: an
+            // operator-owned arena, freed at deinit.
+            if (self.rewrite_arena == null) {
+                const ar = try self.allocator.create(std.heap.ArenaAllocator);
+                ar.* = std.heap.ArenaAllocator.init(self.allocator);
+                self.rewrite_arena = ar;
+            }
+            const aa = self.rewrite_arena.?.allocator();
+            const rewritten = try aa.alloc(@import("compute.zig").Derived, derived.len);
+            for (derived, rewritten) |d, *r| {
+                r.* = .{ .name = d.name, .expr = try expr_mod.deepCloneRenamed(aa, d.expr, renames.items) };
+            }
+            fwd_derived = rewritten;
+        }
+        // Pre-allocate the extended arrays: a downstream fuse is
+        // irreversible, so nothing may fail after it succeeds.
+        const old_n = self.column_map.len;
+        const n = old_n + derived.len;
+        const new_schema = try self.allocator.alloc(Column, n);
+        errdefer self.allocator.free(new_schema);
+        const new_map = try self.allocator.alloc(usize, n);
+        errdefer self.allocator.free(new_map);
+        const new_views = try self.allocator.alloc(ColumnView, n);
+        errdefer self.allocator.free(new_views);
+        const new_stats: []exec.ColStat = if (self.cached_stats.len == 0) &.{} else try self.allocator.alloc(exec.ColStat, n);
+        errdefer if (new_stats.len > 0) self.allocator.free(new_stats);
+
+        if (!try self.upstream.tryFuseCompute(fwd_derived)) {
+            self.allocator.free(new_schema);
+            self.allocator.free(new_map);
+            self.allocator.free(new_views);
+            if (new_stats.len > 0) self.allocator.free(new_stats);
+            return false;
+        }
+        const fused_schema = self.upstream.outputSchema();
+        @memcpy(new_schema[0..old_n], self.output_schema);
+        @memcpy(new_map[0..old_n], self.column_map);
+        for (0..derived.len) |k| {
+            new_map[old_n + k] = up_schema.len + k;
+            new_schema[old_n + k] = fused_schema[up_schema.len + k];
+        }
+        if (new_stats.len > 0) {
+            @memcpy(new_stats[0..old_n], self.cached_stats);
+            for (new_stats[old_n..]) |*s| s.* = .{ .ndv = .unknown };
+        }
+        self.allocator.free(self.output_schema);
+        self.allocator.free(self.column_map);
+        self.allocator.free(self.views);
+        if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
+        self.output_schema = new_schema;
+        self.column_map = new_map;
+        self.views = new_views;
+        self.cached_stats = new_stats;
+        return true;
+    }
+
     /// Forward a join-probe offer downward. The Join resolved its probe
     /// key/gather indices against OUR output order, so a narrowing or
     /// reordering projection hands the accepting scan its column_map via
@@ -311,6 +407,8 @@ pub const Project = struct {
         };
     }
 };
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 fn cloneOutputNames(allocator: Allocator, out_schema: []Column) ![][]u8 {
     const names = try allocator.alloc([]u8, out_schema.len);
