@@ -1514,13 +1514,20 @@ pub const ParallelScan = struct {
         var min_t: u64 = std.math.maxInt(u64);
         var max_t: u64 = 0;
         var sum_t: u64 = 0;
+        var scan_sum: u64 = 0;
+        var copy_sum: u64 = 0;
         for (self.wbufs) |wb| {
             rows += wb.row_count;
             const t = wb.scan_ticks + wb.copy_ticks;
             min_t = @min(min_t, t);
             max_t = @max(max_t, t);
             sum_t += t;
+            scan_sum += wb.scan_ticks;
+            copy_sum += wb.copy_ticks;
         }
+        std.debug.print("[pscan] drain split (worker-summed): scan(decode+filter)={d:.1}ms copy={d:.1}ms\n", .{
+            exec.prof.ticksToMs(@intCast(scan_sum)), exec.prof.ticksToMs(@intCast(copy_sum)),
+        });
         // Pruning effectiveness: how many row groups the workers actually decoded
         // vs considered within their assigned ranges. `considered - scanned` is
         // the zone-map prune count; `max_rgs` shows per-worker skew.
