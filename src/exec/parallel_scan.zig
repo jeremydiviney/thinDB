@@ -1561,6 +1561,13 @@ pub const ParallelScan = struct {
 
         for (self.werr) |e| if (e) |err| return err;
 
+        // The drain deep-copied every surviving batch into owned wbufs, so a
+        // buffer source is fully consumed HERE — release its stage use before
+        // reserving the copies, handing the stage's bytes back to the budget
+        // instead of pinning the source buffer until query teardown (which
+        // costs a whole stage of headroom on whale CTE chains).
+        self.releaseStageUse();
+
         var total: usize = 0;
         for (self.wbufs) |wb| total += wb.bytes;
         if (self.acct) |a| try a.reserve(.materialize, total);

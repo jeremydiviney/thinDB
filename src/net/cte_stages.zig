@@ -971,17 +971,14 @@ fn tryStageParallelChain(input: engine_v2.CompileInput, op: *const ir.Op, map: *
     while (true) {
         switch (cur.*) {
             // A mapped materialize is the stage leaf we scan; an unmapped one
-            // is a single-ref inline CTE wrapper. Walking through it (and
-            // scanning DEFERRED below, via ParallelScan's pending-compute
-            // machinery) is measured at −150ms on the rollforward p6 prefix
-            // — but on the cross-division shape the full query still exceeds
-            // the memory budget by ~one whale stage (+2190 MiB 'materialize'
-            // over 15770, 2026-07-16; eager was equally red, serial baseline
-            // green), so the crossing stays opt-in until the extra stage-
-            // lifetime pin is found. THINDB_CHAIN_WRAPPERS=1 enables it.
+            // is a single-ref inline CTE wrapper: walk through it and scan
+            // DEFERRED below (ParallelScan's pending-compute machinery). The
+            // budget blowout that once kept this opt-in was the materialize-
+            // drain stage pin, released in runMaterialize since the drain
+            // deep-copies. THINDB_NO_CHAIN_WRAPPERS=1 restores the decline.
             .materialize => |m| {
                 if (map.get(cur) != null) break;
-                if (getenv("THINDB_CHAIN_WRAPPERS") == null) return null;
+                if (getenv("THINDB_NO_CHAIN_WRAPPERS") != null) return null;
                 crossed_wrapper = true;
                 cur = m.upstream;
             },
