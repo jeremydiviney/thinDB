@@ -1269,9 +1269,71 @@ pub const ParallelScan = struct {
         }
     }
 
+    /// Prune-aware chunk re-cut, run once at the first pull (prune hints are
+    /// installed by then; chunk bounds were cut byte-balanced over ALL row
+    /// groups at create, before any hint existed). On a clustered table a
+    /// selective filter empties most chunks — the survivors bunch into a few,
+    /// and the scan degrades to their worker count (a 12-thread scan observed
+    /// running effectively 4-wide, straggler chunk 12× the mean). Re-cut the
+    /// same flat index space so each chunk holds ~equal SURVIVING row groups;
+    /// pruned groups in between are skipped at near-zero cost. Only when at
+    /// most half the groups survive — above that, the create-time byte
+    /// balance is the better work model. Bounds stay ascending, so chunk
+    /// emission order (and everything riding it) is unchanged.
+    fn rebalanceChunksForPruning(self: *ParallelScan) void {
+        if (self.table == null or self.workers.len <= 1) return;
+        const first = switch (self.workers[0]) {
+            .segment => |s| s,
+            .chunk => return,
+        };
+        const mask = first.survivingMask(self.allocator) orelse return;
+        defer self.allocator.free(mask);
+        var surviving: usize = 0;
+        for (mask) |m| {
+            if (m) surviving += 1;
+        }
+        if (surviving == 0 or surviving > mask.len / 2) return;
+
+        const n = self.workers.len;
+        const seg_start = self.allocator.alloc(usize, first.segs.len + 1) catch return;
+        defer self.allocator.free(seg_start);
+        var total: usize = 0;
+        for (first.segs, 0..) |entry, i| {
+            seg_start[i] = total;
+            total += entry.row_group_count;
+        }
+        seg_start[first.segs.len] = total;
+        if (total != mask.len) return;
+
+        // Quantile cut: chunk c ends once ceil((c+1)·surviving/n) survivors
+        // are behind it. Trailing chunks may end empty when surviving < n.
+        var lo: usize = 0;
+        var seen: usize = 0;
+        var cut: usize = 0;
+        for (self.workers, 0..) |w, c| {
+            const target = (c + 1) * surviving / n + @intFromBool((c + 1) * surviving % n != 0);
+            while (cut < total and seen < target) : (cut += 1) {
+                if (mask[cut]) seen += 1;
+            }
+            const hi = if (c == n - 1) total else cut;
+            const start = flatToCoord(lo, seg_start, first.segs.len, total);
+            const end = flatToCoord(hi, seg_start, first.segs.len, total);
+            switch (w) {
+                .segment => |s| s.resetRange(start.seg, start.rg, end.seg, end.rg, c == n - 1),
+                .chunk => {},
+            }
+            lo = hi;
+        }
+        if (exec.prof.enabled) std.debug.print(
+            "[pscan] prune-rebalance: surviving={d}/{d} rgs recut across {d} chunks\n",
+            .{ surviving, total, n },
+        );
+    }
+
     pub fn next(self: *ParallelScan) !?Batch {
         if (self.stage_deferred and self.workers.len == 0) try self.buildDeferredWorkers();
         if (self.mode == .unset) {
+            self.rebalanceChunksForPruning();
             // Fusion happens after create() (the wrapping Filter/Compute fuse on
             // their way up), so the strategy is settled by the first pull. A
             // fused filter (bounded survivors) ⇒ materialize + concat. A fused

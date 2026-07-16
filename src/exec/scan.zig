@@ -1457,6 +1457,36 @@ pub const Scan = struct {
         return surviving;
     }
 
+    /// Per-row-group survival against the installed prune hints, in flat
+    /// (segment-order, row-group-order) index space over this scan's segment
+    /// snapshot — the same space ParallelScan cut its chunk bounds in. Null
+    /// when no hints are installed, a footer can't be read, or a segment's
+    /// realized row-group count disagrees with its manifest entry (a torn
+    /// basis would misalign every downstream cut). Caller frees.
+    pub fn survivingMask(self: *const Scan, allocator: std.mem.Allocator) ?[]bool {
+        if (self.prunes.items.len == 0 and self.in_prunes.items.len == 0) return null;
+        var total: usize = 0;
+        for (self.segs) |entry| total += entry.row_group_count;
+        const mask = allocator.alloc(bool, total) catch return null;
+        var i: usize = 0;
+        for (self.segs) |entry| {
+            const handle = self.table.acquireSegment(entry.segment_id) catch {
+                allocator.free(mask);
+                return null;
+            };
+            defer self.table.releaseSegment(handle);
+            if (handle.seg.info.row_groups.len != entry.row_group_count) {
+                allocator.free(mask);
+                return null;
+            }
+            for (handle.seg.info.row_groups) |rg| {
+                mask[i] = self.rowGroupCanMatch(rg);
+                i += 1;
+            }
+        }
+        return mask;
+    }
+
     pub fn outputSchema(self: *Scan) []const Column {
         return self.out_schema;
     }
