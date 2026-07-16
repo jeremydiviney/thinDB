@@ -2640,7 +2640,10 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                         tvf_borrow_srcs[i] = src.stage;
                         tvf_borrow_maps[i] = bm;
                         any_borrow = true;
-                        if (src.win == null and src.stage.adopt_table_fn == null) src.stage.want_contiguous = true;
+                        if (src.win == null and src.stage.adopt_table_fn == null) {
+                            src.stage.want_contiguous = true;
+                            src.stage.fill_dop = input.effectiveDop();
+                        }
                     }
                 }
                 if (getenv("THINDB_TVF_TRACE") != null) {
@@ -2879,7 +2882,10 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     }
                     if (!src.has_filter) {
                         borrow_stage = src.stage;
-                        if (src.win == null) src.stage.want_contiguous = true;
+                        if (src.win == null) {
+                            src.stage.want_contiguous = true;
+                            src.stage.fill_dop = input.effectiveDop();
+                        }
                     }
                     // Both riding and borrowing need the chain to deliver
                     // rows in the source's order (borrowing additionally

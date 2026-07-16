@@ -458,6 +458,11 @@ pub const Stage = struct {
     /// BEFORE any run; a stage that already ran eagerly just misses the
     /// optimization (the borrower's bind degrades to normal accumulation).
     want_contiguous: bool = false,
+    /// Threads for the contiguous fill when the pipeline's batch data is
+    /// stable (`Query.stableData`) — a union of materialized stages fills
+    /// its 700MB contiguous copy in parallel instead of one serial append
+    /// loop. Set by the staged compiler alongside `want_contiguous`.
+    fill_dop: usize = 1,
     /// SEPARABLE BY: the stage fills by running N per-key-range slice
     /// pipelines concurrently and adopting their outputs in slice order,
     /// instead of draining `query`. Installed by the staged compiler; the
@@ -481,7 +486,10 @@ pub const Stage = struct {
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;
-        if (!self.query_alive) return error.UnsupportedQueryShape; // re-run after teardown: can't happen via MatScan
+        if (!self.query_alive) {
+            std.debug.print("[stage] ensureRun after teardown: stage#{d} (result={})\n", .{ self.id, self.result != null });
+            return error.UnsupportedQueryShape; // re-run after teardown: can't happen via MatScan
+        }
         const prof_on = exec.prof.enabled;
         const w0 = if (prof_on) exec.prof.nowTicks() else 0;
         const child0 = if (prof_on) exec.prof.cteChildTicks() else 0;
@@ -534,7 +542,9 @@ pub const Stage = struct {
         } else if (self.want_contiguous) {
             var contig = try ContigSink.init(self.allocator, self.schema, self.expectedRowsHint());
             errdefer contig.deinit();
-            while (try self.query.next()) |batch| {
+            if (self.fill_dop > 1 and self.query.stableData()) {
+                try self.fillContigParallel(&contig, row_bytes, prof_on, &append_ticks);
+            } else while (try self.query.next()) |batch| {
                 if (self.accountant) |acct| {
                     const bytes = row_bytes * batch.row_count;
                     try acct.reserve(.materialize, bytes);
@@ -595,6 +605,123 @@ pub const Stage = struct {
             exec.prof.addCteChildTicks(@intCast(@max(wall, 0)));
             if (append_ticks > 0) std.debug.print("[stage-append] stage#{d} copy={d:.1}ms rows={d} contig={}\n", .{
                 self.id, exec.prof.ticksToMs(append_ticks), res.total_rows, self.want_contiguous,
+            });
+        }
+    }
+
+    /// Parallel contiguous fill over a stable-data pipeline: collect every
+    /// batch's view structs (the DATA is stable until the pipeline tears
+    /// down — `Query.stableData`), size each (batch, column) destination
+    /// once, then fill disjoint batch ranges on `fill_dop` threads with
+    /// positional writes (no allocation). Worker cut points land only on
+    /// 8-row-aligned destination offsets so no two workers share a validity
+    /// byte. Falls back to the serial path when a string column would
+    /// overflow positional (u32-offset) storage.
+    fn fillContigParallel(self: *Stage, contig: *ContigSink, row_bytes: usize, prof_on: bool, append_ticks: *i64) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const ncols = self.schema.len;
+
+        const Collected = struct { views: []ColumnView, rows: usize };
+        var batches: std.ArrayListUnmanaged(Collected) = .empty;
+        const str_bytes = try a.alloc(u64, ncols);
+        @memset(str_bytes, 0);
+        var total: usize = 0;
+        while (try self.query.next()) |batch| {
+            if (self.accountant) |acct| {
+                const bytes = row_bytes * batch.row_count;
+                try acct.reserve(.materialize, bytes);
+                self.reserved_bytes += bytes;
+            }
+            if (batch.row_count == 0) continue;
+            const vs = try a.alloc(ColumnView, batch.values.len);
+            @memcpy(vs, batch.values);
+            for (vs, 0..) |v, ci| switch (v.data) {
+                .varchar, .string, .char, .json => |sv| str_bytes[ci] += sv.offsets[batch.row_count] - sv.offsets[0],
+                else => {},
+            };
+            try batches.append(a, .{ .views = vs, .rows = batch.row_count });
+            total += batch.row_count;
+        }
+        if (total == 0) return;
+
+        const a0 = if (prof_on) exec.prof.nowTicks() else 0;
+        // Positional string writes need u32 offsets end to end; a column
+        // that would overflow falls back to the serial range appends.
+        for (str_bytes) |b| {
+            if (b > std.math.maxInt(u32)) {
+                for (batches.items) |b2| {
+                    try contig.append(.{ .schema = self.schema, .values = b2.views, .row_count = b2.rows });
+                }
+                if (prof_on) append_ticks.* += exec.prof.nowTicks() - a0;
+                return;
+            }
+        }
+
+        const preps = try a.alloc(engine.transform.PreparedAppend, batches.items.len * ncols);
+        for (batches.items, 0..) |b, bi| {
+            for (0..ncols) |ci| {
+                preps[bi * ncols + ci] = try engine.transform.prepareAppend(
+                    contig.arenas[ci].allocator(),
+                    b.views[ci],
+                    b.rows,
+                    &contig.stores[ci],
+                );
+            }
+        }
+
+        const Fill = struct {
+            batches: []const Collected,
+            preps: []const engine.transform.PreparedAppend,
+            stores: []engine.ColumnStore,
+            ncols: usize,
+            fn run(f: *const @This(), lo: usize, hi: usize) void {
+                for (f.batches[lo..hi], lo..) |b, bi| {
+                    for (0..f.ncols) |ci| {
+                        engine.transform.writeAppendSlice(b.views[ci], 0, b.rows, &f.stores[ci], f.preps[bi * f.ncols + ci]);
+                    }
+                }
+            }
+        };
+        const fill = Fill{ .batches = batches.items, .preps = preps, .stores = contig.stores, .ncols = ncols };
+
+        // Cut worker ranges only where the destination offset is 8-aligned
+        // (batch bases are cumulative row counts; preps[bi*ncols].base_row is
+        // the batch's base for every column alike).
+        const n_workers = @min(self.fill_dop, batches.items.len);
+        const cuts = try a.alloc(usize, n_workers + 1);
+        cuts[0] = 0;
+        var w: usize = 1;
+        var bi: usize = 1;
+        while (w < n_workers) : (w += 1) {
+            const target = w * total / n_workers;
+            while (bi < batches.items.len and
+                (preps[bi * ncols].base_row < target or preps[bi * ncols].base_row % 8 != 0)) : (bi += 1)
+            {}
+            cuts[w] = bi;
+        }
+        cuts[n_workers] = batches.items.len;
+
+        const threads = try a.alloc(?std.Thread, n_workers);
+        for (threads, 0..) |*t, i| {
+            if (cuts[i + 1] <= cuts[i]) {
+                t.* = null;
+                continue;
+            }
+            t.* = std.Thread.spawn(.{}, Fill.run, .{ &fill, cuts[i], cuts[i + 1] }) catch blk: {
+                fill.run(cuts[i], cuts[i + 1]);
+                break :blk null;
+            };
+        }
+        for (threads) |t| {
+            if (t) |th| th.join();
+        }
+        contig.rows = total;
+        if (prof_on) {
+            append_ticks.* += exec.prof.nowTicks() - a0;
+            std.debug.print("[stage-parfill] stage#{d} batches={d} rows={d} workers={d}\n", .{
+                self.id, batches.items.len, total, n_workers,
             });
         }
     }
@@ -756,6 +883,10 @@ pub const MatScan = struct {
     views: []ColumnView,
     cursor: usize = 0,
     released: bool = false,
+    /// Set by `stableData`: a consumer holds batches past exhaustion, so
+    /// the early (exhaustion-time) release of the stage use is skipped —
+    /// only deinit releases. See `stableData`.
+    stability_promised: bool = false,
     /// Slice-range chunk skip hint (see setSliceSkip).
     skip_col: ?[]const u8 = null,
     skip_lo: ?types.Value = null,
@@ -804,7 +935,7 @@ pub const MatScan = struct {
     pub fn next(self: *MatScan) !?exec.Batch {
         try self.stage.ensureRun();
         const res = self.stage.result orelse {
-            self.releaseOnce();
+            self.releaseEarly();
             return null;
         };
         const skip_active = self.skip_col != null and res.sliced_key != null and
@@ -828,8 +959,16 @@ pub const MatScan = struct {
                 .row_count = chunk.rows,
             };
         }
-        self.releaseOnce();
+        self.releaseEarly();
         return null;
+    }
+
+    /// Exhaustion-time release — lets the buffer free as soon as the last
+    /// streaming consumer finishes. Suppressed under a stability promise
+    /// (the consumer still reads the data after the drain).
+    fn releaseEarly(self: *MatScan) void {
+        if (self.stability_promised) return;
+        self.releaseOnce();
     }
 
     fn releaseOnce(self: *MatScan) void {
@@ -850,9 +989,14 @@ pub const MatScan = struct {
 
     pub fn addPrune(_: *MatScan, _: exec.Predicate) !void {}
 
-    /// Batches are views over the stage's immutable `MaterializedResult` —
-    /// data lives until the stage is released at deinit.
-    pub fn stableData(_: *MatScan) bool {
+    /// Batches are views over the stage's immutable `MaterializedResult`.
+    /// Answering true is a PROMISE: a stability-relying consumer (parallel
+    /// reduce, parallel contiguous fill) holds batches past exhaustion, so
+    /// the exhaustion-time early release of the stage use — which could
+    /// free the result while the last consumer standing still reads it —
+    /// is deferred to deinit.
+    pub fn stableData(self: *MatScan) bool {
+        self.stability_promised = true;
         return true;
     }
 
