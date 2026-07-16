@@ -65,7 +65,15 @@ pub fn needsStaging(op: *const ir.Op) bool {
 /// `stage_count_out` (optional) receives the number of shared stages the
 /// plan compiled to — the V2 analogue of the legacy `ctx.materialized`
 /// count, used by introspection-style tests.
-pub fn compileStaged(input: engine_v2.CompileInput, root: *const ir.Op, stage_count_out: ?*u32) anyerror!exec.Query {
+pub fn compileStaged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage_count_out: ?*u32) anyerror!exec.Query {
+    // Compiled-join registry (IR node → operator): lets a rider that
+    // crossed a join through rideSource verify the compiled operator's
+    // order guarantees post-compile. Compile-lifetime only.
+    var join_registry: std.AutoHashMapUnmanaged(*const anyopaque, *anyopaque) = .empty;
+    defer join_registry.deinit(input_in.allocator);
+    var input = input_in;
+    if (input.win_registry == null) input.win_registry = &join_registry;
+
     const set = try mat_stage.StageSet.create(input.allocator);
     errdefer set.deinit();
     var map: StageMap = .empty;
@@ -655,7 +663,10 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
     // a MatScan. The deferred leaf materializes at first pull (normal DAG
     // order) and releases its stage use at drain exhaustion, so its memory
     // profile matches the MatScan it replaces.
-    if (input.effectiveDop() > 1 and is_probe and
+    // A force_ordered chain (a downstream consumer rides the source order)
+    // keeps the probe serial: the deferred parallel buffer scan feeds the
+    // join in stripe-completion order.
+    if (input.effectiveDop() > 1 and is_probe and !input.force_ordered and
         streamingChainOverStage(op, map, false, true))
     {
         return buildFusedStreamOverStage(input, op, map, .deferred);
@@ -2581,6 +2592,8 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             @memset(tvf_borrow_maps, &.{});
             var any_borrow = false;
             var eff_input = input;
+            var tvf_crossed: [4]*const ir.Op = undefined;
+            var tvf_n_crossed: u8 = 0;
             for (t.inputs, 0..) |t_in, i| {
                 // Ride keys are a single-input notion (the multi path forms
                 // runs per input from its own sort); borrow applies to all.
@@ -2594,6 +2607,8 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     // advertised order — nothing to mark.
                     if (src.win) |sw| sw.emit_sorted = true;
                     tvf_ordered = true;
+                    tvf_crossed = src.joins;
+                    tvf_n_crossed = src.n_joins;
                 }
                 if (!src.has_filter) {
                     const decl = entry.input_schemas[i];
@@ -2626,6 +2641,17 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             errdefer for (ups.items) |*u| u.deinit();
             for (t.inputs) |inp| {
                 try ups.append(input.allocator, try compileBlock(eff_input, inp, map));
+            }
+            // A ride that crossed LEFT joins holds only if the compiled
+            // operators kept the probe-order pin; sort on any doubt.
+            if (tvf_ordered and tvf_n_crossed > 0 and
+                !verifyCrossedJoins(input, tvf_crossed[0..tvf_n_crossed], .{
+                    .partition_by = t.partition_by,
+                    .order_by = t.order_by,
+                    .frame = ir.Frame.default_no_order,
+                }))
+            {
+                tvf_ordered = false;
             }
             const q = try exec.table_fn.TableFnExec.create(input.allocator, ups.items, entry, t.args, t.partition_by, t.order_by, input.effectiveDop());
             if (exec.queryAs(exec.table_fn.TableFnExec, q)) |tf| {
@@ -2813,6 +2839,8 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             var eff_input = input;
             var ride_keys: ir.WindowSpec = undefined;
             var borrow_stage: ?*mat_stage.Stage = null;
+            var crossed_joins: [4]*const ir.Op = undefined;
+            var n_crossed: u8 = 0;
             if (input.effectiveDop() > 1) {
                 const rider_keys: ?ir.WindowSpec = if (sameKeysAllSpecs(w.specs)) w.specs[0] else null;
                 if (rideSource(map, w.upstream, rider_keys)) |src| {
@@ -2822,6 +2850,8 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                         if (src.win) |sw| sw.emit_sorted = true;
                         ride = true;
                         ride_keys = src.keys.?;
+                        crossed_joins = src.joins;
+                        n_crossed = src.n_joins;
                     }
                     if (!src.has_filter) {
                         borrow_stage = src.stage;
@@ -2835,6 +2865,13 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             }
             var up = try compileBlock(eff_input, w.upstream, map);
             errdefer up.deinit();
+            // A ride that crossed LEFT joins holds only if the compiled
+            // operators kept the probe-order pin; sort on any doubt.
+            if (ride and n_crossed > 0 and
+                !verifyCrossedJoins(input, crossed_joins[0..n_crossed], ride_keys))
+            {
+                ride = false;
+            }
             // Prune the window's input to the columns the window or
             // anything above it references: the below block otherwise
             // emits its fused-filter columns too (often a wide string),
@@ -2984,7 +3021,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner);
             errdefer left.deinit();
             const right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner);
-            const jq = try left.join(right, joinSpecOf(j));
+            const jq = try left.join(right, joinSpecOf(j, input.force_ordered));
             // Window-chain pairing: register the compiled hash join so a
             // downstream window can VERIFY (at pairing time) that this
             // join's probe is the left side — probe-order emission then
@@ -3151,6 +3188,13 @@ const RideSrc = struct {
     /// A filter sits between source and rider: rows still ordered (riding
     /// fine) but no longer 1:1 with the source (borrowing impossible).
     has_filter: bool,
+    /// LEFT equi-joins the walk crossed (probe-order emission pinned by
+    /// preserve_left_order under force_ordered). A rider that skips its
+    /// sort must verify each compiled join post-compile — probe = left,
+    /// no skew handoff, and no kept right-side column shadowing a ride
+    /// key — and fall back to sorting on any doubt.
+    joins: [4]*const ir.Op = undefined,
+    n_joins: u8 = 0,
 };
 
 /// Rider coverage: the source's emitted order satisfies the rider when the
@@ -3324,6 +3368,8 @@ test "riderCoveredBy: partition equality + order-prefix with matching desc" {
 fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {
     var cur = op;
     var has_filter = false;
+    var joins: [4]*const ir.Op = undefined;
+    var n_joins: u8 = 0;
     while (true) {
         switch (cur.*) {
             .filter => |f| {
@@ -3346,6 +3392,29 @@ fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {
                 if (keys) |k| if (!selectPassesKeys(sel, k)) return null;
                 cur = sel.upstream;
             },
+            .join => |j| {
+                // A LEFT equi-join preserves its left side's ORDER (partition
+                // keys stay adjacent, within-partition order survives): the
+                // hash operator pins probe = left, and under force_ordered
+                // the compile pins the hash algorithm, disables the skew
+                // re-route, and keeps the probe serial (joinSpecOf /
+                // compileJoinChild). Duplicate output names are rejected at
+                // join create, so a key name binds unambiguously to the left
+                // column. Rows may be dropped or duplicated, so borrowing
+                // must not survive — same contract as .filter. Range /
+                // opaque / empty-on shapes route to other algorithms with no
+                // order guarantee; only clean equi left joins walk through.
+                if (j.join_type != .left) return null;
+                if (j.on.len == 0 or j.ranges.len != 0) return null;
+                if (j.algorithm != .auto and j.algorithm != .hash) return null;
+                // A/B + safety hatch: rides never cross joins when set.
+                if (getenv("THINDB_NO_JOIN_RIDE") != null) return null;
+                if (n_joins == joins.len) return null;
+                joins[n_joins] = cur;
+                n_joins += 1;
+                has_filter = true;
+                cur = j.left;
+            },
             .materialize => |m| {
                 if (map.get(cur)) |stage| {
                     if (stage.adopt_window) |win| {
@@ -3354,7 +3423,7 @@ fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {
                             (if (src_keys) |sk| riderCoveredBy(sk, k) else false)
                         else
                             false;
-                        return .{ .win = win, .stage = stage, .keys = src_keys, .covered = covered, .has_filter = has_filter };
+                        return .{ .win = win, .stage = stage, .keys = src_keys, .covered = covered, .has_filter = has_filter, .joins = joins, .n_joins = n_joins };
                     }
                     // A TVF stage advertising its output order (partition
                     // keys adjacent, ordered within) is ridable exactly
@@ -3363,12 +3432,12 @@ fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {
                     if (stage.adopt_table_fn) |tf| {
                         if (tf.advertised_keys) |sk| {
                             const covered = if (keys) |k| riderCoveredBy(sk, k) else false;
-                            return .{ .win = null, .stage = stage, .keys = sk, .covered = covered, .has_filter = has_filter };
+                            return .{ .win = null, .stage = stage, .keys = sk, .covered = covered, .has_filter = has_filter, .joins = joins, .n_joins = n_joins };
                         }
                     }
                     // No order to ride, but a filterless chain can still
                     // BORROW its columns: ask it to materialize contiguous.
-                    return .{ .win = null, .stage = stage, .keys = null, .covered = false, .has_filter = has_filter };
+                    return .{ .win = null, .stage = stage, .keys = null, .covered = false, .has_filter = has_filter, .joins = joins, .n_joins = n_joins };
                 }
                 // single-ref: the body compiles inline at this use site —
                 // no rematerialization between us and it.
@@ -3377,6 +3446,27 @@ fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {
             else => return null,
         }
     }
+}
+
+/// Post-compile check for a ride that crossed LEFT joins: every crossed
+/// join's compiled operator must probe its left side with no chance of a
+/// skew handoff (both pinned by preserve_left_order under force_ordered —
+/// this re-verifies the pin held), and no KEPT right-side output column may
+/// shadow a ride key: a spec key that suffix-matches a right column could
+/// resolve there, and left-side order says nothing about right values.
+/// Any join missing from the registry (or no registry) → sort instead.
+fn verifyCrossedJoins(input: engine_v2.CompileInput, joins: []const *const ir.Op, keys: ir.WindowSpec) bool {
+    const reg = input.win_registry orelse return false;
+    for (joins) |jn| {
+        const jopq = reg.get(@ptrCast(jn)) orelse return false;
+        const jop: *join_mod.Join = @ptrCast(@alignCast(jopq));
+        if (jop.build_is_left) return false;
+        if (jop.skew_detector != null or jop.skew_smj != null) return false;
+        for (jop.output_schema[jop.left_col_count..]) |c| {
+            if (nameIsSpecKey(c.name, keys)) return false;
+        }
+    }
+    return true;
 }
 
 /// Second walk of the ride chain for ONE window-input column name: does it
@@ -3487,7 +3577,7 @@ fn columnRefMatchesName(column_name: []const u8, ref_name: []const u8) bool {
     return false;
 }
 
-fn joinSpecOf(j: anytype) ir.JoinSpec {
+fn joinSpecOf(j: anytype, force_ordered: bool) ir.JoinSpec {
     return .{
         .join_type = j.join_type,
         .algorithm = j.algorithm,
@@ -3497,6 +3587,9 @@ fn joinSpecOf(j: anytype) ir.JoinSpec {
         .skew_ratio_threshold = j.skew_ratio_threshold,
         .skew_absolute_threshold = j.skew_absolute_threshold,
         .skew_sample_interval = j.skew_sample_interval,
+        // Inside a force_ordered chain (a downstream window/TVF rides the
+        // source order) a left join must emit its left side in input order.
+        .preserve_left_order = force_ordered and j.join_type == .left,
     };
 }
 
@@ -3562,7 +3655,12 @@ fn compileFilteredJoin(
 
     left_owned = false;
     right_owned = false;
-    var joined = try left.join(right, joinSpecOf(j));
+    var joined = try left.join(right, joinSpecOf(j, input.force_ordered));
+    if (input.win_registry) |reg| {
+        if (exec.queryAs(join_mod.Join, joined)) |jop| {
+            reg.put(input.allocator, @ptrCast(join_op), @ptrCast(jop)) catch {};
+        }
+    }
     if (residual.items.len == 0) return joined;
     errdefer joined.deinit();
     return joined.filter(try combineConjuncts(input.node_arena, residual.items));

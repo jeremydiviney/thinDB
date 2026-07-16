@@ -386,6 +386,133 @@ test "table UDF ordered_output: a same-key window rides the TVF stage" {
     }
 }
 
+test "table UDF ordered_output: a same-key window rides THROUGH a left join" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seed(db);
+    try seedRates(db);
+    try registerChain(db);
+
+    // Order rides the ordered TVF stage through the LEFT equi-join: the
+    // join preserves left-side adjacency/order (probe = left, hash pinned,
+    // serial probe under force_ordered), so the LAG keeps its values with
+    // or without the ride. rates matches g=1 only — g=2 rows null-extend.
+    var res = try run(allocator, db,
+        \\WITH a AS (SELECT id, g, amt FROM TABLE(gap_pad((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id)),
+        \\b AS (SELECT a.id, a.g, a.amt, r.rate FROM a LEFT JOIN (SELECT g AS rg, rate FROM rates) r ON r.rg = a.g)
+        \\SELECT id, rate, LAG(amt) OVER (PARTITION BY g ORDER BY id) AS prev FROM b
+    );
+    defer res.deinit();
+    var got: std.AutoHashMapUnmanaged(i64, [2]?i64) = .empty;
+    defer got.deinit(allocator);
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try got.put(allocator, batch.values[0].data.bigint[i], .{
+                if (batch.values[1].isValid(i)) batch.values[1].data.bigint[i] else null,
+                if (batch.values[2].isValid(i)) batch.values[2].data.bigint[i] else null,
+            });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 7), got.count());
+    const expected = [_]struct { id: i64, rate: ?i64, prev: ?i64 }{
+        .{ .id = 1, .rate = 2, .prev = null },
+        .{ .id = 2, .rate = 2, .prev = 10 },
+        .{ .id = 3, .rate = 2, .prev = 20 },
+        .{ .id = 103, .rate = 2, .prev = 30 },
+        .{ .id = 4, .rate = null, .prev = null },
+        .{ .id = 5, .rate = null, .prev = 40 },
+        .{ .id = 105, .rate = null, .prev = 50 },
+    };
+    for (expected) |e| {
+        const row = got.get(e.id) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(e.rate, row[0]);
+        try std.testing.expectEqual(e.prev, row[1]);
+    }
+}
+
+test "table UDF ordered_output: ride through a DUPLICATING left join stays value-correct" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seed(db);
+    try registerChain(db);
+
+    // Two matches for g=1: every g=1 row duplicates, and the duplicated
+    // pair shares (id, amt) — LAG(amt) values stay deterministic under any
+    // tie order, so ridden and sorted paths must agree exactly.
+    const dup_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "dg", .type = .int },
+            .{ .name = "tag", .type = .bigint },
+        },
+        .order_key = &.{"tag"},
+        .unique = true,
+    };
+    const dk = [_][]const u8{"tag"};
+    const dup = try db.table("dup", dup_schema, .{ .order_key = &dk, .unique = true, .row_group_size = 8 });
+    try dup.insert(&.{
+        .{ .dg = @as(i32, 1), .tag = @as(i64, 1) },
+        .{ .dg = @as(i32, 1), .tag = @as(i64, 2) },
+    });
+    try dup.flush();
+
+    var res = try run(allocator, db,
+        \\WITH a AS (SELECT id, g, amt FROM TABLE(gap_pad((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id)),
+        \\b AS (SELECT a.id, a.g, a.amt FROM a LEFT JOIN dup d ON d.dg = a.g)
+        \\SELECT id, LAG(amt) OVER (PARTITION BY g ORDER BY id) AS prev FROM b
+    );
+    defer res.deinit();
+    var prevs: std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged(i64)) = .empty;
+    defer {
+        var it = prevs.valueIterator();
+        while (it.next()) |l| l.deinit(allocator);
+        prevs.deinit(allocator);
+    }
+    var total: usize = 0;
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            const id = batch.values[0].data.bigint[i];
+            const prev: i64 = if (batch.values[1].isValid(i)) batch.values[1].data.bigint[i] else -1;
+            const entry = try prevs.getOrPut(allocator, id);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(allocator, prev);
+            total += 1;
+        }
+    }
+    // g=1 rows duplicate (8 rows), g=2 unmatched null-extends (3 rows).
+    try std.testing.expectEqual(@as(usize, 11), total);
+    const cases = .{
+        .{ .id = @as(i64, 1), .want = [_]i64{ -1, 10 } },
+        .{ .id = @as(i64, 2), .want = [_]i64{ 10, 20 } },
+        .{ .id = @as(i64, 3), .want = [_]i64{ 20, 30 } },
+        .{ .id = @as(i64, 103), .want = [_]i64{ 0, 30 } },
+        .{ .id = @as(i64, 4), .want = [_]i64{-1} },
+        .{ .id = @as(i64, 5), .want = [_]i64{40} },
+        .{ .id = @as(i64, 105), .want = [_]i64{50} },
+    };
+    inline for (cases) |c| {
+        const list = prevs.get(c.id) orelse return error.TestExpectedEqual;
+        const items = try allocator.dupe(i64, list.items);
+        defer allocator.free(items);
+        std.mem.sort(i64, items, {}, std.sort.asc(i64));
+        const want = c.want;
+        try std.testing.expectEqualSlices(i64, &want, items);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Multi-input generic-sort fallback: ORDER BY shapes packedSortFor declines
 // (multi-column, string, string+date) must run — round 8.5.

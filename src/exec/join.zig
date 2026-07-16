@@ -200,6 +200,17 @@ pub const Spec = struct {
     ///
     /// INNER joins only in v1.
     opaque_predicate: ?OpaquePredicate = null,
+    /// A downstream consumer rides this join's LEFT-side order (adjacency
+    /// of its partition keys + within-partition ordering): emission must
+    /// be probe-row-major with left rows in input order. Left joins pin
+    /// probe = left already; this flag additionally pins the hash
+    /// algorithm (sort-merge emits key order), disables the mid-build
+    /// skew re-route, and keeps the probe serial (fused parallel probes
+    /// emit in worker-completion order). Row drops and match-duplication
+    /// preserve the surviving rows' relative order, so the ride contract
+    /// holds. Set by the staged compiler under force_ordered chains;
+    /// meaningful for `.left` equi-joins only.
+    preserve_left_order: bool = false,
 };
 
 /// User-supplied cross-side predicate callback. Receives the
@@ -674,12 +685,21 @@ pub const Join = struct {
         // .auto picks range_sweep for the specialized pure-single-
         // range shape; nested_loop for empty `on`; the equi-driven
         // algorithms via chooseAlgorithm.
-        const chosen = if (spec.opaque_predicate != null)
+        const chosen_stats: Algorithm = if (spec.opaque_predicate != null)
             .nested_loop
         else if (spec.algorithm == .auto)
             (if (canUseRangeSweep(spec)) .range_sweep else if (spec.on.len == 0) .nested_loop else chooseAlgorithm(left_in, right_in, spec.on))
         else
             spec.algorithm;
+        // An order-preserving left join must emit probe(left)-row-major:
+        // hash is the only algorithm with that property (sort-merge emits
+        // key order; the rider only walks left equi-joins, so the pin
+        // never conflicts with NLJ/range-sweep-only shapes).
+        const chosen: Algorithm = if (spec.preserve_left_order and spec.join_type == .left and
+            spec.on.len > 0 and spec.opaque_predicate == null)
+            .hash
+        else
+            chosen_stats;
 
         // Nested-loop / range_sweep are the only algorithms that
         // handle an empty `on` clause. Reject empty-on with any other.
@@ -916,7 +936,9 @@ pub const Join = struct {
         // time the probe side first pulls (and the sink runs), it exists.
         // FULL stays serial (matched_build writes would race) but is still
         // fast_eligible — its serial probe uses the FastTable too.
-        if (self.fast_eligible and spec.join_type != .full) {
+        // Fused parallel probes emit in worker-completion order — an
+        // order-preserving join stays on the serial streaming probe.
+        if (self.fast_eligible and spec.join_type != .full and !spec.preserve_left_order) {
             const probe = if (build_is_left) self.right else self.left;
             self.probe_fused = probe.tryFuseProbe(.{
                 .ctx = self,
@@ -961,7 +983,9 @@ pub const Join = struct {
         // emitting joined batches, and the FastTable's array-linear chain
         // walk + parallel probe absorb heavy buckets far better than the
         // bucket-list walk the reroute was built to escape.
-        if (spec.skew_ratio_threshold > 0.0 and !self.probe_fused) {
+        // The skew re-route hands the join to sort-merge mid-flight —
+        // key-ordered emission, incompatible with order preservation.
+        if (spec.skew_ratio_threshold > 0.0 and !self.probe_fused and !spec.preserve_left_order) {
             const arena_alloc = self.arena.allocator();
             const det = try arena_alloc.create(@import("skew.zig").MisraGries);
             det.* = @import("skew.zig").MisraGries.init(arena_alloc);
