@@ -23,6 +23,9 @@ const ColumnView = storage.ColumnView;
 const ColumnStore = @import("../engine/store.zig").ColumnStore;
 const exec = @import("exec.zig");
 const Batch = exec.Batch;
+const compute_mod = @import("compute.zig");
+const single_batch = @import("single_batch.zig");
+const udf_mod = @import("../udf.zig");
 
 const HASH_SEED: u64 = 0x9e3779b9;
 /// Bucket refs pack (worker, row) into a u32; buckets stay far below this.
@@ -88,7 +91,11 @@ pub fn gatherColumn(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnVie
 /// partition view is a contiguous range of its shard buffer, so per-group
 /// operator inputs are slice copies, never per-value appends.
 pub fn appendStoreRange(alloc: Allocator, dst: *ColumnStore, src: *const ColumnStore, start: usize, end: usize) !void {
-    const v = src.view();
+    return appendViewRange(alloc, dst, src.view(), start, end);
+}
+
+/// Range append from a view (same contract as `appendStoreRange`).
+pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start: usize, end: usize) !void {
     switch (v.data) {
         inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             try @field(dst.data, @tagName(tag)).appendSlice(alloc, s[start..end]);
@@ -103,6 +110,88 @@ pub fn appendStoreRange(alloc: Allocator, dst: *ColumnStore, src: *const ColumnS
         const base = dst.rowCount() - (end - start);
         for (start..end, 0..) |i, k| try dst.appendValidBit(alloc, base + k, v.isValid(i));
     }
+}
+
+/// Append row `i` of `v` onto `dst` (typed single-row append; group-agg and
+/// probe emission). `dst`'s data variant must match `v`'s — the program
+/// builder validates column types, so a mismatch is a compile bug upstream.
+pub fn appendRowValue(alloc: Allocator, dst: *ColumnStore, v: ColumnView, i: usize) !void {
+    if (!v.isValid(i)) return dst.appendNulls(alloc, 1);
+    switch (v.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+            try @field(dst.data, @tagName(tag)).append(alloc, s[i]);
+        },
+        .varchar, .string, .char, .json => |s| switch (dst.data) {
+            .varchar, .string, .char, .json => |*d| try d.appendValue(alloc, s.rowBytes(i)),
+            else => unreachable,
+        },
+        else => return error.UnsupportedQueryShape,
+    }
+    if (dst.nulls != null) try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
+}
+
+/// Append `count` copies of row `row` of `v` onto `dst` (fill_last emission).
+fn appendRepeat(alloc: Allocator, dst: *ColumnStore, v: ColumnView, row: usize, count: usize) !void {
+    if (!v.isValid(row)) return dst.appendNulls(alloc, count);
+    switch (v.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+            const l = &@field(dst.data, @tagName(tag));
+            try l.ensureUnusedCapacity(alloc, count);
+            l.appendNTimesAssumeCapacity(s[row], count);
+        },
+        .varchar, .string, .char, .json => |s| switch (dst.data) {
+            .varchar, .string, .char, .json => |*d| {
+                const bytes = s.rowBytes(row);
+                try d.ensureUnusedValueCapacity(alloc, count, bytes.len * count);
+                for (0..count) |_| d.appendValueAssumeCapacity(bytes);
+            },
+            else => unreachable,
+        },
+        else => return error.UnsupportedQueryShape,
+    }
+    if (dst.nulls != null) {
+        const base = dst.rowCount() - count;
+        for (0..count) |k| try dst.appendValidBit(alloc, base + k, true);
+    }
+}
+
+/// Integer-family read (program builder guarantees the column type).
+fn viewI64(v: ColumnView, i: usize) ?i64 {
+    if (!v.isValid(i)) return null;
+    return switch (v.data) {
+        .tinyint => |s| s[i],
+        .smallint => |s| s[i],
+        .int => |s| s[i],
+        .bigint => |s| s[i],
+        .date => |s| s[i],
+        .datetime => |s| s[i],
+        else => null,
+    };
+}
+
+fn viewF64(v: ColumnView, i: usize) ?f64 {
+    if (!v.isValid(i)) return null;
+    return switch (v.data) {
+        .float => |s| s[i],
+        .double => |s| s[i],
+        else => null,
+    };
+}
+
+/// Engine comparison dialect for one column: NULLs first (below every
+/// non-null value); bytewise for strings.
+fn viewOrderRows(v: ColumnView, a: usize, b: usize) std.math.Order {
+    const av = v.isValid(a);
+    const bv = v.isValid(b);
+    if (!av or !bv) {
+        if (av == bv) return .eq;
+        return if (!av) .lt else .gt;
+    }
+    return switch (v.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.math.order(s[a], s[b]),
+        .varchar, .string, .char, .json => |s| std.mem.order(u8, s.rowBytes(a), s.rowBytes(b)),
+        else => .eq,
+    };
 }
 
 fn stringViewOf(v: ColumnView) storage.StringView {
@@ -446,6 +535,671 @@ pub fn consolidateOrdered(
 }
 
 // ---------------------------------------------------------------------------
+// Region program: compiled once, interpreted per shard (control plane).
+//
+// A program is a linear op list over a "frame": the current working set of
+// columns (views), a row count, and the region-key group ranges (contiguous
+// by construction — consolidateOrdered's contract). Aligned ops append
+// columns without moving rows; restructuring ops (group_agg, inner
+// hash_probe) replace the frame and rewrite the ranges. There is no
+// materialization and no generic operator chain between ops — this IS the
+// region's fused path (REGION_PLAN.md §6).
+// ---------------------------------------------------------------------------
+
+pub const OrderBy = struct { col: usize, desc: bool = false };
+
+/// One output column of a group_agg op. Aggregation groups are
+/// (range × subkeys); accumulators are generic but typed (the acknowledged
+/// P0 loss vs bespoke structs). `first` = value at the sub-group's first
+/// row in arrival order — covers group keys (constant within the group),
+/// sub-keys, and ANY_VALUE semantics in one kind.
+pub const AggOut = struct {
+    name: []const u8,
+    kind: union(enum) {
+        first: usize,
+        sum_int: usize,
+        sum_float: usize,
+        min_int: usize,
+        max_int: usize,
+        max_by: struct { val: usize, ord: usize },
+    },
+};
+
+/// Broadcast join map: int-family key → row ordinal in the payload views.
+pub const KeyMap = std.AutoHashMapUnmanaged(i64, u32);
+
+pub const Payload = struct {
+    name: []const u8,
+    view: ColumnView,
+    out_type: types.Type,
+};
+
+pub const RegionOp = union(enum) {
+    /// Row-wise derived columns via the engine expression evaluator (one
+    /// exec.Compute instance per worker, evalBatch over the whole shard).
+    /// Same-named derived columns REPLACE their frame slot, others append —
+    /// exec.Compute's contract.
+    compute: struct { derived: []const compute_mod.Derived },
+    /// ROW_NUMBER over each region-key range: argsort by `order`, ranks
+    /// 1..n appended as a non-null bigint column. Stable on arrival order.
+    ranks: struct { name: []const u8, order: []const OrderBy },
+    /// LAST_VALUE(src) OVER (PARTITION BY region key) with the frame's
+    /// current in-range order: the range's last row broadcast to every row.
+    fill_last: struct { name: []const u8, src: usize },
+    /// Keyed aggregation: groups are (range × subkeys). Output rows are
+    /// emitted per range, sub-groups ordered by subkey values ascending
+    /// NULLS FIRST; ranges rewritten to the per-range output spans.
+    group_agg: struct { subkeys: []const usize, out: []const AggOut },
+    /// Broadcast hash join on an int-family probe column. LEFT appends the
+    /// payload columns (NULL on miss); INNER additionally drops non-matching
+    /// rows (frame restructure, ranges rewritten in place).
+    hash_probe: struct {
+        probe: usize,
+        map: *const KeyMap,
+        payload: []const Payload,
+        inner: bool,
+    },
+    /// Final projection into the caller's per-shard output stores. Must be
+    /// the program's last op.
+    emit: struct { cols: []const usize },
+};
+
+const MAX_SUBKEYS = 3;
+const SubKey = struct { v: [MAX_SUBKEYS]u64, valid: u8 };
+const AccCell = struct { i: i64 = 0, f: f64 = 0, row: u32 = 0, seen: bool = false };
+
+fn requireIntFamily(schema: []const Column, c: usize) !void {
+    if (c >= schema.len) return error.UnsupportedQueryShape;
+    switch (schema[c].type) {
+        .tinyint, .smallint, .int, .bigint, .date, .datetime => {},
+        else => return error.UnsupportedQueryShape,
+    }
+}
+
+fn requireFloatFamily(schema: []const Column, c: usize) !void {
+    if (c >= schema.len) return error.UnsupportedQueryShape;
+    switch (schema[c].type) {
+        .float, .double => {},
+        else => return error.UnsupportedQueryShape,
+    }
+}
+
+pub const Program = struct {
+    arena: std.heap.ArenaAllocator,
+    /// Borrowed from the builder (recognizer arena / test scope).
+    ops: []const RegionOp,
+    /// Frame schema before op i; schema_at[ops.len] = final frame.
+    schema_at: []const []const Column,
+    output_schema: []const Column,
+    max_width: usize,
+    registry: ?*const udf_mod.UdfRegistry,
+
+    pub fn build(
+        base_alloc: Allocator,
+        entry_schema: []const Column,
+        ops: []const RegionOp,
+        registry: ?*const udf_mod.UdfRegistry,
+    ) !Program {
+        var arena = std.heap.ArenaAllocator.init(base_alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        const schema_at = try a.alloc([]const Column, ops.len + 1);
+        schema_at[0] = try dupeSchema(a, entry_schema);
+        var output_schema: []const Column = &.{};
+        var max_width: usize = entry_schema.len;
+
+        for (ops, 0..) |op, oi| {
+            if (output_schema.len != 0) return error.UnsupportedQueryShape;
+            const in = schema_at[oi];
+            schema_at[oi + 1] = switch (op) {
+                .compute => |c| try computeOutputSchema(base_alloc, a, in, c.derived, registry),
+                .ranks => |r| blk: {
+                    for (r.order) |ob| if (ob.col >= in.len) return error.UnsupportedQueryShape;
+                    break :blk try appendedSchema(a, in, .{
+                        .name = try a.dupe(u8, r.name),
+                        .type = .bigint,
+                        .nullable = false,
+                    });
+                },
+                .fill_last => |f| blk: {
+                    if (f.src >= in.len) return error.UnsupportedQueryShape;
+                    break :blk try appendedSchema(a, in, .{
+                        .name = try a.dupe(u8, f.name),
+                        .type = in[f.src].type,
+                        .nullable = true,
+                    });
+                },
+                .group_agg => |g| blk: {
+                    if (g.subkeys.len > MAX_SUBKEYS or g.out.len == 0) return error.UnsupportedQueryShape;
+                    for (g.subkeys) |c| try requireIntFamily(in, c);
+                    const cols = try a.alloc(Column, g.out.len);
+                    for (g.out, cols) |spec, *col| {
+                        const t: types.Type = switch (spec.kind) {
+                            .first => |c| in[checkCol(in, c) catch return error.UnsupportedQueryShape].type,
+                            .sum_int => |c| t: {
+                                try requireIntFamily(in, c);
+                                break :t .bigint;
+                            },
+                            .sum_float => |c| t: {
+                                try requireFloatFamily(in, c);
+                                break :t .double;
+                            },
+                            .min_int, .max_int => |c| t: {
+                                try requireIntFamily(in, c);
+                                break :t in[c].type;
+                            },
+                            .max_by => |mb| t: {
+                                try requireIntFamily(in, mb.ord);
+                                break :t in[checkCol(in, mb.val) catch return error.UnsupportedQueryShape].type;
+                            },
+                        };
+                        col.* = .{ .name = try a.dupe(u8, spec.name), .type = t, .nullable = true };
+                    }
+                    break :blk cols;
+                },
+                .hash_probe => |h| blk: {
+                    try requireIntFamily(in, h.probe);
+                    const cols = try a.alloc(Column, in.len + h.payload.len);
+                    @memcpy(cols[0..in.len], in);
+                    for (h.payload, cols[in.len..]) |p, *col| {
+                        col.* = .{ .name = try a.dupe(u8, p.name), .type = p.out_type, .nullable = true };
+                    }
+                    break :blk cols;
+                },
+                .emit => |e| blk: {
+                    const cols = try a.alloc(Column, e.cols.len);
+                    for (e.cols, cols) |c, *col| {
+                        col.* = in[checkCol(in, c) catch return error.UnsupportedQueryShape];
+                    }
+                    output_schema = cols;
+                    break :blk in;
+                },
+            };
+            max_width = @max(max_width, schema_at[oi + 1].len);
+        }
+        if (output_schema.len == 0) return error.UnsupportedQueryShape;
+
+        return .{
+            .arena = arena,
+            .ops = ops,
+            .schema_at = schema_at,
+            .output_schema = output_schema,
+            .max_width = max_width,
+            .registry = registry,
+        };
+    }
+
+    pub fn deinit(self: *Program) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn checkCol(schema: []const Column, c: usize) !usize {
+    if (c >= schema.len) return error.UnsupportedQueryShape;
+    return c;
+}
+
+fn dupeSchema(a: Allocator, schema: []const Column) ![]Column {
+    const out = try a.alloc(Column, schema.len);
+    for (schema, out) |src, *dst| {
+        dst.* = src;
+        dst.name = try a.dupe(u8, src.name);
+    }
+    return out;
+}
+
+fn appendedSchema(a: Allocator, in: []const Column, col: Column) ![]Column {
+    const out = try a.alloc(Column, in.len + 1);
+    @memcpy(out[0..in.len], in);
+    out[in.len] = col;
+    return out;
+}
+
+/// Resolve a compute op's output schema by instantiating a throwaway
+/// exec.Compute against the frame schema (the same resolution the per-worker
+/// instances do at runtime, so the two can never disagree).
+fn computeOutputSchema(
+    gpa: Allocator,
+    a: Allocator,
+    in: []const Column,
+    derived: []const compute_mod.Derived,
+    registry: ?*const udf_mod.UdfRegistry,
+) ![]const Column {
+    var inst = try makeComputeInstance(gpa, in, derived, registry);
+    defer inst.q.deinit();
+    return dupeSchema(a, inst.ptr.output_schema);
+}
+
+const ComputeInstance = struct { q: exec.Query, ptr: *compute_mod.Compute };
+
+/// A Compute over a zero-row SingleBatchSource: never pulled as a Query —
+/// the interpreter drives it via evalBatch, the source exists to carry the
+/// frame schema through create-time resolution. `schema` must outlive the
+/// instance.
+fn makeComputeInstance(
+    gpa: Allocator,
+    schema: []const Column,
+    derived: []const compute_mod.Derived,
+    registry: ?*const udf_mod.UdfRegistry,
+) !ComputeInstance {
+    const src = try single_batch.SingleBatchSource.create(gpa, .{
+        .schema = schema,
+        .values = &.{},
+        .row_count = 0,
+    });
+    const q = try compute_mod.Compute.createWithRegistry(gpa, src, derived, registry);
+    const ptr = exec.queryAs(compute_mod.Compute, q) orelse return error.UnsupportedQueryShape;
+    return .{ .q = q, .ptr = ptr };
+}
+
+/// Per-worker interpreter state: every op's working stores are pooled for
+/// the worker's lifetime (clear per shard, never free — the slab-pool
+/// discipline). One worker runs many shards.
+pub const RegionWorker = struct {
+    alloc: Allocator,
+    prog: *const Program,
+    states: []OpState,
+    /// Per-shard scratch (argsort buffers, keep lists); reset per shard.
+    scratch: std.heap.ArenaAllocator,
+    views: []ColumnView,
+
+    const OpState = union(enum) {
+        compute: ComputeInstance,
+        ranks: struct { out: ColumnStore },
+        fill_last: struct { out: ColumnStore },
+        group_agg: struct {
+            cols: []ColumnStore,
+            ranges: std.ArrayListUnmanaged([2]u32) = .empty,
+            cells: []std.ArrayListUnmanaged(AccCell),
+            sub_first: std.ArrayListUnmanaged(u32) = .empty,
+            map: std.AutoHashMapUnmanaged(SubKey, u32) = .empty,
+        },
+        hash_probe: struct {
+            /// Full-frame compaction stores (inner only; empty for LEFT).
+            cols: []ColumnStore,
+            pay: []ColumnStore,
+            ranges: std.ArrayListUnmanaged([2]u32) = .empty,
+        },
+        emit: void,
+    };
+
+    pub fn init(alloc: Allocator, prog: *const Program) !RegionWorker {
+        const states = try alloc.alloc(OpState, prog.ops.len);
+        var built: usize = 0;
+        errdefer {
+            deinitStates(alloc, states[0..built]);
+            alloc.free(states);
+        }
+        for (prog.ops, states, 0..) |op, *st, oi| {
+            st.* = switch (op) {
+                .compute => |c| .{
+                    .compute = try makeComputeInstance(alloc, prog.schema_at[oi], c.derived, prog.registry),
+                },
+                .ranks => .{ .ranks = .{ .out = try ColumnStore.init(alloc, .bigint, false) } },
+                .fill_last => blk: {
+                    const col = prog.schema_at[oi + 1][prog.schema_at[oi].len];
+                    break :blk .{ .fill_last = .{ .out = try ColumnStore.init(alloc, col.type, true) } };
+                },
+                .group_agg => |g| blk: {
+                    const cols = try initStores(alloc, prog.schema_at[oi + 1]);
+                    errdefer freeStores(alloc, cols);
+                    const cells = try alloc.alloc(std.ArrayListUnmanaged(AccCell), g.out.len);
+                    for (cells) |*l| l.* = .empty;
+                    break :blk .{ .group_agg = .{ .cols = cols, .cells = cells } };
+                },
+                .hash_probe => |h| blk: {
+                    const out_schema = prog.schema_at[oi + 1];
+                    const n_in = out_schema.len - h.payload.len;
+                    const pay = try initStores(alloc, out_schema[n_in..]);
+                    errdefer freeStores(alloc, pay);
+                    const cols: []ColumnStore = if (h.inner)
+                        try initStores(alloc, out_schema[0..n_in])
+                    else
+                        try alloc.alloc(ColumnStore, 0);
+                    break :blk .{ .hash_probe = .{ .cols = cols, .pay = pay } };
+                },
+                .emit => .{ .emit = {} },
+            };
+            built += 1;
+        }
+        return .{
+            .alloc = alloc,
+            .prog = prog,
+            .states = states,
+            .scratch = std.heap.ArenaAllocator.init(alloc),
+            .views = try alloc.alloc(ColumnView, prog.max_width),
+        };
+    }
+
+    pub fn deinit(self: *RegionWorker) void {
+        deinitStates(self.alloc, self.states);
+        self.alloc.free(self.states);
+        self.alloc.free(self.views);
+        self.scratch.deinit();
+        self.* = undefined;
+    }
+
+    fn initStores(alloc: Allocator, schema: []const Column) ![]ColumnStore {
+        const cols = try alloc.alloc(ColumnStore, schema.len);
+        var inited: usize = 0;
+        errdefer {
+            for (cols[0..inited]) |*c| c.deinit(alloc);
+            alloc.free(cols);
+        }
+        for (cols, schema) |*c, col| {
+            c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+            inited += 1;
+        }
+        return cols;
+    }
+
+    fn freeStores(alloc: Allocator, cols: []ColumnStore) void {
+        for (cols) |*c| c.deinit(alloc);
+        alloc.free(cols);
+    }
+
+    fn deinitStates(alloc: Allocator, states: []OpState) void {
+        for (states) |*st| switch (st.*) {
+            .compute => |*c| c.q.deinit(),
+            .ranks => |*s| s.out.deinit(alloc),
+            .fill_last => |*s| s.out.deinit(alloc),
+            .group_agg => |*s| {
+                freeStores(alloc, s.cols);
+                for (s.cells) |*l| l.deinit(alloc);
+                alloc.free(s.cells);
+                s.ranges.deinit(alloc);
+                s.sub_first.deinit(alloc);
+                s.map.deinit(alloc);
+            },
+            .hash_probe => |*s| {
+                freeStores(alloc, s.cols);
+                freeStores(alloc, s.pay);
+                s.ranges.deinit(alloc);
+            },
+            .emit => {},
+        };
+    }
+
+    const Frame = struct {
+        views: []ColumnView,
+        width: usize,
+        rows: usize,
+        ranges: []const [2]u32,
+    };
+
+    /// Run the program over one consolidated shard, appending the emitted
+    /// rows onto `out` (one store per program output column, caller-owned).
+    pub fn runShard(self: *RegionWorker, sd: *const ShardData, out: []ColumnStore) !void {
+        if (sd.rows == 0) return;
+        defer _ = self.scratch.reset(.retain_capacity);
+
+        var fr = Frame{
+            .views = self.views,
+            .width = self.prog.schema_at[0].len,
+            .rows = sd.rows,
+            .ranges = sd.ranges.items,
+        };
+        for (sd.cols, fr.views[0..fr.width]) |*c, *v| v.* = c.view();
+
+        for (self.prog.ops, self.states, 0..) |op, *st, oi| {
+            switch (op) {
+                .compute => {
+                    const b = try st.compute.ptr.evalBatch(.{
+                        .schema = self.prog.schema_at[oi],
+                        .values = fr.views[0..fr.width],
+                        .row_count = fr.rows,
+                    });
+                    @memcpy(fr.views[0..b.values.len], b.values);
+                    fr.width = b.values.len;
+                },
+                .ranks => |r| try self.runRanks(r, &st.ranks.out, &fr),
+                .fill_last => |f| {
+                    const s = &st.fill_last;
+                    s.out.clear();
+                    for (fr.ranges) |rng| {
+                        if (rng[1] == rng[0]) continue;
+                        try appendRepeat(self.alloc, &s.out, fr.views[f.src], rng[1] - 1, rng[1] - rng[0]);
+                    }
+                    fr.views[fr.width] = s.out.view();
+                    fr.width += 1;
+                },
+                .group_agg => |g| try self.runGroupAgg(g, &st.group_agg, &fr),
+                .hash_probe => |h| try self.runHashProbe(h, &st.hash_probe, &fr),
+                .emit => |e| {
+                    for (e.cols, out) |c, *dst| {
+                        try appendViewRange(self.alloc, dst, fr.views[c], 0, fr.rows);
+                    }
+                },
+            }
+        }
+    }
+
+    const RankCtx = struct {
+        views: []const ColumnView,
+        order: []const OrderBy,
+        base: u32,
+
+        fn less(ctx: @This(), x: u32, y: u32) bool {
+            for (ctx.order) |ob| {
+                var o = viewOrderRows(ctx.views[ob.col], ctx.base + x, ctx.base + y);
+                if (ob.desc) o = o.invert();
+                if (o != .eq) return o == .lt;
+            }
+            return x < y;
+        }
+    };
+
+    fn runRanks(
+        self: *RegionWorker,
+        r: anytype,
+        store: *ColumnStore,
+        fr: *Frame,
+    ) !void {
+        store.clear();
+        const out_slice = try store.data.bigint.addManyAsSlice(self.alloc, fr.rows);
+        const sa = self.scratch.allocator();
+        for (fr.ranges) |rng| {
+            const n = rng[1] - rng[0];
+            if (n == 0) continue;
+            const ord = try sa.alloc(u32, n);
+            for (ord, 0..) |*o, k| o.* = @intCast(k);
+            const ctx = RankCtx{ .views = fr.views[0..fr.width], .order = r.order, .base = rng[0] };
+            std.mem.sortUnstable(u32, ord, ctx, RankCtx.less);
+            for (ord, 1..) |li, rk| out_slice[rng[0] + li] = @intCast(rk);
+        }
+        fr.views[fr.width] = store.view();
+        fr.width += 1;
+    }
+
+    fn makeSubKey(subkeys: []const usize, views: []const ColumnView, i: usize) SubKey {
+        var k = SubKey{ .v = @splat(0), .valid = 0 };
+        for (subkeys, 0..) |c, j| {
+            if (viewI64(views[c], i)) |val| {
+                k.v[j] = @bitCast(val);
+                k.valid |= @as(u8, 1) << @intCast(j);
+            }
+        }
+        return k;
+    }
+
+    const SubOrdCtx = struct {
+        views: []const ColumnView,
+        subkeys: []const usize,
+        first: []const u32,
+
+        fn less(ctx: @This(), x: u32, y: u32) bool {
+            for (ctx.subkeys) |c| {
+                const o = viewOrderRows(ctx.views[c], ctx.first[x], ctx.first[y]);
+                if (o != .eq) return o == .lt;
+            }
+            return x < y;
+        }
+    };
+
+    fn runGroupAgg(self: *RegionWorker, g: anytype, s: anytype, fr: *Frame) !void {
+        const alloc = self.alloc;
+        for (s.cols) |*c| c.clear();
+        s.ranges.clearRetainingCapacity();
+        const sa = self.scratch.allocator();
+
+        for (fr.ranges) |rng| {
+            s.map.clearRetainingCapacity();
+            s.sub_first.clearRetainingCapacity();
+            for (s.cells) |*l| l.clearRetainingCapacity();
+
+            for (rng[0]..rng[1]) |i| {
+                const key = makeSubKey(g.subkeys, fr.views, i);
+                const gop = try s.map.getOrPut(alloc, key);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = @intCast(s.sub_first.items.len);
+                    try s.sub_first.append(alloc, @intCast(i));
+                    for (s.cells) |*l| try l.append(alloc, .{});
+                }
+                const gi = gop.value_ptr.*;
+                for (g.out, s.cells) |spec, *cells| {
+                    const cell = &cells.items[gi];
+                    switch (spec.kind) {
+                        .first => {},
+                        .sum_int => |c| if (viewI64(fr.views[c], i)) |v| {
+                            cell.i += v;
+                            cell.seen = true;
+                        },
+                        .sum_float => |c| if (viewF64(fr.views[c], i)) |v| {
+                            cell.f += v;
+                            cell.seen = true;
+                        },
+                        .min_int => |c| if (viewI64(fr.views[c], i)) |v| {
+                            cell.i = if (cell.seen) @min(cell.i, v) else v;
+                            cell.seen = true;
+                        },
+                        .max_int => |c| if (viewI64(fr.views[c], i)) |v| {
+                            cell.i = if (cell.seen) @max(cell.i, v) else v;
+                            cell.seen = true;
+                        },
+                        .max_by => |mb| if (viewI64(fr.views[mb.ord], i)) |o| {
+                            if (!cell.seen or o > cell.i) {
+                                cell.i = o;
+                                cell.row = @intCast(i);
+                                cell.seen = true;
+                            }
+                        },
+                    }
+                }
+            }
+
+            const nsub = s.sub_first.items.len;
+            const sord = try sa.alloc(u32, nsub);
+            for (sord, 0..) |*o, k| o.* = @intCast(k);
+            if (g.subkeys.len > 0) {
+                const ctx = SubOrdCtx{
+                    .views = fr.views[0..fr.width],
+                    .subkeys = g.subkeys,
+                    .first = s.sub_first.items,
+                };
+                std.mem.sortUnstable(u32, sord, ctx, SubOrdCtx.less);
+            }
+
+            const start: u32 = @intCast(if (s.cols.len > 0) s.cols[0].rowCount() else 0);
+            for (sord) |gi| {
+                for (g.out, s.cells, s.cols) |spec, *cells, *dst| {
+                    const cell = &cells.items[gi];
+                    switch (spec.kind) {
+                        .first => |c| try appendRowValue(alloc, dst, fr.views[c], s.sub_first.items[gi]),
+                        .sum_int => if (cell.seen) {
+                            try dst.data.bigint.append(alloc, cell.i);
+                            try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
+                        } else try dst.appendNulls(alloc, 1),
+                        .sum_float => if (cell.seen) {
+                            try dst.data.double.append(alloc, cell.f);
+                            try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
+                        } else try dst.appendNulls(alloc, 1),
+                        .min_int, .max_int => if (cell.seen) {
+                            try appendI64As(alloc, dst, cell.i);
+                        } else try dst.appendNulls(alloc, 1),
+                        .max_by => |mb| if (cell.seen) {
+                            try appendRowValue(alloc, dst, fr.views[mb.val], cell.row);
+                        } else try dst.appendNulls(alloc, 1),
+                    }
+                }
+            }
+            try s.ranges.append(alloc, .{ start, @intCast(s.cols[0].rowCount()) });
+        }
+
+        fr.width = s.cols.len;
+        for (s.cols, fr.views[0..fr.width]) |*c, *v| v.* = c.view();
+        fr.rows = s.cols[0].rowCount();
+        fr.ranges = s.ranges.items;
+    }
+
+    fn runHashProbe(self: *RegionWorker, h: anytype, s: anytype, fr: *Frame) !void {
+        const alloc = self.alloc;
+        for (s.pay) |*c| c.clear();
+
+        if (!h.inner) {
+            for (0..fr.rows) |i| {
+                const m: ?u32 = if (viewI64(fr.views[h.probe], i)) |k| h.map.get(k) else null;
+                for (h.payload, s.pay) |p, *dst| {
+                    if (m) |row| {
+                        try appendRowValue(alloc, dst, p.view, row);
+                    } else {
+                        try dst.appendNulls(alloc, 1);
+                    }
+                }
+            }
+            for (s.pay, fr.views[fr.width..][0..s.pay.len]) |*c, *v| v.* = c.view();
+            fr.width += s.pay.len;
+            return;
+        }
+
+        for (s.cols) |*c| c.clear();
+        s.ranges.clearRetainingCapacity();
+        const sa = self.scratch.allocator();
+        var keep: std.ArrayListUnmanaged(u32) = .empty;
+        var match: std.ArrayListUnmanaged(u32) = .empty;
+
+        for (fr.ranges) |rng| {
+            keep.clearRetainingCapacity();
+            match.clearRetainingCapacity();
+            for (rng[0]..rng[1]) |i| {
+                const k = viewI64(fr.views[h.probe], i) orelse continue;
+                const row = h.map.get(k) orelse continue;
+                try keep.append(sa, @intCast(i));
+                try match.append(sa, row);
+            }
+            const start: u32 = @intCast(s.cols[0].rowCount());
+            for (s.cols, fr.views[0..fr.width]) |*dst, v| {
+                try scatterColumn(alloc, dst, v, keep.items);
+            }
+            for (h.payload, s.pay) |p, *dst| {
+                for (match.items) |row| try appendRowValue(alloc, dst, p.view, row);
+            }
+            try s.ranges.append(alloc, .{ start, @intCast(s.cols[0].rowCount()) });
+        }
+
+        fr.width = s.cols.len + s.pay.len;
+        for (s.cols, fr.views[0..s.cols.len]) |*c, *v| v.* = c.view();
+        for (s.pay, fr.views[s.cols.len..fr.width]) |*c, *v| v.* = c.view();
+        fr.rows = s.cols[0].rowCount();
+        fr.ranges = s.ranges.items;
+    }
+};
+
+fn appendI64As(alloc: Allocator, dst: *ColumnStore, v: i64) !void {
+    switch (dst.data) {
+        .tinyint => |*l| try l.append(alloc, @intCast(v)),
+        .smallint => |*l| try l.append(alloc, @intCast(v)),
+        .int => |*l| try l.append(alloc, @intCast(v)),
+        .bigint => |*l| try l.append(alloc, v),
+        .date => |*l| try l.append(alloc, @intCast(v)),
+        .datetime => |*l| try l.append(alloc, v),
+        else => return error.UnsupportedQueryShape,
+    }
+    if (dst.nulls != null) try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -547,6 +1301,228 @@ test "region exchange + ordered consolidation: multiset, order, group ranges" {
     try testing.expectEqual(@as(usize, 8), total_rows);
     try testing.expectEqual(@as(usize, 4), total_groups); // cust_a, cust_b, whale, NULL
     try testing.expectEqual(@as(i64, 360), sum_v);
+}
+
+fn tAppendStr(alloc: Allocator, store: *ColumnStore, s: ?[]const u8) !void {
+    if (s == null) return store.appendNulls(alloc, 1);
+    switch (store.data) {
+        .varchar, .string, .char, .json => |*d| try d.appendValue(alloc, s.?),
+        else => unreachable,
+    }
+    if (store.nulls != null) try store.appendValidBit(alloc, store.rowCount() - 1, true);
+}
+
+fn tAppendInt(alloc: Allocator, store: *ColumnStore, v: ?i32) !void {
+    if (v == null) return store.appendNulls(alloc, 1);
+    try store.data.int.append(alloc, v.?);
+    try store.appendValidBit(alloc, store.rowCount() - 1, true);
+}
+
+fn tAppendI64(alloc: Allocator, store: *ColumnStore, v: ?i64) !void {
+    if (v == null) return store.appendNulls(alloc, 1);
+    try store.data.bigint.append(alloc, v.?);
+    try store.appendValidBit(alloc, store.rowCount() - 1, true);
+}
+
+/// Two region-key ranges: "a" = rows 0..5, "b" = rows 5..6.
+fn tBuildShard(alloc: Allocator, schema: []const Column) !ShardData {
+    var sd = ShardData{};
+    errdefer sd.deinit(alloc);
+    try sd.ensure(alloc, schema);
+    const G = [_]?i32{ 2, 1, 2, null, 2, 1 };
+    const V = [_]?i64{ 10, 30, null, 5, 20, 7 };
+    for (G, V, 0..) |g, v, i| {
+        try tAppendStr(alloc, &sd.cols[0], if (i < 5) "a" else "b");
+        try tAppendInt(alloc, &sd.cols[1], g);
+        try tAppendI64(alloc, &sd.cols[2], v);
+    }
+    sd.rows = 6;
+    try sd.ranges.append(alloc, .{ 0, 5 });
+    try sd.ranges.append(alloc, .{ 5, 6 });
+    return sd;
+}
+
+test "region program: ranks -> group_agg -> fill_last -> left probe -> emit" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = try tBuildShard(alloc, &entry);
+    defer sd.deinit(alloc);
+
+    var names = try ColumnStore.init(alloc, .string, true);
+    defer names.deinit(alloc);
+    try tAppendStr(alloc, &names, "one");
+    try tAppendStr(alloc, &names, "two");
+    var map = KeyMap.empty;
+    defer map.deinit(alloc);
+    try map.put(alloc, 1, 0);
+    try map.put(alloc, 2, 1);
+
+    const agg_out = [_]AggOut{
+        .{ .name = "k", .kind = .{ .first = 0 } },
+        .{ .name = "g", .kind = .{ .first = 1 } },
+        .{ .name = "sum_v", .kind = .{ .sum_int = 2 } },
+        .{ .name = "top_v", .kind = .{ .max_by = .{ .val = 2, .ord = 3 } } },
+    };
+    const subkeys = [_]usize{1};
+    const rank_order = [_]OrderBy{.{ .col = 2 }};
+    const payload = [_]Payload{.{ .name = "nm", .view = names.view(), .out_type = .string }};
+    const emit_cols = [_]usize{ 0, 1, 2, 3, 4, 5 };
+    const ops = [_]RegionOp{
+        .{ .ranks = .{ .name = "rn", .order = &rank_order } },
+        .{ .group_agg = .{ .subkeys = &subkeys, .out = &agg_out } },
+        .{ .fill_last = .{ .name = "ls", .src = 2 } },
+        .{ .hash_probe = .{ .probe = 1, .map = &map, .payload = &payload, .inner = false } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    try testing.expectEqual(@as(usize, 6), prog.output_schema.len);
+
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+
+    const out = try alloc.alloc(ColumnStore, prog.output_schema.len);
+    defer {
+        for (out) |*c| c.deinit(alloc);
+        alloc.free(out);
+    }
+    for (out, prog.output_schema) |*c, col| c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+
+    try worker.runShard(&sd, out);
+
+    // Sub-groups per range ordered by g NULLS FIRST:
+    //   a: (null: sum 5, top 5) (1: 30, 30) (2: 30, top_v = v at max rank = 20)
+    //   b: (1: 7, 7)
+    const exp_g = [_]?i32{ null, 1, 2, 1 };
+    const exp_sum = [_]?i64{ 5, 30, 30, 7 };
+    const exp_top = [_]?i64{ 5, 30, 20, 7 };
+    const exp_ls = [_]i64{ 30, 30, 30, 7 };
+    const exp_nm = [_]?[]const u8{ null, "one", "two", "one" };
+
+    try testing.expectEqual(@as(usize, 4), out[0].rowCount());
+    const kv = out[0].view();
+    const gv = out[1].view();
+    const sv = out[2].view();
+    const tv = out[3].view();
+    const lv = out[4].view();
+    const nv = out[5].view();
+    for (0..4) |i| {
+        try testing.expectEqualStrings(if (i < 3) "a" else "b", stringViewOf(kv).rowBytes(i));
+        if (exp_g[i]) |g| {
+            try testing.expectEqual(g, gv.data.int[i]);
+        } else try testing.expect(!gv.isValid(i));
+        try testing.expectEqual(exp_sum[i].?, sv.data.bigint[i]);
+        try testing.expectEqual(exp_top[i].?, tv.data.bigint[i]);
+        try testing.expectEqual(exp_ls[i], lv.data.bigint[i]);
+        if (exp_nm[i]) |nm| {
+            try testing.expectEqualStrings(nm, stringViewOf(nv).rowBytes(i));
+        } else try testing.expect(!nv.isValid(i));
+    }
+}
+
+test "region program: inner probe drops non-matching sub-groups" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = try tBuildShard(alloc, &entry);
+    defer sd.deinit(alloc);
+
+    var names = try ColumnStore.init(alloc, .string, true);
+    defer names.deinit(alloc);
+    try tAppendStr(alloc, &names, "one");
+    var map = KeyMap.empty;
+    defer map.deinit(alloc);
+    try map.put(alloc, 1, 0);
+
+    const agg_out = [_]AggOut{
+        .{ .name = "k", .kind = .{ .first = 0 } },
+        .{ .name = "g", .kind = .{ .first = 1 } },
+        .{ .name = "sum_v", .kind = .{ .sum_int = 2 } },
+    };
+    const subkeys = [_]usize{1};
+    const payload = [_]Payload{.{ .name = "nm", .view = names.view(), .out_type = .string }};
+    const emit_cols = [_]usize{ 0, 1, 2, 3 };
+    const ops = [_]RegionOp{
+        .{ .group_agg = .{ .subkeys = &subkeys, .out = &agg_out } },
+        .{ .hash_probe = .{ .probe = 1, .map = &map, .payload = &payload, .inner = true } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+
+    const out = try alloc.alloc(ColumnStore, prog.output_schema.len);
+    defer {
+        for (out) |*c| c.deinit(alloc);
+        alloc.free(out);
+    }
+    for (out, prog.output_schema) |*c, col| c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+
+    try worker.runShard(&sd, out);
+
+    // Only g=1 sub-groups survive: (a, 1, 30, one), (b, 1, 7, one).
+    try testing.expectEqual(@as(usize, 2), out[0].rowCount());
+    const kv = out[0].view();
+    const sv = out[2].view();
+    const nv = out[3].view();
+    try testing.expectEqualStrings("a", stringViewOf(kv).rowBytes(0));
+    try testing.expectEqualStrings("b", stringViewOf(kv).rowBytes(1));
+    try testing.expectEqual(@as(i64, 30), sv.data.bigint[0]);
+    try testing.expectEqual(@as(i64, 7), sv.data.bigint[1]);
+    try testing.expectEqualStrings("one", stringViewOf(nv).rowBytes(0));
+    try testing.expectEqualStrings("one", stringViewOf(nv).rowBytes(1));
+}
+
+test "region program: compute op runs the engine expression evaluator per shard" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = try tBuildShard(alloc, &entry);
+    defer sd.deinit(alloc);
+
+    const derived = [_]compute_mod.Derived{.{ .name = "v2", .expr = .{ .col_ref = "v" } }};
+    const emit_cols = [_]usize{ 2, 3 };
+    const ops = [_]RegionOp{
+        .{ .compute = .{ .derived = &derived } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    try testing.expectEqual(@as(usize, 4), prog.schema_at[1].len);
+
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+
+    const out = try alloc.alloc(ColumnStore, prog.output_schema.len);
+    defer {
+        for (out) |*c| c.deinit(alloc);
+        alloc.free(out);
+    }
+    for (out, prog.output_schema) |*c, col| c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+
+    try worker.runShard(&sd, out);
+
+    try testing.expectEqual(@as(usize, 6), out[0].rowCount());
+    const v0 = out[0].view();
+    const v1 = out[1].view();
+    for (0..6) |i| {
+        try testing.expectEqual(v0.isValid(i), v1.isValid(i));
+        if (v0.isValid(i)) try testing.expectEqual(v0.data.bigint[i], v1.data.bigint[i]);
+    }
 }
 
 test "appendStoreRange: contiguous copy preserves values and validity" {
