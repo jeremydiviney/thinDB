@@ -658,12 +658,21 @@ pub const RegionOp = union(enum) {
     tvf_aligned: TvfSpec,
     /// Per-range TVF (partition = region-key group). `union_append` copies
     /// each range then lets the kernel append its rows at the group tail
-    /// (rf_estimates class; kernel output schema == frame schema), so
-    /// run-contiguity holds by construction. Otherwise the kernel output
-    /// REPLACES the frame (rf_gap_fill class). Ranges rewritten either way.
+    /// (rf_estimates class; kernel output schema == frame schema up to the
+    /// `inputs` permutation — out store k targets frame column inputs[k]),
+    /// so run-contiguity holds by construction. `aligned_append` calls the
+    /// kernel per range and APPENDS its columns row-aligned (rf_updown
+    /// class: a row-aligned passthrough kernel whose state assumes one
+    /// partition per call — whole-shard tvf_aligned would leak LAG/MIN
+    /// state across key groups); rows and ranges are unchanged. Otherwise
+    /// the kernel output REPLACES the frame (rf_gap_fill class) and the
+    /// ranges are rewritten.
     tvf_grouped: struct {
         spec: TvfSpec,
         union_append: bool = false,
+        /// Per-range row-aligned append (mutually exclusive with
+        /// union_append and input_filter).
+        aligned_append: bool = false,
         /// Kernel-input row selection (the estimates date-window): only rows
         /// with `col` non-null and lo <= value <= hi feed the kernel. On
         /// union_append the filtered-out rows still flow through the copy.
@@ -816,11 +825,39 @@ pub const Program = struct {
                     for (t.spec.inputs) |c| _ = try checkCol(in, c);
                     if (t.input_filter) |f| try requireIntFamily(in, f.col);
                     if (t.union_append) {
-                        if (t.spec.out.len != in.len) return error.UnsupportedQueryShape;
-                        for (t.spec.out, in) |o, in_col| {
-                            if (!std.meta.eql(o.type, in_col.type)) return error.UnsupportedQueryShape;
+                        if (t.aligned_append) return error.UnsupportedQueryShape;
+                        // Kernel outputs land on frame columns through the
+                        // `inputs` permutation (out k -> frame inputs[k]);
+                        // each frame column is covered at most once, and
+                        // uncovered ones (e.g. a row-loc tie-break carried
+                        // only for the consolidation order) must be nullable
+                        // — the kernel's appended rows get NULLs there.
+                        if (t.spec.out.len != t.spec.inputs.len or t.spec.inputs.len > in.len) {
+                            return error.UnsupportedQueryShape;
+                        }
+                        const seen = try a.alloc(bool, in.len);
+                        @memset(seen, false);
+                        for (t.spec.out, t.spec.inputs) |o, ci| {
+                            if (seen[ci]) return error.UnsupportedQueryShape;
+                            seen[ci] = true;
+                            if (!std.meta.eql(o.type, in[ci].type)) return error.UnsupportedQueryShape;
+                        }
+                        for (seen, in) |covered, in_col| {
+                            if (!covered and !in_col.nullable) return error.UnsupportedQueryShape;
                         }
                         break :blk in;
+                    }
+                    if (t.aligned_append) {
+                        if (t.input_filter != null or t.spec.out.len == 0) {
+                            return error.UnsupportedQueryShape;
+                        }
+                        const cols = try a.alloc(Column, in.len + t.spec.out.len);
+                        @memcpy(cols[0..in.len], in);
+                        for (t.spec.out, cols[in.len..]) |src, *col| {
+                            col.* = src;
+                            col.name = try a.dupe(u8, src.name);
+                        }
+                        break :blk cols;
                     }
                     break :blk try dupeSchema(a, t.spec.out);
                 },
@@ -877,7 +914,7 @@ fn appendedSchema(a: Allocator, in: []const Column, col: Column) ![]Column {
 /// Resolve a compute op's output schema by instantiating a throwaway
 /// exec.Compute against the frame schema (the same resolution the per-worker
 /// instances do at runtime, so the two can never disagree).
-fn computeOutputSchema(
+pub fn computeOutputSchema(
     gpa: Allocator,
     a: Allocator,
     in: []const Column,
@@ -1010,7 +1047,12 @@ pub const RegionWorker = struct {
                 },
                 .tvf_grouped => |t| blk: {
                     const in_schema = prog.schema_at[oi];
-                    const out_schema = if (t.union_append) in_schema else prog.schema_at[oi + 1];
+                    const out_schema = if (t.union_append)
+                        in_schema
+                    else if (t.aligned_append)
+                        prog.schema_at[oi + 1][in_schema.len..]
+                    else
+                        prog.schema_at[oi + 1];
                     const out = try initStores(alloc, out_schema);
                     errdefer freeStores(alloc, out);
                     const in_scratch = try alloc.alloc(ColumnStore, t.spec.inputs.len);
@@ -1194,7 +1236,10 @@ pub const RegionWorker = struct {
                 .group_agg => |g| try self.runGroupAgg(g, &st.group_agg, &fr),
                 .hash_probe => |h| try self.runHashProbe(h, &st.hash_probe, &fr),
                 .tvf_aligned => |t| try self.runTvfAligned(t, &st.tvf, &fr),
-                .tvf_grouped => |t| try self.runTvfGrouped(t, &st.tvf, &fr),
+                .tvf_grouped => |t| if (t.aligned_append)
+                    try self.runTvfGroupedAligned(t, &st.tvf, &fr)
+                else
+                    try self.runTvfGrouped(t, &st.tvf, &fr),
                 .emit => |e| {
                     for (e.cols, out) |c, *dst| {
                         try appendViewRange(self.alloc, dst, fr.views[c], 0, fr.rows);
@@ -1372,7 +1417,7 @@ pub const RegionWorker = struct {
                     .sum_float => |c| accumSumFloat(cells.items, ord_of, fr.views[c], rng[0]),
                     .min_int => |c| accumMinMax(false, cells.items, ord_of, fr.views[c], rng[0]),
                     .max_int => |c| accumMinMax(true, cells.items, ord_of, fr.views[c], rng[0]),
-                    .max_by => |mb| accumMaxBy(cells.items, ord_of, fr.views[mb.ord], rng[0]),
+                    .max_by => |mb| accumMaxBy(cells.items, ord_of, fr.views[mb.val], fr.views[mb.ord], rng[0]),
                 }
             }
 
@@ -1477,7 +1522,13 @@ pub const RegionWorker = struct {
         s.ranges.clearRetainingCapacity();
         const sa = self.scratch.allocator();
         const out_ptrs = try sa.alloc(*ColumnStore, s.out.len);
-        for (s.out, out_ptrs) |*c, *p| p.* = c;
+        if (t.union_append) {
+            // Kernel outputs are in the kernel's declared order; `inputs`
+            // maps each one back onto its frame column.
+            for (out_ptrs, t.spec.inputs) |*p, ci| p.* = &s.out[ci];
+        } else {
+            for (s.out, out_ptrs) |*c, *p| p.* = c;
+        }
 
         for (fr.ranges) |rng| {
             const start: u32 = @intCast(s.out[0].rowCount());
@@ -1486,7 +1537,8 @@ pub const RegionWorker = struct {
                     try appendViewRange(alloc, dst, v, rng[0], rng[1]);
                 }
             }
-            try self.kernelOverRange(t, s, fr.views[0..fr.width], rng[0], rng[1], out_ptrs);
+            try self.kernelOverRange(t, s, fr.views[0..fr.width], rng[0], rng[1], out_ptrs, null);
+            if (t.union_append) try padUncovered(alloc, s.out, t.spec.inputs);
             try s.ranges.append(alloc, .{ start, @intCast(s.out[0].rowCount()) });
         }
 
@@ -1494,6 +1546,23 @@ pub const RegionWorker = struct {
         for (s.out, fr.views[0..fr.width]) |*c, *v| v.* = c.view();
         fr.rows = s.out[0].rowCount();
         fr.ranges = s.ranges.items;
+    }
+
+    /// aligned_append: one kernel call per range, output columns appended
+    /// to the frame row-aligned (validated per range); rows and ranges are
+    /// untouched.
+    fn runTvfGroupedAligned(self: *RegionWorker, t: anytype, s: *TvfState, fr: *Frame) !void {
+        for (s.out) |*c| c.clear();
+        const sa = self.scratch.allocator();
+        const out_ptrs = try sa.alloc(*ColumnStore, s.out.len);
+        for (s.out, out_ptrs) |*c, *p| p.* = c;
+        for (fr.ranges) |rng| {
+            if (rng[0] == rng[1]) continue;
+            const want = s.out[0].rowCount() + (rng[1] - rng[0]);
+            try self.kernelOverRange(t, s, fr.views[0..fr.width], rng[0], rng[1], out_ptrs, want);
+        }
+        for (s.out, fr.views[fr.width..][0..s.out.len]) |*c, *v| v.* = c.view();
+        fr.width += s.out.len;
     }
 
     /// Select the kernel-visible rows of [lo,hi) per the input filter, copy
@@ -1508,6 +1577,7 @@ pub const RegionWorker = struct {
         lo: usize,
         hi: usize,
         out_ptrs: []*ColumnStore,
+        expect_rows: ?usize,
     ) !void {
         const sa = self.scratch.allocator();
         var kin: std.ArrayListUnmanaged(u32) = .empty;
@@ -1528,7 +1598,7 @@ pub const RegionWorker = struct {
         }
         const in_views = try sa.alloc(ColumnView, t.spec.inputs.len);
         for (s.in_scratch, in_views) |*c, *v| v.* = c.view();
-        try self.callTvf(t.spec, s, in_views, kin.items.len, out_ptrs, null);
+        try self.callTvf(t.spec, s, in_views, kin.items.len, out_ptrs, expect_rows);
     }
 
     /// Lever-1 fusion (general region rule): a program whose FIRST op is a
@@ -1557,9 +1627,30 @@ pub const RegionWorker = struct {
         // stores); they are only read during the input copy.
         const views = try sa.alloc(ColumnView, width);
         for (out.cols[0..width], views) |*c, *v| v.* = c.view();
-        const out_ptrs = try sa.alloc(*ColumnStore, width);
-        for (out.cols[0..width], out_ptrs) |*c, *p| p.* = c;
-        try self.kernelOverRange(t, s, views, g_start, out.cols[0].rowCount(), out_ptrs);
+        const out_ptrs = try sa.alloc(*ColumnStore, t.spec.inputs.len);
+        for (out_ptrs, t.spec.inputs) |*p, ci| p.* = &out.cols[ci];
+        try self.kernelOverRange(t, s, views, g_start, out.cols[0].rowCount(), out_ptrs, null);
+        try padUncovered(self.alloc, out.cols[0..width], t.spec.inputs);
+    }
+
+    /// Union-append with a partial `inputs` coverage: frame columns no
+    /// kernel output maps to (nullable by build contract) get NULLs for the
+    /// kernel's appended rows.
+    fn padUncovered(alloc: Allocator, cols: []ColumnStore, inputs: []const usize) !void {
+        if (inputs.len == 0 or inputs.len == cols.len) return;
+        const target = cols[inputs[0]].rowCount();
+        for (cols, 0..) |*c, ci| {
+            var covered = false;
+            for (inputs) |ic| {
+                if (ic == ci) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) continue;
+            const have = c.rowCount();
+            if (have < target) try c.appendNulls(alloc, target - have);
+        }
     }
 
     /// Lever 6: one hoisted-type pass resolves every row's build-side
@@ -2037,11 +2128,14 @@ fn accumMinMax(comptime is_max: bool, cells: []AccCell, ord_of: []const u32, v: 
     }
 }
 
-fn accumMaxBy(cells: []AccCell, ord_of: []const u32, ord_v: ColumnView, base: usize) void {
+fn accumMaxBy(cells: []AccCell, ord_of: []const u32, val_v: ColumnView, ord_v: ColumnView, base: usize) void {
     switch (ord_v.data) {
         inline .tinyint, .smallint, .int, .bigint, .date, .datetime => |vals| {
             for (ord_of, 0..) |gi, li| {
-                if (!ord_v.isValid(base + li)) continue;
+                // Engine MAX_BY pair semantics: a row with a NULL VALUE or
+                // NULL key contributes nothing — the winner is the best-key
+                // row among rows where both are present.
+                if (!ord_v.isValid(base + li) or !val_v.isValid(base + li)) continue;
                 const o: i64 = vals[base + li];
                 const cell = &cells[gi];
                 if (!cell.seen or o > cell.i) {
@@ -2080,6 +2174,16 @@ pub const RegionExecOp = struct {
     result: ?RegionResult = null,
     emit_shard: usize = 0,
     views_buf: []ColumnView,
+    /// Recognizer-owned state the program borrows (compiled Program,
+    /// broadcast maps/stores, cloned expressions). Freed LAST in deinit —
+    /// after the result/pool that reference it.
+    owned_ctx: ?*anyopaque = null,
+    owned_ctx_deinit: ?*const fn (*anyopaque) void = null,
+
+    pub fn setOwnedCtx(self: *RegionExecOp, ctx: *anyopaque, dtor: *const fn (*anyopaque) void) void {
+        self.owned_ctx = ctx;
+        self.owned_ctx_deinit = dtor;
+    }
 
     pub fn create(
         allocator: Allocator,
@@ -2114,8 +2218,11 @@ pub const RegionExecOp = struct {
         self.allocator.free(self.sources);
         if (self.result) |*r| r.deinit();
         self.allocator.free(self.views_buf);
+        const owned_ctx = self.owned_ctx;
+        const owned_dtor = self.owned_ctx_deinit;
         const allocator = self.allocator;
         allocator.destroy(self);
+        if (owned_ctx) |ctx| owned_dtor.?(ctx);
     }
 
     pub fn ensureExecuted(self: *RegionExecOp) !void {
