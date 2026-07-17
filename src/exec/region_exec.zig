@@ -1076,6 +1076,31 @@ pub const RegionWorker = struct {
         };
     }
 
+    /// Approximate retained capacity across the op states (pool cap input;
+    /// engine Compute internals are not walked).
+    pub fn retainedBytes(self: *const RegionWorker) usize {
+        var n: usize = self.scratch.queryCapacity();
+        for (self.states) |*st| switch (st.*) {
+            .compute, .emit => {},
+            .ranks => |*s| n += storeRetainedBytes(&s.out),
+            .fill_last => |*s| n += storeRetainedBytes(&s.out),
+            .group_agg => |*s| {
+                for (s.cols) |*c| n += storeRetainedBytes(c);
+                for (s.cells) |*l| n += l.capacity * @sizeOf(AccCell);
+            },
+            .hash_probe => |*s| {
+                for (s.cols) |*c| n += storeRetainedBytes(c);
+                for (s.pay) |*c| n += storeRetainedBytes(c);
+            },
+            .tvf => |*s| {
+                for (s.out) |*c| n += storeRetainedBytes(c);
+                for (s.in_scratch) |*c| n += storeRetainedBytes(c);
+                n += s.call_arena.queryCapacity() + s.worker_arena.queryCapacity();
+            },
+        };
+        return n;
+    }
+
     const Frame = struct {
         views: []ColumnView,
         width: usize,
@@ -1608,12 +1633,127 @@ pub const RegionResult = struct {
         self.* = undefined;
     }
 
+    /// Reuse across runs (capacity retained).
+    pub fn clear(self: *RegionResult) void {
+        for (self.shards) |*s| {
+            for (s.cols) |*c| c.clear();
+            s.rows = 0;
+        }
+    }
+
     pub fn totalRows(self: *const RegionResult) usize {
         var n: usize = 0;
         for (self.shards) |s| n += s.rows;
         return n;
     }
 };
+
+/// Lever 4: region slab pool. Everything a region run allocates that is
+/// shape-stable across executions of the SAME compiled program — the
+/// exchange buckets and the per-thread interpreter workers (op-state
+/// stores, TVF worker arenas/state, shard scratch) — clears rather than
+/// frees between runs, the discipline that took the probe from 1.33s cold
+/// to 0.72s steady. The pool's owner is whoever owns the compiled program
+/// (a plan-cache entry once the recognizer lands); per-shard RESULT stores
+/// are deliberately NOT pooled — the E3 exit adopts them into a Stage.
+/// `releaseRun` frees everything once retained capacity exceeds the cap.
+pub const RegionPool = struct {
+    alloc: Allocator,
+    /// Approximate retained-capacity ceiling (store capacities + arena
+    /// footprints; validity bitmaps excluded — ~1/64 of data).
+    max_retained_bytes: usize = 512 << 20,
+    prog: ?*const Program = null,
+    n_shards: usize = 0,
+    ex: ?Exchange = null,
+    slots: std.ArrayListUnmanaged(*WorkerSlot) = .empty,
+
+    pub const WorkerSlot = struct {
+        rw: RegionWorker,
+        sd: ShardData = .{},
+        scratch: std.heap.ArenaAllocator,
+    };
+
+    pub fn init(alloc: Allocator, max_retained_bytes: usize) RegionPool {
+        return .{ .alloc = alloc, .max_retained_bytes = max_retained_bytes };
+    }
+
+    pub fn deinit(self: *RegionPool) void {
+        self.reset();
+        self.slots.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn reset(self: *RegionPool) void {
+        if (self.ex) |*ex| ex.deinit();
+        self.ex = null;
+        for (self.slots.items) |slot| {
+            slot.rw.deinit();
+            slot.sd.deinit(self.alloc);
+            slot.scratch.deinit();
+            self.alloc.destroy(slot);
+        }
+        self.slots.clearRetainingCapacity();
+        self.prog = null;
+    }
+
+    /// Prepare the pool for a run of `prog`: reuse (clear) when the program
+    /// and shape match the previous run, rebuild otherwise.
+    fn acquire(self: *RegionPool, prog: *const Program, opts: DriverOpts) !void {
+        const match = self.prog == prog and self.n_shards == opts.n_shards and
+            self.ex != null and self.ex.?.n_workers == opts.n_threads;
+        if (!match) {
+            self.reset();
+            self.ex = try Exchange.init(self.alloc, prog.schema_at[0], opts.n_threads, opts.n_shards, opts.key_col);
+            self.prog = prog;
+            self.n_shards = opts.n_shards;
+        } else {
+            self.ex.?.clear();
+        }
+        while (self.slots.items.len < opts.n_threads) {
+            const slot = try self.alloc.create(WorkerSlot);
+            errdefer self.alloc.destroy(slot);
+            slot.* = .{
+                .rw = try RegionWorker.init(self.alloc, prog),
+                .scratch = std.heap.ArenaAllocator.init(self.alloc),
+            };
+            try self.slots.append(self.alloc, slot);
+        }
+    }
+
+    /// End-of-run retention policy: keep everything (cleared) for the next
+    /// run unless the retained capacity exceeds the cap.
+    pub fn releaseRun(self: *RegionPool) void {
+        if (self.retainedBytes() > self.max_retained_bytes) self.reset();
+    }
+
+    pub fn retainedBytes(self: *const RegionPool) usize {
+        var n: usize = 0;
+        if (self.ex) |*ex| {
+            for (ex.buckets) |b| {
+                for (b.cols) |*c| n += storeRetainedBytes(c);
+            }
+        }
+        for (self.slots.items) |slot| {
+            n += slot.rw.retainedBytes();
+            for (slot.sd.cols) |*c| n += storeRetainedBytes(c);
+            n += slot.scratch.queryCapacity();
+        }
+        return n;
+    }
+};
+
+/// Approximate retained capacity of one store (validity bitmap excluded).
+fn storeRetainedBytes(c: *const ColumnStore) usize {
+    return switch (c.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |l| l.capacity * @sizeOf(std.meta.Child(@TypeOf(l.items))),
+        .varchar, .string, .char, .json => |s| blk: {
+            var n: usize = s.offsets.capacity * @sizeOf(u32) + s.bytes.capacity;
+            if (s.wide_offsets) |w| n += w.capacity * @sizeOf(u64);
+            break :blk n;
+        },
+        else => 0,
+    };
+}
 
 const ScanPhase = struct {
     ex: *Exchange,
@@ -1653,11 +1793,11 @@ const ScanPhase = struct {
 
 const ShardPhase = struct {
     ex: *Exchange,
-    prog: *const Program,
     opts: DriverOpts,
     order: []const u32,
     next: std.atomic.Value(usize) = .init(0),
     result: *RegionResult,
+    slots: []const *RegionPool.WorkerSlot,
     errs: []?anyerror,
 
     fn worker(self: *ShardPhase, w: usize) void {
@@ -1667,14 +1807,8 @@ const ShardPhase = struct {
     }
 
     fn workerInner(self: *ShardPhase, w: usize) !void {
-        _ = w;
-        const alloc = self.ex.alloc;
-        var rw = try RegionWorker.init(alloc, self.prog);
-        defer rw.deinit();
-        var sd = ShardData{};
-        defer sd.deinit(alloc);
-        var scratch = std.heap.ArenaAllocator.init(alloc);
-        defer scratch.deinit();
+        const slot = self.slots[w];
+        const rw = &slot.rw;
         const tail = rw.fusedFirstTail();
         const start_op: usize = if (tail != null) 1 else 0;
 
@@ -1683,10 +1817,10 @@ const ShardPhase = struct {
             if (oi >= self.order.len) break;
             const s = self.order[oi];
             if (self.ex.shardRows(s) == 0) continue;
-            _ = scratch.reset(.retain_capacity);
-            try consolidateOrderedTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &sd, scratch.allocator(), tail);
+            _ = slot.scratch.reset(.retain_capacity);
+            try consolidateOrderedTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &slot.sd, slot.scratch.allocator(), tail);
             const out = &self.result.shards[s];
-            try rw.runShardFrom(&sd, out.cols, start_op);
+            try rw.runShardFrom(&slot.sd, out.cols, start_op);
             out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
         }
     }
@@ -1696,6 +1830,8 @@ const ShardPhase = struct {
 /// compute into a hash exchange on the program's entry schema, then claim
 /// shards whale-first, consolidating each in the region's order and running
 /// the compiled program shard-locally. `sources` are drained (not deinit'd).
+/// One-shot form — all region state is built and freed within the call; use
+/// `runRegionPooled` for repeated executions of the same program.
 pub fn runRegion(
     alloc: Allocator,
     scan_schema: []const Column,
@@ -1705,8 +1841,23 @@ pub fn runRegion(
     opts: DriverOpts,
     result: *RegionResult,
 ) !void {
-    var ex = try Exchange.init(alloc, prog.schema_at[0], opts.n_threads, opts.n_shards, opts.key_col);
-    defer ex.deinit();
+    var pool = RegionPool.init(alloc, 0);
+    defer pool.deinit();
+    return runRegionPooled(scan_schema, sources, entry_derived, prog, opts, result, &pool);
+}
+
+pub fn runRegionPooled(
+    scan_schema: []const Column,
+    sources: []exec.Query,
+    entry_derived: []const compute_mod.Derived,
+    prog: *const Program,
+    opts: DriverOpts,
+    result: *RegionResult,
+    pool: *RegionPool,
+) !void {
+    const alloc = pool.alloc;
+    try pool.acquire(prog, opts);
+    const ex = &pool.ex.?;
 
     const errs = try alloc.alloc(?anyerror, opts.n_threads);
     defer alloc.free(errs);
@@ -1715,7 +1866,7 @@ pub fn runRegion(
     defer alloc.free(threads);
 
     var scan_phase = ScanPhase{
-        .ex = &ex,
+        .ex = ex,
         .sources = sources,
         .entry_derived = entry_derived,
         .scan_schema = scan_schema,
@@ -1735,11 +1886,11 @@ pub fn runRegion(
     defer alloc.free(order);
     @memset(errs, null);
     var shard_phase = ShardPhase{
-        .ex = &ex,
-        .prog = prog,
+        .ex = ex,
         .opts = opts,
         .order = order,
         .result = result,
+        .slots = pool.slots.items[0..opts.n_threads],
         .errs = errs,
     };
     spawned = 0;
@@ -1750,6 +1901,8 @@ pub fn runRegion(
     shard_phase.worker(opts.n_threads - 1);
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
+
+    pool.releaseRun();
 }
 
 // Group-agg accumulate sweeps: one call per (spec, range). The value-type
@@ -2722,6 +2875,91 @@ test "region driver: leading union-append TVF fuses into the consolidation gathe
         }
     }
     try testing.expectEqual(@as(usize, 2), appended);
+}
+
+test "region pool: repeated runs reuse cleared state; cap evicts at release" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var stores: [3]ColumnStore = undefined;
+    stores[0] = try ColumnStore.init(alloc, .string, true);
+    stores[1] = try ColumnStore.init(alloc, .int, true);
+    stores[2] = try ColumnStore.init(alloc, .bigint, true);
+    defer for (&stores) |*c| c.deinit(alloc);
+    const K = [_]?[]const u8{ "a", "b", "a", "c" };
+    const V = [_]?i64{ 10, 20, 30, 40 };
+    for (K, V) |k, v| {
+        try tAppendStr(alloc, &stores[0], k);
+        try tAppendInt(alloc, &stores[1], 1);
+        try tAppendI64(alloc, &stores[2], v);
+    }
+    var views: [3]ColumnView = undefined;
+    for (&views, &stores) |*v, *c| v.* = c.view();
+
+    const agg_out = [_]AggOut{
+        .{ .name = "k", .kind = .{ .first = 0 } },
+        .{ .name = "sum_v", .kind = .{ .sum_int = 2 } },
+    };
+    const emit_cols = [_]usize{ 0, 1 };
+    const ops = [_]RegionOp{
+        .{ .group_agg = .{ .subkeys = &.{}, .out = &agg_out } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+
+    const sort_cols = [_]OrderCol{.{ .col = 0, .kind = .string }};
+    const opts = DriverOpts{
+        .n_threads = 1,
+        .n_shards = 4,
+        .key_col = 0,
+        .sort_cols = &sort_cols,
+        .group_prefix = 1,
+    };
+
+    var pool = RegionPool.init(alloc, 1 << 30);
+    defer pool.deinit();
+    var result = try RegionResult.init(alloc, prog.output_schema, 4);
+    defer result.deinit();
+
+    for (0..2) |_| {
+        result.clear();
+        var srcs = [1]exec.Query{try single_batch.SingleBatchSource.create(alloc, .{
+            .schema = &entry,
+            .values = &views,
+            .row_count = K.len,
+        })};
+        defer srcs[0].deinit();
+        try runRegionPooled(&entry, &srcs, &.{}, &prog, opts, &result, &pool);
+        try testing.expectEqual(@as(usize, 3), result.totalRows());
+        var sum: i64 = 0;
+        for (result.shards) |s| {
+            const sv = if (s.rows > 0) s.cols[1].view() else continue;
+            for (0..s.rows) |i| sum += sv.data.bigint[i];
+        }
+        try testing.expectEqual(@as(i64, 100), sum);
+        // State retained (cleared, not freed) for the next run.
+        try testing.expect(pool.ex != null);
+        try testing.expect(pool.prog == &prog);
+    }
+    try testing.expect(pool.retainedBytes() > 0);
+
+    // Cap 0: the next release frees everything.
+    pool.max_retained_bytes = 0;
+    result.clear();
+    var srcs = [1]exec.Query{try single_batch.SingleBatchSource.create(alloc, .{
+        .schema = &entry,
+        .values = &views,
+        .row_count = K.len,
+    })};
+    defer srcs[0].deinit();
+    try runRegionPooled(&entry, &srcs, &.{}, &prog, opts, &result, &pool);
+    try testing.expectEqual(@as(usize, 3), result.totalRows());
+    try testing.expect(pool.ex == null);
+    try testing.expectEqual(@as(usize, 0), pool.retainedBytes());
 }
 
 test "appendStoreRange: contiguous copy preserves values and validity" {
