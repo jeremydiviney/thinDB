@@ -84,6 +84,20 @@ pub fn compileStaged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage
         cse.canon.deinit(input.allocator);
     }
     try countMatRefs(input.allocator, root, &cse);
+    // Keyed pipeline regions (task #184, THINDB_REGION=1): a recognized
+    // subtree pre-registers its stage here, BEFORE the window-wrap rewrite
+    // mutates nodes below its anchor; collectStages' map hit then stops the
+    // walk at the anchor and compileBlock reads the region output as an
+    // ordinary stage.
+    if (getenv("THINDB_REGION") != null) {
+        if (@import("region_rollforward.zig").tryRecognize(input, root)) |rec| {
+            const stage = try set.addStage(rec.query, input.accountant);
+            const rep = cse.canon.get(rec.anchor) orelse rec.anchor;
+            try map.put(input.allocator, rep, stage);
+            if (rep != rec.anchor) try map.put(input.allocator, rec.anchor, stage);
+            std.debug.print("[region] rollforward region engaged\n", .{});
+        }
+    }
     wrapWindowsInMaterialize(input.node_arena, @constCast(root), &cse) catch {};
     try collectStages(input, root, set, &map, &cse);
     if (stage_count_out) |out| out.* = @intCast(set.stages.items.len);
@@ -388,7 +402,7 @@ fn blockSource(op: *const ir.Op) BlockSource {
 
 threadlocal var compile_block_depth: usize = 0;
 
-fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
+pub fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
     // Recursion guard: a compile that nests blocks this deep is either a
     // pathological plan or a walk cycle — fail the query instead of
     // silently smashing the stack (Windows kills without a trace). The
