@@ -624,12 +624,21 @@ pub const RegionOp = union(enum) {
     /// Same-named derived columns REPLACE their frame slot, others append —
     /// exec.Compute's contract.
     compute: struct { derived: []const compute_mod.Derived },
-    /// ROW_NUMBER over each region-key range: argsort by `order`, ranks
-    /// 1..n appended as a non-null bigint column. Stable on arrival order.
-    ranks: struct { name: []const u8, order: []const OrderBy },
+    /// ROW_NUMBER over each rank partition: argsort by `order`, ranks 1..n
+    /// appended as a non-null bigint column. Stable on arrival order. A
+    /// partition is one region-key range, or — when `merge_on` is set — a
+    /// run of ADJACENT ranges with equal `merge_on` value (a window
+    /// partitioned coarser than the range keys, e.g. by the region key
+    /// alone while ranges also split on a second column; consolidation
+    /// sorts ranges so equal-prefix runs are consecutive by construction).
+    ranks: struct { name: []const u8, order: []const OrderBy, merge_on: ?usize = null },
     /// LAST_VALUE(src) OVER (PARTITION BY region key) with the frame's
     /// current in-range order: the range's last row broadcast to every row.
     fill_last: struct { name: []const u8, src: usize },
+    /// LAG(src, offset) over the frame's current in-range order: NULL for
+    /// the first `offset` rows of each range, the value `offset` rows back
+    /// otherwise.
+    lag: struct { name: []const u8, src: usize, offset: usize },
     /// Keyed aggregation: groups are (range × subkeys). Output rows are
     /// emitted per range, sub-groups ordered by subkey values ascending
     /// NULLS FIRST; ranges rewritten to the per-range output spans.
@@ -733,6 +742,7 @@ pub const Program = struct {
                 .compute => |c| try computeOutputSchema(base_alloc, a, in, c.derived, registry),
                 .ranks => |r| blk: {
                     for (r.order) |ob| if (ob.col >= in.len) return error.UnsupportedQueryShape;
+                    if (r.merge_on) |c| _ = try checkCol(in, c);
                     break :blk try appendedSchema(a, in, .{
                         .name = try a.dupe(u8, r.name),
                         .type = .bigint,
@@ -744,6 +754,14 @@ pub const Program = struct {
                     break :blk try appendedSchema(a, in, .{
                         .name = try a.dupe(u8, f.name),
                         .type = in[f.src].type,
+                        .nullable = true,
+                    });
+                },
+                .lag => |l| blk: {
+                    if (l.src >= in.len) return error.UnsupportedQueryShape;
+                    break :blk try appendedSchema(a, in, .{
+                        .name = try a.dupe(u8, l.name),
+                        .type = in[l.src].type,
                         .nullable = true,
                     });
                 },
@@ -908,6 +926,7 @@ pub const RegionWorker = struct {
         compute: ComputeInstance,
         ranks: struct { out: ColumnStore },
         fill_last: struct { out: ColumnStore },
+        lag: struct { out: ColumnStore },
         group_agg: struct {
             cols: []ColumnStore,
             ranges: std.ArrayListUnmanaged([2]u32) = .empty,
@@ -956,6 +975,10 @@ pub const RegionWorker = struct {
                 .fill_last => blk: {
                     const col = prog.schema_at[oi + 1][prog.schema_at[oi].len];
                     break :blk .{ .fill_last = .{ .out = try ColumnStore.init(alloc, col.type, true) } };
+                },
+                .lag => blk: {
+                    const col = prog.schema_at[oi + 1][prog.schema_at[oi].len];
+                    break :blk .{ .lag = .{ .out = try ColumnStore.init(alloc, col.type, true) } };
                 },
                 .group_agg => |g| blk: {
                     const cols = try initStores(alloc, prog.schema_at[oi + 1]);
@@ -1052,6 +1075,7 @@ pub const RegionWorker = struct {
             .compute => |*c| c.q.deinit(),
             .ranks => |*s| s.out.deinit(alloc),
             .fill_last => |*s| s.out.deinit(alloc),
+            .lag => |*s| s.out.deinit(alloc),
             .group_agg => |*s| {
                 freeStores(alloc, s.cols);
                 for (s.cells) |*l| l.deinit(alloc);
@@ -1084,6 +1108,7 @@ pub const RegionWorker = struct {
             .compute, .emit => {},
             .ranks => |*s| n += storeRetainedBytes(&s.out),
             .fill_last => |*s| n += storeRetainedBytes(&s.out),
+            .lag => |*s| n += storeRetainedBytes(&s.out),
             .group_agg => |*s| {
                 for (s.cols) |*c| n += storeRetainedBytes(c);
                 for (s.cells) |*l| n += l.capacity * @sizeOf(AccCell);
@@ -1147,6 +1172,21 @@ pub const RegionWorker = struct {
                     for (fr.ranges) |rng| {
                         if (rng[1] == rng[0]) continue;
                         try appendRepeat(self.alloc, &s.out, fr.views[f.src], rng[1] - 1, rng[1] - rng[0]);
+                    }
+                    fr.views[fr.width] = s.out.view();
+                    fr.width += 1;
+                },
+                .lag => |l| {
+                    const s = &st.lag;
+                    s.out.clear();
+                    for (fr.ranges) |rng| {
+                        const n: usize = rng[1] - rng[0];
+                        if (n == 0) continue;
+                        const lead: usize = @min(l.offset, n);
+                        try s.out.appendNulls(self.alloc, lead);
+                        if (n > lead) {
+                            try appendViewRange(self.alloc, &s.out, fr.views[l.src], rng[0], rng[1] - lead);
+                        }
                     }
                     fr.views[fr.width] = s.out.view();
                     fr.width += 1;
@@ -1240,8 +1280,23 @@ pub const RegionWorker = struct {
         const sa = self.scratch.allocator();
         const norms = try sa.alloc(NormCol, r.order.len);
         for (r.order, norms) |ob, *nc| nc.* = try buildNormKeys(sa, fr.views[ob.col], fr.rows);
-        for (fr.ranges) |rng| {
-            const n = rng[1] - rng[0];
+        var ri: usize = 0;
+        while (ri < fr.ranges.len) : (ri += 1) {
+            const lo = fr.ranges[ri][0];
+            var hi = fr.ranges[ri][1];
+            if (r.merge_on) |mc| {
+                // A partition coarser than the range keys: absorb adjacent
+                // ranges with the same merge_on value (equal-prefix runs are
+                // consecutive by the consolidation ordering contract).
+                while (ri + 1 < fr.ranges.len) {
+                    const nxt = fr.ranges[ri + 1];
+                    if (nxt[0] != nxt[1] and lo != hi and
+                        viewOrderRows(fr.views[mc], lo, nxt[0]) != .eq) break;
+                    hi = nxt[1];
+                    ri += 1;
+                }
+            }
+            const n = hi - lo;
             if (n == 0) continue;
             const ord = try sa.alloc(u32, n);
             for (ord, 0..) |*o, k| o.* = @intCast(k);
@@ -1249,10 +1304,10 @@ pub const RegionWorker = struct {
                 .views = fr.views[0..fr.width],
                 .order = r.order,
                 .norms = norms,
-                .base = rng[0],
+                .base = lo,
             };
             std.mem.sortUnstable(u32, ord, ctx, RankCtx.less);
-            for (ord, 1..) |li, rk| out_slice[rng[0] + li] = @intCast(rk);
+            for (ord, 1..) |li, rk| out_slice[lo + li] = @intCast(rk);
         }
         fr.views[fr.width] = store.view();
         fr.width += 1;
@@ -2487,6 +2542,94 @@ test "region program: ranks normalized keys — lossy i64 ties and string prefix
     try testing.expectEqual(@as(i64, 2), rn.data.bigint[1]);
     try testing.expectEqual(@as(i64, 3), rn.data.bigint[2]);
     try testing.expectEqual(@as(i64, 1), rn.data.bigint[3]);
+}
+
+test "region program: lag op shifts within ranges" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = try tBuildShard(alloc, &entry);
+    defer sd.deinit(alloc);
+
+    const emit_cols = [_]usize{ 2, 3 };
+    const ops = [_]RegionOp{
+        .{ .lag = .{ .name = "lv", .src = 2, .offset = 1 } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+    const out = try alloc.alloc(ColumnStore, 2);
+    defer {
+        for (out) |*c| c.deinit(alloc);
+        alloc.free(out);
+    }
+    for (out, prog.output_schema) |*c, col| c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+
+    try worker.runShard(&sd, out);
+
+    // v = 10,30,null,5,20 | 7 -> lag(1): null,10,30,null,5 | null.
+    const exp = [_]?i64{ null, 10, 30, null, 5, null };
+    const lv = out[1].view();
+    for (exp, 0..) |e, i| {
+        if (e) |x| {
+            try testing.expectEqual(x, lv.data.bigint[i]);
+        } else try testing.expect(!lv.isValid(i));
+    }
+}
+
+test "region program: ranks merge_on spans adjacent same-key ranges" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = ShardData{};
+    defer sd.deinit(alloc);
+    try sd.ensure(alloc, &entry);
+    // Ranges (k,g): (a,1)=rows 0..2, (a,2)=row 2..3, (b,1)=row 3..4 — the
+    // rank partitions by k alone must span the two "a" ranges.
+    const K = [_][]const u8{ "a", "a", "a", "b" };
+    const G = [_]i32{ 1, 1, 2, 1 };
+    const V = [_]i64{ 30, 10, 20, 5 };
+    for (K, G, V) |k, g, v| {
+        try tAppendStr(alloc, &sd.cols[0], k);
+        try tAppendInt(alloc, &sd.cols[1], g);
+        try tAppendI64(alloc, &sd.cols[2], v);
+    }
+    sd.rows = 4;
+    try sd.ranges.append(alloc, .{ 0, 2 });
+    try sd.ranges.append(alloc, .{ 2, 3 });
+    try sd.ranges.append(alloc, .{ 3, 4 });
+
+    const order = [_]OrderBy{.{ .col = 2 }};
+    const emit_cols = [_]usize{3};
+    const ops = [_]RegionOp{
+        .{ .ranks = .{ .name = "rn", .order = &order, .merge_on = 0 } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+    const out = try alloc.alloc(ColumnStore, 1);
+    defer {
+        out[0].deinit(alloc);
+        alloc.free(out);
+    }
+    out[0] = try ColumnStore.init(alloc, .bigint, false);
+
+    try worker.runShard(&sd, out);
+
+    // Partition "a" = v {30,10,20} -> ranks 3,1,2; partition "b" -> 1.
+    const exp = [_]i64{ 3, 1, 2, 1 };
+    const rn = out[0].view();
+    for (exp, 0..) |e, i| try testing.expectEqual(e, rn.data.bigint[i]);
 }
 
 test "region program: inner probe drops non-matching sub-groups" {
