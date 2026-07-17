@@ -385,6 +385,11 @@ pub const Compute = struct {
     /// One ColumnStore per derived column. Cleared + refilled each
     /// `next()` from the upstream batch.
     derived_cols: []ColumnStore,
+    /// Per-derived flag set each evalBatch: the output view aliases the
+    /// producer's buffer directly (renamed upstream column, literal slot,
+    /// call/case root output) instead of a copy into `derived_cols`. Same
+    /// lifetime either way — valid until the next call on this instance.
+    derived_direct: []bool,
     /// For each derived column, the output slot it writes into (append
     /// position for fresh names, the matched upstream index for renames).
     derived_output_indices: []usize,
@@ -478,6 +483,9 @@ pub const Compute = struct {
 
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
+        const derived_direct = try allocator.alloc(bool, resolved.len);
+        errdefer allocator.free(derived_direct);
+        @memset(derived_direct, false);
 
         const self = try allocator.create(Compute);
         errdefer allocator.destroy(self);
@@ -487,6 +495,7 @@ pub const Compute = struct {
             .upstream = upstream,
             .derived = resolved,
             .derived_cols = derived_cols,
+            .derived_direct = derived_direct,
             .derived_output_indices = derived_output_indices,
             .output_schema = output_schema,
             .views = views,
@@ -502,6 +511,7 @@ pub const Compute = struct {
         up.deinit();
         for (self.derived_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.derived_cols);
+        self.allocator.free(self.derived_direct);
         self.allocator.free(self.derived_output_indices);
         for (self.derived) |r| {
             switch (r.kind) {
@@ -740,32 +750,70 @@ pub const Compute = struct {
     pub fn evalBatch(self: *Compute, in: Batch) !Batch {
         const n = in.row_count;
 
-        for (self.derived, self.derived_cols) |r, *out_col| {
+        for (self.derived, self.derived_cols, self.derived_direct) |r, *out_col, *direct| {
             out_col.clear();
+            direct.* = false;
             switch (r.kind) {
-                .rename => |rn| try appendCopiedColumn(self.allocator, out_col, in.values[rn.src_idx], n),
+                .rename => |rn| {
+                    // Pass the upstream view through untouched when its
+                    // physical type matches the declared slot (always today;
+                    // the guard keeps a future presentation change safe).
+                    if (std.meta.activeTag(in.values[rn.src_idx].data) == std.meta.activeTag(out_col.data)) {
+                        direct.* = true;
+                    } else {
+                        try appendCopiedColumn(self.allocator, out_col, in.values[rn.src_idx], n);
+                    }
+                },
                 .null_only => try fillNullColumn(self.allocator, out_col, n),
                 .lit_only => |slot| {
                     slot.buf.clear();
                     try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
-                    try appendCopiedColumn(self.allocator, out_col, slot.buf.view(), n);
+                    if (std.meta.activeTag(slot.buf.data) == std.meta.activeTag(out_col.data)) {
+                        direct.* = true;
+                    } else {
+                        try appendCopiedColumn(self.allocator, out_col, slot.buf.view(), n);
+                    }
                 },
                 .call => |plan| {
                     try self.evalCall(plan, in.values, n);
-                    // Root's owned output → derived_cols slot. Copies
-                    // both data + validity (transform.appendAllColumn).
-                    try appendCopiedColumn(self.allocator, out_col, plan.output.view(), n);
+                    // The root's output store IS the derived value; hand its
+                    // view out directly instead of copying into the
+                    // derived_cols slot (same lifetime — both refill on the
+                    // next call). Copy only on a physical-type mismatch or a
+                    // short fill, where the old path's presentation applies.
+                    if (std.meta.activeTag(plan.output.data) == std.meta.activeTag(out_col.data) and
+                        plan.output.rowCount() == n)
+                    {
+                        direct.* = true;
+                    } else {
+                        try appendCopiedColumn(self.allocator, out_col, plan.output.view(), n);
+                    }
                 },
                 .case => |plan| {
                     try self.evalCase(plan, in.values, n);
-                    try appendCopiedColumn(self.allocator, out_col, plan.output.view(), n);
+                    if (std.meta.activeTag(plan.output.data) == std.meta.activeTag(out_col.data) and
+                        plan.output.rowCount() == n)
+                    {
+                        direct.* = true;
+                    } else {
+                        try appendCopiedColumn(self.allocator, out_col, plan.output.view(), n);
+                    }
                 },
                 .fused_scalar => |fs| try self.evalFusedScalar(fs, in.values, out_col, n),
             }
         }
 
         for (in.values, 0..) |v, i| self.views[i] = v;
-        for (self.derived_cols, self.derived_output_indices) |c, out_idx| self.views[out_idx] = c.view();
+        for (self.derived, self.derived_cols, self.derived_output_indices, self.derived_direct) |r, *c, out_idx, direct| {
+            self.views[out_idx] = if (!direct) c.view() else switch (r.kind) {
+                .rename => |rn| in.values[rn.src_idx],
+                .lit_only => |slot| slot.buf.view(),
+                .call => |plan| plan.output.view(),
+                .case => |plan| plan.output.view(),
+                // Only the four kinds above ever set `direct`.
+                .null_only, .fused_scalar => unreachable,
+            };
+        }
 
         return Batch{
             .schema = self.output_schema,
