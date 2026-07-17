@@ -169,15 +169,6 @@ fn viewI64(v: ColumnView, i: usize) ?i64 {
     };
 }
 
-fn viewF64(v: ColumnView, i: usize) ?f64 {
-    if (!v.isValid(i)) return null;
-    return switch (v.data) {
-        .float => |s| s[i],
-        .double => |s| s[i],
-        else => null,
-    };
-}
-
 /// Engine comparison dialect for one column: NULLs first (below every
 /// non-null value); bytewise for strings.
 fn viewOrderRows(v: ColumnView, a: usize, b: usize) std.math.Order {
@@ -1190,7 +1181,9 @@ pub const RegionWorker = struct {
             s.sub_first.clearRetainingCapacity();
             for (s.cells) |*l| l.clearRetainingCapacity();
 
-            for (rng[0]..rng[1]) |i| {
+            // Pass 1 — sub-group assignment only (the hash pass).
+            const ord_of = try sa.alloc(u32, rng[1] - rng[0]);
+            for (rng[0]..rng[1], ord_of) |i, *slot| {
                 const key = makeSubKey(g.subkeys, fr.views, i);
                 const gop = try s.map.getOrPut(alloc, key);
                 if (!gop.found_existing) {
@@ -1198,35 +1191,20 @@ pub const RegionWorker = struct {
                     try s.sub_first.append(alloc, @intCast(i));
                     for (s.cells) |*l| try l.append(alloc, .{});
                 }
-                const gi = gop.value_ptr.*;
-                for (g.out, s.cells) |spec, *cells| {
-                    const cell = &cells.items[gi];
-                    switch (spec.kind) {
-                        .first => {},
-                        .sum_int => |c| if (viewI64(fr.views[c], i)) |v| {
-                            cell.i += v;
-                            cell.seen = true;
-                        },
-                        .sum_float => |c| if (viewF64(fr.views[c], i)) |v| {
-                            cell.f += v;
-                            cell.seen = true;
-                        },
-                        .min_int => |c| if (viewI64(fr.views[c], i)) |v| {
-                            cell.i = if (cell.seen) @min(cell.i, v) else v;
-                            cell.seen = true;
-                        },
-                        .max_int => |c| if (viewI64(fr.views[c], i)) |v| {
-                            cell.i = if (cell.seen) @max(cell.i, v) else v;
-                            cell.seen = true;
-                        },
-                        .max_by => |mb| if (viewI64(fr.views[mb.ord], i)) |o| {
-                            if (!cell.seen or o > cell.i) {
-                                cell.i = o;
-                                cell.row = @intCast(i);
-                                cell.seen = true;
-                            }
-                        },
-                    }
+                slot.* = gop.value_ptr.*;
+            }
+
+            // Pass 2 — one column-at-a-time sweep per agg spec, with the agg
+            // kind, value type, and validity presence all hoisted out of the
+            // row loop (the silo monomorphization discipline).
+            for (g.out, s.cells) |spec, *cells| {
+                switch (spec.kind) {
+                    .first => {},
+                    .sum_int => |c| accumSumInt(cells.items, ord_of, fr.views[c], rng[0]),
+                    .sum_float => |c| accumSumFloat(cells.items, ord_of, fr.views[c], rng[0]),
+                    .min_int => |c| accumMinMax(false, cells.items, ord_of, fr.views[c], rng[0]),
+                    .max_int => |c| accumMinMax(true, cells.items, ord_of, fr.views[c], rng[0]),
+                    .max_by => |mb| accumMaxBy(cells.items, ord_of, fr.views[mb.ord], rng[0]),
                 }
             }
 
@@ -1677,6 +1655,84 @@ pub fn runRegion(
     for (errs) |e| if (e) |err| return err;
 }
 
+// Group-agg accumulate sweeps: one call per (spec, range). The value-type
+// switch runs once (inline arms monomorphize the loop per type) and the
+// no-validity fast path skips the per-row bit check. The `unreachable`s
+// hold by construction — Program.build rejects columns outside the family.
+
+fn accumSumInt(cells: []AccCell, ord_of: []const u32, v: ColumnView, base: usize) void {
+    switch (v.data) {
+        inline .tinyint, .smallint, .int, .bigint, .date, .datetime => |vals| {
+            if (v.nulls == null) {
+                for (ord_of, vals[base..][0..ord_of.len]) |gi, x| {
+                    cells[gi].i += x;
+                    cells[gi].seen = true;
+                }
+            } else {
+                for (ord_of, 0..) |gi, li| {
+                    if (!v.isValid(base + li)) continue;
+                    cells[gi].i += vals[base + li];
+                    cells[gi].seen = true;
+                }
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn accumSumFloat(cells: []AccCell, ord_of: []const u32, v: ColumnView, base: usize) void {
+    switch (v.data) {
+        inline .float, .double => |vals| {
+            if (v.nulls == null) {
+                for (ord_of, vals[base..][0..ord_of.len]) |gi, x| {
+                    cells[gi].f += x;
+                    cells[gi].seen = true;
+                }
+            } else {
+                for (ord_of, 0..) |gi, li| {
+                    if (!v.isValid(base + li)) continue;
+                    cells[gi].f += vals[base + li];
+                    cells[gi].seen = true;
+                }
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn accumMinMax(comptime is_max: bool, cells: []AccCell, ord_of: []const u32, v: ColumnView, base: usize) void {
+    switch (v.data) {
+        inline .tinyint, .smallint, .int, .bigint, .date, .datetime => |vals| {
+            for (ord_of, 0..) |gi, li| {
+                if (!v.isValid(base + li)) continue;
+                const x: i64 = vals[base + li];
+                const cell = &cells[gi];
+                cell.i = if (!cell.seen) x else if (is_max) @max(cell.i, x) else @min(cell.i, x);
+                cell.seen = true;
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn accumMaxBy(cells: []AccCell, ord_of: []const u32, ord_v: ColumnView, base: usize) void {
+    switch (ord_v.data) {
+        inline .tinyint, .smallint, .int, .bigint, .date, .datetime => |vals| {
+            for (ord_of, 0..) |gi, li| {
+                if (!ord_v.isValid(base + li)) continue;
+                const o: i64 = vals[base + li];
+                const cell = &cells[gi];
+                if (!cell.seen or o > cell.i) {
+                    cell.i = o;
+                    cell.row = @intCast(base + li);
+                    cell.seen = true;
+                }
+            }
+        },
+        else => unreachable,
+    }
+}
+
 fn appendI64As(alloc: Allocator, dst: *ColumnStore, v: i64) !void {
     switch (dst.data) {
         .tinyint => |*l| try l.append(alloc, @intCast(v)),
@@ -1914,6 +1970,74 @@ test "region program: ranks -> group_agg -> fill_last -> left probe -> emit" {
             try testing.expectEqualStrings(nm, stringViewOf(nv).rowBytes(i));
         } else try testing.expect(!nv.isValid(i));
     }
+}
+
+test "region program: group_agg min/max/sum_float sweeps (validity hoisted)" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "m", .type = .int, .nullable = true },
+        .{ .name = "d", .type = .double, .nullable = true },
+        .{ .name = "t", .type = .date, .nullable = true },
+    };
+    var sd = ShardData{};
+    defer sd.deinit(alloc);
+    try sd.ensure(alloc, &entry);
+    const M = [_]?i32{ 1, 1, 2 };
+    const D = [_]?f64{ 1.5, null, 2.5 };
+    const T = [_]?i32{ 100, 90, null };
+    for (M, D, T) |m, d, t| {
+        try tAppendStr(alloc, &sd.cols[0], "a");
+        try tAppendInt(alloc, &sd.cols[1], m);
+        if (d) |x| {
+            try sd.cols[2].data.double.append(alloc, x);
+            try sd.cols[2].appendValidBit(alloc, sd.cols[2].rowCount() - 1, true);
+        } else try sd.cols[2].appendNulls(alloc, 1);
+        if (t) |x| {
+            try sd.cols[3].data.date.append(alloc, x);
+            try sd.cols[3].appendValidBit(alloc, sd.cols[3].rowCount() - 1, true);
+        } else try sd.cols[3].appendNulls(alloc, 1);
+    }
+    sd.rows = 3;
+    try sd.ranges.append(alloc, .{ 0, 3 });
+
+    const agg_out = [_]AggOut{
+        .{ .name = "m", .kind = .{ .first = 1 } },
+        .{ .name = "sum_d", .kind = .{ .sum_float = 2 } },
+        .{ .name = "min_t", .kind = .{ .min_int = 3 } },
+        .{ .name = "max_t", .kind = .{ .max_int = 3 } },
+    };
+    const subkeys = [_]usize{1};
+    const emit_cols = [_]usize{ 0, 1, 2, 3 };
+    const ops = [_]RegionOp{
+        .{ .group_agg = .{ .subkeys = &subkeys, .out = &agg_out } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+    const out = try alloc.alloc(ColumnStore, prog.output_schema.len);
+    defer {
+        for (out) |*c| c.deinit(alloc);
+        alloc.free(out);
+    }
+    for (out, prog.output_schema) |*c, col| c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+
+    try worker.runShard(&sd, out);
+
+    // Sub-groups by m asc: m=1 -> sum_d 1.5, min_t 90, max_t 100;
+    // m=2 -> sum_d 2.5, min/max NULL.
+    try testing.expectEqual(@as(usize, 2), out[0].rowCount());
+    const sv = out[1].view();
+    const mn = out[2].view();
+    const mx = out[3].view();
+    try testing.expectEqual(@as(f64, 1.5), sv.data.double[0]);
+    try testing.expectEqual(@as(i32, 90), mn.data.date[0]);
+    try testing.expectEqual(@as(i32, 100), mx.data.date[0]);
+    try testing.expectEqual(@as(f64, 2.5), sv.data.double[1]);
+    try testing.expect(!mn.isValid(1));
+    try testing.expect(!mx.isValid(1));
 }
 
 test "region program: inner probe drops non-matching sub-groups" {
