@@ -599,9 +599,42 @@ pub const RegionOp = union(enum) {
         payload: []const Payload,
         inner: bool,
     },
+    /// Row-aligned TVF over the whole shard (rf_currency class): one raw-ABI
+    /// call, computed output columns appended to the frame. Zero-copy input —
+    /// the kernel's declared input-0 columns are frame views.
+    tvf_aligned: TvfSpec,
+    /// Per-range TVF (partition = region-key group). `union_append` copies
+    /// each range then lets the kernel append its rows at the group tail
+    /// (rf_estimates class; kernel output schema == frame schema), so
+    /// run-contiguity holds by construction. Otherwise the kernel output
+    /// REPLACES the frame (rf_gap_fill class). Ranges rewritten either way.
+    tvf_grouped: struct {
+        spec: TvfSpec,
+        union_append: bool = false,
+        /// Kernel-input row selection (the estimates date-window): only rows
+        /// with `col` non-null and lo <= value <= hi feed the kernel. On
+        /// union_append the filtered-out rows still flow through the copy.
+        input_filter: ?struct { col: usize, lo: i64, hi: i64 } = null,
+    },
     /// Final projection into the caller's per-shard output stores. Must be
     /// the program's last op.
     emit: struct { cols: []const usize },
+};
+
+/// One TVF call site, resolved from a udf.TableEntry by the recognizer.
+/// `extra_parts` are prebuilt broadcast partitions (whole lookup tables),
+/// passed verbatim to every call — TVF ABI6.
+pub const TvfSpec = struct {
+    process: udf_mod.TvfProcess,
+    user_data: ?*anyopaque = null,
+    args: []const ?types.Value = &.{},
+    /// Frame columns in the kernel's declared input-0 column order.
+    inputs: []const usize,
+    extra_parts: []const udf_mod.TvfPartition = &.{},
+    /// Kernel output columns (aligned: appended to the frame; grouped
+    /// replace: the new frame schema; grouped union_append: must equal the
+    /// frame schema — validated at build).
+    out: []const Column,
 };
 
 const MAX_SUBKEYS = 3;
@@ -706,6 +739,28 @@ pub const Program = struct {
                         col.* = .{ .name = try a.dupe(u8, p.name), .type = p.out_type, .nullable = true };
                     }
                     break :blk cols;
+                },
+                .tvf_aligned => |t| blk: {
+                    for (t.inputs) |c| _ = try checkCol(in, c);
+                    const cols = try a.alloc(Column, in.len + t.out.len);
+                    @memcpy(cols[0..in.len], in);
+                    for (t.out, cols[in.len..]) |src, *col| {
+                        col.* = src;
+                        col.name = try a.dupe(u8, src.name);
+                    }
+                    break :blk cols;
+                },
+                .tvf_grouped => |t| blk: {
+                    for (t.spec.inputs) |c| _ = try checkCol(in, c);
+                    if (t.input_filter) |f| try requireIntFamily(in, f.col);
+                    if (t.union_append) {
+                        if (t.spec.out.len != in.len) return error.UnsupportedQueryShape;
+                        for (t.spec.out, in) |o, in_col| {
+                            if (!std.meta.eql(o.type, in_col.type)) return error.UnsupportedQueryShape;
+                        }
+                        break :blk in;
+                    }
+                    break :blk try dupeSchema(a, t.spec.out);
                 },
                 .emit => |e| blk: {
                     const cols = try a.alloc(Column, e.cols.len);
@@ -822,7 +877,23 @@ pub const RegionWorker = struct {
             pay: []ColumnStore,
             ranges: std.ArrayListUnmanaged([2]u32) = .empty,
         },
+        tvf: TvfState,
         emit: void,
+    };
+
+    /// Shared state shape for both TVF op kinds. The worker arena + state
+    /// slot live for the worker (a kernel builds its lookup tables once per
+    /// worker — TVF ABI6); the call arena resets per process() call.
+    const TvfState = struct {
+        out: []ColumnStore,
+        /// Kernel-visible input copies for grouped calls (range offsets have
+        /// no zero-copy view — the proven contiguous-copy pattern). Empty
+        /// for aligned calls (whole-shard views are zero-copy).
+        in_scratch: []ColumnStore,
+        ranges: std.ArrayListUnmanaged([2]u32) = .empty,
+        call_arena: std.heap.ArenaAllocator,
+        worker_arena: std.heap.ArenaAllocator,
+        worker_state: ?*anyopaque = null,
     };
 
     pub fn init(alloc: Allocator, prog: *const Program) !RegionWorker {
@@ -859,6 +930,38 @@ pub const RegionWorker = struct {
                     else
                         try alloc.alloc(ColumnStore, 0);
                     break :blk .{ .hash_probe = .{ .cols = cols, .pay = pay } };
+                },
+                .tvf_aligned => blk: {
+                    const out = try initStores(alloc, prog.schema_at[oi + 1][prog.schema_at[oi].len..]);
+                    errdefer freeStores(alloc, out);
+                    break :blk .{ .tvf = .{
+                        .out = out,
+                        .in_scratch = try alloc.alloc(ColumnStore, 0),
+                        .call_arena = std.heap.ArenaAllocator.init(alloc),
+                        .worker_arena = std.heap.ArenaAllocator.init(alloc),
+                    } };
+                },
+                .tvf_grouped => |t| blk: {
+                    const in_schema = prog.schema_at[oi];
+                    const out_schema = if (t.union_append) in_schema else prog.schema_at[oi + 1];
+                    const out = try initStores(alloc, out_schema);
+                    errdefer freeStores(alloc, out);
+                    const in_scratch = try alloc.alloc(ColumnStore, t.spec.inputs.len);
+                    var inited: usize = 0;
+                    errdefer {
+                        for (in_scratch[0..inited]) |*c| c.deinit(alloc);
+                        alloc.free(in_scratch);
+                    }
+                    for (in_scratch, t.spec.inputs) |*c, ci| {
+                        c.* = try ColumnStore.init(alloc, in_schema[ci].type, in_schema[ci].nullable);
+                        inited += 1;
+                    }
+                    break :blk .{ .tvf = .{
+                        .out = out,
+                        .in_scratch = in_scratch,
+                        .call_arena = std.heap.ArenaAllocator.init(alloc),
+                        .worker_arena = std.heap.ArenaAllocator.init(alloc),
+                    } };
                 },
                 .emit => .{ .emit = {} },
             };
@@ -918,6 +1021,13 @@ pub const RegionWorker = struct {
                 freeStores(alloc, s.pay);
                 s.ranges.deinit(alloc);
             },
+            .tvf => |*s| {
+                freeStores(alloc, s.out);
+                freeStores(alloc, s.in_scratch);
+                s.ranges.deinit(alloc);
+                s.call_arena.deinit();
+                s.worker_arena.deinit();
+            },
             .emit => {},
         };
     }
@@ -967,6 +1077,8 @@ pub const RegionWorker = struct {
                 },
                 .group_agg => |g| try self.runGroupAgg(g, &st.group_agg, &fr),
                 .hash_probe => |h| try self.runHashProbe(h, &st.hash_probe, &fr),
+                .tvf_aligned => |t| try self.runTvfAligned(t, &st.tvf, &fr),
+                .tvf_grouped => |t| try self.runTvfGrouped(t, &st.tvf, &fr),
                 .emit => |e| {
                     for (e.cols, out) |c, *dst| {
                         try appendViewRange(self.alloc, dst, fr.views[c], 0, fr.rows);
@@ -1130,6 +1242,105 @@ pub const RegionWorker = struct {
         fr.width = s.cols.len;
         for (s.cols, fr.views[0..fr.width]) |*c, *v| v.* = c.view();
         fr.rows = s.cols[0].rowCount();
+        fr.ranges = s.ranges.items;
+    }
+
+    /// Assemble parts[0] over `in_views` plus the spec's broadcast parts,
+    /// call the kernel, and validate rectangular output at `expect_rows`
+    /// (null = any row count, but all output columns equal).
+    fn callTvf(
+        self: *RegionWorker,
+        spec: TvfSpec,
+        s: *TvfState,
+        in_views: []const ColumnView,
+        in_rows: usize,
+        out_ptrs: []*ColumnStore,
+        expect_rows: ?usize,
+    ) !void {
+        const sa = self.scratch.allocator();
+        const parts = try sa.alloc(udf_mod.TvfPartition, 1 + spec.extra_parts.len);
+        parts[0] = .{ .columns = in_views, .row_count = in_rows, .keys = &.{} };
+        @memcpy(parts[1..], spec.extra_parts);
+
+        var out = udf_mod.TvfOutput{ .columns = out_ptrs, .allocator = self.alloc };
+        _ = s.call_arena.reset(.retain_capacity);
+        var ctx = udf_mod.TvfContext{
+            .arena = s.call_arena.allocator(),
+            .user_data = spec.user_data,
+            .args = spec.args,
+            .worker_arena = s.worker_arena.allocator(),
+            .worker_state = &s.worker_state,
+        };
+        try spec.process(&ctx, parts, &out);
+
+        const rows = out_ptrs[0].rowCount();
+        if (expect_rows) |want| {
+            if (rows != want) return error.TableFnBadOutput;
+        }
+        for (out_ptrs[1..]) |c| {
+            if (c.rowCount() != rows) return error.TableFnBadOutput;
+        }
+    }
+
+    fn runTvfAligned(self: *RegionWorker, spec: TvfSpec, s: *TvfState, fr: *Frame) !void {
+        for (s.out) |*c| c.clear();
+        if (fr.rows > 0) {
+            const sa = self.scratch.allocator();
+            const in_views = try sa.alloc(ColumnView, spec.inputs.len);
+            for (spec.inputs, in_views) |ci, *v| v.* = fr.views[ci];
+            const out_ptrs = try sa.alloc(*ColumnStore, s.out.len);
+            for (s.out, out_ptrs) |*c, *p| p.* = c;
+            try self.callTvf(spec, s, in_views, fr.rows, out_ptrs, fr.rows);
+        }
+        for (s.out, fr.views[fr.width..][0..s.out.len]) |*c, *v| v.* = c.view();
+        fr.width += s.out.len;
+    }
+
+    fn runTvfGrouped(self: *RegionWorker, t: anytype, s: *TvfState, fr: *Frame) !void {
+        const alloc = self.alloc;
+        const spec: TvfSpec = t.spec;
+        for (s.out) |*c| c.clear();
+        s.ranges.clearRetainingCapacity();
+        const sa = self.scratch.allocator();
+        const out_ptrs = try sa.alloc(*ColumnStore, s.out.len);
+        for (s.out, out_ptrs) |*c, *p| p.* = c;
+        const in_views = try sa.alloc(ColumnView, spec.inputs.len);
+        var kin: std.ArrayListUnmanaged(u32) = .empty;
+
+        for (fr.ranges) |rng| {
+            const start: u32 = @intCast(s.out[0].rowCount());
+            if (t.union_append) {
+                for (s.out, fr.views[0..fr.width]) |*dst, v| {
+                    try appendViewRange(alloc, dst, v, rng[0], rng[1]);
+                }
+            }
+
+            // Kernel-visible input: the (filtered) range, copied contiguous.
+            kin.clearRetainingCapacity();
+            if (t.input_filter) |f| {
+                for (rng[0]..rng[1]) |i| {
+                    const v = viewI64(fr.views[f.col], i) orelse continue;
+                    if (v >= f.lo and v <= f.hi) try kin.append(sa, @intCast(i));
+                }
+            } else {
+                try kin.ensureUnusedCapacity(sa, rng[1] - rng[0]);
+                for (rng[0]..rng[1]) |i| kin.appendAssumeCapacity(@intCast(i));
+            }
+
+            if (kin.items.len > 0) {
+                for (s.in_scratch) |*c| c.clear();
+                for (s.in_scratch, spec.inputs) |*dst, ci| {
+                    try scatterColumn(alloc, dst, fr.views[ci], kin.items);
+                }
+                for (s.in_scratch, in_views) |*c, *v| v.* = c.view();
+                try self.callTvf(spec, s, in_views, kin.items.len, out_ptrs, null);
+            }
+            try s.ranges.append(alloc, .{ start, @intCast(s.out[0].rowCount()) });
+        }
+
+        fr.width = s.out.len;
+        for (s.out, fr.views[0..fr.width]) |*c, *v| v.* = c.view();
+        fr.rows = s.out[0].rowCount();
         fr.ranges = s.ranges.items;
     }
 
@@ -1523,6 +1734,196 @@ test "region program: compute op runs the engine expression evaluator per shard"
         try testing.expectEqual(v0.isValid(i), v1.isValid(i));
         if (v0.isValid(i)) try testing.expectEqual(v0.data.bigint[i], v1.data.bigint[i]);
     }
+}
+
+/// Aligned test kernel: out[0] = in[0] * 2 + broadcast[0].row0.
+fn tKernelDouble(ctx: *const udf_mod.TvfContext, parts: []const udf_mod.TvfPartition, out: *udf_mod.TvfOutput) anyerror!void {
+    _ = ctx;
+    const v = parts[0].columns[0];
+    const addend = viewI64(parts[1].columns[0], 0).?;
+    const dst = out.columns[0];
+    for (0..parts[0].row_count) |i| {
+        if (viewI64(v, i)) |x| {
+            try dst.data.bigint.append(out.allocator, x * 2 + addend);
+            try dst.appendValidBit(out.allocator, dst.rowCount() - 1, true);
+        } else try dst.appendNulls(out.allocator, 1);
+    }
+}
+
+/// Grouped replace test kernel: one row per partition = (k of row 0, sum v).
+fn tKernelSum(ctx: *const udf_mod.TvfContext, parts: []const udf_mod.TvfPartition, out: *udf_mod.TvfOutput) anyerror!void {
+    _ = ctx;
+    const p = parts[0];
+    var sum: i64 = 0;
+    for (0..p.row_count) |i| {
+        if (viewI64(p.columns[1], i)) |x| sum += x;
+    }
+    try appendRowValue(out.allocator, out.columns[0], p.columns[0], 0);
+    try out.columns[1].data.bigint.append(out.allocator, sum);
+    try out.columns[1].appendValidBit(out.allocator, out.columns[1].rowCount() - 1, true);
+}
+
+/// Union-append test kernel over frame (k,g,v): appends one row per call —
+/// (k of row 0, g=99, v=input row count).
+fn tKernelEstimate(ctx: *const udf_mod.TvfContext, parts: []const udf_mod.TvfPartition, out: *udf_mod.TvfOutput) anyerror!void {
+    _ = ctx;
+    const p = parts[0];
+    try appendRowValue(out.allocator, out.columns[0], p.columns[0], 0);
+    try out.columns[1].data.int.append(out.allocator, 99);
+    try out.columns[1].appendValidBit(out.allocator, out.columns[1].rowCount() - 1, true);
+    try out.columns[2].data.bigint.append(out.allocator, @intCast(p.row_count));
+    try out.columns[2].appendValidBit(out.allocator, out.columns[2].rowCount() - 1, true);
+}
+
+test "region program: tvf_aligned appends computed columns (broadcast part)" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = try tBuildShard(alloc, &entry);
+    defer sd.deinit(alloc);
+
+    var addend = try ColumnStore.init(alloc, .bigint, true);
+    defer addend.deinit(alloc);
+    try tAppendI64(alloc, &addend, 5);
+    const bviews = [_]ColumnView{addend.view()};
+    const extra = [_]udf_mod.TvfPartition{.{ .columns = &bviews, .row_count = 1, .keys = &.{} }};
+
+    const inputs = [_]usize{2};
+    const out_cols = [_]Column{.{ .name = "v2", .type = .bigint, .nullable = true }};
+    const emit_cols = [_]usize{ 2, 3 };
+    const ops = [_]RegionOp{
+        .{ .tvf_aligned = .{
+            .process = tKernelDouble,
+            .inputs = &inputs,
+            .extra_parts = &extra,
+            .out = &out_cols,
+        } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+    const out = try alloc.alloc(ColumnStore, prog.output_schema.len);
+    defer {
+        for (out) |*c| c.deinit(alloc);
+        alloc.free(out);
+    }
+    for (out, prog.output_schema) |*c, col| c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+
+    try worker.runShard(&sd, out);
+
+    try testing.expectEqual(@as(usize, 6), out[0].rowCount());
+    const v0 = out[0].view();
+    const v1 = out[1].view();
+    for (0..6) |i| {
+        try testing.expectEqual(v0.isValid(i), v1.isValid(i));
+        if (v0.isValid(i)) try testing.expectEqual(v0.data.bigint[i] * 2 + 5, v1.data.bigint[i]);
+    }
+}
+
+test "region program: tvf_grouped replace emits per-range kernel output" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = try tBuildShard(alloc, &entry);
+    defer sd.deinit(alloc);
+
+    const inputs = [_]usize{ 0, 2 };
+    const out_cols = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "sum_v", .type = .bigint, .nullable = true },
+    };
+    const emit_cols = [_]usize{ 0, 1 };
+    const ops = [_]RegionOp{
+        .{ .tvf_grouped = .{ .spec = .{
+            .process = tKernelSum,
+            .inputs = &inputs,
+            .out = &out_cols,
+        } } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+    const out = try alloc.alloc(ColumnStore, prog.output_schema.len);
+    defer {
+        for (out) |*c| c.deinit(alloc);
+        alloc.free(out);
+    }
+    for (out, prog.output_schema) |*c, col| c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+
+    try worker.runShard(&sd, out);
+
+    // Range "a": 10+30+5+20 = 65; range "b": 7.
+    try testing.expectEqual(@as(usize, 2), out[0].rowCount());
+    const kv = out[0].view();
+    const sv = out[1].view();
+    try testing.expectEqualStrings("a", stringViewOf(kv).rowBytes(0));
+    try testing.expectEqualStrings("b", stringViewOf(kv).rowBytes(1));
+    try testing.expectEqual(@as(i64, 65), sv.data.bigint[0]);
+    try testing.expectEqual(@as(i64, 7), sv.data.bigint[1]);
+}
+
+test "region program: tvf_grouped union_append with input filter" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = try tBuildShard(alloc, &entry);
+    defer sd.deinit(alloc);
+
+    const inputs = [_]usize{ 0, 1, 2 };
+    const emit_cols = [_]usize{ 0, 1, 2 };
+    const ops = [_]RegionOp{
+        .{ .tvf_grouped = .{
+            .spec = .{
+                .process = tKernelEstimate,
+                .inputs = &inputs,
+                .out = &entry,
+            },
+            .union_append = true,
+            // Only v in [10, 30] feeds the kernel; range "b" (v=7) gets none.
+            .input_filter = .{ .col = 2, .lo = 10, .hi = 30 },
+        } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+    const out = try alloc.alloc(ColumnStore, prog.output_schema.len);
+    defer {
+        for (out) |*c| c.deinit(alloc);
+        alloc.free(out);
+    }
+    for (out, prog.output_schema) |*c, col| c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+
+    try worker.runShard(&sd, out);
+
+    // Range "a" (5 rows, filtered kernel input {10,30,20}) gains one row
+    // (k=a, g=99, v=3) at its tail; range "b" is unchanged (no kernel call).
+    try testing.expectEqual(@as(usize, 7), out[0].rowCount());
+    const kv = out[0].view();
+    const gv = out[1].view();
+    const vv = out[2].view();
+    try testing.expectEqualStrings("a", stringViewOf(kv).rowBytes(5));
+    try testing.expectEqual(@as(i32, 99), gv.data.int[5]);
+    try testing.expectEqual(@as(i64, 3), vv.data.bigint[5]);
+    try testing.expectEqualStrings("b", stringViewOf(kv).rowBytes(6));
+    try testing.expectEqual(@as(i64, 7), vv.data.bigint[6]);
 }
 
 test "appendStoreRange: contiguous copy preserves values and validity" {
