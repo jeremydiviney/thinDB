@@ -27,6 +27,8 @@ const compute_mod = @import("compute.zig");
 const single_batch = @import("single_batch.zig");
 const udf_mod = @import("../udf.zig");
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 const HASH_SEED: u64 = 0x9e3779b9;
 /// Bucket refs pack (worker, row) into a u32; buckets stay far below this.
 const REF_ROW_BITS = 24;
@@ -605,6 +607,8 @@ pub const AggOut = struct {
         sum_float: usize,
         min_int: usize,
         max_int: usize,
+        /// MAX over a string column: byte order, NULLs ignored.
+        max_str: usize,
         max_by: struct { val: usize, ord: usize },
     },
 };
@@ -641,8 +645,12 @@ pub const RegionOp = union(enum) {
     lag: struct { name: []const u8, src: usize, offset: usize },
     /// Keyed aggregation: groups are (range × subkeys). Output rows are
     /// emitted per range, sub-groups ordered by subkey values ascending
-    /// NULLS FIRST; ranges rewritten to the per-range output spans.
-    group_agg: struct { subkeys: []const usize, out: []const AggOut },
+    /// NULLS FIRST; ranges rewritten to the per-range output spans. With
+    /// `merge_on`, runs of ADJACENT ranges with equal merge_on value form
+    /// one aggregation span (same contract as ranks.merge_on — a grouping
+    /// coarser than the range keys, consecutive by the consolidation
+    /// ordering).
+    group_agg: struct { subkeys: []const usize, out: []const AggOut, merge_on: ?usize = null },
     /// Broadcast hash join on an int-family probe column. LEFT appends the
     /// payload columns (NULL on miss); INNER additionally drops non-matching
     /// rows (frame restructure, ranges rewritten in place).
@@ -777,6 +785,7 @@ pub const Program = struct {
                 .group_agg => |g| blk: {
                     if (g.subkeys.len > MAX_SUBKEYS or g.out.len == 0) return error.UnsupportedQueryShape;
                     for (g.subkeys) |c| try requireIntFamily(in, c);
+                    if (g.merge_on) |c| _ = try checkCol(in, c);
                     const cols = try a.alloc(Column, g.out.len);
                     for (g.out, cols) |spec, *col| {
                         const t: types.Type = switch (spec.kind) {
@@ -791,6 +800,13 @@ pub const Program = struct {
                             },
                             .min_int, .max_int => |c| t: {
                                 try requireIntFamily(in, c);
+                                break :t in[c].type;
+                            },
+                            .max_str => |c| t: {
+                                switch (in[checkCol(in, c) catch return error.UnsupportedQueryShape].type) {
+                                    .varchar, .string, .char => {},
+                                    else => return error.UnsupportedQueryShape,
+                                }
                                 break :t in[c].type;
                             },
                             .max_by => |mb| t: {
@@ -958,6 +974,9 @@ pub const RegionWorker = struct {
     /// Per-shard scratch (argsort buffers, keep lists); reset per shard.
     scratch: std.heap.ArenaAllocator,
     views: []ColumnView,
+    /// Per-op wall ticks (THINDB_REGION_TRACE only; null otherwise).
+    op_ticks: ?[]i64 = null,
+    consolidate_ticks: i64 = 0,
 
     const OpState = union(enum) {
         compute: ComputeInstance,
@@ -1076,12 +1095,19 @@ pub const RegionWorker = struct {
             };
             built += 1;
         }
+        var op_ticks: ?[]i64 = null;
+        if (getenv("THINDB_REGION_TRACE") != null) {
+            const t = try alloc.alloc(i64, prog.ops.len);
+            @memset(t, 0);
+            op_ticks = t;
+        }
         return .{
             .alloc = alloc,
             .prog = prog,
             .states = states,
             .scratch = std.heap.ArenaAllocator.init(alloc),
             .views = try alloc.alloc(ColumnView, prog.max_width),
+            .op_ticks = op_ticks,
         };
     }
 
@@ -1089,6 +1115,7 @@ pub const RegionWorker = struct {
         deinitStates(self.alloc, self.states);
         self.alloc.free(self.states);
         self.alloc.free(self.views);
+        if (self.op_ticks) |t| self.alloc.free(t);
         self.scratch.deinit();
         self.* = undefined;
     }
@@ -1196,7 +1223,12 @@ pub const RegionWorker = struct {
         };
         for (sd.cols, fr.views[0..fr.width]) |*c, *v| v.* = c.view();
 
+        const tick_ops = self.op_ticks != null;
         for (self.prog.ops[start_op..], self.states[start_op..], start_op..) |op, *st, oi| {
+            const t_op = if (tick_ops) exec.prof.nowTicks() else 0;
+            defer if (tick_ops) {
+                self.op_ticks.?[oi] += exec.prof.nowTicks() - t_op;
+            };
             switch (op) {
                 .compute => {
                     const b = try st.compute.ptr.evalBatch(.{
@@ -1389,7 +1421,21 @@ pub const RegionWorker = struct {
         s.ranges.clearRetainingCapacity();
         const sa = self.scratch.allocator();
 
-        for (fr.ranges) |rng| {
+        var ri: usize = 0;
+        while (ri < fr.ranges.len) : (ri += 1) {
+            var rng = fr.ranges[ri];
+            if (g.merge_on) |mc| {
+                // Aggregation span coarser than the range keys: absorb
+                // adjacent ranges with the same merge_on value (equal runs
+                // are consecutive by the consolidation ordering contract).
+                while (ri + 1 < fr.ranges.len) {
+                    const nxt = fr.ranges[ri + 1];
+                    if (nxt[0] != nxt[1] and rng[0] != rng[1] and
+                        viewOrderRows(fr.views[mc], rng[0], nxt[0]) != .eq) break;
+                    rng[1] = nxt[1];
+                    ri += 1;
+                }
+            }
             s.map.clearRetainingCapacity();
             s.sub_first.clearRetainingCapacity();
             for (s.cells) |*l| l.clearRetainingCapacity();
@@ -1417,6 +1463,7 @@ pub const RegionWorker = struct {
                     .sum_float => |c| accumSumFloat(cells.items, ord_of, fr.views[c], rng[0]),
                     .min_int => |c| accumMinMax(false, cells.items, ord_of, fr.views[c], rng[0]),
                     .max_int => |c| accumMinMax(true, cells.items, ord_of, fr.views[c], rng[0]),
+                    .max_str => |c| accumMaxStr(cells.items, ord_of, fr.views[c], rng[0]),
                     .max_by => |mb| accumMaxBy(cells.items, ord_of, fr.views[mb.val], fr.views[mb.ord], rng[0]),
                 }
             }
@@ -1449,6 +1496,9 @@ pub const RegionWorker = struct {
                         } else try dst.appendNulls(alloc, 1),
                         .min_int, .max_int => if (cell.seen) {
                             try appendI64As(alloc, dst, cell.i);
+                        } else try dst.appendNulls(alloc, 1),
+                        .max_str => |c| if (cell.seen) {
+                            try appendRowValue(alloc, dst, fr.views[c], cell.row);
                         } else try dst.appendNulls(alloc, 1),
                         .max_by => |mb| if (cell.seen) {
                             try appendRowValue(alloc, dst, fr.views[mb.val], cell.row);
@@ -1682,6 +1732,19 @@ pub const RegionWorker = struct {
             for (s.pay, fr.views[fr.width..][0..s.pay.len]) |*c, *v| v.* = c.view();
             fr.width += s.pay.len;
             return;
+        }
+
+        // Pure-filter inner probe (no payload) where every row matches:
+        // the frame is untouched — skip the full restructure copy.
+        if (h.payload.len == 0) {
+            var all_match = true;
+            for (ords) |o| {
+                if (o == NO_MATCH) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) return;
         }
 
         for (s.cols) |*c| c.clear();
@@ -1981,7 +2044,9 @@ const ShardPhase = struct {
             const s = self.order[oi];
             if (self.ex.shardRows(s) == 0) continue;
             _ = slot.scratch.reset(.retain_capacity);
+            const t_con = if (rw.op_ticks != null) exec.prof.nowTicks() else 0;
             try consolidateOrderedTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &slot.sd, slot.scratch.allocator(), tail);
+            if (rw.op_ticks != null) rw.consolidate_ticks += exec.prof.nowTicks() - t_con;
             const out = &self.result.shards[s];
             try rw.runShardFrom(&slot.sd, out.cols, start_op);
             out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
@@ -2028,6 +2093,9 @@ pub fn runRegionPooled(
     const threads = try alloc.alloc(std.Thread, opts.n_threads);
     defer alloc.free(threads);
 
+    const trace = getenv("THINDB_REGION_TRACE") != null;
+    const t0 = if (trace) exec.prof.nowTicks() else 0;
+
     var scan_phase = ScanPhase{
         .ex = ex,
         .sources = sources,
@@ -2044,6 +2112,8 @@ pub fn runRegionPooled(
     scan_phase.worker(opts.n_threads - 1);
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
+
+    const t1 = if (trace) exec.prof.nowTicks() else 0;
 
     const order = try ex.shardOrderDesc(alloc);
     defer alloc.free(order);
@@ -2064,6 +2134,28 @@ pub fn runRegionPooled(
     shard_phase.worker(opts.n_threads - 1);
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
+
+    if (trace) {
+        const t2 = exec.prof.nowTicks();
+        var rows: usize = 0;
+        for (result.shards) |s| rows += s.rows;
+        std.debug.print("[region] scan+scatter={d:.0}ms shards={d:.0}ms out_rows={d} threads={d}\n", .{
+            exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), rows, opts.n_threads,
+        });
+        // Per-op CPU (summed across workers; wall ≈ sum / threads when
+        // load-balanced). Consolidation reported the same way.
+        var con: i64 = 0;
+        for (pool.slots.items[0..opts.n_threads]) |slot| con += slot.rw.consolidate_ticks;
+        std.debug.print("[region]   consolidate={d:.0}ms(cpu)", .{exec.prof.ticksToMs(con)});
+        for (prog.ops, 0..) |op, oi| {
+            var t: i64 = 0;
+            for (pool.slots.items[0..opts.n_threads]) |slot| {
+                if (slot.rw.op_ticks) |ticks| t += ticks[oi];
+            }
+            std.debug.print(" op{d}:{s}={d:.0}ms", .{ oi, @tagName(op), exec.prof.ticksToMs(t) });
+        }
+        std.debug.print("\n", .{});
+    }
 
     pool.releaseRun();
 }
@@ -2122,6 +2214,23 @@ fn accumMinMax(comptime is_max: bool, cells: []AccCell, ord_of: []const u32, v: 
                 const cell = &cells[gi];
                 cell.i = if (!cell.seen) x else if (is_max) @max(cell.i, x) else @min(cell.i, x);
                 cell.seen = true;
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn accumMaxStr(cells: []AccCell, ord_of: []const u32, v: ColumnView, base: usize) void {
+    switch (v.data) {
+        inline .varchar, .string, .char => |sv| {
+            for (ord_of, 0..) |gi, li| {
+                if (!v.isValid(base + li)) continue;
+                const s = sv.rowBytes(base + li);
+                const cell = &cells[gi];
+                if (!cell.seen or std.mem.order(u8, s, sv.rowBytes(cell.row)) == .gt) {
+                    cell.row = @intCast(base + li);
+                    cell.seen = true;
+                }
             }
         },
         else => unreachable,

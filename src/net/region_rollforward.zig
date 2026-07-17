@@ -108,6 +108,10 @@ pub fn tryRecognize(input: engine_v2.CompileInput, root: *const ir.Op) ?Recogniz
 // ---------------------------------------------------------------------------
 
 const Spine = struct {
+    /// The keyed monthly GROUP BY directly above the projection — present
+    /// when the anchor is the materialize ABOVE it (the aggregation then
+    /// runs in-region as a merged-span group_agg).
+    g12: ?*const ir.Op.GroupBy,
     s14: *const ir.Op.Project,
     w15: *const ir.WindowOp,
     c16: []const Derived,
@@ -224,6 +228,12 @@ fn walkSpine(root_mat: *const ir.Op) !Spine {
     var w = Cursor{ .cur = root_mat.materialize.upstream };
     var sp: Spine = undefined;
 
+    sp.g12 = null;
+    if (w.cur.* == .group_by) {
+        sp.g12 = &w.cur.group_by;
+        w.cur = w.cur.group_by.upstream;
+        try w.mat();
+    }
     sp.s14 = try w.sel();
     sp.w15 = try w.win();
     sp.c16 = try w.comp();
@@ -952,7 +962,10 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     try pushRanksFromWindow(&b, sp.w54, null);
     try b.applySelect(sp.s53);
     try b.pushCompute(sp.c51);
-    try pushGroupAgg(&b, sp.g50);
+    {
+        const keys = try b.rangeKeyIdxs();
+        try pushGroupAgg(&b, sp.g50, &keys, null);
+    }
     try b.pushCompute(sp.c49);
     try b.applySelect(sp.s48);
     try pushFillLast(&b, sp.w46);
@@ -1189,19 +1202,22 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         try b.fb.setVis(wc.calls[0].output_name, rank_idx);
     }
 
-    // ---- emit per the projection above the final window ------------------
-    const emit_cols = try a.alloc(usize, sp.s14.columns.len);
-    const emit_names = try a.alloc([]const u8, sp.s14.columns.len);
-    for (sp.s14.columns, 0..) |col, i| {
-        const e = b.fb.resolve(col) orelse return NoMatch;
-        emit_cols[i] = e.idx;
-        var out_name: []const u8 = e.name;
-        if (sp.s14.outputs) |outs| {
-            if (i < outs.len) {
-                if (outs[i]) |o| out_name = o;
-            }
-        }
-        emit_names[i] = try a.dupe(u8, out_name);
+    // ---- projection above the final window, then (when the anchor sits
+    // above it) the keyed monthly GROUP BY runs in-region: spans merge
+    // adjacent equal-customer ranges (projectId is a scan-filter constant;
+    // divisionId became a literal, so it degrades to a constant subkey).
+    try b.applySelect(sp.s14);
+    if (sp.g12) |g12| {
+        const pj = (b.fb.resolve("projectId") orelse return NoMatch).idx;
+        const lc = (b.fb.resolve("customerNumberLC") orelse return NoMatch).idx;
+        const required = [_]usize{ pj, lc };
+        try pushGroupAgg(&b, g12, &required, lc);
+    }
+    const emit_cols = try a.alloc(usize, b.fb.vis.items.len);
+    const emit_names = try a.alloc([]const u8, b.fb.vis.items.len);
+    for (b.fb.vis.items, emit_cols, emit_names) |e, *ec, *en| {
+        ec.* = e.idx;
+        en.* = e.name;
     }
     try b.flushPending();
     try b.ops.append(a, .{ .emit = .{ .cols = emit_cols } });
@@ -1474,28 +1490,32 @@ fn pushFillLast(b: *Builder, w: *const ir.WindowOp) !void {
     }
 }
 
-/// The keyed aggregation: group keys = range keys + int-family subkeys; the
-/// region emits sub-groups in subkey-ascending order per range — exactly the
-/// month order every downstream op requires.
-fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy) !void {
+/// Keyed aggregation: group cols must cover every `required` frame column
+/// (the span identity — the range keys, or (project, customer) when the
+/// span merges adjacent ranges via `merge_on`); the rest become int-family
+/// subkeys. The region emits sub-groups subkey-ascending per span, which is
+/// exactly the month order downstream ops require.
+fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, merge_on: ?usize) !void {
     const a = b.a;
-    const keys = try b.rangeKeyIdxs();
     var subkeys: std.ArrayListUnmanaged(usize) = .empty;
-    var key_covered = [3]bool{ false, false, false };
+    const covered = try a.alloc(bool, required.len);
+    @memset(covered, false);
     for (g.group_cols) |gc| {
         const idx = (b.fb.resolve(gc) orelse return NoMatch).idx;
-        var is_range_key = false;
-        for (keys, 0..) |k, i| {
+        var is_span_key = false;
+        for (required, 0..) |k, i| {
             if (k == idx) {
-                key_covered[i] = true;
-                is_range_key = true;
+                covered[i] = true;
+                is_span_key = true;
                 break;
             }
         }
-        if (!is_range_key) try subkeys.append(a, idx);
+        if (!is_span_key) try subkeys.append(a, idx);
     }
-    if (!key_covered[0] or !key_covered[1] or !key_covered[2]) return NoMatch;
-    if (subkeys.items.len != 1) return NoMatch; // rollforward shape: month only
+    for (covered) |c| {
+        if (!c) return NoMatch;
+    }
+    if (subkeys.items.len == 0 or subkeys.items.len > 3) return NoMatch;
 
     var out: std.ArrayListUnmanaged(region.AggOut) = .empty;
     var new_vis: std.ArrayListUnmanaged(VisEntry) = .empty;
@@ -1513,7 +1533,13 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy) !void {
                 .val = try b.resolveIdx(spec.col orelse return NoMatch),
                 .ord = try b.resolveIdx(spec.arg2_col orelse return NoMatch),
             } },
-            .max => .{ .max_int = try intFamilyIdx(b, spec.col orelse return NoMatch) },
+            .max => blk: {
+                const idx = try b.resolveIdx(spec.col orelse return NoMatch);
+                break :blk switch (b.fb.cols.items[idx].type) {
+                    .varchar, .string, .char => .{ .max_str = idx },
+                    else => .{ .max_int = try intFamilyIdx(b, spec.col orelse return NoMatch) },
+                };
+            },
             .min => .{ .min_int = try intFamilyIdx(b, spec.col orelse return NoMatch) },
             .sum => blk: {
                 const idx = try b.resolveIdx(spec.col orelse return NoMatch);
@@ -1534,6 +1560,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy) !void {
     try b.ops.append(a, .{ .group_agg = .{
         .subkeys = try a.dupe(usize, subkeys.items),
         .out = try a.dupe(region.AggOut, out.items),
+        .merge_on = merge_on,
     } });
 
     // Frame replaced by the aggregation output. Types are re-derived by
@@ -1545,7 +1572,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy) !void {
         const t: types.Type = switch (o.kind) {
             .first => |c| in_cols[c].type,
             .max_by => |mb| in_cols[mb.val].type,
-            .min_int, .max_int => |c| in_cols[c].type,
+            .min_int, .max_int, .max_str => |c| in_cols[c].type,
             .sum_int => .bigint,
             .sum_float => .double,
         };
