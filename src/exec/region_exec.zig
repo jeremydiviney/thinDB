@@ -1108,20 +1108,70 @@ pub const RegionWorker = struct {
         }
     }
 
+    /// Lever 3: precomputed normalized sort keys per order column (the
+    /// consolidation trick applied in-group). `keys == null` falls back to
+    /// the generic comparator (float/decimal orders); `lossy` marks the
+    /// i64-family norm (its low bit is folded into the null flag), which
+    /// resolves norm ties through the exact comparator so ordering stays
+    /// correct for arbitrary values.
+    const NormCol = struct {
+        keys: ?[]const RowKey,
+        lossy: bool,
+    };
+
     const RankCtx = struct {
         views: []const ColumnView,
         order: []const OrderBy,
+        norms: []const NormCol,
         base: u32,
 
         fn less(ctx: @This(), x: u32, y: u32) bool {
-            for (ctx.order) |ob| {
-                var o = viewOrderRows(ctx.views[ob.col], ctx.base + x, ctx.base + y);
+            for (ctx.order, ctx.norms) |ob, nc| {
+                var o: std.math.Order = .eq;
+                if (nc.keys) |ks| {
+                    const a = ks[ctx.base + x];
+                    const b = ks[ctx.base + y];
+                    if (a.norm != b.norm) {
+                        o = if (a.norm < b.norm) .lt else .gt;
+                    } else if (a.str.len != 0 or b.str.len != 0) {
+                        o = std.mem.order(u8, a.str, b.str);
+                    } else if (nc.lossy) {
+                        o = viewOrderRows(ctx.views[ob.col], ctx.base + x, ctx.base + y);
+                    }
+                } else {
+                    o = viewOrderRows(ctx.views[ob.col], ctx.base + x, ctx.base + y);
+                }
                 if (ob.desc) o = o.invert();
                 if (o != .eq) return o == .lt;
             }
             return x < y;
         }
     };
+
+    fn buildNormKeys(sa: Allocator, v: ColumnView, rows: usize) !NormCol {
+        switch (v.data) {
+            inline .tinyint, .smallint, .int, .date => |vals| {
+                const ks = try sa.alloc(RowKey, rows);
+                for (ks, 0..) |*k, i| k.* = .{ .norm = normI32(v.isValid(i), vals[i]), .str = "" };
+                return .{ .keys = ks, .lossy = false };
+            },
+            inline .bigint, .datetime => |vals| {
+                const ks = try sa.alloc(RowKey, rows);
+                for (ks, 0..) |*k, i| k.* = .{ .norm = normI64(v.isValid(i), vals[i]), .str = "" };
+                return .{ .keys = ks, .lossy = true };
+            },
+            .varchar, .string, .char, .json => |sv| {
+                const ks = try sa.alloc(RowKey, rows);
+                for (ks, 0..) |*k, i| {
+                    const valid = v.isValid(i);
+                    const s: []const u8 = if (valid) sv.rowBytes(i) else "";
+                    k.* = .{ .norm = normStrPrefix(valid, s), .str = s };
+                }
+                return .{ .keys = ks, .lossy = false };
+            },
+            else => return .{ .keys = null, .lossy = false },
+        }
+    }
 
     fn runRanks(
         self: *RegionWorker,
@@ -1132,12 +1182,19 @@ pub const RegionWorker = struct {
         store.clear();
         const out_slice = try store.data.bigint.addManyAsSlice(self.alloc, fr.rows);
         const sa = self.scratch.allocator();
+        const norms = try sa.alloc(NormCol, r.order.len);
+        for (r.order, norms) |ob, *nc| nc.* = try buildNormKeys(sa, fr.views[ob.col], fr.rows);
         for (fr.ranges) |rng| {
             const n = rng[1] - rng[0];
             if (n == 0) continue;
             const ord = try sa.alloc(u32, n);
             for (ord, 0..) |*o, k| o.* = @intCast(k);
-            const ctx = RankCtx{ .views = fr.views[0..fr.width], .order = r.order, .base = rng[0] };
+            const ctx = RankCtx{
+                .views = fr.views[0..fr.width],
+                .order = r.order,
+                .norms = norms,
+                .base = rng[0],
+            };
             std.mem.sortUnstable(u32, ord, ctx, RankCtx.less);
             for (ord, 1..) |li, rk| out_slice[rng[0] + li] = @intCast(rk);
         }
@@ -2038,6 +2095,58 @@ test "region program: group_agg min/max/sum_float sweeps (validity hoisted)" {
     try testing.expectEqual(@as(f64, 2.5), sv.data.double[1]);
     try testing.expect(!mn.isValid(1));
     try testing.expect(!mx.isValid(1));
+}
+
+test "region program: ranks normalized keys — lossy i64 ties and string prefix ties" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "s", .type = .string, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = ShardData{};
+    defer sd.deinit(alloc);
+    try sd.ensure(alloc, &entry);
+    // v pairs 6/7 collapse to one norm word (low bit folds into the null
+    // flag); s shares the 7-byte prefix "prefix0" so the norm ties too.
+    const S = [_]?[]const u8{ "prefix0b", "prefix0a", null, "prefix0a" };
+    const V = [_]?i64{ 7, 6, 6, null };
+    for (S, V) |s, v| {
+        try tAppendStr(alloc, &sd.cols[0], "a");
+        try tAppendStr(alloc, &sd.cols[1], s);
+        try tAppendI64(alloc, &sd.cols[2], v);
+    }
+    sd.rows = 4;
+    try sd.ranges.append(alloc, .{ 0, 4 });
+
+    const order = [_]OrderBy{ .{ .col = 2 }, .{ .col = 1, .desc = true } };
+    const emit_cols = [_]usize{3};
+    const ops = [_]RegionOp{
+        .{ .ranks = .{ .name = "rn", .order = &order } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+    const out = try alloc.alloc(ColumnStore, 1);
+    defer {
+        out[0].deinit(alloc);
+        alloc.free(out);
+    }
+    out[0] = try ColumnStore.init(alloc, .bigint, false);
+
+    try worker.runShard(&sd, out);
+
+    // Order by (v ASC NULLS FIRST, s DESC NULLS LAST):
+    //   row3 (v NULL)            -> rank 1
+    //   v=6: row1 (s prefix0a) vs row2 (s NULL, last on DESC) -> ranks 2,3
+    //   row0 (v=7)               -> rank 4
+    const rn = out[0].view();
+    try testing.expectEqual(@as(i64, 4), rn.data.bigint[0]);
+    try testing.expectEqual(@as(i64, 2), rn.data.bigint[1]);
+    try testing.expectEqual(@as(i64, 3), rn.data.bigint[2]);
+    try testing.expectEqual(@as(i64, 1), rn.data.bigint[3]);
 }
 
 test "region program: inner probe drops non-matching sub-groups" {
