@@ -1411,9 +1411,14 @@ pub fn main() !void {
     try bc.buildKernelInputs();
     const bc_ms = prof.ticksToMs(prof.nowTicks() - t);
 
+    const passes: usize = if (getenv("RF_PASSES")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1;
+    const table = try db.openTable("invoice_import_amortized", .{});
+
+    for (0..passes) |pass| {
+        const t_pass = prof.nowTicks();
+
     // ---- phase 1: scan + scatter ----------------------------------------
     t = prof.nowTicks();
-    const table = try db.openTable("invoice_import_amortized", .{});
 
     table.ddl_lock.lockSharedUncancelable(table.io);
     defer table.ddl_lock.unlockShared(table.io);
@@ -1664,8 +1669,8 @@ pub fn main() !void {
         for (0..5) |k| ph[k] += p[k];
     }
     std.debug.print(
-        "rf_custom D: open={d:.0}ms bc={d:.0}ms build={d:.0}ms scan={d:.0}ms stages={d:.0}ms total={d:.0}ms union_rows={d} est_rows={d} agg_rows={d} final_rows={d}\n",
-        .{ open_ms, bc_ms, build_ms, scan_ms, stage_ms, prof.ticksToMs(prof.nowTicks() - t_all), union_total, est_total, agg_total, p15.rows },
+        "rf_custom D pass={d}: open={d:.0}ms bc={d:.0}ms build={d:.0}ms scan={d:.0}ms stages={d:.0}ms wall={d:.0}ms total={d:.0}ms union_rows={d} est_rows={d} agg_rows={d} final_rows={d}\n",
+        .{ pass, open_ms, bc_ms, build_ms, scan_ms, stage_ms, prof.ticksToMs(prof.nowTicks() - t_pass), prof.ticksToMs(prof.nowTicks() - t_all), union_total, est_total, agg_total, p15.rows },
     );
     std.debug.print(
         "stage core-time (summed over {d} threads): sortkeys={d:.0}ms gather+est={d:.0}ms currency={d:.0}ms prerecords+agg={d:.0}ms gapfill+updown+tail={d:.0}ms\n",
@@ -1737,6 +1742,22 @@ pub fn main() !void {
             cap.sum_amount,
         },
     );
+
+        // Per-pass teardown so warm passes measure work, not leak growth.
+        for (shards) |*sd| {
+            if (sd.out_rows == 0) continue;
+            sd.buf.deinit(allocator);
+            for (&sd.cur) |*c| c.deinit(allocator);
+            for (&sd.agg) |*c| c.deinit(allocator);
+            sd.ranges.deinit(allocator);
+            sd.agg_ranges.deinit(allocator);
+        }
+        allocator.free(shards);
+        allocator.free(caps);
+        allocator.free(p5sums);
+        allocator.free(p6caps);
+        allocator.free(p15caps);
+    }
 }
 
 const Coord = struct { seg: usize, rg: usize };
