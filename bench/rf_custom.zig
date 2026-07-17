@@ -474,6 +474,9 @@ const Shard = struct {
     est_rows: usize = 0,
     /// After the gather-reorder: contiguous [start,end) per group.
     ranges: std.ArrayListUnmanaged([2]u32) = .empty,
+    /// Buffers initialized (pooled reuse across passes — region buffers
+    /// clear rather than free, the slab-pool discipline).
+    built: bool = false,
     /// union (base + estimates) row count for reporting.
     out_rows: usize = 0,
     /// rf_currency computed columns, row-aligned with buf.
@@ -511,6 +514,10 @@ fn optStrLessNf(a: ?[]const u8, b: ?[]const u8) ?bool {
 
 const SortKey = struct {
     lc: []const u8,
+    /// Normalized big-endian prefix of `lc` — resolves most comparisons
+    /// without touching the string bytes (region ordering contract uses
+    /// the engine's normalized-key trick).
+    pfx: u64,
     lc_null: bool,
     div: i32,
     div_null: bool,
@@ -518,11 +525,19 @@ const SortKey = struct {
     date: i32,
 };
 
+fn strPfx(s: []const u8) u64 {
+    var b: [8]u8 = @splat(0);
+    const n = @min(8, s.len);
+    @memcpy(b[0..n], s[0..n]);
+    return std.mem.readInt(u64, &b, .big);
+}
+
 fn keyLess(keys: []const SortKey, x: u32, y: u32) bool {
     const a = keys[x];
     const b = keys[y];
     if (a.lc_null != b.lc_null) return a.lc_null; // NULLs first
     if (!a.lc_null) {
+        if (a.pfx != b.pfx) return a.pfx < b.pfx;
         const o = std.mem.order(u8, a.lc, b.lc);
         if (o != .eq) return o == .lt;
     }
@@ -641,6 +656,28 @@ const P5Sums = struct {
     hadj: i64 = 0,
 };
 
+/// Contiguous-range bulk copy of one column (region mechanism: a group's
+/// partition view is a contiguous range of the shard buffer — copy slices,
+/// not values).
+fn appendStoreRange(alloc: std.mem.Allocator, dst: *ColumnStore, src: *const ColumnStore, start: usize, end: usize) !void {
+    const v = src.view();
+    switch (v.data) {
+        .int => |s| try dst.data.int.appendSlice(alloc, s[start..end]),
+        .date => |s| try dst.data.date.appendSlice(alloc, s[start..end]),
+        .bigint => |s| try dst.data.bigint.appendSlice(alloc, s[start..end]),
+        .double => |s| try dst.data.double.appendSlice(alloc, s[start..end]),
+        .varchar, .string, .char, .json => |sv| switch (dst.data) {
+            .varchar, .string, .char, .json => |*d| try d.appendRange(alloc, sv, start, end),
+            else => unreachable,
+        },
+        else => unreachable,
+    }
+    if (dst.nulls != null) {
+        const base = dst.rowCount() - (end - start);
+        for (start..end, 0..) |i, k| try dst.appendValidBit(alloc, base + k, v.isValid(i));
+    }
+}
+
 fn satCastI32(v: i64) i32 {
     if (v > std.math.maxInt(i32)) return std.math.maxInt(i32);
     if (v < std.math.minInt(i32)) return std.math.minInt(i32);
@@ -745,6 +782,11 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
         if (oi >= sh.order.len) break;
         const s: usize = sh.order[oi];
         const shard = &sh.shards[s];
+        shard.est_rows = 0;
+        shard.agg_rows = 0;
+        shard.out_rows = 0;
+        shard.ranges.clearRetainingCapacity();
+        shard.agg_ranges.clearRetainingCapacity();
 
         // ---- S1: sort keys straight from the exchange buckets -------------
         // Region mechanism: the ordering contract is computed over the
@@ -775,8 +817,10 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
                 const date_v = bsrc[SH.date][sw];
                 for (0..bucket_rows) |i| {
                     refs[k] = @intCast((sw << 24) | i);
+                    const lc_s = strOrNull(lc_v, i) orelse "";
                     keys[k] = .{
-                        .lc = strOrNull(lc_v, i) orelse "",
+                        .lc = lc_s,
+                        .pfx = strPfx(lc_s),
                         .lc_null = !lc_v.isValid(i),
                         .div = if (div_v.isValid(i)) div_v.data.int[i] else 0,
                         .div_null = !div_v.isValid(i),
@@ -803,7 +847,12 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
         t0 = prof.nowTicks();
         const win_lo = tdb.Date.fromYmd(.{ .y = 2026, .m = 5, .d = 1 }).days();
         const win_hi = tdb.Date.fromYmd(.{ .y = 2026, .m = 7, .d = 31 }).days();
-        shard.buf = try ShardBuf.init(alloc);
+        if (!shard.built) {
+            shard.buf = try ShardBuf.init(alloc);
+        } else {
+            for (&shard.buf.cols) |*c| c.clear();
+        }
+        shard.buf.rows = 0;
 
         var est_arena = std.heap.ArenaAllocator.init(alloc);
         defer est_arena.deinit();
@@ -901,7 +950,9 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
         // ---- rf_currency_convert: one row-aligned call over the shard -----
         t0 = prof.nowTicks();
         const nrows = shard.buf.rows;
-        for (&shard.cur, CUR_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
+        if (!shard.built) {
+            for (&shard.cur, CUR_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
+        } else for (&shard.cur) |*c| c.clear();
         if (nrows > 0) {
             const cin = [_]usize{
                 SH.projectId,    SH.divisionId,   SH.customerNumberLC, SH.invoiceDate,
@@ -930,7 +981,9 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
 
         // ---- rollforward_pre_records_temp + customer_agg_by_month ---------
         t0 = prof.nowTicks();
-        for (&shard.agg, AGG_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
+        if (!shard.built) {
+            for (&shard.agg, AGG_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
+        } else for (&shard.agg) |*c| c.clear();
         var bviews: [SH.N]ColumnView = undefined;
         for (&bviews, &shard.buf.cols) |*v, *c| v.* = c.view();
         var cuviews: [CU.N]ColumnView = undefined;
@@ -1238,10 +1291,11 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
                 prev_lc_set = true;
             }
 
-            // Gather the group (AG layout) into the reused scratch partition.
+            // Gather the group (AG layout) into the reused scratch partition
+            // — contiguous range, so bulk slice/range copies per column.
             for (&d_ga) |*c| c.clear();
-            for (a0..a1) |ri| {
-                for (&d_ga, aviews) |*dst, srcv| try appendFromView(alloc, dst, srcv, ri);
+            for (&d_ga, &shard.agg) |*dst, *src| {
+                try appendStoreRange(alloc, dst, src, a0, a1);
             }
             var gviews: [AG.N]ColumnView = undefined;
             for (&gviews, &d_ga) |*v, *c| v.* = c.view();
@@ -1346,6 +1400,7 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
         }
         p15c.sum_rn += @divExact(lc_count * (lc_count + 1), 2);
         sh.phase_ticks[w][4] += @intCast(prof.nowTicks() - t0);
+        shard.built = true;
     }
 }
 
@@ -1413,6 +1468,16 @@ pub fn main() !void {
 
     const passes: usize = if (getenv("RF_PASSES")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1;
     const table = try db.openTable("invoice_import_amortized", .{});
+
+    // Pooled across passes: exchange buckets + shard state clear, never free.
+    const worker_shards = try allocator.alloc(ShardBuf, n_threads * n_shards);
+    defer {
+        for (worker_shards) |*sb| sb.deinit(allocator);
+        allocator.free(worker_shards);
+    }
+    for (worker_shards) |*sb| sb.* = try ShardBuf.init(allocator);
+    const shards = try allocator.alloc(Shard, n_shards);
+    for (shards) |*s| s.* = .{ .buf = undefined };
 
     for (0..passes) |pass| {
         const t_pass = prof.nowTicks();
@@ -1496,12 +1561,10 @@ pub fn main() !void {
     const build_ms = prof.ticksToMs(prof.nowTicks() - t);
 
     t = prof.nowTicks();
-    const worker_shards = try allocator.alloc(ShardBuf, n_threads * n_shards);
-    defer {
-        for (worker_shards) |*sb| sb.deinit(allocator);
-        allocator.free(worker_shards);
+    for (worker_shards) |*sb| {
+        for (&sb.cols) |*c| c.clear();
+        sb.rows = 0;
     }
-    for (worker_shards) |*sb| sb.* = try ShardBuf.init(allocator);
 
     const errs = try allocator.alloc(?anyerror, n_threads);
     defer allocator.free(errs);
@@ -1553,9 +1616,6 @@ pub fn main() !void {
     const phase_ticks = try allocator.alloc([5]u64, n_threads);
     defer allocator.free(phase_ticks);
     for (phase_ticks) |*p| p.* = @splat(0);
-
-    const shards = try allocator.alloc(Shard, n_shards);
-    for (shards) |*s| s.* = .{ .buf = undefined };
     const caps = try allocator.alloc(P3Cap, n_threads);
     for (caps) |*c| c.* = .{};
     const p5sums = try allocator.alloc(P5Sums, n_threads);
@@ -1743,16 +1803,7 @@ pub fn main() !void {
         },
     );
 
-        // Per-pass teardown so warm passes measure work, not leak growth.
-        for (shards) |*sd| {
-            if (sd.out_rows == 0) continue;
-            sd.buf.deinit(allocator);
-            for (&sd.cur) |*c| c.deinit(allocator);
-            for (&sd.agg) |*c| c.deinit(allocator);
-            sd.ranges.deinit(allocator);
-            sd.agg_ranges.deinit(allocator);
-        }
-        allocator.free(shards);
+        // Per-pass teardown (shard/exchange buffers are pooled — see above).
         allocator.free(caps);
         allocator.free(p5sums);
         allocator.free(p6caps);
