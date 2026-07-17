@@ -1397,6 +1397,212 @@ pub const RegionWorker = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Region driver: E1 (parallel drain + entry compute + exchange scatter) and
+// E2 (whale-first shard claims: consolidate -> program) across T threads.
+// E3 (stage adoption) lives with the recognizer in net/cte_stages.
+// ---------------------------------------------------------------------------
+
+pub const DriverOpts = struct {
+    n_threads: usize,
+    n_shards: usize,
+    /// Region key column in the ENTRY schema (post entry compute).
+    key_col: usize,
+    /// Ordering contract applied during consolidation; the leading
+    /// `group_prefix` columns define the region-key group ranges.
+    sort_cols: []const OrderCol,
+    group_prefix: usize,
+};
+
+/// Per-shard program outputs. Shards with zero input rows have empty stores.
+pub const RegionResult = struct {
+    alloc: Allocator,
+    schema: []const Column,
+    shards: []ShardOut,
+
+    pub const ShardOut = struct {
+        cols: []ColumnStore,
+        rows: usize = 0,
+    };
+
+    pub fn init(alloc: Allocator, schema: []const Column, n_shards: usize) !RegionResult {
+        const shards = try alloc.alloc(ShardOut, n_shards);
+        var built: usize = 0;
+        errdefer {
+            for (shards[0..built]) |*s| {
+                for (s.cols) |*c| c.deinit(alloc);
+                alloc.free(s.cols);
+            }
+            alloc.free(shards);
+        }
+        for (shards) |*s| {
+            const cols = try alloc.alloc(ColumnStore, schema.len);
+            var inited: usize = 0;
+            errdefer {
+                for (cols[0..inited]) |*c| c.deinit(alloc);
+                alloc.free(cols);
+            }
+            for (cols, schema) |*c, col| {
+                c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+                inited += 1;
+            }
+            s.* = .{ .cols = cols };
+            built += 1;
+        }
+        return .{ .alloc = alloc, .schema = schema, .shards = shards };
+    }
+
+    pub fn deinit(self: *RegionResult) void {
+        for (self.shards) |*s| {
+            for (s.cols) |*c| c.deinit(self.alloc);
+            self.alloc.free(s.cols);
+        }
+        self.alloc.free(self.shards);
+        self.* = undefined;
+    }
+
+    pub fn totalRows(self: *const RegionResult) usize {
+        var n: usize = 0;
+        for (self.shards) |s| n += s.rows;
+        return n;
+    }
+};
+
+const ScanPhase = struct {
+    ex: *Exchange,
+    sources: []exec.Query,
+    next: std.atomic.Value(usize) = .init(0),
+    entry_derived: []const compute_mod.Derived,
+    scan_schema: []const Column,
+    registry: ?*const udf_mod.UdfRegistry,
+    errs: []?anyerror,
+
+    fn worker(self: *ScanPhase, w: usize) void {
+        self.workerInner(w) catch |e| {
+            self.errs[w] = e;
+        };
+    }
+
+    fn workerInner(self: *ScanPhase, w: usize) !void {
+        var wk = try self.ex.worker(w);
+        defer wk.deinit();
+        // Entry compute (e.g. the lowercased key + literal columns) runs
+        // per batch through the engine evaluator, one instance per worker.
+        var inst: ?ComputeInstance = null;
+        defer if (inst) |*i| i.q.deinit();
+        if (self.entry_derived.len > 0) {
+            inst = try makeComputeInstance(self.ex.alloc, self.scan_schema, self.entry_derived, self.registry);
+        }
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.sources.len) break;
+            while (try self.sources[i].next()) |batch| {
+                const routed = if (inst) |*ci| try ci.ptr.evalBatch(batch) else batch;
+                try wk.push(routed);
+            }
+        }
+    }
+};
+
+const ShardPhase = struct {
+    ex: *Exchange,
+    prog: *const Program,
+    opts: DriverOpts,
+    order: []const u32,
+    next: std.atomic.Value(usize) = .init(0),
+    result: *RegionResult,
+    errs: []?anyerror,
+
+    fn worker(self: *ShardPhase, w: usize) void {
+        self.workerInner(w) catch |e| {
+            self.errs[w] = e;
+        };
+    }
+
+    fn workerInner(self: *ShardPhase, w: usize) !void {
+        _ = w;
+        const alloc = self.ex.alloc;
+        var rw = try RegionWorker.init(alloc, self.prog);
+        defer rw.deinit();
+        var sd = ShardData{};
+        defer sd.deinit(alloc);
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+
+        while (true) {
+            const oi = self.next.fetchAdd(1, .monotonic);
+            if (oi >= self.order.len) break;
+            const s = self.order[oi];
+            if (self.ex.shardRows(s) == 0) continue;
+            _ = scratch.reset(.retain_capacity);
+            try consolidateOrdered(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &sd, scratch.allocator());
+            const out = &self.result.shards[s];
+            try rw.runShard(&sd, out.cols);
+            out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
+        }
+    }
+};
+
+/// Run a region end to end: drain `sources` in parallel through the entry
+/// compute into a hash exchange on the program's entry schema, then claim
+/// shards whale-first, consolidating each in the region's order and running
+/// the compiled program shard-locally. `sources` are drained (not deinit'd).
+pub fn runRegion(
+    alloc: Allocator,
+    scan_schema: []const Column,
+    sources: []exec.Query,
+    entry_derived: []const compute_mod.Derived,
+    prog: *const Program,
+    opts: DriverOpts,
+    result: *RegionResult,
+) !void {
+    var ex = try Exchange.init(alloc, prog.schema_at[0], opts.n_threads, opts.n_shards, opts.key_col);
+    defer ex.deinit();
+
+    const errs = try alloc.alloc(?anyerror, opts.n_threads);
+    defer alloc.free(errs);
+    @memset(errs, null);
+    const threads = try alloc.alloc(std.Thread, opts.n_threads);
+    defer alloc.free(threads);
+
+    var scan_phase = ScanPhase{
+        .ex = &ex,
+        .sources = sources,
+        .entry_derived = entry_derived,
+        .scan_schema = scan_schema,
+        .registry = prog.registry,
+        .errs = errs,
+    };
+    var spawned: usize = 0;
+    for (0..opts.n_threads - 1) |w| {
+        threads[w] = try std.Thread.spawn(.{}, ScanPhase.worker, .{ &scan_phase, w });
+        spawned += 1;
+    }
+    scan_phase.worker(opts.n_threads - 1);
+    for (threads[0..spawned]) |t| t.join();
+    for (errs) |e| if (e) |err| return err;
+
+    const order = try ex.shardOrderDesc(alloc);
+    defer alloc.free(order);
+    @memset(errs, null);
+    var shard_phase = ShardPhase{
+        .ex = &ex,
+        .prog = prog,
+        .opts = opts,
+        .order = order,
+        .result = result,
+        .errs = errs,
+    };
+    spawned = 0;
+    for (0..opts.n_threads - 1) |w| {
+        threads[w] = try std.Thread.spawn(.{}, ShardPhase.worker, .{ &shard_phase, w });
+        spawned += 1;
+    }
+    shard_phase.worker(opts.n_threads - 1);
+    for (threads[0..spawned]) |t| t.join();
+    for (errs) |e| if (e) |err| return err;
+}
+
 fn appendI64As(alloc: Allocator, dst: *ColumnStore, v: i64) !void {
     switch (dst.data) {
         .tinyint => |*l| try l.append(alloc, @intCast(v)),
@@ -1924,6 +2130,119 @@ test "region program: tvf_grouped union_append with input filter" {
     try testing.expectEqual(@as(i64, 3), vv.data.bigint[5]);
     try testing.expectEqualStrings("b", stringViewOf(kv).rowBytes(6));
     try testing.expectEqual(@as(i64, 7), vv.data.bigint[6]);
+}
+
+fn tRunDriver(alloc: Allocator, n_threads: usize) !void {
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+
+    // Two source batches over the same schema.
+    var stores: [2][3]ColumnStore = undefined;
+    for (&stores) |*set| {
+        set[0] = try ColumnStore.init(alloc, .string, true);
+        set[1] = try ColumnStore.init(alloc, .int, true);
+        set[2] = try ColumnStore.init(alloc, .bigint, true);
+    }
+    defer for (&stores) |*set| {
+        for (set) |*c| c.deinit(alloc);
+    };
+    const K1 = [_]?[]const u8{ "a", "b", "a" };
+    const G1 = [_]?i32{ 1, 1, 2 };
+    const V1 = [_]?i64{ 10, 20, 30 };
+    const K2 = [_]?[]const u8{ "b", "c", "a" };
+    const G2 = [_]?i32{ 1, null, 1 };
+    const V2 = [_]?i64{ 40, 50, 60 };
+    for (K1, G1, V1) |k, g, v| {
+        try tAppendStr(alloc, &stores[0][0], k);
+        try tAppendInt(alloc, &stores[0][1], g);
+        try tAppendI64(alloc, &stores[0][2], v);
+    }
+    for (K2, G2, V2) |k, g, v| {
+        try tAppendStr(alloc, &stores[1][0], k);
+        try tAppendInt(alloc, &stores[1][1], g);
+        try tAppendI64(alloc, &stores[1][2], v);
+    }
+    var views: [2][3]ColumnView = undefined;
+    for (&views, &stores) |*vs, *set| {
+        for (vs, set) |*v, *c| v.* = c.view();
+    }
+
+    const sources = try alloc.alloc(exec.Query, 2);
+    defer alloc.free(sources);
+    var made: usize = 0;
+    defer for (sources[0..made]) |*q| q.deinit();
+    for (sources, &views, 0..) |*q, *vs, i| {
+        q.* = try single_batch.SingleBatchSource.create(alloc, .{
+            .schema = &entry,
+            .values = vs,
+            .row_count = if (i == 0) K1.len else K2.len,
+        });
+        made += 1;
+    }
+
+    const agg_out = [_]AggOut{
+        .{ .name = "k", .kind = .{ .first = 0 } },
+        .{ .name = "g", .kind = .{ .first = 1 } },
+        .{ .name = "sum_v", .kind = .{ .sum_int = 2 } },
+    };
+    const subkeys = [_]usize{1};
+    const emit_cols = [_]usize{ 0, 1, 2 };
+    const ops = [_]RegionOp{
+        .{ .group_agg = .{ .subkeys = &subkeys, .out = &agg_out } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+
+    var result = try RegionResult.init(alloc, prog.output_schema, 4);
+    defer result.deinit();
+
+    const sort_cols = [_]OrderCol{.{ .col = 0, .kind = .string }};
+    try runRegion(alloc, &entry, sources, &.{}, &prog, .{
+        .n_threads = n_threads,
+        .n_shards = 4,
+        .key_col = 0,
+        .sort_cols = &sort_cols,
+        .group_prefix = 1,
+    }, &result);
+
+    // Expected groups: (a,1)=70 (a,2)=30 (b,1)=60 (c,NULL)=50.
+    try testing.expectEqual(@as(usize, 4), result.totalRows());
+    var sum_all: i64 = 0;
+    var seen_a1 = false;
+    for (result.shards) |s| {
+        if (s.rows == 0) continue;
+        const kv = s.cols[0].view();
+        const gv = s.cols[1].view();
+        const sv = s.cols[2].view();
+        for (0..s.rows) |i| {
+            sum_all += sv.data.bigint[i];
+            const k = stringViewOf(kv).rowBytes(i);
+            if (std.mem.eql(u8, k, "a") and gv.isValid(i) and gv.data.int[i] == 1) {
+                try testing.expectEqual(@as(i64, 70), sv.data.bigint[i]);
+                seen_a1 = true;
+            }
+            if (std.mem.eql(u8, k, "c")) {
+                try testing.expect(!gv.isValid(i));
+                try testing.expectEqual(@as(i64, 50), sv.data.bigint[i]);
+            }
+        }
+    }
+    try testing.expectEqual(@as(i64, 210), sum_all);
+    try testing.expect(seen_a1);
+}
+
+test "region driver: scan -> exchange -> whale-first shards -> program (serial)" {
+    try tRunDriver(testing.allocator, 1);
+}
+
+test "region driver: parallel workers match serial (thread-safe allocator)" {
+    // std.testing.allocator is single-threaded; the parallel claim path
+    // runs on the smp allocator (no leak check — the serial twin has it).
+    try tRunDriver(std.heap.smp_allocator, 3);
 }
 
 test "appendStoreRange: contiguous copy preserves values and validity" {
